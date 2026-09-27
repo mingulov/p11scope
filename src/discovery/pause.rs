@@ -19,6 +19,19 @@ pub(crate) use crate::events::DiscoveryItem;
 /// its hook. Crate-visible so the run loop's gate tests measure against it.
 pub(crate) const CYCLE_NS: u64 = 500_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
+/// Stops one arm may chain after its first (GT-4). A confirmed stop installs
+/// a successor while the child is still stopped, so the owned child's next
+/// pause-eligible event — a loader hit, a `C_GetFunctionList` /
+/// `C_GetInterface` return — is stopped too and its discovery is applied
+/// before the child runs on. An owned child that `dlopen`s one provider needs
+/// about five: two startup loader hits, the `dlopen`'s RT_ADD and
+/// RT_CONSISTENT, and the table-publishing return. Sixteen leaves room for the
+/// provider's own dependencies and still bounds the cost (a few milliseconds
+/// per stop) for a child that loads libraries continuously: after the budget
+/// the child runs unpaused until the next frame re-arms, and a table still
+/// unpublished then is reported as a gap (`PauseIo::note_unpaused_publication`).
+pub(crate) const MAX_SUCCESSORS_PER_ARM: u8 = 16;
+const MSG_UNPAUSED_PUBLICATION: &str = "the owned pause chain ended while a provider's function table was still unpublished; calls before its probes attach may be unobserved";
 const MAX_FAILURE_ITEMS: usize = 128;
 const MSG_ARM_FAILED: &str = "owned child generation changed before pause arm";
 const MSG_POST_RELEASE_REVALIDATION_INCOMPLETE: &str =
@@ -299,6 +312,15 @@ pub(crate) trait PauseIo {
     fn take_stop_candidate_seen(&mut self) -> bool {
         false
     }
+
+    /// Whether the owned child still has a provider whose function table is
+    /// not published: its probes are not all attached yet.
+    fn publication_pending(&mut self) -> bool {
+        false
+    }
+
+    /// The owned pause chain ended while `publication_pending` held.
+    fn note_unpaused_publication(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -368,7 +390,8 @@ pub(crate) struct PauseCoordinator {
     terminal_batch: Option<TerminalBatch>,
     pending_diagnostic: Option<PauseDiagnostic>,
     diagnostic_annotated: bool,
-    cycles: u8,
+    /// Successors this arm may still install (`MAX_SUCCESSORS_PER_ARM`).
+    successors_left: u8,
     cleaning: bool,
     cleaned: bool,
 }
@@ -460,7 +483,7 @@ impl PauseCoordinator {
             terminal_batch: None,
             pending_diagnostic: None,
             diagnostic_annotated: false,
-            cycles: 0,
+            successors_left: MAX_SUCCESSORS_PER_ARM,
             cleaning: false,
             cleaned: false,
         }
@@ -517,6 +540,7 @@ impl PauseCoordinator {
             Ok(Some(PAUSE_ARMED)) => {
                 self.armed = true;
                 self.armed_at_ns = armed_at;
+                self.successors_left = MAX_SUCCESSORS_PER_ARM;
                 Ok(ArmResult::Armed)
             }
             Ok(_) => {
@@ -1071,7 +1095,8 @@ impl PauseCoordinator {
             }
         }
 
-        let install_successor = record_count == 1 && self.cycles == 0 && self.rearming_enabled;
+        let install_successor =
+            record_count == 1 && self.successors_left > 0 && self.rearming_enabled;
         let mut successor_baseline = None;
         if install_successor {
             if let Err(error) = self.remove_and_account(io) {
@@ -1096,6 +1121,7 @@ impl PauseCoordinator {
             };
             self.epoch.successor_installed = true;
             self.epoch.successor_unresolved = true;
+            self.successors_left -= 1;
             if let Err(error) = io.wait_one_ms() {
                 return self.fail_cycle(io, error, true);
             }
@@ -1152,11 +1178,17 @@ impl PauseCoordinator {
         self.active_deadline = None;
         self.failure_deadline = None;
         self.failure_items = 0;
-        self.cycles = self.cycles.saturating_add(1);
         self.armed = install_successor;
         if !install_successor {
             self.may_be_stopped = false;
             self.epoch = PauseEpoch::default();
+            // The chain ends here: the child runs unpaused until the next
+            // frame re-arms. A provider whose table is still unpublished may
+            // be called before its probes attach, and that is said, not
+            // silently absorbed.
+            if io.publication_pending() {
+                io.note_unpaused_publication();
+            }
         } else {
             self.ring_loss_baseline = successor_baseline
                 .expect("an installed successor froze its stopped ring-loss baseline");
@@ -2305,6 +2337,14 @@ impl PauseIo for SessionPauseIo<'_> {
     fn take_stop_candidate_seen(&mut self) -> bool {
         std::mem::take(&mut self.stop_candidate_seen)
     }
+
+    fn publication_pending(&mut self) -> bool {
+        self.engine.owned_publication_pending(self.child.pid())
+    }
+
+    fn note_unpaused_publication(&mut self) {
+        self.engine.note_owned_pause_gap(MSG_UNPAUSED_PUBLICATION);
+    }
 }
 
 /// Whether the coordinator's own generation is still exactly the one behind
@@ -2685,6 +2725,8 @@ mod tests {
         reconcile_results: VecDeque<Result<(), String>>,
         terminal_cleanup_results: VecDeque<Result<(), String>>,
         terminal_authority_pending: bool,
+        publication_pending: bool,
+        unpaused_publications: u64,
     }
 
     impl Default for FakeIo {
@@ -2733,6 +2775,8 @@ mod tests {
                 reconcile_results: VecDeque::new(),
                 terminal_cleanup_results: VecDeque::new(),
                 terminal_authority_pending: false,
+                publication_pending: false,
+                unpaused_publications: 0,
             }
         }
     }
@@ -2968,6 +3012,14 @@ mod tests {
             self.retirement_stop_candidate_seen = false;
             seen
         }
+
+        fn publication_pending(&mut self) -> bool {
+            self.publication_pending
+        }
+
+        fn note_unpaused_publication(&mut self) {
+            self.unpaused_publications += 1;
+        }
     }
 
     fn stopped() -> BTreeMap<u32, u8> {
@@ -3182,7 +3234,7 @@ mod tests {
         io.post_resume_all_stopped = true;
         io.resume_authorization = Some(None);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-        coordinator.cycles = 1;
+        coordinator.successors_left = 0;
         coordinator.arm_for_test();
 
         let error = coordinator.service(&mut io).unwrap_err();
@@ -3241,7 +3293,7 @@ mod tests {
         let mut io = successful_io(vec![record(10, 0, false)]);
         io.resume_authorization = Some(None);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-        coordinator.cycles = 1;
+        coordinator.successors_left = 0;
         coordinator.arm_for_test();
 
         coordinator.service(&mut io).unwrap();
@@ -3255,7 +3307,7 @@ mod tests {
             let mut io = successful_io(vec![record(10, 0, false)]);
             io.resume_authorization = Some(authorization);
             let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-            coordinator.cycles = 1;
+            coordinator.successors_left = 0;
             coordinator.arm_for_test();
 
             let error = coordinator.service(&mut io).unwrap_err();
@@ -3284,7 +3336,7 @@ mod tests {
         io.resume_authorization = Some(None);
         io.original_exited = true;
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-        coordinator.cycles = 1;
+        coordinator.successors_left = 0;
         coordinator.arm_for_test();
 
         coordinator.service(&mut io).unwrap();
@@ -3298,7 +3350,7 @@ mod tests {
         io.resume_authorization = Some(None);
         io.same_generation_results = VecDeque::from([Ok(true), Ok(false)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-        coordinator.cycles = 1;
+        coordinator.successors_left = 0;
         coordinator.arm_for_test();
 
         let error = coordinator.service(&mut io).unwrap_err();
@@ -3351,7 +3403,11 @@ mod tests {
             io.post_resume_all_stopped = all_stopped;
             io.post_resume_now = VecDeque::from([Ok(now)]);
             let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-            coordinator.cycles = cycles;
+            coordinator.successors_left = if cycles == 0 {
+                MAX_SUCCESSORS_PER_ARM
+            } else {
+                0
+            };
             coordinator.arm_for_test();
 
             let result = coordinator.service(&mut io);
@@ -3377,7 +3433,7 @@ mod tests {
             io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped()), Ok(tasks)]);
             io.post_resume_now = VecDeque::from([Ok(CYCLE_NS + 9)]);
             let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-            coordinator.cycles = 1;
+            coordinator.successors_left = 0;
             coordinator.arm_for_test();
 
             coordinator.service(&mut io).unwrap();
@@ -3393,7 +3449,7 @@ mod tests {
         io.resume_authorization = Some(None);
         io.post_resume_now = VecDeque::from([Ok(CYCLE_NS + 10)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-        coordinator.cycles = 1;
+        coordinator.successors_left = 0;
         coordinator.arm_for_test();
 
         let error = coordinator.service(&mut io).unwrap_err();
@@ -3457,7 +3513,7 @@ mod tests {
         io.now = VecDeque::from([Ok(5)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
-        coordinator.cycles = 1;
+        coordinator.successors_left = 0;
         // The record behind it is the one that won, so the map already reads
         // REQUESTED when the leftover is dequeued.
         io.authorization = Some(PAUSE_REQUESTED);
@@ -3602,8 +3658,51 @@ mod tests {
         );
     }
 
+    /// Queues the next stop of an armed owned epoch: the kernel's REQUESTED
+    /// authorization and the one winner record the stopping hook produced.
+    fn queue_next_stop(io: &mut FakeIo) {
+        io.authorization = Some(PAUSE_REQUESTED);
+        let next = record(io.fallback_now, 0, false);
+        io.queue
+            .extend([Ok(Some(DiscoveryItem::Record(next))), Ok(None), Ok(None)]);
+    }
+
+    /// GT-4 (H-4). `run --pause auto` confirmed 2/2 stops and still missed the
+    /// session setup calls and ~0.7 s of the loop: the two stops were the
+    /// startup loader hits, and after them nothing was armed until the next
+    /// frame. The child's `dlopen` (RT_ADD, RT_CONSISTENT) and the
+    /// `C_GetFunctionList` return that publishes the provider's table then ran
+    /// unpaused, and every call before the next frame applied the table was
+    /// lost. Each confirmed stop now keeps the owned epoch armed for the next
+    /// pause-eligible event, so the table is attached while the child is
+    /// still stopped at its publication.
     #[test]
-    fn successor_is_exactly_one_second_owner_and_never_a_third() {
+    fn every_confirmed_stop_keeps_the_owned_epoch_armed_for_the_next() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.service(&mut io).unwrap();
+        // Startup RT_CONSISTENT, then the provider's dlopen RT_ADD and
+        // RT_CONSISTENT, then its C_GetFunctionList return.
+        for stop in 2..=5 {
+            assert!(coordinator.is_armed(), "stop {stop} finds the epoch armed");
+            queue_next_stop(&mut io);
+            coordinator.service(&mut io).unwrap();
+        }
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(5));
+        assert!(
+            coordinator.is_armed(),
+            "the next pause-eligible event is stopped too"
+        );
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            5
+        );
+    }
+
+    #[test]
+    fn the_successor_chain_is_bounded_and_a_fresh_arm_restores_it() {
         let mut io = successful_io(vec![record(10, 0, false)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
@@ -3611,21 +3710,56 @@ mod tests {
         assert!(coordinator.is_armed());
         assert_eq!(io.authorization, Some(PAUSE_ARMED));
 
-        io.authorization = Some(PAUSE_REQUESTED);
-        // The successor's own window: a record this second arm could have
-        // produced, not one left over from before it.
-        let second = record(io.fallback_now, 0, false);
-        io.queue
-            .extend([Ok(Some(DiscoveryItem::Record(second))), Ok(None), Ok(None)]);
-        coordinator.service(&mut io).unwrap();
+        let mut stops = 1;
+        while coordinator.is_armed() {
+            // The successor's own window: a record this arm could have
+            // produced, not one left over from before it.
+            queue_next_stop(&mut io);
+            coordinator.service(&mut io).unwrap();
+            stops += 1;
+            assert!(stops <= usize::from(MAX_SUCCESSORS_PER_ARM) + 1);
+        }
 
-        assert_eq!(coordinator.counters(), PauseCounters::confirmed(2));
+        assert_eq!(stops, usize::from(MAX_SUCCESSORS_PER_ARM) + 1);
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters::confirmed(stops as u64)
+        );
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
-            2
+            stops
         );
-        assert!(!coordinator.is_armed());
-        assert_eq!(io.authorization, None);
+        assert_eq!(io.authorization, None, "the last stop installs nothing");
+        assert_eq!(
+            io.unpaused_publications, 0,
+            "nothing was left unpublished, so nothing is reported"
+        );
+
+        // The next frame's fresh arm restores the whole chain.
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        queue_next_stop(&mut io);
+        coordinator.service(&mut io).unwrap();
+        assert!(coordinator.is_armed());
+    }
+
+    /// The bound is honest: a chain that ends while the owned child still has
+    /// an unpublished provider table says so, because calls made before the
+    /// next frame attaches it may go unobserved.
+    #[test]
+    fn a_chain_that_ends_with_a_table_unpublished_reports_the_gap() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.publication_pending = true;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(io.unpaused_publications, 0, "the chain continues");
+        while coordinator.is_armed() {
+            queue_next_stop(&mut io);
+            coordinator.service(&mut io).unwrap();
+        }
+
+        assert_eq!(io.unpaused_publications, 1);
+        assert_eq!(coordinator.counters().partial, 0, "every stop confirmed");
     }
 
     #[test]

@@ -71,32 +71,26 @@ access is host policy; the QEMU packages do not grant it. The existing Linux
 5.15 guest/runtime qualification remains required even though the primary host
 has changed.
 
-## Pinned Git dependency bootstrap
+## Pinned Git dependency
 
-The lockfile requires `pkcs11-proxy-ng` commit
-`cbf3d019c43cf424d92a5d2033c6714c9f866f65`. A normal public fetch of that
-revision is not known to work on this machine. The transferred sibling checkout
-at `/home/user/src/m/pkcs11-proxy-ng-ws/pkcs11-proxy-ng` contains the commit.
-Verify it and direct this one fetch to the transferred object database:
+The only Git dependency is
+[pkcs11-components](https://github.com/mingulov/pkcs11-components) (its
+`pkcs11-module` and `pkcs11-types` crates and their `pkcs11-abi` dependency),
+pinned to revision `d0a47c71d34294466bc41100ae6b5a5a329029d2` in every
+manifest that names it and in both lockfiles (`Cargo.lock`, `crates/ebpf/Cargo.lock`). The repository is
+public, so an ordinary networked fetch resolves it; no Git configuration or
+local mirror is needed:
 
 ```sh
-proxy_checkout=/home/user/src/m/pkcs11-proxy-ng-ws/pkcs11-proxy-ng
-proxy_revision=cbf3d019c43cf424d92a5d2033c6714c9f866f65
-test "$(git -C "$proxy_checkout" rev-parse --verify "$proxy_revision^{commit}")" = \
-  "$proxy_revision"
-GIT_CONFIG_COUNT=1 \
-GIT_CONFIG_KEY_0="url.file://$proxy_checkout.insteadOf" \
-GIT_CONFIG_VALUE_0=https://github.com/mingulov/pkcs11-proxy-ng \
-CARGO_NET_GIT_FETCH_WITH_CLI=true \
-  mise exec -- ./scripts/cargo.sh +1.88 fetch --locked
+mise exec -- ./scripts/cargo.sh +1.88 fetch --locked
+cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
 ```
 
-This leaves global and repository Git configuration unchanged. Set
-`proxy_checkout` to the transferred checkout's canonical absolute path on a
-different machine. The alternative for a disconnected recipient is a verified
-full offline source export, which includes the complete Cargo dependency
-payload; follow [the offline build guide](build-offline.md) instead of trying a
-public fetch.
+`scripts/cargo.sh` first reconstructs the two patched crates from
+`third-party/sources.json` (hash-pinned crates.io archives plus tracked
+patches). A disconnected recipient uses a verified full offline source export
+instead, which carries the complete Cargo dependency payload; see
+[the offline build guide](build-offline.md).
 
 ## Canonical Rust gates
 

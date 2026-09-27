@@ -170,7 +170,15 @@ fn timing_key(index: usize) -> PinnedTimingKey {
     static KEYS: std::sync::OnceLock<Vec<PinnedTimingKey>> = std::sync::OnceLock::new();
     KEYS.get_or_init(|| {
         let view = ProcessView::open(ProcessViewId(99), std::process::id()).unwrap();
-        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        // The kernel renders /proc/self/maps in chunks and drops its lock in
+        // between, so a snapshot taken while other test threads map and
+        // unmap can overlap itself. Take a consistent one.
+        let maps = (0..100)
+            .find_map(|_| {
+                let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).ok()?;
+                MapIndex::new(&maps).is_ok().then_some(maps)
+            })
+            .expect("a consistent self maps snapshot");
         let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
         let mut keys = Vec::new();
         for mapping in maps
@@ -346,37 +354,31 @@ fn live_collector_stops_at_its_quantum_with_the_backlog_still_queued() {
     );
 }
 
-/// The generic tick route applies a quantum's exact prefix and returns;
-/// the backlog waits on the ring for the next tick, behind the run loop's
-/// duration/signal checks, and is never a batch error.
+/// The generic tick route applies its frame's exact prefix — up to
+/// `LIVE_DISCOVERY_FRAME_QUANTA` quanta — and returns; the backlog waits on
+/// the ring for the next tick, behind the run loop's duration/signal checks,
+/// and is never a batch error.
 #[test]
 fn the_live_drain_applies_the_quantum_prefix_and_leaves_the_backlog_queued() {
     let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
     let mut session = ScriptedSession::default();
+    let frame = LIVE_DISCOVERY_FRAME_QUANTA * LIVE_DISCOVERY_DRAIN_QUANTUM;
+    session.dequeues.extend(malformed_dequeues(frame + 1));
     session
         .dequeues
-        .extend(malformed_dequeues(LIVE_DISCOVERY_DRAIN_QUANTUM + 1));
-    session
-        .dequeues
-        .push_back(Err(anyhow!("dequeued past the quantum")));
+        .push_back(Err(anyhow!("dequeued past the frame bound")));
 
     engine
         .drain_discovery_from(&mut session)
         .expect("a backlog is not a drain failure");
 
-    assert_eq!(
-        engine.malformed_discovery,
-        LIVE_DISCOVERY_DRAIN_QUANTUM as u64
-    );
+    assert_eq!(engine.malformed_discovery, frame as u64);
     assert_eq!(session.dequeues.len(), 2);
 
     session.dequeues.pop_back();
     engine.drain_discovery_from(&mut session).unwrap();
 
-    assert_eq!(
-        engine.malformed_discovery,
-        LIVE_DISCOVERY_DRAIN_QUANTUM as u64 + 1
-    );
+    assert_eq!(engine.malformed_discovery, frame as u64 + 1);
     assert!(session.dequeues.is_empty());
 }
 
@@ -805,7 +807,7 @@ fn initial_provider_exports_are_attached_before_session_readiness() {
         .split_once("\n    }\n}")
         .unwrap()
         .0;
-    let external_loader = route.find("self.arm_loader_or_partial(").unwrap();
+    let external_loader = route.find("self.arm_initial_views(").unwrap();
     let exports = route.find("self.attach_initial_exports(").unwrap();
     let drain = route
         .find("let cleanup = self.process_discovery_records(")
@@ -1672,6 +1674,150 @@ fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
         p11scope_ebpf_common::MAX_SLOTS as usize + 1
     );
     assert_eq!(engine.discovery.modules_skipped.len(), 1);
+}
+
+fn exec_record_for(pid: u32) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_EXEC;
+    record.pid_tgid = u64::from(pid) << 32;
+    record.hook_ts_ns = crate::attach::monotonic_ns().unwrap_or(0);
+    record
+}
+
+/// H-1. A live frame applied every record, scan, arm and attach it was given
+/// with no clock check, so one frame could run for seconds (5.6 s measured)
+/// while EVENTS, signals, pause stops and first-use attach all waited. A
+/// frame now stops dispatching once its work budget is spent, and the rest
+/// of its records wait — in ring order, never dropped — for the next frame,
+/// ahead of anything newer.
+#[test]
+fn a_live_frame_past_its_work_budget_defers_the_rest_in_order() {
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = 0;
+    let mut session = ScriptedSession::default();
+    session.dequeues = (1..=5)
+        .map(|pid| {
+            Ok(Some(crate::events::DiscoveryItem::Record(exec_record_for(
+                4_000_000 + pid,
+            ))))
+        })
+        .collect();
+
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert_eq!(
+        engine.pending_discovery_records_for_test(),
+        5,
+        "an exhausted frame dispatches nothing more and drops nothing"
+    );
+    let order: Vec<u32> = engine
+        .pending_discovery_records
+        .iter()
+        .map(|queued| (queued.record.pid_tgid >> 32) as u32)
+        .collect();
+    assert_eq!(order, (4_000_001..=4_000_005).collect::<Vec<_>>());
+
+    engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(
+        engine.pending_discovery_records_for_test(),
+        0,
+        "the next frame applies them first"
+    );
+}
+
+/// H-1: an operator stop is checked between items too. A frame that sees
+/// the cancel flag defers its remaining work instead of finishing it, so the
+/// loop's end check runs a frame sooner.
+#[test]
+fn a_live_frame_defers_its_work_once_the_capture_is_interrupted() {
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    engine.set_cancel_flag(std::sync::Arc::clone(&cancel));
+    let mut session = ScriptedSession::default();
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        exec_record_for(4_000_010),
+    )))]
+    .into();
+
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert_eq!(engine.pending_discovery_records_for_test(), 1);
+}
+
+/// H-1: deferred loader memory scans are serviced only while the frame's
+/// budget lasts; the rest stay pending for the next frame instead of being
+/// scanned past the budget.
+#[test]
+fn deferred_loader_scans_wait_for_a_frame_with_budget() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    let scans_before = engine.loader_memory_scan_attempts;
+
+    engine.frame_work_budget_ns = 0;
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1, "still pending");
+    assert_eq!(engine.loader_memory_scan_attempts, scans_before);
+
+    engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert!(
+        engine.pending_loader_scans.is_empty(),
+        "serviced next frame"
+    );
+    assert_eq!(engine.loader_memory_scan_attempts, scans_before + 1);
+}
+
+/// RB-2: a live frame applied one 256-item quantum and left the rest for
+/// the next frame, a second later. With the ring now staged every tick, a
+/// host producing more lifecycle records than that per second only moved its
+/// loss from the kernel ring to the staging FIFO. One frame now takes up to
+/// sixteen quanta, in ring order.
+#[test]
+fn one_live_frame_applies_many_quanta_in_ring_order() {
+    // An empty cgroup scope: the frame's inventory pass has nothing to scan.
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+    let backlog = 3 * LIVE_DISCOVERY_DRAIN_QUANTUM + 17;
+    let mut session = ScriptedSession::default();
+    session.dequeues = (0..backlog)
+        .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed)))
+        .collect();
+
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert!(session.dequeues.is_empty(), "the frame drained the backlog");
+    assert_eq!(engine.malformed_discovery, backlog as u64);
+
+    let mut session = ScriptedSession::default();
+    let beyond = LIVE_DISCOVERY_FRAME_QUANTA * LIVE_DISCOVERY_DRAIN_QUANTUM + 5;
+    session.dequeues = (0..beyond)
+        .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed)))
+        .collect();
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(session.dequeues.len(), 5, "a frame stops at its bound");
+}
+
+/// RB-2: capture start arms every retained view's loader one by one — a
+/// locator scan, a plan rebuild and an attach each — while the lifecycle
+/// producers are live and nothing drained the discovery ring. It is staged
+/// after every view now, so a long startup no longer overflows it.
+#[test]
+fn capture_start_stages_the_discovery_ring_between_armed_views() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::System;
+    let mut session = ScriptedSession::default();
+
+    let fatal =
+        engine.arm_initial_views(&mut session, &mut true, &mut PendingViewRetirements::new());
+
+    assert!(fatal.is_none());
+    assert_eq!(session.stage_calls, 3, "one stage after every view");
 }
 
 /// GT-5. A cgroup or system capture without `--module` admits in value
@@ -10815,6 +10961,70 @@ fn rt_add_deferral_fallback_after_target_exit_is_bounded_loss_not_fatal() {
     assert!(engine.pending_loader_scans.is_empty());
     assert_eq!(engine.loader_memory_scan_attempts, 1);
     assert!(engine.discovery_truncated > truncated_before);
+}
+
+/// GT-4: `attach_gap_ms` was `null` on ordinary `run` captures. An RT_ADD or
+/// RT_DELETE hit only defers a memory scan until the RT_CONSISTENT that ends
+/// the loader transaction; a process that exits first never relocated or
+/// initialized the object, so no provider code ran unobserved. Settling that
+/// scan at the process's provable exit stays a counted truncation, but it
+/// used to erase every measured gap in the capture as if a causal record had
+/// been lost.
+#[test]
+fn a_deferred_scan_ended_by_its_process_exit_keeps_the_measured_attach_gap() {
+    let (mut fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    let measured = timing_key(0);
+    engine.timings.observe(&measured, 1_000_000);
+    engine.timings.complete(&measured, 3_000_000);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    let truncated_before = engine.discovery_truncated;
+
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(
+        engine.discovery_truncated > truncated_before,
+        "the unresolved scan stays counted"
+    );
+    assert!(
+        engine
+            .capture_facts()
+            .attach_gap_ms()
+            .is_some_and(|gap| gap >= 2),
+        "the measured gap survives: {:?}",
+        engine.capture_facts().attach_gap_ms()
+    );
+}
+
+/// The same rule on the record path: a loader record of a generation that
+/// provably ended cannot be resolved, but an RT_ADD or RT_DELETE hit
+/// introduces no code that could run. Only a record that could have
+/// published a callable provider (RT_CONSISTENT, an export return, an exec)
+/// still leaves the capture's gap unproven.
+#[test]
+fn an_ended_generations_loader_record_nulls_the_gap_only_if_code_could_have_run() {
+    for (state, keeps_gap) in [(1, true), (2, true), (0, false)] {
+        let (mut fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        let measured = timing_key(0);
+        engine.timings.observe(&measured, 1_000_000);
+        engine.timings.complete(&measured, 3_000_000);
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        record.announced_count = state;
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert_eq!(
+            engine.capture_facts().attach_gap_ms().is_some(),
+            keeps_gap,
+            "r_state {state}: {:?}",
+            engine.counters.object_skips
+        );
+    }
 }
 
 /// Asserts the named capture ended the ordinary way after its target exited:

@@ -45,6 +45,22 @@ def patch_paths():
     )
 
 
+def checks_job_steps():
+    """The checks-and-e2e job's steps, each as its list of raw lines."""
+    lines = CI_YML.read_text(encoding="utf-8").splitlines()
+    start = lines.index("  checks-and-e2e:") + 1
+    steps = []
+    for line in lines[start:]:
+        if line.strip() and not line.startswith("    ") \
+                and not line.lstrip().startswith("#"):
+            break
+        if line.startswith("      - "):
+            steps.append([line])
+        elif steps:
+            steps[-1].append(line)
+    return steps
+
+
 def ci_manifest_steps():
     """(line, tree dir) for every third-party --manifest-path CI step."""
     steps = []
@@ -91,6 +107,47 @@ class DependencySelectionTests(unittest.TestCase):
         for line in by_name["aya-obj"]:
             self.assertIn("--locked", line)
             self.assertNotIn("patch.crates-io", line)
+
+    def test_unlocked_standalone_steps_restore_the_recipe_lock(self):
+        """Hosted run 35831161630 (main, 2026-09-23) failed its dependency
+        check with an aya-0.14.0-p2 tree digest mismatch: the unlocked
+        standalone fetch had rewritten the tree's vendored Cargo.lock.
+        Every step that resolves that tree unlocked must restore the
+        recipe's lock before it ends, and the job must prove afterwards
+        that the prepared trees are unchanged."""
+        trees = recipe_trees()
+        tree = trees["aya"]
+        lock = f"{tree}/Cargo.lock"
+        saved = '"$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock"'
+        self.assertEqual(tree, "third-party/src/aya-0.14.0-p2")
+        steps = checks_job_steps()
+        unlocked_at = []
+        for index, step in enumerate(steps):
+            commands = [line.strip() for line in step]
+            resolving = [
+                at for at, line in enumerate(commands)
+                if f"--manifest-path {tree}/Cargo.toml" in line
+                and "--locked" not in line
+            ]
+            if not resolving:
+                continue
+            unlocked_at.append(index)
+            restore = f"cp -p {saved} {lock}"
+            self.assertIn(restore, commands, step)
+            self.assertGreater(commands.index(restore), resolving[-1], step)
+        self.assertEqual(len(unlocked_at), 2, "fetch and test resolve unlocked")
+        first = unlocked_at[0]
+        self.assertIn(f"cp -p {lock} {saved}",
+                      [line.strip() for line in steps[first]],
+                      "the first unlocked step must save the recipe lock")
+        check = [
+            index for index, step in enumerate(steps)
+            if any(line.strip().endswith(
+                "run: python3 -I scripts/prepare-dependencies.py --check")
+                for line in step)
+        ]
+        self.assertTrue(check, "no prepared-tree check after the standalone steps")
+        self.assertGreater(check[0], unlocked_at[-1])
 
     def test_root_workspace_compilation_and_recipe_audit_retained(self):
         ci = CI_YML.read_text(encoding="utf-8")

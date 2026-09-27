@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 
-const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json]";
+const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json]\n       p11scope-discover --version";
 
 #[derive(Clone, Copy)]
 struct DropTarget {
@@ -398,7 +398,18 @@ fn drop_privileges_and_open_self_memory(target: DropTarget) -> Result<File, Stri
 fn main() {
     let mut module: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    // Like `p11scope --version`: the whole command line, answered before any
+    // privilege handling or provider access.
+    if matches!(args.peek().map(String::as_str), Some("--version" | "-V")) {
+        args.next();
+        if args.next().is_some() {
+            eprintln!("--version takes no arguments\n{USAGE}");
+            std::process::exit(2);
+        }
+        println!("p11scope-discover {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     while let Some(a) = args.next() {
         match a.as_str() {
             "--module" => match args.next() {

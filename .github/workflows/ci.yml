@@ -170,6 +170,7 @@ jobs:
       - run: scripts/verify-live-discovery-preflight.sh --self-test
       - run: scripts/verify-canaries.sh --self-test
       - run: scripts/verify-provider-matrix.sh --self-test
+      - run: scripts/release-gate.sh --self-test
       - run: scripts/verify-receipt-lane02.sh --self-test
       - run: scripts/verify-receipt-lane16.sh --self-test
       - run: scripts/attach-pod.sh --self-test

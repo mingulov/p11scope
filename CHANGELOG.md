@@ -332,6 +332,15 @@ Fixes to defects found while qualifying this release, before it was tagged:
   rescan that finds a provider gained unwatched publishes a loss; a poll
   that finds nothing publishes nothing, and failed or retired polls are
   forgotten exactly once.
+- On kernels before 6.8, providers on overlayfs are attached instead of
+  refused. This covers containers on Debian 12, Amazon Linux 2023 and
+  Container-Optimized OS, which previously captured zero modules.
+  - The cause: `/proc/<pid>/maps` on those kernels names the backing
+    layer's device, while the opened file names the overlay's device.
+  - The check stays exact: p11scope accepts the file only when the kernel
+    maps it at the target's device and inode.
+  - `p11scope-discover` applies the same check, so it runs inside such
+    containers.
 <!-- TODO(release): add any further user-visible fixes merged before the tag. -->
 
 ### Qualification of this release

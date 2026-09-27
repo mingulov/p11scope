@@ -207,7 +207,8 @@ def assert_no_loader_pause_identity(label, data, values=None):
 # identity the capture document may not carry, wherever it appears.
 PUBLISHED_LOADER_PAUSE_FIELDS = {
     "attach_gap_ms", "pause", "pause_attempts", "pause_confirmed",
-    "pause_partial", "loader_discovery", "child_still_running",
+    "pause_partial", "pause_protected", "loader_discovery",
+    "child_still_running",
     # SYSPLAN residual F-15: the run lane's own child, handed back alive.
     # The operator started this process; naming it leaks no target identity
     # they could not already see (mirrors check-capture-evidence.py).

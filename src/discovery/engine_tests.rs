@@ -3198,7 +3198,7 @@ fn inventory_scan_skips_views_retired_before_their_refresh() {
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let mut engine = lifecycle_discovered(vec![view]);
     let views = BTreeSet::from([ProcessViewId(0), ProcessViewId(7)]);
-    let (scans, _, skipped) = engine.scan_inventory_views(&views, "test refresh");
+    let (scans, _, _, skipped) = engine.scan_inventory_views(&views, "test refresh");
     let scanned: Vec<u32> = scans.iter().map(|(view, _, _)| view.0).collect();
     assert!(
         scanned.iter().all(|id| *id == 0),
@@ -5453,11 +5453,30 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     );
     // The surviving retained exploratory view was covered too, so it polls
     // same-tick (a rescan, not a displacement — the view set above proves it).
-    // Queuing a poll is internal evidence, not a published loss (F1).
+    // Queuing a poll is internal evidence, not a published loss (F1): the
+    // fruitless rescan publishes no skip of its own.
     assert_eq!(
         engine.polling_rescans_queued - polls_before_pass4,
         1,
         "the surviving retained view polls"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("for polling rescan")),
+        "queuing the poll publishes no skip: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "a fruitless poll finds no provider to publish: {:?}",
+        engine.counters.object_skips
     );
 
     // Passes 5-7 are ordinary again: they charge nothing and displace
@@ -5631,6 +5650,26 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
         engine.polling_rescans_queued, 2,
         "covered retained exploratory views poll"
     );
+    // Both polls are fruitless (provider-free sleeps), so neither publishes:
+    // queuing is not a loss and there is no gained provider either (F1).
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("for polling rescan")),
+        "queuing the polls publishes no skip: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "fruitless polls find no provider to publish: {:?}",
+        engine.counters.object_skips
+    );
 
     // Pass 8: next slice covers the following two pids, neither retained.
     for _ in 0..3 {
@@ -5767,6 +5806,26 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
         engine.polling_rescans_queued - polls_before,
         1,
         "the polling round runs"
+    );
+    // The round's rescan is fruitless (a provider-free sleep), so it
+    // publishes nothing: neither the queuing nor a gained provider (F1).
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("for polling rescan")),
+        "queuing the poll publishes no skip: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "a fruitless poll finds no provider to publish: {:?}",
+        engine.counters.object_skips
     );
     assert_eq!(
         engine.scheduler.cursor_for_test(),
@@ -24939,6 +24998,18 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
         "the gained provider's unobserved window is published: {:?}",
         engine.counters.object_skips
     );
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "live discovery rotation"
+                && skip.reason == POLLED_PROVIDER_LOSS)
+            .count(),
+        1,
+        "the gained provider publishes exactly once across all rounds: {:?}",
+        engine.counters.object_skips
+    );
     assert!(
         engine
             .counters
@@ -24947,6 +25018,11 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
             .all(|skip| !skip.reason.contains("for polling rescan")),
         "queuing the poll itself is not a loss: {:?}",
         engine.counters.object_skips
+    );
+    assert!(
+        engine.polled_pids.is_empty(),
+        "settled polls leave no pending pid behind: {:?}",
+        engine.polled_pids
     );
 }
 
@@ -24977,6 +25053,175 @@ fn a_polling_rescan_of_provider_free_processes_is_not_a_loss() {
             .all(|skip| skip.subject != "live discovery rotation"),
         "a poll that found nothing is not a loss: {:?}",
         engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "no gained provider, no POLLED_PROVIDER_LOSS: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.polled_pids.is_empty(),
+        "fruitless polls settle completely: {:?}",
+        engine.polled_pids
+    );
+}
+
+/// F1: a polled view whose rescan fails is already published by the
+/// refresh-failure path, so the settle forgets its poll instead of
+/// publishing `POLLED_PROVIDER_LOSS` on top of the failure. A sibling poll
+/// still waiting for its retry stays pending: only the failed one is
+/// forgotten.
+#[test]
+fn a_failed_polling_rescan_publishes_only_through_the_failure_path() {
+    let sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2);
+
+    engine.queue_polling_rescans(&pids);
+    assert_eq!(engine.polled_pids.len(), 2, "both views poll");
+
+    // The first view's rescan fails — the scan path publishes that failure
+    // — while the second view's rescan is still outstanding.
+    engine.settle_polling_rescans(&[], &BTreeSet::from([pids[0]]), &BTreeSet::new());
+    assert!(
+        !engine.polled_pids.contains(&pids[0]),
+        "a failed poll is forgotten, never published twice"
+    );
+    assert!(
+        engine.polled_pids.contains(&pids[1]),
+        "the outstanding poll stays pending for its retry"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "no gained provider, no POLLED_PROVIDER_LOSS: {:?}",
+        engine.counters.object_skips
+    );
+
+    // The retry finds the survivor still provider-free: the poll settles
+    // with nothing published and nothing left pending.
+    let survivor = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pids[1])
+        .expect("the survivor is still retained")
+        .id();
+    engine.settle_polling_rescans(
+        &[(survivor, Vec::new(), PinnedObjects::empty())],
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(
+        engine.polled_pids.is_empty(),
+        "settled polls leave nothing pending: {:?}",
+        engine.polled_pids
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "a fruitless retry publishes nothing: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// F1: a process that exits after its poll is queued but before its rescan
+/// runs leaves no pending poll behind. The retiring view is forgotten at
+/// settle time and nothing is published for it; the survivor's fruitless
+/// rescan settles the same round with nothing published either.
+#[test]
+fn a_polled_process_that_exits_before_its_rescan_leaves_no_pending_poll() {
+    let mut sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2);
+
+    engine.queue_polling_rescans(&pids);
+    assert_eq!(engine.polled_pids.len(), 2, "both views poll");
+
+    let victim = sleeps
+        .iter()
+        .position(|sleep| sleep.pid() == pids[0])
+        .expect("the victim is one of the sleeps");
+    sleeps[victim].reap().expect("the victim exits");
+    refresh_inventory_once(&mut engine);
+
+    let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    kept.sort_unstable();
+    assert_eq!(kept, vec![pids[1]], "the exited view retires");
+    assert!(
+        engine.polled_pids.is_empty(),
+        "the exited view's poll is forgotten: {:?}",
+        engine.polled_pids
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "no refresh outlives its view or its rescan: {:?}",
+        engine.refresh_requested
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "no gained provider, no POLLED_PROVIDER_LOSS: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// F1: a polled view cannot be evicted before its rescan — the queued
+/// refresh makes it unevictable — so exploratory eviction can never strand
+/// (or orphan) a pending poll. The poll survives the eviction attempt and
+/// still settles normally.
+#[test]
+fn a_polled_view_is_not_evictable_before_its_rescan() {
+    let sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2);
+
+    engine.queue_polling_rescans(&pids);
+    assert_eq!(engine.polled_pids.len(), 2, "both views poll");
+
+    let victim = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pids[0])
+        .expect("the victim is retained")
+        .id();
+    assert!(
+        !engine.exploratory_evictable(victim),
+        "a queued poll protects its view from eviction"
+    );
+    engine.evict_exploratory_views(&BTreeSet::from([victim]));
+    assert_eq!(
+        engine.views.len(),
+        2,
+        "the eviction attempt displaces nothing"
+    );
+    assert!(
+        engine.polled_pids.contains(&pids[0]),
+        "the protected poll stays pending for its rescan"
     );
 }
 

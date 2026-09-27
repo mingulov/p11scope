@@ -111,7 +111,14 @@ pub struct Engine {
     /// Under-cap polling rescans queued (internal evidence).
     polling_rescans_queued: u64,
     /// Pids whose queued refresh is a polling rescan of an unarmed,
-    /// provider-free view (F1).
+    /// provider-free view (F1). A subset of `refresh_requested`: every site
+    /// that drops a refresh without a rescan (retirement, link loss, the
+    /// idle-tick clear) drops the poll with it, and the settle drops polls
+    /// whose rescan failed (already published) or whose view retired first
+    /// (nothing to settle). Only a quantum-deferred poll stays pending,
+    /// until its retry settles it. Exploratory eviction needs no prune: a
+    /// queued refresh makes a view unevictable, so a polled view is never
+    /// a victim.
     polled_pids: BTreeSet<u32>,
     /// The capture's operator-stop flag, checked between work items.
     cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -2113,7 +2120,17 @@ struct ScanInput {
 
 type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
 type InventoryNewView = (ProcessView, Vec<ScannedModule>, PinnedObjects);
-type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
+/// Successful scans, pids whose rescan failed (the failure path published),
+/// pids whose rescan the tick quantum deferred before it ran (nothing
+/// published for the view itself; only the tick-level deferral skip), and
+/// the tick's skips. Failed and deferred alike stay queued for retry; only
+/// failed ones are settled losses.
+type InventoryScanOutcome = (
+    Vec<InventoryScan>,
+    BTreeSet<u32>,
+    BTreeSet<u32>,
+    Vec<Skipped>,
+);
 type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
 type TerminalSelectionHandoffs = BTreeMap<u16, Vec<DiscoveryRecord>>;
 type DiscoveryCollector<'a> =
@@ -13319,6 +13336,10 @@ impl Engine {
             match cause {
                 RetirementCause::ExpectedRemoval => {
                     self.refresh_requested.remove(&pid);
+                    // The view is leaving, so its pending poll dies with it:
+                    // no rescan will settle it, and the removal evidence is
+                    // its publication (F1).
+                    self.polled_pids.remove(&pid);
                 }
                 RetirementCause::ExecRefresh | RetirementCause::GenerationLost => {
                     self.request_refresh(pid);
@@ -13630,6 +13651,10 @@ impl Engine {
                         .map(ProcessView::pid)
                     {
                         self.refresh_requested.remove(&pid);
+                        // No rescan will settle this view's pending poll, and
+                        // the link loss is counted separately — forget the
+                        // poll rather than publishing it twice (F1).
+                        self.polled_pids.remove(&pid);
                     }
                 }
             }
@@ -13963,16 +13988,20 @@ impl Engine {
     ) -> InventoryScanOutcome {
         let mut scans = Vec::new();
         let mut failed_pids = BTreeSet::new();
+        let mut deferred_pids = BTreeSet::new();
         let mut skipped = Vec::new();
         let ordered: Vec<ProcessViewId> = views.iter().copied().collect();
         for (index, view_id) in ordered.iter().enumerate() {
             // The tick's deep-scan quantum stops the phase before another
             // scan: the current and remaining views defer to the next tick
-            // with their refresh requests retained, never dropped.
+            // with their refresh requests retained, never dropped. A
+            // deferral is not a failure: the rescan never ran, so nothing
+            // about the view itself is published, and a polling rescan
+            // among them stays pending until its retry settles it (F1).
             if self.scheduler.tick_expired(crate::attach::monotonic_ns()) {
                 for id in &ordered[index..] {
                     if let Some(view) = self.views.iter().find(|view| view.id() == *id) {
-                        failed_pids.insert(view.pid());
+                        deferred_pids.insert(view.pid());
                     }
                 }
                 let left = ordered.len() - index;
@@ -14035,7 +14064,7 @@ impl Engine {
                 }
             }
         }
-        (scans, failed_pids, skipped)
+        (scans, failed_pids, deferred_pids, skipped)
     }
 
     fn inventory_candidate(
@@ -14270,11 +14299,18 @@ impl Engine {
 
     /// Settles the polling rescans among `scans` (F1): a provider found in a
     /// polled, unarmed view is the one loss polling can reveal, published
-    /// once per round; a poll that found nothing publishes nothing. Polls of
-    /// views no longer retained are forgotten.
+    /// once per round; a poll that found nothing publishes nothing. A poll
+    /// whose rescan failed was already published by the refresh-failure
+    /// path, and a poll whose view retired before its rescan has nothing
+    /// left to settle, so both are forgotten, never published here. A poll
+    /// the tick quantum deferred never ran, so it stays pending until its
+    /// retry settles it — that is why `failed_pids` carries true failures
+    /// only, not quantum deferrals.
     fn settle_polling_rescans(
         &mut self,
-        scans: &[(ProcessViewId, Vec<ScannedModule>, PinnedObjects)],
+        scans: &[InventoryScan],
+        failed_pids: &BTreeSet<u32>,
+        removed: &BTreeSet<ProcessViewId>,
     ) {
         let mut gained = false;
         for (view, modules, _) in scans {
@@ -14288,6 +14324,19 @@ impl Engine {
             };
             if self.polled_pids.remove(&pid) && !modules.is_empty() {
                 gained = true;
+            }
+        }
+        for pid in failed_pids {
+            self.polled_pids.remove(pid);
+        }
+        for view in removed {
+            if let Some(pid) = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == *view)
+                .map(ProcessView::pid)
+            {
+                self.polled_pids.remove(&pid);
             }
         }
         if gained {
@@ -14757,6 +14806,10 @@ impl Engine {
         let new_pids: Vec<_> = desired.difference(&known_pids).copied().collect();
         if removed.is_empty() && refreshed.is_empty() && new_pids.is_empty() {
             self.refresh_requested.clear();
+            // No tick queued anything (a queued poll would have made a
+            // retirement cause), so any pending poll is stale: forget it
+            // with the requests rather than leaking it into a later tick.
+            self.polled_pids.clear();
             for skip in skipped {
                 self.mark_partial(&skip.subject, &skip.reason);
             }
@@ -14768,10 +14821,12 @@ impl Engine {
         // count bound. Direct scan calls outside this tick stay unbounded.
         self.scheduler
             .begin_deep_scan_tick(crate::attach::monotonic_ns());
-        let (mut refreshed_scans, mut failed_refresh_pids, refresh_skips) =
+        let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) =
             self.scan_inventory_views(&refreshed, "a requested inventory refresh failed");
+        let mut failed_refresh_pids = failed_scan_pids.clone();
+        failed_refresh_pids.extend(deferred_scan_pids);
         skipped.extend(refresh_skips);
-        self.settle_polling_rescans(&refreshed_scans);
+        self.settle_polling_rescans(&refreshed_scans, &failed_scan_pids, &removed);
 
         // Per-tick admission bound: only the first `max_new_views` newcomers
         // are deep-scanned; the rest defer to the next tick with explicit
@@ -15027,9 +15082,10 @@ impl Engine {
             );
             return Ok(changed);
         }
-        let (rescanned, failed_rescan_pids, rescan_skips) =
+        let (rescanned, failed_rescan_pids, deferred_rescan_pids, rescan_skips) =
             self.scan_inventory_views(&refreshed_ok, "a post-retirement inventory refresh failed");
         failed_refresh_pids.extend(failed_rescan_pids);
+        failed_refresh_pids.extend(deferred_rescan_pids);
         skipped.extend(rescan_skips);
         refreshed_scans = rescanned;
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();

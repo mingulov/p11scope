@@ -485,7 +485,10 @@ IFS=:
             with self.subTest(stream=stream), tempfile.TemporaryDirectory(dir=self.work) as case:
                 case = Path(case)
                 prior = self.env["CASE_DIR"]
-                self.env.update(CASE_DIR=str(case), CASE_DEADLINE="0.25", FINALIZE="1")
+                # Generous test-only deadline: the open-failure path is fast,
+                # but setup must beat the deadline or expiry takes a different
+                # path. The asserted fields/finalized content is unchanged.
+                self.env.update(CASE_DIR=str(case), CASE_DEADLINE="5", FINALIZE="1")
                 stdout = case / "stdout.log"
                 stderr = case / "stderr.log"
                 if stream == "stdout":
@@ -580,8 +583,13 @@ IFS=:
         diagnostic.assert_not_called()
 
     def test_split_ack_interruption_cleans_up_original_launcher_handle(self):
+        # Generous test-only deadline: adoption plus the SIGTERM/release
+        # choreography must run while the hold is engaged; expiry before
+        # adoption reaps the launcher and breaks the adopt assertions.
+        # Cleanup after the choreography is SIGTERM-driven, not deadline
+        # driven, so the asserted path is unchanged.
         self.env.update(HOOK_OPERATION="ack", HOOK_PHASE="launcher", HOOK_ACTION="hold",
-                        CASE_DEADLINE="0.5")
+                        CASE_DEADLINE="5")
         proc, parent_fd = self.child(["sh", str(FIXTURES / "driver.sh"), "split",
                                       "sh", str(FIXTURES / "split-target.sh")],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -614,10 +622,14 @@ IFS=:
         self.assertFalse((self.work / "numeric-signals").exists())
 
     def test_without_ack_native_wrapper_expires_without_exec(self):
-        context = self.context(0.25)
+        # Generous test-only deadline: setup (prepare/bind/spawn) must beat
+        # it so the helper waits for the ack that never comes and expires on
+        # the asserted path. The wait covers the deadline; the expiry and
+        # no-exec assertions are unchanged.
+        context = self.context(5)
         proc, _ = self.child(["python3", "-I", str(HELPER), "exec", context, "launcher", "-",
                               "sh", str(FIXTURES / "target.sh")], stderr=subprocess.PIPE)
-        self.assertNotEqual(proc.wait(timeout=3), 0)
+        self.assertNotEqual(proc.wait(timeout=10), 0)
         self.assertFalse((self.work / "target.entered").exists())
 
     def test_direct_user_preserves_identity_and_input(self):
@@ -722,7 +734,10 @@ IFS=:
         self.shim()
         # Root must first complete the launcher handshake. Use the fixture's
         # normal setup budget, then test expiry at the recorded root boundary.
-        self.env.update(DELAY_PHASE=phase, CASE_DEADLINE="2" if phase == "root" else "0.35")
+        # Launcher/user phases get a generous test-only deadline (3 s) so the
+        # STOPPED-state choreography beats it; it stays inside the kept 4 s
+        # communicate bound below, and the expiry-path assertions are unchanged.
+        self.env.update(DELAY_PHASE=phase, CASE_DEADLINE="2" if phase == "root" else "3")
         if phase == "root":
             self.env.update(HOOK_OPERATION="read", HOOK_PHASE="root", HOOK_ACTION="snapshot")
         mode = "user" if phase == "user" else "root"
@@ -983,7 +998,12 @@ IFS=:
         for phase in ("launcher", "root", "user"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory(dir=self.work) as work:
                 pidfile = Path(work) / "pid"
-                context = self.native("prepare", pidfile, 0.4).stdout.splitlines()[1].decode()
+                # Generous test-only deadline: the prepare/spawn/self-record/
+                # ack setup plus the SIGSTOP hold must all land before it, so
+                # the ack-consumed-after-deadline path is deterministic. The
+                # product enforces whatever deadline it is given; the
+                # post-expiry settlement assertions are unchanged.
+                context = self.native("prepare", pidfile, 5).stdout.splitlines()[1].decode()
                 self.bind_context(context)
                 proc, fd = self.child(["python3", "-I", str(HELPER), "exec", context, phase,
                                        "-" if phase == "launcher" else str(pidfile),
@@ -1021,7 +1041,10 @@ IFS=:
 
     def test_early_exit_without_self_never_enters_sudo(self):
         self.shim()
-        self.env.update(EARLY_PHASE="launcher", CASE_DEADLINE="0.3")
+        # Generous test-only deadline: the wrapper exits 71 immediately, but
+        # setup must beat the deadline or expiry preempts the asserted
+        # early-exit path. Duration unchanged; assertions unchanged.
+        self.env.update(EARLY_PHASE="launcher", CASE_DEADLINE="5")
         rc, _, _ = self.driver("root", "sh", FIXTURES / "target.sh")
         self.assertNotEqual(rc, 0)
         self.assertFalse((self.work / "sudo.entered").exists())

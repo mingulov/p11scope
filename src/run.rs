@@ -8624,15 +8624,17 @@ mod tests {
                 idle_authorization_reads,
                 idle_dequeues: 0,
             };
+        // Every confirmed stop keeps the owned epoch armed (GT-4), so after a
+        // cascade too each idle tick reads the armed authorization once.
         let expected = [
             serviced(HeldStop::One, Auto, [stop, idle], 1, ticks - 2),
-            serviced(HeldStop::Cascade, Auto, [stop, stop], 2, 0),
+            serviced(HeldStop::Cascade, Auto, [stop, stop], 2, ticks - 2),
             serviced(
                 HeldStop::CascadeAfterFrame,
                 Auto,
                 [(Some(DiscoveryPass::Frame), true, true), stop],
                 2,
-                0,
+                ticks - 2,
             ),
             // The failed cycle resumes the child, counts one partial attempt
             // and retires re-arming; the capture continues.

@@ -10762,6 +10762,70 @@ fn rt_add_deferral_fallback_after_target_exit_is_bounded_loss_not_fatal() {
     assert!(engine.discovery_truncated > truncated_before);
 }
 
+/// GT-4: `attach_gap_ms` was `null` on ordinary `run` captures. An RT_ADD or
+/// RT_DELETE hit only defers a memory scan until the RT_CONSISTENT that ends
+/// the loader transaction; a process that exits first never relocated or
+/// initialized the object, so no provider code ran unobserved. Settling that
+/// scan at the process's provable exit stays a counted truncation, but it
+/// used to erase every measured gap in the capture as if a causal record had
+/// been lost.
+#[test]
+fn a_deferred_scan_ended_by_its_process_exit_keeps_the_measured_attach_gap() {
+    let (mut fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    let measured = timing_key(0);
+    engine.timings.observe(&measured, 1_000_000);
+    engine.timings.complete(&measured, 3_000_000);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    let truncated_before = engine.discovery_truncated;
+
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(
+        engine.discovery_truncated > truncated_before,
+        "the unresolved scan stays counted"
+    );
+    assert!(
+        engine
+            .capture_facts()
+            .attach_gap_ms()
+            .is_some_and(|gap| gap >= 2),
+        "the measured gap survives: {:?}",
+        engine.capture_facts().attach_gap_ms()
+    );
+}
+
+/// The same rule on the record path: a loader record of a generation that
+/// provably ended cannot be resolved, but an RT_ADD or RT_DELETE hit
+/// introduces no code that could run. Only a record that could have
+/// published a callable provider (RT_CONSISTENT, an export return, an exec)
+/// still leaves the capture's gap unproven.
+#[test]
+fn an_ended_generations_loader_record_nulls_the_gap_only_if_code_could_have_run() {
+    for (state, keeps_gap) in [(1, true), (2, true), (0, false)] {
+        let (mut fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        let measured = timing_key(0);
+        engine.timings.observe(&measured, 1_000_000);
+        engine.timings.complete(&measured, 3_000_000);
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        record.announced_count = state;
+
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert_eq!(
+            engine.capture_facts().attach_gap_ms().is_some(),
+            keeps_gap,
+            "r_state {state}: {:?}",
+            engine.counters.object_skips
+        );
+    }
+}
+
 /// Asserts the named capture ended the ordinary way after its target exited:
 /// the view retired as an expected removal, and no generation loss was
 /// published for a process that provably just ended.

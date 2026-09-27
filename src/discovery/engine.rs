@@ -6905,6 +6905,18 @@ fn arm_refreshed_views_with(
     Ok(changed)
 }
 
+/// Whether an unresolvable record of an ended generation could have announced
+/// code that then ran unobserved, so the capture's causal gap is unproven. A
+/// loader hit in RT_ADD or RT_DELETE state cannot: dlopen relocates and
+/// initializes an object only after the transaction's RT_CONSISTENT, and a
+/// deletion adds nothing. Every other record (RT_CONSISTENT or an unreadable
+/// state, an export return, an exec) could.
+fn record_could_publish_callable_code(record: &DiscoveryRecord) -> bool {
+    const RT_ADD: u32 = 1;
+    const RT_DELETE: u32 = 2;
+    !(record.kind == DISCOVERY_KIND_LOADER && matches!(record.announced_count, RT_ADD | RT_DELETE))
+}
+
 fn process_view_is_current(
     views: &[ProcessView],
     extra_views: &[&ProcessView],
@@ -7232,6 +7244,42 @@ impl Engine {
             }
         }
         aggregate
+    }
+
+    /// Whether the owned child `pid` still has a provider whose function
+    /// table is not published (GT-4): a loader memory scan deferred at an
+    /// RT_ADD hit, or a provider attached only through its count-only
+    /// `C_GetFunctionList` seed while its table is unknown. The pause keeps
+    /// the child's epoch armed through exactly this window.
+    pub(crate) fn owned_publication_pending(&self, pid: u32) -> bool {
+        let views: BTreeSet<_> = self
+            .views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .map(ProcessView::id)
+            .collect();
+        if self
+            .pending_loader_scans
+            .keys()
+            .any(|key| views.contains(&key.view))
+        {
+            return true;
+        }
+        let objects: BTreeSet<_> = self
+            .modules
+            .iter()
+            .filter(|module| views.contains(&module.scanned.view))
+            .map(|module| module.object)
+            .collect();
+        self.plan
+            .provisional_objects()
+            .any(|object| objects.contains(&object))
+    }
+
+    /// Publishes a gap the owned pause could not cover. It is a coverage gap,
+    /// not a lost record: the causal timing still measures it.
+    pub(crate) fn note_owned_pause_gap(&mut self, reason: &str) {
+        self.mark_partial("owned pause", reason);
     }
 
     /// The admission rule this capture's plan keeps for its whole lifetime
@@ -8321,15 +8369,39 @@ impl Engine {
         self.mark_live_loss("live loader memory discovery", reason);
     }
 
-    fn settle_pending_loader_scan(&mut self, key: PendingLoaderScanKey, reason: &str) -> bool {
+    /// A deferred scan whose process provably exited before the loader
+    /// transaction's RT_CONSISTENT. It stays a counted truncation, but not a
+    /// causal-timing loss: dlopen relocates and initializes an object only
+    /// after RT_CONSISTENT, so an object announced by RT_ADD in a process
+    /// that ended first never ran, and RT_DELETE introduces nothing (GT-4).
+    fn record_pending_loader_scan_end(&mut self, reason: &str) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_partial("live loader memory discovery", reason);
+    }
+
+    fn settle_pending_loader_scan(
+        &mut self,
+        key: PendingLoaderScanKey,
+        reason: &str,
+        ended: bool,
+    ) -> bool {
         if self.pending_loader_scans.remove(&key).is_none() {
             return false;
         }
-        self.record_pending_loader_scan_loss(reason);
+        if ended {
+            self.record_pending_loader_scan_end(reason);
+        } else {
+            self.record_pending_loader_scan_loss(reason);
+        }
         true
     }
 
-    fn settle_pending_loader_scans_for_view(&mut self, view: ProcessViewId, reason: &str) {
+    fn settle_pending_loader_scans_for_view(
+        &mut self,
+        view: ProcessViewId,
+        reason: &str,
+        ended: bool,
+    ) {
         let pending: Vec<_> = self
             .pending_loader_scans
             .keys()
@@ -8337,14 +8409,14 @@ impl Engine {
             .copied()
             .collect();
         for key in pending {
-            self.settle_pending_loader_scan(key, reason);
+            self.settle_pending_loader_scan(key, reason, ended);
         }
     }
 
     fn settle_all_pending_loader_scans(&mut self, reason: &str) {
         let pending: Vec<_> = self.pending_loader_scans.keys().copied().collect();
         for key in pending {
-            self.settle_pending_loader_scan(key, reason);
+            self.settle_pending_loader_scan(key, reason, false);
         }
     }
 
@@ -10191,17 +10263,20 @@ impl Engine {
                     required_complete &= outcome.required_complete();
                 }
                 Err(error) => {
-                    self.record_pending_loader_scan_loss(
-                        "a deferred loader memory scan remained unresolved after its one bounded fallback attempt",
-                    );
-                    // A target that provably exited before its fallback ran is
-                    // the same bounded generation loss the record path takes:
-                    // counted above, never a reason to abandon the capture.
+                    // A target that provably exited before its fallback ran
+                    // ended its loader transaction unfinished: a counted
+                    // truncation, never a reason to abandon the capture, and
+                    // no lost causal timing (`record_pending_loader_scan_end`).
                     if self.original_exited(key.view) {
-                        self.invalidate_causal_timing();
+                        self.record_pending_loader_scan_end(
+                            "a deferred loader memory scan was unresolved at expected process exit",
+                        );
                         required_complete = false;
                         continue;
                     }
+                    self.record_pending_loader_scan_loss(
+                        "a deferred loader memory scan remained unresolved after its one bounded fallback attempt",
+                    );
                     return Err(error);
                 }
             }
@@ -10362,9 +10437,13 @@ impl Engine {
                 pending_views,
             );
             if result.is_err() {
+                // An RT_ADD/RT_DELETE hit of a process that already ended:
+                // its transaction never reached RT_CONSISTENT.
+                let ended = self.original_exited(view_id);
                 self.settle_pending_loader_scan(
                     key,
                     "a deferred loader memory scan failed during export-hook preparation",
+                    ended,
                 );
             } else if let Some(reason) = self.budget.stopped_now() {
                 self.settle_pending_loader_scan(
@@ -10372,6 +10451,7 @@ impl Engine {
                     &format!(
                         "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
                     ),
+                    false,
                 );
             }
             result
@@ -12856,6 +12936,7 @@ impl Engine {
                     context: context_id,
                 },
                 "a deferred loader memory scan was unresolved at loader context retirement",
+                false,
             );
             // A context its own terminal dispatch already removed was removed
             // exactly once; only one still registered can fail to be removed.
@@ -12959,7 +13040,11 @@ impl Engine {
                 "a deferred loader memory scan was unresolved at loader context retirement"
             }
         };
-        self.settle_pending_loader_scans_for_view(view, pending_reason);
+        self.settle_pending_loader_scans_for_view(
+            view,
+            pending_reason,
+            cause == RetirementCause::ExpectedRemoval,
+        );
         if cause != RetirementCause::ExpectedRemoval {
             self.ready_expected_removals.remove(&view);
         }
@@ -13450,7 +13535,9 @@ impl Engine {
                     Err(_) => {
                         closure.fail();
                         if self.record_generation_ended(origin) {
-                            self.invalidate_causal_timing();
+                            if record_could_publish_callable_code(&record) {
+                                self.invalidate_causal_timing();
+                            }
                         } else {
                             self.mark_live_loss(
                                 "live discovery record",

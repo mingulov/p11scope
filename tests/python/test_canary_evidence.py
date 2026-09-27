@@ -82,16 +82,15 @@ def owned_metrics_document(bits, calls=30):
         interface_list="ok",
         child_still_running=False,
     )
-    # The skips an owned lane must publish. `p11scope run` attempts
+    # The one skip an owned lane must publish. `p11scope run` attempts
     # initial-set discovery and the D3 amendment leaves the timing catalog
-    # exactly empty, so the attempt is reported unproven rather than claimed
-    # (categorical floor), plus the F-14 future-minor disclosure the
-    # scanned matrix shape always carries.
+    # exactly empty, so the attempt is reported unproven rather than claimed.
+    # (The F-14 future-minor disclosure is retired with the scanner
+    # emission it mirrored: the scan walks every 2.x/3.x word it sees.)
     # Spelled out rather than taken from `discovery_skipped`, because the
     # fixture's generic skip carries the table-unavailable reason instead.
     evidence["skipped"] = [
         {"name": subject.DISCOVERY_SUBJECT, "reason": subject.DISCOVERY_UNAVAILABLE},
-        dict(subject.CANARY_UNSUPPORTED_SKIP),
     ]
     if bits == 64:
         evidence["discovery_conflicts"] = 1
@@ -2747,6 +2746,10 @@ class OwnedMetricsOracleTests(unittest.TestCase):
     def test_owned_metrics_require_exact_30_and_closed_run_evidence(self):
         canary = load_subject(TARGET_BITS)
         capture, owned = owned_metrics_document(TARGET_BITS)
+        RETIRED_VERSION_SKIP = {
+            "name": capture.DISCOVERY_SUBJECT,
+            "reason": capture.UNSUPPORTED_TABLE_VERSION,
+        }
         for lane in ("owned-default-metrics", "owned-feature-metrics"):
             with self.subTest(lane=lane):
                 capture.validate_canary(lane, copy.deepcopy(owned), TARGET_BITS)
@@ -2760,13 +2763,12 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                         canary.assert_owned_aggregate_metrics(bad)
                 # A retained scan refusal publishes byte-identical to the
                 # initial-set skip, so an owned lane may carry two
-                # categorical skips alongside the F-14 disclosure: the
-                # deterministic floor plus one.
+                # categorical skips: the deterministic floor plus one.
                 two = copy.deepcopy(owned)
                 two["evidence"]["skipped"] = [
                     {"name": capture.DISCOVERY_SUBJECT,
                      "reason": capture.DISCOVERY_UNAVAILABLE}
-                    for _ in range(2)] + [dict(capture.CANARY_UNSUPPORTED_SKIP)]
+                    for _ in range(2)]
                 capture.validate_canary(lane, two, TARGET_BITS)
                 for mutate in (
                     lambda d: d["evidence"].pop("child_still_running"),
@@ -2776,15 +2778,17 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                     # The owned categorical floor is exact: a lane that
                     # published no categorical skip left its initial-set
                     # attempt unreported. Above the ceiling — a third
-                    # categorical skip, or any item that is neither
-                    # categorical nor the disclosure — still fails. Shapes
-                    # carry the correct disclosure so they fail on the
-                    # categorical rule alone; the missing disclosure fails too.
+                    # categorical skip, or any non-categorical item — still
+                    # fails. The retired future-minor version skip is such
+                    # an item (owner-approved 2026-09-27: the scan walks
+                    # future minors as known prefixes and never emits it),
+                    # alone or beside the categorical floor.
                     lambda d: d["evidence"].update(skipped=[
-                        dict(capture.CANARY_UNSUPPORTED_SKIP)]),
+                        dict(RETIRED_VERSION_SKIP)]),
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
-                         "reason": capture.DISCOVERY_UNAVAILABLE}]),
+                         "reason": capture.DISCOVERY_UNAVAILABLE},
+                        dict(RETIRED_VERSION_SKIP)]),
                     lambda d: d["evidence"].update(skipped=[]),
                     lambda d: d["evidence"].update(skipped=[{
                         "name": capture.DISCOVERY_SUBJECT,
@@ -2792,13 +2796,12 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
                          "reason": capture.DISCOVERY_UNAVAILABLE}
-                        for _ in range(3)] + [dict(capture.CANARY_UNSUPPORTED_SKIP)]),
+                        for _ in range(3)]),
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
                          "reason": capture.DISCOVERY_UNAVAILABLE},
                         {"name": capture.DISCOVERY_SUBJECT,
-                         "reason": capture.TABLE_UNAVAILABLE},
-                        dict(capture.CANARY_UNSUPPORTED_SKIP)]),
+                         "reason": capture.TABLE_UNAVAILABLE}]),
                 ):
                     bad = copy.deepcopy(owned)
                     mutate(bad)
@@ -2809,9 +2812,9 @@ class OwnedMetricsOracleTests(unittest.TestCase):
         external["evidence"].pop("child_still_running")
         # The initial-set skip belongs to the owned lane alone: an external
         # `--pid` attach never attempts initial-set discovery, so it has
-        # nothing to leave unproven. The F-14 disclosure stays: the
-        # scanned matrix shape is the same.
-        external["evidence"]["skipped"] = [dict(capture.CANARY_UNSUPPORTED_SKIP)]
+        # nothing to leave unproven, and the known-prefix scan publishes
+        # no version skip for the matrix shape.
+        external["evidence"]["skipped"] = []
         external["functions"][0]["calls"] = 28
         # Dropping the skip changes the verdict's inputs: re-derive the
         # published classes the way the producer would.

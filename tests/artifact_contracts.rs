@@ -6155,10 +6155,13 @@ fn canary_process_custody_lifecycle() {
 
 #[test]
 fn stopped_canary_capture_lifecycle() {
+    // Hang guard at ~4x the ~70 s isolated suite time (43-63 s plus ~4 s
+    // for the widened missing_* budgets): the old 90 s (~1.5x) fired under
+    // 4x CPU oversubscription while every subtest was still healthy.
     let output = Command::new("timeout")
         .args([
             "--kill-after=2s",
-            "90s",
+            "300s",
             "python3",
             "-I",
             "tests/python/test_stopped_canary_capture.py",

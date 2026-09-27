@@ -479,7 +479,11 @@ pub const TAIL_CALLS_ENTRIES: u32 = 2;
 /// through. Classic uprobe programs issue one so the verifier keeps them on the
 /// task's kernel stack (see `keep_kernel_stack` in the BPF crate).
 pub const TAIL_CALLS_NO_PRIVATE_STACK_INDEX: u32 = u32::MAX;
-const _: () = assert!(TAIL_CALLS_NO_PRIVATE_STACK_INDEX >= TAIL_CALLS_ENTRIES);
+const _: () = assert!(
+    TAIL_CALLS_INTERFACE_WORKER_SLOT < TAIL_CALLS_ENTRIES
+        && TAIL_CALLS_TEMPLATE_SECOND_SLOT < TAIL_CALLS_ENTRIES
+        && TAIL_CALLS_ENTRIES < TAIL_CALLS_NO_PRIVATE_STACK_INDEX
+);
 #[cfg(not(feature = "small-discovery-ring"))]
 pub const DISCOVERY_BYTES: u32 = 65_536;
 #[cfg(feature = "small-discovery-ring")]

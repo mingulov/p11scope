@@ -121,8 +121,12 @@ loading provider code. Never give it capabilities or a set-id bit.
 
 **Kernel and privileges.** Linux 5.15 or newer with BTF
 (`/sys/kernel/btf/vmlinux`). Captures need root (`sudo p11scope ...`) or file
-capabilities on the observer. The capability set measured in
-[docs/usage.md](docs/usage.md#privileges-per-environment) is:
+capabilities on the observer. The attach floor is backend-dependent: on
+kernels ≥ 6.9 the product attaches through uprobe-multi links, where
+`CAP_BPF`+`CAP_PERFMON` suffice (measured 136/136 at
+`perf_event_paranoid=4`); below 6.9 it uses per-probe `perf_event` uprobes,
+where a restrictive paranoid needs `CAP_SYS_ADMIN`
+([measured matrix](docs/usage.md#privileges-per-environment)). The full set is:
 
 ```sh
 sudo setcap 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep' \
@@ -244,14 +248,16 @@ report format.
   against a millisecond-scale network HSM
   (`scripts/bench-overhead.sh`, `docs/notes/phase5-overhead.md`; full numbers
   and the event-loss finding at high call rates: [docs/usage.md](docs/usage.md#overhead-measured)).
-- Requires elevated privileges, kernel-version-dependent, x86-64 first. On the
-  measured host (`kernel.perf_event_paranoid=4`,
-  `kernel.yama.ptrace_scope=1`), uprobe attach required `CAP_SYS_ADMIN`;
-  `CAP_BPF`+`CAP_PERFMON` did not suffice. Manifest-free scanning of a same-UID
-  non-descendant additionally required `CAP_SYS_PTRACE`, or equivalently a
-  descendant target / permissive ptrace policy. No `CAP_LEASE`, no
-  `fs.suid_dumpable=0`, no root-owned trusted exec dir
-  ([docs/usage.md](docs/usage.md#privileges-per-environment)).
+- Requires elevated privileges, kernel-version-dependent, x86-64 first. The
+  attach floor follows the backend the product picks automatically: on
+  kernels ≥ 6.9 (uprobe-multi links) `CAP_BPF`+`CAP_PERFMON` suffice to
+  attach at `kernel.perf_event_paranoid=4` (measured 136/136); below 6.9
+  (per-probe `perf_event` uprobes) a restrictive paranoid needs
+  `CAP_SYS_ADMIN`. Manifest-free scanning of a same-UID non-descendant
+  additionally needs `CAP_SYS_PTRACE` under Yama `ptrace_scope=1`, or
+  equivalently a descendant target / `--manifest`. Root works everywhere.
+  No `CAP_LEASE`, no `fs.suid_dumpable=0`, no root-owned trusted exec dir
+  ([measured matrix](docs/usage.md#privileges-per-environment)).
   Kernel floor ≥5.15; on an unsupported environment the tool fails with a
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).

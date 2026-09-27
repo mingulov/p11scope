@@ -5,7 +5,10 @@
 
 use crate::maps::{self, Device, MappedPath, ObjectKey};
 use libloading::Library;
-use p11scope_manifest::identity::{self, ObjectIdentity};
+use p11scope_manifest::identity::{
+    self, KernelSelfMappingProbe, ObjectIdentity, ProbeBudget, SelfMappingProbe,
+    UnboundedProbeBudget, opened_file_matches_maps, self_mapped_fallback_key,
+};
 use p11scope_manifest::manifest::*;
 use pkcs11_module::{
     RawInterface, Surface, TableSet, function_list, interface_list, read_fn_pointers, tables_for,
@@ -71,8 +74,15 @@ pub fn discover_with_self_memory(
         std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?;
     let maps = maps::parse_maps(&maps_bytes)?;
     let map_index = validated_map_index(&maps)?;
-    let module_map_key =
-        loaded_module_key(raw_exports, &map_index, module_file_key, &module_identity)?;
+    let module_file = identity::open_object(module_path)
+        .map_err(|e| format!("cannot open {} for reuse: {e}", module_path.display()))?;
+    let module_map_key = loaded_module_key(
+        raw_exports,
+        &map_index,
+        module_file_key,
+        &module_identity,
+        &module_file,
+    )?;
     let initial_module_mappings: Vec<maps::MapEntry> = map_index
         .entries()
         .iter()
@@ -298,6 +308,28 @@ fn loaded_module_key(
     maps: &maps::MapIndex<'_>,
     module_file_key: ObjectKey,
     module_identity: &ObjectIdentity,
+    module_file: &File,
+) -> Result<ObjectKey, String> {
+    let mut budget = UnboundedProbeBudget;
+    loaded_module_key_with_probe(
+        exports,
+        maps,
+        module_file_key,
+        module_identity,
+        module_file,
+        &KernelSelfMappingProbe,
+        &mut budget,
+    )
+}
+
+fn loaded_module_key_with_probe(
+    exports: ExportAddresses,
+    maps: &maps::MapIndex<'_>,
+    module_file_key: ObjectKey,
+    module_identity: &ObjectIdentity,
+    module_file: &File,
+    probe: &impl SelfMappingProbe,
+    budget: &mut dyn ProbeBudget,
 ) -> Result<ObjectKey, String> {
     for address in [exports.get_function_list, exports.get_interface_list]
         .into_iter()
@@ -310,18 +342,24 @@ fn loaded_module_key(
             ..
         } = maps.resolve(address as u64)
         {
-            if (ObjectKey { device, inode }) == module_file_key {
+            let maps_key = ObjectKey { device, inode };
+            // On pre-6.8 kernels an overlayfs fd and its mappings
+            // legitimately carry different keys (overlay vs backing
+            // device); the self-mapping probe asks the kernel how it
+            // renders this exact fd before refusing.
+            if opened_file_matches_maps(module_file, module_file_key, maps_key, budget, probe) {
                 if let MappedPath::Usable(path) = path {
                     // When the kernel-reported path is reachable, require the
                     // same exact fd identity and whole-file identity too.
                     if std::fs::metadata(&path).is_ok()
-                        && validated_identity(&path, module_file_key).as_ref()
+                        && validated_identity_with_probe(&path, module_file_key, probe, budget)
+                            .as_ref()
                             != Ok(module_identity)
                     {
                         continue;
                     }
                 }
-                return Ok(ObjectKey { device, inode });
+                return Ok(maps_key);
             }
         }
     }
@@ -340,9 +378,19 @@ fn file_key(file: &File) -> Result<ObjectKey, String> {
 }
 
 fn validated_identity(path: &Path, expected: ObjectKey) -> Result<ObjectIdentity, String> {
+    let mut budget = UnboundedProbeBudget;
+    validated_identity_with_probe(path, expected, &KernelSelfMappingProbe, &mut budget)
+}
+
+fn validated_identity_with_probe(
+    path: &Path,
+    expected: ObjectKey,
+    probe: &impl SelfMappingProbe,
+    budget: &mut dyn ProbeBudget,
+) -> Result<ObjectIdentity, String> {
     let file = identity::open_object(path)
         .map_err(|e| format!("cannot open {} for reuse: {e}", path.display()))?;
-    validated_file_identity(path, &file, expected)
+    validated_file_identity_with_probe(path, &file, expected, probe, budget)
 }
 
 fn identity_and_key(path: &Path) -> Result<(ObjectKey, ObjectIdentity), String> {
@@ -358,8 +406,23 @@ fn validated_file_identity(
     file: &File,
     expected: ObjectKey,
 ) -> Result<ObjectIdentity, String> {
+    let mut budget = UnboundedProbeBudget;
+    validated_file_identity_with_probe(path, file, expected, &KernelSelfMappingProbe, &mut budget)
+}
+
+fn validated_file_identity_with_probe(
+    path: &Path,
+    file: &File,
+    expected: ObjectKey,
+    probe: &impl SelfMappingProbe,
+    budget: &mut dyn ProbeBudget,
+) -> Result<ObjectIdentity, String> {
     let actual = file_key(file)?;
-    if actual != expected {
+    // On pre-6.8 kernels an overlayfs fd and its mappings legitimately
+    // carry different keys (overlay vs backing device); the self-mapping
+    // probe asks the kernel how it renders this exact fd before refusing.
+    // A same-file revalidation (`actual == expected`) never probes.
+    if !opened_file_matches_maps(file, actual, expected, budget, probe) {
         return Err(format!(
             "device/inode mismatch for {}: mapped {:?}, path {:?}",
             path.display(),
@@ -1221,18 +1284,51 @@ fn stable_selection_maps(
     expected_key: ObjectKey,
     expected_identity: &ObjectIdentity,
 ) -> Result<Vec<maps::MapEntry>, ()> {
+    let mut budget = UnboundedProbeBudget;
+    stable_selection_maps_with_probe(
+        module_path,
+        expected_key,
+        expected_identity,
+        &KernelSelfMappingProbe,
+        &mut budget,
+    )
+}
+
+fn stable_selection_maps_with_probe(
+    module_path: &Path,
+    expected_key: ObjectKey,
+    expected_identity: &ObjectIdentity,
+    probe: &impl SelfMappingProbe,
+    budget: &mut dyn ProbeBudget,
+) -> Result<Vec<maps::MapEntry>, ()> {
     let bytes = std::fs::read("/proc/self/maps").map_err(|_| ())?;
     let current_maps = maps::parse_maps(&bytes).map_err(|_| ())?;
-    let (current_key, current_identity) = identity_and_key(module_path).map_err(|_| ())?;
-    if current_key != expected_key
-        || current_identity != *expected_identity
-        || !current_maps
-            .iter()
-            .any(|mapping| ObjectKey::of(mapping) == expected_key)
-    {
+    let file = identity::open_object(module_path).map_err(|_| ())?;
+    let current_key = file_key(&file).map_err(|_| ())?;
+    let current_identity =
+        validated_file_identity_with_probe(module_path, &file, current_key, probe, budget)
+            .map_err(|_| ())?;
+    if current_key != expected_key || current_identity != *expected_identity {
         return Err(());
     }
-    Ok(current_maps)
+    if current_maps
+        .iter()
+        .any(|mapping| ObjectKey::of(mapping) == expected_key)
+    {
+        return Ok(current_maps);
+    }
+    // On pre-6.8 kernels the overlay fd key never appears in maps; accept
+    // only when the kernel renders this exact fd at a key the snapshot
+    // contains.
+    if let Some(probed) = self_mapped_fallback_key(&file, current_key, budget, probe) {
+        if current_maps
+            .iter()
+            .any(|mapping| ObjectKey::of(mapping) == probed)
+        {
+            return Ok(current_maps);
+        }
+    }
+    Err(())
 }
 
 fn selection_records(
@@ -1758,10 +1854,11 @@ mod tests {
             inode: module_key.inode,
             raw_path: Some(b"/definitely-not-reachable/provider.so".to_vec()),
         };
+        let module_file = identity::open_object(&std::env::current_exe().unwrap()).unwrap();
         let valid = vec![provider];
         let load = |exports, entries: &[maps::MapEntry]| {
             let index = validated_map_index(entries)?;
-            loaded_module_key(exports, &index, module_key, &module_identity)
+            loaded_module_key(exports, &index, module_key, &module_identity, &module_file)
         };
 
         assert_eq!(
@@ -1851,6 +1948,326 @@ mod tests {
             no_exports.contains("invalid /proc maps snapshot"),
             "{no_exports}"
         );
+    }
+
+    /// A scripted self-mapping probe (see `p11scope_manifest::identity`):
+    /// `overlay` answers the overlayfs question and `key` answers the
+    /// kernel-rendered maps key, counting both consultations. Real
+    /// overlayfs is unmountable without privileges, so unit tests script
+    /// the kernel side of the pre-6.8 split.
+    struct FakeSelfMappingProbe {
+        overlay: bool,
+        key: Option<ObjectKey>,
+        overlay_checks: std::cell::Cell<usize>,
+        probes: std::cell::Cell<usize>,
+    }
+
+    impl FakeSelfMappingProbe {
+        fn new(overlay: bool, key: Option<ObjectKey>) -> Self {
+            Self {
+                overlay,
+                key,
+                overlay_checks: std::cell::Cell::new(0),
+                probes: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl SelfMappingProbe for FakeSelfMappingProbe {
+        fn fd_is_on_overlayfs(&self, _file: &File) -> bool {
+            self.overlay_checks.set(self.overlay_checks.get() + 1);
+            self.overlay
+        }
+
+        fn kernel_maps_key(
+            &self,
+            _file: &File,
+            _budget: &mut dyn ProbeBudget,
+        ) -> Option<ObjectKey> {
+            self.probes.set(self.probes.get() + 1);
+            self.key
+        }
+    }
+
+    /// The inode a two-container docker run really produced for one shared
+    /// image-layer object.
+    const SPLIT_INODE: u64 = 56_317_450;
+
+    /// The fd identity mountinfo gives an overlay file (observed 0:41).
+    fn split_fd_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 41,
+            },
+            inode: SPLIT_INODE,
+        }
+    }
+
+    /// The backing identity a pre-6.8 kernel prints for that fd's mappings:
+    /// `00:15` is 0:21, the measured 6.1 rendering.
+    fn split_maps_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 21,
+            },
+            inode: SPLIT_INODE,
+        }
+    }
+
+    fn wrong_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 43,
+            },
+            inode: SPLIT_INODE,
+        }
+    }
+
+    /// A real non-empty file for probe fixtures. Uses the process temp dir
+    /// so the repo's `TMPDIR` lane override applies.
+    fn probe_tempfile(name: &str) -> (PathBuf, File) {
+        let dir = std::env::temp_dir().join(format!(
+            "p11scope-discover-probe-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probed.so");
+        std::fs::write(&path, "p11scope-discover-probe:page-one").unwrap();
+        let file = File::open(&path).unwrap();
+        (dir, file)
+    }
+
+    /// One executable mapping carrying `key` at 0x1000 with an unreachable
+    /// path, so the reachable-path revalidation never runs and the tests
+    /// stay hermetic.
+    fn provider_entry(key: ObjectKey) -> maps::MapEntry {
+        maps::MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: key.device,
+            inode: key.inode,
+            raw_path: Some(b"/definitely-not-reachable/provider.so".to_vec()),
+        }
+    }
+
+    fn export_at_1000() -> ExportAddresses {
+        ExportAddresses {
+            get_function_list: Some(0x1000),
+            ..ExportAddresses::default()
+        }
+    }
+
+    #[test]
+    fn loaded_split_probe_equal_keys_accept_without_probing() {
+        let (_dir, module_file) = probe_tempfile("loaded-equal");
+        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
+            .unwrap()
+            .1;
+        let entries = vec![provider_entry(split_fd_key())];
+        let index = validated_map_index(&entries).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            loaded_module_key_with_probe(
+                export_at_1000(),
+                &index,
+                split_fd_key(),
+                &module_identity,
+                &module_file,
+                &probe,
+                &mut budget,
+            ),
+            Ok(split_fd_key())
+        );
+        assert_eq!(probe.overlay_checks.get(), 0);
+        assert_eq!(probe.probes.get(), 0);
+    }
+
+    #[test]
+    fn loaded_split_probe_overlay_match_accepts_the_maps_key() {
+        let (_dir, module_file) = probe_tempfile("loaded-match");
+        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
+            .unwrap()
+            .1;
+        let entries = vec![provider_entry(split_maps_key())];
+        let index = validated_map_index(&entries).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, Some(split_maps_key()));
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            loaded_module_key_with_probe(
+                export_at_1000(),
+                &index,
+                split_fd_key(),
+                &module_identity,
+                &module_file,
+                &probe,
+                &mut budget,
+            ),
+            Ok(split_maps_key())
+        );
+        assert_eq!(probe.probes.get(), 1);
+    }
+
+    #[test]
+    fn loaded_split_probe_overlay_mismatch_refuses_with_todays_message() {
+        let (_dir, module_file) = probe_tempfile("loaded-mismatch");
+        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
+            .unwrap()
+            .1;
+        let entries = vec![provider_entry(split_maps_key())];
+        let index = validated_map_index(&entries).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, Some(wrong_key()));
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            loaded_module_key_with_probe(
+                export_at_1000(),
+                &index,
+                split_fd_key(),
+                &module_identity,
+                &module_file,
+                &probe,
+                &mut budget,
+            )
+            .unwrap_err(),
+            "no module acquisition export maps to the requested file identity"
+        );
+    }
+
+    #[test]
+    fn loaded_split_probe_non_overlay_mismatch_refuses_without_probing() {
+        let (_dir, module_file) = probe_tempfile("loaded-non-overlay");
+        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
+            .unwrap()
+            .1;
+        let entries = vec![provider_entry(split_maps_key())];
+        let index = validated_map_index(&entries).unwrap();
+        let probe = FakeSelfMappingProbe::new(false, Some(split_maps_key()));
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            loaded_module_key_with_probe(
+                export_at_1000(),
+                &index,
+                split_fd_key(),
+                &module_identity,
+                &module_file,
+                &probe,
+                &mut budget,
+            )
+            .unwrap_err(),
+            "no module acquisition export maps to the requested file identity"
+        );
+        assert_eq!(probe.overlay_checks.get(), 1);
+        assert_eq!(probe.probes.get(), 0);
+    }
+
+    #[test]
+    fn loaded_split_probe_error_refuses() {
+        let (_dir, module_file) = probe_tempfile("loaded-error");
+        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
+            .unwrap()
+            .1;
+        let entries = vec![provider_entry(split_maps_key())];
+        let index = validated_map_index(&entries).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            loaded_module_key_with_probe(
+                export_at_1000(),
+                &index,
+                split_fd_key(),
+                &module_identity,
+                &module_file,
+                &probe,
+                &mut budget,
+            )
+            .unwrap_err(),
+            "no module acquisition export maps to the requested file identity"
+        );
+    }
+
+    #[test]
+    fn validated_split_probe_equal_keys_accept_without_probing() {
+        let exe = std::env::current_exe().unwrap();
+        let file = identity::open_object(&exe).unwrap();
+        let key = file_key(&file).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let mut budget = UnboundedProbeBudget;
+        assert!(
+            validated_file_identity_with_probe(&exe, &file, key, &probe, &mut budget)
+                .unwrap()
+                .reusable
+        );
+        assert_eq!(probe.overlay_checks.get(), 0);
+        assert_eq!(probe.probes.get(), 0);
+    }
+
+    #[test]
+    fn validated_split_probe_overlay_match_accepts_a_split_maps_key() {
+        let exe = std::env::current_exe().unwrap();
+        let file = identity::open_object(&exe).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, Some(split_maps_key()));
+        let mut budget = UnboundedProbeBudget;
+        // `expected` is the maps rendering (backing) while the fd resolves
+        // to the overlay device, so only the probe bridges them.
+        assert!(
+            validated_file_identity_with_probe(&exe, &file, split_maps_key(), &probe, &mut budget,)
+                .unwrap()
+                .reusable
+        );
+        assert_eq!(probe.probes.get(), 1);
+    }
+
+    #[test]
+    fn validated_split_probe_mismatch_keeps_todays_message() {
+        let exe = std::env::current_exe().unwrap();
+        let file = identity::open_object(&exe).unwrap();
+        for probe in [
+            FakeSelfMappingProbe::new(true, Some(wrong_key())),
+            FakeSelfMappingProbe::new(false, Some(split_maps_key())),
+            FakeSelfMappingProbe::new(true, None),
+        ] {
+            let mut budget = UnboundedProbeBudget;
+            let err = validated_file_identity_with_probe(
+                &exe,
+                &file,
+                split_maps_key(),
+                &probe,
+                &mut budget,
+            )
+            .unwrap_err();
+            assert!(err.contains("device/inode mismatch"), "{err}");
+        }
+    }
+
+    #[test]
+    fn stable_maps_live_module_accepts_without_probing() {
+        let exe = std::env::current_exe().unwrap();
+        let (key, identity) = identity_and_key(&exe).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let mut budget = UnboundedProbeBudget;
+        let maps =
+            stable_selection_maps_with_probe(&exe, key, &identity, &probe, &mut budget).unwrap();
+        assert!(maps.iter().any(|mapping| ObjectKey::of(mapping) == key));
+        assert_eq!(probe.probes.get(), 0);
+    }
+
+    #[test]
+    fn stable_maps_changed_key_refuses() {
+        let exe = std::env::current_exe().unwrap();
+        let (key, identity) = identity_and_key(&exe).unwrap();
+        let wrong = ObjectKey {
+            inode: key.inode.wrapping_add(1),
+            ..key
+        };
+        let probe = FakeSelfMappingProbe::new(true, Some(wrong));
+        let mut budget = UnboundedProbeBudget;
+        stable_selection_maps_with_probe(&exe, wrong, &identity, &probe, &mut budget).unwrap_err();
+        assert_eq!(probe.probes.get(), 0);
     }
 
     #[test]

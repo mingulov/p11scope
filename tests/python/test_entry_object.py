@@ -738,10 +738,11 @@ class EntryObjectTests(unittest.TestCase):
             CHECKER["contract"](mutate(OBJECTS["default"], "p11_entry", pc, old, new), "default")
 
     def test_kernel_stack_opt_out_is_only_the_out_of_range_index(self):
-        # Every classic uprobe program first tail-calls TAIL_CALLS with an
-        # index past every slot (the verifier then keeps the kernel stack; the
-        # kernel always falls through). Pointing it at a real slot would be a
-        # continuation outside the pair mode and must be rejected.
+        # Every uprobe program first tail-calls a program array (p11_entry:
+        # the never-populated STACK_GUARD) with an index past every slot (the
+        # verifier then keeps the kernel stack; the kernel always falls
+        # through). Pointing it at a real slot would be a continuation outside
+        # the pair mode and must be rejected.
         _, insns = instructions("default", "p11_entry")
         sentinel = [p for p, t in insns if t == "r3 = 0xffffffff ll"]
         self.assertEqual(len(sentinel), 1)

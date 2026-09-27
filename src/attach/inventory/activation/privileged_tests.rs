@@ -175,7 +175,18 @@ impl OwnedFixture {
 static unsigned hold_id = UINT_MAX;
 static unsigned hold_action = 0;
 static char **exec_argv;
+/* Opt-in provider-like contention (HAMMER_SHARED only): every call takes one
+ * shared lock and spins inside the endpoint body, as a real provider's
+ * session/token lock does, so concurrent calls overlap and block. */
+static pthread_mutex_t contend_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile unsigned contend_spin;
 static void hold_in_body(unsigned id) {
+    unsigned spin = contend_spin;
+    if (spin) {
+        pthread_mutex_lock(&contend_lock);
+        for (volatile unsigned i = 0; i < spin; i++) {}
+        pthread_mutex_unlock(&contend_lock);
+    }
     if (hold_id != id) return;
     hold_id = UINT_MAX;
     printf("BODY %u\n", id);
@@ -247,6 +258,11 @@ static void *thread_call(void *data) {
     for (unsigned n = 0; n < work->calls; n++) work->sum += functions[work->id](n);
     return NULL;
 }
+static void *hammer_shared_call(void *data) {
+    struct thread_work *work = data;
+    for (unsigned n = 0; n < work->calls; n++) work->sum += functions[0](n);
+    return NULL;
+}
 static void *hammer_call(void *data) {
     struct thread_work *work = data;
     for (unsigned n = 0; n < work->calls; n++) work->sum += functions[work->id](0);
@@ -302,6 +318,25 @@ int main(int argc, char **argv) {
             if (pthread_join(worker, NULL)) return 7;
             if (abandon) { hold_action = 0; printf("ABANDONED %u %u\n", id, work.tid); continue; }
             return 9;
+        }
+        if (!strcmp(command, "HAMMER_SHARED")) {
+            unsigned threads, percalls, spin;
+            if (scanf("%u %u %u", &threads, &percalls, &spin) != 3 || threads < 1 || threads > 64 || percalls < 1 || percalls > 10000000 || spin > 100000) return 2;
+            printf("HAMMER_SHARED_START %u %u %u\n", threads, percalls, spin);
+            contend_spin = spin;
+            struct thread_work works[64]; pthread_t workers[64];
+            for (unsigned t = 0; t < threads; t++) {
+                works[t].id = 0; works[t].calls = percalls; works[t].sum = 0; works[t].tid = 0; works[t].action = 0;
+                if (pthread_create(&workers[t], NULL, hammer_shared_call, &works[t])) return 6;
+            }
+            unsigned long total = 0;
+            for (unsigned t = 0; t < threads; t++) {
+                if (pthread_join(workers[t], NULL)) return 7;
+                total += works[t].sum;
+            }
+            contend_spin = 0;
+            printf("HAMMER_SHARED_DONE %u %u %lu\n", threads, percalls, total);
+            continue;
         }
         if (!strcmp(command, "HAMMER")) {
             unsigned threads, percalls;
@@ -964,6 +999,26 @@ impl OwnedCaller {
             "independent hammer ledger differs: {ledger}"
         );
         eprintln!("OWNED_HAMMER pid={} {ledger}", self.child.id());
+        Ok(())
+    }
+
+    /// Every thread calls endpoint 0 (one slot) through the contended body;
+    /// the independent ledger is threads * sum(0..percalls).
+    fn hammer_shared_calls(&mut self, threads: u32, percalls: u32, spin: u32) -> Result<()> {
+        writeln!(self.input, "HAMMER_SHARED {threads} {percalls} {spin}")?;
+        self.input.flush()?;
+        ensure!(
+            self.line()? == format!("HAMMER_SHARED_START {threads} {percalls} {spin}"),
+            "shared hammer start receipt differs"
+        );
+        let per_thread = u64::from(percalls) * u64::from(percalls.saturating_sub(1)) / 2;
+        let total = per_thread * u64::from(threads);
+        let ledger = self.line()?;
+        ensure!(
+            ledger == format!("HAMMER_SHARED_DONE {threads} {percalls} {total}"),
+            "independent shared hammer ledger differs: {ledger}"
+        );
+        eprintln!("OWNED_HAMMER_SHARED pid={} {ledger}", self.child.id());
         Ok(())
     }
 
@@ -6753,6 +6808,84 @@ fn privileged_detailed_multithread_owner_accounting_exact() -> Result<()> {
         clean_detach,
         "multithread Detailed detach retained failures"
     );
+    Ok(())
+}
+
+/// The product shape of the live mt-exact failure: a provider-like contended
+/// body (one shared lock plus a spin, as SoftHSM's session lock), every thread
+/// on the SAME endpoint, and the Allowlisted policy `profile` uses (identity,
+/// semantic capture and CALL events, not the aggregate path). Owner leases,
+/// START pairing and counters must stay exact: no poison of any kind (the live
+/// run halted with `bookkeeping_failed`), no refused admission, every call
+/// completed and paired. Events are not drained, so only ring loss may occur.
+#[test]
+#[ignore = "root-owned BPF lane; one-slot contended multi-thread Allowlisted capture stays exact"]
+fn privileged_detailed_multithread_same_slot_allowlisted_exact() -> Result<()> {
+    let threads = std::thread::available_parallelism()
+        .map(|cpus| u32::try_from(cpus.get()).unwrap_or(64))
+        .unwrap_or(4)
+        .clamp(4, 32);
+    const PERCALLS: u32 = 100_000;
+    const SPIN: u32 = 200;
+    let fixture = OwnedFixture::build_n(false, 1)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    let mut session = crate::attach::Session::start(
+        &plan,
+        &Scope::Pid(caller.child.id()),
+        &fixture.pins,
+        crate::attach::CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        crate::attach::BackendSelection::Singles,
+    )?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2,
+        "shared-slot Detailed did not retain its paired static probe"
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    caller.go()?;
+    caller.hammer_shared_calls(threads, PERCALLS, SPIN)?;
+    let reports = crate::metrics::read(&session, &plan)?;
+    let kernel = crate::metrics::kernel_evidence(&session)?;
+    let calls: u64 = reports.iter().map(|report| report.calls).sum();
+    let in_flight: u64 = reports.iter().map(|report| report.in_flight).sum();
+    let rv_total: u64 = reports
+        .iter()
+        .flat_map(|report| report.rv_counts.values())
+        .sum();
+    let expected = u64::from(threads) * u64::from(PERCALLS);
+    eprintln!(
+        "MULTITHREAD_SAME_SLOT threads={threads} percalls={PERCALLS} spin={SPIN} expected={expected} \
+         calls={calls} in_flight={in_flight} rv_total={rv_total} control={:?} kernel={kernel:?}",
+        kernel.control.evidence()
+    );
+    ensure!(
+        kernel.control == crate::metrics::KernelControl::default(),
+        "native owner poisoned or refused under one-slot contended load: {:?}",
+        kernel.control.evidence()
+    );
+    ensure!(
+        crate::metrics::KernelEvidence {
+            ring_loss: 0,
+            ..kernel
+        } == crate::metrics::KernelEvidence::default(),
+        "kernel evidence reports pairing loss under one-slot contended load: {kernel:?}"
+    );
+    ensure!(
+        calls == expected && in_flight == 0 && rv_total == calls,
+        "captured calls differ from the independent ledger"
+    );
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(clean_detach, "shared-slot Detailed detach retained failures");
     Ok(())
 }
 

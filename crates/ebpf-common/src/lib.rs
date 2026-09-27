@@ -1,4 +1,4 @@
-//! SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Types shared verbatim between the BPF programs and userspace. Every
 //! type is `#[repr(C)]` with no padding surprises: both sides read the
 //! same bytes out of the same map.

@@ -891,3 +891,34 @@ fn m9_non_utf8_arguments_never_panic() {
         assert!(!stderr.contains("panicked"), "{stderr}");
     }
 }
+
+/// SE-04: `--duration 0` (bare or suffixed) is a usage error, not a
+/// zero-length capture: exit 2 with a clear message on every surface.
+#[test]
+fn se04_zero_duration_is_a_usage_error_exit_2() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let cases: Vec<Vec<String>> = [
+        vec!["profile", "--pid", &pid, "--duration", "0"],
+        vec!["profile", "--pid", &pid, "--duration", "0s"],
+        vec!["profile", "--pid", &pid, "--duration", "0m"],
+        vec!["trace", "--pid", &pid, "--duration", "0"],
+        vec!["run", "--duration", "0", "--", "/bin/true"],
+    ]
+    .into_iter()
+    .map(|args| args.into_iter().map(str::to_string).collect())
+    .collect();
+    for argv in &cases {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let usage = run(&refs);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(
+            usage
+                .stderr
+                .contains("--duration must be greater than zero"),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}

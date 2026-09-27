@@ -512,10 +512,12 @@ fn capture_option(
         }
         "--duration" => {
             let v = require_value(args, "--duration")?;
-            common.duration = Some(
-                parse_duration(&v)
-                    .map_err(|e| usage_err(format!("--duration: invalid value {v:?}: {e}")))?,
-            );
+            let duration = parse_duration(&v)
+                .map_err(|e| usage_err(format!("--duration: invalid value {v:?}: {e}")))?;
+            if duration.is_zero() {
+                return Err(usage_err("--duration must be greater than zero"));
+            }
+            common.duration = Some(duration);
         }
         "--max-events" => {
             let v = require_value(args, "--max-events")?;
@@ -1007,6 +1009,29 @@ mod tests {
         for bad in ["", "5x", "-1", "s", "1.5m"] {
             assert!(parse_duration(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn zero_duration_is_a_usage_error_on_every_capture_surface() {
+        for argv in [
+            vec!["profile", "--pid", "42", "--duration", "0"],
+            vec!["profile", "--pid", "42", "--duration", "0s"],
+            vec!["profile", "--pid", "42", "--duration", "0m"],
+            vec!["trace", "--pid", "42", "--duration", "0"],
+            vec!["run", "--duration", "0h", "--", "/bin/true"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("--duration must be greater than zero")),
+                "{argv:?}"
+            );
+        }
+        // Non-zero durations still parse.
+        let Command::Profile(a) =
+            parse(args(&["profile", "--pid", "42", "--duration", "30"])).unwrap()
+        else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.duration, Some(Duration::from_secs(30)));
     }
 
     #[test]

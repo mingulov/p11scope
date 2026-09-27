@@ -1936,6 +1936,41 @@ class StoppedPopulationTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "stopped"):
                     self.check(root, manifest)
 
+    def test_idle_owner_first_does_not_shadow_affiliated_records(self):
+        # An idle THREAD_OWNER for a task must not collide with that same
+        # task's leased records in other maps: the owned leader holds no
+        # owner lease at STOP (idle) but does hold its root affiliation and
+        # cookie. Frame order must not matter.
+        dumper = load_dumper()
+        manifest, receipt, records, values = self.fixture(Path("/unused"), owned=True)
+        records.insert(0, {"map_id": 102, "pid": 7001, "tid": 7001,
+                           "generation": 900, "value": bytes(544)})
+        controls = {}
+        for item in manifest:
+            if item["name"] in values:
+                words = values[item["name"]]
+                controls[item["name"]] = {
+                    "id": item["id"], "type": item["type"], "bytes_key": item["key_size"],
+                    "bytes_value": item["value_size"], "max_entries": item["max_entries"],
+                    "map_flags": item["map_flags"], "name": item["name"],
+                    "oracle": item["oracle"],
+                    "value": struct.pack("<" + "Q" * len(words), *words)}
+        stream = b"".join(TaskStorageReaderTests.frame(
+            1, row["map_id"], row["pid"], row["tid"], row["value"]
+        ) for row in records) + TaskStorageReaderTests.frame(2)
+        parsed = dumper.parse_task_storage_frames(
+            stream, TaskStorageReaderTests.MAPS, max_records=100, max_bytes=65536)
+        arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
+        arguments["controls"] = controls
+        bound = dumper.reconcile_task_storage(TaskStorageReaderTests.MAPS, parsed, **arguments)
+        self.assertEqual(bound["THREAD_OWNER"], [
+            {"pid": 7001, "tid": 7002, "generation": 901},
+            {"pid": 7001, "tid": 7003, "generation": 902}])
+        self.assertEqual(bound["ROOT_AFFILIATION"], [
+            {"pid": 7001, "tid": 7001, "generation": 900},
+            {"pid": 7001, "tid": 7002, "generation": 901},
+            {"pid": 7001, "tid": 7003, "generation": 902}])
+
     def test_valid_eof_with_missing_or_wrong_identity_population_is_terminal(self):
         for case in ("empty", "missing-worker", "foreign-owner", "nonleader-cookie",
                      "unexpected-root", "owned-missing-root", "owned-foreign-root"):

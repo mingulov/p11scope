@@ -856,7 +856,9 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
                 or record["generation"] != task["generation"]):
             raise RuntimeError(f"{context}: reused identity tid={record['tid']}")
         key = identity(task)
-        if key in seen[item["name"]] or key in idle:
+        # Idle is a THREAD_OWNER-only state: the same task's leased cookie or
+        # affiliation is an independent lease, not a second owner record.
+        if key in seen[item["name"]] or (item["name"] == "THREAD_OWNER" and key in idle):
             raise RuntimeError(f"{context}: duplicate identity tid={record['tid']}")
         if type(record.get("value")) is not bytes or len(record["value"]) != item["bytes_value"]:
             raise RuntimeError(f"{context}: invalid value length")

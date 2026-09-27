@@ -695,18 +695,105 @@ impl PinnedObjects {
     /// Re-files one manifest alias split by pre-6.8 overlayfs onto its scan pin.
     ///
     /// On mainline kernels before 6.8 the helper records the maps/backing key
-    /// while this capture pins the opened fd under the overlay key, so the
-    /// exact join misses. When the shared self-mapping probe renders this
-    /// exact fd at the recorded key, the alias is re-filed onto the scan pin
-    /// retargeting already chose for the record; every downstream exact join
-    /// then resolves to one provider. Stub: re-files nothing yet.
+    /// while this capture pins the opened fd under the overlay key, and
+    /// retargeting rewrites the record to the scan pin's backing key — so the
+    /// exact join misses: neither the scan alias (wrong namespace) nor the
+    /// manifest alias (wrong key) matches the recorded identity. The alias is
+    /// re-filed onto the scan pin if and only if the halves prove to be one
+    /// physical file: the manifest pin's retained fd must render exactly the
+    /// recorded key through the shared self-mapping probe (never inode-only),
+    /// and exactly one scan pin must carry the recorded key with the same
+    /// complete opened-file identity. Every downstream exact join — plan
+    /// lowering, the engine merge, per-function targets — then resolves one
+    /// provider, with the scan pin's maps key canonical for the report and
+    /// its retained fd canonical for attach, exactly as on >= 6.8. Any
+    /// ambiguity, any probe refusal, or an already-exact alias leaves the
+    /// pins untouched, so a >= 6.8 capture never consults the probe here.
     pub(crate) fn refile_split_manifest_alias(
         &mut self,
-        _recorded: ObjectKey,
-        _path: &str,
-        _budget: &mut CaptureWorkBudget,
-        _probe: &impl SelfMappingProbe,
+        recorded: ObjectKey,
+        path: &str,
+        budget: &mut CaptureWorkBudget,
+        probe: &impl SelfMappingProbe,
     ) {
+        if self.id_for_manifest(recorded, path).is_some() {
+            return;
+        }
+        let Some(normalized) = normalize_target_path(path) else {
+            return;
+        };
+        // The one manifest pin filed for this path, under its fd key. More
+        // than one is a genuine change during discovery, not a split.
+        let mut manifest_aliases = self
+            .raw_to_id
+            .iter()
+            .filter(|(raw, _)| raw.mount_namespace.is_none() && raw.path == normalized);
+        let Some((manifest_raw, manifest_id)) = manifest_aliases.next() else {
+            return;
+        };
+        if manifest_aliases.next().is_some() {
+            return;
+        }
+        let manifest_raw = manifest_raw.clone();
+        let manifest_id = *manifest_id;
+        let Some(manifest_entry) = self.by_id.get(&manifest_id) else {
+            return;
+        };
+        // The manifest pin must own its entry alone; otherwise retiring it
+        // would strand another record's alias.
+        if self
+            .raw_to_id
+            .values()
+            .filter(|id| **id == manifest_id)
+            .count()
+            != 1
+        {
+            return;
+        }
+        // The split, proved exactly as the scan path proves it: this opened fd
+        // may stand for the recorded maps identity only when the kernel
+        // renders it exactly there.
+        let fd_key = object_key(manifest_entry.mapping);
+        if !opened_file_matches_maps(&manifest_entry.file, fd_key, recorded, budget, probe) {
+            return;
+        }
+        // The scan pin retargeting chose for this record: the recorded key,
+        // the same opened file. Same-key same-file pins merge at absorb, so
+        // more than one match is ambiguity, never identity.
+        let mut scans = BTreeSet::new();
+        for (raw, id) in &self.raw_to_id {
+            if raw.mount_namespace.is_none() || raw.key != recorded {
+                continue;
+            }
+            if self.exactly_matches(*id, self, manifest_id) {
+                scans.insert(*id);
+            }
+        }
+        if scans.len() != 1 {
+            return;
+        }
+        let scan_id = *scans.first().unwrap();
+        if !self.by_id.contains_key(&scan_id) {
+            return;
+        }
+        self.raw_to_id.remove(&manifest_raw);
+        let referenced = self.raw_to_id.values().any(|id| *id == manifest_id)
+            || self.ownership.values().any(|claims| {
+                claims.tables.contains(&manifest_id)
+                    || claims.pins.contains(&manifest_id)
+                    || claims.targets.iter().any(|(id, _)| *id == manifest_id)
+            });
+        if !referenced {
+            self.by_id.remove(&manifest_id);
+        }
+        self.raw_to_id.insert(
+            RawObjectInstance {
+                mount_namespace: None,
+                key: recorded,
+                path: normalized,
+            },
+            scan_id,
+        );
     }
 
     /// Exact ordinary-file equality between two already opened, hashed pin sets.

@@ -19,6 +19,7 @@ ignore = []
 # until a human allows it here.
 allow = [
   "Apache-2.0",
+  "GPL-2.0-or-later",
   "GPL-3.0-or-later",
   "ISC",
   "MIT",

@@ -34,8 +34,10 @@ change after step 5 means starting again from step 3.
   Filling the qualification record needs results from steps 3–5, so run
   those on the candidate, fill the record, and repeat steps 3 and 5 on the
   final commit.
-- Confirm the license of `crates/ebpf-common` (it is compiled into both the
-  GPL-2.0-only BPF object and the GPL-3.0-or-later observer).
+- `crates/ebpf-common` is compiled into both the GPL-2.0-only BPF object and
+  the GPL-3.0-or-later observer, so it is GPL-2.0-or-later. Confirm no
+  GPL-3.0-only or Apache-2.0-only code has entered the BPF build
+  (`cargo tree -e normal` in `crates/ebpf`).
 
 ## 2. Tag the dependency first
 
@@ -127,7 +129,8 @@ strings -a p11scope | grep -c "$HOME"   # expect 0: build-host paths are remappe
 For a source-only release, skip this step. To attach binaries, name them
 `p11scope-0.1.0-x86_64-linux-musl`, `p11scope-discover-0.1.0-x86_64-linux-gnu`
 and `p11scope-discover-0.1.0-x86_64-linux-musl`, regenerate `SHA256SUMS` over
-those names, and ship beside them `LICENSE`, `LICENSES/GPL-2.0-only.txt`, and
+those names, and ship beside them `LICENSE`, `LICENSES/GPL-2.0-only.txt`,
+`LICENSES/GPL-2.0-or-later.txt`, and
 the third-party license notices of the statically linked Rust crates and musl
 libc (for example generated with `cargo about`); binary distributions must
 carry those notices.

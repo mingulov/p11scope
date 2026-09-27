@@ -422,9 +422,14 @@ it; the eBPF observer itself is new code.
 Public license: GPL-3.0-or-later — see [LICENSE](LICENSE).
 BPF sources: GPL-2.0-only — see
 [LICENSES/GPL-2.0-only.txt](LICENSES/GPL-2.0-only.txt).
+Shared BPF/userspace definitions (`crates/ebpf-common`): GPL-2.0-or-later — see
+[LICENSES/GPL-2.0-or-later.txt](LICENSES/GPL-2.0-or-later.txt). This crate is
+compiled into both the BPF object the kernel loads (used there under GPL-2.0)
+and the observer (used there under GPL-3.0).
 
 Per-file SPDX tags (`GPL-3.0-or-later` for userspace, docs, and scripts;
-`GPL-2.0-only` for BPF programs) remove any ambiguity.
+`GPL-2.0-only` for BPF programs; `GPL-2.0-or-later` for `crates/ebpf-common`)
+remove any ambiguity.
 
 Contributions require a CLA granting broad sublicensing/relicensing rights;
 see [CONTRIBUTING.md](CONTRIBUTING.md).

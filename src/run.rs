@@ -1926,6 +1926,9 @@ fn run_loop(
     // on every path that reaches a loop; later discovery-driven attaches
     // do not re-stamp it.
     session.note_attach_complete();
+    // A live discovery frame checks the operator's stop between work items
+    // and defers the rest, so the loop's end check comes sooner (H-1).
+    engine.set_cancel_flag(interrupted.cancel_flag());
     let drain = resolve_drain_cadence(kind, drain_interval);
     let evidence = match kind {
         Kind::Profile => {

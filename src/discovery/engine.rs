@@ -88,6 +88,16 @@ pub struct Engine {
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
     pending_discovery_records: Vec<QueuedDiscoveryRecord>,
+    /// A live frame's work budget (H-1); `LIVE_FRAME_WORK_BUDGET_NS` except
+    /// in tests.
+    frame_work_budget_ns: u64,
+    /// When the running live frame's work budget ends; `None` outside a
+    /// live frame (pause cycles, terminal drains and startup run unbounded).
+    frame_deadline_ns: Option<u64>,
+    /// Set when this live frame deferred work to the next one.
+    frame_deferred: bool,
+    /// The capture's operator-stop flag, checked between work items.
+    cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     scope: Scope,
     hooks: HookRegistry,
     module_hints: Vec<PathBuf>,
@@ -4707,6 +4717,16 @@ pub(crate) const LIVE_DISCOVERY_DRAIN_QUANTUM: usize = 256;
 /// Sixteen quanta, 4,096 items — the staging capacity — per frame; anything
 /// left stays queued in ring order for the next frame.
 pub(crate) const LIVE_DISCOVERY_FRAME_QUANTA: usize = 16;
+
+/// How long one live discovery frame may work before it defers the rest of
+/// its records, deferred loader scans, loader arming and export attach to
+/// the next frame (H-1). A frame used to run all of it with no clock check —
+/// 4-5.6 s ticks were measured — while EVENTS, signals, pause stops and
+/// first-use attach waited. 100 ms is a tenth of the default profile frame
+/// and half the trace frame; one item already started is always finished,
+/// so a frame overruns by at most one item. Pause cycles and terminal
+/// drains are never bounded by it: they must finish their causal work.
+pub(crate) const LIVE_FRAME_WORK_BUDGET_NS: u64 = 100_000_000;
 const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
     "the live discovery drain stopped at its work quantum with records still queued";
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
@@ -7166,6 +7186,16 @@ impl Engine {
             terminal_batch: None,
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
+            // Ordinary tests exercise discovery semantics, not wall-clock
+            // bounds, on loaded CI hosts; the H-1 tests opt in explicitly.
+            frame_work_budget_ns: if cfg!(test) {
+                u64::MAX
+            } else {
+                LIVE_FRAME_WORK_BUDGET_NS
+            },
+            frame_deadline_ns: None,
+            frame_deferred: false,
+            cancel_flag: None,
             scope: Scope::Pid(std::process::id()),
             hooks: HookRegistry::builtin(),
             module_hints: Vec::new(),
@@ -7307,6 +7337,51 @@ impl Engine {
     /// not a lost record: the causal timing still measures it.
     pub(crate) fn note_owned_pause_gap(&mut self, reason: &str) {
         self.mark_partial("owned pause", reason);
+    }
+
+    /// Whether the running live frame must stop taking on work items (H-1):
+    /// its work budget is spent, or the operator asked the capture to stop.
+    /// Always false outside a live frame.
+    fn frame_work_exhausted(&self) -> bool {
+        let Some(deadline) = self.frame_deadline_ns else {
+            return false;
+        };
+        self.cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            || crate::attach::monotonic_ns().is_some_and(|now| now >= deadline)
+    }
+
+    /// Books one frame's deferral once: deferred work is delayed, never
+    /// dropped, but a provider it names is attached a frame later, so the
+    /// capture says so.
+    fn note_frame_deferral(&mut self) {
+        if !self.frame_deferred {
+            self.frame_deferred = true;
+            self.mark_partial(
+                "live discovery frame",
+                "the frame work budget was spent; remaining discovery work was deferred to the next frame",
+            );
+        }
+    }
+
+    /// Runs one live discovery frame under its work budget (H-1).
+    fn with_live_frame<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        // An unreadable clock bounds nothing rather than deferring forever.
+        self.frame_deadline_ns = Some(crate::attach::monotonic_ns().map_or(u64::MAX, |now| {
+            now.saturating_add(self.frame_work_budget_ns)
+        }));
+        self.frame_deferred = false;
+        let result = work(self);
+        self.frame_deadline_ns = None;
+        self.frame_deferred = false;
+        result
+    }
+
+    /// The capture's operator-stop flag: a live frame that sees it set
+    /// defers its remaining work so the loop can end sooner (H-1).
+    pub(crate) fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel_flag = Some(flag);
     }
 
     /// The admission rule this capture's plan keeps for its whole lifetime
@@ -10251,6 +10326,12 @@ impl Engine {
         let mut changed = false;
         let mut required_complete = true;
         for key in due {
+            // H-1: a spent live frame leaves the rest pending; the next
+            // frame's fallback pass serves them.
+            if self.pending_loader_scans.contains_key(&key) && self.frame_work_exhausted() {
+                self.note_frame_deferral();
+                break;
+            }
             let Some(hook_ts_ns) = self.pending_loader_scans.remove(&key) else {
                 continue;
             };
@@ -13535,7 +13616,26 @@ impl Engine {
         loop {
             let mut exec_refresh_views = BTreeSet::new();
             let mut deferred_mismatches = Vec::new();
-            for queued in std::mem::take(records) {
+            let mut batch = std::mem::take(records).into_iter();
+            while let Some(queued) = batch.next() {
+                // H-1: a spent live frame dispatches nothing more. The rest
+                // waits, in ring order, at the head of the next batch. Only
+                // where that cannot change a verdict: no loader mismatch
+                // awaits an exec later in this vector, and no record carries
+                // terminal authority.
+                if deferred_mismatches.is_empty()
+                    && queued.terminal_owner.is_none()
+                    && batch
+                        .as_slice()
+                        .iter()
+                        .all(|rest| rest.terminal_owner.is_none())
+                    && self.frame_work_exhausted()
+                {
+                    self.note_frame_deferral();
+                    self.pending_discovery_records
+                        .extend(std::iter::once(queued).chain(batch));
+                    break;
+                }
                 let record = queued.record;
                 let origin = (queued.record.pid_tgid >> 32) as u32;
                 match self.dispatch_discovery_record(
@@ -14926,6 +15026,14 @@ impl Engine {
                 })
                 .collect();
             arm_refreshed_views_with(&arm, |position| {
+                // H-1: a spent live frame arms no more views; each one left
+                // is requested, so the next frame rescans and arms it.
+                if self.frame_work_exhausted() {
+                    self.note_frame_deferral();
+                    let pid = self.views[position].pid();
+                    self.request_refresh(pid);
+                    return Ok(false);
+                }
                 self.arm_loader_or_partial(position, session, additions_allowed, pending_views)
             })
         } else {
@@ -14938,6 +15046,13 @@ impl Engine {
             Ok(arm_changed) => {
                 changed |= arm_changed;
                 for view in refreshed_ok.union(&new_view_ids).copied() {
+                    // H-1: export attach left for the next frame is requested
+                    // the way skipped export work already is.
+                    if self.frame_work_exhausted() {
+                        self.note_frame_deferral();
+                        export_incomplete.insert(view);
+                        continue;
+                    }
                     let outcome = self.attach_refreshed_exports(view, session, additions_allowed);
                     self.note_export_attach_outcome(
                         view,
@@ -14978,6 +15093,9 @@ impl Engine {
             // The unarmed filter above cannot see an armed view whose export
             // work the closed tick skipped. Request it too, with the helper
             // shared with startup attach.
+            self.request_skipped_export_views(&export_incomplete);
+        }
+        if *additions_allowed && self.frame_deferred {
             self.request_skipped_export_views(&export_incomplete);
         }
         let cleanup = self.process_discovery_records(
@@ -15042,7 +15160,9 @@ impl Engine {
     ) -> Result<bool> {
         let (records, malformed) = self.collect_frame_discovery(session)?;
         if force_full || !records.is_empty() || malformed != 0 || !self.discovery_shallow_idle() {
-            return self.apply_discovery_batch(session, records, malformed);
+            return self.with_live_frame(|engine| {
+                engine.apply_discovery_batch(session, records, malformed)
+            });
         }
         Ok(false)
     }
@@ -15204,7 +15324,7 @@ impl Engine {
     /// `ring_loss`, read with every batch.
     pub(crate) fn drain_discovery_from(&mut self, session: &mut dyn EngineSession) -> Result<bool> {
         let (records, malformed) = self.collect_frame_discovery(session)?;
-        self.apply_discovery_batch(session, records, malformed)
+        self.with_live_frame(|engine| engine.apply_discovery_batch(session, records, malformed))
     }
 
     /// One live frame's records: up to `LIVE_DISCOVERY_FRAME_QUANTA` collector
@@ -15390,7 +15510,12 @@ impl Engine {
                 &mut closure,
             )?;
         }
-        if self.pending_retirements.is_empty() && self.pending_rejected_keys.is_empty() {
+        // A frame that deferred records runs no inventory pass: the next
+        // frame dispatches them first, then refreshes (H-1).
+        if self.pending_retirements.is_empty()
+            && self.pending_rejected_keys.is_empty()
+            && !self.frame_deferred
+        {
             changed |= self.refresh_inventory(
                 session,
                 &mut additions_allowed,

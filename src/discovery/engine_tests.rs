@@ -1668,6 +1668,101 @@ fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
     assert_eq!(engine.discovery.modules_skipped.len(), 1);
 }
 
+fn exec_record_for(pid: u32) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_EXEC;
+    record.pid_tgid = u64::from(pid) << 32;
+    record.hook_ts_ns = crate::attach::monotonic_ns().unwrap_or(0);
+    record
+}
+
+/// H-1. A live frame applied every record, scan, arm and attach it was given
+/// with no clock check, so one frame could run for seconds (5.6 s measured)
+/// while EVENTS, signals, pause stops and first-use attach all waited. A
+/// frame now stops dispatching once its work budget is spent, and the rest
+/// of its records wait — in ring order, never dropped — for the next frame,
+/// ahead of anything newer.
+#[test]
+fn a_live_frame_past_its_work_budget_defers_the_rest_in_order() {
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = 0;
+    let mut session = ScriptedSession::default();
+    session.dequeues = (1..=5)
+        .map(|pid| {
+            Ok(Some(crate::events::DiscoveryItem::Record(exec_record_for(
+                4_000_000 + pid,
+            ))))
+        })
+        .collect();
+
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert_eq!(
+        engine.pending_discovery_records_for_test(),
+        5,
+        "an exhausted frame dispatches nothing more and drops nothing"
+    );
+    let order: Vec<u32> = engine
+        .pending_discovery_records
+        .iter()
+        .map(|queued| (queued.record.pid_tgid >> 32) as u32)
+        .collect();
+    assert_eq!(order, (4_000_001..=4_000_005).collect::<Vec<_>>());
+
+    engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(
+        engine.pending_discovery_records_for_test(),
+        0,
+        "the next frame applies them first"
+    );
+}
+
+/// H-1: an operator stop is checked between items too. A frame that sees
+/// the cancel flag defers its remaining work instead of finishing it, so the
+/// loop's end check runs a frame sooner.
+#[test]
+fn a_live_frame_defers_its_work_once_the_capture_is_interrupted() {
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    engine.set_cancel_flag(std::sync::Arc::clone(&cancel));
+    let mut session = ScriptedSession::default();
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        exec_record_for(4_000_010),
+    )))]
+    .into();
+
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert_eq!(engine.pending_discovery_records_for_test(), 1);
+}
+
+/// H-1: deferred loader memory scans are serviced only while the frame's
+/// budget lasts; the rest stay pending for the next frame instead of being
+/// scanned past the budget.
+#[test]
+fn deferred_loader_scans_wait_for_a_frame_with_budget() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    let scans_before = engine.loader_memory_scan_attempts;
+
+    engine.frame_work_budget_ns = 0;
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1, "still pending");
+    assert_eq!(engine.loader_memory_scan_attempts, scans_before);
+
+    engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert!(
+        engine.pending_loader_scans.is_empty(),
+        "serviced next frame"
+    );
+    assert_eq!(engine.loader_memory_scan_attempts, scans_before + 1);
+}
+
 /// RB-2: a live frame applied one 256-item quantum and left the rest for
 /// the next frame, a second later. With the ring now staged every tick, a
 /// host producing more lifecycle records than that per second only moved its

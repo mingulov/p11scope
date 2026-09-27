@@ -90,18 +90,15 @@ Support is cumulative: legacy 2.00 (67 slots), 2.01 through 2.40 (68), 3.0
 and 3.1 interfaces (92), and the final 3.2 interface (104 published slots).
 Newer support does not replace 2.x support.
 
-Two matrices govern two paths, and they agree by scope. The live memory
-scan walks the Slice-1 §4.1 plausibility window — 2.x at minor 40 and
-below, 3.x at minor 2 and below — and a version-shaped word above that
-window is refused with an explicit `unsupported function-table version`
-skip plus a `PARTIAL` verdict, never silently. The offline
-`p11scope-discover` helper instead implements the wider v0.1 compatibility
-matrix (known-prefix decode of newer layouts), because it runs offline
-against a provider file rather than live target memory. A future-minor
-table therefore decodes on the helper path and refuses loudly on the scan
-path; the live-export path converts the same table into counted loss, so
-only a never-called provider scanned proactively can vanish, and even that
-leaves its version skip behind.
+One versioning rule governs every path. The live memory scan, the
+live-export path, and the offline `p11scope-discover` helper all walk the
+same layouts: any minor of a known major (2.x, 3.x), with a newer minor
+decoded as its known prefix — 68 slots for 2.x past 2.40, 104 for 3.x
+past 3.2 — and only a new major refused. A walked prefix is a
+`known_prefix` surface, so the report stays `PARTIAL` with a named
+"surface gaps" cause: the unhooked appended tail is disclosed, never
+silent. The `unsupported function-table version` skip reason remains in
+the report vocabulary only so older captures still validate.
 
 The standard name `"PKCS 11"` is common but not universal. Discovery also
 handles alternate, null, unreadable, and non-UTF-8 names. It walks those tables

@@ -807,10 +807,6 @@ pub struct CaptureWorkBudget {
     /// an earlier scan. Repeat recognition never touches these.
     table_refusals: u64,
     interface_refusals: u64,
-    /// Future-minor tables refused at the `spans_for` gate (SYSPLAN
-    /// residual F-14). Sticky and never reset, like the ceilings above:
-    /// a delta proves that scan refused something new.
-    unsupported_version_refusals: u64,
     table_exhaustion_reported: bool,
     interface_exhaustion_reported: bool,
     work_ceiling: u64,
@@ -848,7 +844,6 @@ impl CaptureWorkBudget {
             admitted_interfaces: BTreeSet::new(),
             table_refusals: 0,
             interface_refusals: 0,
-            unsupported_version_refusals: 0,
             table_exhaustion_reported: false,
             interface_exhaustion_reported: false,
             work_ceiling: DEFAULT_WORK_CEILING,
@@ -1228,31 +1223,10 @@ impl CaptureWorkBudget {
     }
 
     /// Sticky cardinality refusals, for per-scan completeness snapshots.
-    /// The third leg counts `spans_for` version refusals (SYSPLAN residual
-    /// F-14): a future-minor table is refused work, not a complete scan.
-    pub(crate) fn refusal_counts(&self) -> (u64, u64, u64) {
-        (
-            self.table_refusals,
-            self.interface_refusals,
-            self.unsupported_version_refusals,
-        )
-    }
-
-    /// Records one `spans_for` version refusal: a version-shaped word for a
-    /// layout the scanner will not walk.
-    pub(crate) fn note_unsupported_version(&mut self) {
-        if !self.may_mutate_retained_state() {
-            return;
-        }
-        self.unsupported_version_refusals = self.unsupported_version_refusals.saturating_add(1);
-    }
-
-    /// Sticky `spans_for` version refusals (SYSPLAN residual F-14).
-    /// Production reads the leg through `refusal_counts`; this names it
-    /// for tests.
-    #[cfg(test)]
-    pub(crate) fn unsupported_version_refusals(&self) -> u64 {
-        self.unsupported_version_refusals
+    /// (Owner-approved 2026-09-27: the F-14 version-refusal leg is retired
+    /// with the skip — future minors walk as known prefixes now.)
+    pub(crate) fn refusal_counts(&self) -> (u64, u64) {
+        (self.table_refusals, self.interface_refusals)
     }
 
     pub(crate) fn admit_table(&mut self, entries: usize) -> bool {
@@ -1923,39 +1897,6 @@ pub(crate) fn order_tables_by_evidence(
     order
 }
 
-/// A version word that parses as a `CK_VERSION` header for a layout the
-/// scanner refuses to walk: 2.x above minor 40 or 3.x above minor 2
-/// (SYSPLAN residual F-14). `None` for words that are not version-shaped
-/// at all (upper bits set, unknown major) — those are data, not tables.
-pub(crate) fn unsupported_version_of(word: u64) -> Option<(u8, u8)> {
-    if word & !0xffff != 0 {
-        return None;
-    }
-    let major = (word & 0xff) as u8;
-    let minor = ((word >> 8) & 0xff) as u8;
-    match major {
-        2 if minor > 40 => Some((major, minor)),
-        3 if minor > 2 => Some((major, minor)),
-        _ => None,
-    }
-}
-
-/// Fixed internal reason for a refused future-minor table. The public
-/// `{name, reason}` stays finite: `capture_skipped_out` renders this as
-/// the `unsupported function-table version` public reason, never with the
-/// version numbers attached.
-pub(crate) const UNSUPPORTED_VERSION_SKIP: &str =
-    "unsupported function-table version; the scanner does not walk this layout";
-
-/// The future-minor version at `offset`, if the word there is one: the
-/// sweep-level re-derivation behind the explicit skip.
-fn unsupported_version_at(layout: LinuxLayout, snapshot: &[u8], offset: usize) -> Option<(u8, u8)> {
-    let width = layout.word_bytes();
-    let bytes = snapshot.get(offset..offset.checked_add(width)?)?;
-    let word = read_word_le(bytes, layout, 0).ok()?;
-    unsupported_version_of(word)
-}
-
 /// Version word → the field spans that describe that layout. Returns `None` when the
 /// word is not a plausible `CK_VERSION` header or the layout is one we refuse to walk.
 pub(crate) fn spans_for(word: u64) -> Option<((u8, u8), &'static [TableSpan], &'static str)> {
@@ -1964,12 +1905,19 @@ pub(crate) fn spans_for(word: u64) -> Option<((u8, u8), &'static [TableSpan], &'
     }
     let major = (word & 0xff) as u8;
     let minor = ((word >> 8) & 0xff) as u8;
-    let plausible = match major {
-        2 => minor <= 40,
-        3 => minor <= 2,
-        _ => false,
-    };
-    if !plausible {
+    // The scan follows the helper/manifest versioning rule (owner-approved
+    // 2026-09-27): any minor of a known major (2.x, 3.x) is plausible and
+    // handed to `tables_for`, which walks a newer minor as its known
+    // prefix and refuses a new major. There is deliberately no upper minor
+    // bound — `tables_for` maps every 0..=255 minor of a known major to a
+    // bounded known prefix (68 / 104 slots), never to a wider walk. The
+    // widened gate is safe because the version word is only plausibility:
+    // a candidate becomes a table only after every structural check still
+    // passes — all published slots NULL or pointing into the module's
+    // executable mappings (`decode_candidate`), export agreement where the
+    // table's evidence is complete (`export_agreement`), and the
+    // table-bytes bound (`span_bytes` / `exact_table_bytes`).
+    if !matches!(major, 2 | 3) {
         return None;
     }
     let version = cryptoki_sys::CK_VERSION { major, minor };
@@ -2039,9 +1987,6 @@ fn decode_candidate(
     };
     let word = read_word_le(raw_word, layout, 0).expect("one target word");
     let Some((version, spans, walk)) = spans_for(word) else {
-        if unsupported_version_of(word).is_some() {
-            budget.note_unsupported_version();
-        }
         return Ok(None);
     };
     let Some(len) = span_bytes(layout, spans) else {
@@ -2306,20 +2251,10 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
         }
         match decode_candidate(layout, snapshot, offset, base_address, maps, budget, None) {
             Ok(Some((table, len))) => found.push((offset, len, table)),
-            Ok(None) => {
-                // A refused future-minor table is explicit evidence, not a
-                // silent gap (SYSPLAN residual F-14). The budget counter in
-                // `decode_candidate` counts every refusal; the skip is
-                // recorded once per sweep — the fixed reason carries no
-                // version numbers, so repeats add nothing.
-                if unsupported_version_at(layout, snapshot, offset).is_some()
-                    && !skipped
-                        .iter()
-                        .any(|reason| reason == UNSUPPORTED_VERSION_SKIP)
-                {
-                    skipped.push(UNSUPPORTED_VERSION_SKIP.into());
-                }
-            }
+            // Owner-approved 2026-09-27: F-14's version skip is retired —
+            // future minors walk as known prefixes, and anything else the
+            // gate rejects (unknown major, upper bits set) is data.
+            Ok(None) => {}
             Err(()) => {
                 if let Some(reason) = budget.take_scan_stop_reason() {
                     skipped.push(reason.into());
@@ -4390,12 +4325,16 @@ mod tests {
 
     #[test]
     fn only_walkable_version_words_become_candidates() {
-        // 67 / 68 / 92 / 104 slots + the version word, in bytes.
+        // 67 / 68 / 92 / 104 slots + the version word, in bytes. Future
+        // minors walk their known prefix (owner-approved 2026-09-27), so
+        // [2,41] and [3,9] size exactly like the layouts they prefix.
         for (word, expected) in [
             (0x0002u64, Some(((2u8, 0u8), 8 + 67 * 8))),
             (0x2802, Some(((2, 40), 8 + 68 * 8))),
+            (0x2902, Some(((2, 41), 8 + 68 * 8))),
             (0x0003, Some(((3, 0), 8 + 92 * 8))),
             (0x0203, Some(((3, 2), 8 + 104 * 8))),
+            (0x0903, Some(((3, 9), 8 + 104 * 8))),
         ] {
             let (version, spans, _) = spans_for(word).expect("walkable");
             assert_eq!(
@@ -4403,18 +4342,19 @@ mod tests {
                 expected
             );
         }
-        // Padding bytes set, implausible minor, unknown major, all-zero word.
-        for word in [0x1_2802u64, 0x2902, 0x0304, 0x0004, 0] {
+        // Padding bytes set, unknown major, all-zero word.
+        for word in [0x1_2802u64, 0x0304, 0x0004, 0] {
             assert!(spans_for(word).is_none(), "{word:#x} must not be a table");
         }
     }
 
     /// Package F (E08/E15/E21): the explicit known ABI bounds. Only
-    /// these version words walk a full table; a non-listed 2.x minor
-    /// walks the known prefix with an explicit marker; everything else
-    /// (including any 3.x past 3.2) refuses. The exhaustive low-word
-    /// sweep proves the set is exactly this — bounded total work, no
-    /// panic on any input.
+    /// these version words walk a full table; any other minor of a known
+    /// major walks the known prefix with an explicit marker (owner-approved
+    /// 2026-09-27: the scan follows the helper's versioning rule, so 3.x
+    /// past 3.2 prefixes the 104-slot 3.2 layout like the manifest path);
+    /// only a new major refuses. The exhaustive low-word sweep proves the
+    /// full set is exactly this — bounded total work, no panic on any input.
     #[test]
     fn f_package_known_abi_bounds_walk_full_only_for_supported_shapes() {
         for (word, version, slots) in [
@@ -4436,16 +4376,20 @@ mod tests {
             walk, "known_prefix",
             "non-listed minors stay explicitly bounded"
         );
-        for word in [
-            0x2902u64,
-            0x0303,
-            0x0004,
-            0x0204,
-            0x0000,
-            0xffff,
-            0x1_0000,
-            u64::MAX,
+        for (word, version, slots) in [
+            (0x2902u64, (2u8, 41u8), 68usize),
+            (0x0303, (3, 3), 104),
+            (0x0903, (3, 9), 104),
         ] {
+            let (decoded, spans, walk) = spans_for(word).expect("future minor walks");
+            assert_eq!((decoded, walk), (version, "known_prefix"));
+            assert_eq!(
+                spans.iter().map(|span| span.fields().len()).sum::<usize>(),
+                slots,
+                "{version:?} walks its known-prefix slot count"
+            );
+        }
+        for word in [0x0004u64, 0x0204, 0x0000, 0xffff, 0x1_0000, u64::MAX] {
             assert!(spans_for(word).is_none(), "{word:#x} must not be a table");
         }
         let mut full = Vec::new();
@@ -6769,7 +6713,9 @@ mod tests {
             "memory scan refused: process generation changed during acquisition: gone",
             "file changed while it was being scanned — retry",
             "partial snapshot of one data mapping: read 3 of 9 bytes: the read failed: gone",
-            UNSUPPORTED_VERSION_SKIP,
+            // Owner-approved 2026-09-27: F-14's version skip is retired, so
+            // its constant is gone; fail-closed coverage stays via the
+            // unknown-reason entry below.
             "some future reason",
         ];
         for reason in truncating {
@@ -6797,34 +6743,18 @@ mod tests {
         }
     }
 
-    // SYSPLAN residual F-14 (GREEN): future minors are explicit version
-    // refusals; anything else `spans_for` rejects is data, not a table.
-    #[test]
-    fn unsupported_version_matrix() {
-        assert_eq!(unsupported_version_of(0x2902), Some((2, 41)));
-        assert_eq!(unsupported_version_of(0xff02), Some((2, 255)));
-        assert_eq!(unsupported_version_of(0x0303), Some((3, 3)));
-        // Supported layouts are not refusals.
-        assert_eq!(unsupported_version_of(0x2802), None);
-        assert_eq!(unsupported_version_of(0x0203), None);
-        // Non-version-shaped words are data.
-        assert_eq!(unsupported_version_of(0x0), None);
-        assert_eq!(unsupported_version_of(0x0002), None);
-        assert_eq!(unsupported_version_of(0x0204), None);
-        assert_eq!(unsupported_version_of(0x1_0000_2802), None);
-        // And `spans_for` agrees on every row.
-        for word in [0x2902u64, 0xff02, 0x0303] {
-            assert!(spans_for(word).is_none(), "{word:#x}");
-        }
-        for word in [0x2802u64, 0x0203] {
-            assert!(spans_for(word).is_some(), "{word:#x}");
-        }
-    }
+    // Owner-approved 2026-09-27: `unsupported_version_of` and its matrix
+    // test are retired with F-14's version skip — future minors walk now,
+    // so there is no version refusal to classify. The version matrix lives
+    // on as `future_minor_version_words_walk_the_known_prefix` above.
 
-    // SYSPLAN residual F-14 (GREEN): a refused future-minor table emits an
-    // explicit skip plus a sticky counter — never silent, never flooded.
+    // Owner-approved 2026-09-27: F-14's version skip is retired. Future
+    // minors now walk as known prefixes (see the tests below), so a
+    // version-shaped word that decodes nothing is data, not a refused
+    // table — the sweep stays silent and the render vocabulary keeps the
+    // legacy reason only so old captures still validate.
     #[test]
-    fn future_minor_table_emits_skip_and_counter() {
+    fn short_future_minor_word_is_data_not_a_refused_table() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
         let map_index = MapIndex::new(&maps).unwrap();
         let mut snapshot = vec![0u8; 64];
@@ -6832,18 +6762,111 @@ mod tests {
         snapshot[16..24].copy_from_slice(&0x2902u64.to_ne_bytes());
         let mut budget = CaptureWorkBudget::default();
         let (tables, skipped) = detect_tables(&snapshot, 0x7000, &map_index, &mut budget);
-        assert!(tables.is_empty());
-        assert_eq!(budget.unsupported_version_refusals(), 2);
-        assert_eq!(budget.refusal_counts(), (0, 0, 2));
-        assert_eq!(skipped, vec![UNSUPPORTED_VERSION_SKIP.to_string()]);
-        // The public mapping renders the explicit reason, finite vocabulary.
+        assert!(tables.is_empty(), "64 bytes cannot hold a 68-slot table");
+        assert!(
+            skipped.is_empty(),
+            "no version skip is emitted: {skipped:?}"
+        );
+        // The public mapping still renders the legacy reason, finite
+        // vocabulary: old captures validate unchanged.
         let out = crate::render::capture_skipped_out(&Skipped {
             subject: "discovery subject".into(),
-            reason: UNSUPPORTED_VERSION_SKIP.into(),
+            reason: "unsupported function-table version; the scanner does not walk this layout"
+                .into(),
         });
         assert_eq!(
             out.reason,
             "unsupported function-table version; the scanner does not walk this layout"
+        );
+    }
+
+    // Owner-approved 2026-09-27: the scanner follows the same versioning
+    // rule as the helper/manifest path — any minor of a known major (2.x,
+    // 3.x) walks, newer minors as the known prefix; only a new major
+    // refuses. `tables_for` bounds every minor to its known prefix (68 /
+    // 104 slots), so no upper minor bound is needed here.
+    #[test]
+    fn future_minor_version_words_walk_the_known_prefix() {
+        for (word, version, slots) in [
+            (0x2902u64, (2u8, 41u8), 68usize),
+            (0xff02, (2, 255), 68),
+            (0x0303, (3, 3), 104),
+            (0x0903, (3, 9), 104),
+            (0xff03, (3, 255), 104),
+        ] {
+            let (decoded, spans, walk) = spans_for(word).expect("future minor walks");
+            assert_eq!((decoded, walk), (version, "known_prefix"), "{word:#x}");
+            assert_eq!(
+                spans.iter().map(|span| span.fields().len()).sum::<usize>(),
+                slots,
+                "{version:?} walks its known-prefix slot count"
+            );
+        }
+        // A new major stays refused: unknown layout, walk nothing.
+        for word in [
+            0x0004u64,
+            0x0204,
+            0x0304,
+            0x0000,
+            0xffff,
+            0x1_0000,
+            u64::MAX,
+        ] {
+            assert!(spans_for(word).is_none(), "{word:#x} must not be a table");
+        }
+    }
+
+    // Owner-approved 2026-09-27: a complete future-minor table decodes and
+    // attaches as its known prefix — the [3,9] interface table as the
+    // 104-slot 3.2 layout, the [2,41] legacy table as the 68-slot layout —
+    // with no version skip.
+    #[test]
+    fn future_minor_tables_decode_as_known_prefix_without_a_version_skip() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for (word, version, slots) in [(0x0903u64, (3u8, 9u8), 104usize), (0x2902, (2, 41), 68)] {
+            let mut snapshot = vec![0u8; 8 + slots * 8];
+            snapshot[..8].copy_from_slice(&word.to_ne_bytes());
+            for slot in 0..slots {
+                let at = 8 + slot * 8;
+                snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
+            }
+            let mut budget = CaptureWorkBudget::default();
+            let (tables, skipped) = detect_tables(&snapshot, 0x7000, &map_index, &mut budget);
+            assert_eq!(tables.len(), 1, "{version:?}: one table");
+            assert_eq!(tables[0].version, version);
+            assert_eq!(tables[0].walk, "known_prefix");
+            assert_eq!(
+                tables[0].entries.len() + tables[0].null_entries.len(),
+                slots,
+                "{version:?}: the known-prefix slots"
+            );
+            assert!(
+                skipped
+                    .iter()
+                    .all(|reason| !reason.contains("unsupported function-table")),
+                "{version:?}: no version skip: {skipped:?}"
+            );
+        }
+    }
+
+    // Owner-approved 2026-09-27: a new major ([4,0]) is refused — and the
+    // refusal is silent at the scan gate, exactly like the manifest path's
+    // `TableSet::Refuse` (empty walk, no skip): a version-shaped word for
+    // an unknown layout is data, not a table.
+    #[test]
+    fn new_major_version_word_is_refused_without_a_skip() {
+        assert!(spans_for(0x0004).is_none());
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 64];
+        snapshot[..8].copy_from_slice(&0x0004u64.to_ne_bytes());
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables(&snapshot, 0x7000, &map_index, &mut budget);
+        assert!(tables.is_empty());
+        assert!(
+            skipped.is_empty(),
+            "a refused major leaves no skip: {skipped:?}"
         );
     }
 
@@ -6925,13 +6948,14 @@ mod tests {
         assert!(budget.note_table_admitted(identity));
         assert!(budget.charge(1));
         assert!(!budget.charge(1));
-        budget.note_unsupported_version();
+        // Owner-approved 2026-09-27: F-14's version-refusal counter is
+        // retired with the skip (future minors walk now); stickiness of
+        // prior loss stays covered by the work-units assertion below.
         budget.finish_scan(first_scan).unwrap();
         let first_receipt = budget.finish_window(first.clone()).unwrap();
         assert_eq!(first_receipt.work_units(), 2);
         assert_eq!(first_receipt.stop_reason(), Some(WORK_CEILING_REASON));
         assert_eq!(budget.retained_counts().0, 1);
-        assert_eq!(budget.unsupported_version_refusals(), 1);
         assert!(
             budget.checkpoint(first.clone()).is_err(),
             "finished token is stale"
@@ -6959,11 +6983,6 @@ mod tests {
             budget.work_units_count(),
             4,
             "lifetime work evidence is cumulative"
-        );
-        assert_eq!(
-            budget.unsupported_version_refusals(),
-            1,
-            "prior loss is sticky"
         );
         budget.finish_scan(second_scan).unwrap();
         budget.finish_window(second).unwrap();
@@ -7112,7 +7131,7 @@ mod tests {
         assert_eq!(budget.table_candidates_count(), 513);
         assert_eq!(budget.decoded_table_entries_count(), 513 * 68);
         assert_eq!(budget.work_units_count(), 513 * 68);
-        assert_eq!(budget.refusal_counts(), (0, 0, 0));
+        assert_eq!(budget.refusal_counts(), (0, 0));
 
         let token = budget.begin_window(WindowId::new(514), u64::MAX).unwrap();
         let scan = budget.checkpoint(token.clone()).unwrap();
@@ -7154,7 +7173,7 @@ mod tests {
         assert_eq!(budget.table_candidates_count(), 515);
         assert_eq!(budget.decoded_table_entries_count(), 515 * 68);
         assert_eq!(budget.work_units_count(), 515 * 68);
-        assert_eq!(budget.refusal_counts(), (1, 0, 0));
+        assert_eq!(budget.refusal_counts(), (1, 0));
         budget.finish_scan(scan).unwrap();
         budget.finish_window(token).unwrap();
     }

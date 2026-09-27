@@ -32,7 +32,7 @@
  *   lowest-index live wrapper, else the legacy interface. Deterministic
  *   under the single-threaded stage driver.
  * - `mw_set_version` rewrites one live wrapper's version word in place
- *   (shape matrix, including future-minor refusal).
+ *   (shape matrix, including future-minor known-prefix decode).
  * - `mw_poke` rewrites one live wrapper entry in place (malicious-pointer
  *   matrix: legal hole, unmapped, file-backed data, anonymous heap data).
  */

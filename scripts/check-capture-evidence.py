@@ -3362,6 +3362,14 @@ def self_test():
         == ["scheduling.sink_dropped_bytes"],
         data_drops["evidence"]["gap_classes"],
     )
+    deferred = copy.deepcopy(clean)
+    deferred["evidence"]["scheduling"]["discovery_deferrals"] = 3
+    settle_fixture_verdict(deferred)
+    require(
+        deferred["evidence"]["gap_classes"]["observation"]["causes"] == [],
+        "frame-budget deferrals are scheduling evidence, never an observation loss",
+    )
+    validate_clean_metrics(deferred, {"C_Initialize": 1})
     for document, mutate in (
         (lossy, lambda d: d["evidence"].update(verdict_detail="clean_but_unproven")),
         (lossy, lambda d: d["evidence"].update(verdict_detail="attribution_only")),

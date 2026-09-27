@@ -3542,6 +3542,13 @@ fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
 /// The loop-end marker for a target that exited mid-capture: the
 /// measurement harness timestamps this stderr line as the actual
 /// early-exit boundary (F-74), instead of assuming the full window.
+/// The one readiness line, printed on stderr once probes are attached and the
+/// capture loop starts. The live frame is TTY-only, so scripts and supervisors
+/// wait for this line instead of guessing when calls start being observed.
+pub(crate) fn capture_ready_line(attached_probes: usize) -> String {
+    format!("p11scope: capturing: {attached_probes} probe(s) attached; stop with Ctrl-C")
+}
+
 fn target_exit_marker(ticks: u64) -> String {
     format!("p11scope: capture ended: target exited after {ticks} ticks")
 }
@@ -3937,6 +3944,7 @@ fn capture_profile(
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
+    eprintln!("{}", capture_ready_line(session.attached_probes()));
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
     #[rustfmt::skip]
@@ -4591,6 +4599,7 @@ fn capture_trace(
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
+    eprintln!("{}", capture_ready_line(session.attached_probes()));
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -10892,6 +10901,16 @@ mod tests {
         assert_eq!(
             cancel_marker(Some(2), 42),
             "p11scope: cancel: loop exited on signal 2 after 42 ticks"
+        );
+    }
+
+    /// The readiness line is the contract scripts wait on (the live frame is
+    /// TTY-only): it must name the attached probe count and how to stop.
+    #[test]
+    fn capture_ready_line_names_probes_and_how_to_stop() {
+        assert_eq!(
+            capture_ready_line(136),
+            "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C"
         );
     }
 

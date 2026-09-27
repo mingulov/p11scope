@@ -6885,7 +6885,10 @@ fn privileged_detailed_multithread_same_slot_allowlisted_exact() -> Result<()> {
     ids.released_with_budget(Duration::from_secs(60))?;
     caller.finish()?;
     detached?;
-    ensure!(clean_detach, "shared-slot Detailed detach retained failures");
+    ensure!(
+        clean_detach,
+        "shared-slot Detailed detach retained failures"
+    );
     Ok(())
 }
 

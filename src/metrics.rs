@@ -14,11 +14,11 @@ use p11scope_ebpf_common::{
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
     EVIDENCE_UNREGISTERED_MECHANISMS, ImageIdentityControl, LATENCY_BUCKETS, OWNER_BAD_CONTROL,
     OWNER_BAD_RECORD, OWNER_BOOKKEEPING_FAILED, OWNER_CLASSIFIER_FAILED, OWNER_DELETE_FAILED,
-    OWNER_DIRECTORY_MISMATCH, OWNER_LOOKUP_UNKNOWN, OWNER_REFUND_FAILED, OWNER_START_COUNT_MISMATCH,
-    OWNER_START_KEY_MISMATCH, OWNER_START_ROW_MISSING, OWNER_STATE_DELETE_FAILED, ROOT_BAD_CELL,
-    ROOT_BAD_CONTROL, ROOT_CAPACITY, ROOT_CREATE_FAILED, ROOT_EXISTING_CHILD, ROOT_EXIT_CLASSIFIER,
-    ROOT_EXIT_DELETE, ROOT_REFUND_FAILED, ROOT_RESERVE_CAS, RootAffiliationControl, RvKey,
-    SlotStats, ThreadOwnerControl,
+    OWNER_DIRECTORY_MISMATCH, OWNER_LOOKUP_UNKNOWN, OWNER_REFUND_FAILED,
+    OWNER_START_COUNT_MISMATCH, OWNER_START_KEY_MISMATCH, OWNER_START_ROW_MISSING,
+    OWNER_STATE_DELETE_FAILED, ROOT_BAD_CELL, ROOT_BAD_CONTROL, ROOT_CAPACITY, ROOT_CREATE_FAILED,
+    ROOT_EXISTING_CHILD, ROOT_EXIT_CLASSIFIER, ROOT_EXIT_DELETE, ROOT_REFUND_FAILED,
+    ROOT_RESERVE_CAS, RootAffiliationControl, RvKey, SlotStats, ThreadOwnerControl,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -495,7 +495,12 @@ mod tests {
                 .lines()
                 .find(|line| line.starts_with(&format!("#define {name} ")))
                 .unwrap_or_else(|| panic!("{name} missing from task_owner.h"));
-            line.split_whitespace().nth(2).unwrap().trim_end_matches("ULL").parse().unwrap()
+            line.split_whitespace()
+                .nth(2)
+                .unwrap()
+                .trim_end_matches("ULL")
+                .parse()
+                .unwrap()
         };
         for (name, bit) in [
             ("OWNER_BAD_CONTROL", OWNER_BAD_CONTROL),
@@ -512,7 +517,10 @@ mod tests {
             ("OWNER_DIRECTORY_MISMATCH", OWNER_DIRECTORY_MISMATCH),
         ] {
             assert_eq!(native(name), bit, "{name}");
-            assert!(OWNER_POISON_NAMES.iter().any(|(named, _)| *named == bit), "{name}");
+            assert!(
+                OWNER_POISON_NAMES.iter().any(|(named, _)| *named == bit),
+                "{name}"
+            );
         }
         // A bookkeeping poison names exactly which invariant failed.
         let control = KernelControl {

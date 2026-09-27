@@ -39,7 +39,7 @@ PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "function_list_entry", "function_list_return", "interface_list_entry",
             "interface_list_return", "interface_list_worker", "interface_entry",
             "interface_return", "sched_process_exec", "sched_process_exit"}
-SYMBOLS = {"p11_owner_reserve", "p11_owner_refund", "p11_read_ia32_arg",
+SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg",
            "p11_link_current_identity"}
 MASK = (1 << 64) - 1
 STACK_GUARD_ID = 0x7F0000  # a map id outside every modelled map segment

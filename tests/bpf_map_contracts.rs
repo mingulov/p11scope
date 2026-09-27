@@ -24,7 +24,7 @@ fn embedded_scalar_helpers_have_exact_linkage_btf_bodies_and_real_calls() {
     let symbols = contract["symbols"]
         .as_array()
         .expect("embedded owner symbol inventory");
-    for helper in ["p11_owner_reserve", "p11_owner_refund"] {
+    for helper in ["p11_owner_lease", "p11_owner_refund"] {
         assert!(
             symbols.iter().any(|symbol| symbol == helper),
             "embedded object must export {helper}"

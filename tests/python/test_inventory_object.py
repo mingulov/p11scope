@@ -31,7 +31,7 @@ PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "function_list_entry", "function_list_return", "interface_list_entry",
             "interface_list_return", "interface_list_worker", "interface_entry",
             "interface_return", "sched_process_exec", "sched_process_exit"}
-SYMBOLS = {"p11_owner_reserve", "p11_owner_refund", "p11_read_ia32_arg"}
+SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg"}
 
 class InventoryManifestTests(unittest.TestCase):
     def test_exact_inventory_and_mutated_policy_shapes(self):

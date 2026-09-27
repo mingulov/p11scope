@@ -272,7 +272,7 @@ class MapDefsTests(unittest.TestCase):
         fixture = fixture.replace(
             '#ifdef OWNER_GLOBAL',
             'static void *(*fixture_map_lookup)(void *, const void *) = (void *)1;\n'
-            '__attribute__((noinline, used)) unsigned p11_owner_reserve(void) {\n'
+            '__attribute__((noinline, used)) unsigned p11_owner_lease(void) {\n'
             '    unsigned key = 0; unsigned long long *ctl = fixture_map_lookup(&OWNER_CTL, &key);\n'
             '    return ctl && *ctl;\n}\n'
             '__attribute__((noinline, used)) unsigned p11_owner_refund(void) {\n'
@@ -285,7 +285,7 @@ class MapDefsTests(unittest.TestCase):
         )
         fixture = fixture.replace(
             'int result = p11_owner_start_get(ctx)',
-            'int result = p11_owner_reserve() + p11_owner_refund() + p11_owner_start_get(ctx)',
+            'int result = p11_owner_lease() + p11_owner_refund() + p11_owner_start_get(ctx)',
         )
         source.write_text(fixture)
         def compile_fixture(*flags):
@@ -306,7 +306,7 @@ class MapDefsTests(unittest.TestCase):
         func = btf.types[func_id]
         fb = elf.sections[".BTF"][0][4] + func[6]
         other = next(i for i, s in enumerate(elf.symbols) if s[0] == "p11_owner_start_get")
-        global_owner_helpers = {"p11_owner_reserve", "p11_owner_refund"}
+        global_owner_helpers = {"p11_owner_lease", "p11_owner_refund"}
         exported = {
             name: next(i for i, s in enumerate(elf.symbols) if s[0] == name)
             for name in global_owner_helpers

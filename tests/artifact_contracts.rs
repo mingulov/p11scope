@@ -2535,6 +2535,56 @@ wait_for_capture_ready "$log" aggregate-only metrics
 }
 
 #[test]
+fn capture_readiness_accepts_the_attach_complete_line() {
+    // Since cb59e2e the profile/metrics live frame (and its ` — privacy=`
+    // marker) is drawn only on a terminal, so an observer logging to a file
+    // announces readiness with `capture_ready_line` alone. Lanes without a
+    // pty (build-release.sh, verify-attach-e2e.sh) must synchronize on it.
+    let ready = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+printf '%s\n' 'p11scope: discovery: 1 module(s), 68 attach slot(s), scan 8ms, conflicts 0, uncorroborated 0' \
+    'p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C' > "$log"
+wait_for_capture_ready "$log" aggregate-only metrics
+"#,
+        ])
+        .output()
+        .expect("exercise attach-complete readiness");
+    assert!(
+        ready.status.success(),
+        "attach-complete line is not readiness: {}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    // Discovery alone is not readiness: an observer that exits before it
+    // attaches still fails the barrier.
+    let not_ready = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+printf '%s\n' 'p11scope: discovery: 1 module(s), 68 attach slot(s), scan 8ms, conflicts 0, uncorroborated 0' > "$log"
+kill() { return 1; }
+SPID=42
+wait_for_capture_ready "$log" aggregate-only metrics
+"#,
+        ])
+        .output()
+        .expect("exercise discovery-only readiness");
+    assert!(
+        !not_ready.status.success(),
+        "a discovery-only log passed the readiness barrier"
+    );
+}
+
+#[test]
 fn container_manifest_rewrite_refuses_escapes_and_rewrites_paths() {
     // Discovery runs on a host copy of the container's provider directory, so
     // every attach path must be rewritten into the container's mount view --

@@ -539,6 +539,11 @@ wait_for_cgroup_provider() {
     return 1
 }
 
+# Readiness: trace prints `CAPTURE privacy=<tier>`; profile/metrics print the
+# attach-complete stderr line (src/run.rs capture_ready_line) once probes are
+# attached and the capture loop starts. Their live frame, whose ` — privacy=`
+# marker is also accepted, is drawn only on a terminal (cb59e2e), so an
+# observer logging to a file announces readiness with the stderr line alone.
 wait_for_capture_ready() {
     wcr_log=$1
     wcr_privacy=$2
@@ -547,13 +552,13 @@ wait_for_capture_ready() {
     while [ "$wcr_attempt" -lt 160 ]; do
         case $wcr_kind in
             trace) grep -Fqx "CAPTURE privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
-            profile|metrics) grep -Fq " — privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
+            profile|metrics) grep -Fq -e " — privacy=$wcr_privacy" -e "p11scope: capturing: " "$wcr_log" 2>/dev/null && return 0 ;;
             *) echo "unknown readiness kind: $wcr_kind" >&2; return 1 ;;
         esac
         [ -z "${SPID-}" ] || kill -0 "$SPID" 2>/dev/null || {
             case $wcr_kind in
                 trace) grep -Fqx "CAPTURE privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
-                profile|metrics) grep -Fq " — privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
+                profile|metrics) grep -Fq -e " — privacy=$wcr_privacy" -e "p11scope: capturing: " "$wcr_log" 2>/dev/null && return 0 ;;
             esac
             echo "observer exited before capture readiness: $wcr_log" >&2
             # Name the reason, not just the file: on a hosted runner the log is

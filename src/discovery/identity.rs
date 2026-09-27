@@ -692,6 +692,23 @@ impl PinnedObjects {
             .copied()
     }
 
+    /// Re-files one manifest alias split by pre-6.8 overlayfs onto its scan pin.
+    ///
+    /// On mainline kernels before 6.8 the helper records the maps/backing key
+    /// while this capture pins the opened fd under the overlay key, so the
+    /// exact join misses. When the shared self-mapping probe renders this
+    /// exact fd at the recorded key, the alias is re-filed onto the scan pin
+    /// retargeting already chose for the record; every downstream exact join
+    /// then resolves to one provider. Stub: re-files nothing yet.
+    pub(crate) fn refile_split_manifest_alias(
+        &mut self,
+        _recorded: ObjectKey,
+        _path: &str,
+        _budget: &mut CaptureWorkBudget,
+        _probe: &impl SelfMappingProbe,
+    ) {
+    }
+
     /// Exact ordinary-file equality between two already opened, hashed pin sets.
     pub fn exactly_matches(
         &self,
@@ -2070,6 +2087,78 @@ pub(crate) mod test_fixture {
         for entry in pins.by_id.values_mut() {
             entry.file = Arc::clone(file);
         }
+    }
+
+    /// The mount both halves of a forged pre-6.8 split resolve in: the scan
+    /// pin and the manifest pin are one file in one mount namespace, so their
+    /// mappings agree exactly.
+    const SPLIT_MOUNT_ID: u64 = 7;
+
+    /// A scan pin for a pre-6.8 overlayfs split: filed under the maps/backing
+    /// key while the opened fd resolves to the overlay key — the shape
+    /// `pin_scanned_object` accepts via the self-mapping probe.
+    pub(crate) fn split_scan_pin(
+        maps_key: ObjectKey,
+        fd_key: ObjectKey,
+        sha256: &str,
+        ctime: i64,
+    ) -> PinnedObjects {
+        let modelled = module(maps_key);
+        let raw = RawObjectInstance::scanned(&modelled, modelled.key, &modelled.path).unwrap();
+        let entry = Entry {
+            mapping: MappingFileKey {
+                mount_id: SPLIT_MOUNT_ID,
+                device_major: fd_key.device.major,
+                device_minor: fd_key.device.minor,
+                inode: fd_key.inode,
+            },
+            raw,
+            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            pin: Pin {
+                ino: INODE,
+                size: 4096,
+                ctime: (ctime, 7),
+            },
+            path: modelled.path.clone(),
+            sha256: sha256.into(),
+            build_id: None,
+            abi: ElfAbi::Lp64,
+            exports: Arc::from(Vec::new()),
+            overlay: true,
+        };
+        let mut pins = PinnedObjects::empty();
+        pins.insert_entry(entry, &mut Vec::new());
+        pins
+    }
+
+    /// A manifest pin as `pin_manifest_objects` files it: under the opened
+    /// fd's key, with the same mapping, pin and digest as its scan pin.
+    pub(crate) fn manifest_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
+        let raw = RawObjectInstance::manifest(fd_key, PATH.to_string()).unwrap();
+        let entry = Entry {
+            mapping: MappingFileKey {
+                mount_id: SPLIT_MOUNT_ID,
+                device_major: fd_key.device.major,
+                device_minor: fd_key.device.minor,
+                inode: fd_key.inode,
+            },
+            raw,
+            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            pin: Pin {
+                ino: INODE,
+                size: 4096,
+                ctime: (ctime, 7),
+            },
+            path: PATH.into(),
+            sha256: sha256.into(),
+            build_id: None,
+            abi: ElfAbi::Lp64,
+            exports: Arc::from(Vec::new()),
+            overlay: true,
+        };
+        let mut pins = PinnedObjects::empty();
+        pins.insert_entry(entry, &mut Vec::new());
+        pins
     }
 
     /// A scripted self-mapping probe: `overlay` answers the overlayfs

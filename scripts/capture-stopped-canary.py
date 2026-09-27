@@ -594,10 +594,23 @@ class Coordinator:
             remaining(deadline)
 
     def capture_ready(self, deadline):
-        marker = (f'CAPTURE privacy={self.config.privacy}' if self.config.mode == 'trace'
-                  else f' — privacy={self.config.privacy}').encode()
+        if self.config.mode == 'trace':
+            marker = f'CAPTURE privacy={self.config.privacy}'.encode()
+            lines = read_bytes(self.config.observer_log, MAX_LOG_BYTES, deadline).splitlines()
+            return marker in lines
+        # Profile/metrics: the live frame is TTY-only (src/run.rs LiveDisplay),
+        # so on this log file its privacy marker lands only in the final frame,
+        # after the capture has ended. Readiness is the attach-complete stderr
+        # line (src/run.rs capture_ready_line); the privacy tier is proven
+        # post-exit by final_privacy_present instead.
+        attach = b'p11scope: capturing: '
         lines = read_bytes(self.config.observer_log, MAX_LOG_BYTES, deadline).splitlines()
-        return marker in lines if self.config.mode == 'trace' else any(marker in line for line in lines)
+        return any(attach in line for line in lines)
+
+    def final_privacy_present(self, deadline):
+        marker = f' — privacy={self.config.privacy}'.encode()
+        lines = read_bytes(self.config.observer_log, MAX_LOG_BYTES, deadline).splitlines()
+        return any(marker in line for line in lines)
 
     def readiness(self, observer, deadline):
         while True:
@@ -873,6 +886,15 @@ class Coordinator:
                     require(observer.wait(time.monotonic() + OBSERVER_WAIT_SECONDS) == 0, 'observer ordinary wait was not successful')
                 except BaseException as error:
                     issues.extend(sanitized('observer-wait', error))
+            if observer is not None and not issues and self.config.mode != 'trace':
+                # The capturing line carries no tier, so the finished observer's
+                # log must still contain the final frame's privacy marker (still
+                # written on non-terminals). Fail closed if absent.
+                try:
+                    privacy_deadline = time.monotonic() + PUBLICATION_SECONDS
+                    require(self.final_privacy_present(privacy_deadline), 'observer privacy marker missing')
+                except BaseException as error:
+                    issues.extend(sanitized('observer-privacy', error))
             if log is not None:
                 try:
                     log.close()

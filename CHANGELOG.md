@@ -101,7 +101,9 @@ provider during capture.
 - The older unvalidated decoders exist only in a build with the
   off-by-default `unsafe-unvalidated-metadata` Cargo feature *and* an explicit
   `--unsafe-unvalidated-metadata` flag. The release artifact is built with
-  `--no-default-features` and cannot enable them.
+  `--no-default-features` and cannot enable them. That feature build loaded
+  on 6.8, 6.12, 7.0 and 7.2. It does not load on 5.15, because one of its
+  programs exceeds that kernel's 1,000,000-instruction verifier limit.
 - The field-by-field inventory is
   [docs/privacy/allowlist-v1.md](docs/privacy/allowlist-v1.md) plus the
   [allowlist-v2.md](docs/privacy/allowlist-v2.md) extension. The secret-canary
@@ -341,6 +343,11 @@ Fixes to defects found while qualifying this release, before it was tagged:
     maps it at the target's device and inode.
   - `p11scope-discover` applies the same check, so it runs inside such
     containers, and its manifests work with `--manifest` there.
+- A build compiled with the `unsafe-unvalidated-metadata` feature loads on
+  uprobe-multi kernels (≥ 6.9) again. It failed there with `Invalid argument`,
+  because kernels with the CVE-2025-40123 fix require every program sharing a
+  program array to have the same attach type. The release build does not
+  include that code and was not affected.
 <!-- TODO(release): add any further user-visible fixes merged before the tag. -->
 
 ### Qualification of this release

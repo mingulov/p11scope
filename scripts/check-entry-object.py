@@ -371,7 +371,8 @@ SEMANTIC_INSERT = {"default": 1244, "p11_entry": 1493, "p11_entry_ia32": 2175,
                    "p11_entry_template": 2770, "p11_entry_template_pair": 3279,
                    "p11_entry_template_types": 3942}
 BYTE_DOMAIN = frozenset(range(256))
-# TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot has (always falls through).
+# TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot of TAIL_CALLS or
+# STACK_GUARD has (always falls through).
 NO_PRIVATE_STACK_INDEX = 0xFFFFFFFF
 BRANCH = re.compile(r"if ([rw]\d+) (==|!=|s>|>|s>=|>=|<|<=) ([rw]\d+|-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+")
 
@@ -700,10 +701,12 @@ class SinkProof:
                 state[("done",)] = True
                 self.witnesses.add(pc)
         if (text == "call 0xc" and pc in consumer.helper
-                and before.get("r2") == ("map", "TAIL_CALLS")
+                and before.get("r2") in (("map", "TAIL_CALLS"), ("map", "STACK_GUARD"))
                 and before.get("r3") == ("constant", NO_PRIVATE_STACK_INDEX)):
-            # The kernel-stack opt-out: an index past every TAIL_CALLS slot, so
-            # the kernel always falls through. It carries no mode and no data.
+            # The kernel-stack opt-out: an index past every slot of either
+            # program array (STACK_GUARD is also never populated), so the
+            # kernel always falls through. It carries no mode and no data.
+            # Which array each program may use is check-bpf-map-defs' rule.
             pass
         elif text == "call 0xc" and pc in consumer.helper:
             require(self.mode == 3 and before.get(("inserted",)) is True

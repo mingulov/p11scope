@@ -105,7 +105,7 @@ const fn map_metadata(
     }
 }
 
-const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 7] = [
+const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 8] = [
     (
         "CONFIG",
         map_metadata(MapType::Array, 4, 8, 2, BPF_F_RDONLY_PROG),
@@ -140,12 +140,21 @@ const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 7] = [
         "TAIL_CALLS",
         map_metadata(MapType::ProgramArray, 4, 4, 2, 0),
     ),
+    // Never populated and frozen before any program loads: the static
+    // endpoint programs' kernel-stack opt-out. They load for uprobe-multi
+    // under the multi backend, and a program array accepts one expected
+    // attach type (CVE-2025-40123), so they cannot share TAIL_CALLS.
+    (
+        "STACK_GUARD",
+        map_metadata(MapType::ProgramArray, 4, 4, 1, 0),
+    ),
 ];
 const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 1] = [(
     "ATTR_BOOL_BITS",
     map_metadata(MapType::Hash, 4, 4, 16, BPF_F_RDONLY_PROG),
 )];
 const TAIL_POLICY_MAP: &str = "TAIL_CALLS";
+const STACK_GUARD_MAP: &str = "STACK_GUARD";
 const DEFAULT_PROGRAMS: [&str; 13] = [
     "p11_entry",
     "p11_return",
@@ -2292,7 +2301,11 @@ fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
         if defers_freeze_until_loaded(name, &meta) {
             continue;
         }
-        freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?;
+        let map = ebpf.map(name).with_context(|| format!("{name} map"))?;
+        if name == STACK_GUARD_MAP {
+            require_empty_stack_guard(map)?;
+        }
+        freeze_map(name, map)?;
     }
     for (name, _) in FEATURE_POLICY_MAPS {
         if let Some(map) = ebpf.map(name) {
@@ -2300,6 +2313,15 @@ fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// STACK_GUARD only exists to be referenced: its one slot must stay empty so
+/// the endpoint programs' opt-out tail call can never jump.
+pub(crate) fn require_empty_stack_guard(map: &Map) -> Result<()> {
+    match program_array_id(STACK_GUARD_MAP, map, 0)? {
+        None => Ok(()),
+        Some(id) => bail!("{STACK_GUARD_MAP} must stay empty but slot 0 holds program {id}"),
+    }
 }
 
 fn validate_runtime_map(
@@ -7260,6 +7282,7 @@ mod tests {
                 "ASYNC_FUNCTIONS",
                 "MECH_SHAPE",
                 "TAIL_CALLS",
+                "STACK_GUARD",
             ]
         );
         assert_eq!(

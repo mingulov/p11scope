@@ -928,20 +928,42 @@ def validate_inventory_usage_transition(elf, root, relocations):
 
 
 TAIL_CALL_HELPER = 12
-# The index no TAIL_CALLS slot can have (ProgramArray max_entries is 2): a tail
-# call with it always falls through. Mirrors TAIL_CALLS_NO_PRIVATE_STACK_INDEX.
+# The index no program-array slot can have (TAIL_CALLS has 2, STACK_GUARD 1):
+# a tail call with it always falls through. Mirrors
+# TAIL_CALLS_NO_PRIVATE_STACK_INDEX.
 NO_PRIVATE_STACK_INDEX = 0xFFFFFFFF
+# The object's program arrays. TAIL_CALLS carries the real continuations and
+# the plainly loaded programs' opt-outs; STACK_GUARD is never populated and
+# carries only the opt-outs of MULTI_LOADED_PROGRAMS.
+PROGRAM_ARRAYS = ("TAIL_CALLS", "STACK_GUARD")
+# Programs userspace may load with expected_attach_type BPF_TRACE_UPROBE_MULTI:
+# `static_probe_side` in src/attach.rs and the usage entries of
+# `inventory_program_load` in src/attach/inventory.rs (a Rust test pins this
+# set against both). Since CVE-2025-40123 (upstream 4540aed51b12, in the
+# stable series) a program array accepts only programs with its owner's
+# expected attach type, so these programs and the plainly loaded ones must
+# never reference the same program array.
+MULTI_LOADED_PROGRAMS = frozenset({
+    "p11_entry", "p11_entry_ia32", "p11_entry_template", "p11_entry_template_types",
+    "p11_entry_template_pair", "p11_return", "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+})
+# Known, pre-existing exception (diagnostic object only): the template-pair
+# continuation tail-calls TAIL_CALLS slot 1 into the plainly loaded
+# p11_entry_template_second, so under the multi backend on a kernel with the
+# CVE-2025-40123 check that build cannot load. It is reported, not fixed here;
+# nothing else may join it.
+MULTI_LOADED_TAIL_CALLS_EXCEPTION = frozenset({"p11_entry_template_pair"})
 
 
-def kernel_stack_opt_out_at(instructions, at, relocation_of):
-    """True for exactly `r2 = TAIL_CALLS ll; r3 = 0xffffffff ll; call 12` at
+def kernel_stack_opt_out_at(instructions, at, relocation_of, arrays=PROGRAM_ARRAYS):
+    """True for exactly `r2 = <array> ll; r3 = 0xffffffff ll; call 12` at
     `at` (5 instruction slots): the kernel-stack opt-out, which never jumps."""
     if at + 5 > len(instructions):
         return False
     relocation = relocation_of(at)
     return (instructions[at][:2] == (0x18, 0x02) and instructions[at + 1] == (0, 0, 0, 0)
             and relocation is not None and relocation[0] == 1
-            and relocation[1][0] == "TAIL_CALLS"
+            and relocation[1][0] in arrays
             and instructions[at + 2] == (0x18, 0x03, 0, -1)
             and instructions[at + 3] == (0, 0, 0, 0)
             and instructions[at + 4] == (0x85, 0, 0, TAIL_CALL_HELPER))
@@ -1061,7 +1083,7 @@ def validate_inventory_entry_reachability(elf):
                                    if candidate[1] & 15 == 1 and candidate[3] == target[3]
                                    and candidate[4] == address]
                         map_name = matches[0] if len(matches) == 1 else ""
-                    if map_name == "TAIL_CALLS" and relocation[0] == 1 and tail_calls_are_opt_outs(
+                    if map_name in PROGRAM_ARRAYS and relocation[0] == 1 and tail_calls_are_opt_outs(
                             body, key, relocations):
                         continue  # the kernel-stack opt-out: no slot, no jump
                     if relocation[0] != 1 or map_name not in allowed_maps:
@@ -1100,32 +1122,66 @@ def validate_inventory_entry_reachability(elf):
     return reports
 
 
+def program_array_relocations(elf):
+    """Every ld_imm64 of a program array as (section index, offset, map name).
+
+    Only relocations applied to executable sections are instructions; debug
+    and BTF sections may name map symbols for other reasons.
+    """
+    rows = {index: elf.sections[name][0] for name, index in elf.indices.items()}
+    found = []
+    for row, raw in elf.sections.values():
+        if row[1] != 9 or row[7] not in rows or not rows[row[7]][2] & 4:  # SHF_EXECINSTR
+            continue
+        for offset in range(0, len(raw), 16):
+            address, info = struct.unpack_from("<QQ", raw, offset)
+            symbol = elf.symbols[info >> 32]
+            if symbol[0] in PROGRAM_ARRAYS:
+                if info & 0xffffffff != 1:
+                    raise RuntimeError(f"{symbol[0]} referenced by a non-map relocation")
+                found.append((row[7], address, symbol[0]))
+    return found
+
+
 def validate_classic_uprobe_kernel_stack(elf):
-    """Every classic uprobe/uretprobe program keeps the task's kernel stack.
+    """Every uprobe/uretprobe program keeps the task's kernel stack.
 
     From Linux 6.13 the x86 JIT gives a KPROBE-type program with a >= 64-byte
-    frame a per-CPU private stack, but classic uprobe programs run preemptible
+    frame a per-CPU private stack, but uprobe programs run preemptible
     (migrate-disabled only) with no recursion guard: a second task running the
     same program on that CPU overwrites a preempted invocation's frame (live:
     a return probe read another thread's START key). The verifier keeps the
     kernel stack for any program containing a tail call, so each program must
     contain one; every tail call is either a real continuation into a known
-    slot or the always-falling-through out-of-range opt-out, whose index is a
-    straight-line constant.
+    TAIL_CALLS slot or the always-falling-through out-of-range opt-out, whose
+    index is a straight-line constant.
+
+    Each program array must also keep one expected attach type (CVE-2025-40123):
+    MULTI_LOADED_PROGRAMS reference only STACK_GUARD, every other program only
+    TAIL_CALLS, and no subprogram or non-uprobe program references either, so
+    this per-program attribution is complete.
     """
+    uprobe_sections = {elf.indices.get("uprobe"), elf.indices.get("uretprobe")} - {None}
+    programs = [(name, section, value, size) for name, info, _, section, value, size in elf.symbols
+                if info & 15 == 2 and size and section in uprobe_sections]
+    references = {}
+    for section, address, array in program_array_relocations(elf):
+        owner = [name for name, program_section, value, size in programs
+                 if program_section == section and value <= address < value + size]
+        if len(owner) != 1:
+            raise RuntimeError(f"{array} referenced outside a uprobe program body")
+        references.setdefault(owner[0], set()).add((address, array))
     reports = {}
-    for name, info, _, section, value, size in elf.symbols:
-        if info & 15 != 2 or not size or section not in {
-                elf.indices.get("uprobe"), elf.indices.get("uretprobe")}:
-            continue
+    for name, section, value, size in programs:
         body = checked_slice(elf.sections[next(n for n, i in elf.indices.items() if i == section)][1],
                              value, size, "classic uprobe program")
         instructions = [struct.unpack_from("<BBhi", body, offset) for offset in range(0, len(body), 8)]
+        arrays_at = {(address - value) // 8: array for address, array in references.get(name, ())}
         opt_outs = slots = 0
         for position, (op, registers, _, immediate) in enumerate(instructions):
             if op != 0x85 or registers != 0 or immediate != TAIL_CALL_HELPER:
                 continue
-            index = None
+            index = array = None
             for previous in range(position - 1, max(-1, position - 16), -1):
                 p_op, p_registers, _, p_immediate = instructions[previous]
                 if previous and instructions[previous - 1][0] == 0x18:
@@ -1138,12 +1194,28 @@ def validate_classic_uprobe_kernel_stack(elf):
                     index = (p_immediate & 0xFFFFFFFF) | (
                         (instructions[previous + 1][3] & 0xFFFFFFFF) << 32)
                 break
+            for previous in range(position - 1, max(-1, position - 16), -1):
+                if instructions[previous][:2] == (0x18, 0x02):  # ld_imm64 r2
+                    array = arrays_at.get(previous)
+                    break
+            if array is None:
+                raise RuntimeError(f"{name}: tail call through an unidentified program array")
             if index == NO_PRIVATE_STACK_INDEX:
                 opt_outs += 1
-            elif index in (0, 1):
+            elif index in (0, 1) and array == "TAIL_CALLS":
                 slots += 1
             else:
                 raise RuntimeError(f"{name}: tail call index is not a known slot or the opt-out")
+        used = {array for _, array in references.get(name, ())}
+        if name in MULTI_LOADED_PROGRAMS:
+            allowed = {"STACK_GUARD"} | ({"TAIL_CALLS"} if name in MULTI_LOADED_TAIL_CALLS_EXCEPTION
+                                         else set())
+        else:
+            allowed = {"TAIL_CALLS"}
+        if used - allowed:
+            raise RuntimeError(
+                f"{name}: references {sorted(used - allowed)}, whose owner has another "
+                "expected attach type (one program array per load class)")
         # The kernel gives no private stack to a frame under 64 bytes. Only a
         # program that never addresses its frame (r10) and calls no BPF
         # subprogram is provably exempt; anything else must opt out.
@@ -1153,7 +1225,7 @@ def validate_classic_uprobe_kernel_stack(elf):
             for op, registers, _, _ in instructions)
         if not opt_outs + slots and not stackless:
             raise RuntimeError(f"{name}: classic uprobe program may run on a shared per-CPU private stack")
-        reports[name] = {"opt_out": opt_outs, "continuation": slots}
+        reports[name] = {"opt_out": opt_outs, "continuation": slots, "arrays": sorted(used)}
     return reports
 
 
@@ -1220,7 +1292,7 @@ def validate_inventory_caller_entry_reachability(elf):
                                    if candidate[1] & 15 == 1 and candidate[3] == target[3]
                                    and candidate[4] == address]
                         map_name = matches[0] if len(matches) == 1 else ""
-                    if map_name == "TAIL_CALLS" and relocation[0] == 1 and tail_calls_are_opt_outs(
+                    if map_name in PROGRAM_ARRAYS and relocation[0] == 1 and tail_calls_are_opt_outs(
                             body, key, relocations):
                         continue  # the kernel-stack opt-out: no slot, no jump
                     if relocation[0] != 1 or map_name not in allowed_maps:
@@ -1414,6 +1486,7 @@ SAFE_MAPS = {
         "STATS": (6, 4, 296, 512),
         "STOP_GATE": (2, 4, 8, 1, 1024),
         "TAIL_CALLS": (3, 4, 4, 2),
+        "STACK_GUARD": (3, 4, 4, 1),
     }.items()
 }
 UNSAFE_MAPS = SAFE_MAPS | {
@@ -1449,8 +1522,8 @@ UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
 
 
 INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
-    "CONFIG", "PID_FILTER", "CGROUP_FILTER", "TAIL_CALLS", "EVIDENCE", "COUNTERS",
-    "DISCOVERY", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
+    "CONFIG", "PID_FILTER", "CGROUP_FILTER", "TAIL_CALLS", "STACK_GUARD", "EVIDENCE",
+    "COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
 )} | {
     "USAGE": map_def(2, 4, 8, 1),
     "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
@@ -1570,10 +1643,12 @@ def self_test():
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
-    assert len(SAFE_MAPS) == 23
-    assert len(UNSAFE_MAPS) == 24
-    assert len(WIDE_MAPS) == 23
-    assert len(WIDE_UNSAFE_MAPS) == 24
+    assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
+    assert INVENTORY_MAPS["STACK_GUARD"] == SAFE_MAPS["STACK_GUARD"]
+    assert len(SAFE_MAPS) == 24
+    assert len(UNSAFE_MAPS) == 25
+    assert len(WIDE_MAPS) == 24
+    assert len(WIDE_UNSAFE_MAPS) == 25
     assert len(SAFE_PROGRAMS) == 13
     assert len(UNSAFE_PROGRAMS) == 18
     good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)

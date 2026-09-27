@@ -1253,9 +1253,9 @@ impl OwnedIds {
             ids.programs.insert(id);
         }
         let expected_maps = if matches!(prepared.flavor, InventoryFlavor::Callers(_)) {
-            18
+            19
         } else {
-            13
+            14
         };
         ensure!(ids.maps.len() == expected_maps && ids.programs.len() == 12);
         Ok(ids)
@@ -6915,10 +6915,10 @@ fn privileged_detailed_multithread_same_slot_allowlisted_exact() -> Result<()> {
     Ok(())
 }
 
-/// Live 7.0 product halt `start_key_mismatch`: Linux 6.13+ runs a classic
-/// uprobe program with a >= 64-byte frame on a per-CPU private stack, but
-/// such programs are preemptible, so another task running the same program on
-/// the same CPU overwrites a preempted invocation's frame (a return probe then
+/// Live 7.0 product halt `start_key_mismatch`: Linux 6.13+ runs a uprobe
+/// program with a >= 64-byte frame on a per-CPU private stack, but such
+/// programs are preemptible, so another task running the same program on the
+/// same CPU overwrites a preempted invocation's frame (a return probe then
 /// read another thread's START key). Pinning every worker to CPU 0 makes
 /// same-CPU preemption inside the probes routine. Every program must keep the
 /// task's kernel stack: no poison, no refused or mismatched pairing, exact
@@ -6926,6 +6926,23 @@ fn privileged_detailed_multithread_same_slot_allowlisted_exact() -> Result<()> {
 #[test]
 #[ignore = "root-owned BPF lane; same-CPU preempted probe invocations keep their own frames"]
 fn privileged_detailed_same_cpu_preemption_keeps_frames() -> Result<()> {
+    same_cpu_preemption_lane(crate::attach::BackendSelection::Singles, "singles")
+}
+
+/// The product's own backend choice (Auto: uprobe-multi from 6.9, singles
+/// below) under the same-CPU preemption lane. Under multi the static endpoint
+/// programs load with `expected_attach_type = BPF_TRACE_UPROBE_MULTI`, and
+/// since CVE-2025-40123 a program array accepts one expected attach type, so
+/// a kernel-stack opt-out shared with the plainly loaded programs makes the
+/// whole session fail to load. The session must load, pick the backend the
+/// kernel policy names (no silent fallback), and keep exact counts.
+#[test]
+#[ignore = "root-owned BPF lane; the Auto backend loads and keeps frames under same-CPU preemption"]
+fn privileged_detailed_auto_backend_same_cpu_preemption_keeps_frames() -> Result<()> {
+    same_cpu_preemption_lane(crate::attach::BackendSelection::Auto, "auto")
+}
+
+fn same_cpu_preemption_lane(selection: crate::attach::BackendSelection, label: &str) -> Result<()> {
     const THREADS: u32 = 4;
     const PERCALLS: u32 = 300_000;
     let fixture = OwnedFixture::build_n(false, 1)?;
@@ -6941,11 +6958,19 @@ fn privileged_detailed_same_cpu_preemption_keeps_frames() -> Result<()> {
         None,
         None,
         None,
-        crate::attach::BackendSelection::Singles,
-    )?;
+        selection,
+    )
+    .with_context(|| format!("same-CPU {label} Detailed session"))?;
+    let multi_expected = selection == crate::attach::BackendSelection::Auto
+        && crate::attach::kernel_supports_multi();
     ensure!(
         session.attach_failures().is_empty() && session.attached_probes() == 2,
-        "same-CPU Detailed did not retain its paired static probe"
+        "same-CPU {label} Detailed did not retain its paired static probe"
+    );
+    ensure!(
+        session.static_multi_attached() == multi_expected,
+        "same-CPU {label} Detailed attached multi={} but the kernel policy names multi={multi_expected}",
+        session.static_multi_attached()
     );
     let ids = OwnedIds::detailed(&session)?;
     caller.go()?;
@@ -6960,13 +6985,14 @@ fn privileged_detailed_same_cpu_preemption_keeps_frames() -> Result<()> {
         .sum();
     let expected = u64::from(THREADS) * u64::from(PERCALLS);
     eprintln!(
-        "SAME_CPU_PREEMPTION threads={THREADS} percalls={PERCALLS} expected={expected} \
-         calls={calls} in_flight={in_flight} rv_total={rv_total} control={:?} kernel={kernel:?}",
+        "SAME_CPU_PREEMPTION backend={label} multi={multi_expected} threads={THREADS} \
+         percalls={PERCALLS} expected={expected} calls={calls} in_flight={in_flight} \
+         rv_total={rv_total} control={:?} kernel={kernel:?}",
         kernel.control.evidence()
     );
     ensure!(
         kernel.control == crate::metrics::KernelControl::default(),
-        "same-CPU preemption poisoned or refused the native owner: {:?}",
+        "same-CPU {label} preemption poisoned or refused the native owner: {:?}",
         kernel.control.evidence()
     );
     ensure!(
@@ -6974,7 +7000,7 @@ fn privileged_detailed_same_cpu_preemption_keeps_frames() -> Result<()> {
             ring_loss: 0,
             ..kernel
         } == crate::metrics::KernelEvidence::default(),
-        "same-CPU preemption lost pairing (ring loss excluded: undrained by design): {kernel:?}"
+        "same-CPU {label} preemption lost pairing (ring loss excluded: undrained by design): {kernel:?}"
     );
     ensure!(
         calls == expected && in_flight == 0 && rv_total == calls,
@@ -6986,7 +7012,10 @@ fn privileged_detailed_same_cpu_preemption_keeps_frames() -> Result<()> {
     ids.released_with_budget(Duration::from_secs(60))?;
     caller.finish()?;
     detached?;
-    ensure!(clean_detach, "same-CPU Detailed detach retained failures");
+    ensure!(
+        clean_detach,
+        "same-CPU {label} Detailed detach retained failures"
+    );
     Ok(())
 }
 
@@ -7485,7 +7514,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             first_ids.maps.len(),
             first_ids.programs.len(),
             first_ids.links.len()
-        ) == (23, 13, 7)
+        ) == (24, 13, 7)
     );
     let first_witness = task4_session_witness(&first, &first_ids, 1, original.child.id())?;
     task4_record_registration(
@@ -7518,7 +7547,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             second_ids.maps.len(),
             second_ids.programs.len(),
             second_ids.links.len()
-        ) == (23, 13, 7)
+        ) == (24, 13, 7)
     );
     let second_witness = task4_session_witness(&second, &second_ids, 2, copy.child.id())?;
     ensure!(
@@ -7537,7 +7566,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
         "second_attached",
     )?;
     let ids = first_ids.union(&second_ids);
-    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (46, 26, 14));
+    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (48, 26, 14));
     task4_ids_phase("second_attached", &ids);
     task4_session_ids("second_attached", second_witness, &second_ids);
     task4_ids_receipt(&ids);

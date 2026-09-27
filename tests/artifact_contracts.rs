@@ -403,6 +403,7 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
         "(\"ASYNC_FUNCTIONS\",map_metadata(MapType::Hash,32,4,128,BPF_F_RDONLY_PROG))",
         "(\"MECH_SHAPE\",map_metadata(MapType::Hash,8,4,p11scope_ebpf_common::MAX_MECH_SHAPES,BPF_F_RDONLY_PROG))",
         "(\"TAIL_CALLS\",map_metadata(MapType::ProgramArray,4,4,2,0))",
+        "(\"STACK_GUARD\",map_metadata(MapType::ProgramArray,4,4,1,0))",
     ] {
         if !compact.contains(expected) {
             return Err(format!("exact policy-map metadata missing {expected}"));
@@ -446,6 +447,14 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
         freeze,
         "if defers_freeze_until_loaded(name, &meta)",
         "deferred freeze for read-only arrays and TAIL_CALLS",
+    )?;
+    // STACK_GUARD is frozen with the other published maps, before any
+    // program loads, and only after its one slot reads back empty.
+    require_before(
+        freeze,
+        "require_empty_stack_guard(map)?;",
+        "freeze_map(name, map)?;",
+        "STACK_GUARD emptiness before its freeze",
     )?;
     // The rule itself, not the two names it happened to cover: freezing a
     // multi-entry BPF_F_RDONLY_PROG array before its readers load makes

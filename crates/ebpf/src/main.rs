@@ -56,8 +56,8 @@ use p11scope_ebpf_common::{
     FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT,
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
     PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, SESSION_NONE, START_ENTRIES, STATE_DOMAIN_EXPORT,
-    STATE_DOMAIN_SELECTION, TAIL_CALLS_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
-    TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE,
+    STACK_GUARD_ENTRIES, STATE_DOMAIN_SELECTION, TAIL_CALLS_ENTRIES,
+    TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE,
     interface_flags_class,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
@@ -114,23 +114,48 @@ static ATTR_BOOL_BITS: HashMap<u32, u32> = HashMap::with_max_entries(16, BPF_F_R
 #[map]
 static TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(TAIL_CALLS_ENTRIES, 0);
 
-/// Keep this classic uprobe program on the task's own kernel stack.
+/// Never populated: the kernel-stack opt-out for the static endpoint
+/// programs, which load with `expected_attach_type = BPF_TRACE_UPROBE_MULTI`
+/// under the multi backend. Since CVE-2025-40123 (upstream 4540aed51b12,
+/// backported to the stable series) a program array accepts only programs
+/// with its owner's expected attach type, so these programs must not
+/// reference TAIL_CALLS, whose owner is the plainly loaded interface
+/// programs and worker. Userspace freezes it empty before any load.
+#[map]
+static STACK_GUARD: ProgramArray = ProgramArray::with_max_entries(STACK_GUARD_ENTRIES, 0);
+
+/// Keep this uprobe program on the task's own kernel stack.
 ///
 /// From Linux 6.13 the x86 JIT runs a KPROBE-type program whose frame is at
-/// least 64 bytes on a per-CPU *private stack*. Classic uprobe programs run
-/// preemptible (migrate-disabled only) and without a recursion guard, so a
-/// second task running the same program on that CPU while the first is
-/// preempted overwrites the first invocation's frame: keys, copied START
-/// records, event bodies (live on 7.0: a return probe read another thread's
-/// START key and the owner refused it as `start_key_mismatch`). The verifier
-/// keeps the kernel stack for any program that contains a tail call, so every
-/// classic uprobe program issues this one first. Its index is past the end of
-/// TAIL_CALLS, so the kernel never jumps and execution continues here; on
+/// least 64 bytes on a per-CPU *private stack*. Uprobe programs (classic and
+/// multi) run preemptible (migrate-disabled only) and without a recursion
+/// guard, so a second task running the same program on that CPU while the
+/// first is preempted overwrites the first invocation's frame: keys, copied
+/// START records, event bodies (live on 7.0: a return probe read another
+/// thread's START key and the owner refused it as `start_key_mismatch`). The
+/// verifier keeps the kernel stack for any program that contains a tail call,
+/// so every uprobe program issues this one first. Its index is past the end of
+/// the array, so the kernel never jumps and execution continues here; on
 /// kernels without private stacks it is an equally harmless no-op.
+///
+/// Programs that always load plainly use TAIL_CALLS
+/// ([`keep_kernel_stack`]); the static endpoint programs, which load for
+/// uprobe-multi under the multi backend, use the empty STACK_GUARD
+/// ([`keep_endpoint_stack`]), so each program array keeps one expected attach
+/// type.
 #[inline(always)]
 fn keep_kernel_stack<C: aya_ebpf::EbpfContext>(ctx: &C) {
     // SAFETY: an out-of-range index makes bpf_tail_call return immediately.
     let _ = unsafe { TAIL_CALLS.tail_call(ctx, TAIL_CALLS_NO_PRIVATE_STACK_INDEX) };
+}
+
+/// [`keep_kernel_stack`] for the static endpoint programs (the ones
+/// userspace may load with `expected_attach_type = BPF_TRACE_UPROBE_MULTI`).
+#[inline(always)]
+fn keep_endpoint_stack<C: aya_ebpf::EbpfContext>(ctx: &C) {
+    // SAFETY: STACK_GUARD is never populated and the index is out of range,
+    // so bpf_tail_call returns immediately.
+    let _ = unsafe { STACK_GUARD.tail_call(ctx, TAIL_CALLS_NO_PRIVATE_STACK_INDEX) };
 }
 
 /// Exact bounded standard function name -> stable shared-table id. Raw
@@ -2329,7 +2354,7 @@ const ENTRY_ABI_ILP32: u8 = 2;
 #[cfg(not(feature = "inventory-only"))]
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
-    keep_kernel_stack(&ctx);
+    keep_endpoint_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2344,7 +2369,7 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_ia32(ctx: ProbeContext) -> u32 {
-    keep_kernel_stack(&ctx);
+    keep_endpoint_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2356,7 +2381,7 @@ pub fn p11_entry_ia32(ctx: ProbeContext) -> u32 {
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
-    keep_kernel_stack(&ctx);
+    keep_endpoint_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2368,7 +2393,7 @@ pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_types(ctx: ProbeContext) -> u32 {
-    keep_kernel_stack(&ctx);
+    keep_endpoint_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2781,7 +2806,7 @@ fn rv_count_add(key: &RvKey) -> bool {
 #[cfg(not(feature = "inventory-only"))]
 #[uretprobe]
 pub fn p11_return(ctx: RetProbeContext) -> u32 {
-    keep_kernel_stack(&ctx);
+    keep_endpoint_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }

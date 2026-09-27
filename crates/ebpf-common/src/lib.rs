@@ -475,14 +475,20 @@ pub const TAIL_CALLS_INTERFACE_WORKER_SLOT: u32 = 0;
 pub const TAIL_CALLS_TEMPLATE_SECOND_SLOT: u32 = 1;
 /// Slots in the TAIL_CALLS program array.
 pub const TAIL_CALLS_ENTRIES: u32 = 2;
-/// A TAIL_CALLS index no slot can have: a tail call with it always falls
-/// through. Classic uprobe programs issue one so the verifier keeps them on the
-/// task's kernel stack (see `keep_kernel_stack` in the BPF crate).
+/// A program-array index no slot can have: a tail call with it always falls
+/// through. Uprobe programs issue one so the verifier keeps them on the task's
+/// kernel stack (see `keep_kernel_stack` in the BPF crate).
 pub const TAIL_CALLS_NO_PRIVATE_STACK_INDEX: u32 = u32::MAX;
+/// Slots in STACK_GUARD, the never-populated program array that the endpoint
+/// programs loaded for uprobe-multi use for that opt-out. A program array is
+/// owned by one expected attach type (CVE-2025-40123), so those programs
+/// cannot share TAIL_CALLS with the plainly loaded ones.
+pub const STACK_GUARD_ENTRIES: u32 = 1;
 const _: () = assert!(
     TAIL_CALLS_INTERFACE_WORKER_SLOT < TAIL_CALLS_ENTRIES
         && TAIL_CALLS_TEMPLATE_SECOND_SLOT < TAIL_CALLS_ENTRIES
         && TAIL_CALLS_ENTRIES < TAIL_CALLS_NO_PRIVATE_STACK_INDEX
+        && STACK_GUARD_ENTRIES < TAIL_CALLS_NO_PRIVATE_STACK_INDEX
 );
 #[cfg(not(feature = "small-discovery-ring"))]
 pub const DISCOVERY_BYTES: u32 = 65_536;

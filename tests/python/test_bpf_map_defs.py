@@ -201,16 +201,27 @@ class MapDefsTests(unittest.TestCase):
     def test_classic_uprobe_kernel_stack(self):
         """A classic uprobe program with a frame must carry a tail call (the
         verifier then keeps the task's kernel stack instead of a shared
-        per-CPU private stack); an opt-out index must never select a slot."""
+        per-CPU private stack); an opt-out index must never select a slot.
+        Each program array keeps one expected attach type (CVE-2025-40123):
+        multi-loaded programs opt out through STACK_GUARD, every other
+        program through TAIL_CALLS, and nothing else references either."""
         source = Path(self.temp.name) / "kernel-stack.c"
         obj = Path(self.temp.name) / "kernel-stack.o"
         source.write_text(
             '#define SEC(n) __attribute__((section(n), used))\n'
             'struct { int (*type)[3]; int (*max_entries)[2]; int (*key_size)[4]; '
             'int (*value_size)[4]; } TAIL_CALLS SEC(".maps");\n'
+            'struct { int (*type)[3]; int (*max_entries)[1]; int (*key_size)[4]; '
+            'int (*value_size)[4]; } STACK_GUARD SEC(".maps");\n'
             'static long (*tail)(void *, void *, unsigned) = (void *)12;\n'
-            'SEC("uprobe") int big(void *ctx) {\n'
-            '#ifdef INDEX\n    tail(ctx, &TAIL_CALLS, INDEX);\n#endif\n'
+            '#ifndef ARRAY\n#define ARRAY TAIL_CALLS\n#endif\n'
+            '#ifndef NAME\n#define NAME big\n#endif\n'
+            '#ifdef SUBPROGRAM\n'
+            '__attribute__((noinline)) static long guard(void *ctx) '
+            '{ return tail(ctx, &ARRAY, 0xffffffffU); }\n#endif\n'
+            'SEC("uprobe") int NAME(void *ctx) {\n'
+            '#ifdef INDEX\n    tail(ctx, &ARRAY, INDEX);\n#endif\n'
+            '#ifdef SUBPROGRAM\n    guard(ctx);\n#endif\n'
             '    volatile char frame[128]; frame[0] = 1; frame[127] = 2;\n'
             '    return frame[0] + frame[127];\n}\n'
             'SEC("uretprobe") int tiny(void *ctx) { return 0; }\n'
@@ -224,11 +235,29 @@ class MapDefsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "big: .*private stack"):
             classify()
         self.assertEqual(classify("-DINDEX=0xffffffffU"),
-                         {"big": {"opt_out": 1, "continuation": 0},
-                          "tiny": {"opt_out": 0, "continuation": 0}})
-        self.assertEqual(classify("-DINDEX=1")["big"], {"opt_out": 0, "continuation": 1})
+                         {"big": {"opt_out": 1, "continuation": 0, "arrays": ["TAIL_CALLS"]},
+                          "tiny": {"opt_out": 0, "continuation": 0, "arrays": []}})
+        self.assertEqual(classify("-DINDEX=1")["big"],
+                         {"opt_out": 0, "continuation": 1, "arrays": ["TAIL_CALLS"]})
         with self.assertRaisesRegex(RuntimeError, "not a known slot or the opt-out"):
             classify("-DINDEX=7")
+        # A multi-loaded program opts out through STACK_GUARD only.
+        self.assertEqual(classify("-DINDEX=0xffffffffU", "-DNAME=p11_entry", "-DARRAY=STACK_GUARD")
+                         ["p11_entry"], {"opt_out": 1, "continuation": 0, "arrays": ["STACK_GUARD"]})
+        with self.assertRaisesRegex(RuntimeError, "p11_entry: references \\['TAIL_CALLS'\\]"):
+            classify("-DINDEX=0xffffffffU", "-DNAME=p11_entry")
+        with self.assertRaisesRegex(RuntimeError, "big: references \\['STACK_GUARD'\\]"):
+            classify("-DINDEX=0xffffffffU", "-DARRAY=STACK_GUARD")
+        # STACK_GUARD never has a real slot, not even for a multi-loaded program.
+        with self.assertRaisesRegex(RuntimeError, "not a known slot or the opt-out"):
+            classify("-DINDEX=0", "-DNAME=p11_entry", "-DARRAY=STACK_GUARD")
+        # A shared subprogram would hide which program owns the reference.
+        with self.assertRaisesRegex(RuntimeError, "outside a uprobe program body"):
+            classify("-DSUBPROGRAM")
+        # The one named pre-existing exception keeps its real continuation.
+        self.assertEqual(classify("-DINDEX=1", "-DNAME=p11_entry_template_pair")
+                         ["p11_entry_template_pair"],
+                         {"opt_out": 0, "continuation": 1, "arrays": ["TAIL_CALLS"]})
 
     def test_owner_linkage(self):
         obj = Path(self.temp.name) / "owner-linkage.o"

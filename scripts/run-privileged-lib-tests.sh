@@ -43,7 +43,7 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (50 ignored tests in the default-feature lib binary): 41 run by
+# Curation (51 ignored tests in the default-feature lib binary): 42 run by
 # default, 4 run only with --include-long, 5 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -56,6 +56,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # Default campaign: every ignored test except the long cells and the static
 # skips. Order is the binary's --list order; each runs in its own process.
 DEFAULT_TESTS=(
+attach::inventory::activation::privileged_tests::privileged_detailed_auto_backend_same_cpu_preemption_keeps_frames
 attach::inventory::activation::privileged_tests::privileged_detailed_multithread_owner_accounting_exact
 attach::inventory::activation::privileged_tests::privileged_detailed_multithread_same_slot_allowlisted_exact
 attach::inventory::activation::privileged_tests::privileged_detailed_owner_poison_is_disclosed
@@ -86,7 +87,7 @@ attach::inventory::activation::privileged_tests::privileged_task4_inventory_phys
 attach::inventory::privileged_tests::privileged_inventory_caller_preparation_faults_release_exact_resources
 attach::inventory::privileged_tests::privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_binding
 attach::inventory::privileged_tests::privileged_inventory_preparation_failure_releases_owned_resources
-attach::inventory::privileged_tests::privileged_inventory_preparation_freezes_all_eight_protected_maps
+attach::inventory::privileged_tests::privileged_inventory_preparation_freezes_all_nine_protected_maps
 attach::inventory::privileged_tests::privileged_inventory_preparation_loads_multi_without_links
 attach::inventory::privileged_tests::privileged_inventory_preparation_loads_runtime_capacity_and_zero_links
 attach::lifecycle_tests::exec_tests::privileged_detailed_failed_nonleader_exec_preserves_start_and_image

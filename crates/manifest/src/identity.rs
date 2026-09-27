@@ -19,6 +19,8 @@ use std::path::Path;
 
 #[cfg(feature = "identify")]
 use crate::elf::{ElfAbi, classified_object, exports_matching_in_object};
+#[cfg(feature = "identify")]
+use crate::maps::{Device, ObjectKey};
 
 #[cfg(feature = "identify")]
 pub const MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
@@ -328,6 +330,342 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The pre-6.8 overlayfs maps-identity split, and its exact fallback.
+///
+/// Before 6.8, overlayfs installs the real (backing) file in the VMA, so
+/// `/proc/<pid>/maps` prints the backing `s_dev:i_ino` while the opened fd —
+/// resolved through mountinfo — names the overlay device. Both name the same
+/// physical file, yet every maps-key-vs-opened-fd comparison refuses it.
+/// Since 6.8 maps prints the overlay identity and the keys agree.
+///
+/// The self-mapping identity probe closes the split without weakening the
+/// proof: when the keys differ and the fd is on overlayfs, mmap one page of
+/// the already-opened fd (`PROT_READ`, `MAP_PRIVATE`, never `PROT_EXEC`),
+/// read this process's own `/proc/self/maps` line for that address, and
+/// accept iff the kernel-rendered `(device, inode)` exactly equals the
+/// target's maps key. The same kernel code produces both lines, so the
+/// accept is exact physical identity, not a heuristic. Every other outcome —
+/// non-overlay, unmappable, probe failure, mismatch — refuses exactly as
+/// before, with the caller's own message unchanged.
+///
+/// One implementation serves the observer and `p11scope-discover`: the trait
+/// and seam, the real mmap probe, and the bounded maps reader with its
+/// parser all live here. Budget accounting is the caller's: the observer
+/// passes a thin adapter over `CaptureWorkBudget` (identical charging), the
+/// helper passes [`UnboundedProbeBudget`].
+#[cfg(feature = "identify")]
+pub const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+
+/// The accounting surface the probe's `/proc/self/maps` read charges. The
+/// observer adapts `CaptureWorkBudget` 1:1 (deadline, per-chunk and per-line
+/// units, bytes); the helper has no budget and passes
+/// [`UnboundedProbeBudget`]. The 1 MiB single-line cap and stop-at-match
+/// bound apply in both.
+#[cfg(feature = "identify")]
+pub trait ProbeBudget {
+    /// True when the caller is already stopped (deadline or ceiling).
+    fn probe_expired(&mut self) -> bool;
+    /// Bytes the read may take this chunk, honouring the caller's ceilings.
+    fn probe_allowed_io(&mut self, operation_bytes: u64, wanted: usize) -> usize;
+    /// Spend one work unit; false refuses (exhausted).
+    fn probe_spend(&mut self) -> bool;
+    /// Record bytes actually read.
+    fn probe_record_io(&mut self, bytes: usize);
+}
+
+/// [`ProbeBudget`] for callers without a capture budget: never expires,
+/// always allows, always spends, records nothing. The probe's own bounds
+/// (stop at the mapping's line, 1 MiB single-line cap, fail closed) still
+/// apply.
+#[cfg(feature = "identify")]
+pub struct UnboundedProbeBudget;
+
+#[cfg(feature = "identify")]
+impl ProbeBudget for UnboundedProbeBudget {
+    fn probe_expired(&mut self) -> bool {
+        false
+    }
+
+    fn probe_allowed_io(&mut self, _operation_bytes: u64, wanted: usize) -> usize {
+        wanted
+    }
+
+    fn probe_spend(&mut self) -> bool {
+        true
+    }
+
+    fn probe_record_io(&mut self, _bytes: usize) {}
+}
+
+#[cfg(feature = "identify")]
+pub trait SelfMappingProbe {
+    /// Whether `file` was reached through an overlay mount (`fstatfs` magic).
+    fn fd_is_on_overlayfs(&self, file: &std::fs::File) -> bool;
+    /// How the kernel renders `file` in `/proc` maps: one private read-only
+    /// page of the fd, then its own maps line. `None` is inconclusive and
+    /// always refuses. The read is charged to `budget` and stops at the
+    /// mapping's line.
+    fn kernel_maps_key(
+        &self,
+        file: &std::fs::File,
+        budget: &mut dyn ProbeBudget,
+    ) -> Option<ObjectKey>;
+}
+
+/// [`SelfMappingProbe`] against the live kernel.
+#[cfg(feature = "identify")]
+pub struct KernelSelfMappingProbe;
+
+#[cfg(feature = "identify")]
+impl SelfMappingProbe for KernelSelfMappingProbe {
+    fn fd_is_on_overlayfs(&self, file: &std::fs::File) -> bool {
+        fd_is_on_overlayfs(file)
+    }
+
+    fn kernel_maps_key(
+        &self,
+        file: &std::fs::File,
+        budget: &mut dyn ProbeBudget,
+    ) -> Option<ObjectKey> {
+        kernel_maps_key_for(file, budget)
+    }
+}
+
+/// `ovl_statfs` reports the underlying filesystem's numbers but overrides
+/// `f_type` with the overlay's own magic, so this answers "was this file
+/// reached *through* an overlay mount", which is the question, and not "what
+/// is it ultimately stored on". Fail-closed: an `fstatfs` error is not
+/// overlay.
+#[cfg(feature = "identify")]
+pub fn fd_is_on_overlayfs(file: &std::fs::File) -> bool {
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fstatfs` fills `buf` for a valid fd and is only read on success.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), buf.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: the successful `fstatfs` above initialized `buf`.
+    unsafe { buf.assume_init().f_type as u64 == OVERLAYFS_SUPER_MAGIC }
+}
+
+#[cfg(feature = "identify")]
+pub fn has_mappable_bytes(file: &std::fs::File) -> bool {
+    file.metadata().is_ok_and(|metadata| metadata.len() != 0)
+}
+
+/// The kernel-rendered maps key for one opened fd: mmap one page
+/// (`PROT_READ`, `MAP_PRIVATE`, never `PROT_EXEC`) and read this process's
+/// own maps line for that address. `None` is inconclusive and always
+/// refuses.
+#[cfg(feature = "identify")]
+pub fn kernel_maps_key_for(
+    file: &std::fs::File,
+    budget: &mut dyn ProbeBudget,
+) -> Option<ObjectKey> {
+    if !has_mappable_bytes(file) {
+        return None;
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let len = usize::try_from(page).unwrap_or(4096).max(1);
+    // SAFETY: one private read-only page of a borrowed valid fd at
+    // offset 0; never PROT_EXEC; unmapped by the guard below.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return None;
+    }
+    let _mapping = MappedProbe { base, len };
+    read_self_maps_key_for(base as u64, budget)
+}
+
+/// One private read-only page of an already-opened fd, unmapped on drop —
+/// including every error path out of the probe.
+#[cfg(feature = "identify")]
+struct MappedProbe {
+    base: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(feature = "identify")]
+impl Drop for MappedProbe {
+    fn drop(&mut self) {
+        // SAFETY: the probe mapped exactly this range with mmap, owns it
+        // exclusively, and Drop runs once.
+        unsafe {
+            libc::munmap(self.base, self.len);
+        }
+    }
+}
+
+/// The kernel-rendered key for the mapping containing `addr` in this
+/// process's own maps. Charged through `budget` (one unit per chunk and per
+/// line, bytes recorded) and stops at the mapping's line.
+#[cfg(feature = "identify")]
+pub fn read_self_maps_key_for(addr: u64, budget: &mut dyn ProbeBudget) -> Option<ObjectKey> {
+    use std::io::Read as _;
+    let mut reader = std::fs::File::open("/proc/self/maps").ok()?;
+    let mut operation_bytes = 0u64;
+    let mut pending = Vec::new();
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        if budget.probe_expired() {
+            return None;
+        }
+        let allowed = budget.probe_allowed_io(operation_bytes, chunk.len());
+        if allowed == 0 {
+            return None;
+        }
+        if !budget.probe_spend() {
+            return None;
+        }
+        let read = match reader.read(&mut chunk[..allowed]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        budget.probe_record_io(read);
+        operation_bytes = operation_bytes.saturating_add(read as u64);
+        if read == 0 {
+            if pending.is_empty() {
+                return None;
+            }
+            return parse_probed_maps_line(&pending, addr).ok().flatten();
+        }
+        pending.extend_from_slice(&chunk[..read]);
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            if !budget.probe_spend() {
+                return None;
+            }
+            match parse_probed_maps_line(&line[..line.len() - 1], addr) {
+                Ok(Some(key)) => return Some(key),
+                Ok(None) => {}
+                Err(()) => return None,
+            }
+        }
+        // A real maps line is hundreds of bytes; a megabyte without a
+        // newline is not one. Fail closed instead of buffering on.
+        if pending.len() > 1024 * 1024 {
+            return None;
+        }
+    }
+}
+
+/// Whether one opened fd may stand for a maps identity: equal keys accept
+/// without consulting the probe; a split identity accepts only when the
+/// kernel renders this exact fd at the maps key.
+#[cfg(feature = "identify")]
+pub fn opened_file_matches_maps(
+    file: &std::fs::File,
+    fd_key: ObjectKey,
+    maps_key: ObjectKey,
+    budget: &mut dyn ProbeBudget,
+    probe: &impl SelfMappingProbe,
+) -> bool {
+    if fd_key == maps_key {
+        return true;
+    }
+    if !probe.fd_is_on_overlayfs(file) {
+        return false;
+    }
+    if !has_mappable_bytes(file) {
+        return false;
+    }
+    probe
+        .kernel_maps_key(file, budget)
+        .is_some_and(|probed| probed == maps_key)
+}
+
+/// The maps key to retry a snapshot with when an overlay fd's own key found
+/// no mapping: `None` unless the kernel renders this exact fd at a
+/// *different* key, so a pointless same-key retry never runs.
+#[cfg(feature = "identify")]
+pub fn self_mapped_fallback_key(
+    file: &std::fs::File,
+    fd_key: ObjectKey,
+    budget: &mut dyn ProbeBudget,
+    probe: &impl SelfMappingProbe,
+) -> Option<ObjectKey> {
+    if !probe.fd_is_on_overlayfs(file) {
+        return None;
+    }
+    if !has_mappable_bytes(file) {
+        return None;
+    }
+    let probed = probe.kernel_maps_key(file, budget)?;
+    (probed != fd_key).then_some(probed)
+}
+
+#[cfg(feature = "identify")]
+fn split_field(field: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
+    let position = field.iter().position(|byte| *byte == separator)?;
+    Some((&field[..position], &field[position + 1..]))
+}
+
+#[cfg(feature = "identify")]
+fn parse_hex_field(field: &[u8]) -> Option<u64> {
+    if field.is_empty() || !field.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    std::str::from_utf8(field)
+        .ok()
+        .and_then(|text| u64::from_str_radix(text, 16).ok())
+}
+
+#[cfg(feature = "identify")]
+fn parse_decimal_field(field: &[u8]) -> Option<u64> {
+    if field.is_empty() || !field.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    // The digit pre-check above already rejected `+`, which `parse` accepts.
+    std::str::from_utf8(field)
+        .ok()
+        .and_then(|text| text.parse().ok())
+}
+
+/// Parse one `/proc/self/maps` line for the self-mapping probe: `Ok(Some)`
+/// when the line's range contains `addr`, `Ok(None)` for any other
+/// well-formed line, `Err(())` when the line is malformed. Malformed fails
+/// closed — an unparseable line could be the mapping's own. Private: only
+/// the probe's own reader consults it.
+#[cfg(feature = "identify")]
+fn parse_probed_maps_line(line: &[u8], addr: u64) -> Result<Option<ObjectKey>, ()> {
+    // <start>-<end> <perms> <offset> <major:minor hex> <inode decimal> [path]
+    let mut fields = line
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let range = fields.next().ok_or(())?;
+    fields.next().ok_or(())?;
+    fields.next().ok_or(())?;
+    let device = fields.next().ok_or(())?;
+    let inode = fields.next().ok_or(())?;
+    let (start, end) = split_field(range, b'-').ok_or(())?;
+    let (major, minor) = split_field(device, b':').ok_or(())?;
+    let start = parse_hex_field(start).ok_or(())?;
+    let end = parse_hex_field(end).ok_or(())?;
+    if start >= end {
+        return Err(());
+    }
+    let major = parse_hex_field(major).ok_or(())?;
+    let minor = parse_hex_field(minor).ok_or(())?;
+    let inode = parse_decimal_field(inode).ok_or(())?;
+    if start <= addr && addr < end {
+        Ok(Some(ObjectKey {
+            device: Device { major, minor },
+            inode,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(all(test, feature = "identify"))]
 mod tests {
     use super::*;
@@ -399,6 +737,438 @@ mod tests {
                 Ok(bytes) => format!("Ok({} bytes)", bytes.len()),
                 Err(error) => format!("Err({error})"),
             }
+        );
+    }
+
+    /// A scripted self-mapping probe: `overlay` answers the overlayfs
+    /// question and `key` answers the kernel-rendered maps key, counting both
+    /// consultations. Real overlayfs is unmountable without privileges, so
+    /// unit tests script the kernel side of the split.
+    struct FakeSelfMappingProbe {
+        overlay: bool,
+        key: Option<ObjectKey>,
+        overlay_checks: Cell<usize>,
+        probes: Cell<usize>,
+    }
+
+    impl FakeSelfMappingProbe {
+        fn new(overlay: bool, key: Option<ObjectKey>) -> Self {
+            Self {
+                overlay,
+                key,
+                overlay_checks: Cell::new(0),
+                probes: Cell::new(0),
+            }
+        }
+    }
+
+    impl SelfMappingProbe for FakeSelfMappingProbe {
+        fn fd_is_on_overlayfs(&self, _file: &std::fs::File) -> bool {
+            self.overlay_checks.set(self.overlay_checks.get() + 1);
+            self.overlay
+        }
+
+        fn kernel_maps_key(
+            &self,
+            _file: &std::fs::File,
+            _budget: &mut dyn ProbeBudget,
+        ) -> Option<ObjectKey> {
+            self.probes.set(self.probes.get() + 1);
+            self.key
+        }
+    }
+
+    /// The inode a two-container docker run really produced for one shared
+    /// image-layer object.
+    const INODE: u64 = 56_317_450;
+
+    fn overlay(minor: u64) -> ObjectKey {
+        ObjectKey {
+            device: Device { major: 0, minor },
+            inode: INODE,
+        }
+    }
+
+    /// The backing identity a pre-6.8 kernel prints for an overlay mapping:
+    /// `00:15` is 0:21, the measured 6.1 rendering of the `overlay(41)` fd.
+    fn backing_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 21,
+            },
+            inode: INODE,
+        }
+    }
+
+    /// A real file on a real filesystem for probe fixtures. Uses the process
+    /// temp dir so the repo's `TMPDIR` lane override applies.
+    fn probe_tempfile(name: &str) -> (std::path::PathBuf, std::fs::File) {
+        let dir = std::env::temp_dir().join(format!(
+            "p11scope-manifest-probe-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probed.so");
+        std::fs::write(&path, "p11scope-self-mapping-probe:page-one").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        (dir, file)
+    }
+
+    struct CountingBudget {
+        spends: usize,
+        recorded: u64,
+    }
+
+    impl ProbeBudget for CountingBudget {
+        fn probe_expired(&mut self) -> bool {
+            false
+        }
+
+        fn probe_allowed_io(&mut self, _operation_bytes: u64, wanted: usize) -> usize {
+            wanted
+        }
+
+        fn probe_spend(&mut self) -> bool {
+            self.spends += 1;
+            true
+        }
+
+        fn probe_record_io(&mut self, bytes: usize) {
+            self.recorded += bytes as u64;
+        }
+    }
+
+    struct RefusingBudget;
+
+    impl ProbeBudget for RefusingBudget {
+        fn probe_expired(&mut self) -> bool {
+            false
+        }
+
+        fn probe_allowed_io(&mut self, _operation_bytes: u64, _wanted: usize) -> usize {
+            0
+        }
+
+        fn probe_spend(&mut self) -> bool {
+            false
+        }
+
+        fn probe_record_io(&mut self, _bytes: usize) {}
+    }
+
+    #[test]
+    fn equal_fd_and_maps_keys_accept_without_consulting_the_probe() {
+        let (_dir, file) = probe_tempfile("equal");
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let mut budget = UnboundedProbeBudget;
+        assert!(opened_file_matches_maps(
+            &file,
+            overlay(41),
+            overlay(41),
+            &mut budget,
+            &probe,
+        ));
+        assert_eq!(probe.overlay_checks.get(), 0);
+        assert_eq!(probe.probes.get(), 0);
+    }
+
+    #[test]
+    fn overlay_probe_match_accepts_a_split_identity() {
+        let (_dir, file) = probe_tempfile("match");
+        let probe = FakeSelfMappingProbe::new(true, Some(backing_key()));
+        let mut budget = UnboundedProbeBudget;
+        assert!(opened_file_matches_maps(
+            &file,
+            overlay(41),
+            backing_key(),
+            &mut budget,
+            &probe,
+        ));
+        assert_eq!(probe.probes.get(), 1);
+    }
+
+    #[test]
+    fn overlay_probe_mismatch_refuses() {
+        let (_dir, file) = probe_tempfile("mismatch");
+        let probe = FakeSelfMappingProbe::new(true, Some(overlay(43)));
+        let mut budget = UnboundedProbeBudget;
+        assert!(!opened_file_matches_maps(
+            &file,
+            overlay(41),
+            backing_key(),
+            &mut budget,
+            &probe,
+        ));
+    }
+
+    #[test]
+    fn non_overlay_mismatch_refuses_without_probing() {
+        let (_dir, file) = probe_tempfile("non-overlay");
+        let probe = FakeSelfMappingProbe::new(false, Some(backing_key()));
+        let mut budget = UnboundedProbeBudget;
+        assert!(!opened_file_matches_maps(
+            &file,
+            overlay(41),
+            backing_key(),
+            &mut budget,
+            &probe,
+        ));
+        assert_eq!(probe.overlay_checks.get(), 1);
+        assert_eq!(probe.probes.get(), 0);
+    }
+
+    #[test]
+    fn inconclusive_probe_refuses() {
+        let (_dir, file) = probe_tempfile("inconclusive");
+        let probe = FakeSelfMappingProbe::new(true, None);
+        let mut budget = UnboundedProbeBudget;
+        assert!(!opened_file_matches_maps(
+            &file,
+            overlay(41),
+            backing_key(),
+            &mut budget,
+            &probe,
+        ));
+    }
+
+    #[test]
+    fn overlay_probe_skips_unmappable_files_without_probing() {
+        let dir = std::env::temp_dir().join(format!(
+            "p11scope-manifest-probe-{}-empty",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.so");
+        std::fs::write(&path, b"").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, Some(backing_key()));
+        let mut budget = UnboundedProbeBudget;
+        assert!(!opened_file_matches_maps(
+            &file,
+            overlay(41),
+            backing_key(),
+            &mut budget,
+            &probe,
+        ));
+        assert_eq!(probe.probes.get(), 0);
+    }
+
+    #[test]
+    fn self_mapped_fallback_key_returns_a_differing_probed_key() {
+        let (_dir, file) = probe_tempfile("fallback");
+        let probe = FakeSelfMappingProbe::new(true, Some(backing_key()));
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            self_mapped_fallback_key(&file, overlay(41), &mut budget, &probe),
+            Some(backing_key())
+        );
+    }
+
+    #[test]
+    fn self_mapped_fallback_key_stays_none_without_a_retry_worth_making() {
+        let (_dir, file) = probe_tempfile("fallback-none");
+        let mut budget = UnboundedProbeBudget;
+        let refused = FakeSelfMappingProbe::new(false, Some(backing_key()));
+        assert_eq!(
+            self_mapped_fallback_key(&file, overlay(41), &mut budget, &refused),
+            None
+        );
+        assert_eq!(refused.probes.get(), 0);
+        let inconclusive = FakeSelfMappingProbe::new(true, None);
+        assert_eq!(
+            self_mapped_fallback_key(&file, overlay(41), &mut budget, &inconclusive),
+            None
+        );
+        let same = FakeSelfMappingProbe::new(true, Some(overlay(41)));
+        assert_eq!(
+            self_mapped_fallback_key(&file, overlay(41), &mut budget, &same),
+            None,
+            "a probe that repeats the fd key must not trigger a same-key retry"
+        );
+    }
+
+    #[test]
+    fn probed_maps_line_parses_hex_devices_and_decimal_inodes() {
+        // The measured 6.1 rendering: backing device 00:15, inode 712355.
+        let line = b"7fb053667000-7fb05367c000 r--p 00000000 00:15 712355 \
+                     /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so";
+        assert_eq!(
+            parse_probed_maps_line(line, 0x7fb053667000),
+            Ok(Some(ObjectKey {
+                device: Device {
+                    major: 0,
+                    minor: 21
+                },
+                inode: 712355,
+            }))
+        );
+        let upper = b"1000-2000 r--p 00000000 0A:fF 42 /lib/x.so";
+        assert_eq!(
+            parse_probed_maps_line(upper, 0x1000),
+            Ok(Some(ObjectKey {
+                device: Device {
+                    major: 10,
+                    minor: 255,
+                },
+                inode: 42,
+            }))
+        );
+    }
+
+    #[test]
+    fn probed_maps_line_matches_only_its_own_range() {
+        let line = b"1000-2000 r--p 00000000 00:15 7 /lib/x.so";
+        let key = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 21,
+            },
+            inode: 7,
+        };
+        assert_eq!(parse_probed_maps_line(line, 0x1000), Ok(Some(key)));
+        assert_eq!(parse_probed_maps_line(line, 0x1fff), Ok(Some(key)));
+        assert_eq!(parse_probed_maps_line(line, 0x2000), Ok(None));
+        assert_eq!(parse_probed_maps_line(line, 0x0fff), Ok(None));
+        assert_eq!(parse_probed_maps_line(line, 0x3000), Ok(None));
+    }
+
+    #[test]
+    fn malformed_probed_maps_lines_fail_closed() {
+        for line in [
+            b"".as_slice(),
+            b"1000-2000 r--p 00000000".as_slice(),
+            b"1000-2000 r--p 00000000 00:15".as_slice(),
+            b"1000_2000 r--p 00000000 00:15 7".as_slice(),
+            b"zz-2000 r--p 00000000 00:15 7".as_slice(),
+            b"2000-1000 r--p 00000000 00:15 7".as_slice(),
+            b"1000-1000 r--p 00000000 00:15 7".as_slice(),
+            b"1000-2000 r--p 00000000 0015 7".as_slice(),
+            b"1000-2000 r--p 00000000 00:zz 7".as_slice(),
+            b"1000-2000 r--p 00000000 00:15 xx".as_slice(),
+            b"1000-2000 r--p 00000000 00:15 0x10".as_slice(),
+            b"1000-2000 r--p 00000000 00:15 18446744073709551616".as_slice(),
+        ] {
+            assert_eq!(parse_probed_maps_line(line, 0x1000), Err(()), "{}", {
+                String::from_utf8_lossy(line).into_owned()
+            });
+        }
+    }
+
+    /// Independent oracle for the real probe: map the file here and read the
+    /// kernel's own maps line for that address with a deliberately minimal
+    /// parse, so the probe's read path and parser are both checked. Compared
+    /// against the maps rendering, never fstat: on btrfs the same file's
+    /// st_dev (anonymous subvolume device, observed 0:37) differs from its
+    /// maps s_dev (observed 00:23) — the reason retained identity resolves
+    /// through mountinfo.
+    fn maps_key_for_fresh_mapping(file: &std::fs::File) -> ObjectKey {
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED, "the oracle mapping must succeed");
+        let addr = addr as u64;
+        let text = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let mut found = None;
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let range = fields.next().unwrap();
+            let (start, end) = range.split_once('-').unwrap();
+            let (start, end) = (
+                u64::from_str_radix(start, 16).unwrap(),
+                u64::from_str_radix(end, 16).unwrap(),
+            );
+            if start <= addr && addr < end {
+                let device = fields.nth(2).unwrap();
+                let inode: u64 = fields.next().unwrap().parse().unwrap();
+                let (major, minor) = device.split_once(':').unwrap();
+                found = Some(ObjectKey {
+                    device: Device {
+                        major: u64::from_str_radix(major, 16).unwrap(),
+                        minor: u64::from_str_radix(minor, 16).unwrap(),
+                    },
+                    inode,
+                });
+                break;
+            }
+        }
+        assert_eq!(unsafe { libc::munmap(addr as *mut libc::c_void, 4096) }, 0);
+        found.expect("the fresh mapping has a maps line")
+    }
+
+    #[test]
+    fn real_probe_reports_the_key_maps_shows_for_a_plain_mapping() {
+        let (_dir, file) = probe_tempfile("real");
+        let mut budget = CountingBudget {
+            spends: 0,
+            recorded: 0,
+        };
+        let probed = KernelSelfMappingProbe
+            .kernel_maps_key(&file, &mut budget)
+            .expect("a plain temp file probes");
+        assert!(
+            budget.spends > 0 && budget.recorded > 0,
+            "the probe's /proc/self/maps read is charged through the budget"
+        );
+        assert_eq!(probed, maps_key_for_fresh_mapping(&file));
+        assert_eq!(
+            probed.inode,
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                file.metadata().unwrap().ino()
+            },
+            "the same file keeps its inode in both renderings"
+        );
+    }
+
+    #[test]
+    fn real_probe_refuses_an_empty_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "p11scope-manifest-probe-{}-real-empty",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.so");
+        std::fs::write(&path, b"").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            KernelSelfMappingProbe.kernel_maps_key(&file, &mut budget),
+            None
+        );
+    }
+
+    #[test]
+    fn real_probe_refuses_an_unmappable_fd() {
+        let (dir, _) = probe_tempfile("real-opath");
+        // O_PATH fds cannot back a mapping, so mmap fails and the probe is
+        // inconclusive rather than wrong.
+        let unmappable = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(dir.join("probed.so"))
+            .unwrap();
+        let mut budget = UnboundedProbeBudget;
+        assert_eq!(
+            KernelSelfMappingProbe.kernel_maps_key(&unmappable, &mut budget),
+            None
+        );
+    }
+
+    #[test]
+    fn real_probe_refuses_when_the_budget_is_exhausted() {
+        let (_dir, file) = probe_tempfile("real-refused");
+        let mut budget = RefusingBudget;
+        assert_eq!(
+            KernelSelfMappingProbe.kernel_maps_key(&file, &mut budget),
+            None
         );
     }
 }

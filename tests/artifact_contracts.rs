@@ -704,7 +704,7 @@ fn assert_live_discovery_host_contract(
         (
             "SessionPreparation::ValidateRuntime",
             "SessionPreparation::ValidatePrograms",
-            "validate_runtime_maps(&ebpf)",
+            "validate_runtime_maps(&ebpf",
         ),
         (
             "SessionPreparation::ValidatePrograms",

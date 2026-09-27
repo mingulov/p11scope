@@ -212,6 +212,11 @@ PUBLISHED_LOADER_PAUSE_FIELDS = {
     # The operator started this process; naming it leaks no target identity
     # they could not already see (mirrors check-capture-evidence.py).
     "handoff_child_pid",
+    # A loader-timing class count (`loader_discovery.*_timing` and
+    # `initial_set_capture`): providers published before attach but held by
+    # the pause until the probes existed. A count, never an identity
+    # (mirrors LOADER_TIMING_KEYS in check-capture-evidence.py).
+    "pause_protected",
 }
 IDENTITY_PREFIXES = ("pause", "loader", "child", "attach_gap")
 IDENTITY_SUFFIXES = ("_pid", "_tid", "_tids", "_tasks", "_task_set")

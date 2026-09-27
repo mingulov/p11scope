@@ -114,6 +114,7 @@ fn native_bpf_map_decoder_contracts() {
         "MapDefsTests.test_relocation_refusals",
         "MapDefsTests.test_duplicate_and_missing_native_entries",
         "MapDefsTests.test_exact_helpers",
+        "MapDefsTests.test_classic_uprobe_kernel_stack",
         "MapDefsTests.test_owner_linkage",
         "MapDefsTests.test_root_helpers",
         "MapDefsTests.test_json_and_legacy_cli",

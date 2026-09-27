@@ -24,11 +24,13 @@ fn bump_usage_evidence(index: u32) {
 
 #[uprobe]
 pub fn p11_usage_entry_lp64(ctx: ProbeContext) -> u32 {
+    keep_endpoint_stack(&ctx);
     usage_entry(ctx, LinuxLayout::Lp64)
 }
 
 #[uprobe]
 pub fn p11_usage_entry_ia32(ctx: ProbeContext) -> u32 {
+    keep_endpoint_stack(&ctx);
     usage_entry(ctx, LinuxLayout::Ilp32)
 }
 

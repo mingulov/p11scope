@@ -36,6 +36,11 @@ static __always_inline void poison(struct owner_control *ctl, u64 reason)
     count(&ctl->reclamation_failures);
 }
 
+static __always_inline void bookkeeping(struct owner_control *ctl, u64 detail)
+{
+    poison(ctl, OWNER_BOOKKEEPING_FAILED | detail);
+}
+
 static __always_inline struct owner_control *control(void)
 {
     u32 key = 0;
@@ -150,50 +155,67 @@ static __always_inline struct thread_owner *get_owner(struct owner_control *ctl,
         return (void *)0;
     }
     owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 0);
-    if (owner)
+    if (owner && owner->flags)
         return valid_owner(ctl, owner) ? owner : (void *)0;
     if (!create) {
-        /* This is refusal, never a non-lifecycle absence certificate. No
-         * numeric-key lookup/deletion or speculative refund follows a miss. */
+        /* An absent or idle owner holds no rows. This is refusal, never a
+         * non-lifecycle absence certificate. No numeric-key lookup/deletion
+         * or speculative refund follows a miss. */
         poison(ctl, OWNER_LOOKUP_UNKNOWN);
         return (void *)0;
     }
     if (!p11_owner_reserve())
         return (void *)0;
-    /* NULL initialization requests kernel-zeroed map storage, not a 544-byte
-     * stack argument. A failed CREATE installed no new value for this lease. */
-    owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 1);
     if (!owner) {
-        count(&ctl->admission_failures);
+        /* First call of this thread: NULL initialization requests
+         * kernel-zeroed map storage, not a 544-byte stack argument. A failed
+         * CREATE installed no new value for this lease. The storage is then
+         * retained idle between calls, so this allocation (and its RCU-deferred
+         * free) never recurs per call, where it could run the allocator dry. */
+        owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 1);
+        if (!owner) {
+            count(&ctl->admission_failures);
+            p11_owner_refund();
+            return (void *)0;
+        }
+        if (owner->flags) {
+            /* A busy initial probe may have hidden an existing owner. Its
+             * lease and keys remain untouched; refund only our speculative
+             * reservation. */
+            if (!p11_owner_refund() || !valid_owner(ctl, owner))
+                return (void *)0;
+            return healthy(ctl) ? owner : (void *)0;
+        }
+        volatile u64 *words = (volatile u64 *)owner;
+        for (u32 i = 0; i < 68; i++)
+            words[i] = 0;
+    }
+    /* A fresh or idle owner: current-task-only writers and frozen userspace
+     * mutation are prerequisites. Idle means every field was cleared by the
+     * release that returned its lease; anything else is a corrupt record. */
+    if (owner->original_pid_tgid || owner->start_count || owner->occupied ||
+        owner->selection_domains) {
+        poison(ctl, OWNER_BAD_RECORD);
         p11_owner_refund();
         return (void *)0;
     }
-    if (owner->flags) {
-        /* A busy initial probe may have hidden an existing owner. Its lease
-         * and keys remain untouched; refund only our speculative reservation. */
-        if (!p11_owner_refund() || !valid_owner(ctl, owner))
-            return (void *)0;
-        return healthy(ctl) ? owner : (void *)0;
-    }
-    /* Current-task-only writers and frozen userspace mutation are prerequisites.
-     * Initialize the newly created value in place, including all directory cells. */
-    volatile u64 *words = (volatile u64 *)owner;
-    for (u32 i = 0; i < 68; i++)
-        words[i] = 0;
     owner->original_pid_tgid = owner_pid_tgid();
     owner->flags = OWNER_LEASED;
     return valid_owner(ctl, owner) && healthy(ctl) ? owner : (void *)0;
 }
 
+/* Return the lease of an owner that holds nothing. The storage is retained
+ * idle (flags 0, all fields zero) instead of deleted: no per-call delete, no
+ * per-call create on the next call. The discovery cells are already zero:
+ * directory_clear zeroes each cell it frees. */
 static __always_inline int release_empty(struct owner_control *ctl, struct thread_owner *owner)
 {
+    (void)ctl; /* The lease is returned through the bounded global refund. */
     if (owner->start_count || owner->occupied)
         return 1;
-    if (owner_storage_delete(&THREAD_OWNER, owner_current_task()) != 0) {
-        poison(ctl, OWNER_DELETE_FAILED);
-        return 0;
-    }
-    /* owner is invalid after successful deletion. Refund only now. */
+    owner->selection_domains = 0;
+    owner->original_pid_tgid = 0;
+    owner->flags = 0;
     return p11_owner_refund();
 }
 
@@ -215,7 +237,8 @@ static __always_inline struct thread_owner *peek_absent_owner(struct owner_contr
     if (!task)
         return (void *)0;
     struct thread_owner *owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 0);
-    return owner && valid_owner(ctl, owner) ? owner : (void *)0;
+    /* An idle owner is absence: it holds no lease and no rows. */
+    return owner && owner->flags && valid_owner(ctl, owner) ? owner : (void *)0;
 }
 
 #ifndef P11SCOPE_INVENTORY_ONLY
@@ -232,13 +255,17 @@ __attribute__((noinline)) void *p11_owner_start_get(const struct owner_start_key
     struct thread_owner *owner = get_owner(ctl, 0);
     if (!owner)
         return (void *)0;
-    if (!start_key_valid(owner, key) || !owner->start_count) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+    if (!start_key_valid(owner, key)) {
+        bookkeeping(ctl, OWNER_START_KEY_MISMATCH);
+        return (void *)0;
+    }
+    if (!owner->start_count) {
+        bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return (void *)0;
     }
     void *value = owner_map_lookup(&START, key);
     if (!value)
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_ROW_MISSING);
     return value;
 }
 
@@ -246,11 +273,11 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
                                          const struct owner_start_key *key)
 {
     if (!owner_map_lookup(&START, key)) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_ROW_MISSING);
         return -1;
     }
     if (!owner->start_count) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return -1;
     }
     long rc = owner_map_delete(&START, key);
@@ -275,7 +302,7 @@ __attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_k
     if (!owner)
         return -1;
     if (!start_key_valid(owner, key)) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_KEY_MISMATCH);
         return -1;
     }
     long rc = remove_start(ctl, owner, key);
@@ -353,7 +380,7 @@ static __always_inline void inspect_absent_discovery(struct owner_control *ctl,
 {
     struct thread_owner *owner = peek_absent_owner(ctl);
     if (owner && discovery_key_valid(owner, key) && directory_find(owner, key) >= 0)
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
 }
 
 __attribute__((noinline)) void *p11_owner_discovery_get(const struct owner_discovery_key *key, u32 required)
@@ -369,12 +396,12 @@ __attribute__((noinline)) void *p11_owner_discovery_get(const struct owner_disco
     if (!owner)
         return (void *)0;
     if (!discovery_key_valid(owner, key) || directory_find(owner, key) < 0) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         return (void *)0;
     }
     void *value = owner_map_lookup(&DISCOVERY_STATE, key);
     if (!value)
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
     return value;
 }
 
@@ -405,12 +432,12 @@ __attribute__((noinline)) long p11_owner_discovery_remove(const struct owner_dis
     if (!owner)
         return -1;
     if (!discovery_key_valid(owner, key)) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         return -1;
     }
     int index = directory_find(owner, key);
     if (index < 0) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         return -1;
     }
     long rc = remove_discovery(ctl, owner, key, (u32)index);
@@ -440,7 +467,7 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
             if (rc) {
                 count(&ctl->admission_failures);
                 if (rc == -2)
-                    poison(ctl, OWNER_BOOKKEEPING_FAILED);
+                    bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
             }
             return rc;
         }
@@ -450,7 +477,7 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
         return -17;
     }
     if (flags == 2) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         return -1;
     }
     for (u32 i = 0; i < 64; i++) {
@@ -468,7 +495,7 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
         count(&ctl->admission_failures);
         /* An unindexed numeric collision cannot authorize its deletion. */
         if (owner_map_lookup(&DISCOVERY_STATE, key))
-            poison(ctl, OWNER_BOOKKEEPING_FAILED);
+            bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         release_empty(ctl, owner);
         return rc;
     }
@@ -497,6 +524,11 @@ __attribute__((noinline)) void p11_owner_cleanup(void)
             poison(ctl, OWNER_CLASSIFIER_FAILED);
         return;
     }
+    /* An idle owner holds no lease, rows or directory cells: nothing to
+     * settle. Its storage stays with the task (exec) or is freed with it (exit). */
+    if (!owner->flags && !owner->original_pid_tgid && !owner->start_count &&
+        !owner->occupied && !owner->selection_domains)
+        return;
     if (!valid_owner(ctl, owner))
         return;
 #ifndef P11SCOPE_INVENTORY_ONLY
@@ -510,7 +542,7 @@ __attribute__((noinline)) void p11_owner_cleanup(void)
         }
     }
     if (owner->start_count) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return;
     }
 #endif

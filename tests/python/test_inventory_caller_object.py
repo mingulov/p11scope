@@ -26,6 +26,7 @@ checker = load_path(ROOT / "scripts/check-bpf-map-defs.py", "caller_map_checker"
 MAPS = {name: checker.map_def(*shape) for name, shape in {
     "CONFIG": (2, 4, 8, 2, 128), "PID_FILTER": (1, 4, 8, 1024, 128),
     "CGROUP_FILTER": (8, 4, 4, 1), "TAIL_CALLS": (3, 4, 4, 2),
+    "STACK_GUARD": (3, 4, 4, 1),
     "EVIDENCE": (6, 4, 8, 9), "COUNTERS": (6, 4, 8, 5),
     "DISCOVERY": (27, 0, 0, 65536), "DISCOVERY_STATE": (1, 24, 24, 64),
     "THREAD_OWNER": (29, 4, 544, 0, 1), "OWNER_CTL": (2, 4, 56, 1),
@@ -41,6 +42,7 @@ PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
 SYMBOLS = {"p11_owner_reserve", "p11_owner_refund", "p11_read_ia32_arg",
            "p11_link_current_identity"}
 MASK = (1 << 64) - 1
+STACK_GUARD_ID = 0x7F0000  # a map id outside every modelled map segment
 TAG = 0x50555347
 
 
@@ -207,6 +209,15 @@ class EntryMachine:
     def external_call(self, helper, target):
         r = self.integer
         result = 0
+        if not target and helper == 12:
+            # Only the kernel-stack opt-out: the never-populated STACK_GUARD
+            # (the usage entries load for uprobe-multi, so never TAIL_CALLS)
+            # with an index past every slot, which the kernel refuses without
+            # jumping. Any real slot would leave this entry, so it is refused.
+            require(self.regs[2] == STACK_GUARD_ID and r(3) & 0xFFFFFFFF == 0xFFFFFFFF,
+                    "entry tail call must be the out-of-range kernel-stack opt-out")
+            self.regs[:6] = [(-2) & MASK] + [None] * 5
+            return
         if target and target[0].endswith("10scope_auth"):
             require(not self.trace, "scope must be the first external entry operation")
             self.authorized = self.scope
@@ -280,7 +291,10 @@ class EntryMachine:
             relocation = self.relocations.get((symbol[3], symbol[4] + self.pc * 8))
             if op == 0x18:
                 require(next_pc < len(self.code) and self.code[next_pc][0] == 0, "malformed entry wide load")
-                if relocation:
+                if relocation and relocation[1][0] == "STACK_GUARD":
+                    require(relocation[0] == 1, "unknown entry map relocation")
+                    self.regs[dst] = STACK_GUARD_ID
+                elif relocation:
                     require(relocation[0] == 1 and relocation[1][0] in self.maps, "unknown entry map relocation")
                     self.regs[dst] = next(key for key, name in self.map_ids.items() if name == relocation[1][0])
                 else:

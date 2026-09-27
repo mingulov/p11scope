@@ -35,6 +35,12 @@ typedef unsigned long long u64;
 #define OWNER_REFUND_FAILED 32ULL
 #define OWNER_CLASSIFIER_FAILED 64ULL
 #define OWNER_STATE_DELETE_FAILED 128ULL
+/* Exactly which bookkeeping invariant failed; always set together with
+ * OWNER_BOOKKEEPING_FAILED so the family bit keeps its meaning. */
+#define OWNER_START_KEY_MISMATCH 256ULL
+#define OWNER_START_COUNT_MISMATCH 512ULL
+#define OWNER_START_ROW_MISSING 1024ULL
+#define OWNER_DIRECTORY_MISMATCH 2048ULL
 
 struct task_struct;
 struct thread_owner {
@@ -45,7 +51,11 @@ struct thread_owner {
     u32 start_count;
     u32 flags;
 };
-/* Loader publishes limit=OWNER_LIMIT, all other fields zero before links,
+/* A thread's owner task storage is created once and retained. flags ==
+ * OWNER_LEASED while it holds a lease (START rows or discovery state); flags
+ * == 0 with every other field zero while idle between calls. Only exec/exit
+ * cleanup removes rows, and the kernel frees the storage with the task.
+ * Loader publishes limit=OWNER_LIMIT, all other fields zero before links,
  * then freezes userspace mutation. Poison and debt are terminal, never reset. */
 struct owner_control {
     u64 limit;

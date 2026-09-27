@@ -96,7 +96,8 @@
             "owner_poison": {"type": "array", "uniqueItems": true, "items": {"enum": [
               "bad_control", "lookup_unknown", "bad_record", "delete_failed",
               "bookkeeping_failed", "refund_failed", "classifier_failed",
-              "state_delete_failed", "unknown"]}},
+              "state_delete_failed", "start_key_mismatch", "start_count_mismatch",
+              "start_row_missing", "directory_mismatch", "unknown"]}},
             "owner_admission_failures": {"type": "integer", "minimum": 0},
             "identity_unavailable": {"type": "integer", "minimum": 0},
             "identity_budget_exhausted": {"type": "boolean"},

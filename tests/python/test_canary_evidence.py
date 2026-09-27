@@ -2002,6 +2002,41 @@ class StoppedPopulationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "record population"):
             dumper.reconcile_task_storage(TaskStorageReaderTests.MAPS, [parsed[0]] * 131073, **arguments)
 
+    def test_idle_owner_storage_is_leaseless_and_roster_bound(self):
+        # The native owner keeps a thread's storage after its first call and
+        # clears it when the lease returns: 544 zero bytes, no lease. It may
+        # belong to any stopped in-process task that is not expected to hold
+        # a lease, and never counts toward OWNER_CTL outstanding.
+        idle = {"map_id": 102, "pid": 7001, "tid": 7001, "generation": 900,
+                "value": bytes(544)}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = self.fixture(root)
+            records.append(dict(idle))
+            self.publish_fixture(root, manifest, receipt, records, controls)
+            self.assertEqual(len(self.check(root, manifest)), 10)
+        for case in ("foreign", "expected-lease", "not-zero", "counted"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                row = dict(idle)
+                if case == "foreign":
+                    row["tid"] = 8888
+                elif case == "expected-lease":
+                    # A worker blocked mid-call must hold its lease, not idle.
+                    records[:] = [r for r in records if not (r["map_id"] == 102 and r["tid"] == 7002)]
+                    row.update(tid=7002, generation=901)
+                elif case == "not-zero":
+                    value = bytearray(544)
+                    struct.pack_into("<Q", value, 0, (7001 << 32) | 7001)
+                    row["value"] = bytes(value)
+                else:
+                    controls["OWNER_CTL"][1] = 3  # an idle owner holds no lease
+                records.append(row)
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                with self.assertRaisesRegex(AssertionError, "stopped"):
+                    self.check(root, manifest)
+
     def test_valid_eof_with_missing_or_wrong_identity_population_is_terminal(self):
         for case in ("empty", "missing-worker", "foreign-owner", "nonleader-cookie",
                      "unexpected-root", "owned-missing-root", "owned-foreign-root"):

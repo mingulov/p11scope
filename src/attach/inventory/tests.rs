@@ -3,7 +3,7 @@ use super::*;
 use crate::capacity::InventoryBudget;
 use p11scope_ebpf_common::{InventoryUsageConfig, ThreadOwnerControl};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
@@ -32,6 +32,15 @@ fn map_fixture(n: u32) -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)>
             4,
             4,
             2,
+            0,
+        ),
+        (
+            "STACK_GUARD",
+            K::ProgramArray,
+            MapType::ProgramArray,
+            4,
+            4,
+            1,
             0,
         ),
         ("EVIDENCE", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 9, 0),
@@ -345,6 +354,7 @@ fn preparation_steps(backend: AttachBackend) -> Vec<InventoryPreparation> {
         Freeze("THREAD_OWNER"),
         Freeze("OWNER_CTL"),
         Freeze("USAGE"),
+        Freeze("STACK_GUARD"),
         LoadProgram("dl_debug_state", UProbe),
         LoadProgram("function_list_entry", UProbe),
         LoadProgram("function_list_return", UProbe),
@@ -435,4 +445,48 @@ fn inventory_final_custody_refuses_stale_or_unknown_lifetimes() {
     assert!(require_inventory_custody_with(|| Ok(false)).is_err());
     let error = require_inventory_custody_with(|| Err(InjectedFailure(99).into())).unwrap_err();
     assert_eq!(error.downcast_ref::<InjectedFailure>().unwrap().0, 99);
+}
+
+/// The object checker keeps every program array to one expected attach type
+/// (CVE-2025-40123) from its MULTI_LOADED_PROGRAMS set. That set must be
+/// exactly the programs userspace may load for uprobe-multi, in both objects,
+/// or the checker proves the wrong split.
+#[test]
+fn object_checker_multi_loaded_programs_match_the_loaders() {
+    let checker = include_str!("../../../scripts/check-bpf-map-defs.py");
+    let start = checker
+        .find("MULTI_LOADED_PROGRAMS = frozenset({")
+        .expect("checker names its multi-loaded programs");
+    let body = &checker[start..];
+    let body = &body[body.find('{').unwrap() + 1..body.find("})").unwrap()];
+    let pinned: BTreeSet<&str> = body
+        .split(',')
+        .map(|name| name.trim().trim_matches('"'))
+        .filter(|name| !name.is_empty())
+        .collect();
+    let mut loaders = BTreeSet::new();
+    for unsafe_enabled in [false, true] {
+        for name in crate::attach::expected_programs(unsafe_enabled) {
+            let multi = crate::attach::loads_with_multi_flag(AttachBackend::Multi, name);
+            assert!(!crate::attach::loads_with_multi_flag(
+                AttachBackend::Singles,
+                name
+            ));
+            if multi {
+                loaders.insert(name);
+            }
+        }
+    }
+    for (name, _) in INVENTORY_PROGRAMS {
+        if inventory_program_load(name, AttachBackend::Multi).unwrap()
+            == InventoryProgramLoad::UProbeMulti
+        {
+            loaders.insert(name);
+        }
+        assert_ne!(
+            inventory_program_load(name, AttachBackend::Singles).unwrap(),
+            InventoryProgramLoad::UProbeMulti
+        );
+    }
+    assert_eq!(pinned, loaders);
 }

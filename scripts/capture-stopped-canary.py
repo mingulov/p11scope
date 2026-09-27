@@ -738,7 +738,9 @@ class Coordinator:
             final_bindings, starts = start_bindings(ordinary['START'], tasks, cfg, complete=True)
             require(bindings == final_bindings, 'START keys changed after readiness')
             owner_id = next(item['id'] for item in task_maps if item['name'] == 'THREAD_OWNER')
-            require(all(evidence.u32(record['value'], 536) == 1 for record in records if record['map_id'] == owner_id),
+            # Idle (all-zero) owners are retained storage without a lease.
+            require(all(evidence.u32(record['value'], 536) == 1 for record in records
+                        if record['map_id'] == owner_id and any(record['value'])),
                     'THREAD_OWNER start_count contradicts START worker keys')
             if cfg.workload_mode == 'blocked':
                 lines = [line.removeprefix('P11SCOPE_POINTERS ') for line in

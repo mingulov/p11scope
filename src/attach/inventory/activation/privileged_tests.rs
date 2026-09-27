@@ -165,17 +165,30 @@ impl OwnedFixture {
         let source = directory.path().join("owned.c");
         let path = directory.path().join("owned-provider");
         let mut c = String::from(
-            r#"#include <stdio.h>
+            r#"#define _GNU_SOURCE
+#include <stdio.h>
 #include <stdint.h>
 #include <limits.h>
 #include <unistd.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/syscall.h>
 static unsigned hold_id = UINT_MAX;
 static unsigned hold_action = 0;
 static char **exec_argv;
+/* Opt-in provider-like contention (HAMMER_SHARED only): every call takes one
+ * shared lock and spins inside the endpoint body, as a real provider's
+ * session/token lock does, so concurrent calls overlap and block. */
+static pthread_mutex_t contend_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile unsigned contend_spin;
 static void hold_in_body(unsigned id) {
+    unsigned spin = contend_spin;
+    if (spin) {
+        pthread_mutex_lock(&contend_lock);
+        for (volatile unsigned i = 0; i < spin; i++) {}
+        pthread_mutex_unlock(&contend_lock);
+    }
     if (hold_id != id) return;
     hold_id = UINT_MAX;
     printf("BODY %u\n", id);
@@ -247,6 +260,19 @@ static void *thread_call(void *data) {
     for (unsigned n = 0; n < work->calls; n++) work->sum += functions[work->id](n);
     return NULL;
 }
+/* One CK_RV (0) for every call: a distinct return value per call would
+ * exhaust RV_COUNTS rows by design, not by contention. The ledger counts
+ * completed calls. action=1 pins the worker to CPU 0 so preempted probe
+ * invocations share that CPU with other invocations of the same program. */
+static void *hammer_shared_call(void *data) {
+    struct thread_work *work = data;
+    if (work->action) {
+        cpu_set_t one; CPU_ZERO(&one); CPU_SET(0, &one);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(one), &one)) return NULL;
+    }
+    for (unsigned n = 0; n < work->calls; n++) work->sum += 1 + functions[0](0);
+    return NULL;
+}
 static void *hammer_call(void *data) {
     struct thread_work *work = data;
     for (unsigned n = 0; n < work->calls; n++) work->sum += functions[work->id](0);
@@ -302,6 +328,25 @@ int main(int argc, char **argv) {
             if (pthread_join(worker, NULL)) return 7;
             if (abandon) { hold_action = 0; printf("ABANDONED %u %u\n", id, work.tid); continue; }
             return 9;
+        }
+        if (!strcmp(command, "HAMMER_SHARED")) {
+            unsigned threads, percalls, spin, pin;
+            if (scanf("%u %u %u %u", &threads, &percalls, &spin, &pin) != 4 || threads < 1 || threads > 64 || percalls < 1 || percalls > 10000000 || spin > 100000 || pin > 1) return 2;
+            printf("HAMMER_SHARED_START %u %u %u %u\n", threads, percalls, spin, pin);
+            contend_spin = spin;
+            struct thread_work works[64]; pthread_t workers[64];
+            for (unsigned t = 0; t < threads; t++) {
+                works[t].id = 0; works[t].calls = percalls; works[t].sum = 0; works[t].tid = 0; works[t].action = pin;
+                if (pthread_create(&workers[t], NULL, hammer_shared_call, &works[t])) return 6;
+            }
+            unsigned long total = 0;
+            for (unsigned t = 0; t < threads; t++) {
+                if (pthread_join(workers[t], NULL)) return 7;
+                total += works[t].sum;
+            }
+            contend_spin = 0;
+            printf("HAMMER_SHARED_DONE %u %u %lu\n", threads, percalls, total);
+            continue;
         }
         if (!strcmp(command, "HAMMER")) {
             unsigned threads, percalls;
@@ -967,6 +1012,35 @@ impl OwnedCaller {
         Ok(())
     }
 
+    /// Every thread calls endpoint 0 (one slot, CK_RV 0) through the contended
+    /// body, optionally pinned to CPU 0; the independent ledger counts calls.
+    fn hammer_shared_calls(
+        &mut self,
+        threads: u32,
+        percalls: u32,
+        spin: u32,
+        pin: bool,
+    ) -> Result<()> {
+        let pin = u32::from(pin);
+        writeln!(
+            self.input,
+            "HAMMER_SHARED {threads} {percalls} {spin} {pin}"
+        )?;
+        self.input.flush()?;
+        ensure!(
+            self.line()? == format!("HAMMER_SHARED_START {threads} {percalls} {spin} {pin}"),
+            "shared hammer start receipt differs"
+        );
+        let total = u64::from(percalls) * u64::from(threads);
+        let ledger = self.line()?;
+        ensure!(
+            ledger == format!("HAMMER_SHARED_DONE {threads} {percalls} {total}"),
+            "independent shared hammer ledger differs: {ledger}"
+        );
+        eprintln!("OWNED_HAMMER_SHARED pid={} {ledger}", self.child.id());
+        Ok(())
+    }
+
     fn fanout_calls(&mut self, threads: u32, percalls: u32) -> Result<()> {
         self.start_fanout(threads, percalls)?;
         self.finish_fanout(threads, percalls)
@@ -1179,9 +1253,9 @@ impl OwnedIds {
             ids.programs.insert(id);
         }
         let expected_maps = if matches!(prepared.flavor, InventoryFlavor::Callers(_)) {
-            18
+            19
         } else {
-            13
+            14
         };
         ensure!(ids.maps.len() == expected_maps && ids.programs.len() == 12);
         Ok(ids)
@@ -6756,6 +6830,195 @@ fn privileged_detailed_multithread_owner_accounting_exact() -> Result<()> {
     Ok(())
 }
 
+/// The product shape of the live mt-exact failure: a provider-like contended
+/// body (one shared lock plus a spin, as SoftHSM's session lock), every thread
+/// on the SAME endpoint, and the Allowlisted policy `profile` uses (identity,
+/// semantic capture and CALL events, not the aggregate path). Owner leases,
+/// START pairing and counters must stay exact: no poison of any kind (the live
+/// run halted with `bookkeeping_failed`), no refused admission, every call
+/// completed and paired. Events are not drained, so only ring loss may occur.
+#[test]
+#[ignore = "root-owned BPF lane; one-slot contended multi-thread Allowlisted capture stays exact"]
+fn privileged_detailed_multithread_same_slot_allowlisted_exact() -> Result<()> {
+    let threads = std::thread::available_parallelism()
+        .map(|cpus| u32::try_from(cpus.get()).unwrap_or(64))
+        .unwrap_or(4)
+        .clamp(4, 32);
+    const PERCALLS: u32 = 100_000;
+    const SPIN: u32 = 200;
+    let fixture = OwnedFixture::build_n(false, 1)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    let mut session = crate::attach::Session::start(
+        &plan,
+        &Scope::Pid(caller.child.id()),
+        &fixture.pins,
+        crate::attach::CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        crate::attach::BackendSelection::Singles,
+    )?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2,
+        "shared-slot Detailed did not retain its paired static probe"
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    caller.go()?;
+    caller.hammer_shared_calls(threads, PERCALLS, SPIN, false)?;
+    let reports = crate::metrics::read(&session, &plan)?;
+    let kernel = crate::metrics::kernel_evidence(&session)?;
+    let calls: u64 = reports.iter().map(|report| report.calls).sum();
+    let in_flight: u64 = reports.iter().map(|report| report.in_flight).sum();
+    let rv_total: u64 = reports
+        .iter()
+        .flat_map(|report| report.rv_counts.values())
+        .sum();
+    let expected = u64::from(threads) * u64::from(PERCALLS);
+    eprintln!(
+        "MULTITHREAD_SAME_SLOT threads={threads} percalls={PERCALLS} spin={SPIN} expected={expected} \
+         calls={calls} in_flight={in_flight} rv_total={rv_total} control={:?} kernel={kernel:?}",
+        kernel.control.evidence()
+    );
+    ensure!(
+        kernel.control == crate::metrics::KernelControl::default(),
+        "native owner poisoned or refused under one-slot contended load: {:?}",
+        kernel.control.evidence()
+    );
+    // EVENTS is deliberately not drained here (a 4 MiB ring holds ~12.7k CALL
+    // events against 10^6 calls), so ring loss is expected and excluded: it
+    // is disclosed evidence, not a pairing or accounting failure. Every other
+    // kernel counter must be zero.
+    ensure!(
+        crate::metrics::KernelEvidence {
+            ring_loss: 0,
+            ..kernel
+        } == crate::metrics::KernelEvidence::default(),
+        "kernel evidence (ring loss excluded: undrained by design) reports loss under one-slot contended load: {kernel:?}"
+    );
+    ensure!(
+        calls == expected && in_flight == 0 && rv_total == calls,
+        "captured calls differ from the independent ledger"
+    );
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(
+        clean_detach,
+        "shared-slot Detailed detach retained failures"
+    );
+    Ok(())
+}
+
+/// Live 7.0 product halt `start_key_mismatch`: Linux 6.13+ runs a uprobe
+/// program with a >= 64-byte frame on a per-CPU private stack, but such
+/// programs are preemptible, so another task running the same program on the
+/// same CPU overwrites a preempted invocation's frame (a return probe then
+/// read another thread's START key). Pinning every worker to CPU 0 makes
+/// same-CPU preemption inside the probes routine. Every program must keep the
+/// task's kernel stack: no poison, no refused or mismatched pairing, exact
+/// counts. Events are not drained (ring loss excluded, as above).
+#[test]
+#[ignore = "root-owned BPF lane; same-CPU preempted probe invocations keep their own frames"]
+fn privileged_detailed_same_cpu_preemption_keeps_frames() -> Result<()> {
+    same_cpu_preemption_lane(crate::attach::BackendSelection::Singles, "singles")
+}
+
+/// The product's own backend choice (Auto: uprobe-multi from 6.9, singles
+/// below) under the same-CPU preemption lane. Under multi the static endpoint
+/// programs load with `expected_attach_type = BPF_TRACE_UPROBE_MULTI`, and
+/// since CVE-2025-40123 a program array accepts one expected attach type, so
+/// a kernel-stack opt-out shared with the plainly loaded programs makes the
+/// whole session fail to load. The session must load, pick the backend the
+/// kernel policy names (no silent fallback), and keep exact counts.
+#[test]
+#[ignore = "root-owned BPF lane; the Auto backend loads and keeps frames under same-CPU preemption"]
+fn privileged_detailed_auto_backend_same_cpu_preemption_keeps_frames() -> Result<()> {
+    same_cpu_preemption_lane(crate::attach::BackendSelection::Auto, "auto")
+}
+
+fn same_cpu_preemption_lane(selection: crate::attach::BackendSelection, label: &str) -> Result<()> {
+    const THREADS: u32 = 4;
+    const PERCALLS: u32 = 300_000;
+    let fixture = OwnedFixture::build_n(false, 1)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    let mut session = crate::attach::Session::start(
+        &plan,
+        &Scope::Pid(caller.child.id()),
+        &fixture.pins,
+        crate::attach::CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        selection,
+    )
+    .with_context(|| format!("same-CPU {label} Detailed session"))?;
+    let multi_expected = selection == crate::attach::BackendSelection::Auto
+        && crate::attach::kernel_supports_multi();
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2,
+        "same-CPU {label} Detailed did not retain its paired static probe"
+    );
+    ensure!(
+        session.static_multi_attached() == multi_expected,
+        "same-CPU {label} Detailed attached multi={} but the kernel policy names multi={multi_expected}",
+        session.static_multi_attached()
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    caller.go()?;
+    caller.hammer_shared_calls(THREADS, PERCALLS, 0, true)?;
+    let reports = crate::metrics::read(&session, &plan)?;
+    let kernel = crate::metrics::kernel_evidence(&session)?;
+    let calls: u64 = reports.iter().map(|report| report.calls).sum();
+    let in_flight: u64 = reports.iter().map(|report| report.in_flight).sum();
+    let rv_total: u64 = reports
+        .iter()
+        .flat_map(|report| report.rv_counts.values())
+        .sum();
+    let expected = u64::from(THREADS) * u64::from(PERCALLS);
+    eprintln!(
+        "SAME_CPU_PREEMPTION backend={label} multi={multi_expected} threads={THREADS} \
+         percalls={PERCALLS} expected={expected} calls={calls} in_flight={in_flight} \
+         rv_total={rv_total} control={:?} kernel={kernel:?}",
+        kernel.control.evidence()
+    );
+    ensure!(
+        kernel.control == crate::metrics::KernelControl::default(),
+        "same-CPU {label} preemption poisoned or refused the native owner: {:?}",
+        kernel.control.evidence()
+    );
+    ensure!(
+        crate::metrics::KernelEvidence {
+            ring_loss: 0,
+            ..kernel
+        } == crate::metrics::KernelEvidence::default(),
+        "same-CPU {label} preemption lost pairing (ring loss excluded: undrained by design): {kernel:?}"
+    );
+    ensure!(
+        calls == expected && in_flight == 0 && rv_total == calls,
+        "captured calls differ from the independent ledger"
+    );
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(
+        clean_detach,
+        "same-CPU {label} Detailed detach retained failures"
+    );
+    Ok(())
+}
+
 /// D1 disclosure end to end: a poisoned native owner (seeded before freeze)
 /// halts every probe at its scope gate, userspace reads OWNER_CTL, and the
 /// published evidence names the halt and is a concrete-gap PARTIAL, instead
@@ -7251,7 +7514,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             first_ids.maps.len(),
             first_ids.programs.len(),
             first_ids.links.len()
-        ) == (23, 13, 7)
+        ) == (24, 13, 7)
     );
     let first_witness = task4_session_witness(&first, &first_ids, 1, original.child.id())?;
     task4_record_registration(
@@ -7284,7 +7547,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             second_ids.maps.len(),
             second_ids.programs.len(),
             second_ids.links.len()
-        ) == (23, 13, 7)
+        ) == (24, 13, 7)
     );
     let second_witness = task4_session_witness(&second, &second_ids, 2, copy.child.id())?;
     ensure!(
@@ -7303,7 +7566,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
         "second_attached",
     )?;
     let ids = first_ids.union(&second_ids);
-    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (46, 26, 14));
+    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (48, 26, 14));
     task4_ids_phase("second_attached", &ids);
     task4_session_ids("second_attached", second_witness, &second_ids);
     task4_ids_receipt(&ids);

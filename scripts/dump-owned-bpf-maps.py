@@ -26,6 +26,16 @@ TASK_STORAGE_HEADER = struct.Struct("<8sIIIII")
 TASK_STORAGE_RECORD = 1
 TASK_STORAGE_EOF = 2
 TASK_STORAGE_NAMES = ("TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION")
+
+
+def idle_owner_value(raw):
+    """A retained THREAD_OWNER between calls: storage kept, lease returned.
+
+    The native owner keeps each thread's storage after its first call and
+    clears every field when it returns the lease, so an idle owner is exactly
+    544 zero bytes. It holds no lease, START row or directory cell.
+    """
+    return type(raw) is bytes and len(raw) == 544 and not any(raw)
 TASK_STORAGE_MAX_RECORDS = 131072
 TASK_STORAGE_MAX_BYTES = 64 * 1024 * 1024
 TASK_STORAGE_TIMEOUT_SECONDS = 8
@@ -827,6 +837,7 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
         raise RuntimeError("stopped map: missing or oversized record population")
     seen = {item["name"]: set() for item in ordered}
     bound = {item["name"]: [] for item in ordered}
+    idle = set()
     for record in records:
         if (not isinstance(record, dict)
                 or not snapshot_uint(record.get("map_id"), 32, positive=True)
@@ -845,15 +856,20 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
                 or record["generation"] != task["generation"]):
             raise RuntimeError(f"{context}: reused identity tid={record['tid']}")
         key = identity(task)
-        if key in seen[item["name"]]:
+        if key in seen[item["name"]] or key in idle:
             raise RuntimeError(f"{context}: duplicate identity tid={record['tid']}")
-        seen[item["name"]].add(key)
-        bound[item["name"]].append({k: task[k] for k in ("pid", "tid", "generation")})
         if type(record.get("value")) is not bytes or len(record["value"]) != item["bytes_value"]:
             raise RuntimeError(f"{context}: invalid value length")
+        if item["name"] == "THREAD_OWNER" and idle_owner_value(record["value"]):
+            # Retained idle storage of an in-process roster task: no lease,
+            # so it joins neither the leased population nor its binding.
+            idle.add(key)
+            continue
+        seen[item["name"]].add(key)
+        bound[item["name"]].append({k: task[k] for k in ("pid", "tid", "generation")})
     for name, flag in zip(TASK_STORAGE_NAMES, ("cookie", "owner", "root")):
         required = {identity(row) for row in roster.values() if row[flag]}
-        if seen[name] != required:
+        if seen[name] != required or (name == "THREAD_OWNER" and idle & required):
             item = next(item for item in ordered if item["name"] == name)
             raise RuntimeError(f"stopped map id={item['id']} name={name}: population identity mismatch")
 
@@ -893,6 +909,8 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
         item = by_id[record["map_id"]]
         name = item["name"]
         raw = record["value"]
+        if name == "THREAD_OWNER" and idle_owner_value(raw):
+            continue
         context = f"stopped map id={item['id']} name={name} tid={record['tid']}"
         if name == "TASK_COOKIE":
             ticket, = struct.unpack("<Q", raw)

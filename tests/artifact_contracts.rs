@@ -253,8 +253,20 @@ fn assert_discovery_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
     require_before(
         collision,
         "if (owner_map_lookup(&DISCOVERY_STATE, key))",
-        "poison(ctl, OWNER_BOOKKEEPING_FAILED);",
+        "bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);",
         "unindexed discovery collision poisoning",
+    )?;
+    // bookkeeping() is the one poison path for every bookkeeping failure: it
+    // always sets OWNER_BOOKKEEPING_FAILED, the named detail only adds to it.
+    let bookkeeping = contract_section(
+        owner,
+        "static __always_inline void bookkeeping(struct owner_control *ctl, u64 detail)",
+        "}",
+    )?;
+    require_contract_marker(
+        bookkeeping,
+        "poison(ctl, OWNER_BOOKKEEPING_FAILED | detail);",
+        "bookkeeping failures always poison the owner",
     )?;
     Ok(())
 }
@@ -403,6 +415,7 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
         "(\"ASYNC_FUNCTIONS\",map_metadata(MapType::Hash,32,4,128,BPF_F_RDONLY_PROG))",
         "(\"MECH_SHAPE\",map_metadata(MapType::Hash,8,4,p11scope_ebpf_common::MAX_MECH_SHAPES,BPF_F_RDONLY_PROG))",
         "(\"TAIL_CALLS\",map_metadata(MapType::ProgramArray,4,4,2,0))",
+        "(\"STACK_GUARD\",map_metadata(MapType::ProgramArray,4,4,1,0))",
     ] {
         if !compact.contains(expected) {
             return Err(format!("exact policy-map metadata missing {expected}"));
@@ -446,6 +459,14 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
         freeze,
         "if defers_freeze_until_loaded(name, &meta)",
         "deferred freeze for read-only arrays and TAIL_CALLS",
+    )?;
+    // STACK_GUARD is frozen with the other published maps, before any
+    // program loads, and only after its one slot reads back empty.
+    require_before(
+        freeze,
+        "require_empty_stack_guard(map)?;",
+        "freeze_map(name, map)?;",
+        "STACK_GUARD emptiness before its freeze",
     )?;
     // The rule itself, not the two names it happened to cover: freezing a
     // multi-entry BPF_F_RDONLY_PROG array before its readers load makes
@@ -1128,7 +1149,7 @@ fn assert_static_descriptor_cookie_contract(
             "RV_COUNTS in-place atomic add",
         ),
         (
-            ".insert(key, &1, aya_ebpf::bindings::BPF_NOEXIST as u64)",
+            ".insert(key, &one, aya_ebpf::bindings::BPF_NOEXIST as u64)",
             "RV_COUNTS create only with BPF_NOEXIST",
         ),
         (
@@ -1138,7 +1159,7 @@ fn assert_static_descriptor_cookie_contract(
     ] {
         require_contract_marker(rv_update, marker, contract)?;
     }
-    if rv_update.contains(".insert(key, &1, 0)") || rv_update.contains("RV_COUNTS.get(") {
+    if rv_update.contains(".insert(key, &one, 0)") || rv_update.contains("RV_COUNTS.get(") {
         return Err("RV_COUNTS must not be read and overwritten".into());
     }
     Ok(())
@@ -4575,9 +4596,9 @@ fn frozen_policy_inventory_matches_embedded_object() {
         (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
     };
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (24, 18)
+        (25, 18)
     } else {
-        (23, 13)
+        (24, 13)
     };
     let report = run_ok(
         "python3",
@@ -4706,8 +4727,8 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     );
 
     let overwrite = ebpf.replacen(
-        ".insert(key, &1, aya_ebpf::bindings::BPF_NOEXIST as u64)",
-        ".insert(key, &1, 0)",
+        ".insert(key, &one, aya_ebpf::bindings::BPF_NOEXIST as u64)",
+        ".insert(key, &one, 0)",
         1,
     );
     assert_ne!(
@@ -5250,7 +5271,7 @@ fn selection_transport_never_carries_name_bytes() {
     assert!(take.contains("owned_discovery_get(&key, false)"));
     assert!(take.contains("owned_discovery_remove(&key, state_present)"));
     let unindexed_collision = owner.replacen(
-        "            poison(ctl, OWNER_BOOKKEEPING_FAILED);\n        release_empty(ctl, owner);",
+        "            bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);\n        release_empty(ctl, owner);",
         "            count(&ctl->admission_failures);\n        release_empty(ctl, owner);",
         1,
     );
@@ -5261,6 +5282,16 @@ fn selection_transport_never_carries_name_bytes() {
     assert!(
         assert_discovery_owner_seam(&source, &unindexed_collision).is_err(),
         "an unindexed numeric collision must still poison the owner"
+    );
+    let detail_only = owner.replacen(
+        "poison(ctl, OWNER_BOOKKEEPING_FAILED | detail);",
+        "poison(ctl, detail);",
+        1,
+    );
+    assert_ne!(owner, detail_only, "bookkeeping mutation must apply");
+    assert!(
+        assert_discovery_owner_seam(&source, &detail_only).is_err(),
+        "a bookkeeping sub-reason must never replace OWNER_BOOKKEEPING_FAILED"
     );
     let indirect = between(
         &source,

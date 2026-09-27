@@ -47,7 +47,9 @@ gated() {
   waitfor $cell.wl READY 30 || { result $cell 0 "workload not ready"; kill $wl; return; }
   local args=("${@//@PID@/$wl}")
   "$P" "${args[@]}" > $cell.stdout 2> $cell.stderr & local pp=$!
-  waitfor $cell.stderr "attach slot" 120 || true; sleep 4; touch "$gate"
+  # The product prints one readiness line once probes are attached and the
+  # loop runs; only then may the ledgered calls start.
+  waitfor $cell.stderr "p11scope: capturing:" 180 || true; sleep 0.5; touch "$gate"
   waitfor $cell.wl LEDGER 60 || true; wait $pp; local rc=$?
   kill -TERM $wl 2>/dev/null; wait $wl 2>/dev/null
   echo $rc > $cell.rc
@@ -88,10 +90,11 @@ result run-short $([ $rc = 0 ] && [ -s run-short.json ] && echo 1 || echo 0) "rc
 SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --pause auto -o $OUT/run-cover.json -- "$FIX/gated" "$MODULE" 2000 300 - > run-cover.stdout 2> run-cover.stderr; rc=$?
 s=$(summ run-cover.json); result run-cover $([ $rc = 0 ] && [ -s run-cover.json ] && echo 1 || echo 0) "rc=$rc ledger=2000 x6 $s"
 # 7 multi-thread exactness (D1)
-asuser "$FIX/mt" "$MODULE" "$THREADS" 5 8 > mt.wl 2>&1 & wl=$!
-waitfor mt.wl READY 30; "$P" profile --pid $wl --duration 20 -o $OUT/mt.json > mt.stdout 2> mt.stderr; rc=$?; wait $wl
+rm -f mt.gate; asuser "$FIX/mt" "$MODULE" "$THREADS" 5 0 "$OUT/mt.gate" > mt.wl 2>&1 & wl=$!
+waitfor mt.wl READY 30; "$P" profile --pid $wl --duration 25 -o $OUT/mt.json > mt.stdout 2> mt.stderr & pp=$!
+waitfor mt.stderr "p11scope: capturing:" 180 || true; sleep 0.5; touch mt.gate; wait $pp; rc=$?; wait $wl
 tot=$(grep -ao 'TOTAL C_GenerateRandom=[0-9]*' mt.wl | cut -d= -f2); s=$(summ mt.json)
-cap=$(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); print(sum(r["calls"] for r in s.get("rows",[])))' "$s")
+cap=$(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); print(sum(r["calls"] for r in s.get("rows",[]) if "C_GenerateRandom" in (r.get("names") or [])))' "$s")
 inf=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("in_flight_at_end"))' "$s")
 result mt-exact $([ "$tot" = "$cap" ] && [ "$inf" = 0 ] && echo 1 || echo 0) "rc=$rc workload_total=$tot captured=$cap in_flight_at_end=$inf threads=$THREADS"
 # 8 system scope (GT-5)
@@ -100,7 +103,7 @@ hsm=$(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s
 result system $(python3 -c 'import json,sys; c=json.loads(sys.argv[1]); n=int(sys.argv[2]); print(1 if c.count(n)>=6 else 0)' "$hsm" $ITERS) "rc=$(cat system.rc) calls=$hsm modules=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("modules"))' "$s") $(grep -a 'module refused' system.stderr | head -2 | tr '\n' ' ')"
 # 9 SIGINT mid-capture
 asuser "$FIX/gated" "$MODULE" 100000000 1000 - > sig.wl 2>&1 & wl=$!; waitfor sig.wl READY 30
-"$P" profile --pid $wl --duration 120 -o $OUT/sigint.json > sig.stdout 2> sig.stderr & pp=$!; waitfor sig.stderr "attach slot" 60; sleep 3; kill -INT $pp; wait $pp; rc=$?; kill -TERM $wl; wait $wl 2>/dev/null
+"$P" profile --pid $wl --duration 120 -o $OUT/sigint.json > sig.stdout 2> sig.stderr & pp=$!; waitfor sig.stderr "p11scope: capturing:" 180; sleep 1; kill -INT $pp; wait $pp; rc=$?; kill -TERM $wl; wait $wl 2>/dev/null
 result sigint $([ $rc = 0 ] && python3 -c 'import json; json.load(open("sigint.json"))' 2>/dev/null && echo 1 || echo 0) "rc=$rc"
 # 10 -o FIFO must be refused and left intact (B RB-1); never uses /dev
 rm -f fifo; mkfifo fifo; asuser "$FIX/gated" "$MODULE" 100000000 1000 - > fifo.wl 2>&1 & wl=$!; waitfor fifo.wl READY 30

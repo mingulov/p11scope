@@ -3991,6 +3991,7 @@ fn capture_evidence_checker_self_test() {
         "canary safe exact allowances: OK",
         "canary unsafe exact allowances: OK",
         "canary aggregate exact baseline: OK",
+        "canary unsupported-table-version disclosure is exact: OK",
         "induced G1 exact allowances: OK",
         "induced G2 exact allowances: OK",
         "induced G3 exact allowances: OK",
@@ -3999,6 +4000,7 @@ fn capture_evidence_checker_self_test() {
         "induced G4 exact allowances: OK",
         "induced G5 exact allowances: OK",
         "induced G5 exact 11 calls and 9 RV failures: OK",
+        "induced G4/G5 require exactly the F-14 disclosure: OK",
         "induced lanes require disclosed ring_bytes/drain_interval_ms: OK",
         "unrelated evidence gap rejected: OK",
     ] {

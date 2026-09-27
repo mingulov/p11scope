@@ -5757,7 +5757,12 @@ fn privileged_task4_inventory_physical_identity_controls() -> Result<()> {
     for (slot, caller) in &mut callers {
         let object = fixture.plan.slots[*slot as usize].object.0;
         evidence.identity_caller(caller, "pre_go", *slot, object)?;
-        await_lifecycle(&mut active, caller.child.id(), DISCOVERY_KIND_EXEC)?;
+        // No EXEC lifecycle record is awaited here: these callers were
+        // spawned by Task4IdentityFixture::build, before the lifecycle
+        // tracepoints were attached, and an exec that predates attach is
+        // unobservable on every kernel. Their initial state comes from the
+        // scan and pins checked above; post-attach EXEC delivery is covered
+        // by the sibling lanes that spawn or exec after attach.
     }
     identity.check_views(1, &[&callers[0].1, &callers[1].1])?;
     for (slot, caller) in &mut callers {

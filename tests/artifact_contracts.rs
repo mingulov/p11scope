@@ -253,8 +253,20 @@ fn assert_discovery_owner_seam(ebpf: &str, owner: &str) -> Result<(), String> {
     require_before(
         collision,
         "if (owner_map_lookup(&DISCOVERY_STATE, key))",
-        "poison(ctl, OWNER_BOOKKEEPING_FAILED);",
+        "bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);",
         "unindexed discovery collision poisoning",
+    )?;
+    // bookkeeping() is the one poison path for every bookkeeping failure: it
+    // always sets OWNER_BOOKKEEPING_FAILED, the named detail only adds to it.
+    let bookkeeping = contract_section(
+        owner,
+        "static __always_inline void bookkeeping(struct owner_control *ctl, u64 detail)",
+        "}",
+    )?;
+    require_contract_marker(
+        bookkeeping,
+        "poison(ctl, OWNER_BOOKKEEPING_FAILED | detail);",
+        "bookkeeping failures always poison the owner",
     )?;
     Ok(())
 }
@@ -4567,9 +4579,9 @@ fn frozen_policy_inventory_matches_embedded_object() {
         (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
     };
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (24, 18)
+        (25, 18)
     } else {
-        (23, 13)
+        (24, 13)
     };
     let report = run_ok(
         "python3",
@@ -5242,7 +5254,7 @@ fn selection_transport_never_carries_name_bytes() {
     assert!(take.contains("owned_discovery_get(&key, false)"));
     assert!(take.contains("owned_discovery_remove(&key, state_present)"));
     let unindexed_collision = owner.replacen(
-        "            poison(ctl, OWNER_BOOKKEEPING_FAILED);\n        release_empty(ctl, owner);",
+        "            bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);\n        release_empty(ctl, owner);",
         "            count(&ctl->admission_failures);\n        release_empty(ctl, owner);",
         1,
     );
@@ -5253,6 +5265,16 @@ fn selection_transport_never_carries_name_bytes() {
     assert!(
         assert_discovery_owner_seam(&source, &unindexed_collision).is_err(),
         "an unindexed numeric collision must still poison the owner"
+    );
+    let detail_only = owner.replacen(
+        "poison(ctl, OWNER_BOOKKEEPING_FAILED | detail);",
+        "poison(ctl, detail);",
+        1,
+    );
+    assert_ne!(owner, detail_only, "bookkeeping mutation must apply");
+    assert!(
+        assert_discovery_owner_seam(&source, &detail_only).is_err(),
+        "a bookkeeping sub-reason must never replace OWNER_BOOKKEEPING_FAILED"
     );
     let indirect = between(
         &source,

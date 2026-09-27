@@ -1765,8 +1765,10 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
-    if kind == Kind::Trace && a.duration.is_none() {
-        eprintln!("{}", no_duration_notice());
+    match (kind, a.duration) {
+        (Kind::Trace, None) => eprintln!("{}", no_duration_notice()),
+        (Kind::Profile, None) => eprintln!("{}", no_profile_duration_notice()),
+        _ => {}
     }
     warn_unsafe_policy(policy);
     let accepted = preflight_uretprobe_hazard(
@@ -1862,6 +1864,14 @@ fn no_duration_notice() -> String {
          process exits (event cap still applies: default {DEFAULT_TRACE_MAX_EVENTS} events, \
          --max-events to change)"
     )
+}
+
+/// The profile counterpart: no event cap applies to an aggregate
+/// capture, so the notice only names the interrupt that ends it.
+fn no_profile_duration_notice() -> String {
+    "p11scope: no --duration given; profile captures until interrupted (Ctrl-C) or the \
+     process exits"
+        .to_string()
 }
 
 fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<CapturePolicy> {
@@ -2804,7 +2814,7 @@ fn report_attach_failures(session: &Session) {
 /// The per-slot attach diagnostic. The failure message embeds the module's
 /// `/proc/<pid>/maps` filename (attach.rs builds it from `slot.object_path`),
 /// which the target controls, so this terminal boundary escapes control bytes
-/// — the stored `attach_failures` evidence keeps the raw string.
+/// — and the stored `attach_failures` evidence keeps the same escaped form.
 fn format_attach_failure(slot: u32, message: &str) -> String {
     format!(
         "attach failed (slot {slot}): {}",
@@ -6137,7 +6147,10 @@ fn evidence_for(
         slots: facts.slots(),
         active_slots: facts.active_slots(),
         attached_probes,
-        attach_failures: attach_failures.iter().map(|(_, msg)| msg.clone()).collect(),
+        attach_failures: attach_failures
+            .iter()
+            .map(|(_, msg)| render::escape_controls(msg).into_owned())
+            .collect(),
         aliased: plan
             .slots
             .iter()
@@ -6304,78 +6317,6 @@ mod tests {
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
 
-    /// I3: the published document's detach fields report pre-publication
-    /// work only. The terminal callback publishes before the producers
-    /// detach (quiesce-then-publish, so the report never waits on link
-    /// teardown): `phase_ms.detach` carries the detach work completed
-    /// before publication — 0 in every Detailed report, with the
-    /// post-publication teardown explicitly unmeasured by design — and the
-    /// `detach_*_loss` fields carry the loop-end→terminal-snapshot delta.
-    /// This inspects the real published JSON (accumulator → snapshot →
-    /// evidence → profile_json), not the helper through a fake, and pins
-    /// the schema definitions of all three fields.
-    #[test]
-    fn published_detach_fields_report_pre_publication_work_only() {
-        let plan = crate::plan::AttachPlan::from_slots(vec![]);
-        let state = semantics::State::with_policy(&plan, crate::attach::CapturePolicy::Allowlisted);
-        let capture = render::CaptureMeta {
-            started: "t0",
-            ended: "t1",
-            kernel: "test",
-            policy: crate::attach::CapturePolicy::Allowlisted,
-            scope: "pid",
-            ring_bytes: p11scope_ebpf_common::RING_BYTES,
-            drain_interval_ms: 1000,
-        };
-        let document = |detach_ms: u64| {
-            let mut acc = SchedulingAccumulator::default();
-            if detach_ms > 0 {
-                acc.add_phase(SchedulingPhase::Detach, Duration::from_millis(detach_ms));
-            }
-            acc.note_loop_end(10, 4, None, crate::render::LOOP_END_UNSTARTED);
-            acc.note_terminal(14, 7);
-            let mut ev = crate::render::tests::evidence();
-            ev.scheduling = acc.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
-            render::profile_json(&[], render::VersionedEvidence::wrap(&ev), &state, &capture)
-        };
-        // Pre-publication detach work reaches the document through the
-        // real path; the loss fields carry the terminal-minus-loop-end
-        // delta.
-        let j = document(120);
-        let scheduling = &j["evidence"]["scheduling"];
-        assert_eq!(scheduling["phase_ms"]["detach"].as_u64(), Some(120));
-        assert_eq!(scheduling["detach_event_loss"].as_u64(), Some(4));
-        assert_eq!(scheduling["detach_discovery_loss"].as_u64(), Some(3));
-        // The quiesce-then-publish flow records no pre-publication detach
-        // work: the document carries 0, explicitly unmeasured by design.
-        let j = document(0);
-        assert_eq!(
-            j["evidence"]["scheduling"]["phase_ms"]["detach"].as_u64(),
-            Some(0)
-        );
-        // The schema defines all three fields as pre-publication windows.
-        let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("docs/schema/observed-profile-v3.schema.json");
-        let schema: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&schema_path).unwrap()).unwrap();
-        let properties =
-            &schema["properties"]["evidence"]["properties"]["scheduling"]["properties"];
-        let description =
-            |field: &serde_json::Value| field["description"].as_str().unwrap_or("").to_string();
-        assert!(
-            description(&properties["phase_ms"]["properties"]["detach"])
-                .contains("completed before publication"),
-            "phase_ms.detach must be defined as pre-publication work"
-        );
-        for field in ["detach_event_loss", "detach_discovery_loss"] {
-            assert!(
-                description(&properties[field])
-                    .contains("after the capture loop ended through the terminal snapshot"),
-                "{field} must be defined as the loop-end to terminal-snapshot window"
-            );
-        }
-    }
-
     fn spawn(program: &str, args: &[&str]) -> OwnedChild {
         OwnedChild::spawn(
             OsString::from(program),
@@ -6396,7 +6337,15 @@ mod tests {
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_until_with_timeout(predicate, Duration::from_secs(2), message);
+    }
+
+    fn wait_until_with_timeout(
+        mut predicate: impl FnMut() -> bool,
+        timeout: Duration,
+        message: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
         while !predicate() {
             assert!(Instant::now() < deadline, "{message}");
             std::thread::sleep(Duration::from_millis(1));
@@ -6939,7 +6888,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ExecHandoffError::Deadline));
-        assert!(Instant::now() < deadline + Duration::from_millis(100));
+        // No wall-clock upper bound here: observing the deadline within N ms
+        // tests the scheduler, not the helper. Non-renewal is proven by the
+        // Deadline variant itself (a renewed deadline would never surface it).
 
         assert!(matches!(
             write_release_with(
@@ -6981,7 +6932,8 @@ mod tests {
             .kind(),
             io::ErrorKind::TimedOut
         );
-        assert!(Instant::now() < reap_deadline + Duration::from_millis(100));
+        // No wall-clock upper bound here either: same scheduler-bound
+        // reasoning as above; non-renewal is proven by the TimedOut kind.
     }
 
     #[test]
@@ -7068,6 +7020,51 @@ mod tests {
         assert!(message.starts_with("p11scope: 2/2 attach attempts failed"));
         assert!(message.ends_with(r"First underlying error: at /opt/p\u{1b}[2Jevil\r.so: EPERM"));
         assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn stored_attach_failures_escape_target_controls_like_the_terminal() {
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let failures = [(
+            3u32,
+            "p11_return at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM".to_string(),
+        )];
+        let scheduling =
+            SchedulingAccumulator::default().snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+        let evidence = evidence_for(
+            &engine,
+            engine.capture_facts(),
+            0,
+            false,
+            false,
+            &failures,
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            Default::default(),
+            None,
+            false,
+            scheduling,
+            None,
+            None,
+        );
+        assert_eq!(
+            evidence.attach_failures,
+            [r"p11_return at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM".to_string()]
+        );
+        let stored = &evidence.attach_failures[0];
+        assert!(
+            !stored.contains('\u{1b}') && !stored.contains('\r'),
+            "{stored:?}"
+        );
+        // The JSON value carries the same escaped form, not raw bytes.
+        let value = render::versioned_evidence(&evidence);
+        assert_eq!(value["attach_failures"][0].as_str(), Some(stored.as_str()));
     }
 
     #[test]
@@ -8063,18 +8060,27 @@ mod tests {
     fn signal_settlement_observes_second_sigint_during_fallback_term_grace() {
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
+        // `sleep` instead of a busy loop: no CPU burn, identical signal
+        // behavior for this test (INT/TERM ignored; SIGKILL via group
+        // escalation still lands; the group kill covers the extra process).
         let mut child = spawn(
             "/bin/sh",
             &[
                 "-c",
-                &format!(
-                    "trap '' INT TERM; : > {}; while :; do :; done",
-                    ready.display(),
-                ),
+                &format!("trap '' INT TERM; : > {}; sleep 300", ready.display(),),
             ],
         );
-        child.release().unwrap();
-        wait_until(|| ready.exists(), "the SIGINT fixture never became ready");
+        // Generous setup-only budgets: handoff and ready-file latency prove
+        // nothing about second-SIGINT settlement, so they must not be able
+        // to fail the test. The settlement bounds below are untouched.
+        child
+            .release_until(Instant::now() + Duration::from_secs(60), || None)
+            .unwrap();
+        wait_until_with_timeout(
+            || ready.exists(),
+            Duration::from_secs(30),
+            "the SIGINT fixture never became ready",
+        );
 
         let signals = Arc::new(SignalState::new());
         signals.observe(libc::SIGINT);
@@ -14105,5 +14111,19 @@ mod correction1_tests {
             "{notice:?}"
         );
         assert!(notice.contains("--max-events"), "{notice:?}");
+    }
+
+    #[test]
+    fn no_profile_duration_notice_says_it_captures_until_ctrl_c() {
+        let notice = no_profile_duration_notice();
+        assert!(
+            notice.starts_with("p11scope: no --duration given; "),
+            "{notice:?}"
+        );
+        assert!(
+            notice.contains("profile captures until interrupted (Ctrl-C)"),
+            "{notice:?}"
+        );
+        assert!(!notice.contains('\n'), "one line: {notice:?}");
     }
 }

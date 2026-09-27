@@ -14,10 +14,11 @@ use p11scope_ebpf_common::{
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
     EVIDENCE_UNREGISTERED_MECHANISMS, ImageIdentityControl, LATENCY_BUCKETS, OWNER_BAD_CONTROL,
     OWNER_BAD_RECORD, OWNER_BOOKKEEPING_FAILED, OWNER_CLASSIFIER_FAILED, OWNER_DELETE_FAILED,
-    OWNER_LOOKUP_UNKNOWN, OWNER_REFUND_FAILED, OWNER_STATE_DELETE_FAILED, ROOT_BAD_CELL,
-    ROOT_BAD_CONTROL, ROOT_CAPACITY, ROOT_CREATE_FAILED, ROOT_EXISTING_CHILD, ROOT_EXIT_CLASSIFIER,
-    ROOT_EXIT_DELETE, ROOT_REFUND_FAILED, ROOT_RESERVE_CAS, RootAffiliationControl, RvKey,
-    SlotStats, ThreadOwnerControl,
+    OWNER_DIRECTORY_MISMATCH, OWNER_LOOKUP_UNKNOWN, OWNER_REFUND_FAILED,
+    OWNER_START_COUNT_MISMATCH, OWNER_START_KEY_MISMATCH, OWNER_START_ROW_MISSING,
+    OWNER_STATE_DELETE_FAILED, ROOT_BAD_CELL, ROOT_BAD_CONTROL, ROOT_CAPACITY, ROOT_CREATE_FAILED,
+    ROOT_EXISTING_CHILD, ROOT_EXIT_CLASSIFIER, ROOT_EXIT_DELETE, ROOT_REFUND_FAILED,
+    ROOT_RESERVE_CAS, RootAffiliationControl, RvKey, SlotStats, ThreadOwnerControl,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -171,7 +172,7 @@ pub struct KernelControl {
     pub root_failures: u64,
 }
 
-const OWNER_POISON_NAMES: [(u64, &str); 8] = [
+const OWNER_POISON_NAMES: [(u64, &str); 12] = [
     (OWNER_BAD_CONTROL, "bad_control"),
     (OWNER_LOOKUP_UNKNOWN, "lookup_unknown"),
     (OWNER_BAD_RECORD, "bad_record"),
@@ -180,6 +181,10 @@ const OWNER_POISON_NAMES: [(u64, &str); 8] = [
     (OWNER_REFUND_FAILED, "refund_failed"),
     (OWNER_CLASSIFIER_FAILED, "classifier_failed"),
     (OWNER_STATE_DELETE_FAILED, "state_delete_failed"),
+    (OWNER_START_KEY_MISMATCH, "start_key_mismatch"),
+    (OWNER_START_COUNT_MISMATCH, "start_count_mismatch"),
+    (OWNER_START_ROW_MISSING, "start_row_missing"),
+    (OWNER_DIRECTORY_MISMATCH, "directory_mismatch"),
 ];
 
 const ROOT_FAILURE_NAMES: [(u64, &str); 9] = [
@@ -478,6 +483,54 @@ mod tests {
         .evidence();
         budget.verdict();
         assert_eq!(budget.completeness, "COMPLETE");
+    }
+
+    #[test]
+    fn owner_poison_names_match_the_native_header_bits() {
+        // The published names are keyed by the native bits: every #define in
+        // task_owner.h must equal the Rust constant the name table uses.
+        let header = include_str!("../crates/ebpf/native/task_owner.h");
+        let native = |name: &str| -> u64 {
+            let line = header
+                .lines()
+                .find(|line| line.starts_with(&format!("#define {name} ")))
+                .unwrap_or_else(|| panic!("{name} missing from task_owner.h"));
+            line.split_whitespace()
+                .nth(2)
+                .unwrap()
+                .trim_end_matches("ULL")
+                .parse()
+                .unwrap()
+        };
+        for (name, bit) in [
+            ("OWNER_BAD_CONTROL", OWNER_BAD_CONTROL),
+            ("OWNER_LOOKUP_UNKNOWN", OWNER_LOOKUP_UNKNOWN),
+            ("OWNER_BAD_RECORD", OWNER_BAD_RECORD),
+            ("OWNER_DELETE_FAILED", OWNER_DELETE_FAILED),
+            ("OWNER_BOOKKEEPING_FAILED", OWNER_BOOKKEEPING_FAILED),
+            ("OWNER_REFUND_FAILED", OWNER_REFUND_FAILED),
+            ("OWNER_CLASSIFIER_FAILED", OWNER_CLASSIFIER_FAILED),
+            ("OWNER_STATE_DELETE_FAILED", OWNER_STATE_DELETE_FAILED),
+            ("OWNER_START_KEY_MISMATCH", OWNER_START_KEY_MISMATCH),
+            ("OWNER_START_COUNT_MISMATCH", OWNER_START_COUNT_MISMATCH),
+            ("OWNER_START_ROW_MISSING", OWNER_START_ROW_MISSING),
+            ("OWNER_DIRECTORY_MISMATCH", OWNER_DIRECTORY_MISMATCH),
+        ] {
+            assert_eq!(native(name), bit, "{name}");
+            assert!(
+                OWNER_POISON_NAMES.iter().any(|(named, _)| *named == bit),
+                "{name}"
+            );
+        }
+        // A bookkeeping poison names exactly which invariant failed.
+        let control = KernelControl {
+            owner_poison: OWNER_BOOKKEEPING_FAILED | OWNER_START_COUNT_MISMATCH,
+            ..KernelControl::default()
+        };
+        assert_eq!(
+            control.evidence().owner_poison,
+            ["bookkeeping_failed", "start_count_mismatch"]
+        );
     }
 
     #[test]

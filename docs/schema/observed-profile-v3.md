@@ -231,7 +231,10 @@ only:
   probe has refused capture since; nothing after that moment was counted.
 - `owner_poison`: sorted, unique reason names from `bad_control`,
   `lookup_unknown`, `bad_record`, `delete_failed`, `bookkeeping_failed`,
-  `refund_failed`, `classifier_failed`, `state_delete_failed`, `unknown`.
+  `refund_failed`, `classifier_failed`, `state_delete_failed`,
+  `start_key_mismatch`, `start_count_mismatch`, `start_row_missing`,
+  `directory_mismatch`, `unknown`. The last four name exactly which
+  bookkeeping invariant failed and always accompany `bookkeeping_failed`.
 - `owner_admission_failures` (u64): owner admissions refused (limit reached,
   invalid key, or collision).
 - `identity_unavailable` (u64): process identities the kernel could not

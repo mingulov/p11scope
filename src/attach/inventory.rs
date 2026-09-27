@@ -2,7 +2,7 @@
 //! Preparation-only capability for the dedicated compact Inventory object.
 use super::{
     AttachBackend, BPF_F_RDONLY_PROG, ExactMapMetadata, Scope, compare_map_metadata, freeze_map,
-    map_metadata, publish_and_freeze_tail_calls, read_map_metadata,
+    map_metadata, publish_and_freeze_tail_calls, read_map_metadata, require_empty_stack_guard,
 };
 use crate::capacity::{CallerBudget, InventoryBudget};
 use crate::events::DiscoveryDomain;
@@ -232,13 +232,14 @@ impl PreparedInventory {
                     callers::validate_caller_control(map.get(&0, 0)?)?;
                 }
                 InventoryPreparation::Freeze(name) => {
-                    freeze_map(
-                        name,
-                        state
-                            .ebpf()?
-                            .map(name)
-                            .with_context(|| format!("{name} map"))?,
-                    )?;
+                    let map = state
+                        .ebpf()?
+                        .map(name)
+                        .with_context(|| format!("{name} map"))?;
+                    if name == "STACK_GUARD" {
+                        require_empty_stack_guard(map)?;
+                    }
+                    freeze_map(name, map)?;
                 }
                 InventoryPreparation::LoadProgram(name, mode) => {
                     let program = state
@@ -403,6 +404,13 @@ fn inventory_maps(
             "TAIL_CALLS",
             K::ProgramArray,
             map_metadata(MapType::ProgramArray, 4, 4, 2, 0),
+        ),
+        // The usage entries' kernel-stack opt-out; never populated, frozen
+        // empty before any load (they load for uprobe-multi under multi).
+        (
+            "STACK_GUARD",
+            K::ProgramArray,
+            map_metadata(MapType::ProgramArray, 4, 4, 1, 0),
         ),
         (
             "EVIDENCE",
@@ -634,6 +642,7 @@ fn prepare_inventory_with_kind<T>(
         Freeze("THREAD_OWNER"),
         Freeze("OWNER_CTL"),
         Freeze("USAGE"),
+        Freeze("STACK_GUARD"),
     ];
     for step in initial {
         operation(&mut state, step).with_context(|| format!("preparing Inventory: {step:?}"))?;

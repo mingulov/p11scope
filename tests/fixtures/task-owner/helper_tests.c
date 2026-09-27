@@ -133,6 +133,12 @@ static long storage_delete(void *map, struct task_struct *task)
     installed[task->index] = 0;
     return 0;
 }
+/* Retained, unleased and empty: what a release now leaves behind. */
+static int idle(int i)
+{
+    return installed[i] && !owners[i].flags && !owners[i].original_pid_tgid &&
+        !owners[i].start_count && !owners[i].occupied && !owners[i].selection_domains;
+}
 static void reset(void)
 {
     memset(&ctl, 0, sizeof(ctl)); ctl.limit = OWNER_LIMIT;
@@ -298,6 +304,56 @@ static struct owner_discovery_key discovery_key(u64 cookie, u64 domain)
 {
     return (struct owner_discovery_key){pid_tgid(), cookie, domain};
 }
+/* Steady-state calls allocate nothing. Creating and deleting the 544-byte task
+ * storage owner on every call made the kernel allocate (and RCU-defer freeing)
+ * an element per call: under multi-threaded load the allocator runs dry and
+ * calls were refused. The owner storage is created once per thread and then
+ * retained idle (no lease) between calls; only exec/exit cleanup settles it. */
+static void idle_owner_retention(void)
+{
+    reset();
+    struct owner_discovery_key dkey = discovery_key(9, 1);
+    for (unsigned i = 0; i < 1000; i++) {
+#ifdef P11SCOPE_INVENTORY_ONLY
+        assert(!p11_owner_discovery_insert(&dkey, value, 1));
+        assert(!p11_owner_discovery_remove(&dkey, 1));
+#else
+        struct owner_start_key key = (struct owner_start_key){pid_tgid(), 7, 0};
+        assert(!p11_owner_start_insert(&key, value));
+        assert(!p11_owner_start_remove(&key, 1));
+        assert(!p11_owner_discovery_insert(&dkey, value, 1));
+        assert(!p11_owner_discovery_remove(&dkey, 1));
+#endif
+    }
+    fprintf(stderr, "1000 call cycles: creates=%d deletes=%d outstanding=%llu poison=%llu\n",
+            creates, deletes, ctl.outstanding, ctl.poison);
+    assert(creates == 1 && deletes == 0);
+    assert(!ctl.outstanding && !ctl.poison && !ctl.admission_failures);
+    /* Between calls the retained owner is idle: installed, unleased, empty. */
+    assert(installed[0] && !owners[0].flags && !owners[0].original_pid_tgid);
+    assert(!owners[0].start_count && !owners[0].occupied && !owners[0].selection_domains);
+    /* Allocation failure after the first call can no longer refuse a call. */
+    fail_create = 1;
+#ifndef P11SCOPE_INVENTORY_ONLY
+    struct owner_start_key key = (struct owner_start_key){pid_tgid(), 7, 0};
+    assert(!p11_owner_start_insert(&key, value));
+    assert(ctl.outstanding == 1 && owners[0].flags == OWNER_LEASED);
+    assert(!p11_owner_start_remove(&key, 1));
+#else
+    assert(!p11_owner_discovery_insert(&dkey, value, 1));
+    assert(!p11_owner_discovery_remove(&dkey, 1));
+#endif
+    assert(!ctl.outstanding && !ctl.admission_failures && !ctl.poison);
+    /* An idle owner is absence, not a record: no poison from peeks. */
+    fail_create = 0;
+    struct owner_discovery_key absent = discovery_key(10, 2);
+    assert(!p11_owner_discovery_get(&absent, 0));
+    assert(p11_owner_discovery_remove(&absent, 0) == -2);
+    assert(!ctl.poison);
+    /* An idle owner can never satisfy a required lookup (it holds no rows). */
+    assert(!p11_owner_discovery_get(&dkey, 1) && (ctl.poison & OWNER_LOOKUP_UNKNOWN));
+}
+
 static void classifier(void)
 {
     reset(); miss_get = 1; delete_error = -16;
@@ -342,23 +398,27 @@ static void transactions(void)
     assert(!row(&START, &key) && owners[0].start_count == 1);
     expected_delete_debt = 1;
     assert(!p11_owner_start_remove(&second, 1));
-    assert(!ctl.outstanding && !installed[0] && !ctl.poison);
+    assert(!ctl.outstanding && idle(0) && !ctl.poison && !deletes);
     reset(); fail_create = 1;
     assert(p11_owner_start_insert(&key, value));
     assert(!ctl.outstanding && !installed[0] && !ctl.poison);
     reset(); update_error = -12;
     assert(p11_owner_start_insert(&key, value));
-    assert(!ctl.outstanding && !installed[0] && !ctl.poison);
+    assert(!ctl.outstanding && idle(0) && !ctl.poison);
     reset(); assert(!p11_owner_start_insert(&key, value));
     pair_delete_error = -16;
     assert(p11_owner_start_remove(&key, 1));
     assert(ctl.poison && ctl.outstanding == 1 && owners[0].start_count == 1);
+    /* Release never deletes storage, so a storage delete error is irrelevant. */
     reset(); assert(!p11_owner_start_insert(&key, value));
-    delete_error = -16; expected_delete_debt = 1;
-    assert(p11_owner_start_remove(&key, 1));
-    assert(ctl.poison && ctl.outstanding == 1 && installed[0]);
-    delete_error = 0; p11_owner_cleanup();
-    assert(!ctl.outstanding && ctl.poison); /* Settlement never clears poison. */
+    delete_error = -16;
+    assert(!p11_owner_start_remove(&key, 1));
+    assert(!ctl.poison && !ctl.outstanding && idle(0) && !deletes);
+    /* Settlement after poison still returns the lease; poison stays terminal. */
+    reset(); assert(!p11_owner_start_insert(&key, value));
+    ctl.poison = OWNER_CLASSIFIER_FAILED; p11_owner_cleanup();
+    assert(!ctl.outstanding && ctl.poison == OWNER_CLASSIFIER_FAILED && idle(0));
+    assert(!row(&START, &key) && ctl.abandoned_start == 1);
     reset(); ctl.limit = 0;
     assert(!p11_owner_healthy() && p11_owner_start_insert(&key, value));
     assert(!creates && ctl.poison);
@@ -395,10 +455,10 @@ static void directory(void)
     assert(!p11_owner_discovery_remove(&a, 1)); assert(!ctl.outstanding && !ctl.poison);
     reset(); update_error = -12;
     assert(p11_owner_discovery_insert(&a, value, 1));
-    assert(!installed[0] && !ctl.outstanding && !ctl.poison);
+    assert(idle(0) && !ctl.outstanding && !ctl.poison);
     reset(); struct owner_discovery_key bad = discovery_key(0, 3);
     assert(p11_owner_discovery_insert(&bad, value, 1));
-    assert(!installed[0] && !ctl.outstanding);
+    assert(idle(0) && !ctl.outstanding);
     reset(); assert(!p11_owner_discovery_insert(&a, value, 1));
     pair_delete_error = -16;
     assert(p11_owner_discovery_remove(&a, 1));
@@ -565,9 +625,10 @@ static void ordinary_absence(void)
     assert(!pair_delete(&DISCOVERY_STATE, &live_discovery));
     assert(p11_owner_discovery_insert(&live_discovery, value, 2));
     assert(ctl.poison && ctl.outstanding == 1 && owners[0].occupied == 1);
+    /* A failed insert returns its lease; no storage delete can fail it. */
     reset(); update_error = -12; delete_error = -16;
     assert(p11_owner_discovery_insert(&live_discovery, value, 1));
-    assert(ctl.poison && ctl.outstanding == 1 && installed[0]);
+    assert(!ctl.poison && !ctl.outstanding && idle(0) && !deletes);
 }
 #endif
 #ifdef P11SCOPE_INVENTORY_ONLY
@@ -606,7 +667,7 @@ static void inventory_contract(void)
 }
 int main(void)
 {
-    cas_boundaries(); accounting_contention(); threaded_contention();
+    cas_boundaries(); accounting_contention(); threaded_contention(); idle_owner_retention();
     classifier(); inventory_contract(); directory(); discovery_foreign_owner();
     puts("task-owner inventory: real discovery capacity, transactions, poison and cleanup passed");
 }
@@ -625,9 +686,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "cas")) cas_boundaries();
         else if (!strcmp(argv[1], "contention")) accounting_contention();
         else if (!strcmp(argv[1], "threads")) threaded_contention();
+        else if (!strcmp(argv[1], "idle")) idle_owner_retention();
         else assert(0);
     } else {
-        cas_boundaries(); accounting_contention(); threaded_contention();
+        cas_boundaries(); accounting_contention(); threaded_contention(); idle_owner_retention();
         classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");

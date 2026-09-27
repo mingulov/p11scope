@@ -146,7 +146,9 @@ pub fn format_line(ev: &Event, wall_ns: u128, function: &str, session: Option<u6
     if let Some(n) = session {
         line.push_str(&format!(" sess#{n}"));
     }
-    line.push_str(&format!(" {function}"));
+    // The function label comes from the target's own tables, so this
+    // terminal boundary escapes controls the way inspect already does.
+    line.push_str(&format!(" {}", render::escape_controls(function)));
     if ev.capture & capture::MECHANISM_MASK == capture::MECHANISM_VALUE {
         line.push(' ');
         line.push_str(&render_mechanism(ev));
@@ -490,6 +492,17 @@ mod tests {
         let line = format_line(&ev, 0, "C_Sign", Some(3));
         assert!(line.contains("CKR_KEY_HANDLE_INVALID"), "line: {line}");
         assert!(!line.contains("CKR_OK"));
+    }
+
+    #[test]
+    fn target_controlled_function_name_controls_are_escaped_like_inspect() {
+        // Slot labels come from the target's own tables: a hostile name
+        // must not reach the terminal raw.
+        let ev = base_event();
+        let line = format_line(&ev, 0, "C_Sign\x1b[2J\n evil", None);
+        assert!(!line.contains('\x1b'), "raw escape: {line:?}");
+        assert!(!line.contains('\n'), "raw newline: {line:?}");
+        assert!(line.contains(r"C_Sign\u{1b}[2J\n evil"), "line: {line:?}");
     }
 
     #[test]

@@ -391,7 +391,11 @@ fn require_path(
     args: &mut impl Iterator<Item = OsString>,
     flag: &str,
 ) -> Result<PathBuf, CliError> {
-    require_os_value(args, flag).map(PathBuf::from)
+    let value = require_os_value(args, flag)?;
+    if value.is_empty() {
+        return Err(usage_err(format!("{flag} requires a non-empty value")));
+    }
+    Ok(PathBuf::from(value))
 }
 
 /// Flags and subcommands are matched as text; a non-UTF-8 word can never
@@ -402,8 +406,13 @@ fn word(arg: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
 
 fn require_pid(args: &mut impl Iterator<Item = OsString>) -> Result<u32, CliError> {
     let v = require_value(args, "--pid")?;
-    v.parse()
-        .map_err(|_| usage_err(format!("--pid: invalid number {v:?}")))
+    let pid: u32 = v
+        .parse()
+        .map_err(|_| usage_err(format!("--pid: invalid number {v:?}")))?;
+    if pid == 0 {
+        return Err(usage_err("--pid must be greater than zero"));
+    }
+    Ok(pid)
 }
 
 /// `--hook-symbol NAME[:abi]`, validated by the registry itself so the CLI has
@@ -466,6 +475,9 @@ struct Common {
     unsafe_requested: bool,
     allow_confined_uretprobe: bool,
     attach_backend: BackendSelection,
+    /// `--attach-backend` is scalar like the rest, but its type has no
+    /// unset state, so repeats are tracked separately.
+    attach_backend_seen: bool,
 }
 
 impl Common {
@@ -493,6 +505,9 @@ fn capture_option(
         "--manifest" => common.manifests.push(require_path(args, "--manifest")?),
         "--hook-symbol" => add_hook(&mut common.hooks, args)?,
         "--mode" => {
+            if common.metrics.is_some() {
+                return Err(usage_err("--mode given twice"));
+            }
             let v = require_value(args, "--mode")?;
             common.metrics = Some(match v.as_str() {
                 "profile" => false,
@@ -511,13 +526,21 @@ fn capture_option(
             });
         }
         "--duration" => {
+            if common.duration.is_some() {
+                return Err(usage_err("--duration given twice"));
+            }
             let v = require_value(args, "--duration")?;
-            common.duration = Some(
-                parse_duration(&v)
-                    .map_err(|e| usage_err(format!("--duration: invalid value {v:?}: {e}")))?,
-            );
+            let duration = parse_duration(&v)
+                .map_err(|e| usage_err(format!("--duration: invalid value {v:?}: {e}")))?;
+            if duration.is_zero() {
+                return Err(usage_err("--duration must be greater than zero"));
+            }
+            common.duration = Some(duration);
         }
         "--max-events" => {
+            if common.max_events.is_some() {
+                return Err(usage_err("--max-events given twice"));
+            }
             let v = require_value(args, "--max-events")?;
             let value = v
                 .parse::<u64>()
@@ -528,6 +551,9 @@ fn capture_option(
             common.max_events = Some(value);
         }
         "--max-scan-pids" => {
+            if common.max_scan_pids.is_some() {
+                return Err(usage_err("--max-scan-pids given twice"));
+            }
             let v = require_value(args, "--max-scan-pids")?;
             let value = v
                 .parse::<usize>()
@@ -538,6 +564,9 @@ fn capture_option(
             common.max_scan_pids = Some(value);
         }
         "--ring-bytes" => {
+            if common.ring_bytes.is_some() {
+                return Err(usage_err("--ring-bytes given twice"));
+            }
             let v = require_value(args, "--ring-bytes")?;
             common.ring_bytes = Some(
                 parse_ring_bytes(&v)
@@ -545,6 +574,9 @@ fn capture_option(
             );
         }
         "--drain-interval-ms" => {
+            if common.drain_interval.is_some() {
+                return Err(usage_err("--drain-interval-ms given twice"));
+            }
             let v = require_value(args, "--drain-interval-ms")?;
             let ms = v
                 .parse::<u64>()
@@ -555,11 +587,20 @@ fn capture_option(
             common.drain_interval = Some(Duration::from_millis(ms));
         }
         "--attach-backend" => {
+            if common.attach_backend_seen {
+                return Err(usage_err("--attach-backend given twice"));
+            }
             let v = require_value(args, "--attach-backend")?;
             common.attach_backend =
                 BackendSelection::from_cli(&v).map_err(|e| usage_err(format!("{e:#}")))?;
+            common.attach_backend_seen = true;
         }
-        "-o" => common.out = Some(require_path(args, "-o")?),
+        "-o" => {
+            if common.out.is_some() {
+                return Err(usage_err("-o given twice"));
+            }
+            common.out = Some(require_path(args, "-o")?);
+        }
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
         "--allow-uretprobe-on-confined-target" => common.allow_confined_uretprobe = true,
         _ => return Ok(false),
@@ -605,7 +646,12 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inspect)),
-            "--pid" => pid = Some(require_pid(&mut args)?),
+            "--pid" => {
+                if pid.is_some() {
+                    return Err(usage_err("--pid given twice"));
+                }
+                pid = Some(require_pid(&mut args)?);
+            }
             "--module" => modules.push(require_path(&mut args, "--module")?),
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
@@ -631,8 +677,18 @@ fn parse_doctor(mut args: impl Iterator<Item = OsString>) -> Result<DoctorArgs, 
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Doctor)),
-            "--pid" => doctor.pid = Some(require_pid(&mut args)?),
-            "--cgroup" => doctor.cgroup = Some(require_path(&mut args, "--cgroup")?),
+            "--pid" => {
+                if doctor.pid.is_some() {
+                    return Err(usage_err("--pid given twice"));
+                }
+                doctor.pid = Some(require_pid(&mut args)?);
+            }
+            "--cgroup" => {
+                if doctor.cgroup.is_some() {
+                    return Err(usage_err("--cgroup given twice"));
+                }
+                doctor.cgroup = Some(require_path(&mut args, "--cgroup")?);
+            }
             "--extra-strict" => doctor.extra_strict = true,
             "--module" => {
                 return Err(usage_err(
@@ -672,8 +728,18 @@ pub fn parse_capture(
         }
         match arg.as_ref() {
             "--help" | "-h" => return Err(CliError::Help(kind.help_topic())),
-            "--pid" => pid = Some(require_pid(&mut args)?),
-            "--cgroup" => cgroup = Some(require_path(&mut args, "--cgroup")?),
+            "--pid" => {
+                if pid.is_some() {
+                    return Err(usage_err("--pid given twice"));
+                }
+                pid = Some(require_pid(&mut args)?);
+            }
+            "--cgroup" => {
+                if cgroup.is_some() {
+                    return Err(usage_err("--cgroup given twice"));
+                }
+                cgroup = Some(require_path(&mut args, "--cgroup")?);
+            }
             "--system" => system = true,
             other => return Err(unknown_arg(other)),
         }
@@ -702,6 +768,7 @@ pub fn parse_capture(
     }
 
     let metrics = common.metrics_for(kind, "trace")?;
+    let out = resolve_dash_out(kind, "profile", common.out)?;
     Ok(CaptureArgs {
         kind,
         modules: common.modules,
@@ -710,7 +777,7 @@ pub fn parse_capture(
         scope,
         metrics,
         duration: common.duration,
-        out: common.out,
+        out,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -727,6 +794,7 @@ pub fn parse_capture(
 fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliError> {
     let mut common = Common::default();
     let mut pause = PausePolicy::Never;
+    let mut pause_seen = false;
     let mut kill_on_timeout = false;
     let mut trace = false;
     let mut command: Vec<OsString> = Vec::new();
@@ -740,7 +808,11 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Run)),
             "--trace" => trace = true,
             "--pause" => {
+                if pause_seen {
+                    return Err(usage_err("--pause given twice"));
+                }
                 let v = require_value(&mut args, "--pause")?;
+                pause_seen = true;
                 pause = match v.as_str() {
                     "never" => PausePolicy::Never,
                     "auto" => PausePolicy::Auto,
@@ -780,6 +852,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         ));
     }
     let metrics = common.metrics_for(kind, "run --trace")?;
+    let out = resolve_dash_out(kind, "run without --trace", common.out)?;
     Ok(RunArgs {
         kind,
         modules: common.modules,
@@ -787,7 +860,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         hooks: common.hooks,
         metrics,
         duration: common.duration,
-        out: common.out,
+        out,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -799,6 +872,28 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         kill_on_timeout,
         command,
     })
+}
+
+/// `-o -` is stdout where the mode already streams there (trace and
+/// `run --trace` print their lines to stdout when `-o` is omitted), and
+/// is refused for profile, whose report requires a file: stdout carries
+/// display frames only there. Either way no file literally named `-`
+/// is ever created.
+fn resolve_dash_out(
+    kind: Kind,
+    profile_subject: &str,
+    out: Option<PathBuf>,
+) -> Result<Option<PathBuf>, CliError> {
+    match out {
+        Some(path) if path.as_os_str() == std::ffi::OsStr::new("-") => match kind {
+            Kind::Trace => Ok(None),
+            Kind::Profile => Err(usage_err(format!(
+                "-o - writes to stdout, which {profile_subject} does not support for its report \
+                 (omit -o for display frames on stdout; the report requires a file)"
+            ))),
+        },
+        out => Ok(out),
+    }
 }
 
 /// Parses a duration given as bare seconds or with a single trailing
@@ -889,6 +984,205 @@ mod tests {
         assert_eq!(a.manifests.len(), 2);
         assert_eq!(a.hooks.abi("V_GetTable"), Some(HookAbi::Interface));
         assert_eq!(a.scope, ScopeArg::Pid(42));
+    }
+
+    #[test]
+    fn dash_output_is_stdout_for_trace_and_refused_for_profile() {
+        // Trace streams to stdout by default, so `-o -` is stdout.
+        let Command::Trace(t) = parse(args(&["trace", "--pid", "42", "-o", "-"])).unwrap() else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.out, None);
+        let Command::Run(r) =
+            parse(args(&["run", "--trace", "-o", "-", "--", "/bin/true"])).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(r.out, None);
+        // Profile's report requires a file; the refusal says how to get
+        // stdout output instead.
+        for argv in [
+            vec!["profile", "--pid", "42", "-o", "-"],
+            vec!["run", "-o", "-", "--", "/bin/true"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("-o -") && m.contains("omit -o")),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scalar_flag_given_twice_is_a_usage_error_naming_the_flag() {
+        for (argv, flag) in [
+            (
+                vec![
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--duration",
+                    "5",
+                    "--duration",
+                    "10",
+                ],
+                "--duration",
+            ),
+            (vec!["profile", "--pid", "42", "-o", "a", "-o", "b"], "-o"),
+            (vec!["profile", "--pid", "1", "--pid", "2"], "--pid"),
+            (
+                vec![
+                    "profile", "--pid", "42", "--mode", "profile", "--mode", "metrics",
+                ],
+                "--mode",
+            ),
+            (
+                vec![
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--ring-bytes",
+                    "1M",
+                    "--ring-bytes",
+                    "2M",
+                ],
+                "--ring-bytes",
+            ),
+            (
+                vec![
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--drain-interval-ms",
+                    "50",
+                    "--drain-interval-ms",
+                    "100",
+                ],
+                "--drain-interval-ms",
+            ),
+            (
+                vec![
+                    "trace",
+                    "--pid",
+                    "42",
+                    "--max-events",
+                    "1",
+                    "--max-events",
+                    "2",
+                ],
+                "--max-events",
+            ),
+            (
+                vec![
+                    "run",
+                    "--pause",
+                    "never",
+                    "--pause",
+                    "auto",
+                    "--",
+                    "/bin/true",
+                ],
+                "--pause",
+            ),
+            (
+                vec![
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--attach-backend",
+                    "auto",
+                    "--attach-backend",
+                    "multi",
+                ],
+                "--attach-backend",
+            ),
+            (
+                vec!["profile", "--cgroup", "/x", "--cgroup", "/y"],
+                "--cgroup",
+            ),
+            (
+                vec![
+                    "profile",
+                    "--pid",
+                    "42",
+                    "--max-scan-pids",
+                    "64",
+                    "--max-scan-pids",
+                    "128",
+                ],
+                "--max-scan-pids",
+            ),
+            (vec!["inspect", "--pid", "1", "--pid", "2"], "--pid"),
+            (vec!["doctor", "--pid", "1", "--pid", "2"], "--pid"),
+            (
+                vec!["doctor", "--cgroup", "/x", "--cgroup", "/y"],
+                "--cgroup",
+            ),
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains(&format!("{flag} given twice"))),
+                "{argv:?}"
+            );
+        }
+        // Repeatable flags stay repeatable.
+        let Command::Profile(a) = parse(args(&[
+            "profile",
+            "--pid",
+            "42",
+            "--module",
+            "/opt/a.so",
+            "--module",
+            "/opt/b.so",
+            "--manifest",
+            "m1.json",
+            "--manifest",
+            "m2.json",
+            "--hook-symbol",
+            "V_GetTable:interface",
+            "--hook-symbol",
+            "C_Sign:functionlist",
+        ]))
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.modules.len(), 2);
+        assert_eq!(a.manifests.len(), 2);
+    }
+
+    #[test]
+    fn empty_string_option_values_are_usage_errors() {
+        for argv in [
+            vec!["profile", "--pid", "42", "--module", ""],
+            vec!["profile", "--pid", "42", "--manifest", ""],
+            vec!["profile", "--cgroup", ""],
+            vec!["profile", "--pid", "42", "-o", ""],
+            vec!["run", "-o", "", "--", "/bin/true"],
+            vec!["inspect", "--pid", "42", "--module", ""],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("requires a non-empty value")),
+                "{argv:?}"
+            );
+        }
+        // `--hook-symbol` already refuses an empty name; pin the usage error.
+        assert!(matches!(
+            parse(args(&["profile", "--pid", "42", "--hook-symbol", ""])),
+            Err(CliError::Usage(m)) if m.contains("empty symbol name")
+        ));
+    }
+
+    #[test]
+    fn pid_zero_is_a_usage_error_not_a_late_runtime_failure() {
+        for argv in [
+            vec!["profile", "--pid", "0"],
+            vec!["trace", "--pid", "0"],
+            vec!["inspect", "--pid", "0"],
+            vec!["doctor", "--pid", "0"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("--pid must be greater than zero")),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]
@@ -1007,6 +1301,29 @@ mod tests {
         for bad in ["", "5x", "-1", "s", "1.5m"] {
             assert!(parse_duration(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn zero_duration_is_a_usage_error_on_every_capture_surface() {
+        for argv in [
+            vec!["profile", "--pid", "42", "--duration", "0"],
+            vec!["profile", "--pid", "42", "--duration", "0s"],
+            vec!["profile", "--pid", "42", "--duration", "0m"],
+            vec!["trace", "--pid", "42", "--duration", "0"],
+            vec!["run", "--duration", "0h", "--", "/bin/true"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("--duration must be greater than zero")),
+                "{argv:?}"
+            );
+        }
+        // Non-zero durations still parse.
+        let Command::Profile(a) =
+            parse(args(&["profile", "--pid", "42", "--duration", "30"])).unwrap()
+        else {
+            panic!("expected profile")
+        };
+        assert_eq!(a.duration, Some(Duration::from_secs(30)));
     }
 
     #[test]

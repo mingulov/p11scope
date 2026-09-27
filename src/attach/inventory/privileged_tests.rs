@@ -166,7 +166,9 @@ fn inspect_prepared(prepared: &PreparedInventory) -> Result<OwnedIds> {
     anyhow::ensure!(super::super::program_array_id("TAIL_CALLS", tails, 1)?.is_none());
     let mut ids = OwnedIds::default();
     ids.observe(&prepared.ebpf)?;
-    anyhow::ensure!(ids.maps.len() == 13 && ids.programs.len() == 12);
+    anyhow::ensure!(ids.maps.len() == 14 && ids.programs.len() == 12);
+    let guard = prepared.ebpf.map("STACK_GUARD").context("STACK_GUARD")?;
+    anyhow::ensure!(super::super::program_array_id("STACK_GUARD", guard, 0)?.is_none());
     ids.assert_no_links()?;
     eprintln!(
         "prepared {:?}, scope {}, N={}, IDs {ids:?}",
@@ -245,7 +247,7 @@ fn map_element<K, V>(
 
 #[test]
 #[ignore = "requires privileged BPF; verifies every frozen map with valid observer-owned inputs"]
-fn privileged_inventory_preparation_freezes_all_eight_protected_maps() -> Result<()> {
+fn privileged_inventory_preparation_freezes_all_nine_protected_maps() -> Result<()> {
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
     anyhow::ensure!(
         pidfd >= 0,
@@ -301,6 +303,7 @@ fn privileged_inventory_preparation_freezes_all_eight_protected_maps() -> Result
         "USAGE",
         "CONFIG",
         "TAIL_CALLS",
+        "STACK_GUARD",
     ] {
         let map = inventory_map_data(name, prepared.ebpf.map(name).context("protected map")?)?.1;
         let result = match name {
@@ -339,7 +342,9 @@ fn privileged_inventory_preparation_freezes_all_eight_protected_maps() -> Result
             ),
             "USAGE" => map_element(bpf_cmd::BPF_MAP_UPDATE_ELEM, map, &0u32, Some(&0u64)),
             "CONFIG" => map_element(bpf_cmd::BPF_MAP_UPDATE_ELEM, map, &0u32, Some(&0xc0u64)),
-            "TAIL_CALLS" => map_element(bpf_cmd::BPF_MAP_UPDATE_ELEM, map, &0u32, Some(&worker_fd)),
+            "TAIL_CALLS" | "STACK_GUARD" => {
+                map_element(bpf_cmd::BPF_MAP_UPDATE_ELEM, map, &0u32, Some(&worker_fd))
+            }
             _ => unreachable!(),
         };
         anyhow::ensure!(
@@ -412,7 +417,7 @@ fn privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_bin
     validate_runtime_inventory_programs(&prepared.ebpf)?;
     let mut ids = OwnedIds::default();
     ids.observe(&prepared.ebpf)?;
-    anyhow::ensure!(ids.maps.len() == 18 && ids.programs.len() == 12);
+    anyhow::ensure!(ids.maps.len() == 19 && ids.programs.len() == 12);
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
     anyhow::ensure!(
         pidfd >= 0,
@@ -516,7 +521,7 @@ fn privileged_inventory_caller_preparation_faults_release_exact_resources() -> R
             |state, step| {
                 ids.observe(state.ebpf()?)?;
                 if step == failed {
-                    anyhow::ensure!(ids.maps.len() == 18 && ids.programs.is_empty());
+                    anyhow::ensure!(ids.maps.len() == 19 && ids.programs.is_empty());
                     ids.assert_no_links()?;
                     eprintln!(
                         "I2C_CALLER_PREP_IDS phase=held step={failed:?} ids={ids:?} links={{}}"

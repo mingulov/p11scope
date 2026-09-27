@@ -845,6 +845,20 @@ mod tests {
     }
 
     #[test]
+    fn private_stream_file_is_private_from_creation_before_begin() {
+        let dir = private_tempdir();
+        let path = dir.path().join("trace.log");
+        // A newly created stream target must already be 0600 here, from
+        // the O_CREAT mode — never created permissive and chmod'ed after.
+        let stream = create_private_stream(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(stream.begin().unwrap());
+    }
+
+    #[test]
     fn private_stream_creates_0600_and_truncates_an_existing_file() {
         let dir = private_tempdir();
         let path = dir.path().join("trace.log");

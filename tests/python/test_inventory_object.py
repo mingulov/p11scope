@@ -20,6 +20,7 @@ checker = load_path(ROOT / "scripts/check-bpf-map-defs.py", "inventory_map_check
 MAPS = {name: checker.map_def(*shape) for name, shape in {
     "CONFIG": (2, 4, 8, 2, 128), "PID_FILTER": (1, 4, 8, 1024, 128),
     "CGROUP_FILTER": (8, 4, 4, 1), "TAIL_CALLS": (3, 4, 4, 2),
+    "STACK_GUARD": (3, 4, 4, 1),
     "EVIDENCE": (6, 4, 8, 9), "COUNTERS": (6, 4, 8, 5),
     "DISCOVERY": (27, 0, 0, 65536), "DISCOVERY_STATE": (1, 24, 24, 64),
     "THREAD_OWNER": (29, 4, 544, 0, 1), "OWNER_CTL": (2, 4, 56, 1),
@@ -55,6 +56,16 @@ class InventoryManifestTests(unittest.TestCase):
                 checker.validate_inventory("inventory", MAPS, PROGRAMS, SYMBOLS | {forbidden})
 
 @unittest.skipUnless(os.environ.get("P11SCOPE_INVENTORY_OBJECT"), "actual object supplied by Rust integration gate")
+def relocations(elf):
+    found = {}
+    for row, raw in elf.sections.values():
+        if row[1] == 9:
+            for offset in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, offset)
+                found[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    return found
+
+
 class ActualInventoryTests(unittest.TestCase):
     def test_actual_usage_scope_refusal_cannot_reach_marking(self):
         """Deleting, bypassing or reversing authorization must fail admission."""
@@ -68,8 +79,19 @@ class ActualInventoryTests(unittest.TestCase):
         section = elf.sections["uprobe"]
         for root in roots:
             start = section[0][4] + root[4]
-            prefix = [struct.unpack_from("<BBhi", body, start + i * 8)
-                      for i in range(6)]
+            # The exact kernel-stack opt-out (a tail call that never jumps)
+            # sits between saving the context and the authorization call. The
+            # usage entries load for uprobe-multi, so it goes through the
+            # never-populated STACK_GUARD, never TAIL_CALLS.
+            instructions = [struct.unpack_from("<BBhi", body, start + i * 8) for i in range(11)]
+            relocation_of = (lambda i: next((r for (sec, address), r in relocations(elf).items()
+                                            if sec == root[3] and address == root[4] + i * 8), None))
+            self.assertTrue(checker.kernel_stack_opt_out_at(
+                instructions, 1, relocation_of, arrays=("STACK_GUARD",)))
+            self.assertFalse(checker.kernel_stack_opt_out_at(
+                instructions, 1, relocation_of, arrays=("TAIL_CALLS",)))
+            start += 5 * 8
+            prefix = [instructions[0]] + instructions[6:11]
             # Hand-checked actual lowering: returned Option discriminator,
             # followed by the first conditional branch, before any USAGE work.
             self.assertEqual(prefix[3], (0x85, 0x10, 0, -1))

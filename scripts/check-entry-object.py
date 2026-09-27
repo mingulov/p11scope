@@ -996,9 +996,9 @@ def retained_contract(consumer, variant, selectors):
     # Return copies these scalars while START is owned, before removal. They
     # are retained values, never permission to reuse the removed map pointer.
     delta = int(variant == "unsafe")
-    sites = {1419+delta: (0x30, 1, 1), 1649+delta: (0x30, 1, 0),
-             1593+delta: (0x20, None, 1), 1658+delta: (0x20, None, 0),
-             1627+delta: (0x30, 12, 1), 1668+delta: (0x30, 12, 0)}
+    sites = {1447+delta: (0x30, 1, 1), 1668+delta: (0x30, 1, 0),
+             1612+delta: (0x20, None, 1), 1677+delta: (0x20, None, 0),
+             1646+delta: (0x30, 12, 1), 1687+delta: (0x30, 12, 0)}
     for selector in selectors:
         abi = int(selector == 0x23)
         for present in (False, True):

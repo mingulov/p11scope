@@ -63,7 +63,7 @@ use p11scope_ebpf_common::{
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
     EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_ATTRS,
-    TAIL_CALLS_TEMPLATE_SECOND_SLOT,
+    PAIR_CALLS_ENTRIES, PAIR_CALLS_SECOND_SLOT,
 };
 
 // Package G: the BPF slot universe and the native task-owner bound are one
@@ -124,6 +124,18 @@ static TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(TAIL_CALLS_ENTR
 #[map]
 static STACK_GUARD: ProgramArray = ProgramArray::with_max_entries(STACK_GUARD_ENTRIES, 0);
 
+/// The template-pair continuation: the pair program tail-calls slot 0 into
+/// `p11_entry_template_second`. The pair loads for uprobe-multi under the
+/// multi backend, so this array cannot be TAIL_CALLS (owned by the plainly
+/// loaded programs since CVE-2025-40123): it is feature-only, referenced only
+/// by the pair, and populated only with the continuation, which userspace
+/// loads with the same expected attach type as the pair in each backend.
+/// Userspace publishes the slot after the programs load, verifies the exact
+/// read-back, then freezes the array.
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[map]
+static PAIR_CALLS: ProgramArray = ProgramArray::with_max_entries(PAIR_CALLS_ENTRIES, 0);
+
 /// Keep this uprobe program on the task's own kernel stack.
 ///
 /// From Linux 6.13 the x86 JIT runs a KPROBE-type program whose frame is at
@@ -139,18 +151,19 @@ static STACK_GUARD: ProgramArray = ProgramArray::with_max_entries(STACK_GUARD_EN
 /// kernels without private stacks it is an equally harmless no-op.
 ///
 /// Programs that always load plainly use TAIL_CALLS
-/// ([`keep_kernel_stack`]); the static endpoint programs, which load for
-/// uprobe-multi under the multi backend, use the empty STACK_GUARD
-/// ([`keep_endpoint_stack`]), so each program array keeps one expected attach
-/// type.
+/// ([`keep_kernel_stack`]); the programs userspace may load for uprobe-multi
+/// under the multi backend (the static endpoints plus the template-second
+/// continuation, which loads with its caller's attach type) use the empty
+/// STACK_GUARD ([`keep_endpoint_stack`]), so each program array keeps one
+/// expected attach type.
 #[inline(always)]
 fn keep_kernel_stack<C: aya_ebpf::EbpfContext>(ctx: &C) {
     // SAFETY: an out-of-range index makes bpf_tail_call return immediately.
     let _ = unsafe { TAIL_CALLS.tail_call(ctx, TAIL_CALLS_NO_PRIVATE_STACK_INDEX) };
 }
 
-/// [`keep_kernel_stack`] for the static endpoint programs (the ones
-/// userspace may load with `expected_attach_type = BPF_TRACE_UPROBE_MULTI`).
+/// [`keep_kernel_stack`] for the programs userspace may load with
+/// `expected_attach_type = BPF_TRACE_UPROBE_MULTI`.
 #[inline(always)]
 fn keep_endpoint_stack<C: aya_ebpf::EbpfContext>(ctx: &C) {
     // SAFETY: STACK_GUARD is never populated and the index is out of range,
@@ -2419,7 +2432,12 @@ pub fn p11_entry_template_pair(ctx: ProbeContext) -> u32 {
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
-    keep_kernel_stack(&ctx);
+    // This continuation loads with its caller's expected attach type (multi
+    // under the multi backend), so its opt-out goes through STACK_GUARD, not
+    // TAIL_CALLS. The opt-out is still required: a tail-called program runs
+    // its own prologue in the same preemptible uprobe context, so without a
+    // tail call of its own it would take the shared per-CPU private stack.
+    keep_endpoint_stack(&ctx);
     // Carried admission: the pair program entered before the tail call and
     // did not leave, so this continuation must not re-check the gate. It
     // releases the carried admission on every exit instead.
@@ -2765,7 +2783,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     if TEMPLATE_MODE == 3 {
         // Success never returns. Failure leaves template0 as usable partial
         // evidence and is independently disclosed below.
-        unsafe { TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_TEMPLATE_SECOND_SLOT) };
+        unsafe { PAIR_CALLS.tail_call(&ctx, PAIR_CALLS_SECOND_SLOT) };
         bump_evidence(EVIDENCE_TEMPLATE_TAIL_FAILURES);
     }
     0

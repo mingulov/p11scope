@@ -325,7 +325,8 @@ class GateAnalysis:
             elif pc in consumer.helper and text in ("call 0x84", "call 0x85"):
                 self.capture_sites.add(pc)
             elif text == TAIL_CALL and pc in consumer.helper:
-                if state.get("r2") in (("map", "TAIL_CALLS"), ("map", "STACK_GUARD")):
+                if state.get("r2") in (("map", "TAIL_CALLS"), ("map", "STACK_GUARD"),
+                                       ("map", "PAIR_CALLS")):
                     self.tail_sites.add(pc)
             target = consumer.calls.get(pc, "")
             if target.startswith(NATIVE_CALL_PREFIX):

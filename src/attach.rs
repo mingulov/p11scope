@@ -22,8 +22,8 @@ use p11scope_ebpf_common::{
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
     EVIDENCE_ABI_REFUSALS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
-    IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl, MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey,
-    ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
+    IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl, MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
+    PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
     TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
     ThreadOwnerControl, attach_cookie,
 };
@@ -149,12 +149,22 @@ const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 8] = [
         map_metadata(MapType::ProgramArray, 4, 4, 1, 0),
     ),
 ];
-const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 1] = [(
-    "ATTR_BOOL_BITS",
-    map_metadata(MapType::Hash, 4, 4, 16, BPF_F_RDONLY_PROG),
-)];
+const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 2] = [
+    (
+        "ATTR_BOOL_BITS",
+        map_metadata(MapType::Hash, 4, 4, 16, BPF_F_RDONLY_PROG),
+    ),
+    // The pair-to-second continuation array. It is populated after the
+    // programs load, so it defers its freeze past publication; see
+    // `publish_and_freeze_tail_calls`.
+    (
+        "PAIR_CALLS",
+        map_metadata(MapType::ProgramArray, 4, 4, 1, 0),
+    ),
+];
 const TAIL_POLICY_MAP: &str = "TAIL_CALLS";
 const STACK_GUARD_MAP: &str = "STACK_GUARD";
+const PAIR_POLICY_MAP: &str = "PAIR_CALLS";
 const DEFAULT_PROGRAMS: [&str; 13] = [
     "p11_entry",
     "p11_return",
@@ -869,11 +879,22 @@ pub(crate) fn resolve_initial_backend(selection: BackendSelection) -> AttachBack
 
 /// The static endpoint twins (every program `static_probe_side` routes)
 /// load with `expected_attach_type=48` under multi so one program can own
-/// the group's return/entry links; everything else (dynamic, diagnostic,
-/// lifecycle, tail-call targets) loads plain under both backends.
+/// the group's return/entry links, and the template-second continuation loads
+/// with its caller's attach type (multi under multi, plain under singles):
+/// it is the tail-call target the pair installs into PAIR_CALLS, and since
+/// CVE-2025-40123 a program array accepts only programs with its owner's
+/// expected attach type. The continuation is never attached
+/// (`static_probe_side` stays `None` for it); everything else (dynamic,
+/// diagnostic, lifecycle, the other tail-call target) loads plain under both
+/// backends.
 pub(crate) fn loads_with_multi_flag(backend: AttachBackend, program: &str) -> bool {
-    backend == AttachBackend::Multi && static_probe_side(program).is_some()
+    backend == AttachBackend::Multi
+        && (static_probe_side(program).is_some() || program == MULTI_LOADED_TAIL_TARGET)
 }
+
+/// The one tail-call target that loads for uprobe-multi: never attached, only
+/// installed into PAIR_CALLS.
+const MULTI_LOADED_TAIL_TARGET: &str = "p11_entry_template_second";
 
 fn process_creation_capture_enabled(scope: &Scope, policy: CapturePolicy) -> bool {
     let _ = (scope, policy);
@@ -2289,10 +2310,12 @@ fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 /// and the defect reproduced on 6.8, 6.17 and 7.0 alike, so this is not a
 /// version-gated workaround. Freezing after the load avoids it, and
 /// every freeze still precedes attachment, so no probe can observe mutable
-/// policy. `TAIL_CALLS` is deferred for its own reason: it is populated with
-/// program fds that do not exist until the programs load.
+/// policy. `TAIL_CALLS` and `PAIR_CALLS` are deferred for their own reason:
+/// they are populated with program fds that do not exist until the programs
+/// load.
 fn defers_freeze_until_loaded(name: &str, meta: &ExactMapMetadata) -> bool {
     name == TAIL_POLICY_MAP
+        || name == PAIR_POLICY_MAP
         || (matches!(meta.map_type, MapType::Array)
             && meta.flags & BPF_F_RDONLY_PROG != 0
             && meta.max_entries != 1)
@@ -2309,7 +2332,10 @@ fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
         }
         freeze_map(name, map)?;
     }
-    for (name, _) in FEATURE_POLICY_MAPS {
+    for (name, meta) in FEATURE_POLICY_MAPS {
+        if defers_freeze_until_loaded(name, &meta) {
+            continue;
+        }
         if let Some(map) = ebpf.map(name) {
             freeze_map(name, map)?;
         }
@@ -2323,6 +2349,20 @@ pub(crate) fn require_empty_stack_guard(map: &Map) -> Result<()> {
     match program_array_id(STACK_GUARD_MAP, map, 0)? {
         None => Ok(()),
         Some(id) => bail!("{STACK_GUARD_MAP} must stay empty but slot 0 holds program {id}"),
+    }
+}
+
+/// PAIR_CALLS under a safe policy is never populated: its one slot must read
+/// back empty before the freeze, so the never-attached pair continuation
+/// cannot be armed later.
+fn require_empty_pair_calls(map: &Map) -> Result<()> {
+    match program_array_id(PAIR_POLICY_MAP, map, PAIR_CALLS_SECOND_SLOT)? {
+        None => Ok(()),
+        Some(id) => {
+            bail!(
+                "{PAIR_POLICY_MAP} must stay empty under a safe policy but slot holds program {id}"
+            )
+        }
     }
 }
 
@@ -2514,26 +2554,38 @@ fn activate_after_preparation_with<T>(
 fn publish_tail_calls_with<S>(
     state: &mut S,
     worker_id: u32,
-    second_id: Option<u32>,
     mut write: impl FnMut(&mut S, u32) -> Result<()>,
     mut read: impl FnMut(&mut S, u32) -> Result<Option<u32>>,
     freeze: impl FnOnce(&mut S) -> Result<()>,
 ) -> Result<()> {
     write(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;
-    if second_id.is_some() {
-        write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;
-    }
     let actual_worker = read(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;
     if actual_worker != Some(worker_id) {
         bail!(
             "TAIL_CALLS worker exact readback id {actual_worker:?} differs from loaded program {worker_id}"
         );
     }
-    let actual_second = read(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;
-    let expected_second = second_id;
-    if actual_second != expected_second {
+    let actual_retired = read(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;
+    if actual_retired.is_some() {
         bail!(
-            "TAIL_CALLS template-second exact readback id {actual_second:?} differs from expected {expected_second:?}"
+            "TAIL_CALLS retired template-second slot reads back {actual_retired:?}, must stay empty"
+        );
+    }
+    freeze(state)
+}
+
+fn publish_pair_calls_with<S>(
+    state: &mut S,
+    second_id: u32,
+    mut write: impl FnMut(&mut S, u32) -> Result<()>,
+    mut read: impl FnMut(&mut S, u32) -> Result<Option<u32>>,
+    freeze: impl FnOnce(&mut S) -> Result<()>,
+) -> Result<()> {
+    write(state, PAIR_CALLS_SECOND_SLOT)?;
+    let actual_second = read(state, PAIR_CALLS_SECOND_SLOT)?;
+    if actual_second != Some(second_id) {
+        bail!(
+            "PAIR_CALLS template-second exact readback id {actual_second:?} differs from loaded program {second_id}"
         );
     }
     freeze(state)
@@ -2547,28 +2599,13 @@ fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
             .try_into()?;
         (worker.fd()?.try_clone()?, worker.info()?.id())
     };
-    let second = if enabled {
-        let second: &UProbe = ebpf
-            .program("p11_entry_template_second")
-            .context("program p11_entry_template_second missing from object")?
-            .try_into()?;
-        Some((second.fd()?.try_clone()?, second.info()?.id()))
-    } else {
-        None
-    };
     publish_tail_calls_with(
         ebpf,
         worker_id,
-        second.as_ref().map(|(_, id)| *id),
         |ebpf, slot| {
-            let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT {
-                &worker_fd
-            } else {
-                &second.as_ref().expect("selected template-second program").0
-            };
             let mut tails: ProgramArray<_> =
                 ProgramArray::try_from(ebpf.map_mut(TAIL_POLICY_MAP).context("TAIL_CALLS map")?)?;
-            tails.set(slot, fd, 0)?;
+            tails.set(slot, &worker_fd, 0)?;
             Ok(())
         },
         |ebpf, slot| {
@@ -2578,6 +2615,42 @@ fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
         |ebpf| {
             let map = ebpf.map(TAIL_POLICY_MAP).context("TAIL_CALLS map")?;
             freeze_map(TAIL_POLICY_MAP, map)
+        },
+    )?;
+    if !enabled {
+        // The unsafe object under a safe policy still carries PAIR_CALLS:
+        // prove it empty and freeze it so the never-attached pair
+        // continuation cannot be armed later. Default and Inventory objects
+        // have no such map (validate_policy_maps proved it absent).
+        if let Some(map) = ebpf.map(PAIR_POLICY_MAP) {
+            require_empty_pair_calls(map)?;
+            freeze_map(PAIR_POLICY_MAP, map)?;
+        }
+        return Ok(());
+    }
+    let (second_fd, second_id) = {
+        let second: &UProbe = ebpf
+            .program("p11_entry_template_second")
+            .context("program p11_entry_template_second missing from object")?
+            .try_into()?;
+        (second.fd()?.try_clone()?, second.info()?.id())
+    };
+    publish_pair_calls_with(
+        ebpf,
+        second_id,
+        |ebpf, slot| {
+            let mut pairs: ProgramArray<_> =
+                ProgramArray::try_from(ebpf.map_mut(PAIR_POLICY_MAP).context("PAIR_CALLS map")?)?;
+            pairs.set(slot, &second_fd, 0)?;
+            Ok(())
+        },
+        |ebpf, slot| {
+            let map = ebpf.map(PAIR_POLICY_MAP).context("PAIR_CALLS map")?;
+            program_array_id(PAIR_POLICY_MAP, map, slot)
+        },
+        |ebpf| {
+            let map = ebpf.map(PAIR_POLICY_MAP).context("PAIR_CALLS map")?;
+            freeze_map(PAIR_POLICY_MAP, map)
         },
     )
 }
@@ -2881,7 +2954,7 @@ impl Session {
                 }
                 SessionPreparation::PublishTailCalls => {
                     publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)
-                        .context("publishing and freezing TAIL_CALLS")?;
+                        .context("publishing and freezing tail calls")?;
                 }
                 SessionPreparation::PrepareEventsDomain => {
                     let events_domain = events::EventsDomain::from_events(&ebpf)?;
@@ -4378,7 +4451,7 @@ mod tests {
     }
 
     #[test]
-    fn only_static_endpoint_twins_take_the_multi_load_flag() {
+    fn only_static_endpoint_twins_and_pair_continuation_take_the_multi_load_flag() {
         use super::AttachBackend;
         use super::loads_with_multi_flag;
         for program in [
@@ -4388,6 +4461,7 @@ mod tests {
             "p11_entry_template",
             "p11_entry_template_types",
             "p11_entry_template_pair",
+            "p11_entry_template_second",
         ] {
             assert!(
                 loads_with_multi_flag(AttachBackend::Multi, program),
@@ -4404,7 +4478,6 @@ mod tests {
             "sched_process_exec",
             "task_newtask",
             "interface_list_worker",
-            "p11_entry_template_second",
             "no_such_program",
         ] {
             assert!(
@@ -4429,6 +4502,9 @@ mod tests {
             assert_eq!(static_probe_side(program), Some(ProbeSide::Entry));
         }
         assert_eq!(static_probe_side("task_newtask"), None);
+        // The continuation loads with its caller's attach type but is never
+        // attached: it is only installed into PAIR_CALLS.
+        assert_eq!(static_probe_side("p11_entry_template_second"), None);
     }
 
     #[test]
@@ -5206,70 +5282,81 @@ mod tests {
 
     #[test]
     fn tail_contract_writes_reads_exact_ids_then_freezes() {
-        for second in [None, Some(902)] {
-            let mut seen = Vec::new();
-            publish_tail_calls_with(
-                &mut seen,
-                701,
-                second,
-                |seen, slot| {
-                    seen.push(TailOperation::Write(slot));
-                    Ok(())
-                },
-                |seen, slot| {
-                    seen.push(TailOperation::Read(slot));
-                    Ok(if slot == 0 { Some(701) } else { second })
-                },
-                |seen| {
-                    seen.push(TailOperation::Freeze);
-                    Ok(())
-                },
-            )
-            .unwrap();
-            let expected = if second.is_some() {
-                vec![
-                    TailOperation::Write(0),
-                    TailOperation::Write(1),
-                    TailOperation::Read(0),
-                    TailOperation::Read(1),
-                    TailOperation::Freeze,
-                ]
-            } else {
-                vec![
-                    TailOperation::Write(0),
-                    TailOperation::Read(0),
-                    TailOperation::Read(1),
-                    TailOperation::Freeze,
-                ]
-            };
-            assert_eq!(seen, expected);
-        }
+        let mut seen = Vec::new();
+        publish_tail_calls_with(
+            &mut seen,
+            701,
+            |seen, slot| {
+                seen.push(TailOperation::Write(slot));
+                Ok(())
+            },
+            |seen, slot| {
+                seen.push(TailOperation::Read(slot));
+                Ok(if slot == 0 { Some(701) } else { None })
+            },
+            |seen| {
+                seen.push(TailOperation::Freeze);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                TailOperation::Write(0),
+                TailOperation::Read(0),
+                TailOperation::Read(1),
+                TailOperation::Freeze,
+            ]
+        );
     }
 
     #[test]
-    fn tail_contract_rejects_absence_wrong_ids_and_unexpected_second_before_freeze() {
-        for (second, worker_read, second_read, message, reads) in [
-            (None, None, None, "worker", vec![0]),
-            (None, Some(700), None, "worker", vec![0]),
-            (None, Some(701), Some(902), "template-second", vec![0, 1]),
-            (Some(902), Some(701), None, "template-second", vec![0, 1]),
-            (
-                Some(902),
-                Some(701),
-                Some(903),
-                "template-second",
-                vec![0, 1],
-            ),
+    fn pair_contract_writes_reads_exact_id_then_freezes() {
+        let mut seen = Vec::new();
+        publish_pair_calls_with(
+            &mut seen,
+            902,
+            |seen, slot| {
+                seen.push(TailOperation::Write(slot));
+                Ok(())
+            },
+            |seen, slot| {
+                seen.push(TailOperation::Read(slot));
+                assert_eq!(slot, 0);
+                Ok(Some(902))
+            },
+            |seen| {
+                seen.push(TailOperation::Freeze);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                TailOperation::Write(0),
+                TailOperation::Read(0),
+                TailOperation::Freeze,
+            ]
+        );
+    }
+
+    #[test]
+    fn tail_contract_rejects_absence_wrong_ids_and_occupied_retired_slot_before_freeze() {
+        for (worker_read, retired_read, message, reads) in [
+            (None, None, "worker", vec![0]),
+            (Some(700), None, "worker", vec![0]),
+            (Some(701), Some(902), "retired", vec![0, 1]),
         ] {
             let mut seen = Vec::new();
             let error = publish_tail_calls_with(
                 &mut seen,
                 701,
-                second,
                 |_, _| Ok(()),
                 |seen, slot| {
                     seen.push(slot);
-                    Ok(if slot == 0 { worker_read } else { second_read })
+                    Ok(if slot == 0 { worker_read } else { retired_read })
                 },
                 |_| panic!("inexact readback must not freeze"),
             )
@@ -5280,13 +5367,32 @@ mod tests {
     }
 
     #[test]
-    fn tail_contract_distinguishes_empty_optional_slot_from_lookup_failure() {
+    fn pair_contract_rejects_absence_and_wrong_id_before_freeze() {
+        for (second_read, reads) in [(None, vec![0]), (Some(903), vec![0])] {
+            let mut seen = Vec::new();
+            let error = publish_pair_calls_with(
+                &mut seen,
+                902,
+                |_, _| Ok(()),
+                |seen, slot| {
+                    seen.push(slot);
+                    Ok(second_read)
+                },
+                |_| panic!("inexact readback must not freeze"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("template-second"), "{error}");
+            assert_eq!(seen, reads);
+        }
+    }
+
+    #[test]
+    fn tail_contract_distinguishes_empty_retired_slot_from_lookup_failure() {
         for errno in [libc::ENOENT, libc::EPERM, libc::EIO] {
             let mut frozen = false;
             let result = publish_tail_calls_with(
                 &mut frozen,
                 701,
-                None,
                 |_, _| Ok(()),
                 |_, slot| {
                     program_array_lookup_result(
@@ -5321,51 +5427,108 @@ mod tests {
     }
 
     #[test]
-    fn tail_contract_preserves_every_io_failure_and_stops() {
-        for second in [None, Some(902)] {
-            let expected = if second.is_some() {
-                vec![
-                    TailOperation::Write(0),
-                    TailOperation::Write(1),
-                    TailOperation::Read(0),
-                    TailOperation::Read(1),
-                    TailOperation::Freeze,
-                ]
-            } else {
-                vec![
-                    TailOperation::Write(0),
-                    TailOperation::Read(0),
-                    TailOperation::Read(1),
-                    TailOperation::Freeze,
-                ]
-            };
-            for fail in 0..expected.len() {
-                let mut seen = Vec::new();
-                let record = |seen: &mut Vec<TailOperation>, op| -> Result<()> {
-                    seen.push(op);
-                    if seen.len() == fail + 1 {
-                        bail!("injected tail I/O failure {fail}");
-                    }
+    fn pair_contract_distinguishes_missing_slot_from_lookup_failure() {
+        for errno in [libc::ENOENT, libc::EPERM, libc::EIO] {
+            let mut frozen = false;
+            let result = publish_pair_calls_with(
+                &mut frozen,
+                902,
+                |_, _| Ok(()),
+                |_, slot| {
+                    program_array_lookup_result(
+                        "PAIR_CALLS",
+                        slot,
+                        902,
+                        Err(io::Error::from_raw_os_error(errno)),
+                    )
+                },
+                |frozen| {
+                    *frozen = true;
                     Ok(())
-                };
-                let error = publish_tail_calls_with(
-                    &mut seen,
-                    701,
-                    second,
-                    |seen, slot| record(seen, TailOperation::Write(slot)),
-                    |seen, slot| {
-                        record(seen, TailOperation::Read(slot))?;
-                        Ok(if slot == 0 { Some(701) } else { second })
-                    },
-                    |seen| record(seen, TailOperation::Freeze),
-                )
-                .unwrap_err();
-                assert_eq!(seen, expected[..=fail]);
+                },
+            );
+            let error = result.unwrap_err();
+            assert!(!frozen);
+            if errno == libc::ENOENT {
+                assert!(error.to_string().contains("template-second"), "{error}");
+            } else {
                 assert_eq!(
-                    error.to_string(),
-                    format!("injected tail I/O failure {fail}")
+                    error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                    Some(errno)
                 );
+                assert_eq!(error.to_string(), "reading back PAIR_CALLS[0]");
             }
+        }
+    }
+
+    #[test]
+    fn tail_contract_preserves_every_io_failure_and_stops() {
+        let expected = [
+            TailOperation::Write(0),
+            TailOperation::Read(0),
+            TailOperation::Read(1),
+            TailOperation::Freeze,
+        ];
+        for fail in 0..expected.len() {
+            let mut seen = Vec::new();
+            let record = |seen: &mut Vec<TailOperation>, op| -> Result<()> {
+                seen.push(op);
+                if seen.len() == fail + 1 {
+                    bail!("injected tail I/O failure {fail}");
+                }
+                Ok(())
+            };
+            let error = publish_tail_calls_with(
+                &mut seen,
+                701,
+                |seen, slot| record(seen, TailOperation::Write(slot)),
+                |seen, slot| {
+                    record(seen, TailOperation::Read(slot))?;
+                    Ok(if slot == 0 { Some(701) } else { None })
+                },
+                |seen| record(seen, TailOperation::Freeze),
+            )
+            .unwrap_err();
+            assert_eq!(seen, expected[..=fail]);
+            assert_eq!(
+                error.to_string(),
+                format!("injected tail I/O failure {fail}")
+            );
+        }
+    }
+
+    #[test]
+    fn pair_contract_preserves_every_io_failure_and_stops() {
+        let expected = [
+            TailOperation::Write(0),
+            TailOperation::Read(0),
+            TailOperation::Freeze,
+        ];
+        for fail in 0..expected.len() {
+            let mut seen = Vec::new();
+            let record = |seen: &mut Vec<TailOperation>, op| -> Result<()> {
+                seen.push(op);
+                if seen.len() == fail + 1 {
+                    bail!("injected pair I/O failure {fail}");
+                }
+                Ok(())
+            };
+            let error = publish_pair_calls_with(
+                &mut seen,
+                902,
+                |seen, slot| record(seen, TailOperation::Write(slot)),
+                |seen, slot| {
+                    record(seen, TailOperation::Read(slot))?;
+                    Ok(Some(902))
+                },
+                |seen| record(seen, TailOperation::Freeze),
+            )
+            .unwrap_err();
+            assert_eq!(seen, expected[..=fail]);
+            assert_eq!(
+                error.to_string(),
+                format!("injected pair I/O failure {fail}")
+            );
         }
     }
 
@@ -5588,6 +5751,14 @@ mod tests {
             .map(|(name, _)| *name)
             .collect();
         assert_eq!(deferred, ["CONFIG", "DESCRIPTORS", TAIL_POLICY_MAP]);
+        // PAIR_CALLS is the only feature map populated after the load, so it
+        // is the only one that defers its freeze past publication.
+        let deferred_feature: Vec<&str> = FEATURE_POLICY_MAPS
+            .iter()
+            .filter(|(name, meta)| defers_freeze_until_loaded(name, meta))
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(deferred_feature, [PAIR_POLICY_MAP]);
     }
 
     #[test]
@@ -7406,9 +7577,10 @@ mod tests {
         );
         assert_eq!(
             FEATURE_POLICY_MAPS.map(|(name, _)| name),
-            ["ATTR_BOOL_BITS"]
+            ["ATTR_BOOL_BITS", "PAIR_CALLS"]
         );
         assert_eq!(TAIL_POLICY_MAP, "TAIL_CALLS");
+        assert_eq!(PAIR_POLICY_MAP, "PAIR_CALLS");
     }
 
     #[test]

@@ -204,7 +204,9 @@ class MapDefsTests(unittest.TestCase):
         per-CPU private stack); an opt-out index must never select a slot.
         Each program array keeps one expected attach type (CVE-2025-40123):
         multi-loaded programs opt out through STACK_GUARD, every other
-        program through TAIL_CALLS, and nothing else references either."""
+        program through TAIL_CALLS, the multi-loaded pair continues through
+        its own PAIR_CALLS into the multi-loaded second, TAIL_CALLS slot 1
+        is retired, and nothing else references any of them."""
         source = Path(self.temp.name) / "kernel-stack.c"
         obj = Path(self.temp.name) / "kernel-stack.o"
         source.write_text(
@@ -213,6 +215,8 @@ class MapDefsTests(unittest.TestCase):
             'int (*value_size)[4]; } TAIL_CALLS SEC(".maps");\n'
             'struct { int (*type)[3]; int (*max_entries)[1]; int (*key_size)[4]; '
             'int (*value_size)[4]; } STACK_GUARD SEC(".maps");\n'
+            'struct { int (*type)[3]; int (*max_entries)[1]; int (*key_size)[4]; '
+            'int (*value_size)[4]; } PAIR_CALLS SEC(".maps");\n'
             'static long (*tail)(void *, void *, unsigned) = (void *)12;\n'
             '#ifndef ARRAY\n#define ARRAY TAIL_CALLS\n#endif\n'
             '#ifndef NAME\n#define NAME big\n#endif\n'
@@ -237,8 +241,11 @@ class MapDefsTests(unittest.TestCase):
         self.assertEqual(classify("-DINDEX=0xffffffffU"),
                          {"big": {"opt_out": 1, "continuation": 0, "arrays": ["TAIL_CALLS"]},
                           "tiny": {"opt_out": 0, "continuation": 0, "arrays": []}})
-        self.assertEqual(classify("-DINDEX=1")["big"],
+        self.assertEqual(classify("-DINDEX=0")["big"],
                          {"opt_out": 0, "continuation": 1, "arrays": ["TAIL_CALLS"]})
+        # TAIL_CALLS slot 1 is retired: the pair continuation moved to PAIR_CALLS.
+        with self.assertRaisesRegex(RuntimeError, "not a known slot or the opt-out"):
+            classify("-DINDEX=1")
         with self.assertRaisesRegex(RuntimeError, "not a known slot or the opt-out"):
             classify("-DINDEX=7")
         # A multi-loaded program opts out through STACK_GUARD only.
@@ -254,10 +261,25 @@ class MapDefsTests(unittest.TestCase):
         # A shared subprogram would hide which program owns the reference.
         with self.assertRaisesRegex(RuntimeError, "outside a uprobe program body"):
             classify("-DSUBPROGRAM")
-        # The one named pre-existing exception keeps its real continuation.
-        self.assertEqual(classify("-DINDEX=1", "-DNAME=p11_entry_template_pair")
-                         ["p11_entry_template_pair"],
-                         {"opt_out": 0, "continuation": 1, "arrays": ["TAIL_CALLS"]})
+        # The multi-loaded pair continues only through its own PAIR_CALLS: a
+        # TAIL_CALLS reference would share the array with the plainly loaded
+        # programs and fail to load for multi (CVE-2025-40123).
+        self.assertEqual(classify("-DINDEX=0", "-DNAME=p11_entry_template_pair",
+                                  "-DARRAY=PAIR_CALLS")["p11_entry_template_pair"],
+                         {"opt_out": 0, "continuation": 1, "arrays": ["PAIR_CALLS"]})
+        with self.assertRaisesRegex(
+                RuntimeError, "p11_entry_template_pair: references \\['TAIL_CALLS'\\]"):
+            classify("-DINDEX=0xffffffffU", "-DNAME=p11_entry_template_pair")
+        with self.assertRaisesRegex(RuntimeError, "not a known slot or the opt-out"):
+            classify("-DINDEX=1", "-DNAME=p11_entry_template_pair")
+        # The continuation loads with the same attach type as its caller, so
+        # it opts out through STACK_GUARD like every multi-loaded program.
+        self.assertEqual(classify("-DINDEX=0xffffffffU", "-DNAME=p11_entry_template_second",
+                                  "-DARRAY=STACK_GUARD")["p11_entry_template_second"],
+                         {"opt_out": 1, "continuation": 0, "arrays": ["STACK_GUARD"]})
+        with self.assertRaisesRegex(
+                RuntimeError, "p11_entry_template_second: references \\['TAIL_CALLS'\\]"):
+            classify("-DINDEX=0xffffffffU", "-DNAME=p11_entry_template_second")
 
     def test_owner_linkage(self):
         obj = Path(self.temp.name) / "owner-linkage.o"

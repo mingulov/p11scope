@@ -10178,7 +10178,9 @@ fn aggregate_policy_returns_before_both_events_reserves() {
 // its exact SPDX header line:
 //
 // - Rust: `//! SPDX-License-Identifier: GPL-3.0-or-later` first line, except
-//   `crates/ebpf/src/main.rs` which carries `GPL-2.0-only`.
+//   `crates/ebpf/src/main.rs` which carries `GPL-2.0-only` and
+//   `crates/ebpf-common/src/` which carries `GPL-2.0-or-later` (it is compiled
+//   into both the GPL-2.0-only BPF object and the GPL-3.0-or-later observer).
 // - Python/Shell: `# SPDX-License-Identifier: GPL-3.0-or-later` after the
 //   shebang, else first line.
 // - Markdown: `<!-- SPDX-License-Identifier: GPL-3.0-or-later -->` first line.
@@ -10254,7 +10256,7 @@ const LICENSE_LEGACY_MARKERS: &[&str] = &[
 const LICENSE_MANIFESTS: &[(&str, &str)] = &[
     ("Cargo.toml", "GPL-3.0-or-later"),
     ("crates/discover/Cargo.toml", "GPL-3.0-or-later"),
-    ("crates/ebpf-common/Cargo.toml", "GPL-3.0-or-later"),
+    ("crates/ebpf-common/Cargo.toml", "GPL-2.0-or-later"),
     ("crates/ebpf/Cargo.toml", "GPL-2.0-only"),
     ("crates/manifest/Cargo.toml", "GPL-3.0-or-later"),
 ];
@@ -10278,6 +10280,9 @@ fn license_expected_header(path: &str) -> Option<&'static str> {
     if path.ends_with(".rs") {
         if path.starts_with("crates/ebpf/src/") {
             return Some("//! SPDX-License-Identifier: GPL-2.0-only");
+        }
+        if path.starts_with("crates/ebpf-common/src/") {
+            return Some("//! SPDX-License-Identifier: GPL-2.0-or-later");
         }
         return Some("//! SPDX-License-Identifier: GPL-3.0-or-later");
     }
@@ -10452,6 +10457,7 @@ fn license_legal_surface_errors(root: &std::path::Path, tracked: &[String]) -> V
     for (name, marker) in [
         ("LICENSE", "Version 3, 29 June 2007"),
         ("LICENSES/GPL-2.0-only.txt", "Version 2, June 1991"),
+        ("LICENSES/GPL-2.0-or-later.txt", "Version 2, June 1991"),
     ] {
         match fs::read_to_string(root.join(name)) {
             Ok(text) if text.contains(marker) => {}
@@ -10810,6 +10816,11 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
     license_write_fixture(
         root.path(),
         "LICENSES/GPL-2.0-only.txt",
+        b"Version 2, June 1991\n",
+    );
+    license_write_fixture(
+        root.path(),
+        "LICENSES/GPL-2.0-or-later.txt",
         b"Version 2, June 1991\n",
     );
     for (manifest, license) in LICENSE_MANIFESTS {

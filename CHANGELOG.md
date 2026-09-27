@@ -170,6 +170,9 @@ provider during capture.
 - `scripts/build-release.sh` builds and verifies both. Release builds remap
   build-host paths, so the binaries do not embed the builder's home or
   checkout directory.
+- Licensing: the observer is GPL-3.0-or-later and the BPF programs are
+  GPL-2.0-only. `crates/ebpf-common`, which is compiled into both, is
+  GPL-2.0-or-later.
 
 ### Known limitations
 

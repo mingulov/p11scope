@@ -6,12 +6,17 @@
 # scans the container process's memory through /proc/<pid>/mem and opens the
 # provider through /proc/<pid>/root — which is what answers spike §6.4: whether
 # a provider on an overlay2 upper layer can be pinned by the mapping's identity.
+#
+# P11SCOPE_BIN=/abs/p11scope (optionally P11SCOPE_DISCOVER_BIN) reuses a
+# prebuilt product instead of building one. The work directory is a fresh
+# private temporary directory (P11SCOPE_MATRIX_TMPDIR, else TMPDIR, else /tmp),
+# because the observer refuses `-o` below a group-writable checkout.
 set -eu
 cd "$(dirname "$0")/../.."
 
 MODULE_IN_CONTAINER=/usr/lib/softhsm/libsofthsm2.so
 RUN_ID=$(date +%s%N)-$$
-WORK="target/matrix-docker/$RUN_ID"
+WORK=
 IMAGE="p11scope-matrix-docker:$RUN_ID"
 NAME="p11scope-matrix-docker-$RUN_ID"
 PRODUCT=target/matrix-product
@@ -25,12 +30,12 @@ ROOT_PROCESS_STARTTIME=
 IMAGE_CREATED=
 CONTAINER_STARTED=
 . scripts/lib.sh
+. scripts/matrix/matrix-lib.sh
 
 require_non_root_caller
 for tool in cargo docker gcc python3 timeout; do
     command -v "$tool" >/dev/null || { echo "$tool required"; exit 1; }
 done
-mkdir -p "$WORK/shared"
 
 remove_owned_container() {
     timeout --signal=TERM --kill-after=5s 30s docker rm -f "$NAME" >/dev/null 2>&1
@@ -60,21 +65,29 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build product + workload ==="
-timeout --signal=TERM --kill-after=5s 600s scripts/cargo.sh +1.88 build --locked --release \
-    --workspace --target-dir "$PRODUCT"
+if ! matrix_prebuilt_product; then
+    timeout --signal=TERM --kill-after=5s 600s scripts/cargo.sh +1.88 build --locked --release \
+        --workspace --target-dir "$PRODUCT"
+    P11SCOPE_EXE=$PRODUCT/release/p11scope
+fi
+matrix_report_product
+matrix_select_timeout
 sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
+matrix_private_work docker
+mkdir -p "$WORK/shared"
 timeout --signal=TERM --kill-after=5s 60s gcc -O0 -o "$WORK/harness" \
     spike/harness.c -ldl
 
 echo "=== build and start owned container ==="
 IMAGE_CREATED=1
 timeout --signal=TERM --kill-after=5s 600s docker build -q -t "$IMAGE" \
+    ${P11SCOPE_MATRIX_BUILD_NETWORK:+--network "$P11SCOPE_MATRIX_BUILD_NETWORK"} \
     -f scripts/matrix/Dockerfile scripts/matrix >/dev/null
 rm -f "$WORK/shared/go"
 CONTAINER_STARTED=1
 timeout --signal=TERM --kill-after=5s 60s docker run -d --name "$NAME" \
-    -v "$PWD/$WORK/harness:/usr/local/bin/harness:ro" \
-    -v "$PWD/$WORK/shared:/shared" \
+    -v "$WORK/harness:/usr/local/bin/harness:ro" \
+    -v "$WORK/shared:/shared" \
     "$IMAGE" >/dev/null
 PID=$(timeout --signal=TERM --kill-after=5s 60s \
     docker inspect -f '{{.State.Pid}}' "$NAME")
@@ -99,7 +112,7 @@ wait_for_cgroup_provider "$CGROUP_PATH" libsofthsm2.so
 echo "=== unprivileged diagnostic: the container provider must be unreadable without privileges ==="
 set +e
 DOCTOR_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
-    "$PRODUCT/release/p11scope" doctor --pid "$MAPPED_PROVIDER_PID" 2>&1)
+    "$P11SCOPE_EXE" doctor --pid "$MAPPED_PROVIDER_PID" 2>&1)
 DOCTOR_RC=$?
 set -e
 printf '%s\n' "$DOCTOR_OUT"
@@ -114,7 +127,7 @@ printf '%s\n' "$DOCTOR_OUT" | grep -Eq 'FAIL +EACCES — memory scan unavailable
     || { echo "doctor did not surface the target memory-scan denial" >&2; exit 1; }
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
-    "$PRODUCT/release/p11scope" profile \
+    "$P11SCOPE_EXE" profile \
     --cgroup "$CGROUP_PATH" --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
@@ -125,8 +138,8 @@ printf '%s\n' "$UNPRIV_OUT" | is_linux_permission_denial \
 
 echo "=== capture one container after observer readiness ==="
 launch_root_recorded_process "$WORK/profile.pid" "$WORK/profile.log" \
-    timeout --signal=TERM --kill-after=35s 45s \
-    "$PRODUCT/release/p11scope" profile \
+    python3 -I "$MATRIX_PTY" "$MATRIX_TIMEOUT" --foreground --signal=TERM --kill-after=35s 45s \
+    "$P11SCOPE_EXE" profile \
     --cgroup "$CGROUP_PATH" \
     --mode metrics --duration 30 -o "$WORK/observed.json"
 SPID=$ROOT_LAUNCH_PID
@@ -166,6 +179,7 @@ fi
 reclaim_root_output "$WORK/observed.json"
 python3 scripts/check-capture-evidence.py clean-metrics \
     "$WORK/observed.json" spike/expected.txt
+python3 -I scripts/matrix/check-count-multiset.py "$WORK/observed.json" spike/expected.txt
 
 echo "=== the provider was pinned inside the container, by the scan alone ==="
 python3 - "$WORK/observed.json" "$MODULE_IN_CONTAINER" <<'PY'

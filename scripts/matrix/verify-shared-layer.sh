@@ -5,17 +5,24 @@
 # Manifest-free: nothing is copied out of either container. This is the measured
 # common shared-layer shape; exact counts prove that its two matching overlay
 # mappings need one attach, while output must retain heuristic uncertainty.
+#
+# Two entry points:
+#   verify-shared-layer.sh ABSENT_EVIDENCE_ROOT   receipt run: builds the
+#       product from this clean checkout with the prepared toolchain;
+#   P11SCOPE_BIN=/abs/p11scope verify-shared-layer.sh   direct run against a
+#       prebuilt product, in a fresh private work directory
+#       (P11SCOPE_MATRIX_TMPDIR, else TMPDIR, else /tmp).
 set -eu
 cd "$(dirname "$0")/../.."
 
 MODULE_IN_CONTAINER=/usr/lib/softhsm/libsofthsm2.so
 RUN_ID=$(date +%s%N)-$$
-WORK=${P11SCOPE_RECEIPT_WORK:-"target/matrix-shared/$RUN_ID"}
+WORK=${P11SCOPE_RECEIPT_WORK-}
 IMAGE="p11scope-matrix-shared:$RUN_ID"
 NAME_A="p11scope-matrix-shared-a-$RUN_ID"
 NAME_B="p11scope-matrix-shared-b-$RUN_ID"
 CGROUP_PARENT="p11scope-shared-$RUN_ID.slice"
-PRODUCT=${P11SCOPE_RECEIPT_PRODUCT:-"$WORK/product"}
+PRODUCT=
 WA=
 WB=
 SPID=
@@ -284,11 +291,11 @@ with tempfile.TemporaryDirectory() as raw:
 lane = """broad-and-a-only-b-only-68-68-136-exact-accepted
 broad-cardinality-mutation-rejected
 leaf-cardinality-mutation-rejected
-broad-2-C_GetFunctionList-2-uncertainty-1-leaves-1-C_GetFunctionList-1-uncertainty-0-exact-accepted
+broad-2-C_GetFunctionList-2-uncertainty-2-leaves-1-C_GetFunctionList-1-uncertainty-0-exact-accepted
 multiplier-function-uncertainty-mutation-rejected
 image-container-identity-mutation-rejected""".splitlines()
 
-good={"broad":{"shape":[68,68,136],"multiplier":2,"get":2,"uncertainty":1},
+good={"broad":{"shape":[68,68,136],"multiplier":2,"get":2,"uncertainty":2},
       "a-only":{"shape":[68,68,136],"multiplier":1,"get":1,"uncertainty":0},
       "b-only":{"shape":[68,68,136],"multiplier":1,"get":1,"uncertainty":0},
       "image":"sha256:image","containers":["id-a","id-b"]}
@@ -314,21 +321,30 @@ if [ "${1-}" = --self-test ]; then
     exit 0
 fi
 
-if [ -z "${P11SCOPE_RECEIPT_BODY-}" ]; then
+if [ -z "${P11SCOPE_RECEIPT_BODY-}" ] && [ -z "${P11SCOPE_BIN-}" ]; then
     receipt_receipt_run "$@"
     exit 0
 fi
 [ "$#" -eq 0 ] || exit 2
-[ -n "${P11SCOPE_PREPARED_STABLE_CARGO-}" ] \
-    && [ -n "${P11SCOPE_PREPARED_STABLE_RUSTC-}" ] \
-    && [ -n "${P11SCOPE_PREPARED_BPF_CARGO-}" ] \
-    && [ -n "${P11SCOPE_PREPARED_BPF_RUSTC-}" ] \
-    || { echo "prepared stable/BPF Cargo/rustc handoff required" >&2; exit 1; }
+. scripts/matrix/matrix-lib.sh
+if [ -z "${P11SCOPE_BIN-}" ]; then
+    [ -n "${P11SCOPE_PREPARED_STABLE_CARGO-}" ] \
+        && [ -n "${P11SCOPE_PREPARED_STABLE_RUSTC-}" ] \
+        && [ -n "${P11SCOPE_PREPARED_BPF_CARGO-}" ] \
+        && [ -n "${P11SCOPE_PREPARED_BPF_RUSTC-}" ] \
+        || { echo "prepared stable/BPF Cargo/rustc handoff required" >&2; exit 1; }
+fi
 require_non_root_caller
 for tool in docker gcc python3 timeout; do
     command -v "$tool" >/dev/null || { echo "$tool required"; exit 1; }
 done
 sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
+if [ -n "$WORK" ]; then
+    matrix_absolute_work
+else
+    matrix_private_work shared
+fi
+PRODUCT=${P11SCOPE_RECEIPT_PRODUCT:-"$WORK/product"}
 mkdir -p "$WORK/shared-a" "$WORK/shared-b"
 
 remove_owned_container() {
@@ -339,6 +355,16 @@ remove_owned_container() {
 remove_owned_image() {
     timeout --signal=TERM --kill-after=5s 30s docker image rm "$1" >/dev/null 2>&1
     ! docker image inspect "$1" >/dev/null 2>&1
+}
+
+# Docker's systemd cgroup driver turns --cgroup-parent into transient slices
+# (dashes nest: p11scope.slice/p11scope-shared.slice/<run>.slice/<run>-<pid>.slice)
+# and leaves them active after the containers are gone. Stop the per-run
+# slice this lane created, which also stops its child; never the shared parents.
+remove_owned_slice() {
+    ros_unit="p11scope-shared-${RUN_ID%-*}.slice"
+    [ -n "$(systemctl list-units --all --plain --no-legend "$ros_unit" 2>/dev/null)" ] || return 0
+    timeout --signal=TERM --kill-after=5s 30s sudo -n systemctl stop "$ros_unit"
 }
 
 cleanup() {
@@ -358,34 +384,41 @@ cleanup() {
     [ -z "$WA" ] || wait "$WA" 2>/dev/null || true
     [ -z "$WB" ] || wait "$WB" 2>/dev/null || true
     [ -z "$IMAGE_CREATED" ] || cleanup_step remove_owned_image "$IMAGE_CREATED"
+    [ -z "$CONTAINER_A_STARTED$CONTAINER_B_STARTED" ] || cleanup_step remove_owned_slice
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
 
 echo "=== build product + workload ==="
-RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
-    P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
-    P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
-    timeout --signal=TERM --kill-after=5s 600s \
-    "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release \
-    --workspace --target-dir "$PRODUCT"
+if ! matrix_prebuilt_product; then
+    RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+        P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
+        P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
+        timeout --signal=TERM --kill-after=5s 600s \
+        "$P11SCOPE_PREPARED_STABLE_CARGO" build --locked --offline --release \
+        --workspace --target-dir "$PRODUCT"
+    P11SCOPE_EXE=$PRODUCT/release/p11scope
+fi
+matrix_report_product
+matrix_select_timeout
 timeout --signal=TERM --kill-after=5s 60s gcc -O0 -o "$WORK/harness" \
     spike/harness.c -ldl
 
 echo "=== build and start two owned containers ==="
 timeout --signal=TERM --kill-after=5s 600s docker build -q -t "$IMAGE" \
+    ${P11SCOPE_MATRIX_BUILD_NETWORK:+--network "$P11SCOPE_MATRIX_BUILD_NETWORK"} \
     -f scripts/matrix/Dockerfile scripts/matrix >/dev/null
 IMAGE_CREATED=$(docker image inspect -f '{{.Id}}' "$IMAGE")
 rm -f "$WORK/shared-a/go" "$WORK/shared-b/go"
 timeout --signal=TERM --kill-after=5s 60s docker run -d --name "$NAME_A" \
     --cgroup-parent="$CGROUP_PARENT" \
-    -v "$PWD/$WORK/harness:/usr/local/bin/harness:ro" \
-    -v "$PWD/$WORK/shared-a:/shared" "$IMAGE" >/dev/null
+    -v "$WORK/harness:/usr/local/bin/harness:ro" \
+    -v "$WORK/shared-a:/shared" "$IMAGE" >/dev/null
 CONTAINER_A_STARTED=$(docker inspect -f '{{.Id}}' "$NAME_A")
 timeout --signal=TERM --kill-after=5s 60s docker run -d --name "$NAME_B" \
     --cgroup-parent="$CGROUP_PARENT" \
-    -v "$PWD/$WORK/harness:/usr/local/bin/harness:ro" \
-    -v "$PWD/$WORK/shared-b:/shared" "$IMAGE" >/dev/null
+    -v "$WORK/harness:/usr/local/bin/harness:ro" \
+    -v "$WORK/shared-b:/shared" "$IMAGE" >/dev/null
 CONTAINER_B_STARTED=$(docker inspect -f '{{.Id}}' "$NAME_B")
 PID_A=$(timeout --signal=TERM --kill-after=5s 60s \
     docker inspect -f '{{.State.Pid}}' "$NAME_A")
@@ -435,7 +468,7 @@ done
 echo "=== unprivileged diagnostic: the container provider must be unreadable without privileges ==="
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
-    "$PRODUCT/release/p11scope" profile \
+    "$P11SCOPE_EXE" profile \
     --cgroup "$BROAD_PATH" --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
@@ -464,8 +497,8 @@ run_capture() {
     wait_for_cgroup_provider "$LEAF_A_PATH" libsofthsm2.so
     wait_for_cgroup_provider "$LEAF_B_PATH" libsofthsm2.so
     launch_root_recorded_process "$WORK/$label.pid" "$WORK/$label.log" \
-        timeout --signal=TERM --kill-after=35s 45s \
-        "$PRODUCT/release/p11scope" profile \
+        python3 -I "$MATRIX_PTY" "$MATRIX_TIMEOUT" --foreground --signal=TERM --kill-after=35s 45s \
+        "$P11SCOPE_EXE" profile \
         --cgroup "$cgroup" \
         --mode metrics --duration 30 -o "$WORK/$label.json"
     SPID=$ROOT_LAUNCH_PID
@@ -523,13 +556,18 @@ doc = json.load(open(sys.argv[1]))
 expected_collapses = int(sys.argv[2])
 ev = doc["evidence"]
 modules = doc["capture"]["modules"]
+assert len(modules) == 1, modules
 assert [m["sources"] for m in ev["discovery"]] == [["scan"]] * len(modules), ev["discovery"]
 assert ev["attached_probes"] == 2 * ev["slots"], (ev["attached_probes"], ev["slots"])
 
 # The common shared-layer lane must collapse matching overlay mappings, but the
-# predicate is heuristic. Require exactly one published uncertainty in broad scope
-# and none in either leaf scope. Capture output bounds its subject so a
-# bystander mapping path or process identity cannot escape into evidence.
+# predicate is heuristic. Require exactly one published uncertainty per collapsed
+# object in broad scope and none in either leaf scope. Broad scope collapses two
+# objects from the one image layer: the provider, and the dynamic loader that
+# live loader discovery pins in each container (skip-attribution run,
+# 2026-09-26: ld-linux-x86-64.so.2 and libsofthsm2.so, each 0:328 onto 0:325).
+# Capture output bounds its subject so a bystander mapping path or process
+# identity cannot escape into evidence.
 reason = ("shared-overlay physical identity is uncertain; a distinct "
           "byte-identical instance may be unobserved")
 uncertainty = [item for item in ev["skipped"] if item["reason"] == reason]
@@ -548,13 +586,18 @@ assert not repeated, (
 )
 print("one shared-layer module; collapse uncertainties:", len(uncertainty), modules[0]["ino"])
 SHARED
-    checker=clean-metrics
-    [ "$expected_collapses" -eq 0 ] || checker=shared-layer-metrics
-    python3 scripts/check-capture-evidence.py "$checker" \
+    if [ "$expected_collapses" -eq 0 ]; then
+        python3 scripts/check-capture-evidence.py clean-metrics \
+            "$WORK/$label.json" spike/expected.txt "$multiplier"
+    else
+        python3 scripts/check-capture-evidence.py shared-layer-metrics \
+            "$WORK/$label.json" spike/expected.txt "$multiplier" "$expected_collapses"
+    fi
+    python3 -I scripts/matrix/check-count-multiset.py \
         "$WORK/$label.json" spike/expected.txt "$multiplier"
 }
 
-run_capture broad "$BROAD_PATH" 2 1
+run_capture broad "$BROAD_PATH" 2 2
 run_capture a-only "$LEAF_A_PATH" 1 0
 run_capture b-only "$LEAF_B_PATH" 1 0
 

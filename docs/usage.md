@@ -196,6 +196,9 @@ produced it.
 - `--drain-interval-ms <n>` — the frame interval: 5 to 60000 ms (defaults:
   profile 1000 ms, trace 200 ms). A shorter interval refreshes discovery,
   aggregate maps and live output more often, with more observer CPU cost.
+  The profile live display redraws (clear screen, then the frame) only when
+  stdout is a terminal; into a file, a pipe or a service log it writes
+  nothing per frame and prints the final frame once, as plain text.
   Events drain on every loop tick. The frame interval does not delay a
   `run --pause` stop. While a pause epoch is armed, the loop checks for a
   pending stop on every loop tick (every 2 ms when idle; one map read between
@@ -336,7 +339,10 @@ Both `profile` and `trace` require exactly one of `--pid`, `--cgroup`, or
 inputs. `--cgroup` matches that
 cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
-directory reaches the workload's actual nested cgroup. `--system` requests
+directory reaches the workload's actual nested cgroup. The path must be a
+cgroup v2 directory (under `/sys/fs/cgroup`): any other directory, `/`
+included, is refused with `not a cgroup v2 directory` before discovery, by
+`doctor --cgroup` as well. `--system` requests
 whole-machine capture with no cgroup path: the BPF scope gate admits
 all tasks subject to the owner-health and config checks, and userspace
 discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
@@ -356,11 +362,17 @@ seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Probe
 teardown and final reporting follow; with many attached functions, this can
 add seconds, and calls may still be observed while probes are being detached.
 Ctrl-C, SIGTERM, or SIGHUP ends a capture cleanly (final frame printed, `-o`
-file written) instead of aborting it. Under `run`, a child the pause holds
+file written) instead of aborting it. A stop that arrives during `profile` or
+`trace` startup, before anything is attached (discovery can take seconds),
+is honoured once discovery returns: exit 1 with `interrupted by SIGINT during
+startup`, no report, no temporary file left behind, and a previous trace
+`-o` file left as it was. Under `run`, a child the pause holds
 stopped is resumed before the observer signals it or hands it back. The stop
 signal is forwarded to the child's process group; a child still alive gets
 SIGTERM 5 s later and SIGKILL 5 s after that, so settling it takes at most
-15 s (a second Ctrl-C sends SIGKILL at once). A hangup — a closed terminal or
+15 s (a second Ctrl-C sends SIGKILL at once; a SIGINT repeated within 100 ms,
+as `timeout -s INT` does when it signals both p11scope and its process group,
+is the same stop and does not count as the second one). A hangup — a closed terminal or
 a dropped ssh session — is handled exactly like SIGTERM, with the same outcome
 and exit status, as long as p11scope itself inherited the default SIGHUP
 disposition. An inherited ignore (`nohup p11scope ...`) is preserved, so the
@@ -515,6 +527,21 @@ kind of workload without a manifest and ends `68`/`0` instead.
 
 ### More capture options
 
+- `-o <file>` — write the profile report (published atomically: a private
+  0600 temporary file beside the target, fsync, rename) or the trace stream
+  to `<file>`. `-o` names a file: an existing directory, a path ending in `/`,
+  or an existing device node, FIFO, socket or symbolic link (for example
+  `/dev/null` or `/dev/stdout`) is refused before the capture starts and is
+  never replaced; the profile report re-checks the name before publishing.
+  An existing trace file is truncated only once the capture has attached: a
+  capture that fails before that leaves it as it was, and removes a file it
+  had only just created. To keep no report file, leave out `-o`. Every
+  directory on the way to the file must be a real directory (no symlinks)
+  owned by root, you, or the user who ran `sudo`, and not group- or
+  world-writable unless it has the sticky bit (as `/tmp` does); otherwise
+  `-o` is refused, naming the directory, its mode and a fix. A home
+  directory created under Ubuntu's default umask (0775) needs
+  `chmod g-w,o-w` first.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one
@@ -528,14 +555,19 @@ kind of workload without a manifest and ends `68`/`0` instead.
   text table. A scan that fails soft (the target changed mid-scan) still
   prints JSON: the success schema with `scan.status` failed and the
   reason, exit 1. A target that cannot be read at all stays a hard
-  error: one stderr line, empty stdout, exit 1.
+  error: one stderr line, empty stdout, exit 1 — including a target whose
+  `/proc/<pid>/maps` is unreadable (another user's process without sudo),
+  which is never reported as "0 PKCS#11 modules mapped".
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
   refusal is deliberate: on affected kernels a uretprobe on a confined target
   can kill it. An unproven kernel (the self-probe could not reach a verdict)
   refuses the same way wherever the target cannot be shown unconfined —
   unreadable targets, `--cgroup`/`--system` scopes, and `run` children,
-  which may confine themselves after attach. See `p11scope doctor` and
+  which may confine themselves after attach. A self-probe the kernel refused
+  for lack of privilege is not a hazard verdict: it is reported as missing
+  privilege (root, or CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON), and the
+  override does not apply to it. See `p11scope doctor` and
   `src/uretprobe_hazard.rs`. When the override is taken, the flag plus the
   hazard reason is recorded in report evidence (`evidence.uretprobe_override`),
   not just on stderr.
@@ -619,7 +651,15 @@ promise. With no `--pid`, target readability is explicitly `unassessed`.
 `doctor --extra-strict` is the qualification gate: it refuses (exit 1, with
 an `extra-strict refusal:` line naming every violating row) when any assessed
 lane warns or fails, and states `extra-strict: no qualification violations`
-when the host is fully clean.
+when the host is fully clean. Three rows are limits of this build, the same
+on every host, and are listed on an `extra-strict: not counted` line instead
+of refusing: the two `loader timing` rows (`unproven`/`none`: the loader
+timing catalog is empty) and `run initial-set capture: none` (an owned `run`
+cannot prove it captured its child's initial provider set, so its reports
+stay `PARTIAL`; `run` itself works, and the verdict line says so). A
+`kernel.perf_event_paranoid` or `kernel.yama.ptrace_scope` restriction is
+`ok` when doctor holds the capability that lifts it (`CAP_SYS_ADMIN`;
+`CAP_SYS_PTRACE` for Yama 1-2), as under `sudo`.
 
 | Tier | Proven prefix | Meaning and loss |
 | --- | --- | --- |

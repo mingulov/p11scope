@@ -1,6 +1,33 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! p11scope — non-interposing PKCS#11 observer (eBPF uprobes).
 
+/// Crate-wide, non-panicking `eprintln!`/`eprint!` (HIGH-4). The Rust
+/// runtime ignores SIGPIPE, so std's macros panic on EPIPE, and stderr is
+/// commonly a pipe whose reader can die first (`2>&1 | tee cap.log`, then
+/// Ctrl-C kills `tee`). A panic there would unwind past an unpublished
+/// report (lost) and SIGKILL a `run` child instead of settling it, all for
+/// a diagnostic nobody can read. These definitions come before every
+/// `mod`, so their textual scope shadows std's macros throughout the
+/// library; a failed diagnostic write is dropped. Test builds keep std's
+/// macros so libtest still captures test output.
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! eprint {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::write!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
 pub mod attach;
 pub mod capacity;
 pub mod cli;

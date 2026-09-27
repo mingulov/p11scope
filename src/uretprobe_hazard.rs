@@ -41,6 +41,12 @@ pub(crate) enum KernelVerdict {
     /// The probe could not reach a verdict. Never treated as `Clean`: the
     /// failure it guards against is fatal and lands on someone else's process.
     Unknown(String),
+    /// The kernel refused to let this process load or attach the probe's BPF
+    /// at all (EPERM, or EACCES from the uprobe attach) — a missing-privilege
+    /// fact about the observer, not a verdict about the kernel (HIGH-1). The
+    /// capture would be refused the same way at attach, so it is reported as
+    /// what it is, and the uretprobe override cannot help.
+    NotPermitted(String),
 }
 
 /// The target's seccomp mode, as `/proc/<pid>/status` reports it.
@@ -70,6 +76,9 @@ pub(crate) enum Action {
     Refuse(String),
     /// The operator accepted the risk explicitly. Carries the warning.
     ProceedUnderOverride(String),
+    /// The self-probe was not permitted to load BPF: whatever the override
+    /// says, nothing can attach. Carries the kernel's refusal.
+    NotPermitted(String),
 }
 
 /// The whole policy, in one pure function so it is testable without a kernel.
@@ -88,6 +97,9 @@ pub(crate) fn decide(
         (KernelVerdict::Clean, _) => return Action::Proceed,
         // The target cannot refuse a syscall, so the trampoline cannot kill it.
         (_, Some(mode)) if !mode.confines_syscalls() => return Action::Proceed,
+        // Not a hazard verdict at all: this process may not load BPF, so the
+        // override (which only accepts a hazard) must not be offered or taken.
+        (KernelVerdict::NotPermitted(why), _) => return Action::NotPermitted(why.clone()),
         (KernelVerdict::Affected(how), Some(_)) => format!(
             "this kernel filters the uretprobe trampoline's syscall through seccomp (self-probe: \
              {how}) and the target confines syscalls, so attaching a uretprobe would kill it on \
@@ -233,7 +245,52 @@ fn evaluate_mode(
 pub(crate) fn probe_kernel() -> KernelVerdict {
     match probe_kernel_inner() {
         Ok(verdict) => verdict,
-        Err(error) => KernelVerdict::Unknown(format!("{error:#}")),
+        Err(error) => classify_probe_error(&error),
+    }
+}
+
+/// Context the self-probe puts on its uprobe attach; an EACCES there is the
+/// perf-event permission check (`kernel.perf_event_paranoid`, CAP_PERFMON).
+const SELF_PROBE_ATTACH_CONTEXT: &str = "attaching the uretprobe self-probe";
+
+/// A self-probe failure is `NotPermitted` when the kernel refused this
+/// process permission: EPERM anywhere in the chain (the `bpf(2)` capability
+/// checks), or EACCES from the uprobe attach. An EACCES from a program load
+/// is a verifier rejection, which says something about the kernel, not about
+/// privilege, so it stays `Unknown` like every other failure.
+fn classify_probe_error(error: &anyhow::Error) -> KernelVerdict {
+    let errno = |wanted: libc::c_int| {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(wanted)
+        })
+    };
+    let attaching = error.to_string() == SELF_PROBE_ATTACH_CONTEXT;
+    if errno(libc::EPERM) || (attaching && errno(libc::EACCES)) {
+        KernelVerdict::NotPermitted(format!("{error:#}"))
+    } else {
+        KernelVerdict::Unknown(format!("{error:#}"))
+    }
+}
+
+/// The operator-facing refusal for [`Action::NotPermitted`]: what was
+/// refused, what privilege it takes, and how to get it — never the uretprobe
+/// override, which cannot grant privilege.
+pub(crate) fn not_permitted_message(why: &str, running_as_root: bool) -> String {
+    if running_as_root {
+        format!(
+            "cannot load p11scope's BPF programs even as root ({why}): a kernel lockdown, an \
+             LSM policy, or a container's seccomp profile is refusing BPF here. Run \
+             `p11scope doctor` to see which"
+        )
+    } else {
+        format!(
+            "cannot load p11scope's BPF programs: the kernel refused ({why}). Capturing requires \
+             root, or CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON: run it with sudo. `p11scope \
+             doctor` shows what this host allows"
+        )
     }
 }
 
@@ -348,7 +405,7 @@ fn probe_parent(
     );
     let link = program
         .attach([point], "/proc/self/exe", scope)
-        .context("attaching the uretprobe self-probe")?;
+        .context(SELF_PROBE_ATTACH_CONTEXT)?;
 
     drop(release_write); // the child's blocking read returns 0 -> it proceeds
     let status = reap(child, Duration::from_secs(10));
@@ -545,10 +602,12 @@ fn describe_owned_child_death_with(
                 ". This kernel exempts the uretprobe trampoline from seccomp, so p11scope's \
                  uretprobes are not the cause",
             ),
-            KernelVerdict::Unknown(why) => message.push_str(&format!(
-                ". Whether this kernel filters the uretprobe trampoline could not be \
-                 established ({why}), so p11scope's uretprobes cannot be ruled out"
-            )),
+            KernelVerdict::Unknown(why) | KernelVerdict::NotPermitted(why) => {
+                message.push_str(&format!(
+                    ". Whether this kernel filters the uretprobe trampoline could not be \
+                     established ({why}), so p11scope's uretprobes cannot be ruled out"
+                ))
+            }
         }
     }
     Some(message)
@@ -562,6 +621,77 @@ pub(crate) fn describe_owned_child_death(exit_code: i32, attached_probes: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn io_chain(errno: libc::c_int, context: &str) -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::from_raw_os_error(errno))
+            .context("map error: failed to create map `STATS`")
+            .context(context.to_string())
+    }
+
+    /// HIGH-1: EPERM from loading the probe's BPF, or EACCES from its uprobe
+    /// attach, is missing privilege; a verifier EACCES or anything else stays
+    /// an unknown kernel verdict.
+    #[test]
+    fn a_refused_self_probe_is_classified_as_not_permitted() {
+        for (errno, context, not_permitted) in [
+            (libc::EPERM, "loading the BPF object", true),
+            (libc::EPERM, "loading p11_return", true),
+            (libc::EPERM, SELF_PROBE_ATTACH_CONTEXT, true),
+            (libc::EACCES, SELF_PROBE_ATTACH_CONTEXT, true),
+            (libc::EACCES, "loading p11_return", false),
+            (libc::EINVAL, "loading the BPF object", false),
+            (libc::ENOENT, "loading the BPF object", false),
+        ] {
+            let verdict = classify_probe_error(&io_chain(errno, context));
+            assert_eq!(
+                matches!(verdict, KernelVerdict::NotPermitted(_)),
+                not_permitted,
+                "{errno} in {context}: {verdict:?}"
+            );
+            if !not_permitted {
+                assert!(matches!(verdict, KernelVerdict::Unknown(_)), "{verdict:?}");
+            }
+        }
+    }
+
+    /// A not-permitted self-probe is never a hazard verdict and never
+    /// something the override can accept, for any target that needed it.
+    #[test]
+    fn a_not_permitted_probe_refuses_by_privilege_whatever_the_override() {
+        let refused = KernelVerdict::NotPermitted("Operation not permitted".to_string());
+        for target in [Some(SeccompMode::Strict), Some(SeccompMode::Filter), None] {
+            for overridden in [false, true] {
+                assert_eq!(
+                    decide(&refused, target, overridden),
+                    Action::NotPermitted("Operation not permitted".to_string()),
+                    "{target:?} overridden={overridden}"
+                );
+            }
+        }
+        assert_eq!(
+            decide(&refused, Some(SeccompMode::Disabled), false),
+            Action::Proceed
+        );
+    }
+
+    #[test]
+    fn the_not_permitted_message_names_the_privilege_and_never_the_override() {
+        let why = "loading the BPF object: Operation not permitted (os error 1)";
+        let user = not_permitted_message(why, false);
+        let root = not_permitted_message(why, true);
+        for message in [&user, &root] {
+            assert!(message.contains(why), "{message}");
+            assert!(message.contains("p11scope doctor"), "{message}");
+            assert!(
+                !message.contains("--allow-uretprobe-on-confined-target"),
+                "{message}"
+            );
+            assert!(!message.contains("seccomp filter"), "{message}");
+        }
+        assert!(user.contains("requires root"), "{user}");
+        assert!(user.contains("sudo"), "{user}");
+        assert!(root.contains("even as root"), "{root}");
+    }
 
     #[test]
     fn a_clean_kernel_never_refuses_however_confined_the_target_is() {

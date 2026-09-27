@@ -2340,7 +2340,11 @@ def validate_shared_layer_metrics(document, expected, multiplier=1, uncertaintie
         f"unexpected shared-overlay uncertainty: {document['evidence']['skipped']}",
     )
 def validate_lane13_knative_metrics(document, expected):
-    """Lane 13: manifest-only clean metrics plus one shared-overlay uncertainty."""
+    """Lane 13: manifest-only clean metrics with nothing collapsed to disclose.
+
+    The manifest names one exact file, so the scan-only overlay heuristic
+    publishes no uncertainty for it; any skip at all is a concrete gap.
+    """
     require(
         "discovery_uncorroborated" in document["evidence"],
         "lane 13 must state discovery_uncorroborated",
@@ -2349,12 +2353,11 @@ def validate_lane13_knative_metrics(document, expected):
         document,
         expected,
         discovery="manifest-only",
-        discovery_skipped=1,
+        discovery_skipped=0,
     )
     require(
-        document["evidence"]["skipped"]
-        == [{"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}],
-        f"unexpected shared-overlay uncertainty: {document['evidence']['skipped']}",
+        document["evidence"]["skipped"] == [],
+        f"unexpected discovery skips: {document['evidence']['skipped']}",
     )
     require(
         [module["skipped"] for module in document["evidence"]["discovery"]] == [[]],
@@ -3113,24 +3116,26 @@ def self_test():
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
     )
     lane13 = copy.deepcopy(manifest_only)
-    lane13["evidence"]["skipped"] = [
-        {
-            "name": DISCOVERY_SUBJECT,
-            "reason": SHARED_OVERLAY_UNCERTAINTY,
-        }
-    ]
     settle_fixture_verdict(lane13)
     validate_lane13_knative_metrics(lane13, {"C_Initialize": 1})
     for mutate in (
-        lambda d: d["evidence"].update(skipped=[]),
         lambda d: d["evidence"]["skipped"].append(
-            copy.deepcopy(d["evidence"]["skipped"][0])
+            {"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}
         ),
-        lambda d: d["evidence"]["skipped"][0].update(name="renamed discovery subject"),
-        lambda d: d["evidence"]["skipped"][0].update(reason=TABLE_UNAVAILABLE),
-        lambda d: d["evidence"]["skipped"][0].update(reason=DISCOVERY_UNAVAILABLE),
+        lambda d: d["evidence"]["skipped"].append(
+            {"name": "renamed discovery subject", "reason": SHARED_OVERLAY_UNCERTAINTY}
+        ),
+        lambda d: d["evidence"]["skipped"].append(
+            {"name": DISCOVERY_SUBJECT, "reason": TABLE_UNAVAILABLE}
+        ),
         lambda d: d["evidence"]["skipped"].append(
             {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
+        ),
+        lambda d: d["evidence"]["skipped"].extend(
+            [
+                {"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY},
+                {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE},
+            ]
         ),
         lambda d: d["evidence"]["discovery"][0].update(
             skipped=[{"name": "C_Initialize", "reason": ENTRY_UNAVAILABLE}]
@@ -3139,7 +3144,9 @@ def self_test():
             skipped=[{"name": "/private/provider/path", "reason": "raw internal error chain"}]
         ),
         lambda d: d["evidence"]["discovery"][0].update(
-            skipped=[copy.deepcopy(d["evidence"]["skipped"][0])]
+            skipped=[
+                {"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}
+            ]
         ),
         lambda d: d["evidence"]["discovery"][0]["objects"][0].update(sources=["scan"]),
         lambda d: d["evidence"]["surfaces"][0].update(

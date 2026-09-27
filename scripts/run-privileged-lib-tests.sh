@@ -43,7 +43,7 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (48 ignored tests in the default-feature lib binary): 39 run by
+# Curation (50 ignored tests in the default-feature lib binary): 41 run by
 # default, 4 run only with --include-long, 5 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -57,7 +57,9 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # skips. Order is the binary's --list order; each runs in its own process.
 DEFAULT_TESTS=(
 attach::inventory::activation::privileged_tests::privileged_detailed_multithread_owner_accounting_exact
+attach::inventory::activation::privileged_tests::privileged_detailed_multithread_same_slot_allowlisted_exact
 attach::inventory::activation::privileged_tests::privileged_detailed_owner_poison_is_disclosed
+attach::inventory::activation::privileged_tests::privileged_detailed_same_cpu_preemption_keeps_frames
 attach::inventory::activation::privileged_tests::privileged_inventory_activation_cgroup_separates_owned_callers
 attach::inventory::activation::privileged_tests::privileged_inventory_activation_failure_preserves_usage_and_releases_resources
 attach::inventory::activation::privileged_tests::privileged_inventory_activation_stop_with_owned_calls_in_progress

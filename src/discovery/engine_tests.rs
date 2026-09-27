@@ -1753,8 +1753,6 @@ fn a_frame_deferral_is_scheduling_evidence_and_loss_only_if_never_completed() {
         engine.counters.object_skips
     );
 
-    let mut unfinished = engine.pending_discovery_records.clone();
-
     engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
     engine.drain_discovery_from(&mut session).unwrap();
     engine.settle_frame_deferrals_at_capture_end();
@@ -1767,14 +1765,59 @@ fn a_frame_deferral_is_scheduling_evidence_and_loss_only_if_never_completed() {
         "completed deferred work lost nothing"
     );
 
-    // Work the terminal drain never completed is a loss.
-    engine.pending_discovery_records.append(&mut unfinished);
+    // The terminal drain dispatches deferred records first, so a capture
+    // whose terminal drain completes has nothing left to settle either.
+    engine.frame_work_budget_ns = 0;
+    let mut deferred = ScriptedSession::default();
+    deferred.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        exec_record_for(4_000_021),
+    )))]
+    .into();
+    engine.drain_discovery_from(&mut deferred).unwrap();
+    assert_eq!(engine.discovery_deferrals(), 2);
+    assert_eq!(engine.pending_discovery_records_for_test(), 1);
+    engine
+        .drain_discovery_terminal_from(&mut ScriptedSession::default())
+        .unwrap();
+    assert_eq!(
+        engine.pending_discovery_records_for_test(),
+        0,
+        "the terminal drain dispatches deferred records"
+    );
     engine.settle_frame_deferrals_at_capture_end();
     assert!(
-        engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == "live discovery frame" && skip.reason == UNFINISHED_DEFERRAL_LOSS
-        }),
-        "{:?}",
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live discovery frame"),
+        "terminal-completed deferred work lost nothing: {:?}",
+        engine.counters.object_skips
+    );
+
+    // Work still deferred when the capture ends — never completed by the
+    // terminal drain — is a loss, published exactly once.
+    engine.frame_work_budget_ns = 0;
+    let mut unfinished = ScriptedSession::default();
+    unfinished.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        exec_record_for(4_000_022),
+    )))]
+    .into();
+    engine.drain_discovery_from(&mut unfinished).unwrap();
+    assert_eq!(engine.pending_discovery_records_for_test(), 1);
+    engine.settle_frame_deferrals_at_capture_end();
+    engine.settle_frame_deferrals_at_capture_end();
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| {
+                skip.subject == "live discovery frame" && skip.reason == UNFINISHED_DEFERRAL_LOSS
+            })
+            .count(),
+        1,
+        "unfinished deferred work publishes exactly once: {:?}",
         engine.counters.object_skips
     );
 }
@@ -1797,6 +1840,18 @@ fn a_live_frame_defers_its_work_once_the_capture_is_interrupted() {
     engine.drain_discovery_from(&mut session).unwrap();
 
     assert_eq!(engine.pending_discovery_records_for_test(), 1);
+    // F4: an operator-stop deferral is the same scheduling fact as a
+    // budget deferral — counted, never a loss.
+    assert_eq!(engine.discovery_deferrals(), 1);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live discovery frame"),
+        "an operator-stop deferral is not a loss: {:?}",
+        engine.counters.object_skips
+    );
 }
 
 /// H-1: deferred loader memory scans are serviced only while the frame's

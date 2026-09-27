@@ -8,7 +8,8 @@ set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 case "$BIN:$OUT" in /tmp/*|/var/tmp/*|*:/tmp/*|*:/var/tmp/*) echo "binary and OUTDIR must be under /home" >&2; exit 64;; esac
-mkdir -p "$OUT"; OUT=$(realpath -e "$OUT")
+# p11scope refuses -o directories writable by group/other; keep the tree owner-only.
+umask 022; mkdir -p "$OUT" && chmod 755 "$OUT"; OUT=$(realpath -e "$OUT")
 cat > "$OUT/inner.sh" <<INNER
 #!/bin/sh
 uname -r > $OUT/uname.txt

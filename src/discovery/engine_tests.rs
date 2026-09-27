@@ -14714,6 +14714,109 @@ fn matching_snapshot_never_consults_the_probe() {
     assert_eq!(probe.probes.get(), 0);
 }
 
+/// The pre-6.8 overlayfs manifest join, forged: a scan pin filed under the
+/// maps/backing key and a manifest pin for the same file under the opened
+/// fd's overlay key, as `pin_scanned_object` and `pin_manifest_objects` file
+/// them. `manifest_naming` records the retargeted (backing) provenance.
+fn split_manifest_join_fixture() -> (
+    tempfile::TempDir,
+    Manifest,
+    PinnedObjects,
+    p11scope_manifest::maps::ObjectKey,
+    p11scope_manifest::maps::ObjectKey,
+) {
+    use crate::discovery::identity::test_fixture::{
+        PATH as PROVIDER_PATH, manifest_pin, split_scan_pin,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let file = overlay_backing_file(&dir, "provider.so");
+    let maps_key = overlay_key(21);
+    let fd_key = overlay_key(41);
+    let mut scan = split_scan_pin(maps_key, fd_key, OVERLAY_SHA, 1);
+    overlay_reback(&mut scan, &file);
+    let mut manifest_pins = manifest_pin(fd_key, OVERLAY_SHA, 1);
+    overlay_reback(&mut manifest_pins, &file);
+    let mut pinned = scan;
+    assert!(pinned.absorb(manifest_pins).is_empty());
+    let mut manifest = manifest_naming(PROVIDER_PATH, Some(OVERLAY_SHA.to_string()));
+    manifest.provenance_objects[0].device_major = maps_key.device.major;
+    manifest.provenance_objects[0].device_minor = maps_key.device.minor;
+    manifest.provenance_objects[0].inode = maps_key.inode;
+    (dir, manifest, pinned, maps_key, fd_key)
+}
+
+fn refile_recorded_aliases(
+    manifest: &Manifest,
+    pinned: &mut PinnedObjects,
+    budget: &mut CaptureWorkBudget,
+    probe: &crate::discovery::identity::test_fixture::FakeSelfMappingProbe,
+) {
+    for object in &manifest.objects {
+        let (key, path) = capture_manifest_object_key(manifest, object.id).unwrap();
+        pinned.refile_split_manifest_alias(key, path, budget, probe);
+    }
+}
+
+/// On pre-6.8 the exact manifest join misses its split pin; the shared
+/// self-mapping probe re-files the manifest alias onto its scan pin, so the
+/// engine merge, plan lowering and every per-function join resolve one
+/// provider exactly as on >= 6.8.
+#[test]
+fn manifest_join_refiles_a_pre68_overlay_split_onto_its_scan_pin() {
+    use crate::discovery::identity::test_fixture::{FakeSelfMappingProbe, PATH as PROVIDER_PATH};
+    let (_dir, manifest, mut pinned, maps_key, _fd_key) = split_manifest_join_fixture();
+    assert_eq!(
+        manifest_module_object(&manifest, &pinned),
+        None,
+        "the split join misses before the probe re-files it"
+    );
+    let mut budget = CaptureWorkBudget::default();
+    let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
+    refile_recorded_aliases(&manifest, &mut pinned, &mut budget, &probe);
+    let found = manifest_module_object(&manifest, &pinned)
+        .expect("the probe re-files the split alias onto its scan pin");
+    assert_eq!(
+        pinned.summary(found).unwrap().key,
+        maps_key,
+        "the scan pin's maps key stays canonical downstream"
+    );
+    assert_eq!(
+        pinned.sources(found),
+        vec!["scan", "manifest"],
+        "the re-filed pin carries both authorities, as on >= 6.8"
+    );
+    assert_eq!(
+        pinned.id_for_path(PROVIDER_PATH),
+        Some(found),
+        "one manifest alias names the provider after re-filing"
+    );
+    assert_eq!(probe.probes.get(), 1, "the probe renders the join key once");
+}
+
+/// A split the probe does not render exactly is not a join: the miss stays,
+/// and both pins resolve as before.
+#[test]
+fn manifest_join_keeps_the_miss_when_the_probe_refuses_the_split() {
+    use crate::discovery::identity::test_fixture::{FakeSelfMappingProbe, PATH as PROVIDER_PATH};
+    let (_dir, manifest, mut pinned, _maps_key, fd_key) = split_manifest_join_fixture();
+    assert_eq!(manifest_module_object(&manifest, &pinned), None);
+    let manifest_before = pinned.id_for_path(PROVIDER_PATH);
+    assert!(manifest_before.is_some());
+    let mut budget = CaptureWorkBudget::default();
+    let probe = FakeSelfMappingProbe::new(true, Some(fd_key));
+    refile_recorded_aliases(&manifest, &mut pinned, &mut budget, &probe);
+    assert_eq!(
+        manifest_module_object(&manifest, &pinned),
+        None,
+        "a split the probe renders elsewhere stays a miss"
+    );
+    assert_eq!(
+        pinned.id_for_path(PROVIDER_PATH),
+        manifest_before,
+        "a refused re-filing leaves the pins untouched"
+    );
+}
+
 #[test]
 fn loader_pin_collision_cannot_commit_a_plan_with_missing_pin_id() {
     let (plan, pins) = plan_with_pins(1, 0);

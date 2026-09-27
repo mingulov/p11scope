@@ -1926,6 +1926,11 @@ fn run_loop(
     // on every path that reaches a loop; later discovery-driven attaches
     // do not re-stamp it.
     session.note_attach_complete();
+    // Harness readiness signal: one stderr line once the attach session has
+    // completed (even with zero probes), strictly before the capture loop.
+    // A readiness wait polls for it instead of sleeping; the count lets it
+    // refuse a zero-probe attach without parsing the final report.
+    eprintln!("{}", format_attach_complete(session.attached_probes()));
     // A live discovery frame checks the operator's stop between work items
     // and defers the rest, so the loop's end check comes sooner (H-1).
     engine.set_cancel_flag(interrupted.cancel_flag());
@@ -2799,6 +2804,18 @@ fn report_attach_failures(session: &Session) {
             );
         }
     }
+}
+
+/// The attach-complete signal (see `run_loop`). Deliberately distinct from
+/// both the discovery marker (`p11scope: discovery: ...`, printed before
+/// attach) and the live frame's "N/M probes attached" evidence phrasing, so
+/// neither discovery-gate nor frame-gate greps can match it.
+fn format_attach_complete(attached: usize) -> String {
+    format!(
+        "p11scope: attached {} probe{}",
+        attached,
+        if attached == 1 { "" } else { "s" }
+    )
 }
 
 /// The per-slot attach diagnostic. The failure message embeds the module's
@@ -6291,6 +6308,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn attach_complete_line_names_the_probe_count() {
+        assert_eq!(format_attach_complete(0), "p11scope: attached 0 probes");
+        assert_eq!(format_attach_complete(1), "p11scope: attached 1 probe");
+        assert_eq!(format_attach_complete(136), "p11scope: attached 136 probes");
+        // Neither the discovery gate nor the live-frame gate may match it.
+        for line in [format_attach_complete(0), format_attach_complete(136)] {
+            assert!(!line.contains("p11scope: discovery:"));
+            assert!(!line.contains("probes attached"));
+            assert!(!line.contains("attach failed"));
+        }
+    }
 
     /// I3: the published document's detach fields report pre-publication
     /// work only. The terminal callback publishes before the producers

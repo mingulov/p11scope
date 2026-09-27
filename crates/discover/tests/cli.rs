@@ -22,6 +22,54 @@ fn manifest_json_on_stdout() {
 }
 
 #[test]
+fn version_prints_the_release_version_and_exits_zero() {
+    for flag in ["--version", "-V"] {
+        let out = Command::new(BIN).arg(flag).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("p11scope-discover {}\n", env!("CARGO_PKG_VERSION")),
+            "{flag}"
+        );
+        assert!(out.stderr.is_empty(), "{flag}: {:?}", out.stderr);
+    }
+}
+
+#[test]
+fn version_takes_no_arguments() {
+    let out = Command::new(BIN)
+        .args(["--version", "--module", SOFTHSM])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--version takes no arguments"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The helper ships beside the observer, so both report one release version.
+#[test]
+fn helper_version_matches_the_observer_version() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let manifest = std::fs::read_to_string(&root).unwrap();
+    let package = manifest
+        .split("\n[")
+        .find(|section| section.starts_with("[package]") || section.starts_with("package]"))
+        .expect("root manifest has a [package] section");
+    let version = package
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "version").then(|| value.trim().trim_matches('"').to_string())
+        })
+        .expect("root [package] declares a version");
+    assert_eq!(version, env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
 fn missing_module_is_usage_error() {
     let out = Command::new(BIN).output().unwrap();
     assert_eq!(out.status.code(), Some(2));

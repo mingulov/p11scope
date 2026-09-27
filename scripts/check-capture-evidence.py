@@ -1466,30 +1466,27 @@ def discovery_skips(evidence):
     return [item for item in evidence["skipped"] if item["name"] == DISCOVERY_SUBJECT]
 
 
-def exact_canary_discovery_skips(evidence, *, owned):
+def exact_canary_discovery_skips(evidence):
     """Property-based discovery-skip contract for canary lanes.
 
     Returns the validated skip count for exact_common to pin. Every
-    discovery skip must be the one categorical public item, and the count
-    must fit the lane's deterministic floor plus at most one retained
-    internal loss: owned lanes carry exactly the initial-set skip,
-    optionally plus one; safe lanes carry none, optionally plus one.
+    discovery skip must be the one categorical public item, and every lane
+    carries none, optionally plus one retained internal loss. Owned lanes
+    no longer publish an initial-set skip (ee51d14): the owned run's
+    initial-set timing gap is stated once, by `loader_discovery`
+    (`initial_set_capture.none`), which `validate_canary` pins exactly.
 
     Why a bound and not an exact count: the P-2 maps bracket refuses an
     acquisition whose mappings changed mid-read and records it, and the
     engine deliberately retains that record even when a later scan succeeds
     and attaches (scan_gap_this_capture_attached tombstones only not-mapped
     and file-backed-data losses). The render layer then flattens the refusal
-    to the categorical item above — byte-identical to the spec-mandated
-    initial-set skip — so no exact count can name which is which. The canary
-    workload mmaps/munmaps while running, so the refusal fires
+    to the categorical item above, so no exact count can name its cause.
+    The canary workload mmaps/munmaps while running, so the refusal fires
     intermittently in any lane.
 
-    Why the bound is still strong: the initial-set skip is unconditional on
-    owned lanes (one initial-set context per owned run, armed or not, and
-    the empty timing catalog leaves it unproven by spec amendment), while
-    the initial-set path never runs for profile/trace lanes. Any additional
-    categorical item is a retained internal loss published through the same
+    Why the bound is still strong: any categorical item is a retained
+    internal loss published through the same
     finite category — most often a bracket refusal, but whole-outcome scan
     losses and failed owned-prearm records flatten identically. That stays
     safe here: whole-outcome losses clear the scanned modules and
@@ -1520,18 +1517,10 @@ def exact_canary_discovery_skips(evidence, *, owned):
             item == CANARY_DISCOVERY_SKIP,
             f"non-categorical canary discovery skip: {item}",
         )
-    if owned:
-        require(
-            len(skips) in (1, 2),
-            "owned canary discovery skips: want the categorical initial-set "
-            f"skip plus at most one retained refusal, got {skips}",
-        )
-    else:
-        require(
-            len(skips) in (0, 1),
-            "safe canary discovery skips: want none or one retained refusal, "
-            f"got {skips}",
-        )
+    require(
+        len(skips) in (0, 1),
+        f"canary discovery skips: want none or one retained refusal, got {skips}",
+    )
     return len(skips)
 
 
@@ -2427,11 +2416,10 @@ def validate_canary(lane, document, target_bits=64):
         table_signature(evidence) == wanted_tables,
         f"unexpected discovery tables: {evidence['discovery']}",
     )
-    # The discovery-skip bound lives in exact_canary_discovery_skips: the
-    # deterministic floor (one initial-set skip on owned lanes, none
-    # elsewhere) plus at most one retained internal loss. exact_common pins
-    # the validated count against the document.
-    skips = exact_canary_discovery_skips(evidence, owned=owned_metrics)
+    # The discovery-skip bound lives in exact_canary_discovery_skips: none,
+    # plus at most one retained internal loss, on every lane. exact_common
+    # pins the validated count against the document.
+    skips = exact_canary_discovery_skips(evidence)
     exact_common(
         evidence,
         aliases=[],
@@ -2487,6 +2475,18 @@ def validate_canary(lane, document, target_bits=64):
         if owned_metrics:
             require(evidence["child_still_running"] is False,
                     f"owned child still running: {evidence['child_still_running']!r}")
+            # The owned run's one initial-set context is stated here, not
+            # as a skip (ee51d14): never paused, so it is unproven and its
+            # capture is `none`.
+            loader = evidence["loader_discovery"]
+            unproven = {key: 0 for key in LOADER_TIMING_KEYS} | {"unproven": 1}
+            require(loader["initial_set_timing"] == unproven,
+                    f"owned initial-set timing: {loader['initial_set_timing']}")
+            require(
+                loader["initial_set_capture"]
+                == {"eligible": 0, "none": 1, "pause_protected": 0},
+                f"owned initial-set capture: {loader['initial_set_capture']}",
+            )
             require(
                 (evidence["pause"], evidence["pause_attempts"],
                  evidence["pause_confirmed"], evidence["pause_partial"])
@@ -4137,13 +4137,15 @@ def self_test():
     owned_aggregate = copy.deepcopy(aggregate)
     owned_aggregate["functions"] = function_items([(["C_GetInterfaceList"], 30)])
     owned_aggregate["evidence"]["child_still_running"] = False
-    # The one skip an owned lane must publish: `p11scope run` attempts
-    # initial-set discovery and the empty timing catalog leaves it unproven.
-    # (The F-14 future-minor disclosure is retired with the scanner
-    # emission it mirrored: the scan walks every 2.x/3.x word it sees.)
-    owned_aggregate["evidence"]["skipped"] = [
-        {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE},
-    ]
+    # An owned lane publishes no skip (ee51d14): `p11scope run` attempts
+    # initial-set discovery, and the empty timing catalog leaves it
+    # unproven, stated once in loader_discovery.
+    owned_aggregate["evidence"]["skipped"] = []
+    owned_aggregate["evidence"]["loader_discovery"] = loader_discovery_fixture(
+        strategies__debug_state_every_hit=1,
+        initial_set_timing__unproven=1,
+        initial_set_capture__none=1,
+    )
     settle_fixture_verdict(owned_aggregate)
     for lane in ("owned-default-metrics", "owned-feature-metrics"):
         validate_canary(lane, owned_aggregate)
@@ -4156,11 +4158,16 @@ def self_test():
             lambda d: d["evidence"].update(child_still_running=True),
             lambda d: d["evidence"].update(
                 pause="sigstop", pause_attempts=1, pause_confirmed=1),
-            # The owned skip floor is exact, not merely permitted: an owned
-            # lane that published none is not a cleaner run, it is a run
-            # whose initial-set attempt went unreported. (The ceiling —
-            # floor plus at most one retained refusal — is covered below.)
-            lambda d: d["evidence"].update(skipped=[]),
+            # The initial-set gap must be stated, exactly once, in
+            # loader_discovery: an owned run that reports it nowhere left
+            # its initial-set attempt unreported. (The skip ceiling — at
+            # most one retained refusal — is covered below.)
+            lambda d: d["evidence"]["loader_discovery"].update(
+                initial_set_capture={"eligible": 0, "none": 0, "pause_protected": 0}),
+            lambda d: d["evidence"]["loader_discovery"].update(
+                initial_set_capture={"eligible": 0, "none": 0, "pause_protected": 1}),
+            lambda d: d["evidence"]["loader_discovery"]["initial_set_timing"].update(
+                unproven=0, pause_protected=1),
             lambda d: d["evidence"].update(skipped=[
                 {"name": DISCOVERY_SUBJECT, "reason": TABLE_UNAVAILABLE}]),
         ):
@@ -4173,22 +4180,20 @@ def self_test():
     rejected(lambda: validate_canary("aggregate-only-metrics", external_owned))
     print("canary owned aggregate exact30 run contract: OK")
 
-    # A retained P-2 bracket refusal publishes byte-identical to the
-    # initial-set skip: an owned lane may carry two categorical skips and a
-    # safe lane one. Anything else — a third skip on owned, a second on
-    # safe, or any non-categorical item — still fails.
-    two_skips = copy.deepcopy(owned_aggregate)
-    two_skips["evidence"]["skipped"] = [
-        dict(CANARY_DISCOVERY_SKIP) for _ in range(2)
-    ]
+    # A retained P-2 bracket refusal publishes as the categorical skip:
+    # any lane may carry one. Anything else — a second skip, or any
+    # non-categorical item — still fails.
+    owned_refusal = copy.deepcopy(owned_aggregate)
+    owned_refusal["evidence"]["skipped"] = [dict(CANARY_DISCOVERY_SKIP)]
+    settle_fixture_verdict(owned_refusal)
     for lane in ("owned-default-metrics", "owned-feature-metrics"):
-        validate_canary(lane, two_skips)
+        validate_canary(lane, owned_refusal)
     safe_refusal = copy.deepcopy(safe)
     safe_refusal["evidence"]["skipped"] = [dict(CANARY_DISCOVERY_SKIP)]
     settle_fixture_verdict(safe_refusal)
     validate_canary("default-safe-profile", safe_refusal)
     for lane, doc, extras in (
-        ("owned-default-metrics", owned_aggregate, 3),
+        ("owned-default-metrics", owned_aggregate, 2),
         ("default-safe-profile", safe, 2),
     ):
         for mutate in (
@@ -4232,16 +4237,14 @@ def self_test():
         rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
     bare_discovery = {"discovery": safe["evidence"]["discovery"], "skipped": []}
     require(
-        exact_canary_discovery_skips(bare_discovery, owned=False) == 0,
+        exact_canary_discovery_skips(bare_discovery) == 0,
         "a scanned [3,9] module with no skip is the clean shape",
     )
     resurrected = {
         "discovery": safe["evidence"]["discovery"], "skipped": [dict(retired)],
     }
     rejected(
-        lambda resurrected=resurrected: exact_canary_discovery_skips(
-            resurrected, owned=False
-        )
+        lambda resurrected=resurrected: exact_canary_discovery_skips(resurrected)
     )
     for skipped in (
         [dict(retired)],

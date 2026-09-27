@@ -82,16 +82,16 @@ def owned_metrics_document(bits, calls=30):
         interface_list="ok",
         child_still_running=False,
     )
-    # The one skip an owned lane must publish. `p11scope run` attempts
-    # initial-set discovery and the D3 amendment leaves the timing catalog
-    # exactly empty, so the attempt is reported unproven rather than claimed.
-    # (The F-14 future-minor disclosure is retired with the scanner
-    # emission it mirrored: the scan walks every 2.x/3.x word it sees.)
-    # Spelled out rather than taken from `discovery_skipped`, because the
-    # fixture's generic skip carries the table-unavailable reason instead.
-    evidence["skipped"] = [
-        {"name": subject.DISCOVERY_SUBJECT, "reason": subject.DISCOVERY_UNAVAILABLE},
-    ]
+    # An owned lane publishes no skip. `p11scope run` attempts initial-set
+    # discovery and the D3 amendment leaves the timing catalog exactly
+    # empty, so the attempt is reported unproven rather than claimed —
+    # once, in loader_discovery, never also as a skip (ee51d14).
+    evidence["skipped"] = []
+    evidence["loader_discovery"] = subject.loader_discovery_fixture(
+        strategies__debug_state_every_hit=1,
+        initial_set_timing__unproven=1,
+        initial_set_capture__none=1,
+    )
     if bits == 64:
         evidence["discovery_conflicts"] = 1
         evidence["discovery"][0]["corroboration"] = ["conflict"]
@@ -2761,42 +2761,43 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                         capture.validate_canary(lane, bad, TARGET_BITS)
                     with self.assertRaises(AssertionError):
                         canary.assert_owned_aggregate_metrics(bad)
-                # A retained scan refusal publishes byte-identical to the
-                # initial-set skip, so an owned lane may carry two
-                # categorical skips: the deterministic floor plus one.
-                two = copy.deepcopy(owned)
-                two["evidence"]["skipped"] = [
+                # A retained scan refusal publishes as the categorical
+                # skip, so an owned lane may carry one.
+                one = copy.deepcopy(owned)
+                one["evidence"]["skipped"] = [
                     {"name": capture.DISCOVERY_SUBJECT,
-                     "reason": capture.DISCOVERY_UNAVAILABLE}
-                    for _ in range(2)]
-                capture.validate_canary(lane, two, TARGET_BITS)
+                     "reason": capture.DISCOVERY_UNAVAILABLE}]
+                capture.settle_fixture_verdict(one)
+                capture.validate_canary(lane, one, TARGET_BITS)
                 for mutate in (
                     lambda d: d["evidence"].pop("child_still_running"),
                     lambda d: d["evidence"].update(child_still_running=True),
                     lambda d: d["evidence"].update(
                         pause="sigstop", pause_attempts=1, pause_confirmed=1),
-                    # The owned categorical floor is exact: a lane that
-                    # published no categorical skip left its initial-set
-                    # attempt unreported. Above the ceiling — a third
-                    # categorical skip, or any non-categorical item — still
-                    # fails. The retired future-minor version skip is such
-                    # an item (owner-approved 2026-09-27: the scan walks
-                    # future minors as known prefixes and never emits it),
-                    # alone or beside the categorical floor.
+                    # The initial-set gap must be stated in
+                    # loader_discovery: a lane that reports it nowhere left
+                    # its initial-set attempt unreported. Above the ceiling
+                    # — a second categorical skip, or any non-categorical
+                    # item — still fails. The retired future-minor version
+                    # skip is such an item (owner-approved 2026-09-27: the
+                    # scan walks future minors as known prefixes and never
+                    # emits it), alone or beside a categorical skip.
+                    lambda d: d["evidence"]["loader_discovery"].update(
+                        initial_set_capture={
+                            "eligible": 0, "none": 0, "pause_protected": 0}),
                     lambda d: d["evidence"].update(skipped=[
                         dict(RETIRED_VERSION_SKIP)]),
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
                          "reason": capture.DISCOVERY_UNAVAILABLE},
                         dict(RETIRED_VERSION_SKIP)]),
-                    lambda d: d["evidence"].update(skipped=[]),
                     lambda d: d["evidence"].update(skipped=[{
                         "name": capture.DISCOVERY_SUBJECT,
                         "reason": capture.TABLE_UNAVAILABLE}]),
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
                          "reason": capture.DISCOVERY_UNAVAILABLE}
-                        for _ in range(3)]),
+                        for _ in range(2)]),
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
                          "reason": capture.DISCOVERY_UNAVAILABLE},

@@ -82,13 +82,16 @@ def owned_metrics_document(bits, calls=30):
         interface_list="ok",
         child_still_running=False,
     )
-    # The one skip an owned lane must publish. `p11scope run` attempts
+    # The skips an owned lane must publish. `p11scope run` attempts
     # initial-set discovery and the D3 amendment leaves the timing catalog
-    # exactly empty, so the attempt is reported unproven rather than claimed.
+    # exactly empty, so the attempt is reported unproven rather than claimed
+    # (categorical floor), plus the F-14 future-minor disclosure the
+    # scanned matrix shape always carries.
     # Spelled out rather than taken from `discovery_skipped`, because the
     # fixture's generic skip carries the table-unavailable reason instead.
     evidence["skipped"] = [
-        {"name": subject.DISCOVERY_SUBJECT, "reason": subject.DISCOVERY_UNAVAILABLE}
+        {"name": subject.DISCOVERY_SUBJECT, "reason": subject.DISCOVERY_UNAVAILABLE},
+        dict(subject.CANARY_UNSUPPORTED_SKIP),
     ]
     if bits == 64:
         evidence["discovery_conflicts"] = 1
@@ -1936,6 +1939,41 @@ class StoppedPopulationTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "stopped"):
                     self.check(root, manifest)
 
+    def test_idle_owner_first_does_not_shadow_affiliated_records(self):
+        # An idle THREAD_OWNER for a task must not collide with that same
+        # task's leased records in other maps: the owned leader holds no
+        # owner lease at STOP (idle) but does hold its root affiliation and
+        # cookie. Frame order must not matter.
+        dumper = load_dumper()
+        manifest, receipt, records, values = self.fixture(Path("/unused"), owned=True)
+        records.insert(0, {"map_id": 102, "pid": 7001, "tid": 7001,
+                           "generation": 900, "value": bytes(544)})
+        controls = {}
+        for item in manifest:
+            if item["name"] in values:
+                words = values[item["name"]]
+                controls[item["name"]] = {
+                    "id": item["id"], "type": item["type"], "bytes_key": item["key_size"],
+                    "bytes_value": item["value_size"], "max_entries": item["max_entries"],
+                    "map_flags": item["map_flags"], "name": item["name"],
+                    "oracle": item["oracle"],
+                    "value": struct.pack("<" + "Q" * len(words), *words)}
+        stream = b"".join(TaskStorageReaderTests.frame(
+            1, row["map_id"], row["pid"], row["tid"], row["value"]
+        ) for row in records) + TaskStorageReaderTests.frame(2)
+        parsed = dumper.parse_task_storage_frames(
+            stream, TaskStorageReaderTests.MAPS, max_records=100, max_bytes=65536)
+        arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
+        arguments["controls"] = controls
+        bound = dumper.reconcile_task_storage(TaskStorageReaderTests.MAPS, parsed, **arguments)
+        self.assertEqual(bound["THREAD_OWNER"], [
+            {"pid": 7001, "tid": 7002, "generation": 901},
+            {"pid": 7001, "tid": 7003, "generation": 902}])
+        self.assertEqual(bound["ROOT_AFFILIATION"], [
+            {"pid": 7001, "tid": 7001, "generation": 900},
+            {"pid": 7001, "tid": 7002, "generation": 901},
+            {"pid": 7001, "tid": 7003, "generation": 902}])
+
     def test_valid_eof_with_missing_or_wrong_identity_population_is_terminal(self):
         for case in ("empty", "missing-worker", "foreign-owner", "nonleader-cookie",
                      "unexpected-root", "owned-missing-root", "owned-foreign-root"):
@@ -2722,22 +2760,31 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                         canary.assert_owned_aggregate_metrics(bad)
                 # A retained scan refusal publishes byte-identical to the
                 # initial-set skip, so an owned lane may carry two
-                # categorical skips: the deterministic floor plus one.
+                # categorical skips alongside the F-14 disclosure: the
+                # deterministic floor plus one.
                 two = copy.deepcopy(owned)
                 two["evidence"]["skipped"] = [
                     {"name": capture.DISCOVERY_SUBJECT,
                      "reason": capture.DISCOVERY_UNAVAILABLE}
-                    for _ in range(2)]
+                    for _ in range(2)] + [dict(capture.CANARY_UNSUPPORTED_SKIP)]
                 capture.validate_canary(lane, two, TARGET_BITS)
                 for mutate in (
                     lambda d: d["evidence"].pop("child_still_running"),
                     lambda d: d["evidence"].update(child_still_running=True),
                     lambda d: d["evidence"].update(
                         pause="sigstop", pause_attempts=1, pause_confirmed=1),
-                    # The owned skip floor is exact: a lane that published
-                    # none left its initial-set attempt unreported. Above
-                    # the ceiling — a third skip, or any non-categorical
-                    # item — still fails.
+                    # The owned categorical floor is exact: a lane that
+                    # published no categorical skip left its initial-set
+                    # attempt unreported. Above the ceiling — a third
+                    # categorical skip, or any item that is neither
+                    # categorical nor the disclosure — still fails. Shapes
+                    # carry the correct disclosure so they fail on the
+                    # categorical rule alone; the missing disclosure fails too.
+                    lambda d: d["evidence"].update(skipped=[
+                        dict(capture.CANARY_UNSUPPORTED_SKIP)]),
+                    lambda d: d["evidence"].update(skipped=[
+                        {"name": capture.DISCOVERY_SUBJECT,
+                         "reason": capture.DISCOVERY_UNAVAILABLE}]),
                     lambda d: d["evidence"].update(skipped=[]),
                     lambda d: d["evidence"].update(skipped=[{
                         "name": capture.DISCOVERY_SUBJECT,
@@ -2745,12 +2792,13 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
                          "reason": capture.DISCOVERY_UNAVAILABLE}
-                        for _ in range(3)]),
+                        for _ in range(3)] + [dict(capture.CANARY_UNSUPPORTED_SKIP)]),
                     lambda d: d["evidence"].update(skipped=[
                         {"name": capture.DISCOVERY_SUBJECT,
                          "reason": capture.DISCOVERY_UNAVAILABLE},
                         {"name": capture.DISCOVERY_SUBJECT,
-                         "reason": capture.TABLE_UNAVAILABLE}]),
+                         "reason": capture.TABLE_UNAVAILABLE},
+                        dict(capture.CANARY_UNSUPPORTED_SKIP)]),
                 ):
                     bad = copy.deepcopy(owned)
                     mutate(bad)
@@ -2761,8 +2809,9 @@ class OwnedMetricsOracleTests(unittest.TestCase):
         external["evidence"].pop("child_still_running")
         # The initial-set skip belongs to the owned lane alone: an external
         # `--pid` attach never attempts initial-set discovery, so it has
-        # nothing to leave unproven.
-        external["evidence"]["skipped"] = []
+        # nothing to leave unproven. The F-14 disclosure stays: the
+        # scanned matrix shape is the same.
+        external["evidence"]["skipped"] = [dict(capture.CANARY_UNSUPPORTED_SKIP)]
         external["functions"][0]["calls"] = 28
         # Dropping the skip changes the verdict's inputs: re-derive the
         # published classes the way the producer would.

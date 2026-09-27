@@ -145,7 +145,20 @@ METRICS_SCHEMA = "p11scope/observed-profile/v3-metrics"
 # SYSPLAN residual F-02: the terminal verdict split. `drain_proven` is the
 # settlement latch (a future COMPLETE requires it set); `verdict_detail`
 # says which terminal story `completeness` tells.
-VERDICT_DETAILS = {"clean_proven", "clean_but_unproven", "concrete_gap"}
+VERDICT_DETAILS = {"clean_proven", "clean_but_unproven", "attribution_only", "concrete_gap"}
+# Review answer (a): the closed gap classes behind the verdict, published so
+# the oracle can recompute `verdict_detail` from the counters instead of
+# trusting it. The three gate inputs that used to be unserialized are
+# published with them.
+VERDICT_CLASS_KEYS = {
+    "gap_classes", "semantic_unverified_slots", "unprotected_live_windows",
+    "module_unresolved_slots",
+}
+GAP_CLASS_KEYS = {
+    "observation", "attribution", "semantics", "open_calls", "settlement",
+    "stdout_data_sink",
+}
+NULL_POINTER_REASON = "null pointer"
 # SYSPLAN residual F-01: the only override flag durable evidence may name.
 URETPROBE_OVERRIDE_FLAG = "--allow-uretprobe-on-confined-target"
 # SYSPLAN residual F-26: capture-visible environment switches.
@@ -176,6 +189,8 @@ PROFILE_V3_FIELDS = {
 RESIDUAL_EVIDENCE_KEYS = {
     # F-02: settlement latch + terminal verdict detail.
     "drain_proven", "verdict_detail",
+    # Review answer (a): the classes and gate inputs behind the verdict.
+    *VERDICT_CLASS_KEYS,
     # F-01: durable uretprobe/hazard override (flag + reason), null when clean.
     "uretprobe_override",
     # F-15: handed-back orphan PID, null unless the run lane left it alive.
@@ -621,6 +636,7 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted.discard("scheduling")
         wanted.discard("active_slots")
         wanted -= RESIDUAL_EVIDENCE_KEYS
+        wanted -= VERDICT_CLASS_KEYS
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
@@ -815,6 +831,191 @@ def exact_task_uprobe_link_losses(evidence):
         )
 
 
+def loader_discovery_complete(loader):
+    """render.rs `LoaderDiscovery::complete`: only neutral strategies,
+    qualified pre-constructor timing, and eligible initial sets."""
+    def timing_gaps(timing):
+        return timing["known_pre_relocation"] + timing["unproven"] + timing["none"]
+
+    return (
+        loader["strategies"]["dlopen_return"] == 0
+        and loader["strategies"]["unavailable"] == 0
+        and timing_gaps(loader["dlopen_timing"]) == 0
+        and timing_gaps(loader["initial_set_timing"]) == 0
+        and loader["initial_set_capture"]["none"] == 0
+        and loader["state_read_failures"] == 0
+    )
+
+
+def selection_observation_complete(selection):
+    """render.rs `InterfaceSelection::observation_complete`."""
+    return (
+        not selection["selection_truncated"]
+        and all(p["coverage"] in ("observed", "absent_covered") for p in selection["providers"])
+        and all(e["status"] in ("present", "legacy_absent") for e in selection["standard_exports"])
+        and all(
+            not (
+                t["rv"] == 0
+                and t["result"] is not None
+                and not t["inventory_matches"]
+                and t["authority"] == "none"
+            )
+            for t in selection["tuples"]
+        )
+    )
+
+
+def expected_gap_classes(evidence):
+    """Recompute the producer's gap classes from the published counters.
+
+    Mirrors `render::Evidence::gap_classes` gate for gate and in order, so a
+    document whose classes or `verdict_detail` disagree with its own counters
+    is refused. A lane carrying `interface_selection` (profile, terminal
+    trace) is selection-aware; metrics is selection-blind by construction.
+    """
+    profile = "interface_selection" in evidence
+    scheduling = evidence["scheduling"]
+    stdout_data_sink = evidence["gap_classes"]["stdout_data_sink"]
+    require(isinstance(stdout_data_sink, bool), f"invalid stdout_data_sink: {stdout_data_sink!r}")
+    gates = {
+        "observation": [
+            ("discovery", not evidence["discovery"]),
+            ("slots", evidence["slots"] == 0),
+            ("scan_unavailable", evidence["scan_unavailable"] is not None),
+            ("modules_skipped", bool(evidence["modules_skipped"])),
+            ("attach_failures", bool(evidence["attach_failures"])),
+            ("skipped", any(s["reason"] != NULL_POINTER_REASON for s in evidence["skipped"])),
+            ("in_flight_at_end", evidence["in_flight_at_end"] > 0),
+            (
+                "surfaces",
+                any(s["walk"] != "full" or s["acquisition"] != "ok" for s in evidence["surfaces"]),
+            ),
+            ("vendor_interfaces", evidence["vendor_interfaces"] > 0),
+            ("interface_list", evidence["interface_list"].startswith("error:")),
+            ("event_loss", evidence["event_loss"] > 0),
+            ("start_insert_failures", evidence["start_insert_failures"] > 0),
+            ("unmatched_returns", evidence["unmatched_returns"] > 0),
+            ("rv_update_failures", evidence["rv_update_failures"] > 0),
+            ("cgroup_scope_failures", evidence["cgroup_scope_failures"] > 0),
+            ("abi_refusals", evidence["abi_refusals"] > 0),
+            ("malformed_records", evidence["malformed_records"] > 0),
+            ("provider_changed", evidence["provider_changed"] is True),
+            ("unprotected_live_windows", evidence["unprotected_live_windows"] > 0),
+            ("discovery_ring_loss", evidence["discovery_ring_loss"] > 0),
+            ("discovery_state_failures", evidence["discovery_state_failures"] > 0),
+            ("discovery_read_failures", evidence["discovery_read_failures"] > 0),
+            ("discovery_truncated", evidence["discovery_truncated"] > 0),
+            ("task_uprobe_link_losses", evidence["task_uprobe_link_losses"] > 0),
+            ("pause_partial", evidence["pause_partial"] > 0),
+            ("loader_discovery", not loader_discovery_complete(evidence["loader_discovery"])),
+            ("scheduling.terminal_drain_truncated", scheduling["terminal_drain_truncated"] is True),
+            (
+                "scheduling.sink_dropped_bytes",
+                stdout_data_sink and scheduling["sink_dropped_bytes"] > 0,
+            ),
+        ],
+        "attribution": [
+            ("semantic_unverified_slots", evidence["semantic_unverified_slots"] > 0),
+            ("aliased", bool(evidence["aliased"])),
+            ("module_ambiguous", evidence["module_ambiguous"] > 0),
+            ("module_unresolved_slots", evidence["module_unresolved_slots"] > 0),
+            ("unregistered_mechanisms", evidence["unregistered_mechanisms"] > 0),
+            ("discovery_conflicts", evidence["discovery_conflicts"] > 0),
+            ("discovery_uncorroborated", evidence["discovery_uncorroborated"] > 0),
+        ],
+        "semantics": [
+            (name, evidence[name] > 0)
+            for name in (
+                "semantic_capture_failures", "template_tail_failures",
+                "process_tracking_failures", "process_tracking_evictions",
+                "state_reconciliations", "session_cancel_ambiguities",
+                "session_cancel_unknown_flags", "operation_state_imports",
+                "auth_state_ambiguities", "async_target_failures", "async_orphans",
+                "async_duplicates", "async_evictions", "fork_state_ambiguities",
+                "semantic_state_drops", "semantic_history_drops", "pending_at_end",
+            )
+        ] + [
+            ("templates_truncated", evidence["templates_truncated"] is True),
+            ("shape_decode_total_failures", evidence["shape_decode_total_failures"] > 0),
+        ],
+    }
+    if profile:
+        selection = evidence["interface_selection"]
+        gates["observation"] += [
+            ("interface_selection", not selection_observation_complete(selection)),
+            ("pid_descendant_gaps", evidence["pid_descendant_gaps"] > 0),
+            ("multi_rebuild_gaps", evidence["multi_rebuild_gaps"] > 0),
+        ]
+        gates["attribution"].append((
+            "interface_selection.selection_count_only",
+            any(t["authority"] == "selection_count_only" for t in selection["tuples"]),
+        ))
+    causes = {name: [cause for cause, hit in gate if hit] for name, gate in gates.items()}
+    if causes["semantics"]:
+        semantics = "degraded"
+    elif evidence["slots"] == 0 or evidence["semantic_unverified_slots"] >= evidence["slots"]:
+        semantics = "not_applicable"
+    else:
+        semantics = "complete"
+    return {
+        "observation": {
+            "status": "lossy" if causes["observation"] else "exact",
+            "causes": causes["observation"],
+        },
+        "attribution": {
+            "status": "withheld" if causes["attribution"] else "attested",
+            "causes": causes["attribution"],
+        },
+        "semantics": {"status": semantics, "causes": causes["semantics"]},
+        "open_calls": evidence["in_flight_at_end"],
+        "settlement": "proven" if evidence["drain_proven"] is True else "unproven",
+        "stdout_data_sink": stdout_data_sink,
+    }
+
+
+def expected_verdict_detail(classes):
+    """`verdict_detail` is a function of the classes alone."""
+    if classes["observation"]["causes"] or classes["semantics"]["causes"]:
+        return "concrete_gap"
+    if classes["attribution"]["causes"]:
+        return "attribution_only"
+    return "clean_proven" if classes["settlement"] == "proven" else "clean_but_unproven"
+
+
+def exact_verdict_classes(evidence):
+    """Refuse any document whose verdict disagrees with its own counters."""
+    for key in ("semantic_unverified_slots", "unprotected_live_windows", "module_unresolved_slots"):
+        require(u64(evidence[key]), f"invalid {key}: {evidence[key]!r}")
+    classes = evidence["gap_classes"]
+    require(isinstance(classes, dict), f"invalid gap_classes: {classes!r}")
+    exact_keys(classes, GAP_CLASS_KEYS, "gap_classes")
+    expected = expected_gap_classes(evidence)
+    require(classes == expected, f"gap_classes disagree with the counters: want {expected}, got {classes}")
+    detail = expected_verdict_detail(expected)
+    require(
+        evidence["verdict_detail"] == detail,
+        f"verdict_detail disagrees with the counters: want {detail!r}, got {evidence['verdict_detail']!r}",
+    )
+    if detail in ("concrete_gap", "attribution_only"):
+        require(evidence["completeness"] == "PARTIAL", f"{detail} cannot be COMPLETE")
+
+
+def settle_fixture_verdict(document):
+    """Self-test helper: recompute a fixture's classes and detail in place,
+    the way the producer's verdict does, so positive fixtures stay
+    self-consistent after they are shaped. Never used on real input."""
+    evidence = document["evidence"] if "evidence" in document else document
+    if not VERDICT_CLASS_KEYS <= set(evidence):
+        return document
+    try:
+        classes = expected_gap_classes(evidence)
+    except (AssertionError, KeyError, TypeError, AttributeError):
+        return document
+    evidence["gap_classes"] = classes
+    evidence["verdict_detail"] = expected_verdict_detail(classes)
+    return document
+
+
 def exact_terminal_verdict(evidence):
     """SYSPLAN residual terminal split (F-02) + durable override (F-01),
     handoff PID (F-15), and environment snapshot (F-26).
@@ -834,6 +1035,7 @@ def exact_terminal_verdict(evidence):
     )
     detail = evidence["verdict_detail"]
     require(detail in VERDICT_DETAILS, f"invalid verdict_detail: {detail!r}")
+    exact_verdict_classes(evidence)
     if evidence["completeness"] == "COMPLETE":
         require(
             evidence["drain_proven"] is True,
@@ -1552,6 +1754,50 @@ def terminal_capture_is_clean(evidence, *, uncorroborated=0):
         require(evidence[name] == wanted, f"{name}: want {wanted}, got {evidence[name]}")
 
 
+# The pinned 104-name catalog: every walkable table layout is a prefix of it.
+MAX_FUNCTION_ORDINALS = 104
+FUNCTION_TARGET_KEYS = {"object", "file_offset"}
+FUNCTION_ORDINAL_KEYS = {"table_file_offset", "ordinal"}
+
+
+def exact_function_target(item):
+    """Review answer (c): every row names its exact target and ordinals.
+
+    `target` is `{object, file_offset}`, `object` the pinned `{dev, ino,
+    sha256}` (null only when no pin identity was recorded); `ordinals` is the
+    sorted, duplicate-free list of `{table_file_offset, ordinal}` positions
+    reaching the target. A position is never a name: an unnamed row stays
+    `["unknown"]`, whatever its ordinals.
+    """
+    require({"target", "ordinals"} <= set(item), f"function row has no target: {item}")
+    target = item["target"]
+    exact_keys(target, FUNCTION_TARGET_KEYS, "function target")
+    require(u64(target["file_offset"]), f"invalid target file_offset: {item}")
+    if target["object"] is not None:
+        exact_keys(target["object"], {"dev", "ino", "sha256"}, "function target object")
+        exact_identity(target["object"])
+    ordinals = item["ordinals"]
+    require(isinstance(ordinals, list), f"invalid ordinals: {item}")
+    keys = []
+    for ordinal in ordinals:
+        exact_keys(ordinal, FUNCTION_ORDINAL_KEYS, "function ordinal")
+        require(
+            ordinal["table_file_offset"] is None or u64(ordinal["table_file_offset"]),
+            f"invalid ordinal table_file_offset: {item}",
+        )
+        require(
+            isinstance(ordinal["ordinal"], int)
+            and not isinstance(ordinal["ordinal"], bool)
+            and 0 <= ordinal["ordinal"] < MAX_FUNCTION_ORDINALS,
+            f"invalid ordinal: {item}",
+        )
+        keys.append((
+            -1 if ordinal["table_file_offset"] is None else ordinal["table_file_offset"],
+            ordinal["ordinal"],
+        ))
+    require(keys == sorted(set(keys)), f"ordinals are not sorted and unique: {item}")
+
+
 def exact_capture_modules(document):
     """`capture.modules[]` — v2's replacement for the singular `capture.module`.
 
@@ -1587,6 +1833,7 @@ def exact_capture_modules(document):
     }
     ineligible = False
     for item in document["functions"]:
+        exact_function_target(item)
         names = item["names"]
         require(isinstance(names, list) and names, f"function without names: {item}")
         require(
@@ -1691,8 +1938,12 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         )
         require(target["path"] == record["path"], target)
     # Task 1.3 provenance: every decoded table carries its version-word file
-    # offset and linkage kind. Zero interfaces means heuristic decode, so the
-    # slots are named `unknown`, never ordinal PKCS#11 labels.
+    # offset and linkage kind. Zero interfaces, but SoftHSM2's own `.dynsym`
+    # defines every standard name exactly where its table points (GT-2), so
+    # its table is export-linked and its slots are named. p11-kit's closure
+    # templates point at per-closure trampolines, never at the three standard
+    # names libp11-kit exports, so they contradict their exports, stay
+    # heuristic, and their slots stay `unknown`.
     soft_tables = by_path[soft["path"]]["tables"]
     require(len(soft_tables) == 1, soft_tables)
     require(
@@ -1700,7 +1951,8 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         == {"version": [2, 40], "entries": 68, "source": "scan"},
         soft_tables,
     )
-    require(soft_tables[0]["linkage"] == "heuristic", soft_tables)
+    require(soft_tables[0]["linkage"] == "exports", soft_tables)
+    require(soft_tables[0]["exports_agreeing"] == 68, soft_tables)
     require(u64(soft_tables[0]["file_offset"]), soft_tables)
     proxy_tables = by_path[proxy["path"]]["tables"]
     require(len(proxy_tables) == PROXY_TABLES, len(proxy_tables))
@@ -1725,6 +1977,7 @@ def validate_proxy_capacity_fallback(document, module_path=None):
             shape = key
         require(key == shape, f"proxy tables mix provider builds: {shape} vs {key}")
         require(table["linkage"] == "heuristic", table)
+        require(u64(table["exports_agreeing"]), table)
         require(u64(table["file_offset"]), table)
         offsets.add(table["file_offset"])
     require(len(offsets) == PROXY_TABLES, "proxy tables share a file offset")
@@ -1778,8 +2031,16 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     attributed = Counter()
     called_soft = 0
     called_proxy = 0
+    soft_names = set()
     for item in functions:
-        require(item["names"] == ["unknown"], f"scan-only function must be unnamed: {item}")
+        if item["module"] == soft_id:
+            require(
+                len(item["names"]) == 1 and item["names"][0].startswith("C_"),
+                f"export-linked SoftHSM2 function must be named: {item}",
+            )
+            soft_names.add(item["names"][0])
+        else:
+            require(item["names"] == ["unknown"], f"heuristic proxy function must be unnamed: {item}")
         require(item["aliased"] is False, item)
         require(item["module_ambiguous"] is False, item)
         require(item["module"] in (soft_id, proxy_id), item)
@@ -1793,6 +2054,7 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         dict(attributed) == {"soft": 68, "proxy": admitted_slots},
         f"per-module function split: {dict(attributed)}",
     )
+    require(len(soft_names) == 68, f"SoftHSM2 names are not 68 distinct: {sorted(soft_names)}")
     # A green lane claims two-provider call coverage (audit F6): one global
     # positive count lets complete loss on either provider pass, so each
     # provider must have handled at least one call.
@@ -1847,10 +2109,12 @@ def validate_clean_metrics(
 ):
     """SoftHSM2 counted exactly, with discovery stated rather than assumed.
 
-    Since the 1.3 mislabel guard, scan-only tables carry no linkage and their
-    slots are named `unknown` — never ordinal PKCS#11 labels — so the scan
-    lane asserts exact counts on totals, while manifest-authorized lanes
-    (manifest-only, corroborated) keep exact per-name counts.
+    SoftHSM2 defines every standard name in its own `.dynsym`, and its one
+    2.40 table points at each of them exactly, so even a scan-only capture
+    names its slots through export linkage (GT-2): every lane keeps exact
+    per-name counts. A scan table must say so — `exports_agreeing` is all 68
+    ordinals and its linkage is never `heuristic` (a live return may still
+    outrank `exports`).
     """
     require(discovery in CLEAN_DISCOVERY, f"unknown clean-metrics discovery: {discovery}")
     wanted_sources, allowances = CLEAN_DISCOVERY[discovery]
@@ -1901,31 +2165,19 @@ def validate_clean_metrics(
         )
     exact_capture_modules(document)
 
+    for module in evidence["discovery"]:
+        for table in module["tables"]:
+            if table["source"] != "scan":
+                require(table["exports_agreeing"] is None, f"manifest table compared: {table}")
+                continue
+            require(
+                table["exports_agreeing"] == 68 and table["linkage"] != "heuristic",
+                f"SoftHSM2 scan table is not export-corroborated: {table}",
+            )
+
     wanted = {name: calls * multiplier for name, calls in expected.items()}
     require("C_GetFunctionList" not in wanted, "expected-count file must omit bootstrap")
     wanted["C_GetFunctionList"] = multiplier
-    if discovery == "scan":
-        # Scan-only: unlinked heuristic tables are count-only under `unknown`
-        # (1.3 mislabel guard) — the bootstrap loader call included — so
-        # exactness is on the total, never per name.
-        total = 0
-        for item in document["functions"]:
-            calls = item["calls"]
-            require(u64(calls), f"invalid call count: {item}")
-            require(
-                item["names"] == ["unknown"],
-                f"scan-only function must be unnamed: {item}",
-            )
-            require(
-                item["aliased"] is False,
-                f"clean metrics cannot contain aliases: {item}",
-            )
-            total += calls
-        require(
-            total == sum(wanted.values()),
-            f"scan-only total calls: want {sum(wanted.values())}, got {total}",
-        )
-        return
     actual = Counter()
     for item in document["functions"]:
         calls = item["calls"]
@@ -2277,8 +2529,10 @@ def function_items(pairs, identity=None):
             "module_ambiguous": False,
             "module_unresolved": False,
             "aliased": len(names) > 1,
+            "target": {"object": dict(identity), "file_offset": 0x1000 + 16 * position},
+            "ordinals": [],
         }
-        for names, calls in pairs
+        for position, (names, calls) in enumerate(pairs)
     ]
 
 
@@ -2312,7 +2566,8 @@ def discovery_fixture(sources=("scan",)):
                     "entries": 68,
                     "source": source,
                     "file_offset": 0x1000 if source == "scan" else None,
-                    "linkage": "heuristic" if source == "scan" else "manifest",
+                    "linkage": "exports" if source == "scan" else "manifest",
+                    "exports_agreeing": 68 if source == "scan" else None,
                 }
                 for source in sources
             ],
@@ -2424,6 +2679,17 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         # no handoff, no env switches live.
         "drain_proven": False,
         "verdict_detail": "concrete_gap",
+        "semantic_unverified_slots": 0,
+        "unprotected_live_windows": 0,
+        "module_unresolved_slots": 0,
+        "gap_classes": {
+            "observation": {"status": "lossy", "causes": []},
+            "attribution": {"status": "attested", "causes": []},
+            "semantics": {"status": "complete", "causes": []},
+            "open_calls": 0,
+            "settlement": "unproven",
+            "stdout_data_sink": False,
+        },
         "uretprobe_override": None,
         "handoff_child_pid": None,
         "p11scope_env": [],
@@ -2449,8 +2715,9 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("semantic_history_drops", None)
             evidence.pop("scheduling", None)
             evidence.pop("active_slots", None)
-            for field in RESIDUAL_EVIDENCE_KEYS:
+            for field in RESIDUAL_EVIDENCE_KEYS | VERDICT_CLASS_KEYS:
                 evidence.pop(field, None)
+    settle_fixture_verdict(evidence)
     capture = {
         "mode": mode,
         "privacy_mode": privacy,
@@ -2505,7 +2772,9 @@ def self_test():
         mode="metrics",
         privacy="aggregate-only",
     )
-    clean["functions"] = function_items([(["unknown"], 2)])
+    clean["functions"] = function_items(
+        [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
+    )
     validate_clean_metrics(clean, {"C_Initialize": 1})
     historical = document_fixture(
         clean_evidence,
@@ -2526,6 +2795,7 @@ def self_test():
             "reason": SHARED_OVERLAY_UNCERTAINTY,
         }
     ]
+    settle_fixture_verdict(shared)
     validate_shared_layer_metrics(shared, {"C_Initialize": 1})
     shared_nested_overlay = copy.deepcopy(shared)
     shared_nested_overlay["evidence"]["discovery"][0]["skipped"] = [
@@ -2542,21 +2812,30 @@ def self_test():
     ):
         bad = copy.deepcopy(shared)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_shared_layer_metrics(bad, {"C_Initialize": 1}))
     print("shared-layer metrics permits exactly one bounded overlay uncertainty: OK")
     bad = copy.deepcopy(clean)
     bad["functions"] += function_items([(["unknown"], 1)])
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
     print("unexpected positive function rejected: OK")
-    # A scan-only slot carrying an ordinal label is a mislabel, not evidence.
-    bad = copy.deepcopy(clean)
-    bad["functions"] = function_items([(["unknown"], 1), (["C_Initialize"], 1)])
-    rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
-    print("scan-only ordinal label rejected: OK")
+    # GT-2: SoftHSM2's scan table is export-linked, so a withheld name, a
+    # heuristic linkage or a partial agreement is a regression, not evidence.
+    for mutate in (
+        lambda d: d["functions"][0].update(names=["unknown"]),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(linkage="heuristic"),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(exports_agreeing=67),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(exports_agreeing=None),
+    ):
+        bad = copy.deepcopy(clean)
+        mutate(bad)
+        settle_fixture_verdict(bad)
+        rejected(lambda bad=bad: validate_clean_metrics(bad, {"C_Initialize": 1}))
+    print("scan-only SoftHSM2 names are export-linked and exact: OK")
     bad = copy.deepcopy(clean)
     bad["functions"][0]["calls"] = 3
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
-    print("scan-only total exact count required: OK")
+    print("scan-only per-name exact count required: OK")
     doubled = copy.deepcopy(clean)
     for item in doubled["functions"]:
         item["calls"] *= 2
@@ -2581,6 +2860,7 @@ def self_test():
             owned["evidence"].update(
                 pause="sigstop", pause_attempts=1, pause_confirmed=1, pause_partial=0
             )
+        settle_fixture_verdict(owned)
         validate_lane02_owned_run_metrics(owned, {"C_Initialize": 1}, pause)
         for mutate in (
             lambda d: d["evidence"].pop("child_still_running"),
@@ -2599,6 +2879,7 @@ def self_test():
         ):
             bad = copy.deepcopy(owned)
             mutate(bad)
+            settle_fixture_verdict(bad)
             rejected(
                 lambda bad=bad, pause=pause: validate_lane02_owned_run_metrics(
                     bad, {"C_Initialize": 1}, pause
@@ -2651,6 +2932,7 @@ def self_test():
             "reason": SHARED_OVERLAY_UNCERTAINTY,
         }
     ]
+    settle_fixture_verdict(lane13)
     validate_lane13_knative_metrics(lane13, {"C_Initialize": 1})
     for mutate in (
         lambda d: d["evidence"].update(skipped=[]),
@@ -2702,6 +2984,7 @@ def self_test():
     ):
         bad = copy.deepcopy(lane13)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_lane13_knative_metrics(bad, {"C_Initialize": 1}))
     corroborated_evidence = evidence_fixture(
         LEGACY_SURFACES + LEGACY_SURFACES, sources=("scan", "manifest")
@@ -2813,6 +3096,105 @@ def self_test():
         )
     )
     print("semantic join eligibility is exact and conservative: OK")
+    # Review answer (c): every row carries its exact target and ordinals.
+    identified = copy.deepcopy(clean)
+    identified["functions"][0]["ordinals"] = [
+        {"table_file_offset": 0x100, "ordinal": 43},
+        {"table_file_offset": 0x100, "ordinal": 44},
+    ]
+    identified["functions"][1]["target"]["object"] = None
+    exact_capture_modules(identified)
+    for mutate in (
+        lambda d: d["functions"][0].pop("target"),
+        lambda d: d["functions"][0].pop("ordinals"),
+        lambda d: d["functions"][0]["target"].update(file_offset=-1),
+        lambda d: d["functions"][0]["target"].update(slot=3),
+        lambda d: d["functions"][0]["target"]["object"].update(path="/opt/p11.so"),
+        lambda d: d["functions"][0]["ordinals"].reverse(),
+        lambda d: d["functions"][0]["ordinals"].append(
+            dict(d["functions"][0]["ordinals"][0])
+        ),
+        lambda d: d["functions"][0]["ordinals"][0].update(ordinal=104),
+        lambda d: d["functions"][0]["ordinals"][0].update(ordinal=True),
+        lambda d: d["functions"][0]["ordinals"][0].update(name="C_Sign"),
+    ):
+        bad = copy.deepcopy(identified)
+        mutate(bad)
+        settle_fixture_verdict(bad)
+        rejected(lambda bad=bad: exact_capture_modules(bad))
+    print("function rows carry an exact target and sorted unique ordinals: OK")
+    # Review answer (a) / F-1: the oracle recomputes the verdict from the
+    # counters and refuses a document whose classes or detail disagree.
+    def verdict_doc(**counters):
+        document = copy.deepcopy(clean)
+        document["evidence"].update(counters)
+        return settle_fixture_verdict(document)
+
+    attributed = verdict_doc(semantic_unverified_slots=68)
+    exact_metrics_schema(attributed)
+    require(
+        attributed["evidence"]["verdict_detail"] == "attribution_only"
+        and attributed["evidence"]["gap_classes"]["attribution"]["causes"]
+        == ["semantic_unverified_slots"]
+        and attributed["evidence"]["gap_classes"]["observation"]["status"] == "exact"
+        and attributed["evidence"]["gap_classes"]["semantics"]["status"] == "not_applicable",
+        f"names-only withholding is attribution_only: {attributed['evidence']['gap_classes']}",
+    )
+    lossy = verdict_doc(unmatched_returns=1)
+    exact_metrics_schema(lossy)
+    require(lossy["evidence"]["verdict_detail"] == "concrete_gap", lossy["evidence"])
+    null_only = verdict_doc(skipped=[{"name": "C_GetFunctionStatus", "reason": "null pointer"}])
+    exact_metrics_schema(null_only)
+    require(
+        null_only["evidence"]["gap_classes"]["observation"]["causes"] == [],
+        "a NULL table entry cannot be called, so it is never an observation loss",
+    )
+    unreadable = verdict_doc(skipped=[{"name": "C_Sign", "reason": ENTRY_UNAVAILABLE}])
+    require(
+        unreadable["evidence"]["gap_classes"]["observation"]["causes"] == ["skipped"],
+        unreadable["evidence"]["gap_classes"],
+    )
+    open_calls = verdict_doc(in_flight_at_end=2)
+    require(
+        open_calls["evidence"]["gap_classes"]["observation"]["causes"] == ["in_flight_at_end"]
+        and open_calls["evidence"]["gap_classes"]["open_calls"] == 2,
+        "open calls stay an observation gap until unpaired entries are separable (F-9)",
+    )
+    display_drops = copy.deepcopy(clean)
+    display_drops["evidence"]["scheduling"]["sink_dropped_bytes"] = 5
+    settle_fixture_verdict(display_drops)
+    require(
+        display_drops["evidence"]["gap_classes"]["observation"]["causes"] == [],
+        "stdout display drops are no observation loss when stdout is not the data sink",
+    )
+    data_drops = copy.deepcopy(display_drops)
+    data_drops["evidence"]["gap_classes"]["stdout_data_sink"] = True
+    settle_fixture_verdict(data_drops)
+    require(
+        data_drops["evidence"]["gap_classes"]["observation"]["causes"]
+        == ["scheduling.sink_dropped_bytes"],
+        data_drops["evidence"]["gap_classes"],
+    )
+    for document, mutate in (
+        (lossy, lambda d: d["evidence"].update(verdict_detail="clean_but_unproven")),
+        (lossy, lambda d: d["evidence"].update(verdict_detail="attribution_only")),
+        (lossy, lambda d: d["evidence"]["gap_classes"]["observation"].update(causes=[])),
+        (lossy, lambda d: d["evidence"]["gap_classes"]["observation"].update(status="exact")),
+        (attributed, lambda d: d["evidence"].update(verdict_detail="concrete_gap")),
+        (attributed, lambda d: d["evidence"].update(verdict_detail="clean_but_unproven")),
+        (attributed, lambda d: d["evidence"].update(semantic_unverified_slots=0)),
+        (attributed, lambda d: d["evidence"]["gap_classes"].update(extra=1)),
+        (attributed, lambda d: d["evidence"]["gap_classes"].pop("settlement")),
+        (attributed, lambda d: d["evidence"].pop("gap_classes")),
+        (attributed, lambda d: d["evidence"].update(unprotected_live_windows=-1)),
+        (open_calls, lambda d: d["evidence"]["gap_classes"].update(open_calls=0)),
+        (data_drops, lambda d: d["evidence"]["gap_classes"].update(stdout_data_sink=False)),
+        (null_only, lambda d: d["evidence"]["skipped"][0].update(reason=ENTRY_UNAVAILABLE)),
+    ):
+        bad = copy.deepcopy(document)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_metrics_schema(bad))
+    print("verdict_detail and gap_classes are recomputed from the counters: OK")
     for discovery, document in documents.items():
         validate_clean_metrics(document, {"C_Initialize": 1}, discovery=discovery)
         for other in documents:
@@ -2866,6 +3248,7 @@ def self_test():
                     "source": "scan",
                     "file_offset": 0x2000 + index * 840,
                     "linkage": "heuristic",
+                    "exports_agreeing": 0,
                 }
                 for index in range(PROXY_TABLES)
             ],
@@ -2892,8 +3275,9 @@ def self_test():
         discovery_uncorroborated_candidates=PROXY_SPILL,
         skipped=[],
     )
+    soft_names = [[f"C_Fixture{index:02d}"] for index in range(68)]
     proxy["functions"] = function_items(
-        [(["unknown"], 1)] + [(["unknown"], 0)] * 67
+        [(soft_names[0], 1)] + [(names, 0) for names in soft_names[1:]]
     ) + function_items(
         [(["unknown"], 1)] + [(["unknown"], 0)] * (PROXY_ADMITTED_SLOTS - 1),
         identity=proxy_id,
@@ -2941,8 +3325,14 @@ def self_test():
         lambda d: d["evidence"]["surfaces"].pop(),
         # A surface neither module owns is a gap, never an allowance.
         lambda d: d["evidence"]["surfaces"][-1].update(source="/usr/lib/other.so table 3.2"),
-        # A labeled slot in a scan-only capture is a mislabel, not evidence.
-        lambda d: d["functions"][0].update(names=["C_Initialize"]),
+        # A labeled slot in a heuristic proxy table is a mislabel, not
+        # evidence; an unnamed or duplicated SoftHSM2 slot is a GT-2
+        # regression, as is its table losing export linkage.
+        lambda d: d["functions"][68].update(names=["C_Initialize"]),
+        lambda d: d["functions"][0].update(names=["unknown"]),
+        lambda d: d["functions"][1].update(names=list(d["functions"][0]["names"])),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(linkage="heuristic"),
+        lambda d: d["evidence"]["discovery"][0]["tables"][0].update(exports_agreeing=0),
         # A proxy slot reattributed to SoftHSM2 breaks the per-module split.
         lambda d: d["functions"][68].update(module=dict(soft_id)),
         # A target both providers publish is attached once: two probes per
@@ -2952,6 +3342,7 @@ def self_test():
     ):
         bad = copy.deepcopy(proxy)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
     # Audit F8: every other admitted 3.x family is accepted when it is
     # internally consistent — same table count, one shape, K=4 spill, and
@@ -2988,6 +3379,7 @@ def self_test():
         ):
             bad = copy.deepcopy(older)
             mutate(bad)
+            settle_fixture_verdict(bad)
             rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
     print("proxy capacity fallback accepts only its exact evidence shape: OK")
 
@@ -3012,6 +3404,7 @@ def self_test():
     version["discovery"][0]["corroboration"] = ["conflict"]
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
+    settle_fixture_verdict(safe)
     validate_canary("default-safe-profile", safe)
 
     safe32 = copy.deepcopy(safe)
@@ -3037,6 +3430,7 @@ def self_test():
         corroboration=["agreed"],
     )
     safe32["evidence"]["discovery_conflicts"] = 0
+    settle_fixture_verdict(safe32)
     validate_canary("default-safe-profile", safe32, 32)
     rejected(lambda: validate_canary("default-safe-profile", safe32, 64))
     rejected(lambda: validate_canary("default-safe-profile", safe, 32))
@@ -3055,6 +3449,7 @@ def self_test():
     ):
         bad = copy.deepcopy(safe32)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_canary("default-safe-profile", bad, 32))
     print("canary ABI-specific scan shapes and cross-width refusals: OK")
 
@@ -3065,6 +3460,7 @@ def self_test():
     ):
         bad = copy.deepcopy(safe)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
     selection_doc = copy.deepcopy(safe)
     selection_doc["evidence"]["interface_selection"] = {
@@ -3154,11 +3550,13 @@ def self_test():
         candidate = copy.deepcopy(selection_doc)
         candidate["evidence"]["interface_selection"]["providers"][0]["coverage"] = coverage
         candidate["evidence"]["completeness"] = "PARTIAL"
+        settle_fixture_verdict(candidate)
         exact_profile_v3_selection(candidate)
     for status in sorted(STANDARD_EXPORT_STATUS):
         candidate = copy.deepcopy(selection_doc)
         candidate["evidence"]["interface_selection"]["standard_exports"][0]["status"] = status
         candidate["evidence"]["completeness"] = "PARTIAL"
+        settle_fixture_verdict(candidate)
         exact_profile_v3_selection(candidate)
     for name in sorted(SELECTION_NAME_CLASSES):
         candidate = copy.deepcopy(selection_doc)
@@ -3180,6 +3578,7 @@ def self_test():
             tuple_.update(table_match=False, inventory_matches=[], authority="none")
             tuple_["result"][field] = class_
             candidate["evidence"]["completeness"] = "PARTIAL"
+            settle_fixture_verdict(candidate)
             exact_profile_v3_selection(candidate)
     for mutate in (
         lambda d: d["evidence"]["interface_selection"].update(secret="canary"),
@@ -3207,6 +3606,7 @@ def self_test():
     ):
         bad = copy.deepcopy(selection_doc)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_profile_v3_selection(bad))
     unordered = copy.deepcopy(selection_doc)
     failed = copy.deepcopy(unordered["evidence"]["interface_selection"]["tuples"][0])
@@ -3299,6 +3699,7 @@ def self_test():
     tuple_ = count_only["evidence"]["interface_selection"]["tuples"][0]
     tuple_.update(table_match=False, inventory_matches=[], authority="selection_count_only")
     count_only["evidence"]["completeness"] = "PARTIAL"
+    settle_fixture_verdict(count_only)
     exact_profile_v3_selection(count_only)
     for mutate in (
         lambda t: t["request"].update(name="other"),
@@ -3320,6 +3721,7 @@ def self_test():
     }.items():
         require(candidate["evidence"]["interface_selection"]["tuples"][0]["authority"] == authority,
                 f"authority fixture mismatch: {authority}")
+        settle_fixture_verdict(candidate)
         exact_profile_v3_selection(candidate)
     overflow_count = copy.deepcopy(selection_doc)
     overflow_count["evidence"]["interface_selection"]["tuples"][0]["count"] = U64_MAX + 1
@@ -3481,6 +3883,7 @@ def self_test():
 
     unsafe = document_fixture(copy.deepcopy(version), privacy="unsafe-unvalidated-metadata")
     unsafe["evidence"].update(UNSAFE_ALLOWANCES)
+    settle_fixture_verdict(unsafe)
     validate_canary("feature-unsafe-profile", unsafe)
     bad = copy.deepcopy(unsafe)
     bad["evidence"]["shape_decode_failures"] = 1
@@ -3508,6 +3911,7 @@ def self_test():
     owned_aggregate["evidence"]["skipped"] = [
         {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
     ]
+    settle_fixture_verdict(owned_aggregate)
     for lane in ("owned-default-metrics", "owned-feature-metrics"):
         validate_canary(lane, owned_aggregate)
         for calls in (28, 29, 31):
@@ -3529,6 +3933,7 @@ def self_test():
         ):
             bad = copy.deepcopy(owned_aggregate)
             mutate(bad)
+            settle_fixture_verdict(bad)
             rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
     external_owned = copy.deepcopy(aggregate)
     external_owned["evidence"]["child_still_running"] = False
@@ -3547,6 +3952,7 @@ def self_test():
         validate_canary(lane, two_skips)
     safe_refusal = copy.deepcopy(safe)
     safe_refusal["evidence"]["skipped"] = [dict(CANARY_DISCOVERY_SKIP)]
+    settle_fixture_verdict(safe_refusal)
     validate_canary("default-safe-profile", safe_refusal)
     for lane, doc, extras in (
         ("owned-default-metrics", owned_aggregate, 3),
@@ -3560,6 +3966,7 @@ def self_test():
         ):
             bad = copy.deepcopy(doc)
             mutate(bad)
+            settle_fixture_verdict(bad)
             rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
     bad = copy.deepcopy(safe)
     bad["evidence"]["skipped"] = [dict(DISCOVERY_SKIP)]
@@ -3765,6 +4172,7 @@ def self_test():
     ):
         bad = copy.deepcopy(fallback)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_capture_modules(bad))
 
     bogus_source = copy.deepcopy(fallback)
@@ -3861,6 +4269,7 @@ def self_test():
     ):
         bad = copy.deepcopy(clean)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_capture_modules(bad))
     print("capture.modules[] matches the discovery record exactly: OK")
 
@@ -3874,6 +4283,7 @@ def self_test():
     ):
         bad = copy.deepcopy(clean)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_capture_modules(bad))
     unattributed = copy.deepcopy(clean)
     unattributed["functions"][0].update(module=None, module_ambiguous=True)
@@ -3996,6 +4406,7 @@ def self_test():
     ):
         bad = copy.deepcopy(live)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_live_discovery_evidence(bad["evidence"]))
     print("loader/pause evidence rejects every injected identity and non-count: OK")
 
@@ -4009,6 +4420,7 @@ def self_test():
     ):
         bad = copy.deepcopy(run_document)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(
             lambda bad=bad: exact_live_discovery_evidence(bad["evidence"], run=True)
         )
@@ -4046,6 +4458,7 @@ def self_test():
     ):
         bad = copy.deepcopy(ownership)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_module_ownership(bad))
     complete_but_unresolved = copy.deepcopy(unresolved)
     complete_but_unresolved["evidence"]["completeness"] = "COMPLETE"
@@ -4063,6 +4476,7 @@ def self_test():
         table_entries=68, slots=68, active_slots=0, attached_probes=136
     )
     exact_active_to_empty(exited)
+    settle_fixture_verdict(exited)
     exact_metrics_schema(exited)
     for mutate in (
         lambda d: d["evidence"]["discovery"].clear(),
@@ -4084,6 +4498,7 @@ def self_test():
     ):
         bad = copy.deepcopy(exited)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_active_to_empty(bad))
     print("active-to-empty keeps its history and declares every owner: OK")
 
@@ -4158,6 +4573,7 @@ def self_test():
     ):
         bad = copy.deepcopy(scheduled)
         mutate(bad)
+        settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_scheduling_evidence(bad["evidence"]))
     print("scheduling evidence is exact and its loss splits are identities: OK")
     print("self-test: OK")

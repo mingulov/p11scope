@@ -3904,8 +3904,10 @@ fn capture_evidence_checker_self_test() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 checker output");
     for marker in [
         "unexpected positive function rejected: OK",
-        "scan-only ordinal label rejected: OK",
-        "scan-only total exact count required: OK",
+        "scan-only SoftHSM2 names are export-linked and exact: OK",
+        "scan-only per-name exact count required: OK",
+        "function rows carry an exact target and sorted unique ordinals: OK",
+        "verdict_detail and gap_classes are recomputed from the counters: OK",
         "clean metrics multiplier is exact: OK",
         "clean metrics discovery source is exact in all three lanes: OK",
         "lane13 manifest-only shared overlay is exact: OK",
@@ -8084,6 +8086,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             source: "scan",
             file_offset: None,
             linkage: "heuristic",
+            exports_agreeing: Some(0),
         }],
         interfaces: 0,
         skipped: vec![],
@@ -8188,6 +8191,8 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         },
         drain_proven: false,
         verdict_detail: p11scope::render::VERDICT_CONCRETE_GAP,
+        gap_classes: p11scope::render::GapClasses::default(),
+        stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
         p11scope_env: vec![],
@@ -8197,6 +8202,9 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
     assert_eq!(evidence.completeness, "PARTIAL");
 
     let mut owned = p11scope::metrics::SlotReport {
+        file_offset: 0,
+        target_object: None,
+        ordinals: Vec::new(),
         names: vec!["C_Sign".into()],
         aliased: false,
         semantic_authorized: true,

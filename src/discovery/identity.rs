@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::identity::{
-    IdentityKind, InspectedObject, MappingFileKey, inspect_file, inspect_file_with_reader,
+    IdentityKind, InspectedObject, MappingFileKey, inspect_file_with_reader_exporting,
     is_missing_mount_id_error, mapping_file_key, mapping_file_key_in_mountinfo, open_object,
     open_regular,
 };
@@ -29,6 +29,7 @@ use p11scope_manifest::maps::{Device, ObjectKey};
 
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedModule, Skipped, read_mountinfo,
+    standard_function_names,
 };
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{MountNamespaceId, MountTableCache, ProcessView, ProcessViewId};
@@ -118,6 +119,11 @@ struct Entry {
     sha256: String,
     build_id: Option<String>,
     abi: ElfAbi,
+    /// The object's own `.dynsym` definitions of standard PKCS#11 function
+    /// names, `(name, file offset)`, read from the bytes that were hashed.
+    /// Export linkage's witness (`scan::export_agreement`); file-derived, so
+    /// every entry for one digest carries the same list.
+    exports: Arc<[(String, u64)]>,
     /// Whether this object was opened through overlayfs. This narrows the collapse
     /// heuristic but does not prove that another overlay instance resolves to the
     /// same underlying kernel inode.
@@ -214,6 +220,7 @@ impl Entry {
                 _ => None,
             },
             abi: inspected.abi,
+            exports: inspected.exports.clone().into(),
         })
     }
 }
@@ -272,6 +279,9 @@ pub struct ReconciledModule {
     pub object: PinnedObjectId,
     /// Parallel to `scanned.tables[*].entries`.
     pub entry_objects: Vec<Vec<PinnedObjectId>>,
+    /// The module object's own standard-name `.dynsym` definitions, from its
+    /// pinned inspection: the export-linkage witness for its tables.
+    pub exports: Arc<[(String, u64)]>,
 }
 
 /// Every object opened, identity-matched, hashed, and pinned by a capture-local ID.
@@ -429,6 +439,14 @@ impl PinnedObjects {
 
     pub(crate) fn abi_for(&self, id: PinnedObjectId) -> Option<ElfAbi> {
         self.by_id.get(&id).map(|entry| entry.abi)
+    }
+
+    /// The pinned object's standard-name `.dynsym` definitions; empty when
+    /// the object is not pinned here.
+    pub(crate) fn exports_for(&self, id: PinnedObjectId) -> Arc<[(String, u64)]> {
+        self.by_id
+            .get(&id)
+            .map_or_else(|| Arc::from(Vec::new()), |entry| entry.exports.clone())
     }
 
     pub(crate) fn retain_inventory_target(
@@ -1387,7 +1405,11 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
 
     let mut opened = BTreeMap::new();
     for (object, file, pin, mountinfo) in pinned {
-        let inspected = match inspect_file(&file) {
+        let inspected = match inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        ) {
             Ok(inspected) => inspected,
             Err(error) => {
                 problems.push(format!(
@@ -1750,6 +1772,7 @@ pub fn bind_scanned_modules(
             scanned,
             object,
             entry_objects,
+            exports: pinned.exports_for(object),
         });
     }
     (reconciled, lost)
@@ -1820,19 +1843,23 @@ fn pin_scanned_object(
         }
     }
     let mut operation_bytes = 0u64;
-    let inspected = inspect_file_with_reader(&file, |file, bytes, offset| {
-        if let Some(reason) = budget.check_deadline_now() {
-            return Err(std::io::Error::other(reason));
-        }
-        let allowed = budget.allowed_io(operation_bytes, bytes.len());
-        if allowed == 0 {
-            return Err(std::io::Error::other(IO_CEILING_REASON));
-        }
-        let read = file.read_at(&mut bytes[..allowed], offset)?;
-        budget.record_io(read);
-        operation_bytes = operation_bytes.saturating_add(read as u64);
-        Ok(read)
-    })?;
+    let inspected = inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| {
+            if let Some(reason) = budget.check_deadline_now() {
+                return Err(std::io::Error::other(reason));
+            }
+            let allowed = budget.allowed_io(operation_bytes, bytes.len());
+            if allowed == 0 {
+                return Err(std::io::Error::other(IO_CEILING_REASON));
+            }
+            let read = file.read_at(&mut bytes[..allowed], offset)?;
+            budget.record_io(read);
+            operation_bytes = operation_bytes.saturating_add(read as u64);
+            Ok(read)
+        },
+        &standard_function_names(),
+    )?;
     // The pin was taken before the bytes were hashed; a write that lands during the
     // hash must not become the baseline the capture trusts.
     if pin_of(&file)? != before {
@@ -1937,6 +1964,7 @@ pub(crate) mod test_fixture {
             sha256: sha256.into(),
             build_id: None,
             abi: ElfAbi::Lp64,
+            exports: Arc::from(Vec::new()),
             overlay,
         };
         let mut pins = PinnedObjects::empty();

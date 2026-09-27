@@ -128,7 +128,12 @@ explicitly `PARTIAL`, not a claim that the proxy layer was captured.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
-return values and latency. Missing mechanism or session evidence does not mean
+return values and latency. They still carry standard names when the provider's
+own `.dynsym` exports every standard name exactly where its function table
+points (`discovery[].tables[].linkage: "exports"`, as SoftHSM2 does); a table
+with no such evidence stays unnamed, and its rows read `unknown#<ordinal>` in
+the live table and trace (`functions[].ordinals` and `functions[].target` in
+JSON), never a guessed name. Missing mechanism or session evidence does not mean
 the application used none. For those semantics, use the separate
 [attested capture workflow](#attested-semantic-capture).
 
@@ -446,6 +451,15 @@ C_DigestInit                       50      0     2.0µs     4.1µs    65.5µs   
 ...
 Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-flight → COMPLETE
 ```
+
+A current capture's evidence line names why it is `PARTIAL`, grouped by the
+same classes `evidence.gap_classes` publishes, for example
+`→ PARTIAL: attribution withheld (68 semantics-unverified/count-only slots)`
+for a clean scan-only capture (`verdict_detail: "attribution_only"`: counts
+are exact, only semantic interpretation is withheld), or
+`→ PARTIAL: observation lossy (12 events lost)` for a lossy one
+(`"concrete_gap"`). `→ PARTIAL: terminal drain unproven` means nothing
+concrete is behind the verdict (`"clean_but_unproven"`).
 
 **Historical pre-terminal-drain output**, `trace` against the same workload
 (`scripts/verify-attach-e2e.sh`'s harness, captured while writing this doc —

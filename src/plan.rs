@@ -27,8 +27,9 @@
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
-    ScannedInterface, ScannedTable, TableEvidenceScore, order_tables_by_evidence,
-    table_evidence_score, table_linkage, table_name_authorized,
+    ObjectExports, ScannedInterface, ScannedTable, TableEvidenceScore, export_agreement,
+    order_tables_by_evidence, standard_ordinal, table_evidence_score, table_linkage,
+    table_name_authorized,
 };
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
@@ -160,6 +161,55 @@ pub struct Slot {
 /// never a rival claim and never semantic authority.
 pub(crate) const UNKNOWN_FUNCTION_NAME: &str = "unknown";
 
+/// One table ordinal that reaches a slot's exact target (review answer (c)).
+/// Several on one target are several ordinals sharing it — the grouping an
+/// unnamed row would otherwise hide. The ordinal is a position, never a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct SlotOrdinal {
+    /// The reaching table's version-word file offset, the same value
+    /// `discovery[].tables[].file_offset` publishes; `None` for a manifest
+    /// surface or selection table (no table location) and for a table with
+    /// no provable file owner.
+    pub table_file_offset: Option<u64>,
+    /// Position in the standard function list (the pinned 104-name catalog,
+    /// of which every walkable layout is a prefix).
+    pub ordinal: u16,
+}
+
+/// The pinned object a slot attaches into, identified exactly as
+/// `discovery[].objects[]` identifies it. File facts only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TargetObject {
+    pub dev: (u64, u64),
+    pub ino: u64,
+    pub sha256: Option<String>,
+}
+
+/// The one display label for a slot: its names, or — for a slot no
+/// authorized source named — `unknown#<ordinal>` per distinct ordinal
+/// reaching it (`unknown@0x<offset>` when none does), so unnamed rows stay
+/// distinguishable without presenting a positional guess as a name.
+pub(crate) fn presented_label(
+    names: &[String],
+    ordinals: &[SlotOrdinal],
+    file_offset: u64,
+) -> String {
+    if names != [UNKNOWN_FUNCTION_NAME] {
+        return names.join("|");
+    }
+    let mut numbers: Vec<u16> = ordinals.iter().map(|ordinal| ordinal.ordinal).collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    if numbers.is_empty() {
+        return format!("{UNKNOWN_FUNCTION_NAME}@0x{file_offset:x}");
+    }
+    numbers
+        .iter()
+        .map(|number| format!("{UNKNOWN_FUNCTION_NAME}#{number}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// `unknown` is the absence of a name claim: it never survives beside a real
 /// name. Applied everywhere slot names union (merge drops it from the claim
 /// map before collecting; extend and selection drop it from the vec).
@@ -254,6 +304,7 @@ fn admission_class(group: &[Discovered<'_>]) -> (AdmissionClass, usize) {
                 evidence.interfaces,
                 &[],
                 &[],
+                &evidence.exports,
             ));
         }
     }
@@ -449,9 +500,16 @@ pub struct TableSummary {
     pub file_offset: Option<u64>,
     /// Strongest publication evidence behind this table: "interface" (named by
     /// an interface triple), "live_return" (returned by a live provider
-    /// export), "manifest" (operator-authoritative), or "heuristic" (bare
-    /// decode with no linkage — its names are presented as `unknown`).
+    /// export), "manifest" (operator-authoritative), "exports" (every
+    /// standard name the object itself exports sits exactly at its ordinal's
+    /// target), or "heuristic" (bare decode with no linkage — its names are
+    /// presented as `unknown`). Every non-heuristic linkage names the table;
+    /// none of them gives a scan target semantic authority.
     pub linkage: &'static str,
+    /// Ordinals whose target is exactly the same-named `.dynsym` definition
+    /// in the table's own object. `None` for manifest tables, which are not
+    /// compared.
+    pub exports_agreeing: Option<usize>,
 }
 
 /// One module that contributed targets to this plan.
@@ -586,6 +644,12 @@ pub struct AttachPlan {
     slot_by_key: BTreeMap<AttachKey, usize>,
     // Exact bootstrap targets which have not yet acquired table authority.
     provisional_get_function_list: BTreeMap<AttachKey, PinnedObjectId>,
+    // Every table ordinal that reached an exact target this capture. Keyed
+    // like `slot_by_key` but never pruned: a retired row keeps its ordinals.
+    slot_ordinals: BTreeMap<AttachKey, BTreeSet<SlotOrdinal>>,
+    // Identity of every pinned object a slot or module used, recorded where
+    // the pins were in hand; capture-lifetime like the slots themselves.
+    object_identities: BTreeMap<PinnedObjectId, TargetObject>,
     // Slot indices never leave this set during one capture. Their historical
     // aggregate-map cells remain readable but may not receive new links.
     retired_slots: BTreeSet<usize>,
@@ -694,7 +758,52 @@ impl AttachPlan {
             aggregate_owners,
             admission_policy,
             admission_scope: AdmissionScope::Named,
+            slot_ordinals: BTreeMap::new(),
+            object_identities: BTreeMap::new(),
         })
+    }
+
+    /// Every table ordinal that reached this slot's exact target, sorted.
+    pub(crate) fn ordinals_of(&self, slot: &Slot) -> Vec<SlotOrdinal> {
+        self.slot_ordinals
+            .get(&AttachKey::of(slot))
+            .map(|ordinals| ordinals.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// The pinned identity of the object this slot attaches into, when the
+    /// plan was built with the pins in hand.
+    pub(crate) fn target_object_of(&self, slot: &Slot) -> Option<TargetObject> {
+        self.object_identities.get(&slot.object).cloned()
+    }
+
+    /// The one display label for `slot` ([`presented_label`]).
+    pub(crate) fn label_of(&self, slot: &Slot) -> String {
+        presented_label(&slot.names, &self.ordinals_of(slot), slot.file_offset)
+    }
+
+    /// Records the pinned identity of every object a slot or module of this
+    /// plan uses. Called wherever a plan is built from pins, so a later
+    /// report can identify a target even after its pin retires.
+    fn note_object_identities(&mut self, pinned: &PinnedObjects) {
+        let objects: BTreeSet<PinnedObjectId> = self
+            .slots
+            .iter()
+            .map(|slot| slot.object)
+            .chain(self.modules.iter().map(|module| module.object))
+            .collect();
+        for id in objects {
+            if let Some(summary) = pinned.summary(id) {
+                self.object_identities.insert(
+                    id,
+                    TargetObject {
+                        dev: (summary.key.device.major, summary.key.device.minor),
+                        ino: summary.key.inode,
+                        sha256: (!summary.sha256.is_empty()).then(|| summary.sha256.to_string()),
+                    },
+                );
+            }
+        }
     }
 
     pub const fn admission_policy(&self) -> AdmissionPolicy {
@@ -727,7 +836,7 @@ impl AttachPlan {
         pinned: &PinnedObjects,
         broad_admit: bool,
     ) -> AttachPlan {
-        self.rebuild_from_sources_with(
+        let mut rebuilt = self.rebuild_from_sources_with(
             scanned,
             manifests,
             |key, path| pinned.id_for_manifest(key, path),
@@ -739,7 +848,9 @@ impl AttachPlan {
             },
             broad_admit,
             self.admission_policy,
-        )
+        );
+        rebuilt.note_object_identities(pinned);
+        rebuilt
     }
 
     fn rebuild_from_sources_with(
@@ -918,6 +1029,16 @@ impl AttachPlan {
         }
 
         for (key, (object_path, names)) in grouped {
+            // Selection tables carry no table location, only positions.
+            self.slot_ordinals.entry(key).or_default().extend(
+                names
+                    .iter()
+                    .filter_map(|name| standard_ordinal(name))
+                    .map(|ordinal| SlotOrdinal {
+                        table_file_offset: None,
+                        ordinal,
+                    }),
+            );
             if let Some(position) = self.slot_by_key.get(&key).copied() {
                 let slot = &mut self.slots[position];
                 slot.names.extend(names.into_iter().map(str::to_string));
@@ -1205,6 +1326,11 @@ impl AttachPlan {
         }
 
         self.slots = slots;
+        // Capture-lifetime disclosure: ordinals and identities only grow.
+        for (key, ordinals) in rebuilt.slot_ordinals {
+            self.slot_ordinals.entry(key).or_default().extend(ordinals);
+        }
+        self.object_identities.extend(rebuilt.object_identities);
         self.modules = rebuilt.modules;
         // The spill count is current-state evidence like `entries_seen`,
         // not a high-water mark (capture history keeps those separately):
@@ -1569,6 +1695,14 @@ struct Target<'a> {
     /// Index into the scan piece's `tables` this target was decoded from.
     /// `None` for manifest targets, which are authoritative and never capped.
     table: Option<usize>,
+    /// The standard-list position this target was published at, with its
+    /// table's location (`SlotOrdinal`); `None` for a non-standard label.
+    ordinal: Option<SlotOrdinal>,
+    /// Other standard names the target's object exports at this exact
+    /// target, presented beside `name` when an export-corroborated table
+    /// published it: an application reaches the target through any of them
+    /// with `dlsym`, so the counts belong to the group.
+    aliases: Vec<&'a str>,
 }
 
 /// Borrowed scan decode behind one scan piece, for evidence-ordered table
@@ -1581,6 +1715,7 @@ struct Target<'a> {
 struct ScanEvidence<'a> {
     tables: &'a [ScannedTable],
     interfaces: &'a [ScannedInterface],
+    exports: ObjectExports<'a>,
 }
 
 /// Identity of one heuristic table for cross-view dedup: one object seen
@@ -1810,15 +1945,20 @@ fn merge(
                     let Some(evidence) = &module.scan_evidence else {
                         continue;
                     };
-                    for index in
-                        order_tables_by_evidence(evidence.tables, evidence.interfaces, &[], &[])
-                    {
+                    for index in order_tables_by_evidence(
+                        evidence.tables,
+                        evidence.interfaces,
+                        &[],
+                        &[],
+                        &evidence.exports,
+                    ) {
                         let score = table_evidence_score(
                             index,
                             evidence.tables,
                             evidence.interfaces,
                             &[],
                             &[],
+                            &evidence.exports,
                         );
                         let key = table_key(piece, index, &evidence.tables[index]);
                         distinct
@@ -2085,6 +2225,7 @@ fn merge(
 
     let mut positions: BTreeMap<(PinnedObjectId, u64), usize> = BTreeMap::new();
     let mut building: Vec<Building> = Vec::new();
+    let mut slot_ordinals: BTreeMap<AttachKey, BTreeSet<SlotOrdinal>> = BTreeMap::new();
     let mut modules = Vec::new();
     let mut modules_skipped = Vec::new();
     let mut refused_module_objects = Vec::new();
@@ -2206,11 +2347,24 @@ fn merge(
                 if !slot.module_ids.contains(&id) {
                     slot.module_ids.push(id);
                 }
-                slot.name_authority
-                    .entry(presented_name(target.name_authorized, target.name).to_string())
-                    .and_modify(|authorized| *authorized |= target.semantic_authorized)
-                    .or_insert(target.semantic_authorized);
+                for name in std::iter::once(presented_name(target.name_authorized, target.name))
+                    .chain(target.aliases.iter().copied())
+                {
+                    slot.name_authority
+                        .entry(name.to_string())
+                        .and_modify(|authorized| *authorized |= target.semantic_authorized)
+                        .or_insert(target.semantic_authorized);
+                }
                 slot.fork_safe &= target.fork_safe;
+                if let Some(ordinal) = target.ordinal {
+                    slot_ordinals
+                        .entry(AttachKey {
+                            object: target.object,
+                            file_offset: target.file_offset,
+                        })
+                        .or_default()
+                        .insert(ordinal);
+                }
             }
             let summary = &mut modules[id.0 as usize];
             if summary.source != module.source {
@@ -2336,6 +2490,7 @@ fn merge(
         .collect();
     let mut plan = AttachPlan::from_slots_with_policy(slots, admission_policy)
         .expect("merge enforces its immutable admission policy");
+    plan.slot_ordinals = slot_ordinals;
     plan.modules = modules;
     plan.uncorroborated_candidates = uncorroborated_candidates;
     plan.skipped = skipped;
@@ -2443,7 +2598,7 @@ fn build_from_sources_with_policy(
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
 ) -> AttachPlan {
-    build_from_sources_with(
+    let mut plan = build_from_sources_with(
         scanned,
         manifests,
         |key, path| pinned.id_for_manifest(key, path),
@@ -2461,7 +2616,9 @@ fn build_from_sources_with_policy(
         broad_admit,
         admission_policy,
         admission_scope,
-    )
+    );
+    plan.note_object_identities(pinned);
+    plan
 }
 
 /// Historical allocations, their still-active subset, and its current owners
@@ -2553,6 +2710,12 @@ fn presented_name(authorized: bool, name: &str) -> &str {
 
 fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
     let scanned = &module.scanned;
+    // The module object's own `.dynsym`: the export-linkage witness for
+    // every table this module published.
+    let exports = ObjectExports {
+        object: scanned.key,
+        symbols: &module.exports,
+    };
     let mut tables = Vec::new();
     let mut surfaces = Vec::new();
     let mut targets = Vec::new();
@@ -2573,7 +2736,14 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         entries_seen += published;
         // Same score inputs `merge` admits by, so provenance, the heuristic
         // cap, and name authorization can never disagree about one table.
-        let score = table_evidence_score(index, &scanned.tables, &scanned.interfaces, &[], &[]);
+        let score = table_evidence_score(
+            index,
+            &scanned.tables,
+            &scanned.interfaces,
+            &[],
+            &[],
+            &exports,
+        );
         let authorized = table_name_authorized(&score);
         tables.push(TableSummary {
             version: table.version,
@@ -2581,6 +2751,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
             source: "scan",
             file_offset: table.file_offset,
             linkage: table_linkage(&score),
+            exports_agreeing: Some(export_agreement(table, &exports).agreeing),
         });
         surfaces.push(SurfaceSummary {
             source: format!(
@@ -2614,6 +2785,15 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 semantic_authorized: false,
                 name_authorized: authorized,
                 table: Some(index),
+                ordinal: standard_ordinal(entry.name).map(|ordinal| SlotOrdinal {
+                    table_file_offset: table.file_offset,
+                    ordinal,
+                }),
+                aliases: if score.exports && entry.object == exports.object {
+                    exports.aliases_at(entry.name, entry.file_offset)
+                } else {
+                    Vec::new()
+                },
             },
         ));
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
@@ -2641,6 +2821,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         scan_evidence: Some(ScanEvidence {
             tables: &scanned.tables,
             interfaces: &scanned.interfaces,
+            exports,
         }),
     }
 }
@@ -2739,6 +2920,7 @@ fn lower_manifest(
             source: "manifest",
             file_offset: None,
             linkage: "manifest",
+            exports_agreeing: None,
         });
         let fork_safe = matches!(
             &surface.source,
@@ -2793,6 +2975,11 @@ fn lower_manifest(
                     targets.push(Target {
                         name: &f.name,
                         table: None,
+                        ordinal: standard_ordinal(&f.name).map(|ordinal| SlotOrdinal {
+                            table_file_offset: None,
+                            ordinal,
+                        }),
+                        aliases: Vec::new(),
                         object,
                         object_path: &record.path,
                         file_offset: *file_offset,
@@ -2933,6 +3120,7 @@ mod tests {
             .collect();
         let object = PinnedObjectId(key.inode as u32);
         ReconciledModule {
+            exports: Default::default(),
             object,
             entry_objects: vec![vec![object; entries.len()]],
             scanned: ScannedModule {
@@ -3683,6 +3871,15 @@ mod tests {
         let mut expected = allocated.clone();
         expected.slots[0].names.push("C_Verify".into());
         expected.slots[0].aliased = true;
+        // The selected position is disclosed too (review answer (c)); a
+        // selection table has no table location.
+        expected.slot_ordinals.insert(
+            AttachKey::of(&expected.slots[0]),
+            BTreeSet::from([SlotOrdinal {
+                table_file_offset: None,
+                ordinal: standard_ordinal("C_Verify").unwrap(),
+            }]),
+        );
         assert_eq!(rebuilt, expected, "only finite alias metadata may change");
         assert_eq!(rebuilt.module_of_slot(0), Some(ModuleId(0)));
     }
@@ -4119,6 +4316,8 @@ mod tests {
                 semantic_authorized: true,
                 name_authorized: true,
                 table: None,
+                ordinal: None,
+                aliases: Vec::new(),
             })
             .collect();
         Discovered {
@@ -5811,7 +6010,13 @@ mod tests {
         // stays the strongest, so its demand is zero and only the published
         // union can refuse.
         assert_eq!(
-            order_tables_by_evidence(&grown.scanned.tables, &grown.scanned.interfaces, &[], &[]),
+            order_tables_by_evidence(
+                &grown.scanned.tables,
+                &grown.scanned.interfaces,
+                &[],
+                &[],
+                &ObjectExports::NONE,
+            ),
             [0, 1]
         );
         let before = plan.clone();

@@ -2127,8 +2127,14 @@ fn slot_semantics_changed(previous: &SlotMeta, next: Option<&SlotMeta>) -> bool 
     let Some(next) = next else {
         return true;
     };
+    // A COUNT_ONLY slot never feeds the reducer (`observe_process` returns
+    // before any semantic state), so its function identity is presentation
+    // only: `unknown` → `C_Sign` with COUNT_ONLY on both sides invalidates
+    // nothing and is not a reconciliation (F-5).
+    let count_only = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+    let presentation_only = previous.semantics == count_only && next.semantics == count_only;
     previous.semantics != next.semantics
-        || previous.function_id != next.function_id
+        || (!presentation_only && previous.function_id != next.function_id)
         || previous.fork_safe != next.fork_safe
         || previous.module != next.module
         || previous.module_ids != next.module_ids
@@ -4360,5 +4366,38 @@ mod tests {
             !state.has_process_state(process),
             "the still-attached old cookie is consumed without semantic state"
         );
+    }
+
+    /// F-5: a COUNT_ONLY slot renamed `unknown` → `C_Sign` (a later live
+    /// return names a heuristic table) changes presentation only. Nothing
+    /// semantic ever came from the slot, so no aggregate may be purged and
+    /// no reconciliation may be claimed.
+    #[test]
+    fn presentation_only_rename_of_a_count_only_slot_keeps_aggregates() {
+        let mut plan = test_plan();
+        plan.slots.truncate(1);
+        plan.slots[0].names = vec![crate::plan::UNKNOWN_FUNCTION_NAME.into()];
+        plan.slots[0].semantic_authorized = false;
+        plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        plan.slots[0].descriptor_index = 0;
+        plan.entries_seen = 1;
+        let mut state = State::new(&plan);
+        for pid in [100, 101, 102] {
+            state.observe(&Event {
+                cgroup_id: 7,
+                ..ev(pid, 0, fnkind::SESSION_ARG0, 1, MECH_NONE, 0, 10)
+            });
+        }
+        assert_eq!(state.cgroups()[&7].calls, 3);
+
+        plan.slots[0].names = vec!["C_Sign".into()];
+        state.sync_plan(&plan);
+
+        assert_eq!(
+            state.cgroups().get(&7).map(|cgroup| cgroup.calls),
+            Some(3),
+            "a presentation-only rename must not purge event-derived aggregates"
+        );
+        assert_eq!(state.semantic_evidence().state_reconciliations, 0);
     }
 }

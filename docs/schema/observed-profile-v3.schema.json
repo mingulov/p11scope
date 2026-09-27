@@ -34,22 +34,24 @@
         "discovery_conflicts", "discovery_read_failures", "discovery_ring_loss",
         "discovery_state_failures", "discovery_truncated",
         "discovery_uncorroborated", "discovery_uncorroborated_candidates",
-        "drain_proven", "event_loss", "fork_state_ambiguities",
+        "drain_proven", "event_loss", "fork_state_ambiguities", "gap_classes",
         "handoff_child_pid", "in_flight_at_end", "interface_list",
         "loader_discovery", "malformed_records", "manifest_object_fallbacks",
-        "module_ambiguous", "modules_skipped", "operation_state_imports",
+        "module_ambiguous", "module_unresolved_slots", "modules_skipped", "operation_state_imports",
         "orphan_ops", "p11scope_env", "pause", "pause_attempts",
         "pause_confirmed", "pause_partial", "pending_at_end",
         "process_tracking_evictions", "process_tracking_failures",
         "process_tracking_fallbacks", "provider_changed", "rv_update_failures",
         "scan_ms", "scan_unavailable", "scheduling",
         "semantic_capture_failures", "semantic_history_drops",
+        "semantic_unverified_slots",
         "semantic_state_drops", "session_cancel_ambiguities",
         "session_cancel_unknown_flags", "shape_decode_failures",
         "shape_decode_total_failures", "skipped", "slots",
         "start_insert_failures", "state_reconciliations", "surfaces",
         "table_entries", "task_uprobe_link_losses", "template_tail_failures",
         "templates_truncated", "unmatched_closes", "unmatched_returns",
+        "unprotected_live_windows",
         "unregistered_mechanisms", "uretprobe_override", "vendor_interfaces",
         "verdict_detail"
       ],
@@ -275,7 +277,47 @@
           "required": ["flag", "reason"]
         },
         "vendor_interfaces": {"type": "integer", "minimum": 0},
-        "verdict_detail": {"enum": ["clean_proven", "clean_but_unproven", "concrete_gap"]},
+        "verdict_detail": {"enum": ["clean_proven", "clean_but_unproven", "attribution_only", "concrete_gap"]},
+        "semantic_unverified_slots": {"type": "integer", "minimum": 0},
+        "unprotected_live_windows": {"type": "integer", "minimum": 0},
+        "module_unresolved_slots": {"type": "integer", "minimum": 0},
+        "gap_classes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["observation", "attribution", "semantics", "open_calls", "settlement", "stdout_data_sink"],
+          "properties": {
+            "observation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "causes"],
+              "properties": {
+                "status": {"enum": ["exact", "lossy"]},
+                "causes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+              }
+            },
+            "attribution": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "causes"],
+              "properties": {
+                "status": {"enum": ["attested", "withheld"]},
+                "causes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+              }
+            },
+            "semantics": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "causes"],
+              "properties": {
+                "status": {"enum": ["complete", "degraded", "not_applicable"]},
+                "causes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+              }
+            },
+            "open_calls": {"type": "integer", "minimum": 0},
+            "settlement": {"enum": ["proven", "unproven"]},
+            "stdout_data_sink": {"type": "boolean"}
+          }
+        },
         "interface_selection": {
           "type": "object",
           "additionalProperties": false,
@@ -366,7 +408,46 @@
         "multi_rebuild_gaps": {"type": "integer", "minimum": 0}
       }
     },
-    "functions": {"type": "array"}
+    "functions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["names", "aliased", "target", "ordinals", "module", "module_ambiguous", "module_unresolved", "calls"],
+        "properties": {
+          "names": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "target": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["object", "file_offset"],
+            "properties": {
+              "object": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["dev", "ino", "sha256"],
+                "properties": {
+                  "dev": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                  "ino": {"type": "integer", "minimum": 0},
+                  "sha256": {"type": ["string", "null"]}
+                }
+              },
+              "file_offset": {"type": "integer", "minimum": 0}
+            }
+          },
+          "ordinals": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["table_file_offset", "ordinal"],
+              "properties": {
+                "table_file_offset": {"type": ["integer", "null"], "minimum": 0},
+                "ordinal": {"type": "integer", "minimum": 0, "maximum": 103}
+              }
+            }
+          }
+        }
+      }
+    }
   },
   "allOf": [
     {

@@ -1117,7 +1117,11 @@ fn assert_static_descriptor_cookie_contract(
     // row takes an in-place atomic add, a missing one is created only with
     // BPF_NOEXIST, and a lost create race retries the in-place add. A
     // get-then-overwrite update would drop concurrent increments.
-    let rv_update = contract_section(ebpf, "fn rv_count_add(key: &RvKey) -> bool {", "#[uretprobe]")?;
+    let rv_update = contract_section(
+        ebpf,
+        "fn rv_count_add(key: &RvKey) -> bool {",
+        "#[uretprobe]",
+    )?;
     for (marker, contract) in [
         (
             "if let Some(cell) = RV_COUNTS.get_ptr_mut(key) {\n        counter_add(cell, 1);",
@@ -4706,7 +4710,10 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         ".insert(key, &1, 0)",
         1,
     );
-    assert_ne!(overwrite, ebpf, "RV_COUNTS overwrite mutation must change the source");
+    assert_ne!(
+        overwrite, ebpf,
+        "RV_COUNTS overwrite mutation must change the source"
+    );
     assert!(
         assert_static_descriptor_cookie_contract(&attach, &overwrite, &owner).is_err(),
         "an RV_COUNTS create that may overwrite a concurrent row must be rejected"

@@ -907,14 +907,19 @@ def exact_task_uprobe_link_losses(evidence):
 
 def loader_discovery_complete(loader):
     """render.rs `LoaderDiscovery::complete`: only neutral strategies,
-    qualified pre-constructor timing, and eligible initial sets."""
+    qualified pre-constructor timing, and eligible initial sets.
+
+    A dlopen timing class is a gap only once a load happened (fa0cbb9): every
+    hit of a bound context is counted before its record is reserved, so zero
+    `hits` proves no load occurred during the capture. `unavailable` stays a
+    gap on its own."""
     def timing_gaps(timing):
         return timing["known_pre_relocation"] + timing["unproven"] + timing["none"]
 
     return (
         loader["strategies"]["dlopen_return"] == 0
         and loader["strategies"]["unavailable"] == 0
-        and timing_gaps(loader["dlopen_timing"]) == 0
+        and (loader["hits"] == 0 or timing_gaps(loader["dlopen_timing"]) == 0)
         and timing_gaps(loader["initial_set_timing"]) == 0
         and loader["initial_set_capture"]["none"] == 0
         and loader["state_read_failures"] == 0
@@ -3047,6 +3052,25 @@ def self_test():
             )
         )
     print("lane02 owned-run metrics self-test: OK")
+
+    # fa0cbb9: an armed loader that never fired (hits 0) leaves no observation
+    # gap even with unproven dlopen timing; one load makes the same timing a gap,
+    # and an unbound context stays a gap on its own.
+    armed = loader_discovery_fixture(
+        strategies__debug_state_every_hit=1, dlopen_timing__unproven=1
+    )
+    require(loader_discovery_complete(armed), "an armed, never-fired loader is a gap")
+    require(
+        not loader_discovery_complete(armed | {"hits": 1}),
+        "a load with unproven dlopen timing is not a gap",
+    )
+    require(
+        not loader_discovery_complete(
+            loader_discovery_fixture(strategies__unavailable=1)
+        ),
+        "an unbound loader context is not a gap",
+    )
+    print("armed loader with zero hits is not an observation gap: OK")
 
     # A lane whose target maps the provider only after attach: the manifest is
     # the sole source and is reported uncorroborated. The scanned expectation

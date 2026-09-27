@@ -6336,7 +6336,7 @@ mod tests {
         }
     }
 
-    fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
+    fn wait_until(predicate: impl FnMut() -> bool, message: &str) {
         wait_until_with_timeout(predicate, Duration::from_secs(2), message);
     }
 

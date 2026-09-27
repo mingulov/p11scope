@@ -36,6 +36,11 @@ static __always_inline void poison(struct owner_control *ctl, u64 reason)
     count(&ctl->reclamation_failures);
 }
 
+static __always_inline void bookkeeping(struct owner_control *ctl, u64 detail)
+{
+    poison(ctl, OWNER_BOOKKEEPING_FAILED | detail);
+}
+
 static __always_inline struct owner_control *control(void)
 {
     u32 key = 0;
@@ -250,13 +255,17 @@ __attribute__((noinline)) void *p11_owner_start_get(const struct owner_start_key
     struct thread_owner *owner = get_owner(ctl, 0);
     if (!owner)
         return (void *)0;
-    if (!start_key_valid(owner, key) || !owner->start_count) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+    if (!start_key_valid(owner, key)) {
+        bookkeeping(ctl, OWNER_START_KEY_MISMATCH);
+        return (void *)0;
+    }
+    if (!owner->start_count) {
+        bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return (void *)0;
     }
     void *value = owner_map_lookup(&START, key);
     if (!value)
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_ROW_MISSING);
     return value;
 }
 
@@ -264,11 +273,11 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
                                          const struct owner_start_key *key)
 {
     if (!owner_map_lookup(&START, key)) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_ROW_MISSING);
         return -1;
     }
     if (!owner->start_count) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return -1;
     }
     long rc = owner_map_delete(&START, key);
@@ -293,7 +302,7 @@ __attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_k
     if (!owner)
         return -1;
     if (!start_key_valid(owner, key)) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_KEY_MISMATCH);
         return -1;
     }
     long rc = remove_start(ctl, owner, key);
@@ -371,7 +380,7 @@ static __always_inline void inspect_absent_discovery(struct owner_control *ctl,
 {
     struct thread_owner *owner = peek_absent_owner(ctl);
     if (owner && discovery_key_valid(owner, key) && directory_find(owner, key) >= 0)
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
 }
 
 __attribute__((noinline)) void *p11_owner_discovery_get(const struct owner_discovery_key *key, u32 required)
@@ -387,12 +396,12 @@ __attribute__((noinline)) void *p11_owner_discovery_get(const struct owner_disco
     if (!owner)
         return (void *)0;
     if (!discovery_key_valid(owner, key) || directory_find(owner, key) < 0) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         return (void *)0;
     }
     void *value = owner_map_lookup(&DISCOVERY_STATE, key);
     if (!value)
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
     return value;
 }
 
@@ -423,12 +432,12 @@ __attribute__((noinline)) long p11_owner_discovery_remove(const struct owner_dis
     if (!owner)
         return -1;
     if (!discovery_key_valid(owner, key)) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         return -1;
     }
     int index = directory_find(owner, key);
     if (index < 0) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         return -1;
     }
     long rc = remove_discovery(ctl, owner, key, (u32)index);
@@ -458,7 +467,7 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
             if (rc) {
                 count(&ctl->admission_failures);
                 if (rc == -2)
-                    poison(ctl, OWNER_BOOKKEEPING_FAILED);
+                    bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
             }
             return rc;
         }
@@ -468,7 +477,7 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
         return -17;
     }
     if (flags == 2) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         return -1;
     }
     for (u32 i = 0; i < 64; i++) {
@@ -486,7 +495,7 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
         count(&ctl->admission_failures);
         /* An unindexed numeric collision cannot authorize its deletion. */
         if (owner_map_lookup(&DISCOVERY_STATE, key))
-            poison(ctl, OWNER_BOOKKEEPING_FAILED);
+            bookkeeping(ctl, OWNER_DIRECTORY_MISMATCH);
         release_empty(ctl, owner);
         return rc;
     }
@@ -533,7 +542,7 @@ __attribute__((noinline)) void p11_owner_cleanup(void)
         }
     }
     if (owner->start_count) {
-        poison(ctl, OWNER_BOOKKEEPING_FAILED);
+        bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return;
     }
 #endif

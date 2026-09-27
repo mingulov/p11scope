@@ -1226,6 +1226,11 @@ pub const OWNER_BOOKKEEPING_FAILED: u64 = 16;
 pub const OWNER_REFUND_FAILED: u64 = 32;
 pub const OWNER_CLASSIFIER_FAILED: u64 = 64;
 pub const OWNER_STATE_DELETE_FAILED: u64 = 128;
+/// Which bookkeeping invariant failed; always set with [`OWNER_BOOKKEEPING_FAILED`].
+pub const OWNER_START_KEY_MISMATCH: u64 = 256;
+pub const OWNER_START_COUNT_MISMATCH: u64 = 512;
+pub const OWNER_START_ROW_MISSING: u64 = 1024;
+pub const OWNER_DIRECTORY_MISMATCH: u64 = 2048;
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ThreadOwner {}

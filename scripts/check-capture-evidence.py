@@ -208,7 +208,8 @@ KERNEL_CONTROL_KEYS = {
 OWNER_POISON_REASONS = {
     "bad_control", "lookup_unknown", "bad_record", "delete_failed",
     "bookkeeping_failed", "refund_failed", "classifier_failed",
-    "state_delete_failed", "unknown",
+    "state_delete_failed", "start_key_mismatch", "start_count_mismatch",
+    "start_row_missing", "directory_mismatch", "unknown",
 }
 ROOT_FAILURE_REASONS = {
     "bad_control", "capacity", "reserve_contention", "create_failed",

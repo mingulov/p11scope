@@ -35,6 +35,12 @@ typedef unsigned long long u64;
 #define OWNER_REFUND_FAILED 32ULL
 #define OWNER_CLASSIFIER_FAILED 64ULL
 #define OWNER_STATE_DELETE_FAILED 128ULL
+/* Exactly which bookkeeping invariant failed; always set together with
+ * OWNER_BOOKKEEPING_FAILED so the family bit keeps its meaning. */
+#define OWNER_START_KEY_MISMATCH 256ULL
+#define OWNER_START_COUNT_MISMATCH 512ULL
+#define OWNER_START_ROW_MISSING 1024ULL
+#define OWNER_DIRECTORY_MISMATCH 2048ULL
 
 struct task_struct;
 struct thread_owner {

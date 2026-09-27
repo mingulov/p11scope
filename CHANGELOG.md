@@ -340,7 +340,7 @@ Fixes to defects found while qualifying this release, before it was tagged:
   - The check stays exact: p11scope accepts the file only when the kernel
     maps it at the target's device and inode.
   - `p11scope-discover` applies the same check, so it runs inside such
-    containers.
+    containers, and its manifests work with `--manifest` there.
 <!-- TODO(release): add any further user-visible fixes merged before the tag. -->
 
 ### Qualification of this release

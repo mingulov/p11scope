@@ -41,7 +41,7 @@ jobs:
           commit $GITHUB_SHA tree $TREE
           scope: printed before any step runs, so it is scope, never a result — each step's own status is the evidence. This job attempts the cargo fmt/check/test/clippy gates, the diagnostic-object inventory test, every --self-test, and these lanes in full: scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh
           UNRUN: scripts/attach-pod.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
-          UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/capture-stopped-canary.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/check-canary-evidence.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -175,6 +175,7 @@ jobs:
       - run: scripts/verify-receipt-lane16.sh --self-test
       - run: scripts/attach-pod.sh --self-test
       - run: scripts/build-release.sh --self-test
+      - run: scripts/bench-overhead.sh --self-test
       - run: scripts/k8s-profile-entry.sh --self-test
       - run: scripts/verify-k8s-attach.sh --self-test
       - run: scripts/tsprobe.sh --self-test
@@ -196,6 +197,7 @@ jobs:
       - run: python3 -I scripts/lane-induced-gaps-oracle-2.py --self-test
       - run: python3 -I scripts/lane-induced-gaps-oracle-3.py --self-test
       - run: python3 -I scripts/lane-induced-gaps-oracle-4.py --self-test
+      - run: python3 -I scripts/lane-bench-overhead-oracle-3.py --self-test
       - run: python3 -I scripts/task-1.6-lane-a.py --self-test
       - run: python3 -I scripts/task-1.6-lane-b-sparse-model.py --self-test
       - run: python3 -I tests/python/test_canary_evidence.py --target-bits 32 -v

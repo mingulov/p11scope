@@ -55,8 +55,15 @@ def config_for(pid, directory, lane='aggregate-only-metrics'):
         **{name: Path(f'{prefix}.{suffix}') for name, suffix in (
             ('ready', 'ready'), ('go', 'go'), ('done', 'done'), ('finish', 'finish'),
             ('observer_log', 'observer.log'), ('workload_log', 'workload.log'))})
-    marker = f'CAPTURE privacy={privacy}' if mode == 'trace' else f'fixture — privacy={privacy}'
-    config.observer_args = [sys.executable, '-c', f'import time; print({marker!r}, flush=True); time.sleep(.2)']
+    if mode == 'trace':
+        script = f'import time; print({f"CAPTURE privacy={privacy}"!r}, flush=True); time.sleep(.2)'
+    else:
+        # The real observer prints the capturing line at attach and the privacy
+        # frame at the end; the fixture prints both up front so readiness and
+        # the post-exit privacy proof each have their line.
+        script = ('import time; print(\'p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C\', flush=True); '
+                  f'print({f"fixture — privacy={privacy}"!r}, flush=True); time.sleep(.2)')
+    config.observer_args = [sys.executable, '-c', script]
     if not config.ready.exists():
         config.ready.write_text(json.dumps({'schema': 'p11scope/canary-roster/v1', 'mode': workload_mode,
             'pid': pid, 'tasks': [{'pid': pid, 'tid': pid, 'generation': config.generation,
@@ -213,8 +220,8 @@ class FakeMaps(capture.LiveMaps):
             rows, consumed = [], 0
             if name == 'DISCOVERY' and self.config.lane in capture.OWNED_LANES:
                 # `p11scope run` drains its own DISCOVERY ring on every capture
-                # tick, before the readiness frame the canary waits for, so a
-                # healthy owned lane retains nothing: the five records it
+                # tick, before the attach-complete line the canary waits for,
+                # so a healthy owned lane retains nothing: the five records it
                 # published survive only in the producer position.
                 consumed = OWNED_DISCOVERY_PRODUCED
             if name == 'EVENTS' and self.config.workload_mode == 'matrix' and self.config.mode != 'metrics':
@@ -376,7 +383,7 @@ def coordinator_case(pid, directory, case):
     roster_samples, start_dumps = {}, 0
     original_handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
     original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    expected_success = kind in ('native', 'immediate_exit')
+    expected_success = kind in ('native', 'immediate_exit', 'idle_owner')
     initial_descriptors = open_descriptors()
     failed_resume = False
     replay_count, inventory_count, position_count = 0, 0, 0
@@ -406,7 +413,14 @@ def coordinator_case(pid, directory, case):
     if kind in ('immediate_exit', 'immediate_bad_exit'):
         config.observer_args = [sys.executable, '-c',
             f"import signal,time,sys; signal.signal(signal.SIGCONT,lambda *_: sys.exit({0 if kind == 'immediate_exit' else 7})); "
+            "print('p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C',flush=True); "
             "print('fixture — privacy=aggregate-only',flush=True); time.sleep(10)"]
+    if kind == 'missing_privacy':
+        # Attach-complete without any privacy frame: readiness must succeed on
+        # the capturing line, the capture must run to a clean exit, and only
+        # the post-exit privacy proof may refuse it.
+        config.observer_args = [sys.executable, '-c',
+            "import time; print('p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C',flush=True); time.sleep(.2)"]
     def launch(*args, **kwargs):
         observer = original_launch(*args, **kwargs)
         test_handles.append(os.dup(observer.group.fd))
@@ -517,6 +531,14 @@ def coordinator_case(pid, directory, case):
             cookie_id = next(item['id'] for item in source.maps if item['name'] == 'TASK_COOKIE')
             return (capture.dumper.TASK_STORAGE_HEADER.pack(capture.dumper.TASK_STORAGE_MAGIC, 1,
                     cookie_id, pid, pid, 8) + struct.pack('<Q', 1) + raw)
+        if kind == 'idle_owner':
+            # The leader holds no lease at STOP (matrix DONE already returned
+            # it), so its retained THREAD_OWNER is idle (all-zero). Reconcile
+            # accepts it outside the leased population; the staged bytes must
+            # likewise exclude it or the replay's byte count mismatches.
+            owner_id = next(item['id'] for item in source.maps if item['name'] == 'THREAD_OWNER')
+            return (capture.dumper.TASK_STORAGE_HEADER.pack(capture.dumper.TASK_STORAGE_MAGIC, 1,
+                    owner_id, pid, pid, 544) + bytes(544) + raw)
         if kind == 'binding' and detail == 'owner_count':
             raw = bytearray(raw)
             offset = 0
@@ -554,6 +576,11 @@ def coordinator_case(pid, directory, case):
                 stack.enter_context(patch.object(signal, 'signal', side_effect=restore_failed))
             if kind == 'deadline':
                 stack.enter_context(patch.object(capture, 'STOP_SECONDS', .08))
+            if kind == 'missing_privacy':
+                # Test-only budget: the RED harness never reaches readiness on
+                # a capturing-only log, so expiry must stay inside the probe's
+                # hang guard; GREEN readiness succeeds immediately.
+                stack.enter_context(patch.object(capture, 'READY_SECONDS', 2))
             if kind == 'boundary':
                 if detail == 'pin':
                     def pin_failed(*args):
@@ -627,6 +654,10 @@ def coordinator_case(pid, directory, case):
             # invented refusal must die there, not survive into a receipt.
             assert errors[0].startswith('refuse-CGROUP_FILTER: RuntimeError'), errors
             assert not list(Path(directory).glob('mapdump_CGROUP_FILTER_*'))
+        if kind == 'missing_privacy':
+            # Readiness succeeded (the capturing line was present) and the
+            # observer exited cleanly; only the post-exit privacy proof refuses.
+            assert errors and 'observer privacy marker missing' in errors[0], errors
         assert not owner.active and all(group.closed for group in owner.groups)
         assert all(reader.closed for reader in source.opened_rings)
         assert sentinel.read_bytes() == b'preserve unrelated bytes'
@@ -671,6 +702,9 @@ def coordinator_case(pid, directory, case):
             assert (groups['workload'].fd, signal.SIGCONT) in signals
         if expected_success:
             assert replay_count == 2 and replay_paths[0].parent != Path(directory)
+        if kind == 'idle_owner' and not errors:
+            retained = Path(directory) / f'mapdump_THREAD_OWNER_{config.lane}.bin'
+            assert retained.is_file() and len(retained.read_bytes()) == 0, 'idle owner bytes were staged'
         for fd in test_handles:
             assert select.select([fd], [], [], 1)[0]
             try:
@@ -706,6 +740,7 @@ assert args[10] == '-o' and args[12] == '--'
 assert args[15] == 'matrix'
 ready = pathlib.Path(args[16])
 def marker():
+    print('p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C', flush=True)
     print('fixture — privacy=aggregate-only', flush=True)
 def record(pid):
     with (root / 'owned-pids').open('a') as stream:
@@ -1333,6 +1368,47 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                                                    '--'] + config.observer_args)
             self.assertEqual(external.workload_origin, 'external')
 
+    def test_profile_readiness_accepts_attach_complete_without_live_frame(self):
+        # The live frame is TTY-only (src/run.rs LiveDisplay): on the canary's
+        # log file it appears only as the final frame, after the capture has
+        # ended. Readiness for profile/metrics is the attach-complete stderr
+        # line, so a log holding only that line is ready.
+        for mode, privacy in (('profile', 'allowlisted'), ('metrics', 'aggregate-only')):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / 'observer.log'
+                log.write_bytes(b'p11scope: discovery: 1 module(s), 104 attach slot(s)\n'
+                                b'p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C\n')
+                config = SimpleNamespace(mode=mode, privacy=privacy, observer_log=log)
+                coordinator = capture.Coordinator(config, None)
+                self.assertTrue(coordinator.capture_ready(time.monotonic() + 1))
+
+    def test_profile_readiness_rejects_final_frame_without_attach_complete(self):
+        # A log holding only the final frame's privacy marker must NOT satisfy
+        # live readiness: that marker lands when the capture ends, so treating
+        # it as readiness would start the stopped acquisition on a finished
+        # capture (or miss the READY budget on a slow attach).
+        for mode, privacy in (('profile', 'allowlisted'), ('metrics', 'aggregate-only')):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / 'observer.log'
+                log.write_bytes(f'p11scope \u2014 test \u2014 up 00:00:06 \u2014 mode {mode} \u2014 privacy={privacy}\n'.encode())
+                config = SimpleNamespace(mode=mode, privacy=privacy, observer_log=log)
+                coordinator = capture.Coordinator(config, None)
+                self.assertFalse(coordinator.capture_ready(time.monotonic() + 1))
+
+    def test_finished_observer_without_privacy_marker_is_refused(self):
+        # The privacy tier is no longer proven at readiness (the capturing line
+        # carries no tier), so the finished observer's log must still contain
+        # the final frame's privacy marker; a log without it is refused.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'observer.log'
+            log.write_bytes(b'p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C\n')
+            config = SimpleNamespace(mode='profile', privacy='allowlisted', observer_log=log)
+            coordinator = capture.Coordinator(config, None)
+            self.assertFalse(coordinator.final_privacy_present(time.monotonic() + 1))
+            with log.open('ab') as stream:
+                stream.write('p11scope \u2014 test \u2014 privacy=allowlisted\n'.encode())
+            self.assertTrue(coordinator.final_privacy_present(time.monotonic() + 1))
+
 
 CASES = (
     ['native:' + lane for lane in ('aggregate-only-metrics', 'default-safe-profile', 'default-safe-trace',
@@ -1353,7 +1429,8 @@ CASES = (
        'inventory:definition', 'inventory:changed', 'population', 'frames', 'close',
        'replay:1', 'replay:2', 'publication:failure', 'publication:collision', 'rollback',
        'roster:observer', 'roster:workload', 'bytes', 'shell:matrix', 'shell:blocked', 'stage_remove',
-       'policy:ignored', 'policy:blocked', 'terminal_restore', 'cookie', 'fifo:ready', 'fifo:done']
+       'policy:ignored', 'policy:blocked', 'terminal_restore', 'cookie', 'fifo:ready', 'fifo:done',
+       'missing_privacy', 'idle_owner']
     + ['boundary:' + point for point in ('pin', 'open_rings', 'ring_records', 'fsync', 'ring_close')])
 for case in CASES:
     def test(self, case=case):

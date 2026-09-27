@@ -5552,6 +5552,25 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         }
     }
 
+    // Pre-6.8 overlayfs splits the manifest join: the helper recorded the
+    // maps/backing key while each manifest pin files the opened fd's overlay
+    // key. Re-file every split alias onto its scan pin — proved by the shared
+    // self-mapping probe — so plan lowering and every later exact join
+    // resolve one provider. Exact captures never consult the probe.
+    for manifest in &accepted {
+        for object in &manifest.objects {
+            let Some((key, path)) = capture_manifest_object_key(manifest, object.id) else {
+                continue;
+            };
+            pinned.refile_split_manifest_alias(
+                key,
+                path,
+                &mut discovered.budget,
+                &KernelSelfMappingProbe,
+            );
+        }
+    }
+
     let (mut modules, differed) = bind_scanned_modules(&scan_modules, &mut pinned);
     attribution::note_all(&differed);
     counters.object_skips.extend(differed);

@@ -928,31 +928,29 @@ def validate_inventory_usage_transition(elf, root, relocations):
 
 
 TAIL_CALL_HELPER = 12
-# The index no program-array slot can have (TAIL_CALLS has 2, STACK_GUARD 1):
-# a tail call with it always falls through. Mirrors
+# The index no program-array slot can have (TAIL_CALLS has 2, STACK_GUARD and
+# PAIR_CALLS have 1 each): a tail call with it always falls through. Mirrors
 # TAIL_CALLS_NO_PRIVATE_STACK_INDEX.
 NO_PRIVATE_STACK_INDEX = 0xFFFFFFFF
-# The object's program arrays. TAIL_CALLS carries the real continuations and
-# the plainly loaded programs' opt-outs; STACK_GUARD is never populated and
-# carries only the opt-outs of MULTI_LOADED_PROGRAMS.
-PROGRAM_ARRAYS = ("TAIL_CALLS", "STACK_GUARD")
+# The object's program arrays. TAIL_CALLS carries the interface continuation
+# and the plainly loaded programs' opt-outs; STACK_GUARD is never populated
+# and carries only the opt-outs of MULTI_LOADED_PROGRAMS; PAIR_CALLS
+# (diagnostic object only) carries only the pair program's continuation into
+# the template second. TAIL_CALLS slot 1 is retired: no program references it.
+PROGRAM_ARRAYS = ("TAIL_CALLS", "STACK_GUARD", "PAIR_CALLS")
 # Programs userspace may load with expected_attach_type BPF_TRACE_UPROBE_MULTI:
-# `static_probe_side` in src/attach.rs and the usage entries of
-# `inventory_program_load` in src/attach/inventory.rs (a Rust test pins this
-# set against both). Since CVE-2025-40123 (upstream 4540aed51b12, in the
-# stable series) a program array accepts only programs with its owner's
-# expected attach type, so these programs and the plainly loaded ones must
-# never reference the same program array.
+# `loads_with_multi_flag` in src/attach.rs (the `static_probe_side` endpoints
+# plus the template-second continuation, which loads with its caller's attach
+# type) and the usage entries of `inventory_program_load` in
+# src/attach/inventory.rs (a Rust test pins this set against both). Since
+# CVE-2025-40123 (upstream 4540aed51b12, in the stable series) a program array
+# accepts only programs with its owner's expected attach type, so these
+# programs and the plainly loaded ones must never reference the same array.
 MULTI_LOADED_PROGRAMS = frozenset({
     "p11_entry", "p11_entry_ia32", "p11_entry_template", "p11_entry_template_types",
-    "p11_entry_template_pair", "p11_return", "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+    "p11_entry_template_pair", "p11_entry_template_second", "p11_return",
+    "p11_usage_entry_lp64", "p11_usage_entry_ia32",
 })
-# Known, pre-existing exception (diagnostic object only): the template-pair
-# continuation tail-calls TAIL_CALLS slot 1 into the plainly loaded
-# p11_entry_template_second, so under the multi backend on a kernel with the
-# CVE-2025-40123 check that build cannot load. It is reported, not fixed here;
-# nothing else may join it.
-MULTI_LOADED_TAIL_CALLS_EXCEPTION = frozenset({"p11_entry_template_pair"})
 
 
 def kernel_stack_opt_out_at(instructions, at, relocation_of, arrays=PROGRAM_ARRAYS):
@@ -1153,13 +1151,15 @@ def validate_classic_uprobe_kernel_stack(elf):
     a return probe read another thread's START key). The verifier keeps the
     kernel stack for any program containing a tail call, so each program must
     contain one; every tail call is either a real continuation into a known
-    TAIL_CALLS slot or the always-falling-through out-of-range opt-out, whose
-    index is a straight-line constant.
+    slot (TAIL_CALLS slot 0, PAIR_CALLS slot 0) or the
+    always-falling-through out-of-range opt-out, whose index is a
+    straight-line constant. TAIL_CALLS slot 1 is retired.
 
     Each program array must also keep one expected attach type (CVE-2025-40123):
-    MULTI_LOADED_PROGRAMS reference only STACK_GUARD, every other program only
-    TAIL_CALLS, and no subprogram or non-uprobe program references either, so
-    this per-program attribution is complete.
+    MULTI_LOADED_PROGRAMS reference only STACK_GUARD, except the pair program,
+    which references only PAIR_CALLS; every other program references only
+    TAIL_CALLS; and no subprogram or non-uprobe program references any of
+    them, so this per-program attribution is complete.
     """
     uprobe_sections = {elf.indices.get("uprobe"), elf.indices.get("uretprobe")} - {None}
     programs = [(name, section, value, size) for name, info, _, section, value, size in elf.symbols
@@ -1202,14 +1202,15 @@ def validate_classic_uprobe_kernel_stack(elf):
                 raise RuntimeError(f"{name}: tail call through an unidentified program array")
             if index == NO_PRIVATE_STACK_INDEX:
                 opt_outs += 1
-            elif index in (0, 1) and array == "TAIL_CALLS":
+            elif index == 0 and array in ("TAIL_CALLS", "PAIR_CALLS"):
                 slots += 1
             else:
                 raise RuntimeError(f"{name}: tail call index is not a known slot or the opt-out")
         used = {array for _, array in references.get(name, ())}
-        if name in MULTI_LOADED_PROGRAMS:
-            allowed = {"STACK_GUARD"} | ({"TAIL_CALLS"} if name in MULTI_LOADED_TAIL_CALLS_EXCEPTION
-                                         else set())
+        if name == "p11_entry_template_pair":
+            allowed = {"PAIR_CALLS"}
+        elif name in MULTI_LOADED_PROGRAMS:
+            allowed = {"STACK_GUARD"}
         else:
             allowed = {"TAIL_CALLS"}
         if used - allowed:
@@ -1491,6 +1492,7 @@ SAFE_MAPS = {
 }
 UNSAFE_MAPS = SAFE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
+    "PAIR_CALLS": map_def(3, 4, 4, 1),
 }
 WIDE_MAPS = SAFE_MAPS | {
     "STATS": map_def(6, 4, 296, 2_112),
@@ -1498,6 +1500,7 @@ WIDE_MAPS = SAFE_MAPS | {
 }
 WIDE_UNSAFE_MAPS = WIDE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
+    "PAIR_CALLS": map_def(3, 4, 4, 1),
 }
 SAFE_PROGRAMS = {
     "p11_entry",
@@ -1645,10 +1648,14 @@ def self_test():
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
     assert INVENTORY_MAPS["STACK_GUARD"] == SAFE_MAPS["STACK_GUARD"]
+    assert UNSAFE_MAPS["PAIR_CALLS"] == map_def(3, 4, 4, 1)
+    assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
+    assert "PAIR_CALLS" not in SAFE_MAPS
+    assert "PAIR_CALLS" not in INVENTORY_MAPS
     assert len(SAFE_MAPS) == 24
-    assert len(UNSAFE_MAPS) == 25
+    assert len(UNSAFE_MAPS) == 26
     assert len(WIDE_MAPS) == 24
-    assert len(WIDE_UNSAFE_MAPS) == 25
+    assert len(WIDE_UNSAFE_MAPS) == 26
     assert len(SAFE_PROGRAMS) == 13
     assert len(UNSAFE_PROGRAMS) == 18
     good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)
@@ -1684,17 +1691,19 @@ def self_test():
 
     assert rejected(
         validate_policy_inventory, (UNSAFE_MAPS, SAFE_PROGRAMS, {"decode_params"}), diagnostic
-    ) == ["map added: ATTR_BOOL_BITS"]
+    ) == ["map added: ATTR_BOOL_BITS", "map added: PAIR_CALLS"]
     # Each variant is compared against ITS OWN freeze, not the other one's.
     assert rejected(validate_inventory, "diagnostic", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
-        "map removed: ATTR_BOOL_BITS"
+        "map removed: ATTR_BOOL_BITS",
+        "map removed: PAIR_CALLS",
     ]
     assert rejected(validate_inventory, "wide-default", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
         "STATS.max_entries: object=512 frozen=2112",
     ]
     assert rejected(validate_inventory, "default", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
-        "map added: ATTR_BOOL_BITS"
+        "map added: ATTR_BOOL_BITS",
+        "map added: PAIR_CALLS",
     ]
     # A one-field drift names exactly that field, nothing else (the W3 CONFIG
     # shape: same maps, one max_entries apart).

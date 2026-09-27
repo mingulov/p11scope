@@ -429,26 +429,34 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
     )?;
     require_contract_marker(
         attach,
-        "const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 1]",
-        "single feature policy map",
+        "const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 2]",
+        "two feature policy maps",
     )?;
     let compact_features: String = features
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect::<String>()
         .replace(",)", ")");
-    if compact_features
-        .matches("(\"ATTR_BOOL_BITS\",map_metadata(MapType::Hash,4,4,16,BPF_F_RDONLY_PROG))")
-        .count()
-        != 1
-        || compact_features.contains("TAIL_CALLS")
-    {
-        return Err("FEATURE_POLICY_MAPS must contain only ATTR_BOOL_BITS".into());
+    for expected in [
+        "(\"ATTR_BOOL_BITS\",map_metadata(MapType::Hash,4,4,16,BPF_F_RDONLY_PROG))",
+        "(\"PAIR_CALLS\",map_metadata(MapType::ProgramArray,4,4,1,0))",
+    ] {
+        if compact_features.matches(expected).count() != 1 {
+            return Err(format!("feature policy-map metadata missing {expected}"));
+        }
+    }
+    if compact_features.contains("TAIL_CALLS") {
+        return Err("FEATURE_POLICY_MAPS must not contain TAIL_CALLS".into());
     }
     require_contract_marker(
         attach,
         "const TAIL_POLICY_MAP: &str = \"TAIL_CALLS\";",
         "TAIL_CALLS policy-map alias",
+    )?;
+    require_contract_marker(
+        attach,
+        "const PAIR_POLICY_MAP: &str = \"PAIR_CALLS\";",
+        "PAIR_CALLS policy-map alias",
     )?;
     let freeze = contract_section(
         attach,
@@ -478,6 +486,7 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
     )?;
     for marker in [
         "name == TAIL_POLICY_MAP",
+        "name == PAIR_POLICY_MAP",
         "matches!(meta.map_type, MapType::Array)",
         "meta.flags & BPF_F_RDONLY_PROG != 0",
         "meta.max_entries != 1",
@@ -819,21 +828,17 @@ fn assert_live_discovery_host_contract(
     let tail_helper = contract_section(
         attach,
         "fn publish_tail_calls_with",
-        "fn publish_and_freeze_tail_calls",
+        "fn publish_pair_calls_with",
     )?;
     for marker in [
         "if actual_worker != Some(worker_id)",
-        "if actual_second != expected_second",
+        "if actual_retired.is_some()",
     ] {
         require_contract_marker(tail_helper, marker, "TAIL_CALLS exact readback")?;
     }
     for pair in [
         (
             "write(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
-            "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
-        ),
-        (
-            "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
             "read(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
         ),
         (
@@ -847,39 +852,57 @@ fn assert_live_discovery_host_contract(
     ] {
         require_before(tail_helper, pair.0, pair.1, "TAIL_CALLS helper sequence")?;
     }
+    let pair_helper = contract_section(
+        attach,
+        "fn publish_pair_calls_with",
+        "fn publish_and_freeze_tail_calls",
+    )?;
+    require_contract_marker(
+        pair_helper,
+        "if actual_second != Some(second_id)",
+        "PAIR_CALLS exact readback",
+    )?;
+    for pair in [
+        (
+            "write(state, PAIR_CALLS_SECOND_SLOT)?;",
+            "read(state, PAIR_CALLS_SECOND_SLOT)?;",
+        ),
+        ("read(state, PAIR_CALLS_SECOND_SLOT)?;", "freeze(state)"),
+    ] {
+        require_before(pair_helper, pair.0, pair.1, "PAIR_CALLS helper sequence")?;
+    }
     let tail_publication = contract_section(
         attach,
         "fn publish_and_freeze_tail_calls(",
         "/// A kernel/environment",
     )?;
-    let fd_selection = contract_section(
-        tail_publication,
-        "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT",
-        "let mut tails: ProgramArray<_>",
-    )?;
-    for marker in [
-        "{\n                &worker_fd\n            } else {",
-        "&second.as_ref().expect(\"selected template-second program\").0",
-    ] {
-        require_contract_marker(fd_selection, marker, "TAIL_CALLS slot-to-FD mapping")?;
-    }
-    require_contract_marker(
-        tail_publication,
-        "worker_id,\n        second.as_ref().map(|(_, id)| *id)",
-        "TAIL_CALLS loaded program IDs",
-    )?;
     for marker in [
         ".program(\"interface_list_worker\")",
         ".program(\"p11_entry_template_second\")",
-        "if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT",
-        "&worker_fd",
-        "&second.as_ref().expect(\"selected template-second program\").0",
-        "tails.set(slot, fd, 0)?;",
+        "tails.set(slot, &worker_fd, 0)?;",
+        "pairs.set(slot, &second_fd, 0)?;",
         "program_array_id(TAIL_POLICY_MAP, map, slot)",
+        "program_array_id(PAIR_POLICY_MAP, map, slot)",
+        "require_empty_pair_calls(map)?;",
         "freeze_map(TAIL_POLICY_MAP, map)",
+        "freeze_map(PAIR_POLICY_MAP, map)",
     ] {
-        require_contract_marker(tail_publication, marker, "TAIL_CALLS publication")?;
+        require_contract_marker(tail_publication, marker, "tail-call publication")?;
     }
+    // The default and Inventory objects have no PAIR_CALLS: only the unsafe
+    // object publishes the pair continuation, after the worker array.
+    require_before(
+        tail_publication,
+        "publish_tail_calls_with(",
+        "if !enabled {",
+        "worker array before the pair gate",
+    )?;
+    require_before(
+        tail_publication,
+        "if !enabled {",
+        "publish_pair_calls_with(",
+        "pair array only for the unsafe object",
+    )?;
     Ok(())
 }
 
@@ -3991,6 +4014,7 @@ fn capture_evidence_checker_self_test() {
         "canary safe exact allowances: OK",
         "canary unsafe exact allowances: OK",
         "canary aggregate exact baseline: OK",
+        "canary unsupported-table-version disclosure is exact: OK",
         "induced G1 exact allowances: OK",
         "induced G2 exact allowances: OK",
         "induced G3 exact allowances: OK",
@@ -3999,6 +4023,7 @@ fn capture_evidence_checker_self_test() {
         "induced G4 exact allowances: OK",
         "induced G5 exact allowances: OK",
         "induced G5 exact 11 calls and 9 RV failures: OK",
+        "induced G4/G5 require exactly the F-14 disclosure: OK",
         "induced lanes require disclosed ring_bytes/drain_interval_ms: OK",
         "unrelated evidence gap rejected: OK",
     ] {
@@ -4601,7 +4626,7 @@ fn frozen_policy_inventory_matches_embedded_object() {
         (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
     };
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (25, 18)
+        (26, 18)
     } else {
         (24, 13)
     };
@@ -4868,14 +4893,23 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
             "{message}"
         );
     };
-    let missing_second_slot_set = attach.replacen(
-        "write(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+    let missing_pair_slot_set = attach.replacen(
+        "write(state, PAIR_CALLS_SECOND_SLOT)?;",
         "write(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
         1,
     );
     assert_rejects_attach_mutation(
-        &missing_second_slot_set,
-        "TAIL_CALLS slot 1 publication must be required",
+        &missing_pair_slot_set,
+        "PAIR_CALLS slot 0 publication must be required",
+    );
+    let missing_retired_slot_read = attach.replacen(
+        "read(state, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;",
+        "read(state, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;",
+        1,
+    );
+    assert_rejects_attach_mutation(
+        &missing_retired_slot_read,
+        "TAIL_CALLS retired slot readback must be required",
     );
     let missing_worker_readback = attach.replacen(
         "if actual_worker != Some(worker_id)",
@@ -4913,13 +4947,31 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         .is_ok(),
         "a benign worker comment must not count as an attachment"
     );
-    let fd_mapping = "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT {\n                &worker_fd\n            } else {\n                &second.as_ref().expect(\"selected template-second program\").0\n            };";
-    let swapped_fd_mapping = "let fd = if slot == TAIL_CALLS_INTERFACE_WORKER_SLOT {\n                &second.as_ref().expect(\"selected template-second program\").0\n            } else {\n                &worker_fd\n            };";
-    let swapped_tail_fds = attach.replacen(fd_mapping, swapped_fd_mapping, 1);
-    assert_ne!(attach, swapped_tail_fds, "tail FD swap mutation must apply");
+    let swapped_worker_fd = attach.replacen(
+        "tails.set(slot, &worker_fd, 0)?;",
+        "tails.set(slot, &second_fd, 0)?;",
+        1,
+    );
+    assert_ne!(
+        attach, swapped_worker_fd,
+        "worker FD swap mutation must apply"
+    );
     assert_rejects_attach_mutation(
-        &swapped_tail_fds,
-        "TAIL_CALLS fixed slots must retain their corresponding loaded FDs",
+        &swapped_worker_fd,
+        "TAIL_CALLS slot 0 must retain the loaded worker FD",
+    );
+    let swapped_second_fd = attach.replacen(
+        "pairs.set(slot, &second_fd, 0)?;",
+        "pairs.set(slot, &worker_fd, 0)?;",
+        1,
+    );
+    assert_ne!(
+        attach, swapped_second_fd,
+        "second FD swap mutation must apply"
+    );
+    assert_rejects_attach_mutation(
+        &swapped_second_fd,
+        "PAIR_CALLS slot 0 must retain the loaded template-second FD",
     );
 
     let public_run = library.replacen("pub(crate) mod run;", "pub mod run;", 1);
@@ -6030,10 +6082,12 @@ fn policy_specific_ebpf() {
     assert_eq!(definitions["ASYNC_FUNCTIONS"][KEY_SIZE], 32);
     assert_eq!(definitions["TAIL_CALLS"][0], 3);
     assert_eq!(definitions["TAIL_CALLS"][3], 2);
-    assert!(
-        !definitions.contains_key("ATTR_BOOL_BITS"),
-        "default object contains unsafe-only map ATTR_BOOL_BITS"
-    );
+    for unsafe_map in ["ATTR_BOOL_BITS", "PAIR_CALLS"] {
+        assert!(
+            !definitions.contains_key(unsafe_map),
+            "default object contains unsafe-only map {unsafe_map}"
+        );
+    }
     for unsafe_symbol in [
         "p11_entry_template",
         "p11_entry_template_types",

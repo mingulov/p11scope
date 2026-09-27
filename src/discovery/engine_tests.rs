@@ -170,7 +170,15 @@ fn timing_key(index: usize) -> PinnedTimingKey {
     static KEYS: std::sync::OnceLock<Vec<PinnedTimingKey>> = std::sync::OnceLock::new();
     KEYS.get_or_init(|| {
         let view = ProcessView::open(ProcessViewId(99), std::process::id()).unwrap();
-        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        // The kernel renders /proc/self/maps in chunks and drops its lock in
+        // between, so a snapshot taken while other test threads map and
+        // unmap can overlap itself. Take a consistent one.
+        let maps = (0..100)
+            .find_map(|_| {
+                let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).ok()?;
+                MapIndex::new(&maps).is_ok().then_some(maps)
+            })
+            .expect("a consistent self maps snapshot");
         let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
         let mut keys = Vec::new();
         for mapping in maps

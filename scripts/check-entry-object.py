@@ -339,38 +339,40 @@ DESTINATIONS = {6: (8, 8), 7: (0x10, 8), 10: (0x28, 8),
                 "join": (0x58, 8), "get": (0x30, 8), 16: (0x104, 4)}
 LP64_OFFSETS = (0x70, 0x68, 0x60, 0x58, 0x48, 0x40)
 LP64_READS = {
-    6: ([1158, 1033, 1162, 1126, 1160, 1121], 1139),
-    7: ([1213, 1169, 1217, 1180, 1215, 1175], 1193),
-    10: ([1268, 1225, 1272, 1237, 1270, 1232], 1250),
-    11: ([1329, 1283, 1333, 1298, 1331, 1289], 1311),
-    8: ([1674, 1540, 1352, 1440, 1365, 1445], 1394),
-    9: ([1436, 1448, 1345, 1438, 1359, 1443], 1379),
-    16: ([1534, 1550, 1497, 1536, 1503, 1538], 1516),
-    "join": ([1656, 1561, 1662, 1589, 1659, 1576], 1603),
-    "get": ([1665, 1569, 1671, 1611, 1668, 1583], 1625),
+    6: ([1184, 1059, 1188, 1152, 1186, 1147], 1165),
+    7: ([1239, 1195, 1243, 1206, 1241, 1201], 1219),
+    10: ([1294, 1251, 1298, 1263, 1296, 1258], 1276),
+    11: ([1355, 1309, 1359, 1324, 1357, 1315], 1337),
+    8: ([1700, 1566, 1378, 1466, 1391, 1471], 1420),
+    9: ([1462, 1474, 1371, 1464, 1385, 1469], 1405),
+    16: ([1560, 1576, 1523, 1562, 1529, 1564], 1542),
+    "join": ([1682, 1587, 1688, 1615, 1685, 1602], 1629),
+    "get": ([1691, 1595, 1697, 1637, 1694, 1609], 1651),
 }
-IA32_READS = {6: 1919, 7: 2008, 10: 2030, 11: 2056,
-              8: 2102, 9: 2080, 16: 2171, "join": 2200, "get": 2222}
-LP64_DISPATCH = {6: (1027,), 7: (1164,), 10: (1219,), 11: (1278,),
-                 8: (1336, 1347), 9: (1339, 1340), 16: (1462, 1492),
-                 "join": (1556,), "get": (1564,)}
-IA32_DISPATCH = {6: (1916,), 7: (2005,), 10: (2028,), 11: (2054,),
-                 8: (2076,), 9: (2078,), 16: (2140,), "join": (2197,), "get": (2219,)}
+IA32_READS = {6: 1949, 7: 2038, 10: 2060, 11: 2086,
+              8: 2132, 9: 2110, 16: 2201, "join": 2230, "get": 2252}
+LP64_DISPATCH = {6: (1053,), 7: (1190,), 10: (1245,), 11: (1304,),
+                 8: (1362, 1373), 9: (1365, 1366), 16: (1488, 1518),
+                 "join": (1582,), "get": (1590,)}
+IA32_DISPATCH = {6: (1946,), 7: (2035,), 10: (2058,), 11: (2084,),
+                 8: (2106,), 9: (2108,), 16: (2170,), "join": (2227,), "get": (2249,)}
 SCALAR_CALLS = {
-    "default": {1033: 6, 1046: 7, 1059: 10, 1075: 11, 1161: 8,
-                1194: 9, 1251: 16, 1421: "join", 1435: "get"},
-    "p11_entry_template": {2492: 6, 2505: 7, 2517: 10, 2534: 11,
-                           2550: 9, 2642: 8, 2692: 12, 2703: 13},
-    "p11_entry_template_pair": {3001: 6, 3014: 7, 3026: 10, 3043: 11,
-                                3059: 9, 3151: 8, 3201: 12, 3212: 13},
-    "p11_entry_template_types": {3648: 6, 3661: 7, 3673: 10, 3690: 11,
-                                 3706: 9, 3798: 8, 3848: 12, 3859: 13},
-    "p11_entry_template_second": {3431: 14, 3443: 15},
+    "default": {1058: 6, 1071: 7, 1084: 10, 1100: 11, 1186: 8,
+                1219: 9, 1276: 16, 1446: "join", 1460: "get"},
+    "p11_entry_template": {2527: 6, 2540: 7, 2552: 10, 2569: 11,
+                           2585: 9, 2677: 8, 2727: 12, 2738: 13},
+    "p11_entry_template_pair": {3036: 6, 3049: 7, 3061: 10, 3078: 11,
+                                3094: 9, 3186: 8, 3236: 12, 3247: 13},
+    "p11_entry_template_types": {3694: 6, 3707: 7, 3719: 10, 3736: 11,
+                                 3752: 9, 3844: 8, 3894: 12, 3905: 13},
+    "p11_entry_template_second": {3472: 14, 3484: 15},
 }
-SEMANTIC_INSERT = {"default": 1219, "p11_entry": 1467, "p11_entry_ia32": 2145,
-                   "p11_entry_template": 2735, "p11_entry_template_pair": 3244,
-                   "p11_entry_template_types": 3896}
+SEMANTIC_INSERT = {"default": 1244, "p11_entry": 1493, "p11_entry_ia32": 2175,
+                   "p11_entry_template": 2770, "p11_entry_template_pair": 3279,
+                   "p11_entry_template_types": 3942}
 BYTE_DOMAIN = frozenset(range(256))
+# TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot has (always falls through).
+NO_PRIVATE_STACK_INDEX = 0xFFFFFFFF
 BRANCH = re.compile(r"if ([rw]\d+) (==|!=|s>|>|s>=|>=|<|<=) ([rw]\d+|-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+")
 
 
@@ -697,7 +699,13 @@ class SinkProof:
                 require(before.get(("success",)), error("mode walker lacks successful capture"))
                 state[("done",)] = True
                 self.witnesses.add(pc)
-        if text == "call 0xc" and pc in consumer.helper:
+        if (text == "call 0xc" and pc in consumer.helper
+                and before.get("r2") == ("map", "TAIL_CALLS")
+                and before.get("r3") == ("constant", NO_PRIVATE_STACK_INDEX)):
+            # The kernel-stack opt-out: an index past every TAIL_CALLS slot, so
+            # the kernel always falls through. It carries no mode and no data.
+            pass
+        elif text == "call 0xc" and pc in consumer.helper:
             require(self.mode == 3 and before.get(("inserted",)) is True
                     and before.get("r1") == ("context", 0)
                     and before.get("r2") == ("map", "TAIL_CALLS")

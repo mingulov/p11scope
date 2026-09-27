@@ -56,7 +56,8 @@ use p11scope_ebpf_common::{
     FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT,
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
     PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, SESSION_NONE, START_ENTRIES, STATE_DOMAIN_EXPORT,
-    STATE_DOMAIN_SELECTION, TAIL_CALLS_INTERFACE_WORKER_SLOT, USER_TYPE_NONE,
+    STATE_DOMAIN_SELECTION, TAIL_CALLS_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
+    TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE,
     interface_flags_class,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
@@ -111,7 +112,26 @@ static MECH_SHAPE: HashMap<u64, u32> =
 static ATTR_BOOL_BITS: HashMap<u32, u32> = HashMap::with_max_entries(16, BPF_F_RDONLY_PROG);
 
 #[map]
-static TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(2, 0);
+static TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(TAIL_CALLS_ENTRIES, 0);
+
+/// Keep this classic uprobe program on the task's own kernel stack.
+///
+/// From Linux 6.13 the x86 JIT runs a KPROBE-type program whose frame is at
+/// least 64 bytes on a per-CPU *private stack*. Classic uprobe programs run
+/// preemptible (migrate-disabled only) and without a recursion guard, so a
+/// second task running the same program on that CPU while the first is
+/// preempted overwrites the first invocation's frame: keys, copied START
+/// records, event bodies (live on 7.0: a return probe read another thread's
+/// START key and the owner refused it as `start_key_mismatch`). The verifier
+/// keeps the kernel stack for any program that contains a tail call, so every
+/// classic uprobe program issues this one first. Its index is past the end of
+/// TAIL_CALLS, so the kernel never jumps and execution continues here; on
+/// kernels without private stacks it is an equally harmless no-op.
+#[inline(always)]
+fn keep_kernel_stack<C: aya_ebpf::EbpfContext>(ctx: &C) {
+    // SAFETY: an out-of-range index makes bpf_tail_call return immediately.
+    let _ = unsafe { TAIL_CALLS.tail_call(ctx, TAIL_CALLS_NO_PRIVATE_STACK_INDEX) };
+}
 
 /// Exact bounded standard function name -> stable shared-table id. Raw
 /// `pFunctionName` bytes never leave the BPF stack.
@@ -1145,6 +1165,7 @@ fn take_selection_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey
 
 #[uprobe]
 pub fn function_list_entry(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -1185,6 +1206,7 @@ fn function_list_entry_impl(ctx: ProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn function_list_return(ctx: RetProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -1236,6 +1258,7 @@ fn function_list_return_impl(ctx: RetProbeContext) -> u32 {
 
 #[uprobe]
 pub fn interface_list_entry(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -1473,6 +1496,7 @@ fn interface_list_worker_impl(ctx: RetProbeContext) -> u32 {
 
 #[uprobe]
 pub fn interface_entry(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -1523,6 +1547,7 @@ fn interface_entry_impl(ctx: ProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn interface_return(ctx: RetProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -1607,6 +1632,7 @@ fn loader_runtime_ip(ctx: &ProbeContext) -> u64 {
 
 #[uprobe]
 pub fn dl_debug_state(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2303,6 +2329,7 @@ const ENTRY_ABI_ILP32: u8 = 2;
 #[cfg(not(feature = "inventory-only"))]
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2317,6 +2344,7 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_ia32(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2328,6 +2356,7 @@ pub fn p11_entry_ia32(ctx: ProbeContext) -> u32 {
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2339,6 +2368,7 @@ pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_types(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }
@@ -2364,6 +2394,7 @@ pub fn p11_entry_template_pair(ctx: ProbeContext) -> u32 {
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     // Carried admission: the pair program entered before the tail call and
     // did not leave, so this continuation must not re-check the gate. It
     // releases the carried admission on every exit instead.
@@ -2750,6 +2781,7 @@ fn rv_count_add(key: &RvKey) -> bool {
 #[cfg(not(feature = "inventory-only"))]
 #[uretprobe]
 pub fn p11_return(ctx: RetProbeContext) -> u32 {
+    keep_kernel_stack(&ctx);
     if !stop_gate_enter() {
         return 0;
     }

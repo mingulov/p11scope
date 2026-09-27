@@ -198,6 +198,38 @@ class MapDefsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unclassified"):
             checker.inspect(self.mutate([(symbase + hook * 24 + 6, "H", elf.indices["uprobe"])], obj))
 
+    def test_classic_uprobe_kernel_stack(self):
+        """A classic uprobe program with a frame must carry a tail call (the
+        verifier then keeps the task's kernel stack instead of a shared
+        per-CPU private stack); an opt-out index must never select a slot."""
+        source = Path(self.temp.name) / "kernel-stack.c"
+        obj = Path(self.temp.name) / "kernel-stack.o"
+        source.write_text(
+            '#define SEC(n) __attribute__((section(n), used))\n'
+            'struct { int (*type)[3]; int (*max_entries)[2]; int (*key_size)[4]; '
+            'int (*value_size)[4]; } TAIL_CALLS SEC(".maps");\n'
+            'static long (*tail)(void *, void *, unsigned) = (void *)12;\n'
+            'SEC("uprobe") int big(void *ctx) {\n'
+            '#ifdef INDEX\n    tail(ctx, &TAIL_CALLS, INDEX);\n#endif\n'
+            '    volatile char frame[128]; frame[0] = 1; frame[127] = 2;\n'
+            '    return frame[0] + frame[127];\n}\n'
+            'SEC("uretprobe") int tiny(void *ctx) { return 0; }\n'
+            'char LICENSE[] SEC("license") = "GPL";\n')
+
+        def classify(*flags):
+            subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", *flags,
+                            "-c", str(source), "-o", str(obj)], check=True, capture_output=True)
+            return checker.validate_classic_uprobe_kernel_stack(checker.Elf(obj.read_bytes()))
+
+        with self.assertRaisesRegex(RuntimeError, "big: .*private stack"):
+            classify()
+        self.assertEqual(classify("-DINDEX=0xffffffffU"),
+                         {"big": {"opt_out": 1, "continuation": 0},
+                          "tiny": {"opt_out": 0, "continuation": 0}})
+        self.assertEqual(classify("-DINDEX=1")["big"], {"opt_out": 0, "continuation": 1})
+        with self.assertRaisesRegex(RuntimeError, "not a known slot or the opt-out"):
+            classify("-DINDEX=7")
+
     def test_owner_linkage(self):
         obj = Path(self.temp.name) / "owner-linkage.o"
         source = Path(self.temp.name) / "owner-linkage.c"

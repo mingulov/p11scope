@@ -55,6 +55,16 @@ class InventoryManifestTests(unittest.TestCase):
                 checker.validate_inventory("inventory", MAPS, PROGRAMS, SYMBOLS | {forbidden})
 
 @unittest.skipUnless(os.environ.get("P11SCOPE_INVENTORY_OBJECT"), "actual object supplied by Rust integration gate")
+def relocations(elf):
+    found = {}
+    for row, raw in elf.sections.values():
+        if row[1] == 9:
+            for offset in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, offset)
+                found[row[7], address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    return found
+
+
 class ActualInventoryTests(unittest.TestCase):
     def test_actual_usage_scope_refusal_cannot_reach_marking(self):
         """Deleting, bypassing or reversing authorization must fail admission."""
@@ -68,8 +78,15 @@ class ActualInventoryTests(unittest.TestCase):
         section = elf.sections["uprobe"]
         for root in roots:
             start = section[0][4] + root[4]
-            prefix = [struct.unpack_from("<BBhi", body, start + i * 8)
-                      for i in range(6)]
+            # The exact kernel-stack opt-out (a tail call that never jumps)
+            # sits between saving the context and the authorization call.
+            instructions = [struct.unpack_from("<BBhi", body, start + i * 8) for i in range(11)]
+            self.assertTrue(checker.kernel_stack_opt_out_at(
+                instructions, 1,
+                lambda i: next((r for (sec, address), r in relocations(elf).items()
+                                if sec == root[3] and address == root[4] + i * 8), None)))
+            start += 5 * 8
+            prefix = [instructions[0]] + instructions[6:11]
             # Hand-checked actual lowering: returned Option discriminator,
             # followed by the first conditional branch, before any USAGE work.
             self.assertEqual(prefix[3], (0x85, 0x10, 0, -1))

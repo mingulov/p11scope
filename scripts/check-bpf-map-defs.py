@@ -927,6 +927,36 @@ def validate_inventory_usage_transition(elf, root, relocations):
     raise RuntimeError("usage already-one path must return without a write or atomic operation")
 
 
+TAIL_CALL_HELPER = 12
+# The index no TAIL_CALLS slot can have (ProgramArray max_entries is 2): a tail
+# call with it always falls through. Mirrors TAIL_CALLS_NO_PRIVATE_STACK_INDEX.
+NO_PRIVATE_STACK_INDEX = 0xFFFFFFFF
+
+
+def kernel_stack_opt_out_at(instructions, at, relocation_of):
+    """True for exactly `r2 = TAIL_CALLS ll; r3 = 0xffffffff ll; call 12` at
+    `at` (5 instruction slots): the kernel-stack opt-out, which never jumps."""
+    if at + 5 > len(instructions):
+        return False
+    relocation = relocation_of(at)
+    return (instructions[at][:2] == (0x18, 0x02) and instructions[at + 1] == (0, 0, 0, 0)
+            and relocation is not None and relocation[0] == 1
+            and relocation[1][0] == "TAIL_CALLS"
+            and instructions[at + 2] == (0x18, 0x03, 0, -1)
+            and instructions[at + 3] == (0, 0, 0, 0)
+            and instructions[at + 4] == (0x85, 0, 0, TAIL_CALL_HELPER))
+
+
+def tail_calls_are_opt_outs(body, key, relocations):
+    """Every tail call in this body is the exact kernel-stack opt-out."""
+    instructions = [struct.unpack_from("<BBhi", body, i) for i in range(0, len(body), 8)]
+    calls = [at for at, (op, registers, _, immediate) in enumerate(instructions)
+             if op == 0x85 and registers == 0 and immediate == TAIL_CALL_HELPER]
+    return all(at >= 4 and kernel_stack_opt_out_at(
+        instructions, at - 4, lambda i: relocations.get((key[0], key[1] + i * 8)))
+        for at in calls)
+
+
 def validate_inventory_scope_prefix(elf, root, relocations):
     """Prove caller refusal for the supported emitted Option<ScopeAuth> ABI.
 
@@ -939,12 +969,20 @@ def validate_inventory_scope_prefix(elf, root, relocations):
     if len(body) % 8 or len(body) < 6 * 8:
         raise RuntimeError("inventory authorization requires an aligned entry prefix")
     instructions = [struct.unpack_from("<BBhi", body, i) for i in range(0, len(body), 8)]
+    # The only instructions allowed between saving the context and the
+    # authorization call are the exact kernel-stack opt-out (a tail call that
+    # never jumps). Removing the block from the proof keeps every index below.
+    if kernel_stack_opt_out_at(instructions, 1, lambda i: relocations.get((root[3], root[4] + i * 8))):
+        instructions = instructions[:1] + instructions[6:]
+        skipped = 5
+    else:
+        skipped = 0
     # No branch, payload access or map operation can precede authorization.
     # R6 preserves the original probe context; R1 is the 32-byte sret frame.
     if instructions[:3] != [(0xbf, 0x16, 0, 0), (0xbf, 0xa1, 0, 0), (0x07, 1, 0, -32)]:
         raise RuntimeError("inventory authorization requires the checked stack-result prefix")
     call = instructions[3]
-    relocation = relocations.get((root[3], root[4] + 3 * 8))
+    relocation = relocations.get((root[3], root[4] + (3 + skipped) * 8))
     auth = [s for s in elf.symbols if s[0].endswith("10scope_auth")]
     if (len(auth) != 1 or auth[0][1:3] != (2, 0)
             or auth[0][3] != elf.indices.get(".text") or not auth[0][5]
@@ -1023,6 +1061,9 @@ def validate_inventory_entry_reachability(elf):
                                    if candidate[1] & 15 == 1 and candidate[3] == target[3]
                                    and candidate[4] == address]
                         map_name = matches[0] if len(matches) == 1 else ""
+                    if map_name == "TAIL_CALLS" and relocation[0] == 1 and tail_calls_are_opt_outs(
+                            body, key, relocations):
+                        continue  # the kernel-stack opt-out: no slot, no jump
                     if relocation[0] != 1 or map_name not in allowed_maps:
                         raise RuntimeError(f"inventory entry reaches forbidden map/global {map_name!r}")
                     # Authorization executes before its result can be checked.
@@ -1033,6 +1074,8 @@ def validate_inventory_entry_reachability(elf):
                     maps.add(map_name)
                 if op == 0x85:
                     if registers == 0:
+                        if immediate == TAIL_CALL_HELPER and tail_calls_are_opt_outs(body, key, relocations):
+                            continue
                         if immediate not in {1, 14, 37, 174}:
                             raise RuntimeError(f"inventory entry reaches forbidden helper {immediate}")
                         helpers.add(immediate)
@@ -1054,6 +1097,63 @@ def validate_inventory_entry_reachability(elf):
             raise RuntimeError(f"inventory entry missing atomic compare-exchange: {name}")
         reports[name] = {"functions": len(seen), "maps": sorted(maps),
                          "helpers": sorted(helpers), "compare_exchanges": compare_exchanges}
+    return reports
+
+
+def validate_classic_uprobe_kernel_stack(elf):
+    """Every classic uprobe/uretprobe program keeps the task's kernel stack.
+
+    From Linux 6.13 the x86 JIT gives a KPROBE-type program with a >= 64-byte
+    frame a per-CPU private stack, but classic uprobe programs run preemptible
+    (migrate-disabled only) with no recursion guard: a second task running the
+    same program on that CPU overwrites a preempted invocation's frame (live:
+    a return probe read another thread's START key). The verifier keeps the
+    kernel stack for any program containing a tail call, so each program must
+    contain one; every tail call is either a real continuation into a known
+    slot or the always-falling-through out-of-range opt-out, whose index is a
+    straight-line constant.
+    """
+    reports = {}
+    for name, info, _, section, value, size in elf.symbols:
+        if info & 15 != 2 or not size or section not in {
+                elf.indices.get("uprobe"), elf.indices.get("uretprobe")}:
+            continue
+        body = checked_slice(elf.sections[next(n for n, i in elf.indices.items() if i == section)][1],
+                             value, size, "classic uprobe program")
+        instructions = [struct.unpack_from("<BBhi", body, offset) for offset in range(0, len(body), 8)]
+        opt_outs = slots = 0
+        for position, (op, registers, _, immediate) in enumerate(instructions):
+            if op != 0x85 or registers != 0 or immediate != TAIL_CALL_HELPER:
+                continue
+            index = None
+            for previous in range(position - 1, max(-1, position - 16), -1):
+                p_op, p_registers, _, p_immediate = instructions[previous]
+                if previous and instructions[previous - 1][0] == 0x18:
+                    continue  # second slot of a wide load, not an instruction
+                if p_registers & 15 != 3:
+                    continue
+                if p_op in (0xB7, 0xB4):  # mov64/mov32 r3, imm
+                    index = p_immediate & 0xFFFFFFFF
+                elif p_op == 0x18 and not p_registers >> 4:  # ld_imm64 r3, constant
+                    index = (p_immediate & 0xFFFFFFFF) | (
+                        (instructions[previous + 1][3] & 0xFFFFFFFF) << 32)
+                break
+            if index == NO_PRIVATE_STACK_INDEX:
+                opt_outs += 1
+            elif index in (0, 1):
+                slots += 1
+            else:
+                raise RuntimeError(f"{name}: tail call index is not a known slot or the opt-out")
+        # The kernel gives no private stack to a frame under 64 bytes. Only a
+        # program that never addresses its frame (r10) and calls no BPF
+        # subprogram is provably exempt; anything else must opt out.
+        stackless = not any(
+            ((registers & 15) == 10 or (registers >> 4) == 10) and op != 0x95
+            or (op == 0x85 and registers == 0x10)
+            for op, registers, _, _ in instructions)
+        if not opt_outs + slots and not stackless:
+            raise RuntimeError(f"{name}: classic uprobe program may run on a shared per-CPU private stack")
+        reports[name] = {"opt_out": opt_outs, "continuation": slots}
     return reports
 
 
@@ -1120,11 +1220,16 @@ def validate_inventory_caller_entry_reachability(elf):
                                    if candidate[1] & 15 == 1 and candidate[3] == target[3]
                                    and candidate[4] == address]
                         map_name = matches[0] if len(matches) == 1 else ""
+                    if map_name == "TAIL_CALLS" and relocation[0] == 1 and tail_calls_are_opt_outs(
+                            body, key, relocations):
+                        continue  # the kernel-stack opt-out: no slot, no jump
                     if relocation[0] != 1 or map_name not in allowed_maps:
                         raise RuntimeError(f"caller inventory reaches forbidden map/global {map_name!r}")
                     maps.add(map_name)
                 if op == 0x85:
                     if registers == 0:
+                        if immediate == TAIL_CALL_HELPER and tail_calls_are_opt_outs(body, key, relocations):
+                            continue
                         if immediate not in allowed_helpers:
                             raise RuntimeError(f"caller inventory reaches forbidden helper {immediate}")
                         helpers.add(immediate)
@@ -1202,6 +1307,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         validate_inventory_caller_entry_reachability(elf)
     else:
         validate_inventory_entry_reachability(elf)
+    validate_classic_uprobe_kernel_stack(elf)
     # A literal pool or static (.rodata*/.data*/.bss*) becomes one more loaded
     # map: it breaks the exact owned-map inventory and the live map counts.
     global_data = sorted(name for name in elf.sections

@@ -737,6 +737,20 @@ class EntryObjectTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "bypasses START insertion"):
             CHECKER["contract"](mutate(OBJECTS["default"], "p11_entry", pc, old, new), "default")
 
+    def test_kernel_stack_opt_out_is_only_the_out_of_range_index(self):
+        # Every classic uprobe program first tail-calls TAIL_CALLS with an
+        # index past every slot (the verifier then keeps the kernel stack; the
+        # kernel always falls through). Pointing it at a real slot would be a
+        # continuation outside the pair mode and must be rejected.
+        _, insns = instructions("default", "p11_entry")
+        sentinel = [p for p, t in insns if t == "r3 = 0xffffffff ll"]
+        self.assertEqual(len(sentinel), 1)
+        self.assertTrue(CHECKER["contract"](OBJECTS["default"], "default")["verified"])
+        changed = mutate(OBJECTS["default"], "p11_entry", sentinel[0],
+                         "r3 = 0xffffffff ll", "r3 = 0x1 ll")
+        with self.assertRaisesRegex(RuntimeError, "mode pair tail"):
+            CHECKER["contract"](changed, "default")
+
     def test_counter_adds_keep_frame_facts_only_through_map_values(self):
         # A non-fetch counter add through a map value (even after a
         # verifier-bounded index offset, or where two lookups joined) cannot

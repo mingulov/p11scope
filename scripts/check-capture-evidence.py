@@ -103,6 +103,7 @@ SCHEDULING_U64_KEYS = (
     "sink_timeouts",
     "sink_dropped_bytes",
     "max_inter_drain_gap_ms",
+    "discovery_deferrals",
 )
 SCHEDULING_KEYS = set(SCHEDULING_U64_KEYS) | {
     "terminal_drain_truncated", "sink_policy", "phase_ms",

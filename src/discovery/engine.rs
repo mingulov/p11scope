@@ -106,6 +106,13 @@ pub struct Engine {
     frame_deadline_ns: Option<u64>,
     /// Set when this live frame deferred work to the next one.
     frame_deferred: bool,
+    /// Live frames that deferred work (F4): scheduling evidence.
+    frame_deferrals: u64,
+    /// Under-cap polling rescans queued (internal evidence).
+    polling_rescans_queued: u64,
+    /// Pids whose queued refresh is a polling rescan of an unarmed,
+    /// provider-free view (F1).
+    polled_pids: BTreeSet<u32>,
     /// The capture's operator-stop flag, checked between work items.
     cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     scope: Scope,
@@ -4737,6 +4744,17 @@ pub(crate) const LIVE_DISCOVERY_FRAME_QUANTA: usize = 16;
 /// so a frame overruns by at most one item. Pause cycles and terminal
 /// drains are never bounded by it: they must finish their causal work.
 pub(crate) const LIVE_FRAME_WORK_BUDGET_NS: u64 = 100_000_000;
+
+/// The one loss an under-cap polling rescan can reveal (F1): a provider-free
+/// process is never armed for loader events, so a provider it loads is found
+/// only by the next poll, and calls to it before then went unobserved. A poll
+/// that finds nothing lost nothing and publishes nothing.
+pub(crate) const POLLED_PROVIDER_LOSS: &str = "a polling rescan found a provider in a process that was not armed for loader events; calls to it before this rescan were not observed";
+/// Frame-budget deferral (H-1) delays work, it does not drop it (F4): it is
+/// counted in `scheduling.discovery_deferrals`. Only work the terminal drain
+/// still left undone is a loss.
+pub(crate) const UNFINISHED_DEFERRAL_LOSS: &str =
+    "discovery work deferred by a frame budget was never completed before the capture ended";
 const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
     "the live discovery drain stopped at its work quantum with records still queued";
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
@@ -7214,6 +7232,9 @@ impl Engine {
             },
             frame_deadline_ns: None,
             frame_deferred: false,
+            frame_deferrals: 0,
+            polling_rescans_queued: 0,
+            polled_pids: BTreeSet::new(),
             cancel_flag: None,
             scope: Scope::Pid(std::process::id()),
             hooks: HookRegistry::builtin(),
@@ -7390,16 +7411,13 @@ impl Engine {
             || crate::attach::monotonic_ns().is_some_and(|now| now >= deadline)
     }
 
-    /// Books one frame's deferral once: deferred work is delayed, never
-    /// dropped, but a provider it names is attached a frame later, so the
-    /// capture says so.
+    /// Books one frame's deferral once (F4). Deferred work is delayed, never
+    /// dropped, so it is scheduling evidence, not a loss; a provider it names
+    /// is attached a frame later, which its causal timing measures.
     fn note_frame_deferral(&mut self) {
         if !self.frame_deferred {
             self.frame_deferred = true;
-            self.mark_partial(
-                "live discovery frame",
-                "the frame work budget was spent; remaining discovery work was deferred to the next frame",
-            );
+            self.frame_deferrals = self.frame_deferrals.saturating_add(1);
         }
     }
 
@@ -7464,6 +7482,20 @@ impl Engine {
                 self.paused_loader_views.insert(view);
             }
         }
+    }
+
+    pub(crate) fn discovery_deferrals(&self) -> u64 {
+        self.frame_deferrals
+    }
+
+    /// Called when the terminal drain is done: deferred records it still
+    /// left undispatched are the one deferral that is a loss (F4).
+    pub(crate) fn settle_frame_deferrals_at_capture_end(&mut self) {
+        if self.pending_discovery_records.is_empty() {
+            return;
+        }
+        self.mark_live_loss("live discovery frame", UNFINISHED_DEFERRAL_LOSS);
+        record_object_skips(&mut self.plan, &self.counters.object_skips);
     }
 
     /// The capture's operator-stop flag: a live frame that sees it set
@@ -14224,18 +14256,45 @@ impl Engine {
             if self.refresh_requested.contains(&pid) {
                 polling += 1;
                 last_queued = Some(pid);
+                self.polled_pids.insert(pid);
             }
         }
         if let Some(last) = last_queued {
             self.scheduler.advance_poll_cursor(last);
         }
-        if polling > 0 {
-            let noun = if polling == 1 { "view" } else { "views" };
-            self.mark_partial(
-                "live discovery rotation",
-                &format!("queued {polling} retained exploratory {noun} for polling rescan"),
-            );
+        // Queuing a poll is not a loss (F1): the rescan either finds the
+        // process still provider-free (nothing lost) or finds a provider it
+        // gained unwatched, which the scan result publishes precisely.
+        self.polling_rescans_queued = self.polling_rescans_queued.saturating_add(polling as u64);
+    }
+
+    /// Settles the polling rescans among `scans` (F1): a provider found in a
+    /// polled, unarmed view is the one loss polling can reveal, published
+    /// once per round; a poll that found nothing publishes nothing. Polls of
+    /// views no longer retained are forgotten.
+    fn settle_polling_rescans(
+        &mut self,
+        scans: &[(ProcessViewId, Vec<ScannedModule>, PinnedObjects)],
+    ) {
+        let mut gained = false;
+        for (view, modules, _) in scans {
+            let Some(pid) = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == *view)
+                .map(ProcessView::pid)
+            else {
+                continue;
+            };
+            if self.polled_pids.remove(&pid) && !modules.is_empty() {
+                gained = true;
+            }
         }
+        if gained {
+            self.mark_live_loss("live discovery rotation", POLLED_PROVIDER_LOSS);
+        }
+        let retained: BTreeSet<u32> = self.views.iter().map(ProcessView::pid).collect();
+        self.polled_pids.retain(|pid| retained.contains(pid));
     }
 
     /// Evicts exploratory views outside the retirement transaction: by the
@@ -14712,6 +14771,7 @@ impl Engine {
         let (mut refreshed_scans, mut failed_refresh_pids, refresh_skips) =
             self.scan_inventory_views(&refreshed, "a requested inventory refresh failed");
         skipped.extend(refresh_skips);
+        self.settle_polling_rescans(&refreshed_scans);
 
         // Per-tick admission bound: only the first `max_new_views` newcomers
         // are deep-scanned; the rest defer to the next tick with explicit
@@ -15385,6 +15445,7 @@ impl Engine {
             )?;
             changed |= outcome.changed;
             if !backlog {
+                self.settle_frame_deferrals_at_capture_end();
                 return Ok(changed);
             }
         }
@@ -15430,6 +15491,7 @@ impl Engine {
                 return Err(failure);
             }
             if complete {
+                self.settle_frame_deferrals_at_capture_end();
                 return Ok(changed);
             }
         }

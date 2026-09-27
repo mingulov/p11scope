@@ -5722,6 +5722,7 @@ impl SchedulingAccumulator {
                 loop_end_reason: self.loop_end_reason,
             },
             max_inter_drain_gap_ms: self.max_inter_drain_gap_ms,
+            discovery_deferrals: 0,
         }
     }
 }
@@ -6110,6 +6111,8 @@ fn evidence_for(
     // Loader and pause identities are discarded before this point: nothing in
     // `facts` or `pause` can name a process, a path, or a proof.
     let plan = engine.plan();
+    let mut scheduling = scheduling;
+    scheduling.discovery_deferrals = engine.discovery_deferrals();
     // Internal-only, stderr-only, `skip-attribution` builds only: which site
     // raised each record the document is about to publish.
     attribution::report(&plan.skipped);

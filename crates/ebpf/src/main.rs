@@ -2727,8 +2727,13 @@ fn rv_count_add(key: &RvKey) -> bool {
         counter_add(cell, 1);
         return true;
     }
+    // The initial count lives on the stack: a reference to a literal would be
+    // placed in a .rodata literal pool, which loads as one more global-data map.
+    let mut one = 0u64;
+    // SAFETY: a plain local; the volatile store only keeps it off .rodata.
+    unsafe { core::ptr::write_volatile(&mut one, 1) };
     if RV_COUNTS
-        .insert(key, &1, aya_ebpf::bindings::BPF_NOEXIST as u64)
+        .insert(key, &one, aya_ebpf::bindings::BPF_NOEXIST as u64)
         .is_ok()
     {
         return true;

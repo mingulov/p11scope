@@ -1128,7 +1128,7 @@ fn assert_static_descriptor_cookie_contract(
             "RV_COUNTS in-place atomic add",
         ),
         (
-            ".insert(key, &1, aya_ebpf::bindings::BPF_NOEXIST as u64)",
+            ".insert(key, &one, aya_ebpf::bindings::BPF_NOEXIST as u64)",
             "RV_COUNTS create only with BPF_NOEXIST",
         ),
         (
@@ -1138,7 +1138,7 @@ fn assert_static_descriptor_cookie_contract(
     ] {
         require_contract_marker(rv_update, marker, contract)?;
     }
-    if rv_update.contains(".insert(key, &1, 0)") || rv_update.contains("RV_COUNTS.get(") {
+    if rv_update.contains(".insert(key, &one, 0)") || rv_update.contains("RV_COUNTS.get(") {
         return Err("RV_COUNTS must not be read and overwritten".into());
     }
     Ok(())
@@ -4689,8 +4689,8 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
     );
 
     let overwrite = ebpf.replacen(
-        ".insert(key, &1, aya_ebpf::bindings::BPF_NOEXIST as u64)",
-        ".insert(key, &1, 0)",
+        ".insert(key, &one, aya_ebpf::bindings::BPF_NOEXIST as u64)",
+        ".insert(key, &one, 0)",
         1,
     );
     assert_ne!(

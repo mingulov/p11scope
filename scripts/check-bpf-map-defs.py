@@ -1202,6 +1202,12 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         validate_inventory_caller_entry_reachability(elf)
     else:
         validate_inventory_entry_reachability(elf)
+    # A literal pool or static (.rodata*/.data*/.bss*) becomes one more loaded
+    # map: it breaks the exact owned-map inventory and the live map counts.
+    global_data = sorted(name for name in elf.sections
+                         if name.startswith((".rodata", ".data", ".bss")))
+    if global_data:
+        raise RuntimeError(f"object carries global-data sections {global_data}")
     image_helpers = (frozenset({"p11_link_current_identity"}) if callers else
                      frozenset() if inventory else REQUIRED_GLOBAL_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers

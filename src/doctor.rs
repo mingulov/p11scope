@@ -165,17 +165,9 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
         kernel_release_check(),
         btf_check(),
         lockdown_check(),
-        sysctl_check(
-            "kernel.perf_event_paranoid",
-            "/proc/sys/kernel/perf_event_paranoid",
-            3,
-            "uprobes need CAP_SYS_ADMIN on this host",
-            // Every paranoid level leaves perf events to CAP_SYS_ADMIN.
-            Some(SysctlLift {
-                capability: "CAP_SYS_ADMIN",
-                up_to: i64::MAX,
-                held: held(CAP_SYS_ADMIN_BIT),
-            }),
+        paranoid_check(
+            held(CAP_SYS_ADMIN_BIT),
+            crate::attach::kernel_supports_multi(),
         ),
         sysctl_check(
             "kernel.yama.ptrace_scope",
@@ -393,6 +385,66 @@ fn sysctl_status(
                     _ => Status::Warn(format!("{v} — {warn_msg}")),
                 },
                 Ok(v) => Status::Ok(v.to_string()),
+                Err(_) => Status::Warn(format!("{trimmed}: unparsable value")),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Status::Ok("not present".to_string()),
+        Err(e) => Status::Warn(format!("{path}: {e}")),
+    }
+}
+
+/// The `kernel.perf_event_paranoid` row, backend-aware. Uprobe-multi links
+/// (kernels ≥ 6.9, the backend `Auto` picks there) never call
+/// `perf_event_open`, so a restrictive paranoid does not limit them:
+/// `CAP_BPF`+`CAP_PERFMON` suffice (measured 136/136 at paranoid=4,
+/// `scripts/matrix/verify-fork-scope.sh` Part 2). Below 6.9 the product
+/// attaches per-probe `perf_event` uprobes, where the old rule holds: a
+/// restrictive paranoid warns unless this process holds `CAP_SYS_ADMIN`.
+/// The multi decision is the same `kernel_supports_multi()` the capture
+/// uses, injected as a bool so both branches are unit-testable.
+fn paranoid_check(held_sysadmin: bool, multi_capable: bool) -> Check {
+    Check {
+        name: "kernel.perf_event_paranoid".to_string(),
+        status: paranoid_status(
+            std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid"),
+            "/proc/sys/kernel/perf_event_paranoid",
+            held_sysadmin,
+            multi_capable,
+        ),
+    }
+}
+
+/// Pure over the sysctl read and the backend decision, mirroring
+/// `sysctl_status` outcomes: on a multi-capable kernel every parsed value
+/// is `Ok` (paranoid gates nothing there); below the multi floor the
+/// restrictive range warns exactly as before.
+fn paranoid_status(
+    read: std::io::Result<String>,
+    path: &str,
+    held_sysadmin: bool,
+    multi_capable: bool,
+) -> Status {
+    if !multi_capable {
+        return sysctl_status(
+            read,
+            path,
+            3,
+            "uprobes need CAP_SYS_ADMIN on this host",
+            // Every paranoid level leaves perf events to CAP_SYS_ADMIN.
+            Some(SysctlLift {
+                capability: "CAP_SYS_ADMIN",
+                up_to: i64::MAX,
+                held: held_sysadmin,
+            }),
+        );
+    }
+    match read {
+        Ok(content) => {
+            let trimmed = content.trim();
+            match trimmed.parse::<i64>() {
+                Ok(v) => Status::Ok(format!(
+                    "{v} — does not limit uprobe-multi attach; CAP_BPF+CAP_PERFMON suffice"
+                )),
                 Err(_) => Status::Warn(format!("{trimmed}: unparsable value")),
             }
         }
@@ -2381,20 +2433,17 @@ mod tests {
     /// lacks the capability which lifts it. As root on stock Ubuntu
     /// (`perf_event_paranoid=4`, `ptrace_scope=1`) neither row limits the
     /// capture, so neither may fail `--extra-strict`; unprivileged, both
-    /// still warn, and `ptrace_scope=3` binds even root.
+    /// still warn, and `ptrace_scope=3` binds even root. The paranoid half
+    /// runs through the row's own constructor on the singles (below-6.9)
+    /// branch, where the lift still applies.
     #[test]
     fn a_sysctl_lifted_by_a_held_capability_is_not_a_warning() {
         let paranoid = |held| {
-            sysctl_status(
+            paranoid_status(
                 Ok("4\n".into()),
                 "/proc/sys/kernel/perf_event_paranoid",
-                3,
-                "uprobes need CAP_SYS_ADMIN on this host",
-                Some(SysctlLift {
-                    capability: "CAP_SYS_ADMIN",
-                    up_to: i64::MAX,
-                    held,
-                }),
+                held,
+                false,
             )
         };
         let Status::Ok(detail) = paranoid(true) else {
@@ -2426,6 +2475,56 @@ mod tests {
         assert!(matches!(ptrace("1", true), Status::Ok(_)));
         assert!(matches!(ptrace("1", false), Status::Warn(_)));
         assert!(matches!(ptrace("3", true), Status::Warn(_)));
+    }
+
+    /// F3: on a multi-capable kernel (≥ 6.9) a restrictive paranoid does
+    /// not limit uprobe-multi attach, so the row is `Ok` even without
+    /// `CAP_SYS_ADMIN` — and says what suffices instead of warning.
+    #[test]
+    fn paranoid_row_does_not_warn_on_multi_capable_kernels() {
+        let status = paranoid_status(
+            Ok("4\n".into()),
+            "/proc/sys/kernel/perf_event_paranoid",
+            false,
+            true,
+        );
+        let Status::Ok(detail) = status else {
+            panic!("paranoid must not warn on multi kernels: {status:?}");
+        };
+        assert!(detail.starts_with("4 — "), "{detail}");
+        assert!(detail.contains("uprobe-multi"), "{detail}");
+        assert!(detail.contains("CAP_BPF+CAP_PERFMON suffice"), "{detail}");
+    }
+
+    /// F3: below the multi floor the per-probe path still needs the old
+    /// rule — restrictive paranoid warns verbatim, `CAP_SYS_ADMIN` lifts.
+    #[test]
+    fn paranoid_row_keeps_the_sysadmin_rule_below_the_multi_floor() {
+        let warn = paranoid_status(
+            Ok("4\n".into()),
+            "/proc/sys/kernel/perf_event_paranoid",
+            false,
+            false,
+        );
+        let Status::Warn(detail) = warn else {
+            panic!("the per-probe path must still warn: {warn:?}");
+        };
+        assert!(
+            detail.contains("uprobes need CAP_SYS_ADMIN on this host"),
+            "{detail}"
+        );
+        assert!(
+            matches!(
+                paranoid_status(
+                    Ok("4\n".into()),
+                    "/proc/sys/kernel/perf_event_paranoid",
+                    true,
+                    false,
+                ),
+                Status::Ok(_)
+            ),
+            "CAP_SYS_ADMIN still lifts paranoid below 6.9"
+        );
     }
 
     // T2 extra-strict (RED): any Warn refuses, even where the default

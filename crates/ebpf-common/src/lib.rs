@@ -472,6 +472,11 @@ pub const COALESCED_NO_HELPER_RC: i64 = i64::MIN;
 pub const DISCOVERY_POINTERS: usize = 104;
 pub const DISCOVERY_INTERFACES: u8 = 16;
 pub const TAIL_CALLS_INTERFACE_WORKER_SLOT: u32 = 0;
+/// Retired continuation slot: the template-pair continuation used to live in
+/// TAIL_CALLS slot 1, but the pair loads for uprobe-multi while TAIL_CALLS is
+/// owned by the plainly loaded programs (CVE-2025-40123), so the continuation
+/// moved to PAIR_CALLS. No program tail-calls this slot; userspace asserts it
+/// reads back empty before freezing TAIL_CALLS.
 pub const TAIL_CALLS_TEMPLATE_SECOND_SLOT: u32 = 1;
 /// Slots in the TAIL_CALLS program array.
 pub const TAIL_CALLS_ENTRIES: u32 = 2;
@@ -484,11 +489,20 @@ pub const TAIL_CALLS_NO_PRIVATE_STACK_INDEX: u32 = u32::MAX;
 /// owned by one expected attach type (CVE-2025-40123), so those programs
 /// cannot share TAIL_CALLS with the plainly loaded ones.
 pub const STACK_GUARD_ENTRIES: u32 = 1;
+/// The pair program's continuation slot in PAIR_CALLS, the feature-only
+/// program array that carries the pair-to-second tail call. The pair and its
+/// continuation load with the same expected attach type in each backend, so
+/// this array keeps one owner where TAIL_CALLS could not.
+pub const PAIR_CALLS_SECOND_SLOT: u32 = 0;
+/// Slots in PAIR_CALLS.
+pub const PAIR_CALLS_ENTRIES: u32 = 1;
 const _: () = assert!(
     TAIL_CALLS_INTERFACE_WORKER_SLOT < TAIL_CALLS_ENTRIES
         && TAIL_CALLS_TEMPLATE_SECOND_SLOT < TAIL_CALLS_ENTRIES
         && TAIL_CALLS_ENTRIES < TAIL_CALLS_NO_PRIVATE_STACK_INDEX
         && STACK_GUARD_ENTRIES < TAIL_CALLS_NO_PRIVATE_STACK_INDEX
+        && PAIR_CALLS_SECOND_SLOT < PAIR_CALLS_ENTRIES
+        && PAIR_CALLS_ENTRIES < TAIL_CALLS_NO_PRIVATE_STACK_INDEX
 );
 #[cfg(not(feature = "small-discovery-ring"))]
 pub const DISCOVERY_BYTES: u32 = 65_536;
@@ -1937,6 +1951,8 @@ mod tests {
     fn interface_continuation_packs_decodes_and_progresses() {
         assert_eq!(TAIL_CALLS_INTERFACE_WORKER_SLOT, 0);
         assert_eq!(TAIL_CALLS_TEMPLATE_SECOND_SLOT, 1);
+        assert_eq!(PAIR_CALLS_SECOND_SLOT, 0);
+        assert_eq!(PAIR_CALLS_ENTRIES, 1);
         let symbol_id = 0x00ab_cdef;
         assert_eq!(
             interface_continuation_pack(1, 0, symbol_id),

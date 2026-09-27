@@ -371,8 +371,8 @@ SEMANTIC_INSERT = {"default": 1244, "p11_entry": 1493, "p11_entry_ia32": 2175,
                    "p11_entry_template": 2770, "p11_entry_template_pair": 3279,
                    "p11_entry_template_types": 3942}
 BYTE_DOMAIN = frozenset(range(256))
-# TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot of TAIL_CALLS or
-# STACK_GUARD has (always falls through).
+# TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot of TAIL_CALLS,
+# STACK_GUARD, or PAIR_CALLS has (always falls through).
 NO_PRIVATE_STACK_INDEX = 0xFFFFFFFF
 BRANCH = re.compile(r"if ([rw]\d+) (==|!=|s>|>|s>=|>=|<|<=) ([rw]\d+|-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+")
 
@@ -711,8 +711,8 @@ class SinkProof:
         elif text == "call 0xc" and pc in consumer.helper:
             require(self.mode == 3 and before.get(("inserted",)) is True
                     and before.get("r1") == ("context", 0)
-                    and before.get("r2") == ("map", "TAIL_CALLS")
-                    and before.get("r3") == ("constant", 1), error("mode pair tail needs successful insertion and slot 1"))
+                    and before.get("r2") == ("map", "PAIR_CALLS")
+                    and before.get("r3") == ("constant", 0), error("mode pair tail needs successful insertion and slot 0"))
             self.boundaries.add("tail")
         if self.kind == "return" and pc in self.retained_sites:
             offset, lifecycle, abi = self.retained_sites[pc]

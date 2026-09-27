@@ -357,6 +357,16 @@ remove_owned_image() {
     ! docker image inspect "$1" >/dev/null 2>&1
 }
 
+# Docker's systemd cgroup driver turns --cgroup-parent into transient slices
+# (dashes nest: p11scope.slice/p11scope-shared.slice/<run>.slice/<run>-<pid>.slice)
+# and leaves them active after the containers are gone. Stop the per-run
+# slice this lane created, which also stops its child; never the shared parents.
+remove_owned_slice() {
+    ros_unit="p11scope-shared-${RUN_ID%-*}.slice"
+    [ -n "$(systemctl list-units --all --plain --no-legend "$ros_unit" 2>/dev/null)" ] || return 0
+    timeout --signal=TERM --kill-after=5s 30s sudo -n systemctl stop "$ros_unit"
+}
+
 cleanup() {
     CLEANUP_STATUS=$?
     trap - EXIT INT TERM
@@ -374,6 +384,7 @@ cleanup() {
     [ -z "$WA" ] || wait "$WA" 2>/dev/null || true
     [ -z "$WB" ] || wait "$WB" 2>/dev/null || true
     [ -z "$IMAGE_CREATED" ] || cleanup_step remove_owned_image "$IMAGE_CREATED"
+    [ -z "$CONTAINER_A_STARTED$CONTAINER_B_STARTED" ] || cleanup_step remove_owned_slice
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh

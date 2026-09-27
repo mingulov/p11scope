@@ -345,7 +345,7 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build product + fork-harness ==="
-if ! matrix_prebuilt_product; then
+if ! matrix_prebuilt_product with-discover; then
     RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
         P11SCOPE_PREPARED_BPF_CARGO="$P11SCOPE_PREPARED_BPF_CARGO" \
         P11SCOPE_PREPARED_BPF_RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \

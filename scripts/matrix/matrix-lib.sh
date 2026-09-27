@@ -37,12 +37,14 @@ matrix_absolute_work() {
 
 # Either reuse a prebuilt product (P11SCOPE_BIN, optionally
 # P11SCOPE_DISCOVER_BIN; both absolute) or report that the lane must build
-# one. Sets P11SCOPE_EXE and P11SCOPE_DISCOVER_EXE when prebuilt; returns 1
+# one. Sets P11SCOPE_EXE, and P11SCOPE_DISCOVER_EXE when the lane needs the
+# helper (it defaults to p11scope-discover beside P11SCOPE_BIN); returns 1
 # when nothing was given.
-#   matrix_prebuilt_product
+#   matrix_prebuilt_product [with-discover]
 matrix_prebuilt_product() {
     [ -n "${P11SCOPE_BIN-}" ] || return 1
-    for mpp_bin in "$P11SCOPE_BIN" "${P11SCOPE_DISCOVER_BIN:-${P11SCOPE_BIN%/*}/p11scope-discover}"; do
+    set -- "$P11SCOPE_BIN" ${1:+"${P11SCOPE_DISCOVER_BIN:-${P11SCOPE_BIN%/*}/p11scope-discover}"}
+    for mpp_bin do
         case $mpp_bin in
             /*) ;;
             *) echo "prebuilt product path must be absolute: $mpp_bin" >&2; exit 2 ;;
@@ -52,8 +54,8 @@ matrix_prebuilt_product() {
             exit 2
         }
     done
-    P11SCOPE_EXE=$P11SCOPE_BIN
-    P11SCOPE_DISCOVER_EXE=${P11SCOPE_DISCOVER_BIN:-${P11SCOPE_BIN%/*}/p11scope-discover}
+    P11SCOPE_EXE=$1
+    P11SCOPE_DISCOVER_EXE=${2-}
     return 0
 }
 

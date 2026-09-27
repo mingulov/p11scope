@@ -1,6 +1,16 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Phase 4 Task 8 — fork scoping and measured privileges
 
+> Addendum 2026-09-27: the capability rows below were measured on the
+> per-probe `perf_event` attach path, which kernels below 6.9 still use.
+> On kernels ≥ 6.9 the product attaches through uprobe-multi links, where
+> `CAP_BPF`+`CAP_PERFMON` suffice: `scripts/matrix/verify-fork-scope.sh`
+> Part 2 measured 136/136 attached probes at `perf_event_paranoid=4`,
+> `ptrace_scope=1` on kernel 7.0.0-31-generic. The scan half is unchanged:
+> a same-UID non-descendant scan still needs `CAP_SYS_PTRACE` (or a
+> descendant target / `--manifest`). Current matrix:
+> `docs/usage.md#privileges-per-environment`.
+
 > Historical measurement note: the pre-2026-08-25 results below predate later
 > live-discovery changes. The 2026-08-25 host rows are current post-fix6,
 > host-specific measurements, not a portable authorization claim. The current

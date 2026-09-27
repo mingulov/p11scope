@@ -673,9 +673,12 @@ of refusing: the two `loader timing` rows (`unproven`/`none`: the loader
 timing catalog is empty) and `run initial-set capture: none` (an owned `run`
 cannot prove it captured its child's initial provider set, so its reports
 stay `PARTIAL`; `run` itself works, and the verdict line says so). A
-`kernel.perf_event_paranoid` or `kernel.yama.ptrace_scope` restriction is
-`ok` when doctor holds the capability that lifts it (`CAP_SYS_ADMIN`;
-`CAP_SYS_PTRACE` for Yama 1-2), as under `sudo`.
+`kernel.yama.ptrace_scope` restriction is `ok` when doctor holds the
+capability that lifts it (`CAP_SYS_PTRACE` for Yama 1-2), as under `sudo`.
+A `kernel.perf_event_paranoid` restriction is `ok` when doctor holds
+`CAP_SYS_ADMIN` on the per-probe path (kernels below 6.9); on uprobe-multi
+kernels (≥ 6.9) the paranoid row is `ok` regardless, since paranoid does
+not gate multi attach.
 
 | Tier | Proven prefix | Meaning and loss |
 | --- | --- | --- |
@@ -693,11 +696,28 @@ they are never inferred from uid, seccomp mode, sysctls, or capabilities.
 `CAP_PERFMON`, `CAP_BPF`, and `CAP_CHECKPOINT_RESTORE` are diagnostic rows only.
 There is no `CAP_SYS_RESOURCE` or `RLIMIT_MEMLOCK` requirement claim.
 
-The current manifest-free matrix was measured on 2026-08-17 by
-`scripts/matrix/verify-fork-scope.sh`, against a same-UID non-descendant with
-SoftHSM2 already mapped. Host: kernel 7.0.0-28-generic,
-`kernel.perf_event_paranoid=4`, `kernel.yama.ptrace_scope=1`. These rows are
-Task 14 artifact evidence; Task 15 ran no new privileged experiment.
+The attach floor is backend-dependent. The product picks the backend
+automatically: one uprobe-multi link per attach group on kernels ≥ 6.9,
+per-probe `perf_event` uprobes below (`src/attach.rs`:
+`kernel_supports_multi`, floor 6.9). Both matrices below were measured by
+`scripts/matrix/verify-fork-scope.sh` against a same-UID non-descendant
+with SoftHSM2 already mapped, at `kernel.perf_event_paranoid=4`,
+`kernel.yama.ptrace_scope=1`.
+
+Uprobe-multi path (kernels ≥ 6.9), measured 2026-09-27 on kernel
+7.0.0-31-generic:
+
+| Effective capability set | Discovery input | Scan result | Uprobe result |
+| --- | --- | --- | --- |
+| none | memory scan | unavailable: `ptrace`; capture exits 1 at BPF map creation | not reached |
+| `CAP_BPF` + `CAP_PERFMON` | manifest | unavailable: `ptrace` | 136/136 probes |
+| `CAP_SYS_ADMIN` | manifest | unavailable: `ptrace` | 136/136 probes |
+| `CAP_SYS_ADMIN` | memory scan | unavailable: `ptrace` | 0 probes planned/attached |
+| `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE` | memory scan | available | 136/136 probes |
+
+Per-probe path (kernels below 6.9), measured 2026-08-17 on kernel
+7.0.0-28-generic. These rows are Task 14 artifact evidence; Task 15 ran
+no new privileged experiment.
 
 | Effective capability set | Discovery input | Scan result | Uprobe result |
 | --- | --- | --- | --- |
@@ -707,14 +727,17 @@ Task 14 artifact evidence; Task 15 ran no new privileged experiment.
 | `CAP_SYS_ADMIN` | memory scan | unavailable: `ptrace` | 0 probes planned/attached |
 | `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE` | memory scan | available | 136/136 probes |
 
-On this host, `CAP_SYS_ADMIN` is required for uprobe attach;
-`CAP_BPF`+`CAP_PERFMON` does not suffice under `perf_event_paranoid=4`.
-Manifest-free scanning of this same-UID non-descendant additionally needs
-`CAP_SYS_PTRACE`. A target that is a descendant of the observer, a target that
-opts in with `PR_SET_PTRACER`, or a permissive Yama policy can remove that
-additional scan requirement. Cross-UID targets remain subject to the same
-ptrace access check. These are host-specific measurements, not a portable
-promise; run `p11scope doctor --pid <pid>` against the actual target.
+On a multi-capable kernel, `CAP_BPF`+`CAP_PERFMON` suffice for uprobe
+attach; `perf_event_paranoid` does not gate it. On the per-probe path a
+restrictive paranoid needs `CAP_SYS_ADMIN` (2026-08-25:
+`CAP_BPF`+`CAP_PERFMON` attached 0/136, every failure `perf_event_open`).
+On every kernel, manifest-free scanning of this same-UID non-descendant
+additionally needs `CAP_SYS_PTRACE`. A target that is a descendant of the
+observer, a target that opts in with `PR_SET_PTRACER`, or a permissive
+Yama policy can remove that additional scan requirement. Cross-UID targets
+remain subject to the same ptrace access check. These are host-specific
+measurements, not a portable promise; run
+`p11scope doctor --pid <pid>` against the actual target.
 
 There is no `CAP_LEASE`, `fs.suid_dumpable=0`, or root-owned trusted exec dir
 requirement.
@@ -744,10 +767,12 @@ hint: this usually means the environment cannot load or attach BPF programs at a
 ```
 
 **`CAP_BPF`+`CAP_PERFMON` but no `CAP_SYS_ADMIN`, restrictive
-`perf_event_paranoid`** — map creation succeeds. The current 2026-08-25
-measurement recorded 68 attach-failure records/per-slot lines, each with the
-real `perf_event_open` refusal, covering 136 probes. One synthesized summary
-line follows:
+`perf_event_paranoid`, on the per-probe path (kernels below 6.9)** — map
+creation succeeds. The 2026-08-25 measurement recorded 68 attach-failure
+records/per-slot lines, each with the real `perf_event_open` refusal,
+covering 136 probes. One synthesized summary line follows (on kernels ≥ 6.9
+the same capabilities attach 136/136 through uprobe-multi links; see
+[Privileges, per environment](#privileges-per-environment)):
 
 ```
 attach failed (slot 0): p11_return at /usr/lib/softhsm/libsofthsm2.so+0x265e0: `perf_event_open` failed: Permission denied (os error 13)

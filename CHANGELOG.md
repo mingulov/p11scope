@@ -151,10 +151,12 @@ provider during capture.
   version itself; an unsupported kernel fails with a named cause and a hint.
   <!-- TODO(release): list the kernels actually qualified on the tag commit (owner decision D4). -->
 - Capture needs root (`sudo`) or file capabilities on the observer binary.
-  On the measured hosts, uprobe attach required `CAP_SYS_ADMIN`
-  (`CAP_BPF` + `CAP_PERFMON` did not suffice under a restrictive
-  `perf_event_paranoid`), and scanning a same-UID non-descendant also needed
-  `CAP_SYS_PTRACE`. See
+  The attach floor is backend-dependent: on kernels ≥ 6.9 (uprobe-multi
+  links, picked automatically) `CAP_BPF` + `CAP_PERFMON` suffice to attach
+  at `perf_event_paranoid=4` (measured 136/136); below 6.9 (per-probe
+  `perf_event` uprobes) a restrictive `perf_event_paranoid` needs
+  `CAP_SYS_ADMIN`. Scanning a same-UID non-descendant also needs
+  `CAP_SYS_PTRACE` under Yama `ptrace_scope=1`. See
   [docs/usage.md](docs/usage.md#privileges-per-environment).
 
 ### Release artifacts

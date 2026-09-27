@@ -13,8 +13,13 @@ umask 022; mkdir -p "$OUT" && chmod 755 "$OUT"; OUT=$(realpath -e "$OUT")
 cat > "$OUT/inner.sh" <<INNER
 #!/bin/sh
 uname -r > $OUT/uname.txt
-THREADS=4 $REPO/scripts/qualify-public-cli.sh $BIN $OUT/cells > $OUT/qual.log 2>&1
+# Capture into a guest-local root-owned tmpfs: the shared 9p tree is owned by the
+# host user and remaps ownership, which p11scope's -o trust and private temp-file
+# identity checks rightly refuse for a root observer. Evidence is copied out after.
+mkdir -p /tmp/qual && chmod 755 /tmp/qual
+THREADS=4 $REPO/scripts/qualify-public-cli.sh $BIN /tmp/qual/cells > $OUT/qual.log 2>&1
 echo "qual_exit=\$?" >> $OUT/qual.log
+cp -r /tmp/qual/cells $OUT/cells
 INNER
 s=$(date +%s)
 vng --run "$K" --user root --cpus 4 --memory 4G --rwdir "$OUT" --exec "sh $OUT/inner.sh" > "$OUT/vng-console.log" 2>&1

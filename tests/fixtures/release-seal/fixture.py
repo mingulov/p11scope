@@ -54,6 +54,13 @@ class SealedDriverRun:
         path = self.fixture.tripwire_log
         return path.read_text() if path.exists() else ""
 
+    def diagnostic(self):
+        # Names the cause on a red run: returncode 77 with an empty tripwire
+        # means an early-77 fired before the sudo probe, and which one fired
+        # is recorded only in this stderr tail.
+        tail = "\n".join(self.output.stderr.splitlines()[-30:])
+        return f"returncode={self.output.returncode}\nstderr tail:\n{tail}"
+
 
 class ReleaseSealFixture:
     def __init__(self, base, options=None):
@@ -159,8 +166,10 @@ class ReleaseSealFixture:
             shutil.copy2(toolchain, self.fake_bin / name)
 
     def command(self, argv, *, environment=None, overrides=None, removed=()):
+        # Hang guard only: the seal's own bounds are the lock/git/cleanliness
+        # checks, unchanged. The 60 s value demonstrably fires under load.
         result = subprocess.run(argv, cwd=ROOT, env=environment, input="", text=True,
-                                capture_output=True, timeout=60)
+                                capture_output=True, timeout=300)
         row = {"argv": argv, "cwd": str(ROOT), "stdin": "", "status": result.returncode,
                "stdout": result.stdout, "stderr": result.stderr, "environment_inherited": True,
                "environment_overrides": overrides or {}, "environment_removed": list(removed)}

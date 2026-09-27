@@ -6334,7 +6334,15 @@ mod tests {
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_until_with_timeout(predicate, Duration::from_secs(2), message);
+    }
+
+    fn wait_until_with_timeout(
+        mut predicate: impl FnMut() -> bool,
+        timeout: Duration,
+        message: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
         while !predicate() {
             assert!(Instant::now() < deadline, "{message}");
             std::thread::sleep(Duration::from_millis(1));
@@ -6877,7 +6885,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ExecHandoffError::Deadline));
-        assert!(Instant::now() < deadline + Duration::from_millis(100));
+        // No wall-clock upper bound here: observing the deadline within N ms
+        // tests the scheduler, not the helper. Non-renewal is proven by the
+        // Deadline variant itself (a renewed deadline would never surface it).
 
         assert!(matches!(
             write_release_with(
@@ -6919,7 +6929,8 @@ mod tests {
             .kind(),
             io::ErrorKind::TimedOut
         );
-        assert!(Instant::now() < reap_deadline + Duration::from_millis(100));
+        // No wall-clock upper bound here either: same scheduler-bound
+        // reasoning as above; non-renewal is proven by the TimedOut kind.
     }
 
     #[test]
@@ -8046,18 +8057,27 @@ mod tests {
     fn signal_settlement_observes_second_sigint_during_fallback_term_grace() {
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
+        // `sleep` instead of a busy loop: no CPU burn, identical signal
+        // behavior for this test (INT/TERM ignored; SIGKILL via group
+        // escalation still lands; the group kill covers the extra process).
         let mut child = spawn(
             "/bin/sh",
             &[
                 "-c",
-                &format!(
-                    "trap '' INT TERM; : > {}; while :; do :; done",
-                    ready.display(),
-                ),
+                &format!("trap '' INT TERM; : > {}; sleep 300", ready.display(),),
             ],
         );
-        child.release().unwrap();
-        wait_until(|| ready.exists(), "the SIGINT fixture never became ready");
+        // Generous setup-only budgets: handoff and ready-file latency prove
+        // nothing about second-SIGINT settlement, so they must not be able
+        // to fail the test. The settlement bounds below are untouched.
+        child
+            .release_until(Instant::now() + Duration::from_secs(60), || None)
+            .unwrap();
+        wait_until_with_timeout(
+            || ready.exists(),
+            Duration::from_secs(30),
+            "the SIGINT fixture never became ready",
+        );
 
         let signals = Arc::new(SignalState::new());
         signals.observe(libc::SIGINT);

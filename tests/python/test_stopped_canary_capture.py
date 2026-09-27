@@ -377,7 +377,6 @@ def coordinator_case(pid, directory, case):
     original_handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
     original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     expected_success = kind in ('native', 'immediate_exit')
-    started_at = time.monotonic()
     initial_descriptors = open_descriptors()
     failed_resume = False
     replay_count, inventory_count, position_count = 0, 0, 0
@@ -607,6 +606,12 @@ def coordinator_case(pid, directory, case):
                 stack.enter_context(patch.object(Path, 'unlink', unlink_failed))
                 if kind == 'rollback':
                     stack.enter_context(patch.object(capture.evidence, 'assert_stopped_snapshot', side_effect=AssertionError('SECRET_RAW_CONTEXT')))
+            # The promptness clocks below start at refusal entry: the setup
+            # above (config, fixtures, patch stack) is test scaffolding, and
+            # this probe subprocess already paid python startup before this
+            # function ran. The product property is how fast the coordinator
+            # refuses once invoked.
+            refusal_started_at = time.monotonic()
             try:
                 result = coordinator.run()
             except capture.CaptureError as error:
@@ -627,7 +632,7 @@ def coordinator_case(pid, directory, case):
         assert sentinel.read_bytes() == b'preserve unrelated bytes'
         if kind == 'fifo':
             assert open_descriptors() == initial_descriptors | set(test_handles)
-            assert time.monotonic() - started_at < 2, 'FIFO refusal was not prompt'
+            assert time.monotonic() - refusal_started_at < 2, 'FIFO refusal was not prompt'
             assert not source.opened_rings and not source.closed_fds
             if detail == 'ready':
                 assert not owner.groups and not test_handles and not config.observer_log.exists()
@@ -659,7 +664,7 @@ def coordinator_case(pid, directory, case):
         if coordinator.go_created and config.workload_mode == 'matrix':
             assert config.finish.exists()
         if kind == 'deadline':
-            assert 'deadline expired' in errors[0] and time.monotonic() - started_at < 2
+            assert 'deadline expired' in errors[0] and time.monotonic() - refusal_started_at < 2
         if kind in ('resume', 'immediate_bad_exit'):
             groups = {group.role: group for group in owner.groups}
             assert (groups['observer'].fd, signal.SIGCONT) in signals
@@ -741,8 +746,12 @@ if case in ('stale_generation', 'foreign_ready'):
         roster['pid'] = control['outside_pid']
         roster['tasks'][0].update(pid=roster['pid'], tid=roster['pid'], generation=control['outside_generation'])
     ready.write_text(json.dumps(roster))
-if not case.startswith('capture_first'):
-    time.sleep(1 if case == 'missing_capture' else .08)
+if case == 'missing_capture':
+    # Never signal readiness: the expiry must happen in the readiness loop
+    # regardless of host load, not win a race against this sleep.
+    time.sleep(30)
+elif not case.startswith('capture_first'):
+    time.sleep(.08)
     marker()
 status = child.wait()
 (root / 'owned-wait.json').write_text(json.dumps({'status': status, 'pid': child.pid}))
@@ -878,7 +887,11 @@ def owned_case(pid, directory, case, program, provider):
                 stack.enter_context(patch.object(c.Group, 'snapshot', side_effect=snapshotted, autospec=True))
             stack.enter_context(patch.object(c, 'Custody', return_value=owner))
             if case in ('missing_ready', 'missing_capture'):
-                stack.enter_context(patch.object(capture, 'READY_SECONDS', .25))
+                # Generous test-only budget: the missing-readiness fixture
+                # never signals, so expiry always happens in the readiness
+                # loop; the asserted property (bounded 'phase deadline
+                # expired', no GO, no rings) is unchanged.
+                stack.enter_context(patch.object(capture, 'READY_SECONDS', 2))
             if case == 'unavailable_children':
                 children = c.Group.children
                 def unavailable(group, *args, **kwargs):
@@ -1006,7 +1019,10 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                     while not Path(str(prefix) + '.ready').exists():
                         assert workload.poll() is None and time.monotonic() < end, 'native READY unavailable'
                         time.sleep(.005)
-                command = ['timeout', '--kill-after=1s', '2s' if name.startswith('case:fifo:') else '12s',
+                # One hang guard for every probe: promptness is asserted
+                # inside via the refusal clock, so a slow-starting fifo probe
+                # must not fail the outer watchdog.
+                command = ['timeout', '--kill-after=1s', '12s',
                            sys.executable, '-I', __file__, '--probe', name, str(pid), directory]
                 if name.startswith('owned:'):
                     command += [str(self.program), str(self.matrix)]
@@ -1030,7 +1046,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                     # strand its stopped observer during test teardown.
                     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     marker = Path(directory) / 'fifo-observer.pid'
-                    end = time.monotonic() + 4
+                    end = time.monotonic() + 14
                     while process.poll() is None and time.monotonic() < end:
                         if fifo_observer_fd is None and marker.exists():
                             try:

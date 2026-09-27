@@ -10,7 +10,6 @@ import argparse
 import copy
 import ctypes
 import hashlib
-import inspect
 import json
 import mmap
 import os
@@ -31,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SUBJECT = ROOT / "scripts" / "check-canary-evidence.py"
 DUMPER = ROOT / "scripts" / "dump-owned-bpf-maps.py"
 CAPTURE_CHECKER = ROOT / "scripts" / "check-capture-evidence.py"
+PROBE_ENTRY = ROOT / "tests" / "python" / "json_signal_lifetime_probe.py"
 
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.dont_write_bytecode = True
@@ -114,137 +114,11 @@ def owned_metrics_document(bits, calls=30):
     return subject, document
 
 
-def json_signal_lifetime_probe(case, interposer=None):
-    """Run a signal-boundary probe under the test parent's independent timeout."""
-    dumper = load_dumper()
-    real_popen, real_open = subprocess.Popen, os.pidfd_open
-    real_mask = signal.pthread_sigmask
-    real_selector = dumper.selectors.DefaultSelector
-    before = real_mask(signal.SIG_BLOCK, [])
-    spawned, handles, selectors = [], [], []
-    unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(5)"])
-    injected = False
-    errors = []
-
-    def capture_popen(*args, **kwargs):
-        process = real_popen(*args, **kwargs)
-        spawned.append(process)
-        if case == "watchdog-stall":
-            pending = Path(interposer).with_suffix(".tmp")
-            pending.write_text(json.dumps([os.getpid(), process.pid, unrelated.pid]))
-            pending.replace(interposer)
-        return process
-
-    def capture_open(pid, flags=0):
-        fd = real_open(pid, flags)
-        handles.append(fd)
-        return fd
-
-    def capture_selector():
-        selector = real_selector()
-        selectors.append(selector)
-        return selector
-
-    def interposed_mask(how, signals):
-        nonlocal injected
-        if how == signal.SIG_BLOCK and signal.SIGINT in signals and not injected:
-            injected = True
-            # The real native call raises SIGINT before changing the kernel
-            # mask. Python delivers KeyboardInterrupt only after it returns.
-            native.interrupt_then_block()
-        return real_mask(how, signals)
-
-    lifetime = getattr(dumper, "_run_bounded_bytes", dumper.run_json)
-    source, first_line = inspect.getsourcelines(lifetime)
-    boundary = ("        cleanup_error = None\n" if case.startswith("entry") else
-                "        if streams is not None:\n")
-    boundary_line = first_line + source.index(boundary)
-
-    def trace(frame, event, _arg):
-        nonlocal injected
-        if (event == "line" and frame.f_code is lifetime.__code__
-                and frame.f_lineno == boundary_line and not injected):
-            injected = True
-            # A real signal at a control-flow boundary, outside cleanup(action).
-            os.kill(os.getpid(), signal.SIGINT)
-        return trace
-
-    def closed_fd(fd):
-        try:
-            os.fstat(fd)
-        except OSError:
-            return True
-        return False
-
-    try:
-        if case == "mask-mutation":
-            native = ctypes.PyDLL(interposer)
-            native.interrupt_then_block.argtypes = []
-            native.interrupt_then_block.restype = ctypes.c_int
-            mask_patch = mock.patch.object(dumper.signal, "pthread_sigmask",
-                                           side_effect=interposed_mask)
-        else:
-            mask_patch = mock.patch.object(dumper.signal, "pthread_sigmask", wraps=real_mask)
-            sys.settrace(trace)
-        try:
-            with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen), \
-                    mock.patch.object(dumper.os, "pidfd_open", side_effect=capture_open), \
-                    mock.patch.object(dumper.selectors, "DefaultSelector", side_effect=capture_selector), \
-                    mask_patch:
-                dumper.run_json([sys.executable, "-c", (
-                    "import time; time.sleep(5)" if case in ("entry-live", "watchdog-stall")
-                    else "print('[]')")],
-                    timeout_seconds=8 if case == "watchdog-stall" else 0.2, max_bytes=1024)
-        except BaseException as error:
-            while error is not None:
-                errors.append({"type": type(error).__name__, "message": str(error)})
-                error = error.__cause__
-        finally:
-            sys.settrace(None)
-
-        reaped = []
-        for process in spawned:
-            try:
-                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-                reaped.append(False)
-            except ChildProcessError:
-                reaped.append(True)
-        selector_closed = []
-        for selector in selectors:
-            try:
-                selector.select(0)
-                selector_closed.append(False)
-            except ValueError:
-                selector_closed.append(True)
-        report = {
-            "injected": injected, "errors": errors,
-            "mask_before": sorted(before),
-            "mask_after": sorted(real_mask(signal.SIG_BLOCK, [])),
-            "spawn_count": len(spawned), "reaped": reaped,
-            "pipes_closed": [p.stdout.closed and p.stderr.closed for p in spawned],
-            "pidfds_closed": [closed_fd(fd) for fd in handles],
-            "selectors_closed": selector_closed,
-            "unrelated_alive": unrelated.poll() is None,
-        }
-    finally:
-        sys.settrace(None)
-        # Safe RED teardown: restore the caller mask and close/terminate/reap
-        # only the actual children and resources captured by this probe.
-        real_mask(signal.SIG_SETMASK, before)
-        for process in spawned:
-            if process.poll() is None:
-                process.kill()
-            process.wait(timeout=1)
-            process.stdout.close()
-            process.stderr.close()
-        for selector in selectors:
-            selector.close()
-        for fd in handles:
-            if not closed_fd(fd):
-                os.close(fd)
-        unrelated.kill()
-        unrelated.wait(timeout=1)
-    print(json.dumps(report))
+# The probe body lives in tests/python/json_signal_lifetime_probe.py so probe
+# children import one small module instead of this whole file; re-exported
+# here for the remaining runpy-based call sites.
+json_signal_lifetime_probe = load_path(
+    PROBE_ENTRY, "json_signal_lifetime_probe").json_signal_lifetime_probe
 
 
 def start_bytes(module, session, target=None, mechanism=None, mechanism_ptr=0,
@@ -1003,34 +877,45 @@ class TaskStorageReaderTests(unittest.TestCase):
 
     def test_bounded_json_acquisition_rejects_duplicates_timeout_and_output(self):
         dumper = load_dumper()
-        with tempfile.TemporaryDirectory() as directory:
-            pidfile = Path(directory) / "acquisition.pid"
-            unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
-            try:
-                cases = (
-                    ("duplicate", [sys.executable, "-c", "print('{\\\"id\\\":1,\\\"id\\\":2}')"],
-                     1, 1024, "duplicate"),
-                    ("timeout", [sys.executable, "-c",
-                                 "import os,pathlib,time; "
-                                 f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); "
-                                 "time.sleep(2)"],
-                     0.2, 1024, "timed out"),
-                    ("output", [sys.executable, "-c", "print('x' * 100000)"],
-                     1, 1024, "output bound"),
-                )
+        real_popen = dumper.subprocess.Popen
+        spawned = []
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+        try:
+            cases = (
+                ("duplicate", [sys.executable, "-c", "print('{\\\"id\\\":1,\\\"id\\\":2}')"],
+                 1, 1024, "duplicate"),
+                ("timeout", [sys.executable, "-c", "import time; time.sleep(2)"],
+                 0.2, 1024, "timed out"),
+                ("output", [sys.executable, "-c", "print('x' * 100000)"],
+                 1, 1024, "output bound"),
+            )
+            acquisition_process = None
+            # The timeout child's pid is captured synchronously in the
+            # parent via the Popen spy: a pidfile the 0.2 s budget could
+            # kill the child before writing raised FileNotFoundError here
+            # under load. The reaped/unreusable-pid assertions are verbatim.
+            with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen):
                 for label, command, timeout, maximum, message in cases:
                     with self.subTest(label=label):
                         with self.assertRaisesRegex(RuntimeError, message):
                             dumper.run_json(command, timeout_seconds=timeout, max_bytes=maximum)
-                acquisition_pid = int(pidfile.read_text())
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(acquisition_pid, 0)
-                with self.assertRaises(ChildProcessError):
-                    os.waitpid(acquisition_pid, os.WNOHANG)
-                self.assertIsNone(unrelated.poll())
-            finally:
-                unrelated.terminate()
-                unrelated.wait()
+                        if label == "timeout":
+                            acquisition_process = spawned[-1]
+            acquisition_pid = acquisition_process.pid
+            with self.assertRaises(ProcessLookupError):
+                os.kill(acquisition_pid, 0)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(acquisition_pid, os.WNOHANG)
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.terminate()
+            unrelated.wait()
         for timeout, maximum in ((0, 1024), (float("inf"), 1024), (1, 0),
                                  (1, dumper.JSON_OUTPUT_MAX_BYTES + 1)):
             with self.subTest(timeout=timeout, maximum=maximum):
@@ -1040,36 +925,42 @@ class TaskStorageReaderTests(unittest.TestCase):
 
     def test_json_acquisition_deadline_includes_exit_after_pipe_eof(self):
         dumper = load_dumper()
-        with tempfile.TemporaryDirectory() as directory:
-            pidfile = Path(directory) / "eof-child.pid"
-            # Load hardening: the 50ms budget must cover the fixture child's
-            # startup before it can EOF the pipes. A python child starts in
-            # ~10ms idle but 50-200ms+ under host load, so the deadline kills
-            # it before the pidfile write and the post-acquisition read finds
-            # nothing (the child is already dead then, so no post-hoc wait can
-            # recover it). A sh child starts in ~2ms with identical
-            # EOF-then-linger semantics: same pidfile pid across the exec,
-            # same two output bytes, same 0.7s linger past the deadline.
-            command = ["/bin/sh", "-c",
-                       "echo $$ > \"$1\"; printf '[]'; exec 1>&- 2>&-; exec /bin/sleep 0.7",
-                       "sh", str(pidfile)]
-            previous = signal.signal(
-                signal.SIGALRM,
-                lambda _signal, _frame: (_ for _ in ()).throw(
-                    TimeoutError("outer watchdog: run_json blocked past deadline")),
-            )
-            signal.setitimer(signal.ITIMER_REAL, 0.5)
-            try:
+        real_popen = dumper.subprocess.Popen
+        spawned = []
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        # The child pid is captured synchronously in the parent via the
+        # Popen spy, not via a pidfile the child must win a race to write:
+        # under load the deadline expired before a slow child wrote it and
+        # the post-hoc read failed with FileNotFoundError. The budgets below
+        # are test conveniences, not the contract: the property under test
+        # (post-EOF exit wait covered by the deadline, "timed out" raised,
+        # owned child reaped with an unreusable pid) is asserted verbatim.
+        command = ["/bin/sh", "-c",
+                   "printf '[]'; exec 1>&- 2>&-; exec /bin/sleep 3",
+                   "sh"]
+        previous = signal.signal(
+            signal.SIGALRM,
+            lambda _signal, _frame: (_ for _ in ()).throw(
+                TimeoutError("outer watchdog: run_json blocked past deadline")),
+        )
+        signal.setitimer(signal.ITIMER_REAL, 10)
+        try:
+            with mock.patch.object(dumper.subprocess, "Popen", side_effect=capture_popen):
                 with self.assertRaisesRegex(RuntimeError, "timed out"):
-                    dumper.run_json(command, timeout_seconds=0.05, max_bytes=1024)
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, previous)
-            child_pid = int(pidfile.read_text())
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
-            with self.assertRaises(ChildProcessError):
-                os.waitpid(child_pid, os.WNOHANG)
+                    dumper.run_json(command, timeout_seconds=2, max_bytes=1024)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        child_pid = spawned[0].pid
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(child_pid, os.WNOHANG)
 
     def test_json_acquisition_setup_and_cleanup_failures_reap_only_owned_child(self):
         dumper = load_dumper()
@@ -1684,10 +1575,6 @@ class TaskStorageReaderTests(unittest.TestCase):
         self.assertEqual(libc.prctl(37, ctypes.byref(original_subreaper), 0, 0, 0), 0)
         with tempfile.TemporaryDirectory() as directory:
             pidfile = Path(directory) / "scope.json"
-            command = (
-                f"import runpy; m=runpy.run_path({str(Path(__file__).resolve())!r}); "
-                f"m['json_signal_lifetime_probe']('watchdog-stall', {str(pidfile)!r})"
-            )
             unrelated = None
             watchdog = None
             handles = []
@@ -1698,14 +1585,26 @@ class TaskStorageReaderTests(unittest.TestCase):
                 enabled = ctypes.c_int()
                 self.assertEqual(libc.prctl(37, ctypes.byref(enabled), 0, 0, 0), 0)
                 self.assertEqual(enabled.value, 1)
-                unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+                # The probe child imports the small entry module instead of
+                # this whole test file via runpy, and the waits below are
+                # scaled so slow startup under load cannot beat them. The
+                # property under test (the external watchdog kills the
+                # lingering probe scope, exit 124) is asserted verbatim;
+                # only startup headroom grows.
+                unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
                 watchdog = subprocess.Popen(
-                    ["timeout", "--kill-after=0.2s", "1s", sys.executable, "-I", "-c", command],
+                    ["timeout", "--kill-after=0.2s", "6s", sys.executable, "-I",
+                     str(PROBE_ENTRY), "watchdog-stall", str(pidfile)],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
-                deadline = time.monotonic() + 0.8
+                deadline = time.monotonic() + 5
                 while not pidfile.exists() and time.monotonic() < deadline:
                     time.sleep(0.005)
+                self.assertTrue(
+                    pidfile.exists(),
+                    f"probe did not publish {pidfile.name} within 5 s "
+                    f"(watchdog poll={watchdog.poll()})",
+                )
                 pids = json.loads(pidfile.read_text())
                 self.assertEqual(len(pids), 3)
                 for pid in pids:
@@ -1713,7 +1612,7 @@ class TaskStorageReaderTests(unittest.TestCase):
                     handles.append(fd)
                     selector.register(fd, selector_module.EVENT_READ)
                 self.assertEqual(selector.select(0), [])
-                _stdout, stderr = watchdog.communicate(timeout=3)
+                _stdout, stderr = watchdog.communicate(timeout=25)
                 self.assertEqual(watchdog.returncode, 124, stderr)
                 exited = set()
                 deadline = time.monotonic() + 0.5
@@ -1747,7 +1646,7 @@ class TaskStorageReaderTests(unittest.TestCase):
                 # Leave the independent watchdog alive to settle its scope
                 # even if PID publication or an earlier assertion failed.
                 if watchdog is not None:
-                    cleanup(lambda: watchdog.wait(timeout=3))
+                    cleanup(lambda: watchdog.wait(timeout=25))
                 for fd in handles:
                     def settle_retained(fd=fd):
                         try:

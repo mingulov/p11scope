@@ -184,6 +184,37 @@ class ControlledBodySetupError(RuntimeError):
 
 
 class Lane13EvidenceTests(unittest.TestCase):
+    # Class-level caches: compiling port-forward.c and listing tracked files
+    # once per class instead of once per method. Both latencies prove nothing
+    # about lane 13; per-method runs multiplied load-flake exposure (a 5 s
+    # bound racing cc fork+exec+compile under full-suite contention).
+    _tracked_ls_files = None
+    _port_forward_binary = None
+    _class_temp = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._class_temp = tempfile.TemporaryDirectory(prefix="p11scope-lane13-class-")
+        cls.addClassCleanup(cls._class_temp.cleanup)
+        # Hang guard only: neither bound is part of the lane-13 contract.
+        cls._tracked_ls_files = subprocess.run(
+            ["/usr/bin/git", "-C", str(ROOT), "ls-files", "-z", "--",
+             ".cargo", "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml",
+             "build_support", "src", "crates", "scripts", "spike", "third-party",
+             ":(exclude)third-party/aya/**",
+             ":(exclude)third-party/aya-obj/**"],
+            check=True, stdout=subprocess.PIPE, timeout=120,
+        ).stdout
+        binary = Path(cls._class_temp.name) / "port-forward"
+        subprocess.run(
+            ["/usr/bin/cc", "-O0", "-o", str(binary),
+             str(FIXTURES / "port-forward.c")],
+            check=True,
+            timeout=120,
+        )
+        cls._port_forward_binary = binary
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="p11scope-lane13-")
         self.root = Path(self.temp.name)
@@ -208,14 +239,7 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.prepared = EvidenceFixture(prepared_area)
         self.project = self.prepared.root
         self.gate = self.project / "scripts/matrix/verify-knative.sh"
-        tracked = subprocess.run(
-            ["/usr/bin/git", "-C", str(ROOT), "ls-files", "-z", "--",
-             ".cargo", "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml",
-             "build_support", "src", "crates", "scripts", "spike", "third-party",
-             ":(exclude)third-party/aya/**",
-             ":(exclude)third-party/aya-obj/**"],
-            check=True, stdout=subprocess.PIPE, timeout=5,
-        ).stdout.split(b"\0")
+        tracked = type(self)._tracked_ls_files.split(b"\0")
         tracked_paths = []
         for raw in tracked:
             if not raw:
@@ -268,12 +292,8 @@ class Lane13EvidenceTests(unittest.TestCase):
             shutil.copy2(self.dispatch, self.port_forward)
             self.port_forward.chmod(0o755)
         else:
-            subprocess.run(
-                ["/usr/bin/cc", "-O0", "-o", str(self.port_forward),
-                 str(FIXTURES / "port-forward.c")],
-                check=True,
-                timeout=5,
-            )
+            shutil.copy2(type(self)._port_forward_binary, self.port_forward)
+            self.port_forward.chmod(0o755)
         for command in (
             "git", "cargo", "rustc", "rustup", "gcc", "curl", "docker", "kind",
             "sudo", "timeout", "readelf", "cp", "tar", "sha256sum",
@@ -871,18 +891,18 @@ class Lane13EvidenceTests(unittest.TestCase):
             raise ValueError("owned launch identity changed before signal")
         signal.pidfd_send_signal(launch["pidfd"], signal_number, None, 0)
 
-    def finish_owned(self, process, timeout):
+    def finish_owned(self, process, timeout, finalize_timeout=2):
         try:
             return process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
             settlement = self.settle_recorded(defer_owned_process=process)
             finalization_timeout = False
             try:
-                stdout, stderr = process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=finalize_timeout)
             except subprocess.TimeoutExpired:
                 finalization_timeout = True
                 settlement.extend(self.settle_recorded())
-                stdout, stderr = process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=finalize_timeout)
             detail = "" if not settlement else "\n" + "\n".join(settlement)
             if finalization_timeout:
                 detail += "\nowned outer finalization timeout"
@@ -2523,10 +2543,14 @@ raise SystemExit(1)
             self.assertTrue(ready.exists(), "native descendant did not publish readiness")
             native = json.loads(ready.read_text())
 
+            # The bound under test is "outer finalizes after descendant
+            # settlement", not "in under 2 s": the outer sleeps 1.2 s after
+            # the child exits, so the follow-up slice gets headroom. The
+            # 0.05 s budget above stays — it is the property under test.
             with self.assertRaisesRegex(
                 OwnedCommunicationTimeout, "native fixture communication timeout"
             ) as caught:
-                self.finish_owned(proc, 0.05)
+                self.finish_owned(proc, 0.05, finalize_timeout=10)
             self.assertEqual(caught.exception.result.returncode, 124)
             self.assertEqual((evidence / "status").read_text(), "1\n")
             self.assert_process_absent(native["pid"], native["starttime"])

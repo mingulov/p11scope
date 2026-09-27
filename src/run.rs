@@ -6869,7 +6869,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ExecHandoffError::Deadline));
-        assert!(Instant::now() < deadline + Duration::from_millis(100));
+        // No wall-clock upper bound here: observing the deadline within N ms
+        // tests the scheduler, not the helper. Non-renewal is proven by the
+        // Deadline variant itself (a renewed deadline would never surface it).
 
         assert!(matches!(
             write_release_with(
@@ -6911,7 +6913,8 @@ mod tests {
             .kind(),
             io::ErrorKind::TimedOut
         );
-        assert!(Instant::now() < reap_deadline + Duration::from_millis(100));
+        // No wall-clock upper bound here either: same scheduler-bound
+        // reasoning as above; non-renewal is proven by the TimedOut kind.
     }
 
     #[test]

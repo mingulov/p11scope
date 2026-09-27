@@ -21,7 +21,9 @@ assessment and incident diagnostics.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
-the final 3.2 header). Exact `"PKCS 11"` interface names take the normal path.
+the final 3.2 header). A newer minor version (after 2.40 or 3.2) is read up to
+the slots of the newest known layout; the report names the rest as a surface
+gap and stays `PARTIAL`. Exact `"PKCS 11"` interface names take the normal path.
 Alternate, null, or unreadable names are not discarded: discovery accepts a
 bounded known prefix only when the table is independently corroborated by the
 module's standard exports or legacy table, records that evidence as `PARTIAL`,

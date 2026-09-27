@@ -47,6 +47,12 @@ provider during capture.
   function-table support: PKCS#11 2.00, 2.01–2.40, 3.0, 3.1 and all 104 slots
   of the final 3.2 interface. Alternate, null or unreadable interface names
   are walked only as independently corroborated known prefixes.
+- A newer minor version of a known major (a 2.x table after 2.40, a 3.x
+  table after 3.2) is walked as a known prefix. The memory scan, the export
+  path and `p11scope-discover` all read the 68 or 104 slots of the newest
+  known layout. The appended slots are not hooked: the report names them as
+  a surface gap and stays `PARTIAL`. A table with a new major version is not
+  walked.
 - Discovery continues while a capture runs: loader hooks on the five built-in
   entry points (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,
   `NSC_GetFunctionList`, `FC_GetFunctionList`, plus `--hook-symbol`) pick up

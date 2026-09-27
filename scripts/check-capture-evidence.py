@@ -321,9 +321,11 @@ SHARED_OVERLAY_UNCERTAINTY = (
 PHYSICAL_IDENTITY_AMBIGUITY = (
     "physical identity is ambiguous; the collision group was not attached"
 )
-# SYSPLAN residual F-14: render.rs `capture_skipped_out` emits this seventh
-# reason when the memory scan refuses a future-minor table at the
-# `spans_for` gate. Fixed string, never with version numbers attached.
+# Retired (owner-approved 2026-09-27): render.rs `capture_skipped_out`
+# keeps this seventh reason so old captures still validate, but the
+# scanner no longer emits it — the known-prefix scan walks every 2.x/3.x
+# word it sees instead of refusing future minors at the `spans_for` gate.
+# Fixed string, never with version numbers attached.
 UNSUPPORTED_TABLE_VERSION = (
     "unsupported function-table version; the scanner does not walk this layout"
 )
@@ -1464,87 +1466,27 @@ def discovery_skips(evidence):
     return [item for item in evidence["skipped"] if item["name"] == DISCOVERY_SUBJECT]
 
 
-def is_unsupported_table_version(major, minor):
-    """Mirror of src/discovery/scan.rs:1930 `unsupported_version_of` exactly.
-
-    Major 2 with minor above 40, or major 3 with minor above 2. Major 4
-    (and any other major) is data, not a table — `unsupported_version_of`
-    returns None for it, and the oracle must too.
-    """
-    return (major == 2 and minor > 40) or (major == 3 and minor > 2)
-
-
-def expected_unsupported_canary_skips(evidence):
-    """Derivable F-14 disclosure count: one per scanned future-minor module.
-
-    Product emission rule (verified, not assumed): the memory scan refuses
-    a future-minor word at the `spans_for` gate
-    (src/discovery/scan.rs:1930 `unsupported_version_of`) and records the
-    fixed reason once per sweep
-    (src/discovery/scan.rs:2315-2320 in `detect_tables_with_clock`), mapped
-    per module path via `scan_skip(&module.path, …)`
-    (src/discovery/scan.rs:2810, applied at 3507-3510). Capture history
-    keeps one loss per exact `(subject, reason)` pair
-    (src/discovery/engine.rs:1911-1915), `apply_to_plan` publishes those
-    losses as `plan.skipped` (src/discovery/engine.rs:1974-1980), and
-    `capture_skipped_out` flattens each to the finite public item
-    `{discovery subject, unsupported function-table version}` without
-    version numbers (src/render.rs:961, reason at 982-983, subject at
-    994-999); run.rs:6172-6176 maps the list with no further dedup. Net:
-    one public item per distinct scanned module whose bytes held a
-    future-minor table — never one per table (repeats in one module
-    collapse), never one per process (one provider ten processes map is
-    one loss). The canary matrix provider deterministically ships such a
-    table ([3,9] at crates/discover/tests/fixture/version_matrix.c:123),
-    visible as a manifest-sourced table in the lane's evidence.
-    """
-    count = 0
-    for module in evidence["discovery"]:
-        if "scan" not in module.get("sources", []):
-            continue
-        for table in module.get("tables", []):
-            if table.get("source") != "manifest":
-                continue
-            version = table.get("version")
-            if (
-                isinstance(version, (list, tuple))
-                and len(version) == 2
-                and isinstance(version[0], int)
-                and not isinstance(version[0], bool)
-                and isinstance(version[1], int)
-                and not isinstance(version[1], bool)
-                and is_unsupported_table_version(version[0], version[1])
-            ):
-                count += 1
-                break
-    return count
-
-
-def exact_canary_discovery_skips(evidence, *, owned):
+def exact_canary_discovery_skips(evidence):
     """Property-based discovery-skip contract for canary lanes.
 
     Returns the validated skip count for exact_common to pin. Every
-    discovery skip must be the one categorical public item or the one
-    derivable F-14 future-minor disclosure, and the categorical count
-    must fit the lane's deterministic floor plus at most one retained
-    internal loss: owned lanes carry exactly the initial-set skip,
-    optionally plus one; safe lanes carry none, optionally plus one.
+    discovery skip must be the one categorical public item, and every lane
+    carries none, optionally plus one retained internal loss. Owned lanes
+    no longer publish an initial-set skip (ee51d14): the owned run's
+    initial-set timing gap is stated once, by `loader_discovery`
+    (`initial_set_capture.none`), which `validate_canary` pins exactly.
 
     Why a bound and not an exact count: the P-2 maps bracket refuses an
     acquisition whose mappings changed mid-read and records it, and the
     engine deliberately retains that record even when a later scan succeeds
     and attaches (scan_gap_this_capture_attached tombstones only not-mapped
     and file-backed-data losses). The render layer then flattens the refusal
-    to the categorical item above — byte-identical to the spec-mandated
-    initial-set skip — so no exact count can name which is which. The canary
-    workload mmaps/munmaps while running, so the refusal fires
+    to the categorical item above, so no exact count can name its cause.
+    The canary workload mmaps/munmaps while running, so the refusal fires
     intermittently in any lane.
 
-    Why the bound is still strong: the initial-set skip is unconditional on
-    owned lanes (one initial-set context per owned run, armed or not, and
-    the empty timing catalog leaves it unproven by spec amendment), while
-    the initial-set path never runs for profile/trace lanes. Any additional
-    categorical item is a retained internal loss published through the same
+    Why the bound is still strong: any categorical item is a retained
+    internal loss published through the same
     finite category — most often a bracket refusal, but whole-outcome scan
     losses and failed owned-prearm records flatten identically. That stays
     safe here: whole-outcome losses clear the scanned modules and
@@ -1557,46 +1499,28 @@ def exact_canary_discovery_skips(evidence, *, owned):
     by design (the public record must not name paths) and is proven by the
     workspace suite instead: the scan.rs bracket fixtures assert the
     refusing subject, and the engine.rs tests assert the refusal survives
-    pinning and retention. A third categorical skip, or any item that is
-    neither the categorical skip nor the derivable F-14 disclosure, is a
+    pinning and retention. A third skip, or any non-categorical item, is a
     new phenomenon and fails closed.
 
-    The F-14 disclosure is accepted ONLY as the deterministic consequence
-    of the evidence: `expected_unsupported_canary_skips` counts the
-    discovery modules whose `sources` include "scan" and whose tables
-    include a manifest-sourced future-minor table (see its docstring for
-    the verified one-per-module emission rule), and the observed count of
-    `{discovery subject, unsupported function-table version}` items must
-    EQUAL that count — a missing disclosure fails exactly like an extra
-    one. The categorical bounds above apply to the categorical items
-    only.
+    Retired version skip (owner-approved 2026-09-27): the F-14
+    future-minor disclosure is gone with the scanner emission it
+    mirrored — the scan walks every 2.x/3.x word it sees as its known
+    prefix and emits no version skip at all. An observed
+    `{discovery subject, unsupported ...}` item is therefore a
+    resurrected emission, refused by the categorical rule above; the
+    reason string stays in DISCOVERY_REASONS only so old captures
+    still validate.
     """
     skips = discovery_skips(evidence)
     for item in skips:
         require(
-            item == CANARY_DISCOVERY_SKIP or item == CANARY_UNSUPPORTED_SKIP,
+            item == CANARY_DISCOVERY_SKIP,
             f"non-categorical canary discovery skip: {item}",
         )
-    unsupported = [item for item in skips if item == CANARY_UNSUPPORTED_SKIP]
-    categorical = [item for item in skips if item == CANARY_DISCOVERY_SKIP]
-    expected = expected_unsupported_canary_skips(evidence)
     require(
-        len(unsupported) == expected,
-        "unsupported-table-version disclosure: want exactly the derivable "
-        f"count {expected}, got {len(unsupported)} in {skips}",
+        len(skips) in (0, 1),
+        f"canary discovery skips: want none or one retained refusal, got {skips}",
     )
-    if owned:
-        require(
-            len(categorical) in (1, 2),
-            "owned canary discovery skips: want the categorical initial-set "
-            f"skip plus at most one retained refusal, got {skips}",
-        )
-    else:
-        require(
-            len(categorical) in (0, 1),
-            "safe canary discovery skips: want none or one retained refusal, "
-            f"got {skips}",
-        )
     return len(skips)
 
 
@@ -2492,11 +2416,10 @@ def validate_canary(lane, document, target_bits=64):
         table_signature(evidence) == wanted_tables,
         f"unexpected discovery tables: {evidence['discovery']}",
     )
-    # The discovery-skip bound lives in exact_canary_discovery_skips: the
-    # deterministic floor (one initial-set skip on owned lanes, none
-    # elsewhere) plus at most one retained internal loss. exact_common pins
-    # the validated count against the document.
-    skips = exact_canary_discovery_skips(evidence, owned=owned_metrics)
+    # The discovery-skip bound lives in exact_canary_discovery_skips: none,
+    # plus at most one retained internal loss, on every lane. exact_common
+    # pins the validated count against the document.
+    skips = exact_canary_discovery_skips(evidence)
     exact_common(
         evidence,
         aliases=[],
@@ -2552,6 +2475,18 @@ def validate_canary(lane, document, target_bits=64):
         if owned_metrics:
             require(evidence["child_still_running"] is False,
                     f"owned child still running: {evidence['child_still_running']!r}")
+            # The owned run's one initial-set context is stated here, not
+            # as a skip (ee51d14): never paused, so it is unproven and its
+            # capture is `none`.
+            loader = evidence["loader_discovery"]
+            unproven = {key: 0 for key in LOADER_TIMING_KEYS} | {"unproven": 1}
+            require(loader["initial_set_timing"] == unproven,
+                    f"owned initial-set timing: {loader['initial_set_timing']}")
+            require(
+                loader["initial_set_capture"]
+                == {"eligible": 0, "none": 1, "pause_protected": 0},
+                f"owned initial-set capture: {loader['initial_set_capture']}",
+            )
             require(
                 (evidence["pause"], evidence["pause_attempts"],
                  evidence["pause_confirmed"], evidence["pause_partial"])
@@ -2635,30 +2570,14 @@ def validate_induced(lane, document):
         )
     elif lane == "G4":
         exact_shape(evidence, *VERSION_SHAPE_SCANNED)
-        # F-14: the version-matrix shape discloses its refused [3,9] table —
-        # exactly the derivable disclosure, no categorical loss (the induced
-        # gap is never the discovery one).
-        require(
-            discovery_skips(evidence) == [CANARY_UNSUPPORTED_SKIP],
-            f"G4 discovery skips: want exactly the F-14 disclosure, got {discovery_skips(evidence)}",
-        )
-        require(
-            expected_unsupported_canary_skips(evidence) == 1,
-            "G4 disclosure is not the derivable future-minor count",
-        )
-        exact_common(evidence, aliases=[], skipped=[], in_flight=9, discovery_skipped=1)
+        # Known-prefix scan (owner-approved 2026-09-27): the retired
+        # version skip is never emitted, so G4 carries no discovery skip
+        # (the induced gap is never the discovery one).
+        exact_common(evidence, aliases=[], skipped=[], in_flight=9)
         exact_counters(evidence, {"discovery_conflicts": 1, "start_insert_failures": 8})
     else:
         exact_shape(evidence, *VERSION_SHAPE_SCANNED)
-        require(
-            discovery_skips(evidence) == [CANARY_UNSUPPORTED_SKIP],
-            f"G5 discovery skips: want exactly the F-14 disclosure, got {discovery_skips(evidence)}",
-        )
-        require(
-            expected_unsupported_canary_skips(evidence) == 1,
-            "G5 disclosure is not the derivable future-minor count",
-        )
-        exact_common(evidence, aliases=[], skipped=[], in_flight=0, discovery_skipped=1)
+        exact_common(evidence, aliases=[], skipped=[], in_flight=0)
         exact_counters(
             evidence,
             {
@@ -2770,14 +2689,11 @@ CANARY_DISCOVERY_SKIP = {
     "name": DISCOVERY_SUBJECT,
     "reason": DISCOVERY_UNAVAILABLE,
 }
-# The one derivable F-14 future-minor disclosure a scanned canary lane must
-# publish: one per scanned module whose manifest tables include a
-# future-minor version (see `expected_unsupported_canary_skips`). Never a
-# free pass — the observed count must equal the derived count.
-CANARY_UNSUPPORTED_SKIP = {
-    "name": DISCOVERY_SUBJECT,
-    "reason": UNSUPPORTED_TABLE_VERSION,
-}
+# Retired (owner-approved 2026-09-27): the F-14 future-minor disclosure
+# item (`{discovery subject, unsupported ...}`) is gone with the scanner
+# emission it mirrored. The reason string stays in DISCOVERY_REASONS so
+# old captures still validate, but no canary lane may publish it — the
+# categorical rule in `exact_canary_discovery_skips` fails it closed.
 
 
 def loader_discovery_fixture(**overrides):
@@ -3707,8 +3623,9 @@ def self_test():
         discovery_conflicts=1,
     )
     version["discovery"][0]["corroboration"] = ["conflict"]
-    # F-14: the scanned matrix shape discloses its refused [3,9] table.
-    version["skipped"] = [dict(CANARY_UNSUPPORTED_SKIP)]
+    # Known-prefix scan (owner-approved 2026-09-27): the retired version
+    # skip is never emitted, so the scanned matrix shape carries no
+    # discovery skip at all — not even beside its manifest [3,9] table.
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
     settle_fixture_verdict(safe)
@@ -4220,14 +4137,15 @@ def self_test():
     owned_aggregate = copy.deepcopy(aggregate)
     owned_aggregate["functions"] = function_items([(["C_GetInterfaceList"], 30)])
     owned_aggregate["evidence"]["child_still_running"] = False
-    # The skips an owned lane must publish: `p11scope run` attempts
-    # initial-set discovery and the empty timing catalog leaves it unproven
-    # (categorical floor), plus the F-14 future-minor disclosure the
-    # scanned matrix shape always carries.
-    owned_aggregate["evidence"]["skipped"] = [
-        {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE},
-        dict(CANARY_UNSUPPORTED_SKIP),
-    ]
+    # An owned lane publishes no skip (ee51d14): `p11scope run` attempts
+    # initial-set discovery, and the empty timing catalog leaves it
+    # unproven, stated once in loader_discovery.
+    owned_aggregate["evidence"]["skipped"] = []
+    owned_aggregate["evidence"]["loader_discovery"] = loader_discovery_fixture(
+        strategies__debug_state_every_hit=1,
+        initial_set_timing__unproven=1,
+        initial_set_capture__none=1,
+    )
     settle_fixture_verdict(owned_aggregate)
     for lane in ("owned-default-metrics", "owned-feature-metrics"):
         validate_canary(lane, owned_aggregate)
@@ -4240,18 +4158,16 @@ def self_test():
             lambda d: d["evidence"].update(child_still_running=True),
             lambda d: d["evidence"].update(
                 pause="sigstop", pause_attempts=1, pause_confirmed=1),
-            # The owned categorical floor is exact, not merely permitted: an
-            # owned lane that published no categorical skip is not a cleaner
-            # run, it is a run whose initial-set attempt went unreported.
-            # (The ceiling — floor plus at most one retained refusal — is
-            # covered below.) Each shape carries the correct F-14
-            # disclosure so it fails on the floor alone; the missing
-            # disclosure itself is refused too.
-            lambda d: d["evidence"].update(skipped=[
-                dict(CANARY_UNSUPPORTED_SKIP)]),
-            lambda d: d["evidence"].update(skipped=[
-                dict(CANARY_DISCOVERY_SKIP)]),
-            lambda d: d["evidence"].update(skipped=[]),
+            # The initial-set gap must be stated, exactly once, in
+            # loader_discovery: an owned run that reports it nowhere left
+            # its initial-set attempt unreported. (The skip ceiling — at
+            # most one retained refusal — is covered below.)
+            lambda d: d["evidence"]["loader_discovery"].update(
+                initial_set_capture={"eligible": 0, "none": 0, "pause_protected": 0}),
+            lambda d: d["evidence"]["loader_discovery"].update(
+                initial_set_capture={"eligible": 0, "none": 0, "pause_protected": 1}),
+            lambda d: d["evidence"]["loader_discovery"]["initial_set_timing"].update(
+                unproven=0, pause_protected=1),
             lambda d: d["evidence"].update(skipped=[
                 {"name": DISCOVERY_SUBJECT, "reason": TABLE_UNAVAILABLE}]),
         ):
@@ -4264,34 +4180,27 @@ def self_test():
     rejected(lambda: validate_canary("aggregate-only-metrics", external_owned))
     print("canary owned aggregate exact30 run contract: OK")
 
-    # A retained P-2 bracket refusal publishes byte-identical to the
-    # initial-set skip: an owned lane may carry two categorical skips and a
-    # safe lane one, each alongside the derivable F-14 disclosure. Anything
-    # else — a third categorical skip on owned, a second on safe, or any
-    # item that is neither categorical nor the disclosure — still fails.
-    two_skips = copy.deepcopy(owned_aggregate)
-    two_skips["evidence"]["skipped"] = [
-        dict(CANARY_DISCOVERY_SKIP) for _ in range(2)
-    ] + [dict(CANARY_UNSUPPORTED_SKIP)]
+    # A retained P-2 bracket refusal publishes as the categorical skip:
+    # any lane may carry one. Anything else — a second skip, or any
+    # non-categorical item — still fails.
+    owned_refusal = copy.deepcopy(owned_aggregate)
+    owned_refusal["evidence"]["skipped"] = [dict(CANARY_DISCOVERY_SKIP)]
+    settle_fixture_verdict(owned_refusal)
     for lane in ("owned-default-metrics", "owned-feature-metrics"):
-        validate_canary(lane, two_skips)
+        validate_canary(lane, owned_refusal)
     safe_refusal = copy.deepcopy(safe)
-    safe_refusal["evidence"]["skipped"] = [
-        dict(CANARY_DISCOVERY_SKIP), dict(CANARY_UNSUPPORTED_SKIP),
-    ]
+    safe_refusal["evidence"]["skipped"] = [dict(CANARY_DISCOVERY_SKIP)]
     settle_fixture_verdict(safe_refusal)
     validate_canary("default-safe-profile", safe_refusal)
     for lane, doc, extras in (
-        ("owned-default-metrics", owned_aggregate, 3),
+        ("owned-default-metrics", owned_aggregate, 2),
         ("default-safe-profile", safe, 2),
     ):
         for mutate in (
             lambda d, n=extras: d["evidence"].update(skipped=[
-                dict(CANARY_DISCOVERY_SKIP) for _ in range(n)
-            ] + [dict(CANARY_UNSUPPORTED_SKIP)]),
+                dict(CANARY_DISCOVERY_SKIP) for _ in range(n)]),
             lambda d: d["evidence"].update(skipped=[
-                dict(CANARY_DISCOVERY_SKIP), dict(DISCOVERY_SKIP),
-                dict(CANARY_UNSUPPORTED_SKIP)]),
+                dict(CANARY_DISCOVERY_SKIP), dict(DISCOVERY_SKIP)]),
         ):
             bad = copy.deepcopy(doc)
             mutate(bad)
@@ -4302,98 +4211,52 @@ def self_test():
     rejected(lambda: validate_canary("default-safe-profile", bad))
     print("canary retained-refusal skip shapes: OK")
 
-    # F-14 future-minor disclosure (RED-first): the matrix provider ships a
-    # [3,9] manifest table the scan refuses. Scanned canary lanes must
-    # disclose exactly one unsupported skip; manifest-only lanes disclose
-    # none. Categorical bounds apply to categorical items only.
-    unsupported = {"name": DISCOVERY_SUBJECT, "reason": UNSUPPORTED_TABLE_VERSION}
-    require(
-        expected_unsupported_canary_skips(safe["evidence"]) == 1,
-        "scanned [3,9] module must expect one unsupported skip",
-    )
-    require(
-        expected_unsupported_canary_skips(freeze["evidence"]) == 0,
-        "manifest-only [3,9] module must expect no unsupported skip",
-    )
-    no_future = {"discovery": [{"sources": ["scan", "manifest"], "tables": [
-        {"source": "manifest", "version": [3, 2], "entries": 104},
-    ]}], "skipped": []}
-    require(
-        expected_unsupported_canary_skips(no_future) == 0,
-        "scanned module without a future-minor table must expect none",
-    )
-    v4_only = {"discovery": [{"sources": ["scan", "manifest"], "tables": [
-        {"source": "manifest", "version": [4, 0], "entries": 104},
-    ]}], "skipped": []}
-    require(
-        expected_unsupported_canary_skips(v4_only) == 0,
-        "major 4 is data, not a future minor (unsupported_version_of)",
-    )
-    manifest_future_no_scan = {"discovery": [{"sources": ["manifest"], "tables": [
-        {"source": "manifest", "version": [3, 9], "entries": 104},
-    ]}], "skipped": []}
-    require(
-        expected_unsupported_canary_skips(manifest_future_no_scan) == 0,
-        "unscanned [3,9] module must expect no unsupported skip",
-    )
-    scan_future_no_manifest = {"discovery": [{"sources": ["scan", "manifest"], "tables": [
-        {"source": "scan", "version": [3, 9], "entries": 104},
-    ]}], "skipped": []}
-    require(
-        expected_unsupported_canary_skips(scan_future_no_manifest) == 0,
-        "future-minor scan table without a manifest record must expect none",
-    )
-    good = copy.deepcopy(safe)
-    good["evidence"]["skipped"] = [dict(unsupported)]
-    settle_fixture_verdict(good)
-    validate_canary("default-safe-profile", good)
-    missing = copy.deepcopy(safe)
-    missing["evidence"]["skipped"] = []
-    settle_fixture_verdict(missing)
-    rejected(lambda missing=missing: validate_canary("default-safe-profile", missing))
-    bad = copy.deepcopy(safe)
-    bad["evidence"]["skipped"] = [dict(unsupported) for _ in range(2)]
-    settle_fixture_verdict(bad)
-    rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
-    bad = copy.deepcopy(safe)
-    bad["evidence"]["skipped"] = [dict(unsupported), dict(DISCOVERY_SKIP)]
-    settle_fixture_verdict(bad)
-    rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
-    bad = {"discovery": no_future["discovery"], "skipped": [dict(unsupported)]}
-    rejected(lambda bad=bad: exact_canary_discovery_skips(bad, owned=False))
-    bad = {"discovery": v4_only["discovery"], "skipped": [dict(unsupported)]}
-    rejected(lambda bad=bad: exact_canary_discovery_skips(bad, owned=False))
-    owned_both = copy.deepcopy(owned_aggregate)
-    owned_both["evidence"]["skipped"] = [
-        dict(CANARY_DISCOVERY_SKIP), dict(unsupported),
-    ]
-    settle_fixture_verdict(owned_both)
-    for lane in ("owned-default-metrics", "owned-feature-metrics"):
-        validate_canary(lane, owned_both)
-    owned_two_categorical = copy.deepcopy(owned_aggregate)
-    owned_two_categorical["evidence"]["skipped"] = [
-        dict(CANARY_DISCOVERY_SKIP) for _ in range(2)
-    ] + [dict(unsupported)]
-    settle_fixture_verdict(owned_two_categorical)
-    for lane in ("owned-default-metrics", "owned-feature-metrics"):
-        validate_canary(lane, owned_two_categorical)
-    safe_categorical_plus = copy.deepcopy(safe)
-    safe_categorical_plus["evidence"]["skipped"] = [
-        dict(CANARY_DISCOVERY_SKIP), dict(unsupported),
-    ]
-    settle_fixture_verdict(safe_categorical_plus)
-    validate_canary("default-safe-profile", safe_categorical_plus)
-    for lane, doc in (
-        ("owned-default-metrics", owned_aggregate),
-        ("default-safe-profile", safe),
+    # Retired version skip (RED-first, owner-approved 2026-09-27): the
+    # scanner walks every 2.x/3.x version word it can see as its known
+    # prefix and emits no version skip at all — the F-14 disclosure
+    # machinery is gone from the product. Any `{discovery subject,
+    # unsupported ...}` item on a canary lane is a resurrected emission
+    # and fails closed, even beside a manifest [3,9] table (which the
+    # LP64 scan never reaches: it lives past the file-backed page tail
+    # in anonymous .bss). Safe lanes carry no discovery skip at all;
+    # categorical bounds are unchanged.
+    retired = {"name": DISCOVERY_SUBJECT, "reason": UNSUPPORTED_TABLE_VERSION}
+    bare = copy.deepcopy(safe)
+    bare["evidence"]["skipped"] = []
+    settle_fixture_verdict(bare)
+    validate_canary("default-safe-profile", bare)
+    for skipped in (
+        [dict(retired)],
+        [dict(retired) for _ in range(2)],
+        [dict(retired), dict(DISCOVERY_SKIP)],
+        [dict(CANARY_DISCOVERY_SKIP), dict(retired)],
     ):
-        bad = copy.deepcopy(doc)
-        bad["evidence"]["skipped"] = [
-            dict(CANARY_DISCOVERY_SKIP) for _ in range(3 if lane.startswith("owned") else 2)
-        ] + [dict(unsupported)]
+        bad = copy.deepcopy(safe)
+        bad["evidence"]["skipped"] = skipped
         settle_fixture_verdict(bad)
-        rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
-    print("canary unsupported-table-version disclosure is exact: OK")
+        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
+    bare_discovery = {"discovery": safe["evidence"]["discovery"], "skipped": []}
+    require(
+        exact_canary_discovery_skips(bare_discovery) == 0,
+        "a scanned [3,9] module with no skip is the clean shape",
+    )
+    resurrected = {
+        "discovery": safe["evidence"]["discovery"], "skipped": [dict(retired)],
+    }
+    rejected(
+        lambda resurrected=resurrected: exact_canary_discovery_skips(resurrected)
+    )
+    for skipped in (
+        [dict(retired)],
+        [dict(CANARY_DISCOVERY_SKIP), dict(retired)],
+        [dict(CANARY_DISCOVERY_SKIP), dict(CANARY_DISCOVERY_SKIP), dict(retired)],
+    ):
+        bad = copy.deepcopy(owned_aggregate)
+        bad["evidence"]["skipped"] = skipped
+        settle_fixture_verdict(bad)
+        for lane in ("owned-default-metrics", "owned-feature-metrics"):
+            rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
+    print("canary retired version skip fails closed: OK")
 
     induced = {}
     g1 = evidence_fixture(G1_SURFACES, sources=("scan", "manifest"))
@@ -4460,18 +4323,19 @@ def self_test():
     rejected(lambda: validate_induced("G5", bad))
     print("induced G5 exact 11 calls and 9 RV failures: OK")
 
+    retired_induced = {"name": DISCOVERY_SUBJECT, "reason": UNSUPPORTED_TABLE_VERSION}
     for lane in ("G4", "G5"):
         for skipped in (
-            [],
-            [dict(CANARY_UNSUPPORTED_SKIP) for _ in range(2)],
+            [dict(retired_induced)],
+            [dict(retired_induced) for _ in range(2)],
             [dict(CANARY_DISCOVERY_SKIP)],
-            [dict(CANARY_UNSUPPORTED_SKIP), dict(CANARY_DISCOVERY_SKIP)],
+            [dict(retired_induced), dict(CANARY_DISCOVERY_SKIP)],
         ):
             bad = copy.deepcopy(induced[lane])
             bad["evidence"]["skipped"] = skipped
             settle_fixture_verdict(bad)
             rejected(lambda lane=lane, bad=bad: validate_induced(lane, bad))
-    print("induced G4/G5 require exactly the F-14 disclosure: OK")
+    print("induced G4/G5 require no discovery skip: OK")
 
     bad = copy.deepcopy(induced["G3"])
     del bad["capture"]["ring_bytes"]

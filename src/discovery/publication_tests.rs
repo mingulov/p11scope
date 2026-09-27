@@ -3849,9 +3849,11 @@ fn f_e08_null_default_and_failure_request_matrix() {
 
 /// Case 16 (Package F, E08): the ABI shape axis. `{3,2}`, `{3,1}` and
 /// `{3,0}` heap tables admit the walked prefix identically on both
-/// routes; a non-listed `{2,39}` minor admits the same known prefix on
-/// both; `{3,3}`, `{4,0}` and `{2,41}` refuse identically with the
-/// explicit decode omission.
+/// routes; non-listed minors (`{2,39}`, `{2,41}`, `{3,3}`) admit the
+/// same known prefix on both (owner-approved 2026-09-27: the live-export
+/// path follows the helper's versioning rule through `spans_for`); only
+/// the new major `{4,0}` refuses identically with the explicit decode
+/// omission.
 #[test]
 fn f_e08_version_shape_matrix() {
     let build = pub_build();
@@ -3931,59 +3933,70 @@ fn f_e08_version_shape_matrix() {
         assert_count_only(&gi_engine);
     }
 
-    // Non-listed 2.x minor: both routes admit the same known 68-entry
-    // prefix with the explicit known-prefix marker — the shared export
-    // contract for shapes past the fully known list.
-    stage.set_version(17, 2, 39);
-    let publish = stage.publish();
-    let heap17 = publish
-        .elements
-        .iter()
-        .find(|table| table.index == 17)
-        .expect("heap 17 published")
-        .clone();
-    assert_eq!((heap17.major, heap17.minor), (2, 39));
-    let iface = stage.gi(Some("P11Scope-MW-17"), None);
-    assert_eq!(iface.rv, 0);
-    let mut element_engine = engine_over_pids(&[stage.pid]);
-    drain_records(
-        &mut element_engine,
-        vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
-    );
-    let mut gi_engine = engine_over_pids(&[stage.pid]);
-    let view = gi_engine.views[0].id();
-    let object = gi_provider_object(&gi_engine);
-    let binding = gi_binding(&mut gi_engine, view, object);
-    drain_records(
-        &mut gi_engine,
-        vec![gi_record(
-            stage.pid,
-            binding.id,
-            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
-            iface.table,
-            (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_OTHER, iface.flags),
-        )],
-    );
-    assert_eq!(
-        slot_targets(&gi_engine),
-        slot_targets(&element_engine),
-        "{{2,39}}: identical known-prefix endpoint sets"
-    );
-    for (label, engine) in [("element", &element_engine), ("gi", &gi_engine)] {
-        let tables: Vec<_> = engine
-            .modules
+    // Non-listed minors: both routes admit the same known prefix with
+    // the explicit known-prefix marker — the shared export contract for
+    // shapes past the fully known list (owner-approved 2026-09-27: the
+    // live-export path follows the helper's versioning rule, so `{2,41}`
+    // and `{3,3}` prefix instead of refusing).
+    for (major, minor, walked) in [(2u8, 39u8, 68usize), (2, 41, 68), (3, 3, 104)] {
+        stage.set_version(17, major, minor);
+        let publish = stage.publish();
+        let heap17 = publish
+            .elements
             .iter()
-            .flat_map(|module| &module.scanned.tables)
-            .filter(|table| table.address == heap17.addr)
-            .collect();
-        assert_eq!(tables.len(), 1, "{label} {{2,39}}: one instance");
-        assert_eq!(tables[0].walk, "known_prefix", "{label}: explicit bound");
-        assert_eq!(tables[0].entries.len(), 68);
+            .find(|table| table.index == 17)
+            .expect("heap 17 published")
+            .clone();
+        assert_eq!((heap17.major, heap17.minor), (major, minor));
+        let iface = stage.gi(Some("P11Scope-MW-17"), None);
+        assert_eq!(iface.rv, 0);
+        let mut element_engine = engine_over_pids(&[stage.pid]);
+        drain_records(
+            &mut element_engine,
+            vec![element_record(stage.pid, heap17.addr, 0, 2, &hooks)],
+        );
+        let mut gi_engine = engine_over_pids(&[stage.pid]);
+        let view = gi_engine.views[0].id();
+        let object = gi_provider_object(&gi_engine);
+        let binding = gi_binding(&mut gi_engine, view, object);
+        drain_records(
+            &mut gi_engine,
+            vec![gi_record(
+                stage.pid,
+                binding.id,
+                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_NULL, 0),
+                iface.table,
+                (DISCOVERY_NAME_OTHER, DISCOVERY_VERSION_OTHER, iface.flags),
+            )],
+        );
+        assert_eq!(
+            slot_targets(&gi_engine),
+            slot_targets(&element_engine),
+            "{{{major},{minor}}}: identical known-prefix endpoint sets"
+        );
+        for (label, engine) in [("element", &element_engine), ("gi", &gi_engine)] {
+            let tables: Vec<_> = engine
+                .modules
+                .iter()
+                .flat_map(|module| &module.scanned.tables)
+                .filter(|table| table.address == heap17.addr)
+                .collect();
+            assert_eq!(tables.len(), 1, "{label} {{{major},{minor}}}: one instance");
+            assert_eq!(tables[0].version, (major, minor));
+            assert_eq!(tables[0].walk, "known_prefix", "{label}: explicit bound");
+            assert_eq!(
+                tables[0].entries.len(),
+                walked,
+                "{label} {{{major},{minor}}}: the walked prefix only"
+            );
+        }
     }
 
     // Unwalkable shapes: both routes refuse with the explicit decode
-    // omission and admit nothing beyond the scan baseline.
-    for (major, minor) in [(3u8, 3u8), (4, 0), (2, 41)] {
+    // omission and admit nothing beyond the scan baseline. Only the new
+    // major refuses now (owner-approved 2026-09-27).
+    {
+        let (major, minor) = (4u8, 0u8);
         stage.set_version(17, major, minor);
         let publish = stage.publish();
         let heap17 = publish

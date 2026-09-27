@@ -4283,6 +4283,43 @@ pub(crate) mod tests {
         }
     }
 
+    // Owner-approved 2026-09-27: a scanned [3,9] provider yields a
+    // `known_prefix` surface — the scan's own `spans_for` label flows
+    // into the report — and the verdict is PARTIAL with a disclosed
+    // "surface gaps" cause, never the retired version skip. What a
+    // `known_prefix` surface means is unchanged; only its source grew.
+    #[test]
+    fn scanned_future_minor_prefix_is_a_surface_gap_not_a_version_skip() {
+        let (_, spans, walk) =
+            crate::discovery::scan::spans_for(0x0903).expect("[3,9] is walked by the scan");
+        assert_eq!(walk, "known_prefix");
+        let mut ev = evidence();
+        ev.surfaces = vec![crate::plan::SurfaceSummary {
+            source: "interface".into(),
+            walk: walk.into(),
+            acquisition: "ok".into(),
+            functions: spans.iter().map(|span| span.fields().len()).sum(),
+        }];
+        assert_eq!(ev.surfaces[0].functions, 104);
+        assert!(
+            ev.skipped.is_empty(),
+            "a walked prefix carries no skip: {:?}",
+            ev.skipped
+        );
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let out = live(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/x.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(out.contains("1 surface gaps"), "{out}");
+        assert!(!out.contains("unsupported function-table"), "{out}");
+    }
+
     #[test]
     fn json_marks_latency_approximate_and_hex_rvs() {
         let mut ev = evidence();

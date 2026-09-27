@@ -8,8 +8,8 @@ use p11scope::discovery::hooks::HookRegistry;
 use p11scope::discovery::scan::{
     CaptureWorkBudget, ScanLimits, ScanOutcome, ScanRequest, scan_pid,
 };
-use p11scope_manifest::manifest::{Resolution, SurfaceSource};
-use std::collections::BTreeMap;
+use p11scope_manifest::manifest::{Resolution, SurfaceSource, Version, WalkOutcome};
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
@@ -175,6 +175,182 @@ fn every_supported_version_layout_is_found_with_its_documented_entry_count() {
             "{major}.{minor} must decode {expected} slots"
         );
     }
+}
+
+/// Owner-approved 2026-09-27: future-minor legacy tables decode as known
+/// prefixes — [2,41] as the 68-slot layout, [3,9] as the 104-slot 3.2
+/// layout — with no version skip; [4,0] stays refused and silent.
+#[test]
+fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
+    let _guard = serial_guard();
+    for (major, minor, expected) in [(2u8, 41u8, 68usize), (3, 9, 104)] {
+        let dir = tmp(&format!("scan-future-{major}-{minor}"));
+        let so = build_fixture(
+            &dir,
+            "future",
+            &[
+                &format!("-DLEGACY_MAJOR={major}"),
+                &format!("-DLEGACY_MINOR={minor}"),
+                "-DMATRIX_INTERFACES=0",
+            ],
+        );
+        load_and_populate(&so);
+        let ScanOutcome::Scanned {
+            modules, skipped, ..
+        } = scan_self(&[so.clone()])
+        else {
+            panic!("scan must be available");
+        };
+        let module = modules
+            .iter()
+            .find(|m| m.path.ends_with("future.so"))
+            .unwrap();
+        let table = module
+            .tables
+            .iter()
+            .find(|t| t.version == (major, minor))
+            .unwrap_or_else(|| panic!("{major}.{minor} table not found"));
+        assert_eq!(table.walk, "known_prefix");
+        assert_eq!(
+            table.entries.len() + table.null_entries.len(),
+            expected,
+            "{major}.{minor} must decode {expected} slots"
+        );
+        assert!(
+            skipped
+                .iter()
+                .all(|skip| !skip.reason.contains("unsupported function-table")),
+            "no version skip: {skipped:?}"
+        );
+    }
+    // A new major stays refused, and the refusal is silent.
+    let dir = tmp("scan-refused-major");
+    let so = build_fixture(
+        &dir,
+        "refused",
+        &[
+            "-DLEGACY_MAJOR=4",
+            "-DLEGACY_MINOR=0",
+            "-DMATRIX_INTERFACES=0",
+        ],
+    );
+    load_and_populate(&so);
+    let ScanOutcome::Scanned {
+        modules, skipped, ..
+    } = scan_self(&[so.clone()])
+    else {
+        panic!("scan must be available");
+    };
+    let module = modules
+        .iter()
+        .find(|m| m.path.ends_with("refused.so"))
+        .unwrap();
+    assert!(
+        !module.tables.iter().any(|t| t.version == (4, 0)),
+        "the [4,0] table stays refused"
+    );
+    assert!(
+        skipped
+            .iter()
+            .all(|skip| !skip.reason.contains("unsupported function-table")),
+        "no version skip: {skipped:?}"
+    );
+}
+
+/// Owner-approved 2026-09-27 (consistency check): for the version-matrix
+/// fixture built as verify-canaries.sh builds matrix-provider.so (legacy
+/// 2.40 plus the 13 interface tables), every table the scan decodes is a
+/// (version, slots, walk) triple the helper manifest also walks, no
+/// version skip is emitted, and the refused [4,0] table is decoded by
+/// neither source. This guards the widened gate: accepting more version
+/// words must not invent tables the helper does not walk.
+///
+/// Reachability note: the scan covers only file-backed mappings
+/// (`candidate_groups` keeps inode-bearing mappings; snapshots are
+/// per-mapping), while the fixture's later statics live past the
+/// file-backed page tail in anonymous .bss — measured on this host's
+/// toolchain, the RW LOAD's file data ends at file offset 0x53c0 with a
+/// 3136-byte .bss tail in the last file-backed page, so the LP64 scan
+/// sees the first statics (legacy, t240, t30) but t31's window already
+/// crosses into the anonymous mapping. The [3,9] static is therefore
+/// outside the LP64 scan's reach by construction (not by version gate),
+/// and the [3,9] scan-decode path itself is covered by
+/// `future_minor_legacy_tables_are_scanned_as_known_prefix` (the legacy
+/// static is first in .bss, always in the tail) and the `scan.rs` unit
+/// tests. On ILP32 the smaller tables put more statics in the tail; the
+/// live canary suite covers that lane.
+#[test]
+fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
+    let _guard = serial_guard();
+    let dir = tmp("scan-manifest-agreement");
+    // Canary shape: default legacy 2.40 plus MATRIX_INTERFACES=1.
+    let so = build_fixture(&dir, "matrix", &[]);
+    load_and_populate(&so);
+    let manifest = p11scope_discover::discover::discover(&so).expect("helper discovery");
+    // Helper oracle: every (version, slots, walk) triple it walks. One
+    // version may appear under several walks (exact and corroborated
+    // prefix), so the oracle is a set, not a map.
+    let mut helper: BTreeSet<((u8, u8), usize, &'static str)> = BTreeSet::new();
+    for surface in &manifest.surfaces {
+        let Some(Version { major, minor }) = surface.version else {
+            continue;
+        };
+        let walk = match &surface.walk {
+            WalkOutcome::Full => "full",
+            WalkOutcome::KnownPrefix => "known_prefix",
+            _ => continue, // refused / not-walked / unreadable: nothing to agree on
+        };
+        helper.insert(((major, minor), surface.functions.len(), walk));
+    }
+    assert!(
+        helper.contains(&((3, 9), 104, "known_prefix")),
+        "the helper must walk [3,9] as a 104-slot known prefix: {helper:?}"
+    );
+    assert!(
+        !helper.iter().any(|((major, _), _, _)| *major == 4),
+        "the helper refuses the new major: {helper:?}"
+    );
+
+    let ScanOutcome::Scanned {
+        modules, skipped, ..
+    } = scan_self(&[so.clone()])
+    else {
+        panic!("scan must be available");
+    };
+    assert!(
+        skipped
+            .iter()
+            .all(|skip| !skip.reason.contains("unsupported function-table")),
+        "no version skip: {skipped:?}"
+    );
+    let module = modules
+        .iter()
+        .find(|m| m.path.ends_with("matrix.so"))
+        .expect("the fixture must be discovered");
+    assert!(!module.tables.is_empty(), "the scan must decode tables");
+    // The legacy static is first in .bss, so it is always in the
+    // file-backed tail; later statics depend on toolchain layout and are
+    // covered only by the membership check below.
+    assert!(
+        module
+            .tables
+            .iter()
+            .any(|t| t.version == (2, 40) && t.walk == "full"),
+        "the scan must decode the legacy table"
+    );
+    for table in &module.tables {
+        let slots = table.entries.len() + table.null_entries.len();
+        assert!(
+            helper.contains(&(table.version, slots, table.walk)),
+            "{:?}: the scan decoded ({slots}, {}), which the helper does not walk: {helper:?}",
+            table.version,
+            table.walk,
+        );
+    }
+    assert!(
+        !module.tables.iter().any(|t| t.version == (4, 0)),
+        "the refused [4,0] table is decoded by neither source"
+    );
 }
 
 /// A provider-owned, statically initialised `CK_FUNCTION_LIST` plus the

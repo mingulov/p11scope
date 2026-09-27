@@ -2811,7 +2811,7 @@ fn report_attach_failures(session: &Session) {
 /// The per-slot attach diagnostic. The failure message embeds the module's
 /// `/proc/<pid>/maps` filename (attach.rs builds it from `slot.object_path`),
 /// which the target controls, so this terminal boundary escapes control bytes
-/// — the stored `attach_failures` evidence keeps the raw string.
+/// — and the stored `attach_failures` evidence keeps the same escaped form.
 fn format_attach_failure(slot: u32, message: &str) -> String {
     format!(
         "attach failed (slot {slot}): {}",
@@ -6077,7 +6077,10 @@ fn evidence_for(
         slots: facts.slots(),
         active_slots: facts.active_slots(),
         attached_probes,
-        attach_failures: attach_failures.iter().map(|(_, msg)| msg.clone()).collect(),
+        attach_failures: attach_failures
+            .iter()
+            .map(|(_, msg)| render::escape_controls(msg).into_owned())
+            .collect(),
         aliased: plan
             .slots
             .iter()
@@ -7008,6 +7011,51 @@ mod tests {
         assert!(message.starts_with("p11scope: 2/2 attach attempts failed"));
         assert!(message.ends_with(r"First underlying error: at /opt/p\u{1b}[2Jevil\r.so: EPERM"));
         assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn stored_attach_failures_escape_target_controls_like_the_terminal() {
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        let failures = [(
+            3u32,
+            "p11_return at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM".to_string(),
+        )];
+        let scheduling =
+            SchedulingAccumulator::default().snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+        let evidence = evidence_for(
+            &engine,
+            engine.capture_facts(),
+            0,
+            false,
+            false,
+            &failures,
+            &[],
+            metrics::KernelEvidence::default(),
+            process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            Default::default(),
+            None,
+            false,
+            scheduling,
+            None,
+            None,
+        );
+        assert_eq!(
+            evidence.attach_failures,
+            [r"p11_return at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM".to_string()]
+        );
+        let stored = &evidence.attach_failures[0];
+        assert!(
+            !stored.contains('\u{1b}') && !stored.contains('\r'),
+            "{stored:?}"
+        );
+        // The JSON value carries the same escaped form, not raw bytes.
+        let value = render::versioned_evidence(&evidence);
+        assert_eq!(value["attach_failures"][0].as_str(), Some(stored.as_str()));
     }
 
     #[test]

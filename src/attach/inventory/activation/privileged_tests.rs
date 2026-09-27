@@ -855,7 +855,17 @@ impl OwnedCaller {
     }
 
     fn line(&mut self) -> Result<String> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        self.line_within(Duration::from_secs(5))
+    }
+
+    /// A hammer's ledger arrives only after every call: a CPU-pinned lane
+    /// under singles uprobes runs far past the 5 s reply bound.
+    fn ledger_line(&mut self) -> Result<String> {
+        self.line_within(Duration::from_secs(180))
+    }
+
+    fn line_within(&mut self, bound: Duration) -> Result<String> {
+        let deadline = Instant::now() + bound;
         let mut line = vec![];
         while line.len() < 256 {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1003,7 +1013,7 @@ impl OwnedCaller {
             "hammer start receipt differs"
         );
         let total: u64 = (0..u64::from(threads)).sum::<u64>() * u64::from(percalls);
-        let ledger = self.line()?;
+        let ledger = self.ledger_line()?;
         ensure!(
             ledger == format!("HAMMER_DONE {threads} {percalls} {total}"),
             "independent hammer ledger differs: {ledger}"
@@ -1032,7 +1042,7 @@ impl OwnedCaller {
             "shared hammer start receipt differs"
         );
         let total = u64::from(percalls) * u64::from(threads);
-        let ledger = self.line()?;
+        let ledger = self.ledger_line()?;
         ensure!(
             ledger == format!("HAMMER_SHARED_DONE {threads} {percalls} {total}"),
             "independent shared hammer ledger differs: {ledger}"

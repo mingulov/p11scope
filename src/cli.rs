@@ -402,8 +402,13 @@ fn word(arg: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
 
 fn require_pid(args: &mut impl Iterator<Item = OsString>) -> Result<u32, CliError> {
     let v = require_value(args, "--pid")?;
-    v.parse()
-        .map_err(|_| usage_err(format!("--pid: invalid number {v:?}")))
+    let pid: u32 = v
+        .parse()
+        .map_err(|_| usage_err(format!("--pid: invalid number {v:?}")))?;
+    if pid == 0 {
+        return Err(usage_err("--pid must be greater than zero"));
+    }
+    Ok(pid)
 }
 
 /// `--hook-symbol NAME[:abi]`, validated by the registry itself so the CLI has
@@ -891,6 +896,21 @@ mod tests {
         assert_eq!(a.manifests.len(), 2);
         assert_eq!(a.hooks.abi("V_GetTable"), Some(HookAbi::Interface));
         assert_eq!(a.scope, ScopeArg::Pid(42));
+    }
+
+    #[test]
+    fn pid_zero_is_a_usage_error_not_a_late_runtime_failure() {
+        for argv in [
+            vec!["profile", "--pid", "0"],
+            vec!["trace", "--pid", "0"],
+            vec!["inspect", "--pid", "0"],
+            vec!["doctor", "--pid", "0"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("--pid must be greater than zero")),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

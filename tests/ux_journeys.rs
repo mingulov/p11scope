@@ -892,6 +892,26 @@ fn m9_non_utf8_arguments_never_panic() {
     }
 }
 
+/// SE-05: `--pid 0` names no process; it is a usage error (exit 2),
+/// not a late runtime pin failure (exit 1).
+#[test]
+fn se05_pid_zero_is_a_usage_error_exit_2() {
+    for argv in [
+        vec!["profile", "--pid", "0"],
+        vec!["trace", "--pid", "0"],
+        vec!["inspect", "--pid", "0"],
+    ] {
+        let usage = run(&argv);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(
+            usage.stderr.contains("--pid must be greater than zero"),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}
+
 /// SE-04: `--duration 0` (bare or suffixed) is a usage error, not a
 /// zero-length capture: exit 2 with a clear message on every surface.
 #[test]

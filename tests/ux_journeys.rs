@@ -892,6 +892,64 @@ fn m9_non_utf8_arguments_never_panic() {
     }
 }
 
+/// SE-07: a scalar flag given twice is a usage error (exit 2) naming
+/// the flag, instead of silent last-wins.
+#[test]
+fn se07_repeated_scalar_flag_is_a_usage_error_exit_2() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let cases: Vec<(Vec<String>, &str)> = [
+        (
+            vec![
+                "profile",
+                "--pid",
+                &pid,
+                "--duration",
+                "5",
+                "--duration",
+                "10",
+            ],
+            "--duration",
+        ),
+        (
+            vec!["profile", "--pid", &pid, "-o", "a.json", "-o", "b.json"],
+            "-o",
+        ),
+        (vec!["profile", "--pid", "1", "--pid", "2"], "--pid"),
+        (
+            vec![
+                "run",
+                "--pause",
+                "never",
+                "--pause",
+                "auto",
+                "--",
+                "/bin/true",
+            ],
+            "--pause",
+        ),
+    ]
+    .into_iter()
+    .map(|(args, flag)| {
+        (
+            args.into_iter().map(str::to_string).collect::<Vec<_>>(),
+            flag,
+        )
+    })
+    .collect();
+    for (argv, flag) in &cases {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let usage = run(&refs);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(
+            usage.stderr.contains(&format!("{flag} given twice")),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}
+
 /// SE-06: empty-string option values are usage errors (exit 2),
 /// naming the flag.
 #[test]

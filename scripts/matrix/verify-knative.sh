@@ -1,6 +1,12 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Task 6: attach before a Knative scale-from-zero pod exists.
+#
+# P11SCOPE_LANE_EVIDENCE_DIR=/absent/path names the retained evidence root.
+# Work lands under ${P11SCOPE_MATRIX_TMPDIR:-${TMPDIR:-/tmp}}, outside the
+# checkout, because the observer refuses `-o` below a group-writable tree.
+# P11SCOPE_MATRIX_BUILD_NETWORK (for example `host`) is passed to the
+# workload image's `docker build --network` (see scripts/matrix/matrix-lib.sh).
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -30,14 +36,19 @@ else
     }
     TOKEN=$(date +%s%N)-$$
 fi
-WORK="target/matrix-knative/$TOKEN"
+LANE13_WORK_BASE=${P11SCOPE_MATRIX_TMPDIR:-${TMPDIR:-/tmp}}
+case $LANE13_WORK_BASE in
+    /*) ;;
+    *) echo "P11SCOPE_MATRIX_TMPDIR/TMPDIR must be absolute: $LANE13_WORK_BASE" >&2; exit 2 ;;
+esac
+WORK="$LANE13_WORK_BASE/p11scope-knative-$TOKEN"
 PRODUCT="$WORK/product"
 IMAGE="kind.local/p11scope-matrix-knative:$TOKEN"
 CLUSTER="p11scope-knative-$TOKEN"
 KSVC="p11scope-ksvc-$TOKEN"
 ANCHOR="p11scope-anchor-$TOKEN"
 KNATIVE_VERSION=knative-v1.23.0
-KUBECONFIG="$PWD/$WORK/kubeconfig"
+KUBECONFIG="$WORK/kubeconfig"
 export KUBECONFIG
 SPID=
 SUPERVISOR_PID=
@@ -87,6 +98,7 @@ LANE13_START_LEDGER_ESTABLISHED=0
 LANE13_ADMISSION_ESTABLISHED=0
 . scripts/lib.sh
 . scripts/prepared-dependency-tools.sh
+. scripts/matrix/matrix-lib.sh
 require_non_root_caller
 
 lane13_fact() {
@@ -609,6 +621,7 @@ lane13_record_base_and_build() {
     docker image inspect ubuntu:24.04 > "$WORK/base-before.json"
     lane13_image_facts base ubuntu:24.04
     IMAGE_ID=$(timeout --signal=TERM --kill-after=5s 600s docker build --pull=false -q -t "$IMAGE" \
+        ${P11SCOPE_MATRIX_BUILD_NETWORK:+--network "$P11SCOPE_MATRIX_BUILD_NETWORK"} \
         -f scripts/matrix/Dockerfile.knative "$WORK")
     case $IMAGE_ID in ''|*[!a-zA-Z0-9:.-]*) return 1 ;; esac
     lane13_image_facts workload "$IMAGE"
@@ -1830,7 +1843,7 @@ capped_container_tar "$WORK/provider.tar" \
     timeout --signal=TERM --kill-after=5s 60s kubectl exec "$ANCHOR" -- \
     tar -chC "$PROVIDER_DIR" .
 tar -xf "$WORK/provider.tar" -C "$WORK/provider-safe"
-    discover_copied_provider "$PWD/$WORK/provider-safe" "$PROVIDER_NAME" \
+    discover_copied_provider "$WORK/provider-safe" "$PROVIDER_NAME" \
         "$PRODUCT/release/p11scope-discover" "/proc/$ANCHOR_PID/root$PROVIDER_DIR" \
         "$WORK/manifest-host.json"
 lane13_record_file_fact copied_provider "$WORK/provider-safe/$PROVIDER_NAME"
@@ -1895,7 +1908,7 @@ printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'cannot inspect the file locator now (Per
 echo "=== attach before the cold-start pod exists ==="
 SERVICE_PODS=$(service_pod_count)
 [ "$SERVICE_PODS" -eq 0 ] || { echo "service pods appeared before attach" >&2; exit 1; }
-set -- timeout --signal=TERM --kill-after=5s 70s \
+set -- python3 -I "$MATRIX_PTY" timeout --signal=TERM --kill-after=5s 70s \
     "$PRODUCT/release/p11scope" profile --manifest "$WORK/manifest-host.json" \
     --cgroup "$KUBEPODS" \
     --mode metrics --duration 40 -o "$WORK/observed.json"

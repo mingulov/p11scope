@@ -14615,6 +14615,105 @@ fn loader_mapping_selection_is_path_qualified_and_offset_exact() {
     assert!(unique_mapping_for_offset(&executable, 0x5000).is_err());
 }
 
+fn overlay_split_snapshot_fixture() -> (ObjectKey, ObjectKey, Vec<MapEntry>, tempfile::TempDir, File)
+{
+    use crate::discovery::identity::test_fixture::overlay as overlay_key_fixture;
+    // The fd names the overlay device; pre-6.8 maps prints the backing one.
+    let fd_key = overlay_key_fixture(41);
+    let maps_key = ObjectKey {
+        device: Device {
+            major: 0,
+            minor: 21,
+        },
+        inode: fd_key.inode,
+    };
+    let maps = vec![MapEntry {
+        start: 0x700000,
+        end: 0x701000,
+        file_offset: 0,
+        permissions: *b"r-xp",
+        device: maps_key.device,
+        inode: maps_key.inode,
+        raw_path: Some(b"/lib/ld.so".to_vec()),
+    }];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loader.so");
+    std::fs::write(&path, "p11scope-loader-probe").unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    (fd_key, maps_key, maps, dir, file)
+}
+
+#[test]
+fn executable_snapshot_retries_on_the_probed_overlay_key() {
+    use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+    let (fd_key, maps_key, maps, _dir, file) = overlay_split_snapshot_fixture();
+    let mut budget = CaptureWorkBudget::default();
+    let index = MapIndex::new(&maps).unwrap();
+    assert_eq!(
+        executable_map_snapshot(&index, fd_key, &mut budget).unwrap_err(),
+        NO_EXECUTABLE_MAPPING_REASON
+    );
+    let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
+    let found = executable_snapshot_for_fd(&index, &file, fd_key, &mut budget, &probe).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].1, PathBuf::from("/lib/ld.so"));
+}
+
+#[test]
+fn executable_snapshot_keeps_todays_error_when_the_probe_refuses() {
+    use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+    let (fd_key, maps_key, maps, _dir, file) = overlay_split_snapshot_fixture();
+    let mut budget = CaptureWorkBudget::default();
+    let index = MapIndex::new(&maps).unwrap();
+    let probe = FakeSelfMappingProbe::new(false, Some(maps_key));
+    assert_eq!(
+        executable_snapshot_for_fd(&index, &file, fd_key, &mut budget, &probe).unwrap_err(),
+        NO_EXECUTABLE_MAPPING_REASON
+    );
+    let mut stopped = CaptureWorkBudget::default();
+    assert!(!stopped.charge(u64::MAX));
+    let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
+    assert_eq!(
+        executable_snapshot_for_fd(&index, &file, fd_key, &mut stopped, &probe).unwrap_err(),
+        WORK_CEILING_REASON,
+        "a budget stop is not a missing mapping and must not retry"
+    );
+    assert_eq!(probe.overlay_checks.get(), 0);
+}
+
+#[test]
+fn loader_snapshot_retries_on_the_probed_overlay_key() {
+    use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+    let (fd_key, maps_key, maps, _dir, file) = overlay_split_snapshot_fixture();
+    let mut budget = CaptureWorkBudget::default();
+    let index = MapIndex::new(&maps).unwrap();
+    let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
+    let (path, found) = loader_snapshot_for_fd(&index, &file, fd_key, &mut budget, &probe).unwrap();
+    assert_eq!(path, PathBuf::from("/lib/ld.so"));
+    assert_eq!(found.len(), 1);
+}
+
+#[test]
+fn matching_snapshot_never_consults_the_probe() {
+    use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+    let (fd_key, _, _, _dir, file) = overlay_split_snapshot_fixture();
+    let maps = vec![MapEntry {
+        start: 0x700000,
+        end: 0x701000,
+        file_offset: 0,
+        permissions: *b"r-xp",
+        device: fd_key.device,
+        inode: fd_key.inode,
+        raw_path: Some(b"/lib/ld.so".to_vec()),
+    }];
+    let mut budget = CaptureWorkBudget::default();
+    let index = MapIndex::new(&maps).unwrap();
+    let probe = FakeSelfMappingProbe::new(true, Some(fd_key));
+    assert!(executable_snapshot_for_fd(&index, &file, fd_key, &mut budget, &probe).is_ok());
+    assert_eq!(probe.overlay_checks.get(), 0);
+    assert_eq!(probe.probes.get(), 0);
+}
+
 #[test]
 fn loader_pin_collision_cannot_commit_a_plan_with_missing_pin_id() {
     let (plan, pins) = plan_with_pins(1, 0);

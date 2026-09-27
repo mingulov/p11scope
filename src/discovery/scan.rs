@@ -2778,7 +2778,16 @@ fn opened_file_identity_guard(
 ) -> Result<(), String> {
     let actual =
         crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)?;
-    if actual == expected {
+    // On pre-6.8 kernels an overlayfs fd and its mappings legitimately carry
+    // different keys (overlay vs backing device); the self-mapping probe
+    // asks the kernel how it renders this exact fd before refusing.
+    if crate::discovery::identity::opened_file_matches_maps(
+        file,
+        actual,
+        expected,
+        budget,
+        &crate::discovery::identity::KernelSelfMappingProbe,
+    ) {
         return Ok(());
     }
     Err(format!(

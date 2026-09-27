@@ -2071,6 +2071,11 @@ fn task11_expected_values(name: &str) -> Vec<String> {
 
 #[test]
 fn release_seal_denies_the_caller_path_to_every_reached_command() {
+    // Like every other native suite: this ~55 s, ~1000-exec class must not
+    // run concurrently with sibling heavy suites (self-inflicted contention).
+    let _native_suite_guard = NATIVE_SUITE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let output = Command::new("python3")
         .args([
             "-I",

@@ -13,6 +13,7 @@
 //! flakes into successes and never masks a genuine failure.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
@@ -1140,12 +1141,97 @@ impl SelfMappingProbe for KernelSelfMappingProbe {
 
     fn kernel_maps_key(
         &self,
-        _file: &std::fs::File,
-        _budget: &mut CaptureWorkBudget,
+        file: &std::fs::File,
+        budget: &mut CaptureWorkBudget,
     ) -> Option<ObjectKey> {
-        // RED: the fix commit implements the real probe. Until then nothing
-        // accepts via probing, which is exactly the 58766c9 behavior.
-        None
+        if !has_mappable_bytes(file) {
+            return None;
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let len = usize::try_from(page).unwrap_or(4096).max(1);
+        // SAFETY: one private read-only page of a borrowed valid fd at
+        // offset 0; never PROT_EXEC; unmapped by the guard below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        let _mapping = MappedProbe { base, len };
+        read_self_maps_key_for(base as u64, budget)
+    }
+}
+
+/// One private read-only page of an already-opened fd, unmapped on drop —
+/// including every error path out of the probe.
+struct MappedProbe {
+    base: *mut libc::c_void,
+    len: usize,
+}
+
+impl Drop for MappedProbe {
+    fn drop(&mut self) {
+        // SAFETY: the probe mapped exactly this range with mmap, owns it
+        // exclusively, and Drop runs once.
+        unsafe {
+            libc::munmap(self.base, self.len);
+        }
+    }
+}
+
+/// The kernel-rendered key for the mapping containing `addr` in this
+/// process's own maps. Charged like other `/proc` reads (one work unit per
+/// chunk and per line, bytes recorded) and stops at the mapping's line, so
+/// the cost stays inside the budget's own ceilings.
+fn read_self_maps_key_for(addr: u64, budget: &mut CaptureWorkBudget) -> Option<ObjectKey> {
+    let mut reader = std::fs::File::open("/proc/self/maps").ok()?;
+    let mut operation_bytes = 0u64;
+    let mut pending = Vec::new();
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        if budget.check_deadline_now().is_some() {
+            return None;
+        }
+        let allowed = budget.allowed_io(operation_bytes, chunk.len());
+        if allowed == 0 {
+            return None;
+        }
+        budget.spend(1).ok()?;
+        let read = match reader.read(&mut chunk[..allowed]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        budget.record_io(read);
+        operation_bytes = operation_bytes.saturating_add(read as u64);
+        if read == 0 {
+            if pending.is_empty() {
+                return None;
+            }
+            return parse_probed_maps_line(&pending, addr).ok().flatten();
+        }
+        pending.extend_from_slice(&chunk[..read]);
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            budget.spend(1).ok()?;
+            match parse_probed_maps_line(&line[..line.len() - 1], addr) {
+                Ok(Some(key)) => return Some(key),
+                Ok(None) => {}
+                Err(()) => return None,
+            }
+        }
+        // A real maps line is hundreds of bytes; a megabyte without a
+        // newline is not one. Fail closed instead of buffering on.
+        if pending.len() > 1024 * 1024 {
+            return None;
+        }
     }
 }
 
@@ -1214,9 +1300,10 @@ fn parse_decimal_field(field: &[u8]) -> Option<u64> {
     if field.is_empty() || !field.iter().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
+    // The digit pre-check above already rejected `+`, which `parse` accepts.
     std::str::from_utf8(field)
         .ok()
-        .and_then(|text| u64::from_str_radix(text, 10).ok())
+        .and_then(|text| text.parse().ok())
 }
 
 /// Parse one `/proc/self/maps` line for the self-mapping probe: `Ok(Some)`
@@ -2461,7 +2548,11 @@ mod tests {
 
     /// Independent oracle for the real probe: map the file here and read the
     /// kernel's own maps line for that address with a deliberately minimal
-    /// parse, so the probe's read path and parser are both checked.
+    /// parse, so the probe's read path and parser are both checked. Compared
+    /// against the maps rendering, never fstat: on btrfs the same file's
+    /// st_dev (anonymous subvolume device, observed 0:37) differs from its
+    /// maps s_dev (observed 00:23) — the reason retained identity resolves
+    /// through mountinfo.
     fn maps_key_for_fresh_mapping(file: &std::fs::File) -> ObjectKey {
         use std::os::fd::AsRawFd as _;
         let addr = unsafe {

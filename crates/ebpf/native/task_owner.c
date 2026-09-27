@@ -107,7 +107,10 @@ static __always_inline int refund_local(struct owner_control *ctl)
 
 /* BPF global functions deliberately take no map-value pointers across their
  * ABI. Keeping the accounting out of its transaction callers gives older
- * verifiers one bounded state frontier per accounting operation. */
+ * verifiers one bounded state frontier per accounting operation. In the BPF
+ * object the reservation is made inside p11_owner_lease (its one global
+ * boundary), so this entry point is not exported there; the native owner
+ * harness drives the same reserve_local body through it. */
 __attribute__((noinline)) u32 p11_owner_reserve(void)
 {
     struct owner_control *ctl = control();
@@ -143,11 +146,74 @@ static __always_inline int valid_owner(struct owner_control *ctl, struct thread_
     return 1;
 }
 
+/* The owner lease transaction as one global scalar boundary: the current task
+ * ends up holding a valid leased owner (already leased, an idle retained one
+ * re-leased, or a fresh one created), or nothing, with the refusal accounted.
+ * Its create/reuse branches are explored once by the verifier instead of once
+ * per caller path, which older verifiers (5.15) need to stay under their
+ * instruction budget. No map-value pointer crosses its ABI. */
+__attribute__((noinline)) u32 p11_owner_lease(void)
+{
+    struct owner_control *ctl = control();
+    struct task_struct *task;
+    struct thread_owner *owner;
+    if (!ctl || !healthy(ctl))
+        return 0;
+    task = owner_current_task();
+    if (!task) {
+        poison(ctl, OWNER_LOOKUP_UNKNOWN);
+        return 0;
+    }
+    owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 0);
+    if (owner && owner->flags)
+        return valid_owner(ctl, owner);
+    if (!reserve_local(ctl))
+        return 0;
+    if (!owner) {
+        /* First call of this thread: NULL initialization requests
+         * kernel-zeroed map storage, not a 544-byte stack argument. A failed
+         * CREATE installed no new value for this lease. The storage is then
+         * retained idle between calls, so this allocation (and its RCU-deferred
+         * free) never recurs per call, where it could run the allocator dry. */
+        owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 1);
+        if (!owner) {
+            count(&ctl->admission_failures);
+            refund_local(ctl);
+            return 0;
+        }
+        if (owner->flags) {
+            /* A busy initial probe may have hidden an existing owner. Its
+             * lease and keys remain untouched; refund only our speculative
+             * reservation. */
+            if (!refund_local(ctl) || !valid_owner(ctl, owner))
+                return 0;
+            return healthy(ctl);
+        }
+        volatile u64 *words = (volatile u64 *)owner;
+        for (u32 i = 0; i < 68; i++)
+            words[i] = 0;
+    }
+    /* A fresh or idle owner: current-task-only writers and frozen userspace
+     * mutation are prerequisites. Idle means every field was cleared by the
+     * release that returned its lease; anything else is a corrupt record. */
+    if (owner->original_pid_tgid || owner->start_count || owner->occupied ||
+        owner->selection_domains) {
+        poison(ctl, OWNER_BAD_RECORD);
+        refund_local(ctl);
+        return 0;
+    }
+    owner->original_pid_tgid = owner_pid_tgid();
+    owner->flags = OWNER_LEASED;
+    return valid_owner(ctl, owner) && healthy(ctl);
+}
+
 static __always_inline struct thread_owner *get_owner(struct owner_control *ctl, int create)
 {
     struct task_struct *task;
     struct thread_owner *owner;
     if (!healthy(ctl))
+        return (void *)0;
+    if (create && !p11_owner_lease())
         return (void *)0;
     task = owner_current_task();
     if (!task) {
@@ -164,44 +230,11 @@ static __always_inline struct thread_owner *get_owner(struct owner_control *ctl,
         poison(ctl, OWNER_LOOKUP_UNKNOWN);
         return (void *)0;
     }
-    if (!p11_owner_reserve())
-        return (void *)0;
-    if (!owner) {
-        /* First call of this thread: NULL initialization requests
-         * kernel-zeroed map storage, not a 544-byte stack argument. A failed
-         * CREATE installed no new value for this lease. The storage is then
-         * retained idle between calls, so this allocation (and its RCU-deferred
-         * free) never recurs per call, where it could run the allocator dry. */
-        owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 1);
-        if (!owner) {
-            count(&ctl->admission_failures);
-            p11_owner_refund();
-            return (void *)0;
-        }
-        if (owner->flags) {
-            /* A busy initial probe may have hidden an existing owner. Its
-             * lease and keys remain untouched; refund only our speculative
-             * reservation. */
-            if (!p11_owner_refund() || !valid_owner(ctl, owner))
-                return (void *)0;
-            return healthy(ctl) ? owner : (void *)0;
-        }
-        volatile u64 *words = (volatile u64 *)owner;
-        for (u32 i = 0; i < 68; i++)
-            words[i] = 0;
-    }
-    /* A fresh or idle owner: current-task-only writers and frozen userspace
-     * mutation are prerequisites. Idle means every field was cleared by the
-     * release that returned its lease; anything else is a corrupt record. */
-    if (owner->original_pid_tgid || owner->start_count || owner->occupied ||
-        owner->selection_domains) {
-        poison(ctl, OWNER_BAD_RECORD);
-        p11_owner_refund();
-        return (void *)0;
-    }
-    owner->original_pid_tgid = owner_pid_tgid();
-    owner->flags = OWNER_LEASED;
-    return valid_owner(ctl, owner) && healthy(ctl) ? owner : (void *)0;
+    /* The lease holds, but its owner is unreadable here (a busy task-storage
+     * lookup). The lease stays with its idle rows and is settled by this
+     * thread's next release or by exit cleanup; nothing is refunded twice. */
+    count(&ctl->admission_failures);
+    return (void *)0;
 }
 
 /* Return the lease of an owner that holds nothing. The storage is retained

@@ -387,7 +387,7 @@ def decode_map_definitions(records, section, data):
 REQUIRED_GLOBAL_HELPERS = frozenset({
     "p11_link_current_identity", "p11_link_emit_fork", "p11_link_fork_allowed",
 })
-REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_reserve", "p11_owner_refund"})
+REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_lease", "p11_owner_refund"})
 REQUIRED_GLOBAL_SCALAR_HELPERS = frozenset({"p11_read_ia32_arg"})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
     "p11_owner_cleanup", "p11_owner_start_get",

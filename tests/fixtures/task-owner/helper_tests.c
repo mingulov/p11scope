@@ -32,7 +32,7 @@ static struct thread_owner owners[3];
 static int installed[3], current_index;
 static u64 current_number[3];
 static struct owner_control ctl;
-static int miss_get, fail_create, delete_error, update_error, pair_delete_error;
+static int miss_get, miss_get_skip, fail_create, delete_error, update_error, pair_delete_error;
 static int gets, creates, deletes;
 static u64 expected_delete_debt;
 static unsigned char value[288];
@@ -111,7 +111,11 @@ static void *storage_get(void *map, struct task_struct *task, void *initial, u64
 {
     assert(map == &THREAD_OWNER && task == current_task() && initial == NULL);
     gets++;
-    if (flags == 0 && miss_get) { miss_get--; return NULL; }
+    if (flags == 0 && miss_get) {
+        /* miss_get_skip lets that many lookups succeed before the misses. */
+        if (miss_get_skip) miss_get_skip--;
+        else { miss_get--; return NULL; }
+    }
     if (flags == 1) {
         creates++;
         assert(ctl.outstanding > 0); /* Reservation precedes CREATE. */
@@ -145,7 +149,7 @@ static void reset(void)
     memset(owners, 0, sizeof(owners)); memset(installed, 0, sizeof(installed));
     memset(rows, 0, sizeof(rows)); memset(value, 0, sizeof(value));
     for (unsigned i = 0; i < 3; i++) current_number[i] = (42ULL << 32) | (100 + i);
-    current_index = miss_get = fail_create = delete_error = update_error = pair_delete_error = 0;
+    current_index = miss_get = miss_get_skip = fail_create = delete_error = update_error = pair_delete_error = 0;
     gets = creates = deletes = 0; expected_delete_debt = 0;
     cas_interference_cell = NULL; cas_failures_remaining = cas_attempts = 0;
     add_interference_cell = NULL; add_racing_claims = 0;
@@ -352,6 +356,48 @@ static void idle_owner_retention(void)
     assert(!ctl.poison);
     /* An idle owner can never satisfy a required lookup (it holds no rows). */
     assert(!p11_owner_discovery_get(&dkey, 1) && (ctl.poison & OWNER_LOOKUP_UNKNOWN));
+}
+
+/* The lease is one global scalar transaction (verified once, not per caller
+ * path, so older verifiers stay under their instruction budget): it creates or
+ * re-leases the owner and counts one reservation, and a caller then only reads
+ * the leased owner back. */
+static void lease_boundary(void)
+{
+    reset();
+    assert(p11_owner_lease());
+    assert(creates == 1 && ctl.outstanding == 1 && owners[0].flags == OWNER_LEASED);
+    assert(owners[0].original_pid_tgid == pid_tgid());
+    /* Re-leasing a held owner reserves nothing more. */
+    assert(p11_owner_lease());
+    assert(creates == 1 && ctl.outstanding == 1 && !ctl.poison);
+    /* It holds no rows, so returning it leaves the retained owner idle. */
+    assert(release_empty(&ctl, &owners[0]) && idle(0) && !ctl.outstanding);
+    /* A lease whose owner the caller then cannot read back (a busy lookup)
+     * refuses the call and refunds nothing twice: the lease stays with its
+     * empty owner until this thread's next release or exit cleanup. */
+    miss_get = 1; miss_get_skip = 1;
+#ifndef P11SCOPE_INVENTORY_ONLY
+    struct owner_start_key key = (struct owner_start_key){pid_tgid(), 3, 0};
+    assert(p11_owner_start_insert(&key, value) == -1);
+#else
+    struct owner_discovery_key dkey = discovery_key(11, 1);
+    assert(p11_owner_discovery_insert(&dkey, value, 1) == -1);
+#endif
+    assert(ctl.admission_failures == 1 && !ctl.poison);
+    assert(ctl.outstanding == 1 && owners[0].flags == OWNER_LEASED && !owners[0].start_count);
+    /* The next call reuses that lease, and its release settles it. */
+#ifndef P11SCOPE_INVENTORY_ONLY
+    assert(!p11_owner_start_insert(&key, value));
+    assert(!p11_owner_start_remove(&key, 1));
+#else
+    assert(!p11_owner_discovery_insert(&dkey, value, 1));
+    assert(!p11_owner_discovery_remove(&dkey, 1));
+#endif
+    assert(!ctl.outstanding && idle(0) && !ctl.poison && creates == 1);
+    /* A poisoned owner control refuses a lease without reserving. */
+    ctl.poison = OWNER_CLASSIFIER_FAILED;
+    assert(!p11_owner_lease() && !ctl.outstanding);
 }
 
 static void classifier(void)
@@ -668,7 +714,7 @@ static void inventory_contract(void)
 int main(void)
 {
     cas_boundaries(); accounting_contention(); threaded_contention(); idle_owner_retention();
-    classifier(); inventory_contract(); directory(); discovery_foreign_owner();
+    lease_boundary(); classifier(); inventory_contract(); directory(); discovery_foreign_owner();
     puts("task-owner inventory: real discovery capacity, transactions, poison and cleanup passed");
 }
 #else
@@ -687,10 +733,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "contention")) accounting_contention();
         else if (!strcmp(argv[1], "threads")) threaded_contention();
         else if (!strcmp(argv[1], "idle")) idle_owner_retention();
+        else if (!strcmp(argv[1], "lease")) lease_boundary();
         else assert(0);
     } else {
         cas_boundaries(); accounting_contention(); threaded_contention(); idle_owner_retention();
-        classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
+        lease_boundary(); classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }

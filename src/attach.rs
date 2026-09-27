@@ -981,6 +981,8 @@ pub struct Session {
     /// One cursor over DISCOVERY for all dequeues. The owned mapping is
     /// created lazily and then lives until this Session is dropped.
     discovery_consumer: Option<events::OwnedDiscoveryDrain>,
+    /// Items moved off the DISCOVERY ring but not yet dequeued (RB-2).
+    discovery_staged: DiscoveryStage,
     root_seed: Option<RootSeed>,
     attach_failures: Vec<(u32, String)>,
     detach_failures: Vec<String>,
@@ -2300,15 +2302,74 @@ fn validate_runtime_map(
     )
 }
 
-fn validate_runtime_maps(ebpf: &Ebpf) -> Result<()> {
-    validate_runtime_map(
-        ebpf,
-        "DISCOVERY",
-        MapType::RingBuf,
-        0,
-        0,
-        p11scope_ebpf_common::DISCOVERY_BYTES,
-    )?;
+/// DISCOVERY ring bytes for a cgroup or system capture (RB-2). Every exec
+/// and thread-group-leader exit in scope produces one 920-byte discovery
+/// record, and the compiled 64 KiB ring holds about 70 of them: a busy host
+/// overflowed it between drains and lost the events that admit new
+/// processes. 2 MiB holds about 2,260 records, a >30x margin, for 2 MiB of
+/// locked kernel memory per capture. A named process keeps the compiled size.
+/// `--ring-bytes` still sizes only EVENTS.
+pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
+
+/// The DISCOVERY ring size this scope loads with.
+pub(crate) fn discovery_ring_bytes(scope: &Scope) -> u32 {
+    match scope {
+        Scope::Pid(_) => p11scope_ebpf_common::DISCOVERY_BYTES,
+        Scope::Cgroup { .. } | Scope::System => {
+            SHARED_SCOPE_DISCOVERY_BYTES.max(p11scope_ebpf_common::DISCOVERY_BYTES)
+        }
+    }
+}
+
+/// DISCOVERY items moved out of the kernel ring but not yet applied (RB-2).
+/// Discovery is *applied* on frames and pause cycles, but the ring is
+/// emptied into this FIFO on every capture tick and between startup phases,
+/// so a slow frame or a long startup no longer overflows it. Every consumer
+/// dequeues through the session, which serves this FIFO first: ring order
+/// is preserved and no item is ever dropped here. Staging stops at
+/// `CAPACITY`; beyond it records wait in the kernel ring, where overflow is
+/// counted by the producer as ring loss.
+#[derive(Default)]
+pub(crate) struct DiscoveryStage {
+    items: std::collections::VecDeque<events::DiscoveryItem>,
+}
+
+impl DiscoveryStage {
+    /// About 3.7 MiB of 920-byte records, more than one full shared-scope
+    /// ring.
+    pub(crate) const CAPACITY: usize = 4096;
+
+    /// Moves up to `quantum` items from `next` into the FIFO; returns how
+    /// many were staged.
+    pub(crate) fn stage(
+        &mut self,
+        quantum: usize,
+        mut next: impl FnMut() -> Option<events::DiscoveryItem>,
+    ) -> usize {
+        let mut staged = 0;
+        while staged < quantum && self.items.len() < Self::CAPACITY {
+            let Some(item) = next() else { break };
+            self.items.push_back(item);
+            staged += 1;
+        }
+        staged
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<events::DiscoveryItem> {
+        self.items.pop_front()
+    }
+
+    pub(crate) fn take(&mut self) -> Vec<events::DiscoveryItem> {
+        self.items.drain(..).collect()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+fn validate_runtime_maps(ebpf: &Ebpf, discovery_bytes: u32) -> Result<()> {
+    validate_runtime_map(ebpf, "DISCOVERY", MapType::RingBuf, 0, 0, discovery_bytes)?;
     validate_runtime_map(ebpf, "DISCOVERY_STATE", MapType::Hash, 24, 24, 64)?;
     validate_runtime_map(
         ebpf,
@@ -2597,6 +2658,9 @@ impl Session {
         session
             .attach_plan(plan, objects)
             .map_err(unsupported_environment_context)?;
+        // The lifecycle producers ran through the whole static attach: stage
+        // what they produced before the Engine's per-view phases (RB-2).
+        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
         // The error path drops `session`, which detaches every probe.
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
@@ -2649,6 +2713,7 @@ impl Session {
             .btf(Some(&btf))
             .allow_unsupported_maps()
             .map_max_entries("EVENTS", crate::run::resolve_ring_bytes(ring_bytes))
+            .map_max_entries("DISCOVERY", discovery_ring_bytes(scope))
             .load(crate::EBPF_OBJECT)
             .context("loading BPF object with required task storage")?;
         let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
@@ -2666,7 +2731,7 @@ impl Session {
                         .context("validating exact policy-map metadata")?;
                 }
                 SessionPreparation::ValidateRuntime => {
-                    validate_runtime_maps(&ebpf)
+                    validate_runtime_maps(&ebpf, discovery_ring_bytes(scope))
                         .context("validating live-discovery runtime maps")?;
                 }
                 SessionPreparation::ValidateStopGate => {
@@ -2828,6 +2893,7 @@ impl Session {
             events_consumer: None,
             discovery_domain,
             discovery_consumer: None,
+            discovery_staged: DiscoveryStage::default(),
             root_seed,
             attach_failures: vec![],
             detach_failures: vec![],
@@ -3639,7 +3705,44 @@ impl Session {
         self.events_domain.as_fd()
     }
 
+    /// Borrow the DISCOVERY map descriptor for readiness waits, beside
+    /// EVENTS: a filling discovery ring wakes the idle loop to stage it.
+    pub(crate) fn discovery_readiness_fd(&self) -> BorrowedFd<'_> {
+        self.discovery_domain.as_fd()
+    }
+
+    /// The descriptors the idle wait polls: EVENTS always, and DISCOVERY
+    /// while the staging FIFO has room. A full FIFO leaves the discovery
+    /// ring readable until the next frame applies it; polling it then would
+    /// spin the loop.
+    pub(crate) fn readiness_fds(&self) -> Vec<BorrowedFd<'_>> {
+        let mut fds = vec![self.events_readiness_fd()];
+        if self.discovery_staged.len() < DiscoveryStage::CAPACITY {
+            fds.push(self.discovery_readiness_fd());
+        }
+        fds
+    }
+
+    /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
+    /// session's FIFO without applying any (RB-2); returns how many.
+    pub(crate) fn stage_discovery(&mut self, quantum: usize) -> Result<usize> {
+        self.ensure_discovery_consumer()?;
+        let consumer = self
+            .discovery_consumer
+            .as_mut()
+            .context("retained DISCOVERY consumer vanished after creation")?;
+        Ok(self.discovery_staged.stage(quantum, || consumer.dequeue()))
+    }
+
+    /// Every staged item, in ring order, leaving the FIFO empty.
+    pub(crate) fn take_staged_discovery(&mut self) -> Vec<events::DiscoveryItem> {
+        self.discovery_staged.take()
+    }
+
     pub(crate) fn discovery_dequeue(&mut self) -> Result<Option<events::DiscoveryItem>> {
+        if let Some(item) = self.discovery_staged.pop() {
+            return Ok(Some(item));
+        }
         if self.discovery_consumer.is_none() {
             let consumer =
                 events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
@@ -3743,14 +3846,30 @@ impl Session {
         quantum: usize,
     ) -> Result<(Vec<p11scope_ebpf_common::DiscoveryRecord>, u64, bool, bool)> {
         self.ensure_discovery_consumer()?;
+        let mut records = Vec::new();
+        let mut malformed = 0u64;
+        // Staged items left the ring before the stop was requested, so they
+        // precede Q and come first.
+        let mut left = quantum;
+        while left > 0 {
+            let Some(item) = self.discovery_staged.pop() else {
+                break;
+            };
+            match item {
+                events::DiscoveryItem::Record(record) => records.push(record),
+                events::DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+            }
+            left -= 1;
+        }
+        if left == 0 {
+            return Ok((records, malformed, false, true));
+        }
         let consumer = self
             .discovery_consumer
             .as_mut()
             .context("retained DISCOVERY consumer vanished after creation")?;
-        let mut records = Vec::new();
-        let mut malformed = 0u64;
         let (post_q_record, backlog) =
-            events::poll_discovery_to_position(consumer, stop, Some(quantum), |item| {
+            events::poll_discovery_to_position(consumer, stop, Some(left), |item| {
                 match item {
                     events::DiscoveryItem::Record(record) => records.push(record),
                     events::DiscoveryItem::Malformed => {
@@ -7435,5 +7554,101 @@ mod tests {
         let cgroup = crate::scope::cgroup(cgroup_dir.path()).unwrap();
         assert_eq!(cgroup.kind(), "cgroup");
         assert_eq!(Scope::System.kind(), "system");
+    }
+
+    /// RB-2 capacity contract: every exec and leader exit in a cgroup or
+    /// system scope costs one 920-byte record plus the 8-byte ring header,
+    /// and the compiled 64 KiB DISCOVERY ring held 70 — a busy host lost
+    /// records every frame. A shared scope loads a ring for at least 2,048;
+    /// a named process keeps the compiled ring. Ring sizes stay page-sized
+    /// powers of two, which the kernel requires.
+    #[test]
+    fn a_shared_scope_discovery_ring_holds_two_thousand_records() {
+        let record = std::mem::size_of::<p11scope_ebpf_common::DiscoveryRecord>() + 8;
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let cgroup = crate::scope::cgroup(cgroup_dir.path()).unwrap();
+        for scope in [cgroup, Scope::System] {
+            let bytes = discovery_ring_bytes(&scope);
+            assert!(
+                bytes as usize / record >= 2048,
+                "{}: {bytes} bytes hold {} records",
+                scope.kind(),
+                bytes as usize / record
+            );
+            assert!(bytes.is_power_of_two() && bytes >= 4096);
+        }
+        assert_eq!(
+            discovery_ring_bytes(&Scope::Pid(7)),
+            p11scope_ebpf_common::DISCOVERY_BYTES
+        );
+    }
+
+    fn discovery_items(first: u64, count: u64) -> Vec<events::DiscoveryItem> {
+        (first..first + count)
+            .map(|ts| {
+                let mut record: p11scope_ebpf_common::DiscoveryRecord =
+                    unsafe { std::mem::zeroed() };
+                record.hook_ts_ns = ts;
+                events::DiscoveryItem::Record(record)
+            })
+            .collect()
+    }
+
+    fn stamps(items: &[events::DiscoveryItem]) -> Vec<Option<u64>> {
+        items
+            .iter()
+            .map(|item| match item {
+                events::DiscoveryItem::Record(record) => Some(record.hook_ts_ns),
+                events::DiscoveryItem::Malformed => None,
+            })
+            .collect()
+    }
+
+    /// RB-2 staging keeps ring order and drops nothing: it stages at most a
+    /// quantum per call, stops at its capacity leaving the rest in the ring,
+    /// and serves every staged item before anything newer.
+    #[test]
+    fn discovery_staging_keeps_ring_order_and_leaves_overflow_in_the_ring() {
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 10).into();
+        ring.insert(3, events::DiscoveryItem::Malformed);
+        let mut stage = DiscoveryStage::default();
+
+        assert_eq!(stage.stage(4, || ring.pop_front()), 4);
+        assert_eq!(stage.stage(100, || ring.pop_front()), 7, "the ring ran dry");
+        assert_eq!(stage.stage(100, || ring.pop_front()), 0);
+        let first = stage.pop().unwrap();
+        let rest = stage.take();
+        let mut all = vec![first];
+        all.extend(rest);
+        assert_eq!(
+            stamps(&all),
+            [
+                Some(0),
+                Some(1),
+                Some(2),
+                None,
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8),
+                Some(9)
+            ]
+        );
+        assert_eq!(stage.len(), 0);
+
+        let mut ring: std::collections::VecDeque<_> =
+            discovery_items(0, DiscoveryStage::CAPACITY as u64 + 5).into();
+        assert_eq!(
+            stage.stage(usize::MAX, || ring.pop_front()),
+            DiscoveryStage::CAPACITY
+        );
+        assert_eq!(ring.len(), 5, "overflow waits in the ring, never dropped");
+        assert_eq!(
+            stage.stage(1, || ring.pop_front()),
+            0,
+            "a full FIFO stages nothing"
+        );
     }
 }

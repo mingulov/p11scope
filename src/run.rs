@@ -3383,19 +3383,29 @@ fn poll_timeout_ms(timeout: Duration) -> i32 {
     timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
 }
 
-fn wait_until_ready(fd: BorrowedFd<'_>, timeout: Duration) {
+fn wait_until_ready(fds: &[BorrowedFd<'_>], timeout: Duration) {
     if timeout.is_zero() {
         return;
     }
-    let mut pollfd = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let mut pollfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|fd| libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
     let timeout_ms = poll_timeout_ms(timeout);
-    // SAFETY: one initialized pollfd; the fd is the capture's EVENTS
-    // map, open for the whole capture.
-    if unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } >= 0 {
+    // SAFETY: `pollfds` is an initialized array of exactly its length; the
+    // fds are the capture's ring maps, open for the whole capture.
+    if unsafe {
+        libc::poll(
+            pollfds.as_mut_ptr(),
+            pollfds.len() as libc::nfds_t,
+            timeout_ms,
+        )
+    } >= 0
+    {
         return;
     }
     if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -3407,6 +3417,31 @@ fn wait_until_ready(fd: BorrowedFd<'_>, timeout: Duration) {
     // owns it): preserve the old sleep exactly rather than spin or
     // abort the capture on an unexpected error.
     std::thread::sleep(timeout);
+}
+
+/// The discovery ring loss at loop end, read fresh from the producer (M-1).
+/// The Engine's copy is the snapshot its last batch took, up to a frame old:
+/// loss produced after it was reported as terminal "detach" loss, although
+/// the stop gate admits no producer after loop end. The cached copy is the
+/// fallback when the read fails, and a fresh read never reports less.
+fn loop_end_discovery_loss(fresh: Result<u64>, cached: u64) -> u64 {
+    fresh.map_or(cached, |fresh| fresh.max(cached))
+}
+
+/// Staged DISCOVERY items as the terminal batch's leading records and its
+/// malformed count.
+fn split_staged_discovery(
+    items: Vec<crate::events::DiscoveryItem>,
+) -> (Vec<p11scope_ebpf_common::DiscoveryRecord>, u64) {
+    let mut records = Vec::new();
+    let mut malformed = 0u64;
+    for item in items {
+        match item {
+            crate::events::DiscoveryItem::Record(record) => records.push(record),
+            crate::events::DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+        }
+    }
+    (records, malformed)
 }
 
 /// The control-latency signal printed on stderr the moment a signalled
@@ -3990,8 +4025,12 @@ fn capture_profile(
             Instant::now(),
         );
         scheduling.note_longrun_tick(ticks, tick_start.elapsed());
+        // Stage the discovery ring on every tick: discovery is applied once
+        // per drain interval, and a busy host overflows the ring in between
+        // (RB-2). Staging applies nothing.
+        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
         wait_until_ready(
-            session.events_readiness_fd(),
+            &session.readiness_fds(),
             ready_sleep_duration(
                 paused,
                 scheduling.last_drain_had_backlog(),
@@ -4025,7 +4064,12 @@ fn capture_profile(
     };
     scheduling.note_loop_end(
         loop_event_loss.unwrap_or(0),
-        engine.capture_facts().discovery_losses()[0],
+        loop_end_discovery_loss(
+            session
+                .counter_snapshot()
+                .map(|snapshot| snapshot.ring_loss),
+            engine.capture_facts().discovery_losses()[0],
+        ),
         loop_end_ns,
         loop_end_reason,
     );
@@ -4039,8 +4083,9 @@ fn capture_profile(
     // SIGKILL a child `--duration` should hand back alive.
     let quiesced = match (|| -> Result<Option<TerminalQuiescence>> {
         let mut service_error: Option<anyhow::Error> = None;
-        let mut staged_records = Vec::new();
-        let mut staged_malformed = 0u64;
+        // Items the ticks staged left the ring first: they lead the batch.
+        let (mut staged_records, mut staged_malformed) =
+            split_staged_discovery(session.take_staged_discovery());
         let stop_state = session.quiesce_terminal(
             STOP_QUIESCE_BUDGET,
             if profile {
@@ -4592,8 +4637,12 @@ fn capture_trace(
             Instant::now(),
         );
         scheduling.note_longrun_tick(ticks, tick_start.elapsed());
+        // Stage the discovery ring on every tick: discovery is applied once
+        // per drain interval, and a busy host overflows the ring in between
+        // (RB-2). Staging applies nothing.
+        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
         wait_until_ready(
-            session.events_readiness_fd(),
+            &session.readiness_fds(),
             ready_sleep_duration(
                 paused,
                 scheduling.last_drain_had_backlog(),
@@ -4623,7 +4672,12 @@ fn capture_trace(
     let loop_event_loss = metrics::lost_events(session).ok();
     scheduling.note_loop_end(
         loop_event_loss.unwrap_or(0),
-        engine.capture_facts().discovery_losses()[0],
+        loop_end_discovery_loss(
+            session
+                .counter_snapshot()
+                .map(|snapshot| snapshot.ring_loss),
+            engine.capture_facts().discovery_losses()[0],
+        ),
         loop_end_ns,
         loop_end_reason,
     );
@@ -4636,8 +4690,9 @@ fn capture_trace(
     // SIGKILL a child `--duration` should hand back alive.
     let quiesced = match (|| -> Result<Option<TerminalQuiescence>> {
         let mut service_error: Option<anyhow::Error> = None;
-        let mut staged_records = Vec::new();
-        let mut staged_malformed = 0u64;
+        // Items the ticks staged left the ring first: they lead the batch.
+        let (mut staged_records, mut staged_malformed) =
+            split_staged_discovery(session.take_staged_discovery());
         let stop_state = session.quiesce_terminal(
             STOP_QUIESCE_BUDGET,
             Some(|events_drain: &mut crate::events::OwnedDrain| {
@@ -10532,7 +10587,7 @@ mod tests {
         let (reader, writer) = readiness_pipe();
         write_byte(&writer);
         let start = Instant::now();
-        wait_until_ready(reader.as_fd(), Duration::from_secs(30));
+        wait_until_ready(&[reader.as_fd()], Duration::from_secs(30));
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "readiness wait sat out the timeout on a readable fd"
@@ -10550,7 +10605,7 @@ mod tests {
             write_byte(&writer);
         });
         let start = Instant::now();
-        wait_until_ready(reader.as_fd(), Duration::from_secs(30));
+        wait_until_ready(&[reader.as_fd()], Duration::from_secs(30));
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "readiness wait missed data that arrived mid-wait"
@@ -10566,7 +10621,7 @@ mod tests {
         use std::os::fd::AsFd as _;
         let (reader, _writer) = readiness_pipe();
         let start = Instant::now();
-        wait_until_ready(reader.as_fd(), Duration::from_millis(200));
+        wait_until_ready(&[reader.as_fd()], Duration::from_millis(200));
         let elapsed = start.elapsed();
         assert!(
             elapsed >= Duration::from_millis(100),
@@ -10576,6 +10631,64 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "readiness wait overran its timeout: {elapsed:?}"
         );
+    }
+
+    /// RB-2: the idle wait watches the DISCOVERY ring beside EVENTS, so a
+    /// filling discovery ring wakes the loop to stage it instead of waiting
+    /// out the tick.
+    #[test]
+    fn ready_wait_wakes_on_either_ring() {
+        use std::os::fd::AsFd as _;
+        let (events, _events_writer) = readiness_pipe();
+        let (discovery, discovery_writer) = readiness_pipe();
+        write_byte(&discovery_writer);
+        let start = Instant::now();
+        wait_until_ready(
+            &[events.as_fd(), discovery.as_fd()],
+            Duration::from_secs(30),
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "a readable discovery ring did not wake the wait"
+        );
+    }
+
+    /// M-1: the loop-end discovery loss is the producer's fresh counter, not
+    /// the Engine's copy from its last batch, which missed loss produced in
+    /// the last frame; the copy is only the fallback.
+    #[test]
+    fn loop_end_discovery_loss_reads_the_producer_fresh() {
+        assert_eq!(loop_end_discovery_loss(Ok(9), 4), 9);
+        assert_eq!(loop_end_discovery_loss(Err(anyhow!("read failed")), 4), 4);
+        assert_eq!(loop_end_discovery_loss(Ok(3), 4), 4, "never less than seen");
+    }
+
+    /// RB-2: both capture loops stage the discovery ring on every tick,
+    /// immediately before their one readiness wait.
+    #[test]
+    fn capture_loops_stage_discovery_every_tick() {
+        let source = include_str!("run.rs");
+        for (start, end) in [
+            ("fn capture_profile(", "fn write_json_report"),
+            ("fn capture_trace(", "fn terminal_trace_count_line"),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            let stage = body
+                .find("session.stage_discovery(")
+                .unwrap_or_else(|| panic!("{start} never stages discovery"));
+            let wait = body.find("wait_until_ready(").unwrap();
+            assert!(stage < wait, "{start} stages before its readiness wait");
+            assert!(
+                body[stage..wait].matches(';').count() <= 2,
+                "{start} stages right before the wait"
+            );
+        }
     }
 
     /// The poll timeout rounds up: exact milliseconds pass through, a
@@ -10600,7 +10713,7 @@ mod tests {
         use std::os::fd::AsFd as _;
         let (reader, _writer) = readiness_pipe();
         let start = Instant::now();
-        wait_until_ready(reader.as_fd(), Duration::ZERO);
+        wait_until_ready(&[reader.as_fd()], Duration::ZERO);
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "zero readiness wait blocked"

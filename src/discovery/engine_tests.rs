@@ -346,37 +346,31 @@ fn live_collector_stops_at_its_quantum_with_the_backlog_still_queued() {
     );
 }
 
-/// The generic tick route applies a quantum's exact prefix and returns;
-/// the backlog waits on the ring for the next tick, behind the run loop's
-/// duration/signal checks, and is never a batch error.
+/// The generic tick route applies its frame's exact prefix — up to
+/// `LIVE_DISCOVERY_FRAME_QUANTA` quanta — and returns; the backlog waits on
+/// the ring for the next tick, behind the run loop's duration/signal checks,
+/// and is never a batch error.
 #[test]
 fn the_live_drain_applies_the_quantum_prefix_and_leaves_the_backlog_queued() {
     let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
     let mut session = ScriptedSession::default();
+    let frame = LIVE_DISCOVERY_FRAME_QUANTA * LIVE_DISCOVERY_DRAIN_QUANTUM;
+    session.dequeues.extend(malformed_dequeues(frame + 1));
     session
         .dequeues
-        .extend(malformed_dequeues(LIVE_DISCOVERY_DRAIN_QUANTUM + 1));
-    session
-        .dequeues
-        .push_back(Err(anyhow!("dequeued past the quantum")));
+        .push_back(Err(anyhow!("dequeued past the frame bound")));
 
     engine
         .drain_discovery_from(&mut session)
         .expect("a backlog is not a drain failure");
 
-    assert_eq!(
-        engine.malformed_discovery,
-        LIVE_DISCOVERY_DRAIN_QUANTUM as u64
-    );
+    assert_eq!(engine.malformed_discovery, frame as u64);
     assert_eq!(session.dequeues.len(), 2);
 
     session.dequeues.pop_back();
     engine.drain_discovery_from(&mut session).unwrap();
 
-    assert_eq!(
-        engine.malformed_discovery,
-        LIVE_DISCOVERY_DRAIN_QUANTUM as u64 + 1
-    );
+    assert_eq!(engine.malformed_discovery, frame as u64 + 1);
     assert!(session.dequeues.is_empty());
 }
 
@@ -805,7 +799,7 @@ fn initial_provider_exports_are_attached_before_session_readiness() {
         .split_once("\n    }\n}")
         .unwrap()
         .0;
-    let external_loader = route.find("self.arm_loader_or_partial(").unwrap();
+    let external_loader = route.find("self.arm_initial_views(").unwrap();
     let exports = route.find("self.attach_initial_exports(").unwrap();
     let drain = route
         .find("let cleanup = self.process_discovery_records(")
@@ -1672,6 +1666,55 @@ fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
         p11scope_ebpf_common::MAX_SLOTS as usize + 1
     );
     assert_eq!(engine.discovery.modules_skipped.len(), 1);
+}
+
+/// RB-2: a live frame applied one 256-item quantum and left the rest for
+/// the next frame, a second later. With the ring now staged every tick, a
+/// host producing more lifecycle records than that per second only moved its
+/// loss from the kernel ring to the staging FIFO. One frame now takes up to
+/// sixteen quanta, in ring order.
+#[test]
+fn one_live_frame_applies_many_quanta_in_ring_order() {
+    // An empty cgroup scope: the frame's inventory pass has nothing to scan.
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+    let backlog = 3 * LIVE_DISCOVERY_DRAIN_QUANTUM + 17;
+    let mut session = ScriptedSession::default();
+    session.dequeues = (0..backlog)
+        .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed)))
+        .collect();
+
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert!(session.dequeues.is_empty(), "the frame drained the backlog");
+    assert_eq!(engine.malformed_discovery, backlog as u64);
+
+    let mut session = ScriptedSession::default();
+    let beyond = LIVE_DISCOVERY_FRAME_QUANTA * LIVE_DISCOVERY_DRAIN_QUANTUM + 5;
+    session.dequeues = (0..beyond)
+        .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed)))
+        .collect();
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(session.dequeues.len(), 5, "a frame stops at its bound");
+}
+
+/// RB-2: capture start arms every retained view's loader one by one — a
+/// locator scan, a plan rebuild and an attach each — while the lifecycle
+/// producers are live and nothing drained the discovery ring. It is staged
+/// after every view now, so a long startup no longer overflows it.
+#[test]
+fn capture_start_stages_the_discovery_ring_between_armed_views() {
+    let views: Vec<_> = (0..3)
+        .map(|id| ProcessView::open(ProcessViewId(id), std::process::id()).unwrap())
+        .collect();
+    let mut engine = lifecycle_discovered(views);
+    engine.scope = Scope::System;
+    let mut session = ScriptedSession::default();
+
+    let fatal =
+        engine.arm_initial_views(&mut session, &mut true, &mut PendingViewRetirements::new());
+
+    assert!(fatal.is_none());
+    assert_eq!(session.stage_calls, 3, "one stage after every view");
 }
 
 /// GT-5. A cgroup or system capture without `--module` admits in value

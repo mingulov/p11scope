@@ -2090,6 +2090,10 @@ type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 pub(crate) trait EngineSession {
     fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
+    /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
+    /// session's FIFO without applying any (RB-2). `discovery_dequeue`
+    /// serves that FIFO first, so ring order is kept.
+    fn stage_discovery(&mut self, quantum: usize) -> Result<usize>;
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
     fn process_creation_tracking_unavailable(&self) -> Option<&str>;
     fn read_selection_table(
@@ -2155,6 +2159,10 @@ impl EngineSession for Session {
 
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
         Session::discovery_dequeue(self)
+    }
+
+    fn stage_discovery(&mut self, quantum: usize) -> Result<usize> {
+        Session::stage_discovery(self, quantum)
     }
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -4680,6 +4688,14 @@ const TERMINAL_DRAIN_SUBJECT: &str = "live loader retirement";
 /// drain itself; that backlog is reported as an incomplete drain, never as an
 /// empty ring, and any overflow it causes is the producer's `ring_loss`.
 pub(crate) const LIVE_DISCOVERY_DRAIN_QUANTUM: usize = 256;
+
+/// Discovery quanta one live frame collects before it applies them (RB-2).
+/// The ring is now staged on every tick, but a frame that applied one
+/// 256-item quantum a second fell behind any host producing more lifecycle
+/// records than that, and the backlog then overflowed into ring loss.
+/// Sixteen quanta, 4,096 items — the staging capacity — per frame; anything
+/// left stays queued in ring order for the next frame.
+pub(crate) const LIVE_DISCOVERY_FRAME_QUANTA: usize = 16;
 const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
     "the live discovery drain stopped at its work quantum with records still queued";
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
@@ -15013,14 +15029,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         force_full: bool,
     ) -> Result<bool> {
-        let (records, malformed) = match Self::collect_discovery_records(session) {
-            Ok(drained) => drained,
-            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                Ok(incomplete) if incomplete.backlog => (incomplete.records, incomplete.malformed),
-                Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
-                Err(error) => return Err(error),
-            },
-        };
+        let (records, malformed) = self.collect_frame_discovery(session)?;
         if force_full || !records.is_empty() || malformed != 0 || !self.discovery_shallow_idle() {
             return self.apply_discovery_batch(session, records, malformed);
         }
@@ -15183,15 +15192,38 @@ impl Engine {
     /// duration/signal checks precede. Overflow in between is the producer's
     /// `ring_loss`, read with every batch.
     pub(crate) fn drain_discovery_from(&mut self, session: &mut dyn EngineSession) -> Result<bool> {
-        let (records, malformed) = match Self::collect_discovery_records(session) {
-            Ok(drained) => drained,
-            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                Ok(incomplete) if incomplete.backlog => (incomplete.records, incomplete.malformed),
-                Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
-                Err(error) => return Err(error),
-            },
-        };
+        let (records, malformed) = self.collect_frame_discovery(session)?;
         self.apply_discovery_batch(session, records, malformed)
+    }
+
+    /// One live frame's records: up to `LIVE_DISCOVERY_FRAME_QUANTA` collector
+    /// quanta, stopping at the first that empties the queue. A quantum stop
+    /// is backlog, never failure; a real dequeue failure aborts the route as
+    /// before.
+    fn collect_frame_discovery(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<(Vec<DiscoveryRecord>, u64)> {
+        let mut records = Vec::new();
+        let mut malformed = 0u64;
+        for _ in 0..LIVE_DISCOVERY_FRAME_QUANTA {
+            match Self::collect_discovery_records(session) {
+                Ok((drained, drained_malformed)) => {
+                    records.extend(drained);
+                    malformed = malformed.saturating_add(drained_malformed);
+                    break;
+                }
+                Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                    Ok(incomplete) if incomplete.backlog => {
+                        records.extend(incomplete.records);
+                        malformed = malformed.saturating_add(incomplete.malformed);
+                    }
+                    Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+        Ok((records, malformed))
     }
 
     /// `drain_discovery_tick` (src/run.rs) aborts the run with `?` on this
@@ -15513,6 +15545,32 @@ impl Engine {
         })
     }
 
+    /// Arms every retained view's loader at capture start, staging the
+    /// DISCOVERY ring after each view so the per-view locator scans, plan
+    /// rebuilds and attaches never let it overflow (RB-2). Returns the first
+    /// fatal arming error; the caller still runs its cleanup pass.
+    fn arm_initial_views(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Option<anyhow::Error> {
+        for position in 0..self.views.len() {
+            if !self.views[position].still_the_same() {
+                continue;
+            }
+            if let Err(error) =
+                self.arm_loader_or_partial(position, session, additions_allowed, pending_views)
+            {
+                return Some(error);
+            }
+            if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM) {
+                return Some(error);
+            }
+        }
+        None
+    }
+
     fn start_session_with(
         &mut self,
         policy: CapturePolicy,
@@ -15546,6 +15604,10 @@ impl Engine {
             };
         self.record_session_lifecycle_tracking(&session);
         let result = (|| {
+            // Lifecycle producers have been live since the load, and the
+            // static attach can take seconds: stage what they produced
+            // before the per-view phases add more (RB-2).
+            session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM)?;
             let mut additions_allowed = true;
             let mut records = Vec::new();
             let mut pending_views = PendingViewRetirements::new();
@@ -15578,23 +15640,11 @@ impl Engine {
                     "the empty timing catalog leaves initial-set capture unproven",
                 );
             } else {
-                for position in 0..self.views.len() {
-                    if !self.views[position].still_the_same() {
-                        continue;
-                    }
-                    match self.arm_loader_or_partial(
-                        position,
-                        &mut session,
-                        &mut additions_allowed,
-                        &mut pending_views,
-                    ) {
-                        Ok(_) => {}
-                        Err(error) => {
-                            fatal = Some(error);
-                            break;
-                        }
-                    }
-                }
+                fatal = self.arm_initial_views(
+                    &mut session,
+                    &mut additions_allowed,
+                    &mut pending_views,
+                );
             }
             #[cfg(test)]
             crate::first_use_probe::discovery_loss(
@@ -15608,6 +15658,9 @@ impl Engine {
                     &mut pending_views,
                     &mut closure,
                 );
+                // Stage what the export attach let accumulate; the first
+                // batch applies it in ring order (RB-2).
+                session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM)?;
                 if owned_prearmed && let Some(generation) = owned_generation {
                     self.mark_owned_selection_pending(generation);
                 }
@@ -15710,6 +15763,8 @@ pub(crate) mod session_fixture {
         /// and before the next generation check.
         detach_losses: VecDeque<Option<u32>>,
         pub(crate) preflight_targets: RefCell<Vec<Vec<(u32, PinnedObjectId, u64)>>>,
+        /// How many times the Engine staged DISCOVERY off the ring.
+        pub(crate) stage_calls: usize,
     }
 
     /// SIGKILL plus `waitpid`, so the retained generation is provably gone
@@ -15846,6 +15901,11 @@ pub(crate) mod session_fixture {
 
         fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
             self.dequeues.pop_front().unwrap_or(Ok(None))
+        }
+
+        fn stage_discovery(&mut self, _: usize) -> Result<usize> {
+            self.stage_calls += 1;
+            Ok(0)
         }
 
         fn counter_snapshot(&self) -> Result<CounterSnapshot> {

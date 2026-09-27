@@ -1497,6 +1497,8 @@ const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHU
 struct SignalState {
     state: AtomicU64,
     cancel: Arc<AtomicBool>,
+    /// CLOCK_MONOTONIC ns of the last counted SIGINT delivery; 0 = none.
+    last_sigint_ns: AtomicU64,
 }
 
 impl SignalState {
@@ -1504,6 +1506,7 @@ impl SignalState {
         Self {
             state: AtomicU64::new(0),
             cancel: Arc::new(AtomicBool::new(false)),
+            last_sigint_ns: AtomicU64::new(0),
         }
     }
 
@@ -1514,8 +1517,39 @@ impl SignalState {
         Arc::clone(&self.cancel)
     }
 
+    /// A delivery with no timestamp: always a distinct stop request.
+    #[cfg(test)]
     fn observe(&self, signal: libc::c_int) {
+        self.observe_delivery(signal, None);
+    }
+
+    /// One real delivery, stamped with CLOCK_MONOTONIC ns by the handler
+    /// (`None` when the clock is unreadable, or in tests: always distinct).
+    /// A SIGINT within [`DUPLICATE_STOP_WINDOW`] of the last counted one is
+    /// the same stop request delivered twice and is not counted again, so it
+    /// cannot escalate to the second-Ctrl-C force stop. Signal-safe: atomics
+    /// only; the compare-exchange keeps two handlers racing on two threads
+    /// from both counting.
+    fn observe_delivery(&self, signal: libc::c_int, at_ns: Option<u64>) {
         self.cancel.store(true, Ordering::SeqCst);
+        if signal == libc::SIGINT
+            && let Some(now) = at_ns
+        {
+            let now = now.max(1);
+            let window = DUPLICATE_STOP_WINDOW.as_nanos() as u64;
+            match self
+                .last_sigint_ns
+                .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {}
+                Err(last) if now.saturating_sub(last) < window => {
+                    // Same identity bookkeeping as any delivery, no count.
+                    self.record_first(signal);
+                    return;
+                }
+                Err(_) => self.last_sigint_ns.store(now, Ordering::SeqCst),
+            }
+        }
         let _ = self
             .state
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
@@ -1528,6 +1562,15 @@ impl SignalState {
                     count
                 };
                 Some((state & HANDOFF_CLAIMED) | first | (count << 8))
+            });
+    }
+
+    /// Records `signal` as the first identity if none is recorded yet.
+    fn record_first(&self, signal: libc::c_int) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                (state & 0xff == 0).then_some(state | signal as u64)
             });
     }
 
@@ -1557,6 +1600,12 @@ impl SignalState {
 }
 
 const HANDOFF_CLAIMED: u64 = 1 << 10;
+
+/// Two deliveries of SIGINT this close together are one stop request: a
+/// relay that signals both the process and its group (GNU `timeout` without
+/// `--foreground`) delivers twice within microseconds, while a person's
+/// second Ctrl-C takes far longer.
+const DUPLICATE_STOP_WINDOW: Duration = Duration::from_millis(100);
 
 /// Reads one signal's current disposition without changing it. A null new
 /// action makes `sigaction` report only. An unreadable disposition (an
@@ -1679,9 +1728,14 @@ fn install_stop_flag() -> Result<Arc<SignalState>> {
             signal
         };
         let observed = Arc::clone(&state);
-        // SAFETY: the callback performs only atomic operations.
-        unsafe { signal_hook::low_level::register(signal, move || observed.observe(recorded)) }
-            .with_context(|| format!("installing handler for signal {signal}"))?;
+        // SAFETY: the callback performs only atomic operations and
+        // `clock_gettime`, which is async-signal-safe.
+        unsafe {
+            signal_hook::low_level::register(signal, move || {
+                observed.observe_delivery(recorded, crate::attach::monotonic_ns())
+            })
+        }
+        .with_context(|| format!("installing handler for signal {signal}"))?;
     }
     Ok(state)
 }
@@ -13092,6 +13146,68 @@ mod tests {
             state.semantic_evidence().semantic_history_drops,
             drops_before + 1,
             "malformed fork must record a rejection"
+        );
+    }
+
+    /// P2 (container lanes): GNU `timeout -s INT` without `--foreground`
+    /// sends SIGINT to its child and then to the child's process group, so
+    /// the observer receives the same stop twice within microseconds. That
+    /// is one stop request, not the operator's second Ctrl-C — which would
+    /// abandon cleanup ("cleanup incomplete", exit 130). A genuinely later
+    /// second SIGINT still escalates.
+    #[test]
+    fn an_immediate_duplicate_sigint_is_one_stop_request() {
+        const T0: u64 = 5_000_000_000;
+        let state = SignalState::new();
+        state.observe_delivery(libc::SIGINT, Some(T0));
+        state.observe_delivery(libc::SIGINT, Some(T0 + 20_000));
+        assert_eq!(state.first_signal(), Some(libc::SIGINT));
+        assert_eq!(state.sigint_deliveries(), 1, "a 20 µs duplicate escalated");
+        // Two handlers on two threads can stamp out of order.
+        state.observe_delivery(libc::SIGINT, Some(T0 - 5_000));
+        assert_eq!(
+            state.sigint_deliveries(),
+            1,
+            "an out-of-order duplicate escalated"
+        );
+        state.observe_delivery(
+            libc::SIGINT,
+            Some(T0 + DUPLICATE_STOP_WINDOW.as_nanos() as u64 + 1),
+        );
+        assert_eq!(
+            state.sigint_deliveries(),
+            2,
+            "a later Ctrl-C must still escalate"
+        );
+
+        // A preceding SIGTERM does not make the first SIGINT a duplicate.
+        let state = SignalState::new();
+        state.observe_delivery(libc::SIGTERM, Some(T0));
+        state.observe_delivery(libc::SIGINT, Some(T0 + 1_000));
+        assert_eq!(state.first_signal(), Some(libc::SIGTERM));
+        assert_eq!(state.sigint_deliveries(), 1);
+    }
+
+    /// The real handler stamps every delivery, so the coalescing above is
+    /// what production runs; `observe` (no stamp) stays test-only.
+    #[test]
+    fn the_stop_handler_stamps_each_delivery_with_the_monotonic_clock() {
+        let source = include_str!("run.rs");
+        let install = source
+            .split_once("fn install_stop_flag()")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            install.contains("observed.observe_delivery(recorded, crate::attach::monotonic_ns())"),
+            "{install}"
+        );
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            !production.contains(".observe(recorded)"),
+            "unstamped handler"
         );
     }
 

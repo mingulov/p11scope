@@ -365,7 +365,9 @@ startup`, no report, no temporary file left behind, and a previous trace
 stopped is resumed before the observer signals it or hands it back. The stop
 signal is forwarded to the child's process group; a child still alive gets
 SIGTERM 5 s later and SIGKILL 5 s after that, so settling it takes at most
-15 s (a second Ctrl-C sends SIGKILL at once). A hangup — a closed terminal or
+15 s (a second Ctrl-C sends SIGKILL at once; a SIGINT repeated within 100 ms,
+as `timeout -s INT` does when it signals both p11scope and its process group,
+is the same stop and does not count as the second one). A hangup — a closed terminal or
 a dropped ssh session — is handled exactly like SIGTERM, with the same outcome
 and exit status, as long as p11scope itself inherited the default SIGHUP
 disposition. An inherited ignore (`nohup p11scope ...`) is preserved, so the

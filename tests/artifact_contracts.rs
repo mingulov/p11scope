@@ -1309,7 +1309,7 @@ fn official_build_is_safe_only() {
     // official build runs the recorded toolchain binaries directly, offline.
     let command = [
         "CARGO_TARGET_DIR=\"$OFFICIAL_TARGET\" \\",
-        "RUSTFLAGS=\"-C target-feature=+crt-static\" \\",
+        "CARGO_ENCODED_RUSTFLAGS=\"-C${RELEASE_FLAG_SEPARATOR}target-feature=+crt-static${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$RELEASE_SOURCE_ROOT=/p11scope${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.cargo=/cargo${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.rustup=/rustup\" \\",
         "RUSTC=\"$T4_TOOLCHAIN_RUSTC\" \\",
         "P11SCOPE_PREPARED_BPF_CARGO=\"$t4_nightly_cargo\" \\",
         "P11SCOPE_PREPARED_BPF_RUSTC=\"$t4_nightly_rustc\" \\",
@@ -1318,6 +1318,23 @@ fn official_build_is_safe_only() {
     ]
     .join("\n");
     assert!(official.contains(&command));
+    // The official bytes carry no build-host paths: the remap roots are the
+    // resolved checkout and the refused-then-default Cargo and rustup homes.
+    for definition in [
+        "RELEASE_FLAG_SEPARATOR=$(printf '\\037')",
+        "RELEASE_SOURCE_ROOT=$(pwd -P)",
+    ] {
+        assert!(
+            official.contains(definition),
+            "official build misses {definition}"
+        );
+    }
+    assert!(
+        !official
+            .lines()
+            .any(|line| line.trim_start().starts_with("RUSTFLAGS=")),
+        "official build must pass its flags encoded, never as space-separated RUSTFLAGS"
+    );
     assert!(
         !official.contains("cargo +1.88"),
         "official build resolves cargo through the argv[0]-dispatching shim"
@@ -6750,7 +6767,10 @@ fn operator_docs_preserve_semantic_authority_limits() {
             "docs/usage.md",
             "P11Lab joins reject scan-only and conflict modules",
         ),
-        ("CHANGELOG.md", "Public `run`, owned-child live discovery"),
+        (
+            "CHANGELOG.md",
+            "Manifest-free (scan-only) function slots are semantics-unverified and count-only",
+        ),
         ("docs/superpowers/plans/ROADMAP.md", "exact-tip CI"),
     ] {
         assert!(
@@ -6763,70 +6783,145 @@ fn operator_docs_preserve_semantic_authority_limits() {
         );
     }
 
-    for path in ["README.md", "docs/usage.md"] {
-        let document = read(path)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
-        assert!(
-            document.contains("exact-tip runtime qualification") && document.contains("pending"),
-            "{path} must say exact-tip runtime qualification is pending"
-        );
-    }
-    for path in ["CHANGELOG.md", "docs/superpowers/plans/ROADMAP.md"] {
-        let document = read(path)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
-        assert!(
-            document.contains("exact-tip ci") && document.contains("pending"),
-            "{path} must say exact-tip CI is pending"
-        );
-    }
-
-    for path in ["README.md", "docs/usage.md", "CHANGELOG.md"] {
-        assert!(read(path).to_lowercase().contains("unreleased"), "{path}");
-    }
-    let usage = read("docs/usage.md")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    assert!(
-        usage.contains("runtime qualification") && usage.contains("remain pending"),
-        "docs/usage.md must keep runtime qualification pending"
-    );
     let roadmap = read("docs/superpowers/plans/ROADMAP.md")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
     assert!(
+        roadmap.contains("exact-tip ci") && roadmap.contains("pending"),
+        "ROADMAP must say exact-tip CI is pending"
+    );
+    assert!(
         roadmap.contains("ci remains pending")
             && roadmap.contains("no release or security-clearance claim applies yet"),
         "ROADMAP must keep CI and release authority pending"
     );
-    let readme = read("README.md")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    assert!(
-        readme.contains("previous frozen mvp passed")
-            && readme.contains("current candidate")
-            && readme.contains("exact-tip runtime qualification")
-            && readme.contains("pending"),
-        "README must distinguish historical evidence from current exact-tip qualification"
+}
+
+/// The release docs describe one version: the CHANGELOG has exactly one heading
+/// for the version Cargo.toml builds (other headings are older releases or an
+/// `[Unreleased]` section), and README/usage point at its known limitations and
+/// qualification record instead of carrying candidate or branch status of their
+/// own (review 2026-09-26 B HIGH-6, F-RB3/F-RB4).
+#[test]
+fn release_docs_describe_the_built_version() {
+    let manifest = read("Cargo.toml");
+    let version = manifest
+        .split("\n[")
+        .next()
+        .expect("root [package] section")
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "version").then(|| value.trim().trim_matches('"').to_string())
+        })
+        .expect("root package version");
+    let changelog = read("CHANGELOG.md");
+    let headings: Vec<&str> = changelog
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .collect();
+    let current = format!("## [{version}] - ");
+    let named: Vec<&str> = headings
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with(&current))
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "CHANGELOG.md must hold exactly one heading for {version}: {headings:?}"
     );
+    for heading in &headings {
+        assert!(
+            heading.starts_with("## ["),
+            "CHANGELOG.md headings are `## [Unreleased]` or `## [x.y.z] - date`: {heading:?}"
+        );
+    }
+    let released = &named[0][current.len()..];
     assert!(
-        usage.contains("frozen pre-w3 candidate")
-            && usage.contains("not been repeated on the current candidate")
-            && usage.contains("exact-tip runtime qualification")
-            && usage.contains("pending"),
-        "docs/usage.md must distinguish historical evidence from current exact-tip qualification"
+        released == "UNRELEASED"
+            || (released.len() == 10
+                && released
+                    .chars()
+                    .enumerate()
+                    .all(|(at, c)| if at == 4 || at == 7 {
+                        c == '-'
+                    } else {
+                        c.is_ascii_digit()
+                    })),
+        "the release date is UNRELEASED or YYYY-MM-DD: {released:?}"
     );
+    for section in ["### Known limitations", "### Qualification of this release"] {
+        assert!(
+            changelog.lines().any(|line| line == section),
+            "CHANGELOG.md lacks {section:?}, which README and usage link to"
+        );
+    }
+
+    let readme = read("README.md");
+    let usage = read("docs/usage.md");
+    assert!(readme.contains(&format!("**Status: v{version}**")));
+    assert!(usage.contains(&format!("**Status: v{version}.**")));
+    assert!(readme.lines().any(|line| line == "## Install"));
+    for (path, text, prefix) in [
+        ("README.md", &readme, "CHANGELOG.md"),
+        ("docs/usage.md", &usage, "../CHANGELOG.md"),
+    ] {
+        for anchor in ["#known-limitations", "#qualification-of-this-release"] {
+            assert!(
+                text.contains(&format!("({prefix}{anchor})")),
+                "{path} must link {prefix}{anchor}"
+            );
+        }
+        let flat = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        for stale in [
+            "unreleased",
+            "current candidate",
+            "this branch",
+            "w3 tip",
+            "frozen pre-w3",
+            "exact-tip runtime qualification",
+            "pkcs11-proxy-ng` git revision",
+        ] {
+            assert!(
+                !flat.contains(stale),
+                "{path} still carries pre-release status wording: {stale:?}"
+            );
+        }
+    }
+}
+
+/// The per-operation scan/hash cap the docs quote is the one the code applies.
+#[test]
+fn documented_scan_operation_cap_matches_the_code() {
+    let scan = read("src/discovery/scan.rs");
+    let expression = scan
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("per_object_bytes: "))
+        .expect("ScanLimits::default sets per_object_bytes")
+        .trim_end_matches(',');
+    let bytes: u64 = expression
+        .split('*')
+        .map(|factor| factor.trim().parse::<u64>().expect("a numeric factor"))
+        .product();
+    assert_eq!(bytes % (1024 * 1024), 0, "{expression}");
+    let quoted = format!("{} MiB per scan/hash operation", bytes / (1024 * 1024));
+    for path in ["README.md", "docs/usage.md", "CHANGELOG.md"] {
+        let flat = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(&quoted), "{path} must state {quoted:?}");
+        let stated = flat.matches("MiB per scan/hash operation").count();
+        assert_eq!(
+            stated,
+            flat.matches(&quoted).count(),
+            "{path} states another per-operation cap"
+        );
+    }
 }
 
 #[test]
@@ -7564,6 +7659,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         matches!(
             line,
             "run: python3 -I scripts/prepare-dependencies.py"
+                | "run: python3 -I scripts/prepare-dependencies.py --check"
                 | ". scripts/prepared-dependency-tools.sh"
                 | r#""$P11SCOPE_PREPARED_PYTHON" -I scripts/check-prepared-dependencies.py \"#
         )

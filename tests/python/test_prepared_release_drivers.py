@@ -242,7 +242,15 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                      "--bin", "p11scope"],
             "cargo_target_dir": str(fixture.base / "official target with spaces"),
             "cargo": str(cargo.resolve()),
-            "rustflags": "-C target-feature=+crt-static",
+            # Encoded flags only: a space-separated RUSTFLAGS would split the
+            # remapped paths, which contain spaces here on purpose.
+            "rustflags": None,
+            "cargo_encoded_rustflags": [
+                "-C", "target-feature=+crt-static",
+                f"--remap-path-prefix={fixture.base / 'source root with spaces'}=/p11scope",
+                f"--remap-path-prefix={fixture.base / 'home with spaces'}/.cargo=/cargo",
+                f"--remap-path-prefix={fixture.base / 'home with spaces'}/.rustup=/rustup",
+            ],
             "rustc": str(tools[1]), "bpf_cargo": str(tools[2]),
             "bpf_rustc": str(tools[3]),
         })

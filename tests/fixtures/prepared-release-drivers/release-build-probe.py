@@ -10,6 +10,7 @@ record = {
     "argv": sys.argv[1:],
     "cargo_target_dir": os.environ.get("CARGO_TARGET_DIR"),
     "rustflags": os.environ.get("RUSTFLAGS"),
+    "cargo_encoded_rustflags": os.environ.get("CARGO_ENCODED_RUSTFLAGS", "").split("\x1f"),
     "rustc": os.environ.get("RUSTC"),
     "bpf_cargo": os.environ.get("P11SCOPE_PREPARED_BPF_CARGO"),
     "bpf_rustc": os.environ.get("P11SCOPE_PREPARED_BPF_RUSTC"),

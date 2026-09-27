@@ -19,7 +19,7 @@
 //! Task 3 used and copy the artifact into OUT_DIR ourselves.
 //!
 use sha2::{Digest, Sha256};
-use std::{env, path::PathBuf, process::Command};
+use std::{env, ffi::OsString, path::PathBuf, process::Command};
 
 #[path = "build_support/bpf_tools.rs"]
 mod bpf_tools;
@@ -187,6 +187,14 @@ fn build_variant(
             BpfFlavor::InventoryCallers => "inventory-callers",
         };
         let bitcode = out_dir.join(format!("{unit}-{suffix}.bc"));
+        // The embedded object keeps DWARF/BTF line info. Name the native
+        // sources by a fixed prefix, as the compilation directory already
+        // is, and do not record the compile command line (some distribution
+        // clangs do by default), so the object never records the build host's
+        // checkout path.
+        let mut file_prefix_map = OsString::from("-ffile-prefix-map=");
+        file_prefix_map.push(manifest_dir.as_os_str());
+        file_prefix_map.push("=/p11scope");
         let mut compile = Command::new("clang-18");
         compile
             .current_dir(&out_dir)
@@ -199,6 +207,7 @@ fn build_variant(
                 },
                 "-O2",
                 "-g",
+                "-gno-record-gcc-switches",
                 "-fdebug-compilation-dir=/p11scope/native",
                 "-Wall",
                 "-Wextra",
@@ -206,6 +215,7 @@ fn build_variant(
                 "-emit-llvm",
                 "-c",
             ])
+            .arg(&file_prefix_map)
             .arg(manifest_dir.join(format!("crates/ebpf/native/{unit}.c")))
             .arg("-o")
             .arg(bitcode.file_name().expect("native bitcode basename"));

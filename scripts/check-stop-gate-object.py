@@ -523,6 +523,123 @@ class GateAnalysis:
         }
 
 
+# Per-CPU counter maps. From Linux 6.1 uprobe programs run migrate-disabled
+# but preemptible, so two programs on one CPU can interleave inside a plain
+# load/add/store of a per-CPU cell and lose an increment. Every write into one
+# of these cells must be a non-fetch ``lock`` add. The one exception is
+# SlotStats.max_ns (offset 0x20): a monotone best-effort maximum, never a sum.
+COUNTER_MAPS = frozenset({"STATS", "EVIDENCE", "COUNTERS", "RV_COUNTS"})
+RACY_MAXIMA = frozenset({("STATS", 0x20)})
+CELL_STORE = re.compile(r"\*\(u(8|16|32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) = \S+")
+CELL_ATOMIC = re.compile(r"lock \*\(u(32|64) \*\)\(r(\d+) ([+-]) 0x([0-9a-f]+)\) \+= r\d+")
+CELL_POINTER = re.compile(r"(?:\*\(u\d+ \*\)|cmpxchg_\d+|xchg_\d+|atomic_\w+\(\(u\d+ \*\))\(?r(\d+) [+-]")
+
+
+def counter_cell_facts(lines):
+    """Must-facts: register -> ("map", name) | ("cell", name, offset|None).
+
+    Like the live-discovery cell owners, but a cell pointer keeps its owner
+    through pointer arithmetic (an unknown index clears only the offset), so a
+    write into an indexed histogram bucket is still attributed to its map.
+    Anything unrecognized clears the register; joins intersect.
+    """
+    insns, graph = D.instruction_graph(lines)
+    if not insns:
+        return {}
+    relocs = {index: (kind, target) for index, kind, target in D.relocation_targets(lines)}
+    loads = {}
+    for index, pc, text in D.instruction_entries(lines):
+        decoded = re.sub(r"^(?:[0-9a-f]{2}\s+){8,16}", "", text)
+        match = re.fullmatch(r"r(\d+) = 0x0 ll", decoded)
+        if match and relocs.get(index + 1, (None, None))[0] == "64":
+            loads[pc] = (match.group(1), relocs[index + 1][1])
+    texts = dict(insns)
+    incoming = {insns[0][0]: {}}
+    pending = [insns[0][0]]
+    while pending:
+        pc = pending.pop()
+        state = incoming[pc].copy()
+        text = texts[pc]
+        if re.search(r"\bcall ", text):
+            lookup = state.get("r1")
+            for register in range(6):
+                state.pop("r" + str(register), None)
+            if text == "call 0x1" and lookup is not None and lookup[0] == "map":
+                state["r0"] = ("cell", lookup[1], 0)
+        elif pc in loads and re.fullmatch(r"r\d+ = 0x0 ll", text):
+            register, target = loads[pc]
+            state["r" + register] = ("map", target)
+        elif match := re.fullmatch(r"r(\d+) = r(\d+)", text):
+            value = state.get("r" + match.group(2))
+            state.pop("r" + match.group(1), None)
+            if value is not None:
+                state["r" + match.group(1)] = value
+        elif match := re.fullmatch(r"r(\d+) \+= (r\d+|-?0x[0-9a-f]+)", text):
+            value = state.pop("r" + match.group(1), None)
+            if value is not None and value[0] == "cell":
+                delta = match.group(2)
+                offset = (value[2] + int(delta, 16)
+                          if value[2] is not None and not delta.startswith("r") else None)
+                state["r" + match.group(1)] = ("cell", value[1], offset)
+        elif match := re.match(r"[rw](\d+)\s", text):
+            state.pop("r" + match.group(1), None)
+        for successor in graph[pc]:
+            if successor not in incoming:
+                merged = state.copy()
+            else:
+                merged = {key: value for key, value in incoming[successor].items()
+                          if state.get(key) == value}
+            if incoming.get(successor) != merged:
+                incoming[successor] = merged
+                pending.append(successor)
+    return incoming
+
+
+def counter_cells_contract(disassembly):
+    """Every attributed write into a per-CPU counter cell is a non-fetch atomic
+    add, and RV_COUNTS is only ever created with BPF_NOEXIST (an existing row
+    is updated in place, so a racing creator cannot overwrite a count)."""
+    split = ENTRY.sections(disassembly)
+    atomic_updates = 0
+    rv_creates = 0
+    for section in (*PROGRAM_SECTIONS, ".text"):
+        if section not in split:
+            continue
+        for name, lines in D.function_blocks(split[section]).items():
+            facts = counter_cell_facts(lines)
+            arguments = D.call_argument_facts(lines)
+            insns, _ = D.instruction_graph(lines)
+            for pc, text in insns:
+                state = facts.get(pc, {})
+                label = f"{section}:{name}:{pc}"
+                if match := CELL_ATOMIC.fullmatch(text):
+                    cell = state.get("r" + match.group(2))
+                    if cell and cell[0] == "cell" and cell[1] in COUNTER_MAPS:
+                        atomic_updates += 1
+                    continue
+                if match := CELL_STORE.fullmatch(text):
+                    width, base, sign, digits = match.groups()
+                    cell = state.get("r" + base)
+                    if cell and cell[0] == "cell" and cell[1] in COUNTER_MAPS:
+                        offset = (None if cell[2] is None
+                                  else cell[2] + signed_offset(sign, digits))
+                        require(width == "64" and (cell[1], offset) in RACY_MAXIMA,
+                                f"{label}: non-atomic write to a {cell[1]} counter cell")
+                    continue
+                if match := CELL_POINTER.search(text):
+                    cell = state.get("r" + match.group(1))
+                    require(not (cell and cell[0] == "cell" and cell[1] in COUNTER_MAPS
+                                 and ("atomic" in text or "xchg" in text)),
+                            f"{label}: fetch-form atomic on a {cell and cell[1]} counter cell")
+                if text == "call 0x2" and state.get("r1") == ("map", "RV_COUNTS"):
+                    require(arguments.get(pc, {}).get("r4") == ("constant", 1),
+                            f"{label}: RV_COUNTS row created without BPF_NOEXIST")
+                    rv_creates += 1
+    require(atomic_updates, "no atomic counter-cell update classified")
+    require(rv_creates, "no RV_COUNTS row creation classified")
+    return {"atomic_updates": atomic_updates, "rv_creates": rv_creates}
+
+
 def analyze(disassembly, variant):
     require(variant in PROGRAMS, "unknown variant " + variant)
     split = ENTRY.sections(disassembly)
@@ -557,6 +674,7 @@ def check_decoded(disassembly, variant):
         "programs": {
             name: analysis.check() for name, analysis in analyze(disassembly, variant).items()
         },
+        "counter_cells": counter_cells_contract(disassembly),
     }
 
 

@@ -998,46 +998,67 @@ def finite_counter_key(lines, relocation):
     return None
 
 
+COUNTER_ATOMIC_ADD = re.compile(r"lock \*\(u64 \*\)\(r(\d+) \+ 0x0\) \+= r(\d+)")
+COUNTER_CELL_WRITE = re.compile(r"\*\(u(?:8|16|32|64) \*\)\(r(\d+) [+-] 0x[0-9a-f]+\) = ")
+
+
 def counter_writeback_contract(lines, lookup_pc):
-    """Every non-null path from this lookup must increment and store its value."""
+    """Every non-null path from this lookup must atomically add one to its value.
+
+    The only accepted update is a non-fetch ``lock *(u64 *)(cell + 0x0) += rN``
+    whose addend is the known constant 1. A plain load/add/store is refused:
+    from Linux 6.1 uprobe programs run preemptible (migrate-disabled only), so
+    two programs on one CPU can interleave inside a per-CPU read-modify-write
+    and lose an increment of the one loss counter a run may have.
+    """
     insns, graph = instruction_graph(lines)
     texts = dict(insns)
-    pending = [(pc, None, False) for pc in graph.get(lookup_pc, [])]
+    facts = call_argument_facts(lines)
+    pending = [(pc, frozenset({"0"}), False) for pc in graph.get(lookup_pc, [])]
     seen = set()
     stored = False
     while pending:
-        pc, register, incremented = pending.pop()
-        key = (pc, register, incremented)
+        pc, cells, checked = pending.pop()
+        key = (pc, cells, checked)
         if key in seen:
             return False  # An update-free cycle cannot establish loss accounting.
         seen.add(key)
         text = texts[pc]
-        if re.search(r"\bif r0 == 0x0 goto ", text) and register is None:
-            edges = [edge for edge in graph[pc] if edge != relative_target(pc, text)]
-        elif match := re.search(r"\br(\d+) = \*\(u64 \*\)\(r0 \+ 0x0\)$", text):
-            register = match.group(1)
-            if register == "0":
+        null = re.fullmatch(r"if r(\d+) (==|!=) 0x0 goto [+-]0x[0-9a-f]+", text)
+        if null and null.group(1) in cells and not checked:
+            target = relative_target(pc, text)
+            if null.group(2) == "==":
+                edges = [edge for edge in graph[pc] if edge != target]
+            else:
+                edges = [target]
+            checked = True
+        elif atomic := COUNTER_ATOMIC_ADD.fullmatch(text):
+            base, addend = atomic.groups()
+            if base not in cells:
                 return False
-            incremented = False
-            edges = graph[pc]
-        elif register and re.search(rf"\br{register} \+= 0x1$", text) and not incremented:
-            incremented = True
-            edges = graph[pc]
-        elif register and incremented and re.search(rf"\*\(u64 \*\)\(r0 \+ 0x0\) = r{register}$", text):
+            if not checked or facts.get(pc, {}).get("r" + addend) != ("constant", 1):
+                return False
             stored = True
             continue
         else:
-            if re.search(r"\bcall ", text):
+            if re.search(r"\bcall ", text) or "atomic" in text or "xchg" in text \
+                    or text.startswith("lock "):
                 return False
-            # As in call_argument_facts, normalize r/w destination aliases and
-            # forget unsupported definitions, rather than enumerate ALU ops.
+            write = COUNTER_CELL_WRITE.match(text)
+            if write and write.group(1) in cells:
+                return False  # Non-atomic writeback of the counter cell.
+            copy = re.fullmatch(r"r(\d+) = r(\d+)", text)
             destination = re.match(r"[rw](\d+)\s", text)
-            if destination and destination.group(1) in ("0", register):
-                return False
+            if copy and copy.group(2) in cells:
+                cells = cells | {copy.group(1)}
+            elif destination and destination.group(1) in cells:
+                cells = cells - {destination.group(1)}
+                if not cells:
+                    return False
             edges = graph[pc]
         if not edges:
             return False
-        pending.extend((edge, register, incremented) for edge in edges)
+        pending.extend((edge, cells, checked) for edge in edges)
     return stored
 
 
@@ -1308,9 +1329,9 @@ def _initializer_block(function, tail=""):
         "\t\t0000000000000040:  R_BPF_64_64\tCOUNTERS",
         "       9:\tcall 0x1",
         "      10:\tif r0 == 0x0 goto +0x74",
-        "      11:\tr1 = *(u64 *)(r0 + 0x0)",
-        "      12:\tr1 += 0x1",
-        "      13:\t*(u64 *)(r0 + 0x0) = r1",
+        "      11:\tr1 = 0x1",
+        "      12:\tlock *(u64 *)(r0 + 0x0) += r1",
+        "      13:\tr1 = 0x0",
         "      14:\tgoto +0x70",
     ]
     lines.extend(
@@ -1415,7 +1436,7 @@ def _owned_disassembly():
     def counter():
         return ["r7 = 0x1", "*(u32 *)(r10 - 0x4) = r7", "r2 = r10", "r2 += -0x4",
                 "r1 = 0x0 ll", "rel64:COUNTERS", "call 0x1", "if r0 == 0x0 goto @exit",
-                "r5 = *(u64 *)(r0 + 0x0)", "r5 += 0x1", "*(u64 *)(r0 + 0x0) = r5"]
+                "r5 = 0x1", "lock *(u64 *)(r0 + 0x0) += r5"]
 
     parts = []
     names = ("function_list_entry", "interface_list_entry", "interface_entry",
@@ -1567,18 +1588,29 @@ def _counter_writeback_self_test(disassembly=None, counter_keys=(0, 1)):
             if accounting(bad, name, key):
                 raise AssertionError(f"counter{key} {label} accepted")
         downstream = reachable(graph, [lookup])
-        load, register = next((pc, match.group(1)) for pc, text in insns
-                              if pc in downstream
-                              if (match := re.fullmatch(r"r(\d+) = \*\(u64 \*\)\(r0 \+ 0x0\)", text)))
-        increment = graph[load][0]
-        store = graph[increment][0]
         texts = dict(insns)
-        assert texts[increment] == f"r{register} += 0x1"
-        assert texts[store] == f"*(u64 *)(r0 + 0x0) = r{register}"
-        for position in (increment, store):
+        update, register = next((pc, match.group(2)) for pc, text in insns
+                                if pc in downstream
+                                if (match := COUNTER_ATOMIC_ADD.fullmatch(text)))
+        assignment = next(pc for pc, text in reversed(insns)
+                          if pc < update and pc in downstream
+                          and text == f"r{register} = 0x1")
+        assert texts[update] == f"lock *(u64 *)(r0 + 0x0) += r{register}"
+        for label, before, after in (
+            ("plain writeback", texts[update], f"*(u64 *)(r0 + 0x0) = r{register}"),
+            ("fetch writeback", texts[update],
+             f"r{register} = atomic_fetch_add((u64 *)(r0 + 0x0), r{register})"),
+            ("addend two", texts[assignment], f"r{register} = 0x2"),
+        ):
+            bad = replace_in_function(good, name, "\t" + before, "\t" + after)
+            if accounting(bad, name, key):
+                raise AssertionError(f"counter{key} {label} accepted")
+            tested += 1
+        for position in (assignment + 1, update):
             for clobber in (f"r{register} ^= 0x1", f"r{register} *= 0x0",
                             f"w{register} ^= 0x1", "r0 ^= 0x8", "w0 ^= 0x8",
-                            f"r{register} += 0x1", "call 0x5"):
+                            f"r{register} += 0x1", "call 0x5",
+                            f"*(u64 *)(r0 + 0x0) = r{register}"):
                 bad = insert_before(name, position, clobber)
                 if accounting(bad, name, key):
                     raise AssertionError(f"counter{key} mutation accepted before {position}: {clobber}")
@@ -1608,8 +1640,9 @@ def _owned_self_test():
             ("cleanup call", "call 0x144f", "call 0x1450"),
             ("tail slot", "r3 = 0x0", "r3 = 0x1"),
             ("insert success gate", "if r0 != 0x0 goto", "if r0 == 0x0 goto"),
-            ("counter increment", "r5 += 0x1", "r5 += 0x0"),
-            ("counter writeback", "*(u64 *)(r0 + 0x0) = r5", "r2 = r5"),
+            ("counter increment", "r5 = 0x1", "r5 = 0x2"),
+            ("counter writeback", "lock *(u64 *)(r0 + 0x0) += r5", "r2 = r5"),
+            ("plain counter writeback", "lock *(u64 *)(r0 + 0x0) += r5", "*(u64 *)(r0 + 0x0) = r5"),
         ):
             if interface_tail_contract(mutate(name, before, after, last=label == "cleanup call")):
                 raise AssertionError(f"mutation accepted: {name} {label}")
@@ -1643,8 +1676,10 @@ def _owned_self_test():
                                ("dl_debug_state", "r7 = -0x8000000000000000 ll", "r7 = 0x0"),
                                ("fixture_emit_export", "R_BPF_64_64\tCOUNTERS", "R_BPF_64_64\tNOT_COUNTERS"),
                                ("fixture_emit_export", "r7 = 0x0", "r7 = 0x1"),
-                               ("fixture_emit_export", "r1 += 0x1", "r1 += 0x0"),
-                               ("fixture_emit_export", "*(u64 *)(r0 + 0x0) = r1", "r2 = r1")):
+                               ("fixture_emit_export", "\tr1 = 0x1\n", "\tr1 = 0x2\n"),
+                               ("fixture_emit_export", "lock *(u64 *)(r0 + 0x0) += r1", "r2 = r1"),
+                               ("fixture_emit_export", "lock *(u64 *)(r0 + 0x0) += r1",
+                                "*(u64 *)(r0 + 0x0) = r1")):
         if producer_object_contract(mutate(name, before, after)):
             raise AssertionError(f"producer edge mutation accepted: {before}")
     if not table_bounds_object_contract(good):

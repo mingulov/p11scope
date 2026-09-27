@@ -397,6 +397,27 @@ fn owner_limit_for_start(actual: ExactMapMetadata) -> Result<u64> {
         .context("thread-owner reservation limit overflow")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: a privileged test seeds sticky owner poison into the
+    /// published OWNER_CTL image (before freeze, exact readback included) to
+    /// prove a halted capture is disclosed end to end. Per thread, so it
+    /// cannot leak into concurrently starting sessions.
+    pub(crate) static TEST_OWNER_POISON: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Always zero outside tests: production never publishes poison.
+fn test_seeded_owner_poison() -> u64 {
+    #[cfg(test)]
+    {
+        TEST_OWNER_POISON.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
+}
+
 fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) -> Result<()> {
     validate_identity_inventory(
         ebpf.maps()
@@ -421,6 +442,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
             };
             owner_limit_for_start(read_map_metadata("START", data)?)?
         },
+        poison: test_seeded_owner_poison(),
         ..Default::default()
     };
     let root_pidfd = child

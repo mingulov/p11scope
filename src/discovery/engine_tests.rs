@@ -16,7 +16,7 @@ use crate::discovery::identity::{
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
-    IO_CEILING_REASON, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
+    IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
     WORK_CEILING_REASON, order_tables_by_evidence,
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
@@ -4139,6 +4139,7 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
             source: "scan",
             file_offset: None,
             linkage: "heuristic",
+            exports_agreeing: Some(0),
         }],
         interfaces: 0,
         source: "scan",
@@ -7439,6 +7440,7 @@ fn evidence_verdict(
         discovery_read_failures: 0,
         discovery_truncated: 0,
         task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
         loader_discovery: render::LoaderDiscovery::default(),
         interface_selection: render::InterfaceSelection::default(),
         attach_mechanisms: vec![],
@@ -7451,6 +7453,8 @@ fn evidence_verdict(
         scheduling: render::SchedulingEvidence::default(),
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
+        gap_classes: render::GapClasses::default(),
+        stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
         p11scope_env: vec![],
@@ -9885,6 +9889,57 @@ fn standard_export_reducer_is_order_independent_and_fail_closed() {
 }
 
 #[test]
+fn selection_result_flags_publish_only_a_finite_class() {
+    // "SECRET!!" as a u64: 8 bytes a caller could aim *ppInterface at.
+    const HOSTILE: u64 = 0x5345_4352_4554_2121;
+    let tuple = |flags: u64| render::SelectionTuple {
+        module: 0,
+        request: SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 1,
+        },
+        rv: 0,
+        result: Some(SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags,
+        }),
+        table_match: false,
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::None,
+        count: 1,
+    };
+    for (flags, class) in [
+        (0, "zero"),
+        (cryptoki_sys::CKF_INTERFACE_FORK_SAFE, "fork_safe"),
+        (
+            p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER,
+            "other",
+        ),
+        (HOSTILE, "other"),
+        (u64::MAX, "other"),
+    ] {
+        let json = serde_json::to_value(tuple(flags)).unwrap();
+        assert_eq!(json["result"]["flags"], class, "{flags:#x}");
+        // Request flags stay the caller's scalar argument.
+        assert_eq!(json["request"]["flags"], 1);
+        let text = json.to_string();
+        assert!(
+            !text.contains(&HOSTILE.to_string()),
+            "raw word leaked: {text}"
+        );
+        assert!(!text.contains("SECRET"), "raw bytes leaked: {text}");
+    }
+    let json = serde_json::to_value(render::SelectionTuple {
+        result: None,
+        ..tuple(0)
+    })
+    .unwrap();
+    assert!(json["result"].is_null());
+}
+
+#[test]
 fn selection_unknown_result_flags_remain_factual_without_authority() {
     let (_fixture, mut engine, _session, binding) = attached_selection_route();
     let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
@@ -9894,7 +9949,7 @@ fn selection_unknown_result_flags_remain_factual_without_authority() {
     record.interface_index = DISCOVERY_VERSION_V3_0;
     record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
     record.selection_version_class = DISCOVERY_VERSION_V3_0;
-    record.interface_flags = 1 << 63;
+    record.interface_flags = p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER;
     record.table_ptr = selection_provider_address(&engine, binding);
     record.binding_id = binding.id;
 
@@ -9912,7 +9967,7 @@ fn selection_unknown_result_flags_remain_factual_without_authority() {
             .as_ref()
             .unwrap()
             .flags,
-        1 << 63
+        p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER
     );
     assert!(engine.selection_claims.is_empty());
     assert!(engine.selection_tables.is_empty());
@@ -19022,6 +19077,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         inode: 42,
     };
     let module = |view, object, path: &str, offset| ReconciledModule {
+        exports: Default::default(),
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
@@ -19107,6 +19163,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
         inode: 42,
     };
     let module = |view: ProcessViewId, path: &str| ReconciledModule {
+        exports: Default::default(),
         object: PinnedObjectId(200),
         entry_objects: vec![vec![PinnedObjectId(200)]],
         scanned: ScannedModule {
@@ -19172,6 +19229,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
         inode: 42,
     };
     let module = |object| ReconciledModule {
+        exports: Default::default(),
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
@@ -19559,6 +19617,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         discovery_read_failures: 0,
         discovery_truncated: 0,
         task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
         loader_discovery: render::LoaderDiscovery::default(),
         interface_selection: render::InterfaceSelection::default(),
         attach_mechanisms: vec![],
@@ -19571,6 +19630,8 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         scheduling: render::SchedulingEvidence::default(),
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
+        gap_classes: render::GapClasses::default(),
+        stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
         p11scope_env: vec![],
@@ -19776,6 +19837,7 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
             } else {
                 "heuristic"
             },
+            exports_agreeing: (source != "manifest").then_some(0),
         });
         record_object_skips(&mut plan, std::slice::from_ref(&refusal));
         record_object_skips(&mut plan, &[]);
@@ -21852,7 +21914,7 @@ fn linked_candidate_table_sorts_before_unlinked_lookalike() {
         table: Some(1),
     }];
 
-    let order = order_tables_by_evidence(&tables, &interfaces, &[], &[]);
+    let order = order_tables_by_evidence(&tables, &interfaces, &[], &[], &ObjectExports::NONE);
 
     assert_eq!(
         order,
@@ -23264,6 +23326,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
     engine.views.push(view);
     engine.next_view_id = 1;
     engine.modules = vec![ReconciledModule {
+        exports: Default::default(),
         object: PinnedObjectId(7),
         scanned: ScannedModule {
             view: view_id,
@@ -23431,6 +23494,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "module without opened identity",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: object_without_identity,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
@@ -23451,6 +23515,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "table without parallel identities",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
@@ -23463,6 +23528,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "entry target without identity",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: vec![vec![

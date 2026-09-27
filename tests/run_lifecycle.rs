@@ -43,7 +43,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         pause: PausePolicy::Never,
         attach_backend: BackendSelection::default(),
         kill_on_timeout: false,
-        command: command.iter().map(|a| a.to_string()).collect(),
+        command: command.iter().map(std::ffi::OsString::from).collect(),
     }
 }
 

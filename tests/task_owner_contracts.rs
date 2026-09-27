@@ -16,6 +16,7 @@ fn production_task_owner_transactions_and_lifecycle() {
                 "-Wall",
                 "-Wextra",
                 "-Werror",
+                "-pthread",
                 "-I",
                 "crates/ebpf/native",
                 "tests/fixtures/task-owner/helper_tests.c",

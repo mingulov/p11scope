@@ -2830,6 +2830,9 @@ class OwnedMetricsOracleTests(unittest.TestCase):
         # nothing to leave unproven.
         external["evidence"]["skipped"] = []
         external["functions"][0]["calls"] = 28
+        # Dropping the skip changes the verdict's inputs: re-derive the
+        # published classes the way the producer would.
+        capture.settle_fixture_verdict(external)
         capture.validate_canary("aggregate-only-metrics", external, TARGET_BITS)
         canary.assert_aggregate_metrics(external)
         external_30 = copy.deepcopy(external)

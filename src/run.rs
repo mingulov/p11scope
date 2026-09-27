@@ -1497,6 +1497,8 @@ const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHU
 struct SignalState {
     state: AtomicU64,
     cancel: Arc<AtomicBool>,
+    /// CLOCK_MONOTONIC ns of the last counted SIGINT delivery; 0 = none.
+    last_sigint_ns: AtomicU64,
 }
 
 impl SignalState {
@@ -1504,6 +1506,7 @@ impl SignalState {
         Self {
             state: AtomicU64::new(0),
             cancel: Arc::new(AtomicBool::new(false)),
+            last_sigint_ns: AtomicU64::new(0),
         }
     }
 
@@ -1514,8 +1517,39 @@ impl SignalState {
         Arc::clone(&self.cancel)
     }
 
+    /// A delivery with no timestamp: always a distinct stop request.
+    #[cfg(test)]
     fn observe(&self, signal: libc::c_int) {
+        self.observe_delivery(signal, None);
+    }
+
+    /// One real delivery, stamped with CLOCK_MONOTONIC ns by the handler
+    /// (`None` when the clock is unreadable, or in tests: always distinct).
+    /// A SIGINT within [`DUPLICATE_STOP_WINDOW`] of the last counted one is
+    /// the same stop request delivered twice and is not counted again, so it
+    /// cannot escalate to the second-Ctrl-C force stop. Signal-safe: atomics
+    /// only; the compare-exchange keeps two handlers racing on two threads
+    /// from both counting.
+    fn observe_delivery(&self, signal: libc::c_int, at_ns: Option<u64>) {
         self.cancel.store(true, Ordering::SeqCst);
+        if signal == libc::SIGINT
+            && let Some(now) = at_ns
+        {
+            let now = now.max(1);
+            let window = DUPLICATE_STOP_WINDOW.as_nanos() as u64;
+            match self
+                .last_sigint_ns
+                .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {}
+                Err(last) if now.saturating_sub(last) < window => {
+                    // Same identity bookkeeping as any delivery, no count.
+                    self.record_first(signal);
+                    return;
+                }
+                Err(_) => self.last_sigint_ns.store(now, Ordering::SeqCst),
+            }
+        }
         let _ = self
             .state
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
@@ -1528,6 +1562,15 @@ impl SignalState {
                     count
                 };
                 Some((state & HANDOFF_CLAIMED) | first | (count << 8))
+            });
+    }
+
+    /// Records `signal` as the first identity if none is recorded yet.
+    fn record_first(&self, signal: libc::c_int) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                (state & 0xff == 0).then_some(state | signal as u64)
             });
     }
 
@@ -1557,6 +1600,12 @@ impl SignalState {
 }
 
 const HANDOFF_CLAIMED: u64 = 1 << 10;
+
+/// Two deliveries of SIGINT this close together are one stop request: a
+/// relay that signals both the process and its group (GNU `timeout` without
+/// `--foreground`) delivers twice within microseconds, while a person's
+/// second Ctrl-C takes far longer.
+const DUPLICATE_STOP_WINDOW: Duration = Duration::from_millis(100);
 
 /// Reads one signal's current disposition without changing it. A null new
 /// action makes `sigaction` report only. An unreadable disposition (an
@@ -1679,9 +1728,14 @@ fn install_stop_flag() -> Result<Arc<SignalState>> {
             signal
         };
         let observed = Arc::clone(&state);
-        // SAFETY: the callback performs only atomic operations.
-        unsafe { signal_hook::low_level::register(signal, move || observed.observe(recorded)) }
-            .with_context(|| format!("installing handler for signal {signal}"))?;
+        // SAFETY: the callback performs only atomic operations and
+        // `clock_gettime`, which is async-signal-safe.
+        unsafe {
+            signal_hook::low_level::register(signal, move || {
+                observed.observe_delivery(recorded, crate::attach::monotonic_ns())
+            })
+        }
+        .with_context(|| format!("installing handler for signal {signal}"))?;
     }
     Ok(state)
 }
@@ -1707,7 +1761,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
                 .map_err(|error| anyhow!("--pid {p}: {error}"))?;
             (Scope::Pid(*p), Some(view))
         }
-        ScopeArg::Cgroup(c) => (scope::cgroup(c)?, None),
+        ScopeArg::Cgroup(c) => (scope::capture_cgroup(c)?, None),
         // No named view and no cgroup path: discovery sweeps /proc itself.
         ScopeArg::System => (Scope::System, None),
     };
@@ -1729,18 +1783,25 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         flag: "--allow-uretprobe-on-confined-target",
         reason,
     });
+    // M-1: own Ctrl-C/SIGTERM/SIGHUP before anything exists that a default
+    // disposition would strand — the `-o` temp file below, a created trace
+    // file — and before discovery, which can take seconds. A stop that lands
+    // before the attach is honoured just after discovery (which cannot be
+    // interrupted part-way), by returning an error that drops the sink.
+    let stop = install_stop_flag()?;
     // Before the discovery scan: a bad `-o` path must fail fast (F-Scale-6)
     // instead of after a scan — and still before any probe is on. The profile
     // sink stays an atomically-published temp file; opening it early only
     // moves the trust failure earlier.
     let out = OutputSink::open(kind, a.out.as_deref())?;
-    let mut engine = Engine::discover(a, &scope, named_view)?;
+    let discovered = Engine::discover(a, &scope, named_view);
+    refuse_if_interrupted_before_attach(&stop)?;
+    let mut engine = discovered?;
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
         eprintln!("{}", no_modules_hint(&a.scope));
     }
-    let stop = install_stop_flag()?;
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
         .context("starting attach session")?;
@@ -1775,6 +1836,23 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     Ok(())
 }
 
+/// A stop signal observed before the capture attached ends startup with an
+/// error naming it (M-1): nothing was captured, so there is no report to
+/// write, and returning drops the `-o` sink, which removes its temp file (or
+/// a trace file it created) and leaves a previous file untouched. Once the
+/// session is attached, the capture loop's own stop path takes over and
+/// publishes the report as usual.
+fn refuse_if_interrupted_before_attach(stop: &SignalState) -> Result<()> {
+    match stop.first_signal() {
+        None => Ok(()),
+        Some(signal) => Err(anyhow!(
+            "interrupted by {} during startup, before anything was attached: nothing was \
+             captured and no report was written",
+            stop_signal_name(signal)
+        )),
+    }
+}
+
 /// The no-duration notice (SYSPLAN residual F-17): "until interrupted" is
 /// only half the story — the event cap still applies, so the notice names
 /// the effective default rather than promising unbounded streaming.
@@ -1806,7 +1884,8 @@ fn capture_policy(kind: Kind, metrics: bool, unsafe_requested: bool) -> Result<C
 enum OutputSink {
     None,
     Profile(Box<AtomicFile>),
-    Trace(std::fs::File),
+    /// Truncated only once the trace loop begins (M-2).
+    Trace(crate::output::PrivateStream),
 }
 
 impl OutputSink {
@@ -2420,7 +2499,7 @@ fn stop_signal_name(signal: libc::c_int) -> String {
 fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOutcome> {
     let policy = capture_policy(args.kind, args.metrics, args.unsafe_requested)?;
     warn_unsafe_policy(policy);
-    let mut command = args.command.iter().map(OsString::from);
+    let mut command = args.command.iter().cloned();
     let program = command
         .next()
         .ok_or_else(|| anyhow!("run: no command to exec"))?;
@@ -2658,8 +2737,12 @@ fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<O
         uretprobe_hazard::Action::Refuse(reason) => Err(anyhow!(
             "refusing to attach: {reason}. Re-run with \
              --allow-uretprobe-on-confined-target to accept that risk, or capture on a kernel \
-             that exempts the trampoline — scripts/matrix/verify-uretprobe-seccomp.sh \
-             classifies the one you are on"
+             that exempts the trampoline (`p11scope doctor` shows this kernel's `uretprobe vs \
+             seccomp` verdict)"
+        )),
+        // HIGH-1: missing privilege is not a hazard; the override is not offered.
+        uretprobe_hazard::Action::NotPermitted(why) => Err(anyhow!(
+            uretprobe_hazard::not_permitted_message(&why, unsafe { libc::geteuid() } == 0)
         )),
     }
 }
@@ -3755,6 +3838,7 @@ fn capture_profile(
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
+    let live_display = LiveDisplay::for_stdout();
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
@@ -4007,12 +4091,10 @@ fn capture_profile(
                 mode,
                 policy,
             );
-            write_stdout(
-                stdout,
-                &mut stdout_open,
-                format!("\x1b[2J\x1b[H{frame}").as_bytes(),
-            )?;
-            flush_stdout(stdout, &mut stdout_open)?;
+            if let Some(bytes) = live_display.frame_bytes(&frame, false) {
+                write_stdout(stdout, &mut stdout_open, bytes.as_bytes())?;
+                flush_stdout(stdout, &mut stdout_open)?;
+            }
             scheduling.add_phase(SchedulingPhase::Render, render_start.elapsed());
             if !stdout_open && !has_output {
                 break Ok(CaptureEnd::Error);
@@ -4350,19 +4432,21 @@ fn capture_profile(
                         mode,
                         policy,
                     );
-                    write_stdout(
-                        context.3,
-                        context.4,
-                        format!("\x1b[2J\x1b[H{frame}").as_bytes(),
-                    )?;
-                    flush_stdout(context.3, context.4)?;
+                    if let Some(bytes) = live_display.frame_bytes(&frame, true) {
+                        write_stdout(context.3, context.4, bytes.as_bytes())?;
+                        flush_stdout(context.3, context.4)?;
+                    }
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Render, render_start.elapsed());
                     collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
-                    ev.scheduling = consumers
-                        .scheduling
-                        .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+                    settle_terminal_scheduling(
+                        &mut ev,
+                        consumers
+                            .scheduling
+                            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+                        profile,
+                    );
 
                     if let Some(mut out_file) = context.5.take() {
                         let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -4426,7 +4510,7 @@ fn capture_trace(
     policy: CapturePolicy,
     duration: Option<Duration>,
     max_events: Option<u64>,
-    out: Option<std::fs::File>,
+    out: Option<crate::output::PrivateStream>,
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
     drain: Duration,
@@ -4435,7 +4519,21 @@ fn capture_trace(
     let trace_limit = resolve_trace_max_events(max_events);
     let mut remaining = Some(trace_limit);
     // A line stream, not a published artifact: opened by the caller before the
-    // attach, then appended to as lines arrive.
+    // attach, then appended to as lines arrive. Only now, with the session
+    // attached and the loop about to write, may a previous `-o` file be
+    // truncated (M-2); every earlier failure leaves it as it was.
+    let out = match out.map(crate::output::PrivateStream::begin).transpose() {
+        Ok(out) => out,
+        Err(error) => {
+            return Err(finish_capture_error(
+                anyhow::Error::msg(error).context("creating trace output"),
+                engine,
+                session,
+                owned.as_deref_mut(),
+                interrupted,
+            ));
+        }
+    };
     let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
     let mut stdout_sink = crate::sink::stdout_sink()?;
@@ -4970,6 +5068,10 @@ fn capture_trace(
                             .as_deref()
                             .and_then(|owned| owned.still_running.then_some(owned.pid)),
                     );
+                    // Trace without `-o` writes its data to stdout, so only
+                    // there are slow-sink drops lost data (review F-4).
+                    evidence.stdout_data_sink = context.7.is_none();
+                    evidence.verdict_with_selection(true);
                     evidence.mark_terminal_drain_unproven();
                     if *consumers.malformed_records > 0 {
                         eprintln!(
@@ -5114,6 +5216,11 @@ fn emit_trace_terminal_accounted<W: Write>(
         trace::evidence_line(evidence, policy, trace_truncated).len() + 1
     });
     evidence.scheduling.sink_dropped_bytes = total;
+    // F-4: the terminal flush's own drops landed after the verdict. Judge the
+    // record and the returned evidence on the final accounting. With `-o`
+    // stdout is display only, so this never changes the file record's
+    // length and the byte-exact total above stays exact.
+    evidence.settle_terminal(true);
     if let Some(file) = out_file.as_mut() {
         writeln!(
             file,
@@ -5124,6 +5231,20 @@ fn emit_trace_terminal_accounted<W: Write>(
         file.flush().context("flushing trace output file")?;
     }
     Ok(())
+}
+
+/// F-4: the final frame's flush and the last sink accounting land after the
+/// verdict the frame showed. The published document is judged on that final
+/// snapshot, never on the frame's: set it, then re-derive and seal. A
+/// profile/metrics stdout carries display frames only, so its drops are
+/// stated there but never gate (`Evidence::stdout_data_sink`).
+fn settle_terminal_scheduling(
+    ev: &mut render::Evidence,
+    scheduling: render::SchedulingEvidence,
+    include_selection: bool,
+) {
+    ev.scheduling = scheduling;
+    ev.settle_terminal(include_selection);
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
@@ -5151,6 +5272,36 @@ fn write_stdout(writer: &mut dyn Write, open: &mut bool, bytes: &[u8]) -> Result
             Ok(())
         }
         Err(error) => Err(error).context("writing stdout"),
+    }
+}
+
+/// How the profile live display reaches stdout (M-10). On a terminal every
+/// frame clears the screen and redraws. Anywhere else (systemd, `nohup`,
+/// `> file`, a pipe) a redraw is noise — one full ANSI frame per drain
+/// interval, and, into a slow reader, display backpressure — so nothing is
+/// written per frame and the final frame is written once, as plain text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveDisplay {
+    terminal: bool,
+}
+
+impl LiveDisplay {
+    fn for_stdout() -> Self {
+        use std::io::IsTerminal as _;
+        Self {
+            terminal: std::io::stdout().is_terminal(),
+        }
+    }
+
+    /// The bytes one frame writes, or `None` for no write at all.
+    fn frame_bytes(self, frame: &str, final_frame: bool) -> Option<String> {
+        if self.terminal {
+            Some(format!("\x1b[2J\x1b[H{frame}"))
+        } else if final_frame {
+            Some(frame.to_string())
+        } else {
+            None
+        }
     }
 }
 
@@ -6042,6 +6193,7 @@ fn evidence_for(
         discovery_read_failures,
         discovery_truncated,
         task_uprobe_link_losses: facts.task_uprobe_link_losses(),
+        kernel_control: kernel_evidence.control.evidence(),
         loader_discovery: facts.loader_discovery(),
         interface_selection,
         attach_mechanisms: if include_selection {
@@ -6070,6 +6222,8 @@ fn evidence_for(
         scheduling,
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
+        gap_classes: render::GapClasses::default(),
+        stdout_data_sink: false,
         uretprobe_override,
         handoff_child_pid,
         p11scope_env: render::snapshot_process_env(),
@@ -8925,7 +9079,7 @@ mod tests {
             pause,
             attach_backend: BackendSelection::default(),
             kill_on_timeout: false,
-            command: command.iter().map(|a| a.to_string()).collect(),
+            command: command.iter().map(OsString::from).collect(),
         }
     }
 
@@ -8987,7 +9141,14 @@ mod tests {
                 run_owned(&run_args(cli::PausePolicy::Never, &["/bin/true"]))
                     .expect_err("an unavailable capture lane must refuse")
             );
-            assert!(never.contains("refusing to attach"), "{never}");
+            // HIGH-1: without privilege the self-probe's refusal names the
+            // missing privilege instead of a hazard; either is the
+            // environment's own category, never a pause failure.
+            let environment = |text: &str| {
+                text.contains("refusing to attach")
+                    || text.contains("cannot load p11scope's BPF programs")
+            };
+            assert!(environment(&never), "{never}");
             assert!(
                 !never.contains("pause"),
                 "an environment failure is not a pause failure: {never}"
@@ -9001,7 +9162,8 @@ mod tests {
                 run_owned(&overridden).expect_err("an unavailable capture lane must refuse")
             );
             assert!(
-                behind_override.contains("attach session"),
+                behind_override.contains("attach session")
+                    || behind_override.contains("cannot load p11scope's BPF programs"),
                 "{behind_override}"
             );
             assert!(
@@ -9015,7 +9177,7 @@ mod tests {
             );
             assert!(always.contains("pause"), "{always}");
             assert!(
-                always.contains("refusing to attach"),
+                environment(&always),
                 "the required-pause category must not hide the real cause: {always}"
             );
         }
@@ -10854,6 +11016,9 @@ mod tests {
         use crate::events::{EventDrain, ScriptedRecords};
         let (mut state, mut tracker, mut tracer) = trace_fixture();
         let reports = [metrics::SlotReport {
+            file_offset: 0,
+            target_object: None,
+            ordinals: Vec::new(),
             names: vec!["C_Initialize".to_string()],
             aliased: false,
             semantic_authorized: true,
@@ -10929,6 +11094,9 @@ mod tests {
     fn task_8d_terminal_trace_emission_orders_exact_count_before_evidence() {
         let (mut state, mut tracker, mut tracer) = trace_fixture();
         let reports = [metrics::SlotReport {
+            file_offset: 0,
+            target_object: None,
+            ordinals: Vec::new(),
             names: vec!["C_Initialize".to_string()],
             aliased: false,
             semantic_authorized: true,
@@ -11174,6 +11342,100 @@ mod tests {
         assert_eq!(
             record["scheduling"]["sink_policy"].as_str().unwrap(),
             render::SINK_POLICY_BOUNDED_WAIT_DROP,
+        );
+    }
+
+    /// F-4: drops that happen only in the terminal flush land after the
+    /// terminal verdict was taken. When stdout is the data sink (trace
+    /// without `-o`), they are lost data, so the production terminal helper
+    /// must re-judge the evidence it returns on the final accounting.
+    #[test]
+    fn terminal_trace_drops_on_the_data_sink_settle_the_returned_verdict() {
+        let (reader, writer) = pipe_pair();
+        let mut sink =
+            crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer)).unwrap();
+        let mut stdout_open = true;
+        let mut scheduling = SchedulingAccumulator::default();
+        sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        // 65 KB with no reader: the pipe holds it, so nothing drops before
+        // the terminal snapshot, and the terminal records cannot fit.
+        emit_pre_terminal_lines(&mut sink, &mut stdout_open, &mut None, 65, 1000);
+        flush_stdout(&mut sink, &mut stdout_open).unwrap();
+        collect_sink_drops(&mut sink, &mut scheduling, &mut None, Instant::now());
+        let snapshot = scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+        assert_eq!(snapshot.sink_dropped_bytes, 0, "fixture dropped too early");
+        let mut evidence = terminal_evidence_for(snapshot);
+        // What the trace terminal does for a capture with no `-o` file.
+        evidence.stdout_data_sink = true;
+        evidence.verdict_with_selection(true);
+        evidence.mark_terminal_drain_unproven();
+        let before = evidence.gap_classes.observation.causes.clone();
+        assert!(!before.contains(&"scheduling.sink_dropped_bytes"));
+
+        let (_, _, tracer) = trace_fixture();
+        emit_trace_terminal_accounted(
+            &mut evidence,
+            CapturePolicy::AggregateOnly,
+            false,
+            DEFAULT_TRACE_MAX_EVENTS,
+            false,
+            &[],
+            &tracer,
+            &mut scheduling,
+            &mut sink,
+            &mut stdout_open,
+            &mut None::<Vec<u8>>,
+        )
+        .unwrap();
+        let done = Arc::new(AtomicBool::new(true));
+        let reader = spawn_slow_sink_reader(reader, Arc::new(AtomicBool::new(false)), done);
+        drop(sink);
+        reader.join().unwrap();
+
+        assert!(
+            evidence.scheduling.sink_dropped_bytes > 0,
+            "fixture dropped nothing in the terminal flush: test is vacuous"
+        );
+        assert!(
+            evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"scheduling.sink_dropped_bytes"),
+            "terminal data-sink drops must reach the returned verdict: {:?}",
+            evidence.gap_classes
+        );
+        assert_eq!(evidence.verdict_detail, render::VERDICT_CONCRETE_GAP);
+        assert_eq!(evidence.completeness, "PARTIAL");
+    }
+
+    /// F-4, profile terminal: the document is judged on the final snapshot.
+    /// A truncation that only the final snapshot carries is a concrete gap;
+    /// display-frame drops are stated but are no gap for a profile document.
+    #[test]
+    fn profile_terminal_settles_on_the_final_scheduling_snapshot() {
+        let mut clean = render::tests::evidence();
+        clean.verdict();
+        clean.mark_terminal_drain_unproven();
+        assert_eq!(clean.verdict_detail, render::VERDICT_CLEAN_BUT_UNPROVEN);
+
+        let mut dropped = clean.clone();
+        let mut scheduling = dropped.scheduling.clone();
+        scheduling.sink_dropped_bytes = 1;
+        scheduling.sink_timeouts = 1;
+        settle_terminal_scheduling(&mut dropped, scheduling, true);
+        assert_eq!(dropped.scheduling.sink_dropped_bytes, 1);
+        assert_eq!(dropped.completeness, "PARTIAL");
+        assert_eq!(dropped.verdict_detail, render::VERDICT_CLEAN_BUT_UNPROVEN);
+
+        let mut truncated = clean.clone();
+        let mut scheduling = truncated.scheduling.clone();
+        scheduling.terminal_drain_truncated = true;
+        settle_terminal_scheduling(&mut truncated, scheduling, true);
+        assert_eq!(truncated.verdict_detail, render::VERDICT_CONCRETE_GAP);
+        assert_eq!(
+            truncated.gap_classes.observation.causes,
+            ["scheduling.terminal_drain_truncated"]
         );
     }
 
@@ -11531,6 +11793,79 @@ mod tests {
             "2024-01-01T00:00:00Z"
         );
         assert_eq!(fmt_rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+    }
+
+    /// M-10: the clear-screen redraw is for a terminal. Under systemd,
+    /// `nohup`, `> file` or a pipe, a long capture wrote one full ANSI
+    /// clear-screen frame per drain interval (86,400 a day); now nothing is
+    /// written per frame there, and the final frame is written once,
+    /// without the escape.
+    #[test]
+    fn live_frames_redraw_only_on_a_terminal() {
+        let frame = "p11scope — 3 calls\n";
+        let terminal = LiveDisplay { terminal: true };
+        for final_frame in [false, true] {
+            assert_eq!(
+                terminal.frame_bytes(frame, final_frame).as_deref(),
+                Some("\x1b[2J\x1b[Hp11scope — 3 calls\n")
+            );
+        }
+        let piped = LiveDisplay { terminal: false };
+        assert_eq!(piped.frame_bytes(frame, false), None);
+        assert_eq!(piped.frame_bytes(frame, true).as_deref(), Some(frame));
+    }
+
+    /// Both profile frame sites go through `LiveDisplay`; nothing else in
+    /// the capture loops writes the clear-screen escape.
+    #[test]
+    fn every_profile_frame_goes_through_the_live_display() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(production.matches("\\x1b[2J").count(), 1);
+        assert_eq!(production.matches("live_display.frame_bytes(").count(), 2);
+    }
+
+    #[test]
+    fn an_interruption_before_attach_is_refused_by_name() {
+        let stop = SignalState::new();
+        assert!(refuse_if_interrupted_before_attach(&stop).is_ok());
+        stop.observe(libc::SIGTERM);
+        let error = refuse_if_interrupted_before_attach(&stop).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("interrupted by SIGTERM"), "{text}");
+        assert!(text.contains("no report was written"), "{text}");
+    }
+
+    /// M-1: `capture` must own Ctrl-C/SIGTERM/SIGHUP before it creates the
+    /// `-o` temp file and starts discovery (a default disposition there kills
+    /// the process and leaves `.p11scope.<pid>.*.tmp` behind), and must look
+    /// at the flag again before attaching.
+    #[test]
+    fn capture_owns_stop_signals_before_output_and_discovery() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("pub fn capture(a: &CaptureArgs)")
+            .unwrap()
+            .1
+            .split_once("\nfn no_duration_notice")
+            .unwrap()
+            .0;
+        let at = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "{needle}");
+            body.find(needle).unwrap()
+        };
+        let install = at("install_stop_flag()");
+        let open = at("OutputSink::open(");
+        let discover = at("Engine::discover(");
+        let refuse = at("refuse_if_interrupted_before_attach(&stop)");
+        let attach = at("start_session(");
+        assert!(install < open, "stop flag after the output sink opened");
+        assert!(
+            open < discover,
+            "output sink must stay a fail-fast preflight"
+        );
+        assert!(discover < refuse, "no interruption check after discovery");
+        assert!(refuse < attach, "interruption checked only after attach");
     }
 
     /// Exercises the interrupt path directly, with no real signal sent:
@@ -13056,6 +13391,68 @@ mod tests {
             state.semantic_evidence().semantic_history_drops,
             drops_before + 1,
             "malformed fork must record a rejection"
+        );
+    }
+
+    /// P2 (container lanes): GNU `timeout -s INT` without `--foreground`
+    /// sends SIGINT to its child and then to the child's process group, so
+    /// the observer receives the same stop twice within microseconds. That
+    /// is one stop request, not the operator's second Ctrl-C — which would
+    /// abandon cleanup ("cleanup incomplete", exit 130). A genuinely later
+    /// second SIGINT still escalates.
+    #[test]
+    fn an_immediate_duplicate_sigint_is_one_stop_request() {
+        const T0: u64 = 5_000_000_000;
+        let state = SignalState::new();
+        state.observe_delivery(libc::SIGINT, Some(T0));
+        state.observe_delivery(libc::SIGINT, Some(T0 + 20_000));
+        assert_eq!(state.first_signal(), Some(libc::SIGINT));
+        assert_eq!(state.sigint_deliveries(), 1, "a 20 µs duplicate escalated");
+        // Two handlers on two threads can stamp out of order.
+        state.observe_delivery(libc::SIGINT, Some(T0 - 5_000));
+        assert_eq!(
+            state.sigint_deliveries(),
+            1,
+            "an out-of-order duplicate escalated"
+        );
+        state.observe_delivery(
+            libc::SIGINT,
+            Some(T0 + DUPLICATE_STOP_WINDOW.as_nanos() as u64 + 1),
+        );
+        assert_eq!(
+            state.sigint_deliveries(),
+            2,
+            "a later Ctrl-C must still escalate"
+        );
+
+        // A preceding SIGTERM does not make the first SIGINT a duplicate.
+        let state = SignalState::new();
+        state.observe_delivery(libc::SIGTERM, Some(T0));
+        state.observe_delivery(libc::SIGINT, Some(T0 + 1_000));
+        assert_eq!(state.first_signal(), Some(libc::SIGTERM));
+        assert_eq!(state.sigint_deliveries(), 1);
+    }
+
+    /// The real handler stamps every delivery, so the coalescing above is
+    /// what production runs; `observe` (no stamp) stays test-only.
+    #[test]
+    fn the_stop_handler_stamps_each_delivery_with_the_monotonic_clock() {
+        let source = include_str!("run.rs");
+        let install = source
+            .split_once("fn install_stop_flag()")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            install.contains("observed.observe_delivery(recorded, crate::attach::monotonic_ns())"),
+            "{install}"
+        );
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert!(
+            !production.contains(".observe(recorded)"),
+            "unstamped handler"
         );
     }
 

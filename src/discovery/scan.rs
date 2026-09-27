@@ -738,7 +738,12 @@ fn inspected_cache_bytes(key: &InspectedFileKey, value: &InspectedFile) -> u64 {
                 .executable_ranges
                 .len()
                 .saturating_mul(std::mem::size_of::<(u64, u64)>()),
-        );
+        )
+        .saturating_add(value.exports.iter().fold(0usize, |bytes, (name, _)| {
+            bytes
+                .saturating_add(name.len())
+                .saturating_add(std::mem::size_of::<(String, u64)>())
+        }));
     u64::try_from(
         std::mem::size_of_val(key)
             .saturating_add(std::mem::size_of_val(value))
@@ -1696,9 +1701,124 @@ impl ScanOutcome {
     }
 }
 
+/// Every name in the pinned 104-field PKCS#11 function catalog, in ordinal
+/// order: the `.dynsym` names export linkage reads. Every walkable layout
+/// (2.x = 68, 3.0/3.1 = 92, 3.2 = 104) is a prefix of this catalog, so a
+/// decoded entry's name is already its version-specific standard name.
+pub(crate) fn standard_function_names() -> Vec<&'static str> {
+    (0..).map_while(function_name).collect()
+}
+
+/// The catalog ordinal of a standard function name, `None` for anything
+/// else (vendor labels, `unknown`).
+pub(crate) fn standard_ordinal(name: &str) -> Option<u16> {
+    (0..)
+        .map_while(|ordinal| function_name(ordinal).map(|known| (ordinal, known)))
+        .find(|(_, known)| *known == name)
+        .and_then(|(ordinal, _)| u16::try_from(ordinal).ok())
+}
+
+/// The export-linkage witness for one module's tables: the module object's
+/// own `.dynsym` definitions of standard names, `(name, file offset)`.
+/// Definitions only — `is_definition` excludes `STT_GNU_IFUNC`, whose value
+/// is a resolver, not the function — so an IFUNC name is simply absent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ObjectExports<'a> {
+    /// The object whose `.dynsym` was read. Only an entry that lands in this
+    /// same object can agree; a forwarded entry is never compared against a
+    /// dependency's symbols it was not read from.
+    pub(crate) object: ObjectKey,
+    pub(crate) symbols: &'a [(String, u64)],
+}
+
+impl<'a> ObjectExports<'a> {
+    /// No witness: every table scores exactly as before export linkage.
+    #[cfg(test)]
+    pub(crate) const NONE: ObjectExports<'static> = ObjectExports {
+        object: ObjectKey {
+            device: Device { major: 0, minor: 0 },
+            inode: 0,
+        },
+        symbols: &[],
+    };
+
+    /// Every definition of `name`, in dynsym order (a versioned name may
+    /// have several).
+    fn offsets_of<'b>(&'b self, name: &'b str) -> impl Iterator<Item = u64> + 'b {
+        self.symbols
+            .iter()
+            .filter(move |(symbol, _)| symbol == name)
+            .map(|(_, offset)| *offset)
+    }
+
+    /// Standard names defined at `offset` in this object, other than `name`.
+    pub(crate) fn aliases_at(&self, name: &str, offset: u64) -> Vec<&'a str> {
+        let symbols: &'a [(String, u64)] = self.symbols;
+        symbols
+            .iter()
+            .filter(|(symbol, at)| *at == offset && symbol != name)
+            .map(|(symbol, _)| symbol.as_str())
+            .collect()
+    }
+}
+
+/// How one table's ordinals line up with its object's exports. An ordinal
+/// whose standard name has no definition (stripped, IFUNC, or a NULL
+/// entry) is neutral: it neither corroborates nor contradicts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ExportAgreement {
+    /// Ordinals whose target is exactly every definition of their name, in
+    /// the exporting object.
+    pub(crate) agreeing: usize,
+    /// Ordinals whose name is defined somewhere other than their target —
+    /// including a target in another object.
+    pub(crate) disagreeing: usize,
+}
+
+impl ExportAgreement {
+    /// The table-level predicate (review follow-up (b)): at least one
+    /// exported standard name agrees and none disagrees. Per-slot naming
+    /// would split the single authorization predicate, so a contradiction
+    /// refuses the whole table.
+    pub(crate) fn corroborates(self) -> bool {
+        self.agreeing > 0 && self.disagreeing == 0
+    }
+}
+
+pub(crate) fn export_agreement(
+    table: &ScannedTable,
+    exports: &ObjectExports<'_>,
+) -> ExportAgreement {
+    let mut agreement = ExportAgreement::default();
+    for entry in &table.entries {
+        let mut offsets = exports.offsets_of(entry.name).peekable();
+        if offsets.peek().is_none() {
+            continue;
+        }
+        let same_target =
+            entry.object == exports.object && offsets.all(|offset| offset == entry.file_offset);
+        if same_target {
+            agreement.agreeing += 1;
+        } else {
+            agreement.disagreeing += 1;
+        }
+    }
+    // Reconciliation moves an entry it could not pin (its target lies in an
+    // object it could not open) to `unpinned` under the same ordinal label.
+    // Its target is not this object's export, so an exported name there is a
+    // contradiction. NULL entries stay neutral: they point at nothing.
+    agreement.disagreeing += table
+        .unpinned
+        .iter()
+        .filter(|skip| exports.offsets_of(&skip.subject).next().is_some())
+        .count();
+    agreement
+}
+
 /// Publication evidence for one candidate table, strongest first: a table
 /// named by an interface triple outranks a live-return address match, which
-/// outranks a manifest offset match, which outranks bare size/version
+/// outranks a manifest offset match, which outranks agreement with the
+/// object's own `.dynsym` exports, which outranks bare size/version
 /// plausibility. Field order is the priority — the derived `Ord` sorts the
 /// strongest score last, so admission ordering reverses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1706,20 +1826,25 @@ pub(crate) struct TableEvidenceScore {
     pub(crate) linked: bool,
     pub(crate) live_return: bool,
     pub(crate) manifest: bool,
+    /// A fully walked table whose ordinals agree with the object's exported
+    /// standard names (`ExportAgreement::corroborates`). Names only: scan
+    /// targets stay count-only whatever their linkage.
+    pub(crate) exports: bool,
     pub(crate) full_walk: bool,
 }
 
 /// Pure evidence score for the candidate at `index`: standard interface
 /// linkage (via `ScannedInterface.table`, only for the `"exact_standard"`
 /// name class — U-15) first, then live-return identity, then manifest
-/// offset, then walk plausibility. No I/O — every input is already-decoded
-/// scan data or caller-held evidence.
+/// offset, then export agreement, then walk plausibility. No I/O — every
+/// input is already-decoded scan data or caller-held evidence.
 pub(crate) fn table_evidence_score(
     index: usize,
     tables: &[ScannedTable],
     interfaces: &[ScannedInterface],
     live_return_addresses: &[u64],
     manifest_offsets: &[u64],
+    exports: &ObjectExports<'_>,
 ) -> TableEvidenceScore {
     let table = &tables[index];
     TableEvidenceScore {
@@ -1741,17 +1866,21 @@ pub(crate) fn table_evidence_score(
             || table
                 .file_offset
                 .is_some_and(|offset| manifest_offsets.contains(&offset)),
+        // Only a complete walk is compared: a known prefix leaves ordinals
+        // unexamined that could contradict.
+        exports: table.walk == "full" && export_agreement(table, exports).corroborates(),
         full_walk: table.walk == "full",
     }
 }
 
 /// Whether a score authorizes presenting the table's ordinal names as PKCS#11
-/// names: some publication evidence (linkage, live return, manifest) said this
-/// table is the provider's — bare size/version plausibility never does. This
-/// is the single authorization predicate: admission bypass and name gating
-/// both read it, so a table cannot be published-but-unnamed or named-but-heuristic.
+/// names: some publication evidence (linkage, live return, manifest, export
+/// agreement) said this table is the provider's — bare size/version
+/// plausibility never does. This is the single authorization predicate:
+/// admission bypass and name gating both read it, so a table cannot be
+/// published-but-unnamed or named-but-heuristic.
 pub(crate) fn table_name_authorized(score: &TableEvidenceScore) -> bool {
-    score.linked || score.live_return || score.manifest
+    score.linked || score.live_return || score.manifest || score.exports
 }
 
 /// Linkage kind for evidence: the strongest publication evidence behind the
@@ -1764,6 +1893,8 @@ pub(crate) fn table_linkage(score: &TableEvidenceScore) -> &'static str {
         "live_return"
     } else if score.manifest {
         "manifest"
+    } else if score.exports {
+        "exports"
     } else {
         "heuristic"
     }
@@ -1776,6 +1907,7 @@ pub(crate) fn order_tables_by_evidence(
     interfaces: &[ScannedInterface],
     live_return_addresses: &[u64],
     manifest_offsets: &[u64],
+    exports: &ObjectExports<'_>,
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (0..tables.len()).collect();
     order.sort_by_cached_key(|&index| {
@@ -1785,6 +1917,7 @@ pub(crate) fn order_tables_by_evidence(
             interfaces,
             live_return_addresses,
             manifest_offsets,
+            exports,
         ))
     });
     order
@@ -2640,9 +2773,11 @@ fn opened_file_identity_guard(
     view: &ProcessView,
     file: &File,
     expected: ObjectKey,
+    mounts: &mut crate::process::MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<(), String> {
-    let actual = crate::discovery::identity::retained_object_key(view, file, budget)?;
+    let actual =
+        crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)?;
     if actual == expected {
         return Ok(());
     }
@@ -3157,6 +3292,8 @@ fn scan_process_view_with_io_mode(
     let mut hint_matched = vec![false; request.hints.len()];
 
     let groups = candidate_groups(&maps);
+    // One mount-table read serves every object this scan opens (H-3).
+    let mut mounts = crate::process::MountTableCache::default();
     for (key, group) in groups {
         if budget.scan_stopped() {
             break;
@@ -3224,7 +3361,7 @@ fn scan_process_view_with_io_mode(
                 continue;
             }
         };
-        if let Err(reason) = opened_file_identity_guard(view, &file, key, budget) {
+        if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {
             skipped.push(Skipped { subject, reason });
             continue;
         }
@@ -4589,12 +4726,13 @@ mod tests {
 
     #[test]
     fn table_name_authorization_matches_linkage_for_every_evidence_pattern() {
-        for bits in 0u8..16 {
+        for bits in 0u8..32 {
             let score = TableEvidenceScore {
                 linked: bits & 1 != 0,
                 live_return: bits & 2 != 0,
                 manifest: bits & 4 != 0,
                 full_walk: bits & 8 != 0,
+                exports: bits & 16 != 0,
             };
             let expected = if score.linked {
                 "interface"
@@ -4602,6 +4740,8 @@ mod tests {
                 "live_return"
             } else if score.manifest {
                 "manifest"
+            } else if score.exports {
+                "exports"
             } else {
                 "heuristic"
             };
@@ -4657,7 +4797,13 @@ mod tests {
             flags: 0,
             table: Some(5),
         }];
-        let order = order_tables_by_evidence(&tables, &interfaces, &[0x7000], &[0x8000]);
+        let order = order_tables_by_evidence(
+            &tables,
+            &interfaces,
+            &[0x7000],
+            &[0x8000],
+            &ObjectExports::NONE,
+        );
         assert_eq!(order, [5, 2, 6, 1, 7, 0, 3, 4]);
         let mut sorted = order.clone();
         sorted.sort_unstable();
@@ -4668,7 +4814,16 @@ mod tests {
         );
         let scores: Vec<_> = order
             .iter()
-            .map(|&index| table_evidence_score(index, &tables, &interfaces, &[0x7000], &[0x8000]))
+            .map(|&index| {
+                table_evidence_score(
+                    index,
+                    &tables,
+                    &interfaces,
+                    &[0x7000],
+                    &[0x8000],
+                    &ObjectExports::NONE,
+                )
+            })
             .collect();
         assert!(
             scores.windows(2).all(|pair| pair[0] >= pair[1]),
@@ -4704,7 +4859,8 @@ mod tests {
                 flags: 0,
                 table: Some(0),
             }];
-            let score = table_evidence_score(0, &tables, &interfaces, &[], &[]);
+            let score =
+                table_evidence_score(0, &tables, &interfaces, &[], &[], &ObjectExports::NONE);
             assert!(!score.linked, "{name_class} must not set linked");
             assert_eq!(
                 table_linkage(&score),
@@ -4725,7 +4881,7 @@ mod tests {
             flags: 0,
             table: Some(0),
         }];
-        let score = table_evidence_score(0, &tables, &standard, &[], &[]);
+        let score = table_evidence_score(0, &tables, &standard, &[], &[], &ObjectExports::NONE);
         assert!(score.linked, "exact_standard must set linked");
         assert_eq!(table_linkage(&score), "interface");
         assert!(table_name_authorized(&score));
@@ -4775,13 +4931,15 @@ mod tests {
             },
         ];
 
-        let live_score = table_evidence_score(0, &tables, &interfaces, &[], &[]);
+        let live_score =
+            table_evidence_score(0, &tables, &interfaces, &[], &[], &ObjectExports::NONE);
         assert!(!live_score.linked, "the vendor interface must not link");
         assert!(live_score.live_return);
         assert_eq!(table_linkage(&live_score), "live_return");
         assert!(table_name_authorized(&live_score));
 
-        let manifest_score = table_evidence_score(1, &tables, &interfaces, &[], &[]);
+        let manifest_score =
+            table_evidence_score(1, &tables, &interfaces, &[], &[], &ObjectExports::NONE);
         assert!(
             !manifest_score.linked,
             "the unreadable interface must not link"
@@ -4824,7 +4982,7 @@ mod tests {
             table: Some(1),
         }];
 
-        let order = order_tables_by_evidence(&tables, &interfaces, &[], &[]);
+        let order = order_tables_by_evidence(&tables, &interfaces, &[], &[], &ObjectExports::NONE);
 
         assert_eq!(
             order,
@@ -4832,7 +4990,8 @@ mod tests {
             "a vendor-only interface link no longer wins evidence priority; \
              equal-evidence tables keep discovery order"
         );
-        let vendor_linked_score = table_evidence_score(1, &tables, &interfaces, &[], &[]);
+        let vendor_linked_score =
+            table_evidence_score(1, &tables, &interfaces, &[], &[], &ObjectExports::NONE);
         assert!(
             !vendor_linked_score.linked,
             "the vendor interface must not set linked"
@@ -5102,6 +5261,44 @@ mod tests {
         );
     }
 
+    /// H-3 regression: one scan read its view's `/proc/<pid>/mountinfo` once
+    /// per mapped executable object — a full kernel render and parse of the
+    /// mount table each time, charged to the capture's non-renewable I/O
+    /// allowance. On a container host with hundreds of objects and a thousand
+    /// mounts that is tens of megabytes per scan. One scan reads it once while
+    /// it stays unchanged.
+    #[test]
+    fn one_scan_reads_its_mount_table_once() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let objects = candidate_groups(&maps).len();
+        assert!(
+            objects >= 3,
+            "this test process maps several objects: {objects}"
+        );
+        let hooks = HookRegistry::default();
+        let request = ScanRequest {
+            pid: std::process::id(),
+            hints: &[],
+            hooks: &hooks,
+        };
+        let witness = crate::process::MountChangeWitness::new();
+        let before = crate::process::mountinfo_reads_for_test();
+
+        scan_process_view_without_memory(&request, &view, &mut CaptureWorkBudget::default())
+            .unwrap();
+
+        let reads = crate::process::mountinfo_reads_for_test() - before;
+        // A mount change elsewhere on the host during the scan must be read
+        // again; only an unchanged table has to be read exactly once.
+        if !witness.changed() {
+            assert_eq!(
+                reads, 1,
+                "one mount-table read for {objects} mapped objects"
+            );
+        }
+    }
+
     #[test]
     fn opened_file_identity_rejects_same_size_inode_before_hint_matching() {
         let directory = tempfile::tempdir().unwrap();
@@ -5135,6 +5332,7 @@ mod tests {
                 &view,
                 &replacement_file,
                 captured,
+                &mut crate::process::MountTableCache::default(),
                 &mut CaptureWorkBudget::default(),
             )
             .is_err(),
@@ -5149,7 +5347,7 @@ mod tests {
             .iter()
             .position(|line| {
                 *line
-                    == "if let Err(reason) = opened_file_identity_guard(view, &file, key, budget) {"
+                    == "if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {"
             })
             .expect("the shared identity guard must run in the scan");
         assert_eq!(
@@ -5189,10 +5387,9 @@ mod tests {
         let guard_body = &include_str!("scan.rs")[include_str!("scan.rs")
             .find("fn opened_file_identity_guard(")
             .expect("identity guard")..];
-        assert!(
-            guard_body
-                .contains("crate::discovery::identity::retained_object_key(view, file, budget)")
-        );
+        assert!(guard_body.contains(
+            "crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)"
+        ));
         for decision in [
             "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
             "if hinted && !attributable {",
@@ -7383,3 +7580,7 @@ mod tests {
         budget.finish_window(window).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "export_linkage_tests.rs"]
+mod export_linkage_tests;

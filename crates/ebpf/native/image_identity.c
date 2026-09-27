@@ -27,11 +27,12 @@ static __always_inline struct control *get_control(void)
     return bpf_map_lookup_elem(&COOKIE_CTL, &key);
 }
 
+/* Exact under contention: a non-fetch atomic add (result never consumed)
+ * never drops an increment the way a single lost compare-exchange did. */
 static __always_inline void finite_increment(u64 *counter)
 {
-    u64 old = *counter;
-    if (old != U64_MAX_VALUE)
-        __sync_val_compare_and_swap(counter, old, old + 1);
+    if (*(volatile u64 *)counter != U64_MAX_VALUE)
+        __sync_fetch_and_add(counter, 1);
 }
 
 static __always_inline struct cookie_result cookie_for(struct task_struct *task)

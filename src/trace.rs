@@ -29,7 +29,7 @@ fn function_name(slots: &[Option<TraceSlot>], slot: u32) -> String {
     slots
         .get(slot as usize)
         .and_then(Option::as_ref)
-        .map(|slot| slot.names.join("|"))
+        .map(|slot| slot.label.clone())
         .unwrap_or_else(|| format!("slot#{slot}"))
 }
 
@@ -247,7 +247,8 @@ pub(crate) fn count_evidence_line(
 /// lookup, which `semantics::State` owns.
 #[derive(Clone)]
 struct TraceSlot {
-    names: Vec<String>,
+    /// `plan::presented_label`: names, or `unknown#<ordinal>` when unnamed.
+    label: String,
     semantics: p11scope_ebpf_common::SlotSemantics,
     semantic_authorized: bool,
 }
@@ -260,7 +261,7 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
             slots.resize_with(index + 1, || None);
         }
         slots[index] = Some(TraceSlot {
-            names: slot.names.clone(),
+            label: plan.label_of(slot),
             semantics: plan.effective_semantics(slot),
             semantic_authorized: slot.semantic_authorized,
         });
@@ -511,6 +512,9 @@ mod tests {
 
     fn slot_report(calls: u64, in_flight: u64) -> crate::metrics::SlotReport {
         crate::metrics::SlotReport {
+            file_offset: 0,
+            target_object: None,
+            ordinals: Vec::new(),
             names: vec![],
             aliased: false,
             semantic_authorized: true,
@@ -607,6 +611,7 @@ mod tests {
             discovery_read_failures: 0,
             discovery_truncated: 0,
             task_uprobe_link_losses: 0,
+            kernel_control: Default::default(),
             loader_discovery: render::LoaderDiscovery::default(),
             interface_selection: render::InterfaceSelection::default(),
             attach_mechanisms: vec![],
@@ -618,6 +623,8 @@ mod tests {
             scheduling: render::SchedulingEvidence::default(),
             drain_proven: false,
             verdict_detail: render::VERDICT_CONCRETE_GAP,
+            gap_classes: render::GapClasses::default(),
+            stdout_data_sink: false,
             uretprobe_override: None,
             handoff_child_pid: None,
             p11scope_env: vec![],

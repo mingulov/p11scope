@@ -18,9 +18,9 @@ struct {
 static ROOT_INLINE void root_fail(struct root_affiliation_control *ctl, u64 reason, u64 *counter)
 {
     __sync_fetch_and_or(&ctl->failure_flags, reason);
-    u64 old = *(volatile u64 *)counter;
-    if (old != ~0ULL)
-        __sync_val_compare_and_swap(counter, old, old + 1);
+    /* Exact under contention: a non-fetch atomic add, result never consumed. */
+    if (*(volatile u64 *)counter != ~0ULL)
+        __sync_fetch_and_add(counter, 1);
 }
 
 static ROOT_INLINE struct root_affiliation_control *root_control(void)

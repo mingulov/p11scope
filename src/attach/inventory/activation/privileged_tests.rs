@@ -247,6 +247,11 @@ static void *thread_call(void *data) {
     for (unsigned n = 0; n < work->calls; n++) work->sum += functions[work->id](n);
     return NULL;
 }
+static void *hammer_call(void *data) {
+    struct thread_work *work = data;
+    for (unsigned n = 0; n < work->calls; n++) work->sum += functions[work->id](0);
+    return NULL;
+}
 int main(int argc, char **argv) {
     if (argc < 1 || argc > 2 || (argc == 2 && strcmp(argv[1], "GO_REQUIRED"))) return 2;
     int go = argc == 1;
@@ -297,6 +302,23 @@ int main(int argc, char **argv) {
             if (pthread_join(worker, NULL)) return 7;
             if (abandon) { hold_action = 0; printf("ABANDONED %u %u\n", id, work.tid); continue; }
             return 9;
+        }
+        if (!strcmp(command, "HAMMER")) {
+            unsigned threads, percalls;
+            if (scanf("%u %u", &threads, &percalls) != 2 || threads < 1 || threads > 64 || percalls < 1 || percalls > 10000000) return 2;
+            printf("HAMMER_START %u %u\n", threads, percalls);
+            struct thread_work works[64]; pthread_t workers[64];
+            for (unsigned t = 0; t < threads; t++) {
+                works[t].id = t; works[t].calls = percalls; works[t].sum = 0; works[t].tid = 0; works[t].action = 0;
+                if (pthread_create(&workers[t], NULL, hammer_call, &works[t])) return 6;
+            }
+            unsigned long total = 0;
+            for (unsigned t = 0; t < threads; t++) {
+                if (pthread_join(workers[t], NULL)) return 7;
+                total += works[t].sum;
+            }
+            printf("HAMMER_DONE %u %u %lu\n", threads, percalls, total);
+            continue;
         }
         if (!strcmp(command, "FANOUT")) {
             unsigned threads, percalls;
@@ -924,6 +946,25 @@ impl OwnedCaller {
         );
         eprintln!("OWNED_THREAD pid={} tid={tid} {receipt}", self.child.id());
         Ok(tid)
+    }
+
+    /// Every thread hammers its own endpoint with a constant input: the
+    /// independent ledger is sum(t * percalls).
+    fn hammer_calls(&mut self, threads: u32, percalls: u32) -> Result<()> {
+        writeln!(self.input, "HAMMER {threads} {percalls}")?;
+        self.input.flush()?;
+        ensure!(
+            self.line()? == format!("HAMMER_START {threads} {percalls}"),
+            "hammer start receipt differs"
+        );
+        let total: u64 = (0..u64::from(threads)).sum::<u64>() * u64::from(percalls);
+        let ledger = self.line()?;
+        ensure!(
+            ledger == format!("HAMMER_DONE {threads} {percalls} {total}"),
+            "independent hammer ledger differs: {ledger}"
+        );
+        eprintln!("OWNED_HAMMER pid={} {ledger}", self.child.id());
+        Ok(())
     }
 
     fn fanout_calls(&mut self, threads: u32, percalls: u32) -> Result<()> {
@@ -3318,7 +3359,7 @@ fn task4_detailed_identity_source_serialization_synthetic_bundle() -> Result<()>
                 return_program + 4,
                 "other",
                 "task_newtask",
-                bpf_link_type::BPF_LINK_TYPE_TRACING as u32,
+                bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32,
             ),
         ]
         .into_iter()
@@ -4187,11 +4228,13 @@ fn task4_record_registration(
         if role != "other" {
             ensure!(info.raw.type_ == bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32);
         } else {
-            let expected = if program == "task_newtask" {
-                bpf_link_type::BPF_LINK_TYPE_TRACING as u32
-            } else {
-                bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32
-            };
+            // All three lifecycle hooks report a raw-tracepoint link. The
+            // typed `task_newtask` is a tp_btf program (TRACING +
+            // BPF_TRACE_RAW_TP), which the kernel attaches through
+            // bpf_raw_tp_link_attach, not bpf_tracing_prog_attach: only
+            // fentry/fexit/fmod_ret get a TRACING link. Measured on host 7.0
+            // and every vng kernel 5.15.0-187..7.2.6.
+            let expected = bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32;
             ensure!(
                 info.raw.type_ == expected,
                 "Detailed lifecycle link type differs from retained attach role"
@@ -4322,7 +4365,6 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
             };
             let kind = match role {
                 "return" | "entry" => bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u64,
-                "other" if program == "task_newtask" => bpf_link_type::BPF_LINK_TYPE_TRACING as u64,
                 "other" => bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u64,
                 _ => unreachable!(),
             };
@@ -4409,9 +4451,7 @@ fn task4_detailed_registration_rejects_missing_tail_entry_and_kernel_link() -> R
         rows.push(serde_json::json!({
             "kind":"kernel_link","phase":"attached","position":index+4,
             "link_id":index+104,"program_id":index+20,
-            "type":if program=="task_newtask" {
-                bpf_link_type::BPF_LINK_TYPE_TRACING as u32
-            } else {bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32},
+            "type":bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32,
             "info_len":32,
             "role":"other","program":program,
             "session_generation":1,"stats_map_id":21,"scope_pid":77,
@@ -4969,7 +5009,8 @@ fn task4_fixture_receipt(fixture: &OwnedFixture) -> Result<()> {
         .iter()
         .map(|slot| {
             serde_json::json!({
-                "dev": metadata.dev(), "ino": metadata.ino(), "offset": slot.file_offset,
+                "object": slot.object.0, "dev": metadata.dev(), "ino": metadata.ino(),
+                "offset": slot.file_offset,
             })
         })
         .collect();
@@ -6604,6 +6645,176 @@ fn privileged_bench_overhead_detailed_calls() -> Result<()> {
     caller.finish()?;
     detached?;
     ensure!(clean_detach, "bench Detailed detach retained failures");
+    Ok(())
+}
+
+/// D1/D5 regression (live repro: 12 SoftHSM threads froze capture within
+/// ~10 ms). Every call reserves and refunds the one shared native owner
+/// count; many threads on many CPUs must never poison it, never refuse an
+/// admission, and every counter must be exact: STATS calls, RV_COUNTS rows
+/// and errors equal the fixture's independent ledger, nothing in flight.
+#[test]
+#[ignore = "root-owned BPF lane; multi-thread owner accounting never poisons and counts exactly"]
+fn privileged_detailed_multithread_owner_accounting_exact() -> Result<()> {
+    let threads = std::thread::available_parallelism()
+        .map(|cpus| u32::try_from(cpus.get()).unwrap_or(64))
+        .unwrap_or(4)
+        .clamp(4, 32);
+    const PERCALLS: u32 = 200_000;
+    let fixture = OwnedFixture::build_n(false, threads)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    // Aggregate policy still pairs every call through the native owner
+    // (reserve at entry, refund at return) but emits no events, so ring
+    // capacity cannot mask or excuse a counting defect.
+    let session = crate::attach::Session::start(
+        &plan,
+        &Scope::Pid(caller.child.id()),
+        &fixture.pins,
+        crate::attach::CapturePolicy::AggregateOnly,
+        None,
+        None,
+        None,
+        crate::attach::BackendSelection::Singles,
+    )?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2 * threads as usize,
+        "multithread Detailed did not retain every paired static probe"
+    );
+    let ids = OwnedIds::detailed(&session)?;
+    caller.go()?;
+    caller.hammer_calls(threads, PERCALLS)?;
+    let reports = crate::metrics::read(&session, &plan)?;
+    let kernel = crate::metrics::kernel_evidence(&session)?;
+    let calls: u64 = reports.iter().map(|report| report.calls).sum();
+    let in_flight: u64 = reports.iter().map(|report| report.in_flight).sum();
+    let rv_total: u64 = reports
+        .iter()
+        .flat_map(|report| report.rv_counts.values())
+        .sum();
+    eprintln!(
+        "MULTITHREAD_OWNER threads={threads} percalls={PERCALLS} expected={} calls={calls} \
+         in_flight={in_flight} rv_total={rv_total} control={:?} kernel={kernel:?}",
+        u64::from(threads) * u64::from(PERCALLS),
+        kernel.control.evidence()
+    );
+    ensure!(
+        kernel.control == crate::metrics::KernelControl::default(),
+        "native owner poisoned or refused under multi-thread load: {:?}",
+        kernel.control.evidence()
+    );
+    ensure!(
+        kernel == crate::metrics::KernelEvidence::default(),
+        "kernel evidence reports loss under multi-thread load: {kernel:?}"
+    );
+    ensure!(
+        calls == u64::from(threads) * u64::from(PERCALLS) && in_flight == 0,
+        "captured calls differ from the independent ledger"
+    );
+    ensure!(
+        rv_total == calls,
+        "RV_COUNTS rows disagree with STATS calls"
+    );
+    ensure!(
+        reports.len() == plan.slots.len(),
+        "one report per planned slot"
+    );
+    for (slot, report) in plan.slots.iter().zip(&reports) {
+        // Thread t calls endpoint t with input 0, and endpoint t returns t.
+        let rv = u64::from(slot.index);
+        ensure!(
+            report.calls == u64::from(PERCALLS)
+                && report.rv_counts == BTreeMap::from([(rv, u64::from(PERCALLS))])
+                && report.errors
+                    == if rv == 0 || rv == 0x204 {
+                        0
+                    } else {
+                        u64::from(PERCALLS)
+                    },
+            "per-slot counts differ from the ledger: {:?}",
+            (
+                report.names.clone(),
+                report.calls,
+                &report.rv_counts,
+                report.errors
+            )
+        );
+    }
+    let mut session = session;
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(
+        clean_detach,
+        "multithread Detailed detach retained failures"
+    );
+    Ok(())
+}
+
+/// D1 disclosure end to end: a poisoned native owner (seeded before freeze)
+/// halts every probe at its scope gate, userspace reads OWNER_CTL, and the
+/// published evidence names the halt and is a concrete-gap PARTIAL, instead
+/// of a quiet zero-call capture.
+#[test]
+#[ignore = "root-owned BPF lane; a poisoned native owner halts capture and is disclosed"]
+fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
+    const CALLS: u32 = 1_000;
+    let fixture = OwnedFixture::build_n(false, 1)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut caller = fixture.spawn_gated()?;
+    crate::attach::TEST_OWNER_POISON
+        .with(|seed| seed.set(p11scope_ebpf_common::OWNER_CLASSIFIER_FAILED));
+    let started = crate::attach::Session::start(
+        &plan,
+        &Scope::Pid(caller.child.id()),
+        &fixture.pins,
+        crate::attach::CapturePolicy::AggregateOnly,
+        None,
+        None,
+        None,
+        crate::attach::BackendSelection::Singles,
+    );
+    crate::attach::TEST_OWNER_POISON.with(|seed| seed.set(0));
+    let mut session = started?;
+    let ids = OwnedIds::detailed(&session)?;
+    caller.go()?;
+    caller.calls(0, CALLS)?;
+    let reports = crate::metrics::read(&session, &plan)?;
+    let kernel = crate::metrics::kernel_evidence(&session)?;
+    let calls: u64 = reports.iter().map(|report| report.calls).sum();
+    let mut evidence = crate::render::tests::evidence();
+    evidence.kernel_control = kernel.control.evidence();
+    evidence.verdict();
+    eprintln!(
+        "OWNER_POISON_DISCLOSURE calls={calls} control={:?} verdict={}/{}",
+        evidence.kernel_control, evidence.completeness, evidence.verdict_detail
+    );
+    ensure!(
+        kernel.control.owner_poison == p11scope_ebpf_common::OWNER_CLASSIFIER_FAILED,
+        "userspace did not read the sticky owner poison"
+    );
+    ensure!(calls == 0, "a halted owner still counted calls");
+    ensure!(
+        evidence.kernel_control.capture_halted
+            && evidence.kernel_control.owner_poison == ["classifier_failed"]
+            && evidence.completeness == "PARTIAL"
+            && evidence.verdict_detail == crate::render::VERDICT_CONCRETE_GAP,
+        "a halted capture was not disclosed as a named concrete gap"
+    );
+    let detached = session.detach_producers();
+    let clean_detach = session.detach_failures().is_empty();
+    drop(session);
+    ids.released_with_budget(Duration::from_secs(60))?;
+    caller.finish()?;
+    detached?;
+    ensure!(clean_detach, "poisoned Detailed detach retained failures");
     Ok(())
 }
 

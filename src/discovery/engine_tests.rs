@@ -16,7 +16,7 @@ use crate::discovery::identity::{
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
-    IO_CEILING_REASON, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
+    IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
     WORK_CEILING_REASON, order_tables_by_evidence,
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
@@ -1674,6 +1674,64 @@ fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
     assert_eq!(engine.discovery.modules_skipped.len(), 1);
 }
 
+/// GT-5. A cgroup or system capture without `--module` admits in value
+/// order (`plan::AdmissionScope::Shared`); a named process, or a capture the
+/// operator aimed with `--module`, keeps first-come admission. A shared
+/// capture whose every discovered module is refused still starts — the
+/// refusal is published, and a later provider can still be admitted — where
+/// a named capture that can attach nothing fails at startup as before.
+#[test]
+fn shared_scope_capture_starts_when_every_module_is_refused() {
+    let (cgroup, _dir) = engine_over_cgroup_naming(&[]);
+    assert_eq!(cgroup.admission_scope(), plan::AdmissionScope::Shared);
+    let mut system = Engine::empty();
+    system.scope = Scope::System;
+    assert_eq!(system.admission_scope(), plan::AdmissionScope::Shared);
+    system.module_hints = vec!["/usr/lib/softhsm/libsofthsm2.so".into()];
+    assert_eq!(system.admission_scope(), plan::AdmissionScope::Named);
+    assert_eq!(
+        Engine::empty().admission_scope(),
+        plan::AdmissionScope::Named
+    );
+
+    let mut raw = overlay_module(overlay_key(57));
+    raw.tables[0].entries =
+        overlay_entries(&raw, first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let build = |scope| {
+        build_current_plan(
+            &modules,
+            &[],
+            &pins,
+            &mut DiscoveryCounters::default(),
+            &BTreeSet::new(),
+            0,
+            0,
+            false,
+            scope,
+        )
+    };
+
+    let error = build(plan::AdmissionScope::Named).expect_err("nothing to attach");
+    assert!(
+        error.to_string().contains("leaving nothing to attach"),
+        "{error:#}"
+    );
+    let shared = build(plan::AdmissionScope::Shared).expect("a shared capture still starts");
+    assert_eq!(shared.admission_scope(), plan::AdmissionScope::Shared);
+    assert!(shared.slots.is_empty());
+    assert_eq!(shared.modules_skipped.len(), 1);
+    assert!(
+        shared.modules_skipped[0]
+            .reason
+            .ends_with("name it with --module <path>"),
+        "{:?}",
+        shared.modules_skipped[0]
+    );
+}
+
 #[test]
 fn capture_facts_keep_a_manifest_only_capacity_refusal() {
     let (_, pins) = pinned_self();
@@ -1707,6 +1765,7 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
         0,
         0,
         false,
+        plan::AdmissionScope::Named,
     )
     .unwrap();
     engine.counters = counters;
@@ -4037,6 +4096,7 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
             source: "scan",
             file_offset: None,
             linkage: "heuristic",
+            exports_agreeing: Some(0),
         }],
         interfaces: 0,
         source: "scan",
@@ -7337,6 +7397,7 @@ fn evidence_verdict(
         discovery_read_failures: 0,
         discovery_truncated: 0,
         task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
         loader_discovery: render::LoaderDiscovery::default(),
         interface_selection: render::InterfaceSelection::default(),
         attach_mechanisms: vec![],
@@ -7349,6 +7410,8 @@ fn evidence_verdict(
         scheduling: render::SchedulingEvidence::default(),
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
+        gap_classes: render::GapClasses::default(),
+        stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
         p11scope_env: vec![],
@@ -9783,6 +9846,57 @@ fn standard_export_reducer_is_order_independent_and_fail_closed() {
 }
 
 #[test]
+fn selection_result_flags_publish_only_a_finite_class() {
+    // "SECRET!!" as a u64: 8 bytes a caller could aim *ppInterface at.
+    const HOSTILE: u64 = 0x5345_4352_4554_2121;
+    let tuple = |flags: u64| render::SelectionTuple {
+        module: 0,
+        request: SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 1,
+        },
+        rv: 0,
+        result: Some(SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags,
+        }),
+        table_match: false,
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::None,
+        count: 1,
+    };
+    for (flags, class) in [
+        (0, "zero"),
+        (cryptoki_sys::CKF_INTERFACE_FORK_SAFE, "fork_safe"),
+        (
+            p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER,
+            "other",
+        ),
+        (HOSTILE, "other"),
+        (u64::MAX, "other"),
+    ] {
+        let json = serde_json::to_value(tuple(flags)).unwrap();
+        assert_eq!(json["result"]["flags"], class, "{flags:#x}");
+        // Request flags stay the caller's scalar argument.
+        assert_eq!(json["request"]["flags"], 1);
+        let text = json.to_string();
+        assert!(
+            !text.contains(&HOSTILE.to_string()),
+            "raw word leaked: {text}"
+        );
+        assert!(!text.contains("SECRET"), "raw bytes leaked: {text}");
+    }
+    let json = serde_json::to_value(render::SelectionTuple {
+        result: None,
+        ..tuple(0)
+    })
+    .unwrap();
+    assert!(json["result"].is_null());
+}
+
+#[test]
 fn selection_unknown_result_flags_remain_factual_without_authority() {
     let (_fixture, mut engine, _session, binding) = attached_selection_route();
     let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
@@ -9792,7 +9906,7 @@ fn selection_unknown_result_flags_remain_factual_without_authority() {
     record.interface_index = DISCOVERY_VERSION_V3_0;
     record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
     record.selection_version_class = DISCOVERY_VERSION_V3_0;
-    record.interface_flags = 1 << 63;
+    record.interface_flags = p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER;
     record.table_ptr = selection_provider_address(&engine, binding);
     record.binding_id = binding.id;
 
@@ -9810,7 +9924,7 @@ fn selection_unknown_result_flags_remain_factual_without_authority() {
             .as_ref()
             .unwrap()
             .flags,
-        1 << 63
+        p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER
     );
     assert!(engine.selection_claims.is_empty());
     assert!(engine.selection_tables.is_empty());
@@ -10703,6 +10817,105 @@ fn rt_add_deferral_fallback_after_target_exit_is_bounded_loss_not_fatal() {
     assert!(engine.discovery_truncated > truncated_before);
 }
 
+/// Asserts the named capture ended the ordinary way after its target exited:
+/// the view retired as an expected removal, and no generation loss was
+/// published for a process that provably just ended.
+fn assert_named_target_exit_ended_capture(engine: &Engine) {
+    assert!(
+        engine.expected_target_exit(),
+        "the capture ends as a target exit: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(engine.views.is_empty());
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            skip.subject != "live discovery generation"
+                && skip.subject != "live inventory generation"
+                && !skip.reason.contains("generation changed")
+        }),
+        "a proven exit is not a lost generation: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// RB-1 remainder, loader arming. A `--pid`/`run` target that exits while its
+/// loader context is being attached failed the whole capture with "the named
+/// process generation changed during loader attachment": `still_the_same()` is
+/// false for an exit and a replacement alike, and the arm path never asked the
+/// retained pin which one it was. A provable exit is the target ending.
+#[test]
+fn named_target_exit_during_loader_arming_ends_the_capture_not_fails_it() {
+    let (_fixture, view, _module, _pins) = loaded_seed_provider();
+    let pid = view.pid();
+    let view_id = view.id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    engine.next_view_id = 1;
+    engine.views.push(view);
+    let mut session = ScriptedSession::default();
+    session.lose_generation_at_dynamic_loader_attach(pid);
+    let mut pending = PendingViewRetirements::new();
+
+    let armed = engine.arm_loader_or_partial(0, &mut session, &mut true, &mut pending);
+
+    armed.expect("a named target that exited mid-arm is not a capture failure");
+    assert_eq!(session.dynamic_loader_attach_calls, 1);
+    assert_eq!(
+        pending.get(&view_id),
+        Some(&RetirementCause::ExpectedRemoval)
+    );
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("the next batch retires the exited target");
+    assert_named_target_exit_ended_capture(&engine);
+    assert!(engine.loader_registry.ids_for_view(view_id).is_empty());
+}
+
+/// RB-1 remainder, inventory preflight. A named target that exits between a
+/// refresh's scan and either inventory preflight is the target ending, not a
+/// changed generation: the capture ends as a target exit with its report.
+/// The post-retirement preflight used to fail the capture with "the named
+/// process generation changed during inventory preflight"; the first one
+/// published a false generation loss.
+#[test]
+fn named_target_exit_during_inventory_preflight_ends_the_capture_not_fails_it() {
+    for (label, losses) in [
+        ("first", vec![Some(())]),
+        ("post-retirement", vec![None, Some(())]),
+    ] {
+        // The preflight kills and reaps this child; the test never waits on it.
+        let pid = spawn_execed_sleep().id();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.next_view_id = 1;
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+        engine.request_refresh(pid);
+        engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+        let mut session = ScriptedSession::default();
+        session.lose_generations_at_preflight(losses.iter().map(|loss| loss.map(|()| pid)));
+        let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+
+        let refreshed = engine.refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+        );
+
+        refreshed.unwrap_or_else(|error| {
+            panic!("{label} preflight: a named target's exit is not a capture failure: {error:#}")
+        });
+        assert!(
+            session.preflight_targets.borrow().len() >= losses.len(),
+            "{label}: the scripted exit ran inside that preflight"
+        );
+        assert_named_target_exit_ended_capture(&engine);
+    }
+}
+
 /// Mutation caught: an expected process exit cannot silently discard a
 /// deferred memory acquisition that never ran.
 #[test]
@@ -11575,6 +11788,122 @@ fn peer_candidate(engine: &mut Engine, modules: &[ScannedModule]) -> LiveCandida
     );
     assert_eq!(candidate.plan.slots.len(), 2);
     candidate
+}
+
+/// `entries` endpoints of one heuristic table at `0x1000, 0x1008, …` of
+/// `module`'s own object.
+fn with_endpoints(mut module: ScannedModule, entries: u32) -> ScannedModule {
+    let table = module.tables[0].clone();
+    module.tables = vec![ScannedTable {
+        entries: (0..entries)
+            .map(|entry| ScannedEntry {
+                name: "C_Sign",
+                object: module.key,
+                object_path: module.path.clone(),
+                file_offset: 0x1000 + u64::from(entry) * 8,
+            })
+            .collect(),
+        ..table
+    }];
+    module
+}
+
+/// PC-1 (A row 1-04). Every ordinary process exit in a cgroup or system
+/// capture queues a conservative replay, which rebuilds the plan from every
+/// still-listed module with additions closed. A listed endpoint that is not
+/// active — its attach failed, or a closed tick blocked it — was allocated a
+/// fresh capture-lifetime cell by every such replay and deactivated unlinked
+/// in the same breath. Under churn that burned the whole slot budget: the
+/// replays kept draining, but a provider that fit the active slots many times
+/// over was then refused for the rest of the capture. A candidate whose
+/// additions never ran gives its unlinked cells back.
+#[test]
+fn conservative_replays_under_churn_never_burn_capacity() {
+    let capacity = p11scope_ebpf_common::MAX_SLOTS;
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let _reap = ChildReaper(child);
+    let view = ProcessView::open(ProcessViewId(3), _reap.0.id()).unwrap();
+    let modules = child_provider_modules(&view);
+    let busy = with_endpoints(modules[0].clone(), capacity - 100);
+    let late = with_endpoints(modules[1].clone(), 50);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.next_view_id = 4;
+    engine.views.push(view);
+    let pins = pin_test_modules(&engine.views[0], std::slice::from_ref(&busy));
+    let candidate = engine
+        .live_candidate(pins, vec![busy.clone()], Vec::new())
+        .unwrap();
+    let mut session = ScriptedSession::default();
+    // Thirty of the busy provider's attaches fail: listed, not active.
+    session.fail_target_slots(0..30);
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    session.fail_target_slots([]);
+    let allocated = engine.plan.slots.len();
+    assert_eq!(allocated, capacity as usize - 100);
+    assert_eq!(engine.plan.active_slot_count(), allocated - 30);
+
+    // Churn: an ambient process with no modules exits, again and again.
+    for exit in 0..8 {
+        engine.pending_retirements.insert(ProcessViewId(100 + exit));
+        engine.replay_pending_conservative(
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        assert!(
+            engine.pending_retirements.is_empty(),
+            "exit {exit}: the replay drained its retirement"
+        );
+        assert_eq!(
+            engine.plan.slots.len(),
+            allocated,
+            "exit {exit}: a replay with additions closed allocates nothing"
+        );
+    }
+    assert!(
+        engine.plan.modules_skipped.is_empty(),
+        "no capacity refusal was published: {:?}",
+        engine.plan.modules_skipped
+    );
+
+    // Discovery still admits a later provider that fits, and retries the
+    // busy provider's inactive endpoints in the same open candidate.
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(
+        &engine.views[0],
+        std::slice::from_ref(&late),
+    ));
+    let candidate = engine
+        .live_candidate(pins, vec![busy, late], skipped)
+        .unwrap();
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    assert!(
+        engine.plan.modules_skipped.is_empty(),
+        "the late provider was admitted: {:?}",
+        engine.plan.modules_skipped
+    );
+    assert_eq!(engine.plan.slots.len(), allocated + 30 + 50);
+    assert_eq!(engine.plan.active_slot_count(), allocated + 50);
+}
+
+/// Kills and reaps its child when dropped.
+struct ChildReaper(std::process::Child);
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
@@ -16153,6 +16482,7 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
     u07_name_members(scope.path(), &[member.pid(), lost]);
     session.lose_generations_at_detach([Some(lost)]);
     let attach_calls = session.attached_slots.len();
+    let allocated = engine.plan.slots.len();
     u07_tick(&mut engine, &mut session, &mut true);
 
     assert!(
@@ -16161,9 +16491,14 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
     );
     let (active, inactive) = u07_provider_slots(&engine, "u07-refreshed.so");
     assert!(
-        active.is_empty() && !inactive.is_empty(),
+        active.is_empty() && inactive.is_empty(),
         "new targets that were never attached must not stay active: active {active:?}, inactive {inactive:?}, attach calls {:?}",
         &session.attached_slots[attach_calls..]
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        allocated,
+        "PC-1: cells no link ever used are given back, not burned"
     );
     assert_eq!(
         session.attached_slots.len(),
@@ -18190,8 +18525,9 @@ fn named_generation_change_during_attach_drops_before_event_consumption() {
 }
 
 /// Mutation caught: retrying without subtracting an originally accepted stale
-/// view can spin forever under cgroup churn. Three accepted views permit only
-/// three stale-session retries, followed by the final stable start.
+/// view can spin forever under cgroup churn. Before any session exists, each
+/// accepted view that went stale is removed with one plan rebuild, and the
+/// session then starts exactly once.
 #[test]
 fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
     let views: Vec<_> = (0..3)
@@ -18207,15 +18543,11 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
         false,
         |_| {
             checks.set(checks.get() + 1);
-            if checks.get() % 2 == 0 {
-                original
-                    .get(checks.get() / 2 - 1)
-                    .copied()
-                    .into_iter()
-                    .collect()
-            } else {
-                Vec::new()
-            }
+            original
+                .get(checks.get() - 1)
+                .copied()
+                .into_iter()
+                .collect()
         },
         |_, _| {
             starts.set(starts.get() + 1);
@@ -18225,7 +18557,12 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
     )
     .unwrap();
 
-    assert_eq!(starts.get(), original.len() + 1);
+    assert_eq!(starts.get(), 1, "the session starts once");
+    assert_eq!(
+        checks.get(),
+        original.len() + 2,
+        "one check per removal, one before and one after the start"
+    );
     assert!(discovered.views.is_empty());
     assert_eq!(
         discovered
@@ -18250,14 +18587,108 @@ fn cgroup_retries_retire_one_original_view_each_time_and_publish_partial() {
             .map(render::capture_skipped_out)
             .all(|skip| skip.name == "discovery subject" && skip.reason == "discovery unavailable")
     );
+    assert_eq!(*log.borrow(), ["start"], "no session was torn down");
+    drop(session);
+}
+
+/// H-2. A multi-process capture started a whole new session — every link
+/// detached, the plan rebuilt, BPF reloaded and reattached — whenever any
+/// retained view went stale during the seconds-long load and attach, once per
+/// ambient exit and with no bound, and the dropped session's loss counters went
+/// with it. It now starts once and retires the stale view live, like any
+/// member that ends mid-capture: a provable exit is an expected removal (no
+/// loss), anything else a counted generation loss.
+#[test]
+fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let exiting = std::cell::RefCell::new(ChildReaper(child));
+    let exiting_pid = exiting.borrow().0.id();
+    let views = vec![
+        ProcessView::open(ProcessViewId(0), exiting_pid).unwrap(),
+        crate::process::unprovable_process_view_for_test(ProcessViewId(1), std::process::id())
+            .unwrap(),
+        ProcessView::open(ProcessViewId(2), std::process::id()).unwrap(),
+    ];
+    let (exited, unprovable, kept) = (views[0].id(), views[1].id(), views[2].id());
+    let mut discovered = lifecycle_discovered(views);
+    discovered.scope = Scope::System;
+    let checks = Cell::new(0usize);
+    let starts = Cell::new(0usize);
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let session = start_retained_with(
+        &mut discovered,
+        false,
+        |views| {
+            checks.set(checks.get() + 1);
+            if checks.get() == 1 {
+                // Nothing is stale yet when the session starts.
+                return Vec::new();
+            }
+            if checks.get() == 2 {
+                let mut exiting = exiting.borrow_mut();
+                exiting.0.kill().unwrap();
+                exiting.0.wait().unwrap();
+            }
+            crate::process::stale_view_ids(views)
+        },
+        |_, _| {
+            starts.set(starts.get() + 1);
+            log.borrow_mut().push("start");
+            Ok(FakeSession(std::rc::Rc::clone(&log)))
+        },
+    )
+    .expect("an ambient exit during attach never fails a multi-process start");
+
+    assert_eq!(starts.get(), 1, "one session, never restarted");
+    assert_eq!(*log.borrow(), ["start"], "the session was not torn down");
     assert_eq!(
-        log.borrow()
-            .iter()
-            .filter(|event| **event == "drop")
-            .count(),
-        original.len(),
-        "every stale post-start pass tears down its whole session"
+        discovered.views.len(),
+        3,
+        "stale views retire live, not here"
     );
+    assert_eq!(
+        discovered.retirement_intents.get(&exited),
+        Some(&RetirementCause::ExpectedRemoval),
+        "a provable exit is the process ending"
+    );
+    assert_eq!(
+        discovered.retirement_intents.get(&unprovable),
+        Some(&RetirementCause::GenerationLost),
+        "a generation whose end cannot be proven is a counted loss"
+    );
+    assert!(!discovered.retirement_intents.contains_key(&kept));
+    assert!(
+        discovered
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery generation"),
+        "the unprovable generation's loss is published: {:?}",
+        discovered.counters.object_skips
+    );
+
+    // The startup record pass retires them like any live retirement.
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    discovered
+        .process_discovery_records(
+            &mut ScriptedSession::default(),
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut *collect,
+            &mut PauseClosure::new(true),
+        )
+        .unwrap();
+    assert!(discovered.retirement_intents.is_empty());
+    assert!(discovered.pending_retirements.is_empty());
+    assert!(
+        discovered.views.iter().all(|view| view.id() != exited),
+        "the exited view is gone"
+    );
+    assert!(discovered.views.iter().any(|view| view.id() == kept));
     drop(session);
 }
 
@@ -18539,6 +18970,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         inode: 42,
     };
     let module = |view, object, path: &str, offset| ReconciledModule {
+        exports: Default::default(),
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
@@ -18580,6 +19012,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         0,
         0,
         false,
+        plan::AdmissionScope::Named,
     )
     .unwrap();
 
@@ -18623,6 +19056,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
         inode: 42,
     };
     let module = |view: ProcessViewId, path: &str| ReconciledModule {
+        exports: Default::default(),
         object: PinnedObjectId(200),
         entry_objects: vec![vec![PinnedObjectId(200)]],
         scanned: ScannedModule {
@@ -18688,6 +19122,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
         inode: 42,
     };
     let module = |object| ReconciledModule {
+        exports: Default::default(),
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
@@ -19075,6 +19510,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         discovery_read_failures: 0,
         discovery_truncated: 0,
         task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
         loader_discovery: render::LoaderDiscovery::default(),
         interface_selection: render::InterfaceSelection::default(),
         attach_mechanisms: vec![],
@@ -19087,6 +19523,8 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         scheduling: render::SchedulingEvidence::default(),
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
+        gap_classes: render::GapClasses::default(),
+        stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
         p11scope_env: vec![],
@@ -19292,6 +19730,7 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
             } else {
                 "heuristic"
             },
+            exports_agreeing: (source != "manifest").then_some(0),
         });
         record_object_skips(&mut plan, std::slice::from_ref(&refusal));
         record_object_skips(&mut plan, &[]);
@@ -21368,7 +21807,7 @@ fn linked_candidate_table_sorts_before_unlinked_lookalike() {
         table: Some(1),
     }];
 
-    let order = order_tables_by_evidence(&tables, &interfaces, &[], &[]);
+    let order = order_tables_by_evidence(&tables, &interfaces, &[], &[], &ObjectExports::NONE);
 
     assert_eq!(
         order,
@@ -22780,6 +23219,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
     engine.views.push(view);
     engine.next_view_id = 1;
     engine.modules = vec![ReconciledModule {
+        exports: Default::default(),
         object: PinnedObjectId(7),
         scanned: ScannedModule {
             view: view_id,
@@ -22947,6 +23387,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "module without opened identity",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: object_without_identity,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
@@ -22967,6 +23408,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "table without parallel identities",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
@@ -22979,6 +23421,7 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
         FailureMode {
             name: "entry target without identity",
             modules: vec![ReconciledModule {
+                exports: Default::default(),
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: vec![vec![

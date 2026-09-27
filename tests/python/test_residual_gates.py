@@ -130,5 +130,41 @@ class ResidualOracleKeys(unittest.TestCase):
             self.assertIn(key, keys)
 
 
+class VerdictRecompute(unittest.TestCase):
+    """Review answer (a) / F-1: the oracle recomputes `verdict_detail` from
+    the published counters and refuses a document that disagrees."""
+
+    def setUp(self):
+        import runpy
+
+        self.checker = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
+
+    def evidence(self, **counters):
+        checker = self.checker
+        evidence = checker["evidence_fixture"](checker["LEGACY_SURFACES"])
+        evidence.update(table_entries=68, slots=68, active_slots=68, attached_probes=136)
+        evidence.update(counters)
+        settle = checker.get("settle_fixture_verdict")
+        if settle is not None:
+            settle(evidence)
+        return evidence
+
+    def test_a_lossy_document_cannot_claim_a_clean_detail(self):
+        evidence = self.evidence(unmatched_returns=1)
+        self.checker["exact_terminal_verdict"](evidence)
+        evidence["verdict_detail"] = "clean_but_unproven"
+        with self.assertRaises(AssertionError):
+            self.checker["exact_terminal_verdict"](evidence)
+
+    def test_withheld_names_alone_are_attribution_only(self):
+        evidence = self.evidence(semantic_unverified_slots=68)
+        self.assertEqual(evidence["verdict_detail"], "attribution_only")
+        self.checker["exact_terminal_verdict"](evidence)
+        for wrong in ("concrete_gap", "clean_but_unproven"):
+            bad = dict(evidence, verdict_detail=wrong)
+            with self.assertRaises(AssertionError):
+                self.checker["exact_terminal_verdict"](bad)
+
+
 if __name__ == "__main__":
     unittest.main()

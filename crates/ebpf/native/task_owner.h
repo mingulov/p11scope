@@ -9,7 +9,6 @@ typedef unsigned long long u64;
 #define __uint(name, value) int (*name)[value]
 #define __type(name, value) typeof(value) *name
 #define OWNER_LEASED 1U
-#define OWNER_CAS_TRIES 8
 #ifndef P11SCOPE_OWNER_SLOT_BOUND
 #define P11SCOPE_OWNER_SLOT_BOUND 512U
 #endif
@@ -20,6 +19,14 @@ typedef unsigned long long u64;
 #else
 #define OWNER_LIMIT 16448ULL
 #endif
+/* Admission claims with a non-fetch atomic add and undoes an over-limit claim,
+ * so in-flight over-limit claims can transiently raise `outstanding` above
+ * OWNER_LIMIT. Each task runs at most one claim at a time (no owner program
+ * nests inside another on one task), so the excess is below PID_MAX_LIMIT
+ * (2^22 on 64-bit). A count past this bound is corruption (a wrapped
+ * underflow), never contention. */
+#define OWNER_TRANSIENT_CLAIMS (1ULL << 22)
+#define OWNER_CONTROL_BOUND (OWNER_LIMIT + OWNER_TRANSIENT_CLAIMS)
 #define OWNER_BAD_CONTROL 1ULL
 #define OWNER_LOOKUP_UNKNOWN 2ULL
 #define OWNER_BAD_RECORD 4ULL

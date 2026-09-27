@@ -1103,11 +1103,7 @@ fn assert_static_descriptor_cookie_contract(
             "let rk = RvKey { slot, _pad: 0, rv };",
             "return RV_COUNTS slot",
         ),
-        ("RV_COUNTS.get(&rk)", "return RV_COUNTS lookup"),
-        (
-            "RV_COUNTS.insert(&rk, &(prev + 1), 0)",
-            "return RV_COUNTS update",
-        ),
+        ("rv_count_add(&rk)", "return RV_COUNTS update"),
         ("\n        slot,\n        target_function:", "Event.slot"),
         (
             "let semantics = semantics_of(&ctx);",
@@ -1115,6 +1111,31 @@ fn assert_static_descriptor_cookie_contract(
         ),
     ] {
         require_contract_marker(returned, marker, contract)?;
+    }
+
+    // The RV_COUNTS row for that cookie slot is counted exactly: an existing
+    // row takes an in-place atomic add, a missing one is created only with
+    // BPF_NOEXIST, and a lost create race retries the in-place add. A
+    // get-then-overwrite update would drop concurrent increments.
+    let rv_update = contract_section(ebpf, "fn rv_count_add(key: &RvKey) -> bool {", "#[uretprobe]")?;
+    for (marker, contract) in [
+        (
+            "if let Some(cell) = RV_COUNTS.get_ptr_mut(key) {\n        counter_add(cell, 1);",
+            "RV_COUNTS in-place atomic add",
+        ),
+        (
+            ".insert(key, &1, aya_ebpf::bindings::BPF_NOEXIST as u64)",
+            "RV_COUNTS create only with BPF_NOEXIST",
+        ),
+        (
+            "match RV_COUNTS.get_ptr_mut(key) {\n        Some(cell) => {\n            counter_add(cell, 1);",
+            "RV_COUNTS create-race retry",
+        ),
+    ] {
+        require_contract_marker(rv_update, marker, contract)?;
+    }
+    if rv_update.contains(".insert(key, &1, 0)") || rv_update.contains("RV_COUNTS.get(") {
+        return Err("RV_COUNTS must not be read and overwritten".into());
     }
     Ok(())
 }
@@ -3921,8 +3942,10 @@ fn capture_evidence_checker_self_test() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 checker output");
     for marker in [
         "unexpected positive function rejected: OK",
-        "scan-only ordinal label rejected: OK",
-        "scan-only total exact count required: OK",
+        "scan-only SoftHSM2 names are export-linked and exact: OK",
+        "scan-only per-name exact count required: OK",
+        "function rows carry an exact target and sorted unique ordinals: OK",
+        "verdict_detail and gap_classes are recomputed from the counters: OK",
         "clean metrics multiplier is exact: OK",
         "clean metrics discovery source is exact in all three lanes: OK",
         "lane13 manifest-only shared overlay is exact: OK",
@@ -4678,6 +4701,16 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         "the return attach site must carry the descriptor word"
     );
 
+    let overwrite = ebpf.replacen(
+        ".insert(key, &1, aya_ebpf::bindings::BPF_NOEXIST as u64)",
+        ".insert(key, &1, 0)",
+        1,
+    );
+    assert_ne!(overwrite, ebpf, "RV_COUNTS overwrite mutation must change the source");
+    assert!(
+        assert_static_descriptor_cookie_contract(&attach, &overwrite, &owner).is_err(),
+        "an RV_COUNTS create that may overwrite a concurrent row must be rejected"
+    );
     let high_word_stats = ebpf.replacen(
         "if let Some(stats) = STATS.get_ptr_mut(slot) {",
         "if let Some(stats) = STATS.get_ptr_mut(cookie_descriptor(cookie_of(&ctx))) {",
@@ -8180,6 +8213,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             source: "scan",
             file_offset: None,
             linkage: "heuristic",
+            exports_agreeing: Some(0),
         }],
         interfaces: 0,
         skipped: vec![],
@@ -8254,6 +8288,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         discovery_read_failures: 0,
         discovery_truncated: 0,
         task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
         loader_discovery: p11scope::render::LoaderDiscovery {
             strategies: p11scope::render::LoaderStrategies {
                 debug_state_every_hit: 1,
@@ -8284,6 +8319,8 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         },
         drain_proven: false,
         verdict_detail: p11scope::render::VERDICT_CONCRETE_GAP,
+        gap_classes: p11scope::render::GapClasses::default(),
+        stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
         p11scope_env: vec![],
@@ -8293,6 +8330,9 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
     assert_eq!(evidence.completeness, "PARTIAL");
 
     let mut owned = p11scope::metrics::SlotReport {
+        file_offset: 0,
+        target_object: None,
+        ordinals: Vec::new(),
         names: vec!["C_Sign".into()],
         aliased: false,
         semantic_authorized: true,

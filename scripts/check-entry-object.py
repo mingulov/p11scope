@@ -79,6 +79,18 @@ def address(state, base, sign, offset):
     return None
 
 
+def join_fact(left, right):
+    """Must-join of one register/stack fact. Different map-helper lookups can
+    join at one shared counter writeback (as in SinkProof's ("result",
+    "map")): the joined pointer is still a map value disjoint from the local
+    frame; only which lookup produced it is forgotten."""
+    if left == right:
+        return left
+    if left and right and left[0] == right[0] == "result":
+        return ("result", "map")
+    return None
+
+
 def forget_stack(state, offset, size):
     for key in list(state):
         if isinstance(key, tuple) and key[0] == "stack":
@@ -95,10 +107,15 @@ def forget_atomic_memory(state, text):
     """Read-modify-write effects precede and survive result-register handling."""
     match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
     pointer = address(state, *match.groups()[1:]) if match else None
+    base = state.get("r" + match[2]) if match else None
     if pointer and pointer[0] == "stack":
         forget_stack(state, pointer[1], int(match[1]) // 8)
     elif pointer and pointer[0] == "event":
         forget_event_slot(state, pointer[1], int(match[1]) // 8)
+    elif pointer is None and base is not None and base[0] == "result":
+        # As for plain stores: a map helper's result (a counter or gate cell)
+        # is disjoint from the BPF frame and the reserved event.
+        return
     else:
         # Unsupported syntax/address cannot establish which tracked bytes survive.
         for key in list(state):
@@ -231,7 +248,12 @@ class Consumer:
             dst, op, src = match.groups()
             old, fact = state.get(reg(dst)), value(state, src)
             if op != "=":
-                if old and fact and fact[0] == "constant":
+                if op == "+=" and old and old[0] == "result":
+                    # As in SinkProof: offset selection within a BPF map value
+                    # (a verifier-bounded histogram index, say) cannot turn its
+                    # address space into the local frame's.
+                    fact = ("result", "map")
+                elif old and fact and fact[0] == "constant":
                     amount = fact[1]
                     if op == "+=" and old[0] in ("stack", "context", "event", "constant"):
                         fact = (old[0], old[1] + amount)
@@ -300,7 +322,9 @@ class Consumer:
             state = self.step(pc, incoming[pc])
             for successor in self.graph[pc]:
                 previous = incoming.get(successor)
-                merged = state.copy() if previous is None else {k: v for k, v in previous.items() if state.get(k) == v}
+                merged = state.copy() if previous is None else {
+                    k: joined for k, v in previous.items()
+                    if (joined := join_fact(v, state.get(k))) is not None}
                 if previous != merged:
                     incoming[successor] = merged
                     pending.append(successor)
@@ -315,37 +339,37 @@ DESTINATIONS = {6: (8, 8), 7: (0x10, 8), 10: (0x28, 8),
                 "join": (0x58, 8), "get": (0x30, 8), 16: (0x104, 4)}
 LP64_OFFSETS = (0x70, 0x68, 0x60, 0x58, 0x48, 0x40)
 LP64_READS = {
-    6: ([1168, 1043, 1172, 1135, 1170, 1130], 1148),
-    7: ([1224, 1179, 1228, 1190, 1226, 1185], 1203),
-    10: ([1280, 1236, 1284, 1248, 1282, 1243], 1261),
-    11: ([1342, 1295, 1346, 1310, 1344, 1301], 1323),
-    8: ([1692, 1557, 1365, 1455, 1378, 1460], 1407),
-    9: ([1451, 1463, 1358, 1453, 1372, 1458], 1392),
-    16: ([1551, 1567, 1513, 1553, 1519, 1555], 1532),
-    "join": ([1674, 1578, 1680, 1606, 1677, 1593], 1620),
-    "get": ([1683, 1586, 1689, 1628, 1686, 1600], 1642),
+    6: ([1158, 1033, 1162, 1126, 1160, 1121], 1139),
+    7: ([1213, 1169, 1217, 1180, 1215, 1175], 1193),
+    10: ([1268, 1225, 1272, 1237, 1270, 1232], 1250),
+    11: ([1329, 1283, 1333, 1298, 1331, 1289], 1311),
+    8: ([1674, 1540, 1352, 1440, 1365, 1445], 1394),
+    9: ([1436, 1448, 1345, 1438, 1359, 1443], 1379),
+    16: ([1534, 1550, 1497, 1536, 1503, 1538], 1516),
+    "join": ([1656, 1561, 1662, 1589, 1659, 1576], 1603),
+    "get": ([1665, 1569, 1671, 1611, 1668, 1583], 1625),
 }
-IA32_READS = {6: 1939, 7: 2028, 10: 2051, 11: 2078,
-              8: 2126, 9: 2103, 16: 2197, "join": 2227, "get": 2250}
-LP64_DISPATCH = {6: (1037,), 7: (1174,), 10: (1230,), 11: (1290,),
-                 8: (1349, 1360), 9: (1352, 1353), 16: (1477, 1508),
-                 "join": (1573,), "get": (1581,)}
-IA32_DISPATCH = {6: (1936,), 7: (2025,), 10: (2049,), 11: (2076,),
-                 8: (2099,), 9: (2101,), 16: (2165,), "join": (2224,), "get": (2247,)}
+IA32_READS = {6: 1919, 7: 2008, 10: 2030, 11: 2056,
+              8: 2102, 9: 2080, 16: 2171, "join": 2200, "get": 2222}
+LP64_DISPATCH = {6: (1027,), 7: (1164,), 10: (1219,), 11: (1278,),
+                 8: (1336, 1347), 9: (1339, 1340), 16: (1462, 1492),
+                 "join": (1556,), "get": (1564,)}
+IA32_DISPATCH = {6: (1916,), 7: (2005,), 10: (2028,), 11: (2054,),
+                 8: (2076,), 9: (2078,), 16: (2140,), "join": (2197,), "get": (2219,)}
 SCALAR_CALLS = {
-    "default": {1043: 6, 1056: 7, 1069: 10, 1085: 11, 1170: 8,
-                1203: 9, 1261: 16, 1432: "join", 1446: "get"},
-    "p11_entry_template": {2522: 6, 2535: 7, 2547: 10, 2564: 11,
-                           2580: 9, 2671: 8, 2722: 12, 2733: 13},
-    "p11_entry_template_pair": {3032: 6, 3045: 7, 3057: 10, 3074: 11,
-                                3090: 9, 3181: 8, 3232: 12, 3243: 13},
-    "p11_entry_template_types": {3683: 6, 3696: 7, 3708: 10, 3725: 11,
-                                 3741: 9, 3832: 8, 3883: 12, 3894: 13},
-    "p11_entry_template_second": {3464: 14, 3476: 15},
+    "default": {1033: 6, 1046: 7, 1059: 10, 1075: 11, 1161: 8,
+                1194: 9, 1251: 16, 1421: "join", 1435: "get"},
+    "p11_entry_template": {2492: 6, 2505: 7, 2517: 10, 2534: 11,
+                           2550: 9, 2642: 8, 2692: 12, 2703: 13},
+    "p11_entry_template_pair": {3001: 6, 3014: 7, 3026: 10, 3043: 11,
+                                3059: 9, 3151: 8, 3201: 12, 3212: 13},
+    "p11_entry_template_types": {3648: 6, 3661: 7, 3673: 10, 3690: 11,
+                                 3706: 9, 3798: 8, 3848: 12, 3859: 13},
+    "p11_entry_template_second": {3431: 14, 3443: 15},
 }
-SEMANTIC_INSERT = {"default": 1228, "p11_entry": 1482, "p11_entry_ia32": 2170,
-                   "p11_entry_template": 2766, "p11_entry_template_pair": 3276,
-                   "p11_entry_template_types": 3931}
+SEMANTIC_INSERT = {"default": 1219, "p11_entry": 1467, "p11_entry_ia32": 2145,
+                   "p11_entry_template": 2735, "p11_entry_template_pair": 3244,
+                   "p11_entry_template_types": 3896}
 BYTE_DOMAIN = frozenset(range(256))
 BRANCH = re.compile(r"if ([rw]\d+) (==|!=|s>|>|s>=|>=|<|<=) ([rw]\d+|-?0x[0-9a-f]+) goto [+-]0x[0-9a-f]+")
 
@@ -485,7 +509,12 @@ class SinkProof:
         if self.effect_start and ("atomic" in text or "xchg" in text or text.startswith("lock ")):
             match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
             pointer = address(before, *match.groups()[1:]) if match else None
-            require(pointer and pointer[0] == "stack" and -512 <= pointer[1] < 0,
+            # As for plain stores: a map helper's result is disjoint from the
+            # BPF frame, so a non-fetch counter add through it (loss evidence)
+            # cannot touch a saved sink. Fetch forms also write a register.
+            counter = (text.startswith("lock ") and match is not None and pointer is None
+                       and before.get("r" + match[2], (None,))[0] == "result")
+            require(counter or (pointer and pointer[0] == "stack" and -512 <= pointer[1] < 0),
                     error("unsupported callee memory footprint"))
         if pc in self.dispatches:
             branch = BRANCH.fullmatch(text)
@@ -959,9 +988,9 @@ def retained_contract(consumer, variant, selectors):
     # Return copies these scalars while START is owned, before removal. They
     # are retained values, never permission to reuse the removed map pointer.
     delta = int(variant == "unsafe")
-    sites = {1421+delta: (0x30, 1, 1), 1651+delta: (0x30, 1, 0),
-             1596+delta: (0x20, None, 1), 1660+delta: (0x20, None, 0),
-             1628+delta: (0x30, 12, 1), 1670+delta: (0x30, 12, 0)}
+    sites = {1419+delta: (0x30, 1, 1), 1649+delta: (0x30, 1, 0),
+             1593+delta: (0x20, None, 1), 1658+delta: (0x20, None, 0),
+             1627+delta: (0x30, 12, 1), 1668+delta: (0x30, 12, 0)}
     for selector in selectors:
         abi = int(selector == 0x23)
         for present in (False, True):
@@ -1194,7 +1223,9 @@ def operation_contract(consumer, facts, variant, internal_blocks):
     if name != "p11_entry_template_second":
         expected_maps[("STATS", "call 0x1")] = 1
     if name == "p11_return":
-        expected_maps.update({("RV_COUNTS", "call 0x1"): 1, ("RV_COUNTS", "call 0x2"): 1,
+        # RV_COUNTS: in-place lookup for the atomic add, one BPF_NOEXIST
+        # create, and the create-race retry lookup (every key is the cookie).
+        expected_maps.update({("RV_COUNTS", "call 0x1"): 2, ("RV_COUNTS", "call 0x2"): 1,
                               ("EVENTS", "call 0x83"): 1, ("EVENTS", "call 0x84"): 1})
     require(owner == expected_owner, name + f": START operation inventory {owner}, expected {expected_owner}")
     require(maps == expected_maps, name + ": distinct map operation inventory differs")

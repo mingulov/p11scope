@@ -11,17 +11,18 @@ use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
     StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays, open_view_object,
-    pin_manifest_objects_deferred_in_views_with_budget, pin_scanned_view_objects,
-    retained_object_key, target_paths_equal, view_object_key,
+    open_view_object_cached, pin_manifest_objects_deferred_in_views_with_budget,
+    pin_scanned_view_objects, retained_object_key, retained_object_key_cached, target_paths_equal,
+    view_object_key_cached,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
-    exact_table_bytes, index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse,
-    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, spans_for,
-    table_evidence_score, table_linkage, target_layout,
+    CaptureWorkBudget, ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface,
+    ScannedModule, ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
+    exact_table_bytes, export_agreement, index_maps_or_refuse, read_elf_snapshot,
+    read_maps_or_refuse, scan_process_view, scan_process_view_without_memory, scan_skip_truncates,
+    spans_for, table_evidence_score, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -1593,14 +1594,22 @@ impl CaptureFacts {
                 }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
+                // The same witness `plan::lower_scanned` scores by, so the
+                // published linkage and the plan's naming never disagree.
+                let exports = ObjectExports {
+                    object: module.scanned.key,
+                    symbols: &module.exports,
+                };
                 let table_score = table_evidence_score(
                     table_index,
                     &module.scanned.tables,
                     &module.scanned.interfaces,
                     &[],
                     &[],
+                    &exports,
                 );
                 let linkage = table_linkage(&table_score);
+                let exports_agreeing = export_agreement(table, &exports).agreeing;
                 history
                     .tables
                     .entry(TableOccurrence::Scan {
@@ -1617,6 +1626,7 @@ impl CaptureFacts {
                         if known.linkage == "heuristic" && linkage != "heuristic" {
                             known.linkage = linkage;
                         }
+                        known.exports_agreeing = known.exports_agreeing.max(Some(exports_agreeing));
                     })
                     .or_insert(plan::TableSummary {
                         version: table_fact.0,
@@ -1624,6 +1634,7 @@ impl CaptureFacts {
                         source: "scan",
                         file_offset: table.file_offset,
                         linkage,
+                        exports_agreeing: Some(exports_agreeing),
                     });
                 *table_occurrence += 1;
                 *surface_occurrence += 1;
@@ -1763,6 +1774,7 @@ impl CaptureFacts {
                         source: "manifest",
                         file_offset: None,
                         linkage: "manifest",
+                        exports_agreeing: None,
                     });
                 for (function_index, function) in surface.functions.iter().enumerate() {
                     let key = DecodedOccurrence::ManifestFunction {
@@ -4328,10 +4340,12 @@ fn build_current_plan(
     identity_mismatches: usize,
     manifest_fallbacks: usize,
     broad_admit: bool,
+    admission_scope: plan::AdmissionScope,
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
-    let mut plan = plan::build_from_sources_broad(modules, manifests, pinned, broad_admit);
+    let mut plan =
+        plan::build_from_sources_scoped(modules, manifests, pinned, broad_admit, admission_scope);
     record_object_skips(&mut plan, &counters.object_skips);
     for object in corroborated {
         if let Some(summary) = plan
@@ -4352,7 +4366,13 @@ fn build_current_plan(
             identity_mismatches + manifest_fallbacks
         );
     }
-    if let Some(error) = refusal_error(&plan) {
+    // A named capture that can attach nothing has nothing to observe. A
+    // shared-scope capture still starts: its refusals are published and
+    // printed, and a provider that loads, or is corroborated, later in the
+    // capture can still be admitted into the reserve.
+    if plan.admission_scope() == plan::AdmissionScope::Named
+        && let Some(error) = refusal_error(&plan)
+    {
         bail!(error);
     }
     plan::ensure_capacity(&plan).map_err(|error| anyhow!(error))?;
@@ -5500,6 +5520,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     }
     let manifest_fallbacks = counters.manifest_fallbacks.len();
     let broad_admit = discovered.broad_admit;
+    let admission_scope = discovered.admission_scope();
     let mut plan = build_current_plan(
         &modules,
         &accepted,
@@ -5509,6 +5530,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         identity_mismatches,
         manifest_fallbacks,
         broad_admit,
+        admission_scope,
     )
     .inspect_err(|_| counters.report_notes())?;
     discovered
@@ -5606,29 +5628,42 @@ fn start_retained_with<S>(
     if named && discovered.views.len() != 1 {
         bail!("the named process generation was not retained through discovery");
     }
+    // Before any session exists a stale view costs one plan rebuild, and each
+    // pass removes at least one accepted view, so this is bounded by them.
     loop {
         let stale = stale_views(&discovered.views);
-        if !stale.is_empty() {
-            if named {
-                bail!("the named process generation changed before attach");
-            }
-            remove_stale_views(discovered, &stale)?;
-            continue;
-        }
-
-        let session = start(&discovered.plan, &discovered.pinned)?;
-        let stale = stale_views(&discovered.views);
         if stale.is_empty() {
-            return Ok(session);
+            break;
         }
-        // No event/map consumer can see this session. Dropping it first tears down
-        // every just-created link before stale ownership changes or a retry begins.
-        drop(session);
         if named {
-            bail!("the named process generation changed while attaching");
+            bail!("the named process generation changed before attach");
         }
         remove_stale_views(discovered, &stale)?;
     }
+
+    let session = start(&discovered.plan, &discovered.pinned)?;
+    let stale = stale_views(&discovered.views);
+    if stale.is_empty() {
+        return Ok(session);
+    }
+    if named {
+        // No event/map consumer can see this session. Dropping it first tears
+        // down every just-created link before the named capture fails.
+        drop(session);
+        bail!("the named process generation changed while attaching");
+    }
+    // H-2: a multi-process capture starts once. Restarting the whole session
+    // for an ambient exit during the seconds-long load and attach detached
+    // every link and attached them all again, once per exit and with no bound.
+    // A view that went stale meanwhile is retired live instead, like any
+    // member that ends mid-capture: the startup record pass settles it — a
+    // provable exit as an expected removal, anything else as a counted
+    // generation loss — and its conservative replay retires every endpoint
+    // only that view owned. Until then its links stay exactly the ones the
+    // accepted plan names.
+    let stale: BTreeSet<_> = stale.into_iter().collect();
+    discovered.queue_stale_views(&stale, &mut PendingViewRetirements::new());
+    Ok(session)
 }
 
 fn export_abi(kind: u8) -> Option<HookAbi> {
@@ -7210,6 +7245,19 @@ impl Engine {
         aggregate
     }
 
+    /// The admission rule this capture's plan keeps for its whole lifetime
+    /// (GT-5). A named process, or a capture the operator aimed with
+    /// `--module` (whose scan sees only the named objects), admits
+    /// first-come. Any other cgroup or system capture admits in value order,
+    /// whole modules only, with a reserve for late corroborated providers.
+    fn admission_scope(&self) -> plan::AdmissionScope {
+        if matches!(self.scope, Scope::Pid(_)) || !self.module_hints.is_empty() {
+            plan::AdmissionScope::Named
+        } else {
+            plan::AdmissionScope::Shared
+        }
+    }
+
     /// True once a named target's expected exit has been fully finalized:
     /// its view, links, and pending work are all released. Never true for a
     /// cgroup capture, which continues when one member exits.
@@ -8054,10 +8102,12 @@ impl Engine {
         budget: &mut CaptureWorkBudget,
     ) -> Result<Option<LoaderLocator>> {
         let pid = view.pid();
+        // One mount-table read serves every identity below (H-3).
+        let mut mounts = crate::process::MountTableCache::default();
         let before_maps = Self::read_maps(view, budget)?;
         let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
-        let before_executable =
-            view_object_key(view, &executable_path, budget).map_err(anyhow::Error::msg)?;
+        let before_executable = view_object_key_cached(view, &executable_path, &mut mounts, budget)
+            .map_err(anyhow::Error::msg)?;
         let executable = view
             .run_while_same(|| std::fs::File::open(&executable_path))
             .map_err(anyhow::Error::msg)??;
@@ -8069,7 +8119,8 @@ impl Engine {
             bail!("retained executable changed during bounded PT_INTERP discovery");
         }
         let retained_executable =
-            retained_object_key(view, &executable, budget).map_err(anyhow::Error::msg)?;
+            retained_object_key_cached(view, &executable, &mut mounts, budget)
+                .map_err(anyhow::Error::msg)?;
 
         let interpreter_file = if let Some(interpreter) = &interpreter {
             let path = PathBuf::from(format!("/proc/{pid}/root")).join(
@@ -8077,7 +8128,8 @@ impl Engine {
                     .strip_prefix("/")
                     .expect("bounded PT_INTERP paths are absolute"),
             );
-            let (file, key) = open_view_object(view, &path, budget).map_err(anyhow::Error::msg)?;
+            let (file, key) = open_view_object_cached(view, &path, &mut mounts, budget)
+                .map_err(anyhow::Error::msg)?;
             let object = read_elf_snapshot(&file, budget).map_err(anyhow::Error::msg)?;
             if object.abi() != executable_abi {
                 bail!("retained executable and PT_INTERP have different target ABIs");
@@ -8089,8 +8141,8 @@ impl Engine {
         };
 
         let after_maps = Self::read_maps(view, budget)?;
-        let after_executable =
-            view_object_key(view, &executable_path, budget).map_err(anyhow::Error::msg)?;
+        let after_executable = view_object_key_cached(view, &executable_path, &mut mounts, budget)
+            .map_err(anyhow::Error::msg)?;
         if before_executable != retained_executable || retained_executable != after_executable {
             bail!("retained executable identity changed during PT_INTERP discovery");
         }
@@ -9453,6 +9505,17 @@ impl Engine {
                 "offline interface selection",
                 "a manifest selection table failed indivisible attachment and was rolled back",
             );
+        }
+        // PC-1: a candidate whose additions never ran — a closed tick, a
+        // conservative replay, a generation lost before the attach — gives
+        // back the cells it allocated for them. No link ever pointed at them,
+        // so no count can be in them. Kept, they burned the capture-lifetime
+        // budget: every conservative replay after an ordinary process exit
+        // allocated one more cell per listed-but-inactive endpoint.
+        if !new_targets_attached {
+            candidate
+                .plan
+                .withdraw_unlinked_additions(self.plan.slots.len());
         }
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
         outcome.changed |= candidate.plan != self.plan;
@@ -11870,7 +11933,11 @@ impl Engine {
                 "live loader arming",
                 "loader generation, mapping, or pinned identity changed during attach",
             );
-            if matches!(self.scope, Scope::Pid(_)) {
+            // A named target that provably exited mid-arm is the target
+            // ending: its retirement is queued as an expected removal and the
+            // capture ends the ordinary way. Only a replaced or unprovable
+            // generation fails the named capture.
+            if matches!(self.scope, Scope::Pid(_)) && !self.original_exited(view_id) {
                 return Err(LoaderArmFailure::ordinary(anyhow!(
                     "the named process generation changed during loader attachment"
                 )));
@@ -12227,8 +12294,13 @@ impl Engine {
                     "live loader arming",
                     "the process generation changed before the loader-arm postcheck",
                 );
+                // `generation_valid` is false for an exit and a replacement
+                // alike; the retained pin tells them apart, as it does for
+                // `queue_retirement`, which already queued an expected removal.
+                let exited = self.original_exited(view_id);
                 match failure {
                     Some(LoaderArmFailure::Invariant(error)) => Err(error),
+                    _ if named && exited => Ok(changed),
                     Some(LoaderArmFailure::Ordinary(error)) if named => Err(error),
                     _ if named => {
                         bail!("the named process generation changed during loader arming")
@@ -12810,6 +12882,29 @@ impl Engine {
             }
         }
         Ok((changed, true))
+    }
+
+    /// Whether an inventory preflight's stale views include a generation
+    /// that was *lost*, not one that merely ended. A newly opened view is
+    /// counted as before; a retained view whose original pin proves it exited
+    /// is the process ending, which `queue_retirement` turns into an expected
+    /// removal — and for a named target, the ordinary end of the capture.
+    /// Asked before the retirement drops the view, while the pin is still held.
+    fn inventory_preflight_lost_generation(
+        &self,
+        retained_stale: &BTreeSet<ProcessViewId>,
+        stale: &BTreeSet<ProcessViewId>,
+    ) -> bool {
+        self.retained_generation_lost(retained_stale)
+            || stale.iter().any(|view| !retained_stale.contains(view))
+    }
+
+    /// Whether any of these retained views changed generation other than by
+    /// a provable exit of its original process.
+    fn retained_generation_lost(&self, retained_stale: &BTreeSet<ProcessViewId>) -> bool {
+        retained_stale
+            .iter()
+            .any(|view| !self.original_exited(*view))
     }
 
     fn queue_stale_views(
@@ -14424,6 +14519,8 @@ impl Engine {
                 .intersection(&retained_ids)
                 .copied()
                 .collect();
+            let generation_lost =
+                self.inventory_preflight_lost_generation(&retained_stale, &admission.stale_views);
             self.queue_stale_views(&retained_stale, pending_views);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
@@ -14431,10 +14528,14 @@ impl Engine {
                     failed_refresh_pids.insert(view.pid());
                 }
             }
-            self.mark_live_loss(
-                "live inventory generation",
-                "an exact retained or newly opened process generation changed during inventory preflight",
-            );
+            if generation_lost {
+                self.mark_live_loss(
+                    "live inventory generation",
+                    "an exact retained or newly opened process generation changed during inventory preflight",
+                );
+            } else {
+                self.invalidate_causal_timing();
+            }
             changed |= self.process_discovery_records(
                 session,
                 records,
@@ -14568,17 +14669,22 @@ impl Engine {
                 .intersection(&retained_ids)
                 .copied()
                 .collect();
+            let generation_lost =
+                self.inventory_preflight_lost_generation(&retained_stale, &admission.stale_views);
+            let retained_lost = self.retained_generation_lost(&retained_stale);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
                     self.request_refresh(view.pid());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
-            if !admission.stale_views.is_empty() {
+            if generation_lost {
                 self.mark_live_loss(
                     "live inventory generation",
                     "an exact retained or newly opened process generation changed during post-retirement preflight",
                 );
+            } else if !admission.stale_views.is_empty() {
+                self.invalidate_causal_timing();
             }
             let outcome = ApplyOutcome {
                 stale_views: retained_stale,
@@ -14612,7 +14718,7 @@ impl Engine {
             for view in removed.iter().chain(&refreshed_ok) {
                 self.scan_inputs.remove(view);
             }
-            if matches!(self.scope, Scope::Pid(_)) && !outcome.stale_views.is_empty() {
+            if matches!(self.scope, Scope::Pid(_)) && retained_lost {
                 bail!("the named process generation changed during inventory preflight");
             }
             return Ok(changed);
@@ -15506,6 +15612,9 @@ pub(crate) mod session_fixture {
         /// Killed and reaped after one dynamic link mutation, before its
         /// generation postcheck.
         kill_on_dynamic_attach: Option<u32>,
+        /// Killed and reaped inside the next `attach_dynamic_loader`, i.e.
+        /// between a loader arm's generation precheck and its postcheck.
+        kill_on_dynamic_loader_attach: Option<u32>,
         /// Pids whose dynamic export attach fails ordinarily: no link is
         /// recorded and no detach bookkeeping is damaged, so the tick stays
         /// open. Mirrors a fixed-purpose attach error, not a refusal.
@@ -15636,6 +15745,13 @@ pub(crate) mod session_fixture {
 
         pub(crate) fn lose_generation_at_dynamic_attach(&mut self, pid: u32) {
             self.kill_on_dynamic_attach = Some(pid);
+        }
+
+        /// Schedules a generation loss inside the next `attach_dynamic_loader`:
+        /// kills and reaps `pid` between the loader arm's generation precheck
+        /// and its postcheck.
+        pub(crate) fn lose_generation_at_dynamic_loader_attach(&mut self, pid: u32) {
+            self.kill_on_dynamic_loader_attach = Some(pid);
         }
 
         pub(crate) fn fail_dynamic_attach_for(&mut self, pid: u32) {
@@ -15820,6 +15936,9 @@ pub(crate) mod session_fixture {
                 .map_err(DynamicLoaderAttachFailure::Registry)?;
             self.dynamic_loader_links.push(identity);
             self.dynamic_loader_attach_calls += 1;
+            if let Some(pid) = self.kill_on_dynamic_loader_attach.take() {
+                kill_and_reap(pid);
+            }
             Ok(false)
         }
 

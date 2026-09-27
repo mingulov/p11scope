@@ -3306,6 +3306,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         })
         .collect();
     let module = ReconciledModule {
+        exports: Default::default(),
         scanned: ScannedModule {
             view: ProcessViewId(0),
             mount_namespace: namespace,
@@ -3329,6 +3330,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         0,
         0,
         false,
+        plan::AdmissionScope::Named,
     )
     .expect("selected plan builds");
     assert_eq!(selected.slots.len(), (4 * per_table) as usize);
@@ -3347,6 +3349,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         0,
         0,
         true,
+        plan::AdmissionScope::Named,
     )
     .expect_err("broad refuses the oversized module whole");
     let text = format!("{error:?}");
@@ -3360,6 +3363,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     // nothing — never a silent prefix.
     let small_object = PinnedObjectId(8);
     let small = ReconciledModule {
+        exports: Default::default(),
         scanned: ScannedModule {
             view: ProcessViewId(0),
             mount_namespace: namespace,
@@ -3400,6 +3404,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         0,
         0,
         true,
+        plan::AdmissionScope::Named,
     )
     .expect("broad plan builds around the refusal");
     assert_eq!(mixed.slots.len(), 10);

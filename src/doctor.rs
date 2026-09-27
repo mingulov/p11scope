@@ -995,7 +995,17 @@ fn assess_target_readability(pid: u32) -> Result<usize, &'static str> {
             let (file, actual) =
                 crate::discovery::identity::open_view_object(&view, &target_path, &mut budget)
                     .map_err(|_| "executable identity unavailable")?;
-            if actual != expected {
+            // On pre-6.8 kernels an overlayfs fd and its mappings legitimately
+            // carry different keys (overlay vs backing device); the
+            // self-mapping probe asks the kernel how it renders this exact fd
+            // before refusing.
+            if !crate::discovery::identity::opened_file_matches_maps(
+                &file,
+                actual,
+                expected,
+                &mut budget,
+                &crate::discovery::identity::KernelSelfMappingProbe,
+            ) {
                 return Err("executable identity mismatch");
             }
             if !p11scope_manifest::elf::exports_matching(&file, &wanted)

@@ -9,10 +9,11 @@ use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
-    ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
-    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays, open_view_object,
-    open_view_object_cached, pin_manifest_objects_deferred_in_views_with_budget,
-    pin_scanned_view_objects, retained_object_key, retained_object_key_cached, target_paths_equal,
+    KernelSelfMappingProbe, ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey,
+    ReconciledModule, SelfMappingProbe, StaleManifestObject, bind_scanned_modules,
+    canonicalize_scanned_overlays, open_view_object, open_view_object_cached,
+    pin_manifest_objects_deferred_in_views_with_budget, pin_scanned_view_objects,
+    retained_object_key, retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
     view_object_key_cached,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
@@ -6567,6 +6568,9 @@ fn loader_state_address(snapshot: &ElfSnapshot) -> std::result::Result<Option<u6
         .transpose()
 }
 
+const NO_EXECUTABLE_MAPPING_REASON: &str = "retained executable has no usable executable mapping";
+const NO_LOADER_MAPPING_REASON: &str = "PT_INTERP has no usable executable loader mapping";
+
 fn executable_map_snapshot(
     maps: &MapIndex<'_>,
     identity: ObjectKey,
@@ -6584,7 +6588,7 @@ fn executable_map_snapshot(
         }
     }
     if mappings.is_empty() {
-        return Err("retained executable has no usable executable mapping".into());
+        return Err(NO_EXECUTABLE_MAPPING_REASON.into());
     }
     Ok(mappings)
 }
@@ -6607,12 +6611,54 @@ fn loader_map_snapshot(
     }
     let mut by_path = by_path.into_iter();
     let Some(loader) = by_path.next() else {
-        return Err("PT_INTERP has no usable executable loader mapping".into());
+        return Err(NO_LOADER_MAPPING_REASON.into());
     };
     if by_path.next().is_some() {
         return Err("PT_INTERP mapping identity has more than one usable path".into());
     }
     Ok(loader)
+}
+
+/// The executable snapshot for one retained fd: on pre-6.8 kernels an
+/// overlayfs fd's own key finds no mapping (maps prints the backing device),
+/// so retry once on the key the kernel renders for this exact fd. Any other
+/// error — budget, ambiguity — keeps today's outcome unchanged.
+fn executable_snapshot_for_fd(
+    maps: &MapIndex<'_>,
+    file: &std::fs::File,
+    fd_key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+) -> std::result::Result<Vec<(MapEntry, PathBuf)>, String> {
+    match executable_map_snapshot(maps, fd_key, budget) {
+        Err(error) if error == NO_EXECUTABLE_MAPPING_REASON => {
+            match self_mapped_fallback_key(file, fd_key, budget, probe) {
+                Some(probed) => executable_map_snapshot(maps, probed, budget),
+                None => Err(error),
+            }
+        }
+        outcome => outcome,
+    }
+}
+
+/// The loader snapshot for one retained fd: the same overlay fallback as
+/// [`executable_snapshot_for_fd`].
+fn loader_snapshot_for_fd(
+    maps: &MapIndex<'_>,
+    file: &std::fs::File,
+    fd_key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+) -> std::result::Result<(PathBuf, Vec<MapEntry>), String> {
+    match loader_map_snapshot(maps, fd_key, budget) {
+        Err(error) if error == NO_LOADER_MAPPING_REASON => {
+            match self_mapped_fallback_key(file, fd_key, budget, probe) {
+                Some(probed) => loader_map_snapshot(maps, probed, budget),
+                None => Err(error),
+            }
+        }
+        outcome => outcome,
+    }
 }
 
 fn unique_mapping_for_offset(
@@ -8411,7 +8457,7 @@ impl Engine {
                 bail!("retained executable and PT_INTERP have different target ABIs");
             }
             let snapshot = FileSnapshot::read(&file).map_err(anyhow::Error::msg)?;
-            Some((snapshot, key))
+            Some((snapshot, key, file))
         } else {
             None
         };
@@ -8425,24 +8471,46 @@ impl Engine {
         let before_index =
             index_maps_or_refuse(&before_maps, budget).map_err(anyhow::Error::msg)?;
         let after_index = index_maps_or_refuse(&after_maps, budget).map_err(anyhow::Error::msg)?;
-        let before_executable_maps =
-            executable_map_snapshot(&before_index, retained_executable, budget)
-                .map_err(anyhow::Error::msg)?;
-        let after_executable_maps =
-            executable_map_snapshot(&after_index, retained_executable, budget)
-                .map_err(anyhow::Error::msg)?;
+        let before_executable_maps = executable_snapshot_for_fd(
+            &before_index,
+            &executable,
+            retained_executable,
+            budget,
+            &KernelSelfMappingProbe,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let after_executable_maps = executable_snapshot_for_fd(
+            &after_index,
+            &executable,
+            retained_executable,
+            budget,
+            &KernelSelfMappingProbe,
+        )
+        .map_err(anyhow::Error::msg)?;
         if before_executable_maps != after_executable_maps {
             bail!("retained executable mappings changed during PT_INTERP discovery");
         }
         let Some(interpreter) = interpreter else {
             return Ok(None);
         };
-        let (interpreter_file, loader_key) =
+        let (interpreter_file, loader_key, loader_file) =
             interpreter_file.expect("a PT_INTERP snapshot has its retained file identity");
-        let (before_loader_path, before_loader_maps) =
-            loader_map_snapshot(&before_index, loader_key, budget).map_err(anyhow::Error::msg)?;
-        let (loader_path, loader_maps) =
-            loader_map_snapshot(&after_index, loader_key, budget).map_err(anyhow::Error::msg)?;
+        let (before_loader_path, before_loader_maps) = loader_snapshot_for_fd(
+            &before_index,
+            &loader_file,
+            loader_key,
+            budget,
+            &KernelSelfMappingProbe,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let (loader_path, loader_maps) = loader_snapshot_for_fd(
+            &after_index,
+            &loader_file,
+            loader_key,
+            budget,
+            &KernelSelfMappingProbe,
+        )
+        .map_err(anyhow::Error::msg)?;
         if before_loader_path != loader_path || before_loader_maps != loader_maps {
             bail!("retained loader mappings changed during PT_INTERP discovery");
         }

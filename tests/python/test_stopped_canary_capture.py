@@ -383,7 +383,7 @@ def coordinator_case(pid, directory, case):
     roster_samples, start_dumps = {}, 0
     original_handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
     original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    expected_success = kind in ('native', 'immediate_exit')
+    expected_success = kind in ('native', 'immediate_exit', 'idle_owner')
     initial_descriptors = open_descriptors()
     failed_resume = False
     replay_count, inventory_count, position_count = 0, 0, 0
@@ -531,6 +531,14 @@ def coordinator_case(pid, directory, case):
             cookie_id = next(item['id'] for item in source.maps if item['name'] == 'TASK_COOKIE')
             return (capture.dumper.TASK_STORAGE_HEADER.pack(capture.dumper.TASK_STORAGE_MAGIC, 1,
                     cookie_id, pid, pid, 8) + struct.pack('<Q', 1) + raw)
+        if kind == 'idle_owner':
+            # The leader holds no lease at STOP (matrix DONE already returned
+            # it), so its retained THREAD_OWNER is idle (all-zero). Reconcile
+            # accepts it outside the leased population; the staged bytes must
+            # likewise exclude it or the replay's byte count mismatches.
+            owner_id = next(item['id'] for item in source.maps if item['name'] == 'THREAD_OWNER')
+            return (capture.dumper.TASK_STORAGE_HEADER.pack(capture.dumper.TASK_STORAGE_MAGIC, 1,
+                    owner_id, pid, pid, 544) + bytes(544) + raw)
         if kind == 'binding' and detail == 'owner_count':
             raw = bytearray(raw)
             offset = 0
@@ -694,6 +702,9 @@ def coordinator_case(pid, directory, case):
             assert (groups['workload'].fd, signal.SIGCONT) in signals
         if expected_success:
             assert replay_count == 2 and replay_paths[0].parent != Path(directory)
+        if kind == 'idle_owner' and not errors:
+            retained = Path(directory) / f'mapdump_THREAD_OWNER_{config.lane}.bin'
+            assert retained.is_file() and len(retained.read_bytes()) == 0, 'idle owner bytes were staged'
         for fd in test_handles:
             assert select.select([fd], [], [], 1)[0]
             try:
@@ -1419,7 +1430,7 @@ CASES = (
        'replay:1', 'replay:2', 'publication:failure', 'publication:collision', 'rollback',
        'roster:observer', 'roster:workload', 'bytes', 'shell:matrix', 'shell:blocked', 'stage_remove',
        'policy:ignored', 'policy:blocked', 'terminal_restore', 'cookie', 'fifo:ready', 'fifo:done',
-       'missing_privacy']
+       'missing_privacy', 'idle_owner']
     + ['boundary:' + point for point in ('pin', 'open_rings', 'ring_records', 'fsync', 'ring_close')])
 for case in CASES:
     def test(self, case=case):

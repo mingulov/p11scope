@@ -713,7 +713,13 @@ class Coordinator:
         records = dumper.parse_task_storage_frames(frames, task_maps,
                     max_records=dumper.TASK_STORAGE_MAX_RECORDS, max_bytes=MAX_BYTES - self.files.total)
         for item in task_maps:
-            raw = b''.join(record['value'] for record in records if record['map_id'] == item['id'])
+            # Idle owners are retained storage without a lease: reconcile binds
+            # only the leased population, so the staged bytes must use the same
+            # predicate or the replay's byte count mismatches the receipt.
+            raw = b''.join(record['value'] for record in records
+                           if record['map_id'] == item['id']
+                           and not (item['name'] == 'THREAD_OWNER'
+                                    and dumper.idle_owner_value(record['value'])))
             self.files.write(self.files.stage / f'mapdump_{item["name"]}_{cfg.lane}.bin', raw)
             values[item['name']] = raw
         self.check('retained-rings', deadline)

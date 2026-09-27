@@ -1014,9 +1014,18 @@ impl OwnedCaller {
 
     /// Every thread calls endpoint 0 (one slot, CK_RV 0) through the contended
     /// body, optionally pinned to CPU 0; the independent ledger counts calls.
-    fn hammer_shared_calls(&mut self, threads: u32, percalls: u32, spin: u32, pin: bool) -> Result<()> {
+    fn hammer_shared_calls(
+        &mut self,
+        threads: u32,
+        percalls: u32,
+        spin: u32,
+        pin: bool,
+    ) -> Result<()> {
         let pin = u32::from(pin);
-        writeln!(self.input, "HAMMER_SHARED {threads} {percalls} {spin} {pin}")?;
+        writeln!(
+            self.input,
+            "HAMMER_SHARED {threads} {percalls} {spin} {pin}"
+        )?;
         self.input.flush()?;
         ensure!(
             self.line()? == format!("HAMMER_SHARED_START {threads} {percalls} {spin} {pin}"),

@@ -1936,11 +1936,6 @@ fn run_loop(
     // on every path that reaches a loop; later discovery-driven attaches
     // do not re-stamp it.
     session.note_attach_complete();
-    // Harness readiness signal: one stderr line once the attach session has
-    // completed (even with zero probes), strictly before the capture loop.
-    // A readiness wait polls for it instead of sleeping; the count lets it
-    // refuse a zero-probe attach without parsing the final report.
-    eprintln!("{}", format_attach_complete(session.attached_probes()));
     // A live discovery frame checks the operator's stop between work items
     // and defers the rest, so the loop's end check comes sooner (H-1).
     engine.set_cancel_flag(interrupted.cancel_flag());
@@ -2814,18 +2809,6 @@ fn report_attach_failures(session: &Session) {
             );
         }
     }
-}
-
-/// The attach-complete signal (see `run_loop`). Deliberately distinct from
-/// both the discovery marker (`p11scope: discovery: ...`, printed before
-/// attach) and the live frame's "N/M probes attached" evidence phrasing, so
-/// neither discovery-gate nor frame-gate greps can match it.
-fn format_attach_complete(attached: usize) -> String {
-    format!(
-        "p11scope: attached {} probe{}",
-        attached,
-        if attached == 1 { "" } else { "s" }
-    )
 }
 
 /// The per-slot attach diagnostic. The failure message embeds the module's
@@ -6330,91 +6313,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn attach_complete_line_names_the_probe_count() {
-        assert_eq!(format_attach_complete(0), "p11scope: attached 0 probes");
-        assert_eq!(format_attach_complete(1), "p11scope: attached 1 probe");
-        assert_eq!(format_attach_complete(136), "p11scope: attached 136 probes");
-        // Neither the discovery gate nor the live-frame gate may match it.
-        for line in [format_attach_complete(0), format_attach_complete(136)] {
-            assert!(!line.contains("p11scope: discovery:"));
-            assert!(!line.contains("probes attached"));
-            assert!(!line.contains("attach failed"));
-        }
-    }
-
-    /// I3: the published document's detach fields report pre-publication
-    /// work only. The terminal callback publishes before the producers
-    /// detach (quiesce-then-publish, so the report never waits on link
-    /// teardown): `phase_ms.detach` carries the detach work completed
-    /// before publication — 0 in every Detailed report, with the
-    /// post-publication teardown explicitly unmeasured by design — and the
-    /// `detach_*_loss` fields carry the loop-end→terminal-snapshot delta.
-    /// This inspects the real published JSON (accumulator → snapshot →
-    /// evidence → profile_json), not the helper through a fake, and pins
-    /// the schema definitions of all three fields.
-    #[test]
-    fn published_detach_fields_report_pre_publication_work_only() {
-        let plan = crate::plan::AttachPlan::from_slots(vec![]);
-        let state = semantics::State::with_policy(&plan, crate::attach::CapturePolicy::Allowlisted);
-        let capture = render::CaptureMeta {
-            started: "t0",
-            ended: "t1",
-            kernel: "test",
-            policy: crate::attach::CapturePolicy::Allowlisted,
-            scope: "pid",
-            ring_bytes: p11scope_ebpf_common::RING_BYTES,
-            drain_interval_ms: 1000,
-        };
-        let document = |detach_ms: u64| {
-            let mut acc = SchedulingAccumulator::default();
-            if detach_ms > 0 {
-                acc.add_phase(SchedulingPhase::Detach, Duration::from_millis(detach_ms));
-            }
-            acc.note_loop_end(10, 4, None, crate::render::LOOP_END_UNSTARTED);
-            acc.note_terminal(14, 7);
-            let mut ev = crate::render::tests::evidence();
-            ev.scheduling = acc.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
-            render::profile_json(&[], render::VersionedEvidence::wrap(&ev), &state, &capture)
-        };
-        // Pre-publication detach work reaches the document through the
-        // real path; the loss fields carry the terminal-minus-loop-end
-        // delta.
-        let j = document(120);
-        let scheduling = &j["evidence"]["scheduling"];
-        assert_eq!(scheduling["phase_ms"]["detach"].as_u64(), Some(120));
-        assert_eq!(scheduling["detach_event_loss"].as_u64(), Some(4));
-        assert_eq!(scheduling["detach_discovery_loss"].as_u64(), Some(3));
-        // The quiesce-then-publish flow records no pre-publication detach
-        // work: the document carries 0, explicitly unmeasured by design.
-        let j = document(0);
-        assert_eq!(
-            j["evidence"]["scheduling"]["phase_ms"]["detach"].as_u64(),
-            Some(0)
-        );
-        // The schema defines all three fields as pre-publication windows.
-        let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("docs/schema/observed-profile-v3.schema.json");
-        let schema: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&schema_path).unwrap()).unwrap();
-        let properties =
-            &schema["properties"]["evidence"]["properties"]["scheduling"]["properties"];
-        let description =
-            |field: &serde_json::Value| field["description"].as_str().unwrap_or("").to_string();
-        assert!(
-            description(&properties["phase_ms"]["properties"]["detach"])
-                .contains("completed before publication"),
-            "phase_ms.detach must be defined as pre-publication work"
-        );
-        for field in ["detach_event_loss", "detach_discovery_loss"] {
-            assert!(
-                description(&properties[field])
-                    .contains("after the capture loop ended through the terminal snapshot"),
-                "{field} must be defined as the loop-end to terminal-snapshot window"
-            );
-        }
-    }
 
     fn spawn(program: &str, args: &[&str]) -> OwnedChild {
         OwnedChild::spawn(

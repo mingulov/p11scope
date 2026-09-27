@@ -15,7 +15,7 @@
 # a mode difference). Each round times only the workload process's own
 # wall-clock via go-file synchronization: the observer attaches first,
 # the harness waits for its attach-complete stderr line
-# ("p11scope: attached N probes", src/run.rs format_attach_complete) with
+# ("p11scope: capturing: N probe(s) attached", src/run.rs capture_ready_line) with
 # a bounded timeout, then releases a short gated warm-up burst whose
 # observation the harness requires (trace: warm-up lines in the live log
 # before the measured window opens; profile/metrics: warm-up calls proven
@@ -52,7 +52,7 @@ N_CALLS=${N_CALLS:-1000000}
 WARMUP_CALLS=${WARMUP_CALLS:-1000}
 ATTACH_TIMEOUT_S=${ATTACH_TIMEOUT_S:-30}
 WARMUP_TIMEOUT_S=${WARMUP_TIMEOUT_S:-15}
-ATTACH_MARKER="p11scope: attached "
+ATTACH_MARKER="p11scope: capturing: "
 WPID=
 SPID=
 mkdir -p "$WORK"
@@ -60,7 +60,7 @@ mkdir -p "$WORK"
 # Prints the probe count from the observer's attach-complete stderr line in
 # $1, or nothing when the line has not landed yet.
 observer_attach_count() {
-    sed -n "s/.*p11scope: attached \([0-9][0-9]*\) probe.*/\1/p" "$1" 2>/dev/null | tail -n 1
+    sed -n "s/.*p11scope: capturing: \([0-9][0-9]*\) probe.*/\1/p" "$1" 2>/dev/null | tail -n 1
 }
 
 # wait_for_observer_attach <log> <timeout_s>: poll for the observer's
@@ -158,11 +158,11 @@ if [ "${1-}" = "--self-test" ]; then
     trap 'rm -rf "$SELF_TEST_WORK"' EXIT INT TERM
     SPID=
     WPID=
-    printf 'p11scope: discovery: 1 module(s)\np11scope: attached 136 probes\n' \
+    printf 'p11scope: discovery: 1 module(s)\np11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n' \
         > "$SELF_TEST_WORK/attached.log"
     wait_for_observer_attach "$SELF_TEST_WORK/attached.log" 5 \
         || { echo "self-test: attach wait missed the marker" >&2; exit 1; }
-    printf 'p11scope: attached 0 probes\n' > "$SELF_TEST_WORK/zero.log"
+    printf 'p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C\n' > "$SELF_TEST_WORK/zero.log"
     if wait_for_observer_attach "$SELF_TEST_WORK/zero.log" 1 2>/dev/null; then
         echo "self-test: zero-probe attach accepted" >&2
         exit 1

@@ -1726,6 +1726,102 @@ fn a_live_frame_past_its_work_budget_defers_the_rest_in_order() {
     );
 }
 
+/// F4: a frame that defers work delays it, it does not drop it, so the
+/// deferral is a scheduling fact (`scheduling.discovery_deferrals`), never an
+/// observation-loss skip. Only work still deferred when the capture ends —
+/// never completed by the terminal drain — is a loss.
+#[test]
+fn a_frame_deferral_is_scheduling_evidence_and_loss_only_if_never_completed() {
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = 0;
+    let mut session = ScriptedSession::default();
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        exec_record_for(4_000_020),
+    )))]
+    .into();
+
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert_eq!(engine.discovery_deferrals(), 1);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live discovery frame"),
+        "a deferral is not a loss: {:?}",
+        engine.counters.object_skips
+    );
+
+    engine.frame_work_budget_ns = LIVE_FRAME_WORK_BUDGET_NS;
+    engine.drain_discovery_from(&mut session).unwrap();
+    engine.settle_frame_deferrals_at_capture_end();
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live discovery frame"),
+        "completed deferred work lost nothing"
+    );
+
+    // The terminal drain dispatches deferred records first, so a capture
+    // whose terminal drain completes has nothing left to settle either.
+    engine.frame_work_budget_ns = 0;
+    let mut deferred = ScriptedSession::default();
+    deferred.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        exec_record_for(4_000_021),
+    )))]
+    .into();
+    engine.drain_discovery_from(&mut deferred).unwrap();
+    assert_eq!(engine.discovery_deferrals(), 2);
+    assert_eq!(engine.pending_discovery_records_for_test(), 1);
+    engine
+        .drain_discovery_terminal_from(&mut ScriptedSession::default())
+        .unwrap();
+    assert_eq!(
+        engine.pending_discovery_records_for_test(),
+        0,
+        "the terminal drain dispatches deferred records"
+    );
+    engine.settle_frame_deferrals_at_capture_end();
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live discovery frame"),
+        "terminal-completed deferred work lost nothing: {:?}",
+        engine.counters.object_skips
+    );
+
+    // Work still deferred when the capture ends — never completed by the
+    // terminal drain — is a loss, published exactly once.
+    engine.frame_work_budget_ns = 0;
+    let mut unfinished = ScriptedSession::default();
+    unfinished.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        exec_record_for(4_000_022),
+    )))]
+    .into();
+    engine.drain_discovery_from(&mut unfinished).unwrap();
+    assert_eq!(engine.pending_discovery_records_for_test(), 1);
+    engine.settle_frame_deferrals_at_capture_end();
+    engine.settle_frame_deferrals_at_capture_end();
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| {
+                skip.subject == "live discovery frame" && skip.reason == UNFINISHED_DEFERRAL_LOSS
+            })
+            .count(),
+        1,
+        "unfinished deferred work publishes exactly once: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// H-1: an operator stop is checked between items too. A frame that sees
 /// the cancel flag defers its remaining work instead of finishing it, so the
 /// loop's end check runs a frame sooner.
@@ -1744,6 +1840,18 @@ fn a_live_frame_defers_its_work_once_the_capture_is_interrupted() {
     engine.drain_discovery_from(&mut session).unwrap();
 
     assert_eq!(engine.pending_discovery_records_for_test(), 1);
+    // F4: an operator-stop deferral is the same scheduling fact as a
+    // budget deferral — counted, never a loss.
+    assert_eq!(engine.discovery_deferrals(), 1);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live discovery frame"),
+        "an operator-stop deferral is not a loss: {:?}",
+        engine.counters.object_skips
+    );
 }
 
 /// H-1: deferred loader memory scans are serviced only while the frame's
@@ -3145,7 +3253,7 @@ fn inventory_scan_skips_views_retired_before_their_refresh() {
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let mut engine = lifecycle_discovered(vec![view]);
     let views = BTreeSet::from([ProcessViewId(0), ProcessViewId(7)]);
-    let (scans, _, skipped) = engine.scan_inventory_views(&views, "test refresh");
+    let (scans, _, _, skipped) = engine.scan_inventory_views(&views, "test refresh");
     let scanned: Vec<u32> = scans.iter().map(|(view, _, _)| view.0).collect();
     assert!(
         scanned.iter().all(|id| *id == 0),
@@ -5351,6 +5459,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
 
     // Pass 4 reconciles: the slice re-reads every enumerated maps file,
     // rarity selection runs over the slice, and the cursor parks at the end.
+    let polls_before_pass4 = engine.polling_rescans_queued;
     let before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
     let pass4 = engine.budget.attempted_io_bytes() - before;
@@ -5399,12 +5508,29 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     );
     // The surviving retained exploratory view was covered too, so it polls
     // same-tick (a rescan, not a displacement — the view set above proves it).
+    // Queuing a poll is internal evidence, not a published loss (F1): the
+    // fruitless rescan publishes no skip of its own.
+    assert_eq!(
+        engine.polling_rescans_queued - polls_before_pass4,
+        1,
+        "the surviving retained view polls"
+    );
     assert!(
-        engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == "live discovery rotation"
-                && skip.reason == "queued 1 retained exploratory view for polling rescan"
-        }),
-        "the surviving retained view polls: {:?}",
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("for polling rescan")),
+        "queuing the poll publishes no skip: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "a fruitless poll finds no provider to publish: {:?}",
         engine.counters.object_skips
     );
 
@@ -5575,12 +5701,28 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
             .any(|skip| skip.reason.contains("evicted")),
         "a slice over retained pids only evicts nothing"
     );
+    assert_eq!(
+        engine.polling_rescans_queued, 2,
+        "covered retained exploratory views poll"
+    );
+    // Both polls are fruitless (provider-free sleeps), so neither publishes:
+    // queuing is not a loss and there is no gained provider either (F1).
     assert!(
-        engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == "live discovery rotation"
-                && skip.reason == "queued 2 retained exploratory views for polling rescan"
-        }),
-        "covered retained exploratory views poll: {:?}",
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("for polling rescan")),
+        "queuing the polls publishes no skip: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "fruitless polls find no provider to publish: {:?}",
         engine.counters.object_skips
     );
 
@@ -5708,18 +5850,36 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
     // (Mandated semantic change: the reconcile tick used to charge nothing
     // at all under a zero quantum.)
     let scans_before = engine.deep_scans;
+    let polls_before = engine.polling_rescans_queued;
     refresh_inventory_once(&mut engine);
     assert_eq!(
         engine.deep_scans - scans_before,
         2,
         "polling rescans proceed under the tick quantum"
     );
+    assert_eq!(
+        engine.polling_rescans_queued - polls_before,
+        1,
+        "the polling round runs"
+    );
+    // The round's rescan is fruitless (a provider-free sleep), so it
+    // publishes nothing: neither the queuing nor a gained provider (F1).
     assert!(
-        engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == "live discovery rotation"
-                && skip.reason == "queued 1 retained exploratory view for polling rescan"
-        }),
-        "the polling round is explicit: {:?}",
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("for polling rescan")),
+        "queuing the poll publishes no skip: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "a fruitless poll finds no provider to publish: {:?}",
         engine.counters.object_skips
     );
     assert_eq!(
@@ -24883,12 +25043,240 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
         !system_scope_slots_for(&engine, "upgrade-lazy.so").is_empty(),
         "the upgrade admits attachable slots"
     );
+    // F1: the only loss a polling round can reveal is exactly this one — a
+    // provider appeared in a process no loader hook watched, and calls to it
+    // before the rescan went unobserved.
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == "live discovery rotation" && skip.reason.contains("for polling rescan")
+            skip.subject == "live discovery rotation" && skip.reason == POLLED_PROVIDER_LOSS
         }),
-        "polling evidence is published: {:?}",
+        "the gained provider's unobserved window is published: {:?}",
         engine.counters.object_skips
+    );
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "live discovery rotation"
+                && skip.reason == POLLED_PROVIDER_LOSS)
+            .count(),
+        1,
+        "the gained provider publishes exactly once across all rounds: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("for polling rescan")),
+        "queuing the poll itself is not a loss: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.polled_pids.is_empty(),
+        "settled polls leave no pending pid behind: {:?}",
+        engine.polled_pids
+    );
+}
+
+/// F1 (kind pod lane): an under-cap cgroup capture polls its provider-free
+/// processes (a pod's pause container, `sleep infinity`) every fourth frame,
+/// and every poll published "queued N retained exploratory views for polling
+/// rescan" as a `discovery unavailable` skip. An exact capture (136/136
+/// probes, exact counts) then read `concrete_gap`, depending only on how
+/// long it ran. A poll that finds nothing lost nothing: it publishes nothing.
+#[test]
+fn a_polling_rescan_of_provider_free_processes_is_not_a_loss() {
+    let sleeps = e06_spawn_sleeps(2);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+
+    for _ in 0..8 {
+        refresh_inventory_once(&mut engine);
+    }
+
+    assert_eq!(engine.views.len(), 2);
+    assert!(engine.polling_rescans_queued > 0, "the rounds did poll");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live discovery rotation"),
+        "a poll that found nothing is not a loss: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "no gained provider, no POLLED_PROVIDER_LOSS: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.polled_pids.is_empty(),
+        "fruitless polls settle completely: {:?}",
+        engine.polled_pids
+    );
+}
+
+/// F1: a polled view whose rescan fails is already published by the
+/// refresh-failure path, so the settle forgets its poll instead of
+/// publishing `POLLED_PROVIDER_LOSS` on top of the failure. A sibling poll
+/// still waiting for its retry stays pending: only the failed one is
+/// forgotten.
+#[test]
+fn a_failed_polling_rescan_publishes_only_through_the_failure_path() {
+    let sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2);
+
+    engine.queue_polling_rescans(&pids);
+    assert_eq!(engine.polled_pids.len(), 2, "both views poll");
+
+    // The first view's rescan fails — the scan path publishes that failure
+    // — while the second view's rescan is still outstanding.
+    engine.settle_polling_rescans(&[], &BTreeSet::from([pids[0]]), &BTreeSet::new());
+    assert!(
+        !engine.polled_pids.contains(&pids[0]),
+        "a failed poll is forgotten, never published twice"
+    );
+    assert!(
+        engine.polled_pids.contains(&pids[1]),
+        "the outstanding poll stays pending for its retry"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "no gained provider, no POLLED_PROVIDER_LOSS: {:?}",
+        engine.counters.object_skips
+    );
+
+    // The retry finds the survivor still provider-free: the poll settles
+    // with nothing published and nothing left pending.
+    let survivor = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pids[1])
+        .expect("the survivor is still retained")
+        .id();
+    engine.settle_polling_rescans(
+        &[(survivor, Vec::new(), PinnedObjects::empty())],
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(
+        engine.polled_pids.is_empty(),
+        "settled polls leave nothing pending: {:?}",
+        engine.polled_pids
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "a fruitless retry publishes nothing: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// F1: a process that exits after its poll is queued but before its rescan
+/// runs leaves no pending poll behind. The retiring view is forgotten at
+/// settle time and nothing is published for it; the survivor's fruitless
+/// rescan settles the same round with nothing published either.
+#[test]
+fn a_polled_process_that_exits_before_its_rescan_leaves_no_pending_poll() {
+    let mut sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2);
+
+    engine.queue_polling_rescans(&pids);
+    assert_eq!(engine.polled_pids.len(), 2, "both views poll");
+
+    let victim = sleeps
+        .iter()
+        .position(|sleep| sleep.pid() == pids[0])
+        .expect("the victim is one of the sleeps");
+    sleeps[victim].reap().expect("the victim exits");
+    refresh_inventory_once(&mut engine);
+
+    let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    kept.sort_unstable();
+    assert_eq!(kept, vec![pids[1]], "the exited view retires");
+    assert!(
+        engine.polled_pids.is_empty(),
+        "the exited view's poll is forgotten: {:?}",
+        engine.polled_pids
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "no refresh outlives its view or its rescan: {:?}",
+        engine.refresh_requested
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.reason != POLLED_PROVIDER_LOSS }),
+        "no gained provider, no POLLED_PROVIDER_LOSS: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// F1: a polled view cannot be evicted before its rescan — the queued
+/// refresh makes it unevictable — so exploratory eviction can never strand
+/// (or orphan) a pending poll. The poll survives the eviction attempt and
+/// still settles normally.
+#[test]
+fn a_polled_view_is_not_evictable_before_its_rescan() {
+    let sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2);
+
+    engine.queue_polling_rescans(&pids);
+    assert_eq!(engine.polled_pids.len(), 2, "both views poll");
+
+    let victim = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == pids[0])
+        .expect("the victim is retained")
+        .id();
+    assert!(
+        !engine.exploratory_evictable(victim),
+        "a queued poll protects its view from eviction"
+    );
+    engine.evict_exploratory_views(&BTreeSet::from([victim]));
+    assert_eq!(
+        engine.views.len(),
+        2,
+        "the eviction attempt displaces nothing"
+    );
+    assert!(
+        engine.polled_pids.contains(&pids[0]),
+        "the protected poll stays pending for its rescan"
     );
 }
 

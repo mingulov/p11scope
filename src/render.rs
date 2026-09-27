@@ -914,6 +914,11 @@ pub struct SchedulingEvidence {
     /// it (frozen at loop end): the detach window is separately counted
     /// (capture/detach split) and timed (detach phase).
     pub max_inter_drain_gap_ms: u64,
+    /// Live discovery frames that spent their work budget and deferred the
+    /// rest of their discovery work, in order, to the next frame (H-1). A
+    /// scheduling fact, never a loss: work still undone after the terminal
+    /// drain is published as a loss instead.
+    pub discovery_deferrals: u64,
 }
 
 impl Default for SchedulingEvidence {
@@ -934,6 +939,7 @@ impl Default for SchedulingEvidence {
             phase_ms: SchedulingPhaseMs::default(),
             phase_mono_ns: PhaseMonoNs::default(),
             max_inter_drain_gap_ms: 0,
+            discovery_deferrals: 0,
         }
     }
 }
@@ -3788,6 +3794,21 @@ pub(crate) mod tests {
         assert_eq!(ev.completeness, "PARTIAL");
     }
 
+    /// F4: frame-budget deferrals are scheduling evidence, never an
+    /// observation loss — a document with deferrals and no skips stays
+    /// exact, whatever the count.
+    #[test]
+    fn discovery_deferrals_are_scheduling_evidence_never_a_loss() {
+        let mut ev = evidence();
+        ev.scheduling.discovery_deferrals = 3;
+        ev.verdict();
+
+        assert_eq!(ev.completeness, "COMPLETE");
+        assert!(ev.gap_classes.observation.causes.is_empty());
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(value["scheduling"]["discovery_deferrals"], 3);
+    }
+
     #[test]
     fn scheduling_evidence_serializes_with_declared_policy() {
         let value = serde_json::to_value(evidence()).unwrap();
@@ -3811,6 +3832,7 @@ pub(crate) mod tests {
             "phase_ms",
             "phase_mono_ns",
             "max_inter_drain_gap_ms",
+            "discovery_deferrals",
         ] {
             assert!(
                 scheduling.get(key).is_some(),

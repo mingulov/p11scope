@@ -4081,6 +4081,7 @@ fn capture_profile(
         if tick_frame.render {
             last_frame = Instant::now();
             let render_start = Instant::now();
+            scheduling.sync_discovery_deferrals(engine);
             let ev = evidence_for(
                 engine,
                 engine.capture_facts(),
@@ -4414,6 +4415,7 @@ fn capture_profile(
                         Duration::from_millis(context.1.detach_wall_ms()),
                     );
                     let render_start = Instant::now();
+                    consumers.scheduling.sync_discovery_deferrals(context.0);
                     let mut ev = evidence_for(
                         context.0,
                         context.0.capture_facts(),
@@ -5061,6 +5063,7 @@ fn capture_trace(
                     // outside the emitted EVIDENCE).
                     flush_stdout(context.5, context.6)?;
                     collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
+                    consumers.scheduling.sync_discovery_deferrals(context.0);
                     let mut evidence = evidence_for(
                         context.0,
                         context.0.capture_facts(),
@@ -5512,6 +5515,7 @@ pub(crate) struct SchedulingAccumulator {
     last_drain_end: Option<Instant>,
     loop_ended: bool,
     max_inter_drain_gap_ms: u64,
+    discovery_deferrals: u64,
     phase_discovery_ms: u64,
     phase_discovery_terminal_ms: u64,
     phase_drain_ms: u64,
@@ -5544,6 +5548,7 @@ impl Default for SchedulingAccumulator {
             last_drain_end: None,
             loop_ended: false,
             max_inter_drain_gap_ms: 0,
+            discovery_deferrals: 0,
             phase_discovery_ms: 0,
             phase_discovery_terminal_ms: 0,
             phase_drain_ms: 0,
@@ -5628,6 +5633,13 @@ impl SchedulingAccumulator {
     pub(crate) fn note_terminal_drain(&mut self, may_remain: bool) {
         self.terminal_drain_truncated = may_remain;
         self.last_backlog = false;
+    }
+
+    /// Carries the engine's live-discovery frame-deferral count (F4) into
+    /// the snapshot. Callers sync before every snapshot on an engine-owned
+    /// capture path; captures with no engine keep the default 0.
+    pub(crate) fn sync_discovery_deferrals(&mut self, engine: &Engine) {
+        self.discovery_deferrals = engine.discovery_deferrals();
     }
 
     pub(crate) fn note_sink_drops(&mut self, drops: &crate::sink::SinkDrops) {
@@ -5732,6 +5744,7 @@ impl SchedulingAccumulator {
                 loop_end_reason: self.loop_end_reason,
             },
             max_inter_drain_gap_ms: self.max_inter_drain_gap_ms,
+            discovery_deferrals: self.discovery_deferrals,
         }
     }
 }
@@ -6120,6 +6133,8 @@ fn evidence_for(
     // Loader and pause identities are discarded before this point: nothing in
     // `facts` or `pause` can name a process, a path, or a proof.
     let plan = engine.plan();
+    let mut scheduling = scheduling;
+    scheduling.discovery_deferrals = engine.discovery_deferrals();
     // Internal-only, stderr-only, `skip-attribution` builds only: which site
     // raised each record the document is about to publish.
     attribution::report(&plan.skipped);

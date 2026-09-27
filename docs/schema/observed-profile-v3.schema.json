@@ -198,7 +198,7 @@
         "scheduling": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["drain_repolls", "drain_budget_exhaustions", "capture_event_loss", "detach_event_loss", "capture_discovery_loss", "detach_discovery_loss", "terminal_drain_bound", "terminal_drain_truncated", "sink_policy", "sink_stall_ms", "sink_timeouts", "sink_dropped_bytes", "max_inter_drain_gap_ms", "phase_ms", "phase_mono_ns"],
+          "required": ["drain_repolls", "drain_budget_exhaustions", "capture_event_loss", "detach_event_loss", "capture_discovery_loss", "detach_discovery_loss", "terminal_drain_bound", "terminal_drain_truncated", "sink_policy", "sink_stall_ms", "sink_timeouts", "sink_dropped_bytes", "max_inter_drain_gap_ms", "discovery_deferrals", "phase_ms", "phase_mono_ns"],
           "properties": {
             "drain_repolls": {"type": "integer", "minimum": 0},
             "drain_budget_exhaustions": {"type": "integer", "minimum": 0},
@@ -213,6 +213,7 @@
             "sink_timeouts": {"type": "integer", "minimum": 0},
             "sink_dropped_bytes": {"type": "integer", "minimum": 0},
             "max_inter_drain_gap_ms": {"type": "integer", "minimum": 0},
+            "discovery_deferrals": {"type": "integer", "minimum": 0, "description": "Live discovery frames that spent their work budget and deferred the rest of their discovery work, in order, to the next frame. A scheduling fact, never a loss; work still undone after the terminal drain is published as a loss instead."},
             "phase_ms": {
               "type": "object",
               "additionalProperties": false,

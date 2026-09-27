@@ -8,10 +8,6 @@ check = runpy.run_path("scripts/check-capture-evidence.py")
 evidence = check["evidence_fixture"](
     check["LEGACY_SURFACES"], sources=("manifest",), discovery_skipped=0
 )
-evidence["skipped"] = [{
-    "name": check["DISCOVERY_SUBJECT"],
-    "reason": check["SHARED_OVERLAY_UNCERTAINTY"],
-}]
 evidence.update(table_entries=68, slots=68, attached_probes=136)
 document = check["document_fixture"](
     evidence,

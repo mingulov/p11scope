@@ -308,6 +308,7 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.update({
             "PATH": f"{self.fake_bin}:/usr/bin:/bin",
+            "P11SCOPE_MATRIX_TMPDIR": str(self.root / "work"),
             "D2_STATE": str(self.state),
             "D2_PROVIDER": str(self.provider),
             "D2_EBPF_OBJECT": str(EBPF_OBJECT),
@@ -1143,7 +1144,7 @@ control.recv(1)
     def assert_no_collision_body(self):
         self.assert_no_cargo_call()
         self.assertFalse((self.state / "checker.calls").exists())
-        work_parent = self.project / "target/matrix-knative"
+        work_parent = Path(self.env["P11SCOPE_MATRIX_TMPDIR"])
         self.assertFalse(work_parent.exists() and any(work_parent.iterdir()))
 
     @staticmethod
@@ -1202,7 +1203,8 @@ control.recv(1)
                 forbidden = ("sudo ", "docker ", "kind ", "gcc ")
                 self.assertFalse(any(line.startswith(forbidden) for line in calls), calls)
                 self.assertFalse(any(" build " in f" {line} " for line in calls), calls)
-                self.assertFalse(any(line.startswith("mkdir ") and "target/matrix-knative" in line
+                work_base = self.env["P11SCOPE_MATRIX_TMPDIR"]
+                self.assertFalse(any(line.startswith("mkdir ") and work_base in line
                                      for line in calls), calls)
                 facts = self.facts(evidence)
                 self.assertIn("input_ledger_phase=unavailable-start", facts)
@@ -1374,8 +1376,9 @@ control.recv(1)
         self.assertFalse(any(line.startswith("kind create cluster") for line in call_lines))
         self.assertFalse((self.state / "cluster").exists())
         self.assertFalse((self.state / "image-created").exists())
+        work_base = self.env["P11SCOPE_MATRIX_TMPDIR"]
         self.assertFalse(
-            any(line.startswith("mkdir ") and "target/matrix-knative/" in line
+            any(line.startswith("mkdir ") and work_base in line
                 for line in call_lines)
         )
         self.assertTrue(evidence.exists())
@@ -1850,7 +1853,8 @@ exit "$helper_status"
         self.assertIn("input_ledger_phase=unavailable-start", facts)
         self.assertIn("work_absent=1", facts)
         self.assertNotIn("input_ledger_start=", facts)
-        self.assertFalse((self.project / "target/matrix-knative").exists())
+        work_parent = Path(self.env["P11SCOPE_MATRIX_TMPDIR"])
+        self.assertFalse(work_parent.exists() and any(work_parent.iterdir()))
 
         self.clear_state()
         evidence = self.root / "terminal-signal"

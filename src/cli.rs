@@ -391,7 +391,11 @@ fn require_path(
     args: &mut impl Iterator<Item = OsString>,
     flag: &str,
 ) -> Result<PathBuf, CliError> {
-    require_os_value(args, flag).map(PathBuf::from)
+    let value = require_os_value(args, flag)?;
+    if value.is_empty() {
+        return Err(usage_err(format!("{flag} requires a non-empty value")));
+    }
+    Ok(PathBuf::from(value))
 }
 
 /// Flags and subcommands are matched as text; a non-UTF-8 word can never
@@ -896,6 +900,28 @@ mod tests {
         assert_eq!(a.manifests.len(), 2);
         assert_eq!(a.hooks.abi("V_GetTable"), Some(HookAbi::Interface));
         assert_eq!(a.scope, ScopeArg::Pid(42));
+    }
+
+    #[test]
+    fn empty_string_option_values_are_usage_errors() {
+        for argv in [
+            vec!["profile", "--pid", "42", "--module", ""],
+            vec!["profile", "--pid", "42", "--manifest", ""],
+            vec!["profile", "--cgroup", ""],
+            vec!["profile", "--pid", "42", "-o", ""],
+            vec!["run", "-o", "", "--", "/bin/true"],
+            vec!["inspect", "--pid", "42", "--module", ""],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("requires a non-empty value")),
+                "{argv:?}"
+            );
+        }
+        // `--hook-symbol` already refuses an empty name; pin the usage error.
+        assert!(matches!(
+            parse(args(&["profile", "--pid", "42", "--hook-symbol", ""])),
+            Err(CliError::Usage(m)) if m.contains("empty symbol name")
+        ));
     }
 
     #[test]

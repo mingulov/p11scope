@@ -892,6 +892,42 @@ fn m9_non_utf8_arguments_never_panic() {
     }
 }
 
+/// SE-06: empty-string option values are usage errors (exit 2),
+/// naming the flag.
+#[test]
+fn se06_empty_option_values_are_usage_errors_exit_2() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let cases: Vec<(Vec<String>, &str)> = [
+        (vec!["profile", "--pid", &pid, "--module", ""], "--module"),
+        (
+            vec!["profile", "--pid", &pid, "--manifest", ""],
+            "--manifest",
+        ),
+        (vec!["profile", "--cgroup", ""], "--cgroup"),
+        (vec!["profile", "--pid", &pid, "-o", ""], "-o"),
+        (
+            vec!["profile", "--pid", &pid, "--hook-symbol", ""],
+            "empty symbol name",
+        ),
+    ]
+    .into_iter()
+    .map(|(args, flag)| {
+        (
+            args.into_iter().map(str::to_string).collect::<Vec<_>>(),
+            flag,
+        )
+    })
+    .collect();
+    for (argv, flag) in &cases {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let usage = run(&refs);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(usage.stderr.contains(flag), "{argv:?}: {}", usage.stderr);
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}
+
 /// SE-05: `--pid 0` names no process; it is a usage error (exit 2),
 /// not a late runtime pin failure (exit 1).
 #[test]

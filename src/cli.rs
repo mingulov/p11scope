@@ -768,6 +768,7 @@ pub fn parse_capture(
     }
 
     let metrics = common.metrics_for(kind, "trace")?;
+    let out = resolve_dash_out(kind, "profile", common.out)?;
     Ok(CaptureArgs {
         kind,
         modules: common.modules,
@@ -776,7 +777,7 @@ pub fn parse_capture(
         scope,
         metrics,
         duration: common.duration,
-        out: common.out,
+        out,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -851,6 +852,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         ));
     }
     let metrics = common.metrics_for(kind, "run --trace")?;
+    let out = resolve_dash_out(kind, "run without --trace", common.out)?;
     Ok(RunArgs {
         kind,
         modules: common.modules,
@@ -858,7 +860,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         hooks: common.hooks,
         metrics,
         duration: common.duration,
-        out: common.out,
+        out,
         max_events: common.max_events,
         max_scan_pids: common.max_scan_pids,
         ring_bytes: common.ring_bytes,
@@ -870,6 +872,28 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         kill_on_timeout,
         command,
     })
+}
+
+/// `-o -` is stdout where the mode already streams there (trace and
+/// `run --trace` print their lines to stdout when `-o` is omitted), and
+/// is refused for profile, whose report requires a file: stdout carries
+/// display frames only there. Either way no file literally named `-`
+/// is ever created.
+fn resolve_dash_out(
+    kind: Kind,
+    profile_subject: &str,
+    out: Option<PathBuf>,
+) -> Result<Option<PathBuf>, CliError> {
+    match out {
+        Some(path) if path.as_os_str() == std::ffi::OsStr::new("-") => match kind {
+            Kind::Trace => Ok(None),
+            Kind::Profile => Err(usage_err(format!(
+                "-o - writes to stdout, which {profile_subject} does not support for its report \
+                 (omit -o for display frames on stdout; the report requires a file)"
+            ))),
+        },
+        out => Ok(out),
+    }
 }
 
 /// Parses a duration given as bare seconds or with a single trailing
@@ -960,6 +984,32 @@ mod tests {
         assert_eq!(a.manifests.len(), 2);
         assert_eq!(a.hooks.abi("V_GetTable"), Some(HookAbi::Interface));
         assert_eq!(a.scope, ScopeArg::Pid(42));
+    }
+
+    #[test]
+    fn dash_output_is_stdout_for_trace_and_refused_for_profile() {
+        // Trace streams to stdout by default, so `-o -` is stdout.
+        let Command::Trace(t) = parse(args(&["trace", "--pid", "42", "-o", "-"])).unwrap() else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.out, None);
+        let Command::Run(r) =
+            parse(args(&["run", "--trace", "-o", "-", "--", "/bin/true"])).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(r.out, None);
+        // Profile's report requires a file; the refusal says how to get
+        // stdout output instead.
+        for argv in [
+            vec!["profile", "--pid", "42", "-o", "-"],
+            vec!["run", "-o", "-", "--", "/bin/true"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("-o -") && m.contains("omit -o")),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

@@ -892,6 +892,42 @@ fn m9_non_utf8_arguments_never_panic() {
     }
 }
 
+/// SE-08: `-o -` never creates a file literally named `-`. Trace
+/// treats it as stdout (its default); profile refuses it with a usage
+/// error saying how to write to stdout.
+#[test]
+fn se08_dash_output_never_creates_a_file_named_dash() {
+    let dir = tempfile::tempdir().unwrap();
+    let run_in = |args: &[&str]| {
+        Command::new(bin())
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap_or_else(|error| panic!("run p11scope {args:?}: {error}"))
+    };
+    // Profile refuses: exit 2, names `-o -`, says how to get stdout.
+    let refused = run_in(&["profile", "--pid", "1", "-o", "-"]);
+    assert_eq!(refused.status.code(), Some(2));
+    let stderr = String::from_utf8(refused.stderr).expect("stderr is UTF-8");
+    assert!(stderr.contains("-o -"), "{stderr}");
+    assert!(stderr.contains("omit -o"), "{stderr}");
+    assert!(stderr.contains("usage:"), "{stderr}");
+    // Trace accepts `-o -` as stdout: never exit 2, never a file.
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let traced = run_in(&["trace", "--pid", &pid, "-o", "-", "--duration", "1"]);
+    assert_ne!(traced.status.code(), Some(2));
+    assert!(
+        !dir.path().join("-").exists(),
+        "a file literally named `-` was created"
+    );
+    let litter: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(litter.is_empty(), "{litter:?}");
+}
+
 /// SE-07: a scalar flag given twice is a usage error (exit 2) naming
 /// the flag, instead of silent last-wins.
 #[test]

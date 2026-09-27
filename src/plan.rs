@@ -909,6 +909,12 @@ impl AttachPlan {
         rebuilt
     }
 
+    /// Provider objects attached only through a count-only
+    /// `C_GetFunctionList` seed: their function table is not published yet.
+    pub(crate) fn provisional_objects(&self) -> impl Iterator<Item = PinnedObjectId> + '_ {
+        self.provisional_get_function_list.values().copied()
+    }
+
     pub(crate) fn add_provisional_get_function_list(
         &mut self,
         provisional: ProvisionalGetFunctionList,

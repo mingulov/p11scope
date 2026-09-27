@@ -88,6 +88,16 @@ pub struct Engine {
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
     pending_discovery_records: Vec<QueuedDiscoveryRecord>,
+    /// A live frame's work budget (H-1); `LIVE_FRAME_WORK_BUDGET_NS` except
+    /// in tests.
+    frame_work_budget_ns: u64,
+    /// When the running live frame's work budget ends; `None` outside a
+    /// live frame (pause cycles, terminal drains and startup run unbounded).
+    frame_deadline_ns: Option<u64>,
+    /// Set when this live frame deferred work to the next one.
+    frame_deferred: bool,
+    /// The capture's operator-stop flag, checked between work items.
+    cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     scope: Scope,
     hooks: HookRegistry,
     module_hints: Vec<PathBuf>,
@@ -2101,6 +2111,10 @@ type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 pub(crate) trait EngineSession {
     fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
+    /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
+    /// session's FIFO without applying any (RB-2). `discovery_dequeue`
+    /// serves that FIFO first, so ring order is kept.
+    fn stage_discovery(&mut self, quantum: usize) -> Result<usize>;
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
     fn process_creation_tracking_unavailable(&self) -> Option<&str>;
     fn read_selection_table(
@@ -2166,6 +2180,10 @@ impl EngineSession for Session {
 
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
         Session::discovery_dequeue(self)
+    }
+
+    fn stage_discovery(&mut self, quantum: usize) -> Result<usize> {
+        Session::stage_discovery(self, quantum)
     }
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -4691,6 +4709,24 @@ const TERMINAL_DRAIN_SUBJECT: &str = "live loader retirement";
 /// drain itself; that backlog is reported as an incomplete drain, never as an
 /// empty ring, and any overflow it causes is the producer's `ring_loss`.
 pub(crate) const LIVE_DISCOVERY_DRAIN_QUANTUM: usize = 256;
+
+/// Discovery quanta one live frame collects before it applies them (RB-2).
+/// The ring is now staged on every tick, but a frame that applied one
+/// 256-item quantum a second fell behind any host producing more lifecycle
+/// records than that, and the backlog then overflowed into ring loss.
+/// Sixteen quanta, 4,096 items — the staging capacity — per frame; anything
+/// left stays queued in ring order for the next frame.
+pub(crate) const LIVE_DISCOVERY_FRAME_QUANTA: usize = 16;
+
+/// How long one live discovery frame may work before it defers the rest of
+/// its records, deferred loader scans, loader arming and export attach to
+/// the next frame (H-1). A frame used to run all of it with no clock check —
+/// 4-5.6 s ticks were measured — while EVENTS, signals, pause stops and
+/// first-use attach waited. 100 ms is a tenth of the default profile frame
+/// and half the trace frame; one item already started is always finished,
+/// so a frame overruns by at most one item. Pause cycles and terminal
+/// drains are never bounded by it: they must finish their causal work.
+pub(crate) const LIVE_FRAME_WORK_BUDGET_NS: u64 = 100_000_000;
 const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
     "the live discovery drain stopped at its work quantum with records still queued";
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
@@ -6916,6 +6952,18 @@ fn arm_refreshed_views_with(
     Ok(changed)
 }
 
+/// Whether an unresolvable record of an ended generation could have announced
+/// code that then ran unobserved, so the capture's causal gap is unproven. A
+/// loader hit in RT_ADD or RT_DELETE state cannot: dlopen relocates and
+/// initializes an object only after the transaction's RT_CONSISTENT, and a
+/// deletion adds nothing. Every other record (RT_CONSISTENT or an unreadable
+/// state, an export return, an exec) could.
+fn record_could_publish_callable_code(record: &DiscoveryRecord) -> bool {
+    const RT_ADD: u32 = 1;
+    const RT_DELETE: u32 = 2;
+    !(record.kind == DISCOVERY_KIND_LOADER && matches!(record.announced_count, RT_ADD | RT_DELETE))
+}
+
 fn process_view_is_current(
     views: &[ProcessView],
     extra_views: &[&ProcessView],
@@ -7138,6 +7186,16 @@ impl Engine {
             terminal_batch: None,
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
+            // Ordinary tests exercise discovery semantics, not wall-clock
+            // bounds, on loaded CI hosts; the H-1 tests opt in explicitly.
+            frame_work_budget_ns: if cfg!(test) {
+                u64::MAX
+            } else {
+                LIVE_FRAME_WORK_BUDGET_NS
+            },
+            frame_deadline_ns: None,
+            frame_deferred: false,
+            cancel_flag: None,
             scope: Scope::Pid(std::process::id()),
             hooks: HookRegistry::builtin(),
             module_hints: Vec::new(),
@@ -7243,6 +7301,87 @@ impl Engine {
             }
         }
         aggregate
+    }
+
+    /// Whether the owned child `pid` still has a provider whose function
+    /// table is not published (GT-4): a loader memory scan deferred at an
+    /// RT_ADD hit, or a provider attached only through its count-only
+    /// `C_GetFunctionList` seed while its table is unknown. The pause keeps
+    /// the child's epoch armed through exactly this window.
+    pub(crate) fn owned_publication_pending(&self, pid: u32) -> bool {
+        let views: BTreeSet<_> = self
+            .views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .map(ProcessView::id)
+            .collect();
+        if self
+            .pending_loader_scans
+            .keys()
+            .any(|key| views.contains(&key.view))
+        {
+            return true;
+        }
+        let objects: BTreeSet<_> = self
+            .modules
+            .iter()
+            .filter(|module| views.contains(&module.scanned.view))
+            .map(|module| module.object)
+            .collect();
+        self.plan
+            .provisional_objects()
+            .any(|object| objects.contains(&object))
+    }
+
+    /// Publishes a gap the owned pause could not cover. It is a coverage gap,
+    /// not a lost record: the causal timing still measures it.
+    pub(crate) fn note_owned_pause_gap(&mut self, reason: &str) {
+        self.mark_partial("owned pause", reason);
+    }
+
+    /// Whether the running live frame must stop taking on work items (H-1):
+    /// its work budget is spent, or the operator asked the capture to stop.
+    /// Always false outside a live frame.
+    fn frame_work_exhausted(&self) -> bool {
+        let Some(deadline) = self.frame_deadline_ns else {
+            return false;
+        };
+        self.cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            || crate::attach::monotonic_ns().is_some_and(|now| now >= deadline)
+    }
+
+    /// Books one frame's deferral once: deferred work is delayed, never
+    /// dropped, but a provider it names is attached a frame later, so the
+    /// capture says so.
+    fn note_frame_deferral(&mut self) {
+        if !self.frame_deferred {
+            self.frame_deferred = true;
+            self.mark_partial(
+                "live discovery frame",
+                "the frame work budget was spent; remaining discovery work was deferred to the next frame",
+            );
+        }
+    }
+
+    /// Runs one live discovery frame under its work budget (H-1).
+    fn with_live_frame<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        // An unreadable clock bounds nothing rather than deferring forever.
+        self.frame_deadline_ns = Some(crate::attach::monotonic_ns().map_or(u64::MAX, |now| {
+            now.saturating_add(self.frame_work_budget_ns)
+        }));
+        self.frame_deferred = false;
+        let result = work(self);
+        self.frame_deadline_ns = None;
+        self.frame_deferred = false;
+        result
+    }
+
+    /// The capture's operator-stop flag: a live frame that sees it set
+    /// defers its remaining work so the loop can end sooner (H-1).
+    pub(crate) fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel_flag = Some(flag);
     }
 
     /// The admission rule this capture's plan keeps for its whole lifetime
@@ -8332,15 +8471,39 @@ impl Engine {
         self.mark_live_loss("live loader memory discovery", reason);
     }
 
-    fn settle_pending_loader_scan(&mut self, key: PendingLoaderScanKey, reason: &str) -> bool {
+    /// A deferred scan whose process provably exited before the loader
+    /// transaction's RT_CONSISTENT. It stays a counted truncation, but not a
+    /// causal-timing loss: dlopen relocates and initializes an object only
+    /// after RT_CONSISTENT, so an object announced by RT_ADD in a process
+    /// that ended first never ran, and RT_DELETE introduces nothing (GT-4).
+    fn record_pending_loader_scan_end(&mut self, reason: &str) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_partial("live loader memory discovery", reason);
+    }
+
+    fn settle_pending_loader_scan(
+        &mut self,
+        key: PendingLoaderScanKey,
+        reason: &str,
+        ended: bool,
+    ) -> bool {
         if self.pending_loader_scans.remove(&key).is_none() {
             return false;
         }
-        self.record_pending_loader_scan_loss(reason);
+        if ended {
+            self.record_pending_loader_scan_end(reason);
+        } else {
+            self.record_pending_loader_scan_loss(reason);
+        }
         true
     }
 
-    fn settle_pending_loader_scans_for_view(&mut self, view: ProcessViewId, reason: &str) {
+    fn settle_pending_loader_scans_for_view(
+        &mut self,
+        view: ProcessViewId,
+        reason: &str,
+        ended: bool,
+    ) {
         let pending: Vec<_> = self
             .pending_loader_scans
             .keys()
@@ -8348,14 +8511,14 @@ impl Engine {
             .copied()
             .collect();
         for key in pending {
-            self.settle_pending_loader_scan(key, reason);
+            self.settle_pending_loader_scan(key, reason, ended);
         }
     }
 
     fn settle_all_pending_loader_scans(&mut self, reason: &str) {
         let pending: Vec<_> = self.pending_loader_scans.keys().copied().collect();
         for key in pending {
-            self.settle_pending_loader_scan(key, reason);
+            self.settle_pending_loader_scan(key, reason, false);
         }
     }
 
@@ -10163,6 +10326,12 @@ impl Engine {
         let mut changed = false;
         let mut required_complete = true;
         for key in due {
+            // H-1: a spent live frame leaves the rest pending; the next
+            // frame's fallback pass serves them.
+            if self.pending_loader_scans.contains_key(&key) && self.frame_work_exhausted() {
+                self.note_frame_deferral();
+                break;
+            }
             let Some(hook_ts_ns) = self.pending_loader_scans.remove(&key) else {
                 continue;
             };
@@ -10202,17 +10371,20 @@ impl Engine {
                     required_complete &= outcome.required_complete();
                 }
                 Err(error) => {
-                    self.record_pending_loader_scan_loss(
-                        "a deferred loader memory scan remained unresolved after its one bounded fallback attempt",
-                    );
-                    // A target that provably exited before its fallback ran is
-                    // the same bounded generation loss the record path takes:
-                    // counted above, never a reason to abandon the capture.
+                    // A target that provably exited before its fallback ran
+                    // ended its loader transaction unfinished: a counted
+                    // truncation, never a reason to abandon the capture, and
+                    // no lost causal timing (`record_pending_loader_scan_end`).
                     if self.original_exited(key.view) {
-                        self.invalidate_causal_timing();
+                        self.record_pending_loader_scan_end(
+                            "a deferred loader memory scan was unresolved at expected process exit",
+                        );
                         required_complete = false;
                         continue;
                     }
+                    self.record_pending_loader_scan_loss(
+                        "a deferred loader memory scan remained unresolved after its one bounded fallback attempt",
+                    );
                     return Err(error);
                 }
             }
@@ -10373,9 +10545,13 @@ impl Engine {
                 pending_views,
             );
             if result.is_err() {
+                // An RT_ADD/RT_DELETE hit of a process that already ended:
+                // its transaction never reached RT_CONSISTENT.
+                let ended = self.original_exited(view_id);
                 self.settle_pending_loader_scan(
                     key,
                     "a deferred loader memory scan failed during export-hook preparation",
+                    ended,
                 );
             } else if let Some(reason) = self.budget.stopped_now() {
                 self.settle_pending_loader_scan(
@@ -10383,6 +10559,7 @@ impl Engine {
                     &format!(
                         "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
                     ),
+                    false,
                 );
             }
             result
@@ -12867,6 +13044,7 @@ impl Engine {
                     context: context_id,
                 },
                 "a deferred loader memory scan was unresolved at loader context retirement",
+                false,
             );
             // A context its own terminal dispatch already removed was removed
             // exactly once; only one still registered can fail to be removed.
@@ -12970,7 +13148,11 @@ impl Engine {
                 "a deferred loader memory scan was unresolved at loader context retirement"
             }
         };
-        self.settle_pending_loader_scans_for_view(view, pending_reason);
+        self.settle_pending_loader_scans_for_view(
+            view,
+            pending_reason,
+            cause == RetirementCause::ExpectedRemoval,
+        );
         if cause != RetirementCause::ExpectedRemoval {
             self.ready_expected_removals.remove(&view);
         }
@@ -13434,7 +13616,26 @@ impl Engine {
         loop {
             let mut exec_refresh_views = BTreeSet::new();
             let mut deferred_mismatches = Vec::new();
-            for queued in std::mem::take(records) {
+            let mut batch = std::mem::take(records).into_iter();
+            while let Some(queued) = batch.next() {
+                // H-1: a spent live frame dispatches nothing more. The rest
+                // waits, in ring order, at the head of the next batch. Only
+                // where that cannot change a verdict: no loader mismatch
+                // awaits an exec later in this vector, and no record carries
+                // terminal authority.
+                if deferred_mismatches.is_empty()
+                    && queued.terminal_owner.is_none()
+                    && batch
+                        .as_slice()
+                        .iter()
+                        .all(|rest| rest.terminal_owner.is_none())
+                    && self.frame_work_exhausted()
+                {
+                    self.note_frame_deferral();
+                    self.pending_discovery_records
+                        .extend(std::iter::once(queued).chain(batch));
+                    break;
+                }
                 let record = queued.record;
                 let origin = (queued.record.pid_tgid >> 32) as u32;
                 match self.dispatch_discovery_record(
@@ -13461,7 +13662,9 @@ impl Engine {
                     Err(_) => {
                         closure.fail();
                         if self.record_generation_ended(origin) {
-                            self.invalidate_causal_timing();
+                            if record_could_publish_callable_code(&record) {
+                                self.invalidate_causal_timing();
+                            }
                         } else {
                             self.mark_live_loss(
                                 "live discovery record",
@@ -14823,6 +15026,14 @@ impl Engine {
                 })
                 .collect();
             arm_refreshed_views_with(&arm, |position| {
+                // H-1: a spent live frame arms no more views; each one left
+                // is requested, so the next frame rescans and arms it.
+                if self.frame_work_exhausted() {
+                    self.note_frame_deferral();
+                    let pid = self.views[position].pid();
+                    self.request_refresh(pid);
+                    return Ok(false);
+                }
                 self.arm_loader_or_partial(position, session, additions_allowed, pending_views)
             })
         } else {
@@ -14835,6 +15046,13 @@ impl Engine {
             Ok(arm_changed) => {
                 changed |= arm_changed;
                 for view in refreshed_ok.union(&new_view_ids).copied() {
+                    // H-1: export attach left for the next frame is requested
+                    // the way skipped export work already is.
+                    if self.frame_work_exhausted() {
+                        self.note_frame_deferral();
+                        export_incomplete.insert(view);
+                        continue;
+                    }
                     let outcome = self.attach_refreshed_exports(view, session, additions_allowed);
                     self.note_export_attach_outcome(
                         view,
@@ -14875,6 +15093,9 @@ impl Engine {
             // The unarmed filter above cannot see an armed view whose export
             // work the closed tick skipped. Request it too, with the helper
             // shared with startup attach.
+            self.request_skipped_export_views(&export_incomplete);
+        }
+        if *additions_allowed && self.frame_deferred {
             self.request_skipped_export_views(&export_incomplete);
         }
         let cleanup = self.process_discovery_records(
@@ -14937,16 +15158,11 @@ impl Engine {
         session: &mut dyn EngineSession,
         force_full: bool,
     ) -> Result<bool> {
-        let (records, malformed) = match Self::collect_discovery_records(session) {
-            Ok(drained) => drained,
-            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                Ok(incomplete) if incomplete.backlog => (incomplete.records, incomplete.malformed),
-                Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
-                Err(error) => return Err(error),
-            },
-        };
+        let (records, malformed) = self.collect_frame_discovery(session)?;
         if force_full || !records.is_empty() || malformed != 0 || !self.discovery_shallow_idle() {
-            return self.apply_discovery_batch(session, records, malformed);
+            return self.with_live_frame(|engine| {
+                engine.apply_discovery_batch(session, records, malformed)
+            });
         }
         Ok(false)
     }
@@ -15107,15 +15323,38 @@ impl Engine {
     /// duration/signal checks precede. Overflow in between is the producer's
     /// `ring_loss`, read with every batch.
     pub(crate) fn drain_discovery_from(&mut self, session: &mut dyn EngineSession) -> Result<bool> {
-        let (records, malformed) = match Self::collect_discovery_records(session) {
-            Ok(drained) => drained,
-            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                Ok(incomplete) if incomplete.backlog => (incomplete.records, incomplete.malformed),
-                Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
-                Err(error) => return Err(error),
-            },
-        };
-        self.apply_discovery_batch(session, records, malformed)
+        let (records, malformed) = self.collect_frame_discovery(session)?;
+        self.with_live_frame(|engine| engine.apply_discovery_batch(session, records, malformed))
+    }
+
+    /// One live frame's records: up to `LIVE_DISCOVERY_FRAME_QUANTA` collector
+    /// quanta, stopping at the first that empties the queue. A quantum stop
+    /// is backlog, never failure; a real dequeue failure aborts the route as
+    /// before.
+    fn collect_frame_discovery(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<(Vec<DiscoveryRecord>, u64)> {
+        let mut records = Vec::new();
+        let mut malformed = 0u64;
+        for _ in 0..LIVE_DISCOVERY_FRAME_QUANTA {
+            match Self::collect_discovery_records(session) {
+                Ok((drained, drained_malformed)) => {
+                    records.extend(drained);
+                    malformed = malformed.saturating_add(drained_malformed);
+                    break;
+                }
+                Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                    Ok(incomplete) if incomplete.backlog => {
+                        records.extend(incomplete.records);
+                        malformed = malformed.saturating_add(incomplete.malformed);
+                    }
+                    Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+        Ok((records, malformed))
     }
 
     /// `drain_discovery_tick` (src/run.rs) aborts the run with `?` on this
@@ -15271,7 +15510,12 @@ impl Engine {
                 &mut closure,
             )?;
         }
-        if self.pending_retirements.is_empty() && self.pending_rejected_keys.is_empty() {
+        // A frame that deferred records runs no inventory pass: the next
+        // frame dispatches them first, then refreshes (H-1).
+        if self.pending_retirements.is_empty()
+            && self.pending_rejected_keys.is_empty()
+            && !self.frame_deferred
+        {
             changed |= self.refresh_inventory(
                 session,
                 &mut additions_allowed,
@@ -15437,6 +15681,32 @@ impl Engine {
         })
     }
 
+    /// Arms every retained view's loader at capture start, staging the
+    /// DISCOVERY ring after each view so the per-view locator scans, plan
+    /// rebuilds and attaches never let it overflow (RB-2). Returns the first
+    /// fatal arming error; the caller still runs its cleanup pass.
+    fn arm_initial_views(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Option<anyhow::Error> {
+        for position in 0..self.views.len() {
+            if !self.views[position].still_the_same() {
+                continue;
+            }
+            if let Err(error) =
+                self.arm_loader_or_partial(position, session, additions_allowed, pending_views)
+            {
+                return Some(error);
+            }
+            if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM) {
+                return Some(error);
+            }
+        }
+        None
+    }
+
     fn start_session_with(
         &mut self,
         policy: CapturePolicy,
@@ -15470,6 +15740,10 @@ impl Engine {
             };
         self.record_session_lifecycle_tracking(&session);
         let result = (|| {
+            // Lifecycle producers have been live since the load, and the
+            // static attach can take seconds: stage what they produced
+            // before the per-view phases add more (RB-2).
+            session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM)?;
             let mut additions_allowed = true;
             let mut records = Vec::new();
             let mut pending_views = PendingViewRetirements::new();
@@ -15502,23 +15776,11 @@ impl Engine {
                     "the empty timing catalog leaves initial-set capture unproven",
                 );
             } else {
-                for position in 0..self.views.len() {
-                    if !self.views[position].still_the_same() {
-                        continue;
-                    }
-                    match self.arm_loader_or_partial(
-                        position,
-                        &mut session,
-                        &mut additions_allowed,
-                        &mut pending_views,
-                    ) {
-                        Ok(_) => {}
-                        Err(error) => {
-                            fatal = Some(error);
-                            break;
-                        }
-                    }
-                }
+                fatal = self.arm_initial_views(
+                    &mut session,
+                    &mut additions_allowed,
+                    &mut pending_views,
+                );
             }
             #[cfg(test)]
             crate::first_use_probe::discovery_loss(
@@ -15532,6 +15794,9 @@ impl Engine {
                     &mut pending_views,
                     &mut closure,
                 );
+                // Stage what the export attach let accumulate; the first
+                // batch applies it in ring order (RB-2).
+                session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM)?;
                 if owned_prearmed && let Some(generation) = owned_generation {
                     self.mark_owned_selection_pending(generation);
                 }
@@ -15634,6 +15899,8 @@ pub(crate) mod session_fixture {
         /// and before the next generation check.
         detach_losses: VecDeque<Option<u32>>,
         pub(crate) preflight_targets: RefCell<Vec<Vec<(u32, PinnedObjectId, u64)>>>,
+        /// How many times the Engine staged DISCOVERY off the ring.
+        pub(crate) stage_calls: usize,
     }
 
     /// SIGKILL plus `waitpid`, so the retained generation is provably gone
@@ -15770,6 +16037,11 @@ pub(crate) mod session_fixture {
 
         fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
             self.dequeues.pop_front().unwrap_or(Ok(None))
+        }
+
+        fn stage_discovery(&mut self, _: usize) -> Result<usize> {
+            self.stage_calls += 1;
+            Ok(0)
         }
 
         fn counter_snapshot(&self) -> Result<CounterSnapshot> {

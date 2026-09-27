@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/system-test-manifest/v1",
-  "ledger_sha256": "74a2f9109bad456db221b26101d9ce74bf68161eb27ce7c4b29809f239fd89c4",
+  "ledger_sha256": "654ffe42bf4b69eda90434798388f13edc03bbeb7f03ac15c5c43f480d588479",
   "deferred_sha256": "b40d74c471ba102813e7eeb4e44ba3064233b5d83c771cd167067f1b3b623d1b",
   "subject": null,
   "cells": [
@@ -1757,7 +1757,7 @@
         "system-product"
       ],
       "expected_behavior": "regression",
-      "limitation": "source-fixed: async cross-process collision. Existing check: `e20_collision_tombstone_lifecycle_matrix` + real-BPF E20 (T9). Final execution not recorded.",
+      "limitation": "source-fixed: async cross-process collision. Existing check: `e20_collision_tombstone_lifecycle_matrix` + live E20 same-domain check NOT implemented (open, T9). Final execution not recorded.",
       "test_ids": [],
       "command": [],
       "artifact_hashes": {},
@@ -2663,7 +2663,7 @@
         "system-product"
       ],
       "expected_behavior": "regression",
-      "limitation": "required-open: semantic scaling/isolation. Existing check: `e20_collision_tombstone_lifecycle_matrix` + real-BPF E20. Final execution not recorded.",
+      "limitation": "required-open: semantic scaling/isolation. Existing check: `e20_collision_tombstone_lifecycle_matrix` (unit only); live E20 same-domain collision check NOT implemented. Final execution not recorded.",
       "test_ids": [],
       "command": [],
       "artifact_hashes": {},

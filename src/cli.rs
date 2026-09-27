@@ -4,6 +4,7 @@
 
 use crate::attach::BackendSelection;
 use crate::discovery::hooks::HookRegistry;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -89,8 +90,9 @@ pub struct RunArgs {
     /// `--kill-on-timeout`: `--duration` expiry ends the child too, instead of
     /// handing it back still running.
     pub kill_on_timeout: bool,
-    /// Everything after `--`, verbatim. Never empty.
-    pub command: Vec<String>,
+    /// Everything after `--`, verbatim — bytes, not text: Linux arguments
+    /// need not be UTF-8 (M-9). Never empty.
+    pub command: Vec<OsString>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,12 +367,40 @@ fn usage_err(msg: impl Into<String>) -> CliError {
     CliError::Usage(format!("{}\n{USAGE}", msg.into()))
 }
 
-fn require_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
+/// A textual option value (a number, a keyword, a hook spec). Linux hands
+/// over bytes; a value that is not UTF-8 is a usage error, never a panic.
+fn require_value(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> Result<String, CliError> {
+    require_os_value(args, flag)?
+        .into_string()
+        .map_err(|value| usage_err(format!("{flag}: invalid value {value:?}: not valid UTF-8")))
+}
+
+/// A path option value, kept as the exact bytes given (M-9).
+fn require_os_value(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> Result<OsString, CliError> {
     args.next()
         .ok_or_else(|| usage_err(format!("{flag} requires a value")))
 }
 
-fn require_pid(args: &mut impl Iterator<Item = String>) -> Result<u32, CliError> {
+fn require_path(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> Result<PathBuf, CliError> {
+    require_os_value(args, flag).map(PathBuf::from)
+}
+
+/// Flags and subcommands are matched as text; a non-UTF-8 word can never
+/// equal one, so its lossy form is only ever shown in an "unknown" refusal.
+fn word(arg: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
+    arg.to_string_lossy()
+}
+
+fn require_pid(args: &mut impl Iterator<Item = OsString>) -> Result<u32, CliError> {
     let v = require_value(args, "--pid")?;
     v.parse()
         .map_err(|_| usage_err(format!("--pid: invalid number {v:?}")))
@@ -380,7 +410,7 @@ fn require_pid(args: &mut impl Iterator<Item = String>) -> Result<u32, CliError>
 /// no second copy of the ABI names; its message is propagated verbatim.
 fn add_hook(
     hooks: &mut HookRegistry,
-    args: &mut impl Iterator<Item = String>,
+    args: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), CliError> {
     let spec = require_value(args, "--hook-symbol")?;
     hooks.add_spec(&spec).map_err(usage_err)
@@ -456,13 +486,11 @@ impl Common {
 fn capture_option(
     common: &mut Common,
     arg: &str,
-    args: &mut impl Iterator<Item = String>,
+    args: &mut impl Iterator<Item = OsString>,
 ) -> Result<bool, CliError> {
     match arg {
-        "--module" => common.modules.push(require_value(args, "--module")?.into()),
-        "--manifest" => common
-            .manifests
-            .push(require_value(args, "--manifest")?.into()),
+        "--module" => common.modules.push(require_path(args, "--module")?),
+        "--manifest" => common.manifests.push(require_path(args, "--manifest")?),
         "--hook-symbol" => add_hook(&mut common.hooks, args)?,
         "--mode" => {
             let v = require_value(args, "--mode")?;
@@ -531,7 +559,7 @@ fn capture_option(
             common.attach_backend =
                 BackendSelection::from_cli(&v).map_err(|e| usage_err(format!("{e:#}")))?;
         }
-        "-o" => common.out = Some(require_value(args, "-o")?.into()),
+        "-o" => common.out = Some(require_path(args, "-o")?),
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
         "--allow-uretprobe-on-confined-target" => common.allow_confined_uretprobe = true,
         _ => return Ok(false),
@@ -540,9 +568,14 @@ fn capture_option(
 }
 
 /// The whole command line: the subcommand plus its own arguments. Pure — no I/O,
-/// no process exit; the caller decides how to report `CliError`.
-pub fn parse(mut argv: impl Iterator<Item = String>) -> Result<Command, CliError> {
-    match argv.next().as_deref() {
+/// no process exit; the caller decides how to report `CliError`. Takes the
+/// arguments as the OS gives them (`std::env::args_os`), so a non-UTF-8
+/// argument is a usage error or, for a path or a `run` command word, kept
+/// byte for byte — never a panic (M-9). `String` items still work.
+pub fn parse(argv: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Command, CliError> {
+    let mut argv = argv.into_iter().map(Into::into);
+    let first = argv.next();
+    match first.as_deref().map(word).as_deref() {
         Some("--version" | "-V") => match argv.next() {
             None => Ok(Command::Version),
             Some(_) => Err(usage_err("--version takes no arguments")),
@@ -564,16 +597,16 @@ pub fn parse(mut argv: impl Iterator<Item = String>) -> Result<Command, CliError
 
 /// `p11scope inspect`: one target, discovery options only — no capture policy,
 /// no duration, no output file (spec §4.6).
-fn parse_inspect(mut args: impl Iterator<Item = String>) -> Result<InspectArgs, CliError> {
+fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs, CliError> {
     let mut pid: Option<u32> = None;
     let mut modules = Vec::new();
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
     while let Some(a) = args.next() {
-        match a.as_str() {
+        match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inspect)),
             "--pid" => pid = Some(require_pid(&mut args)?),
-            "--module" => modules.push(require_value(&mut args, "--module")?.into()),
+            "--module" => modules.push(require_path(&mut args, "--module")?),
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
             other => return Err(unknown_arg(other)),
@@ -589,17 +622,17 @@ fn parse_inspect(mut args: impl Iterator<Item = String>) -> Result<InspectArgs, 
 
 /// `p11scope doctor`: every argument optional — a lane nobody named is reported
 /// as not applicable rather than failed.
-fn parse_doctor(mut args: impl Iterator<Item = String>) -> Result<DoctorArgs, CliError> {
+fn parse_doctor(mut args: impl Iterator<Item = OsString>) -> Result<DoctorArgs, CliError> {
     let mut doctor = DoctorArgs {
         pid: None,
         cgroup: None,
         extra_strict: false,
     };
     while let Some(a) = args.next() {
-        match a.as_str() {
+        match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Doctor)),
             "--pid" => doctor.pid = Some(require_pid(&mut args)?),
-            "--cgroup" => doctor.cgroup = Some(require_value(&mut args, "--cgroup")?.into()),
+            "--cgroup" => doctor.cgroup = Some(require_path(&mut args, "--cgroup")?),
             "--extra-strict" => doctor.extra_strict = true,
             "--module" => {
                 return Err(usage_err(
@@ -624,21 +657,23 @@ fn parse_doctor(mut args: impl Iterator<Item = String>) -> Result<DoctorArgs, Cl
 /// to report `CliError`.
 pub fn parse_capture(
     kind: Kind,
-    mut args: impl Iterator<Item = String>,
+    args: impl IntoIterator<Item = impl Into<OsString>>,
 ) -> Result<CaptureArgs, CliError> {
+    let mut args = args.into_iter().map(Into::into);
     let mut common = Common::default();
     let mut pid: Option<u32> = None;
     let mut cgroup: Option<PathBuf> = None;
     let mut system = false;
 
     while let Some(a) = args.next() {
-        if capture_option(&mut common, a.as_str(), &mut args)? {
+        let arg = word(&a);
+        if capture_option(&mut common, &arg, &mut args)? {
             continue;
         }
-        match a.as_str() {
+        match arg.as_ref() {
             "--help" | "-h" => return Err(CliError::Help(kind.help_topic())),
             "--pid" => pid = Some(require_pid(&mut args)?),
-            "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup")?.into()),
+            "--cgroup" => cgroup = Some(require_path(&mut args, "--cgroup")?),
             "--system" => system = true,
             other => return Err(unknown_arg(other)),
         }
@@ -689,18 +724,19 @@ pub fn parse_capture(
 /// `p11scope run`: the shared capture options, this observer's own pause
 /// policy, and the command it starts. The command is everything after `--`,
 /// taken verbatim so an argument meant for the child is never consumed here.
-fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError> {
+fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliError> {
     let mut common = Common::default();
     let mut pause = PausePolicy::Never;
     let mut kill_on_timeout = false;
     let mut trace = false;
-    let mut command: Vec<String> = Vec::new();
+    let mut command: Vec<OsString> = Vec::new();
 
     while let Some(a) = args.next() {
-        if capture_option(&mut common, a.as_str(), &mut args)? {
+        let arg = word(&a);
+        if capture_option(&mut common, &arg, &mut args)? {
             continue;
         }
-        match a.as_str() {
+        match arg.as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Run)),
             "--trace" => trace = true,
             "--pause" => {
@@ -732,7 +768,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
 
     // No `--`, nothing after it, and an empty program name are the same
     // refusal: there is no command for this observer to start and own.
-    if command.first().is_none_or(String::is_empty) {
+    if command.first().is_none_or(|program| program.is_empty()) {
         return Err(usage_err(
             "run requires a command: `p11scope run [options] -- CMD [ARGS...]`",
         ));
@@ -1197,6 +1233,67 @@ mod tests {
         // Everything after `--` is the command verbatim, flags included: the
         // observer must never consume an argument meant for the child.
         assert_eq!(a.command, ["/usr/bin/app", "--pid", "7"]);
+    }
+
+    /// M-9: paths and the `run` command are bytes; they survive parsing
+    /// exactly, and a non-UTF-8 flag or number is a usage error.
+    #[test]
+    fn non_utf8_paths_and_run_arguments_pass_through_byte_for_byte() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let bytes = |raw: &[u8]| OsString::from_vec(raw.to_vec());
+        let module = bytes(b"/opt/caf\xe9/pkcs11.so");
+        let Command::Run(a) = parse([
+            OsString::from("run"),
+            OsString::from("--module"),
+            module.clone(),
+            OsString::from("-o"),
+            bytes(b"out-\xff.json"),
+            OsString::from("--"),
+            OsString::from("/bin/echo"),
+            bytes(b"caf\xe9"),
+        ])
+        .unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(a.modules, vec![PathBuf::from(module)]);
+        assert_eq!(a.out.unwrap().as_os_str().as_bytes(), b"out-\xff.json");
+        assert_eq!(
+            a.command,
+            vec![OsString::from("/bin/echo"), bytes(b"caf\xe9")]
+        );
+
+        let Command::Profile(p) = parse([
+            OsString::from("profile"),
+            OsString::from("--cgroup"),
+            bytes(b"/sys/fs/cgroup/\xe9.slice"),
+        ])
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(
+            p.scope,
+            ScopeArg::Cgroup(PathBuf::from(bytes(b"/sys/fs/cgroup/\xe9.slice")))
+        );
+
+        for argv in [
+            vec![bytes(b"prof\xe9le")],
+            vec![
+                OsString::from("profile"),
+                OsString::from("--pid"),
+                bytes(b"1\xe9"),
+            ],
+            vec![
+                OsString::from("profile"),
+                OsString::from("--pid"),
+                OsString::from("1"),
+                bytes(b"--\xe9"),
+            ],
+        ] {
+            assert!(
+                matches!(parse(argv.clone()), Err(CliError::Usage(_))),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

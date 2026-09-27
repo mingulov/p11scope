@@ -179,7 +179,7 @@ separate. `discovery[].tables[]` still shows one table record per source.
 | `sources[]` | Exactly `["scan"]`, `["manifest"]`, or `["scan", "manifest"]`, in that canonical order. The same exact arrays apply independently to each `objects[].sources`. |
 | `corroborated` | True exactly when at least one comparable `agreed` or `conflict` outcome was recorded for this final module. It is a summary only; consumers use the exact `corroboration[]` array for semantic decisions. |
 | `corroboration[]` | Which §4.12 outcome each source pairing produced — one entry per `--manifest` that named this object, since `--manifest` is repeatable and one outcome must not hide another. Values: `single_source` (no manifest named it), `agreed`, `conflict` (both decoded targets and they differ), `scan_empty` (the scan pinned this object but decoded no table in it — the documented use of `--manifest`, counted as uncorroborated rather than as a disagreement), `uncorroborated` (not mapped in scope, or no scan), `identity_mismatch` (the manifest's freshly opened module object and the target's scan-opened module are different exact objects), and `object_fallback` (the module object itself was stale and `manifest_object_fallbacks[]` names the scan-owned replacement). |
-| `tables[]` | `{version: [major, minor], entries, source, file_offset, linkage}` per function table published, one entry per source that saw it. `entries` counts usable targets only — NULL slots are excluded, never counted. `file_offset` is the table's version-word file offset (`null` for manifest tables, which record entry offsets rather than table locations, and where no file owner could be proven). `linkage` is the strongest publication evidence behind the table — `"interface"` (named by an interface triple), `"live_return"` (returned by a live provider export), `"manifest"` (operator-authoritative), or `"heuristic"` (bare decode with no linkage, whose slots are named `"unknown"` rather than carrying ordinal PKCS#11 labels). |
+| `tables[]` | `{version: [major, minor], entries, source, file_offset, linkage, exports_agreeing}` per function table published, one entry per source that saw it. `entries` counts usable targets only — NULL slots are excluded, never counted. `file_offset` is the table's version-word file offset (`null` for manifest tables, which record entry offsets rather than table locations, and where no file owner could be proven). `linkage` is the strongest publication evidence behind the table — `"interface"` (named by an interface triple), `"live_return"` (returned by a live provider export), `"manifest"` (operator-authoritative), `"exports"` (see below), or `"heuristic"` (bare decode with no linkage, whose slots are named `"unknown"` rather than carrying ordinal PKCS#11 labels). `"exports"` means the table was fully walked and every standard function name its own object defines in `.dynsym` (a definition, not an `STT_GNU_IFUNC` resolver) sits exactly at the target its ordinal holds, with at least one such agreement: two independent witnesses, the ABI position and the loader-facing symbol table, name the same function. A name the object does not export (stripped, IFUNC, or a NULL entry) is neutral; one exported anywhere else — including an entry forwarded into another object — refuses the whole table, which then stays `"heuristic"`. Where several standard names are defined at one target, that slot carries all of them and is `aliased`. Every linkage names slots; none gives a scan-found slot semantic authority, so `exports` changes labels only, never what is decoded. `exports_agreeing` counts the ordinals that agreed (`null` for manifest tables, which are not compared). |
 | `interfaces` | How many interfaces were seen — **the most any one source saw, never the sum across sources**: the scan and a manifest describing one provider each count its interfaces, and each sees a subset (the scan records only an interface whose table it decoded), so this is a lower bound. **Never their names**: those are bytes read out of a provider's memory, and `p11scope inspect` is where they are shown. |
 | `skipped[]` | The **table entries** this module published that no probe could attach to, `{name, reason}` — a subset of the top-level `skipped`, attributed to the module whose table carried them. It is deliberately not every loss involving this module: a loss recorded *about* the object as a whole — it could not be read, it was over the byte caps, its snapshot ended early, no table was decoded in it — has no entry to attribute, so it appears only in the top-level list as `discovery subject`. Read this list as "records this module published and lost", and the top-level list as the complete set; do not treat their difference as a category. |
 
@@ -281,25 +281,26 @@ pointer, cookie, context id, delta, proof id, absent-state sentinel, signal
 record, interface name, marker, or process identity is published beside the
 counts (`docs/privacy/allowlist-v1.md`).
 
-#### What live discovery does not publish
+#### The unprotected live window
 
-The completeness verdict consumes one more live-discovery fact that is
-deliberately **not** a field: whether any module's first required attach key
-was learned from a live loader or export event that no confirmed pause owner
-protected. The design forbids publishing it, and this document does not.
+The completeness verdict consumes one more live-discovery fact: whether any
+module's first required attach key was learned from a live loader or export
+event that no confirmed pause owner protected. The v3 documents publish it as
+`unprotected_live_windows` (0 or 1) and name it among
+`gap_classes.observation.causes`; v2 did not publish it. It was held back
+because the value is an inference, never for privacy: both of its inputs are
+already public.
 
-It is worth stating plainly how the unpublished input is obtained, because it
-is an inference and not a measurement: the implementation treats a capture as
-having had an unprotected live window when `loader_discovery.hits > 0` and
-`pause` is not `sigstop` — "a live window happened at all, and no confirmed
-pause owner protected it". That is a capture-level approximation of a
-per-module condition, and it is inexact in both directions: over-inclusive,
-because a hit that established no module's first required key still forces
-`PARTIAL`; and under-inclusive, because the export-event lane can establish a
-first required key without incrementing `hits`. It can only ever downgrade a
-verdict, never raise one, and its runtime proof is still outstanding. A
-consumer must not reconstruct it from `hits` and `pause`: it is not a published
-field, and the inference behind it is expected to be replaced by a measured one.
+It is worth stating plainly how the value is obtained: the implementation
+treats a capture as having had an unprotected live window when
+`loader_discovery.hits > 0` and `pause` is not `sigstop` — "a live window
+happened at all, and no confirmed pause owner protected it". That is a
+capture-level approximation of a per-module condition, and it is inexact in
+both directions: over-inclusive, because a hit that established no module's
+first required key still forces `PARTIAL`; and under-inclusive, because the
+export-event lane can establish a first required key without incrementing
+`hits`. It can only ever downgrade a verdict, never raise one, and it is
+expected to be replaced by a measured value.
 
 Process and semantic uncertainty:
 
@@ -383,8 +384,10 @@ One item per attach slot:
 
 | Field | Meaning |
 | --- | --- |
-| `names` | Every standard function name resolving to the target — or exactly `["unknown"]` when no authorized source named it (an unlinked heuristic table's ordinal labels are never presented as PKCS#11 names). |
+| `names` | Every standard function name resolving to the target — or exactly `["unknown"]` when no authorized source named it (an unlinked heuristic table's ordinal labels are never presented as PKCS#11 names). `["unknown"]` is not a key: several rows can carry it. |
 | `aliased` | Whether more than one name shares the target. |
+| `target` | `{object, file_offset}`: the exact function this row counts. `object` is the pinned `{dev, ino, sha256}` the probe attaches into, identified exactly as `discovery[].objects[]` identifies it (a forwarded entry names the dependency, not the module); `null` only when no pin identity was recorded for it. `file_offset` is the function's offset inside that file, so `nm -D` or a disassembler over the same hash-identified file resolves an unnamed row offline. Each row is a distinct aggregate cell: one target has one row, except that a target retired and attached again during the capture gets a fresh cell and so a second row. |
+| `ordinals` | Sorted, unique `{table_file_offset, ordinal}` objects: every function-list position that reached `target`. `ordinal` is the position in the standard list (the 104-name catalog every walkable layout is a prefix of); `table_file_offset` is the reaching table's `discovery[].tables[].file_offset`, or `null` for a manifest surface, a selection table, or a table with no provable file owner. A position is never presented as a name. Two or more distinct `ordinal`s disclose that several functions share one target — the grouping an `["unknown"]` row would otherwise hide. Empty for a target no table position reached (for example the provisional `C_GetFunctionList` export). |
 | `module` | `{dev, ino, sha256}` of the module these counts belong to, matching one `capture.modules[]` entry (its `sha256` may be `null` on the same terms); `null` when the owner is not knowable — see the exclusive relation below. |
 | `module_ambiguous` | True exactly when `module` is `null` because two modules claim the slot. The counts are real; the owner is not knowable and is never guessed. |
 | `module_unresolved` | True exactly when `module` is `null` because this allocated aggregate cell has **no accepted sole owner at all**. Forces `PARTIAL`. |

@@ -70,6 +70,28 @@ class SchemaOracleAgreement(unittest.TestCase):
         }
         self.assertEqual(forbidden, set(CHECKER["PROFILE_V3_FIELDS"]))
 
+    def test_function_row_identity_matches_oracle(self):
+        """`functions[].target` and `.ordinals` keys and bounds match the
+        oracle's closed row-identity shape (review answer (c))."""
+        row = SCHEMA["properties"]["functions"]["items"]["properties"]
+        self.assertEqual(
+            set(row["target"]["properties"]), set(CHECKER["FUNCTION_TARGET_KEYS"])
+        )
+        self.assertEqual(
+            set(row["ordinals"]["items"]["properties"]),
+            set(CHECKER["FUNCTION_ORDINAL_KEYS"]),
+        )
+        self.assertEqual(
+            row["ordinals"]["items"]["properties"]["ordinal"]["maximum"] + 1,
+            CHECKER["MAX_FUNCTION_ORDINALS"],
+        )
+
+    def test_gap_classes_shape_matches_oracle(self):
+        """`evidence.gap_classes` keys match the oracle's closed set."""
+        classes = evidence_schema()["properties"]["gap_classes"]
+        self.assertEqual(set(classes["properties"]), set(CHECKER["GAP_CLASS_KEYS"]))
+        self.assertEqual(set(classes["required"]), set(CHECKER["GAP_CLASS_KEYS"]))
+
     def test_enums_match_oracle(self):
         """Closed enums in the schema equal the oracle's vocabularies."""
         props = evidence_schema()["properties"]

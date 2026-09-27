@@ -35,6 +35,45 @@ pub fn cgroup(path: &Path) -> Result<Scope> {
     })
 }
 
+/// `CGROUP2_SUPER_MAGIC` from `<linux/magic.h>`.
+const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+
+/// `--cgroup` as an operator names it (M-3): [`cgroup`] plus proof, taken
+/// from the retained directory with `fstatfs`, that it lives on cgroup v2.
+/// A plain directory would otherwise be accepted as a scope whose inode no
+/// task ever matches — a full-duration capture of nothing that exits 0 —
+/// and `/` would send discovery walking the whole filesystem.
+pub fn capture_cgroup(path: &Path) -> Result<Scope> {
+    let scope = cgroup(path)?;
+    let Scope::Cgroup { dir, .. } = &scope else {
+        unreachable!("cgroup() returns a cgroup scope")
+    };
+    let magic =
+        filesystem_magic(dir).with_context(|| format!("reading cgroup path {}", path.display()))?;
+    if magic != CGROUP2_SUPER_MAGIC {
+        bail!(
+            "--cgroup {}: not a cgroup v2 directory (its filesystem magic is {magic:#x}, not \
+             cgroup2's {CGROUP2_SUPER_MAGIC:#x}); name a directory under /sys/fs/cgroup, for \
+             example /sys/fs/cgroup/system.slice/<unit>.service",
+            path.display()
+        );
+    }
+    Ok(scope)
+}
+
+fn filesystem_magic(dir: &File) -> std::io::Result<u64> {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fstatfs` fills the buffer on success; the fd is open.
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the successful call above initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    Ok(stat.f_type as u64)
+}
+
 /// Best-effort human label for a `cgroup_id`, for the per-cgroup profile
 /// breakdown (`render::profile_json`'s `cgroups[]`): walks `root` (the
 /// caller passes `/sys/fs/cgroup`) looking for the one directory whose
@@ -349,6 +388,19 @@ mod tests {
             unreachable!()
         };
         assert_eq!(id, expected);
+    }
+
+    /// M-3: only a cgroup2 directory is a capture scope.
+    #[test]
+    fn capture_cgroup_refuses_a_directory_that_is_not_cgroup_v2() {
+        let plain = tempfile::tempdir().unwrap();
+        let error = format!("{:#}", capture_cgroup(plain.path()).unwrap_err());
+        assert!(error.contains("not a cgroup v2 directory"), "{error}");
+        assert!(error.contains("/sys/fs/cgroup"), "{error}");
+        if filesystem_magic(&File::open("/sys/fs/cgroup").unwrap()).unwrap() == CGROUP2_SUPER_MAGIC
+        {
+            assert!(capture_cgroup(Path::new("/sys/fs/cgroup")).is_ok());
+        }
     }
 
     #[test]

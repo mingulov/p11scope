@@ -18,7 +18,7 @@ use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
 #[cfg(feature = "identify")]
-use crate::elf::{ElfAbi, classified_object};
+use crate::elf::{ElfAbi, classified_object, exports_matching_in_object};
 
 #[cfg(feature = "identify")]
 pub const MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
@@ -70,6 +70,12 @@ pub struct InspectedObject {
     pub identity: ObjectIdentity,
     pub executable_ranges: Vec<(u64, u64)>,
     pub abi: ElfAbi,
+    /// `.dynsym` definitions of the names the caller asked for, as
+    /// `(name, file offset)` in dynsym order — the same walk and the same
+    /// definition rule (`is_definition`, which excludes `STT_GNU_IFUNC`) as
+    /// [`crate::elf::exports_matching`]. Read from the bytes already hashed,
+    /// so it costs no I/O. Empty when nothing was asked for.
+    pub exports: Vec<(String, u64)>,
 }
 
 #[cfg(feature = "identify")]
@@ -196,6 +202,17 @@ pub fn inspect_file_with_reader(
     file: &std::fs::File,
     reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
 ) -> Result<InspectedObject, String> {
+    inspect_file_with_reader_exporting(file, reader, &[])
+}
+
+/// [`inspect_file_with_reader`] that also records the `.dynsym` definitions
+/// of `wanted` (see [`InspectedObject::exports`]) from the same bytes.
+#[cfg(feature = "identify")]
+pub fn inspect_file_with_reader_exporting(
+    file: &std::fs::File,
+    reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
+    wanted: &[&str],
+) -> Result<InspectedObject, String> {
     let data = read_object_bytes_with(file, reader)?;
     let (object, abi) = classified_object(&data)?;
     let sha256 = hex(&Sha256::digest(&data));
@@ -236,10 +253,16 @@ pub fn inspect_file_with_reader(
             start.checked_add(size).map(|end| (start, end))
         })
         .collect();
+    let exports = if wanted.is_empty() {
+        Vec::new()
+    } else {
+        exports_matching_in_object(&object, wanted)
+    };
     Ok(InspectedObject {
         identity,
         executable_ranges,
         abi,
+        exports,
     })
 }
 

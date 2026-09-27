@@ -112,7 +112,7 @@ class DiscoveryFlow(unittest.TestCase):
             ('flags-restore', 'task_newtask', '@flags-restore', 'w2 = w6', 'flags'),
             ('redirect-allowed', 'task_newtask', 'R_BPF_64_32\tp11_link_fork_allowed', 'R_BPF_64_32\tp11_link_emit_fork', 'link'),
             ('omit-emit', 'task_newtask', 'R_BPF_64_32\tp11_link_emit_fork', 'R_BPF_64_32\tmissing_bridge', 'link'),
-            ('scope-bypass', 'task_newtask', 'if r0 == 0x0 goto +0x21', 'if r0 == 0x1 goto +0x21', 'scope'),
+            ('scope-bypass', 'task_newtask', '@scope-gate', 'if r0 == 0x1 goto', 'scope'),
             ('scope-result', 'p11_link_fork_allowed', 'if r1 != 0x1 goto', 'if r1 == 0x1 goto', 'scope'),
             ('mask-bypass', 'p11_link_fork_allowed', 'r2 &= 0x42', 'r2 &= 0x0', 'scope'),
             ('system-bit-cleared', 'p11_link_fork_allowed', 'r2 &= 0x42', 'r2 &= 0x2', 'scope'),
@@ -141,6 +141,9 @@ class DiscoveryFlow(unittest.TestCase):
             ('unconditional-exact', 'classify_direct_interface', 'if r1 != r2 goto +0x1', 'goto +0x0', 'classification'),
             ('negative-as-other', 'classify_direct_interface', 'if r1 s> r0 goto', 'if r1 s< r0 goto', 'classification'),
             ('null-as-exact', 'classify_direct_interface', 'r9 = 0x30000', 'r9 = 0x10000', 'null'),
+            ('flags-clamp-removed', 'classify_direct_interface', '\tr5 = 0x2', '\tr5 = r5', 'flags'),
+            ('flags-clamp-inverted', 'classify_direct_interface', 'if r1 > r5 goto', 'if r1 < r5 goto', 'flags'),
+            ('flags-clamp-bound', 'classify_direct_interface', '@flags-bound', 'r1 = -0x1', 'flags'),
             ('other-as-exact', 'classify_direct_interface', 'r9 = 0x20000', 'r9 = 0x10000', 'classification'),
             ('wrong-class-field', 'classify_direct_interface', '*(u64 *)(r10 - 0x40) = r9', '*(u64 *)(r10 - 0x38) = r9', 'metadata'),
             ('metadata-width', 'classify_direct_interface', '@metadata-u32-store', '*(u64 *)(r10 - 0x8) = r1', 'metadata'),
@@ -211,6 +214,23 @@ class DiscoveryFlow(unittest.TestCase):
                         self.assertEqual(len(targets), 1)
                         hook = C.D.function_blocks(secs['tp_btf/task_newtask'])['task_newtask']
                         old = dict(C.D.instructions(hook))[targets[0][2]]
+                    elif old == '@scope-gate':
+                        # The refusal branch on the scope bridge's result,
+                        # located by the call, not by a code-size-dependent
+                        # branch displacement.
+                        secs = C.sections(disassembly)
+                        links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
+                        targets = [c for c in links if c[0] == 'task_newtask' and c[3] == 'p11_link_fork_allowed']
+                        self.assertEqual(len(targets), 1)
+                        _, lines = C.function(secs['tp_btf/task_newtask'], function, 'fixture')
+                        insns = C.D.instructions(lines)
+                        call_index = [i for i, (pc, _) in enumerate(insns) if pc == targets[0][2]]
+                        self.assertEqual(len(call_index), 1)
+                        gates = [(pc, text) for pc, text in insns[call_index[0] + 1:call_index[0] + 4]
+                                 if re.fullmatch(r'if r0 == 0x0 goto \+0x[0-9a-f]+', text)]
+                        self.assertEqual(len(gates), 1)
+                        old, new = instruction_change(lines, gates[0], gates[0][1].replace(
+                            'if r0 == 0x0 goto', new))
                     elif old == '@flags-restore':
                         secs = C.sections(disassembly)
                         links = C.D.internal_call_targets(secs['tp_btf/task_newtask'] + secs['.text'])
@@ -223,6 +243,11 @@ class DiscoveryFlow(unittest.TestCase):
                         self.assertGreater(call_index[0], 0)
                         site = insns[call_index[0] - 1]
                         self.assertEqual(site[1], 'r2 = r6')
+                        old, new = instruction_change(lines, site, new)
+                    elif old == '@flags-bound':
+                        _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')
+                        site = instruction_site(lines, ('r1 = 0x2', 'r4 = *(u64 *)(r10 - 0x60)',
+                                                       'if r1 > r5 goto +0x1', 'r5 = 0x2'))
                         old, new = instruction_change(lines, site, new)
                     elif old == '@name-read-destination':
                         _, lines = C.function(C.sections(disassembly)['.text'], function, 'fixture')

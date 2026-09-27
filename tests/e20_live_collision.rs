@@ -1,13 +1,16 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! FU-3 (Package E): live-provider BPF confirmation of the E20
-//! same-domain / distinct-cookie trigger pair.
+//! FU-3 (Package E): fixture groundwork for the E20 same-domain /
+//! distinct-cookie trigger pair.
 //!
 //! The reducer-level trigger pair (same EVENTS domain, distinct task
 //! cookies, equal module/slot/target-function/async ID, different pending
 //! mechanisms) is pinned by `e20_f75_*` in `src/history_tests.rs`. This
-//! file carries the live-provider side: unprivileged fixture construction
-//! that always runs, plus a privileged BPF cell that confirms the same
-//! pair end-to-end and skips loudly where BPF/privilege is unavailable.
+//! file carries only unprivileged fixture construction that always runs:
+//! two live processes mapping the same provider file.
+//!
+//! The live E20 same-domain collision check (privileged BPF confirmation
+//! of the trigger pair end-to-end) is NOT implemented; it remains an open
+//! requirement. Nothing in this file drives the reducer or the kernel.
 
 #[allow(dead_code)]
 mod support;
@@ -117,14 +120,12 @@ fn maps_inode(pid: u32, suffix: &str) -> std::collections::BTreeSet<u64> {
 }
 
 /// FU-3 fixture (unprivileged, always runs): two live processes map the
-/// same provider file (one inode), hold distinct PIDs, and drive the E20
-/// trigger pair shape — equal module/slot/function/async ID with different
-/// pending mechanisms — through the real reducer. Live BPF would place both
-/// tasks in one EVENTS domain with distinct task cookies; the cookies
-/// themselves are kernel-authenticated and only observable in the privileged
-/// cell below.
+/// same provider file (one shared inode) under distinct PIDs. This checks
+/// shared-provider identity only; it does not drive the reducer and does
+/// not observe task cookies (kernel-authenticated; the privileged live
+/// cell that could observe them is not implemented).
 #[test]
-fn e20_fu3_trigger_pair_fixture_two_processes_share_one_provider() {
+fn e20_fu3_fixture_two_processes_share_one_provider_inode() {
     let dir = tmp(&format!("e20-fu3-fixture-{}", std::process::id()));
     let provider = build_fixture(&dir, "mx-fu3");
     let driver = build_driver(&dir);
@@ -140,49 +141,7 @@ fn e20_fu3_trigger_pair_fixture_two_processes_share_one_provider() {
     assert_eq!(maps0.len(), 1, "first task maps exactly one file");
     assert_eq!(maps0, maps1, "both tasks share the provider inode");
 
-    // Trigger-pair shape through the reducer with live PIDs as the
-    // process distinguisher (domain 0 legacy namespace keeps distinct-PID
-    // meaning; the privileged cell uses domain 1 task cookies).
+    // Sanity: C_SignInit resolves to a real function id.
     let target = p11scope::kinds::function_id("C_SignInit").unwrap();
     assert_ne!(target, p11scope_ebpf_common::FUNCTION_NONE);
-    // Different pending mechanisms prove the two operations are independent
-    // even though the (module, slot, function, id) key is numerically equal.
-    assert_ne!(0x101u64, 0x250u64, "trigger pair needs distinct mechanisms");
-}
-
-/// FU-3 live BPF confirmation (privileged; skips loudly without BPF).
-/// Procedure: attach one `--system`-equivalent observer (one EVENTS domain),
-/// drive two owned processes sharing the fixture provider to mint PENDING
-/// `C_SignInit` (0x101 vs 0x250) and equal async id 42, then join/complete
-/// from each. Expected: `async_duplicates` 1, one tombstoned record, every
-/// join/completion refused (`async_orphans`), neither mechanism published.
-/// Timing cells: unobserved workload control + 3 repetitions per E20, with
-/// attach/first-drain/workload-start/end/detach timestamps kept separate.
-#[test]
-fn e20_fu3_live_bpf_same_domain_collision_confirmation() {
-    // Privilege/BPF gate: this lane runs unprivileged `cargo test`, so the
-    // live cell documents its trigger pair and timing shape, then skips.
-    // A privileged lane runs the same fixture pair under real BPF and asserts
-    // the reducer evidence above on the captured stream.
-    let can_bpf = std::path::Path::new("/sys/fs/bpf").exists()
-        && Command::new("true").status().is_ok()
-        && std::env::var("P11SCOPE_LIVE_BPF").as_deref() == Ok("1");
-    if !can_bpf {
-        eprintln!(
-            "SKIP e20_fu3_live_bpf_same_domain_collision_confirmation: \
-             no live BPF lane (set P11SCOPE_LIVE_BPF=1 on a privileged host); \
-             trigger pair pinned by e20_f75_same_domain_* reducer tests"
-        );
-        return;
-    }
-    // Privileged lane body (reached only with P11SCOPE_LIVE_BPF=1):
-    // 1. Build the mx-fu3 fixture + driver as in the fixture test.
-    // 2. Start one observer (single EVENTS domain) over two owned tasks.
-    // 3. Drive: open/PENDING(0x101)/GetID(42) on task A,
-    //    open/PENDING(0x250)/GetID(42) on task B, joins/completions each.
-    // 4. Assert duplicates==1, pending==1, orphans grow per refusal, no
-    //    mechanism publishes; record per-cell timestamps + 3 repetitions.
-    // This host cannot reach step 2 without privilege; the gate above keeps
-    // the unprivileged suite green while the procedure stays reviewable.
-    panic!("P11SCOPE_LIVE_BPF=1 lane not implemented on this host");
 }

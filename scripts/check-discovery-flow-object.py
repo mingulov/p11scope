@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True
 from _loader import load_sibling
 
-DECODER_SHA256 = '4458281def9699cc100d41248ce0ae53a284abb3cb9f38e72e2fba44ec47a188'
+DECODER_SHA256 = 'c6e5971bad14424522a9bc33653fdd838a8c352d8272826b489c9ab6a6a4f4d5'
 _decoder = Path(__file__).with_name('check-live-discovery-object.py')
 if hashlib.sha256(_decoder.read_bytes()).hexdigest() != DECODER_SHA256:
     raise RuntimeError('discovery decoder source hash changed; review required')
@@ -383,14 +383,26 @@ def interface_name(elf, secs):
     emitter_calls = [c for c in calls if c[3].endswith('emit_export')]
     require(len(emitter_calls) == 1, tag + 'metadata: emitter link')
     defined(elf, emitter_calls[0][3], '.text', tag + 'metadata')
+    # The returned CK_INTERFACE.flags word (r5) is read through a
+    # caller-writable pointer: it is clamped to the finite class
+    # {0, FORK_SAFE, OTHER=2} before either payload path, so the raw word
+    # never reaches the record.
+    flags = recipe(insns, '''
+        r1 = 0x2
+        r4 = *(u64 *)(r10 - 0x60)
+        if r1 > r5 goto @class
+        r5 = 0x2
+        class:
+        r1 = 0x0
+        ''', tag + 'flags')
     null = recipe(insns, '''
         r1 = 0x0
         *(u64 *)(r10 - 0x48) = r1
         r9 = 0x30000
         *(u64 *)(r10 - 0x50) = r1
-        r4 = *(u64 *)(r10 - 0x60)
         if r3 == 0x0 goto ?
         ''', tag + 'null')
+    require(flags[-1] == null[0], tag + 'flags: class clamp is not the name guard prefix')
     read = recipe(insns, '''
         *(u64 *)(r10 - 0x68) = r5
         r9 = r10
@@ -463,6 +475,14 @@ def interface_name(elf, secs):
     for required in (read[0][0], read[-1][0], classified[4][0], classified[7][0], classified[10][0]):
         dominates(graph, insns[0][0], required, exact, tag + 'classification')
     dominates(graph, insns[0][0], meta[0][0], meta[-1][0], tag + 'metadata')
+    # Unreadable/null interfaces reach the payload with the constant 0; every
+    # path from a read of the returned flags word (LP64 or ILP32 third word)
+    # to the payload builder passes the class clamp.
+    word_loads = [pc for pc, op in insns
+                  if re.fullmatch(r'[rw]5 = \*\(u(?:64|32) \*\)\(r10 - 0x(?:30|38)\)', op)]
+    require(len(word_loads) == 2, tag + 'flags: returned-word loads not found')
+    require(not any(meta[-1][0] in D.reachable(graph, [load], {flags[2][0]}) for load in word_loads),
+            tag + 'flags: bypass path')
     return True
 
 

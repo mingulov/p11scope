@@ -11,8 +11,10 @@ v2, and the historical v2-metrics document is not accepted as a v3
 profile. All profile fields documented by
 [`observed-profile-v2.md`](observed-profile-v2.md) remain unchanged except for
 the profile identifier, the `lane` discriminator, the six original additions
-below, and the five residual additions (`drain_proven`, `verdict_detail`,
-`uretprobe_override`, `handoff_child_pid`, `p11scope_env`).
+below, the five residual additions (`drain_proven`, `verdict_detail`,
+`uretprobe_override`, `handoff_child_pid`, `p11scope_env`), the verdict
+classes (`gap_classes` and its three published inputs), and row identity
+(`functions[].target`, `functions[].ordinals`, table linkage `exports`).
 
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` and `templates.operations` is always empty. The diagnostic
@@ -77,7 +79,11 @@ discriminator value.
 Each tuple has exactly `module`, `request`, `rv`, `result`, `table_match`,
 `inventory_matches`, `authority`, and `count`. `count` is a positive saturating
 u64. `request` and a non-null `result` each have exactly `name`, `version`, and
-`flags` (u64). Name classes are `null`, `exact_standard`, `other`, and
+`flags`. Request `flags` is the caller's scalar CK_FLAGS argument (u64). Result
+`flags` is a finite class, never the returned word: `zero`, `fork_safe`
+(exactly `CKF_INTERFACE_FORK_SAFE`), or `other` (any other bit pattern). The
+returned word is read through caller-writable memory, so the kernel reduces it
+to this class before the record leaves the probe. Name classes are `null`, `exact_standard`, `other`, and
 `unreadable`; version classes are `null`, `unreadable`, `v2_40`, `v3_0`,
 `v3_1`, `v3_2`, and `other`.
 
@@ -88,7 +94,8 @@ is nonempty. Authority is exactly `inventory`, `selection_count_only`, or
 `none`: inventory authority requires a readable successful result and at least
 one match; count-only authority has no match and is limited to a successful
 request and result whose names are both `exact_standard`, whose returned
-version is `v3_0`, `v3_1`, or `v3_2`, and whose returned flags are 0 or 1.
+version is `v3_0`, `v3_1`, or `v3_2`, and whose returned flags class is `zero`
+or `fork_safe`.
 Count-only authority applies to a live or offline selection-only target, grants
 no inventory match, is semantically unauthorized, and forces `PARTIAL`. The
 profile tuple does not expose a helper selector or `semantic_authorized` field;
@@ -153,8 +160,41 @@ trace evidence object. Historical documents predate them (see Migration).
   any `COMPLETE` without it.
 - `verdict_detail` is exactly `clean_proven` (no gap, latch set),
   `clean_but_unproven` (no gap, latch unset — the terminal `PARTIAL` with
-  nothing concrete behind it), or `concrete_gap` (a gap forced `PARTIAL`).
-  Clean and lossy runs no longer share one signal.
+  nothing concrete behind it), `attribution_only` (counts are exact; only a
+  name, owner, mechanism, or semantic interpretation is withheld — for
+  example every scan-found slot is count-only), or `concrete_gap` (an
+  observation loss or degraded semantics forced `PARTIAL`). It is a function
+  of `gap_classes` alone. Clean, names-withheld, and lossy runs no longer
+  share one signal; `completeness` is `PARTIAL` for all but `clean_proven`.
+- `gap_classes` is `{observation, attribution, semantics, open_calls,
+  settlement, stdout_data_sink}`. Each of the first three is `{status,
+  causes}`: `causes` lists, in a fixed order, the evidence fields that put the
+  class in that status (a dotted name such as
+  `scheduling.sink_dropped_bytes` names a nested field; `interface_selection`
+  names a selection coverage loss; `loader_discovery` a live-loader timing or
+  strategy gap). `observation` is `exact` or `lossy`: a call or record could
+  be missing, or a count could be wrong. `attribution` is `attested` or
+  `withheld`: `semantic_unverified_slots`, `aliased`, `module_ambiguous`,
+  `module_unresolved_slots`, `unregistered_mechanisms`,
+  `discovery_conflicts`, `discovery_uncorroborated`, or a
+  `selection_count_only` tuple. `semantics` is `complete`, `degraded`, or
+  `not_applicable` (no slot carries semantics). `open_calls` is
+  `in_flight_at_end`; for now a nonzero value is also an observation cause,
+  because an entry whose return never arrives cannot yet be told apart from
+  a lost return. `settlement` is `proven` or `unproven` (`drain_proven`).
+  `stdout_data_sink` is true only for a trace written to stdout (no `-o`):
+  only then are `scheduling.sink_dropped_bytes` an observation loss; a
+  profile, metrics, or `-o` capture's stdout carries display frames only,
+  and its drops are stated but are not a gap. A NULL function-table entry
+  (`skipped` reason `null pointer`) is never a cause: a NULL pointer cannot
+  be called, so no call is missed through it. The release oracle recomputes
+  every class and `verdict_detail` from the counters and refuses a document
+  that disagrees.
+- `semantic_unverified_slots`, `unprotected_live_windows` (0 or 1: a live
+  loader or export window no confirmed pause owner protected, inferred from
+  `loader_discovery.hits > 0` and `pause` other than `sigstop`), and
+  `module_unresolved_slots` (the number of `functions[].module_unresolved`
+  rows) are the three verdict inputs that were previously unpublished.
 - `uretprobe_override` is `null` when the hazard preflight proceeded clean,
   else `{flag, reason}`: the exact `--allow-uretprobe-on-confined-target`
   flag plus the preflight's reason for requiring it. Disclosed, never a
@@ -167,6 +207,45 @@ trace evidence object. Historical documents predate them (see Migration).
 - `p11scope_env` is the active value of every capture-visible `P11SCOPE_*`
   switch: `{name, effect, value}` objects, `value` `null` when unset.
   Absent means the narrow default.
+
+## Row identity and export linkage
+
+Every `functions[]` row carries `target` (`{object: {dev, ino, sha256} |
+null, file_offset}`, the exact function the row counts) and `ordinals` (sorted
+`{table_file_offset, ordinal}` positions reaching it). Several rows may read
+`["unknown"]`; `target` tells them apart, and `ordinals` discloses when several
+positions share one target. `discovery[].tables[]` adds the linkage value
+`exports` and the `exports_agreeing` count (see the v2 document's `tables[]`
+and `functions[]` rows). Export linkage presents standard names only: scan-found
+slots stay semantics-unverified and count-only whatever their linkage.
+
+## Kernel control evidence
+
+`kernel_control` is always present in every v3 profile, v3-metrics, and
+terminal trace evidence object. It is read from the native kernel control
+cells at every snapshot and at terminal, and carries finite names and counts
+only:
+
+- `capture_halted` (boolean) is true exactly when `owner_poison` is non-empty.
+  The in-kernel call-ownership accounting detected an inconsistency and every
+  probe has refused capture since; nothing after that moment was counted.
+- `owner_poison`: sorted, unique reason names from `bad_control`,
+  `lookup_unknown`, `bad_record`, `delete_failed`, `bookkeeping_failed`,
+  `refund_failed`, `classifier_failed`, `state_delete_failed`, `unknown`.
+- `owner_admission_failures` (u64): owner admissions refused (limit reached,
+  invalid key, or collision).
+- `identity_unavailable` (u64): process identities the kernel could not
+  allocate or read. This includes every fork record dropped after the
+  lifetime identity budget (16,384 tickets) is spent.
+- `identity_budget_exhausted` (boolean): the lifetime identity budget is
+  spent. Informational on its own; the refusals it causes are counted above.
+- `root_affiliation_failures`: sorted, unique names from `bad_control`,
+  `capacity`, `reserve_contention`, `create_failed`, `existing_child`,
+  `bad_cell`, `exit_classifier`, `exit_delete`, `refund_failed`, `unknown`.
+
+A halt, any nonzero counter, or any root failure name forces `PARTIAL` with
+`verdict_detail` = `concrete_gap`. Historical v2-metrics documents predate
+this object.
 
 ## Added `capture` fields
 

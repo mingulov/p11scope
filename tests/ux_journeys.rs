@@ -222,50 +222,49 @@ fn b6_doctor_reports_rows_and_verdict() {
 
 #[test]
 fn b7_run_refuses_without_capture_lane() {
-    if !capture_available() {
-        // Hazard-first (Package A, F-01): without the override the run
-        // refuses on the uretprobe hazard before any attach attempt.
-        let hazard = run(&["run", "--", "/bin/true"]);
-        assert_eq!(hazard.code, Some(1));
-        assert!(
-            hazard.stderr.contains("refusing to attach"),
-            "{}",
-            hazard.stderr
-        );
-        assert!(
-            hazard
-                .stderr
-                .contains("--allow-uretprobe-on-confined-target"),
-            "{}",
-            hazard.stderr
-        );
-        assert!(
-            !hazard.stderr.contains("starting attach session"),
-            "{}",
-            hazard.stderr
-        );
-        // F7 pins (Task 3) behind the explicit override: the attach
-        // refusal below is reachable once the hazard risk is accepted.
-        let refused = run(&[
-            "run",
-            "--allow-uretprobe-on-confined-target",
-            "--",
-            "/bin/true",
-        ]);
-        assert_eq!(refused.code, Some(1));
-        assert!(
-            refused.stderr.contains("starting attach session"),
-            "{}",
-            refused.stderr
-        );
-        // F7 fixed (Task 3): the attach hint keeps its cause list and now
-        // points at `p11scope doctor`, which knows the actual cause.
-        assert!(
-            refused.stderr.contains("p11scope doctor"),
-            "{}",
-            refused.stderr
-        );
-    } else {
+    if !capture_available() && unsafe { libc::geteuid() } != 0 {
+        // HIGH-1 (flipped from the F-01 hazard pin): without privilege the
+        // uretprobe self-probe cannot load BPF, which is a missing-privilege
+        // fact, not a seccomp hazard. The refusal says so, points at doctor,
+        // and never offers the override — which cannot grant privilege, so
+        // taking it changes nothing.
+        for args in [
+            &["run", "--", "/bin/true"][..],
+            &[
+                "run",
+                "--allow-uretprobe-on-confined-target",
+                "--",
+                "/bin/true",
+            ][..],
+        ] {
+            let refused = run(args);
+            assert_eq!(refused.code, Some(1), "{args:?}");
+            assert!(
+                refused
+                    .stderr
+                    .contains("cannot load p11scope's BPF programs"),
+                "{args:?}: {}",
+                refused.stderr
+            );
+            assert!(
+                refused.stderr.contains("p11scope doctor"),
+                "{args:?}: {}",
+                refused.stderr
+            );
+            assert!(
+                !refused
+                    .stderr
+                    .contains("--allow-uretprobe-on-confined-target"),
+                "{args:?}: {}",
+                refused.stderr
+            );
+            assert!(
+                !refused.stderr.contains("starting attach session"),
+                "{args:?}: {}",
+                refused.stderr
+            );
+        }
+    } else if capture_available() {
         let outcome = run(&["run", "--", "/bin/true"]);
         assert!(outcome.code.is_some());
     }
@@ -580,36 +579,12 @@ fn t3_f7_attach_refusal_points_at_doctor() {
     // F7 fixed (Task 3): the attach hint keeps its cause list and doc
     // pointer, and now names `p11scope doctor` as the command that knows
     // which cause applies. Exit 1 unchanged.
-    if !capture_available() {
-        // Hazard-first (Package A, F-01): without the override the run
-        // refuses on the uretprobe hazard before any attach attempt.
-        let hazard = run(&["run", "--", "/bin/true"]);
-        assert_eq!(hazard.code, Some(1));
-        assert!(
-            hazard.stderr.contains("refusing to attach"),
-            "{}",
-            hazard.stderr
-        );
-        assert!(
-            hazard
-                .stderr
-                .contains("--allow-uretprobe-on-confined-target"),
-            "{}",
-            hazard.stderr
-        );
-        assert!(
-            !hazard.stderr.contains("starting attach session"),
-            "{}",
-            hazard.stderr
-        );
-        // F7 pins behind the explicit override: the attach refusal below
-        // is reachable once the hazard risk is accepted.
-        let refused = run(&[
-            "run",
-            "--allow-uretprobe-on-confined-target",
-            "--",
-            "/bin/true",
-        ]);
+    if !capture_available() && unsafe { libc::geteuid() } != 0 {
+        // HIGH-1: `run` now stops at the self-probe with the missing
+        // privilege (pinned in b7), so the attach hint is pinned where it is
+        // still reached: an unconfined `--pid` target needs no self-probe.
+        let target = SleepTarget::spawn();
+        let refused = run(&["profile", "--pid", &target.pid(), "--duration", "1"]);
         assert_eq!(refused.code, Some(1));
         assert!(
             refused.stderr.contains("starting attach session"),
@@ -654,5 +629,265 @@ fn j6_k8s_doc_pins() {
     ] {
         let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join(referenced);
         assert!(path.is_file(), "missing {}", path.display());
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ClosedReader {
+    Stdout,
+    Stderr,
+}
+
+/// Runs p11scope with stdout or stderr connected to a pipe whose reader has
+/// already gone away (`p11scope doctor | true`, or `2>&1 | tee` after the
+/// operator's Ctrl-C killed `tee`), capturing the other stream. The Rust
+/// runtime ignores SIGPIPE, so every write there fails with EPIPE.
+fn run_with_closed_reader(args: &[&str], closed: ClosedReader) -> Outcome {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::process::Stdio;
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(reader);
+    let mut command = Command::new(bin());
+    command.args(args);
+    match closed {
+        ClosedReader::Stdout => command.stdout(Stdio::from(writer)).stderr(Stdio::piped()),
+        ClosedReader::Stderr => command.stderr(Stdio::from(writer)).stdout(Stdio::piped()),
+    };
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("run p11scope {args:?}: {error}"));
+    Outcome {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// HIGH-4: a reader that went away is never a panic (exit 101). Help and
+/// version still exit 0, doctor still exits with its verdict, and every
+/// other command keeps its own exit code.
+#[test]
+fn high4_a_closed_stdout_reader_never_panics() {
+    let doctor_verdict = if capture_available() { 0 } else { 1 };
+    for (args, expected) in [
+        (&["--help"][..], Some(0)),
+        (&["profile", "--help"][..], Some(0)),
+        (&["--version"][..], Some(0)),
+        (&["doctor"][..], None),
+    ] {
+        let outcome = run_with_closed_reader(args, ClosedReader::Stdout);
+        assert!(
+            !outcome.stderr.contains("panicked"),
+            "{args:?}: {}",
+            outcome.stderr
+        );
+        assert_ne!(outcome.code, Some(101), "{args:?}: {}", outcome.stderr);
+        match expected {
+            Some(code) => assert_eq!(outcome.code, Some(code), "{args:?}: {}", outcome.stderr),
+            None => assert!(
+                outcome.code == Some(doctor_verdict) || outcome.code == Some(0),
+                "{args:?}: {:?} {}",
+                outcome.code,
+                outcome.stderr
+            ),
+        }
+    }
+}
+
+#[test]
+fn high4_a_closed_stderr_reader_never_panics() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let out = dir.path().join("observed.json");
+    let out = out.to_str().unwrap();
+    for (args, allowed) in [
+        (&["frobnicate"][..], &[2][..]),
+        (&["run", "--", "/bin/true"][..], &[0, 1][..]),
+        (&["inspect", "--pid", "99999999"][..], &[1][..]),
+        (
+            &["profile", "--pid", &pid, "--duration", "1", "-o", out][..],
+            &[0, 1][..],
+        ),
+        (
+            &["trace", "--pid", &pid, "--duration", "1"][..],
+            &[0, 1][..],
+        ),
+    ] {
+        let outcome = run_with_closed_reader(args, ClosedReader::Stderr);
+        assert!(
+            outcome.code.is_some_and(|code| allowed.contains(&code)),
+            "{args:?}: exit {:?} (101 is a panic on the closed stderr)",
+            outcome.code
+        );
+    }
+    let litter: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".p11scope."))
+        .collect();
+    assert!(litter.is_empty(), "{litter:?}");
+}
+
+/// HIGH-1: without privilege the uretprobe self-probe cannot load BPF at
+/// all. That is a missing-privilege fact, not a seccomp hazard: the refusal
+/// must say what privilege is missing and must never recommend the safety
+/// override (which would only disable the interlock and then hit the same
+/// privilege error at attach).
+#[test]
+fn high1_missing_privilege_is_named_and_never_offers_the_override() {
+    if capture_available() || unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for args in [
+        &["run", "--", "/bin/true"][..],
+        &[
+            "run",
+            "--allow-uretprobe-on-confined-target",
+            "--",
+            "/bin/true",
+        ][..],
+        &["profile", "--system", "--duration", "1"][..],
+        &["profile", "--cgroup", "/sys/fs/cgroup", "--duration", "1"][..],
+    ] {
+        let refused = run(args);
+        assert_eq!(refused.code, Some(1), "{args:?}: {}", refused.stderr);
+        assert!(
+            !refused
+                .stderr
+                .contains("--allow-uretprobe-on-confined-target"),
+            "{args:?}: {}",
+            refused.stderr
+        );
+        assert!(
+            !refused.stderr.contains("seccomp") && !refused.stderr.contains("trampoline"),
+            "{args:?}: a privilege failure reported as a hazard: {}",
+            refused.stderr
+        );
+        assert!(
+            refused.stderr.contains("requires root") && refused.stderr.contains("sudo"),
+            "{args:?}: {}",
+            refused.stderr
+        );
+    }
+}
+
+/// HIGH-2: a target whose mappings cannot be read (pid 1 belongs to root)
+/// is the documented hard error — exit 1, empty stdout, one stderr line
+/// with the cause and the fix — never a clean "0 PKCS#11 modules mapped".
+#[test]
+fn high2_inspect_of_an_unreadable_target_exits_1_with_the_fix() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for args in [
+        &["inspect", "--pid", "1"][..],
+        &["inspect", "--pid", "1", "--json"][..],
+    ] {
+        let inspect = run(args);
+        assert_eq!(inspect.code, Some(1), "{args:?}: {}", inspect.stdout);
+        assert!(inspect.stdout.is_empty(), "{args:?}: {}", inspect.stdout);
+        assert!(
+            inspect.stderr.contains("sudo p11scope inspect --pid 1"),
+            "{args:?}: {}",
+            inspect.stderr
+        );
+    }
+}
+
+/// M-3: `--cgroup` must name a cgroup v2 directory. A plain directory (a
+/// typo, or `/`) used to pass scope validation, so a privileged capture ran
+/// its full duration against an inode no task ever matches and exited 0
+/// with an empty report — or, for `/`, walked the whole filesystem. It is
+/// refused up front now, by capture and doctor alike, whatever the
+/// privilege. `/sys/fs/cgroup` itself is cgroup v2 and still passes scope
+/// validation (whatever the capture then needs).
+#[test]
+fn m3_cgroup_scope_must_be_a_cgroup_v2_directory() {
+    let plain = tempfile::tempdir().unwrap();
+    let plain = plain.path().to_str().unwrap().to_string();
+    for path in [plain.as_str(), "/"] {
+        let refused = run(&["profile", "--cgroup", path, "--duration", "1"]);
+        assert_eq!(refused.code, Some(1), "{path}: {}", refused.stderr);
+        assert!(
+            refused.stderr.contains("not a cgroup v2 directory"),
+            "{path}: {}",
+            refused.stderr
+        );
+        let doctor = run(&["doctor", "--cgroup", path]);
+        assert!(
+            doctor
+                .stdout
+                .lines()
+                .any(|line| line.starts_with("cgroup path")
+                    && line.contains("FAIL")
+                    && line.contains("not a cgroup v2 directory")),
+            "{path}: {}",
+            doctor.stdout
+        );
+    }
+    let real = run(&["profile", "--cgroup", "/sys/fs/cgroup", "--duration", "1"]);
+    assert!(
+        !real.stderr.contains("not a cgroup v2 directory"),
+        "{}",
+        real.stderr
+    );
+}
+
+/// M-9: Linux arguments are bytes. A non-UTF-8 argument used to panic in
+/// `std::env::args()` (exit 101) before parsing even started — for a
+/// `--module` path, and for a `run` child argument `run` promises to pass
+/// through exactly. Paths and the `run` command keep their bytes; a flag or
+/// number that is not UTF-8 is an ordinary usage error.
+#[test]
+fn m9_non_utf8_arguments_never_panic() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    let run_os = |args: &[&OsStr]| {
+        let output = Command::new(bin()).args(args).output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let os = |text: &str| OsStr::new(text).to_owned();
+    let module = OsStr::from_bytes(b"/opt/caf\xe9/pkcs11.so").to_owned();
+
+    let (code, stderr) = run_os(&[
+        &os("inspect"),
+        &os("--pid"),
+        &os(&pid),
+        &os("--module"),
+        &module,
+    ]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+
+    let (code, stderr) = run_os(&[
+        &os("run"),
+        &os("--"),
+        &os("/bin/echo"),
+        OsStr::from_bytes(b"caf\xe9"),
+    ]);
+    assert!(matches!(code, Some(0) | Some(1)), "{code:?}: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+
+    for args in [
+        vec![OsStr::from_bytes(b"prof\xe9le").to_owned()],
+        vec![
+            os("profile"),
+            os("--pid"),
+            OsStr::from_bytes(b"12\xe9").to_owned(),
+        ],
+    ] {
+        let refs: Vec<&OsStr> = args.iter().map(|arg| arg.as_os_str()).collect();
+        let (code, stderr) = run_os(&refs);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
     }
 }

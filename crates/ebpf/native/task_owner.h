@@ -45,7 +45,11 @@ struct thread_owner {
     u32 start_count;
     u32 flags;
 };
-/* Loader publishes limit=OWNER_LIMIT, all other fields zero before links,
+/* A thread's owner task storage is created once and retained. flags ==
+ * OWNER_LEASED while it holds a lease (START rows or discovery state); flags
+ * == 0 with every other field zero while idle between calls. Only exec/exit
+ * cleanup removes rows, and the kernel frees the storage with the task.
+ * Loader publishes limit=OWNER_LIMIT, all other fields zero before links,
  * then freezes userspace mutation. Poison and debt are terminal, never reset. */
 struct owner_control {
     u64 limit;

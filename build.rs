@@ -189,7 +189,9 @@ fn build_variant(
         let bitcode = out_dir.join(format!("{unit}-{suffix}.bc"));
         // The embedded object keeps DWARF/BTF line info. Name the native
         // sources by a fixed prefix, as the compilation directory already
-        // is, so the object never records the build host's checkout path.
+        // is, and do not record the compile command line (some distribution
+        // clangs do by default), so the object never records the build host's
+        // checkout path.
         let mut file_prefix_map = OsString::from("-ffile-prefix-map=");
         file_prefix_map.push(manifest_dir.as_os_str());
         file_prefix_map.push("=/p11scope");
@@ -205,6 +207,7 @@ fn build_variant(
                 },
                 "-O2",
                 "-g",
+                "-gno-record-gcc-switches",
                 "-fdebug-compilation-dir=/p11scope/native",
                 "-Wall",
                 "-Wextra",

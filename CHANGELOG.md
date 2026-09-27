@@ -138,7 +138,8 @@ provider during capture.
   Exhaustion is counted in `evidence.kernel_control`
   (`identity_budget_exhausted`, `owner_admission_failures`).
 - The per-call event ring defaults to 4 MiB (`--ring-bytes`, 4K–64M); the
-  live-discovery ring is a fixed 64 KiB. `trace` stops at 10,000,000 events
+  live-discovery ring is 64 KiB for a named process and 2 MiB for
+  `--cgroup`/`--system` captures. `trace` stops at 10,000,000 events
   unless `--max-events` sets another cap.
 - Any bounded omission is reported and forces `PARTIAL`. The
   `wide-detailed-2112` Cargo feature builds a 2,112-slot profile from source;
@@ -250,9 +251,84 @@ Fixes to defects found while qualifying this release, before it was tagged:
   no longer panics; Ctrl-C during startup is honoured without leaving
   temporary files; `inspect` of a target whose maps cannot be read exits 1
   instead of reporting no modules.
-  <!-- TODO(release): the items in this bullet come from fix/rr-cli-output; drop any that is not merged by the tag. -->
 - `p11scope-discover --version`; release builds no longer embed build-host
   paths; hosted CI can run its manual release-preview job.
+- A second SIGINT arriving within 100 ms of the first counts as one stop,
+  not a second Ctrl-C, so a supervisor that delivers the signal twice no
+  longer aborts cleanup.
+- Refusing a writable `-o` directory now names who can write it, its mode,
+  the missing sticky bit and the fix (`chmod g-w,o-w`).
+- The profile live display redraws only when stdout is a terminal; into a
+  file, a pipe or a service log only the final frame is printed, once, as
+  plain text.
+- Non-UTF-8 arguments no longer panic: path flags keep their exact bytes
+  and `run` passes its command through byte for byte.
+- `--cgroup` refuses a path that is not a cgroup v2 directory before any
+  capture work, so capture and `doctor` agree.
+- `doctor --extra-strict` passes a capable host: the three build-limit rows
+  are listed as not counted, sysctl rows are `ok` when the process holds
+  the lifting capability, and the verdict line no longer reads as if `run`
+  cannot work.
+- A BPF self-probe refused for lack of privilege is reported as missing
+  privilege (run with sudo; `p11scope doctor` shows what the host allows),
+  never as a seccomp-hazard refusal offering the override.
+- Owned pauses chain: every confirmed stop installs a successor while the
+  child is still stopped, so a provider's table publication is applied
+  inside the causal cycle; a chain that ends with a table unpublished
+  reports `PARTIAL` instead of running it silently unpaused.
+  `attach_gap_ms` is no longer erased by deferred scans settled at process
+  exit.
+- `--cgroup`/`--system` captures load a 2 MiB discovery ring (about 2,260
+  records) instead of 64 KiB, stage it into a bounded FIFO on every tick,
+  wake on either ring, and read loop-end discovery loss fresh from the
+  producer counters.
+- An armed loader that never fired (zero hits) is no longer an observation
+  gap: `loader_discovery` dlopen timing counts as a gap only when the
+  loader actually fired.
+- A live discovery frame runs under a 100 ms work budget and defers the
+  rest of its work, in order, to the next frame; the stop flag is checked
+  between items.
+- Loader timing a full pause covered is `pause_protected`, not a gap:
+  `loader_discovery` `dlopen_timing`, `initial_set_timing` and
+  `initial_set_capture` each gain a `pause_protected` count, and the
+  duplicate initial-set `skipped` entry is gone.
+- Once probes are attached, `profile` and `trace` print one stderr line
+  (`p11scope: capturing: N probe(s) attached; stop with Ctrl-C`), so
+  scripts and supervisors wait for readiness instead of guessing with
+  sleeps.
+- Trace lines and `attach_failures[]` evidence escape target-controlled
+  names and paths exactly like the terminal diagnostic and `inspect`.
+- `profile` without `--duration` prints a one-line stderr notice that it
+  captures until interrupted, matching `trace`.
+- `-o -` means stdout for `trace` (and `run --trace`); `profile` refuses it
+  as a usage error. No command ever creates a file literally named `-`.
+- Stricter usage errors (exit 2): a repeated scalar flag, an empty-string
+  option value, `--pid 0`, and a zero `--duration` are each refused naming
+  the flag.
+- On Linux 6.13+, every classic uprobe program keeps the task's kernel
+  stack instead of the shared per-CPU private stack, fixing same-CPU
+  preemption corrupting frames and halting capture with owner
+  `start_key_mismatch`.
+- The 6.9+ uprobe-multi endpoint programs opt out through their own empty
+  `STACK_GUARD` program array, so sessions load on kernels that require
+  program-array users to share the expected attach type.
+- Each thread's in-kernel owner storage is created once and retained idle
+  instead of allocated and freed per call, fixing refused calls under
+  multi-threaded load with no per-call allocation on the hot path.
+- `evidence.kernel_control.owner_poison` names exactly which owner
+  bookkeeping invariant failed: `start_key_mismatch`,
+  `start_count_mismatch`, `start_row_missing` and `directory_mismatch`
+  sub-reasons beside `bookkeeping_failed`.
+- The doctor `kernel.perf_event_paranoid` row is backend-aware: `ok` on
+  uprobe-multi kernels (≥ 6.9) where paranoid gates nothing, keeping its
+  warning and `CAP_SYS_ADMIN` lift on the per-probe path.
+- Frame deferrals are counted in `scheduling.discovery_deferrals` as
+  scheduling evidence, never a loss; only work still undone after the
+  terminal drain is a loss.
+- Queuing a polling rescan no longer forces `PARTIAL` by itself: only a
+  rescan that finds a provider gained unwatched publishes a loss; a poll
+  that finds nothing publishes nothing, and failed or retired polls are
+  forgotten exactly once.
 <!-- TODO(release): add any further user-visible fixes merged before the tag. -->
 
 ### Qualification of this release

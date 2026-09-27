@@ -57,6 +57,7 @@ use p11scope_ebpf_common::{
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
     PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, SESSION_NONE, START_ENTRIES, STATE_DOMAIN_EXPORT,
     STATE_DOMAIN_SELECTION, TAIL_CALLS_INTERFACE_WORKER_SLOT, USER_TYPE_NONE,
+    interface_flags_class,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -221,9 +222,25 @@ fn stop_gate_leave() {}
 /// Does this call belong to the capture scope? With no filter configured
 /// nothing is observed — scope is always explicit, and system-wide capture
 /// requires the explicit system scope bit (never a missing filter).
+/// Add to one per-CPU counter cell with a non-fetch atomic add. From Linux
+/// 6.1 uprobe programs run migrate-disabled but preemptible, so another
+/// program can run on this CPU between a plain load and store of the same
+/// per-CPU cell and its increment is lost. The result is deliberately unused:
+/// only the non-fetch BPF ATOMIC ADD lowers on this toolchain (a consumed
+/// fetch-add does not), and the object checker rejects any other counter write.
+#[inline(always)]
+fn counter_add(cell: *mut u64, delta: u64) {
+    // SAFETY: `cell` is a live map-value pointer for this program run.
+    let _ = unsafe {
+        core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::AcqRel }>(
+            cell, delta,
+        )
+    };
+}
+
 fn bump_evidence(index: u32) {
     if let Some(value) = EVIDENCE.get_ptr_mut(index) {
-        unsafe { *value += 1 };
+        counter_add(value, 1);
     }
 }
 
@@ -410,8 +427,7 @@ fn scope_flags() -> Option<u64> {
 
 fn bump_discovery_counter(index: u32) {
     if let Some(value) = COUNTERS.get_ptr_mut(index) {
-        // SAFETY: PerCpuArray gives this CPU exclusive access to its cell.
-        unsafe { *value += 1 };
+        counter_add(value, 1);
     }
 }
 
@@ -715,7 +731,9 @@ fn classify_direct_interface(
         match read_interface(address, layout) {
             Ok([name, table, flags]) => {
                 table_ptr = table;
-                interface_flags = flags;
+                // The word behind a caller-writable pointer leaves this probe
+                // only as a finite class, never verbatim.
+                interface_flags = interface_flags_class(flags);
                 if name == 0 {
                     name_class = DISCOVERY_NAME_NULL;
                 } else {
@@ -2517,9 +2535,9 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         actual_layout
     };
     if let Some(stats) = STATS.get_ptr_mut(slot) {
-        // SAFETY: PerCpuArray gives this CPU exclusive access to its own
-        // copy; there is no cross-CPU aliasing to race with.
-        unsafe { (*stats).entered += 1 };
+        // SAFETY: a live per-CPU cell; only the field address is taken. The
+        // add is atomic because a preempting program can share this CPU.
+        counter_add(unsafe { core::ptr::addr_of_mut!((*stats).entered) }, 1);
     }
     if flags & FLAG_POLICY_AGGREGATE != 0 {
         record_aggregate_start(&key);
@@ -2697,6 +2715,33 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     0
 }
 
+/// Count one completion under its CK_RV. An existing row is updated in place
+/// with an atomic add; a missing row is created with BPF_NOEXIST, so a row
+/// another program created meanwhile (on this CPU or another) is never
+/// overwritten with a stale count, and that race falls back to the in-place
+/// add. Only a full map or a failed update reports loss.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn rv_count_add(key: &RvKey) -> bool {
+    if let Some(cell) = RV_COUNTS.get_ptr_mut(key) {
+        counter_add(cell, 1);
+        return true;
+    }
+    if RV_COUNTS
+        .insert(key, &1, aya_ebpf::bindings::BPF_NOEXIST as u64)
+        .is_ok()
+    {
+        return true;
+    }
+    match RV_COUNTS.get_ptr_mut(key) {
+        Some(cell) => {
+            counter_add(cell, 1);
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(not(feature = "inventory-only"))]
 #[uretprobe]
 pub fn p11_return(ctx: RetProbeContext) -> u32 {
@@ -2750,26 +2795,28 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     let rv = normalize_target_word(ctx.ret(), layout);
 
     if let Some(stats) = STATS.get_ptr_mut(slot) {
-        // SAFETY: as in p11_entry — per-CPU storage, no aliasing.
+        // SAFETY: a live per-CPU cell; only field addresses are taken. Every
+        // sum is an atomic add (a preempting program can share this CPU).
+        // `max_ns` stays a plain best-effort maximum: a lost update can only
+        // keep a smaller maximum, never add or drop a counted call.
         unsafe {
-            (*stats).returned += 1;
-            (*stats).total_ns += delta;
+            counter_add(core::ptr::addr_of_mut!((*stats).returned), 1);
+            counter_add(core::ptr::addr_of_mut!((*stats).total_ns), delta);
             if delta > (*stats).max_ns {
                 (*stats).max_ns = delta;
             }
             let b = bucket_of(delta) as usize;
             if b < (*stats).buckets.len() {
-                (*stats).buckets[b] += 1;
+                counter_add(core::ptr::addr_of_mut!((*stats).buckets[b]), 1);
             }
             if rv != 0 && rv != 0x204 {
-                (*stats).errors += 1;
+                counter_add(core::ptr::addr_of_mut!((*stats).errors), 1);
             }
         }
     }
 
     let rk = RvKey { slot, _pad: 0, rv };
-    let prev = unsafe { RV_COUNTS.get(&rk) }.copied().unwrap_or(0);
-    if RV_COUNTS.insert(&rk, &(prev + 1), 0).is_err() {
+    if !rv_count_add(&rk) {
         bump_evidence(EVIDENCE_RV_UPDATE_FAILURES);
     }
 

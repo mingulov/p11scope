@@ -7,14 +7,21 @@
 use crate::attach::Session;
 use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};
-use aya::maps::{PerCpuArray, PerCpuHashMap};
+use aya::maps::{Array, PerCpuArray, PerCpuHashMap};
 use p11scope_ebpf_common::{
     EVIDENCE_ABI_REFUSALS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
     EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
-    EVIDENCE_UNREGISTERED_MECHANISMS, LATENCY_BUCKETS, RvKey, SlotStats,
+    EVIDENCE_UNREGISTERED_MECHANISMS, ImageIdentityControl, LATENCY_BUCKETS, OWNER_BAD_CONTROL,
+    OWNER_BAD_RECORD, OWNER_BOOKKEEPING_FAILED, OWNER_CLASSIFIER_FAILED, OWNER_DELETE_FAILED,
+    OWNER_LOOKUP_UNKNOWN, OWNER_REFUND_FAILED, OWNER_STATE_DELETE_FAILED, ROOT_BAD_CELL,
+    ROOT_BAD_CONTROL, ROOT_CAPACITY, ROOT_CREATE_FAILED, ROOT_EXISTING_CHILD, ROOT_EXIT_CLASSIFIER,
+    ROOT_EXIT_DELETE, ROOT_REFUND_FAILED, ROOT_RESERVE_CAS, RootAffiliationControl, RvKey,
+    SlotStats, ThreadOwnerControl,
 };
+use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlotReport {
@@ -142,12 +149,179 @@ pub struct KernelEvidence {
     pub template_tail_failures: u64,
     pub unregistered_mechanisms: u64,
     pub abi_refusals: u64,
+    /// Native control cells, read with every snapshot (see [`KernelControl`]).
+    pub control: KernelControl,
+}
+
+/// Native kernel control state: OWNER_CTL (call-ownership accounting),
+/// COOKIE_CTL (lifetime identity tickets) and ROOT_CTL (owned-root
+/// affiliation). Read at every evidence snapshot and at terminal, because
+/// a poisoned owner makes every program refuse at its scope gate: without
+/// this read a halted capture would look like a quiet one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KernelControl {
+    /// `OWNER_CTL.poison` sticky reason bits; nonzero halts all capture.
+    pub owner_poison: u64,
+    pub owner_admission_failures: u64,
+    /// `COOKIE_CTL.unavailable`: identity allocations/reads refused,
+    /// including every fork record dropped once the budget is spent.
+    pub identity_unavailable: u64,
+    pub identity_budget_exhausted: bool,
+    /// `ROOT_CTL.failure_flags` sticky reason bits.
+    pub root_failures: u64,
+}
+
+const OWNER_POISON_NAMES: [(u64, &str); 8] = [
+    (OWNER_BAD_CONTROL, "bad_control"),
+    (OWNER_LOOKUP_UNKNOWN, "lookup_unknown"),
+    (OWNER_BAD_RECORD, "bad_record"),
+    (OWNER_DELETE_FAILED, "delete_failed"),
+    (OWNER_BOOKKEEPING_FAILED, "bookkeeping_failed"),
+    (OWNER_REFUND_FAILED, "refund_failed"),
+    (OWNER_CLASSIFIER_FAILED, "classifier_failed"),
+    (OWNER_STATE_DELETE_FAILED, "state_delete_failed"),
+];
+
+const ROOT_FAILURE_NAMES: [(u64, &str); 9] = [
+    (ROOT_BAD_CONTROL, "bad_control"),
+    (ROOT_CAPACITY, "capacity"),
+    (ROOT_RESERVE_CAS, "reserve_contention"),
+    (ROOT_CREATE_FAILED, "create_failed"),
+    (ROOT_EXISTING_CHILD, "existing_child"),
+    (ROOT_BAD_CELL, "bad_cell"),
+    (ROOT_EXIT_CLASSIFIER, "exit_classifier"),
+    (ROOT_EXIT_DELETE, "exit_delete"),
+    (ROOT_REFUND_FAILED, "refund_failed"),
+];
+
+/// Finite, sorted, duplicate-free reason names for a sticky bitmask. Bits
+/// outside the known set become the single name `unknown`: the raw mask is
+/// never published.
+fn reason_names(bits: u64, names: &[(u64, &'static str)]) -> Vec<&'static str> {
+    let known = names.iter().fold(0, |mask, (bit, _)| mask | bit);
+    let mut out: Vec<&'static str> = names
+        .iter()
+        .filter(|(bit, _)| bits & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if bits & !known != 0 {
+        out.push("unknown");
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+impl KernelControl {
+    /// Decode the three control cells. A cell the object does not carry
+    /// (an Inventory flavor) contributes nothing.
+    pub fn from_cells(
+        owner: Option<ThreadOwnerControl>,
+        cookie: Option<ImageIdentityControl>,
+        root: Option<RootAffiliationControl>,
+    ) -> Self {
+        Self {
+            owner_poison: owner.map_or(0, |owner| owner.poison),
+            owner_admission_failures: owner.map_or(0, |owner| owner.admission_failures),
+            identity_unavailable: cookie.map_or(0, |cookie| cookie.unavailable),
+            identity_budget_exhausted: cookie
+                .is_some_and(|cookie| cookie.next_ticket >= cookie.limit.max(1)),
+            root_failures: root.map_or(0, |root| root.failure_flags),
+        }
+    }
+
+    pub fn halted(&self) -> bool {
+        self.owner_poison != 0
+    }
+
+    /// The published, finite form: reason names and counts only.
+    pub fn evidence(&self) -> KernelControlEvidence {
+        KernelControlEvidence {
+            capture_halted: self.halted(),
+            owner_poison: reason_names(self.owner_poison, &OWNER_POISON_NAMES),
+            owner_admission_failures: self.owner_admission_failures,
+            identity_unavailable: self.identity_unavailable,
+            identity_budget_exhausted: self.identity_budget_exhausted,
+            root_affiliation_failures: reason_names(self.root_failures, &ROOT_FAILURE_NAMES),
+        }
+    }
+}
+
+/// `evidence.kernel_control` (observed-profile-v3): finite names and counts.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct KernelControlEvidence {
+    /// True exactly when `owner_poison` is non-empty: every probe has refused
+    /// capture since the poison, so nothing after it was counted.
+    pub capture_halted: bool,
+    pub owner_poison: Vec<&'static str>,
+    pub owner_admission_failures: u64,
+    pub identity_unavailable: u64,
+    /// Informational on its own; the refusals it causes are counted in
+    /// `identity_unavailable`.
+    pub identity_budget_exhausted: bool,
+    pub root_affiliation_failures: Vec<&'static str>,
+}
+
+impl KernelControlEvidence {
+    /// No halt, refusal or failure: the kernel side lost nothing.
+    pub fn complete(&self) -> bool {
+        !self.capture_halted
+            && self.owner_poison.is_empty()
+            && self.owner_admission_failures == 0
+            && self.identity_unavailable == 0
+            && self.root_affiliation_failures.is_empty()
+    }
+}
+
+/// One `Array` control cell, when the loaded object carries it.
+fn control_cell<T: aya::Pod>(session: &Session, name: &str) -> Result<Option<T>> {
+    let Some(map) = session.ebpf.map(name) else {
+        return Ok(None);
+    };
+    let cell: Array<_, T> = Array::try_from(map).with_context(|| format!("{name} control map"))?;
+    Ok(Some(
+        cell.get(&0, 0)
+            .with_context(|| format!("{name} control cell"))?,
+    ))
+}
+
+static HALT_NOTICE: AtomicBool = AtomicBool::new(false);
+static IDENTITY_NOTICE: AtomicBool = AtomicBool::new(false);
+
+/// One stderr line the first time a halt or an identity refusal is seen, so
+/// the operator learns when capture stopped, not only from the final report.
+fn notice_kernel_control(control: &KernelControl) {
+    if control.halted() && !HALT_NOTICE.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "p11scope: kernel capture halted: in-kernel call ownership accounting \
+             stopped all capture ({}); nothing after this point is counted and \
+             the report is PARTIAL",
+            reason_names(control.owner_poison, &OWNER_POISON_NAMES).join(", ")
+        );
+    }
+    if control.identity_unavailable != 0 && !IDENTITY_NOTICE.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "p11scope: kernel could not give a process an identity{}; its calls \
+             and fork records are not captured and the report is PARTIAL",
+            if control.identity_budget_exhausted {
+                " (lifetime budget of 16384 identities spent)"
+            } else {
+                ""
+            }
+        );
+    }
 }
 
 pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
     let evidence: PerCpuArray<_, u64> =
         PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
     let read = |index| -> Result<u64> { Ok(evidence.get(&index, 0)?.iter().copied().sum()) };
+    let control = KernelControl::from_cells(
+        control_cell::<ThreadOwnerControl>(session, "OWNER_CTL")?,
+        control_cell::<ImageIdentityControl>(session, "COOKIE_CTL")?,
+        control_cell::<RootAffiliationControl>(session, "ROOT_CTL")?,
+    );
+    notice_kernel_control(&control);
     Ok(KernelEvidence {
         ring_loss: read(EVIDENCE_RING_LOSS)?,
         start_insert_failures: read(EVIDENCE_START_INSERT_FAILURES)?,
@@ -158,6 +332,7 @@ pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
         template_tail_failures: read(EVIDENCE_TEMPLATE_TAIL_FAILURES)?,
         unregistered_mechanisms: read(EVIDENCE_UNREGISTERED_MECHANISMS)?,
         abi_refusals: read(EVIDENCE_ABI_REFUSALS)?,
+        control,
     })
 }
 
@@ -251,6 +426,127 @@ mod tests {
             "1_000_000ns falls in the [524288,1048576) bucket"
         );
         assert!(p99 > p50);
+    }
+
+    fn halted_owner() -> KernelControl {
+        KernelControl {
+            owner_poison: OWNER_REFUND_FAILED,
+            ..KernelControl::default()
+        }
+    }
+
+    #[test]
+    fn owner_poison_and_kernel_refusals_force_a_concrete_gap() {
+        let mut clean = crate::render::tests::evidence();
+        clean.verdict();
+        assert_eq!(clean.completeness, "COMPLETE", "the fixture starts clean");
+        for control in [
+            halted_owner(),
+            KernelControl {
+                owner_poison: OWNER_CLASSIFIER_FAILED,
+                ..KernelControl::default()
+            },
+            KernelControl {
+                owner_admission_failures: 1,
+                ..KernelControl::default()
+            },
+            KernelControl {
+                identity_unavailable: 1,
+                identity_budget_exhausted: true,
+                ..KernelControl::default()
+            },
+            KernelControl {
+                root_failures: ROOT_CAPACITY,
+                ..KernelControl::default()
+            },
+        ] {
+            let mut evidence = crate::render::tests::evidence();
+            evidence.kernel_control = control.evidence();
+            evidence.verdict();
+            assert_eq!(
+                (evidence.completeness, evidence.verdict_detail),
+                ("PARTIAL", crate::render::VERDICT_CONCRETE_GAP),
+                "{control:?} must be a concrete gap"
+            );
+        }
+        // A spent budget with no refusal yet lost nothing.
+        let mut budget = crate::render::tests::evidence();
+        budget.kernel_control = KernelControl {
+            identity_budget_exhausted: true,
+            ..KernelControl::default()
+        }
+        .evidence();
+        budget.verdict();
+        assert_eq!(budget.completeness, "COMPLETE");
+    }
+
+    #[test]
+    fn control_cells_publish_only_finite_names_and_counts() {
+        let owner = ThreadOwnerControl {
+            limit: 16_448,
+            outstanding: 3,
+            poison: OWNER_REFUND_FAILED | OWNER_BAD_CONTROL | (1 << 40),
+            admission_failures: 2,
+            reclamation_failures: 9,
+            abandoned_start: 1,
+            abandoned_discovery: 1,
+        };
+        let cookie = ImageIdentityControl {
+            limit: 16_384,
+            next_ticket: 16_384,
+            unavailable: 5,
+            create_failures: 0,
+            retry_exhausted: 0,
+        };
+        let root = RootAffiliationControl {
+            failure_flags: ROOT_RESERVE_CAS | ROOT_BAD_CELL,
+            ..RootAffiliationControl::default()
+        };
+        let control = KernelControl::from_cells(Some(owner), Some(cookie), Some(root));
+        assert!(control.halted());
+        let evidence = control.evidence();
+        assert_eq!(
+            evidence,
+            KernelControlEvidence {
+                capture_halted: true,
+                owner_poison: vec!["bad_control", "refund_failed", "unknown"],
+                owner_admission_failures: 2,
+                identity_unavailable: 5,
+                identity_budget_exhausted: true,
+                root_affiliation_failures: vec!["bad_cell", "reserve_contention"],
+            }
+        );
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(
+            json.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "capture_halted",
+                "identity_budget_exhausted",
+                "identity_unavailable",
+                "owner_admission_failures",
+                "owner_poison",
+                "root_affiliation_failures"
+            ])
+        );
+        // Masks, outstanding leases and other private words never publish.
+        let text = json.to_string();
+        for private in ["1099511627809", "16448", "reclamation", "outstanding"] {
+            assert!(!text.contains(private), "{private} leaked: {text}");
+        }
+        // Absent cells (Inventory objects) contribute nothing.
+        assert_eq!(
+            KernelControl::from_cells(None, None, None),
+            KernelControl::default()
+        );
+        let unspent = ImageIdentityControl {
+            next_ticket: 17,
+            ..cookie
+        };
+        assert!(!KernelControl::from_cells(None, Some(unspent), None).identity_budget_exhausted);
     }
 
     #[test]

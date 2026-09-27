@@ -245,9 +245,9 @@ class EntryObjectTests(unittest.TestCase):
             ("p11_entry_template_types", site('unsafe', 'p11_entry_template_types', 'if\\ r7\\ ==\\ 0x0\\ goto\\ \\+0x17'), "if r7 != 0x0 goto +0x17"),
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r9\\ \\+=\\ 0xb0'), "r9 += 0x60"),
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r4\\ =\\ r9'), "r4 = r10"),
-            ("p11_return", 1409, "if r8 != 0x1 goto +0x1a"),
-            ("p11_return", 1420, "r2 = 0x8"),
-            ("p11_return", 1591, "r3 = *(u64 *)(r10 - 0xf8)"),
+            ("p11_return", 1407, "if r8 != 0x1 goto +0x19"),
+            ("p11_return", 1418, "r2 = 0x8"),
+            ("p11_return", 1588, "r3 = *(u64 *)(r10 - 0xf8)"),
         ]
         for function, pc, new in cases:
             with self.subTest(function=function, pc=pc):
@@ -265,7 +265,7 @@ class EntryObjectTests(unittest.TestCase):
         # Low32(0x100000000) is zero. Low32(RSP32 + argument offset)
         # can also fit the IA32 limit while the complete address overflows.
         cases = [("default", "p11_entry", site('default', 'p11_entry', 'if\\ r1\\ ==\\ 0x0\\ goto\\ \\+0xe')),
-                 ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xc1")),
+                 ("unsafe", "p11_entry", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xbd")),
                  ("default", "capture_scalar", site("default", "capture_scalar", r"if r1 > r0 goto .*")),
                  ("default", "capture_scalar", site("default", "capture_scalar", r"if r3 > -0x10 goto .*")),
                  ("unsafe", "capture_scalar", site("unsafe", "capture_scalar", r"if r1 > r0 goto .*")),
@@ -283,7 +283,7 @@ class EntryObjectTests(unittest.TestCase):
 
     def test_full_pointer_branch_restoration(self):
         for variant, pc in (("default", site("default", "p11_entry", r"if r1 == 0x0 goto \+0xe")),
-                            ("unsafe", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xc1"))):
+                            ("unsafe", site("unsafe", "p11_entry", r"if r7 == 0x0 goto \+0xbd"))):
             with self.subTest(variant=variant):
                 original = OBJECTS[variant]
                 old = dict(CHECKER["D"].instructions(CHECKER["D"].function_blocks(original)["p11_entry"]))[pc]
@@ -300,8 +300,8 @@ class EntryObjectTests(unittest.TestCase):
             with self.subTest(register=register):
                 changed = OBJECTS["unsafe"]
                 for pc, old, new in (
-                    (site("unsafe", "p11_entry_ia32", r"if r0 == 0x0 goto \+0x1f"), "if r0 == 0x0 goto +0x1f", f"if {register} s> 0x0 goto +0x1"),
-                    (site("unsafe", "p11_entry_ia32", r"\*\(u64 \*\)\(r10 - 0x108\) = r0"), "*(u64 *)(r10 - 0x108) = r0", "goto +0x1e"),
+                    (site("unsafe", "p11_entry_ia32", r"if r0 == 0x0 goto \+0x1e"), "if r0 == 0x0 goto +0x1e", f"if {register} s> 0x0 goto +0x1"),
+                    (site("unsafe", "p11_entry_ia32", r"\*\(u64 \*\)\(r10 - 0x108\) = r0"), "*(u64 *)(r10 - 0x108) = r0", "goto +0x1d"),
                     (site("unsafe", "p11_entry_ia32", r"r9 &= 0x8"), "r9 &= 0x8", "*(u64 *)(r10 - 0x108) = r0"),
                 ):
                     changed = mutate(changed, "p11_entry_ia32", pc, old, new)
@@ -361,7 +361,7 @@ class EntryObjectTests(unittest.TestCase):
                  ("default", "capture_scalar", site("default", "capture_scalar", r"if r3 s> 0x2 goto .*")),
                  ("unsafe", "capture_scalar", site("unsafe", "capture_scalar", r"r1 = r3", 0)),
                  ("unsafe", "p11_entry_ia32", site("unsafe", "p11_entry_ia32", r"if r8 == 0xff goto .*")),
-                 ("unsafe", "p11_entry_ia32", site("unsafe", "p11_entry_ia32", r"if r0 == 0x0 goto \+0x1f")),
+                 ("unsafe", "p11_entry_ia32", site("unsafe", "p11_entry_ia32", r"if r0 == 0x0 goto \+0x1e")),
                  ("unsafe", "p11_entry_ia32", site("unsafe", "p11_entry_ia32", r"if r0 > r1 goto .*"))]
         for variant, suffix, pc in cases:
             with self.subTest(variant=variant, function=suffix, pc=pc):
@@ -478,9 +478,15 @@ class EntryObjectTests(unittest.TestCase):
                  ("p11_entry_ia32", before_call("unsafe", "p11_entry_ia32", "p11_decode_params", r"r3 = 0x4"), "r3 = 0x8")]
         for name, pc, new in cases:
             with self.subTest(function=name, pc=pc):
-                old = dict(CHECKER["D"].instructions(blocks[name]))[pc]
+                insns = CHECKER["D"].instructions(blocks[name])
+                old = dict(insns)[pc]
+                changed = mutate(OBJECTS["unsafe"], name, pc, old, new)
+                if new == "call 0xc":
+                    add_pc, add = next((p, t) for p, t in insns
+                                       if p > pc and t.startswith("lock *(u64 *)(r0 + 0x0) += "))
+                    changed = mutate(changed, name, add_pc, add, "r1 = r1")
                 with self.assertRaisesRegex(RuntimeError, "final-sink|mode|layout"):
-                    CHECKER["contract"](mutate(OBJECTS["unsafe"], name, pc, old, new), "unsafe")
+                    CHECKER["contract"](changed, "unsafe")
 
     def test_ordinary_walker_cannot_become_types_walker(self):
         blocks = CHECKER["D"].function_blocks(OBJECTS["unsafe"])
@@ -710,13 +716,48 @@ class EntryObjectTests(unittest.TestCase):
                                 CHECKER["contract"](mutate(disassembly, name, argument_pc, old, new), variant)
 
     def test_atomic_event_slot_corruption(self):
-        changed = mutate(OBJECTS["default"], "p11_return", 1460,
+        changed = mutate(OBJECTS["default"], "p11_return", 1457,
                          "*(u64 *)(r0 + 0x60) = r1", "r1 = 0x400")
-        changed = mutate(changed, "p11_return", 1461,
+        changed = mutate(changed, "p11_return", 1458,
                          "r1 = *(u64 *)(r10 - 0x128)",
                          "r9 = atomic_fetch_or((u64 *)(r0 + 0x68), r9)")
         with self.assertRaisesRegex(RuntimeError, r"Event.slot corrupted before submit"):
             CHECKER["contract"](changed, "default")
+
+    def test_lifecycle_start_insert_bypass_is_rejected(self):
+        # The async lifecycle continuation must reach the semantic START
+        # insertion on every path; a direct exit after the lifecycle match is
+        # exactly the bypass the rule exists to catch.
+        _, insns = instructions("default", "p11_entry")
+        lifecycle = [p for p, t in insns if re.fullmatch(r"if r\d+ == 0xc goto .*", t)]
+        self.assertEqual(len(lifecycle), 1)
+        exit_pc = site("default", "p11_entry", "exit")
+        pc, old = next((p, t) for p, t in insns if p > lifecycle[0])
+        new = f"goto {exit_pc - pc - 1:+#x}"
+        with self.assertRaisesRegex(RuntimeError, "bypasses START insertion"):
+            CHECKER["contract"](mutate(OBJECTS["default"], "p11_entry", pc, old, new), "default")
+
+    def test_counter_adds_keep_frame_facts_only_through_map_values(self):
+        # A non-fetch counter add through a map value (even after a
+        # verifier-bounded index offset, or where two lookups joined) cannot
+        # write the local frame; through an unresolved base it still can.
+        lines = CHECKER["D"].function_blocks(OBJECTS["default"])["p11_return"]
+        consumer = CHECKER["Consumer"]("uretprobe", "p11_return", lines, {})
+        pc = consumer.insns[0][0]
+        frame = ("stack", -0x188, 8)
+        self.assertEqual(CHECKER["join_fact"](("result", 1), ("result", 2)), ("result", "map"))
+        self.assertIsNone(CHECKER["join_fact"](("result", 1), ("stack", -8)))
+        consumer.text[pc] = "r0 += r2"
+        stepped = consumer.step(pc, {"r0": ("result", 7), "r2": ("constant", 8), frame: ("low", 1)})
+        self.assertEqual(stepped["r0"], ("result", "map"))
+        consumer.text[pc] = "lock *(u64 *)(r0 + 0x28) += r2"
+        for base, survives in ((("result", "map"), True), (("result", 7), True),
+                               (None, False), (("stack", -0x1b0), False)):
+            with self.subTest(base=base):
+                state = {"r2": ("constant", 1), frame: ("low", 1)}
+                if base is not None:
+                    state["r0"] = base
+                self.assertEqual(frame in consumer.step(pc, state), survives)
 
     def test_atomic_memory_effects_and_result_registers(self):
         # The immutable objects contain atomic_fetch_or and cmpxchg_64.

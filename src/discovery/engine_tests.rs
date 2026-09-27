@@ -7397,6 +7397,7 @@ fn evidence_verdict(
         discovery_read_failures: 0,
         discovery_truncated: 0,
         task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
         loader_discovery: render::LoaderDiscovery::default(),
         interface_selection: render::InterfaceSelection::default(),
         attach_mechanisms: vec![],
@@ -9845,6 +9846,57 @@ fn standard_export_reducer_is_order_independent_and_fail_closed() {
 }
 
 #[test]
+fn selection_result_flags_publish_only_a_finite_class() {
+    // "SECRET!!" as a u64: 8 bytes a caller could aim *ppInterface at.
+    const HOSTILE: u64 = 0x5345_4352_4554_2121;
+    let tuple = |flags: u64| render::SelectionTuple {
+        module: 0,
+        request: SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 1,
+        },
+        rv: 0,
+        result: Some(SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags,
+        }),
+        table_match: false,
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::None,
+        count: 1,
+    };
+    for (flags, class) in [
+        (0, "zero"),
+        (cryptoki_sys::CKF_INTERFACE_FORK_SAFE, "fork_safe"),
+        (
+            p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER,
+            "other",
+        ),
+        (HOSTILE, "other"),
+        (u64::MAX, "other"),
+    ] {
+        let json = serde_json::to_value(tuple(flags)).unwrap();
+        assert_eq!(json["result"]["flags"], class, "{flags:#x}");
+        // Request flags stay the caller's scalar argument.
+        assert_eq!(json["request"]["flags"], 1);
+        let text = json.to_string();
+        assert!(
+            !text.contains(&HOSTILE.to_string()),
+            "raw word leaked: {text}"
+        );
+        assert!(!text.contains("SECRET"), "raw bytes leaked: {text}");
+    }
+    let json = serde_json::to_value(render::SelectionTuple {
+        result: None,
+        ..tuple(0)
+    })
+    .unwrap();
+    assert!(json["result"].is_null());
+}
+
+#[test]
 fn selection_unknown_result_flags_remain_factual_without_authority() {
     let (_fixture, mut engine, _session, binding) = attached_selection_route();
     let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
@@ -9854,7 +9906,7 @@ fn selection_unknown_result_flags_remain_factual_without_authority() {
     record.interface_index = DISCOVERY_VERSION_V3_0;
     record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
     record.selection_version_class = DISCOVERY_VERSION_V3_0;
-    record.interface_flags = 1 << 63;
+    record.interface_flags = p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER;
     record.table_ptr = selection_provider_address(&engine, binding);
     record.binding_id = binding.id;
 
@@ -9872,7 +9924,7 @@ fn selection_unknown_result_flags_remain_factual_without_authority() {
             .as_ref()
             .unwrap()
             .flags,
-        1 << 63
+        p11scope_ebpf_common::DISCOVERY_INTERFACE_FLAGS_OTHER
     );
     assert!(engine.selection_claims.is_empty());
     assert!(engine.selection_tables.is_empty());
@@ -19458,6 +19510,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         discovery_read_failures: 0,
         discovery_truncated: 0,
         task_uprobe_link_losses: 0,
+        kernel_control: Default::default(),
         loader_discovery: render::LoaderDiscovery::default(),
         interface_selection: render::InterfaceSelection::default(),
         attach_mechanisms: vec![],

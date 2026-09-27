@@ -1,19 +1,29 @@
 /* Executes the actual production transaction and classifier implementation.
- * Only kernel helper operations and CAS interference are injected; there is no
- * second owner-accounting algorithm. */
+ * Only kernel helper operations and atomic interference are injected; there is
+ * no second owner-accounting algorithm. */
 #include "task_owner.h"
-enum { OWNER_CAS_CONTRACT_TRIES = 8 };
-_Static_assert(OWNER_CAS_TRIES == OWNER_CAS_CONTRACT_TRIES,
-               "owner accounting requires exactly eight CAS attempts");
+_Static_assert(OWNER_TRANSIENT_CLAIMS == (1ULL << 22),
+               "transient admission excess is bounded by PID_MAX_LIMIT");
+_Static_assert(OWNER_CONTROL_BOUND == OWNER_LIMIT + OWNER_TRANSIENT_CLAIMS,
+               "corruption bound sits above every transient admission excess");
 static u64 *cas_interference_cell;
 static unsigned cas_failures_remaining, cas_attempts;
 static u64 controlled_cas(u64 *cell, u64 old, u64 replacement);
 #define __sync_val_compare_and_swap controlled_cas
+/* Simulated concurrent claims: another CPU's reservations land between an
+ * admission pre-check and this CPU's own atomic add. */
+static u64 *add_interference_cell;
+static u64 add_racing_claims;
+u64 controlled_add(u64 *cell, u64 delta);
+#define __sync_fetch_and_add controlled_add
 #include "task_owner.c"
+#undef __sync_fetch_and_add
 #undef __sync_val_compare_and_swap
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 unsigned char START, DISCOVERY_STATE;
 struct task_struct { int index; };
@@ -40,6 +50,15 @@ static u64 controlled_cas(u64 *cell, u64 old, u64 replacement)
         }
     }
     return __sync_val_compare_and_swap(cell, old, replacement);
+}
+
+u64 controlled_add(u64 *cell, u64 delta)
+{
+    if (cell == add_interference_cell && delta == 1 && add_racing_claims) {
+        __sync_fetch_and_add(cell, add_racing_claims);
+        add_racing_claims = 0;
+    }
+    return __sync_fetch_and_add(cell, delta);
 }
 
 static size_t key_size(void *map) {
@@ -123,6 +142,7 @@ static void reset(void)
     current_index = miss_get = fail_create = delete_error = update_error = pair_delete_error = 0;
     gets = creates = deletes = 0; expected_delete_debt = 0;
     cas_interference_cell = NULL; cas_failures_remaining = cas_attempts = 0;
+    add_interference_cell = NULL; add_racing_claims = 0;
     owner_map_lookup = lookup; owner_map_update = update; owner_map_delete = pair_delete;
     owner_storage_get = storage_get; owner_storage_delete = storage_delete;
     owner_current_task = current_task; owner_pid_tgid = pid_tgid;
@@ -142,43 +162,131 @@ static void cas_boundaries(void)
 #endif
     );
 
+    /* Accounting never compare-exchanges the count: interference on every
+     * attempt changes nothing (the old eight-try loop poisoned here). */
     ctl.outstanding = 2;
     cas_interference_cell = &ctl.outstanding;
-    cas_failures_remaining = OWNER_CAS_CONTRACT_TRIES - 1;
-    assert(p11_owner_reserve());
-    assert(cas_attempts == OWNER_CAS_CONTRACT_TRIES);
-
-    cas_attempts = 0;
-    cas_failures_remaining = OWNER_CAS_CONTRACT_TRIES - 1;
-    assert(p11_owner_refund());
-    assert(cas_attempts == OWNER_CAS_CONTRACT_TRIES);
-
-    reset(); ctl.outstanding = 2;
-    cas_interference_cell = &ctl.outstanding;
-    cas_failures_remaining = OWNER_CAS_CONTRACT_TRIES;
-    assert(!p11_owner_reserve());
-    assert(cas_attempts == OWNER_CAS_CONTRACT_TRIES && ctl.admission_failures == 1);
-
-    reset(); ctl.outstanding = 2;
-    cas_interference_cell = &ctl.outstanding;
-    cas_failures_remaining = OWNER_CAS_CONTRACT_TRIES;
-    assert(!p11_owner_refund());
-    assert(cas_attempts == OWNER_CAS_CONTRACT_TRIES && (ctl.poison & OWNER_REFUND_FAILED));
+    cas_failures_remaining = OWNER_LIMIT;
+    assert(p11_owner_reserve() && ctl.outstanding == 3);
+    assert(p11_owner_refund() && ctl.outstanding == 2);
+    assert(!cas_attempts && !ctl.poison && !ctl.admission_failures);
 
     reset(); ctl.outstanding = OWNER_LIMIT;
     cas_interference_cell = &ctl.outstanding;
     assert(!p11_owner_reserve());
     assert(!cas_attempts && ctl.outstanding == OWNER_LIMIT && ctl.admission_failures == 1);
+    assert(!ctl.poison);
 
     reset();
     cas_interference_cell = &ctl.outstanding;
     assert(!p11_owner_refund());
-    assert(!cas_attempts && (ctl.poison & OWNER_REFUND_FAILED));
+    assert(!cas_attempts && (ctl.poison & OWNER_REFUND_FAILED) && !ctl.outstanding);
 
     reset(); ctl.outstanding = 1; ctl.poison = OWNER_CLASSIFIER_FAILED;
     cas_interference_cell = &ctl.outstanding;
     assert(p11_owner_refund());
-    assert(cas_attempts == 1 && !ctl.outstanding && ctl.poison == OWNER_CLASSIFIER_FAILED);
+    assert(!cas_attempts && !ctl.outstanding && ctl.poison == OWNER_CLASSIFIER_FAILED);
+
+    /* The corruption bound is exact: the largest transient excess is healthy,
+     * one past it is a bad control. */
+    reset(); ctl.outstanding = OWNER_CONTROL_BOUND;
+    assert(p11_owner_healthy() && !ctl.poison);
+    assert(p11_owner_refund() && ctl.outstanding == OWNER_CONTROL_BOUND - 1);
+    reset(); ctl.outstanding = OWNER_CONTROL_BOUND + 1;
+    assert(!p11_owner_healthy() && ctl.poison == OWNER_BAD_CONTROL);
+    assert(!p11_owner_reserve() && !p11_owner_refund());
+    assert(ctl.outstanding == OWNER_CONTROL_BOUND + 1);
+}
+
+/* Contention is never corruption: another CPU winning every race on the
+ * shared count must neither poison the owner nor refuse an admission. Only a
+ * genuine accounting violation (underflow, wrapped count) poisons. */
+static void accounting_contention(void)
+{
+    reset(); ctl.outstanding = 2;
+    cas_interference_cell = &ctl.outstanding;
+    cas_failures_remaining = ~0U; /* Every compare-exchange on the count loses. */
+    assert(p11_owner_reserve());
+    assert(ctl.outstanding == 3 && !ctl.admission_failures && !ctl.poison);
+    assert(p11_owner_refund());
+    assert(ctl.outstanding == 2 && !ctl.poison && p11_owner_healthy());
+    assert(!cas_attempts); /* No retry loop exists for contention to exhaust. */
+
+    /* A racing claim lands between the admission pre-check and this claim's
+     * add and takes the last unit: this claim undoes exactly itself. */
+    reset(); ctl.outstanding = OWNER_LIMIT - 1;
+    add_interference_cell = &ctl.outstanding; add_racing_claims = 1;
+    assert(!p11_owner_reserve());
+    assert(ctl.outstanding == OWNER_LIMIT && ctl.admission_failures == 1 && !ctl.poison);
+
+    /* In-flight over-limit claims transiently exceed the limit. That is
+     * neither a bad control nor a refund failure. */
+    reset(); ctl.outstanding = OWNER_LIMIT + 3;
+    assert(p11_owner_healthy() && !ctl.poison);
+    assert(!p11_owner_reserve());
+    assert(ctl.outstanding == OWNER_LIMIT + 3 && ctl.admission_failures == 1 && !ctl.poison);
+    assert(p11_owner_refund());
+    assert(ctl.outstanding == OWNER_LIMIT + 2 && !ctl.poison);
+
+    /* A genuine underflow poisons and never wraps the count. */
+    reset();
+    assert(!p11_owner_refund());
+    assert(ctl.poison == OWNER_REFUND_FAILED && !ctl.outstanding);
+    /* A wrapped count is a corrupt control. */
+    reset(); ctl.outstanding = ~0ULL;
+    assert(!p11_owner_healthy() && (ctl.poison & OWNER_BAD_CONTROL));
+}
+
+enum { HAMMER_ROUNDS = 100000, HAMMER_MAX_THREADS = 16 };
+static u64 hammer_refused, hammer_unrefunded;
+static void *reserve_refund_hammer(void *unused)
+{
+    (void)unused;
+    for (unsigned i = 0; i < HAMMER_ROUNDS; i++) {
+        if (!p11_owner_reserve())
+            __atomic_fetch_add(&hammer_refused, 1, __ATOMIC_RELAXED);
+        else if (!p11_owner_refund())
+            __atomic_fetch_add(&hammer_unrefunded, 1, __ATOMIC_RELAXED);
+    }
+    return NULL;
+}
+static void *refused_admission_hammer(void *unused)
+{
+    (void)unused;
+    for (unsigned i = 0; i < HAMMER_ROUNDS; i++)
+        if (p11_owner_reserve())
+            __atomic_fetch_add(&hammer_unrefunded, 1, __ATOMIC_RELAXED);
+    return NULL;
+}
+static unsigned run_hammer(void *(*body)(void *))
+{
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned threads = cpus < 4 ? 4 : cpus > HAMMER_MAX_THREADS ? HAMMER_MAX_THREADS : (unsigned)cpus;
+    pthread_t workers[HAMMER_MAX_THREADS];
+    hammer_refused = hammer_unrefunded = 0;
+    for (unsigned i = 0; i < threads; i++)
+        assert(!pthread_create(&workers[i], NULL, body, NULL));
+    for (unsigned i = 0; i < threads; i++)
+        assert(!pthread_join(workers[i], NULL));
+    return threads;
+}
+/* Real CPUs, real atomics, the production accounting: every call reserves and
+ * refunds the one shared count, so contention must never poison or refuse,
+ * and refused admissions must be counted exactly (no dropped increment). */
+static void threaded_contention(void)
+{
+    reset();
+    unsigned threads = run_hammer(reserve_refund_hammer);
+    fprintf(stderr, "reserve/refund x%u threads: poison=%llu outstanding=%llu admission=%llu refused=%llu unrefunded=%llu\n",
+            threads, ctl.poison, ctl.outstanding, ctl.admission_failures, hammer_refused, hammer_unrefunded);
+    assert(!ctl.poison && !ctl.outstanding && !ctl.admission_failures);
+    assert(!hammer_refused && !hammer_unrefunded);
+    reset(); ctl.outstanding = OWNER_LIMIT;
+    threads = run_hammer(refused_admission_hammer);
+    fprintf(stderr, "refused admissions x%u threads: counted=%llu expected=%llu poison=%llu\n",
+            threads, ctl.admission_failures, (u64)threads * HAMMER_ROUNDS, ctl.poison);
+    assert(!ctl.poison && ctl.outstanding == OWNER_LIMIT && !hammer_unrefunded);
+    assert(ctl.admission_failures == (u64)threads * HAMMER_ROUNDS);
 }
 #ifndef P11SCOPE_INVENTORY_ONLY
 static struct owner_start_key start_key(u32 slot)
@@ -498,7 +606,8 @@ static void inventory_contract(void)
 }
 int main(void)
 {
-    cas_boundaries(); classifier(); inventory_contract(); directory(); discovery_foreign_owner();
+    cas_boundaries(); accounting_contention(); threaded_contention();
+    classifier(); inventory_contract(); directory(); discovery_foreign_owner();
     puts("task-owner inventory: real discovery capacity, transactions, poison and cleanup passed");
 }
 #else
@@ -514,9 +623,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "capacity")) capacity_collision();
         else if (!strcmp(argv[1], "absence")) ordinary_absence();
         else if (!strcmp(argv[1], "cas")) cas_boundaries();
+        else if (!strcmp(argv[1], "contention")) accounting_contention();
+        else if (!strcmp(argv[1], "threads")) threaded_contention();
         else assert(0);
     } else {
-        cas_boundaries(); classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
+        cas_boundaries(); accounting_contention(); threaded_contention();
+        classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }

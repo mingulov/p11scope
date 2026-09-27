@@ -79,7 +79,11 @@ discriminator value.
 Each tuple has exactly `module`, `request`, `rv`, `result`, `table_match`,
 `inventory_matches`, `authority`, and `count`. `count` is a positive saturating
 u64. `request` and a non-null `result` each have exactly `name`, `version`, and
-`flags` (u64). Name classes are `null`, `exact_standard`, `other`, and
+`flags`. Request `flags` is the caller's scalar CK_FLAGS argument (u64). Result
+`flags` is a finite class, never the returned word: `zero`, `fork_safe`
+(exactly `CKF_INTERFACE_FORK_SAFE`), or `other` (any other bit pattern). The
+returned word is read through caller-writable memory, so the kernel reduces it
+to this class before the record leaves the probe. Name classes are `null`, `exact_standard`, `other`, and
 `unreadable`; version classes are `null`, `unreadable`, `v2_40`, `v3_0`,
 `v3_1`, `v3_2`, and `other`.
 
@@ -90,7 +94,8 @@ is nonempty. Authority is exactly `inventory`, `selection_count_only`, or
 `none`: inventory authority requires a readable successful result and at least
 one match; count-only authority has no match and is limited to a successful
 request and result whose names are both `exact_standard`, whose returned
-version is `v3_0`, `v3_1`, or `v3_2`, and whose returned flags are 0 or 1.
+version is `v3_0`, `v3_1`, or `v3_2`, and whose returned flags class is `zero`
+or `fork_safe`.
 Count-only authority applies to a live or offline selection-only target, grants
 no inventory match, is semantically unauthorized, and forces `PARTIAL`. The
 profile tuple does not expose a helper selector or `semantic_authorized` field;
@@ -213,6 +218,34 @@ positions share one target. `discovery[].tables[]` adds the linkage value
 `exports` and the `exports_agreeing` count (see the v2 document's `tables[]`
 and `functions[]` rows). Export linkage presents standard names only: scan-found
 slots stay semantics-unverified and count-only whatever their linkage.
+
+## Kernel control evidence
+
+`kernel_control` is always present in every v3 profile, v3-metrics, and
+terminal trace evidence object. It is read from the native kernel control
+cells at every snapshot and at terminal, and carries finite names and counts
+only:
+
+- `capture_halted` (boolean) is true exactly when `owner_poison` is non-empty.
+  The in-kernel call-ownership accounting detected an inconsistency and every
+  probe has refused capture since; nothing after that moment was counted.
+- `owner_poison`: sorted, unique reason names from `bad_control`,
+  `lookup_unknown`, `bad_record`, `delete_failed`, `bookkeeping_failed`,
+  `refund_failed`, `classifier_failed`, `state_delete_failed`, `unknown`.
+- `owner_admission_failures` (u64): owner admissions refused (limit reached,
+  invalid key, or collision).
+- `identity_unavailable` (u64): process identities the kernel could not
+  allocate or read. This includes every fork record dropped after the
+  lifetime identity budget (16,384 tickets) is spent.
+- `identity_budget_exhausted` (boolean): the lifetime identity budget is
+  spent. Informational on its own; the refusals it causes are counted above.
+- `root_affiliation_failures`: sorted, unique names from `bad_control`,
+  `capacity`, `reserve_contention`, `create_failed`, `existing_child`,
+  `bad_cell`, `exit_classifier`, `exit_delete`, `refund_failed`, `unknown`.
+
+A halt, any nonzero counter, or any root failure name forces `PARTIAL` with
+`verdict_detail` = `concrete_gap`. Historical v2-metrics documents predate
+this object.
 
 ## Added `capture` fields
 

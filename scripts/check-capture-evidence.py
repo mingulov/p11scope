@@ -198,7 +198,27 @@ RESIDUAL_EVIDENCE_KEYS = {
     # F-26: active values of every capture-visible P11SCOPE_* switch.
     "p11scope_env",
 }
+# Native kernel control state (OWNER_CTL / COOKIE_CTL / ROOT_CTL), read at
+# every snapshot. Finite reason names and counters only; any gap forces PARTIAL.
+KERNEL_CONTROL_KEYS = {
+    "capture_halted", "owner_poison", "owner_admission_failures",
+    "identity_unavailable", "identity_budget_exhausted",
+    "root_affiliation_failures",
+}
+OWNER_POISON_REASONS = {
+    "bad_control", "lookup_unknown", "bad_record", "delete_failed",
+    "bookkeeping_failed", "refund_failed", "classifier_failed",
+    "state_delete_failed", "unknown",
+}
+ROOT_FAILURE_REASONS = {
+    "bad_control", "capacity", "reserve_contention", "create_failed",
+    "existing_child", "bad_cell", "exit_classifier", "exit_delete",
+    "refund_failed", "unknown",
+}
+# C_GetInterface result flags publish only this finite class, never the word.
+SELECTION_RESULT_FLAG_CLASSES = {"zero", "fork_safe", "other"}
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
+    "kernel_control",
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
     "scan_unavailable", "scan_ms", "table_entries", "slots", "active_slots",
     "attached_probes",
@@ -451,6 +471,57 @@ def exact_selection_request(value, label):
     uint(value["flags"], U64_MAX, f"{label}.flags")
 
 
+def exact_selection_result(value, label):
+    """A result's flags word is read through caller-writable memory, so only
+    its finite class is published (never the raw u64)."""
+    exact_keys(value, {"name", "version", "flags"}, label)
+    require(value["name"] in SELECTION_NAME_CLASSES, f"invalid {label}.name: {value!r}")
+    require(value["version"] in SELECTION_VERSION_CLASSES, f"invalid {label}.version: {value!r}")
+    require(
+        isinstance(value["flags"], str) and value["flags"] in SELECTION_RESULT_FLAG_CLASSES,
+        f"invalid {label}.flags class",
+    )
+
+
+def kernel_control_lossy(evidence):
+    """Mirror of KernelControlEvidence::complete(): any halt, refusal or
+    failure is observation loss. Documents that predate the object carry
+    none, which is not a loss."""
+    control = evidence.get("kernel_control")
+    if control is None:
+        return False
+    return bool(control["capture_halted"] or control["owner_poison"]
+                or control["owner_admission_failures"]
+                or control["identity_unavailable"]
+                or control["root_affiliation_failures"])
+
+
+def exact_kernel_control(evidence):
+    """Closed native-control shape; any halt/loss must be a concrete gap."""
+    control = evidence["kernel_control"]
+    exact_keys(control, KERNEL_CONTROL_KEYS, "kernel_control")
+    for key in ("capture_halted", "identity_budget_exhausted"):
+        require(control[key] is True or control[key] is False,
+                f"invalid kernel_control.{key}")
+    for key in ("owner_admission_failures", "identity_unavailable"):
+        uint(control[key], U64_MAX, f"kernel_control.{key}")
+    for key, vocabulary in (("owner_poison", OWNER_POISON_REASONS),
+                            ("root_affiliation_failures", ROOT_FAILURE_REASONS)):
+        reasons = control[key]
+        require(isinstance(reasons, list)
+                and all(isinstance(reason, str) and reason in vocabulary for reason in reasons)
+                and reasons == sorted(set(reasons)),
+                f"invalid kernel_control.{key}")
+    require(control["capture_halted"] == bool(control["owner_poison"]),
+            "kernel_control.capture_halted disagrees with owner_poison")
+    gap = (control["capture_halted"] or control["owner_admission_failures"]
+           or control["identity_unavailable"] or control["root_affiliation_failures"])
+    if gap:
+        require(evidence["completeness"] == "PARTIAL"
+                and evidence["verdict_detail"] == "concrete_gap",
+                "kernel control loss must be a concrete PARTIAL gap")
+
+
 def exact_profile_v3_selection(document, *, terminal=False, run=False):
     """Validate the closed, bounded profile-v3 selection/privacy extension."""
     if not terminal:
@@ -464,6 +535,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
         evidence = document
     exact_evidence_keys(evidence, profile=True, terminal=terminal, child=run)
     exact_scheduling_evidence(evidence)
+    exact_kernel_control(evidence)
     exact_task_uprobe_link_losses(evidence)
     exact_terminal_verdict(evidence)
     missing = {
@@ -543,7 +615,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
         require(tuple_["table_match"] == bool(matches), tuple_)
         result = tuple_["result"]
         if result is not None:
-            exact_selection_request(result, "selection result")
+            exact_selection_result(result, "selection result")
         if tuple_["rv"] != 0 or result is None:
             require(not matches and not tuple_["table_match"] and tuple_["authority"] == "none", tuple_)
             require(tuple_["rv"] == 0 or result is None, tuple_)
@@ -560,7 +632,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
             require(
                 tuple_["request"]["name"] == result["name"] == "exact_standard"
                 and result["version"] in {"v3_0", "v3_1", "v3_2"}
-                and result["flags"] in {0, 1},
+                and result["flags"] in {"zero", "fork_safe"},
                 tuple_,
             )
         else:
@@ -637,6 +709,7 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted.discard("active_slots")
         wanted -= RESIDUAL_EVIDENCE_KEYS
         wanted -= VERDICT_CLASS_KEYS
+        wanted.discard("kernel_control")
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
@@ -717,6 +790,7 @@ def exact_metrics_schema(document, *, run=False):
     exact_capture_scope(document)
     exact_evidence_keys(document["evidence"], profile=False, child=run)
     exact_scheduling_evidence(document["evidence"])
+    exact_kernel_control(document["evidence"])
     exact_task_uprobe_link_losses(document["evidence"])
     exact_terminal_verdict(document["evidence"])
 
@@ -900,6 +974,7 @@ def expected_gap_classes(evidence):
             ("abi_refusals", evidence["abi_refusals"] > 0),
             ("malformed_records", evidence["malformed_records"] > 0),
             ("provider_changed", evidence["provider_changed"] is True),
+            ("kernel_control", kernel_control_lossy(evidence)),
             ("unprotected_live_windows", evidence["unprotected_live_windows"] > 0),
             ("discovery_ring_loss", evidence["discovery_ring_loss"] > 0),
             ("discovery_state_failures", evidence["discovery_state_failures"] > 0),
@@ -2631,6 +2706,17 @@ def scheduling_fixture(**overrides):
     return fixture
 
 
+def kernel_control_fixture():
+    return {
+        "capture_halted": False,
+        "owner_poison": [],
+        "owner_admission_failures": 0,
+        "identity_unavailable": 0,
+        "identity_budget_exhausted": False,
+        "root_affiliation_failures": [],
+    }
+
+
 def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
     return {
         "authority": "hash-pinned",
@@ -2674,6 +2760,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         "templates_truncated": False,
         "provider_changed": False,
         "scheduling": scheduling_fixture(),
+        "kernel_control": kernel_control_fixture(),
         "completeness": "PARTIAL",
         # SYSPLAN residual: unproven drain, concrete gap, clean preflight,
         # no handoff, no env switches live.
@@ -2715,6 +2802,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("semantic_history_drops", None)
             evidence.pop("scheduling", None)
             evidence.pop("active_slots", None)
+            evidence.pop("kernel_control", None)
             for field in RESIDUAL_EVIDENCE_KEYS | VERDICT_CLASS_KEYS:
                 evidence.pop(field, None)
     settle_fixture_verdict(evidence)
@@ -2785,6 +2873,42 @@ def self_test():
     exact_historical_metrics_schema(historical)
     rejected(lambda: exact_metrics_schema(historical))
     print("historical v2-metrics fixture remains closed and non-emitted: OK")
+    halted = copy.deepcopy(clean)
+    halted["evidence"]["kernel_control"].update(
+        capture_halted=True, owner_poison=["refund_failed"])
+    halted["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+    settle_fixture_verdict(halted)
+    require(halted["evidence"]["gap_classes"]["observation"]["causes"] == ["kernel_control"]
+            and halted["evidence"]["verdict_detail"] == "concrete_gap",
+            "a kernel control halt must classify as observation loss")
+    exact_metrics_schema(halted)
+    for mutate in (
+        lambda control: control.update(capture_halted=False),
+        lambda control: control.update(owner_poison=["refund_failed", "refund_failed"]),
+        lambda control: control.update(owner_poison=["poison 32"]),
+        lambda control: control.update(owner_poison=["refund_failed"], capture_halted=1),
+        lambda control: control.update(owner_admission_failures=-1),
+        lambda control: control.update(root_affiliation_failures=["capacity", "bad_cell"]),
+        lambda control: control.pop("identity_unavailable"),
+        lambda control: control.update(raw_poison=32),
+    ):
+        invalid = copy.deepcopy(halted)
+        mutate(invalid["evidence"]["kernel_control"])
+        rejected(lambda invalid=invalid: exact_metrics_schema(invalid))
+    for field, value in (("capture_halted", True), ("owner_admission_failures", 1),
+                         ("identity_unavailable", 1),
+                         ("root_affiliation_failures", ["capacity"])):
+        unflagged = copy.deepcopy(clean)
+        unflagged["evidence"]["kernel_control"][field] = value
+        if field == "capture_halted":
+            unflagged["evidence"]["kernel_control"]["owner_poison"] = ["classifier_failed"]
+        unflagged["evidence"].update(completeness="PARTIAL", verdict_detail="clean_but_unproven")
+        rejected(lambda unflagged=unflagged: exact_metrics_schema(unflagged))
+    budget_only = copy.deepcopy(clean)
+    budget_only["evidence"]["kernel_control"]["identity_budget_exhausted"] = True
+    settle_fixture_verdict(budget_only)
+    exact_metrics_schema(budget_only)
+    print("kernel control halt/loss is closed, finite and a concrete gap: OK")
     bad_metrics = copy.deepcopy(clean)
     bad_metrics["evidence"]["secret_selection_payload"] = "CANARY"
     rejected(lambda: validate_clean_metrics(bad_metrics, {"C_Initialize": 1}))
@@ -3474,7 +3598,7 @@ def self_test():
             "module": 0,
             "request": {"name": "exact_standard", "version": "v3_0", "flags": 0},
             "rv": 0,
-            "result": {"name": "exact_standard", "version": "v3_0", "flags": 0},
+            "result": {"name": "exact_standard", "version": "v3_0", "flags": "zero"},
             "table_match": True,
             "inventory_matches": [
                 {"surface": 0, "name_agrees": False, "version_agrees": True},
@@ -3705,7 +3829,8 @@ def self_test():
         lambda t: t["request"].update(name="other"),
         lambda t: t["result"].update(name="other"),
         lambda t: t["result"].update(version="v2_40"),
-        lambda t: t["result"].update(flags=2),
+        lambda t: t["result"].update(flags="other"),
+        lambda t: t["result"].update(flags=0),
     ):
         invalid = copy.deepcopy(count_only)
         mutate(invalid["evidence"]["interface_selection"]["tuples"][0])
@@ -3729,8 +3854,14 @@ def self_test():
     full_width = copy.deepcopy(no_authority)
     full_width_tuple = full_width["evidence"]["interface_selection"]["tuples"][0]
     full_width_tuple["request"]["flags"] = U64_MAX
-    full_width_tuple["result"]["flags"] = U64_MAX
+    full_width_tuple["result"]["flags"] = "other"
     exact_profile_v3_selection(full_width)
+    # A raw result flags word (here a hostile "SECRET!!" sentinel) is never
+    # accepted: only the finite class may be published.
+    for raw in (0, 1, 0x5345_4352_4554_2121, U64_MAX):
+        leaked = copy.deepcopy(full_width)
+        leaked["evidence"]["interface_selection"]["tuples"][0]["result"]["flags"] = raw
+        rejected(lambda leaked=leaked: exact_profile_v3_selection(leaked))
     full_width_rv = copy.deepcopy(selection_doc)
     full_width_rv_tuple = full_width_rv["evidence"]["interface_selection"]["tuples"][0]
     full_width_rv_tuple.update(
@@ -3739,7 +3870,7 @@ def self_test():
     exact_profile_v3_selection(full_width_rv)
     for field, value in (
         ("request.flags", U64_MAX + 1), ("request.flags", True),
-        ("result.flags", U64_MAX + 1), ("result.flags", True),
+        ("result.flags", U64_MAX + 1), ("result.flags", True), ("result.flags", "fork-safe"),
         ("rv", U64_MAX + 1), ("rv", True),
     ):
         invalid = copy.deepcopy(selection_doc)

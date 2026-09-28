@@ -153,6 +153,7 @@ if [ "${1-}" = "--self-test" ]; then
     # readiness-wait positive/negative controls on synthetic logs. No BPF,
     # no sudo, no workload, no build of the observer.
     python3 -I scripts/lane-bench-overhead-oracle-3.py --self-test
+    python3 -I scripts/lane-bench-overhead-oracle-1.py --self-test
     SELF_TEST_WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-bench-selftest-XXXXXX")
     trap 'rm -rf "$SELF_TEST_WORK"' EXIT INT TERM
     SPID=

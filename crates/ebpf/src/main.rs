@@ -2058,6 +2058,41 @@ pub unsafe extern "C" fn p11_walk_template(
     }
 }
 
+/// The types-only walk behind the same global boundary as
+/// [`p11_walk_template`]: attribute *types* only, never values, written into
+/// the caller's template-output region. A separate global rather than a mode
+/// flag, so the full walker's verification is untouched. Older verifiers
+/// verify a global once; the previous direct local calls made the types entry
+/// program re-explore the walk per caller state and exceed the 1,000,000
+/// instruction budget on Ubuntu 5.15.
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+#[allow(private_interfaces)]
+pub unsafe extern "C" fn p11_walk_template_types(
+    ptemplate: u64,
+    count: u64,
+    word_bytes: u32,
+    output: *mut TemplateOutput,
+) -> u32 {
+    if output.is_null() {
+        return TEMPLATE_WALK_FAILURE;
+    }
+    let is_ilp32 = match word_bytes {
+        4 => true,
+        8 => false,
+        _ => return TEMPLATE_WALK_FAILURE,
+    };
+    // SAFETY: null was rejected above. The caller owns exactly one contiguous
+    // template-output region for the duration of this global call.
+    let output = unsafe { &mut *output };
+    if is_ilp32 {
+        walk_template_types::<true>(ptemplate, count, output)
+    } else {
+        walk_template_types::<false>(ptemplate, count, output)
+    }
+}
+
 /// Walk at most `MAX_ATTRS` entries of `pTemplate`, recording each entry's
 /// *type* only into `output.types` — `pValue` is never read except for
 /// the policy-boolean allowlist under the `ulValueLen == 1` gate below.
@@ -2082,9 +2117,20 @@ fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(
         assert!(!TYPES_ONLY || !SECOND);
     }
     if TYPES_ONLY {
-        match layout {
-            LinuxLayout::Ilp32 => walk_template_types::<true>(ptemplate, count, start),
-            LinuxLayout::Lp64 => walk_template_types::<false>(ptemplate, count, start),
+        // The types-only entry program reaches the walk through its own
+        // global, exactly like the full walk below: the layout dispatch lives
+        // inside the global, which older verifiers explore once.
+        let output = unsafe {
+            (start as *mut CallStart)
+                .cast::<u8>()
+                .add(core::mem::offset_of!(CallStart, attr_types))
+                .cast::<TemplateOutput>()
+        };
+        let status = unsafe {
+            p11_walk_template_types(ptemplate, count, layout.word_bytes() as u32, output)
+        };
+        if status != 0 {
+            capture_failure(start);
         }
         return;
     }
@@ -2107,30 +2153,33 @@ fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 #[inline(never)]
-fn walk_template_types<const IS_ILP32: bool>(ptemplate: u64, count: u64, start: &mut CallStart) {
+fn walk_template_types<const IS_ILP32: bool>(
+    ptemplate: u64,
+    count: u64,
+    output: &mut TemplateOutput,
+) -> u32 {
     let layout = if IS_ILP32 {
         LinuxLayout::Ilp32
     } else {
         LinuxLayout::Lp64
     };
     let total = count.min(u32::MAX as u64) as u32;
-    start.attr_total = total;
+    output.total = total;
     for i in 0..MAX_ATTRS {
         if (i as u64) >= count {
             break;
         }
         let width = layout.word_bytes() as u64;
         let Some(base) = ptemplate.checked_add((i as u64) * width * 3) else {
-            capture_failure(start);
-            break;
+            return TEMPLATE_WALK_FAILURE;
         };
         let Ok(attr_type) = read_word(base, layout) else {
-            capture_failure(start);
-            break;
+            return TEMPLATE_WALK_FAILURE;
         };
-        start.attr_types[i] = attr_type;
-        start.attr_count += 1;
+        output.types[i] = attr_type;
+        output.count += 1;
     }
+    0
 }
 
 #[cfg(feature = "unsafe-unvalidated-metadata")]

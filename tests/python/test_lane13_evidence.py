@@ -2302,6 +2302,63 @@ exit "$helper_status"
                 decoy.kill()
                 decoy.wait(timeout=2)
 
+    def observe_missing_terminal_readiness(self, launched, proc, evidence):
+        # The controlled failure starts only after dispatch has recorded its
+        # identity and entered the hold. Scheduling and fsync before that phase
+        # belong to setup, not to the 200 ms missing-readiness observation.
+        held = self.state / "terminal-readiness-hold"
+        setup_deadline = launched + TERMINAL_READINESS_TIMEOUT_SECONDS
+        while not held.exists() and time.monotonic() < setup_deadline:
+            self.assertIsNone(proc.poll(), "terminal boundary exited before controlled hold")
+            time.sleep(0.01)
+        setup_diagnostic = None if held.exists() else self.terminal_readiness_diagnostic(
+            launched, proc, evidence
+        )
+        self.assertTrue(held.exists(), setup_diagnostic)
+
+        ready = self.state / "terminal-signal-ready"
+        deadline = time.monotonic() + 0.2
+        while not ready.exists() and time.monotonic() < deadline:
+            self.assertIsNone(proc.poll(), "terminal boundary exited before controlled timeout")
+            time.sleep(0.01)
+        diagnostic = None if ready.exists() else self.terminal_readiness_diagnostic(
+            launched, proc, evidence
+        )
+        self.assertTrue(ready.exists(), diagnostic)
+
+    def test_missing_terminal_readiness_observation_waits_for_delayed_setup(self):
+        # Model 350 ms of fixture setup without a wall-clock race. The actual
+        # marker and diagnostic formatter remain real; only scheduling is
+        # controlled. Starting the 200 ms observation at launch would inspect
+        # the fixture before it reaches the intentionally held phase.
+        clock = [0.0]
+        evidence = self.root / "delayed-readiness-diagnostic"
+
+        class LiveProcess:
+            pid = os.getpid()
+
+            @staticmethod
+            def poll():
+                return None
+
+        def advance(seconds):
+            clock[0] = round(clock[0] + seconds, 6)
+            if clock[0] >= 0.35:
+                (self.state / "terminal-readiness-hold").touch()
+
+        inner = unittest.FunctionTestCase(
+            lambda: self.observe_missing_terminal_readiness(0.0, LiveProcess(), evidence)
+        )
+        result = unittest.TestResult()
+        with mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(time, "sleep", side_effect=advance):
+            inner.run(result)
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertEqual(result.errors, [])
+        self.assertIn("phase_markers=terminal-readiness-hold", result.failures[0][1])
+        self.assertEqual(clock[0], 0.55, "200 ms observation follows 350 ms of setup")
+        self.assertFalse((self.state / "terminal-signal-ready").exists())
+
     def test_missing_terminal_readiness_reports_bounded_diagnostics(self):
         evidence = self.root / "controlled-readiness-diagnostic"
         proc = self.start_owned(
@@ -2313,18 +2370,9 @@ exit "$helper_status"
         )
         launched = time.monotonic()
 
-        def observe_missing_readiness():
-            ready = self.state / "terminal-signal-ready"
-            deadline = launched + 0.2
-            while not ready.exists() and time.monotonic() < deadline:
-                self.assertIsNone(proc.poll(), "terminal boundary exited before controlled timeout")
-                time.sleep(0.01)
-            diagnostic = None if ready.exists() else self.terminal_readiness_diagnostic(
-                launched, proc, evidence
-            )
-            self.assertTrue(ready.exists(), diagnostic)
-
-        inner = unittest.FunctionTestCase(observe_missing_readiness)
+        inner = unittest.FunctionTestCase(
+            lambda: self.observe_missing_terminal_readiness(launched, proc, evidence)
+        )
         result = unittest.TestResult()
         inner.run(result)
         self.assertEqual(len(result.failures), 1, result.failures)

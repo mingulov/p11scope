@@ -404,7 +404,11 @@ EXACT_PROGRAM_SECTIONS = {
     "sched_process_exit": "raw_tp/sched_process_exit",
 }
 
-DIAGNOSTIC_GLOBAL_HELPERS = frozenset({"p11_decode_params", "p11_walk_template"})
+DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
+    "p11_decode_params",
+    "p11_walk_template",
+    "p11_walk_template_types",
+})
 
 
 def validate_private_helpers(elf, prefix, required, optional, label,
@@ -598,6 +602,35 @@ def validate_owner_helpers(elf, inventory=False):
                 if inventory else REQUIRED_LOCAL_OWNER_HELPERS)
     validate_private_helpers(elf, "p11_owner_", required,
                              OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL", inventory=inventory)
+
+
+def validate_diagnostic_helper_linkage(elf):
+    """Pin GLOBAL linkage for the diagnostic decoder/walkers.
+
+    The oldest supported verifier explores a global subprogram once and a
+    static one per caller state; the types-only walk exceeded the 5.15
+    budget as a static callee. A build that emitted one of these helpers
+    STATIC would reintroduce that blowup, so the inventory freeze's
+    name-only presence check is not enough: require a defined GLOBAL
+    DEFAULT FUNC symbol and a GLOBAL BTF FUNC record.
+    """
+    present = [symbol for symbol in elf.symbols
+               if symbol[0] in DIAGNOSTIC_GLOBAL_HELPERS]
+    if not present:
+        return
+    if ".BTF" not in elf.sections:
+        raise RuntimeError("diagnostic helpers require a BTF section")
+    text = elf.indices.get(".text")
+    btf = Btf(elf.sections[".BTF"][1])
+    for name, info, other, section, _, _ in present:
+        if info != 0x12 or other != 0 or section != text:
+            raise RuntimeError(
+                f"diagnostic helper {name} is not a defined GLOBAL DEFAULT FUNC")
+        funcs = [node for node in btf.types[1:]
+                 if node[0] == 12 and node[1] == name]
+        if len(funcs) != 1 or funcs[0][3] != 1:
+            raise RuntimeError(
+                f"diagnostic helper {name} lacks GLOBAL BTF FUNC linkage")
 
 
 def validate_ia32_span_paths(graph, entry, guard, rejected, read, updates, exits):
@@ -1376,6 +1409,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     validate_owner_helpers(elf, inventory)
     if not inventory:
         validate_root_helpers(elf)
+        validate_diagnostic_helper_linkage(elf)
     elif callers:
         validate_inventory_caller_entry_reachability(elf)
     else:
@@ -1566,14 +1600,14 @@ FROZEN_INVENTORY = {
 # The diagnostic object carries two ABI-specialized local implementations under
 # each global boundary, plus two ABI-specialized local types-only walkers.
 FROZEN_SYMBOLS = {
-    "inventory": (False, False, 0, 0, 0),
-    "inventory-small-discovery": (False, False, 0, 0, 0),
-    "inventory-callers": (False, False, 0, 0, 0),
-    "inventory-callers-small-discovery": (False, False, 0, 0, 0),
-    "default": (False, False, 0, 0, 0),
-    "diagnostic": (True, True, 2, 2, 2),
-    "wide-default": (False, False, 0, 0, 0),
-    "wide-diagnostic": (True, True, 2, 2, 2),
+    "inventory": (False, False, False, 0, 0, 0),
+    "inventory-small-discovery": (False, False, False, 0, 0, 0),
+    "inventory-callers": (False, False, False, 0, 0, 0),
+    "inventory-callers-small-discovery": (False, False, False, 0, 0, 0),
+    "default": (False, False, False, 0, 0, 0),
+    "diagnostic": (True, True, True, 2, 2, 2),
+    "wide-default": (False, False, False, 0, 0, 0),
+    "wide-diagnostic": (True, True, True, 2, 2, 2),
 }
 
 
@@ -1620,14 +1654,19 @@ def validate_inventory(variant, maps, programs, symbols):
     found = (
         "p11_decode_params" in symbols,
         "p11_walk_template" in symbols,
+        "p11_walk_template_types" in symbols,
         sum("decode_params" in name for name in symbols if name != "p11_decode_params"),
         sum("walk_template_impl" in name for name in symbols),
-        sum("walk_template_types" in name for name in symbols),
+        sum(
+            "walk_template_types" in name
+            for name in symbols
+            if name != "p11_walk_template_types"
+        ),
     )
     if found != FROZEN_SYMBOLS[variant]:
         print(
-            f"global_params={found[0]} global_template={found[1]} "
-            f"local_params={found[2]} local_full={found[3]} local_types={found[4]} "
+            f"global_params={found[0]} global_template={found[1]} global_types={found[2]} "
+            f"local_params={found[3]} local_full={found[4]} local_types={found[5]} "
             f"frozen={FROZEN_SYMBOLS[variant]}",
             file=sys.stderr,
         )
@@ -1665,6 +1704,7 @@ def self_test():
         {
             "p11_decode_params",
             "p11_walk_template",
+            "p11_walk_template_types",
             "decode_params-0",
             "decode_params-1",
             "walk_template_impl-0",
@@ -1724,8 +1764,9 @@ def self_test():
     assert rejected(
         validate_inventory, "default", SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry", "decode_params"}
     ) == [
-        "global_params=False global_template=False local_params=1 local_full=0 local_types=0 "
-        "frozen=(False, False, 0, 0, 0)"
+        "global_params=False global_template=False global_types=False "
+        "local_params=1 local_full=0 local_types=0 "
+        "frozen=(False, False, False, 0, 0, 0)"
     ]
     assert rejected(
         validate_inventory,
@@ -1734,12 +1775,14 @@ def self_test():
         SAFE_PROGRAMS,
         {"p11_entry", "p11_decode_params"},
     ) == [
-        "global_params=True global_template=False local_params=0 local_full=0 local_types=0 "
-        "frozen=(False, False, 0, 0, 0)"
+        "global_params=True global_template=False global_types=False "
+        "local_params=0 local_full=0 local_types=0 "
+        "frozen=(False, False, False, 0, 0, 0)"
     ]
     assert rejected(validate_inventory, "diagnostic", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
-        "global_params=False global_template=False local_params=0 local_full=0 local_types=0 "
-        "frozen=(True, True, 2, 2, 2)"
+        "global_params=False global_template=False global_types=False "
+        "local_params=0 local_full=0 local_types=0 "
+        "frozen=(True, True, True, 2, 2, 2)"
     ]
     # The unclassified-section refusal, which no real object can exercise.
     sections = {".text": 1, "uprobe": 2, "raw_tp/sched_process_exit": 3}

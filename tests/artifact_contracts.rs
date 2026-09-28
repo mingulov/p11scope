@@ -4656,7 +4656,11 @@ fn frozen_policy_inventory_matches_embedded_object() {
             parsed.btf_ext.is_some(),
             "diagnostic function info is missing"
         );
-        for helper in ["p11_decode_params", "p11_walk_template"] {
+        for helper in [
+            "p11_decode_params",
+            "p11_walk_template",
+            "p11_walk_template_types",
+        ] {
             btf.id_by_type_name_kind(helper, aya_obj::btf::BtfKind::Func)
                 .unwrap_or_else(|error| {
                     panic!("missing diagnostic BTF function {helper}: {error}")
@@ -4750,6 +4754,37 @@ fn static_detailed_programs_honor_the_stop_gate() {
     assert!(
         output.status.success(),
         "stop-gate contracts: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The diagnostic decoder/walkers are verified once per load only as
+/// GLOBAL functions; a STATIC helper would be re-explored per caller
+/// state and could exceed the oldest supported verifier's budget again.
+/// The inventory freeze pins their names, this pins their linkage, with
+/// negative controls for a STATIC ELF binding and BTF record. Under
+/// `unsafe-unvalidated-metadata` the embedded object is the diagnostic one.
+#[test]
+fn diagnostic_helpers_require_global_linkage() {
+    let directory = tempfile::tempdir().expect("temporary linkage object");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
+    let variant = if cfg!(feature = "unsafe-unvalidated-metadata") {
+        "unsafe"
+    } else {
+        "default"
+    };
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "tests/python/test_diagnostic_linkage.py", "--object"])
+        .arg(&object)
+        .args(["--variant", variant])
+        .output()
+        .expect("execute diagnostic linkage contracts");
+    assert!(
+        output.status.success(),
+        "diagnostic linkage contracts: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -5799,7 +5834,7 @@ fn template_walker_uses_narrow_global_output_and_preserves_read_policy() {
     let exported = between(
         &source,
         "pub unsafe extern \"C\" fn p11_walk_template(",
-        "fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(",
+        "pub unsafe extern \"C\" fn p11_walk_template_types(",
     );
     assert!(exported.contains("word_bytes: u32,"));
     assert!(exported.contains("output: *mut TemplateOutput,"));
@@ -5812,6 +5847,30 @@ fn template_walker_uses_narrow_global_output_and_preserves_read_policy() {
     assert!(null < width && width < reference && reference < dispatch);
     assert!(exported.contains("walk_template_impl::<false>"));
 
+    let types_exported = between(
+        &source,
+        "pub unsafe extern \"C\" fn p11_walk_template_types(",
+        "fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(",
+    );
+    assert!(source.contains(
+        "#[cfg(feature = \"unsafe-unvalidated-metadata\")]\n#[unsafe(no_mangle)]\n#[inline(never)]\n#[allow(private_interfaces)]\npub unsafe extern \"C\" fn p11_walk_template_types("
+    ));
+    assert!(types_exported.contains("word_bytes: u32,"));
+    assert!(types_exported.contains("output: *mut TemplateOutput,"));
+    assert!(!types_exported.contains("*mut CallStart"));
+    let null = types_exported.find("if output.is_null()").unwrap();
+    let width = types_exported
+        .find("let is_ilp32 = match word_bytes")
+        .unwrap();
+    let reference = types_exported
+        .find("let output = unsafe { &mut *output };")
+        .unwrap();
+    let dispatch = types_exported.find("walk_template_types::<true>").unwrap();
+    assert!(null < width && width < reference && reference < dispatch);
+    assert!(types_exported.contains("walk_template_types::<false>"));
+    assert!(types_exported.contains("4 => true,"));
+    assert!(types_exported.contains("8 => false,"));
+
     let adapter = between(
         &source,
         "fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(",
@@ -5819,35 +5878,51 @@ fn template_walker_uses_narrow_global_output_and_preserves_read_policy() {
     );
     assert!(adapter.contains("assert!(!TYPES_ONLY || !SECOND)"));
     let types_branch = adapter.find("if TYPES_ONLY {").unwrap();
-    let projection = adapter.find("(start as *mut CallStart)").unwrap();
-    assert!(types_branch < projection);
-    assert!(adapter.contains("walk_template_types::<true>(ptemplate, count, start)"));
-    assert!(adapter.contains("walk_template_types::<false>(ptemplate, count, start)"));
-    assert!(adapter[..projection].contains("return;"));
+    let types_call = adapter.find("p11_walk_template_types(").unwrap();
+    assert!(types_branch < types_call);
+    assert!(
+        adapter.contains(
+            "p11_walk_template_types(ptemplate, count, layout.word_bytes() as u32, output)"
+        )
+    );
+    assert!(!adapter.contains("walk_template_types::<"));
+    assert!(adapter[types_call..].contains(
+        "if status != 0 {\n            capture_failure(start);\n        }\n        return;"
+    ));
     assert!(adapter.contains("(start as *mut CallStart)"));
     assert!(adapter.contains("offset_of!(CallStart, attr_types1)"));
     assert!(adapter.contains("offset_of!(CallStart, attr_types)"));
     assert!(adapter.contains(".cast::<TemplateOutput>()"));
     assert!(!adapter.contains("MaybeUninit::<TemplateOutput>"));
     assert!(!adapter.contains("&mut start.attr_types"));
-    assert!(adapter.contains("p11_walk_template("));
-    assert_eq!(adapter.matches("capture_failure(start)").count(), 1);
+    assert!(adapter.contains(
+        "let status = unsafe { p11_walk_template(ptemplate, count, layout.word_bytes() as u32, output) };"
+    ));
+    assert_eq!(adapter.matches("capture_failure(start)").count(), 2);
 
     let types = between(&source, "fn walk_template_types<", "fn walk_template_impl<");
+    assert!(source.contains(
+        "#[cfg(feature = \"unsafe-unvalidated-metadata\")]\n#[inline(never)]\nfn walk_template_types<"
+    ));
     assert!(types.contains("const IS_ILP32: bool"));
-    assert!(types.contains("start: &mut CallStart"));
-    assert!(types.contains("start.attr_total = total;"));
-    assert!(types.contains("start.attr_types[i] = attr_type;"));
-    assert!(types.contains("start.attr_count += 1;"));
-    assert_eq!(types.matches("capture_failure(start);").count(), 2);
-    assert_eq!(types.matches("break;").count(), 3);
+    assert!(types.contains("output: &mut TemplateOutput,"));
+    assert!(types.contains(") -> u32 {"));
+    assert!(types.contains("output.total = total;"));
+    assert!(types.contains("output.types[i] = attr_type;"));
+    assert!(types.contains("output.count += 1;"));
+    assert_eq!(types.matches("return TEMPLATE_WALK_FAILURE;").count(), 2);
+    assert_eq!(types.matches("break;").count(), 1);
     for forbidden in [
-        "TemplateOutput",
+        "CallStart",
+        "capture_failure",
         "ATTR_BOOL_BITS",
         "read_word_pair",
         "pvalue",
         "len != 1",
         "attr_bools",
+        "output.bools",
+        "output.seen",
+        "start.",
     ] {
         assert!(
             !types.contains(forbidden),
@@ -5857,8 +5932,8 @@ fn template_walker_uses_narrow_global_output_and_preserves_read_policy() {
     let types_read = types
         .find("let Ok(attr_type) = read_word(base, layout)")
         .unwrap();
-    let types_write = types.find("start.attr_types[i] = attr_type;").unwrap();
-    let types_count = types.find("start.attr_count += 1;").unwrap();
+    let types_write = types.find("output.types[i] = attr_type;").unwrap();
+    let types_count = types.find("output.count += 1;").unwrap();
     assert!(types_read < types_write && types_write < types_count);
 
     let implementation = between(&source, "fn walk_template_impl<", "fn arg_u64(");

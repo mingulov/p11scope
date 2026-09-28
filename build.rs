@@ -343,6 +343,8 @@ fn build_variant(
             "link-arg=--export=p11_decode_params",
             "-C",
             "link-arg=--export=p11_walk_template",
+            "-C",
+            "link-arg=--export=p11_walk_template_types",
         ] {
             append_flag(flag);
         }

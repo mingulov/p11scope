@@ -361,15 +361,15 @@ SCALAR_CALLS = {
                 1219: 9, 1276: 16, 1446: "join", 1460: "get"},
     "p11_entry_template": {2527: 6, 2540: 7, 2552: 10, 2569: 11,
                            2585: 9, 2677: 8, 2727: 12, 2738: 13},
-    "p11_entry_template_pair": {3036: 6, 3049: 7, 3061: 10, 3078: 11,
-                                3094: 9, 3186: 8, 3236: 12, 3247: 13},
-    "p11_entry_template_types": {3694: 6, 3707: 7, 3719: 10, 3736: 11,
-                                 3752: 9, 3844: 8, 3894: 12, 3905: 13},
-    "p11_entry_template_second": {3472: 14, 3484: 15},
+    "p11_entry_template_pair": {3034: 6, 3047: 7, 3059: 10, 3076: 11,
+                                3092: 9, 3184: 8, 3234: 12, 3245: 13},
+    "p11_entry_template_types": {3692: 6, 3705: 7, 3717: 10, 3734: 11,
+                                 3750: 9, 3842: 8, 3892: 12, 3903: 13},
+    "p11_entry_template_second": {3470: 14, 3482: 15},
 }
 SEMANTIC_INSERT = {"default": 1244, "p11_entry": 1493, "p11_entry_ia32": 2175,
-                   "p11_entry_template": 2770, "p11_entry_template_pair": 3279,
-                   "p11_entry_template_types": 3942}
+                   "p11_entry_template": 2770, "p11_entry_template_pair": 3277,
+                   "p11_entry_template_types": 3935}
 BYTE_DOMAIN = frozenset(range(256))
 # TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot of TAIL_CALLS,
 # STACK_GUARD, or PAIR_CALLS has (always falls through).
@@ -682,17 +682,13 @@ class SinkProof:
                 require(before.get("r1") == self.scalar(8) and before.get(("nonnull",)) is True,
                         error("decoder mechanism field 8 pointer"))
                 self.boundaries.add("decoder")
-        if target == "p11_walk_template" or "walk_template_types" in target:
+        if target == "p11_walk_template" or target == "p11_walk_template_types":
             ordinary = target == "p11_walk_template"
             require((ordinary and self.mode in (1, 3, "second")) or (not ordinary and self.mode == 2), error("mode walker callee"))
-            if ordinary:
-                destination = (("owned", self.start[1], 0xb0) if self.mode == "second"
-                               else ("stack", self.start[1]+0x60))
-                require(before.get("r3") == ("constant", 4 if self.abi else 8)
-                        and before.get("r4") == destination, error("mode walker word bytes/output/owned START"))
-            else:
-                require(f"walk_template_typesKb{self.abi}_" in target
-                        and before.get("r3") == self.start, error("mode types layout/whole START"))
+            destination = (("owned", self.start[1], 0xb0) if self.mode == "second"
+                           else ("stack", self.start[1]+0x60))
+            require(before.get("r3") == ("constant", 4 if self.abi else 8)
+                    and before.get("r4") == destination, error("mode walker word bytes/output/owned START"))
             if self.role == "template":
                 ptr, count = (14, 15) if self.mode == "second" else (12, 13)
                 require(before.get("r1") == self.scalar(ptr) and before.get("r2") == self.scalar(count),

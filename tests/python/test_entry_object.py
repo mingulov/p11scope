@@ -239,10 +239,10 @@ class EntryObjectTests(unittest.TestCase):
             ("p11_entry_template", site('unsafe', 'p11_entry_template', 'r4\\ \\+=\\ \\-0xc8'), "r4 += -0x78"),
             ("p11_entry_template", site('unsafe', 'p11_entry_template', 'r3\\ =\\ 0x8', 0), "r3 = 0x4"),
             ("p11_entry_template", site('unsafe', 'p11_entry_template', 'r1\\ =\\ r8', 1), "r1 = r2"),
-            ("p11_entry_template_pair", site('unsafe', 'p11_entry_template_pair', 'r3\\ =\\ 0x1'), "r3 = 0x0"),
+            ("p11_entry_template_pair", site('unsafe', 'p11_entry_template_pair', 'r3\\ =\\ 0x0', 1), "r3 = 0x1"),
             ("p11_entry_template_pair", site('unsafe', 'p11_entry_template_pair', 'if\\ r0\\ ==\\ 0x0\\ goto\\ \\+0x9'), "if r0 != 0x0 goto +0x9"),
-            ("p11_entry_template_types", site('unsafe', 'p11_entry_template_types', 'r3\\ \\+=\\ \\-0x128', 0), "r3 += -0xc8"),
-            ("p11_entry_template_types", site('unsafe', 'p11_entry_template_types', 'if\\ r7\\ ==\\ 0x0\\ goto\\ \\+0x17'), "if r7 != 0x0 goto +0x17"),
+            ("p11_entry_template_types", before_call('unsafe', 'p11_entry_template_types', 'p11_walk_template_types', r'r4 \+= -0xc8'), "r4 += -0x78"),
+            ("p11_entry_template_types", before_call('unsafe', 'p11_entry_template_types', 'p11_walk_template_types', r'r3 = 0x8'), "r3 = 0x4"),
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r9\\ \\+=\\ 0xb0'), "r9 += 0x60"),
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r4\\ =\\ r9'), "r4 = r10"),
             ("p11_return", 1435, "if r8 != 0x1 goto +0x19"),
@@ -466,13 +466,13 @@ class EntryObjectTests(unittest.TestCase):
 
     def test_template_order_layout_and_disabled_controls(self):
         blocks = CHECKER["D"].function_blocks(OBJECTS["unsafe"])
-        types_callee = next(name for name in blocks if "walk_template_typesKb1_" in name)
+        types_callee = "p11_walk_template_types"
         cases = [("p11_entry_template", site('unsafe', 'p11_entry_template', 'r3\\ =\\ \\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x168\\)'), "r3 = *(u64 *)(r10 - 0x180)"),
                  ("p11_entry_template", site('unsafe', 'p11_entry_template', 'r3\\ =\\ \\*\\(u64\\ \\*\\)\\(r10\\ \\-\\ 0x198\\)'), "r3 = *(u64 *)(r10 - 0x160)"),
                  ("p11_entry_template", call_site("unsafe", "p11_entry_template", "p11_walk_template"), "r0 = 0x0"),
                  ("p11_entry_template_pair", call_site("unsafe", "p11_entry_template_pair", "p11_walk_template"), "r0 = 0x0"),
                  ("p11_entry_template_pair", after_call("unsafe", "p11_entry_template_pair", "p11_walk_template", r"call 0x1"), "call 0xc"),
-                 ("p11_entry_template_types", call_site("unsafe", "p11_entry_template_types", types_callee), internal_callee_instruction("unsafe", "walk_template_typesKb0_")),
+                 ("p11_entry_template_types", call_site("unsafe", "p11_entry_template_types", types_callee), "r0 = 0x0"),
                  ("p11_entry_template_second", call_site("unsafe", "p11_entry_template_second", "p11_walk_template"), "r0 = 0x0"),
                  ("p11_entry", before_call("unsafe", "p11_entry", "p11_decode_params", r"r3 = 0x8"), "r3 = 0x4"),
                  ("p11_entry_ia32", before_call("unsafe", "p11_entry_ia32", "p11_decode_params", r"r3 = 0x4"), "r3 = 0x8")]
@@ -489,13 +489,41 @@ class EntryObjectTests(unittest.TestCase):
                     CHECKER["contract"](changed, "unsafe")
 
     def test_ordinary_walker_cannot_become_types_walker(self):
-        blocks = CHECKER["D"].function_blocks(OBJECTS["unsafe"])
-        target = next(name for name in blocks if "walk_template_typesKb1_" in name)
         changed, count = re.subn(r"(R_BPF_64_32[ \t]+)p11_walk_template\b",
-                                 lambda match: match[1] + target, OBJECTS["unsafe"], count=1)
+                                 lambda match: match[1] + "p11_walk_template_types",
+                                 OBJECTS["unsafe"], count=1)
         self.assertEqual(count, 1, "actual ordinary-walker relocation must exist")
         with self.assertRaisesRegex(RuntimeError, "final-sink.*mode walker callee"):
             CHECKER["contract"](changed, "unsafe")
+
+    def test_types_walker_cannot_become_ordinary_walker(self):
+        changed, count = re.subn(r"(R_BPF_64_32[ \t]+)p11_walk_template_types\b",
+                                 lambda match: match[1] + "p11_walk_template",
+                                 OBJECTS["unsafe"], count=1)
+        self.assertEqual(count, 1, "actual types-walker relocation must exist")
+        with self.assertRaisesRegex(RuntimeError, "final-sink.*mode walker callee"):
+            CHECKER["contract"](changed, "unsafe")
+
+    def test_types_walker_cannot_call_local_directly(self):
+        call = call_site("unsafe", "p11_entry_template_types", "p11_walk_template_types")
+        for fragment in ("walk_template_typesKb0_", "walk_template_typesKb1_"):
+            with self.subTest(local=fragment):
+                name = next(n for n in CHECKER["D"].function_blocks(OBJECTS["unsafe"])
+                            if fragment in n)
+                relocated, count = re.subn(
+                    r"(R_BPF_64_32[ \t]+)p11_walk_template_types\b",
+                    lambda match: match[1] + name, OBJECTS["unsafe"], count=1)
+                self.assertEqual(count, 1, "actual types-walker relocation must exist")
+                old = dict(CHECKER["D"].instructions(
+                    CHECKER["D"].function_blocks(relocated)["p11_entry_template_types"]))[call]
+                changed = mutate(relocated, "p11_entry_template_types", call, old,
+                                 internal_callee_instruction("unsafe", fragment))
+                resolved = [target for caller, _, pc, target
+                            in CHECKER["D"].internal_call_targets(changed)
+                            if caller == "p11_entry_template_types" and pc == call]
+                self.assertEqual(resolved, [name])
+                with self.assertRaisesRegex(RuntimeError, "final-sink"):
+                    CHECKER["contract"](changed, "unsafe")
 
     def test_post_capture_overlap_and_atomic_corruption(self):
         old = "*(u32 *)(r10 - 0x68) = r4"

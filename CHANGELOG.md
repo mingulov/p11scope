@@ -107,9 +107,8 @@ provider during capture.
 - The older unvalidated decoders exist only in a build with the
   off-by-default `unsafe-unvalidated-metadata` Cargo feature *and* an explicit
   `--unsafe-unvalidated-metadata` flag. The release artifact is built with
-  `--no-default-features` and cannot enable them. That feature build loaded
-  on 6.8, 6.12, 7.0 and 7.2. It does not load on 5.15, because one of its
-  programs exceeds that kernel's 1,000,000-instruction verifier limit.
+  `--no-default-features` and cannot enable them. That feature build loads on
+  every qualified kernel including 5.15.
 - The field-by-field inventory is
   [docs/privacy/allowlist-v1.md](docs/privacy/allowlist-v1.md) plus the
   [allowlist-v2.md](docs/privacy/allowlist-v2.md) extension. The secret-canary
@@ -365,12 +364,22 @@ Fixes to defects found while qualifying this release, before it was tagged:
   because kernels with the CVE-2025-40123 fix require every program sharing a
   program array to have the same attach type. The release build does not
   include that code and was not affected.
+- The same feature build loads on Ubuntu 5.15 again. Its
+  `p11_entry_template_types` program exceeded that kernel's
+  1,000,000-instruction verifier limit, because the types-only walk ran as a
+  local subprogram the verifier re-explored per caller state. The walk now
+  runs behind its own verified-once global, like the full template walk, with
+  identical captured bytes. The release build does not include that code and
+  was not affected.
 <!-- TODO(release): add any further user-visible fixes merged before the tag. -->
 
 ### Qualification of this release
 
 Run on 2026-09-28 against release candidate `a7800dd`. Later commits change
-only scripts and documentation. The public-command qualification and the
+only scripts and documentation, plus the `unsafe-unvalidated-metadata`
+5.15 verifier fix, which leaves the release artifact unaffected: the default
+object disassembles identically with and without it. The public-command
+qualification and the
 Docker, shared-layer, kind and fork-scope lanes ran the static musl observer
 built by the official path of `scripts/build-release.sh` (sha256
 `9da91f3a60c8404741303841fe2a02df77c4607768f0cdce454ad5730f1ed022`). The
@@ -393,6 +402,12 @@ privacy canaries build their own binaries from the same tree.
   leak.
 - Overhead re-bench (`scripts/bench-overhead.sh`, host): all 15 observed
   samples valid; the numbers are in Known limitations item 9.
+- `unsafe-unvalidated-metadata` 5.15 verifier fix (this branch): the feature
+  build loads on Ubuntu 5.15.0-187 (`doctor` program preflight ok; the
+  pre-fix object fails there with E2BIG at `p11_entry_template_types`), and
+  an unsafe `run` of a SoftHSM `C_GetAttributeValue` workload captures the
+  same 21 attribute types on Ubuntu 5.15 and Ubuntu 6.8 as the pre-fix build
+  captures on 6.8, with identical per-function call counts.
 <!-- TODO(release): the owner adds the hosted CI run (checks-and-e2e, coverage, archive-log, release-preview) and the `scripts/build-release.sh` receipt and `SHA256SUMS` from the tag commit. -->
 
 ### Pre-release development history

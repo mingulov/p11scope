@@ -392,3 +392,5 @@ jobs:
       - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
       - run: scripts/run-flake-quarantine.sh
+        env:
+          TMPDIR: ${{ runner.temp }}

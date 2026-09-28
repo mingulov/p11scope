@@ -12,9 +12,9 @@
 //! absence is not a clean result. These diagnostics do not change the
 //! capture verdict or report schema.
 
-/// Worst observed forced-sweep tick: the 3.1-repair E-system-tick max
-/// (`31r-esys4`, `docs/notes/2026-09-20-task-3.1-repair.md`). A tick slower
-/// than this exceeds every measured forced sweep.
+/// Historical forced-sweep maximum (`31r-esys4`, measured 2026-09-20).
+/// This is a diagnostic threshold, not a latency guarantee; see
+/// `docs/qualification/first-use-contract.md` for its interpretation.
 pub const TICK_LATENCY_MAX_MS: u64 = 1_895;
 /// A drain gap this long means the loop stopped draining: ~5x the worst
 /// observed tick, 10x the profile cadence, 50x the trace cadence.

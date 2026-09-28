@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# System resource and latency pilot: T2 inputs to T7/T12
+# System resource and latency measurement protocol
 
 This protocol freezes the pilot axes, denominators and failure rules. It
-does not declare a production performance envelope. The static T7 tests
+does not declare a production performance envelope. The static inventory tests
 establish entry evidence in an owned fixture; they do not measure arbitrary
 host workloads, public discovery fairness, sustained counts or customer
 latency. Final qualification repeats applicable cells on the installed
@@ -30,7 +30,7 @@ artifact and every claimed kernel/profile combination.
 | Axis | Initial points and purpose |
 | --- | --- |
 | Physical targets | 1, 64, 512, 576, 1024, 2112, 4097, 6530; 8192 is the existing FD-refusal cell under soft limit 8192, not an 8192-capture claim |
-| Lifetime count | More than 16384 sequential lifetimes with low concurrent occupancy; retain the ordinary allocator control and add native acceptance in T7-r3 |
+| Lifetime count | More than 16384 sequential lifetimes with low concurrent occupancy; compare ordinary allocator controls with native identity/capacity evidence |
 | Target arrival | Pre-existing, late file-backed publication, late heap publication, unload/reload, new inode with equal bytes, previously unseen object |
 | Callers | One caller baseline, then 8, 64 and 257 concurrent owners; preserve distinct user/process/generation denominators |
 | Calls | Quiet baseline, paced steady traffic and bounded bursts; pilot rates are measured achieved rates, with offered and completed counts retained separately |
@@ -73,11 +73,12 @@ recorded independently and never counted as completed work.
    does not establish complete capture.
 
 The pilot must produce a table of measured limits and proposed operational
-defaults before T12 chooses customer-facing performance claims. No CPU,
+defaults before making customer-facing performance claims. No CPU,
 throughput, latency or shutdown threshold is silently inferred from a test
-timeout. In particular, T7's per-link retirement allowance is a harness
+timeout. In particular, the static fixture's per-link retirement allowance is a harness
 deadline, and the 576 point is neither a new product ceiling nor a universal
-safe default. Broader acceptance still belongs to the final test manifest.
+safe default. Broader acceptance belongs to the
+[acceptance manifest](system-test-manifest.md).
 
 ## Stop and preserve
 

@@ -1,33 +1,28 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# spike/
+# Experimental sources and retained fixtures
 
-Throwaway-feasibility experiments live here — but two files graduated to
-load-bearing e2e fixtures, so this directory cannot simply be deleted.
+This directory contains early feasibility experiments and source inputs
+that remain part of reproducible product checks.
 
-## Live (do not move)
+## Live fixtures
 
-- `harness.c` + `expected.txt` — deterministic SoftHSM workload and its
-  ground-truth oracle, compiled and asserted by
-  `scripts/verify-attach-e2e.sh` (Gate G1).
-- `discover.c` — v2.40 `CK_FUNCTION_LIST` index reference cited by
-  `scripts/fixtures/*` and `scripts/matrix/fork-harness.c` comments.
-- `Dockerfile` — original SoftHSM holder shape; the committed K8s holder
-  (`deploy/Dockerfile.holder`) is modeled on it.
+- `harness.c` and `expected.txt` supply the deterministic SoftHSM workload
+  and its ground-truth oracle for `scripts/verify-attach-e2e.sh`.
+- `discover.c` supplies the v2.40 `CK_FUNCTION_LIST` index reference cited
+  by fixture source comments under `scripts/fixtures/` and `scripts/matrix/`.
+- `Dockerfile` records the SoftHSM holder shape used by
+  `deploy/Dockerfile.holder`.
 
-## Historical (kept for provenance, executed by nothing)
+## Historical experiments
 
-- `aya-offset-pin/` — evidence for `docs/notes/aya-offset-semantics.md`.
-- `check.sh`, `gen-bt.sh` — phase-0 feasibility helpers (Aug 2026).
-- `work/` — gitignored scratch (binaries, tokens, manifests, outputs).
+- `aya-offset-pin/` records the distinction between an ELF virtual address
+  and the object-file byte offset used for uprobes; see
+  [the offset contract](../docs/notes/aya-offset-semantics.md).
+- `check.sh` and `gen-bt.sh` are the original feasibility helpers.
+- `slice1b2-kernel/` and `slice1b2-loader-host/` retain the kernel and
+  loader experiment sources and their runners.
+- `work/` is ignored scratch output, not a source or qualification input.
 
-## Relocated 2026-09-15
-
-The Slice 1b-2 experiment bundle (`slice1b2-kernel`, `slice1b2-loader`,
-`slice1b2-loader-bpf`, `slice1b2-loader-host`: TCG verifier-gate runner,
-loader witness harnesses, BPF/host fixtures) moved to
-`preserved/2026-09-15-spike-slice1b2/`. Nothing executes these — no
-script, test, or workspace member references them; the productized
-discovery engine (`src/discovery/`) superseded them. They are kept
-because the slice-1b-2 plans and `docs/notes/slice1b2*` pin analyses by
-SHA-256 against these sources. Historical plan prose still says
-`spike/slice1b2-…`; read it as the preserved path above.
+The production discovery engine lives under `src/discovery/`. Historical
+campaign reports live in the development workspace; retained experiment
+sources remain here alongside the fixtures.

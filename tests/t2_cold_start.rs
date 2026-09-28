@@ -8,8 +8,8 @@
 //! named cause, nothing panics, and a spoofed `SUDO_UID` changes no doctor
 //! verdict. Environment-dependent lanes branch on the observer's own doctor
 //! verdict instead of assuming this host's capture lane, so the suite is
-//! unprivileged-safe. Findings and the full gap enumeration live in
-//! `docs/qualification/system-first-use.md`.
+//! unprivileged-safe. The distinction between startup checks and first-call
+//! qualification is in `docs/qualification/first-use-contract.md`.
 
 use std::process::Command;
 

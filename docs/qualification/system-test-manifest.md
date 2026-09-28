@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # System acceptance manifest v1
 
-`system-test-manifest.json` is the checked-in register, not a claim that its
+`tests/fixtures/system-qualification/system-test-manifest.json` is the
+checked-in acceptance fixture, not a claim that its
 tests have run. Initially all 214 cells are `NOT_RUN`: 147 closure findings,
 43 deferred-work groups,
 10 client requirements through public commands, seven private T7 cells,
@@ -11,8 +12,10 @@ group G-09 do not gate the product claim. Source-fixed
 or refuted findings retain their disposition in the limitation field; the
 final audit still needs a named check and an execution receipt at its pin.
 
-The authority is the closure ledger, `system-deferred-gates.json` and `catalog()` in
-`scripts/verify-system-test-manifest.py`. Changes to required cells, levels,
+The policy inputs are `closure-ledger.json` and `system-deferred-gates.json`
+under `tests/fixtures/system-qualification/`, interpreted by `catalog()` in
+`scripts/verify-system-test-manifest.py`. The historical IDs and owner labels
+are stable fixture data. Changes to required cells, levels,
 profiles or claims must be reviewed there; a submitted manifest cannot
 drop a row, remove its claim membership, or relabel its evidence level.
 Unknown cells are refused so newly required lanes cannot be silently ignored.
@@ -21,7 +24,7 @@ The fixed 147-row assertion makes changes to the ledger inventory explicit.
 ```sh
 python3 -I tests/python/test_system_test_manifest.py -v
 python3 -I scripts/verify-system-test-manifest.py \
-  --manifest docs/qualification/system-test-manifest.json \
+  --manifest tests/fixtures/system-qualification/system-test-manifest.json \
   --evidence-root . --check-structure
 ```
 
@@ -55,11 +58,11 @@ also requires the installed command. Installed/soak receipts identify the
 timestamps covering 1800, 14400 or 86400 seconds respectively.
 
 `final-supported-matrix` is deliberately an unqualifiable placeholder.
-T11/T12 must expand those entries into concrete kernel/profile cells and
-register exact test bodies before closing them. An aggregate label cannot
-substitute for missing kernel tests. Existing named T7 selectors are filled
-in the initial register; other owners fill their real test inventory as
-their tasks are implemented.
+Before qualification, expand those entries into concrete kernel/profile
+cells and register exact test bodies in the policy. An aggregate label
+cannot substitute for missing kernel tests. The seven static selectors
+are filled in the initial fixture; the remaining rows are not executable
+qualification until their concrete tests are registered.
 
 This checks receipt consistency and artifact custody. It does not make an
 invented receipt true, validate every product oracle, or replace review of
@@ -67,7 +70,7 @@ the owned runner and its logs. Exact workload denominators, physical joins,
 scope, loss, terminal output and cleanup belong to each registered test.
 Failure logs remain preserved when a successor run is made.
 
-## Owned T7 runner
+## Owned static campaign runner
 
 `scripts/run-t7-static-campaign.py --pins PIN_JSON --output NEW_DIRECTORY`
 runs the fixed seven selectors once, serially, from prebuilt pins. It holds

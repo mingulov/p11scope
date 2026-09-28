@@ -6989,7 +6989,6 @@ fn operator_docs_preserve_semantic_authority_limits() {
             "CHANGELOG.md",
             "Manifest-free (scan-only) function slots are semantics-unverified and count-only",
         ),
-        ("docs/superpowers/plans/ROADMAP.md", "exact-tip CI"),
     ] {
         assert!(
             read(path)
@@ -7000,21 +6999,6 @@ fn operator_docs_preserve_semantic_authority_limits() {
             "{path} is missing: {statement}"
         );
     }
-
-    let roadmap = read("docs/superpowers/plans/ROADMAP.md")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    assert!(
-        roadmap.contains("exact-tip ci") && roadmap.contains("pending"),
-        "ROADMAP must say exact-tip CI is pending"
-    );
-    assert!(
-        roadmap.contains("ci remains pending")
-            && roadmap.contains("no release or security-clearance claim applies yet"),
-        "ROADMAP must keep CI and release authority pending"
-    );
 }
 
 /// The release docs describe one version: the CHANGELOG has exactly one heading
@@ -10369,20 +10353,11 @@ fn aggregate_policy_returns_before_both_events_reserves() {
 //   `GPL-3.0-or-later` elsewhere.
 //
 // Documented exemptions (each pinned below so it cannot silently rot):
-// (a) `CLAUDE.md` is a symlink to the headered `AGENTS.md`;
-// (b) the relicense plan quotes the header formats verbatim, so a
-//     first-line header would be ambiguous (Task 2 idempotency skip);
-// (c) the 24 C fixtures below are test INPUT (parsed/copied/compiled by
-//     tests at runtime) and stay headerless;
-// (d) `preserved/` and `third-party/src/` hold zero tracked files;
-// (e) three historical plan docs still name the pre-relicense texts.
+// test-input C fixtures remain headerless, and generated third-party source
+// trees remain untracked. Internal plans and agent guides live outside the
+// public repository and need no source-tree license exemptions.
 
-// The relicense plan (exemption (b)): quotes the Rust, Python/Shell, and
-// Markdown header formats verbatim (plan lines 18-21; Python and Shell
-// share one `#` spelling, BPF reuse is prose, not a fourth literal).
-const LICENSE_PLAN_EXEMPTION: &str = "docs/superpowers/plans/2026-09-17-relicense-gpl.md";
-
-// Test-input C fixtures (exemption (c)): each is consumed by the test named
+// Test-input C fixtures: each is consumed by the test named
 // in the comment (location rule: tests/fixtures, scripts/fixtures,
 // crates/discover/tests/fixture stay exempt).
 const LICENSE_C_FIXTURES: &[&str] = &[
@@ -10415,14 +10390,6 @@ const LICENSE_C_FIXTURES: &[&str] = &[
     "tests/fixtures/task-owner/helper_tests.c", // tests/task_owner_contracts.rs (also included by root-affiliation/helper_tests.c)
 ];
 
-// Historical plan prose that still names the pre-relicense texts
-// (exemption (e), Task 1 ruling: history is not rewritten).
-const LICENSE_LEGACY_TEXT_EXEMPTIONS: &[&str] = &[
-    "docs/superpowers/plans/2026-08-11-phase1a-discover.md",
-    "docs/superpowers/plans/2026-08-11-phase1b-attach-engine.md",
-    "docs/superpowers/plans/2026-09-17-relicense-gpl.md",
-];
-
 // Pre-relicense markers. Spelled via concat! so this very file (which the
 // scan below reads) never contains them contiguously.
 const LICENSE_REMOVED_TEXTS: &[&str] = &[concat!("LICENSE-", "MIT"), concat!("LICENSE-", "APACHE")];
@@ -10441,9 +10408,6 @@ const LICENSE_MANIFESTS: &[(&str, &str)] = &[
 ];
 
 fn license_expected_header(path: &str) -> Option<&'static str> {
-    if path == "CLAUDE.md" || path == LICENSE_PLAN_EXEMPTION {
-        return None;
-    }
     if path.ends_with(".c") || path.ends_with(".h") {
         if LICENSE_C_FIXTURES.contains(&path) {
             return None;
@@ -10676,9 +10640,6 @@ fn license_legal_surface_errors(root: &std::path::Path, tracked: &[String]) -> V
         }
     }
     for path in tracked {
-        if LICENSE_LEGACY_TEXT_EXEMPTIONS.contains(&path.as_str()) {
-            continue;
-        }
         let full = root.join(path);
         if full
             .symlink_metadata()
@@ -10713,8 +10674,7 @@ fn license_headers_cover_every_tracked_source_file() {
         violations.join("\n")
     );
 
-    // Pin exemption (a): CLAUDE.md is the only in-scope symlink, and it
-    // stays a symlink to the headered AGENTS.md.
+    // No in-scope source file may evade its header through a symlink.
     let symlinks: Vec<&str> = tracked
         .iter()
         .filter(|path| {
@@ -10725,38 +10685,12 @@ fn license_headers_cover_every_tracked_source_file() {
         })
         .map(String::as_str)
         .collect();
-    assert_eq!(
-        symlinks,
-        ["CLAUDE.md"],
-        "only CLAUDE.md may be an in-scope symlink"
-    );
-    assert_eq!(
-        std::fs::read_link("CLAUDE.md").expect("read CLAUDE.md link"),
-        std::path::PathBuf::from("AGENTS.md"),
-        "CLAUDE.md must keep pointing at the headered AGENTS.md"
+    assert!(
+        symlinks.is_empty(),
+        "in-scope source symlinks: {symlinks:?}"
     );
 
-    // Pin exemption (b): the plan still has no first-line header (that is
-    // why it is exempt) and still quotes the formats (that is why a
-    // first-line header would be ambiguous).
-    let plan = read(LICENSE_PLAN_EXEMPTION);
-    assert_ne!(
-        plan.lines().next().unwrap_or(""),
-        "<!-- SPDX-License-Identifier: GPL-3.0-or-later -->",
-        "the plan gained a first-line header; drop its exemption"
-    );
-    for quoted in [
-        "//! SPDX-License-Identifier: GPL-3.0-or-later",
-        "# SPDX-License-Identifier: GPL-3.0-or-later",
-        "<!-- SPDX-License-Identifier: GPL-3.0-or-later -->",
-    ] {
-        assert!(
-            plan.contains(quoted),
-            "the plan no longer quotes {quoted}; re-check its exemption"
-        );
-    }
-
-    // Pin exemption (c): every C fixture is still tracked (stale entries
+    // Every exempt C fixture is still tracked (stale entries
     // fail) and still headerless (a headed fixture moves in scope).
     for fixture in LICENSE_C_FIXTURES {
         assert!(
@@ -10770,7 +10704,7 @@ fn license_headers_cover_every_tracked_source_file() {
         );
     }
 
-    // Pin exemption (d): the empty dirs stay empty of tracked files.
+    // Generated/internal directories stay empty of tracked files.
     for empty in ["preserved/", "third-party/src/"] {
         assert!(
             tracked.iter().all(|path| !path.starts_with(empty)),
@@ -10788,21 +10722,6 @@ fn license_legal_surface_matches_policy() {
         "legal-surface violations:\n{}",
         errors.join("\n")
     );
-
-    // Pin exemption (e): each historical plan still needs its exemption.
-    for exempt in LICENSE_LEGACY_TEXT_EXEMPTIONS {
-        assert!(
-            tracked.iter().any(|path| path == exempt),
-            "exempt plan {exempt} is no longer tracked; drop its exemption"
-        );
-        let text = read(exempt);
-        assert!(
-            LICENSE_LEGACY_MARKERS
-                .iter()
-                .any(|marker| text.contains(marker)),
-            "exempt plan {exempt} no longer names a pre-relicense text; drop its exemption"
-        );
-    }
 }
 
 fn license_write_fixture(root: &std::path::Path, path: &str, content: &[u8]) {
@@ -10860,10 +10779,6 @@ fn license_header_checker_rejects_bad_fixtures() {
         ),
         ("notes.txt", b"no header needed out of scope\n"),
         // Exempt shapes are accepted even without headers.
-        (
-            "docs/superpowers/plans/2026-09-17-relicense-gpl.md",
-            b"# plan prose without a first-line header\n",
-        ),
         (
             "tests/fixtures/bpf-map-defs/mixed.c",
             b"int probe(void *ctx) { return 0; }\n",

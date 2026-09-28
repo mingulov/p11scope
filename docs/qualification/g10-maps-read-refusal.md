@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# G-10: unavailable maps snapshots
+# Unavailable maps snapshots
 
 Initial candidate selection and periodic reconciliation read process maps
 before choosing a deep scan. These reads provide prioritization hints;
@@ -39,7 +39,8 @@ Two behavioral regressions failed on the previous implementation: failed
 open and expired-budget reconciliation emitted no unavailable evidence.
 The successful-read control passed on that same implementation.
 
-This repair addresses one G-10 requirement. It does not establish resumable
-scanning, fair progress across all discovery owners, bounded service latency,
-first-use coverage or live system-scale qualification. Those obligations
-remain in the product completion plan.
+This behavior does not establish resumable scanning, fair progress across
+all discovery owners, bounded service latency, first-use coverage or live
+system-scale qualification. See the [first-use contract](first-use-contract.md)
+and the [release qualification record](../../CHANGELOG.md#qualification-of-this-release)
+for those distinct evidence requirements.

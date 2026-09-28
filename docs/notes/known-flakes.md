@@ -1,158 +1,40 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Known environmental test flakes (created 2026-09-18, profiling-fixes Task 3)
+# Environmental test failure signatures
 
-Full-workspace runs fail ~1 test/run; each entry below is green in
-isolation (at least one green single-test run on record), green on other
-full runs, and — where a pristine-base comparison was run — identical on
-the base tree. Same code, different result ⇒ load/timing flakes, not
-logic breaks.
+These signatures were recorded in September 2026 and identify cases that
+have failed intermittently under parallel suite load. Some also failed in
+isolation. They are diagnostic history, not evidence that a new failure is
+harmless or that the current revision passes. The
+[quarantine mapping](test-quarantine.md) names the exact maintained selectors.
 
-Log pointers in `$TMPDIR` (`/var/tmp/p11scope-ws-tmp/`, uncommitted
-scratch from the usability, refactor-queue, and shebang-gate plans) are
-named per file so a future triager can match signatures; the
-profiling-fixes Task 2 gate logs
-(`.superpowers/sdd/2026-09-17-profiling-fixes/gates-task2/`, gitignored
-worktree scratch — `/.superpowers/` is gitignored, so like the `$TMPDIR`
-logs these will not survive worktree retirement) are likewise named per
-file and carry entries 5–6 plus fresh isolation evidence for entries
-1–3. The Task 4 suite logs in the same directory (likewise gitignored
-worktree scratch) carry entry 7. Match on the recorded signatures and
-durable facts, not the log paths.
+## Triage protocol
 
-## Triage protocol (every entry)
+1. Preserve the original failed run, source revision, build profile, test
+   binary, host load and error text. Do not replace a red result with a later
+   green log.
+2. Run the exact failing selector serially with the same binary/profile.
+   Use the private disk-backed `TMPDIR` described in
+   [contributor verification](../../CONTRIBUTING.md#verification). For a new
+   build, use the pinned repository wrapper and prepared dependencies.
+3. Compare a pristine baseline when the cause is ambiguous. A matching
+   failure can establish that the regression predates the change, but a
+   pass in isolation alone does not establish the cause.
+4. Match the actual mechanism to the signature. Retain assertion strength,
+   test inventory and bounded deadlines. Fix a demonstrated causal race;
+   do not increase budgets merely to make a run green.
 
-1. **Isolate** — re-run the single test alone:
-   `TMPDIR=/var/tmp/p11scope-ws-tmp cargo +1.88 test --locked --offline
-   --test artifact_contracts -- <name>` (`--lib` for entries 5 and 7). Green ⇒
-   load flake; record the log.
-2. **Pristine-base compare** — if isolation is red or ambiguous, run the
-   same filter on a pristine `git archive HEAD` tree (+ gitignored
-   `third-party/src/` copied in). Base-identical behavior exonerates the
-   branch.
-3. **Never weaken** — no assertion softening, no suite shrinking, no gate
-   changes. A red full run needs per-failure triage (isolate + base +
-   mechanism match to a signature below) before any code conclusion.
+## Recorded signatures
 
-## 1. `lane13_evidence_finalizes_only_after_owned_cleanup` (artifact_contracts)
+| Exact selector | Target | Signature |
+| --- | --- | --- |
+| `lane13_evidence_finalizes_only_after_owned_cleanup` | `artifact_contracts` | Readiness/deadline race: `setup-ready-timeout`, original exited before return, or a decoy still live. This is a long-running fixture; a “running for over 60 seconds” notice alone is not failure. |
+| `metadata_canary_matrix` | `artifact_contracts` | Rotating canary subtest errors under load, including `test_json_acquisition_deadline_includes_exit_after_pipe_eof` with a missing `eof-child.pid`. Preserve the failed native subtest and pidfile/custody evidence. |
+| `stopped_canary_capture_lifecycle` | `artifact_contracts` | `test_owned_missing_capture` expected a phase deadline but received a readiness `CustodyError` and custody-close `CleanupError`s. Preserve both the original failure and cleanup outcome. |
+| `native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup` | `artifact_contracts` | Rotating `RecordedLauncherTests` deadline, acknowledgement and cleanup failures; `pidfd-open-gone` after a recorded-launch deadline is one recorded form. |
+| `actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines` | library | `Instant::now() < reap_deadline + Duration::from_millis(100)` exceeded under parallel load. The deadline is the contract; an isolated pass does not justify renewing it. |
+| `release_seal_denies_the_caller_path_to_every_reached_command` | `artifact_contracts` | Missing `sealed-environment` artifacts, empty output where `sudo` was expected, and related Cargo-home/sysroot closure failures in the same run. |
+| `signal_settlement_observes_second_sigint_during_fallback_term_grace` | library | Signal settlement returns `Err(Deadline)` while coordinating SIGINT/SIGTERM across threads. Retain the signal and cleanup sequence when investigating. |
 
-- **Signature:** readiness/deadline race —
-  `setup-ready-timeout: outer exit=1; original exited before return;
-  decoy live`; long-runner (200–270 s; "running for over 60 seconds"
-  notices while healthy).
-- **Evidence:** full-run reds in `usability-t5-run1.log`,
-  `usability-t5-run2.log`, `refactor-t7-1.log`, `refactor-t7-gate1.log`,
-  `refactor-t7-gate2.log`, `shebang-gate2.log`, `gate-iso-artifact.log`
-  (full artifact target), `gate-run-D.log`. Green in isolation:
-  `usability-t5-iso-lane13b.log` (271 s), pristine-base
-  `usability-t5-base-lane13.log` (253 s),
-  `gate-iso-lane13_evidence_finalizes_only_after_owned_cleanup.log`
-  (205 s); Task 2 `gates-task2/isolate-lane13.log` (229 s, run-2-only
-  failure). One isolation attempt (`usability-t5-iso-lane13.log`) was
-  itself red — intermittent even alone, which is the point: timing, not
-  code.
-
-## 2. `metadata_canary_matrix` (artifact_contracts)
-
-- **Signature:** rotating subtest failure inside the wrapped
-  `scripts/verify-canaries.sh --self-test` (60 s timeout harness, panic
-  at `tests/artifact_contracts.rs:1187`) or the native 64-bit canary run
-  (`:6321`). Observed instance: `ERROR:
-  test_json_acquisition_deadline_includes_exit_after_pipe_eof ...
-  FileNotFoundError: .../eof-child.pid` — a pidfile race under load.
-- **Evidence:** full-run reds in `usability-t5-run1.log`,
-  `usability-t5-run2.log`, `refactor-t7-1.log`, `refactor-t7-gate1.log`,
-  `shebang-gate2.log`, `gate-run-D.log`, `gate-iso-artifact.log`. Green
-  in isolation: `usability-t5-iso-metadata.log` (107 s); Task 2
-  `gates-task2/isolate-metadata-canary.log` (94 s, run-2-only failure).
-  Red in `gate-iso-metadata_canary_matrix.log` (96.92 s) — intermittent
-  even alone.
-
-## 3. `stopped_canary_capture_lifecycle` (artifact_contracts)
-
-- **Signature:** rotating subtest FAIL in `StoppedCanaryCaptureTests`,
-  e.g. `FAIL: test_owned_missing_capture`. Failing in run 3 after
-  passing isolation is the textbook load-flake signature.
-- **Evidence:** full-run reds in `usability-t5-run1.log`,
-  `gate-run-C.log`, `gate-run-D.log`. Green in isolation:
-  `usability-t5-iso-stopped.log` (63 s); Task 2
-  `gates-task2/isolate-stopped-canary.log` (56 s; failed full runs 2
-  AND 3).
-- **Recurrence 2026-09-23 (canonical gate at `f0d1801`, wide profile):**
-  `FAIL: test_owned_missing_capture`: `owned_case` expected
-  `phase deadline expired` but the owned readiness phase ended with
-  `CustodyError` plus custody-close `CleanupError`s. Three isolated
-  re-runs of the same wide `artifact_contracts` binary: PASS (42.7 s,
-  43.1 s, 42.7 s). The default-profile run of the same gate passed this
-  test.
-
-## 4. `native_helper_suite_recorded_launcher_requires_authenticated_generations_and_bounded_cleanup` (artifact_contracts)
-
-- **Signature:** rotating FAIL/ERROR across `RecordedLauncherTests`
-  deadline/ack/cleanup subtests — different subtests each run
-  (`test_correct_ack_consumed_after_deadline_cannot_exec`,
-  `test_split_ack_interruption_cleans_up_original_launcher_handle`,
-  `test_missing_root_self_resumed_after_deadline_never_enters_target`,
-  `test_authenticated_adoption_reaps_only_pinned_orphan`, …). The
-  rotation itself is the signature.
-- **Evidence:** full-run reds in `usability-t5-run1.log`,
-  `refactor-t7-2.log`, `shebang-gate2.log`, `gate-run-D.log`; green in
-  18 other logs including the full artifact target
-  (`gate-iso-artifact.log`, where two *other* ledgered tests failed —
-  failures are independent). Isolation runs are intermittent too
-  (`usability-t5-iso-recorded.log` and pristine-base
-  `usability-t5-base-recorded.log` both red with *different* subtests),
-  which exonerates the branch by base-identical behavior.
-- **Recurrence 2026-09-23 (canonical gate at `8cee338`, wide profile):**
-  `test_split_ack_interruption_cleans_up_original_launcher_handle`, adoption
-  `reason=pidfd-open-gone` after `recorded launch deadline expired`, on a
-  host that was also running six unrelated QEMU guests. Isolated re-run of
-  the same `artifact_contracts` binary: PASS (31.7 s). The default-profile
-  run of the same gate passed this test.
-
-## 5. `run::tests::actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines` (lib; new in Task 2)
-
-- **Signature:** 100 ms timing budget exceeded under parallel load:
-  `assertion failed: Instant::now() < reap_deadline +
-  Duration::from_millis(100)` at `src/run.rs:4455`.
-- **Evidence (worktree scratch — gitignored, will not survive worktree
-  retirement; durable facts recorded here):**
-  `gates-task2/full-suite.log` (Task 2 run 1 only),
-  `gates-task2/isolate-handoff.log` (PASS, 0.01 s),
-  `gates-task2/base-handoff.log` (pristine-base PASS).
-- **Recurrence 2026-09-23 (canonical gate at `8cee338`, default profile):**
-  same assertion, now at `src/run.rs:5291`. Three isolated re-runs of the
-  same default lib test binary: PASS (0.01 s each). The wide-profile run of
-  the same gate passed this test.
-- **Recurrence 2026-09-25 (canonical gate at `90b44ff`, wide profile):**
-  same assertion, now at `src/run.rs:6555`. Three isolated re-runs of the
-  same wide lib test binary (`p11scope-c0b65c82a1d894ac --exact ...`):
-  PASS. Default profile of the same gate passed this test. Gate accepted.
-
-## 6. `release_seal_denies_the_caller_path_to_every_reached_command` (artifact_contracts; new in Task 2)
-
-- **Signature:** several `ReleaseSealTests` subtests FAIL/ERROR at once
-  under parallel load — seal-env artifacts missing or raced:
-  `FileNotFoundError: .../p11scope-release-seal-*/case/sealed-environment`,
-  `AssertionError: '' != 'sudo\n'`, plus cargo-home-closure and
-  sysroot-closure subtests in the same run.
-- **Evidence (worktree scratch — gitignored, will not survive worktree
-  retirement; durable facts recorded here):**
-  `gates-task2/full-suite-retry.log` (Task 2 run 2 only),
-  `gates-task2/isolate-release-seal.log` (PASS, 55 s),
-  `gates-task2/base-release-seal.log` (pristine-base PASS).
-
-## 7. `run::tests::signal_settlement_observes_second_sigint_during_fallback_term_grace` (lib; new in Task 4)
-
-- **Signature:** signal-timing — SIGINT/SIGTERM settlement across
-  threads with a deadline-bounded wait: `unwrap()` on `Err(Deadline)`
-  at `src/run.rs:5482`. Same timing-signature family as entry 5.
-- **Evidence (worktree scratch — gitignored, will not survive worktree
-  retirement; durable facts recorded here):**
-  `task-4-suite-run2.log` (Task 4 run 2 only: FAILED at line 1063,
-  panic detail lines 1074–1084, `test result: FAILED. 1054 passed; 1
-  failed`; fail-fast stop after lib), `task-4-isolate-signal.log`
-  (PASS in isolation, 0.12 s), `task-4-suite-run1.log` (line 937 ok)
-  + `task-4-suite-run2-retry.log` (line 936 ok). No pristine-base
-  compare: the branch touches zero `src/` files, so no mechanism
-  connects it to this lib signal-timing test — isolation-green + no
-  mechanism + green on both complete runs closes the triage.
+The quarantine lane runs these selectors once, serially, after a failed
+primary job. It is supporting evidence only: a green quarantine result
+never makes the failed workflow pass.

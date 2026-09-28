@@ -1,0 +1,1034 @@
+{
+  "schema": "p11scope/system-closure-ledger/v1",
+  "findings": [
+    {
+      "id": "F-01",
+      "title": "uretprobe-vs-seccomp fail-open",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`the_full_verdict_target_matrix_fails_closed` + oracle `exact_terminal_verdict`"
+    },
+    {
+      "id": "F-02",
+      "title": "completeness always PARTIAL",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "oracle `exact_terminal_verdict`"
+    },
+    {
+      "id": "F-03",
+      "title": "CI tests stale -p1, ships -p2",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`tests/python/test_ci_dependency_selection.py`"
+    },
+    {
+      "id": "F-04",
+      "title": "no hosted E2E in CI",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`ci.yml` privileged-e2e job"
+    },
+    {
+      "id": "F-05",
+      "title": "privileged parsers, no fuzz/PBT",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-06",
+      "title": "engine.rs god object",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-07",
+      "title": "run/attach/engine coupling",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-08",
+      "title": "untyped evidence constructor",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-09",
+      "title": "doctor always reads T0",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`tier_classification_reads_the_row_bpf_checks_actually_emits`"
+    },
+    {
+      "id": "F-10",
+      "title": "unsafe-decoder build SPOF",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-11",
+      "title": "shared-stdout O_NONBLOCK leak",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`stdout_sink_from_a_pipe_leaves_the_shared_description_blocking` (+socket/file)"
+    },
+    {
+      "id": "F-12",
+      "title": "metrics/profile split undocumented",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "oracle lane discriminator"
+    },
+    {
+      "id": "F-13",
+      "title": "sixth skip reason rejected",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`tests/python/test_skip_reason_vocabulary.py`"
+    },
+    {
+      "id": "F-14",
+      "title": "future-minor tables invisible",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "skip-reason vocab test (7 reasons)"
+    },
+    {
+      "id": "F-15",
+      "title": "unnamed live-child handoff",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "oracle `handoff_child_pid` pin"
+    },
+    {
+      "id": "F-16a",
+      "title": "silent history loss facet",
+      "disposition": "refuted",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-16b",
+      "title": "lifetime capacity facet",
+      "disposition": "required-open",
+      "owner_task": "T7",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-17",
+      "title": "hidden 10M trace cap",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-18",
+      "title": "global signal handlers",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-19",
+      "title": "unvalidated pub-field args",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-20",
+      "title": "inspect --json non-JSON path",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`soft_diagnosis_failure_with_json_prints_a_failure_document`"
+    },
+    {
+      "id": "F-21",
+      "title": "params:null ambiguity",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-22",
+      "title": "path labels as plain strings",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-23",
+      "title": "semantic collapse at scale",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-24",
+      "title": "mid-scan remap ABA residual",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-25",
+      "title": "pause-auto wedge",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`operator_stop_delivers_sigterm_to_a_held_child_then_escalates_within_the_bound`"
+    },
+    {
+      "id": "F-26",
+      "title": "invisible P11SCOPE_* switches",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "oracle `p11scope_env` pin"
+    },
+    {
+      "id": "F-27",
+      "title": "no advisory scanning",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`cargo audit` + `cargo deny check` (ci checks-and-e2e)"
+    },
+    {
+      "id": "F-28",
+      "title": "release bytes never built in CI",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`ci.yml` release-preview job"
+    },
+    {
+      "id": "F-29",
+      "title": "suite time + flakes",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`scripts/run-flake-quarantine.sh` (ci quarantine job)"
+    },
+    {
+      "id": "F-30",
+      "title": "docs/help drift",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`usage_doc_documents_every_cli_flag` + `tests/python/test_help_usage_drift.py`"
+    },
+    {
+      "id": "F-31",
+      "title": "4-artifact verdict predicate",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-32",
+      "title": "dual-backend equivalence gate",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-33",
+      "title": "discover helper sandbox",
+      "disposition": "required-open",
+      "owner_task": "T5/T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-34",
+      "title": "BPF trust root unaudited",
+      "disposition": "required-open",
+      "owner_task": "T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-35",
+      "title": "spoofing residuals",
+      "disposition": "required-open",
+      "owner_task": "T3",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-36",
+      "title": "stringly-typed errors",
+      "disposition": "required-open",
+      "owner_task": "T5/T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-37",
+      "title": "whole-history clones",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-38",
+      "title": "function_id per-call hotspot",
+      "disposition": "refuted",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-39",
+      "title": "cfg(test) in prod modules",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-40",
+      "title": "no coverage measurement",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`cargo llvm-cov --lib --fail-under-lines \"$(cat .coverage-floor)\"` (floor 83)"
+    },
+    {
+      "id": "F-41",
+      "title": "decoder/budget property gaps",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-42",
+      "title": "dual-authority consumer risk",
+      "disposition": "required-open",
+      "owner_task": "T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-43",
+      "title": "aya fork, no exit plan",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-44",
+      "title": "dead Tracker::identify",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-45",
+      "title": "re-round duplicate failures",
+      "disposition": "required-open",
+      "owner_task": "T5",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-46",
+      "title": "debug_assert UAPI layouts",
+      "disposition": "required-open",
+      "owner_task": "T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-47",
+      "title": "CLI parser edge gaps",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-48",
+      "title": "AtomicFile must-use/stat",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`final_name_is_never_stated_only_renamed_over`"
+    },
+    {
+      "id": "F-49",
+      "title": "trace line format",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-50",
+      "title": "schema-doc precision debt",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`tests/python/test_schema_json.py`"
+    },
+    {
+      "id": "F-51",
+      "title": "unsafe w/o Safety docs",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-52",
+      "title": "no shared lint config",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-53",
+      "title": "mapped-file SIGBUS race",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-54",
+      "title": "expect()-as-invariant",
+      "disposition": "required-open",
+      "owner_task": "T5/T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-55",
+      "title": "raw bytes in attach_failures",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-56",
+      "title": "discover -o hygiene",
+      "disposition": "required-open",
+      "owner_task": "T5/T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-57",
+      "title": "SUDO_UID selector semantics",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-58-T7",
+      "title": "u64 counter wraps in release",
+      "disposition": "required-open",
+      "owner_task": "T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-58-R2",
+      "title": "malformed-EVENTS forensics",
+      "disposition": "required-open",
+      "owner_task": "T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-58-R3",
+      "title": "saturating context_failures",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-58-R5",
+      "title": "sink-by-convention only",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-58-I3",
+      "title": "chmod-after-truncate window",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-58-D7",
+      "title": "EMFILE ends whole run",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-58-D8",
+      "title": "doctor detach-on-drop",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-58-E4",
+      "title": "symlink policy matrix",
+      "disposition": "required-open",
+      "owner_task": "T3",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-59",
+      "title": "doctor render newline split",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-60",
+      "title": "notes sprawl, no runbook",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-61a",
+      "title": "discarded userspace errors",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-61b",
+      "title": "BPF diagnostic notes",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-62",
+      "title": "no Python entry point; ignored",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-63",
+      "title": "no script lint in CI",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`shellcheck -S error scripts/` + `ruff check scripts/ tests/python/`"
+    },
+    {
+      "id": "F-64",
+      "title": "no levels/timestamps/quiet",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-65",
+      "title": "edition split; re-export nit",
+      "disposition": "required-open",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-66",
+      "title": "hand-rolled CLI parser",
+      "disposition": "optional",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-67",
+      "title": "overlay-collapse uncertainty",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-68",
+      "title": "--system breadth operator-gated",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-69",
+      "title": "no privsep; unsigned BPF obj",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "F-70",
+      "title": "full view cap blocks explore",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`e06_unique_provider_reached_within_bounded_frames` + T6/T12 live replay"
+    },
+    {
+      "id": "F-71",
+      "title": "budget rescan retires cover",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`e07_unchanged_complete_loader_rescan_retires_nothing` + live replay"
+    },
+    {
+      "id": "F-72",
+      "title": "C_GetInterface admission gaps",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`f_e08_named_gi_heap_matches_list_element` + live replay"
+    },
+    {
+      "id": "F-73",
+      "title": "interface rescans burn life",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`e09_repeated_interface_rescans_charge_once_but_work_every_time`"
+    },
+    {
+      "id": "F-74",
+      "title": "harness invents collapse cause",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`tests/python/test_measure_e03.py` (21 tests)"
+    },
+    {
+      "id": "F-75",
+      "title": "async cross-process collision",
+      "disposition": "source-fixed",
+      "owner_task": "T13",
+      "check": "`e20_collision_tombstone_lifecycle_matrix` + live E20 same-domain check NOT implemented (open, T9)"
+    },
+    {
+      "id": "R-01",
+      "title": "insecure-defaults x14",
+      "disposition": "refuted",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "R-02",
+      "title": "STRIDE mitigated x4",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "R-03",
+      "title": "differential cleared",
+      "disposition": "refuted",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "R-04",
+      "title": "mutants killed",
+      "disposition": "refuted",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "R-05",
+      "title": "verified-safe notes",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "R-06",
+      "title": "OASIS grounding gap",
+      "disposition": "accepted-boundary",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-1",
+      "title": "per-tick consumer re-mmap",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-2",
+      "title": "SlotMeta heap clone",
+      "disposition": "optional",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-3",
+      "title": "String op labels",
+      "disposition": "optional",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-4",
+      "title": "repeated map lookups",
+      "disposition": "optional",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-5",
+      "title": "trace emit allocs",
+      "disposition": "optional",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-6",
+      "title": "frame snapshot clones",
+      "disposition": "required-open",
+      "owner_task": "T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-7",
+      "title": "record_template lookups",
+      "disposition": "optional",
+      "owner_task": "T9",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-8",
+      "title": "receipt module recompile",
+      "disposition": "optional",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-9",
+      "title": "canary/mapdef reload",
+      "disposition": "optional",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-10",
+      "title": "session\u2192op index",
+      "disposition": "required-open",
+      "owner_task": "T9",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-11",
+      "title": "pending-eviction index",
+      "disposition": "required-open",
+      "owner_task": "T9",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-12",
+      "title": "contract-driver memoize",
+      "disposition": "optional",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-13",
+      "title": "discovery tick clones",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-14",
+      "title": "run-flow early ring loss",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-15",
+      "title": "function_id hoist",
+      "disposition": "refuted",
+      "owner_task": "T13",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-16",
+      "title": "quadratic fork work",
+      "disposition": "required-open",
+      "owner_task": "T9",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-17",
+      "title": "lifetime resource policy",
+      "disposition": "required-open",
+      "owner_task": "T7",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "O-18",
+      "title": "mechanism dedup",
+      "disposition": "optional",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E01",
+      "title": "PID vs true system scope",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "`system-scope-measure.sh --scope both --mode both` on final bytes"
+    },
+    {
+      "id": "E02",
+      "title": "doctor/contract reality",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E03",
+      "title": "benchmark validation",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "`tests/python/test_measure_e03.py` + re-run"
+    },
+    {
+      "id": "E04",
+      "title": "persistent EVENTS consumer",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E05",
+      "title": "cross-module admission",
+      "disposition": "required-open",
+      "owner_task": "T7",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E06",
+      "title": "fair exploration at full cap",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "`e06_unique_provider_reached_within_bounded_frames` + live replay"
+    },
+    {
+      "id": "E07",
+      "title": "incomplete rescan retention",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "`e07_unchanged_complete_loader_rescan_retires_nothing` + live replay"
+    },
+    {
+      "id": "E08",
+      "title": "factory-form equivalence",
+      "disposition": "required-open",
+      "owner_task": "T5",
+      "check": "`f_e08_named_gi_heap_matches_list_element` + live replay"
+    },
+    {
+      "id": "E09",
+      "title": "interface dedup budgets",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "`e09_repeated_interface_rescans_charge_once_but_work_every_time` + live replay"
+    },
+    {
+      "id": "E10",
+      "title": "lifetime slot exhaustion",
+      "disposition": "required-open",
+      "owner_task": "T7",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E11",
+      "title": "kernel map ceilings",
+      "disposition": "required-open",
+      "owner_task": "T7",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E12",
+      "title": "reentrancy/missing returns",
+      "disposition": "required-open",
+      "owner_task": "T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E13",
+      "title": "first-call gap",
+      "disposition": "required-open",
+      "owner_task": "T2",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E14",
+      "title": "lifecycle recovery",
+      "disposition": "required-open",
+      "owner_task": "T4",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E15",
+      "title": "ABI/semantic authority",
+      "disposition": "required-open",
+      "owner_task": "T5",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E16",
+      "title": "unsupported surfaces",
+      "disposition": "required-open",
+      "owner_task": "T11",
+      "check": "`python3 -I tests/python/test_e16_oracle.py -v` + `--test e16_execution_surfaces`"
+    },
+    {
+      "id": "E17",
+      "title": "slow sink/burst/cancel",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E18",
+      "title": "metrics extraction cost",
+      "disposition": "required-open",
+      "owner_task": "T8",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E19",
+      "title": "reducer/trace allocs",
+      "disposition": "required-open",
+      "owner_task": "T9",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E20",
+      "title": "semantic scaling/isolation",
+      "disposition": "required-open",
+      "owner_task": "T9",
+      "check": "`e20_collision_tombstone_lifecycle_matrix` (unit only); live E20 same-domain collision check NOT implemented"
+    },
+    {
+      "id": "E21",
+      "title": "parser/privacy stress",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E22",
+      "title": "catalog vs real coverage",
+      "disposition": "required-open",
+      "owner_task": "T9",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E23",
+      "title": "backend/kernel matrix",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E24",
+      "title": "soak with envelope",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "E25",
+      "title": "startup reconciliation",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F1",
+      "title": "E-burst point not lossless (P1)",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F2",
+      "title": "foreign traffic certifies refused workload (P1)",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F3",
+      "title": "terminal sink under-accounting (P2)",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F4",
+      "title": "slow-sink cancel over 100ms (P2)",
+      "disposition": "required-open",
+      "owner_task": "T10",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F5",
+      "title": "publication erases omission history (P2)",
+      "disposition": "required-open",
+      "owner_task": "T7",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F6",
+      "title": "proxy oracle accepts call loss (P2)",
+      "disposition": "required-open",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F7",
+      "title": "stale public provenance (P3)",
+      "disposition": "required-open",
+      "owner_task": "T5",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F8",
+      "title": "oracle pins 3.2/104 shape (P3)",
+      "disposition": "accepted-boundary",
+      "owner_task": "T12",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "A-F9",
+      "title": "inferred phase timing hides tail (P3)",
+      "disposition": "required-open",
+      "owner_task": "T2",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "FB-F1",
+      "title": "first-come admission starvation",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "FB-F3",
+      "title": "64 KiB DISCOVERY ring vs large records",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "FB-F4",
+      "title": "per-process loader hook",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "FB-F6",
+      "title": "BROAD_ADMIT fixture-only, no generic broad path",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    },
+    {
+      "id": "FB-F7",
+      "title": "per-fork Event in system scope",
+      "disposition": "required-open",
+      "owner_task": "T6",
+      "check": "NONE-YET"
+    }
+  ]
+}

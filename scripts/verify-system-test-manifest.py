@@ -15,8 +15,8 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-LEDGER = ROOT / "docs/qualification/system-scale-closure-ledger.md"
-DEFERRED = ROOT / "docs/qualification/system-deferred-gates.json"
+LEDGER = ROOT / "tests/fixtures/system-qualification/closure-ledger.json"
+DEFERRED = ROOT / "tests/fixtures/system-qualification/system-deferred-gates.json"
 SCHEMA = "p11scope/system-test-manifest/v1"
 OUTCOMES = {"PASS", "FAIL", "INVALID", "NOT_RUN", "UNSUPPORTED", "BLOCKED"}
 ENTRYPOINTS = {"model": "unit-test", "artifact": "artifact-check",
@@ -38,12 +38,21 @@ def digest(path):
 
 def catalog():
     policies = {}
-    for line in LEDGER.read_text().splitlines():
-        columns = [column.strip() for column in line.strip("|").split("|")]
-        if len(columns) != 6 or columns[2] not in {
-                "source-fixed", "required-open", "accepted-boundary", "refuted", "optional"}:
-            continue
-        identifier, title, disposition, owner, check, _ = columns
+    ledger = json.loads(LEDGER.read_text())
+    require(isinstance(ledger, dict) and ledger.get("schema") == "p11scope/system-closure-ledger/v1",
+            "wrong closure ledger schema")
+    findings = ledger.get("findings")
+    require(isinstance(findings, list), "closure findings must be a list")
+    fields = {"id", "title", "disposition", "owner_task", "check"}
+    dispositions = {"source-fixed", "required-open", "accepted-boundary", "refuted", "optional"}
+    for finding in findings:
+        require(isinstance(finding, dict) and set(finding) == fields
+                and all(isinstance(value, str) and value for value in finding.values()),
+                "invalid closure finding")
+        identifier, title, disposition, owner, check = (
+            finding[key] for key in ("id", "title", "disposition", "owner_task", "check"))
+        require(disposition in dispositions, f"unknown disposition: {identifier}")
+        require("finding:" + identifier not in policies, f"duplicate finding: {identifier}")
         require(owner != "NEEDS-OWNER", f"missing owner: {identifier}")
         level = "live-mechanism" if disposition == "required-open" and owner != "T13" else "artifact"
         policies["finding:" + identifier] = {

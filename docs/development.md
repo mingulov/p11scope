@@ -4,8 +4,9 @@
 Ubuntu 26.04 is the primary development host. It does not narrow the product
 contract: p11scope remains portable across the older and different Linux
 distributions, kernels, libc implementations, GNU coreutils/uutils
-environments, and supported Rust toolchains covered by the release plans. Do
-not add Ubuntu-specific runtime behavior or use host binary layouts as fixtures.
+environments, and supported Rust toolchains described by the
+[operator guide](usage.md) and [release qualification record](../CHANGELOG.md#qualification-of-this-release).
+Do not add Ubuntu-specific runtime behavior or use host binary layouts as fixtures.
 
 ## Ubuntu 26.04 host
 
@@ -44,7 +45,7 @@ mise exec -- kind version
 docker version
 ```
 
-Privileged W7 qualification additionally requires `sudo -n`, `bpftool`,
+Privileged runtime qualification additionally requires `sudo -n`, `bpftool`,
 `bpftrace`, and `systemd-run`. These are runtime-lane prerequisites rather than
 requirements for ordinary unprivileged builds. Run privileged lanes only when
 they are explicitly authorized.
@@ -96,7 +97,8 @@ instead, which carries the complete Cargo dependency payload; see
 
 Run repository commands through `scripts/cargo.sh`; invoking Cargo directly
 bypasses generated dependency preparation. Keep the existing toolchain
-selectors and gate flags:
+selectors and gate flags. Set a private disk-backed `TMPDIR` as described
+in [contributor verification](../CONTRIBUTING.md#verification) before tests:
 
 ```sh
 mise exec -- ./scripts/cargo.sh +1.88 fmt --all -- --check

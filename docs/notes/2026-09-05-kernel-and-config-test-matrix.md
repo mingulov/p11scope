@@ -4,6 +4,9 @@
 Written 2026-09-05. Every result in §2 was measured that day in local QEMU/KVM
 VMs; anything not measured is marked. Supersedes the first draft of this file,
 which recommended raising the kernel floor — that turned out to be unnecessary.
+This is a dated experiment record. Current support and release qualification
+are stated in the [operator guide](../usage.md#kernel-floor-and-unsupported-environments)
+and [changelog](../../CHANGELOG.md#qualification-of-this-release).
 
 ## 1. Why this exists
 
@@ -62,9 +65,9 @@ buffer (5.8), `probe_read_user` (5.5) and rdonly+freeze (5.2), so 5.15 is
 comfortably the binding one.
 
 `uprobe_multi` needs 6.6, but it is a **runtime-optional optimisation**, not a
-floor: it is still deferred work (ROADMAP.md:659), p11scope attaches 136
-individual probes today, and when it is adopted it should be detected and used
-where present rather than demanded. Raising the floor to 6.6 to pre-buy it would
+floor: at this experiment's revision it was deferred work, and p11scope attached
+136 individual probes. The experiment recommended detecting and using the
+optional capability where present rather than demanding it. Raising the floor to 6.6 to pre-buy it would
 have cost Ubuntu 22.04, Debian 12 and the entire RHEL 9 population for a
 performance feature nobody is using yet.
 
@@ -107,14 +110,15 @@ when run. Reuse the same applicable product oracles for both widths. Missing
 IA32 execution prerequisites require explicit evidence and separate refusal
 checks; they are not positive ABI qualification. Actual product failures stay
 FAIL, and unexecuted positive checks stay UNRUN. See the
-[ABI qualification plan](../superpowers/plans/2026-09-07-ia32-compatibility.md#later-kernel-and-incompatibility-qualification-owner-request-2026-09-07).
+[current ABI limitations](../../CHANGELOG.md#known-limitations) and
+`scripts/matrix/verify-ia32-compat.sh` for the reproducible compatibility lane.
 
 ### MUST — a release claim is false without it
 
 | Cell | Obtain | Uniquely tests |
 | --- | --- | --- |
-| Ubuntu 22.04, **5.15** | `p11scope-ws/vm-bases/jammy` (held) | The floor itself. Caught `24f82d0`. |
-| Ubuntu 24.04, **6.8** | `p11scope-ws/vm-bases/noble` (held) | The mainstream LTS, and the host kernel of every container lane |
+| Ubuntu 22.04, **5.15** | Ubuntu 22.04 amd64 cloud image | The floor itself. Caught `24f82d0`. |
+| Ubuntu 24.04, **6.8** | Ubuntu 24.04 amd64 cloud image | The mainstream LTS, and the host kernel of every container lane |
 | Ubuntu 24.04, **6.17-azure** | `apt install linux-image-6.17.0-1022-azure` into the noble guest | The exact CI runner: turns a hosted red into a 40-second local reproduction |
 | CentOS Stream 9, **5.14-el9** | `cloud.centos.org/centos/9-stream/.../GenericCloud-9-latest` | Backported vendor kernels, where version numbers lie. Caught `c1e1192`. |
 | Ubuntu 24.04, **6.11.0-17** + filtered target | `apt install linux-image-6.11.0-17-generic` into the noble guest — it is in `noble-updates`, no mainline `.deb` needed | The only defect that *harms the observed process*: §5. Also the only cell proving a `uname` gate cannot express the affected set. |
@@ -130,7 +134,7 @@ p11scope *destroying someone else's process* and reporting nothing.
 | Cell | Obtain | What it catches |
 | --- | --- | --- |
 | Debian 12, 6.1 | Debian cloud image | The most-deployed 6.x LTS; second sample of the pre-6.6 `regs.rip` loader path |
-| Fedora current | `p11scope-ws/vm-bases/fedora44-base` (held) | Newest verifier (rejections are non-monotonic in both directions), SELinux enforcing, upstream `perf_event_paranoid=2` |
+| Fedora current | Fedora 44 x86-64 cloud image | Newest verifier (rejections are non-monotonic in both directions), SELinux enforcing, upstream `perf_event_paranoid=2` |
 | Lockdown `confidentiality` | `echo confidentiality > /sys/kernel/security/lockdown` on a throwaway overlay | `bpf_probe_read_kernel` becomes unavailable → `task_newtask` fails to load → the whole session fails, **including `--pid` scope where that program is never attached**. `doctor` reports lockdown as `Ok`. Misleading twice, never once induced. |
 | cgroup v1 | `-append systemd.unified_cgroup_hierarchy=0` | `--cgroup` fails at `CgroupArray::set` with `Bad file descriptor` and a hint that blames caps, lockdown and the kernel floor — none of which is the cause |
 | tracefs absent or 0700 | `umount /sys/kernel/tracing` | Lifecycle degradation; honest today, worth keeping honest |
@@ -289,18 +293,27 @@ Three tiers, matching how fast each needs to be:
    finds the class of defect once; a unit test keeps it found.** Every matrix
    failure should end with a test that fails without a VM.
 
-## 7. How to run one, verified today
+## 7. Reproducing a kernel control
+
+The commands below describe the historical Ubuntu 22.04 control. Set
+`P11SCOPE_VM_BASE` to an absolute path to a prepared qcow2 base, and place
+your NoCloud seed files in the new private work directory before starting
+the HTTP server. Verify that the selected ports are unused. Run only VMs
+you own and retain their pidfile, logs and overlay until cleanup is verified.
 
 ```sh
+: "${P11SCOPE_VM_BASE:?set the absolute path to a prepared qcow2 base}"
+P11SCOPE_VM_WORK=$(mktemp -d /var/tmp/p11scope-vm.XXXXXX)
 qemu-img create -f qcow2 -F qcow2 \
-  -b /home/user/src/m/p11scope-ws/vm-bases/jammy/jammy-server-cloudimg-amd64.img \
-  /tmp/p11-vm/overlay.qcow2 20G
-python3 -m http.server 18191 --bind 127.0.0.1 --directory /tmp/p11-vm &   # NoCloud seed
+  -b "$P11SCOPE_VM_BASE" "$P11SCOPE_VM_WORK/overlay.qcow2" 20G
+# Populate $P11SCOPE_VM_WORK with your NoCloud seed before continuing.
+python3 -m http.server 18191 --bind 127.0.0.1 --directory "$P11SCOPE_VM_WORK" &
 qemu-system-x86_64 -accel kvm -cpu host -machine q35 -m 2048 -smp 4 \
-  -drive file=/tmp/p11-vm/overlay.qcow2,if=virtio,format=qcow2 \
+  -drive "file=$P11SCOPE_VM_WORK/overlay.qcow2,if=virtio,format=qcow2" \
   -netdev user,id=n1,hostfwd=tcp:127.0.0.1:2251-:22 -device virtio-net-pci,netdev=n1 \
   -smbios 'type=1,serial=ds=nocloud;s=http://10.0.2.2:18191/' \
-  -display none -serial file:/tmp/p11-vm/serial.log -daemonize -pidfile /tmp/p11-vm/qemu.pid
+  -display none -serial "file:$P11SCOPE_VM_WORK/serial.log" -daemonize \
+  -pidfile "$P11SCOPE_VM_WORK/qemu.pid"
 ```
 
 Four facts make this cheap, and each cost time to learn:
@@ -318,7 +331,7 @@ Four facts make this cheap, and each cost time to learn:
   short form silently does nothing and the guest returns on the newest kernel —
   which reads exactly like a pass on the kernel you meant to test.
 - **Output paths are checked.** p11scope refuses an output directory with a
-  writable ancestor (`/tmp/...`, `/home/user/src/...`) with `output directory
+  writable ancestor (`/tmp/...`, a writable checkout directory) with `output directory
   ancestor ... is untrusted: writable`. Write evidence to a root-owned path
   inside the guest.
 

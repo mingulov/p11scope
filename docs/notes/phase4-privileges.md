@@ -182,11 +182,10 @@ Protocol: `scripts/matrix/verify-fork-scope.sh` (usage:
 `verify-capability-tier.sh [--self-test]`). Both `--self-test`s pass
 unprivileged (`capability-tier self-test: OK`,
 `verify-fork-scope Task 4 receipt self-test: OK`). The full scripts gate on
-`sudo -n true` plus a `sudo capsh` ladder; no privileged run was approved
-this session (AGENTS.md gate + standing no-sudo session constraint), so
-every privileged cell below is UNRUN with its exact command. (`sudo -n
-true` itself exits 0 on this host; the blocker is approval, not
-availability.) Binary: release workspace build at 873d5c3, whose product
+`sudo -n true` plus a `sudo capsh` ladder. Privileged cells were not
+executed in this 2026-09-18 measurement and remain UNRUN; their commands
+below describe the protocol, not measured results. Binary: release workspace
+build at 873d5c3, whose product
 code is identical to 08756b9 (`git diff 08756b9 HEAD` touches only the
 research plan doc).
 
@@ -204,16 +203,16 @@ attached/total, completeness, and skips are n/a (failure precedes evidence).
 | unprivileged `doctor --pid` | **Measured**, exit 1, tier **T0 offline (target assessed)** | `BPF map create FAIL loading BPF object with required task storage: map error: failed to create map \`PID_FILTER\`: failed to create map \`PID_FILTER\`: Operation not permitted (os error 1)`; `/proc/<pid>/mem FAIL EACCES`; `target readability FAIL mem unavailable`; `host program preflight FAIL loading BPF object with required task storage: map error: failed to create map \`STATS\`: failed to create map \`STATS\`: failed to create map \`STATS\`: Operation not permitted (os error 1)`. Oracle `python3 -I scripts/lane-capability-tier-oracle.py T0 assessed 1 1 <doctor-doc>` accepts (`assessed: T0 offline`). Bare `doctor`: exit 1, T0 offline (target unassessed). |
 | unprivileged live-discovery signal | **Measured via doctor** | `live export reads: warn unavailable`; `loader timing (initial_set): warn unproven`; `loader timing (dlopen): warn unproven`; `lifecycle preflight: warn unavailable`; `run initial-set capture: warn none`. |
 | unprivileged owned `run` | **Measured FAIL**, exit 1 | `p11scope: discovery: 0 module(s), 0 attach slot(s), scan 3ms, conflicts 0, uncorroborated 0`, then `p11scope: starting attach session: hint: this usually means the environment cannot load or attach BPF programs at all — missing CAP_BPF and/or CAP_SYS_ADMIN (or root), a kernel lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF (/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See docs/notes/phase5-unsupported.md for what each looks like when observed. Run \`p11scope doctor\` to see which cause applies on this host.: loading BPF object with required task storage: map error: failed to create map \`MECH_SHAPE\`: failed to create map \`MECH_SHAPE\`: Operation not permitted (os error 1)`. Command: `target/release/p11scope run --mode metrics --duration 1 -o <private-dir>/run-out.json -- /bin/true`. |
-| `CAP_BPF` + `CAP_PERFMON`, manifest | UNRUN | Exact command (from `verify-fork-scope.sh measure_privileges`): `sudo capsh --caps="cap_bpf,cap_perfmon+eip cap_setpcap,cap_setuid,cap_setgid+ep" --keep=1 --user="$(whoami)" --addamb=cap_bpf --addamb=cap_perfmon -- -c "'<bin>' profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o '<out>'"`. UNRUN: needs sudo/capsh-as-privileged; not approved (AGENTS.md gate + no-sudo session constraint). |
+| `CAP_BPF` + `CAP_PERFMON`, manifest | UNRUN | Exact command (from `verify-fork-scope.sh measure_privileges`): `sudo capsh --caps="cap_bpf,cap_perfmon+eip cap_setpcap,cap_setuid,cap_setgid+ep" --keep=1 --user="$(whoami)" --addamb=cap_bpf --addamb=cap_perfmon -- -c "'<bin>' profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o '<out>'"`. UNRUN: needs sudo/capsh-as-privileged; not executed in this measurement. |
 | `CAP_SYS_ADMIN`, manifest | UNRUN | `sudo capsh --caps="cap_sys_admin+eip cap_setpcap,cap_setuid,cap_setgid+ep" --keep=1 --user="$(whoami)" --addamb=cap_sys_admin -- -c "'<bin>' profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o '<out>'"`. Same blocker. |
 | `CAP_SYS_ADMIN`, scan | UNRUN | `sudo capsh --caps="cap_sys_admin+eip cap_setpcap,cap_setuid,cap_setgid+ep" --keep=1 --user="$(whoami)" --addamb=cap_sys_admin -- -c "'<bin>' profile --pid <pid> --mode metrics --duration 1 -o '<out>'"`. Same blocker. |
 | `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, scan | UNRUN | `sudo capsh --caps="cap_sys_admin,cap_sys_ptrace+eip cap_setpcap,cap_setuid,cap_setgid+ep" --keep=1 --user="$(whoami)" --addamb=cap_sys_admin --addamb=cap_sys_ptrace -- -c "'<bin>' profile --pid <pid> --mode metrics --duration 1 -o '<out>'"`. Same blocker. |
-| file-caps minimal | UNRUN | `cp <bin> <private-copy> && sudo setcap 'cap_sys_admin+ep' <private-copy> && <private-copy> profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o <out>; sudo setcap -r <private-copy>`. Single-cap set is the hypothesized host minimum per the historical `CAP_SYS_ADMIN` row, not a measured claim — no file-caps precedent exists in-repo. UNRUN: `setcap` needs privilege; not approved (AGENTS.md gate + no-sudo session constraint). |
-| full root | UNRUN | `sudo <bin> profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o <out>` (host `--pid` same-uid target, same shape as the capsh rows). UNRUN: needs sudo; not approved (AGENTS.md gate + no-sudo session constraint). |
+| file-caps minimal | UNRUN | `cp <bin> <private-copy> && sudo setcap 'cap_sys_admin+ep' <private-copy> && <private-copy> profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o <out>; sudo setcap -r <private-copy>`. Single-cap set is the hypothesized host minimum per the historical `CAP_SYS_ADMIN` row, not a measured claim — no file-caps precedent exists in-repo. UNRUN: `setcap` needs privilege; not executed in this measurement. |
+| full root | UNRUN | `sudo <bin> profile --manifest <m.json> --pid <pid> --mode metrics --duration 1 -o <out>` (host `--pid` same-uid target, same shape as the capsh rows). UNRUN: needs sudo; not executed in this measurement. |
 | Part 1 fork-scope (`--cgroup`) | UNRUN | `sudo systemd-run --scope --unit=<unit> -- sh -c "read -r _ < '<work>/go'; exec env SOFTHSM2_CONF='<conf>' '<work>/fork-harness' '/usr/lib/softhsm/libsofthsm2.so'"` plus `sudo <bin> profile --manifest <work>/manifest.json --cgroup /sys/fs/cgroup/system.slice/<unit>.scope --mode metrics --duration 20 -o <work>/observed.json` (`verify-fork-scope.sh` Part 1, lines ~365-376). Same blocker. |
 | Tier rows (`doctor` under caps) | UNRUN | Full `scripts/verify-capability-tier.sh` gates on `sudo -n true`, then per row `sudo capsh --caps="<row-caps>" --keep=1 --user="$(id -un)" <row-ambient> -- -c "{ id/capsh metadata...; } exec '<bin>' doctor --pid '<pid>'"` with sysadmin row (`cap_sys_admin+eip cap_setpcap,cap_setuid,cap_setgid+ep`, `--addamb=cap_sys_admin`, expects T1) and bpf-perfmon row (`cap_bpf,cap_perfmon+eip cap_setpcap,cap_setuid,cap_setgid+ep`, `--addamb=cap_bpf --addamb=cap_perfmon`, expects T0). Same blocker; `--self-test` passes (see above). |
 
-T1(c) resolution (2026-09-19): `...` gaps in the measured rows above are expanded from static/invariant text — the `UNSUPPORTED_ENV_HINT` const (src/attach.rs, product-identical to the measurement base) and anyhow chain shapes verified against Task 1's own doctor artifact (`/var/tmp/p11scope-ws-tmp/privmin-t1/doctor-pid.txt`); map names are the recorded measured values. The `-o` ancestor path was never recorded (`<path>`). The Tier-row `...` is an UNRUN command template by design; historical-section ellipses predate Task 1 — both out of scope.
+T1(c) resolution (2026-09-19): `...` gaps in the measured rows above are expanded from static/invariant text — the `UNSUPPORTED_ENV_HINT` const (src/attach.rs, product-identical to the measurement base) and anyhow chain shapes verified against the recorded doctor output from the same measurement; map names are the recorded measured values. The `-o` ancestor path was never recorded (`<path>`). The Tier-row `...` is an UNRUN command template by design; historical-section ellipses predate Task 1 — both out of scope.
 
 ### Docker / kind — 2026-09-18: UNRUN (recon only)
 
@@ -222,7 +221,7 @@ present; docker 29.8.1 reachable; `kind version 0.33.0` installed (historical
 row measured kind v0.29.0 / Kubernetes v1.33.1 — toolchain moved). All five
 docker cells and the kind re-measurement need a live container/pod **plus**
 the `sudo capsh` ladder (`CAP_SYS_PTRACE` / `CAP_SYS_ADMIN` shapes per the
-historical table), so all are UNRUN this session: not approved (AGENTS.md
-gate + no-sudo session constraint). The live-discovery capability output
-(above, :131) stays UNRUN for the same reason; the only live-discovery
-signal measured this session is the host unprivileged doctor row above.
+historical table). These privileged cells were not executed in this
+measurement and remain UNRUN. The live-discovery capability output also
+remains UNRUN; the only live-discovery signal measured here is the host
+unprivileged doctor row above.

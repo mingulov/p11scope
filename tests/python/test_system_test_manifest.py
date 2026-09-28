@@ -186,7 +186,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(report["passed"], 0)
 
     def test_checked_in_register_remains_complete(self):
-        manifest = json.loads((ROOT / "docs/qualification/system-test-manifest.json").read_text())
+        manifest = json.loads((ROOT / "tests/fixtures/system-qualification/system-test-manifest.json").read_text())
         report = VERIFY["verify_manifest"](manifest, self.root, structure_only=True)
         self.assertFalse(report["qualification"])
 

@@ -5,8 +5,8 @@
 //! subprocess trial and asserts the behavior observed on 2026-09-17. These
 //! pins PASS on current behavior by design: where the observed behavior is a
 //! friction, the test pins it (with its F-number) so the fixing task REDs the
-//! pin first and then flips it. The FRICTION list itself lives in
-//! `docs/superpowers/reports/2026-09-17-usability-task-1-report.md`.
+//! pin first and then flips it. Each test's comments retain the original
+//! observation and expected public-command behavior.
 //!
 //! Unprivileged-safe only: environment-dependent refusals branch on the
 //! observer's own doctor verdict instead of assuming this host's capture lane.

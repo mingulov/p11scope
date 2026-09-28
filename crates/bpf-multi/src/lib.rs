@@ -8,8 +8,8 @@
 //! ("aya: add multi-uprobe attach support", merged 2026-07-31 as
 //! `5c1a79e0bdc36e77b304c1a08ff8b05e6b823108`); `bisect_attach` is ported
 //! from osslscope `src/plan.rs` (`bisect_attach`, bounded log-n poison
-//! isolation). See `docs/notes/multi-loader-spike.md` for the comparison
-//! measurements and the loader decision.
+//! isolation). See `third-party/README.md` for the loader's dependency
+//! corrections and upstream provenance.
 //!
 //! Composition (Task 2.2): program loading stays in backported Aya 0.14
 //! (`UProbe::load_multi` selects `expected_attach_type=48` for the twins).

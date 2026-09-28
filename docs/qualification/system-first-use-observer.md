@@ -1,11 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Private first-use observer adapter
+# First-use observer test adapter
 
-This test adapter supplies observer facts for the [T2 first-use matrix](t2-first-use-requirements.md).
+This test adapter supplies observer facts for the [first-use matrix](first-use-contract.md).
 It is compiled only under `cfg(test)` and does not add a public command,
 capture policy or identity key. An external owned controller combines these
 facts with the [independent workload and post-call mapping receipt](system-first-use-fixture.md).
-The native matrix is pending; this document describes the adapter contract.
+This document defines the adapter contract; it does not record a completed
+first-use qualification.
 
 ## Actual runtime path
 
@@ -23,7 +24,7 @@ file, at most 8192 bytes, with schema `p11scope/first-use-observer/v1`, a
 absolute `facts` and `loop_marker` paths, an optional `attached_marker`,
 and `fact_limit` in 1..8192. Duration must be positive and at most 30s; a
 separate public JSON `-o` report is required. All output paths must be new.
-The outer supervisor bounds startup and cleanup as well as the loop.
+An independent supervisor bounds startup and cleanup as well as the loop.
 
 | Private fact | Authority and limitation |
 | --- | --- |
@@ -61,15 +62,15 @@ later plan resolves it.
   refer to the same successful domain before releasing a gated call.
 - The fixture remains under the existing independent supervisor/pidfd
   custody. This observer body starts, pauses and terminates no workload.
-  All shared leases and typed before/after BPF census belong to the outer
-  frozen controller.
+  All shared leases and typed before/after BPF census belong to the
+  independent test controller.
 
 The final facts file preserves `capture_returned_ok`, marker delivery,
 journal integrity and the raw metadata. Its first-use verdict is always
 `external_owned_oracle_required`. A successful ignored test body proves
 execution of the collector, not capture of an owned first call.
 
-## Verification and remaining gates
+## Diagnostic boundaries and verification
 
 The discovery-loss diagnostic samples seven boundaries: lifecycle producers
 active, static attachment complete, loader arming finished, initial exports

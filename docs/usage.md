@@ -15,10 +15,9 @@ implementation limits are code contracts, not measurements.
 > recorded in
 > [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release). To build and
 > install the binaries, see [Install](../README.md#install).
-> See the
-> [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
-> and the
-> [productization design](superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md).
+> The [privacy allowlist](privacy/allowlist-v1.md) defines the capture
+> boundary, and the [profile schema](schema/observed-profile-v3.md) defines
+> public evidence and its authority.
 
 - [What it does](#what-it-does)
 - [What it does NOT do](#what-it-does-not-do)
@@ -69,8 +68,6 @@ cannot enable code absent from the shipped eBPF object, `metrics` refuses the
 flag, and the observer prints a warning naming the exposure when it is active.
 The official release artifact is built `--no-default-features`, and packaging
 fails if the unsafe path is reachable. See
-[docs/superpowers/specs/2026-08-10-p11scope-outputs.md](superpowers/specs/2026-08-10-p11scope-outputs.md#what-you-will-not-see-by-design-in-every-mode)
-for the design commitment, and
 [docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md) with its
 [v2 extension](privacy/allowlist-v2.md) for the field-by-field
 enforcement (what is captured, why, and how each read is gated — structural
@@ -178,8 +175,9 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
 > it runs unprivileged with its groups intact: BPF attach succeeds and
 > group-gated providers (e.g. opencryptoki's group-owned shared memory) keep
 > working under observation. Measured 2026-09-15 on Fedora 44 (6.19) and
-> Ubuntu 22.04 (5.15); see
-> [2026-09-15 provider-qual note](notes/2026-09-15-provider-qual-live-capture.md).
+> Ubuntu 22.04 (5.15). Use the
+> [privileges guide](#privileges-per-environment) for current capability
+> requirements.
 
 ### Capture tuning: `--ring-bytes` and `--drain-interval-ms`
 
@@ -1019,5 +1017,5 @@ What this tool proves, and what it deliberately does not claim to:
   the versioned `observed-profile.json` schema (current:
   `p11scope/observed-profile/v3`), the integration boundary
   `pkcs11-lab` reads.
-- [`docs/superpowers/specs/2026-08-10-p11scope-outputs.md`](superpowers/specs/2026-08-10-p11scope-outputs.md)
-  — the original "what you will see" design commitment.
+- [`docs/schema/observed-profile-v2.md`](schema/observed-profile-v2.md) —
+  field definitions and semantic-authority rules inherited by schema v3.

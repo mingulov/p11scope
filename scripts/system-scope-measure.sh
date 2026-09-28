@@ -1,8 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # system-scope-measure.sh — controlled per-PID and --system captures for the
-# system-scale acceptance matrix (docs/superpowers/plans/2026-09-19-system-scale.md,
-# Task 1.4 Step 2): identical deterministic workload, exact binary identity,
+# measurement protocol (docs/testing/system-scope-measurement.md):
+# identical deterministic workload, exact binary identity,
 # and one JSON record + human summary per condition with phase timings,
 # every loss counter, verdict, admission truth, and observer CPU/RSS/fds.
 #

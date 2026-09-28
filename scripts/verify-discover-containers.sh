@@ -436,8 +436,7 @@ MUSL_BUILD="p11scope-discover-musl-build-$TOKEN"
 # one and an exact-id readback confirms it, so a lane that fails after its own
 # container exists is still removed by the trap (Task 10 F5), while a name
 # collision fails creation with nothing recorded and the trap deletes nothing:
-# mutable names alone never authorize deletion
-# (docs/superpowers/reports/2026-08-28-receipt-receipt-architecture-decision.md).
+# mutable names alone never authorize deletion.
 GLIBC_BUILD_ID=
 GLIBC_RUN_ID=
 MUSL_BUILD_ID=

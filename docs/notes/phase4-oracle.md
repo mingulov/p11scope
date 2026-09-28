@@ -5,7 +5,7 @@ Every other verification script in this repo checks p11scope's capture
 against a workload **we** wrote (`spike/harness.c` + `spike/expected.txt`).
 `scripts/matrix/verify-oracle.sh` is the first check against an
 **independent** implementation's own record of what it did:
-[`pkcs11-check`](/home/user/src/m/pkcs11-check-ws/pkcs11-check), a
+[`pkcs11-check`](https://github.com/mingulov/pkcs11-check), a
 separate, vendor-neutral PKCS#11 test client with its own pure-ctypes
 binding and its own per-call `CK_RV` trace feature
 (`docs/rv-trace-design.md` in that repo, `--rv-trace`).

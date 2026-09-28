@@ -589,7 +589,8 @@ fn scenario(
     Ok(())
 }
 
-// TMPDIR-honoring: test temp lives under the workspace tmp dir (see AGENTS.md); the 108-byte control-socket guard below still fails loudly if a TMPDIR is ever too long.
+// TMPDIR-honoring: use the disk-backed test directory described in CONTRIBUTING.md;
+// the 108-byte control-socket guard below still fails loudly if TMPDIR is too long.
 fn control_dir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().prefix("p11root-").tempdir()
 }

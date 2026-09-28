@@ -10,8 +10,8 @@ policy for `profile` and `trace` is `allowlisted`; `metrics` is always
 fixed-offset decoders are present only in a build compiled with the
 off-by-default `unsafe-unvalidated-metadata` Cargo feature *and* run with
 `--unsafe-unvalidated-metadata`; the flag cannot reach code that is absent
-from the object. The design is
-`docs/superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md`.
+from the object. The public output contract is documented in the
+[profile schema](../schema/observed-profile-v3.md).
 
 The boundary assumes ABI-valid PKCS #11 structures for *scalar* fields: a
 deliberately malicious caller can place arbitrary numbers in an allowlisted

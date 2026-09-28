@@ -1,5 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Phase 4 environment matrix — results
+# Phase 4 environment matrix — historical results
+
+This records the August 2026 experiment and its follow-up at those revisions.
+Present-tense implementation descriptions below are historical. Current
+[privileges](../usage.md#privileges-per-environment),
+[semantic authority](../schema/observed-profile-v3.md) and
+[release qualification](../../CHANGELOG.md#qualification-of-this-release)
+are documented separately.
 
 Ground truth for every row: `spike/harness.c`, oracle `spike/expected.txt`
 (the same 9-function-call oracle `verify-attach-e2e.sh` uses). Host:
@@ -25,8 +32,8 @@ hierarchy).
 > read-lease, filesystem-type, and `lease-break-time` evidence. The
 > `verify-fork-scope.sh` and `verify-oracle.sh` rows were **not** rerun; both
 > were corrected on 2026-08-14 to stop asserting the now-impossible terminal
-> `COMPLETE`. Per-slice detail:
-> `.superpowers/sdd/2026-08-13-manifest-provenance/task-6-report.md`.
+> `COMPLETE`. These statements describe the 2026-08-14 follow-up, not a
+> current release qualification.
 
 ## Final matrix (Gate G4)
 
@@ -121,9 +128,7 @@ Two problems, both solved explicitly in `verify-docker.sh`:
    `verify.rs::check_reuse` (the identity re-check gate). Fresh discovery is
    separately run against a byte-identical safe copy and compared before the
    attach plan is built. Matches the
-   Phase 0 spike's bpftrace path-prefix trick exactly (see
-   `docs/superpowers/plans/2026-08-10-phase0-feasibility-spike.md`, Task
-   4).
+   original spike's bpftrace path-prefix technique exactly.
 2. **Scope by the container's cgroup.** `--cgroup /sys/fs/cgroup$(sed
    's/^0:://' /proc/<pid>/cgroup)` — the container's own leaf cgroup, using
    Task 1's descendant matching so this is correct whether or not the
@@ -314,8 +319,8 @@ pod's actual leaf cgroup (informational, not the `--cgroup` used):
 ## Row 5: independent oracle diff — `pkcs11-check` (Task 7)
 
 `scripts/matrix/verify-oracle.sh` is the first check in this phase against
-an oracle p11scope did not write: `pkcs11-check`
-(`/home/user/src/m/pkcs11-check-ws/pkcs11-check`), a separate,
+an oracle p11scope did not write:
+[`pkcs11-check`](https://github.com/mingulov/pkcs11-check), a separate,
 vendor-neutral PKCS#11 test client with its own per-call `CK_RV` trace
 (`--rv-trace`). Direction: **oracle ⊆ capture** — every `(function, CK_RV)`
 pair the oracle logged must appear in the capture at least that many

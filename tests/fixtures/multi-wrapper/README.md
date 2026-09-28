@@ -1,8 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Owned multi-wrapper fixture provider + workload oracle
 
-System-scale plan (`docs/superpowers/plans/2026-09-19-system-scale.md`)
-Tasks 1.4 Step 1, 1.5 Step 1, 1.6 Step 1: ground truth for published-wrapper
+This fixture supplies independent ground truth for published-wrapper
 coverage. The observer must prove coverage against published/called wrappers,
 never infer it from admission counts — this fixture is the owned provider the
 workload activates, and the oracle is the exact expected observation.
@@ -22,9 +21,9 @@ workload activates, and the oracle is the exact expected observation.
 - `workload.c` — seeded deterministic driver: one scenario per process,
   writes the call log (via the provider stubs) and the oracle JSON.
 - `tests/multi_wrapper_oracle.rs` — fixture self-tests (exact oracle
-  assertions + pinned goldens). Later tasks consume the same binaries.
+  assertions + pinned goldens). Coverage experiments consume the same binaries.
 
-Package F additions (no scenario behavior change): `C_GetInterface`
+Selection-coverage additions (no scenario behavior change): `C_GetInterface`
 with a NULL name returns the default interface (lowest-index live
 wrapper, else legacy); `mw_set_version` rewrites one live wrapper's
 version word in place; `mw_poke` rewrites one live entry in place (0
@@ -98,17 +97,17 @@ Pinned goldens at seed 0: `five` 120 (60 wrapper / 60 backend), `holes` 26,
 `reuse` 28, `pair_a` 52, `pair_b` 52, `forward` 20 (7/13), `fail` 23
 (13/10, 3× `C_Sign rv=48`), `legacy` 0; `five` at seed 1: 106.
 
-## How later tasks consume the fixture
+## Using the fixture in coverage experiments
 
-- Task 1.4: attach the observer to `workload … five` (active index 4 > 3),
+- Coverage: attach the observer to `workload … five` (active index 4 > 3),
   `holes`, and the `pair_a`/`pair_b` pair; assert observed counts/names
   match the oracle (count-only admission is not accepted); keep the
   `legacy` scan-only path working.
-- Task 1.5: the nine publication-driven cases map onto scenarios here
+- Publication: the nine publication-driven cases map onto scenarios here
   (holes, five, pair lanes, forwarding, reuse, pre-published legacy,
   stripped unknown build); occupancy snapshots come from `mw_occupied`
   via `free_at_call` / `occupied_at_call`.
-- Task 1.6 Lane A: compare broad fixed-family attach vs
+- Admission strategy: compare broad fixed-family attach vs
   occupancy/publication-selected attach on `five` + `holes` + `forward` +
   `fail`, asserting exact expected invocations and first-call coverage
   from the oracle.

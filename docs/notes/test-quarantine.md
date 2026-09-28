@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Flake quarantine mapping (SYSPLAN residual F-29)
+# Flake quarantine mapping
 
-The seven ledgered flakes from
+The seven recorded failure signatures from
 [`known-flakes.md`](known-flakes.md), each with its owning lane, its
 isolation, and how to triage it. Nothing here weakens a test: the main
 suite runs every flake unfiltered, and the quarantine lane
@@ -25,9 +25,8 @@ contends with a running lane).
 | 6 | `release_seal_denies_the_caller_path_to_every_reached_command` (`--test artifact_contracts`) | release-seal lane | Exact filter + serial: caller-path denial runs without sibling lane load. |
 | 7 | `signal_settlement_observes_second_sigint_during_fallback_term_grace` (`--lib`) | signal-settlement unit tests | `--test-threads=1` + serial: SIGINT-during-grace timing runs alone. |
 
-Triage: run `scripts/run-flake-quarantine.sh` locally (needs the pinned
-1.88 toolchain and prepared dependencies, like `cargo test`). If a flake
-fails in isolation too, it is a real regression, not contention — file it
-against the owning lane with the quarantine log. If it passes in isolation
-but fails in the suite, the contention window narrowed: keep the ledger
-entry, do not raise budgets — the budgets are the contract.
+Triage: run `scripts/run-flake-quarantine.sh` locally with the pinned
+1.88 toolchain and prepared dependencies. Preserve both the original failure
+and the quarantine log. Investigate the causal mechanism even if isolation
+passes; intermittent defects can also reproduce alone. Do not raise budgets
+or weaken assertions to obtain a green rerun.

@@ -39,3 +39,42 @@ Signed-off-by: Your Name <you@example.com>
 The sign-off certifies that you wrote the contribution or otherwise have the
 right to submit it under the terms above, and that you agree to the
 contribution terms in this file.
+
+## Product and source boundaries
+
+Start with [README.md](README.md), the [operator guide](docs/usage.md), and
+[development setup](docs/development.md). The versioned
+[profile schema](docs/schema/observed-profile-v3.md) and
+[privacy allowlist](docs/privacy/allowlist-v1.md), including its
+[v2 extension](docs/privacy/allowlist-v2.md), define the public contracts.
+Keep changes scoped, preserve unrelated work, and never broaden capture
+implicitly. Retain Rust 1.88, edition 2024, and Linux x86-64 host support,
+including the documented ia32 target compatibility.
+
+Commit source, public documentation and reproducible test inputs. Generated
+binaries, dependency trees, local evidence and internal planning/review
+records do not belong in the source tree. Keep measurements tied to their
+actual revision, kernel and workload; an ordinary test does not qualify a
+privileged capture or a release artifact. Run privileged, container or VM
+experiments only with the host owner's authorization.
+
+## Verification
+
+Run Rust checks through the repository wrapper so pinned dependency sources
+are prepared consistently. For test temporary files, choose a private
+writable directory on a disk filesystem with enough free space; a small
+memory-backed `/tmp` can exhaust its quota during the native suites. Set
+and export `TMPDIR` with that absolute path before running tests. Keep it short enough
+for the operating system's Unix-domain socket path limit.
+
+```sh
+mise exec -- ./scripts/cargo.sh +1.88 fmt --all -- --check
+mise exec -- ./scripts/cargo.sh +1.88 check --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.88 clippy --locked --workspace --all-targets -- -D warnings
+```
+
+Record the commands, source revision and results with a change. Commit
+messages use an area followed by an imperative summary, for example
+`fix: preserve unavailable discovery evidence` or `docs: clarify capture
+limits`. Release qualification follows [RELEASING.md](RELEASING.md).

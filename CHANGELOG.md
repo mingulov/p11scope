@@ -364,12 +364,12 @@ Fixes to defects found while qualifying this release, before it was tagged:
   because kernels with the CVE-2025-40123 fix require every program sharing a
   program array to have the same attach type. The release build does not
   include that code and was not affected.
-- The same feature build loads on Ubuntu 5.15 again. Its
+- The same feature build now loads on Ubuntu 5.15. Its
   `p11_entry_template_types` program exceeded that kernel's
   1,000,000-instruction verifier limit, because the types-only walk ran as a
   local subprogram the verifier re-explored per caller state. The walk now
   runs behind its own verified-once global, like the full template walk, with
-  identical captured bytes. The release build does not include that code and
+  identical captured output. The release build does not include that code and
   was not affected.
 <!-- TODO(release): add any further user-visible fixes merged before the tag. -->
 
@@ -402,12 +402,14 @@ privacy canaries build their own binaries from the same tree.
   leak.
 - Overhead re-bench (`scripts/bench-overhead.sh`, host): all 15 observed
   samples valid; the numbers are in Known limitations item 9.
-- `unsafe-unvalidated-metadata` 5.15 verifier fix (this branch): the feature
-  build loads on Ubuntu 5.15.0-187 (`doctor` program preflight ok; the
-  pre-fix object fails there with E2BIG at `p11_entry_template_types`), and
-  an unsafe `run` of a SoftHSM `C_GetAttributeValue` workload captures the
-  same 21 attribute types on Ubuntu 5.15 and Ubuntu 6.8 as the pre-fix build
-  captures on 6.8, with identical per-function call counts.
+- `unsafe-unvalidated-metadata` 5.15 verifier fix (vng, root): the feature
+  build's `doctor` program preflight passes on Ubuntu 5.15.0-187 and 6.8.0-142
+  and on mainline 5.15.221, 6.1.188, 6.6.157, 6.12.111, 7.0.14 and 7.2.6. On
+  Ubuntu 5.15 the pre-fix object fails at `p11_entry_template_types` with
+  E2BIG (1,000,001 instructions processed). An unsafe `run` of a SoftHSM
+  `pkcs11-tool -O` workload records identical template operations and
+  per-function call counts with the fixed build on Ubuntu 5.15, and with both
+  builds on Ubuntu 6.8 and mainline 5.15, with no event loss.
 <!-- TODO(release): the owner adds the hosted CI run (checks-and-e2e, coverage, archive-log, release-preview) and the `scripts/build-release.sh` receipt and `SHA256SUMS` from the tag commit. -->
 
 ### Pre-release development history

@@ -347,8 +347,10 @@ inode-sharing property is the headline bet; it depends on the `overlay2`
 storage driver and is validated, with exact call counts, against a real
 Docker container, two containers sharing one image layer, a Kubernetes pod
 (kind), and a Knative service's scale-from-zero cold start
-(`docs/notes/phase4-matrix.md`).
-<!-- TODO(release): container qualification is pending its re-run on the release bytes (owner decision: re-run, not downgrade). Record the Docker, shared-layer, kind and Knative results here and in CHANGELOG.md, or reword if a lane does not pass. -->
+(`docs/notes/phase4-matrix.md`). On the v0.1.0 release candidate the Docker,
+shared-layer, kind-pod, fork-scope and Knative lanes all passed with exact
+counts (host kernel 7.0; see
+[CHANGELOG.md](CHANGELOG.md#qualification-of-this-release)).
 `deploy/k8s` is an example, not a published image; cluster-wide packaging
 (DaemonSet/operator) comes later.
 

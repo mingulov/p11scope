@@ -217,12 +217,11 @@ The induced-gaps gate (`scripts/verify-induced-gaps.sh`, gap 3/3b) proves both
 directions: the small-ring build and the default build with `--ring-bytes 4K`
 produce the same disclosed event-loss evidence with exact counts.
 
-Measured loss rates — the only bench-measured tuning data points, from the
-`scripts/bench-overhead.sh` run in "Overhead (measured)" (1M back-to-back
-calls/sec, then-default 256K ring): `profile` (1s drain) lost 991,290-991,350
-of 1,000,000 events (99.1%+); `trace` (200ms drain) wrote only
-122,348-145,383 lines. A faster drain cadence meaningfully reduces loss
-but does not eliminate it at that call rate. No larger `--ring-bytes`
+Measured loss rates, from `scripts/bench-overhead.sh` runs (1M back-to-back
+calls; see "Overhead (measured)"). With the then-default 256K ring,
+`profile` (1s drain) lost 991,290-991,350 of 1,000,000 events (99.1%+), and
+`trace` (200ms drain) wrote only 122,348-145,383 lines. With the current
+4 MiB default ring (2026-09-28), both lost nothing. No other `--ring-bytes`
 value and no other `--drain-interval-ms` value has been bench-measured;
 tuning beyond these two points is unmeasured, not tuned-down.
 
@@ -281,10 +280,13 @@ and `--manifest` remains the explicit-attestation path for that case.
 Attach takes time to land (seconds for hundreds of probes), and the first
 calls after a `dlopen` can fire before their probes exist — a workload that
 exits in milliseconds can be gone before attach completes, even with
-`--pause auto`. Measured 2026-09-15: keep the workload alive past attach
-(a sleep/hold phase, `LD_PRELOAD=<provider.so>` so the initial scan sees
-it, or long-lived daemons via `profile --pid`), and expect the earliest
-post-load calls to be absent from the counts.
+`--pause auto`. Keep the workload alive past attach (a sleep/hold phase,
+`LD_PRELOAD=<provider.so>` so the initial scan sees it, or long-lived
+daemons via `profile --pid`). Without `run --pause auto`, expect the
+earliest post-load calls to be absent from the counts; with it, the child
+is held at each loader hit until the new provider's probes are attached,
+and the release qualification captured every call of a child that
+`dlopen`s SoftHSM2.
 
 `p11scope-discover --module <provider.so> -o manifest.json` is that optional
 offline path. It executes provider code in its own unprivileged process; the
@@ -806,78 +808,54 @@ overhead as a far smaller *relative* one. Read the numbers below as "the
 cost on this workload," not "the cost everywhere." Full method and raw
 per-run numbers: `docs/notes/phase5-overhead.md`.
 
-> **Staleness: this table predates policy-specific capture.** It was
-> measured before `4f59ff6` ("feat: enforce policy-specific eBPF capture",
-> 2026-08-13), which made the eBPF program skip ring submission in
-> `metrics` mode. The `metrics` row below no longer describes this tree
-> (its cost is expected to be lower, by an unmeasured amount); the
-> `profile`/`trace` rows and the event-loss figures remain the best
-> measured numbers until the re-bench below is run. Details:
-> `docs/notes/phase5-overhead.md` ("Staleness note").
+Machine: kernel `7.0.0-31-generic`, CPU `AMD Ryzen AI 9 HX PRO 370 w/
+Radeon 890M`, measured 2026-09-28 on the v0.1.0 release candidate.
+Workload: `scripts/fixtures/hammer.c`, 1,000,000 back-to-back
+`C_GenerateRandom` calls after a 1,000-call warm-up, 5 interleaved rounds
+per condition (median and min..max spread, not a single number):
 
-Machine: kernel `7.0.0-28-generic`, CPU `AMD Ryzen AI 9 HX PRO 370 w/
-Radeon 890M`. Workload: `scripts/fixtures/hammer.c`, 1,000,000 back-to-back
-`C_GenerateRandom` calls, 5 runs/condition (median and min..max spread,
-not a single number):
+| Condition | median wall-clock (1M calls) | min..max | median ns/call | overhead ns/call |
+| --- | --- | --- | --- | --- |
+| unobserved | 784.4 ms | 777.5..1293.1 ms | 784.4 ns | — |
+| `profile --mode metrics` | 4928.6 ms | 4835.9..7889.9 ms | 4928.6 ns | **+4144.2 ns** |
+| `profile --mode profile` | 7576.9 ms | 7450.2..9419.7 ms | 7576.9 ns | **+6792.5 ns** |
+| `trace` | 6289.7 ms | 6226.0..9726.0 ms | 6289.7 ns | **+5505.3 ns** |
 
-| Condition | median wall-clock (1M calls) | median ns/call | overhead ns/call |
-| --- | --- | --- | --- |
-| unobserved | 788.2 ms | 788.2 ns | — |
-| `profile --mode metrics` | 4041.6 ms | 4041.6 ns | **+3253.4 ns** |
-| `profile --mode profile` | 4038.7 ms | 4038.7 ns | **+3250.5 ns** |
-| `trace` | 4180.8 ms | 4180.8 ns | **+3392.6 ns** |
+**Overhead on this workload is large: about 6x wall-clock in `metrics`
+mode and 8-10x in `profile` and `trace`**, 4.1-6.8 µs added to every
+~0.8 µs unobserved call. This is a ceiling for SoftHSM2 hammered with no
+per-call delay, not a typical figure. Against a network HSM's
+millisecond-scale calls, the same absolute cost is negligible in relative
+terms.
 
-**Overhead on this workload is large: roughly a 5x wall-clock slowdown**,
-~3.25-3.4µs added to every ~0.8µs unobserved call. This is the honest
-number for SoftHSM2 hammered at 1M calls/sec with no per-call delay — a
-ceiling, not a typical figure. It should not be read as "p11scope adds
-~3.3µs to every PKCS#11 call everywhere," only "...to every call on this
-workload." Against a network HSM's millisecond-scale calls, the identical
-~3.3µs absolute cost becomes negligible in relative terms.
+`metrics` pays for the uprobe/uretprobe traps and the aggregate map
+updates. `profile` and `trace` also build and submit a per-call event,
+which costs another 1.4-2.6 µs per call here.
 
-All three observed conditions cost nearly the same, despite doing very
-different amounts of userspace work — the eBPF program pays for the
-uprobe/uretprobe trap, the map updates, and a ring-buffer submission
-attempt unconditionally, regardless of which userspace mode is running or
-whether it ever reads the ring buffer at all. At this call rate that
-unconditional in-kernel cost dominates. (Pre-policy-capture finding — see
-the staleness note above. Since `4f59ff6`, `metrics` no longer pays the
-ring-submission half of that cost, so the three-way convergence no longer
-holds as stated; the re-bench below will show what replaced it.)
-
-**Event loss at high call rates.** At 1,000,000 calls/sec with the
-default ring buffer, `profile` and `trace` both lose the overwhelming
-majority of per-call events — `event_loss` measured at 991,290-991,350
-out of 1,000,000 (99.1%+) for `profile`, and only 122,348-145,383 lines
-actually written for `trace` (its 200ms drain cadence vs. `profile`'s 1s
-meaningfully reduces, but does not eliminate, the loss). This does **not**
-invalidate the aggregate counts: `functions[]` is built from the BPF
-aggregate maps, which see every attached call and are never subject to
-ring-buffer loss — they stayed exact in every run. `evidence.completeness`
-correctly reports `PARTIAL` whenever this happens; it is never silently
-reported as complete. An operator capturing a bursty, high-rate workload
-should expect `PARTIAL` with a real `event_loss` count, and should trust
-the aggregate `functions[]` counts over event-derived
-`mechanisms`/`sessions`/`logins`/`cgroups` and `trace` lines in that case.
-In `--mode metrics` the ring is never drained and `event_loss` is always
-reported as 0 by construction (`run.rs` zeroes the kernel counter); a
-zero there means "not measured", not "nothing lost" — the aggregate
-counts remain the authority in that mode.
-Same finding `scripts/verify-induced-gaps.sh` demonstrates
+**Event loss.** With the default 4 MiB ring buffer nothing was lost at
+this rate. Every `profile` run reported `event_loss` 0, and every `trace`
+run wrote all 1,001,005 calls (warm-up and setup included) with no `LOST`
+record. The earlier measurement, with a 256 KiB ring, lost over 99% of
+`profile` events. A faster or burstier workload can still overrun the
+ring. `evidence.completeness` then reports `PARTIAL` with a real
+`event_loss` count. The aggregate `functions[]` counts come from BPF
+aggregate maps that ring loss never touches, so they stay exact. Trust
+them over event-derived `mechanisms`/`sessions`/`logins`/`cgroups` and
+`trace` lines in that case. In `--mode metrics` the ring is never drained
+and `event_loss` is 0 by construction: a zero there means "not measured",
+not "nothing lost". `scripts/verify-induced-gaps.sh` demonstrates loss
 deliberately on a lighter workload (`docs/notes/phase2-induced-gaps.md`).
 
-**Post-fix re-bench: UNRUN.** Re-measuring after `4f59ff6` needs the
-privileged bench (owner-gated; never run by automation): exactly
-`scripts/bench-overhead.sh` (defaults: `RUNS=5`, 1,000,000 calls per
-condition, same 4 conditions as the table above). Prerequisites: run as a
-non-root user with passwordless `sudo` (the script attaches via
-`sudo --preserve-env=SOFTHSM2_CONF` and chowns root-owned reports back);
-`gcc`, `softhsm2-util`, and `python3` on `PATH`; SoftHSM2 installed at
-`/usr/lib/softhsm/libsofthsm2.so`; offline Rust toolchains as pinned
-(the script builds release via `scripts/cargo.sh +1.88 build --locked
---release --workspace` first). Until it runs, no updated metrics-mode
-number may be quoted — "unresolved, needs owner re-bench" is the honest
-state.
+To re-measure, run `scripts/bench-overhead.sh` (defaults: `RUNS=5`,
+1,000,000 calls per condition). It needs:
+
+- a non-root user with passwordless `sudo`;
+- `gcc`, `softhsm2-util` and `python3` on `PATH`;
+- SoftHSM2 at `/usr/lib/softhsm/libsofthsm2.so`;
+- the pinned toolchains.
+
+It builds the release workspace first and works in a private directory
+under `$TMPDIR`.
 
 ## The evidence/completeness model
 

@@ -101,6 +101,18 @@ cargo +1.88 fetch --locked
 cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
 ```
 
+Two host pitfalls stop the driver early:
+
+- The `rustup` on `PATH` must be rustup itself. A version manager's shim
+  (for example mise's) rejects `rustup which --toolchain`, and the driver
+  exits 77; put `~/.cargo/bin` first on `PATH`.
+- The discover containers run on Docker's default bridge network and must
+  resolve the Ubuntu and Alpine archives. If the host's DNS server lies
+  inside the bridge subnet (WSL2 NAT at 172.17.x.x against the default
+  172.17.0.0/16, for example), the containers cannot resolve and the driver
+  fails at the discover step. Set `"bip"` or `"dns"` in
+  `/etc/docker/daemon.json`, or build in the `release-preview` CI job.
+
 The single argument is an absent evidence root whose parent is a private
 directory outside the checkout:
 

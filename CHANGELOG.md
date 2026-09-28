@@ -158,7 +158,10 @@ provider during capture.
 
 - x86-64 Linux, kernel 5.15 or newer. p11scope does not check the kernel
   version itself; an unsupported kernel fails with a named cause and a hint.
-  <!-- TODO(release): list the kernels actually qualified on the tag commit (owner decision D4). -->
+  Qualified kernels: Ubuntu 5.15.0-187, 6.1.188, 6.6.157, Ubuntu 6.8.0-142,
+  6.12.111 and 7.2.6 (per-probe links below 6.9, uprobe-multi from 6.9),
+  plus Ubuntu 7.0.0-31 on the host; see
+  [Qualification of this release](#qualification-of-this-release).
 - Capture needs root (`sudo`) or file capabilities on the observer binary.
   The attach floor is backend-dependent: on kernels ≥ 6.9 (uprobe-multi
   links, picked automatically) `CAP_BPF` + `CAP_PERFMON` suffice to attach
@@ -199,13 +202,20 @@ provider during capture.
    records (reported as loss). Aim it with `--system --module <path>`. Long
    `--cgroup`/`--system` captures of busy hosts can spend the 16,384-identity
    budget (about an hour at 5 new processes per second); later processes are
-   then counted only as identity refusals.
-   <!-- TODO(release): restate with the measured `--system` result on a desktop-class host (owner decision D2). -->
-3. **Coverage window.** Calls made before attach are not observed, and the
-   first calls after a late `dlopen` can be missed before that provider's
-   probes land — also under `run`, including with `--pause auto`. Manifest-free
+   then counted only as identity refusals. Measured on a desktop host
+   (Ubuntu, kernel 7.0): the scan took 2.7 s and admitted four providers
+   (272 slots, 544 probes) with exact SoftHSM2 counts, and refused the
+   `libp11-kit` proxies whole, each needing about 6,000 more slots than the
+   512 available.
+3. **Coverage window.** Calls made before attach are not observed. Under
+   `profile`/`trace --pid` and `run --pause never`, the first calls after a
+   late `dlopen` can be missed before that provider's probes land.
+   `run --pause auto` holds the child at each loader hit until the new
+   provider's probes are attached: in qualification it captured every call
+   of a child that `dlopen`s SoftHSM2 (2,000 iterations of six functions,
+   plus setup), on the host and on all six vng kernels. A workload that exits
+   within milliseconds can still end before attach completes. Manifest-free
    captures are count-only by design.
-   <!-- TODO(release): restate with the measured `run` numbers after the `run` fixes land. -->
 4. **Exec.** A `--pid` target that calls `exec` is not re-bound to the new
    image.
 5. **Not observed.** Statically linked providers, JIT-generated or anonymous
@@ -214,17 +224,18 @@ provider during capture.
 6. **Trace output** has no provider column; PIDs are host-namespace PIDs.
 7. **Containers and Kubernetes.** `deploy/k8s` is an example, not a
    published image. Docker, shared-layer, kind and Knative capture is
-   supported; its qualification on the release bytes is recorded under
+   supported and passed on the release candidate; see
    [Qualification of this release](#qualification-of-this-release).
-   <!-- TODO(release): container qualification pending re-run on the release bytes (owner decision: re-run, not downgrade). -->
 8. **`run` under `sudo`** clears supplementary groups, so a workload that
    needs an HSM/device group should be observed with `profile`/`trace` or run
    with a capability-carrying observer instead.
-9. **Overhead** was measured as roughly a 5x wall-clock slowdown against
-   SoftHSM2 at 1M calls/s (about 3.3 µs added per call) — a worst case, not
-   an envelope. At that rate most per-call events are lost; aggregate counts
-   stay exact.
-   <!-- TODO(release): replace with the re-bench on the release bytes. -->
+9. **Overhead** against SoftHSM2 `C_GenerateRandom` called back to back
+   (about 0.8 µs per unobserved call) is about 4.1 µs added per call in
+   `metrics` mode (6.3x wall clock), 6.8 µs in `profile` mode (9.7x) and
+   5.5 µs under `trace` (8.0x). This is a worst case, not an envelope. With
+   the default 4 MiB ring no per-call event was lost at that rate; aggregate
+   counts stay exact even when events are lost. See
+   [docs/usage.md](docs/usage.md#overhead-measured).
 10. **Not claimed.** Continuous system inventory, caller attribution,
     capacity growth, cumulative counters across all providers by default,
     operation-level semantics beyond attested manifests, a first-use
@@ -358,13 +369,31 @@ Fixes to defects found while qualifying this release, before it was tagged:
 
 ### Qualification of this release
 
-<!-- TODO(release): fill in from the tag commit before tagging. -->
+Run on 2026-09-28 against release candidate `a7800dd`. Later commits change
+only scripts and documentation. The public-command qualification and the
+Docker, shared-layer, kind and fork-scope lanes ran the static musl observer
+built by the official path of `scripts/build-release.sh` (sha256
+`9da91f3a60c8404741303841fe2a02df77c4607768f0cdce454ad5730f1ed022`). The
+release gate, the privileged library suite, the Knative lane and the
+privacy canaries build their own binaries from the same tree.
 
-- Hosted CI run: TODO(release)
-- Kernels and lanes run on the release bytes: TODO(release)
-- Container lanes (Docker, shared layer, kind, Knative) re-run on the
-  release bytes: TODO(release)
-- `scripts/build-release.sh` receipt and `SHA256SUMS`: TODO(release)
+- `scripts/release-gate.sh --profile both`, fresh target directory: PASS.
+- Public-command qualification (`scripts/qualify-public-cli.sh`: exact
+  per-function counts for `profile`/`metrics`/`trace --pid`, `run` of a
+  short-lived and of a `dlopen`ing child, a multi-thread exactness cell,
+  `--system`, SIGINT publication, `-o` FIFO refusal): 12/12 on the host
+  (Ubuntu 7.0.0-31) and 12/12 in virtme-ng guests on Ubuntu 5.15.0-187,
+  6.1.188, 6.6.157, Ubuntu 6.8.0-142, 6.12.111 and 7.2.6.
+- Privileged library suite (`scripts/run-privileged-lib-tests.sh`): 42
+  passed, 0 failed on the host, on Ubuntu 5.15 and on Ubuntu 6.8. Five tests
+  that need an external harness were skipped, the same five on each kernel.
+- Container lanes on the host: Docker, shared image layer, kind pod,
+  fork-scope and Knative scale-from-zero, all passed with exact counts.
+- Privacy canaries (`scripts/verify-canaries.sh`): all 12 lanes OK, no
+  leak.
+- Overhead re-bench (`scripts/bench-overhead.sh`, host): all 15 observed
+  samples valid; the numbers are in Known limitations item 9.
+<!-- TODO(release): the owner adds the hosted CI run (checks-and-e2e, coverage, archive-log, release-preview) and the `scripts/build-release.sh` receipt and `SHA256SUMS` from the tag commit. -->
 
 ### Pre-release development history
 

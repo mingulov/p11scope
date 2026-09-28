@@ -142,3 +142,29 @@ as of this writing. No number in this note replaces a bench run; see
 
 History preserved verbatim: the table, raws, and findings above are
 unchanged; only this note is new.
+
+## Re-bench on the v0.1.0 release candidate (2026-09-28)
+
+`scripts/bench-overhead.sh` at `a9ec74e`, whose product code is identical to
+release candidate `a7800dd`. Host kernel `7.0.0-31-generic`, same CPU, 5
+interleaved rounds of 1,000,000 calls after a 1,000-call warm-up; all 15
+observed samples were valid:
+
+| Condition | median ms | min..max ms | overhead ns/call |
+| --- | --- | --- | --- |
+| unobserved | 784.4 | 777.5..1293.1 | — |
+| `profile --mode metrics` | 4928.6 | 4835.9..7889.9 | +4144.2 |
+| `profile --mode profile` | 7576.9 | 7450.2..9419.7 | +6792.5 |
+| `trace` | 6289.7 | 6226.0..9726.0 | +5505.3 |
+
+This replaces the staleness note above. The modes no longer converge:
+`metrics` skips the per-call event, and `profile`/`trace` pay another
+1.4-2.6 µs for it. Every mode costs more per call than the August
+measurement, while the unobserved baseline is unchanged (784 vs 788 ns). The
+per-call BPF path has grown since August; the increase has not been
+attributed to individual changes.
+
+Loss is gone at this rate with the 4 MiB default ring, against the August
+256 KiB ring. Every `profile` run reported `event_loss` 0. Every `trace` run
+wrote all 1,001,005 calls with no `LOST` record, and each run's
+`COUNT_EVIDENCE` `raw_calls` equalled the lines written.

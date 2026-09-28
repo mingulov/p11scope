@@ -39,20 +39,24 @@ change after step 5 means starting again from step 3.
   GPL-3.0-only or Apache-2.0-only code has entered the BPF build
   (`cargo tree -e normal` in `crates/ebpf`).
 
-## 2. Tag the dependency first
+## 2. Confirm the dependency revision is tagged
 
-`pkcs11-components` has no tags; the pinned revision survives only while it
-is reachable from a branch. Tag it before tagging p11scope, so a later
-force-push cannot make this release unbuildable:
+The pinned `pkcs11-components` revision must stay fetchable, so it must be
+reachable from a published tag, not only from a branch a later force-push
+could rewrite. The pinned `d0a47c7` is an ancestor of the published tags
+`v0.2.0` and `v0.2.1`:
 
 ```sh
-git -C <pkcs11-components checkout> tag -a v0.2.0 \
-  d0a47c71d34294466bc41100ae6b5a5a329029d2 -m 'pkcs11-components v0.2.0'
-git -C <pkcs11-components checkout> push origin v0.2.0
 git ls-remote --tags https://github.com/mingulov/pkcs11-components
+git -C <pkcs11-components checkout> fetch --tags origin
+git -C <pkcs11-components checkout> merge-base --is-ancestor \
+  d0a47c71d34294466bc41100ae6b5a5a329029d2 v0.2.0 && echo reachable
 ```
 
-The revision must match the `rev =` in `Cargo.toml` and both lockfiles.
+The revision must match the `rev =` in `Cargo.toml` and both lockfiles. The
+crates.io releases of `pkcs11-types` and `pkcs11-module` (0.2.0, 0.2.1) are
+later revisions with source changes, not `d0a47c7`. Moving to them is a
+dependency upgrade that needs the full checks and qualification again.
 
 ## 3. Get a green hosted CI run on the exact commit
 

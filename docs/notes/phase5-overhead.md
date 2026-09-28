@@ -37,7 +37,8 @@ the observer's own stdout was redirected to a plain file rather than a
 terminal — `trace` prints one line per completed call, and on a real tty
 that I/O would itself become the bottleneck being measured. Both trace
 output files (the `-o` file and the redirected stdout, which duplicate
-each other) land under `target/bench-overhead/`, not committed.
+each other) land in the run's private work directory under `$TMPDIR`
+(printed as `work:` at the start), outside the checkout.
 
 Every run is sanity-checked before its timing is accepted: `metrics`/
 `profile` runs assert `evidence.attached_probes > 0` from the `-o` JSON;

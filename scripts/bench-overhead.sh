@@ -45,7 +45,7 @@ cd "$(dirname "$0")/.."
 . scripts/lib.sh
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
-WORK=target/bench-overhead
+WORK=
 FIX=scripts/fixtures
 RUNS=${RUNS:-5}
 N_CALLS=${N_CALLS:-1000000}
@@ -55,7 +55,6 @@ WARMUP_TIMEOUT_S=${WARMUP_TIMEOUT_S:-15}
 ATTACH_MARKER="p11scope: capturing: "
 WPID=
 SPID=
-mkdir -p "$WORK"
 
 # Prints the probe count from the observer's attach-complete stderr line in
 # $1, or nothing when the line has not landed yet.
@@ -187,6 +186,11 @@ if [ "${1-}" = "--self-test" ]; then
     exit 0
 fi
 [ "$#" -eq 0 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
+# The observer refuses an output directory below any group- or other-writable
+# ancestor, which a checkout under a 0775 home tree has, so the bench works
+# in a private directory under TMPDIR. It is kept for the numbers.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-bench-overhead-XXXXXX")
+echo "work: $WORK"
 
 cleanup() {
     status=$?
@@ -215,7 +219,7 @@ export SOFTHSM2_CONF="$WORK/softhsm2.conf"
 rm -rf "$WORK/tokens"
 mkdir -p "$WORK/tokens"
 cat > "$SOFTHSM2_CONF" <<EOF
-directories.tokendir = $PWD/$WORK/tokens
+directories.tokendir = $WORK/tokens
 objectstore.backend = file
 log.level = ERROR
 slots.removable = false

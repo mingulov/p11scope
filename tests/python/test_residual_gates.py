@@ -147,6 +147,8 @@ class ResidualGates(unittest.TestCase):
             f'  File "/{private}/unknown.py", line 123, in unknown_function\n'
             f'  File "/{private}/capture-stopped-canary.py", line 0, in unknown_function\n'
             f'  File "/{private}/check-canary-evidence.py", line 1234567, in unknown_function\n'
+            'canary-failure-location: capture-stopped-canary.py:773\n'
+            f'canary-failure-location: {private}:123\n'
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -160,6 +162,7 @@ class ResidualGates(unittest.TestCase):
             )
             report = json.loads(result.stdout.split("release-diagnostic: ", 1)[1])
             self.assertEqual(report.get("python_failure_locations"), [
+                {"script": "capture-stopped-canary.py", "line": 773},
                 {"script": "check-canary-evidence.py", "line": 705},
             ])
             self.assertIn("python-assertion-failed", report["observed_signature_ids"])

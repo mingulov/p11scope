@@ -1064,6 +1064,49 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.build.cleanup()
 
+    def test_sanitizing_a_real_canary_failure_retains_only_its_trusted_location(self):
+        private = 'PRIVATE_CANARY_ASSERTION_BYTES'
+        starts = [{'session': 0x401, 'attrs': (private,)}, {'session': 0x402}]
+        diagnostic = io.StringIO()
+        try:
+            capture.evidence.assert_fault_records(starts, 0)
+        except AssertionError as error:
+            with contextlib.redirect_stderr(diagnostic):
+                issues = capture.sanitized('retained-semantics', error)
+        else:
+            self.fail('malformed fault record was accepted')
+        self.assertEqual(issues, ['retained-semantics: AssertionError'])
+        lines = diagnostic.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        prefix = 'canary-failure-location: check-canary-evidence.py:'
+        self.assertTrue(lines[0].startswith(prefix), lines)
+        number = int(lines[0][len(prefix):])
+        source = (ROOT / 'scripts/check-canary-evidence.py').read_text().splitlines()
+        self.assertIn('assert start["attrs"] ==', source[number - 1])
+        for forbidden in (private, str(ROOT), __file__, 'assert start', '0x401'):
+            self.assertNotIn(forbidden, diagnostic.getvalue())
+
+    def test_sanitizing_an_unknown_source_does_not_publish_its_filename(self):
+        diagnostic = io.StringIO()
+        try:
+            exec(compile('raise RuntimeError("PRIVATE_BYTES")',
+                         '/PRIVATE_PATH/check-canary-evidence.py', 'exec'), {})
+        except RuntimeError as error:
+            with contextlib.redirect_stderr(diagnostic):
+                issues = capture.sanitized('retained-semantics', error)
+        self.assertEqual(issues, ['retained-semantics: RuntimeError'])
+        self.assertEqual(diagnostic.getvalue(), '')
+
+    def test_a_closed_diagnostic_stream_does_not_replace_the_original_failure(self):
+        diagnostic = io.StringIO()
+        diagnostic.close()
+        try:
+            capture.evidence.assert_fault_records([], 0)
+        except AssertionError as error:
+            with contextlib.redirect_stderr(diagnostic):
+                issues = capture.sanitized('retained-semantics', error)
+        self.assertEqual(issues, ['retained-semantics: AssertionError'])
+
     def test_custody_deadline_has_a_bounded_specific_diagnostic(self):
         try:
             c._remaining(time.monotonic() - 1)

@@ -57,6 +57,11 @@ OBSERVER_WAIT_SECONDS = 20
 PUBLICATION_SECONDS = 10
 MAX_BYTES = dumper.TASK_STORAGE_MAX_BYTES
 MAX_LOG_BYTES = 4 * 1024 * 1024
+DIAGNOSTIC_SCRIPTS = {str(Path(__file__).resolve().parent / name): name for name in (
+    'capture-stopped-canary.py', 'check-canary-evidence.py',
+    'check-capture-evidence.py', 'canary_process_custody.py',
+    'dump-owned-bpf-maps.py', 'qualify-task-storage-canary.py',
+)}
 
 
 class CaptureError(RuntimeError):
@@ -66,6 +71,26 @@ class CaptureError(RuntimeError):
         super().__init__('; '.join(self.issues))
 
 
+def report_failure_locations(error):
+    """Keep trusted code locations before sanitization discards traceback data."""
+    locations, trace = [], error.__traceback__
+    for _ in range(64):
+        if trace is None:
+            break
+        script = DIAGNOSTIC_SCRIPTS.get(trace.tb_frame.f_code.co_filename)
+        location = (script, trace.tb_lineno)
+        if script and 0 < trace.tb_lineno < 1000000 and location not in locations:
+            locations.append(location)
+        trace = trace.tb_next
+    for script, line in locations[-8:]:
+        try:
+            print(f'canary-failure-location: {script}:{line}', file=sys.stderr)
+        except (OSError, ValueError):
+            # Optional diagnostics must not interrupt custody cleanup or
+            # replace the failure already being retained by the caller.
+            break
+
+
 def sanitized(phase, error):
     issues, pending, seen = [], [error], set()
     while pending and len(issues) < 32:
@@ -73,6 +98,7 @@ def sanitized(phase, error):
         if id(item) in seen:
             continue
         seen.add(id(item))
+        report_failure_locations(item)
         if isinstance(item, CaptureError):
             issues.extend(item.issues[:32 - len(issues)])
         else:

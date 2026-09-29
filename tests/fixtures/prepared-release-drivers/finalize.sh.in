@@ -49,6 +49,16 @@ if [ "$LANE" = release ]; then
     RECEIPT_CHILD_FACTS_HASH=$(receipt_digest /proc/$$/fd/8)
     RECEIPT_TOOLS=
     PREPARED_PREFIX=$RECEIPT_PREPARED_PREFIX
+    DIST=$ROOT/work/dist
+    mkdir -m 700 "$DIST"
+    printf observer > "$DIST/p11scope"
+    printf glibc > "$DIST/p11scope-discover"
+    printf glibc > "$DIST/p11scope-discover-glibc"
+    printf musl > "$DIST/p11scope-discover-musl"
+    (cd "$DIST" && sha256sum p11scope p11scope-discover p11scope-discover-glibc p11scope-discover-musl) \
+        > "$ROOT/artifacts/release-artifacts.sha256"
+    RECEIPT_ARTIFACTS_SHA256=$(receipt_digest "$ROOT/artifacts/release-artifacts.sha256")
+    receipt_fact release_artifacts_sha256 "$RECEIPT_ARTIFACTS_SHA256"
 fi
 if [ "$SCENARIO" != admission ]; then
     "$P11SCOPE_PREPARED_PYTHON" -I scripts/prepared-dependency-evidence.py capture \

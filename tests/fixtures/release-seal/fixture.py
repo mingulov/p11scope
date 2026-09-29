@@ -74,7 +74,7 @@ class ReleaseSealFixture:
         (self.repo / ".gitignore").write_text("/third-party/src/\n__pycache__/\n")
         for name in ("build-release.sh", "lib.sh", "check-capture-evidence.py",
                      "lane-build-release-oracle-1.py", "lane-build-release-oracle-2.py",
-                     "lane-build-release-oracle-3.py",
+                     "lane-build-release-oracle-3.py", "release-artifacts.py",
                      "verify-receipt-lane16.sh", "lane-receipt-lane16-oracle-1.py",
                      "lane-receipt-lane16-oracle-2.py", "lane-receipt-lane16-oracle-3.py",
                      "merge-checksum-ledgers.py", "prepared-dependency-tools.sh"):
@@ -97,6 +97,7 @@ class ReleaseSealFixture:
         for directory in (self.fake_bin, self.tripwire_bin, self.home, self.seal_parent, campaign):
             directory.mkdir()
         campaign.chmod(0o700)
+        self.seal_parent.chmod(0o700)
         self.root = campaign / "evidence"
         self.tripwire_log = self.base / "tripwire.log"
         self.environment_dump = self.base / "sealed-environment"

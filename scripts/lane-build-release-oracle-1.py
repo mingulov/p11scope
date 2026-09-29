@@ -107,7 +107,7 @@ sealed-command-inventory-pinned-before-root-and-git-decisions
 sealed-environment-allowlist-exact-accepted
 forged-seal-marker-rejected
 inventory-wide-tool-ledger-exact-accepted
-sealed-bin-removed-after-terminal-status
+sealed-bin-removed-before-terminal-status
 nightly-toolchain-closure-exact-accepted
 isolated-python-invocations-exact-accepted
 tab-or-newline-root-rejected-status-77""".splitlines()
@@ -200,9 +200,9 @@ def seal_before(a,b): return seal_steps.index(a)<seal_steps.index(b)
 mark(lane[24],all(seal_before("refuse-inherited-build-inputs",step) for step in ("seal","prepare-root","git-head"))
      and all(seal_before("seal",step) for step in ("verify-seal","prepare-root","git-head","pin-tools","body")))
 sealed_environment={"HOME","LC_ALL","OLDPWD","P11SCOPE_RECEIPT_CALLER_ARGV0","P11SCOPE_RECEIPT_CALLER_PATH",
-                    "P11SCOPE_RECEIPT_SEALED","P11SCOPE_RECEIPT_SEALED_BIN","PATH","PWD"}
+                    "P11SCOPE_RECEIPT_SEALED","P11SCOPE_RECEIPT_SEALED_BIN","PATH","PWD","TMPDIR"}
 steering={"RUSTC_WORKSPACE_WRAPPER","P11SCOPE_SMALL_RING","PYTHONPATH","PYTHONHOME","GIT_DIR",
-          "GIT_WORK_TREE","GIT_INDEX_FILE","GIT_CONFIG_GLOBAL","DOCKER_HOST","TMPDIR","LANG"}
+          "GIT_WORK_TREE","GIT_INDEX_FILE","GIT_CONFIG_GLOBAL","DOCKER_HOST","LANG"}
 def seal_accepts(names): return names==sealed_environment
 mark(lane[25],seal_accepts(set(sealed_environment)) and not seal_accepts(sealed_environment|steering)
      and not sealed_environment&steering)
@@ -212,9 +212,9 @@ reached={"git","awk","sort","xargs","realpath","find","cp","sh","stat","id","mkd
          "chmod","date","sync","rm","grep","ldd","cat","ls","cc","gcc","env","ln","mktemp"}
 floor={"cargo","docker","file","jq","python3","rustup","setpriv","sudo","sha256sum"}
 mark(lane[27],not reached<=floor and bool(reached-floor) and reached<=reached|floor)
-finalization=["body","evidence-checks","terminal-status","remove-sealed-bin"]
-mark(lane[28],finalization.index("terminal-status")<finalization.index("remove-sealed-bin")
-     and finalization[-1]=="remove-sealed-bin")
+finalization=["body","evidence-checks","sync-staged-status","remove-sealed-bin","terminal-status"]
+mark(lane[28],finalization.index("sync-staged-status")<finalization.index("remove-sealed-bin")
+     <finalization.index("terminal-status") and finalization[-1]=="terminal-status")
 # The shipped observer embeds an eBPF object built by a second toolchain, so
 # the recorded 1.88 pair is not the effective build closure on its own.
 stable_closure={"toolchain_cargo","toolchain_rustc"}

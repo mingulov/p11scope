@@ -2,13 +2,15 @@
 //! Multi-uprobe link creation plus bounded poison-offset isolation.
 //!
 //! Provenance: `link_create` UAPI layout is borrowed from `ossl-bpf-sys`
-//! v1.0.0 (`osslscope/crates/bpf-sys/src/lib.rs`, 306 lines, GPL-3.0-or-later,
+//! v1.0.0 (`osslscope/crates/bpf-sys/src/lib.rs`, GPL-3.0-or-later,
 //! UAPI verified against `linux/bpf.h`); attach semantics (pid handling,
 //! cookie batching, error classification) follow upstream Aya PR #1417
 //! ("aya: add multi-uprobe attach support", merged 2026-07-31 as
 //! `5c1a79e0bdc36e77b304c1a08ff8b05e6b823108`); `bisect_attach` is ported
 //! from osslscope `src/plan.rs` (`bisect_attach`, bounded log-n poison
-//! isolation). See `third-party/README.md` for the loader's dependency
+//! isolation). Both source routines were compared against osslscope commit
+//! `807dbba8f06c0d215f1c43c57090fe6c3436896f` during release review.
+//! See `third-party/README.md` for the loader's dependency
 //! corrections and upstream provenance.
 //!
 //! Composition (Task 2.2): program loading stays in backported Aya 0.14

@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+case @FAILURE@:$* in
+    final-sync:*/status|final-sync:*/status.pending)
+        echo 'injected final status sync failure' >&2
+        exit 73 ;;
+    sealed-cleanup:*/sealed-bin)
+        echo 'injected sealed directory cleanup failure' >&2
+        exit 74 ;;
+esac
+exec @COMMAND@ "$@"

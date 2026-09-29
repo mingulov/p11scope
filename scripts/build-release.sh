@@ -80,6 +80,15 @@ receipt_snapshot() {
 }
 receipt_fact() { printf '%s\t%s\n' "$1" "$2" >> "$RECEIPT_FACTS"; }
 
+receipt_verify_artifacts() {
+    [ -n "${RECEIPT_ARTIFACTS_SHA256-}" ] \
+        || { echo "release artifact ledger was not recorded" >&2; return 1; }
+    "$T4_TOOL_python3" -I scripts/release-artifacts.py verify \
+        --dist "$RECEIPT_ROOT/work/dist" \
+        --ledger "$RECEIPT_ROOT/artifacts/release-artifacts.sha256" \
+        --sha256 "$RECEIPT_ARTIFACTS_SHA256" >/dev/null
+}
+
 # Hash one complete tree as a typed, sorted transcript. NUL-delimited
 # enumeration keeps hostile names unambiguous; names and symlink targets still
 # refuse tabs/newlines before they can enter the transcript or receipt.
@@ -270,7 +279,7 @@ llvm-objcopy llvm-readelf ln ls mkdir mktemp mv python3 realpath rm rustup sed
 setpriv sh sha256sum sleep softhsm2-util sort stat sudo sync tail timeout touch
 uname xargs'
 
-# The exact environment the sealed child may observe. `env -i` supplies seven
+# The exact environment the sealed child may observe. `env -i` supplies eight
 # of these; dash itself adds PWD and, because line 26 `cd`s, OLDPWD. Nothing
 # else survives -- the set was pinned by observation, not by assumption. The
 # comparison is exact, so a P11SCOPE_RECEIPT_SEALED forged by the caller refuses
@@ -283,7 +292,24 @@ P11SCOPE_RECEIPT_CALLER_PATH
 P11SCOPE_RECEIPT_SEALED
 P11SCOPE_RECEIPT_SEALED_BIN
 PATH
-PWD'
+PWD
+TMPDIR'
+
+# Temporary I/O must stay on the operator-selected filesystem after env -i.
+# The directory is either caller-private or the conventional root-owned sticky
+# temporary root. Canonical names exclude symlink ancestors, and ':' cannot
+# occur because the seal's child directory becomes PATH.
+receipt_validate_tmpdir() {
+    t4_temp=$1
+    t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
+    case $t4_temp in /*) ;; *) return 1 ;; esac
+    case $t4_temp in *":"*|*"$t4_tab"*|*"$t4_nl"*) return 1 ;; esac
+    [ -d "$t4_temp" ] && [ ! -L "$t4_temp" ] \
+        && [ -w "$t4_temp" ] && [ -x "$t4_temp" ] || return 1
+    [ "$(cd "$t4_temp" && pwd -P)" = "$t4_temp" ] || return 1
+    t4_temp_mode=$(stat -Lc %u:%a "$t4_temp") || return 1
+    [ "$t4_temp_mode" = "$(id -u):700" ] || [ "$t4_temp_mode" = 0:1777 ]
+}
 
 # An untracked `.cargo/config.toml` is invisible to `git ls-files`, to the
 # source ledger, and to the cleanliness gate, yet Cargo obeys it. Report every
@@ -339,6 +365,9 @@ receipt_seal_and_reexec() {
         eval "t4_value=\${$t4_var-}"
         [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
     done
+    TMPDIR=${TMPDIR-/var/tmp}
+    receipt_validate_tmpdir "$TMPDIR" \
+        || { echo "refusing unsafe TMPDIR: $TMPDIR" >&2; exit 77; }
     t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
     for t4_value in "${HOME-}" "$PATH" "$0"; do
         case $t4_value in
@@ -353,7 +382,7 @@ receipt_seal_and_reexec() {
         eval "t4_seal_$t4_tool=\$t4_pinned"
     done
     umask 077
-    t4_seal_bin=$("$t4_seal_mktemp" -d "${TMPDIR:-/tmp}/p11scope-receipt-seal-XXXXXX") \
+    t4_seal_bin=$("$t4_seal_mktemp" -d "$TMPDIR/p11scope-receipt-seal-XXXXXX") \
         || { echo "cannot create the sealed release bin directory" >&2; exit 77; }
     for t4_tool in $RECEIPT_TOOL_INVENTORY; do
         t4_pinned=$(receipt_seal_pin "$t4_tool") \
@@ -365,6 +394,7 @@ receipt_seal_and_reexec() {
         PATH="$t4_seal_bin" \
         HOME="${HOME-}" \
         LC_ALL=C \
+        TMPDIR="$TMPDIR" \
         P11SCOPE_RECEIPT_SEALED=1 \
         P11SCOPE_RECEIPT_SEALED_BIN="$t4_seal_bin" \
         P11SCOPE_RECEIPT_CALLER_PATH="$PATH" \
@@ -384,6 +414,7 @@ receipt_verify_seal() {
     case $t4_bin in /*) ;; *) return 1 ;; esac
     [ "$PATH" = "$t4_bin" ] || return 1
     [ "${LC_ALL-}" = C ] || return 1
+    receipt_validate_tmpdir "${TMPDIR-}" || return 1
     [ ! -L "$t4_bin" ] && [ -d "$t4_bin" ] || return 1
     [ "$(env | awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ { print $1 }' | LC_ALL=C sort)" \
         = "$RECEIPT_SEALED_ENVIRONMENT" ] || return 1
@@ -524,21 +555,37 @@ receipt_finalize() {
         [ -s "$RECEIPT_ROOT/artifacts/checker.log" ] || t4_result=1
         [ -n "$RECEIPT_CHILD_FACTS_ID" ] && [ "$(stat -Lc %d:%i /proc/$$/fd/8 2>/dev/null)" = "$RECEIPT_CHILD_FACTS_ID" ] || t4_result=1
         [ -n "$RECEIPT_CHILD_FACTS_HASH" ] && [ "$(receipt_digest /proc/$$/fd/8 2>/dev/null)" = "$RECEIPT_CHILD_FACTS_HASH" ] || t4_result=1
+        receipt_verify_artifacts || t4_result=1
     fi
     find "$RECEIPT_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
     find "$RECEIPT_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
     "$T4_TOOL_python3" -I scripts/lane-build-release-oracle-3.py "$RECEIPT_ROOT" || t4_result=1
     receipt_fact ended_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || t4_result=1
     receipt_fact terminal_status "$t4_result" || t4_result=1
-    sync -f "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log" 2>/dev/null || t4_result=1
-    if [ ! -e "$RECEIPT_ROOT/status" ] && [ ! -L "$RECEIPT_ROOT/status" ]; then
-        printf '%s\n' "$t4_result" > "$RECEIPT_ROOT/status"; chmod 600 "$RECEIPT_ROOT/status"; sync -f "$RECEIPT_ROOT/status" 2>/dev/null || t4_result=1
+    "$T4_TOOL_sync" -f "$RECEIPT_FACTS" "$RECEIPT_ROOT/stdout.log" "$RECEIPT_ROOT/stderr.log" || t4_result=1
+    # A readable status=0 is the receipt's completion marker. Synchronize its
+    # staged content and finish seal cleanup BEFORE publishing that name, so
+    # a late sync/cleanup failure cannot leave a success-looking receipt.
+    t4_pending=$RECEIPT_ROOT/work/status.pending
+    t4_publish=0
+    if [ ! -e "$RECEIPT_ROOT/status" ] && [ ! -L "$RECEIPT_ROOT/status" ] \
+        && (umask 077; set -C; printf '%s\n' "$t4_result" > "$t4_pending") \
+        && "$T4_TOOL_chmod" 600 "$t4_pending" \
+        && "$T4_TOOL_sync" -f "$t4_pending"; then
+        t4_publish=1
     else
         t4_result=1
     fi
-    # The sealed directory is the receipt's own tool evidence: it stays until
-    # the terminal status exists, never earlier.
-    rm -rf "$P11SCOPE_RECEIPT_SEALED_BIN"
+    if ! "$T4_TOOL_rm" -rf "$P11SCOPE_RECEIPT_SEALED_BIN"; then
+        t4_result=1
+        t4_publish=0
+    fi
+    if [ "$t4_publish" -eq 1 ]; then
+        # Both paths are in the receipt filesystem; rename is atomic. The
+        # absolute pinned command remains usable after removing sealed PATH.
+        # There are no fallible operations after successful publication.
+        "$T4_TOOL_mv" -T -- "$t4_pending" "$RECEIPT_ROOT/status" || t4_result=1
+    fi
     exit "$t4_result"
 }
 
@@ -563,6 +610,10 @@ receipt_receipt_run() {
     T4_TOOLCHAIN_CARGO= T4_TOOLCHAIN_RUSTC=
     for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum mktemp find sort xargs sh cat grep; do
         eval "T4_TOOL_$t4_tool=\$t4_tool"
+    done
+    # Final status publication happens after sealed PATH has been removed.
+    for t4_tool in chmod mv rm sync; do
+        receipt_pin_tool "$P11SCOPE_RECEIPT_SEALED_BIN/$t4_tool" "T4_TOOL_$t4_tool" || exit 77
     done
     trap receipt_finalize EXIT INT TERM HUP
     [ ! -L "$RECEIPT_CAMPAIGN/.receipt.lock" ] || exit 77
@@ -756,6 +807,13 @@ echo "musl-dynamic file/ldd/smoke run already verified inside the alpine" \
      "host has no musl dynamic linker to exec it directly."
 cp "$MUSL_DISCOVER" "$DIST/p11scope-discover-musl"
 
+# Bind the exact copied bytes before any packaged helper/static smoke. The
+# receipt keeps this ledger private; a public packager verifies its digest and
+# the four files before restoring executable modes in its own staging tree.
+RECEIPT_ARTIFACTS_SHA256=$("$T4_TOOL_python3" -I scripts/release-artifacts.py record \
+    --dist "$DIST" --ledger "$RECEIPT_ROOT/artifacts/release-artifacts.sha256")
+receipt_fact release_artifacts_sha256 "$RECEIPT_ARTIFACTS_SHA256"
+
 echo "=== packaged discovery helper smoke ==="
 "$DIST/p11scope-discover" --module /usr/lib/softhsm/libsofthsm2.so \
     -o "$DIST/.smoke-manifest-helper.json"
@@ -868,6 +926,8 @@ t4_checker_status=0
 [ "$t4_checker_status" -eq 0 ] \
     || { echo "capture evidence checker failed: $t4_checker_status"; exit "$t4_checker_status"; }
 echo "static p11scope smoke attach OK: $("$T4_TOOL_jq" -c .evidence "$WORK/observed-static-smoke.json")"
+
+receipt_verify_artifacts
 
 echo "=== dist/ ==="
 ls -la "$DIST"

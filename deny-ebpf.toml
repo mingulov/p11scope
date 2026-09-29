@@ -1,0 +1,58 @@
+# BPF-only Cargo graph policy. This separate root contains p11scope-ebpf
+# under GPL-2.0-only; no host package is allowed that license.
+[graph]
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "bpfel-unknown-none" },
+]
+all-features = true
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+
+[licenses]
+# Only licenses admitted by the BPF dependency graph. The BPF package
+# itself is GPL-2.0-only; GPL-3.0-only must not enter this graph.
+allow = [
+  "Apache-2.0",
+  "GPL-2.0-or-later",
+  "MIT",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.8
+# Only the BPF executable carries the GPL-2.0-only SPDX expression.
+[[licenses.exceptions]]
+name = "p11scope-ebpf"
+version = "0.0.0"
+allow = ["GPL-2.0-only"]
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+# Every path/git requirement carries an explicit version (Cargo.toml), so
+# `wildcards = deny` holds with an empty allowlist: any new `*` fails.
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The only git dependency: rev-pinned PKCS #11 bindings, lockfile-pinned.
+allow-git = ["https://github.com/mingulov/pkcs11-components"]
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

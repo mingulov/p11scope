@@ -1835,10 +1835,27 @@ fn task7_tripwire_bin(log: &std::path::Path) -> tempfile::TempDir {
         "cargo", "docker", "file", "jq", "rm", "rustup", "setpriv", "sudo",
     ] {
         let path = bin.path().join(command);
+        let completion = if command == "rm" {
+            let prefix = std::env::temp_dir()
+                .join("p11scope-receipt-seal-")
+                .display()
+                .to_string()
+                .replace('\'', "'\"'\"'");
+            format!(
+                "[ \"$#\" -eq 2 ] && [ \"$1\" = -rf ] || exit 97\n\
+                 prefix='{prefix}'\n\
+                 case \"$2\" in \"$prefix\"??????) ;; *) exit 97 ;; esac\n\
+                 suffix=${{2#\"$prefix\"}}\n\
+                 case \"$suffix\" in *[!A-Za-z0-9]*) exit 97 ;; esac\n\
+                 exec /bin/rm -rf -- \"$2\"\n"
+            )
+        } else {
+            "exit 97\n".to_string()
+        };
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\necho \"${{0##*/}}\" >> {log}\nexit 97\n",
+                "#!/bin/sh\necho \"${{0##*/}}\" >> {log}\n{completion}",
                 log = log.display()
             ),
         )
@@ -1850,7 +1867,7 @@ fn task7_tripwire_bin(log: &std::path::Path) -> tempfile::TempDir {
 }
 
 /// The one command a sealed refusal does legitimately reach: `receipt_finalize`
-/// removes the sealed bin directory once the terminal status exists. Any other
+/// removes the sealed bin directory before publishing terminal status. Any other
 /// name in the log is a command that escaped the refusal.
 const TASK7_EXPECTED_TRIPWIRES: &str = "rm\n";
 
@@ -2125,6 +2142,7 @@ fn release_seal_denies_the_caller_path_to_every_reached_command() {
             "-I",
             "tests/python/test_release_seal.py",
             "ReleaseSealTests",
+            "ReleaseArtifactLedgerTests",
         ])
         .output()
         .expect("run the complete native release-seal suite");
@@ -2169,7 +2187,7 @@ fn release_runs_every_python3_in_isolated_mode() {
         .collect();
     assert_eq!(
         sites.len(),
-        8,
+        10,
         "the pinned-interpreter call sites moved; re-check each one for -I"
     );
     for site in sites {
@@ -2310,6 +2328,7 @@ fn release_refuses_a_forged_seal_marker() {
         .arg(&forged_root)
         .env("PATH", &forged_bin)
         .env("HOME", home.path())
+        .env("TMPDIR", campaign.path())
         .env("LC_ALL", "C")
         .env("P11SCOPE_RECEIPT_SEALED", "1")
         .env("P11SCOPE_RECEIPT_SEALED_BIN", &forged_bin)
@@ -2434,21 +2453,24 @@ fn release_pins_its_reached_command_inventory_and_sealed_environment() {
         "the sysroot closure does not require the top-level compiler driver"
     );
 
-    // The sealed bin directory is evidence until the receipt status exists.
+    // Complete every fallible cleanup before publishing a successful receipt.
     let finalize = between(
         &release,
         "\nreceipt_finalize() {",
         "\nreceipt_receipt_run() {",
     );
     let status = finalize
-        .find("printf '%s\\n' \"$t4_result\" > \"$RECEIPT_ROOT/status\"")
-        .expect("finalization writes the terminal status");
+        .find("\"$T4_TOOL_mv\" -T -- \"$t4_pending\" \"$RECEIPT_ROOT/status\"")
+        .expect("finalization atomically publishes the synchronized status");
     let removal = finalize
-        .find("rm -rf \"$P11SCOPE_RECEIPT_SEALED_BIN\"")
+        .find("\"$T4_TOOL_rm\" -rf \"$P11SCOPE_RECEIPT_SEALED_BIN\"")
         .expect("finalization removes the sealed bin directory");
+    let sync = finalize
+        .find("\"$T4_TOOL_sync\" -f \"$t4_pending\"")
+        .expect("finalization synchronizes staged status before publication");
     assert!(
-        status < removal,
-        "the sealed bin directory is removed before the receipt status is written"
+        sync < removal && removal < status,
+        "status publication must follow synchronization and sealed tool cleanup"
     );
 }
 
@@ -4330,7 +4352,7 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "sealed-environment-allowlist-exact-accepted",
         "forged-seal-marker-rejected",
         "inventory-wide-tool-ledger-exact-accepted",
-        "sealed-bin-removed-after-terminal-status",
+        "sealed-bin-removed-before-terminal-status",
         "nightly-toolchain-closure-exact-accepted",
         "isolated-python-invocations-exact-accepted",
         "tab-or-newline-root-rejected-status-77",
@@ -7024,11 +7046,11 @@ fn release_docs_describe_the_built_version() {
         .lines()
         .filter(|line| line.starts_with("## "))
         .collect();
-    let current = format!("## [{version}] - ");
+    let current = format!("## [{version}]");
     let named: Vec<&str> = headings
         .iter()
         .copied()
-        .filter(|line| line.starts_with(&current))
+        .filter(|line| *line == current || line.starts_with(&format!("{current} - ")))
         .collect();
     assert_eq!(
         named.len(),
@@ -7043,9 +7065,11 @@ fn release_docs_describe_the_built_version() {
     }
     let released = &named[0][current.len()..];
     assert!(
-        released == "UNRELEASED"
-            || (released.len() == 10
-                && released
+        released.is_empty()
+            || released == " - UNRELEASED"
+            || (released.starts_with(" - ")
+                && released.len() == 13
+                && released[3..]
                     .chars()
                     .enumerate()
                     .all(|(at, c)| if at == 4 || at == 7 {
@@ -7053,7 +7077,7 @@ fn release_docs_describe_the_built_version() {
                     } else {
                         c.is_ascii_digit()
                     })),
-        "the release date is UNRELEASED or YYYY-MM-DD: {released:?}"
+        "the release heading is undated or has UNRELEASED/YYYY-MM-DD: {released:?}"
     );
     for section in ["### Known limitations", "### Qualification of this release"] {
         assert!(
@@ -10401,6 +10425,7 @@ const LICENSE_LEGACY_MARKERS: &[&str] = &[
 
 const LICENSE_MANIFESTS: &[(&str, &str)] = &[
     ("Cargo.toml", "GPL-3.0-or-later"),
+    ("crates/bpf-multi/Cargo.toml", "GPL-3.0-or-later"),
     ("crates/discover/Cargo.toml", "GPL-3.0-or-later"),
     ("crates/ebpf-common/Cargo.toml", "GPL-2.0-or-later"),
     ("crates/ebpf/Cargo.toml", "GPL-2.0-only"),
@@ -10506,10 +10531,59 @@ fn license_tracked_files() -> Vec<String> {
         .collect()
 }
 
-/// SHA-256 of each exact trimmed line in the two offline-dependency files that
-/// names upstream license filenames as provenance. Any other occurrence, in any
-/// syntax, is treated as a pre-relicense claim until reviewed and added here.
+/// Exact reviewed upstream filenames and license expressions in dependency
+/// tooling, original-source provenance and its negative/positive fixtures.
+/// Each exception binds both path and trimmed line hash; project license
+/// declarations and arbitrary comments retain the strict relicense gate.
 const LICENSE_PROVENANCE_LINES: &[(&str, &str)] = &[
+    (
+        "third-party/licenses/sources.json",
+        "6643927c9df1bef7e37248a21efacb2bbea9ec476bf566385d266400da6b7f4a",
+    ),
+    (
+        "third-party/licenses/sources.json",
+        "f0615a70ccddb8eab2eeb03ca434e01860cc7f00a58e5a990853bf7dfd09603d",
+    ),
+    (
+        "third-party/licenses/sources.json",
+        "5549f664c0083f32a4562eb23b4425c58390a8047f9df8f055fc5fc29d8a56c1",
+    ),
+    (
+        "third-party/licenses/sources.json",
+        "52ed463f126cececb0381a634a866fa91b60d8ad1dd55c6b88dfce9eeddc76fc",
+    ),
+    (
+        "third-party/licenses/sources.json",
+        "47f8029f7632cf7b5b1c9fa862943d39dfbe586dffc0eb26012543e7be2f8b4c",
+    ),
+    (
+        "third-party/licenses/sources.json",
+        "ed3a09c0c05d47e3ff039cbc2ae8d2f2d3dff3b45d2c72ce8ccced335f560d02",
+    ),
+    (
+        "third-party/licenses/sources.json",
+        "b11f723fdf76510492fbebaee9a7fd68b73b78472419698a6e713588a8f9f216",
+    ),
+    (
+        "third-party/licenses/sources.json",
+        "a76bbf46011b98c8c786a13211f279a32db63981c059c9b6b4749ba0dd61e743",
+    ),
+    (
+        "scripts/release-notices.py",
+        "816831f6bf24503c349eb59cc3963e4bd05cf6467bac885c5f91c79df7a51385",
+    ),
+    (
+        "tests/python/test_release_notices.py",
+        "dde9af2701f62bfb0add0ffd1719b6ad4885eb2e3da69807ed38442fa687421f",
+    ),
+    (
+        "tests/python/test_release_notices.py",
+        "c2c299cf5a89c77220c4c06f1637a5fd709998add0052c75e35e48dff9cf9cb6",
+    ),
+    (
+        "tests/python/test_release_notices.py",
+        "f47e5297de8214f62352c3cba799f273ae1e9715abf088b868c865f1f2eb52f8",
+    ),
     (
         "scripts/offline-dependencies.py",
         "f30fee0bf6b494d477f15672bcade1c817f83d7c203b91bc2a86b4ed0ce87476",
@@ -10577,11 +10651,18 @@ fn license_line_digest(line: &str) -> String {
 }
 
 fn is_upstream_provenance_filename(path: &str, text: &str, offset: usize, marker: &str) -> bool {
-    if !matches!(
+    let original_filenames = matches!(
         path,
         "scripts/offline-dependencies.py" | "tests/python/test_offline_dependencies.py"
-    ) || (marker != LICENSE_LEGACY_MARKERS[0] && marker != LICENSE_LEGACY_MARKERS[1])
-    {
+    ) && (marker == LICENSE_LEGACY_MARKERS[0]
+        || marker == LICENSE_LEGACY_MARKERS[1]);
+    let release_provenance = matches!(
+        path,
+        "third-party/licenses/sources.json"
+            | "scripts/release-notices.py"
+            | "tests/python/test_release_notices.py"
+    );
+    if !original_filenames && !release_provenance {
         return false;
     }
     let line_start = text[..offset].rfind('\n').map_or(0, |index| index + 1);

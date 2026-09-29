@@ -134,6 +134,30 @@ class PreparedReleaseDriverTests(unittest.TestCase):
                         self.assertIn("refusal", result.stderr)
                         self.assertFalse(Path(str(fixture.prefix) + ".final.receipt.json").exists())
 
+    def test_release_finalizer_rejects_artifact_changes_after_smoke(self):
+        for scenario in ("artifact-bytes", "artifact-ledger", "artifact-alias",
+                         "artifact-missing", "artifact-symlink"):
+            with self.subTest(scenario=scenario):
+                fixture = self.fixture("release", scenario)
+                result = FINALIZER(fixture, scenario)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual((fixture.root / "status").read_text(), "1\n")
+                self.assertIn("artifact", result.stderr)
+
+    def test_release_never_publishes_success_after_final_sync_or_seal_cleanup_failure(self):
+        for failure, command in (("final-sync", "sync"), ("sealed-cleanup", "rm")):
+            with self.subTest(failure=failure):
+                fixture = self.fixture("release", failure)
+                fixture.template(str(NATIVE / "completion-failure.sh.in"),
+                                 fixture.fake_bin / command, FAILURE=failure,
+                                 COMMAND=shutil.which(command))
+                result = FINALIZER(fixture, "success")
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                status = fixture.root / "status"
+                self.assertFalse(status.exists() and status.read_bytes() == b"0\n",
+                                 "failed finalization left an acceptable success status")
+                self.assertIn("injected", result.stderr)
+
     def test_lane16_build_uses_selected_cargo_rustc_and_offline_flags(self):
         fixture = self.fixture("lane16", "build paths with spaces")
         fixture.root.mkdir()

@@ -55,12 +55,13 @@ class ResidualGates(unittest.TestCase):
 
     def test_release_preview_passes_an_evidence_root(self):
         """F-28: build-release.sh exits 2 without its one evidence-root
-        argument, whose parent must be a private directory."""
+        argument, whose parent also supplies the private temporary directory."""
         block = ci_text().split("\n  release-preview:\n", 1)[1]
         block = block.split("\n  coverage:\n", 1)[0]
         self.assertIn('mkdir -m 700 "$RUNNER_TEMP/release-evidence"', block)
         self.assertIn(
-            '- run: scripts/build-release.sh "$RUNNER_TEMP/release-evidence/receipt"',
+            '- run: TMPDIR="$RUNNER_TEMP/release-evidence" '
+            'scripts/build-release.sh "$RUNNER_TEMP/release-evidence/receipt"',
             block,
         )
         self.assertNotIn("- run: scripts/build-release.sh\n", block)

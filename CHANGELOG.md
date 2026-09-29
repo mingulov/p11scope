@@ -5,9 +5,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [0.1.0] - UNRELEASED
-
-<!-- TODO(release): the owner replaces UNRELEASED with the tag date (YYYY-MM-DD). -->
+## [0.1.0]
 
 First release. p11scope is a passive, non-interposing PKCS#11 observer for
 Linux: it attaches eBPF uprobes to a running application's PKCS#11 provider at
@@ -60,8 +58,10 @@ provider during capture.
 - Every accepted provider file is opened once, pinned by descriptor and
   SHA-256, and re-checked with `fstat` before, during and after capture; a
   change sets `evidence.provider_changed` and forces `PARTIAL`.
-- Static probes use one multi-uprobe link per attach group on kernels 6.9+ and
-  per-offset links below (`--attach-backend auto|multi|singles`).
+- Static probes default to one multi-uprobe link per attach group on kernels
+  6.9+ when the kernel accepts multi, falling back to per-offset links if it
+  does not; below 6.9 the default uses per-offset links
+  (`--attach-backend auto|multi|singles`).
 
 ### Reports and evidence
 
@@ -151,7 +151,6 @@ provider during capture.
 - Any bounded omission is reported and forces `PARTIAL`. The
   `wide-detailed-2112` Cargo feature builds a 2,112-slot profile from source;
   it is not the release artifact's profile.
-  <!-- TODO(release): confirm the release profile (owner decision D3). -->
 
 ### Platform and privileges
 
@@ -162,24 +161,33 @@ provider during capture.
   plus Ubuntu 7.0.0-31 on the host; see
   [Qualification of this release](#qualification-of-this-release).
 - Capture needs root (`sudo`) or file capabilities on the observer binary.
-  The attach floor is backend-dependent: on kernels ≥ 6.9 (uprobe-multi
-  links, picked automatically) `CAP_BPF` + `CAP_PERFMON` suffice to attach
-  at `perf_event_paranoid=4` (measured 136/136); below 6.9 (per-probe
-  `perf_event` uprobes) a restrictive `perf_event_paranoid` needs
+  The attach floor is backend-dependent: the default tries uprobe-multi on
+  kernels ≥ 6.9 and falls back to per-probe links if multi is unsupported.
+  With multi active, `CAP_BPF` + `CAP_PERFMON` suffice to attach at
+  `perf_event_paranoid=4` (measured 136/136); on the per-probe `perf_event`
+  path a restrictive `perf_event_paranoid` needs
   `CAP_SYS_ADMIN`. Scanning a same-UID non-descendant also needs
   `CAP_SYS_PTRACE` under Yama `ptrace_scope=1`. See
   [docs/usage.md](docs/usage.md#privileges-per-environment).
 
 ### Release artifacts
 
-- `p11scope` — statically linked musl binary with the BPF object embedded; one
-  file, no runtime dependencies.
-- `p11scope-discover` — dynamically linked glibc and musl builds; use the one
-  that matches the provider's C library (a static helper cannot `dlopen` a
-  provider).
-- `scripts/build-release.sh` builds and verifies both. Release builds remap
-  build-host paths, so the binaries do not embed the builder's home or
-  checkout directory.
+- `p11scope-0.1.0-x86_64-linux-musl.tar.gz` — the statically linked observer
+  with the BPF object embedded; the executable has no shared-library runtime
+  dependencies.
+- `p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz` and
+  `p11scope-discover-0.1.0-x86_64-linux-musl.tar.gz` — optional, dynamically
+  linked discovery helpers. Use the one matching the provider's ABI and C
+  library; a static helper cannot `dlopen` a provider.
+- `p11scope-0.1.0-source.tar.gz` — committed source plus the two pinned Aya
+  archives. The remaining locked Cargo dependencies require network access or
+  a pre-populated cache; toolchains and operating-system build tools are
+  separate prerequisites.
+- `RELEASE.json` and `SHA256SUMS` — release provenance and checksums for the
+  public assets. The three binary bundles include project licenses, applicable
+  third-party notices and build provenance. `scripts/build-release.sh` builds
+  and verifies the binaries, remapping build-host paths so they do not embed
+  the builder's home or checkout directory.
 - Licensing: the observer is GPL-3.0-or-later and the BPF programs are
   GPL-2.0-only. `crates/ebpf-common`, which is compiled into both, is
   GPL-2.0-or-later.
@@ -371,20 +379,22 @@ Fixes to defects found while qualifying this release, before it was tagged:
   runs behind its own verified-once global, like the full template walk, with
   identical captured output. The release build does not include that code and
   was not affected.
-<!-- TODO(release): add any further user-visible fixes merged before the tag. -->
 
 ### Qualification of this release
 
-Run on 2026-09-28 against release candidate `a7800dd`. Later commits change
-only scripts and documentation, plus the `unsafe-unvalidated-metadata`
-5.15 verifier fix, which leaves the release artifact unaffected: the default
-object disassembles identically with and without it. The public-command
-qualification and the
-Docker, shared-layer, kind and fork-scope lanes ran the static musl observer
-built by the official path of `scripts/build-release.sh` (sha256
-`9da91f3a60c8404741303841fe2a02df77c4607768f0cdce454ad5730f1ed022`). The
-release gate, the privileged library suite, the Knative lane and the
-privacy canaries build their own binaries from the same tree.
+The runs below are pre-release evidence, not a claim that the final tagged
+binary or source export passed these lanes. The public-command and Docker,
+shared-layer, kind and fork-scope lanes ran on 2026-09-28 against candidate
+`a7800dd`, using the static musl observer built by the official
+`scripts/build-release.sh` path (SHA-256
+`9da91f3a60c8404741303841fe2a02df77c4607768f0cdce454ad5730f1ed022`).
+The release gate, privileged library suite, Knative lane and privacy canaries
+built their own binaries from that tree. The later unsafe-feature verifier
+fix has separate verification below; it does not retroactively change the
+identity of the earlier artifact. The
+[v0.1.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)
+record the exact tagged commit, hosted CI, final artifact checksums and any
+qualification performed on those final bytes.
 
 - `scripts/release-gate.sh --profile both`, fresh target directory: PASS.
 - Public-command qualification (`scripts/qualify-public-cli.sh`: exact
@@ -410,7 +420,6 @@ privacy canaries build their own binaries from the same tree.
   `pkcs11-tool -O` workload records identical template operations and
   per-function call counts with the fixed build on Ubuntu 5.15, and with both
   builds on Ubuntu 6.8 and mainline 5.15, with no event loss.
-<!-- TODO(release): the owner adds the hosted CI run (checks-and-e2e, coverage, archive-log, release-preview) and the `scripts/build-release.sh` receipt and `SHA256SUMS` from the tag commit. -->
 
 ### Pre-release development history
 

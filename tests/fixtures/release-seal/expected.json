@@ -62,6 +62,7 @@
     "P11SCOPE_RECEIPT_SEALED",
     "P11SCOPE_RECEIPT_SEALED_BIN",
     "PATH",
-    "PWD"
+    "PWD",
+    "TMPDIR"
   ]
 }

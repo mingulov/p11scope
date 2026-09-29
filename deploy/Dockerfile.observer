@@ -10,6 +10,7 @@
 # Base rationale (see deploy/k8s/README.md): static-pie needs no libc, so
 # Alpine's musl is fine; sh entrypoint keeps distroless out (no shell).
 FROM alpine:3.24
+# hadolint ignore=DL3018 # Test image tracks the pinned Alpine 3.24 repository; package versions vary by architecture.
 RUN apk add --no-cache ca-certificates curl jq
 COPY target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/p11scope
 COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry

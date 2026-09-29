@@ -1,6 +1,6 @@
-# cargo-deny policy (SYSPLAN residual F-27). The `checks-and-e2e` CI job runs
-# `cargo deny check`; a new license, a yanked/duplicate dependency, or an
-# unvetted source fails the gate until a human reviews it here.
+# Host Cargo graph policy (SYSPLAN residual F-27). CI checks this graph and
+# the separate crates/ebpf graph under deny-ebpf.toml. GPL-2.0-only is
+# permitted only by the BPF policy; new licenses and sources require review.
 [graph]
 targets = [
   { triple = "x86_64-unknown-linux-gnu" },

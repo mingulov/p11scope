@@ -15,9 +15,10 @@ assessment and incident diagnostics.
 > `inspect`, `profile` (including `--mode metrics`), `trace`, and `run`, with
 > memory-scan discovery, multi-module capture, and schema v3. Read the
 > [known limitations](CHANGELOG.md#known-limitations) before relying on a
-> capture; `--system` is a preview. What was qualified on the release commit
-> (kernels, lanes, hosted CI run) is recorded in
-> [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release).
+> capture; `--system` is a preview. The [v0.1.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)
+> identify tagged-artifact qualification and hosted CI;
+> [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) preserves
+> revision-specific pre-release evidence.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -56,12 +57,15 @@ or frozen build, place the exact archives (`aya-0.14.0.crate` and
 `third-party/archives/` first, or
 run `python3 -I scripts/prepare-dependencies.py --archive-dir DIRECTORY`, then
 use `mise exec -- ./scripts/cargo.sh +1.88 build --locked --offline`. An
-ordinary fresh checkout therefore needs archive access. Git-based source exports exclude the
-generated trees, their receipts, and the local archive cache while retaining
-the recipe and patches. An offline distribution must add the exact pinned
-archives explicitly. All locked registry packages and the fixed
+ordinary fresh checkout therefore needs archive access. A plain Git checkout
+or GitHub's automatic source archive excludes the generated trees, receipts
+and local archive cache. All locked registry packages and the fixed
 `pkcs11-components` Git revision (`d0a47c7`) are separate Cargo inputs and
-must already be available in the Cargo cache for a fully offline build.
+must already be cached for an offline build from that checkout. The release's
+source export embeds the two exact pinned Aya archives, but fetching the
+remaining locked Cargo dependencies requires network access or a populated
+cache. A separate full offline export can embed the complete dependency
+payload; see below.
 
 For a self-contained full source export and its fixed unprivileged recipient
 bootstrap, use Python >=3.11, or Python 3.10 with the distro `python3-tomli`
@@ -71,18 +75,63 @@ guide](docs/build-offline.md).
 See [development setup](docs/development.md) for the Ubuntu 26.04 primary-host
 packages, pinned Rust/BPF tools, and canonical checks. Ubuntu 26.04 is a
 development host choice, not a product runtime dependency. The command above
-is a debug build of every binary; [Install](#install) builds the release
-artifacts.
+is a debug build of every binary; [Install](#install) describes the release
+assets and local release-mode builds.
 
 ## Install
 
-p11scope v0.1.0 is distributed as source.
-<!-- TODO(release): if binaries are attached to the GitHub release, name them and SHA256SUMS here. -->
+p11scope v0.1.0 is distributed through the
+[GitHub release](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)
+as a static x86-64 Linux observer bundle, optional glibc and musl discovery
+helper bundles, and a source export. Download `SHA256SUMS` with the bundle you
+choose. The release also provides `RELEASE.json` with curated provenance;
+each bundle contains its license notices and a copy of that record.
+
+| Bundle | Use |
+| --- | --- |
+| `p11scope-0.1.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
+| `p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
+| `p11scope-discover-0.1.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
+
+For example, download the observer and `SHA256SUMS` into a private directory,
+then verify the archive before extraction:
+
+```sh
+download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
+cd "$download_dir"
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.1.0/p11scope-0.1.0-x86_64-linux-musl.tar.gz
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.1.0/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf p11scope-0.1.0-x86_64-linux-musl.tar.gz
+sudo install -m 0755 p11scope-0.1.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
+p11scope --version
+sudo p11scope doctor
+```
+
+Keep the extracted bundle with its licenses, notices and `RELEASE.json` as
+the record of the binary you installed.
+
+To use attested semantic capture, download and verify the helper bundle for
+the provider's C library, then extract and install its `p11scope-discover`
+executable in the same way. Run `p11scope-discover --version` and the helper
+itself as an ordinary user; never give it file capabilities or a set-id bit.
+The observer needs Linux x86-64 and the kernel and privilege requirements
+below. The helper needs the matching provider ABI and libc; a 32-bit provider
+requires a separately built 32-bit helper.
+
+The release also includes `p11scope-0.1.0-source.tar.gz`. It contains the
+committed source and the two pinned Aya archives needed to reconstruct the
+local patches. Building it still needs network access for the remaining
+locked Cargo dependencies, plus the Rust/BPF and host build tools described
+above. The [offline build guide](docs/build-offline.md) describes an optional
+full export assembled separately.
+
+### Build locally from source
+
 `cargo install` is not supported: the root manifest patches two crates whose
 trees `scripts/prepare-dependencies.py` generates. The official artifacts are
 built and verified by `scripts/build-release.sh` (see
-[RELEASING.md](RELEASING.md)); the commands below build the same shapes by
-hand.
+[RELEASING.md](RELEASING.md)); the commands below are local build examples.
 
 **Build prerequisites** (x86-64 Linux; Ubuntu package names): the pinned
 toolchains from [docs/development.md](docs/development.md). The scripts select
@@ -98,7 +147,7 @@ cargo +1.88 install bpf-linker --version 0.10.4 --locked
 ```
 
 **Observer (`p11scope`).** A static musl binary with the BPF object embedded;
-it never loads a provider, so one binary serves every host:
+it never loads a provider, so one binary serves supported x86-64 Linux hosts:
 
 ```sh
 RUSTFLAGS='-C target-feature=+crt-static' ./scripts/cargo.sh +1.88 build \
@@ -124,10 +173,11 @@ loading provider code. Never give it capabilities or a set-id bit.
 **Kernel and privileges.** Linux 5.15 or newer with BTF
 (`/sys/kernel/btf/vmlinux`). Captures need root (`sudo p11scope ...`) or file
 capabilities on the observer. The attach floor is backend-dependent: on
-kernels ≥ 6.9 the product attaches through uprobe-multi links, where
+kernels ≥ 6.9 the default first attempts uprobe-multi links and falls back
+to per-probe links if multi is unsupported. With multi active,
 `CAP_BPF`+`CAP_PERFMON` suffice (measured 136/136 at
-`perf_event_paranoid=4`); below 6.9 it uses per-probe `perf_event` uprobes,
-where a restrictive paranoid needs `CAP_SYS_ADMIN`
+`perf_event_paranoid=4`); on the per-probe `perf_event` path a restrictive
+paranoid needs `CAP_SYS_ADMIN`
 ([measured matrix](docs/usage.md#privileges-per-environment)). The full set is:
 
 ```sh
@@ -143,9 +193,11 @@ group and mode `0750`).
 
 ```sh
 p11scope --version
-p11scope-discover --version
 sudo p11scope doctor
 ```
+
+If you installed the optional helper, also run
+`p11scope-discover --version` as your normal user.
 
 ## Why
 
@@ -251,10 +303,10 @@ report format.
   (`scripts/bench-overhead.sh`, `docs/notes/phase5-overhead.md`; full numbers
   and the event-loss finding at high call rates: [docs/usage.md](docs/usage.md#overhead-measured)).
 - Requires elevated privileges, kernel-version-dependent, x86-64 first. The
-  attach floor follows the backend the product picks automatically: on
-  kernels ≥ 6.9 (uprobe-multi links) `CAP_BPF`+`CAP_PERFMON` suffice to
-  attach at `kernel.perf_event_paranoid=4` (measured 136/136); below 6.9
-  (per-probe `perf_event` uprobes) a restrictive paranoid needs
+  default attempts uprobe-multi on kernels ≥ 6.9, with per-probe fallback if
+  the kernel refuses multi. With multi active, `CAP_BPF`+`CAP_PERFMON`
+  suffice to attach at `kernel.perf_event_paranoid=4` (measured 136/136);
+  on the per-probe `perf_event` path a restrictive paranoid needs
   `CAP_SYS_ADMIN`. Manifest-free scanning of a same-UID non-descendant
   additionally needs `CAP_SYS_PTRACE` under Yama `ptrace_scope=1`, or
   equivalently a descendant target / `--manifest`. Root works everywhere.
@@ -396,10 +448,10 @@ For now, the sudo path clears supplementary groups, so workloads needing an
 HSM/device group should use an already-running target until explicit run-as
 group selection is implemented.
 
-The runtime qualification that applies to v0.1.0 (kernels, lanes, and the
-hosted CI run on the release commit) is recorded in
-[CHANGELOG.md](CHANGELOG.md#qualification-of-this-release); earlier campaign
-results in `docs/` are historical evidence.
+The [v0.1.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)
+identify final tagged-artifact qualification and hosted CI. The
+[changelog](CHANGELOG.md#qualification-of-this-release) and earlier campaign
+records in `docs/` retain revision-specific historical evidence.
 
 When used, the helper recreates the table in its own process; it never reads or
 injects into the observed process. Uprobes are bound to the verified target

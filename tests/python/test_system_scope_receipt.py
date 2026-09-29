@@ -8,7 +8,6 @@ import os
 import re
 import runpy
 import signal
-import stat
 import subprocess
 import tempfile
 import time
@@ -1708,7 +1707,6 @@ PY
             self.assertEqual(result["reaped"], [], result)
 
     def test_launch_and_finish_settle_descendant_after_root_exit(self):
-        helper = ROOT / "scripts" / "system-scope-owned.sh"
         command = f'''
 set -eu
 cd {str(ROOT)!r}

@@ -216,11 +216,16 @@ jobs:
       - name: help-drift (flags/parser/usage agreement)
         run: python3 -I tests/python/test_help_usage_drift.py -v
       - run: python3 -I tests/python/test_schema_json.py -v
+      - run: python3 -I tests/python/test_release_notices.py -v
+      - run: python3 -I tests/python/test_package_release.py -v
       - run: python3 -I tests/python/test_residual_gates.py -v
       - run: cargo +1.88 install cargo-audit --version 0.22.2 --locked
       - run: cargo +1.88 install cargo-deny --version 0.20.2 --locked
       - run: cargo +1.88 audit
-      - run: cargo +1.88 deny check
+      # The host and BPF crates have separate Cargo roots and license policies.
+      # The BPF-only GPL-2.0-only allowance must not leak into the host graph.
+      - run: cargo +1.88 deny --locked check
+      - run: cargo +1.88 deny --locked --manifest-path crates/ebpf/Cargo.toml --config deny-ebpf.toml check
       - run: pipx install ruff==0.16.8
       - name: lint shell scripts (error level)
         shell: bash
@@ -331,32 +336,110 @@ jobs:
       - run: cargo +1.88 build --locked --offline --release --target x86_64-unknown-linux-musl
       - run: docker build -f deploy/Dockerfile.observer -t p11scope-observer:preview .
       - run: docker build -f deploy/Dockerfile.holder -t p11scope-holder:preview .
-      - run: docker run --rm -i hadolint/hadolint < deploy/Dockerfile.observer
-      - run: docker run --rm -i hadolint/hadolint < deploy/Dockerfile.holder
-      # The release driver takes one absent evidence root whose parent is a
-      # private (0700) directory outside the checkout; the receipt, logs and
-      # dist/ binaries land under it and are kept as a run artifact.
+      - name: Download verified release tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/release-tools"
+          mkdir -m 700 "$tools"
+          curl -fsSL --retry 3 -o "$tools/hadolint" \
+            https://github.com/hadolint/hadolint/releases/download/v2.13.1/hadolint-linux-x86_64
+          echo "f8b05e4c724cdeb84c0dca07e40936c3d875c0af5d120a27c94026a0f370b2cf  $tools/hadolint" | sha256sum --check
+          chmod 755 "$tools/hadolint"
+          curl -fsSL --retry 3 -o "$tools/cargo-about.tar.gz" \
+            https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af  $tools/cargo-about.tar.gz" | sha256sum --check
+          tar -xzf "$tools/cargo-about.tar.gz" -C "$tools" \
+            cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about
+          install -m 0755 "$tools/cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about" "$tools/cargo-about"
+          curl -fsSL --retry 3 -o "$tools/musl-1.2.3.tar.gz" \
+            https://musl.libc.org/releases/musl-1.2.3.tar.gz
+          echo "7d5b0b6062521e4627e099e4c9dc8248d32a30285e959b7eecaa780cf8cfd4a4  $tools/musl-1.2.3.tar.gz" | sha256sum --check
+          curl -fsSL --retry 3 -o "$tools/musl-1.2.5.tar.gz" \
+            https://musl.libc.org/releases/musl-1.2.5.tar.gz
+          echo "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  $tools/musl-1.2.5.tar.gz" | sha256sum --check
+          curl -fsSL --retry 3 -o "$tools/kubeconform.tar.gz" \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          echo "95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73  $tools/kubeconform.tar.gz" | sha256sum --check
+          tar -xzf "$tools/kubeconform.tar.gz" -C "$tools" kubeconform
+          chmod 755 "$tools/kubeconform"
+      - run: '"$RUNNER_TEMP/release-tools/hadolint" deploy/Dockerfile.observer'
+      - run: '"$RUNNER_TEMP/release-tools/hadolint" deploy/Dockerfile.holder'
+      # The full receipt, logs and capture stay in ephemeral runner storage.
+      # Only selected public outputs below are uploaded as artifacts.
       - run: mkdir -m 700 "$RUNNER_TEMP/release-evidence"
-      - run: scripts/build-release.sh "$RUNNER_TEMP/release-evidence/receipt"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - run: TMPDIR="$RUNNER_TEMP/release-evidence" scripts/build-release.sh "$RUNNER_TEMP/release-evidence/receipt"
+      - name: Release receipt summary
         if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python3 -I - "$RUNNER_TEMP/release-evidence/receipt" "$GITHUB_STEP_SUMMARY" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          receipt, summary = map(Path, sys.argv[1:])
+          keys = ("head", "tree", "checker_status", "terminal_status",
+                  "release_artifacts_sha256")
+          facts = {}
+          path = receipt / "facts.log"
+          if path.is_file():
+              for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                  key, sep, value = line.partition("\t")
+                  if sep and key in keys:
+                      facts[key] = value if key not in facts else ""
+          status_file = receipt / "status"
+          status = status_file.read_text(encoding="ascii", errors="replace").strip() \
+              if status_file.is_file() else ""
+          facts = {"status": status, **facts}
+          with summary.open("a", encoding="utf-8") as output:
+              output.write("## Release receipt summary\n\n")
+              for key in ("status", *keys):
+                  pattern = r"[0-9]+" if key.endswith("status") else \
+                      (r"[0-9a-f]{40}" if key in ("head", "tree") else r"[0-9a-f]{64}")
+                  value = facts.get(key, "")
+                  valid = bool(re.fullmatch(pattern, value))
+                  if valid and key.endswith("status"):
+                      valid = int(value) <= 255
+                  output.write(f"- {key}: `{value if valid else 'unavailable'}`\n")
+          PY
+      # Assemble public assets from the verified receipt, source and notices.
+      - name: Assemble public release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/export-source.py \
+            --output "$RUNNER_TEMP/release-evidence/p11scope-0.1.0-source.tar.gz"
+          python3 -I scripts/release-notices.py \
+            --cargo-about "$RUNNER_TEMP/release-tools/cargo-about" \
+            --musl-archive "$RUNNER_TEMP/release-tools/musl-1.2.3.tar.gz" \
+            --musl-archive "$RUNNER_TEMP/release-tools/musl-1.2.5.tar.gz" \
+            --output "$RUNNER_TEMP/release-evidence/notices"
+          python3 -I scripts/package-release.py \
+            --receipt "$RUNNER_TEMP/release-evidence/receipt" \
+            --notices "$RUNNER_TEMP/release-evidence/notices" \
+            --source "$RUNNER_TEMP/release-evidence/p11scope-0.1.0-source.tar.gz" \
+            --output "$RUNNER_TEMP/release-evidence/public"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-preview-receipt
-          path: ${{ runner.temp }}/release-evidence/receipt
-          if-no-files-found: warn
+          name: release-preview-public-assets
+          path: ${{ runner.temp }}/release-evidence/public/
+          if-no-files-found: error
           retention-days: 30
+      # This SBOM describes the preview container image, not the official
+      # receipt-built observer executable or the public binary assets.
       - uses: anchore/sbom-action@d8a2c0130026bf585de5c176ab8f7ce62d75bf04 # v0.20.7
         with:
           image: p11scope-observer:preview
           format: spdx-json
-          output-file: sbom-observer.spdx.json
+          output-file: ${{ runner.temp }}/sbom-observer-container-preview.spdx.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sbom-observer-preview
-          path: sbom-observer.spdx.json
+          name: sbom-observer-container-preview
+          path: ${{ runner.temp }}/sbom-observer-container-preview.spdx.json
           if-no-files-found: error
           retention-days: 30
-      - run: curl -sSfL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz -C /tmp kubeconform && /tmp/kubeconform -summary deploy/k8s/
+      - run: '"$RUNNER_TEMP/release-tools/kubeconform" -summary deploy/k8s/'
   # SYSPLAN residual F-40: coverage gate with a ratchet. The floor lives in
   # .coverage-floor (raise it, never lower it); the job fails the workflow
   # when line coverage of the touched lib crate drops below it.

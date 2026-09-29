@@ -1,2 +1,4 @@
 # Unified patches encode an empty context line as a single space. Preserve it.
 third-party/patches/**/*.patch whitespace=-blank-at-eol
+# Original upstream notice bytes are hash-pinned, including their whitespace.
+third-party/licenses/*.txt -text -whitespace

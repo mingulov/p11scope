@@ -1,0 +1,673 @@
+{
+  "clarifications": {
+    "aya-build": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "aya-302985c-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "aya-302985c-apache.txt"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.0"
+    },
+    "aya-ebpf": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "aya-773ca71-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "aya-773ca71-apache.txt"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.1"
+    },
+    "aya-ebpf-bindings": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "aya-302985c-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "aya-302985c-apache.txt"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.0"
+    },
+    "aya-ebpf-macros": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "aya-302985c-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "aya-302985c-apache.txt"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.0"
+    },
+    "pkcs11-abi": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "pkcs11-d0a47c7-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "pkcs11-d0a47c7-apache.txt"
+        }
+      ],
+      "license": "Apache-2.0 OR MIT",
+      "source": "git+https://github.com/mingulov/pkcs11-components?rev=d0a47c71d34294466bc41100ae6b5a5a329029d2#d0a47c71d34294466bc41100ae6b5a5a329029d2",
+      "version": "0.2.0"
+    },
+    "pkcs11-module": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "pkcs11-d0a47c7-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "pkcs11-d0a47c7-apache.txt"
+        }
+      ],
+      "license": "Apache-2.0 OR MIT",
+      "source": "git+https://github.com/mingulov/pkcs11-components?rev=d0a47c71d34294466bc41100ae6b5a5a329029d2#d0a47c71d34294466bc41100ae6b5a5a329029d2",
+      "version": "0.2.0"
+    },
+    "pkcs11-types": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "pkcs11-d0a47c7-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "pkcs11-d0a47c7-apache.txt"
+        }
+      ],
+      "license": "Apache-2.0 OR MIT",
+      "source": "git+https://github.com/mingulov/pkcs11-components?rev=d0a47c71d34294466bc41100ae6b5a5a329029d2#d0a47c71d34294466bc41100ae6b5a5a329029d2",
+      "version": "0.2.0"
+    },
+    "r-efi": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "r-efi-6.0.0-AUTHORS.txt"
+        }
+      ],
+      "license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "6.0.0"
+    },
+    "windows-link": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "windows-link-0.2.1-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "windows-link-0.2.1-apache.txt"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.1"
+    },
+    "windows-sys": {
+      "files": [
+        {
+          "license": "MIT",
+          "path": "windows-sys-0.61.2-mit.txt"
+        },
+        {
+          "license": "Apache-2.0",
+          "path": "windows-sys-0.61.2-apache.txt"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.61.2"
+    }
+  },
+  "files": {
+    "aya-302985c-apache.txt": {
+      "bytes": 10852,
+      "sha256": "937e2efb1ad10b57b31b14d860c2356d012dd33b6ead2e0fc6be2f24d4066326",
+      "url": "https://raw.githubusercontent.com/aya-rs/aya/302985c72850cd9a8f1d791a11d247a4fbe1c5b1/LICENSE-APACHE"
+    },
+    "aya-302985c-mit.txt": {
+      "bytes": 1062,
+      "sha256": "71f5b27660dcd9b566402a9fb724b04453d6da50a46c5e165c32147b2405a5cb",
+      "url": "https://raw.githubusercontent.com/aya-rs/aya/302985c72850cd9a8f1d791a11d247a4fbe1c5b1/LICENSE-MIT"
+    },
+    "aya-773ca71-apache.txt": {
+      "bytes": 10852,
+      "sha256": "937e2efb1ad10b57b31b14d860c2356d012dd33b6ead2e0fc6be2f24d4066326",
+      "url": "https://raw.githubusercontent.com/aya-rs/aya/773ca715385b97eb0c26a581b53246c0c4306959/LICENSE-APACHE"
+    },
+    "aya-773ca71-mit.txt": {
+      "bytes": 1062,
+      "sha256": "71f5b27660dcd9b566402a9fb724b04453d6da50a46c5e165c32147b2405a5cb",
+      "url": "https://raw.githubusercontent.com/aya-rs/aya/773ca715385b97eb0c26a581b53246c0c4306959/LICENSE-MIT"
+    },
+    "gcc-12.2.0-COPYING.RUNTIME.txt": {
+      "bytes": 3324,
+      "original_filename": "COPYING.RUNTIME",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74",
+      "tag": "releases/gcc-12.2.0",
+      "upstream_revision": "2ee5e4300186a92ad73f1a1a64cb918dc76c8d67",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/2ee5e4300186a92ad73f1a1a64cb918dc76c8d67/COPYING.RUNTIME"
+    },
+    "gcc-12.2.0-COPYING3.txt": {
+      "bytes": 35147,
+      "original_filename": "COPYING3",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "tag": "releases/gcc-12.2.0",
+      "upstream_revision": "2ee5e4300186a92ad73f1a1a64cb918dc76c8d67",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/2ee5e4300186a92ad73f1a1a64cb918dc76c8d67/COPYING3"
+    },
+    "gcc-12.2.0-libgcc-crtstuff.c.txt": {
+      "bytes": 26374,
+      "original_filename": "libgcc/crtstuff.c",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "564c9d0c375a494203d6885cd37b8fc22e21fa609dc511497dfb07d44639bf4f",
+      "tag": "releases/gcc-12.2.0",
+      "upstream_revision": "2ee5e4300186a92ad73f1a1a64cb918dc76c8d67",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/2ee5e4300186a92ad73f1a1a64cb918dc76c8d67/libgcc/crtstuff.c"
+    },
+    "gcc-12.2.0-libgcc-libgcc2.c.txt": {
+      "bytes": 55387,
+      "original_filename": "libgcc/libgcc2.c",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "4051e1950496354f87c35cc92840c5b7141f5cc8cbf1723aed40ff73af765959",
+      "tag": "releases/gcc-12.2.0",
+      "upstream_revision": "2ee5e4300186a92ad73f1a1a64cb918dc76c8d67",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/2ee5e4300186a92ad73f1a1a64cb918dc76c8d67/libgcc/libgcc2.c"
+    },
+    "gcc-12.2.0-libgcc-unwind-c.c.txt": {
+      "bytes": 7606,
+      "original_filename": "libgcc/unwind-c.c",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "d47f6da4549b1ed9f6ec2f4b9b98af842d94f45578e69f827424b5288551a196",
+      "tag": "releases/gcc-12.2.0",
+      "upstream_revision": "2ee5e4300186a92ad73f1a1a64cb918dc76c8d67",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/2ee5e4300186a92ad73f1a1a64cb918dc76c8d67/libgcc/unwind-c.c"
+    },
+    "gcc-12.2.0-libgcc-unwind-dw2.c.txt": {
+      "bytes": 47924,
+      "original_filename": "libgcc/unwind-dw2.c",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "0e6fbc64814f82e4d6ad044e81bd70411f1aef06bef5b79fe52fa5e9f3df0c65",
+      "tag": "releases/gcc-12.2.0",
+      "upstream_revision": "2ee5e4300186a92ad73f1a1a64cb918dc76c8d67",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/2ee5e4300186a92ad73f1a1a64cb918dc76c8d67/libgcc/unwind-dw2.c"
+    },
+    "gcc-14.2.0-COPYING.RUNTIME.txt": {
+      "bytes": 3324,
+      "original_filename": "COPYING.RUNTIME",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74",
+      "tag": "releases/gcc-14.2.0",
+      "upstream_revision": "04696df09633baf97cdbbdd6e9929b9d472161d3",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/04696df09633baf97cdbbdd6e9929b9d472161d3/COPYING.RUNTIME"
+    },
+    "gcc-14.2.0-COPYING3.txt": {
+      "bytes": 35147,
+      "original_filename": "COPYING3",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "tag": "releases/gcc-14.2.0",
+      "upstream_revision": "04696df09633baf97cdbbdd6e9929b9d472161d3",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/04696df09633baf97cdbbdd6e9929b9d472161d3/COPYING3"
+    },
+    "gcc-14.2.0-libgcc-crtstuff.c.txt": {
+      "bytes": 26399,
+      "original_filename": "libgcc/crtstuff.c",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "5859380c2242ce108b323fe216847df6f2be052fa98ca56eb6284daacda3befd",
+      "tag": "releases/gcc-14.2.0",
+      "upstream_revision": "04696df09633baf97cdbbdd6e9929b9d472161d3",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/04696df09633baf97cdbbdd6e9929b9d472161d3/libgcc/crtstuff.c"
+    },
+    "gcc-14.2.0-libgcc-libgcc2.c.txt": {
+      "bytes": 74797,
+      "original_filename": "libgcc/libgcc2.c",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "0bf1fa3e4b9be1fd45a47682cb119d4f8fda17f02398d157a189d49c6f2d2919",
+      "tag": "releases/gcc-14.2.0",
+      "upstream_revision": "04696df09633baf97cdbbdd6e9929b9d472161d3",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/04696df09633baf97cdbbdd6e9929b9d472161d3/libgcc/libgcc2.c"
+    },
+    "gcc-14.2.0-libgcc-unwind-c.c.txt": {
+      "bytes": 7606,
+      "original_filename": "libgcc/unwind-c.c",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "4b24c9f672c4d0dbd3058b4596209b51bdc32a2a1949acc4c3245055665cd98e",
+      "tag": "releases/gcc-14.2.0",
+      "upstream_revision": "04696df09633baf97cdbbdd6e9929b9d472161d3",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/04696df09633baf97cdbbdd6e9929b9d472161d3/libgcc/unwind-c.c"
+    },
+    "gcc-14.2.0-libgcc-unwind-dw2.c.txt": {
+      "bytes": 40456,
+      "original_filename": "libgcc/unwind-dw2.c",
+      "repository": "https://github.com/gcc-mirror/gcc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "20a26a4744f132f059c1026776c421cc957573b31d3d0fdb1e6e6ac03df7e169",
+      "tag": "releases/gcc-14.2.0",
+      "upstream_revision": "04696df09633baf97cdbbdd6e9929b9d472161d3",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/04696df09633baf97cdbbdd6e9929b9d472161d3/libgcc/unwind-dw2.c"
+    },
+    "glibc-2.36-COPYING.LIB.txt": {
+      "bytes": 26530,
+      "original_filename": "COPYING.LIB",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/COPYING.LIB"
+    },
+    "glibc-2.36-COPYING.txt": {
+      "bytes": 18092,
+      "original_filename": "COPYING",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/COPYING"
+    },
+    "glibc-2.36-LICENSES.txt": {
+      "bytes": 18943,
+      "original_filename": "LICENSES",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "b33d0bd9f685b46853548814893a6135e74430d12f6d94ab3eba42fc591f83bc",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/LICENSES"
+    },
+    "glibc-2.36-csu-gmon-start.c.txt": {
+      "bytes": 3199,
+      "original_filename": "csu/gmon-start.c",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "34a748b26be8528ae1794a5eb6a427d1d7931a405d70a3194e61d6eb7a776532",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/csu/gmon-start.c"
+    },
+    "glibc-2.36-csu-init.c.txt": {
+      "bytes": 1103,
+      "original_filename": "csu/init.c",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "03ef9ca46cb369cd431025c0aa99ba5943abdd85c671635aa058ce19b5c1f47d",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/csu/init.c"
+    },
+    "glibc-2.36-csu-libc-start.c.txt": {
+      "bytes": 13282,
+      "original_filename": "csu/libc-start.c",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "dc9a5d172c41b04cbcadfc88bddb6630a59c6005a4f0bed9a69dc4a2d1d9885e",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/csu/libc-start.c"
+    },
+    "glibc-2.36-csu-start.c.txt": {
+      "bytes": 434,
+      "original_filename": "csu/start.c",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "48bc39ccfa0082deea0d8f17d100b9acb33fb225900551c6902ec30c69ad2c2b",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/csu/start.c"
+    },
+    "glibc-2.36-sysdeps-x86_64-crti.S.txt": {
+      "bytes": 2805,
+      "original_filename": "sysdeps/x86_64/crti.S",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "8199377446025c231d6962b16d74f14bbcdd0094f42947ae956dfc3178f103ed",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/sysdeps/x86_64/crti.S"
+    },
+    "glibc-2.36-sysdeps-x86_64-crtn.S.txt": {
+      "bytes": 1971,
+      "original_filename": "sysdeps/x86_64/crtn.S",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "8a2dad61572ad1e9e30177b1ac50e6a9d1d93046d1ced8063facb52668fcefed",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/sysdeps/x86_64/crtn.S"
+    },
+    "glibc-2.36-sysdeps-x86_64-start.S.txt": {
+      "bytes": 4431,
+      "original_filename": "sysdeps/x86_64/start.S",
+      "repository": "https://github.com/bminor/glibc",
+      "scope": "Conservative helper startup/runtime source notices; membership and distro patch level require official build evidence.",
+      "sha256": "8b3187d30b9b603821a4115ff392efaf396c366c64bd61ecd212baf8c2dfe1e5",
+      "tag": "glibc-2.36",
+      "upstream_revision": "c804cd1c00adde061ca51711f63068c103e94eef",
+      "url": "https://raw.githubusercontent.com/bminor/glibc/c804cd1c00adde061ca51711f63068c103e94eef/sysdeps/x86_64/start.S"
+    },
+    "llvm-c1118fd-compiler-rt-lib-builtins-crtbegin.c.txt": {
+      "bytes": 5818,
+      "sha256": "e2f5ef3d814f49a371b9f34c4a6272e0f9b9e47e55c7d73e8ccf6415bff4c12a",
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/c1118fdbb3024157df7f4cfe765f2b0b4339e8a2/compiler-rt/lib/builtins/crtbegin.c"
+    },
+    "llvm-c1118fd-compiler-rt-lib-builtins-crtend.c.txt": {
+      "bytes": 890,
+      "sha256": "6d5a61b8f2f6fa541a12ec52aea40b5085e40fcf8626984d318523cb30335d06",
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/c1118fdbb3024157df7f4cfe765f2b0b4339e8a2/compiler-rt/lib/builtins/crtend.c"
+    },
+    "llvm-c1118fd-compiler-rt-license.txt": {
+      "bytes": 16708,
+      "sha256": "1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d",
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/c1118fdbb3024157df7f4cfe765f2b0b4339e8a2/compiler-rt/LICENSE.TXT"
+    },
+    "llvm-c1118fd-libunwind-license.txt": {
+      "bytes": 16706,
+      "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d",
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/c1118fdbb3024157df7f4cfe765f2b0b4339e8a2/libunwind/LICENSE.TXT"
+    },
+    "musl-1.2.3-COPYRIGHT.txt": {
+      "archive": "musl-1.2.3.tar.gz",
+      "bytes": 6204,
+      "member": "musl-1.2.3/COPYRIGHT",
+      "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+    },
+    "musl-1.2.5-COPYRIGHT.txt": {
+      "archive": "musl-1.2.5.tar.gz",
+      "bytes": 6204,
+      "member": "musl-1.2.5/COPYRIGHT",
+      "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+    },
+    "pkcs11-d0a47c7-apache.txt": {
+      "bytes": 11286,
+      "git_revision": "d0a47c71d34294466bc41100ae6b5a5a329029d2",
+      "original_filename": "LICENSE-APACHE",
+      "repository": "https://github.com/mingulov/pkcs11-components",
+      "sha256": "0ce791dda40abbd4d2864eed831cd6d1149adbe4cf194c64bc795be6e576e785"
+    },
+    "pkcs11-d0a47c7-mit.txt": {
+      "bytes": 1058,
+      "git_revision": "d0a47c71d34294466bc41100ae6b5a5a329029d2",
+      "original_filename": "LICENSE-MIT",
+      "repository": "https://github.com/mingulov/pkcs11-components",
+      "sha256": "3aa121fcdb31dbf67f6db829710bfd37daed8ed0de3b32913673dec378377402"
+    },
+    "r-efi-6.0.0-AUTHORS.txt": {
+      "bytes": 3733,
+      "crate_archive_sha256": "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf",
+      "crate_archive_url": "https://static.crates.io/crates/r-efi/r-efi-6.0.0.crate",
+      "original_filename": "AUTHORS",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#r-efi@6.0.0",
+      "sha256": "d027e91dbc9cdbb2f1190068e498bd6b61cff022b6a032b191021ba658d96111"
+    },
+    "windows-link-0.2.1-apache.txt": {
+      "bytes": 11351,
+      "crate_archive_sha256": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+      "crate_archive_url": "https://static.crates.io/crates/windows-link/windows-link-0.2.1.crate",
+      "original_filename": "license-apache-2.0",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#windows-link@0.2.1",
+      "sha256": "c16f8dcf1a368b83be78d826ea23de4079fe1b4469a0ab9ee20563f37ff3d44b"
+    },
+    "windows-link-0.2.1-mit.txt": {
+      "bytes": 1141,
+      "crate_archive_sha256": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+      "crate_archive_url": "https://static.crates.io/crates/windows-link/windows-link-0.2.1.crate",
+      "original_filename": "license-mit",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#windows-link@0.2.1",
+      "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+    },
+    "windows-sys-0.61.2-apache.txt": {
+      "bytes": 11351,
+      "crate_archive_sha256": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+      "crate_archive_url": "https://static.crates.io/crates/windows-sys/windows-sys-0.61.2.crate",
+      "original_filename": "license-apache-2.0",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#windows-sys@0.61.2",
+      "sha256": "c16f8dcf1a368b83be78d826ea23de4079fe1b4469a0ab9ee20563f37ff3d44b"
+    },
+    "windows-sys-0.61.2-mit.txt": {
+      "bytes": 1141,
+      "crate_archive_sha256": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+      "crate_archive_url": "https://static.crates.io/crates/windows-sys/windows-sys-0.61.2.crate",
+      "original_filename": "license-mit",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#windows-sys@0.61.2",
+      "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+    }
+  },
+  "musl": [
+    {
+      "notice_scope": "COPYRIGHT and complete original source archive preserve per-file notices; no assertion all source files are linked",
+      "rust_build_recipe": "https://github.com/rust-lang/rust/blob/1.88.0/src/ci/docker/scripts/musl-toolchain.sh",
+      "sha256": "7d5b0b6062521e4627e099e4c9dc8248d32a30285e959b7eecaa780cf8cfd4a4",
+      "url": "https://musl.libc.org/releases/musl-1.2.3.tar.gz",
+      "version": "1.2.3"
+    },
+    {
+      "build_recipe": "scripts/verify-discover-containers.sh",
+      "notice_scope": "Full original musl source archive preserves individual file notices; helper build pins Alpine musl1.2.5-r12. No assertion all archive files or distro changes are linked.",
+      "sha256": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+      "url": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+      "version": "1.2.5"
+    }
+  ],
+  "native_runtime": {
+    "build_recipe": "https://github.com/rust-lang/rust/blob/1.88.0/src/bootstrap/src/core/build_steps/llvm.rs",
+    "components": [
+      "libunwind",
+      "compiler-rt crtbegin/crtend"
+    ],
+    "helper_inputs": [
+      {
+        "commit": "2ee5e4300186a92ad73f1a1a64cb918dc76c8d67",
+        "lookup_url": "https://api.github.com/repos/gcc-mirror/gcc/commits/releases/gcc-12.2.0",
+        "notice_scope": "Pinned upstream baseline source notices; official helper build must establish actual link membership and distro patch-level differences.",
+        "repository": "https://github.com/gcc-mirror/gcc",
+        "tag": "releases/gcc-12.2.0"
+      },
+      {
+        "commit": "04696df09633baf97cdbbdd6e9929b9d472161d3",
+        "lookup_url": "https://api.github.com/repos/gcc-mirror/gcc/commits/releases/gcc-14.2.0",
+        "notice_scope": "Pinned upstream baseline source notices; official helper build must establish actual link membership and distro patch-level differences.",
+        "repository": "https://github.com/gcc-mirror/gcc",
+        "tag": "releases/gcc-14.2.0"
+      },
+      {
+        "commit": "c804cd1c00adde061ca51711f63068c103e94eef",
+        "lookup_url": "https://api.github.com/repos/bminor/glibc/commits/glibc-2.36",
+        "notice_scope": "Pinned upstream baseline source notices; official helper build must establish actual link membership and distro patch-level differences.",
+        "repository": "https://github.com/bminor/glibc",
+        "tag": "glibc-2.36"
+      }
+    ],
+    "helper_link_membership": "UNVERIFIED_PENDING_OFFICIAL_HELPER_BUILD",
+    "llvm_revision": "c1118fdbb3024157df7f4cfe765f2b0b4339e8a2",
+    "rust_gitlink": "https://github.com/rust-lang/rust/tree/1.88.0/src/llvm-project",
+    "scope": "Notices for the native libraries and startup objects supplied by the pinned Rust target; actual linked members depend on the final artifact."
+  },
+  "schema_version": 1,
+  "toolchains": [
+    {
+      "files": [
+        {
+          "payload": "licenses/rust-1.88/COPYRIGHT-library.html",
+          "sha256": "3d3f60160f5214efa0a7fd804102d02ce9ea6af04b5249a19eeb243450246ae9",
+          "source": "share/doc/rust/COPYRIGHT-library.html"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/Apache-2.0.txt",
+          "sha256": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff",
+          "source": "share/doc/rust/licenses/Apache-2.0.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/BSD-2-Clause.txt",
+          "sha256": "f32fb3b417a194167cfad068223fc975ba96c5960513a10f66a3c28720aec1df",
+          "source": "share/doc/rust/licenses/BSD-2-Clause.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/CC-BY-SA-4.0.txt",
+          "sha256": "23ee78c8bae49cf08ea2f0c84945c66b987ebe4520881fb51b3dad4fb43d07c2",
+          "source": "share/doc/rust/licenses/CC-BY-SA-4.0.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/GCC-exception-3.1.txt",
+          "sha256": "a3966c9410ef94a1efbfa9ec04e9c1994026a70623fbf0885ce36737bfba3b54",
+          "source": "share/doc/rust/licenses/GCC-exception-3.1.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/GPL-2.0-only.txt",
+          "sha256": "54b212ba1f97f6948fa5486239ab505dd820b02e50cbfd296b4062c8609a70af",
+          "source": "share/doc/rust/licenses/GPL-2.0-only.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/GPL-3.0-or-later.txt",
+          "sha256": "05315fce6c35f79b8a35454828995fa26336f235895ac64557abc028f4ffcea2",
+          "source": "share/doc/rust/licenses/GPL-3.0-or-later.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/ISC.txt",
+          "sha256": "0ff61769b238634e042ab759dddfd104a8e69d091e3600ae3410e401a6164381",
+          "source": "share/doc/rust/licenses/ISC.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/LLVM-exception.txt",
+          "sha256": "e34c58338bd89d43e709e226610d8f32b3e3c47f4ad9a99a8dc1d4ac7842488e",
+          "source": "share/doc/rust/licenses/LLVM-exception.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/MIT.txt",
+          "sha256": "b85dcd3e453d05982552c52b5fc9e0bdd6d23c6f8e844b984a88af32570b0cc0",
+          "source": "share/doc/rust/licenses/MIT.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/NCSA.txt",
+          "sha256": "39cb0234065c92b9e6cee3830cbb52b1aa289aa8fe9ba2e66730fec5cf05c630",
+          "source": "share/doc/rust/licenses/NCSA.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/OFL-1.1.txt",
+          "sha256": "8eea8287e5876b539670cadb82e99f9a7afddec6f6730811be1daf25d2e9bcfd",
+          "source": "share/doc/rust/licenses/OFL-1.1.txt"
+        },
+        {
+          "payload": "licenses/rust-1.88/licenses/Unicode-3.0.txt",
+          "sha256": "f5062c9a188d81dfe66b56db4182dcf9e4b17c0d9b0d311a8e20b3a1b075c443",
+          "source": "share/doc/rust/licenses/Unicode-3.0.txt"
+        }
+      ],
+      "name": "1.88",
+      "rustc_verbose_version": "rustc 1.88.0 (6b00bc388 2025-06-23)\nbinary: rustc\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\ncommit-date: 2025-06-23\nhost: x86_64-unknown-linux-gnu\nrelease: 1.88.0\nLLVM version: 20.1.5"
+    },
+    {
+      "files": [
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/COPYRIGHT-library.html",
+          "sha256": "0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed",
+          "source": "share/doc/rust/COPYRIGHT-library.html"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/Apache-2.0.txt",
+          "sha256": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff",
+          "source": "share/doc/rust/licenses/Apache-2.0.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/BSD-2-Clause.txt",
+          "sha256": "f32fb3b417a194167cfad068223fc975ba96c5960513a10f66a3c28720aec1df",
+          "source": "share/doc/rust/licenses/BSD-2-Clause.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/CC-BY-SA-4.0.txt",
+          "sha256": "23ee78c8bae49cf08ea2f0c84945c66b987ebe4520881fb51b3dad4fb43d07c2",
+          "source": "share/doc/rust/licenses/CC-BY-SA-4.0.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/GCC-exception-3.1.txt",
+          "sha256": "a3966c9410ef94a1efbfa9ec04e9c1994026a70623fbf0885ce36737bfba3b54",
+          "source": "share/doc/rust/licenses/GCC-exception-3.1.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/GPL-2.0-only.txt",
+          "sha256": "54b212ba1f97f6948fa5486239ab505dd820b02e50cbfd296b4062c8609a70af",
+          "source": "share/doc/rust/licenses/GPL-2.0-only.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/GPL-3.0-or-later.txt",
+          "sha256": "05315fce6c35f79b8a35454828995fa26336f235895ac64557abc028f4ffcea2",
+          "source": "share/doc/rust/licenses/GPL-3.0-or-later.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/ISC.txt",
+          "sha256": "0ff61769b238634e042ab759dddfd104a8e69d091e3600ae3410e401a6164381",
+          "source": "share/doc/rust/licenses/ISC.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/LLVM-exception.txt",
+          "sha256": "e34c58338bd89d43e709e226610d8f32b3e3c47f4ad9a99a8dc1d4ac7842488e",
+          "source": "share/doc/rust/licenses/LLVM-exception.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/MIT.txt",
+          "sha256": "b85dcd3e453d05982552c52b5fc9e0bdd6d23c6f8e844b984a88af32570b0cc0",
+          "source": "share/doc/rust/licenses/MIT.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/NCSA.txt",
+          "sha256": "39cb0234065c92b9e6cee3830cbb52b1aa289aa8fe9ba2e66730fec5cf05c630",
+          "source": "share/doc/rust/licenses/NCSA.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/OFL-1.1.txt",
+          "sha256": "8eea8287e5876b539670cadb82e99f9a7afddec6f6730811be1daf25d2e9bcfd",
+          "source": "share/doc/rust/licenses/OFL-1.1.txt"
+        },
+        {
+          "payload": "licenses/rust-nightly-2026-05-20/licenses/Unicode-3.0.txt",
+          "sha256": "f5062c9a188d81dfe66b56db4182dcf9e4b17c0d9b0d311a8e20b3a1b075c443",
+          "source": "share/doc/rust/licenses/Unicode-3.0.txt"
+        }
+      ],
+      "name": "nightly-2026-05-20",
+      "rustc_verbose_version": "rustc 1.97.0-nightly (e50aa6fba 2026-05-19)\nbinary: rustc\ncommit-hash: e50aa6fba4e63ab34c72bf9acfd2c307c1155d1a\ncommit-date: 2026-05-19\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0-nightly\nLLVM version: 22.1.4"
+    }
+  ]
+}

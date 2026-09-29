@@ -1,6 +1,31 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build a full source export offline
 
+The v0.1.0 GitHub release attaches a networked source export containing the
+committed source and two pinned Aya archives. It is not a full offline export:
+the remaining locked Cargo dependencies still require network access or a
+pre-populated cache. This guide covers a separate full export that can be
+produced with `scripts/export-source.py`. A plain Git checkout and GitHub's
+automatically generated source archives also lack the offline dependency
+payload. The producer must first assemble and verify that payload against the
+committed `third-party/offline-dependencies.json` recipe, then create the full
+export from a clean, committed revision with an absent absolute output path:
+
+```sh
+nightly_rustc=$(rustup which --toolchain nightly-2026-05-20 rustc)
+python3 -I scripts/export-source.py \
+  --output /absolute/private-parent/full-offline-source.tar.gz \
+  --offline-payload /absolute/verified-offline-payload \
+  --nightly-rustc "$nightly_rustc"
+```
+
+The paths are producer inputs, not directories created by this command:
+replace them with the verified payload location and a new output filename
+outside the checkout, under an existing private parent. An export made with
+`--output` alone embeds only the two pinned patched-crate archives. It still
+needs network access or pre-populated Cargo caches for the remaining locked
+dependencies; do not describe it as a full offline export.
+
 The full source export contains the complete Cargo dependency payload but does
 not contain Rust toolchains or operating-system build tools. Install Rust 1.88,
 `nightly-2026-05-20` with `rust-src`, `bpf-linker`, Clang/LLVM, the native C
@@ -27,8 +52,11 @@ can import the helper:
 Python 3.11 and newer provide `tomllib` in the standard library and do not
 need `python3-tomli`.
 
-Extract the full export into a private temporary parent, preserving the
-recorded directory modes and rejecting archive ownership changes:
+Before accepting a separately supplied full export, verify its SHA-256 against
+the digest supplied by its producer. The v0.1.0 release's `SHA256SUMS` covers
+its attached networked source export, not a separate full export. Extract the
+full export into a private temporary parent, preserving the recorded directory
+modes and rejecting archive ownership changes:
 
 ```sh
 umask 077

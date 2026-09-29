@@ -1,6 +1,34 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Local dependency corrections
 
+## Release attribution
+
+`licenses/sources.json` records immutable provenance and SHA-256 hashes for
+original upstream license texts used by release packaging. The corresponding
+text files under `licenses/` preserve upstream terms and copyright notices;
+they do not change p11scope's GPL license. This includes the Aya notices for
+the source fragments retained in the patch files below.
+
+`scripts/release-notices.py` inventories both locked Cargo workspaces and
+preserves original licensing files independently of the selected SPDX
+alternative. It adds pinned Rust library reports, native runtime notices and
+musl 1.2.3/1.2.5 source archives, including their per-file notices. The
+inventory includes build, development and non-Linux dependencies and does not
+claim that every listed package is linked into each release binary. Generated
+bundles remain outside this source tree. See [the release runbook](../RELEASING.md).
+
+The small `p11scope-bpf-multi` support crate also borrows the raw multi-link
+UAPI layout and bounded attach bisection from
+[osslscope's BPF helper](https://github.com/mingulov/osslscope/blob/807dbba8f06c0d215f1c43c57090fe6c3436896f/crates/bpf-sys/src/lib.rs)
+and [capture planner](https://github.com/mingulov/osslscope/blob/807dbba8f06c0d215f1c43c57090fe6c3436896f/src/plan.rs).
+Those source routines were compared at the linked revision during release
+review; the original import did not record its exact upstream checkout.
+osslscope is by Denis Mingulov and uses GPL-3.0-or-later. p11scope's subsequent
+layout, error handling and integration changes remain in its own Git history.
+The Aya attach semantics and their upstream revision are described below.
+
+## Source reconstruction
+
 `sources.json` is the source of truth for reconstructed packages. From a fresh
 checkout, `python3 -I scripts/prepare-dependencies.py` obtains and verifies the
 pinned archives; `--archive-dir DIRECTORY` supplies those archives explicitly.

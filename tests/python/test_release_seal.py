@@ -3,9 +3,12 @@
 """Task11 release seal contracts exercised through the actual driver CLI."""
 
 import os
+import hashlib
 from pathlib import Path
 import runpy
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -140,6 +143,124 @@ class ReleaseSealTests(unittest.TestCase):
         sealed_bin = run.fact("sealed_bin")
         self.assertIsNotNone(sealed_bin, run.diagnostic())
         self.assertFalse(Path(sealed_bin).exists())
+
+    def test_release_preserves_private_tmpdir_in_sealed_child_and_facts(self):
+        fixture = ReleaseSealFixture(self.base / "temporary paths with spaces")
+        fixture.seal_parent.chmod(0o700)
+        run = fixture.run_to_sudo_probe()
+        self.assert_probe_refused(run)
+        self.assertEqual(run.tripped(), "sudo\n", run.diagnostic())
+        environment = dict(line.split("=", 1) for line in
+                           run.environment_dump.read_text().splitlines())
+        self.assertEqual(environment.get("TMPDIR"), str(fixture.seal_parent))
+        self.assertEqual(run.fact("sealed_env_TMPDIR"), str(fixture.seal_parent))
+        self.assertEqual(list(fixture.seal_parent.iterdir()), [])
+
+    def test_release_refuses_unsafe_tmpdir_before_receipt_and_privileged_probe(self):
+        unsafe = self.base / "public-temp"
+        unsafe.mkdir(mode=0o777)
+        unsafe.chmod(0o777)
+        linked = self.base / "linked-temp"
+        linked.symlink_to(unsafe, target_is_directory=True)
+        for value in ("relative-temp", str(self.base / "absent"), str(unsafe),
+                      str(linked), str(self.base) + "/../", "/tmp\tbad", ""):
+            with self.subTest(value=value):
+                fixture = ReleaseSealFixture(self.base / ("invalid-" + str(len(list(self.base.iterdir())))))
+                run = fixture.run_to_sudo_probe({"TMPDIR": value})
+                self.assert_probe_refused(run)
+                self.assertEqual(run.tripped(), "")
+                self.assertFalse(run.root.exists())
+                self.assertIn("TMPDIR", run.output.stderr)
+
+
+class ReleaseArtifactLedgerTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="p11scope-release-artifacts-")
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        self.dist = self.base / "dist"
+        self.dist.mkdir(mode=0o700)
+        self.inputs = {"p11scope": b"observer", "p11scope-discover": b"glibc",
+                       "p11scope-discover-glibc": b"glibc", "p11scope-discover-musl": b"musl"}
+        for name, content in self.inputs.items():
+            (self.dist / name).write_bytes(content)
+        self.ledger = self.base / "release-artifacts.sha256"
+
+    def command(self, operation, digest=None):
+        argv = [sys.executable, "-I", str(ROOT / "scripts/release-artifacts.py"),
+                operation, "--dist", str(self.dist), "--ledger", str(self.ledger)]
+        if digest is not None:
+            argv.extend(["--sha256", digest])
+        return subprocess.run(argv, text=True, capture_output=True, timeout=15)
+
+    def record(self):
+        result = self.command("record")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_record_and_verify_bind_exact_fixed_artifacts_and_0600_ledger(self):
+        digest = self.record()
+        expected = "".join(hashlib.sha256(content).hexdigest() + "  " + name + "\n"
+                           for name, content in sorted(self.inputs.items())).encode()
+        self.assertEqual(self.ledger.read_bytes(), expected)
+        self.assertEqual(digest, hashlib.sha256(expected).hexdigest())
+        self.assertEqual(self.ledger.stat().st_mode & 0o777, 0o600)
+        checked = self.command("verify", digest)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_record_preserves_existing_ledger(self):
+        self.ledger.write_bytes(b"keep")
+        self.assertNotEqual(self.command("record").returncode, 0)
+        self.assertEqual(self.ledger.read_bytes(), b"keep")
+
+    def test_changed_binary_and_alias_mismatch_refuse(self):
+        digest = self.record()
+        (self.dist / "p11scope").write_bytes(b"different")
+        self.assertNotEqual(self.command("verify", digest).returncode, 0)
+        self.ledger.unlink()
+        (self.dist / "p11scope-discover").write_bytes(b"other helper")
+        result = self.command("record")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("alias", result.stderr)
+        self.assertFalse(self.ledger.exists())
+
+    def test_duplicate_missing_unknown_or_reordered_ledger_rows_refuse(self):
+        self.record()
+        rows = self.ledger.read_bytes().splitlines(keepends=True)
+        for content in (b"".join(rows + rows[:1]), b"".join(rows[:-1]),
+                        b"".join(reversed(rows)), b"".join(rows).replace(b"  p11scope\n", b"  other\n")):
+            with self.subTest(content=content):
+                self.ledger.write_bytes(content)
+                result = self.command("verify", hashlib.sha256(content).hexdigest())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("ledger", result.stderr)
+
+    def test_ledger_digest_and_symlink_inputs_refuse(self):
+        digest = self.record()
+        self.assertNotEqual(self.command("verify", "0" * 64).returncode, 0)
+        original = self.base / "original"
+        original.write_bytes(self.inputs["p11scope"])
+        (self.dist / "p11scope").unlink()
+        (self.dist / "p11scope").symlink_to(original)
+        self.assertNotEqual(self.command("verify", digest).returncode, 0)
+        self.ledger.unlink()
+        self.assertNotEqual(self.command("record").returncode, 0)
+        (self.dist / "p11scope").unlink()
+        (self.dist / "p11scope").write_bytes(self.inputs["p11scope"])
+        digest = self.record()
+        real_ledger = self.base / "ledger-real"
+        self.ledger.rename(real_ledger)
+        self.ledger.symlink_to(real_ledger)
+        self.assertNotEqual(self.command("verify", digest).returncode, 0)
+
+    def test_missing_binary_and_symlink_dist_refuse(self):
+        (self.dist / "p11scope").unlink()
+        self.assertNotEqual(self.command("record").returncode, 0)
+        (self.dist / "p11scope").write_bytes(self.inputs["p11scope"])
+        real_dist = self.base / "real-dist"
+        self.dist.rename(real_dist)
+        self.dist.symlink_to(real_dist, target_is_directory=True)
+        self.assertNotEqual(self.command("record").returncode, 0)
 
 
 if __name__ == "__main__":

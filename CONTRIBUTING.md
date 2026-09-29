@@ -43,7 +43,8 @@ contribution terms in this file.
 ## Product and source boundaries
 
 Start with [README.md](README.md), the [operator guide](docs/usage.md), and
-[development setup](docs/development.md). The versioned
+[development setup](docs/development.md). [AGENTS.md](AGENTS.md) summarizes
+repository navigation and working rules for coding agents. The versioned
 [profile schema](docs/schema/observed-profile-v3.md) and
 [privacy allowlist](docs/privacy/allowlist-v1.md), including its
 [v2 extension](docs/privacy/allowlist-v2.md), define the public contracts.

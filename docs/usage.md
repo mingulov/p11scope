@@ -21,7 +21,7 @@ implementation limits are code contracts, not measurements.
 > public evidence and its authority.
 
 - [What it does](#what-it-does)
-- [What it does NOT do](#what-it-does-not-do)
+- [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
 - [Quickstart](#quickstart)
 - [PKCS #11 versions and interface names](#pkcs-11-versions-and-interface-names)
 - [Privileges, per environment](#privileges-per-environment)
@@ -1018,7 +1018,7 @@ What this tool proves, and what it deliberately does not claim to:
   refusal evidence).
 - [`docs/schema/observed-profile-v3.md`](schema/observed-profile-v3.md) —
   the versioned `observed-profile.json` schema (current:
-  `p11scope/observed-profile/v3`), the integration boundary
-  `pkcs11-lab` reads.
+  `p11scope/observed-profile/v3`), the boundary for the planned integration
+  with [p11lab](https://github.com/mingulov/p11lab).
 - [`docs/schema/observed-profile-v2.md`](schema/observed-profile-v2.md) —
   field definitions and semantic-authority rules inherited by schema v3.

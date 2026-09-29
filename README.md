@@ -60,7 +60,8 @@ use `mise exec -- ./scripts/cargo.sh +1.88 build --locked --offline`. An
 ordinary fresh checkout therefore needs archive access. A plain Git checkout
 or GitHub's automatic source archive excludes the generated trees, receipts
 and local archive cache. All locked registry packages and the fixed
-`pkcs11-components` Git revision (`d0a47c7`) are separate Cargo inputs and
+[pkcs11-components](https://github.com/mingulov/pkcs11-components/) Git revision
+(`d0a47c7`) are separate Cargo inputs and
 must already be cached for an offline build from that checkout. The release's
 source export embeds the two exact pinned Aya archives, but fetching the
 remaining locked Cargo dependencies requires network access or a populated
@@ -245,7 +246,7 @@ If you installed the optional helper, also run
   generating a file or matching its hash does not make that decision for you.
 
   Automated combination with candidate-provider test results is the planned
-  `pkcs11-lab` integration; no `pkcs11-lab assess` command is delivered here.
+  integration with [p11lab](https://github.com/mingulov/p11lab).
   An unobserved call or missing metadata remains unknown.
 
   Full quickstart, real command output, and `trace` mode:
@@ -464,9 +465,9 @@ capture.
 | --- | --- |
 | [pkcs11-check](https://github.com/mingulov/pkcs11-check) | Actively exercises and validates a provider |
 | **p11scope** | Passively observes real application behavior |
-| pkcs11-components | Shared PKCS#11 core: name tables, mechanism registry, module-loading FFI |
-| pkcs11-proxy-ng | Controlled interposition, transport, fault injection |
-| pkcs11-lab (planned) | Will combine profiles and test results into migration assessments |
+| [pkcs11-components](https://github.com/mingulov/pkcs11-components/) | Shared PKCS#11 ABI layouts, module acquisition and mechanism metadata |
+| [pkcs11-proxy-ng](https://github.com/mingulov/pkcs11-proxy-ng) | Remote PKCS#11 access through a daemon and client shim |
+| [p11lab](https://github.com/mingulov/p11lab) | Planned integration: combine observed profiles and provider test results into migration assessments |
 
 Integration boundary: the versioned `observed-profile.json` schema. The
 userspace side is Rust and reuses pkcs11-components' PKCS#11 core (official

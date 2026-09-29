@@ -18,6 +18,11 @@ requires the affected gates to run again on that new revision.
 ## 1. Freeze the candidate
 
 - Merge the release work to `main` and check out the exact commit to tag.
+  A release branch can stage and test the candidate first. When `main` is
+  an ancestor of that branch, use a fast-forward to preserve the candidate
+  commit. A merge commit, squash, rebase or history rewrite changes its
+  identity; reconcile source-bound receipts and run the affected gates on
+  the final commit before tagging.
   The tree must be clean, including untracked files:
   `git status --porcelain=v1 --untracked-files=all` prints nothing.
 - Confirm the versions: `Cargo.toml` and `crates/discover/Cargo.toml` both

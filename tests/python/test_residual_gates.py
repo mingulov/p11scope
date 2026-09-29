@@ -85,7 +85,7 @@ class ResidualGates(unittest.TestCase):
     def test_release_summary_exposes_fixed_diagnostics_without_private_log_text(self):
         block = ci_text().split("      - name: Release receipt summary\n", 1)[1]
         program = textwrap.dedent(
-            block.split("<<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+            block.split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0]
         )
         private = "PRIVATE_CANARY_/secret-path/::error::untrusted"
         cases = (
@@ -132,6 +132,41 @@ class ResidualGates(unittest.TestCase):
                 rendered = result.stdout + result.stderr + summary.read_text()
                 self.assertNotIn(private, rendered)
                 self.assertNotIn("private compiler input", rendered)
+
+    def test_release_summary_locates_canary_assertions_without_their_values(self):
+        block = ci_text().split("      - name: Release receipt summary\n", 1)[1]
+        program = textwrap.dedent(
+            block.split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0]
+        )
+        private = "PRIVATE_::error::canary-bytes"
+        stderr = (
+            "Traceback (most recent call last):\n"
+            f'  File "/{private}/scripts/check-canary-evidence.py", line 705, in private_function\n'
+            "    assert evidence_total == 2, evidence_total\n"
+            f"AssertionError: {private}\n"
+            f'  File "/{private}/unknown.py", line 123, in unknown_function\n'
+            f'  File "/{private}/capture-stopped-canary.py", line 0, in unknown_function\n'
+            f'  File "/{private}/check-canary-evidence.py", line 1234567, in unknown_function\n'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt = root / "receipt"
+            receipt.mkdir()
+            (receipt / "stderr.log").write_text(stderr)
+            summary = root / "summary.md"
+            result = subprocess.run(
+                [sys.executable, "-I", "-", str(receipt), str(summary)],
+                input=program, text=True, capture_output=True, check=True,
+            )
+            report = json.loads(result.stdout.split("release-diagnostic: ", 1)[1])
+            self.assertEqual(report.get("python_failure_locations"), [
+                {"script": "check-canary-evidence.py", "line": 705},
+            ])
+            self.assertIn("python-assertion-failed", report["observed_signature_ids"])
+            rendered = result.stdout + result.stderr + summary.read_text()
+            for forbidden in (private, "private_function", "unknown.py", "unknown_function",
+                              "assert evidence_total", "1234567"):
+                self.assertNotIn(forbidden, rendered)
 
     def test_scripts_lint_gate_exists(self):
         """F-63: shellcheck/ruff CI over scripts/."""

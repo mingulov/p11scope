@@ -429,6 +429,12 @@ jobs:
               "finalizer-artifact-ledger-unrecorded": r"^release artifact ledger was not recorded$",
               "cargo-compilation-failed": r"^error: could not compile ",
               "cargo-build-script-failed": r"^error: failed to run custom build command for ",
+              "python-assertion-failed": r"^AssertionError(?::|$)",
+          }
+          PYTHON_SCRIPTS = {
+              "capture-stopped-canary.py", "check-canary-evidence.py",
+              "check-capture-evidence.py", "canary_process_custody.py",
+              "dump-owned-bpf-maps.py", "qualify-task-storage-canary.py",
           }
           ERRNOS = {
               "EPERM": (1, "Operation not permitted"),
@@ -445,6 +451,7 @@ jobs:
           def diagnostics(receipt):
               stage, substage = "unknown", "unknown"
               signals, rustc_codes, errnos = set(), set(), set()
+              locations = set()
               stderr_state = "missing"
               for filename in ("stdout.log", "stderr.log"):
                   path = receipt / filename
@@ -463,6 +470,12 @@ jobs:
                           for label, pattern in SIGNATURES.items():
                               if re.search(pattern, line):
                                   signals.add(label); matched = True
+                          location = re.fullmatch(r'  File "([^"\n]+)", line ([1-9][0-9]{0,5}), in [A-Za-z_][A-Za-z_0-9]*', line)
+                          if location and len(locations) < 64:
+                              script = Path(location[1]).name
+                              if script in PYTHON_SCRIPTS:
+                                  locations.add((script, int(location[2])))
+                                  matched = True
                           for code in re.findall(r"\berror\[(E[0-9]{4})\]:", line):
                               rustc_codes.add(code); matched = True
                           for name, (number, message) in ERRNOS.items():
@@ -473,6 +486,7 @@ jobs:
                       stderr_state = "matched-signature" if matched else ("unknown" if nonempty else "empty")
               return dict(last_recorded_stage=stage, last_recorded_substage=substage,
                           observed_signature_ids=sorted(signals), rustc_error_codes=sorted(rustc_codes),
+                          python_failure_locations=[dict(script=script, line=line) for script, line in sorted(locations)],
                           observed_errno_names=sorted(errnos), stderr_classification=stderr_state)
 
           receipt, summary = map(Path, sys.argv[1:])

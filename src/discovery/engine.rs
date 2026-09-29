@@ -86,6 +86,7 @@ pub struct Engine {
     /// `--max-scan-pids`: how many scope members each scan pass covers.
     max_scan_pids: usize,
     loader_registry: LoaderRegistry,
+    owned_initial_exec: Option<OwnedInitialExec>,
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
     pending_discovery_records: Vec<QueuedDiscoveryRecord>,
@@ -2809,6 +2810,16 @@ struct TerminalJournal {
     owner: LoaderContextId,
     dispatch_started: bool,
     retry_used: bool,
+}
+
+/// One pre-release attachment, activated by the owned executable's post-exec
+/// identity check. Clean, ordered lifecycle transport identifies its first
+/// EXEC; PID/executable identity alone never authorizes skipping a refresh.
+#[derive(Clone, Copy)]
+struct OwnedInitialExec {
+    view: ProcessViewId,
+    context: LoaderContextId,
+    revalidated: bool,
 }
 
 impl TerminalAuthority {
@@ -7298,6 +7309,7 @@ impl Engine {
             retired_view_ids: Vec::new(),
             max_scan_pids: MAX_SCAN_PIDS,
             loader_registry: LoaderRegistry::default(),
+            owned_initial_exec: None,
             terminal_batch: None,
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
@@ -8005,6 +8017,7 @@ impl Engine {
         if count == 0 {
             return;
         }
+        self.owned_initial_exec = None;
         self.discovery_truncated = self.discovery_truncated.saturating_add(count);
         self.invalidate_silent_selection_coverage();
         self.invalidate_causal_timing();
@@ -8270,6 +8283,7 @@ impl Engine {
 
     #[track_caller]
     fn mark_live_loss(&mut self, subject: &str, reason: &str) {
+        self.owned_initial_exec = None;
         self.invalidate_causal_timing();
         self.mark_partial(subject, reason);
     }
@@ -8602,6 +8616,7 @@ impl Engine {
         if malformed == 0 {
             return;
         }
+        self.owned_initial_exec = None;
         self.malformed_discovery = self.malformed_discovery.saturating_add(malformed);
         self.invalidate_silent_selection_coverage();
         self.invalidate_causal_timing();
@@ -8887,6 +8902,7 @@ impl Engine {
             Err(error) => {
                 self.capture_facts.rollback_stage();
                 self.restore_start_publication(snapshot);
+                self.owned_initial_exec = None;
                 self.settle_all_pending_loader_scans(
                     "a deferred loader memory scan was unresolved when capture start was cancelled",
                 );
@@ -10096,8 +10112,11 @@ impl Engine {
     }
 
     fn update_counter_snapshot(&mut self, session: &dyn EngineSession) -> Result<()> {
-        let next = session.counter_snapshot()?;
+        let next = session.counter_snapshot().inspect_err(|_| {
+            self.owned_initial_exec = None;
+        })?;
         if !self.counter_snapshot.replace_with(next) {
+            self.owned_initial_exec = None;
             self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
             self.mark_partial(
@@ -10107,6 +10126,7 @@ impl Engine {
             return Ok(());
         }
         if self.counter_snapshot.ring_loss > 0 {
+            self.owned_initial_exec = None;
             self.invalidate_silent_selection_coverage();
             self.invalidate_causal_timing();
             self.mark_partial(
@@ -12523,6 +12543,13 @@ impl Engine {
                         format!("loader registry mark-attached failed: {error}"),
                     );
                 }
+                if session.lifecycle_tracking_unavailable().is_none() {
+                    self.owned_initial_exec = Some(OwnedInitialExec {
+                        view: view_id,
+                        context,
+                        revalidated: false,
+                    });
+                }
                 Ok(OwnedLoaderPrearmOutcome::Armed)
             }
             OwnedPrearmAttachDisposition::Unavailable { reason } => {
@@ -13171,6 +13198,12 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
     ) -> Result<(bool, bool)> {
+        if self
+            .owned_initial_exec
+            .is_some_and(|initial| initial.view == view)
+        {
+            self.owned_initial_exec = None;
+        }
         let mut changed = false;
         // A pending journal owns this retirement pass: advance it once before
         // any other context of this view is touched, and never start a second
@@ -13385,6 +13418,12 @@ impl Engine {
         cause: RetirementCause,
         pending_views: &mut PendingViewRetirements,
     ) {
+        if self
+            .owned_initial_exec
+            .is_some_and(|initial| initial.view == view)
+        {
+            self.owned_initial_exec = None;
+        }
         let previous = self.retirement_intents.get(&view).copied();
         let cause = if cause == RetirementCause::GenerationLost && self.original_exited(view) {
             RetirementCause::ExpectedRemoval
@@ -13585,6 +13624,36 @@ impl Engine {
         outcome
     }
 
+    fn acknowledge_owned_initial_exec(&mut self, view: ProcessViewId) -> bool {
+        let Some(initial) = self
+            .owned_initial_exec
+            .filter(|initial| initial.view == view)
+        else {
+            return false;
+        };
+        // Consume even a refused acknowledgment. A later identity recheck
+        // cannot turn a later EXEC into the original barrier handoff.
+        self.owned_initial_exec = None;
+        initial.revalidated
+            && self.counter_snapshot.ring_loss == 0
+            && self.malformed_discovery == 0
+            && self.discovery_truncated == 0
+            && self
+                .views
+                .iter()
+                .any(|retained| retained.id() == view && retained.still_the_same())
+            && self
+                .loader_registry
+                .context(initial.context)
+                .is_some_and(|context| {
+                    context.spec.view == view
+                        && context.spec.mapping.is_none()
+                        && context.was_attached
+                        && !self.loader_registry.is_tombstoned(initial.context)
+                })
+            && self.pinned.check_unchanged().unwrap_or(false)
+    }
+
     fn dispatch_lifecycle_record(
         &mut self,
         record: &DiscoveryRecord,
@@ -13617,6 +13686,16 @@ impl Engine {
                 },
             )
         {
+            if record.kind == DISCOVERY_KIND_EXEC && self.acknowledge_owned_initial_exec(view) {
+                // The validated prearm now also serves ordinary live loader
+                // discovery. Keep the existing per-load-kind classification;
+                // no new link, hit, scan or timing proof is manufactured.
+                self.record_loader_arm(view, false);
+                // In particular, do not request inventory retirement or put
+                // this acknowledgment in exec_refresh_views: it cannot excuse
+                // a mismatched loader record elsewhere in this batch.
+                return None;
+            }
             if record.kind == DISCOVERY_KIND_LEADER_EXIT {
                 self.close_cgroup_admission(view, record.hook_ts_ns);
                 if !self.admitted_cgroup_views.contains_key(&view) {
@@ -15958,6 +16037,7 @@ impl Engine {
             .find(|view| view.pid() == child.pid())
             .map(ProcessView::id)
         else {
+            self.owned_initial_exec = None;
             self.mark_partial(
                 "owned initial-set discovery",
                 "the owned child generation was absent after barrier release",
@@ -15974,11 +16054,19 @@ impl Engine {
         let mut closure = PauseClosure::new(true);
         let mut no_terminal_selection_handoffs = TerminalSelectionHandoffs::new();
         if direct_stable && !self.loader_registry.ids_for_view(view).is_empty() {
+            if let Some(initial) = self
+                .owned_initial_exec
+                .as_mut()
+                .filter(|initial| initial.view == view)
+            {
+                initial.revalidated = true;
+            }
             return Ok(DiscoveryBatchOutcome {
                 changed: false,
                 required_complete: true,
             });
         }
+        self.owned_initial_exec = None;
         if !self.loader_registry.ids_for_view(view).is_empty() {
             let (_, complete) = self.retire_loader_contexts(
                 view,
@@ -16211,6 +16299,7 @@ pub(crate) mod session_fixture {
         dynamic_export_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64, HookAbi)>,
         pub(crate) dynamic_attach_reports_added: bool,
         pub(crate) dynamic_loader_attach_calls: usize,
+        pub(crate) dynamic_loader_reports_added: bool,
         pub(crate) dynamic_loader_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64)>,
         pub(crate) selection_table_read: Option<(MapEntry, ScannedTable)>,
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
@@ -16553,7 +16642,7 @@ pub(crate) mod session_fixture {
             if let Some(pid) = self.kill_on_dynamic_loader_attach.take() {
                 kill_and_reap(pid);
             }
-            Ok(false)
+            Ok(self.dynamic_loader_reports_added)
         }
 
         fn detach_dynamic_context(

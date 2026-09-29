@@ -8391,6 +8391,303 @@ fn armed_seed_route(
     (fixture, engine, context, record, session)
 }
 
+/// Real direct-ELF child, pre-exec loader pin and post-exec identity check;
+/// only kernel link installation and ring delivery use the scripted seam.
+fn mapped_loader_record(engine: &mut Engine, context: LoaderContextId) -> DiscoveryRecord {
+    let spec = engine
+        .loader_registry
+        .context(context)
+        .unwrap()
+        .spec
+        .clone();
+    let key = engine.pinned.summary(spec.loader).unwrap().key;
+    let view = engine
+        .views
+        .iter()
+        .find(|view| view.id() == spec.view)
+        .unwrap();
+    let maps = Engine::read_maps(view, &mut engine.budget).unwrap();
+    let mapping = maps
+        .iter()
+        .find(|mapping| {
+            ObjectKey::of(mapping) == key
+                && mapping.permissions[2] == b'x'
+                && spec.hook.file_offset >= mapping.file_offset
+                && spec.hook.file_offset - mapping.file_offset < mapping.end - mapping.start
+        })
+        .unwrap();
+    let mut record = loader_record_for(context, view.pid());
+    record.table_ptr = mapping.start + spec.hook.file_offset - mapping.file_offset;
+    record.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+    record
+}
+
+fn owned_prearmed_seed_route(
+    revalidate: bool,
+) -> (
+    LoadedSeedProvider,
+    OwnedChild,
+    Engine,
+    LoaderContextId,
+    DiscoveryRecord,
+    ScriptedSession,
+) {
+    let (fixture, _, _, _) = loaded_seed_provider();
+    let mut child = OwnedChild::spawn(
+        fixture._dir.path().join("seed-runner").into_os_string(),
+        vec![
+            fixture
+                ._dir
+                .path()
+                .join("seed-provider.so")
+                .into_os_string(),
+        ],
+    )
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(child.pid());
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), child.pid()).unwrap());
+    let mut session = ScriptedSession::default();
+    session.dynamic_loader_reports_added = true;
+    assert!(matches!(
+        engine
+            .arm_owned_loader_before_release(
+                &child,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new()
+            )
+            .unwrap(),
+        OwnedLoaderPrearmOutcome::Armed
+    ));
+    let context = engine.loader_registry.ids_for_view(ProcessViewId(0))[0];
+    engine.record_loader_arm(ProcessViewId(0), true);
+    child.release().unwrap();
+    let exec = exec_record_for(child.pid());
+    if revalidate {
+        engine
+            .revalidate_owned_session_with(
+                &child,
+                &mut session,
+                &mut Engine::collect_discovery_records,
+            )
+            .unwrap();
+    }
+    assert!(session.detached.is_empty());
+    // Wait for the provider's real mapping, not an arbitrary settle sleep.
+    let provider = fixture._dir.path().join("seed-provider.so");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !std::fs::read_to_string(format!("/proc/{}/maps", child.pid()))
+        .unwrap()
+        .contains(provider.to_str().unwrap())
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    (fixture, child, engine, context, exec, session)
+}
+
+/// The generic EXEC refresh must not undo the successful owned prearm
+/// revalidation. A later ADD still discovers the provider and its next-tick
+/// fallback runs once without replaying the hit.
+#[test]
+fn owned_initial_exec_preserves_the_prearm_until_later_loader_discovery() {
+    let (_fixture, _child, mut engine, context, exec, mut session) =
+        owned_prearmed_seed_route(true);
+
+    apply_ordinary_batch(&mut engine, &mut session, vec![exec]).unwrap();
+
+    assert!(
+        session.detached.is_empty(),
+        "the validated prearm must survive its initial exec"
+    );
+    assert!(engine.loader_registry.context(context).is_some());
+    assert_eq!(
+        engine.loader_records_accepted, 0,
+        "an EXEC is not a loader hit"
+    );
+    assert_eq!(engine.loader_discovery().initial_set_capture.eligible, 0);
+    assert_eq!(engine.loader_discovery().initial_set_capture.none, 1);
+    assert_eq!(engine.loader_discovery().initial_set_timing.unproven, 1);
+    assert_eq!(engine.loader_discovery().dlopen_timing.unproven, 1);
+    let mut add = mapped_loader_record(&mut engine, context);
+    add.announced_count = 1;
+    session.counters.loader_hits = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![add]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    assert_eq!(engine.loader_memory_scan_attempts, 0);
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert_eq!(engine.loader_memory_scan_attempts, 1);
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(session.detached.is_empty());
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.path.ends_with("seed-provider.so"))
+    );
+    assert!(
+        session
+            .dynamic_attach_calls
+            .iter()
+            .any(|export| export.abi == HookAbi::FunctionList)
+    );
+    assert_eq!(engine.capture_facts().discovery_truncated, 0);
+    assert!(!engine.retirement_intents.contains_key(&ProcessViewId(0)));
+    assert!(
+        !engine
+            .refresh_requested
+            .contains(&((exec.pid_tgid >> 32) as u32))
+    );
+}
+
+#[test]
+fn owned_initial_exec_acknowledgment_cannot_cover_a_later_exec() {
+    let (_fixture, child, mut engine, context, exec, mut session) = owned_prearmed_seed_route(true);
+    apply_ordinary_batch(&mut engine, &mut session, vec![exec]).unwrap();
+    assert!(session.detached.is_empty());
+    let mut add = mapped_loader_record(&mut engine, context);
+    add.announced_count = 1;
+    session.counters.loader_hits = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![add]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    // Rechecking the same direct executable cannot create a second token.
+    engine
+        .revalidate_owned_session_with(&child, &mut session, &mut Engine::collect_discovery_records)
+        .unwrap();
+
+    apply_ordinary_batch(
+        &mut engine,
+        &mut session,
+        vec![exec_record_for(child.pid())],
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.detached.iter().filter(|id| **id == context).count(),
+        1
+    );
+    assert_eq!(engine.capture_facts().discovery_truncated, 1);
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, 0);
+}
+
+#[test]
+fn owned_initial_exec_requires_an_unbroken_discovery_stream() {
+    for fault in [
+        "ring",
+        "malformed",
+        "unvalidated",
+        "unknown",
+        "decrease",
+        "read",
+        "startup",
+    ] {
+        let (_fixture, child, mut engine, context, exec, mut session) =
+            owned_prearmed_seed_route(true);
+        match fault {
+            "ring" => session.counters.ring_loss = 1,
+            "malformed" => engine.record_malformed_discovery(1),
+            "unvalidated" => engine.account_unvalidated_discovery(1),
+            "unknown" => {
+                let mut unknown = exec;
+                unknown.kind = u8::MAX;
+                apply_ordinary_batch(&mut engine, &mut session, vec![unknown]).unwrap();
+            }
+            "decrease" => {
+                engine.counter_snapshot.loader_hits = 1;
+                apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+            }
+            "read" => {
+                session.fail_counter_reads([true]);
+                assert!(apply_ordinary_batch(&mut engine, &mut session, Vec::new()).is_err());
+            }
+            "startup" => {
+                let snapshot = engine.begin_start_capture_attempt().unwrap();
+                assert!(
+                    engine
+                        .finish_start_capture_attempt::<()>(
+                            snapshot,
+                            Err(anyhow!("startup failed"))
+                        )
+                        .is_err()
+                );
+            }
+            _ => unreachable!(),
+        }
+        // A later successful identity check cannot restore lost stream proof.
+        engine
+            .revalidate_owned_session_with(
+                &child,
+                &mut session,
+                &mut Engine::collect_discovery_records,
+            )
+            .unwrap();
+        apply_ordinary_batch(&mut engine, &mut session, vec![exec]).unwrap();
+
+        assert!(session.detached.contains(&context), "fault={fault}");
+        assert!(
+            engine.loader_registry.context(context).is_none(),
+            "fault={fault}"
+        );
+    }
+}
+
+#[test]
+fn owned_initial_exec_without_revalidation_uses_ordinary_retirement() {
+    let (_fixture, _child, mut engine, context, exec, mut session) =
+        owned_prearmed_seed_route(false);
+    apply_ordinary_batch(&mut engine, &mut session, vec![exec]).unwrap();
+    assert!(session.detached.contains(&context));
+    assert!(engine.loader_registry.context(context).is_none());
+}
+
+#[test]
+fn owned_initial_exec_cannot_preserve_a_replacement_context() {
+    let (_fixture, child, mut engine, original, exec, mut session) =
+        owned_prearmed_seed_route(true);
+    engine
+        .retire_loader_contexts(
+            ProcessViewId(0),
+            &mut TerminalSelectionHandoffs::new(),
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+            &mut Engine::collect_discovery_records,
+            &mut PauseClosure::new(true),
+        )
+        .unwrap();
+    engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    let replacement = engine.loader_registry.ids_for_view(ProcessViewId(0))[0];
+    assert_ne!(original, replacement);
+    engine
+        .revalidate_owned_session_with(&child, &mut session, &mut Engine::collect_discovery_records)
+        .unwrap();
+
+    apply_ordinary_batch(&mut engine, &mut session, vec![exec]).unwrap();
+
+    assert_eq!(
+        session
+            .detached
+            .iter()
+            .filter(|id| **id == replacement)
+            .count(),
+        1
+    );
+    assert!(engine.loader_registry.context(replacement).is_none());
+}
+
 #[test]
 fn exec_refresh_attaches_provider_exports_before_readiness() {
     let (fixture, view, _module, _pins) = loaded_seed_provider();

@@ -296,8 +296,11 @@ class Group:
         try:
             self._confirm(deadline, self.stopped_members, stopped=False)
         except (CustodyError, OSError):
-            if not (allow_successful_exit and self.process is not None and _ready(self.fd)):
+            if not (allow_successful_exit and self.process is not None):
                 raise
+            # During group exit a task can disappear or become a zombie before
+            # the process pidfd is readable. Only our owned ordinary wait can
+            # establish successful exit; keep the existing absolute deadline.
             if self.process.wait(deadline) != 0:
                 raise CustodyError('resumed owned process exited unsuccessfully')
 

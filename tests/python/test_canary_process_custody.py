@@ -127,6 +127,72 @@ def complete_threads(observer, workload):
                 raises(FileNotFoundError, lambda: group.snapshot(time.monotonic() + 2))
 
 
+def exiting_thread_group(observer, workload):
+    # Linux x86-64's thread-only exit leaves a real zombie leader while its
+    # gated worker keeps the process pidfd unreadable. No readiness result is
+    # mocked: the worker is released only when the owned ordinary wait starts.
+    assert os.uname().machine == 'x86_64'
+    for kind in ('success', 'nonzero', 'signalled', 'timeout', 'strict'):
+        with tempfile.TemporaryDirectory() as directory, c.Custody() as owner:
+            ready, leave, finish = [Path(directory) / name for name in ('ready', 'leave', 'finish')]
+            code = f'''
+import pathlib, threading
+def worker():
+    while not pathlib.Path({str(finish)!r}).exists():
+        time.sleep(.001)
+    if {kind!r} == 'signalled':
+        os.kill(os.getpid(), signal.SIGKILL)
+    os._exit(7 if {kind!r} == 'nonzero' else 0)
+threading.Thread(target=worker).start()
+pathlib.Path({str(ready)!r}).touch()
+while not pathlib.Path({str(leave)!r}).exists():
+    time.sleep(.001)
+ctypes.CDLL(None).syscall(60, 0)
+'''
+            child = launch(owner, '\n' + code)
+            until(ready.exists)
+            group = child.group
+            group.stop(time.monotonic() + 2)
+            confirm, wait = group._confirm, child.wait
+            waits = []
+
+            def confirming(deadline, members, *, stopped):
+                assert not stopped
+                leave.touch()
+                until(lambda: state(child.popen.pid) == 'Z')
+                assert not select.select([group.fd], [], [], 0)[0]
+                return confirm(deadline, members, stopped=stopped)
+
+            def waiting(deadline):
+                assert not owner.sealed
+                waits.append(deadline)
+                if kind != 'timeout':
+                    finish.touch()
+                return wait(deadline)
+
+            with patch.object(group, '_confirm', side_effect=confirming), \
+                    patch.object(child, 'wait', side_effect=waiting):
+                deadline = time.monotonic() + (0.3 if kind == 'timeout' else 2)
+                action = lambda: group.resume(deadline, allow_successful_exit=kind != 'strict')
+                if kind == 'success':
+                    action()
+                    assert child.settled and child.popen.returncode == 0
+                elif kind == 'timeout':
+                    raises((subprocess.TimeoutExpired, c.DeadlineExpired), action)
+                else:
+                    raises(c.CustodyError, action)
+                assert waits == ([] if kind == 'strict' else [deadline])
+                assert not group.owed_cont
+    with c.Custody() as owner:
+        borrowed = owner.borrow(observer, identity(observer), role='observer')
+        borrowed.stop(time.monotonic() + 2)
+        assert borrowed.process is None
+        with patch.object(borrowed, '_confirm', side_effect=c.CustodyError('injected confirmation failure')):
+            raises(c.CustodyError,
+                   lambda: borrowed.resume(time.monotonic() + 2, allow_successful_exit=True))
+        assert not borrowed.owed_cont
+
+
 def identity_refusals(observer, workload):
     with c.Custody() as owner:
         raises(c.CustodyError, lambda: owner.borrow(observer, identity(observer) + 1, role='observer'))
@@ -1000,6 +1066,7 @@ class ProcessCustodyTests(unittest.TestCase):
     def test_stop_refusal_resumes_only_successful_stop(self): self.probe('first_red')
     def test_direct_term_and_policy_restoration(self): self.probe('direct_term')
     def test_complete_thread_roster_and_read_failure(self): self.probe('complete_threads')
+    def test_exiting_thread_group_requires_bounded_owned_wait(self): self.probe('exiting_thread_group')
     def test_identity_and_dead_refusals(self): self.probe('identity_refusals')
     def test_live_identity_checks_preserve_deadline_generation_and_exit_guards(self): self.probe('live_identity_refusals')
     def test_independent_prestop_is_not_resumed(self): self.probe('prestop_refusal')

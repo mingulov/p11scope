@@ -80,8 +80,13 @@ def owned_metrics_document(bits, calls=30):
         attached_probes=208,
         vendor_interfaces=1,
         interface_list="ok",
-        child_still_running=False,
+        child_still_running=True,
+        handoff_child_pid=123,
     )
+    evidence["scheduling"]["phase_mono_ns"] = {
+        "attach_mono_ns": 1, "loop_start_mono_ns": 2,
+        "loop_end_mono_ns": 3, "loop_end_reason": "expiry",
+    }
     # An owned lane publishes no skip. `p11scope run` attempts initial-set
     # discovery and the D3 amendment leaves the timing catalog exactly
     # empty, so the attempt is reported unproven rather than claimed —
@@ -2771,7 +2776,9 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                 capture.validate_canary(lane, one, TARGET_BITS)
                 for mutate in (
                     lambda d: d["evidence"].pop("child_still_running"),
-                    lambda d: d["evidence"].update(child_still_running=True),
+                    lambda d: d["evidence"].update(child_still_running=False, handoff_child_pid=None),
+                    lambda d: d["evidence"].update(handoff_child_pid=None),
+                    lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(loop_end_reason="target_exit"),
                     lambda d: d["evidence"].update(
                         pause="sigstop", pause_attempts=1, pause_confirmed=1),
                     # The initial-set gap must be stated in
@@ -2811,6 +2818,7 @@ class OwnedMetricsOracleTests(unittest.TestCase):
 
         external = copy.deepcopy(owned)
         external["evidence"].pop("child_still_running")
+        external["evidence"]["handoff_child_pid"] = None
         # The initial-set skip belongs to the owned lane alone: an external
         # `--pid` attach never attempts initial-set discovery, so it has
         # nothing to leave unproven, and the known-prefix scan publishes

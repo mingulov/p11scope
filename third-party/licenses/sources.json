@@ -168,6 +168,26 @@
       "sha256": "71f5b27660dcd9b566402a9fb724b04453d6da50a46c5e165c32147b2405a5cb",
       "url": "https://raw.githubusercontent.com/aya-rs/aya/773ca715385b97eb0c26a581b53246c0c4306959/LICENSE-MIT"
     },
+    "debian-gcc-12.2.0-14+deb12u1-copyright.txt": {
+      "bytes": 68194,
+      "image": "rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0",
+      "package": "gcc-12-base / libgcc-12-dev",
+      "package_version": "12.2.0-14+deb12u1",
+      "scope": "Original distribution copyright inventory retained conservatively; not an assertion all described code is linked or shipped.",
+      "sha256": "da8191658b3452ce9caf31638ba61dab31a38c619fa39df119812e050f592fd3",
+      "source_kind": "pinned-container-file",
+      "source_path": "/usr/share/doc/gcc-12-base/copyright"
+    },
+    "debian-glibc-2.36-9+deb12u10-copyright.txt": {
+      "bytes": 25467,
+      "image": "rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0",
+      "package": "libc6-dev",
+      "package_version": "2.36-9+deb12u10",
+      "scope": "Original distribution copyright inventory retained conservatively; not an assertion all described code is linked or shipped.",
+      "sha256": "40c7e1f2118531f038ca22999bd976901254e1bc5cd1b0f0211bdd064c599987",
+      "source_kind": "pinned-container-file",
+      "source_path": "/usr/share/doc/libc6-dev/copyright"
+    },
     "gcc-12.2.0-COPYING.RUNTIME.txt": {
       "bytes": 3324,
       "original_filename": "COPYING.RUNTIME",
@@ -501,26 +521,58 @@
       {
         "commit": "2ee5e4300186a92ad73f1a1a64cb918dc76c8d67",
         "lookup_url": "https://api.github.com/repos/gcc-mirror/gcc/commits/releases/gcc-12.2.0",
-        "notice_scope": "Pinned upstream baseline source notices; official helper build must establish actual link membership and distro patch-level differences.",
+        "notice_scope": "Upstream native startup/runtime notices supplemented by the pinned distribution copyright inventories and patch review. Inclusion does not assert that every described source file is linked.",
         "repository": "https://github.com/gcc-mirror/gcc",
         "tag": "releases/gcc-12.2.0"
       },
       {
         "commit": "04696df09633baf97cdbbdd6e9929b9d472161d3",
         "lookup_url": "https://api.github.com/repos/gcc-mirror/gcc/commits/releases/gcc-14.2.0",
-        "notice_scope": "Pinned upstream baseline source notices; official helper build must establish actual link membership and distro patch-level differences.",
+        "notice_scope": "Upstream native startup/runtime notices supplemented by the pinned distribution copyright inventories and patch review. Inclusion does not assert that every described source file is linked.",
         "repository": "https://github.com/gcc-mirror/gcc",
         "tag": "releases/gcc-14.2.0"
       },
       {
         "commit": "c804cd1c00adde061ca51711f63068c103e94eef",
         "lookup_url": "https://api.github.com/repos/bminor/glibc/commits/glibc-2.36",
-        "notice_scope": "Pinned upstream baseline source notices; official helper build must establish actual link membership and distro patch-level differences.",
+        "notice_scope": "Upstream native startup/runtime notices supplemented by the pinned distribution copyright inventories and patch review. Inclusion does not assert that every described source file is linked.",
         "repository": "https://github.com/bminor/glibc",
         "tag": "glibc-2.36"
       }
     ],
-    "helper_link_membership": "UNVERIFIED_PENDING_OFFICIAL_HELPER_BUILD",
+    "helper_link_membership": "not asserted",
+    "helper_notice_scope": "Notices cover upstream native startup/runtime sources and the pinned helper toolchains conservatively. Inclusion does not establish per-object linkage. The release artifact inspection separately records the helper binary SHA-256, ELF interpreter and DT_NEEDED entries; dynamically loaded system runtime libraries are not included in the binary bundles.",
+    "helper_toolchains": [
+      {
+        "copyright_files": [
+          "debian-gcc-12.2.0-14+deb12u1-copyright.txt",
+          "debian-glibc-2.36-9+deb12u10-copyright.txt"
+        ],
+        "distribution": "Debian 12 bookworm",
+        "image": "rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0",
+        "packages": {
+          "gcc-12": "12.2.0-14+deb12u1",
+          "libc6-dev": "2.36-9+deb12u10",
+          "libgcc-12-dev": "12.2.0-14+deb12u1"
+        }
+      },
+      {
+        "aports_gcc_commit": "fbf60319be3bbaf6dd32ef55cc6fb7189e05c266",
+        "aports_musl_commit": "1546f29a1fd233db15464ce000b6247ed71b31e7",
+        "base_image_musl": "1.2.5-r10; release build explicitly installs r12",
+        "distribution": "Alpine 3.22",
+        "gcc_recipe_url": "https://raw.githubusercontent.com/alpinelinux/aports/fbf60319be3bbaf6dd32ef55cc6fb7189e05c266/main/gcc/APKBUILD",
+        "image": "rust:1.88.0-alpine@sha256:64eba3726734dcfe89e0a62a0485007a3ab7c7372ce5b38c621d8812f70215f0",
+        "musl_recipe_url": "https://raw.githubusercontent.com/alpinelinux/aports/1546f29a1fd233db15464ce000b6247ed71b31e7/main/musl/APKBUILD",
+        "packages": {
+          "gcc": "14.2.0-r6",
+          "libgcc": "14.2.0-r6",
+          "musl": "1.2.5-r12",
+          "musl-dev": "1.2.5-r12"
+        },
+        "patch_review_scope": "Recipe-local patches verified against APKBUILD SHA-512 values. No patch changes libgcc/crtstuff.c, the copied unwind source files, or musl crt startup sources. No added standalone copyright or licensing terms in reviewed patches. Runtime-wide per-object membership is not asserted."
+      }
+    ],
     "llvm_revision": "c1118fdbb3024157df7f4cfe765f2b0b4339e8a2",
     "rust_gitlink": "https://github.com/rust-lang/rust/tree/1.88.0/src/llvm-project",
     "scope": "Notices for the native libraries and startup objects supplied by the pinned Rust target; actual linked members depend on the final artifact."

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# shellcheck shell=sh
 # Launch-time supervisor custody for system-scope-measure.sh.
 
 : "${P11SCOPE_RECEIPT_HELPER:=scripts/system-scope-receipt.py}"

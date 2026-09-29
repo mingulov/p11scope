@@ -7917,8 +7917,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // SYSPLAN residual: three jobs outside the checks job may name lanes, each
     // with its gate pinned. None runs on the push/PR success path (manual
     // dispatch or post-failure evidence only), so the checks job's UNRUN and
-    // scope: claims keep their exact meaning. A new lane in any of these
-    // jobs, or a fourth lane-naming job, fails here until this table is
+    // scope: claims keep their exact meaning. A new script in any of these
+    // jobs, or a fourth script-naming job, fails here until this table is
     // taught about it first.
     let manual_jobs: [(&str, &str, &[&str]); 3] = [
         (
@@ -7929,7 +7929,12 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         (
             "release-preview",
             "github.event_name == 'workflow_dispatch'",
-            &["scripts/build-release.sh"],
+            &[
+                "scripts/build-release.sh",
+                "scripts/export-source.py",
+                "scripts/release-notices.py",
+                "scripts/package-release.py",
+            ],
         ),
         (
             "quarantine",

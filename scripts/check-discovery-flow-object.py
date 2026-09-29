@@ -121,10 +121,15 @@ def typed_birth(elf, secs):
         found = [c for c in calls if c[0] == 'task_newtask' and c[3] == target]
         require(len(found) == 1, tag + 'link: missing/redirected ' + target)
         links[target] = found[0][2]
-    gate = recipe(hi, '''
+    # LLVM 18 uses r7 and LLVM 21 uses w7 for the same BPF STXW bytes.
+    # Keep the store width, stack address and source register exact.
+    key_stores = [op for _, op in hi
+                  if re.fullmatch(r'\*\(u32 \*\)\(r10 - 0x18\) = [rw]7', op)]
+    require(len(key_stores) == 1, tag + 'admission: exact u32 gate key store')
+    gate = recipe(hi, f'''
         r6 = r1
         r7 = 0x0
-        *(u32 *)(r10 - 0x18) = w7
+        {key_stores[0]}
         r2 = r10
         r2 += -0x18
         r1 = 0x0 ll

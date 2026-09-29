@@ -99,6 +99,34 @@ class DiscoveryFlow(unittest.TestCase):
                     self.reject(bad, disassembly, 'typed-birth', 'section')
                     print(f'verified {variant} typed-birth:section {mutation}')
 
+    def test_admission_key_store_aliases(self):
+        # LLVM versions spell the same u32 STX source as r7 or w7. Check
+        # both spellings against the complete compiled-object contract.
+        for variant, elf, disassembly in self.objects:
+            _, lines = C.function(C.sections(disassembly)['tp_btf/task_newtask'],
+                                  'task_newtask', 'fixture')
+            site = instruction_site(lines, ('r6 = r1', 'r7 = 0x0'), 2)
+            for register in ('r7', 'w7'):
+                replacement = f'*(u32 *)(r10 - 0x18) = {register}'
+                with self.subTest(variant=variant, source=register):
+                    if site[1] == replacement:
+                        accepted = disassembly
+                    else:
+                        old, new = instruction_change(lines, site, replacement)
+                        accepted = change_function(disassembly, 'task_newtask', old, new)
+                    self.assertTrue(C.check_decoded(elf, accepted, 'typed-birth'))
+            for label, replacement in (
+                ('wider', '*(u64 *)(r10 - 0x18) = r7'),
+                ('narrower', '*(u16 *)(r10 - 0x18) = w7'),
+                ('register', '*(u32 *)(r10 - 0x18) = w6'),
+                ('slot', '*(u32 *)(r10 - 0x10) = w7'),
+                ('base', '*(u32 *)(r9 - 0x18) = w7'),
+            ):
+                with self.subTest(variant=variant, mutation=label):
+                    old, new = instruction_change(lines, site, replacement)
+                    self.reject_and_restore(elf, disassembly, 'task_newtask', old, new,
+                                            'typed-birth', 'admission')
+
     def test_typed_mutations(self):
         cases = [
             ('redirect-propagation', 'task_newtask', '@propagation-call', 'call 0x0', 'link'),

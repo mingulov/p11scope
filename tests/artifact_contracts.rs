@@ -1884,6 +1884,9 @@ fn task7_run_preflight(
     command
         .arg(repo.path().join("scripts/build-release.sh"))
         .arg(root)
+        // Match the exact temporary root used by the cleanup tripwire.
+        // The release driver otherwise defaults an unset TMPDIR to /var/tmp.
+        .env("TMPDIR", std::env::temp_dir())
         // The whole reached-command inventory must resolve through the
         // caller's PATH for the seal to be built at all; the tripwires only
         // shadow the build and mutating commands ahead of it.

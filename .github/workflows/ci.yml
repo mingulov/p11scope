@@ -24,6 +24,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Offline/source custody tests require a self-contained commit graph.
+          fetch-depth: 0
       # UNRUN lanes begin
       # Honest scope, printed first so it reaches the log even when a later step
       # fails. A passing --self-test exercises a lane's oracle model, never the
@@ -298,6 +301,8 @@ jobs:
     runs-on: [self-hosted, bpf]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
@@ -320,6 +325,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
@@ -442,7 +449,8 @@ jobs:
       - run: '"$RUNNER_TEMP/release-tools/kubeconform" -summary deploy/k8s/'
   # SYSPLAN residual F-40: coverage gate with a ratchet. The floor lives in
   # .coverage-floor (raise it, never lower it); the job fails the workflow
-  # when line coverage of the touched lib crate drops below it.
+  # when workspace line coverage drops below it. Include the existing CLI and
+  # integration tests so their exercised production paths count toward the gate.
   coverage:
     runs-on: ubuntu-24.04
     env:
@@ -452,6 +460,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy,llvm-tools-preview
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
@@ -461,7 +471,7 @@ jobs:
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - run: cargo +1.88 llvm-cov --locked --offline --lib --fail-under-lines "$(cat .coverage-floor)"
+      - run: cargo +1.88 llvm-cov --locked --offline --workspace --all-targets --fail-under-lines "$(cat .coverage-floor)"
   # SYSPLAN residual F-29: flake quarantine. Failure-gated triage evidence:
   # when checks fail, each ledgered flake re-runs exactly once, serially,
   # in isolation. A green quarantine run never greens the workflow.

@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/system-test-manifest/v1",
-  "ledger_sha256": "56504a0214f6dc42a8de5baa5807b68884164cf6228baa2e6848750cf49e964b",
+  "ledger_sha256": "8ce71711b26c84350bdd58573ee700ed5ff1e851ac474cf4396b9bd866398c3a",
   "deferred_sha256": "b40d74c471ba102813e7eeb4e44ba3064233b5d83c771cd167067f1b3b623d1b",
   "subject": null,
   "cells": [
@@ -856,7 +856,7 @@
         "system-product"
       ],
       "expected_behavior": "regression",
-      "limitation": "source-fixed: no coverage measurement. Existing check: `cargo llvm-cov --lib --fail-under-lines \"$(cat .coverage-floor)\"` (floor 83). Final execution not recorded.",
+      "limitation": "source-fixed: no coverage measurement. Existing check: `cargo +1.88 llvm-cov --locked --offline --workspace --all-targets --fail-under-lines \"$(cat .coverage-floor)\"` (floor 83). Final execution not recorded.",
       "test_ids": [],
       "command": [],
       "artifact_hashes": {},

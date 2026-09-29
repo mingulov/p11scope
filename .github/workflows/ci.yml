@@ -395,6 +395,86 @@ jobs:
           import re
           import sys
 
+          # Publish only fixed IDs and constrained error codes, never raw logs.
+          import json
+
+          STAGES = {
+              "=== release privacy gate ===": "privacy-gate",
+              "=== p11scope: dynamic-build attach correctness ===": "dynamic-attach",
+              "=== p11scope: isolated safe-only official static build ===": "static-build",
+              "=== p11scope-discover: dynamic glibc + dynamic musl builds ===": "discover-containers",
+              "--- smoke run: p11scope-discover (glibc), on host ---": "discover-host-smoke",
+              "=== packaged discovery helper smoke ===": "packaged-helper-smoke",
+              "=== p11scope: smoke run of the packaged STATIC artifact itself ===": "static-help-smoke",
+              "=== official static hostile-target smoke ===": "static-hostile-smoke",
+              "=== build-release: ALL OK ===": "body-complete",
+          }
+          SUBSTAGES = {
+              "=== build ===": "build",
+              "=== discover deterministic matrix providers ===": "canary-provider-discovery",
+              "=== live safe START policy: hostile exact-name and mechanism controls ===": "canary-safe-start",
+              "=== live diagnostic START policy: distinct template faults ===": "canary-diagnostic-start",
+              "=== isolated seeded task-storage byte controls ===": "canary-task-storage",
+              "=== assert capture-policy matrix ===": "canary-matrix-check",
+              "=== softhsm token ===": "attach-token-setup",
+              "=== observe (manifest-free: memory scan only) ===": "attach-scan",
+              "=== observe (manifest corroborated against the scan) ===": "attach-manifest",
+          }
+          SIGNATURES = {
+              "observer-readiness-custody-error": r"^capture-stopped-canary: observer-readiness: CustodyError$",
+              "apt-dns-resolution": r"^W: Failed to fetch https?://\S+\s+Temporary failure resolving '[^']+'$",
+              "apt-no-installation-candidate": r"^E: Package '[^']+' has no installation candidate$",
+              "process-terminated": r"^Terminated$",
+              "process-killed": r"^Killed$",
+              "finalizer-artifact-ledger-unrecorded": r"^release artifact ledger was not recorded$",
+              "cargo-compilation-failed": r"^error: could not compile ",
+              "cargo-build-script-failed": r"^error: failed to run custom build command for ",
+          }
+          ERRNOS = {
+              "EPERM": (1, "Operation not permitted"),
+              "ENOENT": (2, "No such file or directory"),
+              "ENOMEM": (12, "Cannot allocate memory"),
+              "EACCES": (13, "Permission denied"),
+              "EINVAL": (22, "Invalid argument"),
+              "ENOSPC": (28, "No space left on device"),
+              "EOPNOTSUPP": (95, "Operation not supported"),
+              "ETIMEDOUT": (110, "Connection timed out"),
+              "EDQUOT": (122, "Disk quota exceeded"),
+          }
+
+          def diagnostics(receipt):
+              stage, substage = "unknown", "unknown"
+              signals, rustc_codes, errnos = set(), set(), set()
+              stderr_state = "missing"
+              for filename in ("stdout.log", "stderr.log"):
+                  path = receipt / filename
+                  if not path.is_file():
+                      continue
+                  nonempty, matched = False, False
+                  with path.open(encoding="utf-8", errors="replace") as stream:
+                      for raw in stream:
+                          line = raw.rstrip("\r\n")
+                          nonempty |= bool(line.strip())
+                          if filename == "stdout.log":
+                              if line in STAGES:
+                                  stage, substage = STAGES[line], "unknown"
+                              elif line in SUBSTAGES:
+                                  substage = SUBSTAGES[line]
+                          for label, pattern in SIGNATURES.items():
+                              if re.search(pattern, line):
+                                  signals.add(label); matched = True
+                          for code in re.findall(r"\berror\[(E[0-9]{4})\]:", line):
+                              rustc_codes.add(code); matched = True
+                          for name, (number, message) in ERRNOS.items():
+                              pattern = rf"\b{name}\b|\bos error {number}\b|{re.escape(message)}"
+                              if re.search(pattern, line):
+                                  errnos.add(name); matched = True
+                  if filename == "stderr.log":
+                      stderr_state = "matched-signature" if matched else ("unknown" if nonempty else "empty")
+              return dict(last_recorded_stage=stage, last_recorded_substage=substage,
+                          observed_signature_ids=sorted(signals), rustc_error_codes=sorted(rustc_codes),
+                          observed_errno_names=sorted(errnos), stderr_classification=stderr_state)
+
           receipt, summary = map(Path, sys.argv[1:])
           keys = ("head", "tree", "checker_status", "terminal_status",
                   "release_artifacts_sha256")
@@ -419,6 +499,11 @@ jobs:
                   if valid and key.endswith("status"):
                       valid = int(value) <= 255
                   output.write(f"- {key}: `{value if valid else 'unavailable'}`\n")
+          report = diagnostics(receipt)
+          print("release-diagnostic: " + json.dumps(report, sort_keys=True))
+          with summary.open("a", encoding="utf-8") as output:
+              output.write("\n## Release diagnostic summary\n\n```json\n")
+              output.write(json.dumps(report, sort_keys=True, indent=2) + "\n```\n")
           PY
       # Assemble public assets from the verified receipt, source and notices.
       - name: Assemble public release candidate

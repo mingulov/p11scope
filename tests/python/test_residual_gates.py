@@ -10,6 +10,11 @@ green by implementation, never by weakening.
 Run: python3 -I tests/python/test_residual_gates.py -v
 """
 
+import json
+import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -76,6 +81,57 @@ class ResidualGates(unittest.TestCase):
             "cargo-deny" in text or "cargo deny" in text, "no cargo deny gate"
         )
         self.assertTrue(DENY_TOML.is_file(), "deny.toml missing")
+
+    def test_release_summary_exposes_fixed_diagnostics_without_private_log_text(self):
+        block = ci_text().split("      - name: Release receipt summary\n", 1)[1]
+        program = textwrap.dedent(
+            block.split("<<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+        )
+        private = "PRIVATE_CANARY_/secret-path/::error::untrusted"
+        cases = (
+            (
+                "=== release privacy gate ===\n"
+                "=== live safe START policy: hostile exact-name and mechanism controls ===\n",
+                "capture-stopped-canary: observer-readiness: CustodyError\n",
+                "privacy-gate", "canary-safe-start", "matched-signature",
+                ["observer-readiness-custody-error"], [], [],
+            ),
+            (
+                "=== p11scope: isolated safe-only official static build ===\n",
+                "error[E0463]: private compiler input\nPermission denied (os error 13)\n",
+                "static-build", "unknown", "matched-signature", [], ["E0463"], ["EACCES"],
+            ),
+            (
+                "=== release privacy gate === " + private + "\n",
+                private + "\n",
+                "unknown", "unknown", "unknown", [], [], [],
+            ),
+        )
+        for stdout, stderr, stage, substage, classification, signatures, codes, errnos in cases:
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                receipt = root / "receipt"
+                receipt.mkdir()
+                (receipt / "stdout.log").write_text(stdout + private + "\n")
+                (receipt / "stderr.log").write_text(stderr + private + "\n")
+                (receipt / "facts.log").write_text("head\t" + private + "\n")
+                (receipt / "status").write_text("1\n")
+                summary = root / "summary.md"
+                result = subprocess.run(
+                    [sys.executable, "-I", "-", str(receipt), str(summary)],
+                    input=program, text=True, capture_output=True, check=True,
+                )
+                self.assertIn("release-diagnostic: ", result.stdout)
+                report = json.loads(result.stdout.split("release-diagnostic: ", 1)[1])
+                self.assertEqual(report["last_recorded_stage"], stage)
+                self.assertEqual(report["last_recorded_substage"], substage)
+                self.assertEqual(report["stderr_classification"], classification)
+                self.assertEqual(report["observed_signature_ids"], signatures)
+                self.assertEqual(report["rustc_error_codes"], codes)
+                self.assertEqual(report["observed_errno_names"], errnos)
+                rendered = result.stdout + result.stderr + summary.read_text()
+                self.assertNotIn(private, rendered)
+                self.assertNotIn("private compiler input", rendered)
 
     def test_scripts_lint_gate_exists(self):
         """F-63: shellcheck/ruff CI over scripts/."""

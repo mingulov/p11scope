@@ -18180,11 +18180,16 @@ fn a_conservative_replay_that_cannot_be_rebuilt_closes_the_tick() {
     let (mut child, mut engine, _) = engine_with_one_accepted_provider();
     let retired = ProcessViewId(9);
     // The capture-lifetime module registry no longer maps the accepted
-    // provider bijectively, so no candidate over it can be rebuilt.
-    engine
+    // provider bijectively, so no candidate over it can be rebuilt. Remove
+    // its reverse mapping: another process's first mapped object can have
+    // the same physical identity and is not a distinct-key sentinel.
+    let owner = engine.plan.module_of_slot(0).unwrap();
+    let removed = engine
         .capture_facts
         .module_keys
-        .insert(plan::ModuleId(0), timing_key(0));
+        .remove(&owner)
+        .expect("the accepted owner has a registered physical identity");
+    assert_eq!(engine.capture_facts.module_ids.get(&removed), Some(&owner));
     let mut session = ScriptedSession::default();
 
     let (outcome, additions) = u07_replay(&mut engine, &mut session, retired);

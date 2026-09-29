@@ -452,12 +452,18 @@ mod tests {
             ],
             DetachOrder,
         );
+        // `attempted` is published before the closer runs. Wait for its
+        // released/uncertain result before inspecting failure progress.
         for _ in 0..1000 {
-            if worker.progress().attempted == 2 {
+            if worker.is_done() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(
+            worker.is_done(),
+            "both closes must settle before inspection"
+        );
         let progress = worker.progress();
         assert_eq!(
             progress.uncertain, 1,

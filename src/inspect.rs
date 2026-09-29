@@ -305,7 +305,25 @@ fn run_with_writer(
     json: bool,
     out: &mut dyn std::io::Write,
 ) -> Result<i32> {
-    let view = ProcessView::open(ProcessViewId(0), pid).map_err(anyhow::Error::msg)?;
+    run_with_view(
+        pid,
+        hints,
+        hooks,
+        json,
+        out,
+        ProcessView::open(ProcessViewId(0), pid),
+    )
+}
+
+fn run_with_view(
+    pid: u32,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    json: bool,
+    out: &mut dyn std::io::Write,
+    view: Result<ProcessView, String>,
+) -> Result<i32> {
+    let view = view.map_err(|reason| unreadable_target_error(pid, &reason))?;
     let mut context = (&view, CaptureWorkBudget::default());
     let result = scan_and_pin_retained_with(
         &mut context,
@@ -348,7 +366,10 @@ fn emit_diagnosis(
         }
     };
     if let Some(reason) = unreadable_mappings(&outcome) {
-        return Err(unreadable_target_error(pid, reason));
+        return Err(unreadable_target_error(
+            pid,
+            &format!("cannot read /proc/{pid}/maps ({reason})"),
+        ));
     }
     let outcome = with_extra_skips(outcome, pin_skips);
 
@@ -375,7 +396,8 @@ fn unreadable_mappings(outcome: &ScanOutcome) -> Option<&str> {
 
 /// "The target could not be read at all" (docs/usage.md, exit codes): a hard
 /// error, so `main` prints one stderr line and stdout stays empty. A
-/// permission refusal names the fix: another user's process needs root.
+/// permission refusal names the fix even when opening the retained view
+/// fails before the mapping scan (for example, reading its mount namespace).
 fn unreadable_target_error(pid: u32, reason: &str) -> anyhow::Error {
     let denied = reason.contains("Permission denied") || reason.contains("not permitted");
     let fix = if denied {
@@ -386,7 +408,7 @@ fn unreadable_target_error(pid: u32, reason: &str) -> anyhow::Error {
     } else {
         "; its modules are unknown, not absent".to_string()
     };
-    anyhow::anyhow!("cannot read /proc/{pid}/maps ({reason}){fix}")
+    anyhow::anyhow!("{reason}{fix}")
 }
 
 /// The machine-readable soft-failure document: the success schema with
@@ -479,6 +501,35 @@ mod tests {
                 "{error}"
             );
             assert!(!error.contains("0 PKCS#11 modules"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unreadable_process_namespace_is_a_hard_error_with_guidance() {
+        let reason = "cannot identify process mount namespace: Permission denied (os error 13)";
+        for json in [false, true] {
+            let mut stdout = Vec::new();
+            let error = run_with_view(
+                1379,
+                &[],
+                &HookRegistry::builtin(),
+                json,
+                &mut stdout,
+                Err(reason.into()),
+            )
+            .expect_err("an unreadable namespace must fail")
+            .to_string();
+            assert!(stdout.is_empty(), "json={json}: {stdout:?}");
+            assert!(error.contains(reason), "{error}");
+            assert!(
+                error.contains("sudo p11scope inspect --pid 1379"),
+                "{error}"
+            );
+            assert!(error.contains("unknown, not absent"), "{error}");
+            assert!(
+                !error.contains("/maps"),
+                "the namespace lookup failed: {error}"
+            );
         }
     }
 

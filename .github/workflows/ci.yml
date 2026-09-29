@@ -452,6 +452,20 @@ jobs:
               "check-capture-evidence.py", "canary_process_custody.py",
               "dump-owned-bpf-maps.py", "qualify-task-storage-canary.py",
           }
+          COUNTERS = {
+              "event_loss", "start_insert_failures", "unmatched_returns", "rv_update_failures",
+              "cgroup_scope_failures", "abi_refusals", "semantic_capture_failures",
+              "unregistered_mechanisms", "template_tail_failures", "process_tracking_fallbacks",
+              "process_tracking_failures", "process_tracking_evictions", "state_reconciliations",
+              "session_cancel_ambiguities", "session_cancel_unknown_flags", "operation_state_imports",
+              "auth_state_ambiguities", "async_target_failures", "async_orphans", "async_duplicates",
+              "async_evictions", "fork_state_ambiguities", "semantic_state_drops", "semantic_history_drops",
+              "pending_at_end", "malformed_records", "orphan_ops", "unmatched_closes",
+              "shape_decode_failures", "shape_decode_total_failures", "discovery_conflicts",
+              "discovery_uncorroborated", "module_ambiguous", "discovery_ring_loss",
+              "discovery_state_failures", "discovery_read_failures", "discovery_truncated",
+              "task_uprobe_link_losses",
+          }
           ERRNOS = {
               "EPERM": (1, "Operation not permitted"),
               "ENOENT": (2, "No such file or directory"),
@@ -468,6 +482,7 @@ jobs:
               stage, substage = "unknown", "unknown"
               signals, rustc_codes, errnos = set(), set(), set()
               locations = set()
+              counter_mismatches = set()
               stderr_state = "missing"
               for filename in ("stdout.log", "stderr.log"):
                   path = receipt / filename
@@ -486,6 +501,12 @@ jobs:
                           for label, pattern in SIGNATURES.items():
                               if re.search(pattern, line):
                                   signals.add(label); matched = True
+                          counter = re.fullmatch(r"capture evidence rejected: ([a-z_]+): want (0|[1-9][0-9]{0,19}), got (0|[1-9][0-9]{0,19})", line)
+                          if counter and counter[1] in COUNTERS and len(counter_mismatches) < 64:
+                              expected, observed = int(counter[2]), int(counter[3])
+                              if expected < 2**64 and observed < 2**64:
+                                  counter_mismatches.add((counter[1], expected, observed))
+                                  matched = True
                           location = re.fullmatch(r'  File "([^"\n]+)", line ([1-9][0-9]{0,5}), in [A-Za-z_][A-Za-z_0-9]*', line)
                           if not location:
                               location = re.fullmatch(r'canary-failure-location: ([A-Za-z_][A-Za-z_0-9.-]*):([1-9][0-9]{0,5})', line)
@@ -505,6 +526,8 @@ jobs:
               return dict(last_recorded_stage=stage, last_recorded_substage=substage,
                           observed_signature_ids=sorted(signals), rustc_error_codes=sorted(rustc_codes),
                           python_failure_locations=[dict(script=script, line=line) for script, line in sorted(locations)],
+                          counter_mismatches=[dict(counter=name, expected=expected, observed=observed)
+                                              for name, expected, observed in sorted(counter_mismatches)],
                           observed_errno_names=sorted(errnos), stderr_classification=stderr_state)
 
           receipt, summary = map(Path, sys.argv[1:])

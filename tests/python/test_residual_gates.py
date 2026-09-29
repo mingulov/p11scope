@@ -217,6 +217,43 @@ class ResidualGates(unittest.TestCase):
             for forbidden in (private, str(root), "capture evidence rejected:"):
                 self.assertNotIn(forbidden, result.stdout + result.stderr + summary.read_text())
 
+    def test_release_summary_reports_only_known_bounded_counter_mismatches(self):
+        import runpy
+
+        checker = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
+        block = ci_text().split("      - name: Release receipt summary\n", 1)[1]
+        program = textwrap.dedent(block.split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0])
+        errors = []
+        for name in checker["COUNTERS"]:
+            values = dict.fromkeys(checker["COUNTERS"], 0)
+            values[name] = 3
+            with self.assertRaises(AssertionError) as caught:
+                checker["exact_counters"](values)
+            errors.append(f"capture evidence rejected: {caught.exception}\n")
+        errors.extend([
+            "capture evidence rejected: PRIVATE_COUNTER_NAME: want 0, got 3\n",
+            "capture evidence rejected: event_loss: want 0, got 18446744073709551616\n",
+            "capture evidence rejected: event_loss: want -1, got 3\n",
+            "capture evidence rejected: event_loss: want 0, got True\n",
+            "capture evidence rejected: event_loss: want 0, got 4 PRIVATE_VALUE\n",
+        ])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "stderr.log").write_text("".join(errors))
+            summary = root / "summary.md"
+            result = subprocess.run(
+                [sys.executable, "-I", "-", str(root), str(summary)],
+                input=program, text=True, capture_output=True, check=True,
+            )
+            report = json.loads(result.stdout.split("release-diagnostic: ", 1)[1])
+            self.assertEqual(report["counter_mismatches"], [
+                {"counter": name, "expected": 0, "observed": 3}
+                for name in sorted(checker["COUNTERS"])
+            ])
+            public = result.stdout + result.stderr + summary.read_text()
+            for private in ("PRIVATE_COUNTER_NAME", "PRIVATE_VALUE", "18446744073709551616"):
+                self.assertNotIn(private, public)
+
     def test_coverage_gate_exists(self):
         """F-40: llvm-cov/tarpaulin CI gate with a ratchet."""
         text = ci_text()

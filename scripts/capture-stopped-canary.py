@@ -615,7 +615,7 @@ class Coordinator:
     def readiness(self, observer, deadline):
         while True:
             self.check('observer-readiness', deadline)
-            observer.group.snapshot(deadline)
+            observer.group.check_alive(deadline)
             if self.capture_ready(deadline):
                 return
             time.sleep(min(.01, remaining(deadline)))
@@ -638,7 +638,7 @@ class Coordinator:
         tasks = None
         while True:
             self.check('owned-readiness', deadline)
-            observer.group.snapshot(deadline)
+            observer.group.check_alive(deadline)
             if tasks is None and os.path.lexists(self.config.ready):
                 tasks = ready_roster(self.config, deadline)
             if self.capture_ready(deadline) and tasks is not None:

@@ -137,6 +137,20 @@ def identity_refusals(observer, workload):
     assert all(g.closed for g in owner.groups)
 
 
+def live_identity_refusals(observer, workload):
+    with c.Custody() as owner:
+        child = launch(owner)
+        group = child.group
+        group.check_alive(time.monotonic() + 1)
+        raises(c.DeadlineExpired, lambda: group.check_alive(time.monotonic() - 1))
+        raises(c.CustodyError, lambda: group.check_alive(float('nan')))
+        with patch.object(group, 'generation', group.generation + 1):
+            raises(c.CustodyError, lambda: group.check_alive(time.monotonic() + 1))
+        child.terminate(time.monotonic() + 2)
+        raises(c.CustodyError, lambda: group.check_alive(time.monotonic() + 1))
+    raises(c.CustodyError, lambda: group.check_alive(time.monotonic() + 1))
+
+
 def prestop_refusal(observer, workload):
     fd = os.pidfd_open(workload)
     try:
@@ -913,6 +927,7 @@ class ProcessCustodyTests(unittest.TestCase):
     def test_direct_term_and_policy_restoration(self): self.probe('direct_term')
     def test_complete_thread_roster_and_read_failure(self): self.probe('complete_threads')
     def test_identity_and_dead_refusals(self): self.probe('identity_refusals')
+    def test_live_identity_checks_preserve_deadline_generation_and_exit_guards(self): self.probe('live_identity_refusals')
     def test_independent_prestop_is_not_resumed(self): self.probe('prestop_refusal')
     def test_real_tracer_stop_refused(self): self.probe('traced_refusal')
     def test_partial_stop_timeout_still_resumes(self): self.probe('partial_timeout')

@@ -77,6 +77,53 @@ def synthetic_done(config, group, deadline, check):
                                       'pid': config.workload_pid, 'generation': config.generation}))
 
 
+STARTUP_THREAD = '''import pathlib, threading, time
+startup = pathlib.Path({directory!r})
+while not (startup / 'start-thread').exists():
+    time.sleep(.001)
+threading.Thread(target=lambda: time.sleep(30), daemon=True).start()
+(startup / 'thread-started').touch()
+'''
+
+
+@contextlib.contextmanager
+def startup_schedule(coordinator, directory):
+    """Schedule an actual clone across the first readiness roster read.
+
+    With leader-only readiness there is no roster read; the normal capture
+    marker poll releases startup instead. Acquisition still uses real, strict
+    task snapshots after the observer has finished creating its worker.
+    """
+    directory = Path(directory)
+    tasks, ready = c._tasks, coordinator.capture_ready
+    def start():
+        (directory / 'start-thread').touch()
+        end = time.monotonic() + 2
+        while not (directory / 'thread-started').exists():
+            assert time.monotonic() < end, 'startup thread did not start'
+            time.sleep(.001)
+    def census(pid, deadline):
+        rows = tasks(pid, deadline)
+        if coordinator.phase in ('observer-readiness', 'owned-readiness'):
+            start()
+        return rows
+    def marker(deadline):
+        start()
+        return ready(deadline)
+    with patch.object(c, '_tasks', side_effect=census), \
+            patch.object(coordinator, 'capture_ready', side_effect=marker):
+        yield
+
+
+def startup_threads(pid, directory):
+    config = config_for(pid, directory)
+    config.observer_args[-1] = STARTUP_THREAD.format(directory=directory) + config.observer_args[-1]
+    coordinator = capture.Coordinator(config, FakeMaps(config))
+    with startup_schedule(coordinator, directory), \
+            patch.object(capture, 'wait_done', side_effect=synthetic_done):
+        assert coordinator.run().exists()
+
+
 # Five DISCOVERY records published and all five drained: the shape a real
 # owned metrics lane was measured at, and the one its oracle must accept.
 OWNED_DISCOVERY_PRODUCED = 5 * capture.evidence.RING_RECORD_STRIDES['DISCOVERY']
@@ -746,6 +793,12 @@ def record(pid):
     with (root / 'owned-pids').open('a') as stream:
         stream.write(str(pid) + '\n')
 record(os.getpid())
+if case == 'startup_threads':
+    import threading
+    while not (root / 'start-thread').exists():
+        time.sleep(.001)
+    threading.Thread(target=lambda: time.sleep(30), daemon=True).start()
+    (root / 'thread-started').touch()
 if case.startswith('capture_first'):
     marker()
     time.sleep(.08)
@@ -825,9 +878,9 @@ def owned_case(pid, directory, case, program, provider):
     handles, signals, waits, replays, readiness_deadlines = [], [], [], [], []
     launch, retain, send = owner.launch, owner.retain_observer_child, signal.pidfd_send_signal
     check, frames, dump, refuse = coordinator.check, source.frames, source.dump, source.refuse
-    snapshot = c.Group.snapshot
+    check_alive = c.Group.check_alive
     replay = capture.evidence.assert_stopped_snapshot
-    positive = case.startswith(('ready_first', 'capture_first'))
+    positive = case.startswith(('ready_first', 'capture_first', 'startup_threads'))
     def launched(*args, **kwargs):
         readiness_deadlines.append(kwargs['deadline'])
         observer = launch(*args, **kwargs)
@@ -862,15 +915,14 @@ def owned_case(pid, directory, case, program, provider):
             send(observer.fd, signal.SIGKILL)
             assert select.select([observer.fd], [], [], 1)[0]
             raise capture.CaptureError('injected observer death after workload STOP')
-    def snapshotted(group, deadline, **kwargs):
-        rows = snapshot(group, deadline, **kwargs)
-        if (case == 'missing_ready_snapshot_deadline' and group.role == 'observer'
+    def checked_alive(group, deadline):
+        check_alive(group, deadline)
+        if (case == 'missing_ready_liveness_deadline' and group.role == 'observer'
                 and coordinator.phase == 'owned-readiness'
                 and coordinator.capture_ready(deadline)):
             # The observer has really started its unreported child. Force the
             # shared deadline to expire inside custody, not at check()/sleep.
             c._remaining(time.monotonic() - 1)
-        return rows
     def framed(*args):
         raw = frames(*args)
         header = capture.dumper.TASK_STORAGE_HEADER
@@ -912,14 +964,16 @@ def owned_case(pid, directory, case, program, provider):
     error = None
     try:
         with ExitStack() as stack:
+            if case == 'startup_threads':
+                stack.enter_context(startup_schedule(coordinator, directory))
             for target, name, side_effect in ((owner, 'launch', launched),
                     (owner, 'retain_observer_child', retained), (signal, 'pidfd_send_signal', sent),
                     (coordinator, 'check', checked), (source, 'frames', framed), (source, 'dump', dumped),
                     (source, 'refuse', refused),
                     (capture.evidence, 'assert_stopped_snapshot', replayed)):
                 stack.enter_context(patch.object(target, name, side_effect=side_effect))
-            if case == 'missing_ready_snapshot_deadline':
-                stack.enter_context(patch.object(c.Group, 'snapshot', side_effect=snapshotted, autospec=True))
+            if case == 'missing_ready_liveness_deadline':
+                stack.enter_context(patch.object(c.Group, 'check_alive', side_effect=checked_alive, autospec=True))
             stack.enter_context(patch.object(c, 'Custody', return_value=owner))
             if case in ('missing_ready', 'missing_capture'):
                 # Generous test-only budget: the missing-readiness fixture
@@ -989,6 +1043,9 @@ def owned_case(pid, directory, case, program, provider):
 
 
 class StoppedCanaryCaptureTests(unittest.TestCase):
+    def test_observer_may_start_worker_before_capture_ready(self):
+        self.probe('startup_threads')
+
     @classmethod
     def setUpClass(cls):
         cls.build = tempfile.TemporaryDirectory()
@@ -1437,11 +1494,11 @@ for case in CASES:
         self.probe('case:' + case)
     setattr(StoppedCanaryCaptureTests, 'test_' + case.replace(':', '_').replace('-', '_'), test)
 
-for case in ('ready_first', 'capture_first', 'ready_first_feature', 'capture_first_feature',
+for case in ('ready_first', 'capture_first', 'ready_first_feature', 'capture_first_feature', 'startup_threads',
              'death_unknown', 'death_stopped', 'wrong_executable', 'extra_child', 'stale_generation',
              'foreign_ready', 'unavailable_children', 'root_missing', 'root_invalid', 'root_control',
              'cookie', 'cookie_history', 'owner', 'start', 'events', 'observer_bad_exit',
-             'cgroup_value', 'missing_ready', 'missing_capture', 'missing_ready_snapshot_deadline'):
+             'cgroup_value', 'missing_ready', 'missing_capture', 'missing_ready_liveness_deadline'):
     def test(self, case=case):
         self.probe('owned:' + case)
     setattr(StoppedCanaryCaptureTests, 'test_owned_' + case, test)

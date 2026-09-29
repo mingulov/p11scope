@@ -196,6 +196,21 @@ class Group:
         if self.closed or self.fd is None or _ready(self.fd):
             raise CustodyError(f'{self.role} retained process has exited or closed')
 
+    def check_alive(self, deadline):
+        """Check retained leader identity while startup may create threads.
+
+        This makes no claim about a stable task or child population. Callers
+        must still use snapshot/children for acquisition and STOP/CONT.
+        """
+        self._live()
+        generation, state, _ = _stat(self.pid, deadline)
+        if generation != self.generation:
+            raise CustodyError('leader generation changed')
+        if state in ('Z', 'X', 'x', 't'):
+            raise CustodyError('dead or tracer-stopped task')
+        self._live()
+        _remaining(deadline)
+
     def snapshot(self, deadline, *, expected=None):
         self._live()
         if _stat(self.pid, deadline)[0] != self.generation:

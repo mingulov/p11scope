@@ -363,7 +363,7 @@ run_owned_lane() {
     echo "=== $owned_lane ($owned_build owned metrics) ==="
     refuse_lane_destinations "$owned_lane"
     set -- "$owned_observer" run --manifest "$WORK/matrix-manifest.json" \
-        --mode metrics --pause never --duration 120 --kill-on-timeout -o "$WORK/$owned_lane.output" -- \
+        --mode metrics --pause never --duration 35 -o "$WORK/$owned_lane.output" -- \
         "$WORK/canary_workload" "$WORK/matrix-provider.so" matrix \
         "$WORK/$owned_lane.ready" "$WORK/$owned_lane.go" "$WORK/$owned_lane.done" "$WORK/$owned_lane.finish"
     sudo python3 -I scripts/capture-stopped-canary.py \

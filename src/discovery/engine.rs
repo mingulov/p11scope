@@ -13985,6 +13985,19 @@ impl Engine {
                     }
                     continue;
                 };
+                // A frame-budget deferral must not let EXEC refresh retire
+                // a context still needed by this view's collected records.
+                // The persistent intent is retried after their dispatch.
+                // Exit/generation-loss retirement keeps its terminal handoff
+                // path; unrelated views remain eligible for retirement.
+                if cause == RetirementCause::ExecRefresh
+                    && self
+                        .pending_discovery_records
+                        .iter()
+                        .any(|queued| (queued.record.pid_tgid >> 32) as u32 == retained.pid())
+                {
+                    continue;
+                }
                 let ready = if self.ready_expected_removals.contains(&view)
                     && cause == RetirementCause::ExpectedRemoval
                 {

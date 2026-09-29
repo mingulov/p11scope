@@ -880,6 +880,79 @@ os._exit(0 if statuses == [7] * {count} else 19)
                 os.close(fd)
 
 
+def handed_off_child_wait(observer, outside):
+    for case in ('normal', 'nonzero', 'signal', 'deadline', 'parent_nonzero', 'child_early_exit'):
+        with tempfile.TemporaryDirectory() as directory:
+            ready, handoff, finish = [Path(directory) / name for name in ('ready', 'handoff', 'finish')]
+            code = f"""
+pid = os.fork()
+if pid == 0:
+    while not os.path.exists({str(finish)!r}):
+        time.sleep(.005)
+    os._exit({7 if case == 'nonzero' else 0})
+open({str(ready)!r}, 'w').write(str(pid))
+while not os.path.exists({str(handoff)!r}):
+    time.sleep(.005)
+os._exit({7 if case == 'parent_nonzero' else 0})
+"""
+            owner = c.Custody()
+            owner.__enter__()
+            handles = []
+            try:
+                parent = launch(owner, '\n' + code)
+                until(lambda: ready.exists() and ready.read_text())
+                pid = int(ready.read_text())
+                child = owner.retain_observer_child(parent, pid, identity(pid), time.monotonic() + 2)
+                handles.append(os.dup(child.fd))
+                raises(c.CustodyError, lambda: owner.adopt_observer_child(parent, child, time.monotonic() + 1))
+                raises(c.CustodyError, lambda: owner.wait_observer_child(child, time.monotonic() + 1))
+                raises(ChildProcessError, lambda: os.waitid(os.P_PIDFD, child.fd, os.WEXITED | os.WNOHANG))
+                if case == 'child_early_exit':
+                    finish.touch()
+                    until(lambda: select.select([child.fd], [], [], 0)[0])
+                handoff.touch()
+                assert parent.wait(time.monotonic() + 2) == (7 if case == 'parent_nonzero' else 0)
+                if case in ('parent_nonzero', 'child_early_exit'):
+                    raises(c.CustodyError, lambda: owner.adopt_observer_child(parent, child, time.monotonic() + 1))
+                    finish.touch()
+                    raises(c.CustodyError, owner.close)
+                    assert owner.reaped_orphans == [(pid, child.generation)]
+                else:
+                    foreign = owner.borrow(outside, identity(outside), role='workload')
+                    raises(c.CustodyError, lambda: owner.adopt_observer_child(parent, foreign, time.monotonic() + 1))
+                    raises(c.CustodyError, lambda: owner.adopt_observer_child(c.OwnedProcess(owner), child, time.monotonic() + 1))
+                    child.generation += 1
+                    raises(c.CustodyError, lambda: owner.adopt_observer_child(parent, child, time.monotonic() + 1))
+                    child.generation -= 1
+                    owner.adopt_observer_child(parent, child, time.monotonic() + 1)
+                    assert child.wait_owner == 'custody'
+                    raises(c.CustodyError, lambda: owner.adopt_observer_child(parent, child, time.monotonic() + 1))
+                    if case == 'deadline':
+                        raises(c.DeadlineExpired, lambda: owner.wait_observer_child(child, time.monotonic() + .02))
+                    if case == 'signal':
+                        signal.pidfd_send_signal(child.fd, signal.SIGTERM)
+                    else:
+                        finish.touch()
+                    if case in ('nonzero', 'signal'):
+                        raises(c.CustodyError, lambda: owner.wait_observer_child(child, time.monotonic() + 2))
+                    else:
+                        owner.wait_observer_child(child, time.monotonic() + 2)
+                    assert child.wait_owner == 'reaped'
+                    gone(child.fd)
+                    raises(c.CustodyError, lambda: owner.wait_observer_child(child, time.monotonic() + 1))
+                    owner.close()
+                    assert not owner.reaped_orphans
+                for fd in handles:
+                    gone(fd)
+            finally:
+                finish.touch()
+                handoff.touch()
+                if owner.active:
+                    owner.close()
+                for fd in handles:
+                    os.close(fd)
+
+
 class ProcessCustodyTests(unittest.TestCase):
     def probe(self, name):
         old_subreaper = c._subreaper()
@@ -923,6 +996,7 @@ class ProcessCustodyTests(unittest.TestCase):
             c._subreaper(old_subreaper)
 
     def test_retained_observer_child_keeps_its_observers_ordinary_wait(self): self.probe('retained_observer_child_wait')
+    def test_only_successful_exact_handoffs_transfer_wait_ownership(self): self.probe('handed_off_child_wait')
     def test_stop_refusal_resumes_only_successful_stop(self): self.probe('first_red')
     def test_direct_term_and_policy_restoration(self): self.probe('direct_term')
     def test_complete_thread_roster_and_read_failure(self): self.probe('complete_threads')

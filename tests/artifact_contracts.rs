@@ -6516,7 +6516,8 @@ aggregate-only-metrics default metrics"
     assert!(
         owned_lane.contains("--workload-origin owned")
             && owned_lane.contains("run --manifest \"$WORK/matrix-manifest.json\"")
-            && owned_lane.contains("--mode metrics --pause never --duration 120 --kill-on-timeout")
+            && owned_lane.contains("--mode metrics --pause never --duration 35")
+            && !owned_lane.contains("--kill-on-timeout")
             && owned_lane.contains(
                 "--observer-log \"$WORK/$owned_lane.observer.log\" --workload-log \"$WORK/$owned_lane.observer.log\""
             )
@@ -6526,7 +6527,7 @@ aggregate-only-metrics default metrics"
             && !owned_lane.contains("--generation")
             && !owned_lane.contains("wait \"$WPID\"")
             && !owned_lane.contains("signal_verified_process"),
-        "owned metrics lanes must bind run argv and combined logs while preserving observer wait ownership"
+        "owned metrics lanes must bind run argv and combined logs while retaining the child through terminal collection"
     );
     let start_lane = between(
         &canaries,

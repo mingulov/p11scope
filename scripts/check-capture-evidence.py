@@ -2473,8 +2473,13 @@ def validate_canary(lane, document, target_bits=64):
         require(calls == wanted_calls,
                 f"aggregate calls: want {wanted_calls}, got {calls}")
         if owned_metrics:
-            require(evidence["child_still_running"] is False,
-                    f"owned child still running: {evidence['child_still_running']!r}")
+            require(evidence["child_still_running"] is True,
+                    "owned canary requires a live child through terminal collection")
+            require(evidence["scheduling"]["phase_mono_ns"]["loop_end_reason"] == "expiry",
+                    "owned canary requires duration expiry and a named live-child handoff")
+            # exact_evidence binds a positive handoff PID to this true flag;
+            # the coordinator also binds it to its retained workload before
+            # FINISH and consumes that child's exact normal status-zero wait.
             # The owned run's one initial-set context is stated here, not
             # as a skip (ee51d14): never paused, so it is unproven and its
             # capture is `none`.
@@ -4136,7 +4141,12 @@ def self_test():
 
     owned_aggregate = copy.deepcopy(aggregate)
     owned_aggregate["functions"] = function_items([(["C_GetInterfaceList"], 30)])
-    owned_aggregate["evidence"]["child_still_running"] = False
+    owned_aggregate["evidence"]["child_still_running"] = True
+    owned_aggregate["evidence"]["handoff_child_pid"] = 123
+    owned_aggregate["evidence"]["scheduling"]["phase_mono_ns"] = {
+        "attach_mono_ns": 1, "loop_start_mono_ns": 2,
+        "loop_end_mono_ns": 3, "loop_end_reason": "expiry",
+    }
     # An owned lane publishes no skip (ee51d14): `p11scope run` attempts
     # initial-set discovery, and the empty timing catalog leaves it
     # unproven, stated once in loader_discovery.
@@ -4155,7 +4165,9 @@ def self_test():
             rejected(lambda bad=bad, lane=lane: validate_canary(lane, bad))
         for mutate in (
             lambda d: d["evidence"].pop("child_still_running"),
-            lambda d: d["evidence"].update(child_still_running=True),
+            lambda d: d["evidence"].update(child_still_running=False, handoff_child_pid=None),
+            lambda d: d["evidence"].update(handoff_child_pid=None),
+            lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(loop_end_reason="target_exit"),
             lambda d: d["evidence"].update(
                 pause="sigstop", pause_attempts=1, pause_confirmed=1),
             # The initial-set gap must be stated, exactly once, in

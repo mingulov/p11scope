@@ -1726,6 +1726,122 @@ fn a_live_frame_past_its_work_budget_defers_the_rest_in_order() {
     );
 }
 
+/// An EXEC can use the last work in a frame while loader hits from that
+/// same batch still name its old context. Retirement must wait for those
+/// already-collected hits; deferral cannot invalidate their authority.
+#[test]
+fn frame_deferred_loader_records_keep_their_context_until_dispatch() {
+    let (_fixture, mut engine, context, record, mut session) = armed_seed_route(1);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    let mut pending_views = PendingViewRetirements::new();
+    assert_eq!(
+        engine.dispatch_lifecycle_record(&exec_record_for(pid), &mut pending_views),
+        Some(view)
+    );
+    assert_eq!(
+        pending_views.get(&view),
+        Some(&RetirementCause::ExecRefresh)
+    );
+    engine.frame_work_budget_ns = 0;
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(record)))].into();
+
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert_eq!(engine.pending_discovery_records.len(), 1);
+    assert_eq!(
+        engine.pending_discovery_records[0].record.case_id,
+        record.case_id
+    );
+    assert_eq!(
+        engine.retirement_intents.get(&view),
+        Some(&RetirementCause::ExecRefresh)
+    );
+    assert!(
+        engine.loader_registry.context(context).is_some(),
+        "a deferred loader record still owns its context"
+    );
+    assert!(
+        session.detached.is_empty(),
+        "retirement cannot overtake replay"
+    );
+    assert_eq!(engine.loader_records_accepted, 0);
+    assert_eq!(engine.capture_facts().discovery_truncated, 0);
+
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.drain_discovery_from(&mut session).unwrap();
+
+    assert!(engine.pending_discovery_records.is_empty());
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert_eq!(engine.capture_facts().discovery_truncated, 0);
+    assert_eq!(
+        session.detached.iter().filter(|id| **id == context).count(),
+        1
+    );
+    assert!(!engine.retirement_intents.contains_key(&view));
+}
+
+#[test]
+fn frame_deferred_loader_records_resolve_rt_add_before_exec_retirement() {
+    for cancelled in [false, true] {
+        let (_fixture, mut engine, context, mut add, mut session) = armed_seed_route(2);
+        let pid = engine.views[0].pid();
+        let mut pending_views = PendingViewRetirements::new();
+        engine.dispatch_lifecycle_record(&exec_record_for(pid), &mut pending_views);
+        engine.update_counter_snapshot(&session).unwrap();
+        add.announced_count = 1;
+        let queued = QueuedDiscoveryRecord {
+            record: add,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        };
+        engine
+            .dispatch_discovery_record(
+                queued,
+                &mut session,
+                &mut true,
+                &mut pending_views,
+                &mut BTreeSet::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(engine.pending_loader_scans.len(), 1);
+        assert_eq!(engine.loader_records_accepted, 1);
+
+        let mut consistent = add;
+        consistent.announced_count = 0;
+        session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(consistent)))].into();
+        engine.frame_work_budget_ns = if cancelled { u64::MAX } else { 0 };
+        if cancelled {
+            engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            )));
+        }
+        engine.drain_discovery_from(&mut session).unwrap();
+
+        assert_eq!(engine.pending_loader_scans.len(), 1);
+        assert_eq!(engine.pending_discovery_records.len(), 1);
+        assert!(engine.loader_registry.context(context).is_some());
+        assert!(session.detached.is_empty());
+        assert_eq!(engine.capture_facts().discovery_truncated, 0);
+
+        if cancelled {
+            engine.drain_discovery_terminal_from(&mut session).unwrap();
+        } else {
+            engine.frame_work_budget_ns = u64::MAX;
+            engine.drain_discovery_from(&mut session).unwrap();
+        }
+        assert_eq!(engine.loader_records_accepted, 2);
+        assert!(engine.pending_discovery_records.is_empty());
+        assert!(engine.pending_loader_scans.is_empty());
+        assert_eq!(engine.capture_facts().discovery_truncated, 0);
+        assert_eq!(
+            session.detached.iter().filter(|id| **id == context).count(),
+            1
+        );
+    }
+}
+
 /// F4: a frame that defers work delays it, it does not drop it, so the
 /// deferral is a scheduling fact (`scheduling.discovery_deferrals`), never an
 /// observation-loss skip. Only work still deferred when the capture ends —

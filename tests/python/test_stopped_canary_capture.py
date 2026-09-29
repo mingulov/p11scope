@@ -781,11 +781,11 @@ root = pathlib.Path(sys.argv[0]).parent
 control = json.loads((root / 'owned-control.json').read_text())
 case = control['case']
 args = sys.argv[1:]
-assert len(args) == 20 and args[:2] == ['run', '--manifest']
-assert args[3:10] == ['--mode', 'metrics', '--pause', 'never', '--duration', '120', '--kill-on-timeout']
-assert args[10] == '-o' and args[12] == '--'
-assert args[15] == 'matrix'
-ready = pathlib.Path(args[16])
+assert len(args) == 19 and args[:2] == ['run', '--manifest']
+assert args[3:9] == ['--mode', 'metrics', '--pause', 'never', '--duration', '35']
+assert args[9] == '-o' and args[11] == '--'
+assert args[14] == 'matrix'
+ready, done, finish = (pathlib.Path(args[i]) for i in (15, 17, 18))
 def marker():
     print('p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C', flush=True)
     print('fixture — privacy=aggregate-only', flush=True)
@@ -817,7 +817,7 @@ if case == 'wrong_executable':
     ready.write_text(json.dumps(dict(schema='p11scope/canary-roster/v1', mode='matrix', pid=child.pid,
         tasks=[dict(pid=child.pid, tid=child.pid, generation=generation, role='leader', call_index=None)])))
 else:
-    child = subprocess.Popen(args[13:])
+    child = subprocess.Popen(args[12:])
     record(child.pid)
 end = time.monotonic() + 3
 while not ready.exists():
@@ -841,9 +841,26 @@ if case == 'missing_capture':
 elif not case.startswith('capture_first'):
     time.sleep(.08)
     marker()
-status = child.wait()
-(root / 'owned-wait.json').write_text(json.dumps({'status': status, 'pid': child.pid}))
-sys.exit(7 if case == 'observer_bad_exit' else status)
+while not done.exists():
+    assert child.poll() is None
+    time.sleep(.005)
+if case == 'handoff_timeout':
+    time.sleep(30)
+assert not finish.exists(), 'FINISH preceded observer finalization'
+facts = {'child_still_running': True, 'handoff_child_pid': child.pid,
+         'scheduling': {'phase_mono_ns': {'loop_end_reason': 'expiry'}}}
+if case == 'handoff_foreign':
+    facts['handoff_child_pid'] = control['outside_pid']
+elif case == 'handoff_end':
+    facts['scheduling']['phase_mono_ns']['loop_end_reason'] = 'target_exit'
+elif case == 'handoff_exited':
+    facts['child_still_running'] = False
+elif case == 'handoff_child_early_exit':
+    child.terminate()
+    child.wait()
+if case != 'handoff_missing':
+    pathlib.Path(args[10]).write_text(json.dumps({'evidence': facts}))
+sys.exit(7 if case == 'observer_bad_exit' else 0)
 '''
 
 
@@ -865,7 +882,7 @@ def owned_config(pid, directory, case, program, provider):
             ('ready', 'ready'), ('go', 'go'), ('done', 'done'), ('finish', 'finish'),
             ('observer_log', 'observer.log'), ('workload_log', 'observer.log'))})
     config.observer_args = [str(executable), 'run', '--manifest', str(directory / 'matrix-manifest.json'),
-        '--mode', 'metrics', '--pause', 'never', '--duration', '120', '--kill-on-timeout', '-o',
+        '--mode', 'metrics', '--pause', 'never', '--duration', '35', '-o',
         str(prefix) + '.output', '--', program, provider, 'matrix', str(config.ready),
         str(config.go), str(config.done), str(config.finish)]
     return config
@@ -879,6 +896,7 @@ def owned_case(pid, directory, case, program, provider):
     launch, retain, send = owner.launch, owner.retain_observer_child, signal.pidfd_send_signal
     check, frames, dump, refuse = coordinator.check, source.frames, source.dump, source.refuse
     check_alive = c.Group.check_alive
+    observer_wait = c.OwnedProcess.wait
     replay = capture.evidence.assert_stopped_snapshot
     positive = case.startswith(('ready_first', 'capture_first', 'startup_threads'))
     def launched(*args, **kwargs):
@@ -901,6 +919,10 @@ def owned_case(pid, directory, case, program, provider):
         else:
             raise AssertionError('coordinator stole observer child wait')
         return group
+    def waited(process, deadline):
+        if case == 'ready_first_terminal_barrier' and not owner.sealed:
+            assert not config.finish.exists(), 'FINISH preceded observer terminal collection'
+        return observer_wait(process, deadline)
     def sent(fd, number, *args):
         signals.append((fd, number))
         if number == signal.SIGSTOP:
@@ -910,6 +932,9 @@ def owned_case(pid, directory, case, program, provider):
         return send(fd, number, *args)
     def checked(phase, deadline=None):
         check(phase, deadline)
+        if case == 'handoff_cancel' and phase == 'owned-observer-wait':
+            owner._record_signal(signal.SIGTERM, None)
+            owner.check_cancelled()
         if case == 'death_stopped' and phase == 'workload-stopped':
             observer = next(group for group in owner.groups if group.role == 'observer')
             send(observer.fd, signal.SIGKILL)
@@ -958,7 +983,8 @@ def owned_case(pid, directory, case, program, provider):
         if len(replays) == 2:
             observer = next(process for process in owner.processes if process.group.role == 'observer')
             assert observer.settled and observer.popen.returncode == 0
-            assert json.loads((Path(directory) / 'owned-wait.json').read_text())['status'] == 0
+            workload = next(group for group in owner.groups if group.role == 'workload')
+            assert workload.wait_owner == 'reaped', 'handoff workload ordinary wait was not consumed'
             assert not owner.active and all(group.closed for group in owner.groups)
         return replay(manifest, prefix)
     error = None
@@ -972,6 +998,7 @@ def owned_case(pid, directory, case, program, provider):
                     (source, 'refuse', refused),
                     (capture.evidence, 'assert_stopped_snapshot', replayed)):
                 stack.enter_context(patch.object(target, name, side_effect=side_effect))
+            stack.enter_context(patch.object(c.OwnedProcess, 'wait', side_effect=waited, autospec=True))
             if case == 'missing_ready_liveness_deadline':
                 stack.enter_context(patch.object(c.Group, 'check_alive', side_effect=checked_alive, autospec=True))
             stack.enter_context(patch.object(c, 'Custody', return_value=owner))
@@ -981,6 +1008,12 @@ def owned_case(pid, directory, case, program, provider):
                 # loop; the asserted property (bounded 'phase deadline
                 # expired', no GO, no rings) is unchanged.
                 stack.enter_context(patch.object(capture, 'READY_SECONDS', 2))
+            if case == 'handoff_timeout':
+                finish_owned = coordinator.finish_owned_observer
+                def expired(*args):
+                    coordinator.owned_observer_deadline = time.monotonic() + .1
+                    return finish_owned(*args)
+                stack.enter_context(patch.object(coordinator, 'finish_owned_observer', side_effect=expired))
             if case == 'unavailable_children':
                 children = c.Group.children
                 def unavailable(group, *args, **kwargs):
@@ -1399,12 +1432,12 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
     def test_owned_argv_rejects_options_overrides_and_mismatched_paths_before_launch(self):
         changes = {'command': (1, 'profile'), 'manifest': (3, '/tmp/other-manifest.json'),
             'mode': (5, 'profile'), 'pause': (7, 'always'), 'duration': (9, '6'),
-            'kill_timeout': (10, '--other'), 'output': (12, '/tmp/other-output'),
-            'separator': (13, '--pid'), 'provider': (15, 'relative-provider.so'),
-            'matrix': (16, 'blocked'), 'ready': (17, '/tmp/other-ready'),
-            'go': (18, '/tmp/other-go'), 'done': (19, '/tmp/other-done'),
-            'finish': (20, '/tmp/other-finish')}
-        for problem in (*changes, 'duplicate_pause', 'missing_tail', 'missing_manifest'):
+            'output': (11, '/tmp/other-output'),
+            'separator': (12, '--pid'), 'provider': (14, 'relative-provider.so'),
+            'matrix': (15, 'blocked'), 'ready': (16, '/tmp/other-ready'),
+            'go': (17, '/tmp/other-go'), 'done': (18, '/tmp/other-done'),
+            'finish': (19, '/tmp/other-finish')}
+        for problem in (*changes, 'duplicate_pause', 'kill_timeout', 'missing_tail', 'missing_manifest'):
             with self.subTest(problem=problem), tempfile.TemporaryDirectory() as directory:
                 config = owned_config(os.getpid(), directory, 'ready_first', str(self.program), str(self.matrix))
                 if problem in changes:
@@ -1412,6 +1445,8 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                     config.observer_args[index] = value
                 elif problem == 'duplicate_pause':
                     config.observer_args[10:10] = ['--pause', 'never']
+                elif problem == 'kill_timeout':
+                    config.observer_args.insert(10, '--kill-on-timeout')
                 elif problem == 'missing_tail':
                     config.observer_args.pop()
                 else:
@@ -1537,10 +1572,13 @@ for case in CASES:
         self.probe('case:' + case)
     setattr(StoppedCanaryCaptureTests, 'test_' + case.replace(':', '_').replace('-', '_'), test)
 
-for case in ('ready_first', 'capture_first', 'ready_first_feature', 'capture_first_feature', 'startup_threads',
+for case in ('ready_first', 'ready_first_terminal_barrier', 'capture_first', 'ready_first_feature', 'capture_first_feature', 'startup_threads',
              'death_unknown', 'death_stopped', 'wrong_executable', 'extra_child', 'stale_generation',
              'foreign_ready', 'unavailable_children', 'root_missing', 'root_invalid', 'root_control',
              'cookie', 'cookie_history', 'owner', 'start', 'events', 'observer_bad_exit',
+             'handoff_missing', 'handoff_foreign', 'handoff_end', 'handoff_exited',
+             'handoff_child_early_exit', 'handoff_timeout',
+             'handoff_cancel',
              'cgroup_value', 'missing_ready', 'missing_capture', 'missing_ready_liveness_deadline'):
     def test(self, case=case):
         self.probe('owned:' + case)

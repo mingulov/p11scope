@@ -6,8 +6,9 @@ Other asynchronous Python handlers must not raise or perform competing waits.
 Fixtures must not exec, independently stop/continue, or mutate their expected
 thread/child population during acquisition. A pidfd does not enforce these
 conditions or protect cleanup against coordinator SIGKILL. Borrowed groups keep
-their external ordinary waiter; only launch() children and final adopted orphans
-are reaped here. All deadlines are absolute finite time.monotonic() values.
+their external ordinary waiter. Direct children and explicitly validated
+observer handoffs are reaped here; unexpected adopted orphans fail cleanup.
+All deadlines are absolute finite time.monotonic() values.
 """
 import contextlib
 import ctypes
@@ -191,6 +192,7 @@ class Group:
         self.stopped_members = None
         self.allowed_children = None
         self.process = None
+        self.observer_parent = None
 
     def _live(self):
         if self.closed or self.fd is None or _ready(self.fd):
@@ -466,8 +468,53 @@ class Custody:
         parent.children(deadline, allowed=allowed)
         if any(record[2] != parent.pid for record in group.snapshot(deadline).values()):
             raise CustodyError('observer child parent changed')
+        group.observer_parent = observer
         self.check_cancelled()
         return group
+
+    def adopt_observer_child(self, observer, group, deadline):
+        """Claim only a retained child handed back by its successful observer."""
+        self._require_active()
+        self.check_cancelled()
+        _remaining(deadline)
+        if (self.sealed or self.helper_depth or observer not in self.processes
+                or observer.scope is not self or not observer.settled
+                or observer.popen is None or observer.popen.returncode != 0
+                or group not in self.groups or group.scope is not self
+                or group.observer_parent is not observer or group.origin != 'observer-child'
+                or group.wait_owner != 'observer' or group.process is not None):
+            raise CustodyError('handoff requires the retained successful observer and child')
+        group.check_alive(deadline)
+        rows = group.snapshot(deadline, expected=group.stopped_members)
+        if any(row[2] != os.getpid() for row in rows.values()):
+            raise CustodyError('handoff child was not adopted by this coordinator')
+        group.children(deadline, allowed={})
+        self.check_cancelled()
+        group.wait_owner = 'custody'
+
+    def wait_observer_child(self, group, deadline):
+        """Reap an explicitly claimed handoff, never another observer's wait."""
+        self._require_active()
+        self.check_cancelled()
+        if (group not in self.groups or group.scope is not self or group.closed
+                or group.origin != 'observer-child' or group.wait_owner != 'custody'
+                or group.observer_parent is None or not group.observer_parent.settled):
+            raise CustodyError('child wait requires an explicitly adopted handoff')
+        generation, _, parent = _stat(group.pid, deadline)
+        if generation != group.generation or parent != os.getpid():
+            raise CustodyError('handoff child identity or parent changed')
+        while True:
+            self.check_cancelled()
+            _remaining(deadline)
+            status = os.waitid(os.P_PIDFD, group.fd, os.WEXITED | os.WNOHANG)
+            if status is not None:
+                if status.si_pid != group.pid:
+                    raise CustodyError('handoff child wait identity mismatch')
+                group.wait_owner = 'reaped'
+                if status.si_code != os.CLD_EXITED or status.si_status != 0:
+                    raise CustodyError('handoff child did not exit normally with status zero')
+                return
+            select.select([group.fd], [], [], min(.05, _remaining(deadline)))
 
     def launch(self, argv, *, role='observer', stdout=None, stderr=None, deadline=None, pass_fds=()):
         self._require_active()

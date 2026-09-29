@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """One retained, stopped acquisition for the closed canary lanes.
 
-The shell owns external workload waits; an owned run observer waits its child.
+The shell owns external workload waits. Owned runs retain their child through
+terminal collection, then this coordinator claims and reaps the exact handoff.
 This coordinator owns its observer, BPF references and acquisition files. Controlled fixtures must
 not exec or independently mutate STOP/CONT, task membership or output paths.
 No Python result alone qualifies a live kernel, BPF build or target ABI.
@@ -47,7 +48,8 @@ LANES = {
     'owned-feature-metrics': ('diagnostic', 'metrics', 'aggregate-only', 'matrix'),
 }
 OWNED_LANES = frozenset(('owned-default-metrics', 'owned-feature-metrics'))
-OWNED_DURATION_SECONDS = 120
+OWNED_DURATION_SECONDS = 35
+OWNED_CHILD_WAIT_SECONDS = 5
 MAP_TYPES = {1: 'hash', 2: 'array', 3: 'prog_array', 5: 'percpu_hash',
              6: 'percpu_array', 8: 'cgroup_array', 27: 'ringbuf', 29: 'task_storage'}
 STOP_SECONDS = 30
@@ -182,11 +184,11 @@ def encoded(value):
 
 def validate_owned_argv(config):
     argv = config.observer_args
-    require(len(argv) == 21, 'owned observer command has unexpected arguments')
-    manifest, executable, provider = config.out_dir / 'matrix-manifest.json', Path(argv[14]), Path(argv[15])
+    require(len(argv) == 20, 'owned observer command has unexpected arguments')
+    manifest, executable, provider = config.out_dir / 'matrix-manifest.json', Path(argv[13]), Path(argv[14])
     require(argv == [argv[0], 'run', '--manifest', str(manifest), '--mode', 'metrics',
                     '--pause', 'never', '--duration', str(OWNED_DURATION_SECONDS),
-                    '--kill-on-timeout', '-o', f'{config.prefix}.output', '--',
+                    '-o', f'{config.prefix}.output', '--',
                     str(executable), str(provider), 'matrix', str(config.ready),
                     str(config.go), str(config.done), str(config.finish)],
             'owned observer command contradicts lane or barrier paths')
@@ -609,6 +611,7 @@ class Coordinator:
         self.files = AcquisitionFiles(config)
         self.phase = 'configuration'
         self.stopped_deadline = None
+        self.owned_observer_deadline = None
         self.go_created = False
 
     def check(self, phase, deadline=None):
@@ -637,6 +640,25 @@ class Coordinator:
         marker = f' — privacy={self.config.privacy}'.encode()
         lines = read_bytes(self.config.observer_log, MAX_LOG_BYTES, deadline).splitlines()
         return any(marker in line for line in lines)
+
+    def finish_owned_observer(self, observer, workload):
+        # One absolute deadline from readiness: STOP overlaps capture duration.
+        # The final child release/reap fits inside the fixture's DONE+60s bound.
+        deadline = self.owned_observer_deadline
+        self.check('owned-observer-wait', deadline)
+        while observer.popen.poll() is None:
+            self.check('owned-observer-wait', deadline)
+            time.sleep(min(.01, remaining(deadline)))
+        require(observer.wait(deadline) == 0, 'owned observer ordinary wait was not successful')
+        self.check('owned-handoff', deadline)
+        report = read_json(Path(f'{self.config.prefix}.output'), MAX_LOG_BYTES, deadline=deadline)
+        facts = report['evidence']
+        require(facts['child_still_running'] is True, 'owned observer did not hand back a live child')
+        pid = facts['handoff_child_pid']
+        require(type(pid) is int and pid == workload.pid, 'owned observer handed back another child')
+        require(facts['scheduling']['phase_mono_ns']['loop_end_reason'] == 'expiry',
+                'owned observer did not finish by duration expiry')
+        self.owner.adopt_observer_child(observer, workload, deadline)
 
     def readiness(self, observer, deadline):
         while True:
@@ -859,6 +881,7 @@ class Coordinator:
 
     def run(self):
         issues, observer, workload, log = [], None, None, None
+        owned = False
         try:
             validate_config(self.config)
             self.signals.enter()
@@ -887,6 +910,8 @@ class Coordinator:
                                          deadline=ready_deadline if owned else None)
             if owned:
                 workload, tasks = self.owned_readiness(observer, ready_deadline)
+                self.owned_observer_deadline = (time.monotonic() + OWNED_DURATION_SECONDS
+                                                + OBSERVER_WAIT_SECONDS)
             else:
                 self.readiness(observer, time.monotonic() + READY_SECONDS)
             self.stopped_deadline = time.monotonic() + STOP_SECONDS
@@ -901,19 +926,28 @@ class Coordinator:
                         group.resume(resume_deadline, allow_successful_exit=allow_exit)
                     except BaseException as error:
                         issues.extend(sanitized(f'resume-{group.role}', error))
-            if self.go_created and self.config.workload_mode == 'matrix':
-                try:
-                    create_control(self.config.finish)
-                    if self.stopped_deadline is not None:
-                        require(time.monotonic() <= self.stopped_deadline + 20, 'matrix FINISH exceeded safety margin')
-                except BaseException as error:
-                    issues.extend(sanitized('FINISH-release', error))
             if self.source is not None:
                 try:
                     self.source.close()
                 except BaseException as error:
                     issues.extend(sanitized('acquisition-resources', error))
-            if observer is not None and not issues:
+            if owned and observer is not None and not issues:
+                try:
+                    self.finish_owned_observer(observer, workload)
+                except BaseException as error:
+                    issues.extend(sanitized('owned-handoff', error))
+            if self.go_created and self.config.workload_mode == 'matrix':
+                try:
+                    create_control(self.config.finish)
+                    if owned and not issues:
+                        deadline = self.owned_observer_deadline + OWNED_CHILD_WAIT_SECONDS
+                        self.check('owned-child-wait', deadline)
+                        self.owner.wait_observer_child(workload, deadline)
+                    elif not owned and self.stopped_deadline is not None:
+                        require(time.monotonic() <= self.stopped_deadline + 20, 'matrix FINISH exceeded safety margin')
+                except BaseException as error:
+                    issues.extend(sanitized('FINISH-release', error))
+            if observer is not None and not owned and not issues:
                 try:
                     require(observer.wait(time.monotonic() + OBSERVER_WAIT_SECONDS) == 0, 'observer ordinary wait was not successful')
                 except BaseException as error:

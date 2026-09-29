@@ -55,6 +55,9 @@ provider during capture.
   entry points (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,
   `NSC_GetFunctionList`, `FC_GetFunctionList`, plus `--hook-symbol`) pick up
   providers loaded after attach.
+- System and cgroup inventory refreshes rotate bounded admission attempts
+  past unreadable processes, allowing later callers to be considered without
+  increasing the per-tick count or time limits.
 - Every accepted provider file is opened once, pinned by descriptor and
   SHA-256, and re-checked with `fstat` before, during and after capture; a
   change sets `evidence.provider_changed` and forces `PARTIAL`.

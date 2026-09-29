@@ -24759,6 +24759,56 @@ fn refresh_tick_bounds_new_admissions_with_explicit_deferral() {
     assert_eq!(kept, expected, "every newcomer is eventually admitted");
 }
 
+/// A failed low-PID admission must not occupy every bounded tick forever.
+/// The reaped child stays in this owned listing to model a persistently
+/// unreadable process; a later live child must still get its turn.
+#[test]
+fn failed_newcomer_does_not_starve_later_process_admission() {
+    let first = e06_spawn_sleeps(1);
+    let first_pid = first[0].pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[first_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], None);
+    let mut engine = Engine::discover(&args, &scope, None).unwrap();
+    engine.scheduler.set_max_new_views_for_test(1);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+
+    let mut newcomers = e06_spawn_sleeps(2);
+    newcomers.sort_by_key(SystemScopeChildGuard::pid);
+    let failed_pid = newcomers[0].pid();
+    let later_pid = newcomers[1].pid();
+    newcomers[0]
+        .reap()
+        .expect("reap the owned failed candidate");
+    e06_write_listing(scope_dir.path(), &[first_pid, failed_pid, later_pid]);
+    engine.request_refresh(later_pid);
+
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.views.len(),
+        1,
+        "the first tick attempts only the failed PID"
+    );
+    assert!(engine.refresh_requested.contains(&later_pid));
+
+    refresh_inventory_once(&mut engine);
+    let kept: BTreeSet<_> = engine.views.iter().map(ProcessView::pid).collect();
+    assert_eq!(
+        kept,
+        BTreeSet::from([first_pid, later_pid]),
+        "the next bounded tick reaches the live child after the failed PID"
+    );
+    assert!(!engine.refresh_requested.contains(&later_pid));
+
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.views.len(),
+        2,
+        "retrying the failed PID duplicates no view"
+    );
+}
+
 /// Package C: a zero deep-scan quantum defers the whole phase — refreshed
 /// views and new admissions alike — with exact evidence and zero scans;
 /// restoring the quantum serves everything next tick. Extremes only, so no

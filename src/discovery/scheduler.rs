@@ -75,9 +75,9 @@ pub(crate) enum InventoryCadence {
     Reconcile,
 }
 
-/// The per-capture discovery schedule: over-cap pass count plus the
-/// incremental reconcile cursor. Under-cap passes never touch it, so
-/// under-cap behavior is unchanged by scheduling.
+/// The per-capture discovery schedule. Reconciliation, polling and new-view
+/// admission have independent cursors so failed candidates cannot monopolize
+/// a bounded tick, including when the whole scope fits under the view cap.
 #[derive(Debug)]
 pub(crate) struct DiscoveryScheduler {
     over_cap_passes: u64,
@@ -97,6 +97,7 @@ pub(crate) struct DiscoveryScheduler {
     max_evictions: usize,
     cooldown_sweeps: u64,
     max_new_views: usize,
+    new_view_cursor: Option<u32>,
     tick_quantum_ns: u64,
     under_cap_ticks: u64,
     poll_cursor: Option<u32>,
@@ -118,6 +119,7 @@ impl DiscoveryScheduler {
             max_evictions: MAX_EXPLORATORY_EVICTIONS_PER_PASS,
             cooldown_sweeps: RECONCILE_EVICTION_COOLDOWN_SWEEPS,
             max_new_views: MAX_NEW_VIEWS_PER_TICK,
+            new_view_cursor: None,
             tick_quantum_ns: TICK_DEEP_SCAN_QUANTUM_NS,
             tick_deadline_ns: None,
             under_cap_ticks: 0,
@@ -201,6 +203,19 @@ impl DiscoveryScheduler {
 
     pub(crate) fn max_new_views_per_tick(&self) -> usize {
         self.max_new_views
+    }
+
+    /// Rotate sorted newcomers past the last attempted process, even if that
+    /// attempt could not retain or scan it. Successful admission alone cannot
+    /// advance fairness when lower PIDs remain unreadable on every tick.
+    pub(crate) fn new_view_order(&self, pids: &[u32]) -> Vec<u32> {
+        Self::rotated_after(pids, self.new_view_cursor)
+    }
+
+    /// Called only after the tick's time and capacity checks permit an attempt.
+    /// Work deferred before an attempt keeps its place for the next tick.
+    pub(crate) fn note_new_view_attempt(&mut self, pid: u32) {
+        self.new_view_cursor = Some(pid);
     }
 
     /// Counts one under-cap inventory tick and reports whether it runs a

@@ -728,8 +728,13 @@ class TaskStorageCanaryTests(unittest.TestCase):
                 replaced = config.out_dir / 'replaced.ready.json'
                 replaced.write_bytes(b'{}')
                 files.adopt(replaced)
-                replaced.unlink()
-                replaced.write_bytes(b'{}')
+                # Create the foreign inode while the adopted one still exists.
+                # Unlink-then-create can reuse the same inode on ext4, which
+                # does not exercise the ledger's different-identity refusal.
+                replacement = config.out_dir / 'foreign.ready.json'
+                replacement.write_bytes(b'{}')
+                self.assertNotEqual(replaced.stat().st_ino, replacement.stat().st_ino)
+                replacement.replace(replaced)
                 issues = files.remove()
                 self.assertTrue(issues, 'a substituted adopted path was unlinked anyway')
                 self.assertTrue(replaced.is_file(), 'rollback unlinked a foreign file')

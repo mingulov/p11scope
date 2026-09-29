@@ -14915,11 +14915,12 @@ impl Engine {
         skipped.extend(refresh_skips);
         self.settle_polling_rescans(&refreshed_scans, &failed_scan_pids, &removed);
 
-        // Per-tick admission bound: only the first `max_new_views` newcomers
-        // are deep-scanned; the rest defer to the next tick with explicit
-        // evidence, and their queued refresh requests are retained.
+        // Per-tick admission bound: rotate past the last attempted newcomer
+        // before selecting this tick's window. Failed opens/scans must not
+        // consume the same first window forever and starve later processes.
+        // Deferred requests and their explicit evidence are retained.
         let max_new_views = self.scheduler.max_new_views_per_tick();
-        let mut new_pids = new_pids.into_iter();
+        let mut new_pids = self.scheduler.new_view_order(&new_pids).into_iter();
         let admitted: Vec<u32> = new_pids.by_ref().take(max_new_views).collect();
         let deferred: Vec<u32> = new_pids.collect();
         if !deferred.is_empty() {
@@ -14965,6 +14966,7 @@ impl Engine {
                     break;
                 }
             };
+            self.scheduler.note_new_view_attempt(pid);
             let view = match ProcessView::open(id, pid) {
                 Ok(view) => view,
                 Err(error) => {

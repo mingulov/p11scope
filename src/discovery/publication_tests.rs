@@ -2597,16 +2597,11 @@ fn unknown_build_admits_by_publication_without_layout() {
     let scan_baseline = engine.plan().slots.len();
     let baseline_targets = slot_targets(&engine);
     eprintln!("t8-stripped: scan-only baseline is {scan_baseline} slots");
-    // Link-order accidents, pinned loudly. (1) The stripped build packs
-    // the static legacy table into the last file page (the normal build
-    // spills it past the file page into anonymous BSS), so the sweep
-    // decodes it and the live return merges onto the scan instance
-    // instead of admitting a heap instance. (2) Since Package F's fixture
-    // controls grew .text/.eh_frame, the CET note's feature word now sits
-    // where padding plus relocated pointer arrays decode as one extra
-    // file-backed {3,0}/44 table. Both are layout luck, not contracts:
-    // if a toolchain relayouts this, the merge assertions below name what
-    // to re-derive.
+    // The stripped fixture's file tail may decode incidental tables depending
+    // on the compiler and linker layout. This case tests publication, so retain
+    // the exact pre-publication set and require the independently printed live
+    // targets to be the only additions. Numeric offsets from one compiler are
+    // not an oracle for another build.
     let legacy_extent =
         publish.legacy.addr..publish.legacy.addr + 8 + 8 * publish.legacy.nentry as u64;
     assert!(
@@ -2616,31 +2611,6 @@ fn unknown_build_admits_by_publication_without_layout() {
         "stripped legacy sits in the file page; re-derive the merge arm if this moves"
     );
     let (legacy_path, legacy_offset, _) = MapLite::file_target(&maps, publish.legacy.entries[0].0);
-    let artifact_tables: Vec<_> = engine
-        .modules
-        .iter()
-        .flat_map(|module| &module.scanned.tables)
-        .filter(|table| table.file_offset.is_some() && table.address != publish.legacy.addr)
-        .collect();
-    assert_eq!(
-        artifact_tables.len(),
-        1,
-        "exactly one non-legacy sweep-decoded table"
-    );
-    assert_eq!(artifact_tables[0].version, (3, 0));
-    assert_eq!(artifact_tables[0].walk, "full");
-    assert_eq!(artifact_tables[0].entries.len(), 44);
-    assert!(
-        !artifact_tables[0].live_return,
-        "the artifact is sweep-decoded, never published"
-    );
-    assert_eq!(
-        scan_baseline, 45,
-        "the sweep sees the file-backed legacy plus the layout artifact"
-    );
-    let mut baseline_offsets: Vec<u64> =
-        baseline_targets.iter().map(|(_, offset)| *offset).collect();
-    baseline_offsets.sort();
     assert_eq!(
         baseline_targets
             .iter()
@@ -2648,16 +2618,6 @@ fn unknown_build_admits_by_publication_without_layout() {
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([build.stripped.to_string_lossy().to_string()]),
         "every baseline slot pins the exact stripped fixture file"
-    );
-    assert_eq!(
-        baseline_offsets,
-        vec![
-            12736, 13008, 13072, 13392, 54592, 54704, 54832, 54960, 55088, 55216, 55344, 55472,
-            55600, 55728, 55856, 55984, 56112, 56240, 56368, 56496, 56624, 56752, 56880, 57008,
-            57136, 57264, 57392, 57520, 57648, 57776, 57904, 58032, 58160, 58288, 58416, 58544,
-            58672, 58800, 58928, 59056, 59184, 59312, 59440, 59568, 59696,
-        ],
-        "baseline is the legacy target plus the 44 artifact targets, exactly"
     );
     assert!(
         baseline_targets.contains(&(legacy_path, legacy_offset)),
@@ -2687,21 +2647,10 @@ fn unknown_build_admits_by_publication_without_layout() {
             .all(|target| slot_targets(&engine).contains(target)),
         "every published target admits without layout knowledge"
     );
-    // No extras: every slot is published-derived or decoded by the
-    // sweep from this layout's file tail (the unknown part).
-    let mut scan_derived = std::collections::BTreeSet::new();
-    for table in engine
-        .modules
-        .iter()
-        .flat_map(|module| &module.scanned.tables)
-        .filter(|table| table.file_offset.is_some())
-    {
-        for entry in &table.entries {
-            scan_derived.insert((entry.object_path.clone(), entry.file_offset));
-        }
-    }
+    // No extras or lost baseline slots: compare against the state before
+    // publication plus the child's independent printed-target oracle.
     let mut union = published_targets.clone();
-    union.extend(scan_derived);
+    union.extend(baseline_targets);
     assert_eq!(slot_targets(&engine), union, "no unaccounted slots");
     assert_eq!(
         engine.plan().uncorroborated_candidates,

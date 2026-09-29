@@ -31,6 +31,9 @@ def record(kind, **details):
         "child_exit_present": any(line.startswith("child_exit\t") for line in fact_lines),
         "recorded_ids": [line.split("\t")[1] for line in fact_lines if line.startswith("container_")],
         "remaining_ids": sorted(state()["ids"]),
+        "remaining_network_ids": sorted(state().get("networks", {})),
+        "recorded_network_ids": [line.split("\t")[1] for line in fact_lines
+                                 if line.startswith("network_identity\t")],
         **details,
     }
     with Path(CONFIG["events"]).open("a") as stream:

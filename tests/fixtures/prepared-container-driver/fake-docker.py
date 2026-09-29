@@ -3,7 +3,9 @@
 """Stateful Docker stand-in; container command bodies are never evaluated."""
 
 import json
+import os
 from pathlib import Path
+import signal
 import sys
 from fixture_common import CONFIG, record, refuse, save, state
 
@@ -20,7 +22,86 @@ def resolve(target):
     return target if target in current["ids"] else current["names"].get(target)
 
 
-if operation == "pull":
+if operation == "network":
+    if len(arguments) < 2:
+        refuse("missing network operation")
+    network_operation = arguments[1]
+    failure = CONFIG.get("network_failure")
+    if network_operation == "create":
+        if len(arguments) != 7 or arguments[2:5] != ["--driver", "bridge", "--label"]:
+            refuse("unsupported network create")
+        label, owner = arguments[5].split("=", 1)
+        if label != "io.p11scope.discover.owner" or len(owner) != 32:
+            refuse("network create lacks per-run owner")
+        identity = "f" * 64 if failure == "collision" else "a" * 64
+        current["networks"][identity] = {
+            "Id": identity, "Name": arguments[6], "Driver": "bridge", "Scope": "local",
+            "Labels": {label: "foreign" if failure == "collision" else owner},
+            "IPAM": {"Driver": "default", "Config": [{"Subnet": "172.28.0.0/16", "Gateway": "172.28.0.1"}]},
+        }
+        if failure == "ambiguous":
+            duplicate = dict(current["networks"][identity], Id="b" * 64)
+            current["networks"]["b" * 64] = duplicate
+        save(current)
+        if failure == "interrupted":
+            os.kill(os.getpid(), signal.SIGTERM)
+        if failure in ("collision", "lost-reply", "ambiguous"):
+            print("injected network create failure: " + failure, file=sys.stderr)
+            raise SystemExit(125)
+        print(identity)
+    elif network_operation == "inspect":
+        if len(arguments) != 3:
+            refuse("unsupported network inspect")
+        if arguments[2] not in current["networks"]:
+            raise SystemExit(1)
+        data = current["networks"][arguments[2]]
+        if failure in ("facts-replaced", "facts-symlink") and not current.get("facts_mutated"):
+            facts = Path(CONFIG["facts"])
+            retained = facts.with_name("original.facts")
+            facts.rename(retained)
+            current["facts_before_tamper"] = retained.read_text()
+            if failure == "facts-replaced":
+                facts.write_text("foreign receipt bytes\n")
+            else:
+                facts.symlink_to(retained)
+            current["facts_mutated"] = True
+            save(current)
+        if failure == "wrong-owner":
+            data["Labels"] = {"io.p11scope.discover.owner": "foreign"}
+        print(json.dumps([data]))
+    elif network_operation == "ls":
+        if (len(arguments) != 7 or arguments[2:4] != ["--no-trunc", "--filter"]
+                or arguments[5:] != ["--format", "{{.ID}}"]):
+            refuse("unsupported network list")
+        if failure == "query":
+            print("injected network query failure", file=sys.stderr)
+            raise SystemExit(42)
+        selector = arguments[4]
+        for identity, network in current["networks"].items():
+            if selector.startswith("label="):
+                label, value = selector[len("label="):].split("=", 1)
+                selected = network["Labels"].get(label) == value
+            elif selector.startswith("id="):
+                selected = identity == selector[len("id="):]
+            else:
+                refuse("unsupported network selector")
+            if selected:
+                print(identity)
+    elif network_operation == "rm":
+        if len(arguments) != 3 or arguments[2] not in current["networks"]:
+            refuse("unsupported network removal")
+        if any(identity in current["ids"] and network == arguments[2]
+               for identity, network in current["container_networks"].items()):
+            print("network retains active container endpoints", file=sys.stderr)
+            raise SystemExit(32)
+        if failure == "remove":
+            raise SystemExit(31)
+        if failure != "absence":
+            current["networks"].pop(arguments[2])
+            save(current)
+    else:
+        refuse("unsupported network operation: " + network_operation)
+elif operation == "pull":
     if len(arguments) != 3 or arguments[1] != "-q":
         refuse("unsupported pull")
 elif operation == "create":
@@ -39,6 +120,11 @@ elif operation == "create":
     identity = f'{current["count"]:064d}'
     current["ids"][identity] = name
     current["names"][name] = identity
+    if "--network" in arguments:
+        network = arguments[arguments.index("--network") + 1]
+        if network not in current["networks"]:
+            refuse("container uses an unknown network")
+        current["container_networks"][identity] = network
     save(current)
     print(identity)
 elif operation == "inspect":

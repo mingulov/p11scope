@@ -114,17 +114,27 @@ cargo +1.88 fetch --locked
 cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
 ```
 
-Two host pitfalls stop the driver early:
+The driver checks the host tool selection before building:
 
 - The `rustup` on `PATH` must be rustup itself. A version manager's shim
   (for example mise's) rejects `rustup which --toolchain`, and the driver
   exits 77; put `~/.cargo/bin` first on `PATH`.
-- The discover containers run on Docker's default bridge network and must
-  resolve the Ubuntu and Alpine archives. If the host's DNS server lies
-  inside the bridge subnet (WSL2 NAT at 172.17.x.x against the default
-  172.17.0.0/16, for example), the containers cannot resolve and the driver
-  fails at the discover step. Set `"bip"` or `"dns"` in
-  `/etc/docker/daemon.json`, or build in the `release-preview` CI job.
+- A version manager may also inject `CARGO_HOME`, `RUSTUP_HOME` or
+  `RUSTUP_TOOLCHAIN`, which the release preflight rejects. If these select
+  only the standard homes and the pinned toolchain, remove those inherited
+  variables when launching the driver, for example
+  `mise exec -- env -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN scripts/build-release.sh /var/tmp/p11scope-release/v0.1.0`.
+  A custom Cargo or rustup home requires a separate build environment.
+
+The discover helper lane creates one dedicated Docker bridge with automatic
+subnet allocation, records its identity and subnet, and removes it after its
+owned containers. Its containers must resolve and reach the Ubuntu and Alpine
+package archives. This avoids relying on Docker's default bridge, whose subnet
+can overlap the host's DNS network (for example, WSL2 NAT at `172.17.x.x`
+against `172.17.0.0/16`). No Docker daemon restart is needed. If network setup
+or package access still fails, retain the failed receipt and inspect the
+recorded network and the host's resolver configuration before retrying, or use the
+`release-preview` CI job.
 
 The single argument is an absent evidence root whose parent is a private
 directory outside the checkout:

@@ -49,7 +49,8 @@ class DriverFixture:
         self.prefix = self.artifacts / "discover.prepared"
         self.events_path = base / "events.jsonl"
         self.state_path = base / "docker-state.json"
-        self.state_path.write_text(json.dumps({"count": 0, "ids": {}, "names": {}, "mutated": False}))
+        self.state_path.write_text(json.dumps({"count": 0, "ids": {}, "names": {}, "networks": {},
+                                               "container_networks": {}, "mutated": False}))
         self.config_path = base / "driver-config.json"
         self.config = {
             "state": str(self.state_path), "events": str(self.events_path),
@@ -62,10 +63,20 @@ class DriverFixture:
                       "nightly-2026-05-20:rustc": str(self.bpf_rustc)},
         }
 
-    def run(self, *, arguments=None, work=None):
+    def run(self, *, arguments=None, work=None, sealed=False):
         self.config_path.write_text(json.dumps(self.config))
         environment = dict(os.environ)
-        environment.update(PATH=str(self.bin) + ":/usr/bin:/bin",
+        tool_path = str(self.bin) + ":/usr/bin:/bin"
+        if sealed:
+            sealed_bin = self.base / "sealed-bin"
+            sealed_bin.mkdir(mode=0o700)
+            inventory = json.loads((ROOT / "tests/fixtures/release-seal/expected.json").read_text())["tool_inventory"]
+            for name in inventory:
+                selected = shutil.which(name, path=tool_path)
+                if selected is not None:
+                    (sealed_bin / name).symlink_to(Path(selected).resolve())
+            tool_path = str(sealed_bin)
+        environment.update(PATH=tool_path,
                            P11SCOPE_CONTAINER_FIXTURE=str(self.config_path),
                            P11SCOPE_RECEIPT_WORK=str(self.work if work is None else work))
         return subprocess.run(
@@ -113,7 +124,8 @@ class PreparedContainerDriverTests(unittest.TestCase):
                    and row["argv"][0] == "inspect" and len(row["argv"]) == 2]
         self.assertEqual(len(absence), 3)
         self.assertLess(max(absence), metadata[2][0])
-        self.assertTrue(all(not row["child_exit_present"] and not row["remaining_ids"] for _, row in metadata[2:]))
+        self.assertTrue(all(not row["child_exit_present"] and not row["remaining_ids"]
+                            and not row["remaining_network_ids"] for _, row in metadata[2:]))
         vendor = next(row for _, row in resources if row["kind"] == "vendor")
         self.assertEqual(vendor["executable"], str(fixture.stable_cargo.resolve()))
         self.assertEqual(vendor["rustc"], str(fixture.stable_rustc.resolve()))
@@ -136,6 +148,89 @@ class PreparedContainerDriverTests(unittest.TestCase):
             self.assertEqual(receipt["tools"]["stable"]["cargo"]["path"], str(fixture.stable_cargo.resolve()))
         text = fixture.facts_path.read_text()
         self.assertLess(text.index("prepared_final_ledger\t"), text.index("child_exit\t"))
+
+    def test_one_owned_bridge_serves_all_containers_and_is_removed_last(self):
+        fixture = self.fixture()
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        docker = [row["argv"] for row in fixture.events() if row["kind"] == "docker"]
+        networks = [args for args in docker if args[:2] == ["network", "create"]]
+        self.assertEqual(len(networks), 1, "driver did not create exactly one private bridge")
+        self.assertEqual(networks[0][networks[0].index("--driver") + 1], "bridge")
+        self.assertNotIn("--subnet", networks[0], "Docker must select IPAM without a hard-coded host range")
+        facts = fixture.facts()
+        identity = facts["network_identity"][0]
+        self.assertRegex(identity, r"^[0-9a-f]{64}$")
+        provenance = json.loads(facts["network_provenance"][0])
+        self.assertEqual(provenance["id"], identity)
+        self.assertEqual(provenance["driver"], "bridge")
+        self.assertEqual(provenance["ipam"]["Config"], [{"Subnet": "172.28.0.0/16", "Gateway": "172.28.0.1"}])
+        creates = [args for args in docker if args[0] == "create"]
+        self.assertEqual(len(creates), 3)
+        self.assertTrue(all(args[args.index("--network") + 1] == identity for args in creates))
+        for event in fixture.events():
+            if event["kind"] == "docker" and event["argv"][0] == "create":
+                self.assertEqual(event["recorded_network_ids"], [identity])
+        removal = docker.index(["network", "rm", identity])
+        self.assertTrue(all(index < removal for index, args in enumerate(docker) if args[0] == "rm"))
+        self.assertEqual(facts["network_cleanup_status"], ["0"])
+        self.assertFalse(json.loads(fixture.state_path.read_text())["networks"])
+
+    def test_network_lifecycle_uses_only_sealed_release_tools(self):
+        fixture = self.fixture()
+        result = fixture.run(sealed=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fixture.facts()["network_cleanup_status"], ["0"])
+        self.assertIn("network_identity", fixture.facts())
+        self.assertFalse(json.loads(fixture.state_path.read_text())["networks"])
+
+    def test_network_name_collision_never_authorizes_foreign_removal(self):
+        fixture = self.fixture()
+        fixture.config["network_failure"] = "collision"
+        result = fixture.run()
+        self.assertEqual(result.returncode, 125, result.stderr)
+        docker = [row["argv"] for row in fixture.events() if row["kind"] == "docker"]
+        self.assertFalse(any(args[:2] == ["network", "rm"] for args in docker))
+        self.assertFalse(any(args[0] == "create" for args in docker))
+        self.assertEqual(set(json.loads(fixture.state_path.read_text())["networks"]), {"f" * 64})
+
+    def test_lost_or_interrupted_network_create_reply_is_reconciled_by_owner_label(self):
+        for failure in ("lost-reply", "interrupted"):
+            with self.subTest(failure=failure):
+                fixture = self.fixture(failure)
+                fixture.config["network_failure"] = failure
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                docker = [row["argv"] for row in fixture.events() if row["kind"] == "docker"]
+                removed = [args[-1] for args in docker if args[:2] == ["network", "rm"]]
+                self.assertEqual(removed, ["a" * 64])
+                self.assertFalse(json.loads(fixture.state_path.read_text())["networks"])
+                self.assertEqual(fixture.facts()["network_cleanup_status"], ["0"])
+
+    def test_network_cleanup_and_ambiguous_ownership_fail_closed(self):
+        for failure in ("remove", "absence", "query", "ambiguous", "wrong-owner"):
+            with self.subTest(failure=failure):
+                fixture = self.fixture(failure)
+                fixture.config["network_failure"] = failure
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                docker = [row["argv"] for row in fixture.events() if row["kind"] == "docker"]
+                if failure in ("query", "ambiguous", "wrong-owner"):
+                    self.assertFalse(any(args[:2] == ["network", "rm"] for args in docker))
+                self.assertTrue(json.loads(fixture.state_path.read_text())["networks"])
+                self.assertNotEqual(fixture.facts()["network_cleanup_status"], ["0"])
+
+    def test_replaced_or_symlinked_facts_refuse_provenance_writes_but_clean_owned_network(self):
+        for failure in ("facts-replaced", "facts-symlink"):
+            with self.subTest(failure=failure):
+                fixture = self.fixture(failure)
+                fixture.config["network_failure"] = failure
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                state = json.loads(fixture.state_path.read_text())
+                expected = "foreign receipt bytes\n" if failure == "facts-replaced" else state["facts_before_tamper"]
+                self.assertEqual(fixture.facts_path.read_text(), expected)
+                self.assertFalse(state["networks"], "known owned resource must still be cleaned")
 
     def test_foreign_name_collision_never_grants_cleanup_ownership(self):
         fixture = self.fixture()
@@ -167,7 +262,8 @@ class PreparedContainerDriverTests(unittest.TestCase):
             start = next(row for row in fixture.events() if row["kind"] == "docker"
                          and row["argv"] == ["start", "-a", identity])
             self.assertIn(identity, start["recorded_ids"])
-        self.assertNotIn("p11scope-discover-", fixture.facts_path.read_text())
+        self.assertEqual(json.loads(facts["network_provenance"][0])["name"],
+                         facts["network_requested_name"][0])
         self.assertFalse(json.loads(fixture.state_path.read_text())["ids"])
 
     def test_bad_prepared_bytes_or_metadata_refuse_before_resources(self):

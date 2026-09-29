@@ -440,13 +440,74 @@ MUSL_BUILD="p11scope-discover-musl-build-$TOKEN"
 GLIBC_BUILD_ID=
 GLIBC_RUN_ID=
 MUSL_BUILD_ID=
+NETWORK_ID=
+NETWORK_TOKEN=
+NETWORK_NAME=
+NETWORK_CREATE_ATTEMPTED=0
+NETWORK_OWNER_LABEL=io.p11scope.discover.owner
 LANE14_PREPARED_ADMITTED=0
+facts_identity_valid() {
+    [ ! -L "$LANE14_FACTS" ] &&
+        [ "$(stat -Lc %d:%i "$LANE14_FACTS" 2>/dev/null)" = "$LANE14_FACTS_ID" ]
+}
 bind_prepared_ledger() {
     ledger=$LANE14_PREPARED_PREFIX.$1.ledger.sha256
     ledger_digest=$(sha256sum < "$ledger") || return 1
-    [ "$(stat -Lc %d:%i "$LANE14_FACTS" 2>/dev/null)" = "$LANE14_FACTS_ID" ] || return 1
+    facts_identity_valid || return 1
     printf 'prepared_%s_ledger\t%s\t%s\n' "$1" "${ledger##*/}" "${ledger_digest%% *}" >> "$LANE14_FACTS"
 }
+
+network_readback() {
+    network_inspect=$(timeout --signal=TERM --kill-after=5s 30s \
+        docker network inspect "$1") || return 1
+    printf '%s\n' "$network_inspect" | jq -ce \
+        --arg id "$1" --arg name "$NETWORK_NAME" \
+        --arg label "$NETWORK_OWNER_LABEL" --arg owner "$NETWORK_TOKEN" '
+        if length == 1 and .[0].Id == $id and .[0].Name == $name
+           and .[0].Driver == "bridge" and .[0].Scope == "local"
+           and .[0].Labels[$label] == $owner
+        then .[0] | {id: .Id, name: .Name, driver: .Driver, scope: .Scope,
+                     owner: .Labels[$label], ipam: .IPAM}
+        else error("network identity or owner mismatch") end'
+}
+
+cleanup_network() {
+    [ "$NETWORK_CREATE_ATTEMPTED" -eq 1 ] || return 0
+    # A create may succeed in the daemon without delivering its reply. Only
+    # this run's random label can recover that identity; a mutable name cannot.
+    network_candidates=$(timeout --signal=TERM --kill-after=5s 30s \
+        docker network ls --no-trunc --filter "label=$NETWORK_OWNER_LABEL=$NETWORK_TOKEN" \
+        --format '{{.ID}}') || return 1
+    if [ -z "$network_candidates" ]; then
+        # If a verified identity was retained, query it as well: absence of a
+        # matching label alone must not hide a still-existing network.
+        [ -z "$NETWORK_ID" ] || {
+            network_remaining=$(timeout --signal=TERM --kill-after=5s 30s \
+                docker network ls --no-trunc --filter "id=$NETWORK_ID" --format '{{.ID}}') || return 1
+            [ -z "$network_remaining" ] || return 1
+        }
+        return 0
+    fi
+    case $network_candidates in *[!0-9a-f]*) echo "ambiguous owned network identities" >&2; return 1 ;; esac
+    [ "${#network_candidates}" -eq 64 ] || return 1
+    [ -z "$NETWORK_ID" ] || [ "$NETWORK_ID" = "$network_candidates" ] || return 1
+    network_provenance=$(network_readback "$network_candidates") || return 1
+    # Lost receipt custody fails the lane, but must not strand a network whose
+    # ownership was independently authenticated above.
+    network_record_status=0
+    if facts_identity_valid; then
+        printf 'network_cleanup_identity\t%s\nnetwork_cleanup_provenance\t%s\n' \
+            "$network_candidates" "$network_provenance" >> "$LANE14_FACTS" || network_record_status=1
+    else
+        network_record_status=1
+    fi
+    timeout --signal=TERM --kill-after=5s 30s \
+        docker network rm "$network_candidates" >/dev/null || return 1
+    network_remaining=$(timeout --signal=TERM --kill-after=5s 30s \
+        docker network ls --no-trunc --filter "id=$network_candidates" --format '{{.ID}}') || return 1
+    [ -z "$network_remaining" ] && [ "$network_record_status" -eq 0 ]
+}
+
 cleanup() {
     status=$?
     trap - EXIT INT TERM
@@ -457,6 +518,8 @@ cleanup() {
     for owned_id in "$GLIBC_BUILD_ID" "$GLIBC_RUN_ID" "$MUSL_BUILD_ID"; do
         [ -z "$owned_id" ] || if docker inspect "$owned_id" >/dev/null 2>&1; then status=1; fi
     done
+    if cleanup_network; then network_cleanup_status=0;
+    else network_cleanup_status=1; status=1; fi
     # Final verification follows every owned-container cleanup attempt, even
     # when cleanup failed. Successful verification cannot erase that failure.
     if [ "$LANE14_PREPARED_ADMITTED" -eq 1 ]; then
@@ -468,9 +531,10 @@ cleanup() {
             status=1
         fi
     fi
-    if [ "$(stat -Lc %d:%i "$LANE14_FACTS" 2>/dev/null)" != "$LANE14_FACTS_ID" ]; then
+    if ! facts_identity_valid; then
         status=1
     else
+        printf 'network_cleanup_status\t%s\n' "$network_cleanup_status" >> "$LANE14_FACTS" || status=1
         if [ "$LANE14_PREPARED_ADMITTED" -eq 1 ]; then
             printf 'prepared_recheck_status\t%s\n' "$recheck_status" >> "$LANE14_FACTS" || status=1
             if [ "$recheck_status" -eq 0 ]; then bind_prepared_ledger final || status=1; fi
@@ -520,6 +584,27 @@ create_owned() {
     printf '%s\n' "$owned"
 }
 
+create_discover_network() {
+    NETWORK_TOKEN=$("$LANE14_PYTHON" -I -c 'import secrets; print(secrets.token_hex(16))') || return 1
+    NETWORK_NAME=p11scope-discover-network-$NETWORK_TOKEN
+    facts_identity_valid || return 1
+    printf 'network_requested_name\t%s\nnetwork_owner_label\t%s=%s\n' \
+        "$NETWORK_NAME" "$NETWORK_OWNER_LABEL" "$NETWORK_TOKEN" >> "$LANE14_FACTS" || return 1
+    NETWORK_CREATE_ATTEMPTED=1
+    # Run in the parent shell so the cleanup trap knows creation was attempted,
+    # including failed/interrupted commands whose network id never arrived.
+    network_created_id=$(timeout --signal=TERM --kill-after=5s 60s \
+        docker network create --driver bridge --label "$NETWORK_OWNER_LABEL=$NETWORK_TOKEN" \
+        "$NETWORK_NAME") || return $?
+    case $network_created_id in *[!0-9a-f]*) return 1 ;; esac
+    [ "${#network_created_id}" -eq 64 ] || return 1
+    network_provenance=$(network_readback "$network_created_id") || return 1
+    NETWORK_ID=$network_created_id
+    facts_identity_valid || return 1
+    printf 'network_identity\t%s\nnetwork_provenance\t%s\n' \
+        "$NETWORK_ID" "$network_provenance" >> "$LANE14_FACTS"
+}
+
 # Keep the index pins above as the recorded supply-chain identities. Pull and
 # create use the statically recorded linux/amd64 manifests directly, so the
 # driver does not need a live manifest-resolution operation.
@@ -540,8 +625,13 @@ RUSTC="$LANE14_STABLE_RUSTC" timeout --signal=TERM --kill-after=5s 600s \
 sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
     "$DISCOVER_WORK/vendor/config.toml" > "$DISCOVER_WORK/vendor/config.container.toml"
 
+# Docker chooses a free subnet for this per-run bridge. In particular, avoid
+# inheriting docker0's fixed subnet when it overlaps the host's DNS route.
+create_discover_network
+
 echo "=== glibc: build in $DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE, run in $DISCOVER_GLIBC_RUN_PLATFORM_IMAGE ==="
 GLIBC_BUILD_ID=$(create_owned --name "$GLIBC_BUILD" \
+    --network "$NETWORK_ID" \
     --platform linux/amd64 -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src \
     "$DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE" sh -ec '
   export CARGO_HOME=/tmp/cargo
@@ -554,6 +644,7 @@ GLIBC_BUILD_ID=$(create_owned --name "$GLIBC_BUILD" \
 printf 'container_glibc_build\t%s\n' "$GLIBC_BUILD_ID" >> "$LANE14_FACTS"
 timeout --signal=TERM --kill-after=5s 600s docker start -a "$GLIBC_BUILD_ID"
 GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
+    --network "$NETWORK_ID" \
     --platform linux/amd64 -e UBUNTU_APT_SNAPSHOT="$UBUNTU_APT_SNAPSHOT" \
     -v "$PWD:/src:ro" \
     -v "$DISCOVER_WORK/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
@@ -579,6 +670,7 @@ timeout --signal=TERM --kill-after=5s 300s docker start -a "$GLIBC_RUN_ID"
 
 echo "=== musl-dynamic: build + run in $DISCOVER_MUSL_PLATFORM_IMAGE ==="
 MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
+    --network "$NETWORK_ID" \
     --platform linux/amd64 -e ALPINE_MAIN_REPOSITORY="$ALPINE_MAIN_REPOSITORY" \
     -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src \
     "$DISCOVER_MUSL_PLATFORM_IMAGE" sh -ec '

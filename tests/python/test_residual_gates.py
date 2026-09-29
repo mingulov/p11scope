@@ -177,6 +177,46 @@ class ResidualGates(unittest.TestCase):
         self.assertIn("shellcheck", text)
         self.assertIn("ruff", text)
 
+    def test_caught_capture_rejection_is_located_without_publishing_its_data(self):
+        block = ci_text().split("      - name: Release receipt summary\n", 1)[1]
+        program = textwrap.dedent(
+            block.split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0]
+        )
+        private = "PRIVATE_CAPTURE_SCHEMA_AND_PATH"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / private
+            capture.write_text(json.dumps({"schema": private, "evidence": {}}))
+            rejected = subprocess.run(
+                [sys.executable, "-I", str(ROOT / "scripts/check-capture-evidence.py"),
+                 "canary", "owned-default-metrics", str(capture)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(rejected.returncode, 1)
+            receipt = root / "receipt"
+            receipt.mkdir()
+            (receipt / "stderr.log").write_text(rejected.stderr)
+            (receipt / "stdout.log").write_text(
+                "=== release privacy gate ===\n"
+                "=== live diagnostic START policy: distinct template faults ===\n"
+                "=== owned-default-metrics (default owned metrics) ===\n"
+            )
+            summary = root / "summary.md"
+            result = subprocess.run(
+                [sys.executable, "-I", "-", str(receipt), str(summary)],
+                input=program, text=True, capture_output=True, check=True,
+            )
+            report = json.loads(result.stdout.split("release-diagnostic: ", 1)[1])
+            self.assertEqual(report["last_recorded_substage"], "canary-owned-default-metrics")
+            self.assertIn("capture-evidence-rejected", report["observed_signature_ids"])
+            locations = report["python_failure_locations"]
+            self.assertTrue(locations)
+            self.assertTrue(all(row["script"] == "check-capture-evidence.py" for row in locations))
+            source = (ROOT / "scripts/check-capture-evidence.py").read_text().splitlines()
+            self.assertTrue(any('"schema"' in source[row["line"] - 1] for row in locations))
+            for forbidden in (private, str(root), "capture evidence rejected:"):
+                self.assertNotIn(forbidden, result.stdout + result.stderr + summary.read_text())
+
     def test_coverage_gate_exists(self):
         """F-40: llvm-cov/tarpaulin CI gate with a ratchet."""
         text = ci_text()

@@ -4933,5 +4933,20 @@ if __name__ == "__main__":
     try:
         main(sys.argv[1:])
     except (AssertionError, KeyError, TypeError, ValueError, OSError) as error:
+        # The hosted summary must identify the rejected check without exposing
+        # paths or values from the capture in this privately retained error.
+        frame = error.__traceback__
+        locations = []
+        for _ in range(64):
+            if frame is None:
+                break
+            if frame.tb_frame.f_code.co_filename == __file__:
+                line = frame.tb_lineno
+                if 1 <= line <= 999999 and line not in locations:
+                    locations.append(line)
+            frame = frame.tb_next
+        for line in locations[-8:]:
+            print(f"canary-failure-location: check-capture-evidence.py:{line}",
+                  file=sys.stderr)
         print(f"capture evidence rejected: {error}", file=sys.stderr)
         raise SystemExit(1)

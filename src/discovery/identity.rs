@@ -1180,6 +1180,34 @@ pub fn retained_object_key(
     retained_object_key_cached(view, file, &mut MountTableCache::default(), budget)
 }
 
+/// Maps identity for the retained interpreter before the owned child maps it.
+/// On pre-6.8 overlayfs the mountinfo/fd key can differ from the key the
+/// kernel later reports for the loader hook. Ask the existing bounded,
+/// read-only self-mapping probe about this exact retained descriptor once;
+/// an inconclusive overlay probe cannot authorize the future mapping.
+pub(crate) fn preexec_object_key(
+    view: &ProcessView,
+    file: &std::fs::File,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ObjectKey, String> {
+    preexec_object_key_with(view, file, budget, &KernelSelfMappingProbe)
+}
+
+fn preexec_object_key_with(
+    view: &ProcessView,
+    file: &std::fs::File,
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+) -> Result<ObjectKey, String> {
+    let fd_key = retained_object_key(view, file, budget)?;
+    if !probe.fd_is_on_overlayfs(file) {
+        return Ok(fd_key);
+    }
+    probe
+        .kernel_maps_key(file, &mut BudgetAdapter(budget))
+        .ok_or_else(|| "the retained pre-exec interpreter maps identity was unavailable".into())
+}
+
 /// [`retained_object_key`] over a mount table `mounts` reads once per view.
 pub(crate) fn retained_object_key_cached(
     view: &ProcessView,
@@ -2557,6 +2585,63 @@ mod tests {
             file.metadata().unwrap().ino(),
             "the same file keeps its inode in both renderings"
         );
+    }
+
+    /// A retained pre-exec interpreter has no target mapping to compare yet.
+    /// On old overlayfs kernels its fd key must not become the live hook key.
+    #[test]
+    fn preexec_loader_key_uses_the_exact_kernel_maps_identity_on_overlay() {
+        let (_dir, file) = probe_tempfile();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let maps_key = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 21,
+            },
+            inode: 712_355,
+        };
+        let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            preexec_object_key_with(&view, &file, &mut budget, &probe).unwrap(),
+            maps_key,
+            "the live loader record will name the maps identity, not the overlay fd device"
+        );
+    }
+
+    #[test]
+    fn preexec_loader_key_refuses_an_inconclusive_overlay_probe() {
+        let (_dir, file) = probe_tempfile();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let probe = FakeSelfMappingProbe::new(true, None);
+        assert!(
+            preexec_object_key_with(&view, &file, &mut CaptureWorkBudget::default(), &probe)
+                .is_err(),
+            "an unproven fd identity cannot authorize a future mapped loader"
+        );
+    }
+
+    #[test]
+    fn preexec_loader_key_keeps_the_mount_identity_off_overlayfs() {
+        let (_dir, file) = probe_tempfile();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let probe = FakeSelfMappingProbe::new(false, None);
+        let mut budget = CaptureWorkBudget::default();
+        let fd_key = retained_object_key(&view, &file, &mut budget).unwrap();
+        assert_eq!(
+            preexec_object_key_with(&view, &file, &mut budget, &probe).unwrap(),
+            fd_key
+        );
+        assert_eq!(probe.probes.get(), 0, "ordinary mounts need no extra probe");
+    }
+
+    #[test]
+    fn preexec_loader_key_refuses_an_exhausted_capture_budget() {
+        let (_dir, file) = probe_tempfile();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        assert!(!budget.charge(u64::MAX));
+        assert!(preexec_object_key(&view, &file, &mut budget).is_err());
     }
 
     #[test]

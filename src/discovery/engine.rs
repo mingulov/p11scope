@@ -13,7 +13,7 @@ use crate::discovery::identity::{
     ReconciledModule, SelfMappingProbe, StaleManifestObject, bind_scanned_modules,
     canonicalize_scanned_overlays, open_view_object, open_view_object_cached,
     pin_manifest_objects_deferred_in_views_with_budget, pin_scanned_view_objects,
-    retained_object_key, retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
+    preexec_object_key, retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
     view_object_key_cached,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
@@ -12422,7 +12422,7 @@ impl Engine {
         }
 
         let view_id = self.views[position].id();
-        let loader_identity = retained_object_key(
+        let loader_identity = preexec_object_key(
             &self.views[position],
             prepared_executable.interpreter_file(),
             &mut self.budget,

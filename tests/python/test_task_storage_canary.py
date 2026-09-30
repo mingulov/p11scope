@@ -12,6 +12,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import struct
 import subprocess
@@ -83,9 +84,24 @@ if plan.get('exit_before_ready'):
     sys.exit(plan.get('status', 1))
 generation = int(Path('/proc/self/stat').read_text().rsplit(') ', 1)[1].split()[19])
 body = plan['ready'].replace('@PID@', str(os.getpid())).replace('@GEN@', str(generation))
-handle = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-os.write(handle, body.encode())
-os.close(handle)
+# Match the native fixture's private, complete, no-replacement publication.
+# READY's existence is the consumer's signal to decode it immediately.
+temporary = ready + '.tmp.' + str(os.getpid())
+handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    try:
+        pending = memoryview(body.encode())
+        while pending:
+            written = os.write(handle, pending)
+            if written <= 0:
+                raise OSError('stand-in READY write made no progress')
+            pending = pending[written:]
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+    os.link(temporary, ready)
+finally:
+    os.unlink(temporary)
 deadline = time.monotonic() + float(timeout_ms) / 1000
 while not os.path.lexists(release):
     if time.monotonic() > deadline:
@@ -924,6 +940,109 @@ class TaskStorageCanaryTests(unittest.TestCase):
             qualifier.validate_infos(truncated, maps)
 
     # ---- real custody with an injected acquisition (childless probes) ------
+
+    def test_standin_publishes_complete_ready_after_held_write_injected(self):
+        self.standin_publication_case(partial_write=False)
+
+    def test_standin_completes_partial_writes_before_ready_injected(self):
+        self.standin_publication_case(partial_write=True)
+
+    def standin_publication_case(self, partial_write):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ready, release = root / 'ready.json', root / 'release'
+            plan = root / 'plan.json'
+            plan.write_text(json.dumps({'ready': ready_template()}))
+            notification_read, notification_write = os.pipe()
+            continue_read, continue_write = os.pipe()
+            wrapper = root / 'held_standin.py'
+            wrapper.write_text("""import os,runpy
+real_write = os.write
+held = False
+
+def controlled_write(fd, data):
+    global held
+    if not held:
+        held = True
+        count = real_write(fd, data[:max(1, len(data) // 2)]) if {partial_write!r} else None
+        real_write({notification_write}, b'held')
+        os.read({continue_read}, 1)
+        if count is not None:
+            return count
+    return real_write(fd, data)
+
+os.write = controlled_write
+runpy.run_path({standin_script!r}, run_name='__main__')
+""".format(partial_write=partial_write, notification_write=notification_write,
+           continue_read=continue_read, standin_script=str(self.standin_script)))
+            environment = dict(os.environ, P11SCOPE_STANDIN_PYTHON=sys.executable,
+                               P11SCOPE_STANDIN_SCRIPT=str(wrapper),
+                               P11SCOPE_STANDIN_PLAN=str(plan))
+            process = None
+            try:
+                process = subprocess.Popen(
+                    [str(self.standin), str(root / 'object'), str(root / 'seed'),
+                     str(ready), str(release), '10000'],
+                    env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    pass_fds=(notification_write, continue_read),
+                )
+                self.assertTrue(select.select([notification_read], [], [], 5)[0],
+                                'stand-in did not reach the controlled write')
+                self.assertEqual(os.read(notification_read, 4), b'held')
+                self.assertFalse(os.path.lexists(ready),
+                                 'READY became visible before its JSON write completed')
+                os.write(continue_write, b'go')
+                deadline = time.monotonic() + 5
+                while not os.path.lexists(ready) and time.monotonic() < deadline:
+                    self.assertIsNone(process.poll())
+                    time.sleep(.005)
+                document = coordinator.read_json(ready, qualifier.READY_BOUND, deadline=deadline)
+                generation = qualifier.read_generation(process.pid, deadline)
+                qualifier.validate_ready(document, process.pid, generation)
+                self.assertEqual(ready.stat().st_mode & 0o777, 0o600)
+                release.touch()
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertFalse(list(root.glob('ready.json.tmp.*')))
+            finally:
+                os.write(continue_write, b'go')
+                release.touch(exist_ok=True)
+                if process is not None:
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
+                for descriptor in (notification_read, notification_write,
+                                   continue_read, continue_write):
+                    os.close(descriptor)
+
+    def test_standin_ready_publication_preserves_foreign_destinations_injected(self):
+        for target in ('regular', 'symlink'):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                ready = root / 'ready.json'
+                foreign = root / 'foreign.json'
+                foreign.write_bytes(b'foreign readiness')
+                if target == 'symlink':
+                    ready.symlink_to(foreign)
+                else:
+                    ready.write_bytes(b'foreign readiness')
+                plan = root / 'plan.json'
+                plan.write_text(json.dumps({'ready': ready_template()}))
+                environment = dict(os.environ, P11SCOPE_STANDIN_PYTHON=sys.executable,
+                                   P11SCOPE_STANDIN_SCRIPT=str(self.standin_script),
+                                   P11SCOPE_STANDIN_PLAN=str(plan))
+                result = subprocess.run(
+                    [str(self.standin), str(root / 'object'), str(root / 'seed'),
+                     str(ready), str(root / 'release'), '10000'],
+                    env=environment, capture_output=True, timeout=5,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(ready.read_bytes(), b'foreign readiness')
+                self.assertEqual(foreign.read_bytes(), b'foreign readiness')
+                self.assertEqual(ready.is_symlink(), target == 'symlink')
+                self.assertFalse(list(root.glob('ready.json.tmp.*')))
 
     def test_complete_run_publishes_one_receipt_injected(self):
         self.probe('complete', {'ready': ready_template(), 'ids': list(IDS)})

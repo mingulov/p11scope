@@ -17,8 +17,8 @@ export TMPDIR="${TMPDIR:-/var/tmp/p11scope-ws-tmp}"
 # Build once; run serially. Exact filters, one test thread each: the
 # ledgered flakes are wall-clock contention (parallel siblings, shared
 # build IO), not logic, so isolation is serial execution, not retries.
-cargo +1.88 test --locked --offline --test artifact_contracts --no-run
-cargo +1.88 test --locked --offline --lib --no-run
+cargo "+$(cat .release-rust-version)" test --locked --offline --test artifact_contracts --no-run
+cargo "+$(cat .release-rust-version)" test --locked --offline --lib --no-run
 
 pass=0
 fail=0
@@ -54,7 +54,7 @@ guard_single() {
 run_artifact() {
     echo "--- quarantine: $1"
     set +e
-    out=$(cargo +1.88 test --locked --offline --test artifact_contracts "$1" -- --exact --nocapture --test-threads=1 2>&1)
+    out=$(cargo "+$(cat .release-rust-version)" test --locked --offline --test artifact_contracts "$1" -- --exact --nocapture --test-threads=1 2>&1)
     status=$?
     guard_single "$1" "$out" "$status"
     status=$?
@@ -65,7 +65,7 @@ run_artifact() {
 run_lib() {
     echo "--- quarantine: $1"
     set +e
-    out=$(cargo +1.88 test --locked --offline --lib "$1" -- --exact --nocapture --test-threads=1 2>&1)
+    out=$(cargo "+$(cat .release-rust-version)" test --locked --offline --lib "$1" -- --exact --nocapture --test-threads=1 2>&1)
     status=$?
     guard_single "$1" "$out" "$status"
     status=$?

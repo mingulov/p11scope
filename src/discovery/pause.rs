@@ -670,7 +670,7 @@ impl PauseCoordinator {
                             Ok(now) => now,
                             Err(error) => return self.fail_cycle(io, error, true),
                         };
-                        let deadline = now.checked_add(CYCLE_NS).unwrap_or(u64::MAX);
+                        let deadline = now.saturating_add(CYCLE_NS);
                         return self.service_requested(io, deadline);
                     }
                     Some(_) | None => {
@@ -696,10 +696,10 @@ impl PauseCoordinator {
         self.may_be_stopped = true;
         self.epoch.authorization_consumed = true;
         let deadline = clamp_deadline(&mut self.failure_deadline, fixed_deadline);
-        if !self.pending_records.is_empty() {
-            if let Err(error) = self.apply_unowned(io, Some(deadline)) {
-                return self.fail_cycle(io, error.to_string(), error.lifecycle());
-            }
+        if !self.pending_records.is_empty()
+            && let Err(error) = self.apply_unowned(io, Some(deadline))
+        {
+            return self.fail_cycle(io, error.to_string(), error.lifecycle());
         }
         loop {
             match io.cancelled() {
@@ -764,7 +764,7 @@ impl PauseCoordinator {
             self.terminal_batch = Some(batch);
         }
         self.take_stop_candidate_seen(io);
-        let failure_candidate = received.after_ns.checked_add(CYCLE_NS).unwrap_or(u64::MAX);
+        let failure_candidate = received.after_ns.saturating_add(CYCLE_NS);
         clamp_deadline(&mut self.failure_deadline, failure_candidate);
         match io.cancelled() {
             Ok(false) => {}
@@ -1684,10 +1684,11 @@ impl PauseCoordinator {
         if let Err(error) = io.reconcile_terminal_authority(&mut self.terminal_batch) {
             errors.push(error);
         }
-        if self.terminal_batch.is_none() && io.terminal_authority_pending() {
-            if let Err(error) = io.cleanup_terminal_batch_without_replay(&mut self.terminal_batch) {
-                errors.push(error);
-            }
+        if self.terminal_batch.is_none()
+            && io.terminal_authority_pending()
+            && let Err(error) = io.cleanup_terminal_batch_without_replay(&mut self.terminal_batch)
+        {
+            errors.push(error);
         }
         let deadline = self.failure_bound(io, &mut errors);
         while self.failure_items < MAX_FAILURE_ITEMS {
@@ -1874,7 +1875,7 @@ impl PauseCoordinator {
                 u64::MAX.saturating_sub(CYCLE_NS)
             }
         };
-        let deadline = now.checked_add(CYCLE_NS).unwrap_or(u64::MAX);
+        let deadline = now.saturating_add(CYCLE_NS);
         clamp_deadline(&mut self.failure_deadline, deadline)
     }
 

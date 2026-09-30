@@ -56,7 +56,7 @@ fn bounded(label: &str, value: &str, limit: usize, problems: &mut Vec<String>) {
 }
 
 fn valid_hex(value: &str) -> bool {
-    value.len() % 2 == 0 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len().is_multiple_of(2) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_identity(label: &str, identity: &ObjectIdentity, problems: &mut Vec<String>) {
@@ -816,10 +816,10 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
                 if !matches!(surface.acquisition, Acquisition::Ok) {
                     problems.push(format!("interface {index} acquisition must be ok"));
                 }
-                if let Some(raw) = raw_name_hex {
-                    if raw.len() > 512 || !valid_hex(raw) {
-                        problems.push(format!("interface {index} has invalid raw_name_hex"));
-                    }
+                if let Some(raw) = raw_name_hex
+                    && (raw.len() > 512 || !valid_hex(raw))
+                {
+                    problems.push(format!("interface {index} has invalid raw_name_hex"));
                 }
                 if let Some(name) = name_lossy {
                     bounded("interface name", name, 768, &mut problems);

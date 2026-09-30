@@ -177,12 +177,12 @@ impl Tracker {
         }
 
         let mut retired = self.records.remove(&pid).map(|record| record.key);
-        if self.records.len() >= self.process_limit {
-            if let Some(evicted) = self.least_recent_pid() {
-                let key = self.records.remove(&evicted).unwrap().key;
-                retired = retired.or(Some(key));
-                self.evidence.evictions = self.evidence.evictions.saturating_add(1);
-            }
+        if self.records.len() >= self.process_limit
+            && let Some(evicted) = self.least_recent_pid()
+        {
+            let key = self.records.remove(&evicted).unwrap().key;
+            retired = retired.or(Some(key));
+            self.evidence.evictions = self.evidence.evictions.saturating_add(1);
         }
 
         self.make_pidfd_room();

@@ -135,7 +135,10 @@ impl DiscoveryScheduler {
     /// sticky (see `cooling`) and pruned by enumeration, not by time.
     pub(crate) fn begin_over_cap_pass(&mut self) -> InventoryCadence {
         self.over_cap_passes = self.over_cap_passes.saturating_add(1);
-        if self.over_cap_passes % RECONCILE_EVERY_N_OVER_CAP_PASSES == 0 {
+        if self
+            .over_cap_passes
+            .is_multiple_of(RECONCILE_EVERY_N_OVER_CAP_PASSES)
+        {
             self.reconcile_sweeps = self.reconcile_sweeps.saturating_add(1);
             InventoryCadence::Reconcile
         } else {
@@ -223,7 +226,8 @@ impl DiscoveryScheduler {
     /// quiet under-cap ticks keep their no-op behavior between rounds.
     pub(crate) fn begin_under_cap_tick(&mut self) -> bool {
         self.under_cap_ticks = self.under_cap_ticks.saturating_add(1);
-        self.under_cap_ticks % RECONCILE_EVERY_N_OVER_CAP_PASSES == 0
+        self.under_cap_ticks
+            .is_multiple_of(RECONCILE_EVERY_N_OVER_CAP_PASSES)
     }
 
     /// The pids rotated to start after the poll cursor, for fair

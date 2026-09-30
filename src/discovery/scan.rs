@@ -2230,7 +2230,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     let mut offset = 0usize;
     let width = layout.word_bytes();
     while offset + width <= snapshot.len() {
-        if (offset / width) % 4096 == 0
+        if (offset / width).is_multiple_of(4096)
             && budget.has_deadline()
             && budget.check_deadline(now()).is_some()
         {
@@ -2364,7 +2364,7 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             });
     let mut offset = 0usize;
     while offset + interface.stride <= snapshot.len() {
-        if (offset / layout.word_bytes()) % 4096 == 0
+        if (offset / layout.word_bytes()).is_multiple_of(4096)
             && budget.has_deadline()
             && budget.check_deadline(now()).is_some()
         {
@@ -2855,10 +2855,8 @@ fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
     if io_ceiling {
         reasons.push(IO_CEILING_REASON);
     }
-    if deadline_stop {
-        if let Some(reason) = budget.take_scan_stop_reason() {
-            reasons.push(reason);
-        }
+    if deadline_stop && let Some(reason) = budget.take_scan_stop_reason() {
+        reasons.push(reason);
     }
     if byte_ceiling || io_ceiling || deadline_stop {
         end = bytes[..end]
@@ -2881,10 +2879,10 @@ pub(crate) fn read_maps_or_refuse<R: Read, F: FnMut() -> Option<u64>>(
 ) -> Result<Vec<MapEntry>, String> {
     // The reader reports a stopped batch's reason only once; the refusal must
     // not depend on that, so ask the budget directly before reading.
-    if budget.has_deadline() {
-        if let Some(reason) = budget.check_deadline(now()) {
-            return Err(reason.into());
-        }
+    if budget.has_deadline()
+        && let Some(reason) = budget.check_deadline(now())
+    {
+        return Err(reason.into());
     }
     let (bytes, reasons) = read_maps_with_limits(
         reader,
@@ -4394,10 +4392,10 @@ mod tests {
         }
         let mut full = Vec::new();
         for word in 0..=0xffffu64 {
-            if let Some(((major, minor), _, walk)) = spans_for(word) {
-                if walk == "full" {
-                    full.push((major, minor));
-                }
+            if let Some(((major, minor), _, walk)) = spans_for(word)
+                && walk == "full"
+            {
+                full.push((major, minor));
             }
         }
         full.sort();
@@ -4571,7 +4569,7 @@ mod tests {
         let (interfaces, interface_skips) = scan_interfaces(
             &interfaces,
             &mem,
-            &[table.clone()],
+            std::slice::from_ref(&table),
             &map_index,
             ObjectKey::of(&maps[0]),
             &mut budget,
@@ -6650,7 +6648,7 @@ mod tests {
             scan(
                 &mut budget,
                 &mut operation_bytes,
-                &[table.clone()],
+                std::slice::from_ref(&table),
                 ProcessViewId(0)
             ),
             1
@@ -6659,7 +6657,7 @@ mod tests {
             scan(
                 &mut budget,
                 &mut operation_bytes,
-                &[table.clone()],
+                std::slice::from_ref(&table),
                 ProcessViewId(0)
             ),
             1,
@@ -6669,7 +6667,7 @@ mod tests {
             scan(
                 &mut budget,
                 &mut operation_bytes,
-                &[table.clone()],
+                std::slice::from_ref(&table),
                 ProcessViewId(1)
             ),
             2,

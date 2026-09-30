@@ -15,6 +15,7 @@ import unittest
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (REPOSITORY / ".release-rust-version").read_text(encoding="utf-8").strip()
 SNAPSHOT = REPOSITORY / "scripts/prepared-dependency-snapshot.sh"
 MERGER = REPOSITORY / "scripts/merge-checksum-ledgers.py"
 FIXTURES = REPOSITORY / "tests/fixtures/prepared-four-callers"
@@ -86,6 +87,7 @@ class FinalizerFixture:
             (REPOSITORY / ".gitignore").read_text(encoding="utf-8") + ignored + "/\n",
             encoding="utf-8",
         )
+        shutil.copy2(REPOSITORY / ".release-rust-version", self.root / ".release-rust-version")
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         subprocess.run(["git", "config", "user.name", "fixture"], cwd=self.root, check=True)
         subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=self.root, check=True)
@@ -369,6 +371,7 @@ class PreparedFourCallersTests(unittest.TestCase):
                     (REPOSITORY / ".gitignore").read_text(encoding="utf-8") + ignored + "/\n",
                     encoding="utf-8",
                 )
+                shutil.copy2(REPOSITORY / ".release-rust-version", root / ".release-rust-version")
                 generated = prepared.base.output / "src/lib.rs"
                 if scenario == "missing-tree":
                     generated.unlink()
@@ -415,8 +418,8 @@ class PreparedFourCallersTests(unittest.TestCase):
                     "root_metadata": str(prepared.root_metadata),
                     "bpf_metadata": str(prepared.bpf_metadata),
                     "tools": {
-                        "1.88:cargo": str(prepared.tools / "stable cargo"),
-                        "1.88:rustc": str(prepared.tools / "stable rustc"),
+                        f"{RELEASE_RUST}:cargo": str(prepared.tools / "stable cargo"),
+                        f"{RELEASE_RUST}:rustc": str(prepared.tools / "stable rustc"),
                         "nightly-2026-05-20:cargo": str(prepared.tools / "bpf cargo"),
                         "nightly-2026-05-20:rustc": str(prepared.tools / "bpf rustc"),
                     },
@@ -492,6 +495,7 @@ class PreparedFourCallersTests(unittest.TestCase):
                 (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
                 + prepared_relative + "/\n", encoding="utf-8",
             )
+            shutil.copy2(REPOSITORY / ".release-rust-version", root / ".release-rust-version")
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.name", "fixture"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=root, check=True)
@@ -522,8 +526,8 @@ class PreparedFourCallersTests(unittest.TestCase):
                 "bpf_metadata": str(prepared.bpf_metadata),
                 "sudo_status": 0,
                 "tools": {
-                    "1.88:cargo": str(prepared.tools / "stable cargo"),
-                    "1.88:rustc": str(prepared.tools / "stable rustc"),
+                    f"{RELEASE_RUST}:cargo": str(prepared.tools / "stable cargo"),
+                    f"{RELEASE_RUST}:rustc": str(prepared.tools / "stable rustc"),
                     "nightly-2026-05-20:cargo": str(prepared.tools / "bpf cargo"),
                     "nightly-2026-05-20:rustc": str(prepared.tools / "bpf rustc"),
                 },

@@ -161,9 +161,9 @@ gcc -O0 -o "$WORK/workload" scripts/system-scope-workload.c -ldl
 if [ -z "$BINARY" ]; then
     if [ "$NO_BUILD" -eq 0 ]; then
         if [ "$PROFILE" = release ]; then
-            scripts/cargo.sh +1.88 build --locked --offline --release -p p11scope -p p11scope-discover
+            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline --release -p p11scope -p p11scope-discover
         else
-            scripts/cargo.sh +1.88 build --locked --offline -p p11scope -p p11scope-discover
+            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline -p p11scope -p p11scope-discover
         fi
     fi
     BINARY="$PWD/target/$PROFILE/p11scope"

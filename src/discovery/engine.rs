@@ -3922,24 +3922,23 @@ fn broad_pool_table(
     // no manifest support — heuristic evidence with unauthorized names.
     table.live_return = false;
     table.manifest_supported = false;
-    if let Some(offset) = table.file_offset {
-        if let Some(known) = module
+    if let Some(offset) = table.file_offset
+        && let Some(known) = module
             .tables
             .iter()
             .find(|known| known.file_offset == Some(offset) && known.version == table.version)
-        {
-            if known.entries == table.entries {
-                tallies.covered += 1;
-                return Ok(bytes.len());
-            }
-            // Same version-word location, different entries: memory is the
-            // live truth, so the pool instance admits alongside — loudly.
-            eprintln!(
-                "p11scope: discovery: broad fixed-family: {}: pool table at file offset \
-                 {offset:#x} diverges from the swept instance; admitting the live bytes",
-                module.path,
-            );
+    {
+        if known.entries == table.entries {
+            tallies.covered += 1;
+            return Ok(bytes.len());
         }
+        // Same version-word location, different entries: memory is the
+        // live truth, so the pool instance admits alongside — loudly.
+        eprintln!(
+            "p11scope: discovery: broad fixed-family: {}: pool table at file offset \
+                 {offset:#x} diverges from the swept instance; admitting the live bytes",
+            module.path,
+        );
     }
     module.tables.push(table);
     tallies.added += 1;
@@ -5889,10 +5888,11 @@ fn heap_table_layouts(
 ) -> Vec<LinuxLayout> {
     let mut abis = BTreeSet::new();
     for module in modules.iter().map(|module| &module.scanned) {
-        if module.view == view && module.exports.iter().any(|name| name == hook) {
-            if let Some(abi) = module.decoder_abi {
-                abis.insert(abi);
-            }
+        if module.view == view
+            && module.exports.iter().any(|name| name == hook)
+            && let Some(abi) = module.decoder_abi
+        {
+            abis.insert(abi);
         }
     }
     if let Some(abi) = abis.iter().next().filter(|_| abis.len() == 1) {
@@ -6779,10 +6779,10 @@ fn block_unperformed_static(
 
 fn lose_unperformed_dynamic_work(timings: &mut CausalTimings, work: &[DynamicExportWork]) {
     for work in work {
-        if !work.already_attached {
-            if let Some(module) = &work.module {
-                timings.lose(module);
-            }
+        if !work.already_attached
+            && let Some(module) = &work.module
+        {
+            timings.lose(module);
         }
     }
 }
@@ -7759,10 +7759,10 @@ impl Engine {
     }
 
     fn close_cgroup_admission(&mut self, view: ProcessViewId, closed_ns: u64) {
-        if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {
-            if admission.closed_ns.is_none() {
-                admission.closed_ns = Some(closed_ns);
-            }
+        if let Some(admission) = self.admitted_cgroup_views.get_mut(&view)
+            && admission.closed_ns.is_none()
+        {
+            admission.closed_ns = Some(closed_ns);
         }
     }
 
@@ -8026,11 +8026,10 @@ impl Engine {
     fn allocate_view_id(&mut self) -> Result<ProcessViewId> {
         if self.inventory.is_some() {
             self.inventory_state()?;
-            return self
-                .inventory
-                .as_mut()
-                .expect("checked Inventory state")
-                .reserve_owner(&mut self.next_view_id);
+            let Some(inventory) = self.inventory.as_mut() else {
+                unreachable!("checked Inventory state");
+            };
+            return inventory.reserve_owner(&mut self.next_view_id);
         }
         if let Some(reused) = self.retired_view_ids.pop() {
             return Ok(ProcessViewId(reused));
@@ -8141,10 +8140,11 @@ impl Engine {
     }
 
     fn open_owned_selection(&mut self, id: u64) {
-        if let Some(binding) = self.selection_bindings.get_mut(&id) {
-            if binding.attached && !binding.retired {
-                binding.coverage.open();
-            }
+        if let Some(binding) = self.selection_bindings.get_mut(&id)
+            && binding.attached
+            && !binding.retired
+        {
+            binding.coverage.open();
         }
     }
 
@@ -11417,59 +11417,51 @@ impl Engine {
                     table.walk == "full" && inventory_version_class(table.version) == result.version
                 })
             })
-        {
-            if let (Some(table), Some(result), Some(provider)) = (
+            && let (Some(table), Some(result), Some(provider)) = (
                 decoded_table.as_ref(),
                 result.as_ref(),
                 self.pinned.owned_timing_key(binding.object),
-            ) {
-                if let Some((claims, tables, pending)) =
-                    self.propose_selection_claim(&binding, provider, table, result)
-                {
-                    let raw_modules = self
-                        .modules
-                        .iter()
-                        .map(|module| module.scanned.clone())
-                        .collect();
-                    let candidate = self.live_candidate_with_selection(
-                        self.pinned.clone(),
-                        raw_modules,
-                        claims,
-                        tables,
-                        pending,
-                    )?;
-                    if let Some((session, additions_allowed, pending_views)) = transaction {
-                        let outcome = self.apply_candidate(
-                            session,
-                            candidate,
-                            additions_allowed,
-                            false,
-                            &[],
-                        )?;
-                        self.record_apply_timing(&outcome);
-                        self.queue_apply_outcome(&outcome, pending_views);
-                        claim_authorized = outcome.selection_authorized;
-                        if !claim_authorized {
-                            self.mark_live_loss(
-                                "live interface selection",
-                                "an eligible selection-only table was refused by the attach transaction",
-                            );
-                        }
-                        if claim_authorized
-                            && let (Some(table), Some(provider)) = (
-                                decoded_table.as_ref(),
-                                self.pinned.owned_timing_key(binding.object),
-                            )
-                        {
-                            self.record_selection_occurrences(module, provider, table);
-                        }
-                    } else {
-                        self.mark_live_loss(
-                            "live interface selection",
-                            "an eligible selection-only table had no attach transaction",
-                        );
-                    }
+            )
+            && let Some((claims, tables, pending)) =
+                self.propose_selection_claim(&binding, provider, table, result)
+        {
+            let raw_modules = self
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect();
+            let candidate = self.live_candidate_with_selection(
+                self.pinned.clone(),
+                raw_modules,
+                claims,
+                tables,
+                pending,
+            )?;
+            if let Some((session, additions_allowed, pending_views)) = transaction {
+                let outcome =
+                    self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
+                self.record_apply_timing(&outcome);
+                self.queue_apply_outcome(&outcome, pending_views);
+                claim_authorized = outcome.selection_authorized;
+                if !claim_authorized {
+                    self.mark_live_loss(
+                        "live interface selection",
+                        "an eligible selection-only table was refused by the attach transaction",
+                    );
                 }
+                if claim_authorized
+                    && let (Some(table), Some(provider)) = (
+                        decoded_table.as_ref(),
+                        self.pinned.owned_timing_key(binding.object),
+                    )
+                {
+                    self.record_selection_occurrences(module, provider, table);
+                }
+            } else {
+                self.mark_live_loss(
+                    "live interface selection",
+                    "an eligible selection-only table had no attach transaction",
+                );
             }
         }
         if claim_authorized {
@@ -11952,13 +11944,11 @@ impl Engine {
                         binding.attached = true;
                         self.selection_bindings.insert(binding.id, binding);
                     }
-                    if added {
-                        if let Some(module) = &work.module {
-                            self.complete_causal_timing(
-                                &[module.clone()].into_iter().collect(),
-                                completed,
-                            );
-                        }
+                    if added && let Some(module) = &work.module {
+                        self.complete_causal_timing(
+                            &[module.clone()].into_iter().collect(),
+                            completed,
+                        );
                     }
                 }
                 GenerationMutation::Committed(Err(_)) => {

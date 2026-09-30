@@ -297,7 +297,8 @@ def generate(root, cargo_about, musl_archives, output):
     for name in ["GPL-2.0-only", "GPL-2.0-or-later"]:
         payload[f"licenses/p11scope-{name}.txt"] = checked_bytes(root / f"LICENSES/{name}.txt")
     graphs = {}
-    environment = dict(os.environ, RUSTUP_TOOLCHAIN="1.88")
+    release_rust = (root / ".release-rust-version").read_text(encoding="utf-8").strip()
+    environment = dict(os.environ, RUSTUP_TOOLCHAIN=release_rust)
     temporary_root = Path(os.environ.get("TMPDIR", "/var/tmp/p11scope-ws-tmp"))
     temporary_root.mkdir(mode=0o700, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="p11scope-notices-", dir=temporary_root) as temporary:

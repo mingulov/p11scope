@@ -18387,7 +18387,7 @@ fn startup_export_attach_retries_the_view_a_lost_generation_skipped() {
             .iter()
             .all(|call| earlier_objects.contains(&call.object)),
         "none of the later view's exports attached: {:?}",
-        &session.dynamic_attach_calls
+        session.dynamic_attach_calls
     );
     assert!(!later_objects.is_empty(), "the later view stays published");
     assert!(
@@ -19452,7 +19452,7 @@ fn discovery_open_stale_sole_source_is_fatal_after_scan_availability_is_known() 
     let dir = tempfile::tempdir().unwrap();
     let provider = dir.path().join("provider.so");
     std::fs::copy("/bin/sh", &provider).unwrap();
-    let manifest = valid_manifest_for(&[provider.clone()], &vec![0; 67]);
+    let manifest = valid_manifest_for(std::slice::from_ref(&provider), &vec![0; 67]);
     std::fs::remove_file(&provider).unwrap();
     let input = manifest_input_from_pinning("sole-source.json", manifest);
     let mut discovered = lifecycle_discovered(Vec::new());
@@ -20779,8 +20779,8 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
         record_object_skips(&mut plan, std::slice::from_ref(&refusal));
         record_object_skips(&mut plan, &[]);
         assert_eq!(
-            plan.skipped,
-            [refusal.clone()],
+            plan.skipped.as_slice(),
+            std::slice::from_ref(&refusal),
             "later {source} erased acquisition loss"
         );
         let public = render::capture_skipped_out(&plan.skipped[0]);
@@ -20814,7 +20814,11 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
             std::process::id()
         ),
     };
-    assert_eq!(skips, [expected.clone()], "the scan reports the exact loss");
+    assert_eq!(
+        skips.as_slice(),
+        std::slice::from_ref(&expected),
+        "the scan reports the exact loss"
+    );
 
     let (reconciled, _, _) = reconcile_scanned_modules(&modules, &mut pinned);
     let mut plan = plan::build_from_reconciled_modules(&reconciled);
@@ -23726,7 +23730,7 @@ impl E07Provider {
         let words = unsafe { std::slice::from_raw_parts_mut(table, E07_TABLE_WORDS) };
         words[0] = 0x2802; // CK_VERSION { major 2, minor 40 }.
         for word in &mut words[1..] {
-            *word = e07_anchor as usize as u64;
+            *word = e07_anchor as *const () as usize as u64;
         }
         // The interface triple linking the table: publication evidence, so
         // the plan authorizes the table's endpoints.
@@ -23957,7 +23961,8 @@ fn e07_saturated_table_cap_unchanged_rescan_retires_nothing() {
     snapshot[..8].copy_from_slice(&0x2802u64.to_le_bytes());
     for slot in 0..255 {
         let at = 8 + slot * 8;
-        snapshot[at..at + 8].copy_from_slice(&(e07_anchor as usize as u64).to_le_bytes());
+        snapshot[at..at + 8]
+            .copy_from_slice(&(e07_anchor as *const () as usize as u64).to_le_bytes());
     }
     for table in 0..511 {
         let address = data.start + table as u64 * 8;

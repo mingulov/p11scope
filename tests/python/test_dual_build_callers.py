@@ -12,6 +12,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 FIXTURES = ROOT / "tests/fixtures/dual-build-callers"
 CHILDREN = (ROOT / "scripts/verify-attach-e2e.sh", ROOT / "scripts/verify-canaries.sh")
 PREPARED = ("P11SCOPE_PREPARED_STABLE_CARGO", "P11SCOPE_PREPARED_STABLE_RUSTC",
@@ -42,6 +43,7 @@ class DualBuildCallerTests(unittest.TestCase):
         for name in ("product-build.sh", "cargo.sh", "lib.sh", "cleanup-traps.sh"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
         shutil.copy2(FIXTURES / "record-preparer.py", self.repo / "scripts/prepare-dependencies.py")
+        shutil.copy2(ROOT / ".release-rust-version", self.repo / ".release-rust-version")
         self.bin = self.base / "PATH tripwires"
         self.bin.mkdir()
         shutil.copy2(FIXTURES / "dispatch.py", self.bin / "dispatch.py")
@@ -94,7 +96,7 @@ class DualBuildCallerTests(unittest.TestCase):
                               stderr=subprocess.PIPE, timeout=10)
 
     def expected(self, child, bits, prepared):
-        prefix = ["build", "--locked", "--offline"] if prepared else ["+1.88", "build", "--locked"]
+        prefix = ["build", "--locked", "--offline"] if prepared else [f"+{RELEASE_RUST}", "build", "--locked"]
         if child.name == "verify-attach-e2e.sh":
             return [prefix + ["--release", "--workspace", "--target-dir", str(self.work / "build")]]
         rows = [

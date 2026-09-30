@@ -78,6 +78,7 @@ class Lane02Fixture:
 
         ignore = self.prepared.base.output.relative_to(self.root).as_posix()
         (self.root / ".gitignore").write_text(f"{ignore}/\n", encoding="utf-8")
+        shutil.copy2(REPOSITORY / ".release-rust-version", self.root / ".release-rust-version")
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         subprocess.run(["git", "config", "user.name", "fixture"], cwd=self.root, check=True)
         subprocess.run(

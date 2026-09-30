@@ -110,10 +110,10 @@ fn maps_inode(pid: u32, suffix: &str) -> std::collections::BTreeSet<u64> {
         ) else {
             continue;
         };
-        if path.ends_with(suffix) {
-            if let Ok(inode) = inode.parse::<u64>() {
-                inodes.insert(inode);
-            }
+        if path.ends_with(suffix)
+            && let Ok(inode) = inode.parse::<u64>()
+        {
+            inodes.insert(inode);
         }
     }
     inodes

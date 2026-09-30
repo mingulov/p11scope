@@ -10,6 +10,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 LIBRARY = ROOT / "scripts" / "prepared-dependency-tools.sh"
 FIXTURES = ROOT / "tests" / "fixtures" / "prepared-dependency-tools"
 OUTPUT_KEYS = (
@@ -30,6 +31,7 @@ class PreparedDependencyToolsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="p11scope tools ")
         self.work = Path(self.tempdir.name)
+        shutil.copy2(ROOT / ".release-rust-version", self.work / ".release-rust-version")
         self.bin_dir = self.work / "selected tools"
         self.bin_dir.mkdir()
         self.log = self.work / "rustup calls.log"
@@ -143,8 +145,8 @@ class PreparedDependencyToolsTests(unittest.TestCase):
         self.assertEqual(
             self.rustup_calls(),
             [
-                "0\t4\twhich\t--toolchain\t1.88\tcargo",
-                "0\t4\twhich\t--toolchain\t1.88\trustc",
+                f"0\t4\twhich\t--toolchain\t{RELEASE_RUST}\tcargo",
+                f"0\t4\twhich\t--toolchain\t{RELEASE_RUST}\trustc",
                 "0\t4\twhich\t--toolchain\tnightly-2026-05-20\tcargo",
                 "0\t4\twhich\t--toolchain\tnightly-2026-05-20\trustc",
             ],
@@ -251,7 +253,7 @@ class PreparedDependencyToolsTests(unittest.TestCase):
 
     def test_rustup_query_failure_stops_later_queries_and_clears_outputs(self) -> None:
         env = self.env.copy()
-        env["P11SCOPE_FIXTURE_FAIL_QUERY"] = "1.88:rustc"
+        env["P11SCOPE_FIXTURE_FAIL_QUERY"] = f"{RELEASE_RUST}:rustc"
         result = self.run_select(
             self.links["python actual"], self.links["rustup actual"], env=env
         )

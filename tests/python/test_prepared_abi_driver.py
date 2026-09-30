@@ -13,6 +13,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 FIXTURES = ROOT / "tests/fixtures/prepared-abi-driver"
 EvidenceFixture = runpy.run_path(
     str(ROOT / "tests/python/test_prepared_dependency_evidence.py")
@@ -56,6 +57,7 @@ class AbiDriverFixture:
         (self.prepared.tools / "stable rustc").chmod(0o755)
         alias = self.prepared.tools / "stable cargo link"
         alias.symlink_to(self.prepared.tools / "stable cargo")
+        shutil.copy2(ROOT / ".release-rust-version", self.root / ".release-rust-version")
 
         self.private = base / "private evidence parent"
         self.private.mkdir(mode=0o700)
@@ -73,8 +75,8 @@ class AbiDriverFixture:
             "prepared_source": str(self.prepared.base.output / "src/lib.rs"),
             "recipe": str(self.root / "third-party/sources.json"),
             "tools": {
-                "1.88:cargo": str(alias),
-                "1.88:rustc": str(self.prepared.tools / "stable rustc"),
+                f"{RELEASE_RUST}:cargo": str(alias),
+                f"{RELEASE_RUST}:rustc": str(self.prepared.tools / "stable rustc"),
                 "nightly-2026-05-20:cargo": str(self.prepared.tools / "bpf cargo"),
                 "nightly-2026-05-20:rustc": str(self.prepared.tools / "bpf rustc"),
             },
@@ -266,8 +268,8 @@ class PreparedAbiDriverTests(unittest.TestCase):
         self.assertEqual(
             [event["argv"] for event in rustup],
             [
-                ["which", "--toolchain", "1.88", "cargo"],
-                ["which", "--toolchain", "1.88", "rustc"],
+                ["which", "--toolchain", RELEASE_RUST, "cargo"],
+                ["which", "--toolchain", RELEASE_RUST, "rustc"],
                 ["which", "--toolchain", "nightly-2026-05-20", "cargo"],
                 ["which", "--toolchain", "nightly-2026-05-20", "rustc"],
             ],
@@ -378,8 +380,8 @@ class PreparedAbiDriverTests(unittest.TestCase):
         self.assertLess(kinds.index("rustc_version"), kinds.index("compiler_version"))
         self.assertLess(kinds.index("compiler_version"), kinds.index("compiler_refusal"))
         environment = (fixture.evidence / "environment.status").read_text(encoding="utf-8")
-        self.assertIn("cargo_version=cargo 1.88.0 (fixture)\n", environment)
-        self.assertIn("rustc_version=rustc 1.88.0 (fixture)\n", environment)
+        self.assertIn(f"cargo_version=cargo {RELEASE_RUST} (fixture)\n", environment)
+        self.assertIn(f"rustc_version=rustc {RELEASE_RUST} (fixture)\n", environment)
 
     def test_actual_cli_version_failures_stop_before_compiler(self):
         cases = (

@@ -12,7 +12,7 @@ config = json.loads(Path(os.environ["P11SCOPE_LANE02_FIXTURE"]).read_text())
 
 
 if sys.argv[1:] == ["--version"]:
-    print("rustc 1.88.0 (lane02 fixture)")
+    print("rustc 1.98.1 (lane02 fixture)")
     status = config.get("rustc_version_status", 0)
     if status:
         print("controlled selected rustc version failure", file=sys.stderr)

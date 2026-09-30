@@ -11,12 +11,15 @@
 # The first failing step stops the gate (fail fast); result.json then
 # holds the steps that ran.
 #
-# Cargo always runs through "mise exec -- ./scripts/cargo.sh +1.88", with
+# Cargo always runs through "mise exec -- ./scripts/cargo.sh +<release>"
+# (release Rust version from .release-rust-version), with
 # TMPDIR=/var/tmp/p11scope-ws-tmp and CARGO_BUILD_JOBS (default 4). The
 # wide profile follows .github/workflows/ci.yml: it selects the p11scope
 # package ("-p p11scope --features wide-detailed-2112") instead of the
 # workspace, since the feature belongs to that package.
 set -eu
+
+GATE_ROOT=$(CDPATH= cd -P "$(dirname "$0")/.." && pwd)
 
 GATE_TMPDIR=/var/tmp/p11scope-ws-tmp
 JOBS=${CARGO_BUILD_JOBS:-4}
@@ -191,7 +194,7 @@ self_test() {
 # One exact, re-runnable command line for a gate step.
 display_cmd() {
     local line word
-    line="TMPDIR=$GATE_TMPDIR CARGO_BUILD_JOBS=$JOBS mise exec -- ./scripts/cargo.sh +1.88"
+    line="TMPDIR=$GATE_TMPDIR CARGO_BUILD_JOBS=$JOBS mise exec -- ./scripts/cargo.sh +$(cat "$GATE_ROOT/.release-rust-version")"
     for word in "$@"; do
         line="$line $(printf '%q' "$word")"
     done
@@ -238,7 +241,7 @@ run_step() {
         printf '+ %s\n' "$(display_cmd "$@")"
     } >"$log"
     set +e
-    TMPDIR="$GATE_TMPDIR" CARGO_BUILD_JOBS="$JOBS" mise exec -- ./scripts/cargo.sh +1.88 "$@" >>"$log" 2>&1
+    TMPDIR="$GATE_TMPDIR" CARGO_BUILD_JOBS="$JOBS" mise exec -- ./scripts/cargo.sh "+$(cat "$GATE_ROOT/.release-rust-version")" "$@" >>"$log" 2>&1
     code=$?
     set -e
     end_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)

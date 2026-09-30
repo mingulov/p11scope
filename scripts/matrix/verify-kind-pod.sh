@@ -87,7 +87,7 @@ for command in cargo docker gcc kind kubectl python3 timeout; do
 done
 echo "=== build product, workload, and unique pod image ==="
 if ! matrix_prebuilt_product; then
-    timeout --signal=TERM --kill-after=5s 600s scripts/cargo.sh +1.88 build --locked --release \
+    timeout --signal=TERM --kill-after=5s 600s scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release \
         --workspace --target-dir "$PRODUCT"
     P11SCOPE_EXE=$PRODUCT/release/p11scope
 fi

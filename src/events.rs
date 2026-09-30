@@ -336,8 +336,8 @@ impl<S: RecordSource> EventDrain<S> {
             anyhow::ensure!(
                 p.capacity >= 8
                     && p.capacity.is_power_of_two()
-                    && p.consumer % 8 == 0
-                    && p.producer % 8 == 0
+                    && p.consumer.is_multiple_of(8)
+                    && p.producer.is_multiple_of(8)
                     && distance < p.capacity,
                 "invalid root tail boundary"
             );

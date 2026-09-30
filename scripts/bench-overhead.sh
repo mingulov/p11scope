@@ -210,7 +210,7 @@ command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 
 echo "=== build ==="
-scripts/cargo.sh +1.88 build --locked --release --workspace
+scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --workspace
 DISCOVER=./target/release/p11scope-discover
 P11SCOPE=./target/release/p11scope
 gcc -O0 -o "$WORK/hammer" "$FIX/hammer.c" -ldl

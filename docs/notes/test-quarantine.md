@@ -26,7 +26,8 @@ contends with a running lane).
 | 7 | `signal_settlement_observes_second_sigint_during_fallback_term_grace` (`--lib`) | signal-settlement unit tests | `--test-threads=1` + serial: SIGINT-during-grace timing runs alone. |
 
 Triage: run `scripts/run-flake-quarantine.sh` locally with the pinned
-1.88 toolchain and prepared dependencies. Preserve both the original failure
+release toolchain (`.release-rust-version`) and prepared dependencies.
+Preserve both the original failure
 and the quarantine log. Investigate the causal mechanism even if isolation
 passes; intermittent defects can also reproduce alone. Do not raise budgets
 or weaken assertions to obtain a green rerun.

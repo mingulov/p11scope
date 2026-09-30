@@ -17,6 +17,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 NATIVE = ROOT / "tests/fixtures/capability-prepared-dependencies"
 EvidenceFixture = runpy.run_path(str(ROOT / "tests/python/test_prepared_dependency_evidence.py"))["EvidenceFixture"]
 
@@ -60,14 +61,15 @@ class CapabilityFixture:
             "root_metadata": str(self.evidence.root_metadata),
             "bpf_metadata": str(self.evidence.bpf_metadata),
             "tools": {
-                "1.88:cargo": str(self.tools / "stable cargo"),
-                "1.88:rustc": str(self.tools / "stable rustc"),
+                f"{RELEASE_RUST}:cargo": str(self.tools / "stable cargo"),
+                f"{RELEASE_RUST}:rustc": str(self.tools / "stable rustc"),
                 "nightly-2026-05-20:cargo": str(self.tools / "bpf cargo"),
                 "nightly-2026-05-20:rustc": str(self.tools / "bpf rustc"),
             },
         }
         self.write_config()
         (self.repo / ".gitignore").write_text("third-party/src/\ntarget/\n", encoding="utf-8")
+        shutil.copy2(ROOT / ".release-rust-version", self.repo / ".release-rust-version")
         subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
         subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
                         "add", "."], cwd=self.repo, check=True)

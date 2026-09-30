@@ -109,7 +109,7 @@ fn scanned_offsets_equal_the_helpers_for_the_legacy_table() {
     let so = build_fixture(&dir, "oracle", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
 
-    let ScanOutcome::Scanned { modules, .. } = scan_self(&[so.clone()]) else {
+    let ScanOutcome::Scanned { modules, .. } = scan_self(std::slice::from_ref(&so)) else {
         panic!("/proc/self/mem must always be readable");
     };
     let module = modules
@@ -157,7 +157,7 @@ fn every_supported_version_layout_is_found_with_its_documented_entry_count() {
             ],
         );
         load_and_populate(&so);
-        let ScanOutcome::Scanned { modules, .. } = scan_self(&[so.clone()]) else {
+        let ScanOutcome::Scanned { modules, .. } = scan_self(std::slice::from_ref(&so)) else {
             panic!("scan must be available");
         };
         let module = modules
@@ -197,7 +197,7 @@ fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
         load_and_populate(&so);
         let ScanOutcome::Scanned {
             modules, skipped, ..
-        } = scan_self(&[so.clone()])
+        } = scan_self(std::slice::from_ref(&so))
         else {
             panic!("scan must be available");
         };
@@ -237,7 +237,7 @@ fn future_minor_legacy_tables_are_scanned_as_known_prefix() {
     load_and_populate(&so);
     let ScanOutcome::Scanned {
         modules, skipped, ..
-    } = scan_self(&[so.clone()])
+    } = scan_self(std::slice::from_ref(&so))
     else {
         panic!("scan must be available");
     };
@@ -313,7 +313,7 @@ fn scanned_tables_agree_with_the_helper_manifest_for_every_walked_version() {
 
     let ScanOutcome::Scanned {
         modules, skipped, ..
-    } = scan_self(&[so.clone()])
+    } = scan_self(std::slice::from_ref(&so))
     else {
         panic!("scan must be available");
     };
@@ -414,7 +414,7 @@ fn interfaces_are_recorded_with_their_name_class() {
     let so = compile(&dir, "ifaces", &source, &[]);
     load_and_populate(&so);
 
-    let ScanOutcome::Scanned { modules, .. } = scan_self(&[so.clone()]) else {
+    let ScanOutcome::Scanned { modules, .. } = scan_self(std::slice::from_ref(&so)) else {
         panic!("scan must be available")
     };
     let module = modules
@@ -543,7 +543,7 @@ fn interface_names_do_not_cross_readable_vmas() {
         (containing.device, containing.inode)
     );
 
-    let outcome = scan_self(&[so.clone()]);
+    let outcome = scan_self(std::slice::from_ref(&so));
     assert_eq!(unsafe { libc::munmap(reserved, 2 * page) }, 0);
     let module = outcome
         .modules()
@@ -591,7 +591,7 @@ fn a_table_less_object_and_a_non_elf_hint_produce_no_module_and_no_panic() {
     );
     load_and_populate_ignoring_missing_entry(&plain);
 
-    let ScanOutcome::Scanned { modules, .. } = scan_self(&[plain.clone()]) else {
+    let ScanOutcome::Scanned { modules, .. } = scan_self(std::slice::from_ref(&plain)) else {
         panic!("scan must be available")
     };
     // The hint is honoured, so the object is identified; it just has nothing in it.
@@ -606,7 +606,7 @@ fn a_table_less_object_and_a_non_elf_hint_produce_no_module_and_no_panic() {
 
     let text = dir.join("not-elf.so");
     std::fs::write(&text, b"not an elf at all\n").unwrap();
-    let ScanOutcome::Scanned { skipped, .. } = scan_self(&[text.clone()]) else {
+    let ScanOutcome::Scanned { skipped, .. } = scan_self(std::slice::from_ref(&text)) else {
         panic!("scan must be available")
     };
     // The hint names a file that is not mapped at all: recorded, never fatal.
@@ -632,7 +632,7 @@ fn a_table_header_running_past_file_backed_data_is_silently_ignored() {
     load_and_populate(&so);
     let ScanOutcome::Scanned {
         modules, skipped, ..
-    } = scan_self(&[so.clone()])
+    } = scan_self(std::slice::from_ref(&so))
     else {
         panic!("scan must be available")
     };
@@ -719,7 +719,7 @@ fn a_hinted_object_with_no_table_says_so() {
             .success()
     );
     load_and_populate_ignoring_missing_entry(&plain);
-    let ScanOutcome::Scanned { skipped, .. } = scan_self(&[plain.clone()]) else {
+    let ScanOutcome::Scanned { skipped, .. } = scan_self(std::slice::from_ref(&plain)) else {
         panic!("scan must be available")
     };
     assert!(
@@ -1000,7 +1000,7 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
     let outcome = scan_pid(
         &ScanRequest {
             pid: std::process::id(),
-            hints: &[so.clone()],
+            hints: std::slice::from_ref(&so),
             hooks: &hooks,
         },
         &mut budget,
@@ -1137,7 +1137,7 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
     let outcome = scan_pid(
         &ScanRequest {
             pid,
-            hints: &[exe.clone()],
+            hints: std::slice::from_ref(&exe),
             hooks: &hooks,
         },
         &mut budget,
@@ -1239,7 +1239,7 @@ fn inspect_renders_a_scanned_fixture_end_to_end() {
     let outcome = scan_pid(
         &ScanRequest {
             pid: std::process::id(),
-            hints: &[so.clone()],
+            hints: std::slice::from_ref(&so),
             hooks: &hooks,
         },
         &mut budget,

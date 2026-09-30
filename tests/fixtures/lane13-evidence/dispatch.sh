@@ -117,7 +117,7 @@ git)
     esac
     exit 1 ;;
 cargo|"stable cargo"|"bpf cargo")
-    if [ "${1-}" = --version ]; then echo 'cargo 1.88.0 (fake)'; exit 0; fi
+    if [ "${1-}" = --version ]; then echo 'cargo 1.98.1 (fake)'; exit 0; fi
     [ "${1-}" != metadata ] || exec /usr/bin/python3 -I "$D2_METADATA_CARGO" "$@"
     if [ "${1-}" = build ]; then
         printf 'selected-build-rustc %s\n' "${RUSTC-}" >> "$D2_STATE/calls"
@@ -142,12 +142,12 @@ cargo|"stable cargo"|"bpf cargo")
     fi
     [ "$D2_MODE" = mutate-head ] && : > "$D2_STATE/mutate-head"
     exit 0 ;;
-rustc|"stable rustc"|"bpf rustc") echo 'rustc 1.88.0 (fake)'; exit 0 ;;
+rustc|"stable rustc"|"bpf rustc") echo 'rustc 1.98.1 (fake)'; exit 0 ;;
 rustup)
     [ "$#" -eq 4 ] && [ "$1" = which ] && [ "$2" = --toolchain ] || exit 64
     case "$3:$4" in
-        1.88:cargo) printf '%s\n' "$D2_STABLE_CARGO" ;;
-        1.88:rustc) printf '%s\n' "$D2_STABLE_RUSTC" ;;
+        1.98.1:cargo) printf '%s\n' "$D2_STABLE_CARGO" ;;
+        1.98.1:rustc) printf '%s\n' "$D2_STABLE_RUSTC" ;;
         nightly-2026-05-20:cargo) printf '%s\n' "$D2_BPF_CARGO" ;;
         nightly-2026-05-20:rustc) printf '%s\n' "$D2_BPF_RUSTC" ;;
         *) exit 65 ;;

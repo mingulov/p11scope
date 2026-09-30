@@ -12,6 +12,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 HELPER = ROOT / "scripts/product-build.sh"
 FIXTURES = ROOT / "tests/fixtures/product-build"
 PREPARED_NAMES = (
@@ -66,6 +67,7 @@ class ProductBuildTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         shutil.copy2(ROOT / "scripts/cargo.sh", scripts / "cargo.sh")
         shutil.copy2(FIXTURES / "record-preparer.py", scripts / "prepare-dependencies.py")
+        shutil.copy2(ROOT / ".release-rust-version", root / ".release-rust-version")
         bin_dir = self.base / "ordinary bin"
         self.make_tool(bin_dir, "cargo")
         environment = self.environment.copy()
@@ -78,7 +80,7 @@ class ProductBuildTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.read_record()
-        self.assertEqual(record["argv"], ["+1.88", "build", "--locked", *arguments])
+        self.assertEqual(record["argv"], [f"+{RELEASE_RUST}", "build", "--locked", *arguments])
         self.assertEqual(record["cwd"], str(root))
         self.assertEqual(record["environment"], {})
         preparation = json.loads((self.base / "preparation.json").read_text())
@@ -154,6 +156,7 @@ class ProductBuildTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         shutil.copy2(ROOT / "scripts/cargo.sh", scripts / "cargo.sh")
         shutil.copy2(FIXTURES / "record-preparer.py", scripts / "prepare-dependencies.py")
+        shutil.copy2(ROOT / ".release-rust-version", root / ".release-rust-version")
         bin_dir = self.base / "ordinary failure bin"
         self.make_tool(bin_dir, "cargo")
         environment["PATH"] = f"{bin_dir}:/usr/bin:/bin"
@@ -164,7 +167,7 @@ class ProductBuildTests(unittest.TestCase):
         self.assertEqual(result.stdout, "selected stdout\n")
         self.assertEqual(result.stderr, "selected stderr\n")
         self.assertEqual(self.read_record()["argv"],
-                         ["+1.88", "build", "--locked", "--release"])
+                         [f"+{RELEASE_RUST}", "build", "--locked", "--release"])
 
     def test_invalid_mode_and_source_time_have_no_side_effects(self):
         invalid = self.invoke("unknown", ("", "", "", ""))

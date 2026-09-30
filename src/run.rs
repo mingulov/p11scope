@@ -1149,10 +1149,11 @@ impl OwnedChild {
         let direct_error = self.pin.send_signal(libc::SIGKILL).err();
         if let Some(error) = direct_error {
             if let Some(code) = self.try_reap()? {
-                return if self.released && group_error.is_some() {
+                return if self.released
+                    && let Some(group) = group_error.as_ref()
+                {
                     Err(io::Error::other(format!(
-                        "owned process-group SIGKILL failed after exact child exit: {}",
-                        group_error.unwrap()
+                        "owned process-group SIGKILL failed after exact child exit: {group}"
                     )))
                 } else {
                     Ok(code)
@@ -2797,17 +2798,17 @@ fn report_attach_failures(session: &Session) {
     for (idx, msg) in session.attach_failures() {
         eprintln!("{}", format_attach_failure(*idx, msg));
     }
-    if session.attached_probes() == 0 {
-        if let Some((_, first)) = session.attach_failures().first() {
-            eprintln!(
-                "{}",
-                format_total_attach_refusal(
-                    session.attach_failures().len(),
-                    session.attached_probes() + session.attach_failures().len(),
-                    first
-                )
-            );
-        }
+    if session.attached_probes() == 0
+        && let Some((_, first)) = session.attach_failures().first()
+    {
+        eprintln!(
+            "{}",
+            format_total_attach_refusal(
+                session.attach_failures().len(),
+                session.attached_probes() + session.attach_failures().len(),
+                first
+            )
+        );
     }
 }
 
@@ -3071,11 +3072,11 @@ fn observe_fork(
     for old in retired {
         state.retire_process(old);
     }
-    if let (Some(parent), Some(child)) = (parent, child) {
-        if tracker.history_birth(parent, child) {
-            state.fork_process(parent, child);
-            return true;
-        }
+    if let (Some(parent), Some(child)) = (parent, child)
+        && tracker.history_birth(parent, child)
+    {
+        state.fork_process(parent, child);
+        return true;
     }
     state.reject_history(ev);
     true
@@ -3170,6 +3171,11 @@ fn profile_frame_decisions(
 /// fresh; any other tick reuses the cached snapshot (reading fresh when no
 /// snapshot was cached yet). Shared by the profile loop and the cadence
 /// tests, so the cached-vs-fresh composition is production code.
+///
+/// The nested `if` shape below is intentional and pinned by
+/// `the_profile_loop_decides_each_frame_from_one_clock_read`, which
+/// asserts on this function's source text: keep it, do not collapse.
+#[allow(clippy::collapsible_if)]
 fn profile_tick_snapshot<T: Clone>(
     tick_frame: ProfileFrame,
     cache: &mut Option<T>,
@@ -3404,7 +3410,7 @@ pub(crate) const FULL_DISCOVERY_EVERY_N_FRAMES: u64 = 5;
 /// and blocks the drain path ~2.5s (the system max-gap spike); frame N
 /// re-verifies warm instead.
 fn force_full_frame(frame_tick: u64) -> bool {
-    frame_tick % FULL_DISCOVERY_EVERY_N_FRAMES == 0
+    frame_tick.is_multiple_of(FULL_DISCOVERY_EVERY_N_FRAMES)
 }
 
 /// One gated discovery pass with its frame count applied: the pass plus
@@ -3870,16 +3876,16 @@ fn capture_profile(
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
     let mut process_tracker = process::Tracker::for_producer(domain, 16_384);
-    if policy.uses_unsafe_decoders() {
-        if let Err(error) = load_mech_shapes(&mut state) {
-            return Err(finish_capture_error(
-                error,
-                engine,
-                session,
-                owned.as_deref_mut(),
-                interrupted,
-            ));
-        }
+    if policy.uses_unsafe_decoders()
+        && let Err(error) = load_mech_shapes(&mut state)
+    {
+        return Err(finish_capture_error(
+            error,
+            engine,
+            session,
+            owned.as_deref_mut(),
+            interrupted,
+        ));
     }
     let clock = Instant::now();
     let drain_events = |session: &mut Session,
@@ -6016,10 +6022,8 @@ fn reduce_trace_event<W: Write>(
             out_file,
         );
         *write_error = error;
-        if !emitted {
-            if let Some(process) = process {
-                state.observe_process(process, &ev);
-            }
+        if !emitted && let Some(process) = process {
+            state.observe_process(process, &ev);
         }
     }
     Ok(())
@@ -12334,7 +12338,7 @@ mod tests {
         // SAFETY: zeroed sigaction with an empty mask and no flags, naming
         // the empty shim for a valid signal.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = isolated_observer_caught_shim as libc::sighandler_t;
+        action.sa_sigaction = isolated_observer_caught_shim as *const () as libc::sighandler_t;
         unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 }
     }
 

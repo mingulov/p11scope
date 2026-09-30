@@ -15,7 +15,7 @@ if arguments == ["--version"]:
     if status:
         print("fixture Cargo version refusal", file=sys.stderr)
         raise SystemExit(status)
-    print(CONFIG.get("cargo_version", "cargo 1.88.0 (fixture)"))
+    print(CONFIG.get("cargo_version", "cargo 1.98.1 (fixture)"))
     raise SystemExit(0)
 expected = [
     "metadata",

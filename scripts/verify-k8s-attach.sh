@@ -45,7 +45,7 @@ for command in kubectl docker python3; do
     command -v "$command" >/dev/null || { echo "$command required" >&2; exit 1; }
 done
 [ -x target/release/p11scope ] || {
-    echo "target/release/p11scope is missing; build with: cargo +1.88 build --locked --release" >&2
+    echo "target/release/p11scope is missing; build with: cargo +$(cat .release-rust-version) build --locked --release" >&2
     exit 1
 }
 kubectl cluster-info >/dev/null 2>&1 || { echo "no cluster reachable by kubectl" >&2; exit 1; }

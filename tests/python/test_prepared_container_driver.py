@@ -14,6 +14,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 FIXTURES = ROOT / "tests/fixtures/prepared-container-driver"
 EvidenceFixture = runpy.run_path(str(ROOT / "tests/python/test_prepared_dependency_evidence.py"))["EvidenceFixture"]
 
@@ -25,6 +26,7 @@ class DriverFixture:
         self.root = self.evidence.root
         for name in ("verify-discover-containers.sh", "cleanup-traps.sh", "prepared-dependency-tools.sh"):
             shutil.copy2(ROOT / "scripts" / name, self.root / "scripts" / name)
+        shutil.copy2(ROOT / ".release-rust-version", self.root / ".release-rust-version")
         self.bin = base / "bin"
         self.bin.mkdir()
         for directory in (self.bin, self.evidence.tools):
@@ -58,7 +60,7 @@ class DriverFixture:
             "root_metadata": str(self.evidence.root_metadata),
             "bpf_metadata": str(self.evidence.bpf_metadata),
             "prepared_source": str(self.evidence.base.output / "src/lib.rs"),
-            "tools": {"1.88:cargo": str(alias), "1.88:rustc": str(self.stable_rustc),
+            "tools": {f"{RELEASE_RUST}:cargo": str(alias), f"{RELEASE_RUST}:rustc": str(self.stable_rustc),
                       "nightly-2026-05-20:cargo": str(self.bpf_cargo),
                       "nightly-2026-05-20:rustc": str(self.bpf_rustc)},
         }
@@ -287,7 +289,7 @@ class PreparedContainerDriverTests(unittest.TestCase):
 
     def test_non_executable_tool_selection_refuses_before_admission(self):
         fixture = self.fixture()
-        fixture.config["tools"]["1.88:cargo"] = str(fixture.evidence.tools)
+        fixture.config["tools"][f"{RELEASE_RUST}:cargo"] = str(fixture.evidence.tools)
         result = fixture.run()
         self.assertEqual(result.returncode, 77, result.stderr)
         self.assertFalse(any(row["kind"] != "rustup" for row in fixture.events()))

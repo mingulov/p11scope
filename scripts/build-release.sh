@@ -440,11 +440,11 @@ receipt_tool_ledger() {
         printf 'tool_%s\t%s %s %s\n' \
             "$t4_tool" "$t4_pinned" "$t4_now" "$(receipt_digest "$t4_pinned")" || return 1
     done
-    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 cargo) || return 1
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain "$(cat .release-rust-version)" cargo) || return 1
     t4_now=$(realpath -e "$t4_found") || return 1
     printf 'toolchain_cargo\t%s %s %s\n' \
         "$T4_TOOLCHAIN_CARGO" "$t4_now" "$(receipt_digest "$T4_TOOLCHAIN_CARGO")" || return 1
-    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 rustc) || return 1
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain "$(cat .release-rust-version)" rustc) || return 1
     t4_now=$(realpath -e "$t4_found") || return 1
     printf 'toolchain_rustc\t%s %s %s\n' \
         "$T4_TOOLCHAIN_RUSTC" "$t4_now" "$(receipt_digest "$T4_TOOLCHAIN_RUSTC")" || return 1
@@ -456,7 +456,8 @@ receipt_tool_ledger() {
 # SECOND toolchain: `cargo +nightly-2026-05-20 ... -Z build-std=core`. Its
 # cargo, rustc, sysroot, the `rust-src` tree build-std compiles, and the BPF
 # linker are all effective inputs of the release artifact, and none of them is
-# the 1.88 pair the receipt already records. `bpf-linker` is bound at the
+# the release pair (`.release-rust-version`) the receipt already records.
+# `bpf-linker` is bound at the
 # effective cargo home because Cargo prepends `$CARGO_HOME/bin` to the PATH of
 # every rustc it spawns -- verified on this host by an execve trace, which
 # resolved the bpfel-unknown-none link to `~/.cargo/bin/bpf-linker` and NOT to
@@ -652,9 +653,9 @@ receipt_receipt_run() {
         [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
         receipt_fact "inherited_$t4_var" ""
     done
-    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 cargo) || exit 77
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain "$(cat .release-rust-version)" cargo) || exit 77
     receipt_pin_tool "$t4_found" T4_TOOLCHAIN_CARGO || exit 77
-    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain 1.88 rustc) || exit 77
+    t4_found=$(RUSTUP_AUTO_INSTALL=0 "$T4_TOOL_rustup" which --toolchain "$(cat .release-rust-version)" rustc) || exit 77
     receipt_pin_tool "$t4_found" T4_TOOLCHAIN_RUSTC || exit 77
     # Keep the nightly selections made by the complete ledger in this shell.
     receipt_tool_ledger > "$RECEIPT_ROOT/artifacts/tools.initial.tsv" || exit 77
@@ -730,7 +731,8 @@ P11SCOPE_RECEIPT_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
 echo "=== p11scope: isolated safe-only official static build ==="
 rm -rf "$OFFICIAL_TARGET"
 # The rustup shim dispatches on argv[0], so its resolved non-symlink path is
-# not invocable as cargo and `+1.88` cannot survive path pinning. Run the
+# not invocable as cargo and a `+toolchain` selector cannot survive path
+# pinning. Run the
 # recorded toolchain binaries directly instead, offline, with RUSTC supplied
 # command-locally so cargo never resolves the compiler through PATH.
 # The official bytes must not embed the build host's checkout, Cargo home or

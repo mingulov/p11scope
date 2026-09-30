@@ -9753,10 +9753,10 @@ fn owned_retirement_barrier_checks_nonce_and_bounds_unreleased_wait() -> Result<
         let worker = std::thread::spawn(move || barrier.wait(timeout));
         let deadline = Instant::now() + Duration::from_secs(2);
         let entered = loop {
-            if let Ok(entered) = std::fs::read_to_string(path.join("entered")) {
-                if entered.lines().count() == 2 {
-                    break entered;
-                }
+            if let Ok(entered) = std::fs::read_to_string(path.join("entered"))
+                && entered.lines().count() == 2
+            {
+                break entered;
             }
             ensure!(Instant::now() < deadline, "fixture barrier not entered");
             std::thread::sleep(Duration::from_millis(1));

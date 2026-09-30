@@ -63,7 +63,7 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build ==="
-scripts/cargo.sh +1.88 build --locked --release --workspace --target-dir "$WORK/build"
+scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --workspace --target-dir "$WORK/build"
 sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 

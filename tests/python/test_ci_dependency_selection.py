@@ -152,7 +152,7 @@ class DependencySelectionTests(unittest.TestCase):
     def test_root_workspace_compilation_and_recipe_audit_retained(self):
         ci = CI_YML.read_text(encoding="utf-8")
         self.assertIn(
-            "cargo +1.88 test --locked --offline --workspace --all-targets",
+            'cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets',
             ci,
         )
         self.assertIn("scripts/check-prepared-dependencies.py", ci)

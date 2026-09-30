@@ -257,6 +257,9 @@ class Lane13EvidenceTests(unittest.TestCase):
         for reached in (
             Path("scripts/recorded-process-exec.py"),
             Path("scripts/lane13-input-ledger.py"),
+            # The release compiler is single-sourced from this root file,
+            # which the ls-files pathspecs above do not cover.
+            Path(".release-rust-version"),
         ):
             (self.project / reached).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / reached, self.project / reached)

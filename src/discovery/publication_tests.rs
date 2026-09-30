@@ -2870,7 +2870,7 @@ fn legacy_static_table_scan_manifest_and_live() {
     assert_eq!(engine_a.plan().slots.len(), 68);
     assert_eq!(
         slot_targets(&engine_a),
-        printed_targets(&maps, &[table0.clone()])
+        printed_targets(&maps, std::slice::from_ref(&table0))
     );
     assert!(
         engine_a

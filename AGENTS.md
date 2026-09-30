@@ -62,10 +62,10 @@ memory-backed `/tmp`. Existing native fixtures expect a conventional
 `umask 022`; private evidence directories should still be created as 0700.
 
 ```sh
-mise exec -- ./scripts/cargo.sh +1.88 fmt --all -- --check
-mise exec -- ./scripts/cargo.sh +1.88 check --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.88 clippy --locked --workspace --all-targets -- -D warnings
+mise exec -- ./scripts/cargo.sh +1.98.1 fmt --all -- --check
+mise exec -- ./scripts/cargo.sh +1.98.1 check --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.98.1 test --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 Privileged, container and VM experiments need the host owner's authorization.

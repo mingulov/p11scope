@@ -50,3 +50,10 @@ exclude = ["third-party/src/aya-0.14.0-p2", "third-party/src/aya-obj-0.3.0-p2"]
 [patch.crates-io]
 aya = { path = "third-party/src/aya-0.14.0-p2" }
 aya-obj = { path = "third-party/src/aya-obj-0.3.0-p2" }
+
+[profile.test]
+# 0b: line tables only. Full debuginfo pushes the lib unit-test
+# binary past the product's 256 MiB MAX_OBJECT_BYTES cap, and many
+# tests pin/identify their own test binary as a fixture object.
+# Backtraces keep file:line; variable inspection in tests is reduced.
+debug = "line-tables-only"

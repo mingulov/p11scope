@@ -15,6 +15,7 @@ _p11scope_prepared_tools_clear_results() {
 _p11scope_prepared_tools_clear_scratch() {
     unset _p11scope_prepared_tools_python \
         _p11scope_prepared_tools_rustup \
+        _p11scope_prepared_tools_release_rust \
         _p11scope_prepared_tools_stable_cargo \
         _p11scope_prepared_tools_stable_rustc \
         _p11scope_prepared_tools_bpf_cargo \
@@ -135,8 +136,15 @@ argv[0] cannot be pinned; pass the real rustup (for example
         return $?
     }
 
+    _p11scope_prepared_tools_release_rust=$(cat .release-rust-version 2>/dev/null) || {
+        _p11scope_prepared_tools_refuse 'cannot read the release Rust version' 66
+        return $?
+    }
+    case $_p11scope_prepared_tools_release_rust in
+        '') _p11scope_prepared_tools_refuse 'empty release Rust version' 66; return $? ;;
+    esac
     _p11scope_prepared_tools_stable_cargo=$(
-        _p11scope_prepared_tools_rustup_which 1.88 cargo
+        _p11scope_prepared_tools_rustup_which "$_p11scope_prepared_tools_release_rust" cargo
     ) || {
         _p11scope_prepared_tools_refuse \
             'rustup failed to select stable cargo' 66
@@ -150,7 +158,7 @@ argv[0] cannot be pinned; pass the real rustup (for example
         return $?
     }
     _p11scope_prepared_tools_stable_rustc=$(
-        _p11scope_prepared_tools_rustup_which 1.88 rustc
+        _p11scope_prepared_tools_rustup_which "$_p11scope_prepared_tools_release_rust" rustc
     ) || {
         _p11scope_prepared_tools_refuse \
             'rustup failed to select stable rustc' 66

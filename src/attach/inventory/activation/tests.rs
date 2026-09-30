@@ -177,13 +177,13 @@ impl InventoryLinkIo for LinkIo {
             anyhow::bail!("original attach failure {ordinal}");
         }
         self.state.lock().unwrap().live.insert(ordinal);
-        if let Some((when, path)) = &self.mutate_after_attach {
-            if *when == ordinal {
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(path)?
-                    .write_all(&[0])?;
-            }
+        if let Some((when, path)) = &self.mutate_after_attach
+            && *when == ordinal
+        {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)?
+                .write_all(&[0])?;
         }
         Ok(TestLink {
             ordinal,

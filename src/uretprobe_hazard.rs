@@ -317,7 +317,7 @@ fn probe_kernel_inner() -> Result<KernelVerdict> {
         program.load().context("loading p11_return")?;
     }
     let ebpf = &mut ebpf;
-    let offset = own_text_file_offset(probe_point as usize as u64)
+    let offset = own_text_file_offset(probe_point as *const () as usize as u64)
         .context("locating the self-probe attach point in this executable")?;
     let (ready_read, ready_write) = pipe_pair().context("self-probe readiness pipe")?;
     let (release_read, release_write) = pipe_pair().context("self-probe release pipe")?;

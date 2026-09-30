@@ -24,8 +24,8 @@ if record.is_dir():
                                  "auto_install": os.environ.get("RUSTUP_AUTO_INSTALL")},
                                 sort_keys=True) + "\n")
 mapping = {
-    ("1.88", "cargo"): "stable-cargo",
-    ("1.88", "rustc"): "stable-rustc",
+    ("1.98.1", "cargo"): "stable-cargo",
+    ("1.98.1", "rustc"): "stable-rustc",
     ("nightly-2026-05-20", "cargo"): "bpf-cargo",
     ("nightly-2026-05-20", "rustc"): "bpf-rustc",
 }

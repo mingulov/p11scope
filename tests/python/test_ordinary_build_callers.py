@@ -12,6 +12,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
+BUILD_SELECTOR = 'scripts/cargo.sh "+$(cat .release-rust-version)" build --locked'
 FIXTURES = ROOT / "tests/fixtures/ordinary-build-callers"
 CALLERS = (
     ROOT / "scripts/matrix/verify-kind-pod.sh",
@@ -49,6 +51,8 @@ class OrdinaryBuildCallerTests(unittest.TestCase):
             shutil.copy2(ROOT / relative, destination)
         shutil.copy2(FIXTURES / "record-preparer.py",
                      self.root / "scripts/prepare-dependencies.py")
+        shutil.copy2(ROOT / ".release-rust-version",
+                     self.root / ".release-rust-version")
         for caller in CALLERS:
             relative = caller.relative_to(ROOT)
             shutil.copy2(caller, self.root / relative)
@@ -79,21 +83,21 @@ class OrdinaryBuildCallerTests(unittest.TestCase):
 
     def build_command(self, caller):
         matches = [command for command in logical_commands(caller)
-                   if "scripts/cargo.sh +1.88 build --locked" in command]
+                   if BUILD_SELECTOR in command]
         self.assertEqual(len(matches), 1, caller.name)
         return matches[0]
 
     def expected_cargo(self, caller):
         if caller.name in ("verify-kind-pod.sh", "verify-docker.sh"):
-            return ["+1.88", "build", "--locked", "--release", "--workspace",
+            return [f"+{RELEASE_RUST}", "build", "--locked", "--release", "--workspace",
                     "--target-dir", "target/matrix-product"]
         if caller.name == "verify-proxy-stack.sh":
-            return ["+1.88", "build", "--locked", "--release", "--workspace",
+            return [f"+{RELEASE_RUST}", "build", "--locked", "--release", "--workspace",
                     "--target-dir", "target/test-work/build"]
         if caller.name == "verify-inspect-doctor.sh":
-            return ["+1.88", "build", "--locked", "--release", "--target-dir",
+            return [f"+{RELEASE_RUST}", "build", "--locked", "--release", "--target-dir",
                     "target/test-work/build"]
-        return ["+1.88", "build", "--locked", "--release", "--workspace"]
+        return [f"+{RELEASE_RUST}", "build", "--locked", "--release", "--workspace"]
 
     def test_each_real_build_command_preserves_exact_arguments_and_timeout(self):
         for caller in CALLERS:
@@ -166,7 +170,7 @@ class OrdinaryBuildCallerTests(unittest.TestCase):
     def test_build_precedes_privilege_and_container_commands_in_every_source(self):
         for caller in CALLERS:
             source = caller.read_text(encoding="utf-8")
-            build = source.index("scripts/cargo.sh +1.88 build --locked")
+            build = source.index(BUILD_SELECTOR)
             for marker in ("sudo -n true", "docker build", "kind create cluster"):
                 if marker in source:
                     self.assertLess(build, source.index(marker), (caller.name, marker))

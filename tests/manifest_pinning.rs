@@ -1821,7 +1821,7 @@ fn scan_self() -> (PathBuf, Vec<p11scope::discovery::scan::ScannedModule>) {
     let outcome = scan_pid(
         &ScanRequest {
             pid: std::process::id(),
-            hints: &[exe.clone()],
+            hints: std::slice::from_ref(&exe),
             hooks: &hooks,
         },
         &mut self_binary_budget(),
@@ -2025,7 +2025,7 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
     let outcome = scan_pid(
         &ScanRequest {
             pid,
-            hints: &[exe.clone()],
+            hints: std::slice::from_ref(&exe),
             hooks: &hooks,
         },
         &mut self_binary_budget(),

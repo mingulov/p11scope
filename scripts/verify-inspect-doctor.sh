@@ -52,7 +52,7 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
-scripts/cargo.sh +1.88 build --locked --release --target-dir "$WORK/build"
+scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --target-dir "$WORK/build"
 P11SCOPE="$WORK/build/release/p11scope"
 
 # The target dlopens the provider itself, so this lane also proves the scan

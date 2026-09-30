@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 SPEC = importlib.util.spec_from_file_location("package_release", ROOT / "scripts/package-release.py")
 PACKAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PACKAGE)
@@ -53,6 +54,7 @@ class PackageReleaseTests(unittest.TestCase):
             } for name in ("1.88", "nightly-2026-05-20")],
         }
         self.inputs["third-party/licenses/sources.json"] = json.dumps(self.recipe).encode()
+        self.inputs[".release-rust-version"] = (RELEASE_RUST + "\n").encode()
         for name, data in self.inputs.items():
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)

@@ -81,6 +81,7 @@ class ReleaseSealFixture:
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
         (self.repo / "scripts/fixtures").mkdir()
         shutil.copy2(ROOT / "scripts/fixtures/hammer.c", self.repo / "scripts/fixtures/hammer.c")
+        shutil.copy2(ROOT / ".release-rust-version", self.repo / ".release-rust-version")
         for arguments in (
             ["init", "--quiet", "-b", "task7"], ["add", "-A"],
             ["-c", "user.email=task7@example.invalid", "-c", "user.name=task7",

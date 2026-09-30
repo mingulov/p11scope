@@ -19,7 +19,7 @@ config = json.loads(Path(os.environ["P11SCOPE_LANE02_FIXTURE"]).read_text())
 if len(sys.argv) != 5 or sys.argv[1:3] != ["which", "--toolchain"]:
     raise SystemExit(97)
 toolchain, program = sys.argv[3:]
-key = ("stable" if toolchain == "1.88" else "bpf") + "_" + program
+key = ("stable" if toolchain == "1.98.1" else "bpf") + "_" + program
 with Path(config["events"]).open("a", encoding="utf-8") as stream:
     stream.write(json.dumps({"kind": "select", "key": key}, sort_keys=True) + "\n")
 print(config[key])

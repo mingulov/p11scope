@@ -3,7 +3,7 @@
 #   docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:1 p11scope
 # Requires the static binary (pure-Rust deps + aya make this work):
 #   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-#     cargo +1.88 build --locked --release \
+#     cargo +1.98.1 build --locked --release \
 #     --target x86_64-unknown-linux-musl --bin p11scope
 # (musl-tools provides the linker; the target-scoped env var keeps the
 # nested bpfel-unknown-none build inside build.rs on its own linker.)

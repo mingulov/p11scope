@@ -8,7 +8,6 @@ use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LEADER_EXIT, Disc
 use p11scope_manifest::maps::parse_maps;
 use sha2::Digest as _;
 use std::io::Read as _;
-use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 
 struct OwnedElf {

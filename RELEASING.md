@@ -110,14 +110,18 @@ inherited `RUSTFLAGS`/`CARGO_*`/`RUSTUP_*` build variables, no untracked
 `.cargo/config.toml`, and the pinned toolchains:
 
 ```sh
-rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
-rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
+rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+rustup target add --toolchain 1.98.1 x86_64-unknown-linux-musl
 rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-cargo +1.88 install bpf-linker --version 0.10.4 --locked
+cargo +1.98.1 install bpf-linker --version 0.10.4 --locked
 python3 -I scripts/prepare-dependencies.py
-cargo +1.88 fetch --locked
+cargo +1.98.1 fetch --locked
 cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
 ```
+
+The stable version above is the release compiler, single-sourced from
+`.release-rust-version` (currently 1.98.1); the release scripts and CI read
+that file rather than pinning a literal.
 
 The driver checks the host tool selection before building:
 
@@ -163,7 +167,7 @@ Record the build facts for the release notes:
 
 ```sh
 cd /var/tmp/p11scope-release/v0.1.0/work/dist
-rustc +1.88 -V; rustc +nightly-2026-05-20 -V; bpf-linker --version; clang-18 --version
+rustc +1.98.1 -V; rustc +nightly-2026-05-20 -V; bpf-linker --version; clang-18 --version
 if strings -a p11scope | grep -Fq -- "$HOME"; then
   echo 'release binary embeds build-home path' >&2
   exit 1
@@ -203,7 +207,7 @@ example paths below are absolute; `/var/tmp/p11scope-release` was created with
 mode `0700` in step 5, each output is absent, and their parent remains private:
 
 ```sh
-cargo +1.88 install cargo-about --version 0.9.2 --locked
+cargo +1.98.1 install cargo-about --version 0.9.2 --locked
 mkdir -m 700 /var/tmp/p11scope-release/package-inputs
 curl -fL https://musl.libc.org/releases/musl-1.2.3.tar.gz \
   -o /var/tmp/p11scope-release/package-inputs/musl-1.2.3.tar.gz
@@ -259,7 +263,7 @@ tar --same-permissions --no-same-owner -xzf \
 (
   cd "$source_recipient/p11scope-source"
   python3 -I scripts/prepare-dependencies.py --offline
-  mise exec -- ./scripts/cargo.sh +1.88 build --locked --release \
+  mise exec -- ./scripts/cargo.sh +1.98.1 build --locked --release \
     --no-default-features --target x86_64-unknown-linux-musl --bin p11scope
 )
 ```

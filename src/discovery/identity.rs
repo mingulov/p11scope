@@ -917,15 +917,15 @@ impl PinnedObjects {
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
         }
-        if incoming_scan_only {
-            if let Some(id) = same_key.iter().copied().find(|id| {
+        if incoming_scan_only
+            && let Some(id) = same_key.iter().copied().find(|id| {
                 self.aliases_are_scan_only(*id) && overlay_identity_equal(&self.by_id[id], &entry)
-            }) {
-                skipped.push(overlay_uncertainty(&entry, &self.by_id[&id]));
-                self.overlay_uncertain = true;
-                self.raw_to_id.insert(entry.raw, id);
-                return Some(id);
-            }
+            })
+        {
+            skipped.push(overlay_uncertainty(&entry, &self.by_id[&id]));
+            self.overlay_uncertain = true;
+            self.raw_to_id.insert(entry.raw, id);
+            return Some(id);
         }
         if !same_key.is_empty() {
             self.reject_key(key);

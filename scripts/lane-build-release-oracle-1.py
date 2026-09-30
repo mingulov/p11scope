@@ -216,7 +216,7 @@ finalization=["body","evidence-checks","sync-staged-status","remove-sealed-bin",
 mark(lane[28],finalization.index("sync-staged-status")<finalization.index("remove-sealed-bin")
      <finalization.index("terminal-status") and finalization[-1]=="terminal-status")
 # The shipped observer embeds an eBPF object built by a second toolchain, so
-# the recorded 1.88 pair is not the effective build closure on its own.
+# the recorded release pair (`.release-rust-version`) is not the effective build closure on its own.
 stable_closure={"toolchain_cargo","toolchain_rustc"}
 nightly_closure={"toolchain_nightly_cargo","toolchain_nightly_rustc","toolchain_nightly_sysroot",
                  "toolchain_nightly_rust_src","toolchain_bpf_linker"}

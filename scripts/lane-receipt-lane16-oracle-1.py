@@ -11,6 +11,8 @@ if sys.argv[1:] in (["--help"], ["-h"]):
 import copy, fcntl, os, stat, sys, tempfile
 from pathlib import Path
 
+RELEASE_RUST = Path(__file__).resolve().parents[1].joinpath(".release-rust-version").read_text(encoding="utf-8").strip()
+
 report, lane = Path(sys.argv[1]), sys.argv[2]
 rows = []
 common = [
@@ -55,7 +57,7 @@ lane_cases = [
     "auto-call-timing-performance-change-accepted",
     "bare-observer-rejected", "path-observer-rejected",
     "outside-ROOT-work-target-release-observer-rejected",
-    "cargo-not-Rust-1.88-rejected",
+    f"cargo-not-Rust-{RELEASE_RUST}-rejected",
     "cargo-without-locked-workspace-release-rejected",
     "private-CARGO_TARGET_DIR-ROOT-work-target-exact-accepted",
     "missing-observer-identity-ledger-rejected",
@@ -162,9 +164,9 @@ def row(mode):
             "inflight": [0, 0], "child": False,
             "pause": ["none", 0, 0, 0] if mode == "never" else ["sigstop", 2, 2, 0],
             "observer": "/receipt/work/target/release/p11scope",
-            "cargo": ["cargo", "+1.88", "build", "--locked", "--release", "--workspace"],
+            "cargo": ["cargo", f"+{RELEASE_RUST}", "build", "--locked", "--release", "--workspace"],
             "target": "/receipt/work/target", "observer_identity": "1:2:3:hash",
-            "cargo_identity": "cargo-1.88:rustc-1.88", "calls": 200001, "median": 7}
+            "cargo_identity": f"cargo-{RELEASE_RUST}:rustc-{RELEASE_RUST}", "calls": 200001, "median": 7}
 
 def structural(d, mode):
     want_pause = ["none", 0, 0, 0] if mode == "never" else ["sigstop", 2, 2, 0]

@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 FIXTURES = ROOT / "tests/fixtures/live-freeze-prepared-dependencies"
 EvidenceFixture = runpy.run_path(
     str(ROOT / "tests/python/test_prepared_dependency_evidence.py")
@@ -40,6 +41,7 @@ class LiveFreezePreparedTests(unittest.TestCase):
             shutil.copy2(ROOT / relative, target)
         shutil.copy2(FIXTURES / "object-inventory.py",
                      self.root / "scripts/check-live-discovery-object.py")
+        shutil.copy2(ROOT / ".release-rust-version", self.root / ".release-rust-version")
         self.bin = base / "bin with spaces"
         self.bin.mkdir()
         for name in ("rustup", "gcc", "ld", "ldd", "sudo", "cargo", "rustc"):
@@ -57,13 +59,13 @@ class LiveFreezePreparedTests(unittest.TestCase):
             "object_checker": str(ROOT / "scripts/check-live-discovery-object.py"),
             "libc": str(Path("/lib/x86_64-linux-gnu/libc.so.6").resolve()),
             "tools": {f"{chain}:{kind}": str(self.prepared.tools / f"{prefix} {kind}")
-                      for chain, prefix in (("1.88", "stable"), ("nightly-2026-05-20", "bpf"))
+                      for chain, prefix in ((RELEASE_RUST, "stable"), ("nightly-2026-05-20", "bpf"))
                       for kind in ("cargo", "rustc")},
         }
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(["git", "-C", str(self.root), "add", "scripts", "src", "crates",
                         "docs", "tests", "Cargo.toml", "Cargo.lock", "third-party/sources.json",
-                        "third-party/patches"], check=True)
+                        "third-party/patches", ".release-rust-version"], check=True)
 
     def tearDown(self):
         self.temporary.cleanup()

@@ -23,16 +23,21 @@ locations: mise data under `~/.local/share/mise`, rustup toolchains under
 `~/.rustup`, and Cargo state and installed tools under `~/.cargo`. Do not set
 project-specific `MISE_DATA_DIR`, `RUSTUP_HOME`, or `CARGO_HOME` values.
 
-The tracked `mise.toml` selects stable Rust 1.88.0 and Kind 0.33.0 for the
+The tracked `mise.toml` selects stable Rust 1.98.1 and Kind 0.33.0 for the
 later Kubernetes lane. The eBPF build also needs the exact nightly and linker
 used by CI:
 
 ```sh
-rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
 rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
 mise install
-mise exec -- cargo +1.88 install bpf-linker --version 0.10.4 --locked
+mise exec -- cargo +1.98.1 install bpf-linker --version 0.10.4 --locked
 ```
+
+The release Rust version is single-sourced from `.release-rust-version`
+(currently 1.98.1): `mise.toml`, CI, and the shell/Python selectors all read
+that file, so a future bump starts there. Crate `rust-version` fields stay at
+1.88, the minimum supported compiler.
 
 Keep `~/.cargo/bin` on `PATH` so Cargo-installed tools such as `bpf-linker`
 are directly discoverable. The later container lanes also require a working
@@ -83,7 +88,7 @@ public, so an ordinary networked fetch resolves it; no Git configuration or
 local mirror is needed:
 
 ```sh
-mise exec -- ./scripts/cargo.sh +1.88 fetch --locked
+mise exec -- ./scripts/cargo.sh +1.98.1 fetch --locked
 cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
 ```
 
@@ -101,8 +106,8 @@ selectors and gate flags. Set a private disk-backed `TMPDIR` as described
 in [contributor verification](../CONTRIBUTING.md#verification) before tests:
 
 ```sh
-mise exec -- ./scripts/cargo.sh +1.88 fmt --all -- --check
-mise exec -- ./scripts/cargo.sh +1.88 check --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.88 clippy --locked --workspace --all-targets -- -D warnings
+mise exec -- ./scripts/cargo.sh +1.98.1 fmt --all -- --check
+mise exec -- ./scripts/cargo.sh +1.98.1 check --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.98.1 test --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
 ```

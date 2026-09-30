@@ -2161,11 +2161,9 @@ fn merge(
                             // and the omission below is suppressed for an
                             // empty total. Tables with nothing to keep still
                             // spill, counted once as uncorroborated.
-                            if !kept_only {
-                                if let Some(demand) = kept_demand(key) {
-                                    refused_top = Some(*key);
-                                    break 'refused demand;
-                                }
+                            if !kept_only && let Some(demand) = kept_demand(key) {
+                                refused_top = Some(*key);
+                                break 'refused demand;
                             }
                             // The budget is spent: this table and every weaker one spill.
                             // Admission stays a strongest-evidence prefix — a strong
@@ -2969,14 +2967,13 @@ fn lower_manifest(
                         .and_then(|candidate| {
                             object_key(m, candidate).and_then(|key| pinned_id(key, &candidate.path))
                         })
+                        && !compatible(provider, object)
                     {
-                        if !compatible(provider, object) {
-                            skip(format!(
-                                "object id {} has a different target ABI from the provider",
-                                record.id
-                            ));
-                            continue;
-                        }
+                        skip(format!(
+                            "object id {} has a different target ABI from the provider",
+                            record.id
+                        ));
+                        continue;
                     }
                     targets.push(Target {
                         name: &f.name,
@@ -4162,7 +4159,7 @@ mod tests {
             .unwrap();
 
         let retired = plan.retire_unpinned_targets(&PinnedObjects::empty(), 0);
-        assert_eq!(retired, [seeded.clone()]);
+        assert_eq!(retired.as_slice(), std::slice::from_ref(&seeded));
         assert!(!plan.is_active(seeded.index));
         assert!(plan.provisional_get_function_list.is_empty());
     }

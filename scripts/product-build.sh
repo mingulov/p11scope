@@ -10,7 +10,7 @@ p11scope_product_build() {
     case $1 in
         ordinary)
             shift
-            scripts/cargo.sh +1.88 build --locked "$@"
+            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked "$@"
             ;;
         prepared)
             shift

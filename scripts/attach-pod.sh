@@ -171,7 +171,7 @@ for command in kubectl timeout; do
 done
 sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 1; }
 [ -x "$OBSERVER" ] || {
-    echo "$OBSERVER is missing; build with: cargo +1.88 build --locked --release" >&2
+    echo "$OBSERVER is missing; build with: cargo +$(cat .release-rust-version) build --locked --release" >&2
     exit 1
 }
 case $OBSERVER in /*) ;; *) OBSERVER="$PWD/$OBSERVER" ;; esac

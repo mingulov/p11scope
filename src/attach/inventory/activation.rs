@@ -659,11 +659,11 @@ impl InventoryState {
                 .binary_search_by_key(&id, |entry| entry.id)
             {
                 let object = self.targets.entries[index].object;
-                if checked_pins.insert(object) {
-                    if let Err(error) = self.targets.check_pin(object) {
-                        self.pin_check_failures = self.pin_check_failures.saturating_add(1);
-                        pin_error.get_or_insert_with(|| format!("{error:#}"));
-                    }
+                if checked_pins.insert(object)
+                    && let Err(error) = self.targets.check_pin(object)
+                {
+                    self.pin_check_failures = self.pin_check_failures.saturating_add(1);
+                    pin_error.get_or_insert_with(|| format!("{error:#}"));
                 }
             }
             let map: Array<_, u64> =

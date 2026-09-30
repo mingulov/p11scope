@@ -62,7 +62,7 @@ backend), `fail` (ordinal 43 fails wrapper-only with `CKR_DEVICE_ERROR`),
 `legacy` (publish only, zero calls).
 
 ```sh
-TMPDIR=/var/tmp/p11scope-ws-tmp ./scripts/cargo.sh +1.88 test \
+TMPDIR=/var/tmp/p11scope-ws-tmp ./scripts/cargo.sh +1.98.1 test \
     --locked --offline --test multi_wrapper_oracle
 ```
 

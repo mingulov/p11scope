@@ -8166,7 +8166,7 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
         let mut exit_statuses = std::collections::BTreeMap::<u64, u32>::new();
         let mut wif_statuses = std::collections::BTreeMap::<u64, u32>::new();
         let mut exec_superseded = BTreeSet::new();
-        for (index, record) in bytes.chunks_exact(128).enumerate() {
+        for (index, record) in bytes.as_chunks::<128>().0.iter().enumerate() {
             assert_eq!(&record[..8], b"P11S9R1\0", "RED2 journal magic changed");
             assert_eq!(
                 &record[8..10],
@@ -8615,21 +8615,27 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
         }
         if matches!(case, "sim-event-first" | "sim-stop-first") {
             let clone_entries = bytes
-                .chunks_exact(128)
+                .as_chunks::<128>()
+                .0
+                .iter()
                 .filter(|record| {
                     u16::from_le_bytes(record[10..12].try_into().unwrap()) == CREATE_ENTRY
                         && u16::from_le_bytes(record[40..42].try_into().unwrap()) == 4
                 })
                 .count();
             let clone_events = bytes
-                .chunks_exact(128)
+                .as_chunks::<128>()
+                .0
+                .iter()
                 .filter(|record| {
                     u16::from_le_bytes(record[10..12].try_into().unwrap()) == CREATE_EVENT
                         && u16::from_le_bytes(record[40..42].try_into().unwrap()) == 3
                 })
                 .count();
             let clone_joins = bytes
-                .chunks_exact(128)
+                .as_chunks::<128>()
+                .0
+                .iter()
                 .filter(|record| {
                     u16::from_le_bytes(record[10..12].try_into().unwrap()) == CHILD_JOIN
                         && u64::from_le_bytes(record[40..48].try_into().unwrap()) != 1
@@ -8659,9 +8665,15 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                 u64::from_le_bytes(record[offset..offset + 8].try_into().unwrap())
             };
             let find = |kind, ordinal| {
-                bytes.chunks_exact(128).enumerate().find(|(_, record)| {
-                    read_u16(record, 10) == kind && read_u64(record, 24) == ordinal
-                })
+                bytes
+                    .as_chunks::<128>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .find(|(_, record)| {
+                        let record = record.as_slice();
+                        read_u16(record, 10) == kind && read_u64(record, 24) == ordinal
+                    })
             };
             let (clone_entry, entry) =
                 find(CREATE_ENTRY, 3).expect("RED2 simulated clone entry missing");
@@ -8743,7 +8755,7 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
         }
         if case == "sim-stop-first" {
             let find = |kind, ordinal| {
-                bytes.chunks_exact(128).position(|record| {
+                bytes.as_chunks::<128>().0.iter().position(|record| {
                     u16::from_le_bytes(record[10..12].try_into().unwrap()) == kind
                         && u64::from_le_bytes(record[24..32].try_into().unwrap()) == ordinal
                 })

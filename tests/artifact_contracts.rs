@@ -327,7 +327,8 @@ fn assert_lane14_selected_python_isolated(source: &str) -> Result<(), String> {
 fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
     let checks = checks_job(ci);
     let prepare = "run: python3 -I scripts/prepare-dependencies.py";
-    let root_fetch = "run: cargo +1.88 fetch --locked --manifest-path Cargo.toml";
+    let root_fetch =
+        "run: cargo +\"$(cat .release-rust-version)\" fetch --locked --manifest-path Cargo.toml";
     let selection =
         "p11scope_prepared_tools_select \"$(command -v python3)\" \"$(command -v rustup)\"";
     let root_metadata = "\"$P11SCOPE_PREPARED_STABLE_CARGO\" metadata --locked --offline --all-features --format-version 1 --manifest-path Cargo.toml";
@@ -386,7 +387,7 @@ fn assert_hosted_offline_gates(checks: &str) -> Result<(), String> {
             .lines()
             .map(str::trim)
             .filter_map(command_of)
-            .any(|call| call == format!("cargo +1.88 {gate}"))
+            .any(|call| call == format!("cargo +\"$(cat .release-rust-version)\" {gate}"))
         {
             return Err(format!(
                 "the scope line claims the {gate} gate, which no step runs"
@@ -1349,8 +1350,9 @@ fn official_build_is_safe_only() {
         "=== p11scope-discover: dynamic glibc + dynamic musl builds ===",
     );
     // The rustup shim dispatches on argv[0], so its resolved non-symlink path
-    // is not invocable as cargo and `+1.88` cannot survive path pinning. The
-    // official build runs the recorded toolchain binaries directly, offline.
+    // is not invocable as cargo and a `+toolchain` selector cannot survive
+    // path pinning. The official build runs the recorded toolchain binaries
+    // directly, offline.
     let command = [
         "CARGO_TARGET_DIR=\"$OFFICIAL_TARGET\" \\",
         "CARGO_ENCODED_RUSTFLAGS=\"-C${RELEASE_FLAG_SEPARATOR}target-feature=+crt-static${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$RELEASE_SOURCE_ROOT=/p11scope${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.cargo=/cargo${RELEASE_FLAG_SEPARATOR}--remap-path-prefix=$HOME/.rustup=/rustup\" \\",
@@ -1380,7 +1382,7 @@ fn official_build_is_safe_only() {
         "official build must pass its flags encoded, never as space-separated RUSTFLAGS"
     );
     assert!(
-        !official.contains("cargo +1.88"),
+        !official.contains("cargo +"),
         "official build resolves cargo through the argv[0]-dispatching shim"
     );
     for marker in [
@@ -4370,7 +4372,7 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "bare-observer-rejected",
         "path-observer-rejected",
         "outside-ROOT-work-target-release-observer-rejected",
-        "cargo-not-Rust-1.88-rejected",
+        "cargo-not-Rust-1.98.1-rejected",
         "cargo-without-locked-workspace-release-rejected",
         "private-CARGO_TARGET_DIR-ROOT-work-target-exact-accepted",
         "missing-observer-identity-ledger-rejected",
@@ -7218,7 +7220,7 @@ fn gate_scripts_pin_the_toolchain() {
                 && (line.starts_with("cargo ") || line.contains(" cargo build"))
             {
                 assert!(
-                    line.contains("cargo +1.88"),
+                    line.contains("$(cat .release-rust-version)"),
                     "unpinned cargo command in {path}: {line}"
                 );
             }
@@ -7343,13 +7345,13 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
         .position(|line| {
             command_of(line).is_some_and(|call| {
                 call
-                    == "cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings"
+                    == "cargo +\"$(cat .release-rust-version)\" clippy --locked --offline --workspace --all-targets -- -D warnings"
             })
         })
         .expect("the checks job must run the clippy gate");
     // `--nocapture` so the inventory report the wave cites as exit evidence
     // actually reaches the hosted log.
-    let prefix = "cargo +1.88 test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- ";
+    let prefix = "cargo +\"$(cat .release-rust-version)\" test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- ";
     let command_at = lines
         .iter()
         .position(|line| line.starts_with(prefix))
@@ -8137,7 +8139,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         );
     }
     let prepare = "run: python3 -I scripts/prepare-dependencies.py";
-    let first_project = "run: cargo +1.88 fetch --locked --manifest-path Cargo.toml";
+    let first_project =
+        "run: cargo +\"$(cat .release-rust-version)\" fetch --locked --manifest-path Cargo.toml";
     let moved = ci.replacen(prepare, "", 1).replacen(
         first_project,
         &format!("{first_project}\n        {prepare}"),

@@ -27,12 +27,13 @@ needs network access or pre-populated Cargo caches for the remaining locked
 dependencies; do not describe it as a full offline export.
 
 The full source export contains the complete Cargo dependency payload but does
-not contain Rust toolchains or operating-system build tools. Install Rust 1.88,
+not contain Rust toolchains or operating-system build tools. Install Rust 1.98.1,
 `nightly-2026-05-20` with `rust-src`, `bpf-linker`, Clang/LLVM, the native C
 toolchain, Python >=3.11 (or Python 3.10 with the distro `python3-tomli`
 package), Git, and ordinary POSIX shell/archive tools before the machine is
 disconnected. `rustup` and `bpf-linker` must be in the same
-canonical executable directory.
+canonical executable directory. The Rust version above tracks
+`.release-rust-version`, the single authoritative release-compiler pin.
 
 On Debian or Ubuntu with Python 3.10, install and verify the TOML parser while
 the machine is still connected:

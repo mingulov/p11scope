@@ -1320,13 +1320,12 @@ fn stable_selection_maps_with_probe(
     // On pre-6.8 kernels the overlay fd key never appears in maps; accept
     // only when the kernel renders this exact fd at a key the snapshot
     // contains.
-    if let Some(probed) = self_mapped_fallback_key(&file, current_key, budget, probe) {
-        if current_maps
+    if let Some(probed) = self_mapped_fallback_key(&file, current_key, budget, probe)
+        && current_maps
             .iter()
             .any(|mapping| ObjectKey::of(mapping) == probed)
-        {
-            return Ok(current_maps);
-        }
+    {
+        return Ok(current_maps);
     }
     Err(())
 }
@@ -1417,7 +1416,7 @@ fn selection_records(
         let mut authority = SelectionAuthority::None;
         if raw.helper_failure.is_none()
             && raw.request.name == SelectionNameClass::ExactStandard
-            && raw_result.table.is_some()
+            && let Some((mut table, origin)) = raw_result.table
             && matches.is_empty()
             && result.name == SelectionNameClass::ExactStandard
             && matches!(
@@ -1428,7 +1427,6 @@ fn selection_records(
             )
             && matches!(result.flags, 0 | 1)
         {
-            let (mut table, origin) = raw_result.table.unwrap();
             let key = (origin, result.version);
             let pair = (result.version, result.flags);
             if let Some((known_origin, table_id)) = pair_tables.get(&pair).copied() {

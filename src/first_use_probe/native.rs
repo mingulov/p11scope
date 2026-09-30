@@ -64,7 +64,7 @@ fn validate(config: &Config) -> anyhow::Result<crate::cli::CaptureArgs> {
         (1..=8192).contains(&config.fact_limit),
         "invalid fact limit"
     );
-    let crate::cli::Command::Profile(args) = crate::cli::parse(config.argv.clone().into_iter())
+    let crate::cli::Command::Profile(args) = crate::cli::parse(config.argv.clone())
         .map_err(|error| anyhow::anyhow!("probe CLI rejected: {error:?}"))?
     else {
         anyhow::bail!("probe requires the public profile command");

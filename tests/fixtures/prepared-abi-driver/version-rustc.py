@@ -14,4 +14,4 @@ status = CONFIG.get("rustc_version_status", 0)
 if status:
     print("fixture rustc version refusal", file=sys.stderr)
     raise SystemExit(status)
-print(CONFIG.get("rustc_version", "rustc 1.88.0 (fixture)"))
+print(CONFIG.get("rustc_version", "rustc 1.98.1 (fixture)"))

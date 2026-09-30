@@ -18,6 +18,7 @@ from unittest import mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+RELEASE_RUST = (REPOSITORY / ".release-rust-version").read_text(encoding="utf-8").strip()
 FIXTURES = REPOSITORY / "tests/fixtures/build-offline"
 OFFLINE_TESTS = REPOSITORY / "tests/python/test_offline_dependencies.py"
 
@@ -132,6 +133,7 @@ class BuildOfflineTests(unittest.TestCase):
         for source, target in copies.items():
             shutil.copyfile(source, target)
         (self.source / "scripts/prepare-dependencies.py").write_text("# fixture\n", encoding="utf-8")
+        shutil.copy2(REPOSITORY / ".release-rust-version", self.source / ".release-rust-version")
         for name in (".p11scope-source-export.json", ".cargo/config.toml",
                      "third-party/offline-dependencies.json", "third-party/offline/marker",
                      "bound-input"):
@@ -326,7 +328,7 @@ class BuildOfflineTests(unittest.TestCase):
         controls = [{"coherent_mutation": True}, {"payload_mutation": True},
                     {"tool_mutation": True}, {"unknown_sibling": True},
                     {"late_config_mutation": True}, {"build_fail": True},
-                    {"validator_fail": 2}, {"rustup_fail": "1.88:cargo"},
+                    {"validator_fail": 2}, {"rustup_fail": f"{RELEASE_RUST}:cargo"},
                     {"prepared_mtime_mutation": True}]
         controls.append({"swap_root_foreign": True})
         controls.extend({"swap_private": name} for name in
@@ -530,6 +532,7 @@ class BuildOfflineTests(unittest.TestCase):
         fixture.export_manifest.unlink()
         (fixture.root / ".gitignore").write_text(
             "third-party/src/\nthird-party/.prepare-dependencies.lock\n", encoding="utf-8")
+        shutil.copy2(REPOSITORY / ".release-rust-version", fixture.root / ".release-rust-version")
         clean_git = {key: value for key, value in os.environ.items()
                      if not key.startswith("GIT_")}
         clean_git.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
@@ -560,8 +563,8 @@ class BuildOfflineTests(unittest.TestCase):
         for name in ("rustup", "stable-cargo", "stable-rustc", "bpf-cargo", "bpf-linker"):
             (tools / name).chmod(0o755)
         (tools / "tool-map.json").write_text(json.dumps({
-            "1.88:cargo": str(tools / "stable-cargo"),
-            "1.88:rustc": str(tools / "stable-rustc"),
+            f"{RELEASE_RUST}:cargo": str(tools / "stable-cargo"),
+            f"{RELEASE_RUST}:rustc": str(tools / "stable-rustc"),
             "nightly-2026-05-20:cargo": str(tools / "bpf-cargo"),
             "nightly-2026-05-20:rustc": str(fixture.tools / "nightly rustc"),
         }), encoding="utf-8")

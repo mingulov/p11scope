@@ -18,6 +18,6 @@ if arguments == ["--version"]:
 record("rustup")
 if len(arguments) != 4 or arguments[:2] != ["which", "--toolchain"]:
     refuse("unsupported rustup arguments")
-if arguments[2] not in ("1.88", "nightly-2026-05-20") or arguments[3] not in ("cargo", "rustc"):
+if arguments[2] not in ("1.98.1", "nightly-2026-05-20") or arguments[3] not in ("cargo", "rustc"):
     refuse("unsupported toolchain or executable")
 print(CONFIG["tools"][arguments[2] + ":" + arguments[3]])

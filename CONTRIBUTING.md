@@ -69,10 +69,10 @@ and export `TMPDIR` with that absolute path before running tests. Keep it short 
 for the operating system's Unix-domain socket path limit.
 
 ```sh
-mise exec -- ./scripts/cargo.sh +1.88 fmt --all -- --check
-mise exec -- ./scripts/cargo.sh +1.88 check --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.88 test --locked --workspace --all-targets
-mise exec -- ./scripts/cargo.sh +1.88 clippy --locked --workspace --all-targets -- -D warnings
+mise exec -- ./scripts/cargo.sh +1.98.1 fmt --all -- --check
+mise exec -- ./scripts/cargo.sh +1.98.1 check --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.98.1 test --locked --workspace --all-targets
+mise exec -- ./scripts/cargo.sh +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 Record the commands, source revision and results with a change. Commit

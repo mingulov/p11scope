@@ -26,8 +26,8 @@ if [ "${P11SCOPE_FIXTURE_FAIL_QUERY-}" = "$query" ]; then
 fi
 
 case "$query" in
-    1.88:cargo) printf '%s\n' "$P11SCOPE_FIXTURE_STABLE_CARGO" ;;
-    1.88:rustc) printf '%s\n' "$P11SCOPE_FIXTURE_STABLE_RUSTC" ;;
+    1.98.1:cargo) printf '%s\n' "$P11SCOPE_FIXTURE_STABLE_CARGO" ;;
+    1.98.1:rustc) printf '%s\n' "$P11SCOPE_FIXTURE_STABLE_RUSTC" ;;
     nightly-2026-05-20:cargo) printf '%s\n' "$P11SCOPE_FIXTURE_BPF_CARGO" ;;
     nightly-2026-05-20:rustc) printf '%s\n' "$P11SCOPE_FIXTURE_BPF_RUSTC" ;;
     *)

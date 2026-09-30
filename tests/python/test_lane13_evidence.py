@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -224,6 +225,7 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.processes = []
         self.evidence_roots = []
         self.owned_launches = {}
+        self.accepted_sessions = set()
         self.settlement_errors = []
         self.settlement_diagnostics = []
         self.acknowledged_settlement_errors = 0
@@ -624,6 +626,7 @@ class Lane13EvidenceTests(unittest.TestCase):
             raise
         retained = {"record": record, "pidfd": descriptor}
         self.retained_body_handles[record["record_id"]] = retained
+        self.accepted_sessions.add(record["sid"])
         if controlled is not None:
             controlled["socket"].sendall(b"retained")
             if controlled["socket"].recv(16) != b"retained":
@@ -683,6 +686,7 @@ class Lane13EvidenceTests(unittest.TestCase):
                 descriptor = accepted["pidfd"]
                 if not self._pidfd_is_live(descriptor):
                     continue
+                self.accepted_sessions.add(accepted["record"]["sid"])
                 # Settlement authority was established at original admission.
                 # Publish before optional numeric observation, which can neither
                 # revoke that authority nor describe an already exited original.
@@ -732,6 +736,7 @@ class Lane13EvidenceTests(unittest.TestCase):
                     continue
                 pinned.append((record, descriptor, False))
                 descriptor_published = True
+                self.accepted_sessions.add(record["sid"])
                 signal.pidfd_send_signal(descriptor, signal.SIGTERM, None, 0)
             except (FileNotFoundError, ProcessLookupError):
                 if descriptor is not None and self._pidfd_is_live(descriptor):
@@ -772,6 +777,55 @@ class Lane13EvidenceTests(unittest.TestCase):
                 os.close(descriptor)
         return self._remember_settlement_errors(failures)
 
+    def wait_for_session_writers(self):
+        # A retired leader does not retire its children. In particular, a
+        # final input-ledger helper can still create files after its shell
+        # exits. Only observe sessions accepted through original launch or
+        # validated process handles; this grants no additional kill authority.
+        if not self.accepted_sessions:
+            return []
+        deadline = time.monotonic() + CLEANUP_SETTLE_SECONDS
+        empty_inventories = 0
+        while True:
+            remaining = []
+            try:
+                for path in Path("/proc").iterdir():
+                    if not path.name.isdecimal():
+                        continue
+                    descriptor = None
+                    identity = None
+                    try:
+                        pid = int(path.name)
+                        identity = self.read_process_snapshot(pid)["identity"]
+                        if identity["sid"] not in self.accepted_sessions:
+                            continue
+                        descriptor = os.pidfd_open(pid)
+                        if not self._pidfd_is_live(descriptor):
+                            continue
+                        second = self.read_process_snapshot(pid)["identity"]
+                        if any(second[key] != identity[key] for key in ("starttime", "sid")):
+                            return [f"session writer identity changed during inventory: {pid}"]
+                        # A zombie main thread can still have a worker writing
+                        # evidence. Pidfd readiness covers the whole thread group.
+                        if self._pidfd_is_live(descriptor):
+                            remaining.append((pid, identity["starttime"]))
+                    except (FileNotFoundError, ProcessLookupError):
+                        if descriptor is not None and self._pidfd_is_live(descriptor):
+                            remaining.append((pid, identity["starttime"]))
+                    finally:
+                        if descriptor is not None:
+                            os.close(descriptor)
+            except (OSError, ValueError) as error:
+                return [f"session writer inventory: {error}"]
+            empty_inventories = 0 if remaining else empty_inventories + 1
+            # Re-enumerate after an empty scan: a listed parent can fork and
+            # disappear before its stat read while its new child is still live.
+            if empty_inventories >= 2:
+                return []
+            if time.monotonic() >= deadline:
+                return [f"owned session writers remained live: {remaining}"]
+            time.sleep(0.02)
+
     def cleanup_case(self):
         if self.cleaned:
             return
@@ -789,6 +843,7 @@ class Lane13EvidenceTests(unittest.TestCase):
                     process.communicate(timeout=2)
                 except subprocess.TimeoutExpired:
                     failures.append(f"direct child {process.pid} did not settle")
+        failures.extend(self.wait_for_session_writers())
         failures.extend(self.settlement_errors[self.acknowledged_settlement_errors:])
         for launch in self.owned_launches.values():
             os.close(launch["pidfd"])
@@ -876,6 +931,7 @@ class Lane13EvidenceTests(unittest.TestCase):
             "evidence": evidence,
             "record": {"pid": process.pid, **first, "argv": list(arguments)},
         }
+        self.accepted_sessions.add(first["sid"])
         return process
 
     def signal_owned_process(self, process, signal_number):
@@ -1905,6 +1961,160 @@ exit "$helper_status"
         self.assertFalse(self.work_path(work).exists())
         self.assertEqual(self.settle_recorded(), [])
         self.assertFalse(self._pidfd_is_live(retained_body["pidfd"]))
+
+    def test_cleanup_waits_for_writer_after_its_session_leader_exits(self):
+        self.cleanup_writer_case(refuse_cleanup=False)
+
+    def test_cleanup_retains_evidence_if_session_writer_does_not_exit(self):
+        self.cleanup_writer_case(refuse_cleanup=True)
+
+    def test_cleanup_waits_for_worker_after_thread_group_leader_exits(self):
+        self.cleanup_writer_case(refuse_cleanup=False, threaded_writer=True)
+
+    def test_cleanup_rescans_child_forked_during_process_inventory(self):
+        self.cleanup_writer_case(refuse_cleanup=False, relay_writer=True)
+
+    def test_cleanup_retains_evidence_if_zombie_leader_has_live_worker(self):
+        self.cleanup_writer_case(refuse_cleanup=True, threaded_writer=True)
+
+    def test_cleanup_retains_evidence_for_child_forked_during_inventory(self):
+        self.cleanup_writer_case(refuse_cleanup=True, relay_writer=True)
+
+    def cleanup_writer_case(self, refuse_cleanup, threaded_writer=False, relay_writer=False):
+        evidence = self.root / "late-writer"
+        evidence.mkdir()
+        read_fd, write_fd = os.pipe()
+        descriptor = None
+        descriptors = []
+        relay_read, relay_write = os.pipe()
+        timer = None
+        real_cleanup = self.temp.cleanup
+        try:
+            code = """import os,sys,time
+from pathlib import Path
+root = Path(sys.argv[1])
+control = int(sys.argv[2])
+mode = sys.argv[3]
+relay = int(sys.argv[4])
+pid = os.fork()
+if pid == 0:
+    null = os.open(os.devnull, os.O_RDWR)
+    for target in (0, 1, 2):
+        os.dup2(null, target)
+    os.close(null)
+    def write_late():
+        os.read(control, 1)
+        (root / 'late.sha256').write_text('completed\\n')
+        os._exit(0)
+    (root / 'writer.pending').write_text(str(os.getpid()))
+    (root / 'writer.pending').replace(root / 'writer.pid')
+    if mode == 'threaded':
+        import ctypes,threading
+        threading.Thread(target=write_late).start()
+        ctypes.CDLL(None).pthread_exit(None)
+    elif mode == 'relay':
+        os.read(relay, 1)
+        if os.fork() != 0:
+            os._exit(0)
+        (root / 'writer-next.pending').write_text(str(os.getpid()))
+        (root / 'writer-next.pending').replace(root / 'writer-next.pid')
+        write_late()
+    else:
+        write_late()
+os.close(control)
+time.sleep(20)
+"""
+            mode = "threaded" if threaded_writer else "relay" if relay_writer else "single"
+            parent = self.start_owned(
+                [sys.executable, "-I", "-c", code, str(evidence), str(read_fd),
+                 mode, str(relay_read)],
+                self.env | {"P11SCOPE_LANE_EVIDENCE_DIR": str(evidence)},
+                pass_fds=(read_fd, relay_read),
+            )
+            deadline = time.monotonic() + 5
+            while not (evidence / "writer.pid").exists() and time.monotonic() < deadline:
+                self.assertIsNone(parent.poll())
+                time.sleep(0.01)
+            child = int((evidence / "writer.pid").read_text())
+            descriptor = os.pidfd_open(child)
+            descriptors.append(descriptor)
+            self.assertEqual(self.read_process_identity(child)["sid"], parent.pid)
+            self.assertTrue(self._pidfd_is_live(descriptor))
+            if threaded_writer:
+                while self.read_process_snapshot(child)["state"] != "Z" \
+                        and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(self.read_process_snapshot(child)["state"], "Z")
+                self.assertTrue(self._pidfd_is_live(descriptor))
+            settled = self.settle_recorded
+            read_snapshot = self.read_process_snapshot
+            relay_started = False
+
+            def snapshot_after_relay(pid):
+                nonlocal descriptor, relay_started, timer
+                if relay_writer and pid == child and not relay_started:
+                    relay_started = True
+                    os.write(relay_write, b"go")
+                    ready = evidence / "writer-next.pid"
+                    deadline = time.monotonic() + 5
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    replacement = int(ready.read_text())
+                    descriptor = os.pidfd_open(replacement)
+                    descriptors.append(descriptor)
+                    self.assertEqual(read_snapshot(replacement)["identity"]["sid"], parent.pid)
+                    self.assertTrue(select.select([descriptors[0]], [], [], 5)[0])
+                    self.assertTrue(self._pidfd_is_live(descriptor))
+                    if not refuse_cleanup:
+                        timer = threading.Timer(0.25, os.write, args=(write_fd, b"go"))
+                        timer.start()
+                return read_snapshot(pid)
+
+            def settle_then_release_writer(*args, **kwargs):
+                nonlocal timer
+                result = settled(*args, **kwargs)
+                launch = next(item for item in self.owned_launches.values()
+                              if item["process"] is parent)
+                self.assertFalse(self._pidfd_is_live(launch["pidfd"]))
+                if not refuse_cleanup and not relay_writer:
+                    timer = threading.Timer(0.25, os.write, args=(write_fd, b"go"))
+                    timer.start()
+                return result
+
+            def delete_only_after_writer_exit():
+                self.assertFalse(self._pidfd_is_live(descriptor),
+                                 "evidence deletion raced an owned session writer")
+                self.assertEqual((evidence / "late.sha256").read_text(), "completed\n")
+                real_cleanup()
+
+            with mock.patch.object(self, "settle_recorded", side_effect=settle_then_release_writer), \
+                    mock.patch.object(self, "read_process_snapshot", side_effect=snapshot_after_relay), \
+                    mock.patch.object(self.temp, "cleanup", side_effect=delete_only_after_writer_exit):
+                if refuse_cleanup:
+                    with mock.patch(__name__ + ".CLEANUP_SETTLE_SECONDS", 0), \
+                            self.assertRaisesRegex(AssertionError, "owned session writers remained live"):
+                        self.cleanup_case()
+                    self.assertTrue(self.root.exists())
+                    self.assertTrue(self._pidfd_is_live(descriptor))
+                    self.assertFalse((evidence / "late.sha256").exists())
+                else:
+                    self.cleanup_case()
+                    self.assertFalse(self.root.exists())
+                if relay_writer:
+                    self.assertTrue(relay_started)
+        finally:
+            os.write(relay_write, b"go")
+            if timer is not None:
+                timer.join(timeout=2)
+            else:
+                os.write(write_fd, b"go")
+            for handle in descriptors:
+                self.close_controlled_handle(handle)
+            os.close(read_fd)
+            os.close(write_fd)
+            os.close(relay_read)
+            os.close(relay_write)
+            real_cleanup()
 
     def test_retained_body_handle_settles_when_late_inventory_is_malformed(self):
         decoy = self.start_decoy()

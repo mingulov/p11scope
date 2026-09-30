@@ -77,6 +77,12 @@ unrelated browser, service, VM, container or another agent's capture.
 
 - Inspect branch, worktree and status first. Preserve unrelated changes;
   use an isolated worktree when needed. Commit finished, verified work.
+- Git worktree disk hygiene: always run `cargo clean` in a worktree before
+  `git worktree remove` -- with cargo's build dir redirected outside the
+  worktree (`build.build-dir`), removal orphans that worktree's cached build
+  instead of deleting it. If removal refuses or the worktree stays idle, at
+  least `cargo clean` it. Prefer `remove` over `rm -rf` (manual deletion needs
+  a follow-up `git worktree prune`).
 - Use the contributor's real configured Git identity; do not invent an
   automation identity or replace another contributor's attribution.
   Add the sign-off required by [CONTRIBUTING.md](CONTRIBUTING.md).

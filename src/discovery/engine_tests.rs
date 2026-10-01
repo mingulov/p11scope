@@ -90,7 +90,7 @@ fn unvalidated_discovery_accounting_changes_only_bounded_loss_evidence() {
     engine.timings.observe(&timing, 1_000_000);
     engine.timings.complete(&timing, 2_000_000);
     engine.discovery_truncated = 1;
-    engine.refresh_requested.insert(std::process::id());
+    engine.refresh_requested.insert(std::process::id(), None);
     engine.pending_retirements.insert(view);
     engine.ready_expected_removals.insert(view);
     engine.expected_target_exit_pending = Some(view);
@@ -396,7 +396,7 @@ fn shallow_idle_predicate_covers_pending_refresh_staged_and_scope() {
     assert!(!engine.discovery_shallow_idle());
     engine.pending_retirements.clear();
 
-    engine.refresh_requested.insert(std::process::id());
+    engine.refresh_requested.insert(std::process::id(), None);
     assert!(!engine.discovery_shallow_idle());
     engine.refresh_requested.clear();
 
@@ -3004,7 +3004,7 @@ fn cgroup_exec_rejects_a_stale_retained_generation() {
     engine.dispatch_lifecycle_record(&exec, &mut pending);
 
     assert!(pending.is_empty());
-    assert!(!engine.refresh_requested.contains(&child.id()));
+    assert!(!engine.refresh_requested.contains_key(&child.id()));
     assert!(
         engine.admitted_cgroup_views[&ProcessViewId(35)]
             .closed_ns
@@ -3291,7 +3291,7 @@ fn leader_exit_loss_closes_only_the_owned_selection_view() {
         },
     );
     engine.pending_leader_exit_views.insert(ProcessViewId(25));
-    engine.refresh_requested.insert(std::process::id());
+    engine.refresh_requested.insert(std::process::id(), None);
     let mut pending_views = PendingViewRetirements::new();
     let mut additions_allowed = true;
     let mut closure = PauseClosure::new(true);
@@ -3321,7 +3321,7 @@ fn leader_exit_loss_closes_only_the_owned_selection_view() {
         SelectionCoverageState::OwnedClosed(generation)
     );
     assert!(
-        !engine.refresh_requested.contains(&std::process::id()),
+        !engine.refresh_requested.contains_key(&std::process::id()),
         "link loss does not re-arm the same live view"
     );
 }
@@ -3369,7 +3369,8 @@ fn inventory_scan_skips_views_retired_before_their_refresh() {
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let mut engine = lifecycle_discovered(vec![view]);
     let views = BTreeSet::from([ProcessViewId(0), ProcessViewId(7)]);
-    let (scans, _, _, skipped) = engine.scan_inventory_views(&views, "test refresh");
+    let mut tick_now = crate::attach::monotonic_ns;
+    let (scans, _, _, skipped) = engine.scan_inventory_views(&views, "test refresh", &mut tick_now);
     let scanned: Vec<u32> = scans.iter().map(|(view, _, _)| view.0).collect();
     assert!(
         scanned.iter().all(|id| *id == 0),
@@ -3495,7 +3496,7 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
         pending.get(&ProcessViewId(18)),
         Some(&RetirementCause::ExpectedRemoval)
     );
-    assert!(!engine.refresh_requested.contains(&child.id()));
+    assert!(!engine.refresh_requested.contains_key(&child.id()));
     assert!(
         engine
             .counters
@@ -4517,6 +4518,7 @@ fn refresh_inventory_once(engine: &mut Engine) {
 
 fn refresh_inventory_with(engine: &mut Engine, session: &mut ScriptedSession) {
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
     engine
         .refresh_inventory(
             session,
@@ -4525,6 +4527,7 @@ fn refresh_inventory_with(engine: &mut Engine, session: &mut ScriptedSession) {
             &mut PendingViewRetirements::new(),
             &mut *collect,
             &mut PauseClosure::new(true),
+            &mut tick_now,
         )
         .expect("an inventory refresh over a cgroup scope");
 }
@@ -4732,7 +4735,7 @@ fn a_sticky_refresh_request_does_not_excuse_a_live_armed_mapping() {
 
     let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
     engine.retirement_intents.clear();
-    engine.refresh_requested.insert(pid);
+    engine.refresh_requested.insert(pid, None);
     let mut record = loader_record_for(context, pid);
     record.table_ptr = 0x1000;
     let mut session = ScriptedSession::with_records([], 1);
@@ -5277,7 +5280,7 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
 fn refresh_request_queue_is_bounded_with_explicit_overflow() {
     let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
     for pid in 1..=(MAX_PENDING_REFRESH as u32 + 44) {
-        engine.request_refresh(pid);
+        engine.request_refresh(pid, None);
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 44);
@@ -5294,7 +5297,7 @@ fn refresh_request_queue_is_bounded_with_explicit_overflow() {
         engine.counters.object_skips
     );
     // Re-requesting a queued pid is a no-op, not more overflow.
-    engine.request_refresh(1);
+    engine.request_refresh(1, None);
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 44);
 }
@@ -6091,13 +6094,14 @@ fn refresh_requests_survive_allocation_exhaustion() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     engine.max_scan_pids = 2;
     // Queue event-driven refreshes for the two unknown members.
-    engine.refresh_requested.insert(pids[3]);
-    engine.refresh_requested.insert(pids[4]);
+    engine.refresh_requested.insert(pids[3], None);
+    engine.refresh_requested.insert(pids[4], None);
 
     refresh_inventory_once(&mut engine);
 
     assert!(
-        engine.refresh_requested.contains(&pids[3]) && engine.refresh_requested.contains(&pids[4]),
+        engine.refresh_requested.contains_key(&pids[3])
+            && engine.refresh_requested.contains_key(&pids[4]),
         "exhaustion retains the queued work: {:?}",
         engine.refresh_requested
     );
@@ -6205,7 +6209,7 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     // A queued lifecycle refresh for the newcomer attempts admission and
     // exhausts: the standard skip names the effective value, the request
     // stays queued for a later pass, and nothing is displaced.
-    engine.request_refresh(newcomer);
+    engine.request_refresh(newcomer, None);
     refresh_inventory_once(&mut engine);
 
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
@@ -6220,7 +6224,7 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains(&newcomer),
+        engine.refresh_requested.contains_key(&newcomer),
         "exhaustion retains the queued refresh: {:?}",
         engine.refresh_requested
     );
@@ -6366,6 +6370,7 @@ fn a_capture_refresh_ends_on_a_proven_exit_instead_of_failing() {
 
     let mut session = ScriptedSession::with_records([], 0);
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
     let outcome = engine.refresh_inventory(
         &mut session,
         &mut true,
@@ -6373,6 +6378,7 @@ fn a_capture_refresh_ends_on_a_proven_exit_instead_of_failing() {
         &mut PendingViewRetirements::new(),
         &mut *collect,
         &mut PauseClosure::new(true),
+        &mut tick_now,
     );
 
     assert!(
@@ -6636,7 +6642,7 @@ fn lifecycle_completed_discovery_agreement_survives_real_child_exit() {
     let mut engine = fixture.discover_before_load();
     let generation = engine.views[0].id();
     fixture.load();
-    engine.request_refresh(fixture.child.pid());
+    engine.request_refresh(fixture.child.pid(), None);
     refresh_inventory_once(&mut engine);
     engine.publish_current_capture_facts().unwrap();
 
@@ -6723,7 +6729,7 @@ fn lifecycle_scan_only_exit_reports_zero_active_slots() {
     let mut fixture = DiscoveryLifecycleFixture::start();
     let mut engine = fixture.discover_scan_only_before_load();
     fixture.load();
-    engine.request_refresh(fixture.child.pid());
+    engine.request_refresh(fixture.child.pid(), None);
     refresh_inventory_once(&mut engine);
     engine.publish_current_capture_facts().unwrap();
 
@@ -6770,7 +6776,7 @@ fn lifecycle_exit_before_discovery_service_stays_explicitly_uncorroborated() {
     let mut fixture = DiscoveryLifecycleFixture::start();
     let mut engine = fixture.discover_before_load();
     fixture.load();
-    engine.request_refresh(fixture.child.pid());
+    engine.request_refresh(fixture.child.pid(), None);
     // The workload did load and acquire its provider, but the observer has
     // deliberately not serviced the request when this exact generation exits.
     fixture.exit_and_reap();
@@ -7155,7 +7161,7 @@ fn delayed_pre_admission_exec_cannot_refresh_a_reused_pid() {
     engine.dispatch_lifecycle_record(&delayed, &mut pending);
 
     assert!(pending.is_empty());
-    assert!(!engine.refresh_requested.contains(&std::process::id()));
+    assert!(!engine.refresh_requested.contains_key(&std::process::id()));
 }
 
 #[test]
@@ -7206,7 +7212,7 @@ fn cgroup_departure_is_journaled_before_fallible_retirement() {
         Some(&RetirementCause::ExpectedRemoval)
     );
     assert!(engine.ready_expected_removals.contains(&ProcessViewId(20)));
-    assert!(!engine.refresh_requested.contains(&std::process::id()));
+    assert!(!engine.refresh_requested.contains_key(&std::process::id()));
     pending.clear();
     assert_eq!(
         engine.retirement_intents.get(&ProcessViewId(20)),
@@ -7274,7 +7280,7 @@ fn retirement_intent_is_persistent_and_generation_loss_is_sticky() {
         pending.get(&ProcessViewId(15)),
         Some(&RetirementCause::GenerationLost)
     );
-    assert!(engine.refresh_requested.contains(&std::process::id()));
+    assert!(engine.refresh_requested.contains_key(&std::process::id()));
     assert_eq!(
         engine
             .counters
@@ -8541,7 +8547,7 @@ fn owned_initial_exec_preserves_the_prearm_until_later_loader_discovery() {
     assert!(
         !engine
             .refresh_requested
-            .contains(&((exec.pid_tgid >> 32) as u32))
+            .contains_key(&((exec.pid_tgid >> 32) as u32))
     );
 }
 
@@ -11727,12 +11733,13 @@ fn named_target_exit_during_inventory_preflight_ends_the_capture_not_fails_it() 
         engine
             .views
             .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
-        engine.request_refresh(pid);
+        engine.request_refresh(pid, None);
         engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
         let mut session = ScriptedSession::default();
         session.lose_generations_at_preflight(losses.iter().map(|loss| loss.map(|()| pid)));
         let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
 
+        let mut tick_now = crate::attach::monotonic_ns;
         let refreshed = engine.refresh_inventory(
             &mut session,
             &mut true,
@@ -11740,6 +11747,7 @@ fn named_target_exit_during_inventory_preflight_ends_the_capture_not_fails_it() 
             &mut PendingViewRetirements::new(),
             &mut *collect,
             &mut PauseClosure::new(true),
+            &mut tick_now,
         );
 
         refreshed.unwrap_or_else(|error| {
@@ -16983,7 +16991,7 @@ fn refresh_releases_view_ids_when_a_new_generation_ends_before_admission() {
     );
     assert!(
         lost.iter()
-            .all(|pid| engine.refresh_requested.contains(pid)),
+            .all(|pid| engine.refresh_requested.contains_key(pid)),
         "every lost newcomer's pid is queued again: {:?}",
         engine.refresh_requested
     );
@@ -17050,7 +17058,7 @@ fn refresh_releases_view_ids_at_the_post_retirement_preflight_exits() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains(&pid),
+        engine.refresh_requested.contains_key(&pid),
         "tick 2: the lost newcomer's pid is queued again"
     );
     assert_eq!(
@@ -17155,6 +17163,7 @@ fn u07_name_members(scope: &Path, members: &[u32]) {
 /// One inventory tick that hands the tick's additions frame to the caller.
 fn u07_tick(engine: &mut Engine, session: &mut ScriptedSession, additions: &mut bool) {
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
     engine
         .refresh_inventory(
             session,
@@ -17163,6 +17172,7 @@ fn u07_tick(engine: &mut Engine, session: &mut ScriptedSession, additions: &mut 
             &mut PendingViewRetirements::new(),
             &mut *collect,
             &mut PauseClosure::new(true),
+            &mut tick_now,
         )
         .expect("an inventory refresh over a cgroup scope");
 }
@@ -17362,7 +17372,7 @@ fn a_closed_tick_leaves_a_newcomer_unpublished_and_requested() {
         "the unpublished newcomer's view ID returns to the pool"
     );
     assert!(
-        engine.refresh_requested.contains(&newcomer.pid()),
+        engine.refresh_requested.contains_key(&newcomer.pid()),
         "the unpublished newcomer is requested again"
     );
 
@@ -17389,7 +17399,7 @@ fn a_closed_tick_leaves_a_newcomer_unpublished_and_requested() {
         "the next open tick arms the newcomer's loader"
     );
     assert!(
-        !engine.refresh_requested.contains(&newcomer.pid()),
+        !engine.refresh_requested.contains_key(&newcomer.pid()),
         "the admission consumes the retry request"
     );
 }
@@ -17448,7 +17458,7 @@ fn a_generation_lost_during_a_newcomers_attach_leaves_no_orphaned_publication() 
         "the survivor's attached links were rolled back"
     );
     assert!(
-        engine.refresh_requested.contains(&survivor.pid()),
+        engine.refresh_requested.contains_key(&survivor.pid()),
         "the unpublished survivor is requested again"
     );
 
@@ -17514,7 +17524,7 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
     // The member dlopens its provider; the request models the refresh event.
     member.send(b'L');
     member.wait_for(b"P11SCOPE_LAZY loaded\n");
-    engine.request_refresh(member.pid());
+    engine.request_refresh(member.pid(), None);
     // Killed and reaped inside the candidate's detach, before its attach
     // precheck; the test never waits on it.
     let lost = spawn_execed_sleep().id();
@@ -17553,7 +17563,7 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains(&member.pid()),
+        engine.refresh_requested.contains_key(&member.pid()),
         "the member's refresh request survives for the retry"
     );
 
@@ -17575,7 +17585,7 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
         "the next tick arms the member's loader"
     );
     assert!(
-        !engine.refresh_requested.contains(&member.pid()),
+        !engine.refresh_requested.contains_key(&member.pid()),
         "the retry consumes the refresh request"
     );
 }
@@ -17646,7 +17656,7 @@ fn a_closure_after_admission_requests_the_newcomer_it_left_unarmed() {
         "the closed tick skips arming"
     );
     assert!(
-        engine.refresh_requested.contains(&newcomer.pid()),
+        engine.refresh_requested.contains_key(&newcomer.pid()),
         "the newcomer the closed tick left unarmed is requested again"
     );
 
@@ -17657,7 +17667,7 @@ fn a_closure_after_admission_requests_the_newcomer_it_left_unarmed() {
         "the next tick arms the newcomer"
     );
     assert!(
-        !engine.refresh_requested.contains(&newcomer.pid()),
+        !engine.refresh_requested.contains_key(&newcomer.pid()),
         "arming consumes the refresh request"
     );
 }
@@ -17707,7 +17717,7 @@ fn a_foreign_exit_during_arming_requests_the_newcomer_it_left_unarmed() {
         "the closed tick leaves the surviving newcomer unarmed"
     );
     assert!(
-        engine.refresh_requested.contains(&survivor.pid()),
+        engine.refresh_requested.contains_key(&survivor.pid()),
         "the newcomer the closed tick left unarmed is requested again"
     );
 
@@ -17718,7 +17728,7 @@ fn a_foreign_exit_during_arming_requests_the_newcomer_it_left_unarmed() {
         "the next tick arms the surviving newcomer"
     );
     assert!(
-        !engine.refresh_requested.contains(&survivor.pid()),
+        !engine.refresh_requested.contains_key(&survivor.pid()),
         "arming consumes the refresh request"
     );
 }
@@ -17766,7 +17776,7 @@ fn a_foreign_exit_during_arming_requests_the_refreshed_view_it_left_unarmed() {
     // The member dlopens its provider; the request models the refresh event.
     member.send(b'L');
     member.wait_for(b"P11SCOPE_LAZY loaded\n");
-    engine.request_refresh(member.pid());
+    engine.request_refresh(member.pid(), None);
     // Preflights 1 and 2 are the tick's own; 3 is the member's loader
     // candidate, where the foreign view ends.
     session.lose_generations_at_preflight([None, None, Some(foreign.pid())]);
@@ -17787,7 +17797,7 @@ fn a_foreign_exit_during_arming_requests_the_refreshed_view_it_left_unarmed() {
         "the closed tick leaves the refreshed member unarmed"
     );
     assert!(
-        engine.refresh_requested.contains(&member.pid()),
+        engine.refresh_requested.contains_key(&member.pid()),
         "the refreshed view the closed tick left unarmed is requested again"
     );
 
@@ -17798,7 +17808,7 @@ fn a_foreign_exit_during_arming_requests_the_refreshed_view_it_left_unarmed() {
         "the next tick arms the member"
     );
     assert!(
-        !engine.refresh_requested.contains(&member.pid()),
+        !engine.refresh_requested.contains_key(&member.pid()),
         "arming consumes the refresh request"
     );
 }
@@ -17874,8 +17884,8 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
 
     // Tick 3 refreshes both. The earlier view ends inside its own export
     // attachment, closing additions before the later view's work runs.
-    engine.request_refresh(earlier.pid());
-    engine.request_refresh(later.pid());
+    engine.request_refresh(earlier.pid(), None);
+    engine.request_refresh(later.pid(), None);
     session.lose_generation_at_dynamic_attach(earlier.pid());
     let calls_before = session.dynamic_attach_calls.len();
     let mut additions = true;
@@ -17908,7 +17918,7 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
         "the later view was armed before its exports were skipped"
     );
     assert!(
-        engine.refresh_requested.contains(&later.pid()),
+        engine.refresh_requested.contains_key(&later.pid()),
         "the armed view whose exports were skipped is requested again"
     );
 
@@ -17931,7 +17941,7 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
         .count();
     assert_eq!(live_contexts, 1, "the retry does not double-arm the loader");
     assert!(
-        !engine.refresh_requested.contains(&later.pid()),
+        !engine.refresh_requested.contains_key(&later.pid()),
         "the retry consumes the refresh request"
     );
     let (active, _) = u07_provider_slots(&engine, "u07-exp-second.so");
@@ -17994,8 +18004,8 @@ fn an_open_tick_export_failure_is_not_retried_by_a_later_closure() {
     // Tick 3 refreshes both. The earlier view's exports fail ordinarily
     // while the tick is still open; the later view then ends inside its
     // own export attachment, closing additions.
-    engine.request_refresh(earlier.pid());
-    engine.request_refresh(later.pid());
+    engine.request_refresh(earlier.pid(), None);
+    engine.request_refresh(later.pid(), None);
     session.fail_dynamic_attach_for(earlier.pid());
     session.lose_generation_at_dynamic_attach(later.pid());
     let calls_before = session.dynamic_attach_calls.len();
@@ -18030,7 +18040,7 @@ fn an_open_tick_export_failure_is_not_retried_by_a_later_closure() {
         "the earlier view stays armed through its ordinary failure"
     );
     assert!(
-        !engine.refresh_requested.contains(&earlier.pid()),
+        !engine.refresh_requested.contains_key(&earlier.pid()),
         "an open-tick ordinary failure is not re-requested by a later closure"
     );
     assert!(
@@ -18150,7 +18160,7 @@ fn a_generation_skipped_replacement_recovers_the_surviving_owner() {
         "A's slots are active with links, not merely reactivated"
     );
     assert!(
-        !engine.refresh_requested.contains(&owner_a.pid()),
+        !engine.refresh_requested.contains_key(&owner_a.pid()),
         "the recovery consumes the re-request"
     );
 
@@ -18254,7 +18264,7 @@ fn a_replacement_skipped_by_an_attach_phase_loss_recovers_the_surviving_owner() 
         "B never joins the retained views"
     );
     assert!(
-        engine.refresh_requested.contains(&owner_a.pid()),
+        engine.refresh_requested.contains_key(&owner_a.pid()),
         "the surviving owner is requested again"
     );
 
@@ -18273,7 +18283,7 @@ fn a_replacement_skipped_by_an_attach_phase_loss_recovers_the_surviving_owner() 
         "A's slots are active with links, not merely reactivated"
     );
     assert!(
-        !engine.refresh_requested.contains(&owner_a.pid()),
+        !engine.refresh_requested.contains_key(&owner_a.pid()),
         "the recovery consumes the re-request"
     );
 
@@ -18395,7 +18405,7 @@ fn startup_export_attach_retries_the_view_a_lost_generation_skipped() {
         "the later view stays armed through the skipped startup attach"
     );
     assert!(
-        engine.refresh_requested.contains(&later.pid()),
+        engine.refresh_requested.contains_key(&later.pid()),
         "the view skipped by the lost startup generation is requested again"
     );
 
@@ -18421,7 +18431,7 @@ fn startup_export_attach_retries_the_view_a_lost_generation_skipped() {
         "the recovery does not double-arm the loader"
     );
     assert!(
-        !engine.refresh_requested.contains(&later.pid()),
+        !engine.refresh_requested.contains_key(&later.pid()),
         "the recovery consumes the refresh request"
     );
     let (active, _) = u07_provider_slots(&engine, "u07-g3-second.so");
@@ -20322,6 +20332,7 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
     let hooks = HookRegistry::builtin();
     let mut counters = DiscoveryCounters::default();
     let first_view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let mut stage = crate::timing::StageTimings::new();
     let (_, first) = scan_and_pin(
         &first_view,
         &hints,
@@ -20329,6 +20340,7 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
         &mut budget,
         &mut counters,
         false,
+        &mut stage,
     )
     .unwrap();
     let second_view = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
@@ -20339,6 +20351,7 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
         &mut budget,
         &mut counters,
         false,
+        &mut stage,
     )
     .unwrap();
     assert_eq!(first.pinned().count(), 1);
@@ -20648,6 +20661,7 @@ fn p2_refuse_then_exit(
         &mut CaptureWorkBudget::default(),
         counters,
         false,
+        &mut crate::timing::StageTimings::default(),
         |_, view, budget| {
             let outcome = crate::discovery::scan::bracket_refusal_for_test(view, budget);
             assert!(outcome.modules().is_empty());
@@ -22585,6 +22599,7 @@ fn system_scope_refresh_admits_later_generation_in_same_engine() {
     // still fails the assertions below.
     for _ in 0..25 {
         let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+        let mut tick_now = crate::attach::monotonic_ns;
         engine
             .refresh_inventory(
                 &mut session,
@@ -22593,6 +22608,7 @@ fn system_scope_refresh_admits_later_generation_in_same_engine() {
                 &mut PendingViewRetirements::new(),
                 &mut *collect,
                 &mut PauseClosure::new(true),
+                &mut tick_now,
             )
             .expect("the refresh tick applies");
         if engine.views.iter().any(|view| view.pid() == pid_b) {
@@ -22704,6 +22720,7 @@ fn system_scope_refresh_admits_later_generation_in_same_engine() {
     // attributed slot holds steady and the later child is not attached
     // a second time.
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let mut tick_now = crate::attach::monotonic_ns;
     engine
         .refresh_inventory(
             &mut session,
@@ -22712,6 +22729,7 @@ fn system_scope_refresh_admits_later_generation_in_same_engine() {
             &mut PendingViewRetirements::new(),
             &mut *collect,
             &mut PauseClosure::new(true),
+            &mut tick_now,
         )
         .expect("a quiet refresh tick applies");
     let views_a: Vec<_> = engine
@@ -22761,6 +22779,7 @@ fn system_scope_refresh_admits_later_generation_in_same_engine() {
     // refresh until the reaped generation's view is gone.
     for _ in 0..25 {
         let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+        let mut tick_now = crate::attach::monotonic_ns;
         engine
             .refresh_inventory(
                 &mut session,
@@ -22769,6 +22788,7 @@ fn system_scope_refresh_admits_later_generation_in_same_engine() {
                 &mut PendingViewRetirements::new(),
                 &mut *collect,
                 &mut PauseClosure::new(true),
+                &mut tick_now,
             )
             .expect("the refresh after the owned reap applies");
         if engine.views.iter().all(|view| view.id() != id_b) {
@@ -23895,6 +23915,7 @@ fn e07_unchanged_complete_loader_rescan_retires_nothing() {
         &engine.hooks,
         &mut engine.budget,
         false,
+        &mut engine.stage_timings,
     );
     let (found, _, complete) = scan_result.expect("the view still scans");
     assert!(complete, "an unchanged full scan is complete");
@@ -24614,8 +24635,17 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
     // A clean scan over a live budget is complete.
     let mut budget = CaptureWorkBudget::default();
     let mut counters = DiscoveryCounters::default();
-    let (_, _, complete) =
-        scan_and_pin_with(&view, &[], &hooks, &mut budget, &mut counters, false, clean).unwrap();
+    let (_, _, complete) = scan_and_pin_with(
+        &view,
+        &[],
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        clean,
+    )
+    .unwrap();
     assert!(complete);
 
     // Verified absence keeps a scan complete.
@@ -24628,6 +24658,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut budget,
         &mut counters,
         false,
+        &mut crate::timing::StageTimings::default(),
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Scanned {
                 modules: Vec::new(),
@@ -24652,6 +24683,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut budget,
         &mut counters,
         false,
+        &mut crate::timing::StageTimings::default(),
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Scanned {
                 modules: Vec::new(),
@@ -24676,6 +24708,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut budget,
         &mut counters,
         false,
+        &mut crate::timing::StageTimings::default(),
         |_, _, _| {
             Ok::<_, String>(ScanOutcome::Unavailable {
                 reason: "ptrace",
@@ -24691,8 +24724,17 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
     let mut budget = CaptureWorkBudget::default();
     assert!(!budget.charge(u64::MAX), "the budget stops");
     let mut counters = DiscoveryCounters::default();
-    let (_, _, complete) =
-        scan_and_pin_with(&view, &[], &hooks, &mut budget, &mut counters, false, clean).unwrap();
+    let (_, _, complete) = scan_and_pin_with(
+        &view,
+        &[],
+        &hooks,
+        &mut budget,
+        &mut counters,
+        false,
+        &mut crate::timing::StageTimings::default(),
+        clean,
+    )
+    .unwrap();
     assert!(!complete, "a stopped scan is incomplete");
 
     // A refused new candidate marks the scan incomplete.
@@ -24708,6 +24750,7 @@ fn scan_and_pin_reports_completeness_for_the_candidate_boundary() {
         &mut budget,
         &mut counters,
         false,
+        &mut crate::timing::StageTimings::default(),
         |_, _, budget| {
             assert!(!budget.admit_table(1), "the 513th candidate refuses");
             Ok::<_, String>(ScanOutcome::Scanned {
@@ -24973,7 +25016,7 @@ fn exploratory_rotation_never_evicts_owned_views() {
     // A same-image refresh mid-rotation: the rescan must run (deep-scan
     // delta below) and replace with identical content, and the view must
     // arm (it owns a provider, so the ownership gate passes).
-    engine.request_refresh(provider_pid);
+    engine.request_refresh(provider_pid, None);
     let scans_before = engine.deep_scans;
 
     let mut sleep_a_seen = false;
@@ -25144,12 +25187,12 @@ fn refresh_tick_bounds_new_admissions_with_explicit_deferral() {
     pids.extend(more.iter().copied());
     e06_write_listing(scope_dir.path(), &pids);
     // The highest pid defers twice; its queued request must survive both.
-    engine.request_refresh(more[4]);
+    engine.request_refresh(more[4], None);
 
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.views.len(), 3, "two of five newcomers drain first");
     assert!(
-        engine.refresh_requested.contains(&more[4]),
+        engine.refresh_requested.contains_key(&more[4]),
         "the deferred request is retained, not dropped"
     );
     assert!(
@@ -25165,14 +25208,14 @@ fn refresh_tick_bounds_new_admissions_with_explicit_deferral() {
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.views.len(), 5, "two more drain next");
     assert!(
-        engine.refresh_requested.contains(&more[4]),
+        engine.refresh_requested.contains_key(&more[4]),
         "still retained after the second deferral"
     );
 
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.views.len(), 6, "the last newcomer drains third");
     assert!(
-        !engine.refresh_requested.contains(&more[4]),
+        !engine.refresh_requested.contains_key(&more[4]),
         "the served request clears"
     );
     let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
@@ -25205,7 +25248,7 @@ fn failed_newcomer_does_not_starve_later_process_admission() {
         .reap()
         .expect("reap the owned failed candidate");
     e06_write_listing(scope_dir.path(), &[first_pid, failed_pid, later_pid]);
-    engine.request_refresh(later_pid);
+    engine.request_refresh(later_pid, None);
 
     refresh_inventory_once(&mut engine);
     assert_eq!(
@@ -25213,7 +25256,7 @@ fn failed_newcomer_does_not_starve_later_process_admission() {
         1,
         "the first tick attempts only the failed PID"
     );
-    assert!(engine.refresh_requested.contains(&later_pid));
+    assert!(engine.refresh_requested.contains_key(&later_pid));
 
     refresh_inventory_once(&mut engine);
     let kept: BTreeSet<_> = engine.views.iter().map(ProcessView::pid).collect();
@@ -25222,7 +25265,7 @@ fn failed_newcomer_does_not_starve_later_process_admission() {
         BTreeSet::from([first_pid, later_pid]),
         "the next bounded tick reaches the live child after the failed PID"
     );
-    assert!(!engine.refresh_requested.contains(&later_pid));
+    assert!(!engine.refresh_requested.contains_key(&later_pid));
 
     refresh_inventory_once(&mut engine);
     assert_eq!(
@@ -25249,7 +25292,7 @@ fn refresh_tick_deep_scan_quantum_defers_with_evidence() {
     let rest = e06_spawn_sleeps(2);
     let more: Vec<u32> = rest.iter().map(|guard| guard.pid()).collect();
     e06_write_listing(scope_dir.path(), &[kept_pid, more[0], more[1]]);
-    engine.request_refresh(kept_pid);
+    engine.request_refresh(kept_pid, None);
     engine.scheduler.set_tick_quantum_ns_for_test(0);
     let scans_before = engine.deep_scans;
 
@@ -25260,7 +25303,7 @@ fn refresh_tick_deep_scan_quantum_defers_with_evidence() {
     );
     assert_eq!(engine.views.len(), 1, "no admission runs past the quantum");
     assert!(
-        engine.refresh_requested.contains(&kept_pid),
+        engine.refresh_requested.contains_key(&kept_pid),
         "the refreshed request is retained"
     );
     assert!(
@@ -25318,7 +25361,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     let mut pids = sleep_pids.clone();
     pids.push(newcomer);
     e06_write_listing(scope_dir.path(), &pids);
-    engine.request_refresh(newcomer);
+    engine.request_refresh(newcomer, None);
     engine.budget.set_deadline(Some(0));
 
     // Ordinary frames cannot reach the newcomer (no free slots); the queued
@@ -25331,7 +25374,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
         );
     }
     assert!(
-        engine.refresh_requested.contains(&newcomer),
+        engine.refresh_requested.contains_key(&newcomer),
         "the queued request survives the ordinary frames"
     );
 
@@ -26009,7 +26052,7 @@ fn unloaded_provider_view_stays_pinned_by_dirty_history() {
     // and can therefore only add coverage, never flap owned modules).
     loader.send(b'U');
     loader.wait_for(b"P11SCOPE_LAZY unloaded\n");
-    engine.request_refresh(loader_pid);
+    engine.request_refresh(loader_pid, None);
     for _ in 1..=8 {
         refresh_inventory_once(&mut engine);
     }
@@ -26598,4 +26641,429 @@ fn maps_sweep_refusal_does_not_retire_a_retained_generation() {
     assert!(engine.pending_retirements.is_empty());
     assert!(engine.retirement_intents.is_empty());
     assert_eq!(engine.counters.object_skips.len(), 1);
+}
+
+/// B1: a batch tail that changed nothing and dirtied no publication input
+/// republishes byte-identical facts — the skip removes repeated work only.
+/// Proved by counter (publishes vs skips), not timing; the published
+/// `discovery` JSON, the attach plan, the pin revision, and the retained
+/// generation are identical across the skip.
+#[test]
+fn batch_tail_skip_republishes_byte_identical_facts() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_before_load();
+    let generation = engine.views[0].id();
+    fixture.load();
+    engine.request_refresh(fixture.child.pid(), None);
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+
+    // The first tail call publishes: the revision gate starts dirty.
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(engine.tail_stats(), (1, 0));
+    let facts = serde_json::to_value(&engine.discovery).unwrap();
+    let plan = engine.plan.clone();
+    let pinned_revision = engine.pinned.revision();
+
+    // A quiet tail skips the recompute — observable only in the counter.
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(engine.tail_stats(), (1, 1));
+    assert_eq!(serde_json::to_value(&engine.discovery).unwrap(), facts);
+    assert_eq!(engine.plan, plan);
+    assert_eq!(engine.pinned.revision(), pinned_revision);
+    assert_eq!(engine.views[0].id(), generation);
+
+    // A dirtied input republishes: absorbed scan time alone (no `changed`)
+    // forces the tail to run, so the skip can never hide a mutation.
+    engine.absorb_scan_counters(DiscoveryCounters::default());
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(engine.tail_stats(), (2, 1));
+
+    // An explicit change always republishes, whatever the revision says.
+    engine.publish_batch_tail(true).unwrap();
+    assert_eq!(engine.tail_stats(), (3, 1));
+
+    // The same skip fires on real idle batches, not just direct tail
+    // calls: each refresh finds nothing to do and its tail skips, leaving
+    // the published discovery JSON byte-identical.
+    let facts = serde_json::to_value(&engine.discovery).unwrap();
+    for skips in [2u64, 3] {
+        refresh_inventory_once(&mut engine);
+        engine.publish_batch_tail(false).unwrap();
+        assert_eq!(engine.tail_stats(), (3, skips));
+        assert_eq!(serde_json::to_value(&engine.discovery).unwrap(), facts);
+    }
+
+    // A clean publish still runs after the skips: newly absorbed scan
+    // time forces the tail to run again.
+    engine.absorb_scan_counters(DiscoveryCounters::default());
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(engine.tail_stats(), (4, 3));
+}
+
+/// C2: the tick deep-scan quantum is honored on the refreshed-rescan path.
+/// A zero quantum expires before the first scan (any clock poll is past a
+/// zero deadline, deterministically — no wall-clock dependence): the view
+/// defers with explicit evidence and its refresh request is retained for
+/// the next tick, never dropped. The newcomer-admission loop's own gate
+/// has its injected mid-path test below.
+#[test]
+fn expired_tick_quantum_defers_refreshed_scans_with_requests_retained() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_before_load();
+    fixture.load();
+    let pid = fixture.child.pid();
+    engine.request_refresh(pid, None);
+    engine.scheduler.set_tick_quantum_ns_for_test(0);
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.refresh_requested.contains_key(&pid),
+        "the deferred refresh request stays queued"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skipped| skipped.reason.contains("tick deep-scan quantum exhausted")),
+        "the deferral publishes explicit evidence: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// C2: the tick deep-scan quantum is honored mid-path on the
+/// newcomer-admission loop. An injected clock passes the first two checks
+/// and expires before the third scan: exactly one scan runs (the live
+/// pid's; the dead pid's open fails first), and the last pid defers with
+/// its request retained and explicit evidence. No wall clock is read on
+/// this path: the script drives every quantum poll, and an exhausted
+/// script reads a failed clock, which also stops the phase.
+#[test]
+fn tick_quantum_expires_mid_path_in_newcomer_admission() {
+    let mut engine = Engine::empty();
+    let live_pid = std::process::id();
+    // Pids that can never be alive: the open fails deterministically, so
+    // only the quantum decides whether they are attempted or deferred.
+    let dead_pid = u32::MAX - 1;
+    let deferred_pid = u32::MAX;
+    let tick_start = 1_000_000u64;
+    let quantum = 500u64;
+    engine.scheduler.set_tick_quantum_ns_for_test(quantum);
+    engine.scheduler.begin_deep_scan_tick(Some(tick_start));
+    let script = [
+        Some(tick_start),
+        Some(tick_start),
+        Some(tick_start + quantum + 1),
+    ];
+    let mut script = script.into_iter();
+    let mut tick_now = || script.next().flatten();
+    let max_scan_pids = engine.max_scan_pids;
+    let (new_views, failed, skipped) = engine.admit_inventory_new_views(
+        vec![live_pid, dead_pid, deferred_pid],
+        max_scan_pids,
+        &mut tick_now,
+    );
+    // Mid-path, not pre-first: exactly one scan ran — the live pid's. The
+    // dead pid's open failed before any scan, and the deferred pid's scan
+    // never started.
+    assert_eq!(engine.deep_scans, 1);
+    // ... and the loop stopped before the end: the last pid deferred with
+    // its request retained and explicit evidence, unstaged like the dead
+    // one, while the live pid was attempted exactly once.
+    assert!(
+        failed.contains(&dead_pid),
+        "open failure stays queued: {failed:?}"
+    );
+    assert!(
+        failed.contains(&deferred_pid),
+        "the deferred pid stays queued: {failed:?}"
+    );
+    assert!(
+        !new_views
+            .iter()
+            .any(|(view, _, _)| view.pid() == dead_pid || view.pid() == deferred_pid),
+        "neither the dead nor the deferred pid stages a view"
+    );
+    let staged_live = new_views.iter().any(|(view, _, _)| view.pid() == live_pid);
+    assert!(
+        staged_live != failed.contains(&live_pid),
+        "the live pid stages xor stays queued, exactly once"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|skip| skip.reason.contains("remaining new processes deferred")),
+        "the deferral publishes explicit evidence: {skipped:?}"
+    );
+}
+/// C3: discovery-before-semantics ordering. The discovery batch publishes
+/// synchronously before it returns: when the arrival batch (refresh commit
+/// plus tail) completes, the published artifact already carries the
+/// arrival, so an event drain reducing into semantics next cannot observe
+/// pre-arrival facts. Pinned on the owned lifecycle with the publication
+/// revisions as sequence numbers: the pre-batch observation sits at the
+/// pre-arrival revision, and the batch advances and re-syncs the published
+/// revision exactly once. A scripted event drain after the batch then
+/// reduces CALLs through the real reducer at the published revision, with
+/// nothing unpublished left to observe.
+#[test]
+fn discovery_batch_publishes_synchronously_before_it_returns() {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_before_load();
+    engine.publish_batch_tail(false).unwrap();
+    let pre_plan = engine.plan.clone();
+    let published_before = engine.published_facts_revision;
+    // Observation 1 (pre-arrival): corroboration is unobservable.
+    assert_eq!(engine.discovery.uncorroborated, 1);
+    assert_eq!(engine.discovery.modules.len(), 1);
+    assert!(!engine.discovery.modules[0].corroborated);
+    let pre_arrival = engine.discovery.clone();
+
+    // The arrival batch: refresh commits and publishes, the tail
+    // re-syncs. No step defers publication past the batch return.
+    fixture.load();
+    engine.request_refresh(fixture.child.pid(), None);
+    refresh_inventory_once(&mut engine);
+    engine.publish_batch_tail(false).unwrap();
+
+    // Synchronous: the batch return already carries the arrival.
+    assert_eq!(engine.discovery.uncorroborated, 0);
+    assert!(engine.discovery.modules[0].corroborated);
+    assert_ne!(engine.discovery, pre_arrival);
+    // Sequenced: the arrival advanced the published revision, and the
+    // tail left no unpublished mutation behind.
+    assert!(engine.published_facts_revision > published_before);
+    assert_eq!(engine.published_facts_revision, engine.facts_revision);
+
+    // Observation 2 (post-publication): a scripted event drain reduces
+    // CALLs through the real reducer after the batch. Sequence: arrival
+    // (facts R1) → publication (published R1) → observation (the drain
+    // sees the published plan at R1, with nothing unpublished left for
+    // the reducer to trip over).
+    let arrival = engine.facts_revision;
+    assert_eq!(engine.published_facts_revision, arrival);
+    let child_pid = fixture.child.pid();
+    let call = || p11scope_ebpf_common::Event {
+        event_type: p11scope_ebpf_common::event_type::CALL,
+        pid_tgid: u64::from(child_pid) << 32,
+        session: 7,
+        slot_id: 0,
+        slot: 0,
+        capture: p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+        ..p11scope_ebpf_common::Event::default()
+    };
+    let process = semantics::ProcessKey::from_pid(child_pid);
+    let drain_script = |state: &mut semantics::State| {
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::events([call(), call()], usize::MAX),
+            1,
+        );
+        let may_remain = drain.poll(None, |ev| {
+            state.observe_process(process, &ev);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert!(!may_remain, "the scripted drain consumes its whole script");
+        assert_eq!(drain.malformed(), 0, "the script decodes cleanly");
+    };
+    // The reducer's pre-arrival observation at R0: the same script through
+    // the pre-arrival plan. This fixture's stub provider table carries no
+    // semantic descriptors (both plans slot-identical, zero semantics), so
+    // no session opens either side — the order proof is sequential, and
+    // these counts fail loudly if the fixture ever gains descriptors.
+    let mut pre_state = semantics::State::new(&pre_plan);
+    drain_script(&mut pre_state);
+    assert_eq!(pre_state.sessions().opened, 0);
+    assert_eq!(
+        pre_state
+            .cgroups()
+            .values()
+            .map(|cgroup| cgroup.calls)
+            .sum::<u64>(),
+        2,
+        "the pre-arrival reducer observes its script"
+    );
+    // The reducer's post-arrival observation at R1: the published plan.
+    let mut post_state = semantics::State::new(&engine.plan);
+    drain_script(&mut post_state);
+    assert_eq!(post_state.sessions().opened, 0);
+    assert_eq!(
+        post_state
+            .cgroups()
+            .values()
+            .map(|cgroup| cgroup.calls)
+            .sum::<u64>(),
+        2,
+        "the reducer observes post-arrival facts"
+    );
+    // ... and at observation time nothing was unpublished: no reducer can
+    // observe a fact this batch did not publish.
+    assert_eq!(engine.published_facts_revision, arrival);
+    assert_eq!(engine.published_facts_revision, engine.facts_revision);
+}
+
+/// D1: cold/warm coverage-equality harness (unprivileged-runnable). Two
+/// back-to-back engines run the same discover → refresh → quiet-tail
+/// procedure over the same loaded owned child: the first run is cold
+/// (page cache, mount-table caches), the second warm. Both must agree on
+/// the catalog (discovery modules), the attach set (plan slots), and the
+/// per-stage call counts (invocation counts, not wall time — only wall
+/// time may differ). Any mismatch prints `BENCH_DISCOVERY_INVALID` and
+/// fails: the bench script excludes such samples from the statistics,
+/// counts them, and fails the run at the end. Each run also prints one
+/// `BENCH_DISCOVERY <json>` sample line for the script.
+#[test]
+fn cold_and_warm_discovery_agree_on_catalog_attach_sets_and_call_counts() {
+    use crate::timing::StageKind;
+
+    fn discover_loaded(fixture: &DiscoveryLifecycleFixture) -> Engine {
+        let pid = fixture.child.pid();
+        let mut args = system_args(vec![fixture.provider.clone()], None);
+        args.scope = crate::cli::ScopeArg::Pid(pid);
+        args.manifests = vec![fixture.manifest.clone()];
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the owned generation");
+        Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("discover loaded child")
+    }
+
+    fn bench_line(tag: &str, wall_ms: u64, engine: &Engine) {
+        let stages = engine.stage_timings();
+        let ms: Vec<String> = StageKind::ALL
+            .iter()
+            .map(|stage| {
+                format!(
+                    "\"{}\":{}",
+                    stage.as_str(),
+                    stages.total_ns(*stage) / 1_000_000
+                )
+            })
+            .collect();
+        let calls: Vec<String> = StageKind::ALL
+            .iter()
+            .map(|stage| format!("\"{}\":{}", stage.as_str(), stages.invocations(*stage)))
+            .collect();
+        let newcomer = engine.newcomer_stats(crate::attach::monotonic_ns());
+        let (publishes, skips) = engine.tail_stats();
+        println!(
+            "BENCH_DISCOVERY {{\"run\":\"{tag}\",\"wall_ms\":{wall_ms},\
+             \"modules\":{},\"slots\":{},\"stage_ms\":{{{}}},\
+             \"stage_invocations\":{{{}}},\"tail_publishes\":{publishes},\
+             \"tail_skips\":{skips},\"newcomer_admitted\":{},\
+             \"newcomer_admitted_unknown\":{},\"newcomer_pending\":{}}}",
+            engine.discovery.modules.len(),
+            engine.plan.slots.len(),
+            ms.join(","),
+            calls.join(","),
+            newcomer.admitted,
+            newcomer.admitted_unknown,
+            newcomer.pending,
+        );
+    }
+
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    // Load first: both engines see identical target state.
+    fixture.load();
+    let pid = fixture.child.pid();
+
+    let mut snapshots = Vec::new();
+    for tag in ["cold", "warm"] {
+        let wall_start = std::time::Instant::now();
+        let mut engine = discover_loaded(&fixture);
+        engine.publish_batch_tail(false).unwrap();
+        // One refresh cycle exercises the newcomer arrival → admission
+        // path; the trailing quiet tail exercises the B1 skip.
+        engine.request_refresh(pid, crate::attach::monotonic_ns());
+        refresh_inventory_once(&mut engine);
+        engine.publish_batch_tail(false).unwrap();
+        engine.publish_batch_tail(false).unwrap();
+        let wall_ms = wall_start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        bench_line(tag, wall_ms, &engine);
+        let calls: Vec<u64> = StageKind::ALL
+            .iter()
+            .map(|stage| engine.stage_timings().invocations(*stage))
+            .collect();
+        snapshots.push((
+            engine.discovery.modules.clone(),
+            engine.plan.slots.clone(),
+            calls,
+            engine.tail_stats(),
+        ));
+    }
+
+    let (cold_modules, cold_slots, cold_calls, cold_tail) = &snapshots[0];
+    let (warm_modules, warm_slots, warm_calls, warm_tail) = &snapshots[1];
+    let mut mismatches: Vec<String> = Vec::new();
+    if cold_modules != warm_modules {
+        mismatches.push("catalog objects differ".to_string());
+    }
+    if cold_slots != warm_slots {
+        mismatches.push("attach sets differ".to_string());
+    }
+    if cold_calls != warm_calls {
+        mismatches.push(format!(
+            "call counts differ: {cold_calls:?} vs {warm_calls:?}"
+        ));
+    }
+    if cold_tail != warm_tail {
+        mismatches.push(format!(
+            "tail counters differ: {cold_tail:?} vs {warm_tail:?}"
+        ));
+    }
+    if !mismatches.is_empty() {
+        println!("BENCH_DISCOVERY_INVALID {}", mismatches.join("; "));
+        panic!("cold/warm coverage mismatch: {}", mismatches.join("; "));
+    }
+}
+
+/// A3: the newcomer queue-age path end to end at the engine seam. A
+/// diff-discovered arrival marked at T admits at T+5ms and samples a
+/// known 5ms age; a refresh-first arrival keeps the earlier mark across
+/// orders; a clock-unknown arrival counts unknown, never zero; a pid
+/// waiting in both queues counts pending once.
+#[test]
+fn newcomer_arrival_to_admission_samples_queue_ages() {
+    let mut engine = Engine::empty();
+    // Diff-first order: arrival mark, then admission 5ms later.
+    engine.mark_newcomer_arrival(4242, Some(1_000_000_000));
+    // Refresh-first order: the queued refresh predates the diff mark.
+    engine.request_refresh(4343, Some(2_000_000_000));
+    engine.mark_newcomer_arrival(4343, Some(2_010_000_000));
+    // Clock-unknown: no mark at all (arrival clock unreadable).
+    engine.mark_newcomer_arrival(4444, None);
+    // Still waiting: marked, never admitted.
+    engine.mark_newcomer_arrival(4545, Some(3_000_000_000));
+    engine.request_refresh(4545, Some(3_000_000_000));
+
+    let waiting = engine.newcomer_stats(Some(3_010_000_000));
+    assert_eq!(waiting.admitted, 0);
+    // 4242, 4343, 4444, 4545 — the double-queued pid counts once.
+    assert_eq!(waiting.pending, 4);
+    assert_eq!(waiting.oldest_pending_age_ms, Some(2010));
+
+    engine.sample_newcomer_admission(4242, Some(1_005_000_000));
+    engine.sample_newcomer_admission(4343, Some(2_004_000_000));
+    engine.sample_newcomer_admission(4444, Some(2_004_000_000));
+    let stats = engine.newcomer_stats(Some(3_010_000_000));
+    assert_eq!(stats.admitted, 2);
+    assert_eq!(stats.admitted_unknown, 1);
+    assert_eq!(stats.max_admitted_age_ms, Some(5));
+    assert_eq!(stats.mean_admitted_age_ms(), Some(4));
+    // 4545 (both queues, counted once) plus 4343's refresh request, which
+    // the admission sampler does not consume — the refresh pass owns that
+    // queue and drains it when the refresh is serviced.
+    assert_eq!(stats.pending, 2);
+    assert_eq!(stats.dropped, 0);
+
+    // Past the queue cap the excess request drops with its loss marker
+    // and its dropped age (here clock-unknown: the diff never marked it).
+    let queued = engine.refresh_requested.len();
+    for pid in 0..(MAX_PENDING_REFRESH - queued) as u32 {
+        engine.request_refresh(50_000 + pid, Some(4_000_000_000));
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let truncated_before = engine.discovery_truncated;
+    engine.request_refresh(60_000, Some(4_001_000_000));
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.discovery_truncated, truncated_before + 1);
+    let stats = engine.newcomer_stats(Some(4_002_000_000));
+    assert_eq!(stats.dropped, 0);
+    assert_eq!(stats.dropped_unknown, 1);
 }

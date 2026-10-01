@@ -4152,6 +4152,7 @@ fn every_script_parses_with_sh_n() {
         "scripts/gates.sh",
         "scripts/cleanup-traps.sh",
         "scripts/bench-overhead.sh",
+        "scripts/bench-discovery.sh",
         "scripts/build-release.sh",
         "scripts/attach-pod.sh",
         "scripts/tsprobe.sh",

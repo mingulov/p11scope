@@ -148,6 +148,32 @@ an uncompleted call, with no fabricated return value. The field is always
 present in v3 profile, metrics and terminal trace evidence; nonzero forces
 `PARTIAL`.
 
+`scheduling` gains the Phase 2 responsiveness sub-objects, all always
+present with closed keys. `stage_ms` and `stage_invocations` split the
+discovery batch into `scan`, `pin`, `bind`, `plan`, `merge`, `projection`,
+`attach`, `drain`, and `cleanup` leaf-span totals and counts (a different
+clock from `phase_ms`; no identity between them). `stage_unknown_clock`
+counts spans dropped for a failed clock read. `longest_op` names the
+longest single span (`stage`, `op`, `duration_ms`), all null when none was
+recorded. `inter_drain_gap` is the bounded gap distribution (`samples`,
+bucket-upper-bound `p50_ms`/`p99_ms`, exact `max_ms` agreeing with
+`max_inter_drain_gap_ms` whenever samples exist). `newcomer_queue` carries
+first-seen-to-admission ages (`admitted`, `max_admitted_age_ms`,
+`mean_admitted_age_ms`, `pending`, `oldest_pending_age_ms`, `dropped`,
+`max_dropped_age_ms`, plus `admitted_unknown`, `dropped_unknown`, and
+`marks_dropped` for clock-unknown or cap-dropped marks). A refresh-overflow
+drop reports the newcomer's wait since diff discovery (its first-seen diff
+mark); a never-diffed pid — a refresh-first arrival dropped before any
+diff marked it — reports unknown age (`dropped_unknown`), never zero.
+`resource` is the `/proc/self` timeline (`start`, `readiness`, `end`
+samples of `rss_kb`, `utime_ms`, `stime_ms`, `read_bytes`, `write_bytes`,
+each null on a failed read; `samples`, `max_rss_kb`, `last_periodic`
+summarize the bounded periodic series). `max_rss_kb` covers the periodic
+samples only: a short capture with no periodic tick reports null max even
+though the start/readiness/end samples hold RSS. `tail_publishes`/
+`tail_skips` count executed versus provably redundant batch-tail
+publications.
+
 ## Residual additions: terminal verdict, override, handoff, environment
 
 These fields are always present in every v3 profile, v3-metrics, and terminal

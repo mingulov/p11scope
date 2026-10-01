@@ -181,6 +181,7 @@ jobs:
       - run: scripts/attach-pod.sh --self-test
       - run: scripts/build-release.sh --self-test
       - run: scripts/bench-overhead.sh --self-test
+      - run: scripts/bench-discovery.sh --self-test
       - run: scripts/k8s-profile-entry.sh --self-test
       - run: scripts/verify-k8s-attach.sh --self-test
       - run: scripts/tsprobe.sh --self-test
@@ -204,6 +205,7 @@ jobs:
       - run: python3 -I scripts/lane-induced-gaps-oracle-4.py --self-test
       - run: python3 -I scripts/lane-bench-overhead-oracle-1.py --self-test
       - run: python3 -I scripts/lane-bench-overhead-oracle-3.py --self-test
+      - run: python3 -I scripts/bench-discovery-stats.py --self-test
       - run: python3 -I scripts/task-1.6-lane-a.py --self-test
       - run: python3 -I scripts/task-1.6-lane-b-sparse-model.py --self-test
       - run: python3 -I tests/python/test_canary_evidence.py --target-bits 32 -v

@@ -868,6 +868,128 @@ pub struct SchedulingPhaseMs {
     pub detach: u64,
 }
 
+/// Per-stage wall time in milliseconds, cumulative over the capture, in
+/// [`crate::timing::StageKind::ALL`] order. Each total is the saturating sum
+/// of that stage's recorded leaf spans only; spans whose clock read failed
+/// contribute nothing (see `stage_unknown_clock`). Independent measurements
+/// from `phase_ms` (different clocks, leaf spans vs wall brackets): they do
+/// not sum to any phase and no identity is asserted between them.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct StageMs {
+    pub scan: u64,
+    pub pin: u64,
+    pub bind: u64,
+    pub plan: u64,
+    pub merge: u64,
+    pub projection: u64,
+    pub attach: u64,
+    pub drain: u64,
+    pub cleanup: u64,
+}
+
+/// Per-stage recorded span counts, same keys as [`StageMs`]. A stage that
+/// never ran publishes total `0` with `0` invocations (an exact empty sum,
+/// not a missing sample).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct StageInvocations {
+    pub scan: u64,
+    pub pin: u64,
+    pub bind: u64,
+    pub plan: u64,
+    pub merge: u64,
+    pub projection: u64,
+    pub attach: u64,
+    pub drain: u64,
+    pub cleanup: u64,
+}
+
+/// The capture's longest single recorded span: its longest indivisible
+/// operation. All three fields are `null` when no span was recorded —
+/// a missing sample, never an invented zero.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct LongestOpEvidence {
+    /// The stage key (`scan`, `pin`, `bind`, `plan`, `merge`,
+    /// `projection`, `attach`, `drain`, `cleanup`), or `null`.
+    pub stage: Option<&'static str>,
+    /// The leaf operation label (e.g. `"attach_targets"`), or `null`.
+    pub op: Option<&'static str>,
+    /// Whole milliseconds (floor), or `null`.
+    pub duration_ms: Option<u64>,
+}
+
+/// The bounded inter-drain gap distribution. Quantiles are bucket
+/// upper-bound estimates in milliseconds (see
+/// [`crate::timing::GAP_BUCKET_BOUNDS_MS`]); a quantile above the bucketed
+/// range, or with no samples at all, publishes `null` — missing, never
+/// zero. The maximum is exact and agrees with `max_inter_drain_gap_ms`
+/// whenever samples exist.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct InterDrainGapEvidence {
+    /// Gaps sampled (drains minus one; the first drain samples no gap).
+    pub samples: u64,
+    pub p50_ms: Option<u64>,
+    pub p99_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+}
+
+/// Newcomer/refresh queue-age evidence in whole milliseconds. Ages run from
+/// first-seen (arrival mark) to first-observed-ready (admission) or to the
+/// drop tick. Clock-unknown samples count in the `*_unknown` counters and
+/// never enter a mean or maximum.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct NewcomerQueueEvidence {
+    /// Admissions with a known first-seen mark.
+    pub admitted: u64,
+    /// Admissions without one (clock unavailable or mark dropped).
+    pub admitted_unknown: u64,
+    /// Maximum known admission age, or `null` when none was sampled.
+    pub max_admitted_age_ms: Option<u64>,
+    /// Mean known admission age (floor), or `null` when none was sampled.
+    pub mean_admitted_age_ms: Option<u64>,
+    /// Pids still waiting at the snapshot (the union of the pending
+    /// refresh queue and the deferred diff-discovered newcomers).
+    pub pending: u64,
+    /// Oldest known pending age at the snapshot, or `null` when no
+    /// pending pid has a known mark.
+    pub oldest_pending_age_ms: Option<u64>,
+    /// Queue-cap drops with a known age (loss markers kept alongside).
+    pub dropped: u64,
+    /// Queue-cap drops without one.
+    pub dropped_unknown: u64,
+    /// Maximum known drop age, or `null` when none was sampled.
+    pub max_dropped_age_ms: Option<u64>,
+    /// Arrival marks dropped past the mark cap (bounded memory).
+    pub marks_dropped: u64,
+}
+
+/// One capture-process resource sample. Every field is `null` when its
+/// read or parse failed — a missing sample, never a zero.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ResourceSampleEvidence {
+    pub rss_kb: Option<u64>,
+    pub utime_ms: Option<u64>,
+    pub stime_ms: Option<u64>,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+}
+
+/// The capture's resource timeline: `/proc/self` samples at capture start,
+/// attach readiness, and loop end, plus the bounded periodic summary (one
+/// sample every [`crate::timing::RESOURCE_SAMPLE_EVERY_N_TICKS`] ticks;
+/// only the count, maximum RSS, and latest sample publish).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ResourceEvidence {
+    /// Periodic samples taken.
+    pub samples: u64,
+    /// Maximum periodic RSS, or `null` when no periodic sample read RSS.
+    pub max_rss_kb: Option<u64>,
+    pub start: ResourceSampleEvidence,
+    pub readiness: ResourceSampleEvidence,
+    pub end: ResourceSampleEvidence,
+    /// The latest periodic sample (all `null` when none was taken).
+    pub last_periodic: ResourceSampleEvidence,
+}
+
 /// Consumer-scheduling evidence (Task 3.1 repair): which bound broke when
 /// the event path lost data, and how the capture loop spent its time.
 /// The loss splits are identities, not estimates: capture + detach shares
@@ -919,6 +1041,25 @@ pub struct SchedulingEvidence {
     /// scheduling fact, never a loss: work still undone after the terminal
     /// drain is published as a loss instead.
     pub discovery_deferrals: u64,
+    /// Per-stage wall time (Phase 2): the discovery batch split into
+    /// scan/pin/bind/plan/merge/projection/attach plus drain and cleanup.
+    pub stage_ms: StageMs,
+    /// Per-stage recorded span counts.
+    pub stage_invocations: StageInvocations,
+    /// Stage spans dropped for a failed clock read (in no total).
+    pub stage_unknown_clock: u64,
+    /// The longest single recorded span.
+    pub longest_op: LongestOpEvidence,
+    /// The inter-drain gap distribution (bounded histogram).
+    pub inter_drain_gap: InterDrainGapEvidence,
+    /// Newcomer/refresh queue ages.
+    pub newcomer_queue: NewcomerQueueEvidence,
+    /// Capture-process resource timeline.
+    pub resource: ResourceEvidence,
+    /// Batch-tail publications executed.
+    pub tail_publishes: u64,
+    /// Batch-tail publications skipped as provably redundant (B1).
+    pub tail_skips: u64,
 }
 
 impl Default for SchedulingEvidence {
@@ -940,6 +1081,15 @@ impl Default for SchedulingEvidence {
             phase_mono_ns: PhaseMonoNs::default(),
             max_inter_drain_gap_ms: 0,
             discovery_deferrals: 0,
+            stage_ms: StageMs::default(),
+            stage_invocations: StageInvocations::default(),
+            stage_unknown_clock: 0,
+            longest_op: LongestOpEvidence::default(),
+            inter_drain_gap: InterDrainGapEvidence::default(),
+            newcomer_queue: NewcomerQueueEvidence::default(),
+            resource: ResourceEvidence::default(),
+            tail_publishes: 0,
+            tail_skips: 0,
         }
     }
 }
@@ -3833,6 +3983,15 @@ pub(crate) mod tests {
             "phase_mono_ns",
             "max_inter_drain_gap_ms",
             "discovery_deferrals",
+            "stage_ms",
+            "stage_invocations",
+            "stage_unknown_clock",
+            "longest_op",
+            "inter_drain_gap",
+            "newcomer_queue",
+            "resource",
+            "tail_publishes",
+            "tail_skips",
         ] {
             assert!(
                 scheduling.get(key).is_some(),

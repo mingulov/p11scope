@@ -486,6 +486,7 @@ impl Engine {
             &mut self.budget,
             &mut counters,
             false,
+            &mut self.stage_timings,
             scan,
         );
         let pinning_complete = self.budget.stopped_reason().is_none()

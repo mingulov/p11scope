@@ -129,10 +129,37 @@ pub struct Engine {
     module_hints: Vec<PathBuf>,
     counter_snapshot: CounterSnapshot,
     malformed_discovery: u64,
-    refresh_requested: BTreeSet<u32>,
+    /// Pending lifecycle/loader refresh requests: pid to its first-seen
+    /// monotonic-nanosecond arrival mark (`None` when the clock read failed).
+    /// Re-requesting an already-queued pid keeps the earliest mark. Bounded
+    /// by `MAX_PENDING_REFRESH`.
+    refresh_requested: BTreeMap<u32, Option<u64>>,
     scheduler: DiscoveryScheduler,
     loader_records_accepted: u64,
     timings: CausalTimings,
+    /// Per-stage wall-time accumulation (Phase 2): scan, pin, bind, plan,
+    /// merge, projection, attach, plus the terminal cleanup overhead. The
+    /// run loop merges these into its own drain/cleanup spans at snapshot.
+    stage_timings: crate::timing::StageTimings,
+    /// First-seen arrival marks for diff-discovered newcomers, keyed by pid.
+    /// Marked eagerly at diff time (arrival is the first diff); removed on
+    /// admission; pruned to the enumerated scope every inventory tick.
+    /// Bounded by `MAX_NEWCOMER_MARKS`, overflow counted, never silent.
+    newcomer_first_seen: crate::timing::NewcomerMarks,
+    /// Cumulative newcomer queue-age evidence (admissions and drops sample
+    /// here; pending counts fill in at snapshot time).
+    newcomer_ages: crate::timing::NewcomerStats,
+    /// Publication-input revision (B1): bumped on every live-batch mutation
+    /// of the batch-tail merge inputs (plan, pins, modules, corroboration,
+    /// fallback, skips, scan time). The tail skips its publication work only
+    /// when the batch changed nothing AND this equals the last published
+    /// revision — a quiet batch republishes byte-identical facts otherwise.
+    facts_revision: u64,
+    published_facts_revision: u64,
+    /// Batch-tail publications executed (counter, not timing: the B1 proof).
+    tail_publishes: u64,
+    /// Batch-tail publications skipped as provably redundant (same proof).
+    tail_skips: u64,
     discovery_truncated: u64,
     pending_rejected_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
@@ -2137,6 +2164,13 @@ type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
 type TerminalSelectionHandoffs = BTreeMap<u16, Vec<DiscoveryRecord>>;
 type DiscoveryCollector<'a> =
     dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
+/// The tick quantum's clock: one `Option<u64>` mono-ns poll per call, in
+/// the scheduler-hook style (`None` is a failed clock read). Production
+/// passes `crate::attach::monotonic_ns`; tests pass a scripted closure.
+/// Threaded through the refreshed-scan and newcomer-admission loops so an
+/// injected clock can expire mid-path; the poll count and order match the
+/// direct reads it replaces exactly.
+type TickClock<'a> = dyn FnMut() -> Option<u64> + 'a;
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 
@@ -3562,6 +3596,14 @@ fn read_manifest_file(path: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
+/// One newcomer queue age in whole milliseconds: first-observed-ready minus
+/// first-seen. Either endpoint missing (a failed clock read, a dropped
+/// mark) samples unknown — never an invented zero.
+fn newcomer_age_ms(first_seen_ns: Option<u64>, now_ns: Option<u64>) -> Option<u64> {
+    let (seen, now) = (first_seen_ns?, now_ns?);
+    Some(now.saturating_sub(seen) / 1_000_000)
+}
+
 /// Scans one process and pins every object the scan named. The scan's own skips and
 /// the pinning skips are printed rather than dropped: a module the observer could
 /// see but not read is exactly the gap an operator needs to know about.
@@ -3572,6 +3614,7 @@ fn scan_and_pin(
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
     broad_admit: bool,
+    stage: &mut crate::timing::StageTimings,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
     scan_and_pin_with(
         view,
@@ -3580,6 +3623,7 @@ fn scan_and_pin(
         budget,
         counters,
         broad_admit,
+        stage,
         scan_process_view,
     )
     .map(|(modules, pins, _)| (modules, pins))
@@ -3591,6 +3635,7 @@ fn scan_and_pin(
 /// new candidate, and emitted no truncating skip may retire previously
 /// observed modules by absence. Broadening and pinning run after the
 /// snapshot, so their own budget effects never rewrite the scan's verdict.
+#[allow(clippy::too_many_arguments)]
 fn scan_and_pin_with(
     view: &ProcessView,
     hints: &[PathBuf],
@@ -3598,6 +3643,7 @@ fn scan_and_pin_with(
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
     broad_admit: bool,
+    stage: &mut crate::timing::StageTimings,
     scan: impl FnOnce(
         &ScanRequest<'_>,
         &ProcessView,
@@ -3606,7 +3652,8 @@ fn scan_and_pin_with(
 ) -> Result<(Vec<ScannedModule>, PinnedObjects, bool)> {
     let stop_before = budget.stopped_reason();
     let refusals_before = budget.refusal_counts();
-    let outcome = scan(
+    let scan_start = crate::attach::monotonic_ns();
+    let scanned = scan(
         &ScanRequest {
             pid: view.pid(),
             hints,
@@ -3614,8 +3661,15 @@ fn scan_and_pin_with(
         },
         view,
         budget,
-    )
-    .map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
+    );
+    stage.span(
+        crate::timing::StageKind::Scan,
+        "scan_view",
+        scan_start,
+        crate::attach::monotonic_ns(),
+    );
+    let outcome =
+        scanned.map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
     let complete = outcome.unavailable_reason().is_none()
         && stop_before.is_none()
         && budget.stopped_reason().is_none()
@@ -3642,8 +3696,16 @@ fn scan_and_pin_with(
     if broad_admit {
         broad_fixed_pool_pass(view, &mut modules, budget, counters);
     }
-    let (pinned, pin_skips) = pin_scanned_view_objects(view, &modules, budget)
-        .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
+    let pin_start = crate::attach::monotonic_ns();
+    let pinned = pin_scanned_view_objects(view, &modules, budget);
+    stage.span(
+        crate::timing::StageKind::Pin,
+        "pin_view_objects",
+        pin_start,
+        crate::attach::monotonic_ns(),
+    );
+    let (pinned, pin_skips) =
+        pinned.map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
     for skipped in pin_skips {
         counters.noise.note_skip(&skipped.subject, &skipped.reason);
         attribution::note(&skipped);
@@ -4226,13 +4288,28 @@ fn discover_plan(
     // deep-scans the selected candidates only. Under the cap selection is
     // the identity, so the sweep (and its budget charge) is skipped there.
     let selected = if pids.len() > max_scan_pids {
+        let sweep_start = crate::attach::monotonic_ns();
         let (sweep, unavailable) =
             sweep_process_maps(&pids, &mut discovered.budget).into_selection();
+        discovered.stage_timings.span(
+            crate::timing::StageKind::Scan,
+            "sweep_process_maps",
+            sweep_start,
+            crate::attach::monotonic_ns(),
+        );
         if let Some(skipped) = unavailable {
             attribution::note(&skipped);
             discovered.base_counters.object_skips.push(skipped);
         }
-        select_deep_scan_candidates(&sweep, max_scan_pids)
+        let select_start = crate::attach::monotonic_ns();
+        let selected = select_deep_scan_candidates(&sweep, max_scan_pids);
+        discovered.stage_timings.span(
+            crate::timing::StageKind::Scan,
+            "select_deep_scan_candidates",
+            select_start,
+            crate::attach::monotonic_ns(),
+        );
+        selected
     } else {
         pids.clone()
     };
@@ -4309,6 +4386,7 @@ fn discover_plan(
             &mut discovered.budget,
             &mut counters,
             broad_admit,
+            &mut discovered.stage_timings,
         );
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
@@ -4362,12 +4440,19 @@ fn discover_plan(
     for path in &a.manifests {
         let manifest =
             read_manifest_file(path).inspect_err(|_| discovered.base_counters.report_notes())?;
-        let pinning = pin_manifest_objects_deferred_in_views_with_budget(
+        let pin_start = crate::attach::monotonic_ns();
+        let pinning_result = pin_manifest_objects_deferred_in_views_with_budget(
             &manifest,
             &discovered.views,
             &mut discovered.budget,
-        )
-        .map_err(|error| {
+        );
+        discovered.stage_timings.span(
+            crate::timing::StageKind::Pin,
+            "pin_manifest_objects",
+            pin_start,
+            crate::attach::monotonic_ns(),
+        );
+        let pinning = pinning_result.map_err(|error| {
             discovered.base_counters.report_notes();
             for problem in error.problems() {
                 eprintln!("p11scope: {problem}");
@@ -5363,6 +5448,7 @@ fn fallback_proof_in_plan(proof: &BoundFallbackProof, plan: &plan::AttachPlan) -
 }
 
 fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
+    let aggregate_start = crate::attach::monotonic_ns();
     let mut counters = discovered.base_counters.clone();
     let mut scan_modules = Vec::new();
     for input in discovered.scan_inputs.values() {
@@ -5596,9 +5682,23 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         }
     }
 
+    discovered.stage_timings.span(
+        crate::timing::StageKind::Merge,
+        "rebuild_aggregate",
+        aggregate_start,
+        crate::attach::monotonic_ns(),
+    );
+    let bind_start = crate::attach::monotonic_ns();
     let (mut modules, differed) = bind_scanned_modules(&scan_modules, &mut pinned);
+    discovered.stage_timings.span(
+        crate::timing::StageKind::Bind,
+        "bind_rebuild",
+        bind_start,
+        crate::attach::monotonic_ns(),
+    );
     attribution::note_all(&differed);
     counters.object_skips.extend(differed);
+    let proofs_start = crate::attach::monotonic_ns();
     let corroborated =
         bind_pending_corroboration(pending_outcomes, &modules, &pinned, &mut counters)?;
 
@@ -5644,6 +5744,13 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
             proof,
         });
     }
+    discovered.stage_timings.span(
+        crate::timing::StageKind::Merge,
+        "rebuild_bind_proofs",
+        proofs_start,
+        crate::attach::monotonic_ns(),
+    );
+    let plan_start = crate::attach::monotonic_ns();
     let manifest_fallbacks = counters.manifest_fallbacks.len();
     let broad_admit = discovered.broad_admit;
     let admission_scope = discovered.admission_scope();
@@ -5691,7 +5798,20 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     if pinned.has_overlay_uncertainty() {
         discovered.invalidate_causal_timing();
     }
+    discovered.stage_timings.span(
+        crate::timing::StageKind::Plan,
+        "build_initial_plan",
+        plan_start,
+        crate::attach::monotonic_ns(),
+    );
+    let evidence_start = crate::attach::monotonic_ns();
     let discovery = discovery_evidence(&plan, &pinned, &counters);
+    discovered.stage_timings.span(
+        crate::timing::StageKind::Projection,
+        "build_initial_evidence",
+        evidence_start,
+        crate::attach::monotonic_ns(),
+    );
     discovered.plan = plan;
     discovered.pinned = pinned;
     discovered.discovery = discovery;
@@ -7350,10 +7470,20 @@ impl Engine {
             module_hints: Vec::new(),
             counter_snapshot: CounterSnapshot::default(),
             malformed_discovery: 0,
-            refresh_requested: BTreeSet::new(),
+            refresh_requested: BTreeMap::new(),
             scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
             timings: CausalTimings::default(),
+            stage_timings: crate::timing::StageTimings::new(),
+            newcomer_first_seen: BTreeMap::new(),
+            newcomer_ages: crate::timing::NewcomerStats::new(),
+            // A fresh engine owes its first tail publication: the revision
+            // starts dirty so the first batch tail publishes unconditionally,
+            // exactly like the un-gated tail it replaces.
+            facts_revision: 1,
+            published_facts_revision: 0,
+            tail_publishes: 0,
+            tail_skips: 0,
             discovery_truncated: 0,
             pending_rejected_keys: BTreeSet::new(),
             pending_retirements: BTreeSet::new(),
@@ -7812,6 +7942,7 @@ impl Engine {
         }
         if !self.counters.object_skips.contains(&skipped) {
             self.counters.object_skips.push(skipped);
+            self.note_facts_mutated();
         }
     }
 
@@ -8103,6 +8234,10 @@ impl Engine {
         if !self.counters.object_skips.contains(&skipped) {
             self.counters.object_skips.push(skipped);
         }
+        // The batch-tail merge folds `object_skips` into the published
+        // history: any marker (even a dedup hit after a real mutation, like
+        // a repeated eviction message) dirties the publication inputs.
+        self.note_facts_mutated();
     }
 
     pub(crate) fn selection_coverage(
@@ -8343,7 +8478,7 @@ impl Engine {
             // refresh failed — so it is confined to the one context shape that
             // has no alternative, never used for a context that carries a
             // mapping of its own.
-            None => self.refresh_requested.contains(&pid),
+            None => self.refresh_requested.contains_key(&pid),
         }
     }
 
@@ -8647,6 +8782,7 @@ impl Engine {
         hooks: &HookRegistry,
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
+        stage: &mut crate::timing::StageTimings,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
@@ -8659,6 +8795,7 @@ impl Engine {
                 budget,
                 counters,
                 broad_admit,
+                stage,
                 scan_process_view,
             )
         })
@@ -8670,6 +8807,7 @@ impl Engine {
         hooks: &HookRegistry,
         budget: &mut CaptureWorkBudget,
         broad_admit: bool,
+        stage: &mut crate::timing::StageTimings,
     ) -> (
         Result<(Vec<ScannedModule>, PinnedObjects, bool)>,
         DiscoveryCounters,
@@ -8682,6 +8820,7 @@ impl Engine {
                 budget,
                 counters,
                 broad_admit,
+                stage,
                 scan_process_view_without_memory,
             )
         })
@@ -8690,20 +8829,68 @@ impl Engine {
     /// Enqueues one lifecycle/loader refresh request on the bounded pending
     /// queue (Task 3.1b). Past the cap the excess request is dropped with
     /// explicit truncation evidence — the queue never grows unbounded.
-    /// Re-requesting an already-queued pid is free.
-    fn request_refresh(&mut self, pid: u32) {
-        if self.refresh_requested.contains(&pid) {
+    /// Re-requesting an already-queued pid is free and keeps the earliest
+    /// arrival mark. `now_ns` is the caller's clock poll (scheduler style);
+    /// `None` marks the arrival clock-unknown.
+    fn request_refresh(&mut self, pid: u32, now_ns: Option<u64>) {
+        if self.refresh_requested.contains_key(&pid) {
             return;
         }
         if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
             self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+            // The drop keeps its loss marker and reports the dropped age:
+            // a diff-discovered newcomer carries its first-seen mark, so a
+            // drop then still says how long the newcomer had waited.
+            let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+            self.newcomer_ages
+                .note_dropped(newcomer_age_ms(seen, now_ns));
             self.mark_live_loss(
                 "live discovery refresh",
                 "refresh requests exceeded the bounded pending queue; excess requests were dropped",
             );
             return;
         }
-        self.refresh_requested.insert(pid);
+        self.refresh_requested.insert(pid, now_ns);
+    }
+
+    /// Marks one diff-discovered newcomer's arrival (first diff wins; later
+    /// diffs keep the earliest mark). Past the mark cap the mark drops and
+    /// counts itself — those admissions sample clock-unknown, never zero.
+    fn mark_newcomer_arrival(&mut self, pid: u32, now_ns: Option<u64>) {
+        if self.newcomer_first_seen.contains_key(&pid) {
+            return;
+        }
+        if self.newcomer_first_seen.len() >= crate::timing::MAX_NEWCOMER_MARKS {
+            self.newcomer_ages.note_mark_dropped();
+            return;
+        }
+        self.newcomer_first_seen.insert(pid, now_ns);
+    }
+
+    /// Samples one newcomer admission age: first-observed-ready minus
+    /// first-seen, in whole milliseconds. First-seen is the earliest known
+    /// mark (a loader event can queue a refresh before the diff finds the
+    /// pid, or after — either order keeps the earlier observation).
+    fn sample_newcomer_admission(&mut self, pid: u32, now_ns: Option<u64>) {
+        let refresh_seen = self.refresh_requested.get(&pid).copied().flatten();
+        let diff_seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+        let seen = match (refresh_seen, diff_seen) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        self.newcomer_ages
+            .note_admitted(newcomer_age_ms(seen, now_ns));
+        self.newcomer_first_seen.remove(&pid);
+    }
+
+    /// Bumps the publication-input revision: every live-batch mutation of
+    /// the batch-tail merge inputs calls this, so the tail skip gate sees
+    /// it. Unconditional by design — a dedup-hit marker (an eviction message
+    /// identical to an earlier one) still follows a real mutation.
+    fn note_facts_mutated(&mut self) {
+        self.facts_revision = self.facts_revision.saturating_add(1);
     }
 
     fn defer_loader_memory_scan(&mut self, key: PendingLoaderScanKey, hook_ts_ns: u64) {
@@ -8792,6 +8979,10 @@ impl Engine {
             self.counters.scan_unavailable.or(counters.scan_unavailable);
         self.counters.scan_ms = self.counters.scan_ms.saturating_add(counters.scan_ms);
         self.counters.noise.merge(&counters.noise);
+        // A scan ran: its time and availability feed the published history
+        // through the batch tail, so the publication inputs are dirty even
+        // when the scan found nothing new.
+        self.note_facts_mutated();
         // An acquisition failure has already happened. Keep it even if later
         // inventory construction fails or normal exit suppresses a generic gap.
         for skipped in &counters.object_skips {
@@ -8803,14 +8994,22 @@ impl Engine {
     }
 
     fn publish_current_capture_facts(&mut self) -> Result<()> {
-        self.capture_facts.merge_current(
+        let merge_start = crate::attach::monotonic_ns();
+        let merged = self.capture_facts.merge_current(
             &self.plan,
             &self.pinned,
             &self.modules,
             &self.manifests,
             &self.manifest_ordinals,
             &self.counters,
-        )?;
+        );
+        self.stage_timings.span(
+            crate::timing::StageKind::Projection,
+            "merge_facts",
+            merge_start,
+            crate::attach::monotonic_ns(),
+        );
+        merged?;
         if self.capture_facts.staged.is_some() {
             return Ok(());
         }
@@ -8818,9 +9017,42 @@ impl Engine {
         Ok(())
     }
 
+    /// One batch tail's publication work, gated (B1). A batch that changed
+    /// nothing and dirtied no publication input republishes byte-identical
+    /// facts: skip the skip-recompute, the evidence rebuild, and the
+    /// consumer resync. The revision gate (not `changed` alone) is what
+    /// makes this sound: scan time, loss markers, and plan-equal pin commits
+    /// all bump the revision without setting `changed`, and any of them
+    /// forces the tail to run.
+    fn publish_batch_tail(&mut self, changed: bool) -> Result<()> {
+        if changed || self.facts_revision != self.published_facts_revision {
+            let skips_start = crate::attach::monotonic_ns();
+            record_object_skips(&mut self.plan, &self.counters.object_skips);
+            self.stage_timings.span(
+                crate::timing::StageKind::Projection,
+                "record_tail_skips",
+                skips_start,
+                crate::attach::monotonic_ns(),
+            );
+            self.publish_current_capture_facts()?;
+            self.published_facts_revision = self.facts_revision;
+            self.tail_publishes = self.tail_publishes.saturating_add(1);
+        } else {
+            self.tail_skips = self.tail_skips.saturating_add(1);
+        }
+        Ok(())
+    }
+
     fn project_capture_facts(&mut self) {
+        let project_start = crate::attach::monotonic_ns();
         self.capture_facts.apply_to_plan(&mut self.plan);
         self.discovery = self.capture_facts.discovery(&self.plan);
+        self.stage_timings.span(
+            crate::timing::StageKind::Projection,
+            "project_facts",
+            project_start,
+            crate::attach::monotonic_ns(),
+        );
     }
 
     fn start_publication_snapshot(&self) -> StartPublicationSnapshot {
@@ -8884,6 +9116,7 @@ impl Engine {
         self.modules = modules;
         self.counters.corroboration = snapshot.corroboration;
         self.counters.manifest_fallbacks = snapshot.manifest_fallbacks;
+        self.note_facts_mutated();
         self.next_selection_binding_id = snapshot.next_selection_binding_id;
         self.selection_bindings = snapshot.selection_bindings;
         self.selection_claims = snapshot.selection_claims;
@@ -8943,6 +9176,7 @@ impl Engine {
         mut skipped: Vec<Skipped>,
         pending_selection: Option<&SelectionTableKey>,
     ) -> Result<LiveCandidate> {
+        let merge_head_start = crate::attach::monotonic_ns();
         self.pending_rejected_keys
             .extend(pinned.newly_rejected_keys(&self.pinned));
         let (_, overlay_skips) = canonicalize_scanned_overlays(&mut pinned);
@@ -8954,6 +9188,7 @@ impl Engine {
         for skip in skipped {
             if !self.counters.object_skips.contains(&skip) {
                 self.counters.object_skips.push(skip);
+                self.note_facts_mutated();
             }
         }
         raw_modules.retain(|module| {
@@ -8965,13 +9200,35 @@ impl Engine {
                     .any(|entry| pinned.rejects(entry.object))
         });
         pinned.reset_derived_claims();
+        self.stage_timings.span(
+            crate::timing::StageKind::Merge,
+            "live_merge_head",
+            merge_head_start,
+            crate::attach::monotonic_ns(),
+        );
+        let bind_start = crate::attach::monotonic_ns();
         let (modules, binding_skips) = bind_scanned_modules(&raw_modules, &mut pinned);
+        self.stage_timings.span(
+            crate::timing::StageKind::Bind,
+            "bind_live_modules",
+            bind_start,
+            crate::attach::monotonic_ns(),
+        );
+        let merge_mid_start = crate::attach::monotonic_ns();
         attribution::note_all(&binding_skips);
         for skip in binding_skips {
             if !self.counters.object_skips.contains(&skip) {
                 self.counters.object_skips.push(skip);
+                self.note_facts_mutated();
             }
         }
+        self.stage_timings.span(
+            crate::timing::StageKind::Merge,
+            "live_merge_mid",
+            merge_mid_start,
+            crate::attach::monotonic_ns(),
+        );
+        let plan_start = crate::attach::monotonic_ns();
         let broad_admit = self.broad_admit;
         let mut rebuilt =
             self.plan
@@ -9005,6 +9262,13 @@ impl Engine {
         for reason in selection_refusals {
             self.mark_partial("offline interface selection", &reason);
         }
+        self.stage_timings.span(
+            crate::timing::StageKind::Plan,
+            "rebuild_live_plan",
+            plan_start,
+            crate::attach::monotonic_ns(),
+        );
+        let mut merge_tail_start = crate::attach::monotonic_ns();
         record_object_skips(&mut rebuilt, &self.counters.object_skips);
         let module_objects: BTreeSet<_> =
             rebuilt.modules.iter().map(|module| module.object).collect();
@@ -9039,9 +9303,18 @@ impl Engine {
         if !invalidated_modules.is_empty() || !invalidated_fallbacks.is_empty() {
             self.capture_facts
                 .invalidate_discovery_proofs(invalidated_modules, invalidated_fallbacks);
+            // The projection below records its own span: close the merge
+            // tail before it and reopen after, so stages never overlap.
+            self.stage_timings.span(
+                crate::timing::StageKind::Merge,
+                "live_merge_tail",
+                merge_tail_start,
+                crate::attach::monotonic_ns(),
+            );
             if self.capture_facts.staged.is_none() {
                 self.project_capture_facts();
             }
+            merge_tail_start = crate::attach::monotonic_ns();
             self.mark_partial(
                 "live discovery evidence",
                 "a late identity collision invalidated prior exact fallback or corroboration evidence",
@@ -9163,6 +9436,12 @@ impl Engine {
         }
         record_object_skips(&mut candidate_plan, &self.counters.object_skips);
         let views = modules.iter().map(|module| module.scanned.view).collect();
+        self.stage_timings.span(
+            crate::timing::StageKind::Merge,
+            "live_merge_tail",
+            merge_tail_start,
+            crate::attach::monotonic_ns(),
+        );
         Ok(LiveCandidate {
             pinned,
             modules,
@@ -9243,6 +9522,7 @@ impl Engine {
         retirements: &BTreeSet<ProcessViewId>,
         keys: &BTreeSet<ObjectKey>,
     ) -> Result<LiveCandidate> {
+        let assemble_start = crate::attach::monotonic_ns();
         let mut pinned = self.pinned.clone();
         for view in retirements {
             pinned.remove_view(*view);
@@ -9254,6 +9534,12 @@ impl Engine {
             .filter(|module| !retirements.contains(&module.scanned.view))
             .map(|module| module.scanned.clone())
             .collect();
+        self.stage_timings.span(
+            crate::timing::StageKind::Merge,
+            "conservative_assemble",
+            assemble_start,
+            crate::attach::monotonic_ns(),
+        );
         self.live_candidate(pinned, raw_modules, skipped)
     }
 
@@ -9275,10 +9561,19 @@ impl Engine {
             .collect();
         let timing_owners = candidate_timing_owners(&candidate);
         let target_modules = delta_timing_keys(&candidate.delta, &timing_owners);
+        let preflight_start = crate::attach::monotonic_ns();
         let targets_ok = preflighted
             || session
                 .preflight_targets(&targets, &candidate.pinned)
                 .is_ok();
+        // A preflighted candidate paid nothing here: the span still records
+        // (usually zero) so invocations count applications, not syscalls.
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "apply_preflight",
+            preflight_start,
+            crate::attach::monotonic_ns(),
+        );
         let admission = candidate_admission(
             &self.views,
             extra_views,
@@ -9331,7 +9626,15 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
-        let detach_failed = match session.detach_slots(&selected) {
+        let detach_slots_start = crate::attach::monotonic_ns();
+        let detach_slots_outcome = session.detach_slots(&selected);
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "detach_slots",
+            detach_slots_start,
+            crate::attach::monotonic_ns(),
+        );
+        let detach_failed = match detach_slots_outcome {
             Ok(report) => {
                 self.apply_group_rebuild(&mut candidate.plan, &timing_owners, report, &mut outcome);
                 false
@@ -9364,9 +9667,16 @@ impl Engine {
         } else {
             let candidate_views = candidate.views.clone();
             let mut generation_lost = false;
+            let attach_targets_start = crate::attach::monotonic_ns();
             let attach = generation_checked_mutation(
                 || process_views_are_current(&self.views, extra_views, &candidate_views),
                 || session.attach_targets(&candidate.delta.new, &candidate.pinned),
+            );
+            self.stage_timings.span(
+                crate::timing::StageKind::Attach,
+                "attach_targets",
+                attach_targets_start,
+                crate::attach::monotonic_ns(),
             );
             let (attach, attach_stale) = match attach {
                 GenerationMutation::PrecheckFailed => (None, true),
@@ -9386,7 +9696,15 @@ impl Engine {
                             .filter(|slot| failed.contains(&slot.index))
                             .cloned()
                             .collect();
-                        match session.detach_slots(&failed_slots) {
+                        let detach_failed_slots_start = crate::attach::monotonic_ns();
+                        let detach_failed_slots_outcome = session.detach_slots(&failed_slots);
+                        self.stage_timings.span(
+                            crate::timing::StageKind::Attach,
+                            "detach_failed_slots",
+                            detach_failed_slots_start,
+                            crate::attach::monotonic_ns(),
+                        );
+                        match detach_failed_slots_outcome {
                             Ok(report) => self.apply_group_rebuild(
                                 &mut candidate.plan,
                                 &timing_owners,
@@ -9424,6 +9742,7 @@ impl Engine {
             }
             if *additions_allowed && !generation_lost {
                 let detach_failures = session.detach_failures().len();
+                let replace_targets_start = crate::attach::monotonic_ns();
                 let replacement = generation_checked_mutation(
                     || process_views_are_current(&self.views, extra_views, &candidate_views),
                     || {
@@ -9433,6 +9752,12 @@ impl Engine {
                             &candidate.pinned,
                         )
                     },
+                );
+                self.stage_timings.span(
+                    crate::timing::StageKind::Attach,
+                    "replace_targets",
+                    replace_targets_start,
+                    crate::attach::monotonic_ns(),
                 );
                 let (replacement, replacement_stale) = match replacement {
                     GenerationMutation::PrecheckFailed => (None, true),
@@ -9616,7 +9941,7 @@ impl Engine {
             })
             .collect();
         for pid in pids {
-            self.request_refresh(pid);
+            self.request_refresh(pid, crate::attach::monotonic_ns());
         }
     }
 
@@ -9802,7 +10127,15 @@ impl Engine {
                     })
                     .cloned()
                     .collect();
-                match session.detach_slots(&detach) {
+                let detach_selection_start = crate::attach::monotonic_ns();
+                let detach_selection_outcome = session.detach_slots(&detach);
+                self.stage_timings.span(
+                    crate::timing::StageKind::Attach,
+                    "detach_selection",
+                    detach_selection_start,
+                    crate::attach::monotonic_ns(),
+                );
+                match detach_selection_outcome {
                     Ok(report) => {
                         let owners = candidate_timing_owners(&candidate);
                         self.apply_group_rebuild(
@@ -9929,7 +10262,15 @@ impl Engine {
                 })
                 .cloned()
                 .collect();
-            match session.detach_slots(&rollback) {
+            let detach_rollback_start = crate::attach::monotonic_ns();
+            let detach_rollback_outcome = session.detach_slots(&rollback);
+            self.stage_timings.span(
+                crate::timing::StageKind::Attach,
+                "detach_rollback",
+                detach_rollback_start,
+                crate::attach::monotonic_ns(),
+            );
+            match detach_rollback_outcome {
                 Ok(report) => {
                     let owners = candidate_timing_owners(&candidate);
                     self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
@@ -9965,6 +10306,10 @@ impl Engine {
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;
+        // The commit replaces the whole publication input set (plan, pins,
+        // modules, and below corroboration and fallbacks) even when the plan
+        // compares equal, so it dirties the inputs unconditionally.
+        self.note_facts_mutated();
         for binding in self.selection_bindings.values_mut() {
             if let Some(module) = self
                 .plan
@@ -10084,7 +10429,15 @@ impl Engine {
             .cloned()
             .collect();
         if !orphaned_selection.is_empty() {
-            match session.detach_slots(&orphaned_selection) {
+            let detach_orphaned_start = crate::attach::monotonic_ns();
+            let detach_orphaned_outcome = session.detach_slots(&orphaned_selection);
+            self.stage_timings.span(
+                crate::timing::StageKind::Attach,
+                "detach_orphaned_selection",
+                detach_orphaned_start,
+                crate::attach::monotonic_ns(),
+            );
+            match detach_orphaned_outcome {
                 Ok(report) => {
                     let owners = candidate_timing_owners(candidate);
                     self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
@@ -10103,7 +10456,15 @@ impl Engine {
         let retired = candidate
             .plan
             .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
-        match session.detach_slots(&retired) {
+        let detach_retired_start = crate::attach::monotonic_ns();
+        let detach_retired_outcome = session.detach_slots(&retired);
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "detach_retired",
+            detach_retired_start,
+            crate::attach::monotonic_ns(),
+        );
+        match detach_retired_outcome {
             Ok(report) => {
                 let owners = candidate_timing_owners(candidate);
                 self.apply_group_rebuild(&mut candidate.plan, &owners, report, &mut *outcome);
@@ -10186,7 +10547,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.request_refresh(pid);
+            self.request_refresh(pid, crate::attach::monotonic_ns());
             self.mark_live_loss(
                 "live export discovery",
                 "an export record had no retained process generation",
@@ -10254,8 +10615,16 @@ impl Engine {
         crate::first_use_probe::publication_validated(&self.views[position], &lowered, hook_ts_ns);
         let (pins, pin_skips) = {
             let view = &self.views[position];
-            pin_scanned_view_objects(view, std::slice::from_ref(&lowered), &mut self.budget)
-                .map_err(anyhow::Error::msg)?
+            let pin_start = crate::attach::monotonic_ns();
+            let pinned =
+                pin_scanned_view_objects(view, std::slice::from_ref(&lowered), &mut self.budget);
+            self.stage_timings.span(
+                crate::timing::StageKind::Pin,
+                "pin_lowered_module",
+                pin_start,
+                crate::attach::monotonic_ns(),
+            );
+            pinned.map_err(anyhow::Error::msg)?
         };
         let mut candidate_pins = self.pinned.clone();
         let mut skipped = pin_skips;
@@ -10310,7 +10679,7 @@ impl Engine {
         let Some(position) = self.views.iter().position(|view| {
             view.id() == binding_view && view.pid() == pid && view.still_the_same()
         }) else {
-            self.request_refresh(pid);
+            self.request_refresh(pid, crate::attach::monotonic_ns());
             self.mark_live_loss(
                 "live interface selection",
                 "a selection result had no retained process generation when its table was validated",
@@ -10407,6 +10776,7 @@ impl Engine {
                 &self.hooks,
                 &mut self.budget,
                 broad_admit,
+                &mut self.stage_timings,
             ),
             LoaderScanMode::MetadataOnly => Self::scan_retained_view_without_memory(
                 &self.views[position],
@@ -10414,6 +10784,7 @@ impl Engine {
                 &self.hooks,
                 &mut self.budget,
                 broad_admit,
+                &mut self.stage_timings,
             ),
         };
         let mut skipped = self.absorb_scan_counters(scan_counters);
@@ -10479,9 +10850,16 @@ impl Engine {
                 .filter(|module| is_newly_observed_module(&retained, module))
                 .cloned()
                 .collect();
-            let (new_pins, pin_skips) =
-                pin_scanned_view_objects(&self.views[position], &new_modules, &mut self.budget)
-                    .map_err(anyhow::Error::msg)?;
+            let pin_start = crate::attach::monotonic_ns();
+            let pinned =
+                pin_scanned_view_objects(&self.views[position], &new_modules, &mut self.budget);
+            self.stage_timings.span(
+                crate::timing::StageKind::Pin,
+                "pin_new_modules",
+                pin_start,
+                crate::attach::monotonic_ns(),
+            );
+            let (new_pins, pin_skips) = pinned.map_err(anyhow::Error::msg)?;
             skipped.extend(pin_skips);
             skipped.extend(candidate_pins.absorb(new_pins));
             let mut retained = retained;
@@ -10713,7 +11091,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.request_refresh(pid);
+            self.request_refresh(pid, crate::attach::monotonic_ns());
             self.reject_loader_record("a loader hit had no retained process generation");
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::LoaderNoRetainedView,
@@ -11935,6 +12313,7 @@ impl Engine {
                 continue;
             }
             let detach_failures = session.detach_failures().len();
+            let attach_dynamic_export_start = crate::attach::monotonic_ns();
             let attach = generation_checked_mutation(
                 || {
                     self.views
@@ -11952,6 +12331,12 @@ impl Engine {
                         &self.pinned,
                     )
                 },
+            );
+            self.stage_timings.span(
+                crate::timing::StageKind::Attach,
+                "attach_dynamic_export",
+                attach_dynamic_export_start,
+                crate::attach::monotonic_ns(),
             );
             match attach {
                 GenerationMutation::Committed(Ok((added, completed))) => {
@@ -12100,7 +12485,7 @@ impl Engine {
             .map(ProcessView::pid)
             .collect();
         for pid in pids {
-            self.request_refresh(pid);
+            self.request_refresh(pid, crate::attach::monotonic_ns());
         }
     }
 
@@ -12169,12 +12554,19 @@ impl Engine {
             &locator.authority.loader_maps[0],
             &loader_path,
         );
-        let (loader_pins, loader_skips) = pin_scanned_view_objects(
+        let pin_start = crate::attach::monotonic_ns();
+        let pinned = pin_scanned_view_objects(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
-        )
-        .map_err(anyhow::Error::msg)?;
+        );
+        self.stage_timings.span(
+            crate::timing::StageKind::Pin,
+            "pin_loader_module",
+            pin_start,
+            crate::attach::monotonic_ns(),
+        );
+        let (loader_pins, loader_skips) = pinned.map_err(anyhow::Error::msg)?;
         let skipped = loader_skips;
         for skip in &skipped {
             self.mark_partial(&skip.subject, &skip.reason);
@@ -12278,6 +12670,7 @@ impl Engine {
             .prepare(prepared)
             .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
         let mut revalidation_error = None;
+        let attach_dynamic_loader_start = crate::attach::monotonic_ns();
         let attach = generation_checked_mutation(
             || {
                 if !self.views[position].still_the_same() {
@@ -12315,6 +12708,12 @@ impl Engine {
                     &self.pinned,
                 )
             },
+        );
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "attach_dynamic_loader",
+            attach_dynamic_loader_start,
+            crate::attach::monotonic_ns(),
         );
         let generation_lost = match attach {
             GenerationMutation::Committed(Ok(_)) => {
@@ -12443,12 +12842,19 @@ impl Engine {
             tables: Vec::new(),
             interfaces: Vec::new(),
         };
-        let (loader_pins, skipped) = pin_scanned_view_objects(
+        let pin_start = crate::attach::monotonic_ns();
+        let pinned = pin_scanned_view_objects(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
-        )
-        .map_err(anyhow::Error::msg)?;
+        );
+        self.stage_timings.span(
+            crate::timing::StageKind::Pin,
+            "pin_owned_loader",
+            pin_start,
+            crate::attach::monotonic_ns(),
+        );
+        let (loader_pins, skipped) = pinned.map_err(anyhow::Error::msg)?;
         for skip in &skipped {
             self.mark_partial(&skip.subject, &skip.reason);
         }
@@ -12519,6 +12925,7 @@ impl Engine {
             .loader_registry
             .prepare(prepared_context)
             .map_err(anyhow::Error::msg)?;
+        let attach_owned_prearm_start = crate::attach::monotonic_ns();
         let attach = generation_checked_mutation(
             || {
                 self.views[position].still_the_same()
@@ -12536,6 +12943,12 @@ impl Engine {
                     &self.pinned,
                 )
             },
+        );
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "attach_owned_prearm_loader",
+            attach_owned_prearm_start,
+            crate::attach::monotonic_ns(),
         );
         match classify_owned_prearm_attach(attach) {
             OwnedPrearmAttachDisposition::Attached => {
@@ -12620,7 +13033,14 @@ impl Engine {
         initiating_error: String,
     ) -> Result<OwnedLoaderPrearmOutcome> {
         let mut errors = vec![initiating_error];
+        let detach_dynamic_start = crate::attach::monotonic_ns();
         let (terminal_exports, detach_failed) = session.detach_dynamic_context(context);
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "detach_dynamic_context",
+            detach_dynamic_start,
+            crate::attach::monotonic_ns(),
+        );
         if detach_failed {
             errors.push("dynamic loader detach failed".into());
         }
@@ -13244,7 +13664,14 @@ impl Engine {
                 if self.terminal_journal.is_some() {
                     bail!("terminal loader drain authority is already pending");
                 }
+                let detach_retire_dynamic_start = crate::attach::monotonic_ns();
                 let (terminal_exports, detach_failed) = session.detach_dynamic_context(context_id);
+                self.stage_timings.span(
+                    crate::timing::StageKind::Attach,
+                    "detach_dynamic_context",
+                    detach_retire_dynamic_start,
+                    crate::attach::monotonic_ns(),
+                );
                 for binding in self.selection_bindings.values_mut() {
                     if binding.context == context_id {
                         binding.retired = true;
@@ -13473,7 +13900,7 @@ impl Engine {
                     self.polled_pids.remove(&pid);
                 }
                 RetirementCause::ExecRefresh | RetirementCause::GenerationLost => {
-                    self.request_refresh(pid);
+                    self.request_refresh(pid, crate::attach::monotonic_ns());
                 }
             }
         }
@@ -13719,7 +14146,7 @@ impl Engine {
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
         {
-            self.request_refresh(pid);
+            self.request_refresh(pid, crate::attach::monotonic_ns());
             None
         } else {
             if record.kind == DISCOVERY_KIND_LEADER_EXIT {
@@ -14169,6 +14596,7 @@ impl Engine {
         &mut self,
         views: &BTreeSet<ProcessViewId>,
         failure: &str,
+        tick_now: &mut TickClock<'_>,
     ) -> InventoryScanOutcome {
         let mut scans = Vec::new();
         let mut failed_pids = BTreeSet::new();
@@ -14182,7 +14610,7 @@ impl Engine {
             // deferral is not a failure: the rescan never ran, so nothing
             // about the view itself is published, and a polling rescan
             // among them stays pending until its retry settles it (F1).
-            if self.scheduler.tick_expired(crate::attach::monotonic_ns()) {
+            if self.scheduler.tick_expired(tick_now()) {
                 for id in &ordered[index..] {
                     if let Some(view) = self.views.iter().find(|view| view.id() == *id) {
                         deferred_pids.insert(view.pid());
@@ -14217,6 +14645,7 @@ impl Engine {
                 &self.hooks,
                 &mut self.budget,
                 broad_admit,
+                &mut self.stage_timings,
             );
             self.deep_scans = self.deep_scans.saturating_add(1);
             skipped.extend(self.absorb_scan_counters(counters));
@@ -14258,6 +14687,7 @@ impl Engine {
         new_views: &[(ProcessView, Vec<ScannedModule>, PinnedObjects)],
         mut skipped: Vec<Skipped>,
     ) -> Result<LiveCandidate> {
+        let assemble_start = crate::attach::monotonic_ns();
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();
         let mut candidate_pins = self.pinned.clone();
         for view in removed {
@@ -14284,6 +14714,12 @@ impl Engine {
                 merge_scanned_module(&mut raw_modules, module.clone());
             }
         }
+        self.stage_timings.span(
+            crate::timing::StageKind::Merge,
+            "inventory_assemble",
+            assemble_start,
+            crate::attach::monotonic_ns(),
+        );
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate
             .views
@@ -14392,7 +14828,7 @@ impl Engine {
         {
             return false;
         }
-        if self.refresh_requested.contains(&pid) {
+        if self.refresh_requested.contains_key(&pid) {
             return false;
         }
         if self.pending_leader_exit_views.contains(&id)
@@ -14455,7 +14891,7 @@ impl Engine {
             if polling >= MAX_POLLING_RESCANS {
                 break;
             }
-            if self.refresh_requested.contains(&pid) {
+            if self.refresh_requested.contains_key(&pid) {
                 continue;
             }
             let retained_exploratory = self
@@ -14465,8 +14901,8 @@ impl Engine {
             if !retained_exploratory {
                 continue;
             }
-            self.request_refresh(pid);
-            if self.refresh_requested.contains(&pid) {
+            self.request_refresh(pid, crate::attach::monotonic_ns());
+            if self.refresh_requested.contains_key(&pid) {
                 polling += 1;
                 last_queued = Some(pid);
                 self.polled_pids.insert(pid);
@@ -14592,10 +15028,10 @@ impl Engine {
     fn select_over_cap_desired(&mut self, pids: &[u32]) -> BTreeSet<u32> {
         let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
         let enumerated: BTreeSet<u32> = pids.iter().copied().collect();
-        let pending: BTreeSet<u32> = self
-            .refresh_requested
-            .intersection(&enumerated)
+        let pending: BTreeSet<u32> = enumerated
+            .iter()
             .copied()
+            .filter(|pid| self.refresh_requested.contains_key(pid))
             .collect();
         let mut desired = known.clone();
         desired.extend(pending.iter().copied());
@@ -14783,12 +15219,122 @@ impl Engine {
         select_rotation_candidates(&pool, free_slots, &stale)
     }
 
+    /// Admits one tick's newcomer window: opens, scans, and stages each
+    /// admitted pid as an inventory new view. The tick quantum stops
+    /// admissions before another scan — the current pid and the rest defer
+    /// with their requests retained, never dropped. Returns the staged new
+    /// views, the pids to keep queued (failures and deferrals alike), and
+    /// the tick's skips. Extracted verbatim from the inventory tick so an
+    /// injected clock can expire mid-path; production behavior is unchanged.
+    fn admit_inventory_new_views(
+        &mut self,
+        admitted: Vec<u32>,
+        max_scan_pids: usize,
+        tick_now: &mut TickClock<'_>,
+    ) -> (Vec<InventoryNewView>, BTreeSet<u32>, Vec<Skipped>) {
+        let mut new_views = Vec::new();
+        let mut failed_refresh_pids = BTreeSet::new();
+        let mut skipped = Vec::new();
+        let mut unprocessed = admitted.into_iter();
+        while let Some(pid) = unprocessed.next() {
+            // The tick quantum stops admissions before another scan: this
+            // pid and the rest defer with their requests retained.
+            if self.scheduler.tick_expired(tick_now()) {
+                failed_refresh_pids.insert(pid);
+                failed_refresh_pids.extend(unprocessed);
+                skipped.push(Skipped {
+                    subject: "live discovery tick".into(),
+                    reason: "tick deep-scan quantum exhausted; remaining new processes deferred to the next tick"
+                        .into(),
+                });
+                break;
+            }
+            let id = match self.allocate_view_id() {
+                Ok(id) => id,
+                Err(_) => {
+                    skipped.push(Skipped {
+                        subject: "process view".into(),
+                        reason: format!(
+                            "capture process-view capacity {max_scan_pids} was exhausted; remaining generations were not scanned"
+                        ),
+                    });
+                    // Exhaustion drops nothing: the unprocessed pids stay
+                    // queued (bounded) so a later pass with a free slot
+                    // serves them instead of losing event-driven work.
+                    failed_refresh_pids.insert(pid);
+                    failed_refresh_pids.extend(unprocessed);
+                    break;
+                }
+            };
+            self.scheduler.note_new_view_attempt(pid);
+            let open_start = crate::attach::monotonic_ns();
+            let opened = ProcessView::open(id, pid);
+            self.stage_timings.span(
+                crate::timing::StageKind::Scan,
+                "open_view",
+                open_start,
+                crate::attach::monotonic_ns(),
+            );
+            let view = match opened {
+                Ok(view) => view,
+                Err(error) => {
+                    // Allocated but never admitted: the ID returns to
+                    // the pool instead of burning for the capture lifetime.
+                    self.release_view_id(id);
+                    failed_refresh_pids.insert(pid);
+                    skipped.extend(unreadable_member_skip(
+                        pid,
+                        process::generation_gone(pid),
+                        &format!("the process generation could not be retained: {error}"),
+                        &mut self.counters.noise,
+                    ));
+                    continue;
+                }
+            };
+            let broad_admit = self.broad_admit;
+            let (scan_result, counters) = Self::scan_retained_view(
+                &view,
+                &self.module_hints,
+                &self.hooks,
+                &mut self.budget,
+                broad_admit,
+                &mut self.stage_timings,
+            );
+            self.deep_scans = self.deep_scans.saturating_add(1);
+            skipped.extend(self.absorb_scan_counters(counters));
+            match scan_result {
+                // Completeness is intentionally unused here: a new view has
+                // no retained modules, so a partial first scan simply
+                // attaches what it verified with the skips as evidence.
+                Ok((modules, pins, _complete)) => {
+                    self.note_scan_observed(view.id(), &modules);
+                    self.scheduler.note_admitted(pid);
+                    new_views.push((view, modules, pins));
+                }
+                Err(error) => {
+                    // Allocated but never admitted: the failed scan drops
+                    // this view, so its ID returns to the pool.
+                    self.release_view_id(view.id());
+                    failed_refresh_pids.insert(pid);
+                    skipped.extend(unreadable_member_skip(
+                        pid,
+                        view.original_exited() == Ok(true),
+                        &format!("the process generation could not be scanned: {error:#}"),
+                        &mut self.counters.noise,
+                    ));
+                }
+            }
+        }
+        (new_views, failed_refresh_pids, skipped)
+    }
+
     /// One inventory tick. Every process view the tick opens waits in
     /// `new_views` until an accepted candidate moves it into `self.views`,
     /// and the tick has many earlier ways out: preflight refusals, stale
     /// generations, queued retirements, a refused apply, and every `?`.
     /// Whatever is still waiting when the tick returns was never admitted;
     /// it is settled here, once, whichever exit was taken (U-11).
+    #[allow(clippy::too_many_arguments)]
     fn refresh_inventory(
         &mut self,
         session: &mut dyn EngineSession,
@@ -14797,6 +15343,7 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
+        tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
         let mut new_views = Vec::new();
         let result = self.refresh_inventory_inner(
@@ -14807,6 +15354,7 @@ impl Engine {
             collect,
             closure,
             &mut new_views,
+            tick_now,
         );
         self.release_unadmitted_views(new_views);
         result
@@ -14842,6 +15390,7 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
         new_views: &mut Vec<InventoryNewView>,
+        tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
         if matches!(self.scope, Scope::Pid(_)) {
             let mut stale: BTreeSet<_> = self
@@ -14900,6 +15449,7 @@ impl Engine {
                 return Ok(false);
             }
         }
+        let enumerate_start = crate::attach::monotonic_ns();
         let (pids, mut skipped) = scope_pids(&self.scope);
         let max_scan_pids = self.max_scan_pids;
         let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
@@ -14910,6 +15460,9 @@ impl Engine {
         // new generation, correctly fresh).
         let live: BTreeSet<u32> = pids.iter().copied().collect();
         self.scheduler.prune_stale_to_enumerated(&live);
+        // Newcomer arrival marks track the same live scope: a departed pid's
+        // mark is arrival evidence for a generation that can never arrive.
+        self.newcomer_first_seen.retain(|pid, _| live.contains(pid));
         // Ordinary ticks never sweep maps: over the cap the scheduler serves
         // queued event-driven work plus a fairness-rotation window, and only
         // the slower reconciliation pass re-reads one bounded slice (Task
@@ -14957,7 +15510,7 @@ impl Engine {
                     view.still_the_same(),
                     membership_authoritative,
                     desired.contains(&view.pid()),
-                    self.refresh_requested.contains(&view.pid()),
+                    self.refresh_requested.contains_key(&view.pid()),
                 )
                 .map(|cause| (view.id(), cause))
             })
@@ -14988,6 +15541,12 @@ impl Engine {
             .map(ProcessView::pid)
             .collect();
         let new_pids: Vec<_> = desired.difference(&known_pids).copied().collect();
+        self.stage_timings.span(
+            crate::timing::StageKind::Scan,
+            "inventory_enumerate",
+            enumerate_start,
+            crate::attach::monotonic_ns(),
+        );
         if removed.is_empty() && refreshed.is_empty() && new_pids.is_empty() {
             self.refresh_requested.clear();
             // No tick queued anything (a queued poll would have made a
@@ -15003,10 +15562,13 @@ impl Engine {
         // The tick's deep-scan phase starts here: refreshed rescans plus
         // new-view admissions share one wall-time quantum and one admission
         // count bound. Direct scan calls outside this tick stay unbounded.
-        self.scheduler
-            .begin_deep_scan_tick(crate::attach::monotonic_ns());
-        let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) =
-            self.scan_inventory_views(&refreshed, "a requested inventory refresh failed");
+        self.scheduler.begin_deep_scan_tick(tick_now());
+        let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) = self
+            .scan_inventory_views(
+                &refreshed,
+                "a requested inventory refresh failed",
+                &mut *tick_now,
+            );
         let mut failed_refresh_pids = failed_scan_pids.clone();
         failed_refresh_pids.extend(deferred_scan_pids);
         skipped.extend(refresh_skips);
@@ -15020,6 +15582,12 @@ impl Engine {
         let mut new_pids = self.scheduler.new_view_order(&new_pids).into_iter();
         let admitted: Vec<u32> = new_pids.by_ref().take(max_new_views).collect();
         let deferred: Vec<u32> = new_pids.collect();
+        // Arrival marks in processing order (first diff wins; the admitted
+        // window marks first so cap pressure lands on the deferred tail).
+        let arrival_now = crate::attach::monotonic_ns();
+        for pid in admitted.iter().chain(deferred.iter()) {
+            self.mark_newcomer_arrival(*pid, arrival_now);
+        }
         if !deferred.is_empty() {
             failed_refresh_pids.extend(deferred.iter().copied());
             let pending = admitted.len() + deferred.len();
@@ -15032,87 +15600,11 @@ impl Engine {
                 ),
             });
         }
-        let mut unprocessed = admitted.into_iter();
-        while let Some(pid) = unprocessed.next() {
-            // The tick quantum stops admissions before another scan: this
-            // pid and the rest defer with their requests retained.
-            if self.scheduler.tick_expired(crate::attach::monotonic_ns()) {
-                failed_refresh_pids.insert(pid);
-                failed_refresh_pids.extend(unprocessed);
-                skipped.push(Skipped {
-                    subject: "live discovery tick".into(),
-                    reason: "tick deep-scan quantum exhausted; remaining new processes deferred to the next tick"
-                        .into(),
-                });
-                break;
-            }
-            let id = match self.allocate_view_id() {
-                Ok(id) => id,
-                Err(_) => {
-                    skipped.push(Skipped {
-                        subject: "process view".into(),
-                        reason: format!(
-                            "capture process-view capacity {max_scan_pids} was exhausted; remaining generations were not scanned"
-                        ),
-                    });
-                    // Exhaustion drops nothing: the unprocessed pids stay
-                    // queued (bounded) so a later pass with a free slot
-                    // serves them instead of losing event-driven work.
-                    failed_refresh_pids.insert(pid);
-                    failed_refresh_pids.extend(unprocessed);
-                    break;
-                }
-            };
-            self.scheduler.note_new_view_attempt(pid);
-            let view = match ProcessView::open(id, pid) {
-                Ok(view) => view,
-                Err(error) => {
-                    // Allocated but never admitted: the ID returns to
-                    // the pool instead of burning for the capture lifetime.
-                    self.release_view_id(id);
-                    failed_refresh_pids.insert(pid);
-                    skipped.extend(unreadable_member_skip(
-                        pid,
-                        process::generation_gone(pid),
-                        &format!("the process generation could not be retained: {error}"),
-                        &mut self.counters.noise,
-                    ));
-                    continue;
-                }
-            };
-            let broad_admit = self.broad_admit;
-            let (scan_result, counters) = Self::scan_retained_view(
-                &view,
-                &self.module_hints,
-                &self.hooks,
-                &mut self.budget,
-                broad_admit,
-            );
-            self.deep_scans = self.deep_scans.saturating_add(1);
-            skipped.extend(self.absorb_scan_counters(counters));
-            match scan_result {
-                // Completeness is intentionally unused here: a new view has
-                // no retained modules, so a partial first scan simply
-                // attaches what it verified with the skips as evidence.
-                Ok((modules, pins, _complete)) => {
-                    self.note_scan_observed(view.id(), &modules);
-                    self.scheduler.note_admitted(pid);
-                    new_views.push((view, modules, pins));
-                }
-                Err(error) => {
-                    // Allocated but never admitted: the failed scan drops
-                    // this view, so its ID returns to the pool.
-                    self.release_view_id(view.id());
-                    failed_refresh_pids.insert(pid);
-                    skipped.extend(unreadable_member_skip(
-                        pid,
-                        view.original_exited() == Ok(true),
-                        &format!("the process generation could not be scanned: {error:#}"),
-                        &mut self.counters.noise,
-                    ));
-                }
-            }
-        }
+        let (admitted_views, failed_admission_pids, admission_skips) =
+            self.admit_inventory_new_views(admitted, max_scan_pids, &mut *tick_now);
+        new_views.extend(admitted_views);
+        failed_refresh_pids.extend(failed_admission_pids);
+        skipped.extend(admission_skips);
 
         for (view, _, _) in new_views.iter() {
             if !view.still_the_same() {
@@ -15128,8 +15620,15 @@ impl Engine {
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         let candidate =
             self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped.clone())?;
+        let admission_start = crate::attach::monotonic_ns();
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, new_views);
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "candidate_admission",
+            admission_start,
+            crate::attach::monotonic_ns(),
+        );
         let mut changed = self.latch_candidate_ambiguity(&candidate.plan);
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
@@ -15145,7 +15644,7 @@ impl Engine {
             self.queue_stale_views(&retained_stale, pending_views);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
-                    self.request_refresh(view.pid());
+                    self.request_refresh(view.pid(), crate::attach::monotonic_ns());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
@@ -15197,7 +15696,7 @@ impl Engine {
                 .find(|candidate| candidate.id() == view)
                 .map(ProcessView::pid)
             {
-                self.request_refresh(pid);
+                self.request_refresh(pid, crate::attach::monotonic_ns());
             }
         }
 
@@ -15232,7 +15731,7 @@ impl Engine {
                     .map(ProcessView::pid)
                 {
                     failed_refresh_pids.insert(pid);
-                    self.request_refresh(pid);
+                    self.request_refresh(pid, crate::attach::monotonic_ns());
                 }
             }
         }
@@ -15268,8 +15767,12 @@ impl Engine {
             );
             return Ok(changed);
         }
-        let (rescanned, failed_rescan_pids, deferred_rescan_pids, rescan_skips) =
-            self.scan_inventory_views(&refreshed_ok, "a post-retirement inventory refresh failed");
+        let (rescanned, failed_rescan_pids, deferred_rescan_pids, rescan_skips) = self
+            .scan_inventory_views(
+                &refreshed_ok,
+                "a post-retirement inventory refresh failed",
+                &mut *tick_now,
+            );
         failed_refresh_pids.extend(failed_rescan_pids);
         failed_refresh_pids.extend(deferred_rescan_pids);
         skipped.extend(rescan_skips);
@@ -15278,8 +15781,15 @@ impl Engine {
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
         let candidate = self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped)?;
+        let admission_start = crate::attach::monotonic_ns();
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, new_views);
+        self.stage_timings.span(
+            crate::timing::StageKind::Attach,
+            "candidate_admission",
+            admission_start,
+            crate::attach::monotonic_ns(),
+        );
         changed |= self.latch_candidate_ambiguity(&candidate.plan);
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
@@ -15296,7 +15806,7 @@ impl Engine {
             let retained_lost = self.retained_generation_lost(&retained_stale);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
-                    self.request_refresh(view.pid());
+                    self.request_refresh(view.pid(), crate::attach::monotonic_ns());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
@@ -15379,7 +15889,7 @@ impl Engine {
                 .find(|(candidate, _, _)| candidate.id() == *view)
                 .map(|(view, _, _)| view.pid())
             {
-                self.request_refresh(pid);
+                self.request_refresh(pid, crate::attach::monotonic_ns());
                 failed_refresh_pids.insert(pid);
             }
         }
@@ -15388,7 +15898,12 @@ impl Engine {
                 .into_iter()
                 .partition(|(view, _, _)| new_view_ids.contains(&view.id()));
             *new_views = unpublished;
+            // First-observed-ready: the accepted newcomers join the retained
+            // set here, so their queue ages sample now, just before the
+            // tick's event drain.
+            let admission_now = crate::attach::monotonic_ns();
             for (view, _, _) in admitted {
+                self.sample_newcomer_admission(view.pid(), admission_now);
                 self.views.push(view);
             }
             self.record_cgroup_view_admissions(new_view_ids.iter().copied());
@@ -15418,7 +15933,7 @@ impl Engine {
             failed_refresh_pids.extend(new_view_pids);
         }
         self.refresh_requested
-            .retain(|pid| failed_refresh_pids.contains(pid));
+            .retain(|pid, _| failed_refresh_pids.contains(pid));
         self.close_cgroup_admissions_at_removal(&removed);
         self.settle_leader_exits_at_removal(removed.iter().copied());
         let released: Vec<_> = self
@@ -15450,7 +15965,7 @@ impl Engine {
                 if self.frame_work_exhausted() {
                     self.note_frame_deferral();
                     let pid = self.views[position].pid();
-                    self.request_refresh(pid);
+                    self.request_refresh(pid, crate::attach::monotonic_ns());
                     return Ok(false);
                 }
                 self.arm_loader_or_partial(position, session, additions_allowed, pending_views)
@@ -15507,7 +16022,7 @@ impl Engine {
                 .map(ProcessView::pid)
                 .collect();
             for pid in unarmed {
-                self.request_refresh(pid);
+                self.request_refresh(pid, crate::attach::monotonic_ns());
             }
             // The unarmed filter above cannot see an armed view whose export
             // work the closed tick skipped. Request it too, with the helper
@@ -15670,6 +16185,19 @@ impl Engine {
         stop: usize,
         post_q_record: &mut bool,
     ) -> Result<bool> {
+        let wall_start = crate::attach::monotonic_ns();
+        let totals_before = self.stage_timings.totals_ns();
+        let result = self.drain_discovery_terminal_to_position_inner(session, stop, post_q_record);
+        self.span_terminal_overhead("terminal_q_overhead", wall_start, &totals_before);
+        result
+    }
+
+    fn drain_discovery_terminal_to_position_inner(
+        &mut self,
+        session: &mut Session,
+        stop: usize,
+        post_q_record: &mut bool,
+    ) -> Result<bool> {
         let mut changed = false;
         let mut collect = Self::collect_discovery_records;
         loop {
@@ -15694,6 +16222,17 @@ impl Engine {
     }
 
     pub(crate) fn drain_discovery_terminal_from(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<bool> {
+        let wall_start = crate::attach::monotonic_ns();
+        let totals_before = self.stage_timings.totals_ns();
+        let result = self.drain_discovery_terminal_from_inner(session);
+        self.span_terminal_overhead("terminal_overhead", wall_start, &totals_before);
+        result
+    }
+
+    fn drain_discovery_terminal_from_inner(
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<bool> {
@@ -15737,6 +16276,36 @@ impl Engine {
                 return Ok(changed);
             }
         }
+    }
+
+    /// Records the terminal dispatch's *exclusive* cleanup span: wall time
+    /// minus the scan/pin/bind/plan/merge/projection/attach spans the
+    /// terminal batches recorded inside it. Exclusive, so stages never
+    /// overlap; the per-stage totals stay complete (terminal work included).
+    fn span_terminal_overhead(
+        &mut self,
+        op: &'static str,
+        wall_start: Option<u64>,
+        totals_before: &[u64; crate::timing::STAGE_COUNT],
+    ) {
+        let wall = match (wall_start, crate::attach::monotonic_ns()) {
+            (Some(start), Some(end)) => end.saturating_sub(start),
+            _ => {
+                self.stage_timings
+                    .span_known(crate::timing::StageKind::Cleanup, op, None);
+                return;
+            }
+        };
+        let totals_after = self.stage_timings.totals_ns();
+        let mut inner = 0u64;
+        for (slot, before) in totals_before.iter().enumerate() {
+            inner = inner.saturating_add(totals_after[slot].saturating_sub(*before));
+        }
+        self.stage_timings.span_known(
+            crate::timing::StageKind::Cleanup,
+            op,
+            Some(wall.saturating_sub(inner)),
+        );
     }
 
     /// A quantum stop is backlog, not failure: the exact prefix is applied now
@@ -15942,6 +16511,7 @@ impl Engine {
             && self.pending_rejected_keys.is_empty()
             && !self.frame_deferred
         {
+            let mut tick_now = crate::attach::monotonic_ns;
             changed |= self.refresh_inventory(
                 session,
                 &mut additions_allowed,
@@ -15949,6 +16519,7 @@ impl Engine {
                 &mut pending_views,
                 collect,
                 &mut closure,
+                &mut tick_now,
             )?;
         }
         if !records.is_empty() {
@@ -15961,8 +16532,7 @@ impl Engine {
                 &mut closure,
             )?;
         }
-        record_object_skips(&mut self.plan, &self.counters.object_skips);
-        self.publish_current_capture_facts()?;
+        self.publish_batch_tail(changed)?;
         Ok(DiscoveryBatchOutcome {
             changed,
             required_complete: closure.required_complete() && additions_allowed,
@@ -15988,6 +16558,61 @@ impl Engine {
 
     pub fn discovery(&self) -> &render::DiscoveryEvidence {
         &self.discovery
+    }
+
+    /// Per-stage wall-time accumulation (Phase 2 measurement API): totals,
+    /// invocation counts, and the longest indivisible operation.
+    pub fn stage_timings(&self) -> &crate::timing::StageTimings {
+        &self.stage_timings
+    }
+
+    /// Newcomer queue-age evidence with pending counts sampled at `now_ns`
+    /// (the caller's clock poll, scheduler style; `None` samples pending
+    /// ages unknown). Admissions and drops are cumulative; pending and the
+    /// oldest pending age describe this instant.
+    pub fn newcomer_stats(&self, now_ns: Option<u64>) -> crate::timing::NewcomerStats {
+        let mut stats = self.newcomer_ages.clone();
+        // Pending is the union of the two queues: a diff newcomer with a
+        // queued refresh waits once, not twice.
+        let mut pending = self.newcomer_first_seen.len() as u64;
+        for pid in self.refresh_requested.keys() {
+            if !self.newcomer_first_seen.contains_key(pid) {
+                pending = pending.saturating_add(1);
+            }
+        }
+        stats.pending = pending;
+        let mut oldest: Option<u64> = None;
+        for seen in self
+            .refresh_requested
+            .values()
+            .chain(self.newcomer_first_seen.values())
+            .flatten()
+        {
+            let age = newcomer_age_ms(Some(*seen), now_ns);
+            oldest = match (oldest, age) {
+                (Some(known), Some(age)) => Some(known.max(age)),
+                (None, age) => age,
+                (known, None) => known,
+            };
+        }
+        stats.oldest_pending_age_ms = oldest;
+        stats
+    }
+
+    /// Deep-scan executions driven by discovery and inventory (the E06
+    /// oracle alongside maps bytes).
+    pub fn deep_scans(&self) -> u64 {
+        self.deep_scans
+    }
+
+    /// Loader-arm attempts driven by inventory.
+    pub fn loader_arms(&self) -> u64 {
+        self.loader_arms
+    }
+
+    /// Batch-tail publications executed vs skipped as provably redundant.
+    pub(crate) fn tail_stats(&self) -> (u64, u64) {
+        (self.tail_publishes, self.tail_skips)
     }
 
     /// Private-loader transport failures as finite aggregate counters only.
@@ -16108,8 +16733,7 @@ impl Engine {
             collect,
             &mut closure,
         )?;
-        record_object_skips(&mut self.plan, &self.counters.object_skips);
-        self.publish_current_capture_facts()?;
+        self.publish_batch_tail(changed)?;
         Ok(DiscoveryBatchOutcome {
             changed,
             required_complete: closure.required_complete() && additions_allowed,

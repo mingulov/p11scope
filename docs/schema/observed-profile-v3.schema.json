@@ -198,7 +198,7 @@
         "scheduling": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["drain_repolls", "drain_budget_exhaustions", "capture_event_loss", "detach_event_loss", "capture_discovery_loss", "detach_discovery_loss", "terminal_drain_bound", "terminal_drain_truncated", "sink_policy", "sink_stall_ms", "sink_timeouts", "sink_dropped_bytes", "max_inter_drain_gap_ms", "discovery_deferrals", "phase_ms", "phase_mono_ns"],
+          "required": ["drain_repolls", "drain_budget_exhaustions", "capture_event_loss", "detach_event_loss", "capture_discovery_loss", "detach_discovery_loss", "terminal_drain_bound", "terminal_drain_truncated", "sink_policy", "sink_stall_ms", "sink_timeouts", "sink_dropped_bytes", "max_inter_drain_gap_ms", "discovery_deferrals", "stage_unknown_clock", "tail_publishes", "tail_skips", "phase_ms", "phase_mono_ns", "stage_ms", "stage_invocations", "longest_op", "inter_drain_gap", "newcomer_queue", "resource"],
           "properties": {
             "drain_repolls": {"type": "integer", "minimum": 0},
             "drain_budget_exhaustions": {"type": "integer", "minimum": 0},
@@ -214,6 +214,9 @@
             "sink_dropped_bytes": {"type": "integer", "minimum": 0},
             "max_inter_drain_gap_ms": {"type": "integer", "minimum": 0},
             "discovery_deferrals": {"type": "integer", "minimum": 0, "description": "Live discovery frames that spent their work budget and deferred the rest of their discovery work, in order, to the next frame. A scheduling fact, never a loss; work still undone after the terminal drain is published as a loss instead."},
+            "stage_unknown_clock": {"type": "integer", "minimum": 0, "description": "Stage spans dropped for a failed clock read; in no total."},
+            "tail_publishes": {"type": "integer", "minimum": 0, "description": "Batch-tail publications executed."},
+            "tail_skips": {"type": "integer", "minimum": 0, "description": "Batch-tail publications skipped as provably redundant."},
             "phase_ms": {
               "type": "object",
               "additionalProperties": false,
@@ -236,6 +239,95 @@
                 "loop_start_mono_ns": {"type": ["integer", "null"], "minimum": 0, "description": "Authoritative CLOCK_MONOTONIC reading at the first capture-loop tick, or null when the loop never started."},
                 "loop_end_mono_ns": {"type": ["integer", "null"], "minimum": 0, "description": "Authoritative CLOCK_MONOTONIC reading when the capture loop ended, or null when the loop never ended."},
                 "loop_end_reason": {"enum": ["expiry", "operator_stop", "target_exit", "limit_reached", "error", "unstarted"]}
+              }
+            },
+            "stage_ms": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scan", "pin", "bind", "plan", "merge", "projection", "attach", "drain", "cleanup"],
+              "description": "Per-stage wall time in whole milliseconds, cumulative leaf-span sums (a different clock from phase_ms; no identity between them).",
+              "properties": {
+                "scan": {"type": "integer", "minimum": 0},
+                "pin": {"type": "integer", "minimum": 0},
+                "bind": {"type": "integer", "minimum": 0},
+                "plan": {"type": "integer", "minimum": 0},
+                "merge": {"type": "integer", "minimum": 0},
+                "projection": {"type": "integer", "minimum": 0},
+                "attach": {"type": "integer", "minimum": 0},
+                "drain": {"type": "integer", "minimum": 0},
+                "cleanup": {"type": "integer", "minimum": 0}
+              }
+            },
+            "stage_invocations": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scan", "pin", "bind", "plan", "merge", "projection", "attach", "drain", "cleanup"],
+              "description": "Per-stage recorded span counts.",
+              "properties": {
+                "scan": {"type": "integer", "minimum": 0},
+                "pin": {"type": "integer", "minimum": 0},
+                "bind": {"type": "integer", "minimum": 0},
+                "plan": {"type": "integer", "minimum": 0},
+                "merge": {"type": "integer", "minimum": 0},
+                "projection": {"type": "integer", "minimum": 0},
+                "attach": {"type": "integer", "minimum": 0},
+                "drain": {"type": "integer", "minimum": 0},
+                "cleanup": {"type": "integer", "minimum": 0}
+              }
+            },
+            "longest_op": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["stage", "op", "duration_ms"],
+              "description": "The capture's longest single recorded span; all null when none was recorded.",
+              "properties": {
+                "stage": {"type": ["string", "null"], "enum": ["scan", "pin", "bind", "plan", "merge", "projection", "attach", "drain", "cleanup", null]},
+                "op": {"type": ["string", "null"]},
+                "duration_ms": {"type": ["integer", "null"], "minimum": 0}
+              }
+            },
+            "inter_drain_gap": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["samples", "p50_ms", "p99_ms", "max_ms"],
+              "description": "Bounded inter-drain gap distribution; quantiles are bucket upper bounds, max is exact.",
+              "properties": {
+                "samples": {"type": "integer", "minimum": 0},
+                "p50_ms": {"type": ["integer", "null"], "minimum": 0},
+                "p99_ms": {"type": ["integer", "null"], "minimum": 0},
+                "max_ms": {"type": ["integer", "null"], "minimum": 0}
+              }
+            },
+            "newcomer_queue": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["admitted", "admitted_unknown", "max_admitted_age_ms", "mean_admitted_age_ms", "pending", "oldest_pending_age_ms", "dropped", "dropped_unknown", "max_dropped_age_ms", "marks_dropped"],
+              "description": "Newcomer/refresh queue ages in whole milliseconds.",
+              "properties": {
+                "admitted": {"type": "integer", "minimum": 0},
+                "admitted_unknown": {"type": "integer", "minimum": 0},
+                "max_admitted_age_ms": {"type": ["integer", "null"], "minimum": 0},
+                "mean_admitted_age_ms": {"type": ["integer", "null"], "minimum": 0},
+                "pending": {"type": "integer", "minimum": 0},
+                "oldest_pending_age_ms": {"type": ["integer", "null"], "minimum": 0},
+                "dropped": {"type": "integer", "minimum": 0},
+                "dropped_unknown": {"type": "integer", "minimum": 0},
+                "max_dropped_age_ms": {"type": ["integer", "null"], "minimum": 0},
+                "marks_dropped": {"type": "integer", "minimum": 0}
+              }
+            },
+            "resource": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["samples", "max_rss_kb", "start", "readiness", "end", "last_periodic"],
+              "description": "Capture-process /proc/self resource timeline.",
+              "properties": {
+                "samples": {"type": "integer", "minimum": 0},
+                "max_rss_kb": {"type": ["integer", "null"], "minimum": 0},
+                "start": {"$ref": "#/$defs/resource_sample"},
+                "readiness": {"$ref": "#/$defs/resource_sample"},
+                "end": {"$ref": "#/$defs/resource_sample"},
+                "last_periodic": {"$ref": "#/$defs/resource_sample"}
               }
             }
           }
@@ -507,6 +599,19 @@
     }
   ],
   "$defs": {
+    "resource_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rss_kb", "utime_ms", "stime_ms", "read_bytes", "write_bytes"],
+      "description": "One capture-process resource sample; every field is null when its read or parse failed.",
+      "properties": {
+        "rss_kb": {"type": ["integer", "null"], "minimum": 0, "description": "Resident set in kibibytes, from /proc/self/statm."},
+        "utime_ms": {"type": ["integer", "null"], "minimum": 0, "description": "User CPU time in whole milliseconds, from /proc/self/stat."},
+        "stime_ms": {"type": ["integer", "null"], "minimum": 0, "description": "System CPU time in whole milliseconds, from /proc/self/stat."},
+        "read_bytes": {"type": ["integer", "null"], "minimum": 0, "description": "Storage bytes read (the read_bytes key), from /proc/self/io."},
+        "write_bytes": {"type": ["integer", "null"], "minimum": 0, "description": "Storage bytes written (the write_bytes key), from /proc/self/io."}
+      }
+    },
     "loader_timing": {
       "type": "object",
       "additionalProperties": false,

@@ -104,11 +104,31 @@ SCHEDULING_U64_KEYS = (
     "sink_dropped_bytes",
     "max_inter_drain_gap_ms",
     "discovery_deferrals",
+    "stage_unknown_clock",
+    "tail_publishes",
+    "tail_skips",
 )
 SCHEDULING_KEYS = set(SCHEDULING_U64_KEYS) | {
     "terminal_drain_truncated", "sink_policy", "phase_ms",
-    "phase_mono_ns",
+    "phase_mono_ns", "stage_ms", "stage_invocations", "longest_op",
+    "inter_drain_gap", "newcomer_queue", "resource",
 }
+# Phase 2 per-stage timing: the discovery batch split into leaf spans.
+# Key order mirrors timing::StageKind::ALL on the producer side.
+SCHEDULING_STAGE_KEYS = ("scan", "pin", "bind", "plan", "merge",
+                         "projection", "attach", "drain", "cleanup")
+SCHEDULING_LONGEST_OP_KEYS = ("stage", "op", "duration_ms")
+SCHEDULING_GAP_KEYS = ("samples", "p50_ms", "p99_ms", "max_ms")
+SCHEDULING_NEWCOMER_U64_KEYS = ("admitted", "admitted_unknown", "pending",
+                                "dropped", "dropped_unknown", "marks_dropped")
+SCHEDULING_NEWCOMER_NULLABLE_KEYS = ("max_admitted_age_ms",
+                                     "mean_admitted_age_ms",
+                                     "oldest_pending_age_ms",
+                                     "max_dropped_age_ms")
+SCHEDULING_RESOURCE_KEYS = ("samples", "max_rss_kb", "start", "readiness",
+                            "end", "last_periodic")
+SCHEDULING_RESOURCE_SAMPLE_KEYS = ("rss_kb", "utime_ms", "stime_ms",
+                                   "read_bytes", "write_bytes")
 SCHEDULING_PHASE_KEYS = ("discovery", "discovery_terminal", "drain",
                            "maps", "render", "detach")
 # Authoritative observer phase stamps (T2, G-14): CLOCK_MONOTONIC ns or
@@ -884,6 +904,10 @@ def exact_scheduling_evidence(evidence):
         f"scheduling.phase_mono_ns: loop_end {stamps['loop_end_mono_ns']!r} "
         f"disagrees with reason {stamps['loop_end_reason']!r}",
     )
+    exact_scheduling_stage_timing(scheduling)
+    exact_scheduling_gap_distribution(scheduling)
+    exact_scheduling_newcomer_queue(scheduling)
+    exact_scheduling_resource(scheduling)
     event_split = scheduling["capture_event_loss"] + scheduling["detach_event_loss"]
     require(
         event_split == evidence["event_loss"],
@@ -897,6 +921,156 @@ def exact_scheduling_evidence(evidence):
         f"scheduling discovery split {discovery_split} != discovery_ring_loss "
         f"{evidence['discovery_ring_loss']}",
     )
+
+
+def exact_scheduling_stage_timing(scheduling):
+    """Closed per-stage timing shape (Phase 2).
+
+    Stage totals are leaf-span sums on a different clock from `phase_ms`,
+    so no identity is asserted between them — only shape, and the
+    longest-op coherence: all three fields null together (no span was
+    recorded) or all three present together.
+    """
+    for name in ("stage_ms", "stage_invocations"):
+        stages = scheduling[name]
+        require(isinstance(stages, dict), f"scheduling.{name} must be an object")
+        require(
+            set(stages) == set(SCHEDULING_STAGE_KEYS),
+            f"unexpected {name} keys: {sorted(stages)}",
+        )
+        for key in SCHEDULING_STAGE_KEYS:
+            require(
+                u64(stages[key]),
+                f"scheduling.{name}.{key}: invalid counter {stages[key]!r}",
+            )
+    longest = scheduling["longest_op"]
+    require(isinstance(longest, dict), "scheduling.longest_op must be an object")
+    require(
+        set(longest) == set(SCHEDULING_LONGEST_OP_KEYS),
+        f"unexpected longest_op keys: {sorted(longest)}",
+    )
+    require(
+        longest["stage"] is None or longest["stage"] in SCHEDULING_STAGE_KEYS,
+        f"scheduling.longest_op.stage: invalid stage {longest['stage']!r}",
+    )
+    require(
+        longest["op"] is None
+        or (isinstance(longest["op"], str) and longest["op"] != ""),
+        f"scheduling.longest_op.op: invalid op {longest['op']!r}",
+    )
+    require(
+        longest["duration_ms"] is None or u64(longest["duration_ms"]),
+        f"scheduling.longest_op.duration_ms: invalid duration "
+        f"{longest['duration_ms']!r}",
+    )
+    nulls = sum(1 for key in SCHEDULING_LONGEST_OP_KEYS if longest[key] is None)
+    require(
+        nulls in (0, 3),
+        f"scheduling.longest_op: null and present fields mix {longest!r}",
+    )
+    if nulls == 0:
+        require(
+            scheduling["stage_invocations"][longest["stage"]] > 0,
+            f"scheduling.longest_op: stage {longest['stage']!r} claims a span "
+            f"but has no invocations",
+        )
+
+
+def exact_scheduling_gap_distribution(scheduling):
+    """Closed gap-distribution shape plus the max identity.
+
+    Quantiles are bucket upper bounds (estimates); the maximum is exact
+    and must agree with `max_inter_drain_gap_ms` whenever a gap was
+    sampled. With no samples every quantile is null — a missing sample,
+    never a zero.
+    """
+    gaps = scheduling["inter_drain_gap"]
+    require(isinstance(gaps, dict), "scheduling.inter_drain_gap must be an object")
+    require(
+        set(gaps) == set(SCHEDULING_GAP_KEYS),
+        f"unexpected inter_drain_gap keys: {sorted(gaps)}",
+    )
+    require(u64(gaps["samples"]), f"scheduling.inter_drain_gap.samples: invalid "
+            f"counter {gaps['samples']!r}")
+    for key in SCHEDULING_GAP_KEYS[1:]:
+        require(
+            gaps[key] is None or u64(gaps[key]),
+            f"scheduling.inter_drain_gap.{key}: invalid quantile {gaps[key]!r}",
+        )
+    if gaps["samples"] == 0:
+        require(
+            all(gaps[key] is None for key in SCHEDULING_GAP_KEYS[1:]),
+            f"scheduling.inter_drain_gap: no samples but quantiles present {gaps!r}",
+        )
+    else:
+        require(
+            gaps["max_ms"] == scheduling["max_inter_drain_gap_ms"],
+            f"scheduling.inter_drain_gap.max_ms {gaps['max_ms']} != "
+            f"max_inter_drain_gap_ms {scheduling['max_inter_drain_gap_ms']}",
+        )
+        if gaps["p50_ms"] is not None and gaps["p99_ms"] is not None:
+            require(
+                gaps["p50_ms"] <= gaps["p99_ms"],
+                f"scheduling.inter_drain_gap: p50 {gaps['p50_ms']} > "
+                f"p99 {gaps['p99_ms']}",
+            )
+
+
+def exact_scheduling_newcomer_queue(scheduling):
+    """Closed newcomer-queue shape (Phase 2). Ages are whole milliseconds
+    from first-seen to admission or drop; clock-unknown samples count in
+    the `*_unknown` counters and never enter a mean or maximum."""
+    queue = scheduling["newcomer_queue"]
+    require(isinstance(queue, dict), "scheduling.newcomer_queue must be an object")
+    require(
+        set(queue)
+        == set(SCHEDULING_NEWCOMER_U64_KEYS) | set(SCHEDULING_NEWCOMER_NULLABLE_KEYS),
+        f"unexpected newcomer_queue keys: {sorted(queue)}",
+    )
+    for key in SCHEDULING_NEWCOMER_U64_KEYS:
+        require(
+            u64(queue[key]),
+            f"scheduling.newcomer_queue.{key}: invalid counter {queue[key]!r}",
+        )
+    for key in SCHEDULING_NEWCOMER_NULLABLE_KEYS:
+        require(
+            queue[key] is None or u64(queue[key]),
+            f"scheduling.newcomer_queue.{key}: invalid age {queue[key]!r}",
+        )
+
+
+def exact_scheduling_resource(scheduling):
+    """Closed resource-timeline shape (Phase 2): `/proc/self` samples at
+    capture start, attach readiness, and loop end, plus the bounded
+    periodic summary. Every sample field is null when its read or parse
+    failed — missing, never zero."""
+    resource = scheduling["resource"]
+    require(isinstance(resource, dict), "scheduling.resource must be an object")
+    require(
+        set(resource) == set(SCHEDULING_RESOURCE_KEYS),
+        f"unexpected resource keys: {sorted(resource)}",
+    )
+    require(u64(resource["samples"]), f"scheduling.resource.samples: invalid "
+            f"counter {resource['samples']!r}")
+    require(
+        resource["max_rss_kb"] is None or u64(resource["max_rss_kb"]),
+        f"scheduling.resource.max_rss_kb: invalid rss {resource['max_rss_kb']!r}",
+    )
+    for name in SCHEDULING_RESOURCE_KEYS[2:]:
+        sample = resource[name]
+        require(
+            isinstance(sample, dict),
+            f"scheduling.resource.{name} must be an object",
+        )
+        require(
+            set(sample) == set(SCHEDULING_RESOURCE_SAMPLE_KEYS),
+            f"unexpected resource.{name} keys: {sorted(sample)}",
+        )
+        for key in SCHEDULING_RESOURCE_SAMPLE_KEYS:
+            require(
+                sample[key] is None or u64(sample[key]),
+                f"scheduling.resource.{name}.{key}: invalid sample {sample[key]!r}",
+            )
 
 
 def exact_task_uprobe_link_losses(evidence):
@@ -2730,6 +2904,24 @@ def scheduling_fixture(**overrides):
         "loop_start_mono_ns": None,
         "loop_end_mono_ns": None,
         "loop_end_reason": "unstarted",
+    }
+    fixture["stage_ms"] = {name: 0 for name in SCHEDULING_STAGE_KEYS}
+    fixture["stage_invocations"] = {name: 0 for name in SCHEDULING_STAGE_KEYS}
+    fixture["longest_op"] = {name: None for name in SCHEDULING_LONGEST_OP_KEYS}
+    fixture["inter_drain_gap"] = {"samples": 0} | {
+        name: None for name in SCHEDULING_GAP_KEYS[1:]
+    }
+    fixture["newcomer_queue"] = {name: 0 for name in SCHEDULING_NEWCOMER_U64_KEYS} | {
+        name: None for name in SCHEDULING_NEWCOMER_NULLABLE_KEYS
+    }
+    null_sample = {name: None for name in SCHEDULING_RESOURCE_SAMPLE_KEYS}
+    fixture["resource"] = {
+        "samples": 0,
+        "max_rss_kb": None,
+        "start": dict(null_sample),
+        "readiness": dict(null_sample),
+        "end": dict(null_sample),
+        "last_periodic": dict(null_sample),
     }
     for name, value in overrides.items():
         require(

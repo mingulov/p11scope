@@ -304,6 +304,12 @@ pub struct PinnedObjects {
     overlay_uncertain: bool,
     /// Latched by `check_unchanged` the first time any pin differs.
     changed: std::cell::Cell<bool>,
+    /// Membership revision (B2): bumped on every pin-set membership change
+    /// (inserts, removals, absorbs, replaces, binds). The run loop's
+    /// pin-sweep gate compares it across ticks; a missed bump only delays
+    /// the live display (the frame backstop and the terminal sweep carry
+    /// correctness), so bumps are conservative, never exact.
+    revision: u64,
 }
 
 impl PinnedObjects {
@@ -321,12 +327,23 @@ impl PinnedObjects {
             next_id: 0,
             overlay_uncertain: false,
             changed: std::cell::Cell::new(false),
+            revision: 0,
         }
+    }
+
+    /// The current membership revision for the pin-sweep gate.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
 
     /// Folds another pin set into this capture. Exact comparable identities merge;
     /// an equal raw `ObjectKey` with any unequal full identity rejects the whole group.
     pub fn absorb(&mut self, other: PinnedObjects) -> Vec<Skipped> {
+        self.bump_revision();
         let other_overlay_uncertain = other.overlay_uncertain;
         let other_raw_ownership = other.raw_ownership;
         let mut entries = other.by_id;
@@ -482,6 +499,7 @@ impl PinnedObjects {
         incoming: PinnedObjects,
         preserve: &[PinnedObjectId],
     ) -> Vec<Skipped> {
+        self.bump_revision();
         self.ownership.remove(&view);
         let preserved: BTreeSet<_> = preserve.iter().copied().collect();
         let preserved_raws: BTreeSet<_> = self
@@ -628,6 +646,7 @@ impl PinnedObjects {
     /// were removed so the caller can rebuild its plan from the remaining modules.
     pub fn remove_view(&mut self, view: ProcessViewId) -> Option<ViewClaims> {
         let removed = self.ownership.remove(&view)?;
+        self.bump_revision();
         let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
         let retained_raws: BTreeSet<_> = self
             .raw_ownership
@@ -785,6 +804,7 @@ impl PinnedObjects {
             });
         if !referenced {
             self.by_id.remove(&manifest_id);
+            self.bump_revision();
         }
         self.raw_to_id.insert(
             RawObjectInstance {
@@ -940,6 +960,7 @@ impl PinnedObjects {
         crate::first_use_probe::known(&entry.file, &entry.sha256);
         self.raw_to_id.insert(entry.raw.clone(), id);
         self.by_id.insert(id, entry);
+        self.bump_revision();
         Some(id)
     }
 
@@ -955,6 +976,7 @@ impl PinnedObjects {
     }
 
     fn reject_key(&mut self, key: ObjectKey) {
+        self.bump_revision();
         self.rejected_keys.insert(key);
         let ids: BTreeSet<PinnedObjectId> = self
             .by_id
@@ -1888,6 +1910,9 @@ pub fn canonicalize_scanned_overlays(pinned: &mut PinnedObjects) -> (usize, Vec<
     }
     for id in canonical.keys() {
         pinned.by_id.remove(id);
+    }
+    if !canonical.is_empty() {
+        pinned.bump_revision();
     }
     pinned.overlay_uncertain |= !canonical.is_empty();
     (canonical.len(), lost)
@@ -4385,5 +4410,31 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    /// B2: the pin-sweep gate's watermark. Membership mutations advance
+    /// the revision; no-op removals do not; a sweep over an unchanged
+    /// revision is a provable skip (counter, not timing).
+    #[test]
+    fn pin_revision_advances_on_membership_change_only() {
+        let mut pins = PinnedObjects::empty();
+        assert_eq!(pins.revision(), 0);
+        // A merge ran: conservative bump even for an empty donor.
+        let _ = pins.absorb(PinnedObjects::empty());
+        assert_eq!(pins.revision(), 1);
+        // A replace bumps twice (the replace plus the incoming merge).
+        let _ = pins.replace_view_pins(ProcessViewId(3), PinnedObjects::empty(), &[]);
+        assert_eq!(pins.revision(), 3);
+        // Removing a view that was never there changes nothing.
+        assert!(pins.remove_view(ProcessViewId(9)).is_none());
+        assert_eq!(pins.revision(), 3);
+        // The gate counts the skip; the next sweep needs a new revision.
+        let mut gate = crate::timing::PinSweepGate::new();
+        assert!(gate.should_sweep(pins.revision(), false));
+        assert!(!gate.should_sweep(pins.revision(), false));
+        assert_eq!((gate.sweeps(), gate.skips()), (1, 1));
+        let _ = pins.absorb(PinnedObjects::empty());
+        assert!(gate.should_sweep(pins.revision(), false));
+        assert_eq!((gate.sweeps(), gate.skips()), (2, 1));
     }
 }

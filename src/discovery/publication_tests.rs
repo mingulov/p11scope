@@ -935,9 +935,16 @@ fn scan_engine_over_pids(pids: &[u32], broad_admit: bool) -> Engine {
         engine.retain_view_id(id).expect("retain view id");
         let mut counters = DiscoveryCounters::default();
         let broad = engine.broad_admit;
-        let (found, pins) =
-            scan_and_pin(&view, &[], &hooks, &mut engine.budget, &mut counters, broad)
-                .expect("scan live child");
+        let (found, pins) = scan_and_pin(
+            &view,
+            &[],
+            &hooks,
+            &mut engine.budget,
+            &mut counters,
+            broad,
+            &mut engine.stage_timings,
+        )
+        .expect("scan live child");
         engine.scan_inputs.insert(
             view.id(),
             ScanInput {

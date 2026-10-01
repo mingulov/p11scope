@@ -1797,6 +1797,9 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     // sink stays an atomically-published temp file; opening it early only
     // moves the trust failure earlier.
     let out = OutputSink::open(kind, a.out.as_deref())?;
+    // Capture-process resource baseline, before the discovery scan charges
+    // its first byte: threaded to the loops as the timeline's start point.
+    let resource_start = crate::timing::read_resource_sample();
     let discovered = Engine::discover(a, &scope, named_view);
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
@@ -1822,6 +1825,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         a.drain_interval,
         a.ring_bytes,
         uretprobe_override,
+        resource_start,
     )?;
     // `--pid` cannot read a non-child's exit status, so the honest report is
     // the pairing of two facts we do have: the target went away, and this
@@ -1931,6 +1935,7 @@ fn run_loop(
     drain_interval: Option<Duration>,
     ring_bytes: Option<u32>,
     uretprobe_override: Option<render::UretprobeOverride>,
+    resource_start: crate::timing::ResourceSample,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
     // Authoritative attach stamp (T2, G-14): the session is fully attached
@@ -1959,6 +1964,7 @@ fn run_loop(
                 drain,
                 ring_bytes,
                 uretprobe_override,
+                resource_start,
             )?
         }
         Kind::Trace => {
@@ -1978,6 +1984,7 @@ fn run_loop(
                 owned,
                 drain,
                 uretprobe_override,
+                resource_start,
             )?
         }
     };
@@ -2565,6 +2572,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     };
     // Initial capture still uses the one `discover_plan` pass and keeps its
     // accepted state inside `Engine`; nothing below rescans or reopens.
+    let resource_start = crate::timing::read_resource_sample();
     let mut engine = Engine::discover(&capture_args, &scope, Some(view))
         .map_err(|error| combine_setup_failure(error, &mut child))?;
     // The stop flag arrives from `run_owned`, which keeps its own clone so a
@@ -2694,6 +2702,7 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
         args.drain_interval,
         args.ring_bytes,
         uretprobe_override,
+        resource_start,
     )
     .map_err(|error| {
         combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
@@ -3860,6 +3869,7 @@ fn capture_profile(
     drain: Duration,
     ring_bytes: Option<u32>,
     uretprobe_override: Option<render::UretprobeOverride>,
+    resource_start: crate::timing::ResourceSample,
 ) -> Result<render::Evidence> {
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
@@ -3905,8 +3915,15 @@ fn capture_profile(
         let drain = session.event_drain()?;
         if let Some((events_q, post_q_record)) = quiesced {
             let phase_start = Instant::now();
-            let (malformed, post_q) =
-                drain_profile_events_to_position(drain, events_q, state, tracker, scope)?;
+            let span_start = crate::attach::monotonic_ns();
+            let drained = drain_profile_events_to_position(drain, events_q, state, tracker, scope);
+            acc.span_stage(
+                crate::timing::StageKind::Drain,
+                "drain_profile_q",
+                span_start,
+                crate::attach::monotonic_ns(),
+            );
+            let (malformed, post_q) = drained?;
             *post_q_record |= post_q;
             acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
             acc.note_drain_at(Instant::now());
@@ -3915,7 +3932,8 @@ fn capture_profile(
         }
         let budget = ReadyBudget::tick();
         let phase_start = Instant::now();
-        let outcome = poll_ready(
+        let span_start = crate::attach::monotonic_ns();
+        let polled = poll_ready(
             terminal,
             &budget,
             crate::events::LIVE_POLL_QUANTUM,
@@ -3927,7 +3945,18 @@ fn capture_profile(
                     |drain, quantum| drain_profile_events(drain, state, tracker, scope, quantum),
                 )
             },
-        )?;
+        );
+        acc.span_stage(
+            crate::timing::StageKind::Drain,
+            if terminal {
+                "drain_profile_terminal"
+            } else {
+                "drain_profile_live"
+            },
+            span_start,
+            crate::attach::monotonic_ns(),
+        );
+        let outcome = polled?;
         acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
         acc.note_drain_at(Instant::now());
         if terminal {
@@ -3946,11 +3975,13 @@ fn capture_profile(
     let mut stdout_open = true;
     let wall_start = SystemTime::now();
     let mut scheduling = SchedulingAccumulator::default();
+    scheduling.note_resource(crate::timing::ResourcePoint::Start, resource_start);
     scheduling.note_attach(session.attach_mono_ns());
     let mut last_sink_note = None;
     let mut last_frame = Instant::now() - drain;
     let mut frames = 0u64;
     let mut ticks = 0u64;
+    let mut pin_gate = crate::timing::PinSweepGate::new();
     let mut last_snapshot: Option<(Vec<metrics::SlotReport>, metrics::KernelEvidence)> = None;
     #[cfg(test)]
     crate::first_use_probe::discovery_loss(
@@ -3960,6 +3991,7 @@ fn capture_profile(
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
+    scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
     eprintln!("{}", capture_ready_line(session.attached_probes()));
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
@@ -4070,12 +4102,15 @@ fn capture_profile(
                     })
                 },
                 |context| {
-                    context
-                        .0
-                        .pinned()
-                        .check_unchanged()
-                        .map(|_| ())
-                        .map_err(anyhow::Error::msg)
+                    let pinned = context.0.pinned();
+                    if pin_gate.should_sweep(pinned.revision(), tick_frame.render) {
+                        pinned
+                            .check_unchanged()
+                            .map(|_| ())
+                            .map_err(anyhow::Error::msg)
+                    } else {
+                        Ok(())
+                    }
                 },
             )?
         };
@@ -4088,6 +4123,9 @@ fn capture_profile(
             last_frame = Instant::now();
             let render_start = Instant::now();
             scheduling.sync_discovery_deferrals(engine);
+            scheduling.sync_engine_stages(engine);
+            scheduling.sync_newcomer_stats(engine, crate::attach::monotonic_ns());
+            scheduling.sync_tail_stats(engine);
             let ev = evidence_for(
                 engine,
                 engine.capture_facts(),
@@ -4135,6 +4173,7 @@ fn capture_profile(
             Instant::now(),
         );
         scheduling.note_longrun_tick(ticks, tick_start.elapsed());
+        scheduling.maybe_sample_resource_periodic();
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
         // (RB-2). Staging applies nothing.
@@ -4184,6 +4223,7 @@ fn capture_profile(
         loop_end_reason,
     );
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
+    scheduling.sample_resource(crate::timing::ResourcePoint::End);
     let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
@@ -4407,7 +4447,14 @@ fn capture_profile(
                         .pinned()
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
+                    let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
+                    consumers.scheduling.span_stage(
+                        crate::timing::StageKind::Cleanup,
+                        "settle_terminal_drain",
+                        settle_start,
+                        crate::attach::monotonic_ns(),
+                    );
                     consumers.scheduling.note_terminal(
                         kernel_evidence.ring_loss,
                         context.0.capture_facts().discovery_losses()[0],
@@ -4422,6 +4469,11 @@ fn capture_profile(
                     );
                     let render_start = Instant::now();
                     consumers.scheduling.sync_discovery_deferrals(context.0);
+                    consumers.scheduling.sync_engine_stages(context.0);
+                    consumers
+                        .scheduling
+                        .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
+                    consumers.scheduling.sync_tail_stats(context.0);
                     let mut ev = evidence_for(
                         context.0,
                         context.0.capture_facts(),
@@ -4476,6 +4528,8 @@ fn capture_profile(
                             .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
                         profile,
                     );
+                    let summary = timing_summary_line(&ev.scheduling);
+                    eprintln!("{summary}");
 
                     if let Some(mut out_file) = context.5.take() {
                         let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -4544,6 +4598,7 @@ fn capture_trace(
     mut owned: Option<&mut Owned>,
     drain: Duration,
     uretprobe_override: Option<render::UretprobeOverride>,
+    resource_start: crate::timing::ResourceSample,
 ) -> Result<render::Evidence> {
     let trace_limit = resolve_trace_max_events(max_events);
     let mut remaining = Some(trace_limit);
@@ -4594,11 +4649,13 @@ fn capture_trace(
     );
     let mut last_reported_loss: u64 = 0;
     let mut scheduling = SchedulingAccumulator::default();
+    scheduling.note_resource(crate::timing::ResourcePoint::Start, resource_start);
     scheduling.note_attach(session.attach_mono_ns());
     let mut last_sink_note = None;
     let mut last_frame = Instant::now() - drain;
     let mut frames = 0u64;
     let mut ticks = 0u64;
+    let mut pin_gate = crate::timing::PinSweepGate::new();
     if let Err(error) = emit_trace_line(
         &trace::capture_line(policy),
         stdout,
@@ -4617,6 +4674,7 @@ fn capture_trace(
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
+    scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
     eprintln!("{}", capture_ready_line(session.attached_probes()));
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
@@ -4738,12 +4796,15 @@ fn capture_trace(
                     outcome
                 },
                 |context| {
-                    context
-                        .0
-                        .pinned()
-                        .check_unchanged()
-                        .map(|_| ())
-                        .map_err(anyhow::Error::msg)
+                    let pinned = context.0.pinned();
+                    if pin_gate.should_sweep(pinned.revision(), false) {
+                        pinned
+                            .check_unchanged()
+                            .map(|_| ())
+                            .map_err(anyhow::Error::msg)
+                    } else {
+                        Ok(())
+                    }
                 },
             )?
         };
@@ -4765,6 +4826,7 @@ fn capture_trace(
             Instant::now(),
         );
         scheduling.note_longrun_tick(ticks, tick_start.elapsed());
+        scheduling.maybe_sample_resource_periodic();
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
         // (RB-2). Staging applies nothing.
@@ -4809,6 +4871,7 @@ fn capture_trace(
         loop_end_ns,
         loop_end_reason,
     );
+    scheduling.sample_resource(crate::timing::ResourcePoint::End);
     let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
@@ -5044,7 +5107,14 @@ fn capture_trace(
                         .pinned()
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
+                    let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
+                    consumers.scheduling.span_stage(
+                        crate::timing::StageKind::Cleanup,
+                        "settle_terminal_drain",
+                        settle_start,
+                        crate::attach::monotonic_ns(),
+                    );
                     let trace_truncated = end == CaptureEnd::LimitReached || *context.3 == Some(0);
                     let maps_start = Instant::now();
                     let terminal_kernel = metrics::kernel_evidence(context.1)?;
@@ -5070,6 +5140,11 @@ fn capture_trace(
                     flush_stdout(context.5, context.6)?;
                     collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     consumers.scheduling.sync_discovery_deferrals(context.0);
+                    consumers.scheduling.sync_engine_stages(context.0);
+                    consumers
+                        .scheduling
+                        .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
+                    consumers.scheduling.sync_tail_stats(context.0);
                     let mut evidence = evidence_for(
                         context.0,
                         context.0.capture_facts(),
@@ -5123,6 +5198,8 @@ fn capture_trace(
                         context.6,
                         context.7,
                     )?;
+                    let summary = timing_summary_line(&evidence.scheduling);
+                    eprintln!("{summary}");
                     Ok(evidence)
                 },
             )
@@ -5543,6 +5620,22 @@ pub(crate) struct SchedulingAccumulator {
     longrun: crate::longrun::LongRunDetector,
     longrun_first_loss_sampled: bool,
     longrun_first_loss_unavailable: bool,
+    /// Run-side stage spans (drain; the engine's scan..cleanup spans merge
+    /// in at snapshot via [`SchedulingAccumulator::sync_engine_stages`]).
+    stage: crate::timing::StageTimings,
+    /// Last-synced copy of the engine's stage totals (replaced, never
+    /// merged: the engine's accumulator is cumulative).
+    engine_stage: crate::timing::StageTimings,
+    /// Bounded inter-drain gap distribution, fed alongside the maximum.
+    gaps: crate::timing::GapHistogram,
+    /// Capture-process resource timeline.
+    resource: crate::timing::ResourceTimeline,
+    ticks_since_resource_sample: u64,
+    /// Last-synced newcomer queue-age evidence (replaced per snapshot).
+    newcomer: crate::timing::NewcomerStats,
+    /// Last-synced batch-tail publication counters (replaced per snapshot).
+    tail_publishes: u64,
+    tail_skips: u64,
 }
 
 impl Default for SchedulingAccumulator {
@@ -5576,6 +5669,14 @@ impl Default for SchedulingAccumulator {
             longrun: crate::longrun::LongRunDetector::default(),
             longrun_first_loss_sampled: false,
             longrun_first_loss_unavailable: false,
+            stage: crate::timing::StageTimings::new(),
+            engine_stage: crate::timing::StageTimings::new(),
+            gaps: crate::timing::GapHistogram::new(),
+            resource: crate::timing::ResourceTimeline::new(),
+            ticks_since_resource_sample: 0,
+            newcomer: crate::timing::NewcomerStats::new(),
+            tail_publishes: 0,
+            tail_skips: 0,
         }
     }
 }
@@ -5648,6 +5749,63 @@ impl SchedulingAccumulator {
         self.discovery_deferrals = engine.discovery_deferrals();
     }
 
+    /// Carries the engine's cumulative stage totals into the snapshot
+    /// (replaced, never merged). Callers sync before every snapshot on an
+    /// engine-owned capture path, next to the deferral sync.
+    pub(crate) fn sync_engine_stages(&mut self, engine: &Engine) {
+        self.engine_stage = engine.stage_timings().clone();
+    }
+
+    /// Carries the engine's newcomer queue-age evidence into the snapshot,
+    /// sampling pending ages at `now_ns` (the caller's clock poll).
+    pub(crate) fn sync_newcomer_stats(&mut self, engine: &Engine, now_ns: Option<u64>) {
+        self.newcomer = engine.newcomer_stats(now_ns);
+    }
+
+    /// Carries the engine's batch-tail publication counters into the
+    /// snapshot (executed vs skipped-as-redundant).
+    pub(crate) fn sync_tail_stats(&mut self, engine: &Engine) {
+        (self.tail_publishes, self.tail_skips) = engine.tail_stats();
+    }
+
+    /// Records one run-side stage span (drain; the terminal settle records
+    /// cleanup). Injected clock, scheduler style.
+    pub(crate) fn span_stage(
+        &mut self,
+        stage: crate::timing::StageKind,
+        op: &'static str,
+        start_ns: Option<u64>,
+        end_ns: Option<u64>,
+    ) {
+        self.stage.span(stage, op, start_ns, end_ns);
+    }
+
+    /// Samples the capture-process resources at a defined point.
+    pub(crate) fn sample_resource(&mut self, point: crate::timing::ResourcePoint) {
+        self.note_resource(point, crate::timing::read_resource_sample());
+    }
+
+    /// Records a capture-process resource sample taken elsewhere (the start
+    /// point is sampled before discovery, outside the loops).
+    pub(crate) fn note_resource(
+        &mut self,
+        point: crate::timing::ResourcePoint,
+        sample: crate::timing::ResourceSample,
+    ) {
+        self.resource.note(point, sample);
+    }
+
+    /// Samples the periodic resource point every
+    /// [`crate::timing::RESOURCE_SAMPLE_EVERY_N_TICKS`] ticks. Callers pass
+    /// each tick once, in order.
+    pub(crate) fn maybe_sample_resource_periodic(&mut self) {
+        self.ticks_since_resource_sample = self.ticks_since_resource_sample.saturating_add(1);
+        if self.ticks_since_resource_sample >= crate::timing::RESOURCE_SAMPLE_EVERY_N_TICKS {
+            self.ticks_since_resource_sample = 0;
+            self.sample_resource(crate::timing::ResourcePoint::Periodic);
+        }
+    }
+
     pub(crate) fn note_sink_drops(&mut self, drops: &crate::sink::SinkDrops) {
         self.sink_stall_ms = self.sink_stall_ms.saturating_add(drops.stall_ms);
         self.sink_timeouts = self.sink_timeouts.saturating_add(drops.timeouts);
@@ -5663,9 +5821,9 @@ impl SchedulingAccumulator {
             let gap_ms = gap.as_millis();
             self.longrun
                 .note_gap(gap.as_nanos().div_ceil(1_000_000).min(u128::from(u64::MAX)) as u64);
-            self.max_inter_drain_gap_ms = self
-                .max_inter_drain_gap_ms
-                .max(gap_ms.min(u128::from(u64::MAX)) as u64);
+            let gap_ms = gap_ms.min(u128::from(u64::MAX)) as u64;
+            self.max_inter_drain_gap_ms = self.max_inter_drain_gap_ms.max(gap_ms);
+            self.gaps.observe_ms(gap_ms);
         }
         self.last_drain_end = Some(now);
     }
@@ -5722,6 +5880,10 @@ impl SchedulingAccumulator {
     }
 
     pub(crate) fn snapshot(&self, terminal_bound: u64) -> render::SchedulingEvidence {
+        // The run-side spans (drain) plus the last-synced engine spans
+        // (scan..cleanup): one merged view per snapshot.
+        let mut merged_stages = self.stage.clone();
+        merged_stages.merge(&self.engine_stage);
         render::SchedulingEvidence {
             drain_repolls: self.drain_repolls,
             drain_budget_exhaustions: self.drain_budget_exhaustions,
@@ -5751,8 +5913,162 @@ impl SchedulingAccumulator {
             },
             max_inter_drain_gap_ms: self.max_inter_drain_gap_ms,
             discovery_deferrals: self.discovery_deferrals,
+            stage_ms: stage_ms_of(&merged_stages),
+            stage_invocations: stage_invocations_of(&merged_stages),
+            stage_unknown_clock: merged_stages.unknown_clock(),
+            longest_op: longest_op_of(&merged_stages),
+            inter_drain_gap: render::InterDrainGapEvidence {
+                samples: self.gaps.samples(),
+                p50_ms: self.gaps.p50_ms(),
+                p99_ms: self.gaps.p99_ms(),
+                max_ms: self.gaps.max_ms(),
+            },
+            newcomer_queue: render::NewcomerQueueEvidence {
+                admitted: self.newcomer.admitted,
+                admitted_unknown: self.newcomer.admitted_unknown,
+                max_admitted_age_ms: self.newcomer.max_admitted_age_ms,
+                mean_admitted_age_ms: self.newcomer.mean_admitted_age_ms(),
+                pending: self.newcomer.pending,
+                oldest_pending_age_ms: self.newcomer.oldest_pending_age_ms,
+                dropped: self.newcomer.dropped,
+                dropped_unknown: self.newcomer.dropped_unknown,
+                max_dropped_age_ms: self.newcomer.max_dropped_age_ms,
+                marks_dropped: self.newcomer.marks_dropped,
+            },
+            resource: resource_evidence_of(&self.resource),
+            tail_publishes: self.tail_publishes,
+            tail_skips: self.tail_skips,
         }
     }
+}
+
+fn stage_ms_of(stages: &crate::timing::StageTimings) -> render::StageMs {
+    use crate::timing::StageKind::*;
+    let ms = |stage| stages.total_ns(stage) / 1_000_000;
+    render::StageMs {
+        scan: ms(Scan),
+        pin: ms(Pin),
+        bind: ms(Bind),
+        plan: ms(Plan),
+        merge: ms(Merge),
+        projection: ms(Projection),
+        attach: ms(Attach),
+        drain: ms(Drain),
+        cleanup: ms(Cleanup),
+    }
+}
+
+fn stage_invocations_of(stages: &crate::timing::StageTimings) -> render::StageInvocations {
+    use crate::timing::StageKind::*;
+    let count = |stage| stages.invocations(stage);
+    render::StageInvocations {
+        scan: count(Scan),
+        pin: count(Pin),
+        bind: count(Bind),
+        plan: count(Plan),
+        merge: count(Merge),
+        projection: count(Projection),
+        attach: count(Attach),
+        drain: count(Drain),
+        cleanup: count(Cleanup),
+    }
+}
+
+fn longest_op_of(stages: &crate::timing::StageTimings) -> render::LongestOpEvidence {
+    stages
+        .longest()
+        .map_or_else(render::LongestOpEvidence::default, |longest| {
+            render::LongestOpEvidence {
+                stage: Some(longest.stage.as_str()),
+                op: Some(longest.op),
+                duration_ms: Some(longest.duration_ns / 1_000_000),
+            }
+        })
+}
+
+fn resource_sample_of(sample: &crate::timing::ResourceSample) -> render::ResourceSampleEvidence {
+    render::ResourceSampleEvidence {
+        rss_kb: sample.rss_kb,
+        utime_ms: sample.utime_ms,
+        stime_ms: sample.stime_ms,
+        read_bytes: sample.read_bytes,
+        write_bytes: sample.write_bytes,
+    }
+}
+
+fn resource_evidence_of(timeline: &crate::timing::ResourceTimeline) -> render::ResourceEvidence {
+    render::ResourceEvidence {
+        samples: timeline.periodic_samples,
+        max_rss_kb: timeline.max_rss_kb,
+        start: resource_sample_of(&timeline.start),
+        readiness: resource_sample_of(&timeline.readiness),
+        end: resource_sample_of(&timeline.end),
+        last_periodic: resource_sample_of(&timeline.last_periodic),
+    }
+}
+
+/// The concise operator-visible timing summary (Phase 2): stage totals,
+/// the longest indivisible operation, the inter-drain gap distribution,
+/// newcomer queue ages, and capture-process resources. Missing samples
+/// render as `n/a`, never as zero.
+pub(crate) fn timing_summary_line(scheduling: &render::SchedulingEvidence) -> String {
+    fn ms(value: Option<u64>) -> String {
+        value.map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"))
+    }
+    let stages = &scheduling.stage_ms;
+    let longest = &scheduling.longest_op;
+    let longest_text = match (longest.stage, longest.op, longest.duration_ms) {
+        (Some(stage), Some(op), Some(duration)) => format!("{stage}/{op}@{duration}ms"),
+        _ => "n/a".to_string(),
+    };
+    let gap = &scheduling.inter_drain_gap;
+    let queue = &scheduling.newcomer_queue;
+    let resource = &scheduling.resource;
+    format!(
+        "p11scope: timing: stages scan={}ms pin={}ms bind={}ms plan={}ms merge={}ms projection={}ms attach={}ms drain={}ms cleanup={}ms (unknown-clock spans: {}); longest op: {}; inter-drain gap p50/p99/max: {}/{}/{} ({} samples); newcomer queue: admitted {} (max/mean age {}/{}), pending {} (oldest {}), dropped {} (max age {}); tails: {} published, {} skipped; rss start/readiness/end/max: {}/{}/{}/{} kB",
+        stages.scan,
+        stages.pin,
+        stages.bind,
+        stages.plan,
+        stages.merge,
+        stages.projection,
+        stages.attach,
+        stages.drain,
+        stages.cleanup,
+        scheduling.stage_unknown_clock,
+        longest_text,
+        ms(gap.p50_ms),
+        ms(gap.p99_ms),
+        ms(gap.max_ms),
+        gap.samples,
+        queue.admitted,
+        ms(queue.max_admitted_age_ms),
+        ms(queue.mean_admitted_age_ms),
+        queue.pending,
+        ms(queue.oldest_pending_age_ms),
+        queue.dropped,
+        ms(queue.max_dropped_age_ms),
+        scheduling.tail_publishes,
+        scheduling.tail_skips,
+        scheduling
+            .resource
+            .start
+            .rss_kb
+            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
+        scheduling
+            .resource
+            .readiness
+            .rss_kb
+            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
+        scheduling
+            .resource
+            .end
+            .rss_kb
+            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
+        resource
+            .max_rss_kb
+            .map_or_else(|| "n/a".to_string(), |kb| kb.to_string()),
+    )
 }
 
 fn reduce_profile_event(
@@ -5920,7 +6236,8 @@ fn drain_trace_events<W: Write>(
     let drain = session.event_drain()?;
     if let Some((events_q, post_q_record)) = quiesced {
         let phase_start = Instant::now();
-        let (malformed, post_q) = drain_trace_events_to_position(
+        let span_start = crate::attach::monotonic_ns();
+        let drained = drain_trace_events_to_position(
             drain,
             events_q,
             remaining,
@@ -5931,7 +6248,14 @@ fn drain_trace_events<W: Write>(
             stdout,
             stdout_open,
             out_file,
-        )?;
+        );
+        acc.span_stage(
+            crate::timing::StageKind::Drain,
+            "drain_trace_q",
+            span_start,
+            crate::attach::monotonic_ns(),
+        );
+        let (malformed, post_q) = drained?;
         *post_q_record |= post_q;
         acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
         acc.note_drain_at(Instant::now());
@@ -5940,7 +6264,8 @@ fn drain_trace_events<W: Write>(
     }
     let budget = ReadyBudget::tick();
     let phase_start = Instant::now();
-    let outcome = poll_ready(
+    let span_start = crate::attach::monotonic_ns();
+    let polled = poll_ready(
         terminal,
         &budget,
         crate::events::LIVE_POLL_QUANTUM,
@@ -5965,7 +6290,18 @@ fn drain_trace_events<W: Write>(
                 },
             )
         },
-    )?;
+    );
+    acc.span_stage(
+        crate::timing::StageKind::Drain,
+        if terminal {
+            "drain_trace_terminal"
+        } else {
+            "drain_trace_live"
+        },
+        span_start,
+        crate::attach::monotonic_ns(),
+    );
+    let outcome = polled?;
     acc.add_phase(SchedulingPhase::Drain, phase_start.elapsed());
     acc.note_drain_at(Instant::now());
     if terminal {

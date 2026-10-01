@@ -2775,8 +2775,8 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
             path.display()
         ),
         ScopeArg::System => "p11scope: no PKCS#11 modules discovered system-wide; run \
-             `p11scope inspect --pid <n>` for a process using PKCS#11 or \
-             `p11scope doctor` to see why"
+             `p11scope inspect --system` for the whole-machine catalog, \
+             `p11scope inspect --pid <n>` for one process, or `p11scope doctor` to see why"
             .to_string(),
     }
 }
@@ -13535,6 +13535,7 @@ mod tests {
         );
         let hint = no_modules_hint(&ScopeArg::System);
         assert!(hint.contains("system-wide"), "{hint}");
+        assert!(hint.contains("p11scope inspect --system"), "{hint}");
         assert!(hint.contains("p11scope inspect --pid"), "{hint}");
         assert!(hint.contains("p11scope doctor"), "{hint}");
     }
@@ -13545,10 +13546,11 @@ mod tests {
     fn inspect_on_a_nonexistent_pid_is_one_line_and_not_a_panic() {
         // Above /proc/sys/kernel/pid_max on every supported kernel.
         let error = crate::inspect::run(
-            0x7fff_fff0,
+            crate::cli::InspectScope::Pid(0x7fff_fff0),
             &[],
             &crate::discovery::hooks::HookRegistry::builtin(),
             false,
+            None,
         )
         .expect_err("a pid that names nothing cannot be inspected");
         let rendered = format!("{error:#}");

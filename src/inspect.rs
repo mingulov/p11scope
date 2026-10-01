@@ -294,8 +294,23 @@ fn scan_and_pin_retained_with<C, S, P>(
 
 /// `p11scope inspect` — scans, pins, prints. Exit code: 0 when the scan ran
 /// (even with zero modules), 1 when the target could not be read at all.
-pub fn run(pid: u32, hints: &[PathBuf], hooks: &HookRegistry, json: bool) -> Result<i32> {
-    run_with_writer(pid, hints, hooks, json, &mut std::io::stdout().lock())
+/// `--pid` keeps the single-process scan below byte-compatible; `--system`
+/// catalogs every process on the machine (see `inspect_system`).
+pub fn run(
+    scope: crate::cli::InspectScope,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    json: bool,
+    max_scan_pids: Option<usize>,
+) -> Result<i32> {
+    match scope {
+        crate::cli::InspectScope::Pid(pid) => {
+            run_with_writer(pid, hints, hooks, json, &mut std::io::stdout().lock())
+        }
+        crate::cli::InspectScope::System => {
+            crate::inspect_system::run(hints, hooks, json, max_scan_pids)
+        }
+    }
 }
 
 fn run_with_writer(

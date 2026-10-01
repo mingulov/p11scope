@@ -95,12 +95,25 @@ pub struct RunArgs {
     pub command: Vec<OsString>,
 }
 
+/// What `p11scope inspect` scans: one named process, or every process on
+/// the machine. System scope reuses the capture two-phase scan (enumerate,
+/// sweep, rarity-selected deep scans) with a published cap record, but stays
+/// scan-only: no BPF, no manifest reads, no capture state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectScope {
+    Pid(u32),
+    System,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectArgs {
-    pub pid: u32,
+    pub scope: InspectScope,
     pub modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     pub json: bool,
+    /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
+    /// Only `--system` scans more than one member, so only it reads this.
+    pub max_scan_pids: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +191,7 @@ pub const USAGE: &str = "usage:
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
+  p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
@@ -307,6 +321,7 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// both together when the CLI changes.
 const INSPECT_HELP: &str = "usage:
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
+  p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -636,13 +651,17 @@ pub fn parse(argv: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Comm
     }
 }
 
-/// `p11scope inspect`: one target, discovery options only — no capture policy,
-/// no duration, no output file (spec §4.6).
+/// `p11scope inspect`: one target or the whole machine, discovery options
+/// only — no capture policy, no duration, no output file (spec §4.6).
+/// `--pid` and `--system` name the scope and are mutually exclusive;
+/// `--max-scan-pids` bounds the system two-phase scan like a capture.
 fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs, CliError> {
     let mut pid: Option<u32> = None;
+    let mut system = false;
     let mut modules = Vec::new();
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
+    let mut max_scan_pids: Option<usize> = None;
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inspect)),
@@ -652,17 +671,41 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
                 }
                 pid = Some(require_pid(&mut args)?);
             }
+            "--system" => system = true,
             "--module" => modules.push(require_path(&mut args, "--module")?),
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
+            "--max-scan-pids" => {
+                if max_scan_pids.is_some() {
+                    return Err(usage_err("--max-scan-pids given twice"));
+                }
+                let v = require_value(&mut args, "--max-scan-pids")?;
+                let value = v
+                    .parse::<usize>()
+                    .map_err(|_| usage_err(format!("--max-scan-pids: invalid number {v:?}")))?;
+                if value == 0 {
+                    return Err(usage_err("--max-scan-pids must be greater than zero"));
+                }
+                max_scan_pids = Some(value);
+            }
             other => return Err(unknown_arg(other)),
         }
     }
+    if system && pid.is_some() {
+        return Err(usage_err("--pid and --system are mutually exclusive"));
+    }
+    let scope = match (pid, system) {
+        (Some(pid), false) => InspectScope::Pid(pid),
+        (None, true) => InspectScope::System,
+        (None, false) => return Err(usage_err("inspect requires --pid <n> or --system")),
+        (Some(_), true) => unreachable!("mutual exclusion returns above"),
+    };
     Ok(InspectArgs {
-        pid: pid.ok_or_else(|| usage_err("inspect requires --pid <n>"))?,
+        scope,
         modules,
         hooks,
         json,
+        max_scan_pids,
     })
 }
 
@@ -1190,7 +1233,8 @@ mod tests {
         let Command::Inspect(i) = parse(args(&["inspect", "--pid", "7", "--json"])).unwrap() else {
             panic!("expected inspect")
         };
-        assert_eq!((i.pid, i.json), (7, true));
+        assert_eq!((i.scope, i.json), (InspectScope::Pid(7), true));
+        assert_eq!(i.max_scan_pids, None);
         assert!(
             matches!(parse(args(&["inspect"])), Err(CliError::Usage(m)) if m.contains("--pid"))
         );
@@ -1199,6 +1243,53 @@ mod tests {
             panic!("expected doctor")
         };
         assert_eq!((d.pid, d.cgroup), (None, None));
+    }
+
+    #[test]
+    fn inspect_system_scope_parses_and_excludes_pid() {
+        let Command::Inspect(i) = parse(args(&[
+            "inspect",
+            "--system",
+            "--json",
+            "--max-scan-pids",
+            "8",
+        ]))
+        .unwrap() else {
+            panic!("expected inspect")
+        };
+        assert_eq!(i.scope, InspectScope::System);
+        assert!(i.json);
+        assert_eq!(i.max_scan_pids, Some(8));
+        // No scope at all names both spellings.
+        assert!(matches!(parse(args(&["inspect"])), Err(CliError::Usage(m))
+                if m.contains("--pid") && m.contains("--system")));
+        // The mutual-exclusion refusal names both flags, whichever order.
+        for argv in [
+            vec!["inspect", "--pid", "7", "--system"],
+            vec!["inspect", "--system", "--pid", "7"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m))
+                    if m.contains("--pid") && m.contains("--system") && m.contains("mutually exclusive")),
+                "{argv:?}"
+            );
+        }
+        // `--max-scan-pids` keeps the capture validation wording.
+        assert!(matches!(
+            parse(args(&["inspect", "--system", "--max-scan-pids", "0"])),
+            Err(CliError::Usage(m)) if m.contains("--max-scan-pids must be greater than zero")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inspect",
+                "--system",
+                "--max-scan-pids",
+                "1",
+                "--max-scan-pids",
+                "2"
+            ])),
+            Err(CliError::Usage(m)) if m.contains("--max-scan-pids given twice")
+        ));
     }
 
     #[test]
@@ -1780,8 +1871,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 3461);
-        assert_eq!(hash, 0x9986ad8b_a334f261);
+        assert_eq!(USAGE.len(), 3573);
+        assert_eq!(hash, 0x5d2de1b8_5f34dab6);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

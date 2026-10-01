@@ -111,3 +111,20 @@ Pinned goldens at seed 0: `five` 120 (60 wrapper / 60 backend), `holes` 26,
   occupancy/publication-selected attach on `five` + `holes` + `forward` +
   `fail`, asserting exact expected invocations and first-call coverage
   from the oracle.
+
+## Catalog extension (module/caller inventory Phase 1)
+
+The provider constructor additionally appends `getpid()` to
+`$P11SCOPE_CATALOG_MARKER` when that variable names a file. Env-gated, so
+every oracle scenario above (variable unset) is byte-identical; the
+`inspect --system` catalog test sets it to pin that inspection executes no
+provider code (only fixture pids may appear). The unactivated provider is
+that test's *admitted* multi-table case: the constructor fills all 64
+`{3,2}` templates, but only the 4 within the file-backed page tail are
+visible to the memory scan (later statics live in anonymous .bss past the
+file pages — see `scanned_tables_agree_with_the_helper_manifest_for_
+every_walked_version`), so the catalog records 4 heuristic tables and
+admits them. The test's *refused* p11-kit case is the separate
+`../catalog-closure/provider.c` shape: 65 statically-initialized (hence
+file-backed) `{3,2}` tables with no linkage, which classify as a closure
+array and refuse whole over capacity.

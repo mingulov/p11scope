@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! The release compiler is single-sourced from `.release-rust-version`.
 //!
 //! Every live toolchain selector (shell, Python, CI) reads that file instead

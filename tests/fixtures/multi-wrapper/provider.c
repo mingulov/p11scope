@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef unsigned long CK_ULONG;
 typedef unsigned long CK_RV;
@@ -319,6 +320,20 @@ __attribute__((constructor)) static void mw_init(void)
     legacy_table.version.minor = 40;
     for (int o = 0; o < 68; o++) {
         legacy_table.funcs[o] = mw_legacy;
+    }
+    /* Phase 1 catalog extension (E3 side-effect marker): when the observer
+     * test sets $P11SCOPE_CATALOG_MARKER, record that this constructor ran
+     * in this process. Env-gated, so every existing oracle scenario (env
+     * unset) behaves exactly as before. */
+    {
+        const char *marker = getenv("P11SCOPE_CATALOG_MARKER");
+        if (marker != NULL && marker[0] != '\0') {
+            FILE *f = fopen(marker, "a");
+            if (f != NULL) {
+                fprintf(f, "%d\n", (int)getpid());
+                fclose(f);
+            }
+        }
     }
 }
 

@@ -56,9 +56,16 @@ fn run() -> Result<i32> {
         Ok(Command::Run(a)) => run_owned(&a).map(|outcome| outcome.child_exit_code.unwrap_or(0)),
         // Both of `inspect`'s hard failures — a pid that names nothing, and a target
         // that exited while its objects were being pinned — mean "the target could
-        // not be read at all": one line here, exit 1, never a panic.
-        Ok(Command::Inspect(a)) => inspect::run(a.pid, &a.modules, &a.hooks, a.json)
-            .with_context(|| format!("inspect --pid {}", a.pid)),
+        // not be read at all": one line here, exit 1, never a panic. A
+        // fully-unreadable machine fails the same way under `--system`.
+        Ok(Command::Inspect(a)) => {
+            let scope = match a.scope {
+                cli::InspectScope::Pid(pid) => format!("inspect --pid {pid}"),
+                cli::InspectScope::System => "inspect --system".to_string(),
+            };
+            inspect::run(a.scope, &a.modules, &a.hooks, a.json, a.max_scan_pids)
+                .with_context(|| scope)
+        }
         Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
         // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
         Err(CliError::Help(topic)) => print_stdout(format_args!("{}\n", topic.text())),

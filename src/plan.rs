@@ -268,17 +268,18 @@ enum AdmissionClass {
     /// Named by the operator's `--manifest`: attested, admitted first and
     /// under the named-scope rule.
     Operator,
-    /// At least one table with publication evidence: the single
-    /// [`table_name_authorized`] predicate, so any linkage the scan learns
-    /// counts here too.
+    /// At least one table with publication evidence, and no closure-array
+    /// excess of unresolved lookalikes: the single [`table_name_authorized`]
+    /// predicate, so any linkage the scan learns counts here too. Evidence
+    /// beats count — a corroborated table is never a lookalike.
     Corroborated,
     /// Only unresolved heuristic tables, at most [`MAX_TABLES_PER_OBJECT`].
     Heuristic,
-    /// More than [`MAX_TABLES_PER_OBJECT`] lookalike tables in one object: a
-    /// proxy's closure array (p11-kit decodes 64). A call through the proxy is
-    /// seen at the real provider's own functions once that provider is
-    /// attached, and the whole array (~6,656 endpoints) never fits, so it is
-    /// admitted last and only whole.
+    /// More than [`MAX_TABLES_PER_OBJECT`] *unresolved* lookalike tables in
+    /// one object: a proxy's closure array (p11-kit decodes 64). A call
+    /// through the proxy is seen at the real provider's own functions once
+    /// that provider is attached, and the whole array (~6,656 endpoints)
+    /// never fits, so it is admitted last and only whole.
     ClosureArray,
 }
 
@@ -288,17 +289,23 @@ impl AdmissionClass {
     }
 }
 
-/// One object's admission class and its distinct decoded table count.
+/// One object's admission class and its distinct *unresolved* lookalike
+/// count. Corroborated (interface-linked, live-return, manifest or
+/// export-authorized) tables never count as lookalikes: a genuine
+/// multi-table provider (NSS softokn) is corroborated however many tables
+/// it publishes, while a proxy closure array (p11-kit) stays one however
+/// few linked tables it keeps beside its templates. The count feeds the
+/// shared-scope within-class order and the closure-array refusal message,
+/// both of which are about lookalikes.
 fn admission_class(group: &[Discovered<'_>]) -> (AdmissionClass, usize) {
-    let mut tables = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
     let mut corroborated = false;
     for (piece, module) in group.iter().enumerate() {
         let Some(evidence) = &module.scan_evidence else {
             continue;
         };
         for (index, table) in evidence.tables.iter().enumerate() {
-            tables.insert(table_key(piece, index, table));
-            corroborated |= table_name_authorized(&table_evidence_score(
+            let authorized = table_name_authorized(&table_evidence_score(
                 index,
                 evidence.tables,
                 evidence.interfaces,
@@ -306,18 +313,49 @@ fn admission_class(group: &[Discovered<'_>]) -> (AdmissionClass, usize) {
                 &[],
                 &evidence.exports,
             ));
+            corroborated |= authorized;
+            if !authorized {
+                unresolved.insert(table_key(piece, index, table));
+            }
         }
     }
     let class = if group.iter().any(|module| module.scan_evidence.is_none()) {
         AdmissionClass::Operator
-    } else if tables.len() > MAX_TABLES_PER_OBJECT {
+    } else if unresolved.len() > MAX_TABLES_PER_OBJECT {
         AdmissionClass::ClosureArray
     } else if corroborated {
         AdmissionClass::Corroborated
     } else {
         AdmissionClass::Heuristic
     };
-    (class, tables.len())
+    (class, unresolved.len())
+}
+
+impl AdmissionClass {
+    /// The catalog label for this class. `operator` never appears in a
+    /// scan-only lowering (no manifests), but the mapping stays total so a
+    /// future manifest-aware catalog cannot mislabel it.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Corroborated => "corroborated",
+            Self::Heuristic => "heuristic",
+            Self::ClosureArray => "closure_array",
+        }
+    }
+}
+
+/// Scan-evidence-only classification of one pinned object's reconciled
+/// observations: the same [`lower_scanned`] + [`admission_class`] the merge
+/// decides by, so the reported class is the deciding class, never a
+/// reimplementation. Pure over its inputs — no attach, no history, no
+/// budget — which is what makes it safe for `inspect --system` to call on
+/// every catalog object. Returns the class label and the unresolved
+/// lookalike count (meaningful for `closure_array`).
+pub(crate) fn classify_scanned_object(modules: &[ReconciledModule]) -> (&'static str, usize) {
+    let lowered: Vec<Discovered<'_>> = modules.iter().map(lower_scanned).collect();
+    let (class, lookalikes) = admission_class(&lowered);
+    (class.label(), lookalikes)
 }
 
 /// One module's view of the slot budget: the policy's capacity, or less for a
@@ -7098,5 +7136,106 @@ mod tests {
                 capacity - 212,
             )
         );
+    }
+
+    /// An NSS-softokn-shaped provider: every table named by a standard
+    /// interface triple, so each carries publication evidence. `live_return`
+    /// stays false: linkage alone must authorize.
+    fn provider_with_linked_tables(
+        inode: u32,
+        path: &str,
+        tables: usize,
+        entries: usize,
+    ) -> ReconciledModule {
+        use crate::discovery::scan::ScannedInterface;
+
+        let mut module = provider_with_tables(inode, path, tables, entries, false);
+        module.scanned.interfaces = (0..tables)
+            .map(|index| ScannedInterface {
+                index,
+                name_class: "exact_standard",
+                name_lossy: Some("PKCS 11".into()),
+                name_private: Some(b"PKCS 11".to_vec()),
+                flags: 0,
+                table: Some(index),
+            })
+            .collect();
+        module
+    }
+
+    /// The multiple-interface/closure-array precedence problem: a provider
+    /// whose tables all carry publication evidence is corroborated however
+    /// many tables it has. Only *unresolved* lookalikes count toward the
+    /// closure-array threshold — the K4 cap and the closure-array class are
+    /// both about unresolved tables (module docs), and `Corroborated` reads
+    /// "at least one table with publication evidence".
+    #[test]
+    fn interface_linked_tables_do_not_count_as_closure_lookalikes() {
+        let nss = provider_with_linked_tables(81, "/opt/nss-softokn.so", 6, 10);
+        let (class, lookalikes) = admission_class(&[lower_scanned(&nss)]);
+        assert_eq!(class, AdmissionClass::Corroborated);
+        assert_eq!(lookalikes, 0);
+    }
+
+    /// The behavioral half of the precedence fix: in a shared scope the
+    /// corroborated multi-table provider admits ahead of a proxy closure
+    /// array in every discovery order. Within one class the fewer-table
+    /// object decides first, so the closure array carries fewer tables
+    /// than the provider: pre-fix both are closure arrays and the provider
+    /// loses; post-fix evidence beats count.
+    #[test]
+    fn shared_scope_admits_a_corroborated_multi_table_provider_ahead_of_closure_arrays() {
+        let open = MAX_SLOTS as usize - shared_scope_reserve(MAX_SLOTS as usize);
+        // The closure array fits on its own but not beside the provider.
+        let closure = provider_with_tables(82, P11_KIT, 5, 64, false);
+        assert_eq!(5 * 64 + 6 * 11, 386);
+        assert!((5 * 64..386).contains(&open), "the margin the test needs");
+        let nss = provider_with_linked_tables(83, "/opt/nss-softokn.so", 6, 11);
+        for modules in [&[nss.clone(), closure.clone()], &[closure, nss]] {
+            let plan = scoped_plan(modules, AdmissionScope::Shared);
+            assert_eq!(slots_of(&plan, 83), 66, "the provider admits whole");
+            assert_eq!(slots_of(&plan, 82), 0, "no closure-array prefix");
+            let refusal = refusal_of(&plan, P11_KIT).expect("closure refused whole");
+            assert!(
+                refusal
+                    .reason
+                    .contains("a proxy closure array is admitted whole or not at all"),
+                "{}",
+                refusal.reason
+            );
+            assert!(
+                refusal_of(&plan, "/opt/nss-softokn.so").is_none(),
+                "the provider is admitted, never refused"
+            );
+        }
+    }
+
+    /// Unresolved lookalikes still dominate a mixed object: two linked
+    /// tables beside sixty bare decodes stay a closure array, and the
+    /// refusal counts the lookalikes (60), not the linked tables.
+    #[test]
+    fn unresolved_tables_still_make_a_mixed_object_a_closure_array() {
+        let mut mixed = provider_with_tables(84, "/opt/mixed-array.so", 62, 1, false);
+        mixed.scanned.interfaces = vec![
+            crate::discovery::scan::ScannedInterface {
+                index: 0,
+                name_class: "exact_standard",
+                name_lossy: Some("PKCS 11".into()),
+                name_private: Some(b"PKCS 11".to_vec()),
+                flags: 0,
+                table: Some(0),
+            },
+            crate::discovery::scan::ScannedInterface {
+                index: 1,
+                name_class: "exact_standard",
+                name_lossy: Some("PKCS 11".into()),
+                name_private: Some(b"PKCS 11".to_vec()),
+                flags: 0,
+                table: Some(1),
+            },
+        ];
+        let (class, lookalikes) = admission_class(&[lower_scanned(&mixed)]);
+        assert_eq!(class, AdmissionClass::ClosureArray);
+        assert_eq!(lookalikes, 60);
     }
 }

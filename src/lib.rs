@@ -37,6 +37,7 @@ pub mod events;
 #[cfg(test)]
 mod first_use_probe;
 pub mod inspect;
+pub mod inspect_system;
 pub mod kinds;
 pub mod longrun;
 pub mod manifest_input;

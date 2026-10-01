@@ -3049,7 +3049,8 @@ struct BoundFallbackProof {
 ///
 /// ponytail: the capture byte budget already bounds work; this flat cap also bounds
 /// `/proc` inventory overhead for cgroups containing thousands of processes.
-const MAX_SCAN_PIDS: usize = 256;
+/// Shared with `inspect --system` as the default `--max-scan-pids`.
+pub(crate) const MAX_SCAN_PIDS: usize = 256;
 
 /// What the discovery pass learned besides the plan itself — everything
 /// `discovery_evidence` needs that the plan does not already carry.
@@ -3412,7 +3413,9 @@ fn corroboration_corroborates(outcome: Corroboration) -> bool {
     matches!(outcome, Corroboration::Agreed | Corroboration::Conflict)
 }
 
-fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
+/// Enumerates the processes in `scope`. Shared with `inspect --system`,
+/// which walks the same membership with scan-only semantics.
+pub(crate) fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
     // Whole-machine scope: every numeric /proc entry is a thread-group ID
     // (threads live under /proc/<pid>/task, never top-level). No cgroup path
     // is consulted; the caller's scan cap still bounds discovery.
@@ -3532,7 +3535,8 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
 
 /// What a scope-wide loss is filed under: the cgroup path, the pid, or the
 /// whole machine.
-fn scope_label(scope: &Scope) -> String {
+/// The skip subject naming a scope. Shared with `inspect --system`.
+pub(crate) fn scope_label(scope: &Scope) -> String {
     match scope {
         Scope::Pid(pid) => format!("pid {pid}"),
         Scope::Cgroup { path, .. } => path.display().to_string(),
@@ -3960,7 +3964,12 @@ fn is_provider_mapping(entry: &MapEntry) -> bool {
 /// Under the cap this is the identity (all pids ascending — today's exact
 /// order); over the cap each provider group sends its lowest pid, rarest
 /// providers first, and pids with no provider mapping trail as individuals.
-fn select_deep_scan_candidates(sweep: &[(u32, Vec<MapEntry>)], max_pids: usize) -> Vec<u32> {
+/// Phase-2 selection, shared with `inspect --system` so one implementation
+/// decides which swept pids earn a deep scan.
+pub(crate) fn select_deep_scan_candidates(
+    sweep: &[(u32, Vec<MapEntry>)],
+    max_pids: usize,
+) -> Vec<u32> {
     if sweep.len() <= max_pids {
         let mut pids: Vec<u32> = sweep.iter().map(|(pid, _)| *pid).collect();
         pids.sort_unstable();
@@ -4085,7 +4094,9 @@ fn select_rotation_candidates(
 /// provider-rarity order, not a pid prefix, so the message must never say
 /// "first N". Never names pids or paths. Refresh passes only new candidates
 /// (known views excluded); it must not claim successful scans.
-fn scan_cap_reason(total: usize, selected: usize, cap: usize, live: bool) -> String {
+/// The published over-cap record, shared with `inspect --system` so the
+/// bound reads the same everywhere it is hit.
+pub(crate) fn scan_cap_reason(total: usize, selected: usize, cap: usize, live: bool) -> String {
     if live {
         let noun = if selected == 1 {
             "new candidate"
@@ -4107,8 +4118,9 @@ enum MapsSnapshot {
     Unavailable,
 }
 
+/// Phase-1 maps snapshots, shared with `inspect --system`.
 #[derive(Default)]
-struct MapsSweep {
+pub(crate) struct MapsSweep {
     snapshots: Vec<(u32, MapsSnapshot)>,
 }
 
@@ -4149,7 +4161,7 @@ impl MapsSweep {
     /// authority: an admitted deep scan acquires its own retained view.
     /// Return the gap with the hints so both callers publish it even when
     /// none of these candidates can receive a deep-scan slot.
-    fn into_selection(self) -> (Vec<(u32, Vec<MapEntry>)>, Option<Skipped>) {
+    pub(crate) fn into_selection(self) -> (Vec<(u32, Vec<MapEntry>)>, Option<Skipped>) {
         let skipped = self.unavailable_skip();
         let hints = self
             .snapshots
@@ -4169,7 +4181,8 @@ impl MapsSweep {
 /// Phase 1 reads every in-scope pid's maps snapshot with bounded I/O and
 /// parsing, without decode or view allocation. Failed or budget-refused
 /// snapshots remain unavailable, independently of later deep-scan selection.
-fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> MapsSweep {
+/// Shared with `inspect --system`.
+pub(crate) fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> MapsSweep {
     let mut sweep = MapsSweep::default();
     for &pid in pids {
         let result = std::fs::File::open(format!("/proc/{pid}/maps"))
@@ -4833,7 +4846,9 @@ fn format_module_refusal(subject: &str, reason: &str) -> String {
 /// nothing a capture that keeps running can still observe. Loss stays loss,
 /// and loud, whenever the end cannot be proven. Loud means aggregated (Task
 /// 3.2): the detail is noted to `noise` scrubbed of PIDs, never printed raw.
-fn unreadable_member_skip(
+/// Shared with `inspect --system`, which pairs the deduped record with a
+/// per-pid status in its process table.
+pub(crate) fn unreadable_member_skip(
     pid: u32,
     gone: bool,
     detail: &str,

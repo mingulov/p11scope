@@ -164,6 +164,45 @@ fn assert_stderr_honest(stderr: &str) {
     );
 }
 
+/// The per-pass gap/refusal/suppressed line (`report_progress`) is the
+/// actual honesty mechanism on refused and partial runs: it must name
+/// exactly the gap, budget-refusal, and suppressed counts the document
+/// carries. Parses `p11scope: pass N: G gap(s) (R budget refusal(s), S
+/// suppressed)` and pins all three against the caller's exact values.
+fn assert_pass_gap_line(stderr: &str, pass: u64, gaps: usize, refusals: usize, suppressed: u64) {
+    let prefix = format!("p11scope: pass {pass}: ");
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with(&prefix) && line.contains("budget refusal"))
+        .unwrap_or_else(|| panic!("pass {pass} gap/refusal/suppressed line present: {stderr:?}"));
+    let rest = line.strip_prefix(&prefix).unwrap();
+    let (seen_gaps, rest) = rest.split_once(' ').unwrap();
+    let seen_gaps: usize = seen_gaps.parse().unwrap();
+    let inner = rest.split('(').nth(1).unwrap().strip_suffix(')').unwrap();
+    let mut parts = inner.split(", ");
+    let seen_refusals: usize = parts
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let seen_suppressed: u64 = parts
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        (seen_gaps, seen_refusals, seen_suppressed),
+        (gaps, refusals, suppressed),
+        "stderr gap line agrees with the document: {line:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // E2: scale through the real binary.
 // ---------------------------------------------------------------------------
@@ -461,11 +500,26 @@ fn slow_stdout_reader_gets_exact_bytes() {
     reader.read_exact(&mut first).unwrap();
     assert_eq!(&first[..2], b"{\n", "the document starts streaming");
     sample_peak(&mut peak);
+    // Child-side FD oracle for the stalled writer: its FD set stays
+    // stable across the stall — no leak while blocked on
+    // backpressure. The helper exec'd the observer, so `pid` IS the
+    // writer.
+    let child_fds = || {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .count()
+    };
+    let fds_before = child_fds();
     std::thread::sleep(Duration::from_secs(3));
     sample_peak(&mut peak);
+    let fds_after = child_fds();
     assert!(
         child.try_wait().unwrap().is_none(),
         "the writer stalls on the unread pipe (backpressure engaged)"
+    );
+    assert_eq!(
+        fds_after, fds_before,
+        "the stalled writer's FD set stays stable across the stall"
     );
     let mut body = first.to_vec();
     reader.read_to_end(&mut body).unwrap();
@@ -563,6 +617,14 @@ fn unwritable_out_is_a_hard_error_not_success() {
 #[test]
 fn sigkill_mid_run_leaves_no_partial_report() {
     let _guard = serial_guard();
+    // The test parent must not leak across the kill: the scope opens
+    // before the spawn and asserts a zero delta after the reap.
+    //
+    // No observer-RSS bound exists for this cell, by construction: the
+    // observed process is dead, so there is no peak to sample — and no
+    // document to settle. Atomicity-by-absence (no report file at the
+    // destination) is the oracle, alongside the parent-side FD delta.
+    let fd_scope = FdScope::open("sigkill command run");
     let dir = tmp("inventory-sigkill-e2");
     // `-o` needs a trusted directory; the target dir does not qualify.
     let out_dir = tempfile::tempdir().unwrap();
@@ -628,4 +690,81 @@ fn sigkill_mid_run_leaves_no_partial_report() {
     );
     let pid: u32 = ready_pid(&ready);
     let _guard = FixtureGuard { pids: vec![pid] };
+    drop(_guard);
+    fd_scope.assert_delta(0);
+}
+
+// ---------------------------------------------------------------------------
+// E2: a partial run names its gaps on stderr, exactly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
+    let _guard = serial_guard();
+    let fd_scope = FdScope::open("scan-cap command run");
+    let dir = tmp("inventory-gapline-e2");
+    // `-o` needs a trusted directory; the target dir does not qualify.
+    let out_dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = out_dir.path().join("partial.json");
+    let stderr_log = dir.join("stderr.log");
+    // One small budget, overflowed on purpose: the machine always holds
+    // more than one process (the test, its shell, the observer), so a
+    // scan cap of 1 always truncates and the run is always partial.
+    // `cmd` drops with the block: the parent's copy of the child's
+    // stderr file must not outlive the spawn (the FD scope below
+    // counts it otherwise).
+    let (output, peak) = {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_p11scope"));
+        cmd.args([
+            "inventory",
+            "--system",
+            "--json",
+            "--max-scan-pids",
+            "1",
+            "-o",
+        ])
+        .arg(&file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+        spawn_with_peak(&mut cmd, &stderr_log)
+    };
+    let stderr = std::fs::read_to_string(&stderr_log).unwrap();
+    assert!(
+        output.status.success(),
+        "capped observe exits 0: {:?} {stderr}",
+        output.status,
+    );
+    // Both sinks carry the same bytes: the `-o` file and stdout agree.
+    assert_eq!(
+        output.stdout,
+        std::fs::read(&file).unwrap(),
+        "stdout and the -o report agree byte for byte"
+    );
+    assert_stderr_honest(&stderr);
+    assert!(
+        peak < OBSERVER_RSS_BOUND_BYTES,
+        "observer peak RSS {peak} stays within {OBSERVER_RSS_BOUND_BYTES}"
+    );
+    let body = std::fs::read_to_string(&file).unwrap();
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    // The run is genuinely partial: the over-cap diagnostic made the
+    // document.
+    let gaps = doc["gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter().any(|gap| gap["reason"]
+            .as_str()
+            .unwrap()
+            .contains("for deep scanning by provider rarity (limit 1)")),
+        "the truncation gap names the overflowed budget: {}",
+        doc["gaps"]
+    );
+    // The stderr gap line names exactly what the document carries —
+    // the honesty mechanism on a partial run.
+    let refusals = gaps.iter().filter(|gap| !gap["budget"].is_null()).count();
+    let suppressed = doc["gaps_suppressed"].as_u64().unwrap();
+    assert_pass_gap_line(&stderr, 0, gaps.len(), refusals, suppressed);
+    assert_settled_consistent(&doc);
+    fd_scope.assert_delta(0);
 }

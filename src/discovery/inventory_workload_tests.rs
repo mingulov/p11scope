@@ -33,6 +33,29 @@ fn harness() -> Harness {
     Harness::new(RegistryLimits::default_limits()).unwrap()
 }
 
+/// Retry a deterministic injection body against process-global FD
+/// measurement noise: parallel suite threads can hold FDs across a
+/// whole sampling window. The bodies are single-threaded and
+/// deterministic, so a real leak fails every attempt identically while
+/// noise fails sporadically — three attempts, then the last panic
+/// resumes. (The isolated RSS worker re-runs the same bodies without
+/// retries: single test per process, no noise to tolerate.)
+fn retry_against_fd_noise(body: fn()) {
+    let mut attempts = 0;
+    loop {
+        match std::panic::catch_unwind(body) {
+            Ok(()) => return,
+            Err(payload) => {
+                attempts += 1;
+                if attempts >= 3 {
+                    std::panic::resume_unwind(payload);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 fn limited(
     callers: usize,
     modules: usize,
@@ -432,6 +455,12 @@ fn inventory_projection_at_t7_cardinality_8192() {
 #[test]
 fn native_owner_growth_to_257_over_owned_sleepers() {
     let _serial = serial_guard();
+    retry_against_fd_noise(grow_native_owners_to_257);
+}
+
+/// 257 native owners through the real growth path, callable from the
+/// test above (with FD-noise retries under parallelism).
+fn grow_native_owners_to_257() {
     // 257 owned sleepers: the pids behind 257 native owners through the
     // real `open_inventory_owner` growth path.
     let mut children = Vec::new();
@@ -457,20 +486,24 @@ fn native_owner_growth_to_257_over_owned_sleepers() {
     }
     let _reaper = Reaper(children);
     let pids: Vec<u32> = _reaper.0.iter().map(|child| child.id()).collect();
+    let owned: BTreeSet<u32> = pids.iter().copied().collect();
     let mut harness = harness();
     let mut guard = AcceptAllImages;
-    // FD accounting, measured never assumed: the first owner establishes
-    // the unit cost (one pin fd where the kernel offers pidfds, zero
-    // where it falls back), and the remaining 256 must cost exactly
-    // 256× that unit — retained by design, never leaked beyond it.
+    // Owned-FD accounting, measured never assumed: the census counts
+    // only pidfds for these 257 sleepers, so parallel tests'
+    // pipes/sockets/eventfds — and their pidfds for other pids —
+    // cannot move the needle. The first owner establishes the unit
+    // cost (one pin fd where the kernel offers pidfds, zero where it
+    // falls back), and the remaining 256 must cost exactly 256× that
+    // unit — retained by design, never leaked beyond it.
     let now = harness.now_ns();
-    let before = count_fds();
+    let before = count_owned_pidfds_floor(&owned);
     harness.source().spawn(pids[0], 5000);
     let first = harness
         .coordinator_mut()
         .test_open_native_owner(pids[0], owner_image(pids[0]), &mut guard, now)
         .unwrap();
-    let unit = count_fds().saturating_sub(before);
+    let unit = count_owned_pidfds_floor(&owned).saturating_sub(before);
     assert!(unit <= 1, "one owner retains at most one fd, got {unit}");
     for (index, pid) in pids.iter().enumerate().skip(1) {
         harness.source().spawn(*pid, 5000 + index as u64);
@@ -480,7 +513,7 @@ fn native_owner_growth_to_257_over_owned_sleepers() {
             .unwrap();
     }
     assert_eq!(
-        count_fds(),
+        count_owned_pidfds_floor(&owned),
         before + 257 * unit,
         "257 owners retain exactly the accounted pins"
     );
@@ -521,6 +554,113 @@ fn native_owner_growth_to_257_over_owned_sleepers() {
             "every grown caller carries native authority",
         );
     }
+}
+
+/// Direct pidfd_open for the census classifier below, mirroring
+/// `crate::process`'s private opener. `None` where the kernel lacks
+/// pidfds (the fallback shape).
+fn pidfd_open_test(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: Linux pidfd_open takes scalar pid/flags, returns a new fd or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: the syscall returned a live fd this test owns.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[test]
+fn owned_pidfd_census_counts_only_owned_pidfds() {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    // Two owned sleepers behind the census; nothing else in this
+    // process pins them, so the owned count is exactly what this test
+    // opens itself — no serial guard needed.
+    let mut reapers = Vec::new();
+    for _ in 0..2 {
+        reapers.push(ChildReaper(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
+    }
+    let owned: BTreeSet<u32> = reapers.iter().map(|reaper| reaper.0.id()).collect();
+    assert_eq!(owned.len(), 2);
+    assert_eq!(
+        count_owned_pidfds(&owned),
+        0,
+        "nothing pins the fresh sleepers yet"
+    );
+    // Foreign FD shapes never move the owned needle: a pipe, a
+    // socketpair, and an eventfd stay open for the rest of the test.
+    let mut pipe_fds = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
+        0,
+        "pipe opens"
+    );
+    // SAFETY: `pipe` returned two live fds this test owns.
+    let (_pipe_read, _pipe_write) = unsafe {
+        (
+            OwnedFd::from_raw_fd(pipe_fds[0]),
+            OwnedFd::from_raw_fd(pipe_fds[1]),
+        )
+    };
+    let mut sock_fds = [0; 2];
+    assert_eq!(
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr()) },
+        0,
+        "socketpair opens"
+    );
+    // SAFETY: `socketpair` returned two live fds this test owns.
+    let (_sock_a, _sock_b) = unsafe {
+        (
+            OwnedFd::from_raw_fd(sock_fds[0]),
+            OwnedFd::from_raw_fd(sock_fds[1]),
+        )
+    };
+    let eventfd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    assert!(eventfd >= 0, "eventfd opens");
+    // SAFETY: `eventfd` returned a live fd this test owns.
+    let _event = unsafe { OwnedFd::from_raw_fd(eventfd) };
+    assert_eq!(
+        count_owned_pidfds(&owned),
+        0,
+        "foreign pipes/sockets/eventfds are not owned pidfds"
+    );
+    match pidfd_open_test(std::process::id()) {
+        None => {
+            // No pidfd_open on this kernel: the fallback shape pins the
+            // census at zero — nothing can count as an owned pidfd.
+            assert_eq!(count_owned_pidfds(&owned), 0);
+        }
+        Some(foreign) => {
+            assert_eq!(
+                count_owned_pidfds(&owned),
+                0,
+                "a pidfd for a foreign pid is not owned"
+            );
+            let first = pidfd_open_test(*owned.iter().next().unwrap())
+                .expect("an owned pid opens where self did");
+            assert_eq!(
+                count_owned_pidfds(&owned),
+                1,
+                "a pidfd for an owned pid counts exactly once"
+            );
+            drop(first);
+            assert_eq!(
+                count_owned_pidfds(&owned),
+                0,
+                "closing the pin releases the count"
+            );
+            drop(foreign);
+        }
+    }
+    assert_eq!(count_owned_pidfds(&owned), 0);
 }
 
 /// The attach path at t7 scale is privileged-only: these cells run the
@@ -909,6 +1049,124 @@ fn endpoint_census_charges_only_admitted_modules() {
     );
 }
 
+#[test]
+fn counter_saturation_renders_nonzero_in_budgets_census() {
+    let mut harness = limited(64, 64, 64, 64, 1 << 20, 64);
+    let spec = ScaleSpec {
+        name: "counter-saturation",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 63_500,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    // One observed batch at the cap: the counter saturates through the
+    // normal budgets path, and the census renders it nonzero.
+    let now = harness.now_ns();
+    let caller = harness.coordinator().adapter().live_id(63_500).unwrap();
+    let key = harness
+        .coordinator()
+        .registry()
+        .modules()
+        .next()
+        .unwrap()
+        .key
+        .clone();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .observe_entries(caller, &key, u64::MAX, now);
+    harness.commit();
+    let document = harness.render();
+    assert_ledger(&document, &spec.expected_ledger());
+    assert_settled(&document, 0);
+    assert_eq!(document["budgets"]["counters"]["observed_edges"], 1);
+    assert_eq!(document["budgets"]["counters"]["saturated_edges"], 1);
+    assert_eq!(document["edges"][0]["entries"]["count"], u64::MAX);
+    assert_eq!(document["edges"][0]["entries"]["saturated"], true);
+}
+
+#[test]
+fn refusal_preserves_previously_observed_entry_counts() {
+    // One caller, one module, one edge with observed use — then a
+    // second caller overflows the caller budget. The refusal names its
+    // budget while the frozen entry count stays intact.
+    let mut harness = limited(1, 64, 64, 64, 1 << 20, 64);
+    let spec = ScaleSpec {
+        name: "use-preservation",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 63_600,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let now = harness.now_ns();
+    let caller = harness.coordinator().adapter().live_id(63_600).unwrap();
+    let key = harness
+        .coordinator()
+        .registry()
+        .modules()
+        .next()
+        .unwrap()
+        .key
+        .clone();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .observe_entries(caller, &key, 5, now);
+    harness.commit();
+    // Overflow the caller budget: the second pid refuses at admission
+    // while the first stays live (both observed, so no exit).
+    let now = harness.now_ns();
+    harness.source().spawn(63_601, 2222);
+    let observed: BTreeSet<u32> = [63_600, 63_601].into_iter().collect();
+    let events = harness.coordinator_mut().adapter_mut().reconcile(
+        &observed,
+        &mut |_| ImageAuthority::ScanPinned,
+        now,
+    );
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        CallerEvent::AdmitFailed { pid, budget, .. } => {
+            assert_eq!(*pid, 63_601);
+            let refusal = budget.expect("caller overflow names its budget");
+            assert_eq!(
+                (refusal.resource, refusal.limit, refusal.requested),
+                ("callers", 1, 2)
+            );
+        }
+        other => panic!("expected a budget refusal, got {other:?}"),
+    }
+    harness
+        .coordinator_mut()
+        .apply_reconcile_events(&events, now);
+    harness.commit();
+    let document = harness.render();
+    assert_ledger(
+        &document,
+        &Ledger {
+            callers: 1,
+            modules: 1,
+            edges: 1,
+            endpoints: 4,
+            callers_refused: 1,
+            modules_refused: 0,
+            edges_refused: 0,
+            endpoints_refused: 0,
+            gaps: Some(1),
+            gaps_suppressed: 0,
+        },
+    );
+    assert_settled(&document, 0);
+    // Use-preservation: the staged entry count survived the refusal.
+    assert_eq!(document["edges"][0]["entries"]["count"], 5);
+    assert_eq!(document["gaps"][0]["budget"]["resource"], "callers");
+}
+
 // ---------------------------------------------------------------------------
 // C: failure injection with exact loss accounting and terminal settlement.
 // ---------------------------------------------------------------------------
@@ -916,7 +1174,7 @@ fn endpoint_census_charges_only_admitted_modules() {
 #[test]
 fn admission_failures_gap_exactly_with_zero_fd_delta() {
     let _serial = serial_guard();
-    inject_admission_failures();
+    retry_against_fd_noise(inject_admission_failures);
 }
 
 /// Admission/growth failure injection, callable from the test above
@@ -992,9 +1250,132 @@ fn inject_admission_failures() {
 }
 
 #[test]
+fn native_owner_growth_failure_accounts_loss_exactly() {
+    let _serial = serial_guard();
+    retry_against_fd_noise(inject_native_owner_growth_failure);
+}
+
+/// Native-owner growth-path failure injection, callable from the test
+/// above (with FD-noise retries under parallelism).
+fn inject_native_owner_growth_failure() {
+    fn some_image(pid: u32) -> Option<ImageIdentity> {
+        Some(owner_image(pid))
+    }
+    // One owned sleeper behind a real scan pass: BPF-style image
+    // identity exists for it, but the guard refuses exact authority,
+    // so `open_inventory_owner` fails through the production path.
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let _reaper = ChildReaper(child);
+    let owned: BTreeSet<u32> = [pid].into_iter().collect();
+    // Pin shape, measured never assumed: on pidfd kernels the admitted
+    // caller retains one pidfd; on fallback kernels it retains none.
+    // The failed growth must retain nothing either way, so the owned
+    // census after the scan is exactly the caller's pin.
+    let probe = crate::process::PidPin::open(pid).expect("the owned sleeper pins");
+    let pin_holds_fd = probe.pidfd().is_ok();
+    drop(probe);
+    let before = count_owned_pidfds_floor(&owned);
+    let mut coordinator = InventoryCoordinator::new(
+        Scope::Pid(pid),
+        HookRegistry::builtin(),
+        Vec::new(),
+        OsProcessSource,
+        RegistryLimits::default_limits(),
+    )
+    .unwrap();
+    let t0 = crate::discovery::caller_registry::now_ns();
+    let report = coordinator
+        .scan_pass(
+            &InventoryScope::Pid(pid),
+            None,
+            &mut UnavailableImageGuard,
+            some_image,
+            u64::MAX,
+            t0,
+        )
+        .unwrap();
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.native_callers, 0, "growth failed: no native caller");
+    assert_eq!(report.scan_callers, 1, "the scan lane still admits the pid");
+    coordinator.commit_batch(false).unwrap();
+    assert_eq!(
+        count_owned_pidfds_floor(&owned),
+        before + usize::from(pin_holds_fd),
+        "the scan retains exactly the admitted caller's pin; the failed growth retains nothing"
+    );
+    let document = crate::inventory::render_json(&coordinator, "workload", t0, t0, 1);
+    // Exact loss accounting: one gap names the failed growth with the
+    // pid and the open error; the scan-lane incarnation carries on
+    // with scan-pinned authority and no retained owner.
+    let growth_gaps: Vec<&serde_json::Value> = document["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|gap| gap["subject"] == "native inventory owner unavailable")
+        .collect();
+    assert_eq!(
+        growth_gaps.len(),
+        1,
+        "one growth-failure gap: {}",
+        document["gaps"]
+    );
+    assert_eq!(growth_gaps[0]["pid"], pid);
+    assert!(
+        growth_gaps[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("inventory exact-image authority unavailable or changed"),
+        "the gap carries the open error: {}",
+        growth_gaps[0]["reason"]
+    );
+    assert!(growth_gaps[0]["budget"].is_null());
+    assert_eq!(document["callers"].as_array().unwrap().len(), 1);
+    assert_eq!(document["callers"][0]["lifecycle"], "mapped");
+    assert_eq!(
+        document["callers"][0]["image"]["authority"], "scan_pinned",
+        "growth failure falls back to scan-lane authority"
+    );
+    let caller = coordinator.adapter().live_id(pid).unwrap();
+    assert!(
+        coordinator.owner_of(caller).is_none(),
+        "the failed growth retains no owner"
+    );
+    assert_eq!(document["gaps_suppressed"], 0);
+    assert_settled(&document, 0);
+    // The bad-image shape, direct: a zero task cookie never reaches the
+    // open — the growth path refuses it with no state change.
+    let mut harness = harness();
+    let now = harness.now_ns();
+    let mut guard = AcceptAllImages;
+    let error = harness
+        .coordinator_mut()
+        .test_open_native_owner(
+            pid,
+            ImageIdentity {
+                task_cookie: 0,
+                exec_id: 7,
+            },
+            &mut guard,
+            now,
+        )
+        .expect_err("a zero task cookie refuses the growth path");
+    assert!(
+        format!("{error:#}").contains("lacks image identity"),
+        "the error names the missing identity: {error:#}"
+    );
+}
+
+#[test]
 fn provider_mutation_mid_run_splits_module_instances() {
     let _serial = serial_guard();
-    inject_provider_mutation();
+    retry_against_fd_noise(inject_provider_mutation);
 }
 
 /// Provider-mutation injection (dlclose/dlopen of a changed `.so`),
@@ -1152,7 +1533,7 @@ fn inject_provider_mutation() {
 #[test]
 fn discovery_loss_marks_uncertain_with_exact_gaps() {
     let _serial = serial_guard();
-    inject_discovery_loss();
+    retry_against_fd_noise(inject_discovery_loss);
 }
 
 /// Event/discovery-loss injection, callable from the test above and
@@ -1225,7 +1606,7 @@ fn inject_discovery_loss() {
 #[test]
 fn caller_churn_storm_settles_with_exact_ledger() {
     let _serial = serial_guard();
-    run_churn_storm();
+    retry_against_fd_noise(run_churn_storm);
 }
 
 /// Caller churn (spawn/exit storm), callable from the test above and
@@ -1285,7 +1666,7 @@ fn run_churn_storm() {
 #[test]
 fn interrupted_shutdown_drops_the_batch_whole_never_partial() {
     let _serial = serial_guard();
-    interrupt_shutdown();
+    retry_against_fd_noise(interrupt_shutdown);
 }
 
 /// Interrupted-shutdown injection (coordinator dropped mid-batch),

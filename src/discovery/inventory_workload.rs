@@ -8,12 +8,18 @@
 //! [`render_json`](crate::inventory::render_json) — and the assertion API
 //! checks the rendered document against the ledger.
 //!
-//! The spec/ledger/assertion API is public and stable: the U-track
-//! (dashboard) and S-track (semantics) replay the SAME workloads later
-//! through their own backends. The JSON backend here depends on neither
-//! dashboard nor semantic code. Integration tests drive the public API
-//! against real `p11scope inventory` output; in-crate tests additionally
-//! drive the scripted backend ([`Harness`]).
+//! The spec/ledger/assertion API is public and stable: integration
+//! tests drive it against real `p11scope inventory` output, and the
+//! U-track (dashboard) and S-track (semantics) replay the SAME
+//! workloads later through their own backends. The JSON backend here
+//! depends on neither dashboard nor semantic code.
+//!
+//! E1 decision: replay is in-crate — the S-track
+//! ([`crate::semantics`]) already lives in this crate and the U-track
+//! dashboard lands here too — so the scripted execution backend
+//! (`ScriptedSource`, `ChurnSpec`, `Harness`) is `#[cfg(test)]`-gated:
+//! unit tests pin it, no external bench replays it, and no
+//! `allow(dead_code)` carries it in production builds.
 //!
 //! Unit vocabulary (no conflation): attach *endpoints* project into
 //! inventory as per-module `admission.endpoints`, summed into the
@@ -22,19 +28,29 @@
 //! its usage evidence — with native engine owners 1:1 behind native
 //! callers.
 
+#[cfg(test)]
 use crate::attach::Scope;
+#[cfg(test)]
 use crate::discovery::caller_registry::{
     AdmissionState, CallerEvent, CallerId, ExeIdentity, ImageAuthority, ModuleInfo, ModuleKey,
     ProcessSource, RegistryLimits,
 };
+#[cfg(test)]
 use crate::discovery::engine::inventory::UnavailableImageGuard;
+#[cfg(test)]
 use crate::discovery::engine::inventory_coordinator::{
     BatchReceipt, InventoryCoordinator, PassReport,
 };
+#[cfg(test)]
 use crate::discovery::hooks::HookRegistry;
+#[cfg(test)]
 use anyhow::Result;
+#[cfg(test)]
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeSet, HashSet};
+#[cfg(test)]
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
@@ -421,37 +437,102 @@ pub fn rss_bytes() -> u64 {
     resident_pages.saturating_mul(page as u64)
 }
 
+/// Owned-FD census: pidfds this process retains for exactly `pids`.
+///
+/// The all-FD census counts every parallel test's transients; the
+/// growth test needs its OWN pins only. Each `/proc/self/fd` entry
+/// whose readlink is `anon_inode:[pidfd]` resolves through its fdinfo
+/// `Pid:` line, so foreign pipes, sockets, eventfds — and foreign
+/// tests' pidfds for other pids — cannot move the needle. Entries
+/// that vanish mid-census (a parallel thread's transient) are
+/// skipped, never counted; owned pins are retained, so every sample
+/// sees all of them.
+pub fn count_owned_pidfds(pids: &BTreeSet<u32>) -> usize {
+    let mut owned = 0;
+    for entry in std::fs::read_dir("/proc/self/fd")
+        .expect("/proc/self/fd is readable")
+        .flatten()
+    {
+        let path = entry.path();
+        let is_pidfd = std::fs::read_link(&path)
+            .is_ok_and(|target| target.to_string_lossy() == "anon_inode:[pidfd]");
+        if !is_pidfd {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Ok(fdinfo) = std::fs::read_to_string(format!("/proc/self/fdinfo/{name}")) else {
+            continue;
+        };
+        let pid = fdinfo.lines().find_map(|line| {
+            line.strip_prefix("Pid:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|pid| pid.parse::<u32>().ok())
+        });
+        if pid.is_some_and(|pid| pids.contains(&pid)) {
+            owned += 1;
+        }
+    }
+    owned
+}
+
 /// An FD-measurement scope: open before the injection, assert the exact
 /// delta after. Most injections hold no FDs and assert zero; growth
 /// that retains pins by design asserts its accounted cost.
 ///
-/// The census is process-global, so parallel test threads can park a
-/// transient FD inside the window (a file open that closes a
-/// millisecond later). The assertion polls briefly for quiescence: a
-/// retained leak persists and still fails; a transient clears.
+/// The census is process-global, so a parallel test thread can park a
+/// transient FD inside any single sample. Both ends sample the FLOOR
+/// over a short window instead: transients only inflate single
+/// samples, so the floor is the true retained count, while a retained
+/// leak persists in every sample and still fails.
 pub struct FdScope {
     before: usize,
     label: &'static str,
 }
 
+/// The retained-FD floor: the minimum census over ten 10ms samples.
+/// Millisecond transients from parallel threads never survive the
+/// window; genuinely retained FDs appear in all ten. Multi-step
+/// accountings (unit cost, then total) sample this at each step.
+pub fn count_fds_floor() -> usize {
+    let mut floor = usize::MAX;
+    for _ in 0..10 {
+        floor = floor.min(count_fds());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    floor
+}
+
+/// The owned-pidfd floor: the minimum owned census over ten 10ms
+/// samples, mirroring [`count_fds_floor`]. Retained pins appear in
+/// every sample; nothing else can.
+pub fn count_owned_pidfds_floor(pids: &BTreeSet<u32>) -> usize {
+    let mut floor = usize::MAX;
+    for _ in 0..10 {
+        floor = floor.min(count_owned_pidfds(pids));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    floor
+}
+
 impl FdScope {
     pub fn open(label: &'static str) -> Self {
         Self {
-            before: count_fds(),
+            before: count_fds_floor(),
             label,
         }
     }
 
     pub fn assert_delta(&self, expected: usize) {
-        let target = self.before + expected;
-        for _ in 0..40 {
-            if count_fds() == target {
+        let target = self.before.saturating_add(expected);
+        for _ in 0..20 {
+            if count_fds_floor() == target {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert_eq!(
-            count_fds(),
+            count_fds_floor(),
             target,
             "FD delta across {} (no quiescence in 2s)",
             self.label,
@@ -478,14 +559,14 @@ pub fn peak_rss_bytes() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Scripted JSON backend (in-crate): the real coordinator path, programmed pids.
+// Scripted JSON backend (in-crate, test-gated per the E1 decision
+// above): the real coordinator path, programmed pids.
 // ---------------------------------------------------------------------------
 
 /// One programmed process: liveness, start-time, exe identity, and
 /// whether identity reads succeed (a race or permission wall blinds
 /// them while liveness still answers).
-// Stable workload seam; unit tests pin it, U/S tracks replay through it.
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct ScriptedProcess {
     alive: bool,
@@ -497,14 +578,14 @@ struct ScriptedProcess {
 /// Scripted process source: the pid/exit/reuse/exec/admission-failure
 /// sequence is programmed, never observed from the host. Pins capture
 /// the start-time they opened. Cloned handles share one script.
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ScriptedSource {
     state: Rc<RefCell<HashMap<u32, ScriptedProcess>>>,
     fail_open: Rc<RefCell<HashSet<u32>>>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl ScriptedSource {
     /// Spawn (or respawn, for reuse scripts) one programmed pid.
     pub(crate) fn spawn(&self, pid: u32, start_time: u64) {
@@ -531,6 +612,7 @@ impl ScriptedSource {
         }
     }
 
+    #[allow(dead_code)] // E1: reserved scripted seam for exec scripts; churn respawns via `spawn` today.
     pub(crate) fn exec(&self, pid: u32, ino: u64, path: &str) {
         if let Some(process) = self.state.borrow_mut().get_mut(&pid) {
             process.exe = Some(ExeIdentity {
@@ -544,6 +626,7 @@ impl ScriptedSource {
     }
 
     /// Blind one pid's identity reads (liveness still answers).
+    #[allow(dead_code)] // E1: reserved scripted seam for blind-identity scripts; no workload blinds today.
     pub(crate) fn blind(&self, pid: u32) {
         if let Some(process) = self.state.borrow_mut().get_mut(&pid) {
             process.readable = false;
@@ -560,6 +643,7 @@ impl ScriptedSource {
     }
 }
 
+#[cfg(test)]
 impl ProcessSource for ScriptedSource {
     type Pin = (u32, u64);
 
@@ -611,7 +695,7 @@ impl ProcessSource for ScriptedSource {
 /// (spawn, map one of `modules` modules, die), each death reconciled.
 /// Exact ledger: `pids * generations` incarnations admitted, every one
 /// retired, every edge retained with its end reason.
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChurnSpec {
     pub pids: usize,
@@ -624,7 +708,7 @@ pub(crate) struct ChurnSpec {
 /// source, driven through staging → `commit_batch` → `render_json`.
 /// Every workload here runs the production batch boundary — never a
 /// mock registry.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct Harness {
     coordinator: InventoryCoordinator<ScriptedSource>,
     source: ScriptedSource,
@@ -633,7 +717,7 @@ pub(crate) struct Harness {
     passes: u64,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Harness {
     pub(crate) fn new(limits: RegistryLimits) -> Result<Self> {
         let source = ScriptedSource::default();
@@ -829,7 +913,7 @@ mod tests;
 
 /// One scripted module: distinct physical identity per index, admitted
 /// with its endpoint count.
-#[allow(dead_code)]
+#[cfg(test)]
 fn scale_module_info(index: usize, endpoints: usize) -> ModuleInfo {
     let path = format!("/scale/m{index}.so");
     ModuleInfo {

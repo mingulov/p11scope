@@ -66,9 +66,11 @@ never a changed meaning for an existing field.
   retained attach-endpoint census: the sum of admitted per-module
   endpoint counts), `counters` (per-edge entry counts: the `cap`
   plus `observed_edges` and `saturated_edges`), `semantic_state`
-  (`limit`, `occupied`, and `status`; capture stays withheld, so
-  `occupied` is always 0 and every edge's `semantics` column reads
-  `unknown (semantic capture withheld)`, never an invented state),
+  (`limit`, `occupied`, `status`, and `unknown_edges`; capture stays
+  withheld, so `occupied` is always 0, every edge's `semantics`
+  column reads `unknown (semantic capture withheld)` (never an
+  invented state), and `unknown_edges` counts the edges lacking
+  semantic state — the whole edge census while withheld),
   and `retained_history` (`limit`, `retained`, `suppressed` — the gap
   retention cap and its eviction marker). Refusal never erases
   retained evidence: over-budget members are dropped with a named

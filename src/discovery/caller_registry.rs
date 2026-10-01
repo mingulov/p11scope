@@ -958,7 +958,7 @@ impl CallerRegistry {
     }
 
     // Registry-side caller occupancy; workload tests pin adapter/registry agreement.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn caller_count(&self) -> usize {
         self.callers.len()
     }

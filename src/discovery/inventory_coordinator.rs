@@ -179,8 +179,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Mutable adapter access for the workload harness (scripted
     /// reconciles over programmed pids) and tests. The production
     /// command never mutates the adapter except through `scan_pass`.
-    // The harness is the only non-test caller; unit tests pin the seam.
-    #[allow(dead_code)]
+    // Test-only seam: the cfg(test) harness and unit tests pin it.
+    #[cfg(test)]
     pub(crate) fn adapter_mut(&mut self) -> &mut CallerAdapter<Source> {
         &mut self.adapter
     }

@@ -6,6 +6,7 @@ pub(crate) mod caller_registry;
 pub mod engine;
 pub mod hooks;
 pub mod identity;
+pub mod inventory_workload;
 pub(crate) mod loader;
 pub mod noise;
 pub(crate) mod pause;

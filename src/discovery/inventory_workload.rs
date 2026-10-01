@@ -1,0 +1,851 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! The reusable inventory workload harness (Phase 4 breadth).
+//!
+//! ONE harness for every scale, churn, and failure workload. A workload
+//! is a [`ScaleSpec`] (or churn/failure script) plus its exact [`Ledger`];
+//! the JSON backend drives the REAL coordinator path — adapter
+//! reconcile/admit, registry staging, [`InventoryCoordinator::commit_batch`],
+//! [`render_json`](crate::inventory::render_json) — and the assertion API
+//! checks the rendered document against the ledger.
+//!
+//! The spec/ledger/assertion API is public and stable: the U-track
+//! (dashboard) and S-track (semantics) replay the SAME workloads later
+//! through their own backends. The JSON backend here depends on neither
+//! dashboard nor semantic code. Integration tests drive the public API
+//! against real `p11scope inventory` output; in-crate tests additionally
+//! drive the scripted backend ([`Harness`]).
+//!
+//! Unit vocabulary (no conflation): attach *endpoints* project into
+//! inventory as per-module `admission.endpoints`, summed into the
+//! `endpoints` budget; inventory *edges* are (caller, module) pairs.
+//! `owners` on the inventory side are caller incarnations — each owns
+//! its usage evidence — with native engine owners 1:1 behind native
+//! callers.
+
+use crate::attach::Scope;
+use crate::discovery::caller_registry::{
+    AdmissionState, CallerEvent, CallerId, ExeIdentity, ImageAuthority, ModuleInfo, ModuleKey,
+    ProcessSource, RegistryLimits,
+};
+use crate::discovery::engine::inventory::UnavailableImageGuard;
+use crate::discovery::engine::inventory_coordinator::{
+    BatchReceipt, InventoryCoordinator, PassReport,
+};
+use crate::discovery::hooks::HookRegistry;
+use anyhow::Result;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
+
+// ---------------------------------------------------------------------------
+// Public spec/ledger/assertion API (stable for U/S-track replay).
+// ---------------------------------------------------------------------------
+
+/// One scale workload: `callers` caller incarnations each mapping
+/// `edges_per_caller` of `modules` modules (striped layout, exact and
+/// deterministic — see [`ScaleSpec::layout`]). Every module is admitted
+/// with `endpoints_per_module` attach endpoints. Requires
+/// `edges_per_caller <= modules` (each caller maps distinct modules).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScaleSpec {
+    pub name: &'static str,
+    pub callers: usize,
+    pub modules: usize,
+    pub edges_per_caller: usize,
+    pub endpoints_per_module: usize,
+    pub first_pid: u32,
+}
+
+impl ScaleSpec {
+    /// The exact (caller index, module index) pairs the workload stages:
+    /// caller `i` maps modules `(i * edges_per_caller + k) % modules`
+    /// for `k` in `0..edges_per_caller`. Every pair is distinct, so the
+    /// edge count is exactly `callers * edges_per_caller`.
+    pub fn layout(&self) -> Vec<(usize, usize)> {
+        assert!(
+            self.edges_per_caller <= self.modules,
+            "edges_per_caller must not exceed modules ({} > {})",
+            self.edges_per_caller,
+            self.modules,
+        );
+        let mut pairs = Vec::with_capacity(self.callers * self.edges_per_caller);
+        for caller in 0..self.callers {
+            for k in 0..self.edges_per_caller {
+                pairs.push((caller, (caller * self.edges_per_caller + k) % self.modules));
+            }
+        }
+        pairs
+    }
+
+    /// The exact ledger of a refusal-free run: admitted callers,
+    /// modules touched by the layout, edges, and the endpoint census.
+    /// Over-budget runs derive their ledgers by hand (see the B-track
+    /// tests), never by editing this function.
+    pub fn expected_ledger(&self) -> Ledger {
+        let layout = self.layout();
+        let modules: BTreeSet<usize> = layout.iter().map(|(_, module)| *module).collect();
+        Ledger {
+            callers: self.callers as u64,
+            modules: modules.len() as u64,
+            edges: layout.len() as u64,
+            endpoints: (modules.len() * self.endpoints_per_module) as u64,
+            callers_refused: 0,
+            modules_refused: 0,
+            edges_refused: 0,
+            endpoints_refused: 0,
+            gaps: Some(0),
+            gaps_suppressed: 0,
+        }
+    }
+}
+
+/// The exact expected outcome of one workload: admitted/retained counts
+/// plus per-resource refusals. `gaps` is `Some` only where the gap count
+/// is deterministic (scripted runs); command-level runs over a live
+/// machine leave it `None` and pin `gaps_suppressed` plus settlement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ledger {
+    pub callers: u64,
+    pub modules: u64,
+    pub edges: u64,
+    pub endpoints: u64,
+    pub callers_refused: u64,
+    pub modules_refused: u64,
+    pub edges_refused: u64,
+    pub endpoints_refused: u64,
+    pub gaps: Option<usize>,
+    pub gaps_suppressed: u64,
+}
+
+/// Assert the rendered document carries exactly the ledger: array
+/// lengths, per-resource budgets (limit/occupied/refused), the endpoint
+/// census recomputed independently from the modules, unknown semantic
+/// columns on every edge, and gap accounting.
+pub fn assert_ledger(document: &serde_json::Value, ledger: &Ledger) {
+    assert_eq!(document["schema"], "p11scope/inventory/v1");
+    let callers = document["callers"].as_array().expect("callers array");
+    let modules = document["modules"].as_array().expect("modules array");
+    let edges = document["edges"].as_array().expect("edges array");
+    assert_eq!(callers.len() as u64, ledger.callers, "caller ledger");
+    assert_eq!(modules.len() as u64, ledger.modules, "module ledger");
+    assert_eq!(edges.len() as u64, ledger.edges, "edge ledger");
+    // The endpoint census, recomputed from the document — not trusted
+    // from the budgets row.
+    let mut census: u64 = 0;
+    for module in modules {
+        if module["admission"]["state"] == "admitted"
+            && let Some(endpoints) = module["admission"]["endpoints"].as_u64()
+        {
+            census += endpoints;
+        }
+    }
+    assert_eq!(census, ledger.endpoints, "endpoint census");
+    assert_eq!(document["budgets"]["endpoints"]["occupied"], census);
+    assert_eq!(
+        document["budgets"]["callers"]["occupied"], ledger.callers,
+        "caller occupancy",
+    );
+    assert_eq!(
+        document["budgets"]["modules"]["occupied"], ledger.modules,
+        "module occupancy",
+    );
+    assert_eq!(
+        document["budgets"]["edges"]["occupied"], ledger.edges,
+        "edge occupancy",
+    );
+    assert_eq!(
+        document["budgets"]["callers"]["refused"].as_u64().unwrap(),
+        ledger.callers_refused,
+        "caller refusals",
+    );
+    assert_eq!(
+        document["budgets"]["modules"]["refused"].as_u64().unwrap(),
+        ledger.modules_refused,
+        "module refusals",
+    );
+    assert_eq!(
+        document["budgets"]["edges"]["refused"].as_u64().unwrap(),
+        ledger.edges_refused,
+        "edge refusals",
+    );
+    assert_eq!(
+        document["budgets"]["endpoints"]["refused"]
+            .as_u64()
+            .unwrap(),
+        ledger.endpoints_refused,
+        "endpoint refusals",
+    );
+    // Semantic capture stays withheld: unknown on every edge, zero
+    // occupancy in the budget row.
+    for edge in edges {
+        assert_eq!(
+            edge["semantics"], "unknown (semantic capture withheld)",
+            "semantic column for {} -> {}",
+            edge["caller"], edge["module"],
+        );
+    }
+    assert_eq!(document["budgets"]["semantic_state"]["occupied"], 0);
+    assert_eq!(document["budgets"]["semantic_state"]["status"], "withheld",);
+    assert_eq!(
+        document["budgets"]["semantic_state"]["unknown_edges"]
+            .as_u64()
+            .unwrap(),
+        ledger.edges,
+        "edges lacking semantic state",
+    );
+    if let Some(gaps) = ledger.gaps {
+        assert_eq!(
+            document["gaps"].as_array().unwrap().len(),
+            gaps,
+            "retained gaps"
+        );
+    }
+    assert_eq!(
+        document["gaps_suppressed"].as_u64().unwrap(),
+        ledger.gaps_suppressed,
+        "suppressed gaps",
+    );
+    assert_eq!(
+        document["budgets"]["retained_history"]["suppressed"]
+            .as_u64()
+            .unwrap(),
+        ledger.gaps_suppressed,
+        "retained-history loss counter",
+    );
+}
+
+/// Assert terminal settlement structurally: every admitted caller,
+/// module, and edge is either live-with-evidence or retired-with-reason,
+/// every edge endpoint resolves, and `gaps_suppressed` is exact.
+/// Structural, never by example-count.
+pub fn assert_settled(document: &serde_json::Value, expected_suppressed: u64) {
+    let callers = document["callers"].as_array().expect("callers array");
+    let modules = document["modules"].as_array().expect("modules array");
+    let edges = document["edges"].as_array().expect("edges array");
+    let caller_ids: HashSet<&str> = callers
+        .iter()
+        .map(|caller| caller["id"].as_str().unwrap())
+        .collect();
+    let module_ids: HashSet<&str> = modules
+        .iter()
+        .map(|module| module["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(caller_ids.len(), callers.len(), "caller ids are unique");
+    assert_eq!(module_ids.len(), modules.len(), "module ids are unique");
+    for caller in callers {
+        let lifecycle = caller["lifecycle"].as_str().unwrap();
+        assert!(
+            ["mapped", "exited", "exec_retired", "unknown"].contains(&lifecycle),
+            "known caller lifecycle for {}",
+            caller["id"],
+        );
+        if lifecycle == "mapped" {
+            assert_eq!(
+                caller["retired"], false,
+                "live caller {} is not retired",
+                caller["id"],
+            );
+        } else {
+            assert_eq!(
+                caller["retired"], true,
+                "retired caller {} is marked",
+                caller["id"],
+            );
+            assert!(
+                caller["lifecycle_reason"].is_string(),
+                "retired caller {} names its reason",
+                caller["id"],
+            );
+        }
+        assert!(
+            caller["first_seen_ns"].as_u64().unwrap() <= caller["last_seen_ns"].as_u64().unwrap(),
+            "caller {} last-seen never precedes first-seen",
+            caller["id"],
+        );
+    }
+    for module in modules {
+        let lifecycle = module["lifecycle"].as_str().unwrap();
+        assert!(
+            ["mapped", "unloaded", "unknown"].contains(&lifecycle),
+            "known module lifecycle for {}",
+            module["id"],
+        );
+        if lifecycle == "unloaded" {
+            assert_eq!(
+                module["unloaded_observed"], true,
+                "unloaded module {} retains its unload proof",
+                module["id"],
+            );
+        }
+    }
+    for edge in edges {
+        assert!(
+            caller_ids.contains(edge["caller"].as_str().unwrap()),
+            "edge caller {} resolves",
+            edge["caller"],
+        );
+        assert!(
+            module_ids.contains(edge["module"].as_str().unwrap()),
+            "edge module {} resolves",
+            edge["module"],
+        );
+        let mapping = edge["mapping"]["state"].as_str().unwrap();
+        assert!(
+            ["mapped", "ended", "uncertain"].contains(&mapping),
+            "known mapping state for {} -> {}",
+            edge["caller"],
+            edge["module"],
+        );
+        if mapping == "ended" {
+            assert!(
+                edge["mapping"]["reason"].is_string(),
+                "ended edge {} -> {} names its reason",
+                edge["caller"],
+                edge["module"],
+            );
+        }
+        assert!(
+            edge["entries"]["count"].is_number(),
+            "edge {} -> {} carries a count",
+            edge["caller"],
+            edge["module"],
+        );
+        assert_eq!(
+            edge["semantics"], "unknown (semantic capture withheld)",
+            "semantic column for {} -> {}",
+            edge["caller"], edge["module"],
+        );
+    }
+    for gap in document["gaps"].as_array().expect("gaps array") {
+        assert!(
+            gap["subject"].is_string() && gap["reason"].is_string(),
+            "every gap names its subject and reason",
+        );
+        if gap["budget"].is_null() {
+            continue;
+        }
+        assert!(
+            gap["budget"]["resource"].is_string()
+                && gap["budget"]["limit"].is_number()
+                && gap["budget"]["requested"].is_number(),
+            "refusal gaps name resource, limit, and requested",
+        );
+    }
+    assert_eq!(
+        document["gaps_suppressed"].as_u64().unwrap(),
+        expected_suppressed,
+        "suppressed gaps are exact",
+    );
+}
+
+/// Assert the exact edge ledger for an owned subset of a command-level
+/// document: callers filtered by pid, modules by `.so` basename, edges
+/// among them — every one mapped. The rest of the machine may appear in
+/// the document; only the owned subset is pinned.
+pub fn assert_subset_ledger(
+    document: &serde_json::Value,
+    pids: &[u32],
+    sonames: &[&str],
+    expected_edges: usize,
+) {
+    let pid_set: HashSet<u64> = pids.iter().map(|pid| u64::from(*pid)).collect();
+    let caller_ids: HashSet<&str> = document["callers"]
+        .as_array()
+        .expect("callers array")
+        .iter()
+        .filter(|caller| pid_set.contains(&caller["pid"].as_u64().unwrap()))
+        .map(|caller| caller["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        caller_ids.len(),
+        pids.len(),
+        "one incarnation per owned pid",
+    );
+    let module_ids: HashSet<&str> = document["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .filter(|module| {
+            module["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| sonames.contains(&basename(path.as_str().unwrap())))
+        })
+        .map(|module| module["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(module_ids.len(), sonames.len(), "one module per owned .so");
+    let owned: Vec<&serde_json::Value> = document["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .filter(|edge| {
+            caller_ids.contains(edge["caller"].as_str().unwrap())
+                && module_ids.contains(edge["module"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(owned.len(), expected_edges, "owned edge ledger");
+    for edge in owned {
+        assert_eq!(
+            edge["mapping"]["state"], "mapped",
+            "owned edge {} -> {} is mapped",
+            edge["caller"], edge["module"],
+        );
+    }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Live file-descriptor census of this process (`/proc/self/fd`).
+/// Failure-injection tests assert a zero (or exactly accounted) delta
+/// across the injection.
+pub fn count_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("/proc/self/fd is readable")
+        .count()
+}
+
+/// Resident set size in bytes (`/proc/self/statm`).
+pub fn rss_bytes() -> u64 {
+    let statm = std::fs::read_to_string("/proc/self/statm").expect("/proc/self/statm is readable");
+    let resident_pages: u64 = statm
+        .split_whitespace()
+        .nth(1)
+        .expect("statm carries resident pages")
+        .parse()
+        .expect("resident pages parse");
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(page > 0, "page size is positive");
+    resident_pages.saturating_mul(page as u64)
+}
+
+/// An FD-measurement scope: open before the injection, assert the exact
+/// delta after. Most injections hold no FDs and assert zero; growth
+/// that retains pins by design asserts its accounted cost.
+///
+/// The census is process-global, so parallel test threads can park a
+/// transient FD inside the window (a file open that closes a
+/// millisecond later). The assertion polls briefly for quiescence: a
+/// retained leak persists and still fails; a transient clears.
+pub struct FdScope {
+    before: usize,
+    label: &'static str,
+}
+
+impl FdScope {
+    pub fn open(label: &'static str) -> Self {
+        Self {
+            before: count_fds(),
+            label,
+        }
+    }
+
+    pub fn assert_delta(&self, expected: usize) {
+        let target = self.before + expected;
+        for _ in 0..40 {
+            if count_fds() == target {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            count_fds(),
+            target,
+            "FD delta across {} (no quiescence in 2s)",
+            self.label,
+        );
+    }
+}
+
+/// Peak RSS of this process in bytes (`VmHWM` from `/proc/self/status`).
+/// The RSS worker prints it; the parent test asserts the bound.
+pub fn peak_rss_bytes() -> u64 {
+    let status =
+        std::fs::read_to_string("/proc/self/status").expect("/proc/self/status is readable");
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("VmHWM:"))
+        .expect("status carries VmHWM");
+    let kb: u64 = line
+        .split_whitespace()
+        .nth(1)
+        .expect("VmHWM carries kB")
+        .parse()
+        .expect("VmHWM parses");
+    kb.saturating_mul(1024)
+}
+
+// ---------------------------------------------------------------------------
+// Scripted JSON backend (in-crate): the real coordinator path, programmed pids.
+// ---------------------------------------------------------------------------
+
+/// One programmed process: liveness, start-time, exe identity, and
+/// whether identity reads succeed (a race or permission wall blinds
+/// them while liveness still answers).
+// Stable workload seam; unit tests pin it, U/S tracks replay through it.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct ScriptedProcess {
+    alive: bool,
+    start_time: u64,
+    exe: Option<ExeIdentity>,
+    readable: bool,
+}
+
+/// Scripted process source: the pid/exit/reuse/exec/admission-failure
+/// sequence is programmed, never observed from the host. Pins capture
+/// the start-time they opened. Cloned handles share one script.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScriptedSource {
+    state: Rc<RefCell<HashMap<u32, ScriptedProcess>>>,
+    fail_open: Rc<RefCell<HashSet<u32>>>,
+}
+
+#[allow(dead_code)]
+impl ScriptedSource {
+    /// Spawn (or respawn, for reuse scripts) one programmed pid.
+    pub(crate) fn spawn(&self, pid: u32, start_time: u64) {
+        self.state.borrow_mut().insert(
+            pid,
+            ScriptedProcess {
+                alive: true,
+                start_time,
+                exe: Some(ExeIdentity {
+                    dev: 1,
+                    ino: 100,
+                    mtime_secs: 10,
+                    mtime_nanos: 0,
+                    path: Some("/bin/driver".into()),
+                }),
+                readable: true,
+            },
+        );
+    }
+
+    pub(crate) fn kill(&self, pid: u32) {
+        if let Some(process) = self.state.borrow_mut().get_mut(&pid) {
+            process.alive = false;
+        }
+    }
+
+    pub(crate) fn exec(&self, pid: u32, ino: u64, path: &str) {
+        if let Some(process) = self.state.borrow_mut().get_mut(&pid) {
+            process.exe = Some(ExeIdentity {
+                dev: 1,
+                ino,
+                mtime_secs: 20,
+                mtime_nanos: 0,
+                path: Some(path.into()),
+            });
+        }
+    }
+
+    /// Blind one pid's identity reads (liveness still answers).
+    pub(crate) fn blind(&self, pid: u32) {
+        if let Some(process) = self.state.borrow_mut().get_mut(&pid) {
+            process.readable = false;
+        }
+    }
+
+    /// Inject admission failure: `open` fails for this pid until cleared.
+    pub(crate) fn set_fail_open(&self, pid: u32, fail: bool) {
+        if fail {
+            self.fail_open.borrow_mut().insert(pid);
+        } else {
+            self.fail_open.borrow_mut().remove(&pid);
+        }
+    }
+}
+
+impl ProcessSource for ScriptedSource {
+    type Pin = (u32, u64);
+
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        if self.fail_open.borrow().contains(&pid) {
+            return Err(format!("injected admission failure for pid {pid}"));
+        }
+        let state = self.state.borrow();
+        let process = state
+            .get(&pid)
+            .filter(|process| process.alive)
+            .ok_or_else(|| format!("no live scripted process {pid}"))?;
+        Ok((pid, process.start_time))
+    }
+
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        self.state
+            .borrow()
+            .get(&pin.0)
+            .is_some_and(|process| process.alive && process.start_time == pin.1)
+    }
+
+    fn start_time(&self, pid: u32) -> Option<u64> {
+        self.state
+            .borrow()
+            .get(&pid)
+            .filter(|process| process.alive && process.readable)
+            .map(|process| process.start_time)
+    }
+
+    fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
+        self.state
+            .borrow()
+            .get(&pid)
+            .filter(|process| process.alive && process.readable)
+            .and_then(|process| process.exe.clone())
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        !self
+            .state
+            .borrow()
+            .get(&pid)
+            .is_some_and(|process| process.alive)
+    }
+}
+
+/// One churn workload: `pids` pids turning over `generations` times
+/// (spawn, map one of `modules` modules, die), each death reconciled.
+/// Exact ledger: `pids * generations` incarnations admitted, every one
+/// retired, every edge retained with its end reason.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChurnSpec {
+    pub pids: usize,
+    pub generations: usize,
+    pub modules: usize,
+    pub first_pid: u32,
+}
+
+/// The JSON backend: a real [`InventoryCoordinator`] over a scripted
+/// source, driven through staging → `commit_batch` → `render_json`.
+/// Every workload here runs the production batch boundary — never a
+/// mock registry.
+#[allow(dead_code)]
+pub(crate) struct Harness {
+    coordinator: InventoryCoordinator<ScriptedSource>,
+    source: ScriptedSource,
+    started_ns: u64,
+    now_ns: u64,
+    passes: u64,
+}
+
+#[allow(dead_code)]
+impl Harness {
+    pub(crate) fn new(limits: RegistryLimits) -> Result<Self> {
+        let source = ScriptedSource::default();
+        let coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            source.clone(),
+            limits,
+        )?;
+        let started_ns = crate::discovery::caller_registry::now_ns();
+        Ok(Self {
+            coordinator,
+            source,
+            started_ns,
+            now_ns: started_ns,
+            passes: 0,
+        })
+    }
+
+    pub(crate) fn source(&self) -> &ScriptedSource {
+        &self.source
+    }
+
+    pub(crate) fn coordinator(&self) -> &InventoryCoordinator<ScriptedSource> {
+        &self.coordinator
+    }
+
+    pub(crate) fn coordinator_mut(&mut self) -> &mut InventoryCoordinator<ScriptedSource> {
+        &mut self.coordinator
+    }
+
+    /// Move the harness clock forward (monotonic; deterministic scripts
+    /// advance it explicitly between batches).
+    pub(crate) fn advance(&mut self, delta_ns: u64) {
+        self.now_ns = self.now_ns.saturating_add(delta_ns.max(1));
+    }
+
+    pub(crate) fn now_ns(&self) -> u64 {
+        self.now_ns
+    }
+
+    /// Stage one scale workload: spawn its pids, reconcile them through
+    /// the production admission path, and stage its exact edge layout.
+    /// Returns the reconcile events (admissions, or failures under
+    /// injection). Invisible until [`Harness::commit`].
+    pub(crate) fn stage_scale(&mut self, spec: &ScaleSpec) -> Vec<CallerEvent> {
+        for index in 0..spec.callers {
+            let pid = spec.first_pid + index as u32;
+            self.source.spawn(pid, 1000 + index as u64);
+        }
+        let observed: BTreeSet<u32> = (0..spec.callers)
+            .map(|index| spec.first_pid + index as u32)
+            .collect();
+        let mut adapter_events = self.coordinator.adapter_mut().reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            self.now_ns,
+        );
+        // Bind staged retirements and gap admission failures exactly as
+        // a scanned pass would.
+        let replay = std::mem::take(&mut adapter_events);
+        self.coordinator
+            .apply_reconcile_events(&replay, self.now_ns);
+        let live: Vec<(u32, CallerId)> = observed
+            .iter()
+            .filter_map(|pid| {
+                self.coordinator
+                    .adapter()
+                    .live_id(*pid)
+                    .map(|id| (*pid, id))
+            })
+            .collect();
+        let live_by_index: HashMap<u32, CallerId> = live.into_iter().collect();
+        let infos: Vec<ModuleInfo> = (0..spec.modules)
+            .map(|module| scale_module_info(module, spec.endpoints_per_module))
+            .collect();
+        for (caller_index, module_index) in spec.layout() {
+            let pid = spec.first_pid + caller_index as u32;
+            let Some(caller) = live_by_index.get(&pid).copied() else {
+                continue;
+            };
+            self.coordinator.registry_mut().note_mapping(
+                caller,
+                pid,
+                infos[module_index].clone(),
+                self.now_ns,
+            );
+        }
+        replay
+    }
+
+    /// Run one churn workload: every generation spawns, reconciles,
+    /// maps one module per live caller, and commits; then every pid
+    /// dies and the deaths reconcile and commit. Returns
+    /// (incarnations admitted, reconcile events).
+    pub(crate) fn run_churn(&mut self, spec: &ChurnSpec) -> (usize, Vec<CallerEvent>) {
+        let mut admitted = 0;
+        let mut events = Vec::new();
+        let infos: Vec<ModuleInfo> = (0..spec.modules)
+            .map(|module| scale_module_info(module, 4))
+            .collect();
+        for generation in 0..spec.generations {
+            let observed: BTreeSet<u32> = (0..spec.pids)
+                .map(|index| spec.first_pid + index as u32)
+                .collect();
+            for pid in &observed {
+                self.source
+                    .spawn(*pid, 1000 + (generation * spec.pids) as u64);
+            }
+            let mut batch = self.coordinator.adapter_mut().reconcile(
+                &observed,
+                &mut |_| ImageAuthority::ScanPinned,
+                self.now_ns,
+            );
+            admitted += batch
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        CallerEvent::Admitted { .. }
+                            | CallerEvent::Reused { .. }
+                            | CallerEvent::ExecRetired { .. }
+                    )
+                })
+                .count();
+            self.coordinator.apply_reconcile_events(&batch, self.now_ns);
+            events.append(&mut batch);
+            for (index, pid) in observed.iter().enumerate() {
+                let Some(caller) = self.coordinator.adapter().live_id(*pid) else {
+                    continue;
+                };
+                self.coordinator.registry_mut().note_mapping(
+                    caller,
+                    *pid,
+                    infos[(generation + index) % spec.modules].clone(),
+                    self.now_ns,
+                );
+            }
+            self.commit();
+            self.advance(10);
+            for pid in &observed {
+                self.source.kill(*pid);
+            }
+            let batch = self.coordinator.adapter_mut().reconcile(
+                &BTreeSet::new(),
+                &mut |_| ImageAuthority::ScanPinned,
+                self.now_ns,
+            );
+            self.coordinator.apply_reconcile_events(&batch, self.now_ns);
+            events.extend(batch);
+            self.commit();
+            self.advance(10);
+        }
+        (admitted, events)
+    }
+
+    /// One pass with no observation behind it (discovery loss): the
+    /// production empty-pass path, then the batch commit.
+    pub(crate) fn observe_loss(&mut self, reason: &str) -> PassReport {
+        let mut guard = UnavailableImageGuard;
+        let report = self
+            .coordinator
+            .observe_empty_pass(&mut guard, |_| None, reason, self.now_ns);
+        self.commit();
+        report
+    }
+
+    /// The I4b batch: engine tail plus registry publish, counting one
+    /// harness pass.
+    pub(crate) fn commit(&mut self) -> BatchReceipt {
+        self.passes += 1;
+        self.coordinator
+            .commit_batch(false)
+            .expect("scripted batch commits")
+    }
+
+    /// Render the published snapshot through the real renderer.
+    pub(crate) fn render(&self) -> serde_json::Value {
+        crate::inventory::render_json(
+            &self.coordinator,
+            "workload",
+            self.started_ns,
+            self.now_ns,
+            self.passes,
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "inventory_workload_tests.rs"]
+mod tests;
+
+/// One scripted module: distinct physical identity per index, admitted
+/// with its endpoint count.
+#[allow(dead_code)]
+fn scale_module_info(index: usize, endpoints: usize) -> ModuleInfo {
+    let path = format!("/scale/m{index}.so");
+    ModuleInfo {
+        path: path.clone(),
+        key: ModuleKey::physical(
+            8,
+            1,
+            100_000 + index as u64,
+            Some(format!("sha{index:06}")),
+            &path,
+        ),
+        build_id: None,
+        identity_source: Some("workload".into()),
+        admission: AdmissionState::Admitted,
+        admission_class: Some("exact".into()),
+        admission_endpoints: Some(endpoints),
+        admission_reasons: Vec::new(),
+    }
+}

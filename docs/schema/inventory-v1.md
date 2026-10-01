@@ -57,6 +57,22 @@ never a changed meaning for an existing field.
   unreadable pids, deferred scans, unknown identities — with subject
   and reason. Absence from the document is never evidence of
   absence; `gaps_suppressed` counts gaps dropped past the bound.
+  A gap that records a budget refusal carries `budget` with the
+  `resource`, its `limit`, and the `requested` occupancy; every other
+  gap carries `budget: null`.
+- `budgets`: every budgeted resource with its own limit, occupancy
+  source, and loss counter — `callers`, `modules` (physical module
+  instances), `edges` (caller relationships), `endpoints` (the
+  retained attach-endpoint census: the sum of admitted per-module
+  endpoint counts), `counters` (per-edge entry counts: the `cap`
+  plus `observed_edges` and `saturated_edges`), `semantic_state`
+  (`limit`, `occupied`, and `status`; capture stays withheld, so
+  `occupied` is always 0 and every edge's `semantics` column reads
+  `unknown (semantic capture withheld)`, never an invented state),
+  and `retained_history` (`limit`, `retained`, `suppressed` — the gap
+  retention cap and its eviction marker). Refusal never erases
+  retained evidence: over-budget members are dropped with a named
+  gap while catalog entries and previously observed use stay.
 
 ## Example (abridged)
 
@@ -66,6 +82,15 @@ never a changed meaning for an existing field.
   "scope": "pid:4242",
   "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
   "observation": {"started_ns": 100, "ended_ns": 200, "passes": 1, "usage_feed": false},
+  "budgets": {
+    "callers": {"limit": 4096, "occupied": 1, "refused": 0},
+    "modules": {"limit": 4096, "occupied": 1, "refused": 0},
+    "edges": {"limit": 32768, "occupied": 1, "refused": 0},
+    "endpoints": {"limit": 1048576, "occupied": 68, "refused": 0},
+    "counters": {"cap": 18446744073709551615, "observed_edges": 0, "saturated_edges": 0},
+    "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1},
+    "retained_history": {"limit": 1024, "retained": 1, "suppressed": 0}
+  },
   "callers": [
     {
       "id": "c0", "pid": 4242, "start_time": 987654, "start_time_unit": "clock_ticks_since_boot",
@@ -93,13 +118,15 @@ never a changed meaning for an existing field.
       "mapping": {"state": "mapped", "reason": null, "first_seen_ns": 110, "last_seen_ns": 190, "interruptions": 0},
       "entries": {"count": 0, "saturated": false, "cap": 18446744073709551615,
                  "first_seen_ns": null, "last_seen_ns": null, "in_flight": false,
-                 "observation": "unknown (usage observation unavailable)"}
+                 "observation": "unknown (usage observation unavailable)"},
+      "semantics": "unknown (semantic capture withheld)"
     }
   ],
   "gaps": [
     {"caller": null, "module": null, "pid": null,
      "subject": "exact image authority unavailable",
-     "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection"}
+     "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection",
+     "budget": null}
   ],
   "gaps_suppressed": 0
 }

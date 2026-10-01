@@ -192,11 +192,27 @@ impl ProcessSource for OsProcessSource {
 /// What one `reconcile` concluded about a caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CallerEvent {
-    Admitted { id: CallerId },
-    Exited { id: CallerId, reason: String },
-    ExecRetired { old: CallerId, new: CallerId },
-    Reused { old: CallerId, new: CallerId },
-    AdmitFailed { pid: u32, reason: String },
+    Admitted {
+        id: CallerId,
+    },
+    Exited {
+        id: CallerId,
+        reason: String,
+    },
+    ExecRetired {
+        old: CallerId,
+        new: CallerId,
+    },
+    Reused {
+        old: CallerId,
+        new: CallerId,
+    },
+    AdmitFailed {
+        pid: u32,
+        reason: String,
+        /// `Some` exactly when admission refused on the caller budget.
+        budget: Option<BudgetRefusal>,
+    },
 }
 
 struct TrackedCaller<Pin> {
@@ -213,6 +229,15 @@ pub(crate) struct CallerAdapter<Source: ProcessSource> {
     incarnations: BTreeMap<u32, u32>,
     callers: BTreeMap<CallerId, TrackedCaller<Source::Pin>>,
     live_by_pid: BTreeMap<u32, CallerId>,
+    max_callers: usize,
+    admit_refused: u64,
+}
+
+/// Why one admission attempt failed: an honest pin failure, or a budget
+/// refusal carrying the resource, limit, and requested occupancy.
+struct AdmitFailure {
+    reason: String,
+    budget: Option<BudgetRefusal>,
 }
 
 impl<Source: ProcessSource> CallerAdapter<Source> {
@@ -223,7 +248,26 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             incarnations: BTreeMap::new(),
             callers: BTreeMap::new(),
             live_by_pid: BTreeMap::new(),
+            max_callers: DEFAULT_MAX_CALLERS,
+            admit_refused: 0,
         }
+    }
+
+    /// The caller budget this adapter enforces at admission. The
+    /// coordinator sets it from the registry limits so the two agree.
+    pub(crate) fn set_max_callers(&mut self, max_callers: usize) {
+        self.max_callers = max_callers.max(1);
+    }
+
+    /// Retained incarnations (live plus retired-with-evidence).
+    pub(crate) fn len(&self) -> usize {
+        self.callers.len()
+    }
+
+    /// Admissions refused on the caller budget. Exact even when gap
+    /// retention overflows — the loss counter is not a gap.
+    pub(crate) fn admit_refused(&self) -> u64 {
+        self.admit_refused
     }
 
     pub(crate) fn record(&self, id: CallerId) -> Option<&CallerRecord> {
@@ -248,7 +292,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     }
 
     /// Admit a pid as a new incarnation. Fails honestly when the process
-    /// cannot be pinned; the caller decides whether that is fatal.
+    /// cannot be pinned, and refuses on the caller budget when the table
+    /// is full — the refusal never erases a retained incarnation; the
+    /// caller decides whether either is fatal.
     pub(crate) fn admit(
         &mut self,
         pid: u32,
@@ -257,6 +303,14 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     ) -> Result<CallerId> {
         if let Some(live) = self.live_by_pid.get(&pid) {
             bail!("pid {pid} already has live caller {}", live.label());
+        }
+        if self.callers.len() >= self.max_callers {
+            self.admit_refused = self.admit_refused.saturating_add(1);
+            bail!(
+                "caller budget exhausted: the registry retains at most {} callers (requested caller {}); the admission was refused",
+                self.max_callers,
+                self.callers.len() + 1,
+            );
         }
         let pin = self
             .source
@@ -296,6 +350,45 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         );
         self.live_by_pid.insert(pid, id);
         Ok(id)
+    }
+
+    /// Reconcile's admission: the budget refusal carries its
+    /// resource/limit/requested structurally; pin failures stay bare.
+    fn try_admit(
+        &mut self,
+        pid: u32,
+        authority: ImageAuthority,
+        now_ns: u64,
+    ) -> Result<CallerId, AdmitFailure> {
+        if self.live_by_pid.contains_key(&pid) {
+            return Err(AdmitFailure {
+                reason: format!(
+                    "pid {pid} already has live caller {}",
+                    self.live_by_pid[&pid].label()
+                ),
+                budget: None,
+            });
+        }
+        if self.callers.len() >= self.max_callers {
+            self.admit_refused = self.admit_refused.saturating_add(1);
+            let refusal = BudgetRefusal {
+                resource: "callers",
+                limit: self.max_callers,
+                requested: self.callers.len() + 1,
+            };
+            return Err(AdmitFailure {
+                reason: format!(
+                    "caller budget exhausted: the registry retains at most {} callers (requested caller {}); the admission was refused",
+                    refusal.limit, refusal.requested,
+                ),
+                budget: Some(refusal),
+            });
+        }
+        self.admit(pid, authority, now_ns)
+            .map_err(|error| AdmitFailure {
+                reason: format!("{error:#}"),
+                budget: None,
+            })
     }
 
     fn retire(&mut self, id: CallerId, lifecycle: CallerLifecycle, reason: String, now_ns: u64) {
@@ -356,11 +449,12 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                         "executable image changed while the generation pin held (exec)".into(),
                         now_ns,
                     );
-                    match self.admit(pid, authority_for(pid), now_ns) {
+                    match self.try_admit(pid, authority_for(pid), now_ns) {
                         Ok(new) => events.push(CallerEvent::ExecRetired { old: id, new }),
-                        Err(error) => events.push(CallerEvent::AdmitFailed {
+                        Err(failure) => events.push(CallerEvent::AdmitFailed {
                             pid,
-                            reason: format!("post-exec re-admission failed: {error:#}"),
+                            reason: format!("post-exec re-admission failed: {}", failure.reason),
+                            budget: failure.budget,
                         }),
                     }
                 } else if let Some(tracked) = self.callers.get_mut(&id) {
@@ -411,11 +505,12 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     ),
                 };
                 self.retire(id, lifecycle, reason, now_ns);
-                match self.admit(pid, authority_for(pid), now_ns) {
+                match self.try_admit(pid, authority_for(pid), now_ns) {
                     Ok(new) => events.push(CallerEvent::Reused { old: id, new }),
-                    Err(error) => events.push(CallerEvent::AdmitFailed {
+                    Err(failure) => events.push(CallerEvent::AdmitFailed {
                         pid,
-                        reason: format!("post-reuse re-admission failed: {error:#}"),
+                        reason: format!("post-reuse re-admission failed: {}", failure.reason),
+                        budget: failure.budget,
                     }),
                 }
             }
@@ -426,11 +521,12 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             if self.live_by_pid.contains_key(&pid) {
                 continue;
             }
-            match self.admit(pid, authority_for(pid), now_ns) {
+            match self.try_admit(pid, authority_for(pid), now_ns) {
                 Ok(id) => events.push(CallerEvent::Admitted { id }),
-                Err(error) => events.push(CallerEvent::AdmitFailed {
+                Err(failure) => events.push(CallerEvent::AdmitFailed {
                     pid,
-                    reason: format!("{error:#}"),
+                    reason: failure.reason,
+                    budget: failure.budget,
                 }),
             }
         }
@@ -609,6 +705,16 @@ pub(crate) struct ModuleRecord {
     pub unloaded_observed: bool,
 }
 
+/// One budget refusal, carried structurally so the rendered gap names
+/// the resource, its limit, and the requested occupancy — never a bare
+/// sentence a reader must parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetRefusal {
+    pub resource: &'static str,
+    pub limit: usize,
+    pub requested: usize,
+}
+
 /// One explicit coverage gap: what is unknown and why. Never silent
 /// absence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,11 +724,17 @@ pub(crate) struct RegistryGap {
     pub pid: Option<u32>,
     pub subject: String,
     pub reason: String,
+    /// `Some` exactly when the gap records a budget refusal.
+    pub budget: Option<BudgetRefusal>,
 }
 
 /// Named cap for cumulative per-edge entry counts. Addition saturates
 /// and sets the edge's saturation flag — counts never wrap silently.
 pub(crate) const MAX_EDGE_ENTRY_COUNT: u64 = u64::MAX;
+
+/// What every edge's semantic column reads while capture stays
+/// withheld (S-track): unknown, never an invented state.
+pub(crate) const SEMANTIC_UNKNOWN: &str = "unknown (semantic capture withheld)";
 
 /// Default retained-table bounds. Exhaustion drops the association and
 /// records a gap — never an eviction that rewrites published history.
@@ -630,6 +742,14 @@ pub(crate) const DEFAULT_MAX_CALLERS: usize = 4096;
 pub(crate) const DEFAULT_MAX_MODULES: usize = 4096;
 pub(crate) const DEFAULT_MAX_EDGES: usize = 32768;
 pub(crate) const DEFAULT_MAX_GAPS: usize = 1024;
+/// Default bound on the retained attach-endpoint census: the sum of
+/// admitted per-module endpoint counts. A retained-census bound, not an
+/// attach bound — 4096 modules at up to 256 endpoints each.
+pub(crate) const DEFAULT_MAX_ENDPOINTS: usize = 1_048_576;
+/// Default bound on retained semantic states (one per edge, the S-track
+/// shape). The budget exists now; capture stays withheld, so occupancy
+/// is always zero and every semantic column renders unknown.
+pub(crate) const DEFAULT_MAX_SEMANTIC_STATES: usize = 32768;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RegistryLimits {
@@ -637,6 +757,8 @@ pub(crate) struct RegistryLimits {
     pub max_modules: usize,
     pub max_edges: usize,
     pub max_gaps: usize,
+    pub max_endpoints: usize,
+    pub max_semantic_states: usize,
 }
 
 impl RegistryLimits {
@@ -645,8 +767,16 @@ impl RegistryLimits {
         max_modules: usize,
         max_edges: usize,
         max_gaps: usize,
+        max_endpoints: usize,
+        max_semantic_states: usize,
     ) -> Result<Self> {
-        if max_callers == 0 || max_modules == 0 || max_edges == 0 || max_gaps == 0 {
+        if max_callers == 0
+            || max_modules == 0
+            || max_edges == 0
+            || max_gaps == 0
+            || max_endpoints == 0
+            || max_semantic_states == 0
+        {
             bail!("caller registry limits must be non-zero");
         }
         Ok(Self {
@@ -654,6 +784,8 @@ impl RegistryLimits {
             max_modules,
             max_edges,
             max_gaps,
+            max_endpoints,
+            max_semantic_states,
         })
     }
 
@@ -663,6 +795,8 @@ impl RegistryLimits {
             DEFAULT_MAX_MODULES,
             DEFAULT_MAX_EDGES,
             DEFAULT_MAX_GAPS,
+            DEFAULT_MAX_ENDPOINTS,
+            DEFAULT_MAX_SEMANTIC_STATES,
         )
         .expect("default registry limits are non-zero")
     }
@@ -738,6 +872,11 @@ pub(crate) struct CallerRegistry {
     usage_feed: bool,
     facts_revision: u64,
     published_revision: u64,
+    endpoints_total: usize,
+    callers_refused: u64,
+    modules_refused: u64,
+    edges_refused: u64,
+    endpoints_refused: u64,
 }
 
 impl CallerRegistry {
@@ -756,6 +895,11 @@ impl CallerRegistry {
             usage_feed: false,
             facts_revision: 1,
             published_revision: 0,
+            endpoints_total: 0,
+            callers_refused: 0,
+            modules_refused: 0,
+            edges_refused: 0,
+            endpoints_refused: 0,
         }
     }
 
@@ -805,6 +949,66 @@ impl CallerRegistry {
 
     pub(crate) fn gaps_suppressed(&self) -> u64 {
         self.gaps_suppressed
+    }
+
+    /// The enforced budgets (limits, occupancy, and loss counters render
+    /// from these plus the table sizes).
+    pub(crate) fn limits(&self) -> RegistryLimits {
+        self.limits
+    }
+
+    // Registry-side caller occupancy; workload tests pin adapter/registry agreement.
+    #[allow(dead_code)]
+    pub(crate) fn caller_count(&self) -> usize {
+        self.callers.len()
+    }
+
+    pub(crate) fn module_count(&self) -> usize {
+        self.modules.len()
+    }
+
+    pub(crate) fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Retained attach-endpoint census: the sum of admitted per-module
+    /// endpoint counts. Only admitted modules with a count cost budget.
+    pub(crate) fn endpoints_total(&self) -> usize {
+        self.endpoints_total
+    }
+
+    /// Per-resource refusal counts. Exact even when gap retention
+    /// overflows — loss counters are not gaps.
+    pub(crate) fn callers_refused(&self) -> u64 {
+        self.callers_refused
+    }
+
+    pub(crate) fn modules_refused(&self) -> u64 {
+        self.modules_refused
+    }
+
+    pub(crate) fn edges_refused(&self) -> u64 {
+        self.edges_refused
+    }
+
+    pub(crate) fn endpoints_refused(&self) -> u64 {
+        self.endpoints_refused
+    }
+
+    /// Counter budget census: edges with observed entries (count or
+    /// in-flight), and edges whose counter saturated at the cap.
+    pub(crate) fn counter_census(&self) -> (usize, usize) {
+        let mut observed = 0;
+        let mut saturated = 0;
+        for edge in self.edges.values() {
+            if edge.entry_count > 0 || edge.entry_in_flight {
+                observed += 1;
+            }
+            if edge.entry_saturated {
+                saturated += 1;
+            }
+        }
+        (observed, saturated)
     }
 
     /// What the edge's entry columns mean, from admission plus feed
@@ -1017,20 +1221,28 @@ impl CallerRegistry {
                 reason:
                     "the caller incarnation retired; late mapping evidence was dropped, not merged"
                         .into(),
+                budget: None,
             });
             return;
         }
         if !self.callers.contains(&caller) {
             if self.callers.len() >= self.limits.max_callers {
+                self.callers_refused = self.callers_refused.saturating_add(1);
+                let refusal = BudgetRefusal {
+                    resource: "callers",
+                    limit: self.limits.max_callers,
+                    requested: self.callers.len() + 1,
+                };
                 self.push_gap(RegistryGap {
                     caller: Some(caller),
                     module: None,
                     pid: Some(pid),
                     subject: "caller capacity exhausted".into(),
                     reason: format!(
-                        "the registry retains at most {} callers; the mapping was dropped",
-                        self.limits.max_callers
+                        "the registry retains at most {} callers (requested caller {}); the mapping was dropped",
+                        refusal.limit, refusal.requested,
                     ),
+                    budget: Some(refusal),
                 });
                 return;
             }
@@ -1046,6 +1258,7 @@ impl CallerRegistry {
                     "no comparable file identity for {}; the edge is keyed by path and distinct objects sharing it would merge",
                     info.path
                 ),
+                budget: None,
             });
         }
         let module = match self.modules_by_key.get(&info.key).copied() {
@@ -1058,15 +1271,49 @@ impl CallerRegistry {
             }
             None => {
                 if self.modules.len() >= self.limits.max_modules {
+                    self.modules_refused = self.modules_refused.saturating_add(1);
+                    let refusal = BudgetRefusal {
+                        resource: "modules",
+                        limit: self.limits.max_modules,
+                        requested: self.modules.len() + 1,
+                    };
                     self.push_gap(RegistryGap {
                         caller: Some(caller),
                         module: None,
                         pid: Some(pid),
                         subject: "module capacity exhausted".into(),
                         reason: format!(
-                            "the registry retains at most {} modules; the mapping was dropped",
-                            self.limits.max_modules
+                            "the registry retains at most {} modules (requested module {}); the mapping was dropped",
+                            refusal.limit, refusal.requested,
                         ),
+                        budget: Some(refusal),
+                    });
+                    return;
+                }
+                // The endpoint census charges only admitted modules with a
+                // count. Over budget, the new module is refused with a
+                // named gap; retained modules and their edges are untouched.
+                let cost = match info.admission {
+                    AdmissionState::Admitted => info.admission_endpoints.unwrap_or(0),
+                    AdmissionState::Refused | AdmissionState::Unresolved => 0,
+                };
+                if self.endpoints_total.saturating_add(cost) > self.limits.max_endpoints {
+                    self.endpoints_refused = self.endpoints_refused.saturating_add(1);
+                    let refusal = BudgetRefusal {
+                        resource: "endpoints",
+                        limit: self.limits.max_endpoints,
+                        requested: self.endpoints_total.saturating_add(cost),
+                    };
+                    self.push_gap(RegistryGap {
+                        caller: Some(caller),
+                        module: None,
+                        pid: Some(pid),
+                        subject: "endpoint budget exhausted".into(),
+                        reason: format!(
+                            "the registry retains at most {} attach endpoints (requested {}); the mapping was dropped",
+                            refusal.limit, refusal.requested,
+                        ),
+                        budget: Some(refusal),
                     });
                     return;
                 }
@@ -1074,6 +1321,7 @@ impl CallerRegistry {
                 self.next_module = self.next_module.saturating_add(1);
                 let mut paths = BTreeSet::new();
                 paths.insert(info.path.clone());
+                self.endpoints_total = self.endpoints_total.saturating_add(cost);
                 self.modules.insert(
                     id,
                     ModuleRecord {
@@ -1104,15 +1352,22 @@ impl CallerRegistry {
             }
             None => {
                 if self.edges.len() >= self.limits.max_edges {
+                    self.edges_refused = self.edges_refused.saturating_add(1);
+                    let refusal = BudgetRefusal {
+                        resource: "edges",
+                        limit: self.limits.max_edges,
+                        requested: self.edges.len() + 1,
+                    };
                     self.push_gap(RegistryGap {
                         caller: Some(caller),
                         module: Some(module),
                         pid: Some(pid),
                         subject: "edge capacity exhausted".into(),
                         reason: format!(
-                            "the registry retains at most {} edges; the mapping was dropped",
-                            self.limits.max_edges
+                            "the registry retains at most {} edges (requested edge {}); the mapping was dropped",
+                            refusal.limit, refusal.requested,
                         ),
+                        budget: Some(refusal),
                     });
                     return;
                 }
@@ -1158,6 +1413,7 @@ impl CallerRegistry {
                 pid: None,
                 subject: "entry without mapping evidence".into(),
                 reason: "observed entries never invent mappings; the batch was dropped".into(),
+                budget: None,
             });
             return EntryOutcome::UnknownEdge;
         };
@@ -1168,6 +1424,7 @@ impl CallerRegistry {
                 pid: None,
                 subject: "entry without mapping evidence".into(),
                 reason: "observed entries never invent mappings; the batch was dropped".into(),
+                budget: None,
             });
             return EntryOutcome::UnknownEdge;
         };
@@ -1588,13 +1845,21 @@ mod tests {
 
     #[test]
     fn registry_limits_reject_empty_envelopes() {
-        for limits in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1), (1, 1, 1, 0)] {
+        for limits in [
+            (0, 1, 1, 1, 1, 1),
+            (1, 0, 1, 1, 1, 1),
+            (1, 1, 0, 1, 1, 1),
+            (1, 1, 1, 0, 1, 1),
+            (1, 1, 1, 1, 0, 1),
+            (1, 1, 1, 1, 1, 0),
+        ] {
             assert!(
-                RegistryLimits::new(limits.0, limits.1, limits.2, limits.3).is_err(),
+                RegistryLimits::new(limits.0, limits.1, limits.2, limits.3, limits.4, limits.5)
+                    .is_err(),
                 "envelope {limits:?} must be refused"
             );
         }
-        assert!(RegistryLimits::new(1, 1, 1, 1).is_ok());
+        assert!(RegistryLimits::new(1, 1, 1, 1, 1, 1).is_ok());
     }
 
     fn registry() -> CallerRegistry {
@@ -1740,7 +2005,7 @@ mod tests {
 
     #[test]
     fn capacity_exhaustion_drops_with_a_gap_never_an_eviction() {
-        let mut registry = CallerRegistry::new(RegistryLimits::new(8, 1, 8, 8).unwrap());
+        let mut registry = CallerRegistry::new(RegistryLimits::new(8, 1, 8, 8, 64, 8).unwrap());
         registry.note_mapping(
             CallerId(0),
             50,

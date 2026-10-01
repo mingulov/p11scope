@@ -154,9 +154,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         source: Source,
         registry_limits: RegistryLimits,
     ) -> Result<Self> {
+        let mut adapter = CallerAdapter::new(source);
+        // One caller budget, enforced where incarnations are minted; the
+        // registry's caller cap stands behind it as a backstop.
+        adapter.set_max_callers(registry_limits.max_callers);
         Ok(Self {
             engine: Engine::inventory(default_inventory_config()?, scope, hooks, hints)?,
-            adapter: CallerAdapter::new(source),
+            adapter,
             registry: CallerRegistry::new(registry_limits),
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
@@ -172,7 +176,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.adapter
     }
 
-    #[cfg(test)]
+    /// Mutable adapter access for the workload harness (scripted
+    /// reconciles over programmed pids) and tests. The production
+    /// command never mutates the adapter except through `scan_pass`.
+    // The harness is the only non-test caller; unit tests pin the seam.
+    #[allow(dead_code)]
     pub(crate) fn adapter_mut(&mut self) -> &mut CallerAdapter<Source> {
         &mut self.adapter
     }
@@ -188,6 +196,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn owner_of(&self, caller: CallerId) -> Option<ProcessViewId> {
         self.owners.get(&caller).copied()
+    }
+
+    /// Owned-fixture growth path: open one native owner through the real
+    /// engine call, admit its caller, and bind the two — the same three
+    /// steps `scan_pass` performs per pid, without a scope collection.
+    /// Scale tests drive this over owned sleepers; admission failure
+    /// after a successful open keeps the owner retained (no removal API
+    /// exists) and says so in the error.
+    #[cfg(test)]
+    pub(crate) fn test_open_native_owner(
+        &mut self,
+        pid: u32,
+        image: ImageIdentity,
+        guard: &mut dyn super::inventory::ImageGuard,
+        now_ns: u64,
+    ) -> Result<CallerId> {
+        let owner = self.engine.open_inventory_owner(pid, image, guard)?;
+        let authority = ImageAuthority::NativeExact {
+            task_cookie: image.task_cookie,
+            exec_id: image.exec_id,
+        };
+        match self.adapter.admit(pid, authority, now_ns) {
+            Ok(caller) => {
+                self.owners.insert(caller, owner);
+                Ok(caller)
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "{error:#} (the native owner opened and stays retained)"
+            )),
+        }
     }
 
     pub(crate) fn passes(&self) -> u64 {
@@ -272,6 +310,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         pid: self.adapter.record(*caller).map(|record| record.pid),
                         subject: "native inventory scan failed".into(),
                         reason: format!("{error:#}"),
+                        budget: None,
                     });
                 }
             }
@@ -294,6 +333,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         subject: "no complete inventory scan".into(),
                         reason: "only partial receipts committed for this owner; absences for its caller are uncertain"
                             .into(),
+                        budget: None,
                     });
                 }
                 Err(error) => {
@@ -303,6 +343,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         pid: self.adapter.record(*caller).map(|record| record.pid),
                         subject: "native owner lost".into(),
                         reason: format!("{error:#}"),
+                        budget: None,
                     });
                 }
             }
@@ -363,6 +404,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pid: None,
             subject: "scan pass produced no observation".into(),
             reason: reason.to_string(),
+            budget: None,
         });
         let native_callers = live
             .iter()
@@ -382,8 +424,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Stage retirements for reconciled events, bind freshly opened
-    /// native owners to their callers, and gap admission failures.
-    fn apply_reconcile_events(&mut self, events: &[CallerEvent], now_ns: u64) {
+    /// native owners to their callers, and gap admission failures. The
+    /// workload harness reuses this after scripted reconciles so staged
+    /// facts follow the same path as scanned ones.
+    pub(crate) fn apply_reconcile_events(&mut self, events: &[CallerEvent], now_ns: u64) {
         for event in events {
             let id = match event {
                 CallerEvent::Admitted { id }
@@ -393,7 +437,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     self.retire_caller_in_registry(*id, now_ns);
                     continue;
                 }
-                CallerEvent::AdmitFailed { pid, reason } => {
+                CallerEvent::AdmitFailed {
+                    pid,
+                    reason,
+                    budget,
+                } => {
                     if self.pending_owners.remove(pid).is_some() {
                         // The native owner opened but the caller pin
                         // failed (an exit raced admission): no removal
@@ -407,6 +455,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             reason: format!(
                                 "the native owner opened but caller admission failed ({reason}); the owner stays retained"
                             ),
+                            budget: None,
                         });
                     }
                     self.registry.record_gap(RegistryGap {
@@ -415,6 +464,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         pid: Some(*pid),
                         subject: "caller admission failed".into(),
                         reason: reason.clone(),
+                        budget: *budget,
                     });
                     continue;
                 }
@@ -451,6 +501,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 pid: Some(pid),
                 subject: "native inventory owner unavailable".into(),
                 reason: format!("{reason}; scan-lane incarnation by pidfd/start-time"),
+                budget: None,
             });
         }
         if scan_pinned > 0 && !self.authority_gap_recorded {
@@ -462,6 +513,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "exact image authority unavailable".into(),
                 reason: "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection"
                     .into(),
+                budget: None,
             });
         }
     }
@@ -676,6 +728,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 pid: gap.pid,
                 subject: gap.subject.clone(),
                 reason: gap.reason.clone(),
+                budget: None,
             });
         }
     }

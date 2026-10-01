@@ -13,8 +13,8 @@
 use crate::attach::Scope;
 use crate::cli::InspectScope;
 use crate::discovery::caller_registry::{
-    CallerEvent, CallerId, ImageAuthority, ModuleId, ModuleKey, OsProcessSource, RegistryLimits,
-    now_ns,
+    CallerEvent, CallerId, ImageAuthority, ModuleId, ModuleKey, OsProcessSource, ProcessSource,
+    RegistryLimits, now_ns,
 };
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory_coordinator::{
@@ -181,8 +181,13 @@ fn run_with_writer(
 }
 
 /// Per-pass progress on stderr (stdout stays parseable): what the pass
-/// scanned and which caller incarnations turned over.
-fn report_progress(coordinator: &InventoryCoordinator<OsProcessSource>, report: &PassReport) {
+/// scanned, which caller incarnations turned over, and what the pass
+/// cost — gaps, budget refusals, and suppressed gaps are reported, so a
+/// refused or partial run can never look clean on stderr.
+fn report_progress<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
+    report: &PassReport,
+) {
     eprintln!(
         "p11scope: pass {}: {} scanned ({} native, {} scan-pinned){}",
         report.pass,
@@ -195,6 +200,25 @@ fn report_progress(coordinator: &InventoryCoordinator<OsProcessSource>, report: 
             format!("; {} refresh pending", report.pending_refresh.len())
         }
     );
+    let gaps = coordinator.registry().gaps().len();
+    let suppressed = coordinator.registry().gaps_suppressed();
+    if gaps > 0 || suppressed > 0 {
+        let refusals = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.budget.is_some())
+            .count();
+        eprintln!(
+            "p11scope: pass {}: {} gap{} ({} budget refusal{}, {} suppressed)",
+            report.pass,
+            gaps,
+            if gaps == 1 { "" } else { "s" },
+            refusals,
+            if refusals == 1 { "" } else { "s" },
+            suppressed,
+        );
+    }
     for event in &report.events {
         let line = match event {
             CallerEvent::Admitted { id } => {
@@ -214,7 +238,7 @@ fn report_progress(coordinator: &InventoryCoordinator<OsProcessSource>, report: 
             CallerEvent::Reused { old, new } => {
                 format!("caller {} reused, now {}", old.label(), new.label())
             }
-            CallerEvent::AdmitFailed { pid, reason } => {
+            CallerEvent::AdmitFailed { pid, reason, .. } => {
                 format!("caller admission failed for pid {pid}: {reason}")
             }
         };
@@ -222,8 +246,8 @@ fn report_progress(coordinator: &InventoryCoordinator<OsProcessSource>, report: 
     }
 }
 
-fn caller_json(
-    coordinator: &InventoryCoordinator<OsProcessSource>,
+fn caller_json<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
     id: CallerId,
 ) -> serde_json::Value {
     let record = coordinator
@@ -270,8 +294,8 @@ fn caller_json(
     })
 }
 
-fn module_json(
-    coordinator: &InventoryCoordinator<OsProcessSource>,
+fn module_json<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
     id: ModuleId,
 ) -> serde_json::Value {
     let record = coordinator
@@ -317,8 +341,8 @@ fn module_json(
     })
 }
 
-fn edge_json(
-    coordinator: &InventoryCoordinator<OsProcessSource>,
+fn edge_json<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
     caller: CallerId,
     module: ModuleId,
 ) -> serde_json::Value {
@@ -345,14 +369,19 @@ fn edge_json(
             "in_flight": edge.entry_in_flight,
             "observation": registry.entry_observation(edge).label(),
         },
+        // Semantic capture stays withheld (S-track): the column reads
+        // unknown on every edge, never an invented state.
+        "semantics": crate::discovery::caller_registry::SEMANTIC_UNKNOWN,
     })
 }
 
 /// Render the published snapshot as `p11scope/inventory/v1`. Every edge
 /// endpoint resolves: a dangling reference is a coordinator bug, and the
 /// debug assertion names it instead of emitting a partial document.
-pub(crate) fn render_json(
-    coordinator: &InventoryCoordinator<OsProcessSource>,
+/// Generic over the process source so scripted scale workloads render
+/// through this same path — never a second renderer.
+pub(crate) fn render_json<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
     scope_label: &str,
     started_ns: u64,
     ended_ns: u64,
@@ -393,6 +422,11 @@ pub(crate) fn render_json(
                 "pid": gap.pid,
                 "subject": gap.subject,
                 "reason": gap.reason,
+                "budget": gap.budget.map(|refusal| serde_json::json!({
+                    "resource": refusal.resource,
+                    "limit": refusal.limit,
+                    "requested": refusal.requested,
+                })).unwrap_or(serde_json::Value::Null),
             })
         })
         .collect();
@@ -409,6 +443,7 @@ pub(crate) fn render_json(
             "passes": passes,
             "usage_feed": coordinator.registry().usage_feed(),
         },
+        "budgets": budgets_json(coordinator),
         "callers": callers.iter().map(|caller| caller_json(coordinator, *caller)).collect::<Vec<_>>(),
         "modules": modules.iter().map(|module| module_json(coordinator, *module)).collect::<Vec<_>>(),
         "edges": edges.iter().map(|(caller, module)| edge_json(coordinator, *caller, *module)).collect::<Vec<_>>(),
@@ -417,8 +452,57 @@ pub(crate) fn render_json(
     })
 }
 
-pub(crate) fn render_text(
-    coordinator: &InventoryCoordinator<OsProcessSource>,
+/// Every budgeted resource with its own limit, occupancy source, and
+/// loss counter. Semantic state renders its budget with zero occupancy:
+/// capture stays withheld, so every semantic column reads unknown.
+fn budgets_json<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
+) -> serde_json::Value {
+    let registry = coordinator.registry();
+    let limits = registry.limits();
+    let (observed_edges, saturated_edges) = registry.counter_census();
+    serde_json::json!({
+        "callers": {
+            "limit": limits.max_callers,
+            "occupied": coordinator.adapter().len(),
+            "refused": coordinator.adapter().admit_refused().saturating_add(registry.callers_refused()),
+        },
+        "modules": {
+            "limit": limits.max_modules,
+            "occupied": registry.module_count(),
+            "refused": registry.modules_refused(),
+        },
+        "edges": {
+            "limit": limits.max_edges,
+            "occupied": registry.edge_count(),
+            "refused": registry.edges_refused(),
+        },
+        "endpoints": {
+            "limit": limits.max_endpoints,
+            "occupied": registry.endpoints_total(),
+            "refused": registry.endpoints_refused(),
+        },
+        "counters": {
+            "cap": crate::discovery::caller_registry::MAX_EDGE_ENTRY_COUNT,
+            "observed_edges": observed_edges,
+            "saturated_edges": saturated_edges,
+        },
+        "semantic_state": {
+            "limit": limits.max_semantic_states,
+            "occupied": 0,
+            "status": "withheld",
+            "unknown_edges": registry.edge_count(),
+        },
+        "retained_history": {
+            "limit": limits.max_gaps,
+            "retained": registry.gaps().len(),
+            "suppressed": registry.gaps_suppressed(),
+        },
+    })
+}
+
+pub(crate) fn render_text<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
     scope_label: &str,
     started_ns: u64,
     ended_ns: u64,
@@ -493,7 +577,18 @@ pub(crate) fn render_text(
         );
     }
     for gap in coordinator.registry().gaps() {
-        let _ = writeln!(out, "gap [{}] {}", gap.subject, gap.reason);
+        match gap.budget {
+            Some(refusal) => {
+                let _ = writeln!(
+                    out,
+                    "gap [{}] {} (budget {}: limit {}, requested {})",
+                    gap.subject, gap.reason, refusal.resource, refusal.limit, refusal.requested,
+                );
+            }
+            None => {
+                let _ = writeln!(out, "gap [{}] {}", gap.subject, gap.reason);
+            }
+        }
     }
     let suppressed = coordinator.registry().gaps_suppressed();
     if suppressed > 0 {

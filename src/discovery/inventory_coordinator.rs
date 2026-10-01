@@ -820,6 +820,47 @@ mod tests {
         .unwrap()
     }
 
+    /// E-test-style fixture build: compile one C source with gcc into the
+    /// test tmp dir.
+    fn gcc(
+        dir: &std::path::Path,
+        out: &str,
+        source: &std::path::Path,
+        args: &[&str],
+        libs: &[&str],
+    ) -> PathBuf {
+        let bin = dir.join(out);
+        let mut cmd = std::process::Command::new("gcc");
+        cmd.args(args).arg("-o").arg(&bin).arg(source).args(libs);
+        assert!(
+            cmd.status().unwrap().success(),
+            "gcc failed for {out}: {cmd:?}"
+        );
+        bin
+    }
+
+    /// Poll for a driver ready file, like the observe helpers.
+    fn wait_ready(ready: &std::path::Path) {
+        for _ in 0..300 {
+            if std::fs::metadata(ready).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("fixture driver never became ready: {}", ready.display());
+    }
+
+    /// Kills the owned fixture child on drop, so a failed assert cannot
+    /// leak a sleeper.
+    struct ChildReaper(std::process::Child);
+
+    impl Drop for ChildReaper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[test]
     fn native_pass_over_self_commits_and_publishes_through_one_batch() {
         let mut coordinator = coordinator();
@@ -1063,6 +1104,8 @@ mod tests {
 
     #[test]
     fn batch_publishes_registry_edges_synchronously_with_the_return() {
+        // Sibling: scripted_entries_flow_from_a_scan_built_edge_through_commit_to_json
+        // pins the same batch boundary for entry counts through render_json.
         let mut coordinator = coordinator();
         let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
         coordinator.registry_mut().note_mapping(
@@ -1095,5 +1138,152 @@ mod tests {
         assert_eq!(receipt.registry_facts, receipt.registry_published);
         assert_eq!(receipt.engine_facts, receipt.engine_published);
         assert!(coordinator.engine.tail_publishes > tails_before || receipt.engine_facts > 1);
+    }
+
+    #[test]
+    fn scripted_entries_flow_from_a_scan_built_edge_through_commit_to_json() {
+        // Sibling: batch_publishes_registry_edges_synchronously_with_the_return
+        // pins the same batch boundary for mapping edges.
+        use crate::discovery::caller_registry::{MAX_EDGE_ENTRY_COUNT, ModuleId};
+
+        fn rendered_edge(
+            document: &serde_json::Value,
+            caller: CallerId,
+            module: ModuleId,
+        ) -> &serde_json::Value {
+            document["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|edge| edge["caller"] == caller.label() && edge["module"] == module.label())
+                .unwrap()
+        }
+
+        // Owned fixture, E1-style: a driver child mapping a version-matrix
+        // provider. Hints name the provider, so the scan lane projects the
+        // edge deterministically (empty hints only keep objects exporting a
+        // registry symbol, which a bare self scan has none of).
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join("coordinator-entry-flow");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            &dir,
+            "f1-p1.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        let driver = gcc(
+            &dir,
+            "f1-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let ready = dir.join("A.ready");
+        let child = std::process::Command::new(&driver)
+            .arg("--ready")
+            .arg(&ready)
+            .arg(&provider)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let driver_pid = child.id();
+        let _reaper = ChildReaper(child);
+        wait_ready(&ready);
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(driver_pid),
+            HookRegistry::builtin(),
+            vec![provider.clone()],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let started = crate::discovery::caller_registry::now_ns();
+        let scope = format!("pid:{driver_pid}");
+        let report = coordinator
+            .scan_pass(
+                &InventoryScope::Pid(driver_pid),
+                None,
+                &mut UnavailableImageGuard,
+                |_| None,
+                u64::MAX,
+                started,
+            )
+            .unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.scan_callers, 1);
+        coordinator.commit_batch(false).unwrap();
+        let caller = coordinator.adapter().live_id(driver_pid).unwrap();
+        // The edge under test is scan-built: the pass projected it, so no
+        // hand-staged mapping stands in for the staging path.
+        let provider_name = provider.file_name().unwrap().to_string_lossy().into_owned();
+        let module = coordinator
+            .registry()
+            .edges()
+            .filter(|edge| edge.caller == caller)
+            .map(|edge| edge.module)
+            .find(|module| {
+                coordinator
+                    .registry()
+                    .module(*module)
+                    .is_some_and(|record| {
+                        record
+                            .paths
+                            .iter()
+                            .any(|path| path.contains(&provider_name))
+                    })
+            })
+            .expect("the hinted scan maps the fixture provider");
+        let key = coordinator.registry().module(module).unwrap().key.clone();
+
+        // Scripted entries (+ in-flight) stage behind the batch boundary:
+        // the pre-commit render still shows the quiet edge.
+        let t1 = started.saturating_add(10);
+        coordinator
+            .registry_mut()
+            .observe_entries(caller, &key, 7, t1);
+        coordinator.registry_mut().set_in_flight(caller, &key, true);
+        let staged = crate::inventory::render_json(&coordinator, &scope, started, t1, 1);
+        assert_eq!(
+            rendered_edge(&staged, caller, module)["entries"]["count"],
+            0
+        );
+        let receipt = coordinator.commit_batch(false).unwrap();
+        assert_eq!(receipt.registry_facts, receipt.registry_published);
+        let document = crate::inventory::render_json(&coordinator, &scope, started, t1, 1);
+        let edge = rendered_edge(&document, caller, module);
+        assert_eq!(edge["entries"]["count"], 7);
+        assert_eq!(edge["entries"]["observation"], "observed");
+        assert!(edge["entries"]["in_flight"].as_bool().unwrap());
+        assert_eq!(edge["entries"]["saturated"], false);
+        assert_eq!(edge["entries"]["last_seen_ns"], t1);
+
+        // Fill to MAX - 1, then +5 overflows: the count stops at the cap
+        // with the saturation flag set while recency keeps advancing.
+        let t2 = t1 + 10;
+        let t3 = t2 + 10;
+        coordinator
+            .registry_mut()
+            .observe_entries(caller, &key, MAX_EDGE_ENTRY_COUNT - 1 - 7, t2);
+        coordinator
+            .registry_mut()
+            .observe_entries(caller, &key, 5, t3);
+        let receipt = coordinator.commit_batch(false).unwrap();
+        assert_eq!(receipt.registry_facts, receipt.registry_published);
+        let document = crate::inventory::render_json(&coordinator, &scope, started, t3, 1);
+        let edge = rendered_edge(&document, caller, module);
+        assert_eq!(edge["entries"]["count"], u64::MAX);
+        assert!(edge["entries"]["saturated"].as_bool().unwrap());
+        assert_eq!(edge["entries"]["observation"], "observed");
+        assert_eq!(edge["entries"]["last_seen_ns"], t3);
+        assert_eq!(edge["entries"]["first_seen_ns"], t1);
+        assert!(edge["entries"]["in_flight"].as_bool().unwrap());
     }
 }

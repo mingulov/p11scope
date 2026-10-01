@@ -1,0 +1,543 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! Public-command inventory tests (module/caller inventory behaviors).
+//!
+//! Every behavior is asserted through the public `p11scope inventory`
+//! command over owned fixtures, reading the public JSON with the same
+//! independent reader as the contract test: multi-caller/multi-module/
+//! multi-user edges, fork/exec incarnations, unload/reload history,
+//! SIGKILL evidence freezing, and `-o`/stdout document identity.
+
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
+
+fn serial_guard() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn tmp(name: &str) -> PathBuf {
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn gcc(dir: &Path, out: &str, source: &Path, args: &[&str], libs: &[&str]) -> PathBuf {
+    let bin = dir.join(out);
+    let mut cmd = Command::new("gcc");
+    cmd.args(args).arg("-o").arg(&bin).arg(source).args(libs);
+    assert!(
+        cmd.status().unwrap().success(),
+        "gcc failed for {out}: {cmd:?}"
+    );
+    bin
+}
+
+fn fixture_source(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(rel)
+}
+
+fn matrix_source() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/discover/tests/fixture/version_matrix.c")
+}
+
+/// Kills owned fixture pids on drop, so a failed assert cannot leak
+/// sleepers.
+struct FixtureGuard {
+    pids: Vec<u32>,
+}
+
+impl FixtureGuard {
+    fn pid_is_gone(pid: u32) -> bool {
+        std::fs::metadata(format!("/proc/{pid}")).is_err()
+    }
+}
+
+impl Drop for FixtureGuard {
+    fn drop(&mut self) {
+        for &pid in &self.pids {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for &pid in &self.pids {
+            while !Self::pid_is_gone(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn caller_for(doc: &Value, pid: u64) -> Vec<&Value> {
+    doc["callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|caller| caller["pid"] == pid)
+        .collect()
+}
+
+fn module_for<'a>(doc: &'a Value, so_name: &str) -> &'a Value {
+    let found: Vec<&Value> = doc["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|module| {
+            module["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path.as_str().unwrap().rsplit('/').next().unwrap() == so_name)
+        })
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one module observing {so_name}"
+    );
+    found[0]
+}
+
+fn edges_for<'a>(doc: &'a Value, caller_id: &str, module_id: &str) -> Vec<&'a Value> {
+    doc["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edge| edge["caller"] == caller_id && edge["module"] == module_id)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// E1: multi-caller, multi-module, multi-provider, multi-user.
+// ---------------------------------------------------------------------------
+
+struct E1Dance {
+    doc: Value,
+    pids: BTreeMap<String, u32>,
+    guard: Option<FixtureGuard>,
+}
+
+fn e1_dance(dir: &Path) -> E1Dance {
+    let ready = dir.join("ready");
+    let _ = std::fs::remove_dir_all(&ready);
+    std::fs::create_dir_all(&ready).unwrap();
+    let driver = gcc(
+        dir,
+        "driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let matrix = matrix_source();
+    let p1 = gcc(
+        dir,
+        "ic-p1.so",
+        &matrix,
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let p2 = gcc(
+        dir,
+        "ic-p2.so",
+        &matrix,
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=41"],
+        &[],
+    );
+    let out = dir.join("out.json");
+    let _ = std::fs::remove_file(&out);
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe.sh"))
+        .arg("--system")
+        .args(["--json", "--max-scan-pids", "4096"])
+        .env("INV_DRIVER", &driver)
+        .env("INV_SET", "e1")
+        .env("INV_P1", &p1)
+        .env("INV_P2", &p2)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &out)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "e1 observe failed: {output:?} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let mut pids = BTreeMap::new();
+    for name in ["A", "B", "C"] {
+        let text = std::fs::read_to_string(ready.join(format!("{name}.ready"))).unwrap();
+        let pid: u32 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+        pids.insert(name.to_owned(), pid);
+    }
+    let guard = FixtureGuard {
+        pids: pids.values().copied().collect(),
+    };
+    let body = std::fs::read_to_string(&out).unwrap();
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    E1Dance {
+        doc,
+        pids,
+        guard: Some(guard),
+    }
+}
+
+#[test]
+fn e1_multi_caller_multi_module_edges() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-e1");
+    let mut dance = e1_dance(&dir);
+    let doc = &dance.doc;
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+
+    // Multi-caller: A and B share P1. Multi-module: C maps P1 and P2.
+    // Multi-provider (P1, P2) and multi-user (A, B, C) in one document.
+    let p1 = module_for(doc, "ic-p1.so");
+    let p2 = module_for(doc, "ic-p2.so");
+    assert_ne!(p1["id"], p2["id"]);
+    assert_ne!(p1["identity"]["sha256"], p2["identity"]["sha256"]);
+    let mut pairs = BTreeMap::new();
+    for (name, so_names) in [
+        ("A", vec!["ic-p1.so"]),
+        ("B", vec!["ic-p1.so"]),
+        ("C", vec!["ic-p1.so", "ic-p2.so"]),
+    ] {
+        let pid = u64::from(*dance.pids.get(name).unwrap());
+        let callers = caller_for(doc, pid);
+        assert_eq!(callers.len(), 1, "one incarnation for {name}");
+        let caller_id = callers[0]["id"].as_str().unwrap();
+        for so_name in so_names {
+            let module = if so_name == "ic-p1.so" { p1 } else { p2 };
+            let module_id = module["id"].as_str().unwrap();
+            let found = edges_for(doc, caller_id, module_id);
+            assert_eq!(found.len(), 1, "expected edge {name} -> {so_name}");
+            assert_eq!(found[0]["mapping"]["state"], "mapped");
+            assert_eq!(found[0]["entries"]["count"], 0);
+            pairs.insert((name, so_name), (caller_id, module_id));
+        }
+    }
+    // Exactly the four expected edges among our callers — no more.
+    let our_callers: Vec<&str> = pairs.values().map(|(caller, _)| *caller).collect();
+    let our_edges: Vec<&Value> = doc["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edge| our_callers.contains(&edge["caller"].as_str().unwrap()))
+        .collect();
+    assert_eq!(our_edges.len(), 4);
+    drop(dance.guard.take());
+}
+
+// ---------------------------------------------------------------------------
+// --pid dances: exec, unload/reload, SIGKILL, -o identity.
+// ---------------------------------------------------------------------------
+
+struct PidDance {
+    doc: Value,
+    pid: u32,
+    guard: Option<FixtureGuard>,
+}
+
+/// Run the pid observer: `mode` selects the fixture driver, `observer`
+/// holds the observer args after `--pid`, `prov` the provider basename.
+fn pid_dance(
+    dir: &Path,
+    name: &str,
+    driver_source: &str,
+    driver_out: &str,
+    mode: &str,
+    prov_name: &str,
+    observer: &[&str],
+) -> PidDance {
+    let ready = dir.join(format!("{name}.ready"));
+    let _ = std::fs::remove_file(&ready);
+    let driver = gcc(
+        dir,
+        driver_out,
+        &fixture_source(driver_source),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let prov = gcc(
+        dir,
+        prov_name,
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let out = dir.join(format!("{name}.json"));
+    let _ = std::fs::remove_file(&out);
+    let mut cmd = Command::new("sh");
+    cmd.arg(fixture_source("inventory-observe-pid.sh"))
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", mode)
+        .env("INV_PROV", &prov)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &out)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for arg in observer {
+        cmd.arg(arg);
+    }
+    let output = cmd.spawn().unwrap().wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{name} observe failed: {output:?} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let guard = FixtureGuard { pids: vec![pid] };
+    let body = std::fs::read_to_string(&out).unwrap();
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    PidDance {
+        doc,
+        pid,
+        guard: Some(guard),
+    }
+}
+
+#[test]
+fn e2_exec_retires_and_admits_incarnations() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-exec");
+    let mut dance = pid_dance(
+        &dir,
+        "exec",
+        "inventory-exec-driver.c",
+        "exec-driver",
+        "exec",
+        "ic-exec.so",
+        &["--json", "--duration", "10s"],
+    );
+    let doc = &dance.doc;
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    assert_eq!(doc["scope"], format!("pid:{}", dance.pid));
+    assert!(doc["observation"]["passes"].as_u64().unwrap() >= 2);
+
+    // Two incarnations, one pid: the pre-exec driver and post-exec sleep.
+    let callers = caller_for(doc, u64::from(dance.pid));
+    assert_eq!(callers.len(), 2, "exec must split incarnations");
+    let (old, new) = if callers[0]["incarnation"] == 0 {
+        (callers[0], callers[1])
+    } else {
+        (callers[1], callers[0])
+    };
+    assert_eq!(old["incarnation"], 0);
+    assert_eq!(old["lifecycle"], "exec_retired");
+    assert_eq!(old["retired"], true);
+    assert!(
+        old["image"]["exe"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("exec-driver"),
+        "old exe: {}",
+        old["image"]["exe"]["path"]
+    );
+    assert_eq!(new["incarnation"], 1);
+    assert_eq!(new["lifecycle"], "mapped");
+    assert_eq!(new["retired"], false);
+    assert!(
+        new["image"]["exe"]["path"]
+            .as_str()
+            .unwrap()
+            .contains("sleep"),
+        "new exe: {}",
+        new["image"]["exe"]["path"]
+    );
+    assert_ne!(old["id"], new["id"]);
+
+    // The old incarnation's usage evidence is retained: its edge ends
+    // but stays in the document, and the module is unknown (no unload
+    // was proven — the new image simply never mapped it).
+    let module = module_for(doc, "ic-exec.so");
+    let old_edges = edges_for(
+        doc,
+        old["id"].as_str().unwrap(),
+        module["id"].as_str().unwrap(),
+    );
+    assert_eq!(old_edges.len(), 1);
+    assert_eq!(old_edges[0]["mapping"]["state"], "ended");
+    assert_eq!(old_edges[0]["entries"]["count"], 0);
+    assert!(
+        edges_for(
+            doc,
+            new["id"].as_str().unwrap(),
+            module["id"].as_str().unwrap()
+        )
+        .is_empty()
+    );
+    assert_eq!(module["lifecycle"], "unknown");
+    assert_eq!(module["unloaded_observed"], false);
+    drop(dance.guard.take());
+}
+
+#[test]
+fn e2_unload_reload_observed_with_history() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-reload");
+    let mut dance = pid_dance(
+        &dir,
+        "reload",
+        "inventory-reload-driver.c",
+        "reload-driver",
+        "reload",
+        "ic-reload.so",
+        &["--json", "--duration", "14s"],
+    );
+    let doc = &dance.doc;
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+
+    let callers = caller_for(doc, u64::from(dance.pid));
+    assert_eq!(callers.len(), 1);
+    assert_eq!(callers[0]["lifecycle"], "mapped");
+    let module = module_for(doc, "ic-reload.so");
+    let edge = edges_for(
+        doc,
+        callers[0]["id"].as_str().unwrap(),
+        module["id"].as_str().unwrap(),
+    );
+    assert_eq!(edge.len(), 1);
+    // Reloaded: mapped now, with exactly one observed interruption and
+    // the unload retained in history.
+    assert_eq!(edge[0]["mapping"]["state"], "mapped");
+    assert_eq!(edge[0]["mapping"]["interruptions"], 1);
+    assert_eq!(module["lifecycle"], "mapped");
+    assert_eq!(module["unloaded_observed"], true);
+    drop(dance.guard.take());
+}
+
+#[test]
+fn b3_sigkill_freezes_evidence_with_exit_state() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-suicide");
+    // `-o` needs a trusted directory (no group-writable ancestors); the
+    // worktree target dir does not qualify, so the report goes to TMPDIR.
+    let out_dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = out_dir.path().join("suicide.json");
+    let mut dance = pid_dance(
+        &dir,
+        "suicide",
+        "inventory-suicide-driver.c",
+        "suicide-driver",
+        "suicide",
+        "ic-suicide.so",
+        &["--json", "--duration", "10s", "-o", file.to_str().unwrap()],
+    );
+    assert_eq!(dance.doc["schema"], "p11scope/inventory/v1");
+    // The run survived its target's mid-observation death: exit 0 above
+    // plus the empty-pass gap below.
+    assert!(
+        dance.doc["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["subject"] == "scan pass produced no observation"),
+        "death passes must gap: {}",
+        dance.doc["gaps"]
+    );
+    let callers = caller_for(&dance.doc, u64::from(dance.pid));
+    assert_eq!(callers.len(), 1);
+    assert_eq!(callers[0]["lifecycle"], "exited");
+    assert_eq!(callers[0]["retired"], true);
+    let module = module_for(&dance.doc, "ic-suicide.so");
+    let edge = edges_for(
+        &dance.doc,
+        callers[0]["id"].as_str().unwrap(),
+        module["id"].as_str().unwrap(),
+    );
+    assert_eq!(edge.len(), 1);
+    assert_eq!(edge[0]["mapping"]["state"], "ended");
+    // Frozen: zero entries, no recency, and the module is unknown (a
+    // dead caller's absence proves no unload).
+    assert_eq!(edge[0]["entries"]["count"], 0);
+    assert!(edge[0]["entries"]["last_seen_ns"].is_null());
+    assert_eq!(module["lifecycle"], "unknown");
+    assert_eq!(module["unloaded_observed"], false);
+    // `-o` holds the same document stdout carried.
+    let file_body = std::fs::read_to_string(&file).unwrap();
+    let file_doc: Value = serde_json::from_str(&file_body).unwrap();
+    assert_eq!(file_doc, dance.doc);
+    drop(dance.guard.take());
+}
+
+#[test]
+fn out_file_matches_stdout_document() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-outfile");
+    let out_dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = out_dir.path().join("snapshot.json");
+    // One snapshot pass, both sinks: byte-identical documents.
+    let ready = dir.join("plain.ready");
+    let _ = std::fs::remove_file(&ready);
+    let driver = gcc(
+        &dir,
+        "driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let prov = gcc(
+        &dir,
+        "ic-plain.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let out = dir.join("plain.json");
+    let _ = std::fs::remove_file(&out);
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-pid.sh"))
+        .arg("--json")
+        .arg("-o")
+        .arg(&file)
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", "plain")
+        .env("INV_PROV", &prov)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &out)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "plain observe failed: {output:?} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let guard = FixtureGuard { pids: vec![pid] };
+    let stdout_body = std::fs::read_to_string(&out).unwrap();
+    let file_body = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(stdout_body, file_body, "-o and --json must agree");
+    let doc: Value = serde_json::from_str(&stdout_body).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    assert_eq!(doc["observation"]["passes"], 1);
+    drop(guard);
+}

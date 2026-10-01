@@ -47,7 +47,8 @@ const DOC_ID: &str = "p11scope/inspect-system/v1";
 /// plan recap: the catalog reports admission computed WITHOUT manifest
 /// input, so an object whose admission could differ with a manifest says
 /// so plainly instead of reading as a capture promise.
-const SCAN_ONLY_NOTE: &str = "scan-only admission: manifest corroboration was not consulted";
+pub(crate) const SCAN_ONLY_NOTE: &str =
+    "scan-only admission: manifest corroboration was not consulted";
 
 /// `p11scope inspect --system` — enumerate, sweep, deep-scan, pin, lower
 /// admission scan-only, render. Exit 0 when the loop ran (even with zero
@@ -87,14 +88,14 @@ fn run_with_writer(
 /// One gap record with optional member attribution. Scope-level gaps
 /// (enumeration, sweep, cap) carry no pid; member gaps carry theirs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PidGap {
-    pid: Option<u32>,
-    subject: String,
-    reason: String,
+pub(crate) struct PidGap {
+    pub pid: Option<u32>,
+    pub subject: String,
+    pub reason: String,
     /// True only for the deduped unreadable-member record: one public
     /// record however many members were unreadable (the engine's
     /// convention), with per-pid reasons in the process table instead.
-    generic: bool,
+    pub generic: bool,
 }
 
 impl PidGap {
@@ -128,7 +129,7 @@ impl PidGap {
 
 /// What one deep-scan attempt over a scope member concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MemberStatus {
+pub(crate) enum MemberStatus {
     Scanned,
     MemoryUnavailable { reason: &'static str },
     Unreadable { reason: String },
@@ -137,7 +138,7 @@ enum MemberStatus {
 }
 
 impl MemberStatus {
-    const fn label(&self) -> &'static str {
+    pub(crate) const fn label(&self) -> &'static str {
         match self {
             Self::Scanned => "scanned",
             Self::MemoryUnavailable { .. } => "memory_unavailable",
@@ -147,7 +148,7 @@ impl MemberStatus {
         }
     }
 
-    fn reason(&self) -> Option<&str> {
+    pub(crate) fn reason(&self) -> Option<&str> {
         match self {
             Self::MemoryUnavailable { reason } => Some(reason),
             Self::Unreadable { reason } => Some(reason),
@@ -157,7 +158,7 @@ impl MemberStatus {
 
     /// A scan ran far enough to inventory the member's mappings, with or
     /// without its memory: pid-inspect's `Scanned`/`Unavailable` line.
-    const fn inventoried(&self) -> bool {
+    pub(crate) const fn inventoried(&self) -> bool {
         matches!(self, Self::Scanned | Self::MemoryUnavailable { .. })
     }
 }
@@ -493,7 +494,7 @@ fn unreadable_system_error(collection: &Collection) -> anyhow::Error {
 /// bind loss for a scanned module that earned no comparable identity.
 /// Every pinned verdict carries the scan-only note (no manifest input).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AdmissionRecord {
+pub(crate) enum AdmissionRecord {
     Admitted {
         class: &'static str,
         endpoints: usize,
@@ -508,11 +509,33 @@ enum AdmissionRecord {
 }
 
 impl AdmissionRecord {
-    const fn state(&self) -> &'static str {
+    pub(crate) const fn state(&self) -> &'static str {
         match self {
             Self::Admitted { .. } => "admitted",
             Self::Refused { .. } => "refused",
             Self::Unresolved { .. } => "unresolved",
+        }
+    }
+
+    pub(crate) fn class(&self) -> Option<&'static str> {
+        match self {
+            Self::Admitted { class, .. } | Self::Refused { class, .. } => Some(class),
+            Self::Unresolved { .. } => None,
+        }
+    }
+
+    pub(crate) fn endpoints(&self) -> Option<usize> {
+        match self {
+            Self::Admitted { endpoints, .. } => Some(*endpoints),
+            Self::Refused { .. } | Self::Unresolved { .. } => None,
+        }
+    }
+
+    pub(crate) fn reasons(&self) -> Vec<String> {
+        match self {
+            Self::Admitted { .. } => Vec::new(),
+            Self::Refused { reason, .. } => vec![reason.clone()],
+            Self::Unresolved { reasons } => reasons.clone(),
         }
     }
 }
@@ -521,41 +544,41 @@ impl AdmissionRecord {
 /// per view because generations remap (addresses) and even file versions
 /// (tables) can differ between two mappings of one object.
 #[derive(Debug, Clone)]
-struct Observation {
-    pid: u32,
-    path: String,
-    exports: Vec<String>,
-    tables: Vec<crate::discovery::scan::ScannedTable>,
-    interfaces: Vec<crate::discovery::scan::ScannedInterface>,
+pub(crate) struct Observation {
+    pub pid: u32,
+    pub path: String,
+    pub exports: Vec<String>,
+    pub tables: Vec<crate::discovery::scan::ScannedTable>,
+    pub interfaces: Vec<crate::discovery::scan::ScannedInterface>,
 }
 
 /// One catalog object: every pinned physical object the machine maps —
 /// admitted or refused — plus every scanned module that earned no pin.
 /// The identity block mirrors `ObjectSummary`'s fields; the admission
 /// verdict beside it is the separate record the brief requires.
-struct CatalogObject {
-    path: String,
-    key: p11scope_manifest::maps::ObjectKey,
-    sha256: Option<String>,
-    build_id: Option<String>,
-    identity_source: Option<&'static str>,
-    note: Option<String>,
-    mappings: Vec<(u32, ProcessViewId)>,
-    observations: Vec<Observation>,
-    admission: AdmissionRecord,
+pub(crate) struct CatalogObject {
+    pub path: String,
+    pub key: p11scope_manifest::maps::ObjectKey,
+    pub sha256: Option<String>,
+    pub build_id: Option<String>,
+    pub identity_source: Option<&'static str>,
+    pub note: Option<String>,
+    pub mappings: Vec<(u32, ProcessViewId)>,
+    pub observations: Vec<Observation>,
+    pub admission: AdmissionRecord,
 }
 
-struct ProcessRecord {
-    pid: u32,
-    status: MemberStatus,
-    objects: Vec<usize>,
+pub(crate) struct ProcessRecord {
+    pub pid: u32,
+    pub status: MemberStatus,
+    pub objects: Vec<usize>,
 }
 
 /// A discovered relationship between catalog objects: two observations of
 /// one path that are not one object, or one object observed under two
 /// paths. Indices into `Catalog::objects`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Relationship {
+pub(crate) enum Relationship {
     SamePath {
         path: String,
         members: Vec<RelationshipMember>,
@@ -569,41 +592,41 @@ enum Relationship {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RelationshipMember {
+pub(crate) struct RelationshipMember {
     object: usize,
     sha256: Option<String>,
     pids: Vec<u32>,
 }
 
-struct AdmissionSummary {
-    uncorroborated_candidates: u64,
-    module_ambiguous: usize,
-    admitted: usize,
-    refused: usize,
-    unresolved: usize,
+pub(crate) struct AdmissionSummary {
+    pub uncorroborated_candidates: u64,
+    pub module_ambiguous: usize,
+    pub admitted: usize,
+    pub refused: usize,
+    pub unresolved: usize,
 }
 
 /// The assembled catalog: everything both renderers read. Built once from
 /// the collection; rendering is pure over it.
-struct Catalog {
-    scan_status: &'static str,
-    enumerated: usize,
-    selected: usize,
-    scanned: usize,
-    cap: usize,
-    scan_ms: u64,
-    processes: Vec<ProcessRecord>,
-    objects: Vec<CatalogObject>,
-    relationships: Vec<Relationship>,
-    admission: AdmissionSummary,
-    skipped: Vec<PidGap>,
-    notes: Vec<PidGap>,
-    explanation: Option<String>,
+pub(crate) struct Catalog {
+    pub scan_status: &'static str,
+    pub enumerated: usize,
+    pub selected: usize,
+    pub scanned: usize,
+    pub cap: usize,
+    pub scan_ms: u64,
+    pub processes: Vec<ProcessRecord>,
+    pub objects: Vec<CatalogObject>,
+    pub relationships: Vec<Relationship>,
+    pub admission: AdmissionSummary,
+    pub skipped: Vec<PidGap>,
+    pub notes: Vec<PidGap>,
+    pub explanation: Option<String>,
 }
 
 /// Collect the machine, lower scan-only admission, assemble the catalog.
 /// The only `Err` is the fully-unreadable machine (stdout stays empty).
-fn collect(
+pub(crate) fn collect(
     hints: &[PathBuf],
     hooks: &HookRegistry,
     max_scan_pids: Option<usize>,
@@ -620,6 +643,40 @@ fn collect(
     }
     eprintln!("p11scope: lowering scan-only admission and rendering...");
     Ok(assemble(collection))
+}
+
+/// Collect one pid through the same member scan and the same assembly:
+/// the inventory scan lane's `--pid` pass. The only `Err` is a target no
+/// scan inventoried — pid-inspect's hard failure, kept honest.
+pub(crate) fn collect_pid(pid: u32, hints: &[PathBuf], hooks: &HookRegistry) -> Result<Catalog> {
+    eprintln!("p11scope: deep-scanning pid {pid}...");
+    let mut budget = CaptureWorkBudget::default();
+    let mut noise = DiscoveryNoiseAggregator::default();
+    let member = scan_member(pid, ProcessViewId(0), hints, hooks, &mut budget, &mut noise);
+    noise.report();
+    if !member.status.inventoried() {
+        let detail = member
+            .status
+            .reason()
+            .unwrap_or("the process could not be read");
+        let fix = if detail.contains("Permission denied") || detail.contains("not permitted") {
+            "; its modules are unknown, not absent. Processes owned by other users need \
+             root: run `sudo p11scope inventory --pid {pid}`"
+        } else {
+            "; its modules are unknown, not absent"
+        };
+        return Err(anyhow::anyhow!("cannot inventory pid {pid}: {detail}{fix}"));
+    }
+    eprintln!("p11scope: lowering scan-only admission and rendering...");
+    Ok(assemble(Collection {
+        enumerated: vec![pid],
+        selected: vec![pid],
+        cap: 1,
+        cap_hit: false,
+        members: vec![member],
+        scope_gaps: Vec::new(),
+        proc_list_failed: false,
+    }))
 }
 
 /// Aggregate every view's pins, bind every module, lower one shared-scope

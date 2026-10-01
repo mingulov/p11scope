@@ -9,7 +9,9 @@ use std::io::Write as _;
 
 use anyhow::{Context as _, Result};
 use p11scope::cli::{self, CliError, Command};
-use p11scope::{capture, capture_startup_signal_dispositions, doctor, inspect, run_owned};
+use p11scope::{
+    capture, capture_startup_signal_dispositions, doctor, inspect, inventory, run_owned,
+};
 
 fn main() {
     match run() {
@@ -67,6 +69,25 @@ fn run() -> Result<i32> {
                 .with_context(|| scope)
         }
         Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
+        // `inventory`'s hard failures — an unreadable target, an
+        // unwritable `-o` — mean "nothing could be observed": one line
+        // here, exit 1, never a panic and never an empty-success report.
+        Ok(Command::Inventory(a)) => {
+            let scope = match a.scope {
+                cli::InspectScope::Pid(pid) => format!("inventory --pid {pid}"),
+                cli::InspectScope::System => "inventory --system".to_string(),
+            };
+            inventory::run(
+                a.scope,
+                &a.modules,
+                &a.hooks,
+                a.json,
+                a.max_scan_pids,
+                a.duration,
+                a.out.as_deref(),
+            )
+            .with_context(|| scope)
+        }
         // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
         Err(CliError::Help(topic)) => print_stdout(format_args!("{}\n", topic.text())),
         Err(CliError::Usage(msg)) => {

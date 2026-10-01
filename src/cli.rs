@@ -123,6 +123,26 @@ pub struct DoctorArgs {
     pub extra_strict: bool,
 }
 
+/// What `p11scope inventory` observes: one named process, or every
+/// process on the machine, for one snapshot or across `--duration`.
+/// Scan-only like inspect (no BPF, no manifest reads); usage columns
+/// read unknown unless an entry feed observed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryArgs {
+    pub scope: InspectScope,
+    pub modules: Vec<PathBuf>,
+    pub hooks: HookRegistry,
+    pub json: bool,
+    /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
+    /// Only `--system` scans more than one member, so only it reads this.
+    pub max_scan_pids: Option<usize>,
+    /// `--duration`: keep observing (rescanning) until the deadline;
+    /// None ⇒ a single snapshot pass.
+    pub duration: Option<Duration>,
+    /// `-o`: write the JSON inventory document to this file (atomic).
+    pub out: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Version,
@@ -131,6 +151,7 @@ pub enum Command {
     Run(RunArgs),
     Inspect(InspectArgs),
     Doctor(DoctorArgs),
+    Inventory(InventoryArgs),
 }
 
 /// Which help text `--help` asked for: the global usage or one subcommand's
@@ -143,6 +164,7 @@ pub enum HelpTopic {
     Run,
     Inspect,
     Doctor,
+    Inventory,
 }
 
 impl HelpTopic {
@@ -154,6 +176,7 @@ impl HelpTopic {
             HelpTopic::Run => RUN_HELP,
             HelpTopic::Inspect => INSPECT_HELP,
             HelpTopic::Doctor => DOCTOR_HELP,
+            HelpTopic::Inventory => INVENTORY_HELP,
         }
     }
 }
@@ -192,6 +215,8 @@ pub const USAGE: &str = "usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
@@ -351,6 +376,36 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// both together when the CLI changes.
 const DOCTOR_HELP: &str = "usage:
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
+
+notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+--module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
+selects what run may do to its own child while it observes loading: never (default) touches
+nothing, auto only when the child would otherwise load unobserved, always on every load.
+--kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--attach-backend selects the static probe backend: auto (default) uses one
+multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
+multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+export probes always use per-offset links.
+--mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
+ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
+every descendant (kernel >= 5.15). --system requests whole-machine capture with
+no cgroup path; per-process and per-module attribution is still recorded. Provider
+identity is pinned by SHA-256 at attach and
+checked for in-place change during capture (evidence.provider_changed).
+trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
+environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
+P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
+capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
+";
+
+/// `p11scope inventory --help`: that subcommand's usage section plus the
+/// shared notes footer. Every line is verbatim from [`USAGE`]; update
+/// both together when the CLI changes.
+const INVENTORY_HELP: &str = "usage:
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -641,6 +696,7 @@ pub fn parse(argv: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Comm
         Some("run") => Ok(Command::Run(parse_run(argv)?)),
         Some("inspect") => Ok(Command::Inspect(parse_inspect(argv)?)),
         Some("doctor") => Ok(Command::Doctor(parse_doctor(argv)?)),
+        Some("inventory") => Ok(Command::Inventory(parse_inventory(argv)?)),
         Some("--help" | "-h") => Err(CliError::Help(HelpTopic::Global)),
         Some("discover") => Err(usage_err(
             "`p11scope discover` was removed: run `p11scope-discover --module <provider.so> \
@@ -706,6 +762,92 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
         hooks,
         json,
         max_scan_pids,
+    })
+}
+
+/// `p11scope inventory`: inspect's scope and discovery options, plus a
+/// `--duration` observation window and a `-o` JSON document. `-o -` is
+/// refused: the inventory report requires a file, like profile's.
+fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<InventoryArgs, CliError> {
+    let mut pid: Option<u32> = None;
+    let mut system = false;
+    let mut modules = Vec::new();
+    let mut hooks = HookRegistry::builtin();
+    let mut json = false;
+    let mut max_scan_pids: Option<usize> = None;
+    let mut duration: Option<Duration> = None;
+    let mut out: Option<PathBuf> = None;
+    while let Some(a) = args.next() {
+        match word(&a).as_ref() {
+            "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inventory)),
+            "--pid" => {
+                if pid.is_some() {
+                    return Err(usage_err("--pid given twice"));
+                }
+                pid = Some(require_pid(&mut args)?);
+            }
+            "--system" => system = true,
+            "--module" => modules.push(require_path(&mut args, "--module")?),
+            "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
+            "--json" => json = true,
+            "--max-scan-pids" => {
+                if max_scan_pids.is_some() {
+                    return Err(usage_err("--max-scan-pids given twice"));
+                }
+                let v = require_value(&mut args, "--max-scan-pids")?;
+                let value = v
+                    .parse::<usize>()
+                    .map_err(|_| usage_err(format!("--max-scan-pids: invalid number {v:?}")))?;
+                if value == 0 {
+                    return Err(usage_err("--max-scan-pids must be greater than zero"));
+                }
+                max_scan_pids = Some(value);
+            }
+            "--duration" => {
+                if duration.is_some() {
+                    return Err(usage_err("--duration given twice"));
+                }
+                let v = require_value(&mut args, "--duration")?;
+                let value = parse_duration(&v)
+                    .map_err(|e| usage_err(format!("--duration: invalid value {v:?}: {e}")))?;
+                if value.is_zero() {
+                    return Err(usage_err("--duration must be greater than zero"));
+                }
+                duration = Some(value);
+            }
+            "-o" => {
+                if out.is_some() {
+                    return Err(usage_err("-o given twice"));
+                }
+                out = Some(require_path(&mut args, "-o")?);
+            }
+            other => return Err(unknown_arg(other)),
+        }
+    }
+    if system && pid.is_some() {
+        return Err(usage_err("--pid and --system are mutually exclusive"));
+    }
+    let scope = match (pid, system) {
+        (Some(pid), false) => InspectScope::Pid(pid),
+        (None, true) => InspectScope::System,
+        (None, false) => return Err(usage_err("inventory requires --pid <n> or --system")),
+        (Some(_), true) => unreachable!("mutual exclusion returns above"),
+    };
+    if out.as_deref() == Some(std::path::Path::new("-")) {
+        return Err(usage_err(
+            "-o - writes to stdout, which inventory does not support for its report \
+             (omit -o for the text summary, or pass --json for the document on stdout; \
+             the report requires a file)",
+        ));
+    }
+    Ok(InventoryArgs {
+        scope,
+        modules,
+        hooks,
+        json,
+        max_scan_pids,
+        duration,
+        out,
     })
 }
 
@@ -1293,6 +1435,90 @@ mod tests {
     }
 
     #[test]
+    fn inventory_parses_scope_duration_and_output() {
+        let Command::Inventory(i) = parse(args(&[
+            "inventory",
+            "--pid",
+            "7",
+            "--duration",
+            "60s",
+            "-o",
+            "inventory.json",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(i.scope, InspectScope::Pid(7));
+        assert_eq!(i.duration, Some(Duration::from_secs(60)));
+        assert_eq!(i.out, Some(PathBuf::from("inventory.json")));
+        assert!(!i.json);
+        let Command::Inventory(i) = parse(args(&[
+            "inventory",
+            "--system",
+            "--json",
+            "--max-scan-pids",
+            "8",
+            "--duration",
+            "5m",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(i.scope, InspectScope::System);
+        assert!(i.json);
+        assert_eq!(i.max_scan_pids, Some(8));
+        assert_eq!(i.duration, Some(Duration::from_secs(300)));
+        assert_eq!(i.out, None);
+        // No scope at all names both spellings.
+        assert!(
+            matches!(parse(args(&["inventory"])), Err(CliError::Usage(m))
+                if m.contains("--pid") && m.contains("--system"))
+        );
+        // The mutual-exclusion refusal names both flags, whichever order.
+        for argv in [
+            vec!["inventory", "--pid", "7", "--system"],
+            vec!["inventory", "--system", "--pid", "7"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m))
+                    if m.contains("--pid") && m.contains("--system") && m.contains("mutually exclusive")),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_refuses_bad_duration_and_stdout_report() {
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "--duration", "0"])),
+            Err(CliError::Usage(m)) if m.contains("--duration must be greater than zero")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--pid", "7", "--duration", "10", "--duration", "20"
+            ])),
+            Err(CliError::Usage(m)) if m.contains("--duration given twice")
+        ));
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "--duration", "soon"])),
+            Err(CliError::Usage(m)) if m.contains("--duration: invalid value")
+        ));
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "-o", "a", "-o", "b"])),
+            Err(CliError::Usage(m)) if m.contains("-o given twice")
+        ));
+        // The report requires a file, like profile's.
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "-o", "-"])),
+            Err(CliError::Usage(m)) if m.contains("-o - writes to stdout")
+        ));
+        assert!(matches!(
+            parse(args(&["inventory", "--system", "--bogus"])),
+            Err(CliError::Usage(m)) if m.contains("unknown argument: --bogus")
+        ));
+    }
+
+    #[test]
     fn doctor_rejects_unsupported_module_option() {
         assert!(matches!(
             parse(args(&["doctor", "--module", "/opt/provider.so"])),
@@ -1871,8 +2097,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 3573);
-        assert_eq!(hash, 0x5d2de1b8_5f34dab6);
+        assert_eq!(USAGE.len(), 3850);
+        assert_eq!(hash, 0x4e220551_08f90df3);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

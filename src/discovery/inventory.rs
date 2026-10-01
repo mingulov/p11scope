@@ -1,10 +1,10 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Inventory-only ownership and reconciliation preparation. This component does
-//! not attach probes, publish capture output, schedule work, or commit link state.
-//! I3 must revalidate a prepared candidate at its actual publication boundary.
-//! The live exact-image adapter and resumable scan coordinator are separate work.
-#![allow(dead_code)] // Internal capability awaiting the I3/I4b coordinator callers.
+//! not attach probes, publish capture output, or schedule work; the I3/I4b
+//! coordinator (`inventory_coordinator`) owns the scan window, drives
+//! scan→reconcile→publish through `commit_inventory_reconciliation`, and
+//! revalidates every prepared candidate at its publication boundary.
 
 use super::*;
 use crate::capacity::InventoryBudget;
@@ -85,6 +85,9 @@ impl ImageGuard for UnavailableImageGuard {
 
 /// Opaque until the native lifecycle adapter can prove an exact old/new image
 /// transition. No PID or ordinary refresh API can construct this proof.
+/// Constructed only by the privileged native lane; the scan lane retires
+/// suspected execs through exe-identity comparison instead.
+#[allow(dead_code)] // Privileged native lane constructs the proof; matching is live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExecProof {
     owner: ProcessViewId,
@@ -96,8 +99,14 @@ pub(crate) struct ExecProof {
 pub(crate) enum RefreshCause {
     LoaderHint,
     Periodic,
+    /// No event transport exists on the coordinator's synchronous path;
+    /// the privileged live lane constructs this on session recovery.
+    #[allow(dead_code)] // Privileged live lane only; matching is live.
     TransportRecovery(u64),
     ScopeRecheck,
+    /// Unconstructible until the native lifecycle adapter proves an
+    /// exact old/new image transition (see `ExecProof`).
+    #[allow(dead_code)] // Privileged native lane only; matching is live.
     ValidatedExec(ExecProof),
 }
 
@@ -525,9 +534,11 @@ impl Engine {
         let (facts, complete) = match receipt {
             ScanReceipt::Complete(VerifiedAbsence(facts)) => (facts, true),
             ScanReceipt::AdditionsOnly(facts) => (facts, false),
-            ScanReceipt::Deferred { reason, .. } => bail!("inventory scan deferred: {reason}"),
-            ScanReceipt::Unavailable { reason, .. } => {
-                bail!("inventory scan unavailable: {reason}")
+            ScanReceipt::Deferred { owner, reason } => {
+                bail!("inventory scan deferred for owner {}: {reason}", owner.0)
+            }
+            ScanReceipt::Unavailable { owner, reason } => {
+                bail!("inventory scan unavailable for owner {}: {reason}", owner.0)
             }
         };
         self.check_inventory_image(&facts.identity, guard)?;
@@ -624,6 +635,135 @@ impl Engine {
             bail!("prepared inventory pins changed; existing claims retained");
         }
         Ok(())
+    }
+
+    /// Last claim revision for which `owner` committed a complete receipt,
+    /// if any. Absence authority (module unload, edge end by rescan)
+    /// requires a complete commit; partial receipts only add.
+    pub(crate) fn inventory_last_complete(&self, owner: ProcessViewId) -> Result<Option<u64>> {
+        Ok(self
+            .inventory_state()?
+            .owners
+            .get(&owner)
+            .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?
+            .last_complete_revision)
+    }
+
+    /// Owner bookkeeping snapshot for tests: refresh epochs, dirty
+    /// causes, image state, and the last complete revision. Production
+    /// learns the same facts through commit receipts.
+    #[cfg(test)]
+    pub(crate) fn inventory_owner_epochs(
+        &self,
+        owner: ProcessViewId,
+    ) -> Result<InventoryOwnerEpochs> {
+        let owner = self
+            .inventory_state()?
+            .owners
+            .get(&owner)
+            .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?;
+        Ok(InventoryOwnerEpochs {
+            requested: owner.requested_epoch,
+            serviced: owner.serviced_epoch,
+            dirty: owner.dirty,
+            image_state: owner.image_state,
+            complete: owner.last_complete_revision,
+        })
+    }
+}
+
+/// Owner bookkeeping snapshot (see `inventory_owner_epochs`).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InventoryOwnerEpochs {
+    pub requested: u64,
+    pub serviced: u64,
+    pub dirty: u8,
+    pub image_state: ImageCheck,
+    pub complete: Option<u64>,
+}
+
+/// What one inventory commit concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InventoryCommit {
+    pub owner: ProcessViewId,
+    pub complete: bool,
+    pub serviced_epoch: u64,
+    /// A refresh was requested after the committed receipt was prepared:
+    /// the owner stays dirty and the coordinator must scan again.
+    pub refresh_pending: bool,
+    pub changed: bool,
+}
+
+impl Engine {
+    /// The explicit integration seam preparation was built for. I3
+    /// revalidates at this publication boundary — including after any
+    /// asynchronous work the coordinator ran since preparation — and then
+    /// the candidate becomes the engine's exact current state: pins,
+    /// modules, plan, corroboration. No session exists on this path, so no
+    /// link can attach: the plan commits as facts (admission verdicts
+    /// feed the caller registry), never as attach work. Owner
+    /// bookkeeping closes the serviced epoch; requests that arrived after
+    /// preparation stay pending.
+    pub(crate) fn commit_inventory_reconciliation(
+        &mut self,
+        prepared: PreparedReconciliation,
+        guard: &mut dyn ImageGuard,
+    ) -> Result<InventoryCommit> {
+        self.revalidate_inventory_reconciliation(&prepared, guard)?;
+        self.inventory_state()?;
+        self.preflight_candidate_publication(&prepared.candidate)?;
+        let PreparedReconciliation {
+            identity,
+            complete,
+            mut candidate,
+        } = prepared;
+        record_object_skips(&mut candidate.plan, &self.counters.object_skips);
+        let changed = candidate.plan != self.plan;
+        self.pinned = candidate.pinned;
+        self.modules = candidate.modules;
+        self.plan = candidate.plan;
+        // The commit replaces the whole publication input set even when
+        // the plan compares equal, so it dirties the inputs
+        // unconditionally — the batch tail republishes on the revision.
+        self.note_facts_mutated();
+        for binding in self.selection_bindings.values_mut() {
+            if let Some(module) = self
+                .plan
+                .modules
+                .iter()
+                .find(|module| module.object == binding.object)
+            {
+                binding.provider = module.id;
+            }
+        }
+        self.counters.corroboration = candidate.corroboration;
+        self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
+        self.selection_claims = candidate.selection_claims;
+        self.selection_tables = candidate.selection_tables;
+        let state = self.inventory.as_mut().expect("checked Inventory state");
+        let owner = state
+            .owners
+            .get_mut(&identity.owner)
+            .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?;
+        if owner.serviced_epoch > identity.requested_epoch {
+            bail!("inventory owner serviced a refresh newer than the committed receipt");
+        }
+        owner.serviced_epoch = identity.requested_epoch;
+        let refresh_pending = owner.requested_epoch != owner.serviced_epoch;
+        if !refresh_pending {
+            owner.dirty = 0;
+        }
+        if complete {
+            owner.last_complete_revision = Some(identity.revision);
+        }
+        Ok(InventoryCommit {
+            owner: identity.owner,
+            complete,
+            serviced_epoch: owner.serviced_epoch,
+            refresh_pending,
+            changed,
+        })
     }
 }
 

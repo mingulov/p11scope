@@ -954,11 +954,31 @@ pub(crate) fn generation_gone(pid: u32) -> bool {
     gone_from(process_start_time(pid))
 }
 
+/// True when `pid` names a zombie: the generation exited but its parent
+/// has not reaped it, so `/proc/<pid>/stat` still parses while the
+/// process is dead. Any read or parse failure answers false — an
+/// unreadable pid is merely unknown here, and `generation_gone` covers
+/// the reaped case. The inventory adapter treats zombies as exited:
+/// without this, an unreaped target (the observer is often its parent)
+/// re-admits every pass under a fresh caller ID.
+pub(crate) fn process_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(end) = stat.rfind(')') else {
+        return false;
+    };
+    stat[end + 1..]
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| state == "Z")
+}
+
 fn gone_from(start_time: io::Result<u64>) -> bool {
     start_time.is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
-fn process_start_time(pid: u32) -> io::Result<u64> {
+pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let end = stat
         .rfind(')')

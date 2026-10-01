@@ -570,6 +570,19 @@ kind of workload without a manifest and ends `68`/`0` instead.
   error: one stderr line, empty stdout, exit 1 — including a target whose
   `/proc/<pid>/maps` is unreadable (another user's process without sudo),
   which is never reported as "0 PKCS#11 modules mapped".
+- `inventory [--pid <n> | --system]` — answer "which module is used by
+  whom": one snapshot pass, or a `--duration` observation window of
+  rescanning passes, reporting callers (per process incarnation), modules
+  (per physical object, with scan-only admission verdicts), and the
+  caller/module edges between them with cumulative entry counts, recency,
+  and lifecycle. `--json` prints the `p11scope/inventory/v1` document
+  (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
+  <out.json>` writes that document atomically (and refuses `-o -`: the
+  report requires a file). Scan-only like inspect: entry columns read
+  unknown unless an entry feed observed them, mappings are never reported
+  as observed calls, and every coverage loss is an explicit gap. A target
+  no scan inventoried is a hard error (one stderr line, exit 1), never an
+  empty-success report.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
   refusal is deliberate: on affected kernels a uretprobe on a confined target

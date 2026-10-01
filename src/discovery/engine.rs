@@ -62,6 +62,8 @@ use std::sync::Arc;
 
 #[path = "inventory.rs"]
 pub(crate) mod inventory;
+#[path = "inventory_coordinator.rs"]
+pub(crate) mod inventory_coordinator;
 
 pub struct Engine {
     plan: plan::AttachPlan,

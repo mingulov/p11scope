@@ -38,6 +38,7 @@ pub mod events;
 mod first_use_probe;
 pub mod inspect;
 pub mod inspect_system;
+pub mod inventory;
 pub mod kinds;
 pub mod longrun;
 pub mod manifest_input;

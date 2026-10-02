@@ -161,8 +161,13 @@ fn dashboard_on_pipe_degrades_to_snapshots_never_ansi() {
         assert!(stdout.contains(soname), "owned {soname} visible: {stdout}");
     }
     assert!(stdout.contains("presence mapped"), "{stdout}");
-    assert!(stdout.contains("capture armed"), "{stdout}");
-    assert!(stdout.contains("activity quiet"), "{stdout}");
+    // Scan only: nothing instruments the edge, so it is neither armed
+    // nor idle (Task 6 C2 review I3).
+    assert!(stdout.contains("capture scan only"), "{stdout}");
+    assert!(
+        stdout.contains("activity unknown (not covered)"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("unknown (semantic capture withheld)"),
         "{stdout}"

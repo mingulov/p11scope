@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::discovery::caller_registry::{
-    AdmissionState, BudgetRefusal, CallerId, ImageAuthority, ModuleInfo, ModuleKey, RegistryGap,
-    RegistryLimits,
+    AdmissionState, BudgetRefusal, CallerId, CoverageNote, ImageAuthority, ModuleInfo, ModuleKey,
+    RegistryGap, RegistryLimits,
 };
 use crate::discovery::inventory_workload::{ChurnSpec, Harness, ScaleSpec};
 use crate::inventory_present::Presentation;
@@ -269,6 +269,14 @@ fn assert_frame_matches_presentation(presentation: &Presentation) {
         assert!(
             text.contains(&format!("activity {}", edge.activity.label())),
             "activity for {}",
+            edge.caller.label()
+        );
+        assert!(
+            text.contains(&format!(
+                "entries {}",
+                crate::inventory_present::entries_display(edge)
+            )),
+            "entries for {}",
             edge.caller.label()
         );
     }
@@ -1042,10 +1050,6 @@ fn observed_presentation() -> Presentation {
     };
     harness.stage_scale(&spec);
     harness.commit();
-    harness
-        .coordinator_mut()
-        .registry_mut()
-        .set_usage_feed(true);
     let caller = harness.coordinator().adapter().live_id(81_000).unwrap();
     let key = ModuleKey::physical(8, 1, 100_000, Some("sha000000".into()), "/scale/m0.so");
     let init = SemanticCall {
@@ -1144,6 +1148,9 @@ fn detail_pages_keep_shaved_facts_reachable_at_80x14() {
         assert!(text.contains(&format!("ev {short}=0")), "{text}");
     }
     assert!(!text.contains("hidden"), "{text}");
+    // The evidence page carries the edge's full coverage label (the
+    // summary shows only the compact entries form).
+    assert!(text.contains("coverage unknown (scan only)"), "{text}");
     assert!(text.contains("--- edges 1-1 of 1 [evidence]"), "{text}");
     summary.next_detail();
     assert_eq!(summary.detail, DetailPage::Gaps);
@@ -1643,4 +1650,216 @@ fn each_detail_page_scrolls_its_own_items_with_clamped_ranges() {
         &state,
     ));
     assert!(text.contains("showing gaps 1-1 of 1"), "{text}");
+}
+
+#[test]
+fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
+    // Task 6 C2: per-edge coverage — counted, witnessed, watched (and
+    // a demoted watch), scan-only unknown, and not-admitted unknown —
+    // renders from the ONE presentation into the JSON document, the
+    // JSONL edge events, the pager snapshot, and dashboard frames.
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "dash-coverage",
+        callers: 1,
+        modules: 5,
+        edges_per_caller: 5,
+        endpoints_per_module: 4,
+        first_pid: 82_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let caller = harness.coordinator().adapter().live_id(82_000).unwrap();
+    let now = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_mapping(
+        caller,
+        82_000,
+        refused_module_info(1),
+        now,
+    );
+    harness.commit();
+    harness.advance(100);
+    let at = harness.now_ns();
+    let key = |index: u64| {
+        let path = format!("/scale/m{index}.so");
+        ModuleKey::physical(8, 1, 100_000 + index, Some(format!("sha{index:06}")), &path)
+    };
+    {
+        let registry = harness.coordinator_mut().registry_mut();
+        registry.note_coverage(caller, &key(0), CoverageNote::Counted { since_ns: at });
+        registry.observe_entries(caller, &key(0), 4, at);
+        registry.note_witness(caller, &key(1), at);
+        registry.note_coverage(caller, &key(2), CoverageNote::Watched { since_ns: at });
+        registry.note_coverage(caller, &key(3), CoverageNote::Watched { since_ns: at });
+    }
+    harness.commit();
+    harness.advance(10);
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_health_regression("CALLER_EVIDENCE rose", at + 5);
+    harness.commit();
+    harness.advance(10);
+    let at2 = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_coverage(
+        caller,
+        &key(2),
+        CoverageNote::Watched { since_ns: at2 },
+    );
+    harness.coordinator_mut().registry_mut().note_coverage(
+        caller,
+        &key(4),
+        CoverageNote::Watched { since_ns: at2 },
+    );
+    harness.commit();
+    let presentation = capture_from_harness(&harness);
+    let document = render_json_from_presentation_for(&presentation);
+    let states: Vec<String> = presentation
+        .edges
+        .iter()
+        .map(|edge| match &edge.coverage {
+            crate::discovery::caller_registry::UseCoverage::Unknown(reason) => {
+                format!("unknown/{}", reason.code())
+            }
+            other => other.state().to_string(),
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            "counted",
+            "witnessed",
+            "unknown/loss",
+            "unknown/loss",
+            "watched_no_use",
+            "unknown/not_admitted",
+        ],
+        "every coverage shape in one fixture"
+    );
+
+    // JSONL: every edge event carries the JSON edge verbatim.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = crate::inventory_events::EventWriter::create(&path, 1 << 20, 5).unwrap();
+    crate::inventory_events::emit_snapshot_as_events(&mut writer, &presentation, 1).unwrap();
+    drop(writer);
+    let body = std::fs::read_to_string(&path).unwrap();
+    let edge_events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|line| line["kind"] == "edge_observed")
+        .map(|line| line["event"].clone())
+        .collect();
+    let edges_json = document["edges"].as_array().unwrap();
+    assert_eq!(edge_events.len(), edges_json.len());
+
+    let snapshot = crate::inventory_present::render_snapshot(&presentation);
+    let frame = frame_for(&presentation);
+    let viewport = Viewport {
+        width: 200,
+        height: 120,
+    };
+    let summary = frame_text(&render_frame(&frame, viewport, &DashboardState::new()));
+    let mut evidence_state = DashboardState::new();
+    evidence_state.next_detail();
+    assert_eq!(evidence_state.detail, DetailPage::Evidence);
+    let evidence = frame_text(&render_frame(&frame, viewport, &evidence_state));
+    for ((edge, edge_json), event) in presentation
+        .edges
+        .iter()
+        .zip(edges_json.iter())
+        .zip(edge_events.iter())
+    {
+        let name = format!("{}->{}", edge.caller.label(), edge.module.label());
+        // JSONL == JSON, coverage included; the derived states agree.
+        assert_eq!(event["entries"], edge_json["entries"], "{name}");
+        assert_eq!(event["capture"], edge.capture.label(), "{name}");
+        assert_eq!(event["activity"], edge.activity.label(), "{name}");
+        let coverage = &edge_json["entries"]["coverage"];
+        assert_eq!(coverage["state"], edge.coverage.state(), "{name}");
+        // Snapshot and dashboard: one label, one compact count, one
+        // activity — each derived from the same view.
+        let label = crate::inventory_present::coverage_label(&edge.coverage);
+        let line = snapshot
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "edge {} -> {} ",
+                    edge.caller.label(),
+                    edge.module.label()
+                ))
+            })
+            .unwrap();
+        assert!(line.contains(&format!("coverage {label}")), "{line}");
+        assert!(
+            evidence.contains(&format!("coverage {label}")),
+            "{name}: {evidence}"
+        );
+        // The edge's block: its identity line plus the indented item
+        // lines under it.
+        let lines: Vec<&str> = summary.lines().collect();
+        let head = lines
+            .iter()
+            .position(|line| line.contains(&format!("-> {} (", edge.module.label())))
+            .unwrap_or_else(|| panic!("{name} block: {summary}"));
+        let block = lines[head..]
+            .iter()
+            .enumerate()
+            .take_while(|(index, line)| *index == 0 || line.starts_with("  "))
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let display = crate::inventory_present::entries_display(edge);
+        assert!(
+            block.contains(&format!("entries {display}")),
+            "{name}: {block}"
+        );
+        assert!(
+            block.contains(&format!("activity {}", edge.activity.label())),
+            "{name}: {block}"
+        );
+        assert!(
+            block.contains(&format!("capture {}", edge.capture.label())),
+            "{name}: {block}"
+        );
+        // Quiet only where it is a fact; armed only where covered.
+        if edge.activity.label() == "quiet" {
+            assert!(
+                matches!(edge.coverage.state(), "watched_no_use" | "counted"),
+                "{name}"
+            );
+        }
+        if edge.capture.label() == "armed" {
+            assert_ne!(edge.coverage.state(), "unknown", "{name}");
+        }
+        match edge.coverage.state() {
+            "counted" => {
+                assert_eq!(edge_json["entries"]["count"], 4);
+                assert_eq!(display, "4");
+                assert_eq!(coverage["since_ns"], at);
+                assert_eq!(edge_json["entries"]["observation"], "observed");
+            }
+            "witnessed" => {
+                assert_eq!(display, "?");
+                assert_eq!(coverage["first_ns"], at);
+                assert_eq!(edge.activity.label(), "used (recency unknown)");
+            }
+            "watched_no_use" => {
+                assert_eq!(display, "0");
+                assert_eq!(coverage["since_ns"], at2);
+                assert_eq!(edge_json["entries"]["observation"], "observed");
+            }
+            _ => {
+                assert_eq!(display, "?");
+                assert_ne!(edge_json["entries"]["observation"], "observed");
+                assert!(coverage["since_ns"].is_null() && coverage["first_ns"].is_null());
+            }
+        }
+    }
+    // The sticky demotion keeps m2 unknown although it was re-watched.
+    assert_eq!(edges_json[2]["entries"]["coverage"]["reason"], "loss");
+    assert_eq!(
+        edges_json[2]["entries"]["coverage"]["detail"],
+        "CALLER_EVIDENCE rose"
+    );
 }

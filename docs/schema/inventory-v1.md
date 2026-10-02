@@ -8,7 +8,8 @@ Emitted by `p11scope inventory [--json | -o <out.json>]`.
 Consumers must dispatch on the exact `schema` string
 (`p11scope/inventory/v1`). There is no semver-style compatibility:
 a new schema id means a new contract. Within v1, additive evolution
-only — new optional fields, new enum labels behind explicit gaps —
+only — new optional fields and new enum labels, each documented here
+(a label this document does not list must be read as unknown) —
 never a changed meaning for an existing field.
 
 ## Clock and units
@@ -39,29 +40,112 @@ never a changed meaning for an existing field.
   the path list is an attribute. `admission` carries the scan-only
   verdict (`admitted`, `refused`, `unresolved`) with class, endpoint
   count, and reasons, plus the scan-only note: manifest corroboration
-  was not consulted. `lifecycle` is `mapped`, `unloaded` (a complete
-  rescan proved it gone; sticky in `unloaded_observed` even across a
-  reload), or `unknown` (no live mapping evidence remains).
+  was not consulted. The run's attach set is the only admission
+  source: `admitted` means the attach set holds the module's
+  endpoints for this run. An object the attach set never judged (no
+  comparable pin or digest) never reads `admitted` — the catalog's own
+  admission is not taken over: it reads `unresolved` (or the
+  catalog's `refused`, since nothing attaches either way) with a
+  reason saying the attach set did not judge it. Within that one
+  source the verdict only rises (`unresolved` < `refused` <
+  `admitted`) and never falls back, so a module the attach set admits
+  after a first refusal reads `admitted` — an instrumented module never
+  reads `refused`; a lower later verdict is not applied but is
+  disclosed in `reasons` (deduplicated, at most 8 entries).
+  `admission.history` (additive within v1) lists each rise as
+  `{from, to, at_ns}` in order (`[]` while the first verdict stands, at
+  most two entries), and each rise is also a `module admission changed`
+  gap. The verdict is judged against the Inventory
+  endpoint budget (4096 endpoints), not the 512-slot detailed ceiling
+  `inspect --system` reports, so the two can disagree either way: an
+  object `inspect` refuses can read `admitted` here, and one it admits
+  can read `refused` here. Each pass lowers under that budget with the
+  same shared-scope reserve `inspect` applies (uncorroborated providers
+  — unlinked heuristic tables, proxy closure arrays — take at most 3072
+  of the 4096), and endpoints admitted earlier in the run stay counted
+  for the whole run: an endpoint ID is never reused, so a module can be
+  refused once earlier modules hold the budget. Refusals by the run's
+  attach set — the run-lifetime endpoint or module-record budget, an
+  object that could not be resolved or retained, and a module whose
+  object changed identity since its endpoints were taken — are also
+  recorded in `gaps[]` (`inventory attach set refused module`, or
+  `inventory attach target changed identity`), once per module and
+  refusal kind (bounded: past the bound one `inventory attach set
+  refusal gaps bounded` gap is recorded and later refusals live in
+  their verdicts only); a refusal by one pass's lowering reads `refused` with
+  its reason and no gap.
+  `lifecycle` is `mapped`, `unloaded` (a complete rescan proved it
+  gone; sticky in `unloaded_observed` even across a reload), or
+  `unknown` (no live mapping evidence remains).
   Boundary: the key is file identity, not load-instance authority —
   a same-file double-load (two loader mappings of one file, notably
   a `dlmopen` private-namespace double-load whose objects own
   distinct PKCS#11 session namespaces) merges into one record and
-  one edge per caller, joining the instances' session namespaces
-  with no marking gap. For `dlopen` in one namespace the merge is
-  correct (same file → same loaded object → one session namespace);
-  the `dlmopen` case is S2 scope (instance authority — see
-  `docs/notes/s2-instance-authority.md`).
+  one edge per caller. When the scan evidence shows the double load
+  (duplicate executable file-offset coverage in the caller's
+  process), the edge latches: its semantics read `unknown (same-file
+  double-load)`, its calls establish no claim, and the `same-file
+  double-load detected` gap names it; without that evidence the
+  merge carries no marking. For `dlopen` in one namespace the merge
+  is correct (same file → same loaded object → one session
+  namespace); per-instance separation for `dlmopen` is S2 scope
+  (instance authority — see `docs/notes/s2-instance-authority.md`).
 - `edges[]`: one record per (caller incarnation, module instance)
   pair. `mapping` is scan evidence (state `mapped`, `ended`, or
   `uncertain`, with first/last seen and an interruption count of
   observed mapped→absent→mapped transitions). `entries` is usage
   evidence from observed entries only: cumulative `count` plus
   first/last seen, an in-flight flag, and `observation` —
-  `observed`, `unknown (not admitted)`, or `unknown (usage
-  observation unavailable)`. A zero count with an `unknown`
+  `observed`, `unknown (not admitted)`, `unknown (usage observation
+  unavailable)`, `unknown (count unavailable; use witnessed)`, or
+  `unknown (usage observation lossy)`. A zero count with an `unknown`
   observation is not a fact about usage; a caller with zero observed
   entries is "mapped, quiet", never "active". Recency ("active now")
-  is last-seen plus in-flight state, never a sticky bit.
+  is last-seen plus in-flight state, never a sticky bit; last-seen
+  comes only from counted entries.
+- `edges[].entries.coverage` (additive within v1): what this edge's
+  usage columns can claim, per edge — never a run-wide flag. Always
+  the six keys `{state, since_ns, first_ns, lossy, reason, detail}`
+  (`null` where a key does not apply: `lossy` is a boolean only for
+  `counted`). `state` is:
+  - `counted`: a counting feed (actual call observations) covers the
+    edge since `since_ns`; `count` and `last_seen_ns` are meaningful.
+    `lossy: true` means records were lost: a positive count is a lower
+    bound and a zero reads `unknown (usage observation lossy)`.
+  - `witnessed`: use was witnessed (first at `first_ns`) but nothing
+    counts it — `count` stays 0 for old consumers, `observation` reads
+    `unknown (count unavailable; use witnessed)`, and the dashboard
+    activity reads `used (recency unknown)`, never quiet.
+  - `watched_no_use`: every endpoint of the module is attached for
+    this caller since `since_ns` with clean health, and no use was
+    seen: the zero is a fact (`observation` `observed`). `since_ns`
+    never precedes the last health regression (a watch noted later
+    starts at the regression). The watched interval ends when the edge
+    does — caller retirement or a complete-absence unload
+    (`mapping.state` `ended`, `mapping.last_seen_ns`); the state then
+    reads as the frozen fact for that interval.
+  - `unknown`: nothing can be claimed; `reason` is one of
+    `scan_only` (no native usage producer runs — every edge of a
+    scan-only run), `not_admitted`, `not_attached`, `attach_failed`,
+    `identity_unavailable`, `capacity_limited` (`detail` names the
+    resource), `loss` (`detail` says what was lost), or
+    `retired_before_coverage`.
+  A zero reads `observed` only under `watched_no_use` or a loss-free
+  `counted`. Positive coverage (`counted` entries, `witnessed`) is
+  monotonic history: it survives loss, caller retirement, and module
+  unload. A global health regression (a native identity, pair, or
+  usage evidence counter rising) demotes every `watched_no_use` edge
+  to `unknown`/`loss`, sticky for the run, and is recorded as a
+  `usage coverage health regression` gap. The demotion is
+  conservative: it also demotes edges whose watched interval had
+  already ended (retired callers, unloaded modules) before the
+  regression, because the failure cannot be localized in time per
+  edge. Coverage notes that cannot apply are gaps, once per (caller,
+  module): `usage coverage without mapping evidence` (no such edge)
+  and `coverage for an unadmitted module` (a counting or watch note
+  for a module not `admitted`; its usage stays unknown). `observation.usage_feed` is
+  a derived summary: true iff at least one edge holds non-`unknown`
+  coverage.
 - `edges[].semantics` (S1): the per-edge semantic summary label —
   `observed` iff the edge holds at least one mechanism or operation
   claim, otherwise the reason no claim exists:
@@ -142,12 +226,24 @@ never a changed meaning for an existing field.
   absence; `gaps_suppressed` counts gaps dropped past the bound.
   A gap that records a budget refusal carries `budget` with the
   `resource`, its `limit`, and the `requested` occupancy; every other
-  gap carries `budget: null`.
+  gap carries `budget: null`. Run-lifetime admission refusals name the
+  `inventory_endpoints` or `inventory_attach_modules` resource.
 - `budgets`: every budgeted resource with its own limit, occupancy
   source, and loss counter — `callers`, `modules` (physical module
   instances), `edges` (caller relationships), `endpoints` (the
   retained attach-endpoint census: the sum of admitted per-module
-  endpoint counts), `counters` (per-edge entry counts: the `cap`
+  endpoint counts), `inventory_endpoints` (additive within v1:
+  `{limit, occupied}` — the run's Inventory attach set, whose
+  capture-lifetime endpoint budget the admission verdicts are judged
+  against, and the endpoints it holds; IDs are never reused, so
+  occupancy only grows, and its refusals are the
+  `inventory_endpoints`/`inventory_attach_modules` budget gaps;
+  `refused` counts per-pass module refusals on that budget, so one
+  module refused on every pass counts once per pass),
+  `inventory_attach_modules` (additive within v1: `{limit, occupied,
+  refused}` — the attach set's module records, capped at its endpoint
+  budget, with per-pass refusals on that cap),
+  `counters` (per-edge entry counts: the `cap`
   plus `observed_edges` and `saturated_edges`), `semantic_state`
   (`limit`, `occupied`, `status`, `unknown_edges`, and `refused`;
   `status` is `withheld` while no edge holds semantic state — the
@@ -176,6 +272,8 @@ never a changed meaning for an existing field.
     "modules": {"limit": 4096, "occupied": 1, "refused": 0},
     "edges": {"limit": 32768, "occupied": 1, "refused": 0},
     "endpoints": {"limit": 1048576, "occupied": 68, "refused": 0},
+    "inventory_endpoints": {"limit": 4096, "occupied": 68, "refused": 0},
+    "inventory_attach_modules": {"limit": 4096, "occupied": 1, "refused": 0},
     "counters": {"cap": 18446744073709551615, "observed_edges": 0, "saturated_edges": 0},
     "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1, "refused": 0},
     "retained_history": {"limit": 1024, "retained": 1, "suppressed": 0}
@@ -197,7 +295,8 @@ never a changed meaning for an existing field.
       "identity": {"device": {"major": 8, "minor": 1}, "inode": 23456,
                   "sha256": "abc…", "build_id": null, "source": "mountinfo"},
       "admission": {"state": "admitted", "class": "exact", "endpoints": 68, "reasons": [],
-                   "note": "scan-only admission: manifest corroboration was not consulted"},
+                   "note": "scan-only admission: manifest corroboration was not consulted",
+                   "history": []},
       "lifecycle": "mapped", "unloaded_observed": false
     }
   ],
@@ -207,7 +306,9 @@ never a changed meaning for an existing field.
       "mapping": {"state": "mapped", "reason": null, "first_seen_ns": 110, "last_seen_ns": 190, "interruptions": 0},
       "entries": {"count": 0, "saturated": false, "cap": 18446744073709551615,
                  "first_seen_ns": null, "last_seen_ns": null, "in_flight": false,
-                 "observation": "unknown (usage observation unavailable)"},
+                 "observation": "unknown (usage observation unavailable)",
+                 "coverage": {"state": "unknown", "since_ns": null, "first_ns": null,
+                              "lossy": null, "reason": "scan_only", "detail": null}},
       "semantics": "unknown (semantic capture withheld)",
       "mechanisms": null,
       "operations": null

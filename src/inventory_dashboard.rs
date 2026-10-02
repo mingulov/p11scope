@@ -276,8 +276,9 @@ pub(crate) enum DetailPage {
     /// operations, riding gaps) with adaptive detail budgets.
     #[default]
     Summary,
-    /// Per-edge operation-evidence counters (all nine per observed
-    /// edge; the bare semantic label otherwise).
+    /// Per-edge usage coverage plus the operation-evidence counters
+    /// (all nine per observed edge; the bare semantic label
+    /// otherwise).
     Evidence,
     /// The coverage ledger: every gap with its caller/module
     /// attribution, including gaps that ride no edge block.
@@ -482,12 +483,14 @@ fn render_minimal(frame: &DisplayFrame, width: usize, height: usize) -> Vec<Stri
         ),
         truncate_cell(
             &format!(
-                "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{}",
+                "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{} | attach {}/{}",
                 presentation.gaps.len(),
                 budgets.refusals(),
                 presentation.gaps_suppressed,
                 budgets.endpoints_occupied,
                 budgets.endpoints_limit,
+                budgets.inventory_endpoints_occupied,
+                budgets.inventory_endpoints_limit,
             ),
             width,
         ),
@@ -570,12 +573,14 @@ fn render_full(
         ),
         truncate_cell(
             &format!(
-                "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{} | semantic {} ({} held, {} unknown, {} refused)",
+                "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{} | attach {}/{} | semantic {} ({} held, {} unknown, {} refused)",
                 presentation.gaps.len(),
                 budgets.refusals(),
                 presentation.gaps_suppressed,
                 budgets.endpoints_occupied,
                 budgets.endpoints_limit,
+                budgets.inventory_endpoints_occupied,
+                budgets.inventory_endpoints_limit,
                 crate::inventory_present::semantic_status(budgets),
                 budgets.semantic_occupied,
                 budgets.semantic_unknown_edges,
@@ -1133,7 +1138,13 @@ fn render_edge_block(
         format!("presence {}", edge.presence.label()),
         format!("capture {}", edge.capture.label()),
         format!("activity {}", edge.activity.label()),
-        format!("entries {}", edge.entry_count),
+        // `?` where the count is not a fact; the full coverage label
+        // (state, instant, reason) is on the evidence page, so the
+        // summary block keeps its 80x14 fit.
+        format!(
+            "entries {}",
+            crate::inventory_present::entries_display(edge)
+        ),
         format!("semantics {}", edge.semantics.label),
     ];
     if let Some(operations) = edge.semantics.operations.as_ref() {
@@ -1188,25 +1199,35 @@ fn render_edge_block(
     lines
 }
 
-/// One edge's evidence block: the identity line plus all nine
-/// operation-evidence counters (or the bare semantic label when the
-/// edge holds no operations). Operation aggregates stay on the
-/// summary page, which already shows them at 80x14 — this page
-/// answers the counters alone, so its blocks fit tight rooms.
+/// One edge's evidence block: the identity line, the edge's usage
+/// coverage (state, instant, reason — the summary page shows only the
+/// compact `entries` form), plus all nine operation-evidence counters
+/// (or the bare semantic label when the edge holds no operations).
+/// Operation aggregates stay on the summary page, which already shows
+/// them at 80x14 — this page answers the counters alone, so its blocks
+/// fit tight rooms.
 fn render_evidence_block(
     presentation: &Presentation,
     edge: &crate::inventory_present::EdgeView,
     width: usize,
 ) -> Vec<String> {
     let mut lines = vec![edge_identity_line(presentation, edge, width)];
+    let mut items = vec![coverage_item(edge)];
     match edge.semantics.operations.as_ref() {
-        Some(operations) => lines.extend(wrap_items(width, &evidence_items(operations))),
-        None => lines.extend(wrap_items(
-            width,
-            &[format!("semantics {}", edge.semantics.label)],
-        )),
+        Some(operations) => items.extend(evidence_items(operations)),
+        None => items.push(format!("semantics {}", edge.semantics.label)),
     }
+    lines.extend(wrap_items(width, &items));
     lines
+}
+
+/// The edge's coverage item (`coverage <label>`), control-escaped: a
+/// loss reason may carry producer text.
+pub(crate) fn coverage_item(edge: &crate::inventory_present::EdgeView) -> String {
+    format!(
+        "coverage {}",
+        escape_controls(&crate::inventory_present::coverage_label(&edge.coverage))
+    )
 }
 
 /// One evidence block within `budget` rows, or `None` when even the

@@ -229,6 +229,7 @@ fn e1_multi_caller_multi_module_edges() {
             assert_eq!(found.len(), 1, "expected edge {name} -> {so_name}");
             assert_eq!(found[0]["mapping"]["state"], "mapped");
             assert_eq!(found[0]["entries"]["count"], 0);
+            assert_scan_only_entries(found[0], &format!("{name} -> {so_name}"));
             pairs.insert((name, so_name), (caller_id, module_id));
         }
     }
@@ -540,6 +541,154 @@ fn out_file_matches_stdout_document() {
     assert_eq!(doc["schema"], "p11scope/inventory/v1");
     assert_eq!(doc["observation"]["passes"], 1);
     drop(guard);
+}
+
+// ---------------------------------------------------------------------------
+// M8: inventory admission is judged against the Inventory endpoint budget.
+// ---------------------------------------------------------------------------
+
+/// The NSS-softokn-shaped fixture publishes 8 interface-linked tables of 68
+/// distinct entry targets each (`catalog-nss/provider.c`): 544 endpoints,
+/// past the 512-slot Detailed ceiling `inspect` judges by, inside the
+/// 4096-endpoint Inventory budget the inventory command instruments under.
+/// Its verdict must be the Inventory one.
+#[test]
+fn admission_verdict_uses_the_inventory_budget_not_the_detailed_slot_ceiling() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-admission");
+    let ready = dir.join("nss.ready");
+    let _ = std::fs::remove_file(&ready);
+    let driver = gcc(
+        &dir,
+        "driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let prov = gcc(
+        &dir,
+        "ic-nss.so",
+        &fixture_source("catalog-nss/provider.c"),
+        &[
+            "-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-fPIC", "-shared",
+        ],
+        &[],
+    );
+    let out = dir.join("nss.json");
+    let _ = std::fs::remove_file(&out);
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-pid.sh"))
+        .arg("--json")
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", "plain")
+        .env("INV_PROV", &prov)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &out)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "nss observe failed: {output:?} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let guard = FixtureGuard { pids: vec![pid] };
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+
+    let module = module_for(&doc, "ic-nss.so");
+    assert_eq!(
+        module["admission"]["state"], "admitted",
+        "admission: {}",
+        module["admission"]
+    );
+    assert_eq!(module["admission"]["endpoints"], 8 * 68);
+    assert_eq!(module["admission"]["reasons"], serde_json::json!([]));
+    let callers = caller_for(&doc, u64::from(pid));
+    assert_eq!(callers.len(), 1);
+    let edges = edges_for(
+        &doc,
+        callers[0]["id"].as_str().unwrap(),
+        module["id"].as_str().unwrap(),
+    );
+    assert_eq!(edges.len(), 1);
+    assert_eq!(
+        edges[0]["entries"]["observation"],
+        "unknown (usage observation unavailable)"
+    );
+    assert_eq!(edges[0]["entries"]["count"], 0);
+    assert_scan_only_entries(edges[0], "driver -> ic-nss.so");
+    // The first verdict stood: no admission change history.
+    assert_eq!(module["admission"]["history"], serde_json::json!([]));
+    // The run's attach set holds the module's 544 endpoints of 4096.
+    assert_eq!(
+        doc["budgets"]["inventory_endpoints"],
+        serde_json::json!({"limit": 4096, "occupied": 8 * 68, "refused": 0}),
+        "budgets: {}",
+        doc["budgets"]
+    );
+    assert_eq!(
+        doc["budgets"]["inventory_attach_modules"],
+        serde_json::json!({"limit": 4096, "occupied": 1, "refused": 0}),
+    );
+    assert_eq!(doc["observation"]["usage_feed"], false);
+    drop(guard);
+}
+
+/// The scan lane's entries object: the v1 columns unchanged (count 0,
+/// no recency, not in flight, `unknown (usage observation
+/// unavailable)`) plus the additive Task 6 C2 coverage — unknown, for
+/// the reason `scan_only`, with no instant and no loss flag.
+fn assert_scan_only_entries(edge: &Value, name: &str) {
+    let entries = &edge["entries"];
+    let mut keys: Vec<&str> = entries
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "cap",
+            "count",
+            "coverage",
+            "first_seen_ns",
+            "in_flight",
+            "last_seen_ns",
+            "observation",
+            "saturated"
+        ],
+        "{name}"
+    );
+    assert_eq!(entries["count"], 0, "{name}");
+    assert!(entries["first_seen_ns"].is_null(), "{name}");
+    assert!(entries["last_seen_ns"].is_null(), "{name}");
+    assert_eq!(entries["in_flight"], false, "{name}");
+    assert_eq!(
+        entries["observation"], "unknown (usage observation unavailable)",
+        "{name}"
+    );
+    assert_eq!(
+        entries["coverage"],
+        serde_json::json!({
+            "state": "unknown",
+            "since_ns": null,
+            "first_ns": null,
+            "lossy": null,
+            "reason": "scan_only",
+            "detail": null,
+        }),
+        "{name}"
+    );
 }
 
 // ---------------------------------------------------------------------------

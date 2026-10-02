@@ -23,6 +23,7 @@ use crate::semantics_edge::{EdgeSemantics, SemanticCall};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
+use std::sync::Arc;
 
 /// Capture-clock basis for every `*_ns` timestamp in the registry.
 pub(crate) const CLOCK_BASIS: &str = "CLOCK_MONOTONIC";
@@ -681,11 +682,18 @@ impl MappingState {
 
 /// What the edge's entry columns mean. Counts are cumulative observed
 /// entries only; anything else reads as unknown, never zero-as-fact.
+/// Derived from the edge's [`UseCoverage`]: a zero reads `observed`
+/// only under `WatchedNoUse` or a loss-free `Counted` feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EntryObservation {
     Observed,
     UnknownNotAdmitted,
     UnknownUnavailable,
+    /// Use was witnessed, but no feed counts this edge's entries.
+    UnknownCountUnavailable,
+    /// A counting feed covers the edge, but it lost records: a zero is
+    /// not a fact.
+    UnknownLossy,
 }
 
 impl EntryObservation {
@@ -694,8 +702,164 @@ impl EntryObservation {
             Self::Observed => "observed",
             Self::UnknownNotAdmitted => "unknown (not admitted)",
             Self::UnknownUnavailable => "unknown (usage observation unavailable)",
+            Self::UnknownCountUnavailable => "unknown (count unavailable; use witnessed)",
+            Self::UnknownLossy => "unknown (usage observation lossy)",
         }
     }
+}
+
+/// Why one edge's usage is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnknownReason {
+    /// No native usage producer runs: the scan lane alone.
+    ScanOnly,
+    /// The module's admission verdict is not `admitted`.
+    NotAdmitted,
+    /// A producer runs, but this edge's module endpoints are not attached
+    /// for this caller.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C3/C5 producers stage it.
+    NotAttached,
+    /// Attaching one of the module's endpoints failed.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C3 facade stages it.
+    AttachFailed,
+    /// The caller's identity cannot be bound to native evidence.
+    #[allow(dead_code)] // Task 6 C4 binder stages it.
+    IdentityUnavailable,
+    /// A capture capacity (named resource) ran out.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C3/C4 stage it.
+    CapacityLimited(&'static str),
+    /// Evidence was lost (a global health regression demoted the edge).
+    /// Shared: one regression's text is not cloned per edge.
+    Loss(Arc<str>),
+    /// The caller retired before any coverage reached the edge.
+    RetiredBeforeCoverage,
+}
+
+impl UnknownReason {
+    /// Stable machine code (`entries.coverage.reason`).
+    pub(crate) const fn code(&self) -> &'static str {
+        match self {
+            Self::ScanOnly => "scan_only",
+            Self::NotAdmitted => "not_admitted",
+            Self::NotAttached => "not_attached",
+            Self::AttachFailed => "attach_failed",
+            Self::IdentityUnavailable => "identity_unavailable",
+            Self::CapacityLimited(_) => "capacity_limited",
+            Self::Loss(_) => "loss",
+            Self::RetiredBeforeCoverage => "retired_before_coverage",
+        }
+    }
+
+    /// The reason's detail (`entries.coverage.detail`): the exhausted
+    /// resource, or what was lost.
+    pub(crate) fn detail(&self) -> Option<&str> {
+        match self {
+            Self::CapacityLimited(resource) => Some(resource),
+            Self::Loss(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// Human wording for snapshots and the dashboard.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::ScanOnly => "scan only".into(),
+            Self::NotAdmitted => "not admitted".into(),
+            Self::NotAttached => "not attached".into(),
+            Self::AttachFailed => "attach failed".into(),
+            Self::IdentityUnavailable => "caller identity unavailable".into(),
+            Self::CapacityLimited(resource) => format!("capacity limited: {resource}"),
+            Self::Loss(reason) => format!("loss: {reason}"),
+            Self::RetiredBeforeCoverage => "retired before coverage".into(),
+        }
+    }
+}
+
+/// Per-edge usage coverage: what the edge's usage columns can claim.
+/// Published at `publish` from staged producer notes; never inferred from
+/// a global flag.
+///
+/// - `Counted`: a counting feed (actual call observations) covers the
+///   edge since `since_ns`; the count and recency are meaningful, and
+///   `lossy` says records were lost (a zero is then not a fact).
+/// - `Witnessed`: positive use was witnessed (first at `first_ns`); count
+///   and recency are unavailable. Never rendered idle.
+/// - `WatchedNoUse`: every endpoint of the module is attached for this
+///   caller since `since_ns` with clean health, and no use was seen — the
+///   zero is a fact.
+/// - `Unknown`: nothing can be claimed, with the reason.
+///
+/// Positives (`Counted` entries, `Witnessed`) are monotonic history:
+/// they survive loss, retirement, and unload. A global health regression
+/// demotes every `WatchedNoUse` edge to `Unknown`, sticky.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UseCoverage {
+    Counted { since_ns: u64, lossy: bool },
+    Witnessed { first_ns: u64 },
+    WatchedNoUse { since_ns: u64 },
+    Unknown(UnknownReason),
+}
+
+impl UseCoverage {
+    /// Stable state label (`entries.coverage.state`).
+    pub(crate) const fn state(&self) -> &'static str {
+        match self {
+            Self::Counted { .. } => "counted",
+            Self::Witnessed { .. } => "witnessed",
+            Self::WatchedNoUse { .. } => "watched_no_use",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    pub(crate) const fn is_witnessed(&self) -> bool {
+        matches!(self, Self::Witnessed { .. })
+    }
+}
+
+/// One coverage note a producer stages for an edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Task 6 C3/C5/C6 producers construct it.
+pub(crate) enum CoverageNote {
+    /// A counting feed covers the edge from `since_ns`.
+    Counted { since_ns: u64 },
+    /// Every endpoint of the module is attached for this caller from
+    /// `since_ns`, with clean health.
+    Watched { since_ns: u64 },
+    /// The edge's usage is unknown for this reason (an attach failure, a
+    /// capacity refusal, …). Never overrides positive history.
+    Unknown(UnknownReason),
+}
+
+/// The watch half of an edge's coverage (negative evidence).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Watch {
+    #[default]
+    Unset,
+    Watching {
+        since_ns: u64,
+    },
+    Unknown(UnknownReason),
+}
+
+/// Staged coverage evidence for one edge: positive history plus the
+/// current watch. The published [`UseCoverage`] derives from it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EdgeCoverage {
+    counted_since_ns: Option<u64>,
+    lossy: bool,
+    witnessed_first_ns: Option<u64>,
+    watch: Watch,
+    /// Sticky: a global health regression demoted this edge's watch; it
+    /// never reads `WatchedNoUse` again.
+    demoted: bool,
+}
+
+/// One admission-state change of a retained module (`from` → `to`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmissionChange {
+    pub from: AdmissionState,
+    pub to: AdmissionState,
+    pub at_ns: u64,
 }
 
 /// One caller/module edge: mapping evidence plus cumulative usage.
@@ -727,6 +891,10 @@ pub(crate) struct EdgeRecord {
     /// cannot attribute to one instance); the latch follows the
     /// latest note, so a resolved double-load unlatches.
     pub double_loaded: bool,
+    /// Staged usage-coverage evidence (Task 6 C2); the published
+    /// [`UseCoverage`] derives from it through
+    /// [`CallerRegistry::coverage`].
+    pub coverage: EdgeCoverage,
 }
 
 /// One module instance: static facts plus lifecycle.
@@ -741,6 +909,10 @@ pub(crate) struct ModuleRecord {
     pub admission_class: Option<String>,
     pub admission_endpoints: Option<usize>,
     pub admission_reasons: Vec<String>,
+    /// Admission-state changes after the first verdict, in order. The
+    /// state only rises (`unresolved` < `refused` < `admitted`), so this
+    /// holds at most two entries.
+    pub admission_history: Vec<AdmissionChange>,
     pub lifecycle: ModuleLifecycle,
     /// True once a complete rescan proved the module gone, even if it
     /// later reloaded: unload evidence is retained.
@@ -777,6 +949,13 @@ pub(crate) const MAX_EDGE_ENTRY_COUNT: u64 = u64::MAX;
 /// What every edge's semantic column reads while capture stays
 /// withheld (S-track): unknown, never an invented state.
 pub(crate) const SEMANTIC_UNKNOWN: &str = "unknown (semantic capture withheld)";
+
+const COVERAGE_WITHOUT_MAPPING: &str = "usage coverage without mapping evidence";
+const COVERAGE_UNADMITTED: &str = "coverage for an unadmitted module";
+
+/// Bound on one module's admission reasons: ignored lower verdicts append
+/// here (deduplicated) until the bound, never growing per pass.
+pub(crate) const MAX_ADMISSION_REASONS: usize = 8;
 
 /// Default retained-table bounds. Exhaustion drops the association and
 /// records a gap — never an eviction that rewrites published history.
@@ -892,6 +1071,20 @@ enum Mutation {
     NoteSemanticLoss {
         reason: String,
     },
+    NoteWitness {
+        caller: CallerId,
+        module: ModuleKey,
+        first_ns: u64,
+    },
+    NoteCoverage {
+        caller: CallerId,
+        module: ModuleKey,
+        note: CoverageNote,
+    },
+    NoteHealthRegression {
+        reason: Arc<str>,
+        at_ns: u64,
+    },
     RetireCaller {
         caller: CallerId,
         reason: String,
@@ -926,7 +1119,16 @@ pub(crate) struct CallerRegistry {
     gaps: Vec<RegistryGap>,
     gaps_suppressed: u64,
     staged: Vec<Mutation>,
-    usage_feed: bool,
+    /// Why an edge no producer covered reads unknown: `ScanOnly` until a
+    /// native usage producer runs (Task 6 C5 sets `NotAttached`).
+    uncovered_reason: UnknownReason,
+    /// Instant of the last staged global health regression: no watch
+    /// starts before it.
+    last_health_regression_ns: Option<u64>,
+    /// Coverage-note gaps already recorded, once per (caller, module,
+    /// subject); bounded by the gap retention bound (past it the gap
+    /// list is full and further gaps only count as suppressed).
+    coverage_gap_memo: BTreeSet<(CallerId, ModuleKey, &'static str)>,
     facts_revision: u64,
     published_revision: u64,
     endpoints_total: usize,
@@ -955,7 +1157,9 @@ impl CallerRegistry {
             gaps: Vec::new(),
             gaps_suppressed: 0,
             staged: Vec::new(),
-            usage_feed: false,
+            uncovered_reason: UnknownReason::ScanOnly,
+            last_health_regression_ns: None,
+            coverage_gap_memo: BTreeSet::new(),
             facts_revision: 1,
             published_revision: 0,
             endpoints_total: 0,
@@ -968,15 +1172,21 @@ impl CallerRegistry {
         }
     }
 
-    /// Whether an entry-observation feed (BPF usage events or a scripted
-    /// harness) is attached. Without one, admitted edges report their
-    /// entry columns as unknown — never zero-as-fact.
-    pub(crate) fn set_usage_feed(&mut self, attached: bool) {
-        self.usage_feed = attached;
+    /// Why edges no producer covered read unknown. The scan lane leaves
+    /// `ScanOnly`; the native lane (Task 6 C5) sets `NotAttached`. This
+    /// only names the reason — it never makes a zero read observed.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 native lane.
+    pub(crate) fn set_uncovered_reason(&mut self, reason: UnknownReason) {
+        self.uncovered_reason = reason;
     }
 
+    /// Derived summary only: true when at least one edge holds usage
+    /// coverage (counted, witnessed, or watched). Never an input to any
+    /// edge's coverage.
     pub(crate) fn usage_feed(&self) -> bool {
-        self.usage_feed
+        self.edges
+            .values()
+            .any(|edge| !matches!(self.coverage(edge), UseCoverage::Unknown(_)))
     }
 
     pub(crate) fn facts_revision(&self) -> u64 {
@@ -1066,15 +1276,18 @@ impl CallerRegistry {
         self.semantic_occupied
     }
 
-    /// Edges lacking semantic claims: withheld edges plus tracked
-    /// edges whose feed established no mechanism/operation claim.
+    /// Edges whose semantic label reads unknown: withheld edges, tracked
+    /// edges whose feed established no mechanism/operation claim, and
+    /// latched same-file double-load edges (retained claims, unknown
+    /// label). One predicate with the label, so census and label agree
+    /// (DR-09).
     pub(crate) fn semantic_unknown_edges(&self) -> usize {
         self.edges
             .values()
             .filter(|edge| {
                 edge.semantics
                     .as_ref()
-                    .is_none_or(|state| !state.has_claims())
+                    .is_none_or(|state| state.label() != crate::semantics_edge::SEMANTIC_OBSERVED)
             })
             .count()
     }
@@ -1101,22 +1314,63 @@ impl CallerRegistry {
         (observed, saturated)
     }
 
-    /// What the edge's entry columns mean, from admission plus feed
-    /// state. A positive count always reads as observed.
-    pub(crate) fn entry_observation(&self, edge: &EdgeRecord) -> EntryObservation {
+    /// The edge's published usage coverage. Precedence: counted entries,
+    /// then witnessed use, then a counting feed with no entries yet, then
+    /// the watch (admitted modules only), then the uncovered reason.
+    /// Positives come first, so loss or retirement never erases them.
+    pub(crate) fn coverage(&self, edge: &EdgeRecord) -> UseCoverage {
+        let coverage = &edge.coverage;
         if edge.entry_count > 0 {
-            return EntryObservation::Observed;
+            return UseCoverage::Counted {
+                since_ns: coverage
+                    .counted_since_ns
+                    .or(edge.entry_first_seen_ns)
+                    .unwrap_or(0),
+                lossy: coverage.lossy,
+            };
+        }
+        if let Some(first_ns) = coverage.witnessed_first_ns {
+            return UseCoverage::Witnessed { first_ns };
+        }
+        if let Some(since_ns) = coverage.counted_since_ns {
+            return UseCoverage::Counted {
+                since_ns,
+                lossy: coverage.lossy,
+            };
         }
         let admitted = self
             .modules
             .get(&edge.module)
             .is_some_and(|module| module.admission == AdmissionState::Admitted);
         if !admitted {
-            EntryObservation::UnknownNotAdmitted
-        } else if self.usage_feed {
-            EntryObservation::Observed
-        } else {
-            EntryObservation::UnknownUnavailable
+            return UseCoverage::Unknown(UnknownReason::NotAdmitted);
+        }
+        match &coverage.watch {
+            Watch::Watching { since_ns } => UseCoverage::WatchedNoUse {
+                since_ns: *since_ns,
+            },
+            Watch::Unknown(reason) => UseCoverage::Unknown(reason.clone()),
+            Watch::Unset => UseCoverage::Unknown(self.uncovered_reason.clone()),
+        }
+    }
+
+    /// What the edge's entry columns mean, from its coverage. A positive
+    /// count always reads as observed; a zero reads observed only under
+    /// `WatchedNoUse` or a loss-free `Counted` feed.
+    pub(crate) fn entry_observation(&self, edge: &EdgeRecord) -> EntryObservation {
+        if edge.entry_count > 0 {
+            return EntryObservation::Observed;
+        }
+        match self.coverage(edge) {
+            UseCoverage::Counted { lossy: false, .. } | UseCoverage::WatchedNoUse { .. } => {
+                EntryObservation::Observed
+            }
+            UseCoverage::Counted { lossy: true, .. } => EntryObservation::UnknownLossy,
+            UseCoverage::Witnessed { .. } => EntryObservation::UnknownCountUnavailable,
+            UseCoverage::Unknown(UnknownReason::NotAdmitted) => {
+                EntryObservation::UnknownNotAdmitted
+            }
+            UseCoverage::Unknown(_) => EntryObservation::UnknownUnavailable,
         }
     }
 
@@ -1218,6 +1472,47 @@ impl CallerRegistry {
             caller,
             module: module.clone(),
             call,
+        });
+    }
+
+    /// Stage one witnessed use of an edge (a native `CALLER_USE` row bound
+    /// to this caller): positive, monotonic history with no count or
+    /// recency. Accepted for retired callers — a row read after exit is
+    /// still use — but never invents an edge.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C4 binder.
+    pub(crate) fn note_witness(&mut self, caller: CallerId, module: &ModuleKey, first_ns: u64) {
+        self.staged.push(Mutation::NoteWitness {
+            caller,
+            module: module.clone(),
+            first_ns,
+        });
+    }
+
+    /// Stage one coverage note for an edge from its producer (the capture
+    /// facade's attach receipts, the Detailed subset's counting feed).
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C3/C5/C6 producers.
+    pub(crate) fn note_coverage(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        note: CoverageNote,
+    ) {
+        self.staged.push(Mutation::NoteCoverage {
+            caller,
+            module: module.clone(),
+            note,
+        });
+    }
+
+    /// Stage one global health regression (a native identity, pair, or
+    /// usage evidence counter rose). The failure cannot be localized, so
+    /// every `WatchedNoUse` edge demotes to `Unknown`, sticky; positives
+    /// stand. The regression itself is a gap.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 health reads.
+    pub(crate) fn note_health_regression(&mut self, reason: impl Into<Arc<str>>, at_ns: u64) {
+        self.staged.push(Mutation::NoteHealthRegression {
+            reason: reason.into(),
+            at_ns,
         });
     }
 
@@ -1327,6 +1622,11 @@ impl CallerRegistry {
                     if let Some(state) = edge.semantics.as_mut() {
                         state.invalidate();
                     }
+                    // Lost call records make every counted column a
+                    // lower bound: a counted zero is no longer a fact.
+                    if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
+                        edge.coverage.lossy = true;
+                    }
                 }
                 self.push_gap(RegistryGap {
                     caller: None,
@@ -1334,6 +1634,49 @@ impl CallerRegistry {
                     pid: None,
                     subject: "semantic capture loss".into(),
                     reason,
+                    budget: None,
+                });
+            }
+            Mutation::NoteWitness {
+                caller,
+                module,
+                first_ns,
+            } => {
+                if let Some(edge) = self.coverage_edge(caller, &module) {
+                    let first = edge
+                        .coverage
+                        .witnessed_first_ns
+                        .map_or(first_ns, |was| was.min(first_ns));
+                    edge.coverage.witnessed_first_ns = Some(first);
+                }
+            }
+            Mutation::NoteCoverage {
+                caller,
+                module,
+                note,
+            } => self.apply_coverage(caller, &module, note),
+            Mutation::NoteHealthRegression { reason, at_ns } => {
+                self.last_health_regression_ns = Some(
+                    self.last_health_regression_ns
+                        .map_or(at_ns, |last| last.max(at_ns)),
+                );
+                let mut demoted = 0usize;
+                for edge in self.edges.values_mut() {
+                    if matches!(edge.coverage.watch, Watch::Watching { .. }) {
+                        edge.coverage.watch = Watch::Unknown(UnknownReason::Loss(reason.clone()));
+                        edge.coverage.demoted = true;
+                        demoted += 1;
+                    }
+                }
+                self.push_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "usage coverage health regression".into(),
+                    reason: format!(
+                        "{reason}; the failure cannot be localized, so {demoted} watched no-use {} demoted to unknown for the rest of the capture",
+                        if demoted == 1 { "edge was" } else { "edges were" }
+                    ),
                     budget: None,
                 });
             }
@@ -1430,8 +1773,11 @@ impl CallerRegistry {
             Some(id) => {
                 let record = self.modules.get_mut(&id).expect("indexed module");
                 record.paths.insert(info.path.clone());
-                // Admission is deterministic scan-only lowering: the first
-                // verdict stands so records never flap between passes.
+                // Admission follows the attach set's authoritative verdict
+                // (I2): a module the run's attach set admits after a first
+                // refusal reads admitted, with the change kept as history
+                // and a gap — an instrumented module never reads refused.
+                self.follow_admission(id, caller, pid, &info, at_ns);
                 id
             }
             None => {
@@ -1499,6 +1845,7 @@ impl CallerRegistry {
                         admission_class: info.admission_class.clone(),
                         admission_endpoints: info.admission_endpoints,
                         admission_reasons: info.admission_reasons.clone(),
+                        admission_history: Vec::new(),
                         lifecycle: ModuleLifecycle::Mapped,
                         unloaded_observed: false,
                     },
@@ -1553,6 +1900,7 @@ impl CallerRegistry {
                         entry_in_flight: false,
                         semantics: None,
                         double_loaded: false,
+                        coverage: EdgeCoverage::default(),
                     },
                 );
             }
@@ -1608,6 +1956,212 @@ impl CallerRegistry {
             budget: None,
         };
         self.push_gap(gap);
+    }
+
+    /// The edge a coverage note names, or `None` with a gap: coverage
+    /// notes never invent edges. Retired callers stay addressable —
+    /// positive history survives retirement.
+    fn coverage_edge(&mut self, caller: CallerId, module: &ModuleKey) -> Option<&mut EdgeRecord> {
+        let id = self.modules_by_key.get(module).copied();
+        if let Some(id) = id
+            && self.edges.contains_key(&(caller, id))
+        {
+            return self.edges.get_mut(&(caller, id));
+        }
+        self.push_coverage_gap(
+            caller,
+            module,
+            id,
+            COVERAGE_WITHOUT_MAPPING,
+            "usage coverage never invents mappings; the note was dropped".into(),
+        );
+        None
+    }
+
+    /// One coverage-note gap, recorded once per (caller, module, subject)
+    /// so a producer repeating a bad note every pass cannot flood the gap
+    /// retention bound.
+    fn push_coverage_gap(
+        &mut self,
+        caller: CallerId,
+        key: &ModuleKey,
+        module: Option<ModuleId>,
+        subject: &'static str,
+        reason: String,
+    ) {
+        let memo = (caller, key.clone(), subject);
+        if self.coverage_gap_memo.contains(&memo) {
+            return;
+        }
+        if self.coverage_gap_memo.len() < self.limits.max_gaps {
+            self.coverage_gap_memo.insert(memo);
+        }
+        self.push_gap(RegistryGap {
+            caller: Some(caller),
+            module,
+            pid: None,
+            subject: subject.into(),
+            reason,
+            budget: None,
+        });
+    }
+
+    fn apply_coverage(&mut self, caller: CallerId, module: &ModuleKey, note: CoverageNote) {
+        let retired = self.retired.contains_key(&caller);
+        let admitted = self
+            .modules_by_key
+            .get(module)
+            .and_then(|id| self.modules.get(id))
+            .is_some_and(|record| record.admission == AdmissionState::Admitted);
+        let module_id = self.modules_by_key.get(module).copied();
+        let regression = self.last_health_regression_ns;
+        let positive = matches!(
+            note,
+            CoverageNote::Counted { .. } | CoverageNote::Watched { .. }
+        );
+        if positive && !admitted && module_id.is_some() {
+            // Counting and watching both mean "instrumented": a module
+            // whose admission is not admitted has neither, so the note is
+            // a producer error and its zero stays unknown.
+            if self.coverage_edge(caller, module).is_some() {
+                self.push_coverage_gap(
+                    caller,
+                    module,
+                    module_id,
+                    COVERAGE_UNADMITTED,
+                    "a coverage note named a module whose admission is not admitted; its usage stays unknown"
+                        .into(),
+                );
+            }
+            return;
+        }
+        let Some(edge) = self.coverage_edge(caller, module) else {
+            return;
+        };
+        let coverage = &mut edge.coverage;
+        match note {
+            CoverageNote::Counted { .. } | CoverageNote::Watched { .. } if retired => {
+                // The caller retired before this note: it covers nothing
+                // that is still observable. An edge with no coverage at
+                // all says so; existing coverage stays as it was.
+                if coverage.counted_since_ns.is_none() && coverage.watch == Watch::Unset {
+                    coverage.watch = Watch::Unknown(UnknownReason::RetiredBeforeCoverage);
+                }
+            }
+            CoverageNote::Counted { since_ns } => {
+                // Positive history: the first counting start stands.
+                coverage.counted_since_ns = Some(
+                    coverage
+                        .counted_since_ns
+                        .map_or(since_ns, |was| was.min(since_ns)),
+                );
+            }
+            CoverageNote::Watched { since_ns } => {
+                if coverage.demoted || matches!(coverage.watch, Watch::Watching { .. }) {
+                    // Sticky health demotion: never "no use" again. An
+                    // ongoing watch keeps its earliest start.
+                } else {
+                    // A watch never starts before the last regression:
+                    // only the clean interval after it is watched.
+                    let since_ns = regression.map_or(since_ns, |at| since_ns.max(at));
+                    coverage.watch = Watch::Watching { since_ns };
+                }
+            }
+            CoverageNote::Unknown(reason) => {
+                if !coverage.demoted {
+                    coverage.watch = Watch::Unknown(reason);
+                }
+            }
+        }
+    }
+
+    /// I2: a retained module's admission follows later verdicts, rising
+    /// only (`unresolved` < `refused` < `admitted`). A rise replaces the
+    /// verdict, charges the endpoint census, keeps the change in
+    /// `admission_history`, and records a gap; the same state refreshes
+    /// the class, endpoint count, and reasons (the attach set's latest
+    /// disclosure); a lower state never demotes it, so records never
+    /// flap and an instrumented module never reads refused.
+    fn follow_admission(
+        &mut self,
+        id: ModuleId,
+        caller: CallerId,
+        pid: u32,
+        info: &ModuleInfo,
+        at_ns: u64,
+    ) {
+        const fn rank(state: AdmissionState) -> u8 {
+            match state {
+                AdmissionState::Unresolved => 0,
+                AdmissionState::Refused => 1,
+                AdmissionState::Admitted => 2,
+            }
+        }
+        let record = self.modules.get_mut(&id).expect("indexed module");
+        let from = record.admission;
+        if rank(info.admission) < rank(from) {
+            // Never demoted, but never silent: the ignored verdict is
+            // disclosed in the reasons (deduplicated, bounded).
+            let detail = if info.admission_reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", info.admission_reasons.join("; "))
+            };
+            let note = format!(
+                "a later verdict read {}{detail} and was not applied: the {} verdict stands",
+                info.admission.label(),
+                from.label(),
+            );
+            if record.admission_reasons.len() < MAX_ADMISSION_REASONS
+                && !record.admission_reasons.contains(&note)
+            {
+                record.admission_reasons.push(note);
+            }
+            return;
+        }
+        let cost = |state: AdmissionState, endpoints: Option<usize>| match state {
+            AdmissionState::Admitted => endpoints.unwrap_or(0),
+            AdmissionState::Refused | AdmissionState::Unresolved => 0,
+        };
+        let old_cost = cost(from, record.admission_endpoints);
+        let new_cost = cost(info.admission, info.admission_endpoints);
+        record.admission = info.admission;
+        record.admission_class = info.admission_class.clone();
+        record.admission_endpoints = info.admission_endpoints;
+        record.admission_reasons = info.admission_reasons.clone();
+        // The record is retained already: the census follows the verdict
+        // and never refuses it (the attach set is the authority).
+        self.endpoints_total = self
+            .endpoints_total
+            .saturating_sub(old_cost)
+            .saturating_add(new_cost);
+        if info.admission == from {
+            return;
+        }
+        record.admission_history.push(AdmissionChange {
+            from,
+            to: info.admission,
+            at_ns,
+        });
+        let reasons = if info.admission_reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", info.admission_reasons.join("; "))
+        };
+        let reason = format!(
+            "{}: admission changed from {} to {}{reasons}",
+            info.path,
+            from.label(),
+            info.admission.label(),
+        );
+        self.push_gap(RegistryGap {
+            caller: Some(caller),
+            module: Some(id),
+            pid: Some(pid),
+            subject: "module admission changed".into(),
+            reason,
+            budget: None,
+        });
     }
 
     fn apply_entries(
@@ -2213,7 +2767,6 @@ mod tests {
     #[test]
     fn entry_counts_saturate_with_an_explicit_flag_and_keep_recency() {
         let mut registry = registry();
-        registry.set_usage_feed(true);
         let info = module_info("/lib/a.so", 11, AdmissionState::Admitted);
         let key = info.key.clone();
         registry.note_mapping(CallerId(0), 50, info, 100);
@@ -2273,7 +2826,6 @@ mod tests {
             }
         }
         let mut registry = registry();
-        registry.set_usage_feed(true);
         let mut info = module_info("/lib/nss.so", 12, AdmissionState::Admitted);
         let key = info.key.clone();
         info.double_loaded = true;
@@ -2323,7 +2875,6 @@ mod tests {
     #[test]
     fn refused_modules_report_unknown_not_admitted_with_zero_invented_calls() {
         let mut registry = registry();
-        registry.set_usage_feed(true);
         let info = ModuleInfo {
             admission: AdmissionState::Refused,
             admission_class: Some("closure-array".into()),
@@ -2349,7 +2900,6 @@ mod tests {
     #[test]
     fn retirement_freezes_counts_and_ends_edges_with_evidence_retained() {
         let mut registry = registry();
-        registry.set_usage_feed(true);
         let info = module_info("/lib/a.so", 11, AdmissionState::Admitted);
         let key = info.key.clone();
         registry.note_mapping(CallerId(0), 50, info, 100);
@@ -2373,7 +2923,6 @@ mod tests {
     #[test]
     fn entries_without_mappings_are_dropped_with_a_gap() {
         let mut registry = registry();
-        registry.set_usage_feed(true);
         let key = ModuleKey::physical(8, 1, 77, Some("sha0077".into()), "/lib/ghost.so");
         registry.observe_entries(CallerId(0), &key, 3, 100);
         registry.publish();
@@ -2504,7 +3053,6 @@ mod tests {
     #[test]
     fn in_flight_entries_read_as_active_now() {
         let mut registry = registry();
-        registry.set_usage_feed(true);
         let info = module_info("/lib/a.so", 11, AdmissionState::Admitted);
         let key = info.key.clone();
         registry.note_mapping(CallerId(0), 50, info, 100);
@@ -2514,5 +3062,681 @@ mod tests {
         let edge = registry.edge(CallerId(0), id).unwrap();
         assert!(edge.entry_in_flight);
         assert!(registry.entry_active_within(edge, 1_000_000, 10));
+    }
+
+    /// Map `caller` onto each `(path, ino, admission)` module and publish;
+    /// returns the module keys in order.
+    fn mapped(
+        registry: &mut CallerRegistry,
+        caller: CallerId,
+        modules: &[(&str, u64, AdmissionState)],
+    ) -> Vec<ModuleKey> {
+        let mut keys = Vec::new();
+        for (path, ino, admission) in modules {
+            let info = module_info(path, *ino, *admission);
+            keys.push(info.key.clone());
+            registry.note_mapping(caller, 50 + caller.0, info, 100);
+        }
+        registry.publish();
+        keys
+    }
+
+    fn edge_of<'a>(
+        registry: &'a CallerRegistry,
+        caller: CallerId,
+        key: &ModuleKey,
+    ) -> &'a EdgeRecord {
+        let id = registry.module_id_for(key).expect("module retained");
+        registry.edge(caller, id).expect("edge retained")
+    }
+
+    #[test]
+    fn scan_only_edges_read_unknown_scan_only_never_observed() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Refused),
+            ],
+        );
+        let a = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(
+            registry.coverage(a),
+            UseCoverage::Unknown(UnknownReason::ScanOnly)
+        );
+        assert_eq!(
+            registry.entry_observation(a),
+            EntryObservation::UnknownUnavailable
+        );
+        let b = edge_of(&registry, CallerId(0), &keys[1]);
+        assert_eq!(
+            registry.coverage(b),
+            UseCoverage::Unknown(UnknownReason::NotAdmitted)
+        );
+        assert!(!registry.usage_feed(), "the summary derives from edges");
+    }
+
+    #[test]
+    fn partial_attach_reads_no_use_since_for_the_attached_module_only() {
+        // The preflight's partial-coverage defect: one global flag made
+        // every admitted zero read observed. Per edge, only the module
+        // whose endpoints are all attached reads "no use since".
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Refused),
+                ("/lib/c.so", 13, AdmissionState::Admitted),
+            ],
+        );
+        registry.set_uncovered_reason(UnknownReason::NotAttached);
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 150 },
+        );
+        // A watch note for a refused module is a producer error: it never
+        // makes the refused module's zero a fact.
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Watched { since_ns: 150 },
+        );
+        registry.publish();
+        let a = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(a.entry_count, 0);
+        assert_eq!(
+            registry.coverage(a),
+            UseCoverage::WatchedNoUse { since_ns: 150 }
+        );
+        assert_eq!(registry.entry_observation(a), EntryObservation::Observed);
+        let b = edge_of(&registry, CallerId(0), &keys[1]);
+        assert_eq!(b.entry_count, 0);
+        assert_eq!(
+            registry.coverage(b),
+            UseCoverage::Unknown(UnknownReason::NotAdmitted)
+        );
+        assert_eq!(
+            registry.entry_observation(b),
+            EntryObservation::UnknownNotAdmitted
+        );
+        let c = edge_of(&registry, CallerId(0), &keys[2]);
+        assert_eq!(
+            registry.coverage(c),
+            UseCoverage::Unknown(UnknownReason::NotAttached)
+        );
+        assert_eq!(
+            registry.entry_observation(c),
+            EntryObservation::UnknownUnavailable
+        );
+        assert!(registry.usage_feed());
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "coverage for an unadmitted module"),
+            "{:?}",
+            registry.gaps()
+        );
+    }
+
+    #[test]
+    fn a_health_regression_demotes_every_watched_edge_sticky_and_keeps_positives() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+                ("/lib/c.so", 13, AdmissionState::Admitted),
+                ("/lib/d.so", 14, AdmissionState::Admitted),
+            ],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 120 },
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Watched { since_ns: 130 },
+        );
+        registry.note_witness(CallerId(0), &keys[2], 140);
+        registry.note_coverage(
+            CallerId(0),
+            &keys[3],
+            CoverageNote::Counted { since_ns: 110 },
+        );
+        registry.observe_entries(CallerId(0), &keys[3], 3, 145);
+        registry.publish();
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[1])),
+            UseCoverage::WatchedNoUse { since_ns: 130 }
+        );
+        registry.note_health_regression("COOKIE_CTL.create_failures rose from 0 to 2", 200);
+        registry.publish();
+        for key in &keys[..2] {
+            let edge = edge_of(&registry, CallerId(0), key);
+            assert_eq!(
+                registry.coverage(edge),
+                UseCoverage::Unknown(UnknownReason::Loss(
+                    "COOKIE_CTL.create_failures rose from 0 to 2".into()
+                ))
+            );
+            assert_eq!(
+                registry.entry_observation(edge),
+                EntryObservation::UnknownUnavailable
+            );
+        }
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[2])),
+            UseCoverage::Witnessed { first_ns: 140 }
+        );
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[3])),
+            UseCoverage::Counted {
+                since_ns: 110,
+                lossy: false
+            }
+        );
+        let regressions = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "usage coverage health regression")
+            .count();
+        assert_eq!(regressions, 1, "{:?}", registry.gaps());
+        // Sticky: a later watch note never restores "no use since".
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 500 },
+        );
+        registry.publish();
+        assert!(matches!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::Unknown(UnknownReason::Loss(_))
+        ));
+    }
+
+    #[test]
+    fn a_witnessed_edge_reads_used_count_unavailable_never_quiet_or_recent() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.note_witness(CallerId(0), &keys[0], 140);
+        // A later, larger first-seen never moves the first witness.
+        registry.note_witness(CallerId(0), &keys[0], 900);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        let coverage = registry.coverage(edge);
+        assert_eq!(coverage, UseCoverage::Witnessed { first_ns: 140 });
+        assert!(coverage.is_witnessed());
+        assert_eq!(edge.entry_count, 0);
+        assert_eq!(
+            registry.entry_observation(edge),
+            EntryObservation::UnknownCountUnavailable
+        );
+        // Recency comes only from counted entries.
+        assert_eq!(edge.entry_last_seen_ns, None);
+        assert!(!registry.entry_recent_within(edge, 150, 1_000_000));
+    }
+
+    #[test]
+    fn retirement_loss_and_unload_never_erase_witnessed_use() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+            ],
+        );
+        registry.note_witness(CallerId(0), &keys[0], 140);
+        registry.publish();
+        let b = registry.module_id_for(&keys[1]).unwrap();
+        registry.note_module_absent(CallerId(0), b, true, 150);
+        registry.note_capture_loss("EVENTS ring lost 4 records".into());
+        registry.note_health_regression("USAGE_EVIDENCE rose", 158);
+        registry.retire_caller(CallerId(0), "process exited".into(), 160);
+        // A row read after exit is still use: a late witness for the
+        // retired caller lands, and moves first-seen earlier only.
+        registry.note_witness(CallerId(0), &keys[1], 155);
+        registry.publish();
+        let a = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(a.mapping, MappingState::Ended);
+        assert_eq!(
+            registry.coverage(a),
+            UseCoverage::Witnessed { first_ns: 140 }
+        );
+        let b = edge_of(&registry, CallerId(0), &keys[1]);
+        assert_eq!(
+            registry.coverage(b),
+            UseCoverage::Witnessed { first_ns: 155 }
+        );
+        // ...while a watch note for the retired caller lands nowhere.
+        let keys2 = mapped(
+            &mut registry,
+            CallerId(1),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.retire_caller(CallerId(1), "process exited".into(), 170);
+        registry.note_coverage(
+            CallerId(1),
+            &keys2[0],
+            CoverageNote::Watched { since_ns: 165 },
+        );
+        registry.publish();
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(1), &keys2[0])),
+            UseCoverage::Unknown(UnknownReason::RetiredBeforeCoverage)
+        );
+    }
+
+    #[test]
+    fn a_lossy_counting_feed_never_reads_a_zero_as_observed() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+            ],
+        );
+        for key in &keys {
+            registry.note_coverage(CallerId(0), key, CoverageNote::Counted { since_ns: 110 });
+        }
+        registry.observe_entries(CallerId(0), &keys[1], 2, 120);
+        registry.publish();
+        let a = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(registry.entry_observation(a), EntryObservation::Observed);
+        registry.note_capture_loss("EVENTS ring lost 1 record".into());
+        registry.publish();
+        let a = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(
+            registry.coverage(a),
+            UseCoverage::Counted {
+                since_ns: 110,
+                lossy: true
+            }
+        );
+        assert_eq!(
+            registry.entry_observation(a),
+            EntryObservation::UnknownLossy
+        );
+        // A positive count still reads observed (a lower bound), flagged.
+        let b = edge_of(&registry, CallerId(0), &keys[1]);
+        assert_eq!(
+            registry.coverage(b),
+            UseCoverage::Counted {
+                since_ns: 110,
+                lossy: true
+            }
+        );
+        assert_eq!(registry.entry_observation(b), EntryObservation::Observed);
+    }
+
+    #[test]
+    fn an_explicit_unknown_note_never_overrides_positive_history() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+            ],
+        );
+        registry.note_witness(CallerId(0), &keys[0], 140);
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Unknown(UnknownReason::AttachFailed),
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Watched { since_ns: 120 },
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Unknown(UnknownReason::CapacityLimited("caller_pairs")),
+        );
+        registry.publish();
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::Witnessed { first_ns: 140 }
+        );
+        let b = registry.coverage(edge_of(&registry, CallerId(0), &keys[1]));
+        assert_eq!(
+            b,
+            UseCoverage::Unknown(UnknownReason::CapacityLimited("caller_pairs"))
+        );
+        // Re-attached later: watched again from the new instant.
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Watched { since_ns: 300 },
+        );
+        registry.publish();
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[1])),
+            UseCoverage::WatchedNoUse { since_ns: 300 }
+        );
+    }
+
+    #[test]
+    fn coverage_notes_never_invent_edges() {
+        let mut registry = registry();
+        let key = ModuleKey::physical(8, 1, 77, Some("sha0077".into()), "/lib/ghost.so");
+        registry.note_witness(CallerId(0), &key, 100);
+        registry.note_coverage(CallerId(0), &key, CoverageNote::Watched { since_ns: 100 });
+        registry.publish();
+        assert!(registry.module_id_for(&key).is_none());
+        assert_eq!(registry.edge_count(), 0);
+        assert_eq!(
+            registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == "usage coverage without mapping evidence")
+                .count(),
+            1,
+            "one gap for the (caller, module) pair, however many notes",
+        );
+    }
+
+    #[test]
+    fn a_later_admission_replaces_a_first_pass_refusal_with_history() {
+        // I2: the attach set may admit a module a first pass refused. The
+        // registry follows its verdict (rising only), keeps the change as
+        // history plus a gap, and never shows an instrumented module as
+        // refused.
+        let mut registry = registry();
+        let mut refused = module_info("/lib/nss.so", 12, AdmissionState::Refused);
+        refused.admission_endpoints = None;
+        refused.admission_reasons = vec!["needs 544 more endpoints".into()];
+        let key = refused.key.clone();
+        registry.note_mapping(CallerId(0), 50, refused.clone(), 100);
+        registry.publish();
+        let id = registry.module_id_for(&key).unwrap();
+        assert_eq!(registry.endpoints_total(), 0);
+        let mut admitted = module_info("/lib/nss.so", 12, AdmissionState::Admitted);
+        admitted.admission_endpoints = Some(544);
+        registry.note_mapping(CallerId(0), 50, admitted, 200);
+        registry.publish();
+        let module = registry.module(id).unwrap();
+        assert_eq!(module.admission, AdmissionState::Admitted);
+        assert_eq!(module.admission_endpoints, Some(544));
+        assert!(module.admission_reasons.is_empty());
+        assert_eq!(
+            module.admission_history,
+            vec![AdmissionChange {
+                from: AdmissionState::Refused,
+                to: AdmissionState::Admitted,
+                at_ns: 200,
+            }]
+        );
+        assert_eq!(registry.endpoints_total(), 544);
+        let changes: Vec<&RegistryGap> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "module admission changed")
+            .collect();
+        assert_eq!(changes.len(), 1, "{:?}", registry.gaps());
+        assert_eq!(changes[0].module, Some(id));
+        assert!(
+            changes[0].reason.contains("from refused to admitted"),
+            "{}",
+            changes[0].reason
+        );
+        // Never demoted: a later refusal leaves the admitted verdict.
+        registry.note_mapping(CallerId(0), 50, refused, 300);
+        registry.publish();
+        let module = registry.module(id).unwrap();
+        assert_eq!(module.admission, AdmissionState::Admitted);
+        assert_eq!(module.admission_history.len(), 1);
+        assert_eq!(registry.endpoints_total(), 544);
+        // Unresolved rises to a verdict too.
+        let mut unresolved = module_info("/lib/u.so", 13, AdmissionState::Unresolved);
+        unresolved.admission_endpoints = None;
+        let ukey = unresolved.key.clone();
+        registry.note_mapping(CallerId(0), 50, unresolved, 100);
+        registry.publish();
+        let mut refused_u = module_info("/lib/u.so", 13, AdmissionState::Refused);
+        refused_u.admission_endpoints = None;
+        registry.note_mapping(CallerId(0), 50, refused_u, 400);
+        registry.publish();
+        let module = registry
+            .module(registry.module_id_for(&ukey).unwrap())
+            .unwrap();
+        assert_eq!(module.admission, AdmissionState::Refused);
+        assert_eq!(module.admission_history[0].from, AdmissionState::Unresolved);
+    }
+
+    #[test]
+    fn the_semantic_census_counts_a_latched_edge_with_claims_as_unknown() {
+        // DR-09: the census and the label share one predicate. An edge
+        // that held claims and then latched on a same-file double-load
+        // reads `unknown (same-file double-load)`, so it counts as an
+        // unknown edge too.
+        let mut registry = registry();
+        let info = module_info("/lib/nss.so", 12, AdmissionState::Admitted);
+        let key = info.key.clone();
+        registry.note_mapping(CallerId(0), 50, info, 100);
+        registry.observe_semantic(
+            CallerId(0),
+            &key,
+            SemanticCall {
+                function: "C_SignInit".into(),
+                rv: 0,
+                session: 7,
+                mechanism: 0x000d,
+                capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                    | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                ts_ns: 110,
+                ..SemanticCall::default()
+            },
+        );
+        registry.publish();
+        assert_eq!(registry.semantic_unknown_edges(), 0);
+        let mut latched = module_info("/lib/nss.so", 12, AdmissionState::Admitted);
+        latched.double_loaded = true;
+        registry.note_mapping(CallerId(0), 50, latched, 200);
+        registry.publish();
+        let id = registry.module_id_for(&key).unwrap();
+        let state = registry
+            .edge(CallerId(0), id)
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap();
+        assert!(state.has_claims(), "retained claims stand as history");
+        assert_eq!(
+            state.label(),
+            crate::semantics_edge::SEMANTIC_UNKNOWN_DOUBLE_LOAD
+        );
+        assert_eq!(registry.semantic_unknown_edges(), 1);
+    }
+
+    #[test]
+    fn a_watch_never_starts_before_the_last_health_regression() {
+        // I2 (review): a regression is timestamped. A watch noted after
+        // it — in a later batch or later in the same batch — covers only
+        // the clean interval from the regression on; a watch staged
+        // before it in the same batch is demoted with the others.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+                ("/lib/c.so", 13, AdmissionState::Admitted),
+            ],
+        );
+        registry.note_health_regression("CALLER_EVIDENCE rose", 200);
+        registry.publish();
+        // A later batch, a watch whose start predates the regression.
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 150 },
+        );
+        registry.publish();
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::WatchedNoUse { since_ns: 200 }
+        );
+        // One batch: a watch, the regression, then another watch.
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Watched { since_ns: 250 },
+        );
+        registry.note_health_regression("COOKIE_CTL.unavailable rose", 300);
+        registry.note_coverage(
+            CallerId(0),
+            &keys[2],
+            CoverageNote::Watched { since_ns: 260 },
+        );
+        registry.publish();
+        assert!(matches!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[1])),
+            UseCoverage::Unknown(UnknownReason::Loss(_))
+        ));
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[2])),
+            UseCoverage::WatchedNoUse { since_ns: 300 }
+        );
+        // The earlier watch was demoted by the second regression too.
+        assert!(matches!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::Unknown(UnknownReason::Loss(_))
+        ));
+    }
+
+    #[test]
+    fn an_ignored_lower_verdict_is_disclosed_in_bounded_reasons() {
+        let mut registry = registry();
+        let key = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        )
+        .remove(0);
+        let id = registry.module_id_for(&key).unwrap();
+        for pass in 0..(MAX_ADMISSION_REASONS + 4) {
+            let mut lower = module_info("/lib/a.so", 11, AdmissionState::Refused);
+            lower.admission_reasons =
+                vec![format!("refusal {}", pass % (MAX_ADMISSION_REASONS + 2))];
+            registry.note_mapping(CallerId(0), 50, lower, 200);
+            registry.publish();
+        }
+        let module = registry.module(id).unwrap();
+        assert_eq!(module.admission, AdmissionState::Admitted);
+        assert!(module.admission_history.is_empty());
+        assert_eq!(module.admission_reasons.len(), MAX_ADMISSION_REASONS);
+        assert!(
+            module.admission_reasons[0].contains("refused (refusal 0)")
+                && module.admission_reasons[0].contains("not applied"),
+            "{:?}",
+            module.admission_reasons
+        );
+        let distinct: BTreeSet<&String> = module.admission_reasons.iter().collect();
+        assert_eq!(distinct.len(), module.admission_reasons.len(), "no repeats");
+    }
+
+    #[test]
+    fn a_counting_note_for_an_unadmitted_module_is_refused_with_one_gap() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/r.so", 12, AdmissionState::Refused)],
+        );
+        for _ in 0..3 {
+            registry.note_coverage(
+                CallerId(0),
+                &keys[0],
+                CoverageNote::Counted { since_ns: 110 },
+            );
+            registry.note_coverage(
+                CallerId(0),
+                &keys[0],
+                CoverageNote::Watched { since_ns: 110 },
+            );
+            registry.publish();
+        }
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::Unknown(UnknownReason::NotAdmitted)
+        );
+        let gaps = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "coverage for an unadmitted module")
+            .count();
+        assert_eq!(gaps, 1, "{:?}", registry.gaps());
+    }
+
+    #[test]
+    fn coverage_gaps_are_remembered_once_per_caller_and_module() {
+        let mut registry = registry();
+        let ghost = ModuleKey::physical(8, 1, 77, Some("sha0077".into()), "/lib/ghost.so");
+        let other = ModuleKey::physical(8, 1, 78, Some("sha0078".into()), "/lib/other.so");
+        for _ in 0..5 {
+            registry.note_witness(CallerId(0), &ghost, 100);
+            registry.note_coverage(CallerId(0), &ghost, CoverageNote::Watched { since_ns: 100 });
+            registry.note_witness(CallerId(1), &ghost, 100);
+            registry.note_witness(CallerId(0), &other, 100);
+            registry.publish();
+        }
+        let gaps = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "usage coverage without mapping evidence")
+            .count();
+        assert_eq!(gaps, 3, "one per (caller, module): {:?}", registry.gaps());
+    }
+
+    #[test]
+    fn a_witness_before_a_complete_absence_unload_survives_it() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_witness(CallerId(0), &keys[0], 140);
+        registry.publish();
+        let id = registry.module_id_for(&keys[0]).unwrap();
+        registry.note_module_absent(CallerId(0), id, true, 150);
+        registry.publish();
+        assert_eq!(
+            registry.module(id).unwrap().lifecycle,
+            ModuleLifecycle::Unloaded
+        );
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.mapping, MappingState::Ended);
+        assert_eq!(
+            registry.coverage(edge),
+            UseCoverage::Witnessed { first_ns: 140 }
+        );
     }
 }

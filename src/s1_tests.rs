@@ -472,10 +472,6 @@ fn d1_right_now_trichotomy_stays_three_distinct_facts() {
     };
     harness.stage_scale(&spec);
     harness.commit();
-    harness
-        .coordinator_mut()
-        .registry_mut()
-        .set_usage_feed(true);
     let caller = caller_of(&harness, 9200);
     let now = harness.now_ns();
     harness
@@ -934,10 +930,6 @@ fn d2_same_file_double_load_with_scan_evidence_forces_unknown_with_named_gap() {
     };
     harness.stage_scale(&spec);
     harness.commit();
-    harness
-        .coordinator_mut()
-        .registry_mut()
-        .set_usage_feed(true);
     let caller = caller_of(&harness, 9960);
     let now = harness.now_ns();
     harness.coordinator_mut().registry_mut().note_mapping(
@@ -1324,10 +1316,6 @@ fn d3_replay_scale_workload_with_four_way_semantic_agreement() {
     };
     harness.stage_scale(&spec);
     harness.commit();
-    harness
-        .coordinator_mut()
-        .registry_mut()
-        .set_usage_feed(true);
     let now = harness.now_ns();
     // Completed sign, in-flight encrypt, unauthorized feed, failed
     // Init, plus bare entries — every semantic shape in one replay.
@@ -1409,10 +1397,6 @@ fn divergent_harness() -> Harness {
     };
     harness.stage_scale(&spec);
     harness.commit();
-    harness
-        .coordinator_mut()
-        .registry_mut()
-        .set_usage_feed(true);
     let caller = caller_of(&harness, 9800);
     let now = harness.now_ns();
     // m0: two mechanisms completed, one with a retry error.
@@ -1469,6 +1453,15 @@ fn divergent_harness() -> Harness {
             init("C_SignInit", session, 0x2000 + index as u64, ts),
         );
         harness.observe_semantic(caller, &scale_key(6), op("C_Sign", session, ts + 1));
+    }
+    // The Detailed feed counts every edge it delivers semantics for
+    // (Task 6 plan §3.5, C6): the claim-bearing edges are counted.
+    for index in [0, 1, 2, 5, 6] {
+        harness.coordinator_mut().registry_mut().note_coverage(
+            caller,
+            &scale_key(index),
+            crate::discovery::caller_registry::CoverageNote::Counted { since_ns: now },
+        );
     }
     // Three gaps with distinct subjects: capture loss, a semantic
     // call without mapping evidence, entries without mapping evidence.
@@ -1582,7 +1575,7 @@ fn d3_divergent_fixture_displays_at_80x14_with_honest_budgets() {
             "scroll {index} mapping: {block}"
         );
         assert!(
-            block.contains(&format!("entries {}", edge_json["entries"]["count"])),
+            block.contains(&format!("entries {}", json_entries_display(edge_json))),
             "scroll {index} entries: {block}"
         );
         let label = edge_json["semantics"].as_str().unwrap();
@@ -2194,6 +2187,20 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             snapshot_line.contains(edge_json["entries"]["observation"].as_str().unwrap()),
             "snapshot entry observation for {caller}->{module}: {snapshot_line}"
         );
+        // Usage coverage (Task 6 C2): JSON state, snapshot label, and
+        // the dashboard's compact entries all derive from one view.
+        assert_eq!(
+            edge_json["entries"]["coverage"]["state"],
+            view.coverage.state(),
+            "JSON coverage for {caller}->{module}"
+        );
+        assert!(
+            snapshot_line.contains(&format!(
+                "coverage {}",
+                crate::inventory_present::coverage_label(&view.coverage)
+            )),
+            "snapshot coverage for {caller}->{module}: {snapshot_line}"
+        );
         for (state, name) in [
             (view.presence.label(), "presence"),
             (view.capture.label(), "capture"),
@@ -2216,7 +2223,7 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             "dashboard mapping for {caller}->{module}: {block}"
         );
         assert!(
-            block.contains(&format!("entries {}", edge_json["entries"]["count"])),
+            block.contains(&format!("entries {}", json_entries_display(edge_json))),
             "dashboard entries for {caller}->{module}: {block}"
         );
         assert!(
@@ -2288,8 +2295,13 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             // Unknown edge: the bare semantic label everywhere, no
             // semantic detail rows (gaps above are coverage rows, not
             // semantic detail).
+            // The bare label, followed only by the coverage field (new
+            // fields append at the line end).
             assert!(
-                snapshot_line.ends_with(&format!("semantics {label}")),
+                snapshot_line.ends_with(&format!(
+                    "semantics {label} coverage {}",
+                    crate::inventory_present::coverage_label(&view.coverage)
+                )),
                 "snapshot bare label for {caller}->{module}: {snapshot_line}"
             );
             assert!(
@@ -2515,7 +2527,7 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
     };
     assert!(
         snapshot.contains(&format!(
-            "budgets: callers {} | modules {} | edges {} | endpoints {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {}",
+            "budgets: callers {} | modules {} | edges {} | endpoints {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {} | inventory_attach_modules {}",
             row("callers"),
             row("modules"),
             row("edges"),
@@ -2530,6 +2542,8 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             budgets["retained_history"]["retained"],
             budgets["retained_history"]["limit"],
             budgets["retained_history"]["suppressed"],
+            row("inventory_endpoints"),
+            row("inventory_attach_modules"),
         )),
         "snapshot budgets"
     );
@@ -2547,12 +2561,14 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
     let suppressed = document["gaps_suppressed"].as_u64().unwrap();
     assert!(
         dashboard.contains(&format!(
-            "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{} | semantic {} ({} held, {} unknown, {} refused)",
+            "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{} | attach {}/{} | semantic {} ({} held, {} unknown, {} refused)",
             gaps.len(),
             refusals,
             suppressed,
             budgets["endpoints"]["occupied"],
             budgets["endpoints"]["limit"],
+            budgets["inventory_endpoints"]["occupied"],
+            budgets["inventory_endpoints"]["limit"],
             budgets["semantic_state"]["status"].as_str().unwrap(),
             budgets["semantic_state"]["occupied"],
             budgets["semantic_state"]["unknown_edges"],
@@ -2721,10 +2737,6 @@ fn d5_matched_runs_report_identical_totals_with_measured_overhead() {
         let mut harness = harness();
         harness.stage_scale(&spec);
         harness.commit();
-        harness
-            .coordinator_mut()
-            .registry_mut()
-            .set_usage_feed(true);
         let now = harness.now_ns();
         let mut fed = 0u64;
         for (index, (caller_index, module_index)) in spec.layout().iter().enumerate() {
@@ -2838,5 +2850,22 @@ fn feed_semantic_script(
             harness.observe_semantic(caller, key, unauthorized);
             1
         }
+    }
+}
+
+/// The dashboard's compact `entries` form, derived from the JSON alone
+/// (count plus `entries.coverage`): the number where it is a fact, `+`
+/// on a lossy positive count, `?` where the count is unavailable.
+fn json_entries_display(edge_json: &serde_json::Value) -> String {
+    let count = edge_json["entries"]["count"].as_u64().unwrap();
+    let coverage = &edge_json["entries"]["coverage"];
+    // `lossy` is a boolean for counted coverage and null otherwise.
+    let lossy = coverage["lossy"].as_bool().unwrap_or(false);
+    match coverage["state"].as_str().unwrap() {
+        "counted" if lossy && count > 0 => format!("{count}+"),
+        "counted" if !lossy => count.to_string(),
+        "watched_no_use" => count.to_string(),
+        _ if count > 0 => count.to_string(),
+        _ => "?".to_string(),
     }
 }

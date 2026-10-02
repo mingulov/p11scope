@@ -374,6 +374,8 @@ pub(crate) fn started_payload(
             "modules": presentation.budgets.modules_limit,
             "edges": presentation.budgets.edges_limit,
             "endpoints": presentation.budgets.endpoints_limit,
+            "inventory_endpoints": presentation.budgets.inventory_endpoints_limit,
+            "inventory_attach_modules": presentation.budgets.inventory_modules_limit,
             "semantic_state": presentation.budgets.semantic_limit,
             "retained_history": presentation.budgets.retained_limit,
         },

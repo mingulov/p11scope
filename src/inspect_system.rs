@@ -8,8 +8,12 @@
 //! same-path observations stay comparable), and the aggregate is lowered
 //! through the existing plan-lowering path — scan evidence only, no
 //! manifests — far enough to report per-object admission state. No BPF, no
-//! attach, no slot reservation, no history latching: the plan built here is
-//! discarded after rendering; only its admission verdicts reach the catalog.
+//! attach, no slot reservation, no history latching: `inspect` lowers under
+//! the Detailed policy and drops the plan with the catalog after rendering.
+//! The inventory command lowers the same collection under its Inventory
+//! policy instead and hands the plan and the aggregate pins to its attach
+//! set (`CatalogLowering`), so the pins this pass opened and hashed are
+//! retained, never reopened.
 //!
 //! The catalog (what was discovered) and the admission verdicts (what a
 //! capture would do with it) are visibly separate records: `objects[]` is
@@ -34,7 +38,7 @@ use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
     scan_skip_truncates,
 };
-use crate::plan::{self, AdmissionScope};
+use crate::plan::{self, AdmissionPolicy, AdmissionScope};
 use crate::process::{ProcessView, ProcessViewId, generation_gone};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
@@ -75,7 +79,7 @@ fn run_with_writer(
     max_scan_pids: Option<usize>,
     out: &mut dyn std::io::Write,
 ) -> Result<i32> {
-    let catalog = collect(hints, hooks, max_scan_pids)?;
+    let catalog = collect(hints, hooks, max_scan_pids, AdmissionPolicy::detailed())?;
     if json {
         let document = serde_json::to_string_pretty(&render_json(&catalog))?;
         writeln!(out, "{document}")?;
@@ -524,13 +528,6 @@ impl AdmissionRecord {
         }
     }
 
-    pub(crate) fn endpoints(&self) -> Option<usize> {
-        match self {
-            Self::Admitted { endpoints, .. } => Some(*endpoints),
-            Self::Refused { .. } | Self::Unresolved { .. } => None,
-        }
-    }
-
     pub(crate) fn reasons(&self) -> Vec<String> {
         match self {
             Self::Admitted { .. } => Vec::new(),
@@ -614,6 +611,10 @@ pub(crate) struct AdmissionSummary {
 /// the collection; rendering is pure over it.
 pub(crate) struct Catalog {
     pub scan_status: &'static str,
+    /// What the admission verdicts were lowered from: inventory's attach
+    /// set takes it right after collection (so the aggregate pins and
+    /// their fds do not outlive that step); rendering never reads it.
+    pub lowering: Option<CatalogLowering>,
     pub enumerated: usize,
     pub selected: usize,
     pub scanned: usize,
@@ -628,12 +629,24 @@ pub(crate) struct Catalog {
     pub explanation: Option<String>,
 }
 
-/// Collect the machine, lower scan-only admission, assemble the catalog.
-/// The only `Err` is the fully-unreadable machine (stdout stays empty).
+/// The one scan-only lowering behind a catalog's admission verdicts: the
+/// aggregate pins every reconciled module was bound against and the plan
+/// built over them under the caller's policy. Plan object IDs index these
+/// pins and nothing else.
+pub(crate) struct CatalogLowering {
+    pub plan: plan::AttachPlan,
+    pub pins: PinnedObjects,
+}
+
+/// Collect the machine, lower scan-only admission under `policy`, assemble
+/// the catalog. `inspect --system` lowers Detailed; the inventory command
+/// lowers Inventory. The only `Err` is the fully-unreadable machine
+/// (stdout stays empty).
 pub(crate) fn collect(
     hints: &[PathBuf],
     hooks: &HookRegistry,
     max_scan_pids: Option<usize>,
+    policy: AdmissionPolicy,
 ) -> Result<Catalog> {
     let collection = collect_members(hints, hooks, max_scan_pids);
     let stats = OutcomeStats {
@@ -646,13 +659,18 @@ pub(crate) fn collect(
         return Err(unreadable_system_error(&collection));
     }
     eprintln!("p11scope: lowering scan-only admission and rendering...");
-    Ok(assemble(collection))
+    Ok(assemble(collection, policy))
 }
 
 /// Collect one pid through the same member scan and the same assembly:
 /// the inventory scan lane's `--pid` pass. The only `Err` is a target no
 /// scan inventoried — pid-inspect's hard failure, kept honest.
-pub(crate) fn collect_pid(pid: u32, hints: &[PathBuf], hooks: &HookRegistry) -> Result<Catalog> {
+pub(crate) fn collect_pid(
+    pid: u32,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    policy: AdmissionPolicy,
+) -> Result<Catalog> {
     eprintln!("p11scope: deep-scanning pid {pid}...");
     let mut budget = CaptureWorkBudget::default();
     let mut noise = DiscoveryNoiseAggregator::default();
@@ -672,20 +690,24 @@ pub(crate) fn collect_pid(pid: u32, hints: &[PathBuf], hooks: &HookRegistry) -> 
         return Err(anyhow::anyhow!("cannot inventory pid {pid}: {detail}{fix}"));
     }
     eprintln!("p11scope: lowering scan-only admission and rendering...");
-    Ok(assemble(Collection {
-        enumerated: vec![pid],
-        selected: vec![pid],
-        cap: 1,
-        cap_hit: false,
-        members: vec![member],
-        scope_gaps: Vec::new(),
-        proc_list_failed: false,
-    }))
+    Ok(assemble(
+        Collection {
+            enumerated: vec![pid],
+            selected: vec![pid],
+            cap: 1,
+            cap_hit: false,
+            members: vec![member],
+            scope_gaps: Vec::new(),
+            proc_list_failed: false,
+        },
+        policy,
+    ))
 }
 
 /// Aggregate every view's pins, bind every module, lower one shared-scope
-/// plan over scan evidence only, and project the catalog records.
-fn assemble(mut collection: Collection) -> Catalog {
+/// plan over scan evidence only under `policy`, and project the catalog
+/// records.
+fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
     // One aggregate pin set first: exact comparable identities merge and
     // equal raw keys with unequal full identity reject the group — the
     // same absorb semantics capture relies on.
@@ -725,9 +747,10 @@ fn assemble(mut collection: Collection) -> Catalog {
     }
 
     // The existing plan-lowering path, scan evidence only: no manifests,
-    // no history, no reserved slots, no attach. `build_from_sources_scoped`
-    // is pure over its inputs, so no narrower entry point was needed —
-    // there are no side effects to carve out.
+    // no history, no reserved slots, no attach. The lowering is pure over
+    // its inputs, so no narrower entry point was needed — there are no
+    // side effects to carve out. Detailed (inspect) and Inventory
+    // (inventory) differ only in the policy passed here.
     let inputs: Vec<ReconciledModule> = reconciled
         .iter()
         .map(|(_, _, module)| module.clone())
@@ -736,8 +759,13 @@ fn assemble(mut collection: Collection) -> Catalog {
         .iter()
         .map(|(pid, view, _)| (*pid, *view))
         .collect();
-    let plan =
-        plan::build_from_sources_scoped(&inputs, &[], &aggregate, false, AdmissionScope::Shared);
+    let plan = plan::build_from_sources_for_policy_scoped(
+        &inputs,
+        &[],
+        &aggregate,
+        policy,
+        AdmissionScope::Shared,
+    );
     let refused: BTreeMap<PinnedObjectId, &Skipped> = plan.refused_modules().collect();
     let admitted: BTreeMap<PinnedObjectId, usize> = plan
         .modules
@@ -934,6 +962,10 @@ fn assemble(mut collection: Collection) -> Catalog {
         None
     };
     Catalog {
+        lowering: Some(CatalogLowering {
+            plan,
+            pins: aggregate,
+        }),
         scan_status: if complete { "complete" } else { "partial" },
         enumerated: collection.enumerated.len(),
         selected: collection.selected.len(),
@@ -1623,6 +1655,7 @@ mod tests {
             .count();
         let unresolved = objects.len() - admitted - refused;
         Catalog {
+            lowering: None,
             scan_status: "complete",
             enumerated: 2,
             selected: 2,

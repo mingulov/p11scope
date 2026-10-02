@@ -6,7 +6,8 @@
 
 use super::*;
 use crate::discovery::caller_registry::{
-    AdmissionState, CallerId, ImageAuthority, ModuleInfo, ModuleKey, RegistryLimits,
+    AdmissionState, CallerId, CoverageNote, ImageAuthority, ModuleInfo, ModuleKey, RegistryGap,
+    RegistryLimits, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::inventory::{render_json, render_text};
@@ -113,6 +114,7 @@ fn state_vocab_is_the_plans_exact_wording() {
     assert_eq!(Presence::ProcessExited.label(), "process exited");
     assert_eq!(Presence::Unknown.label(), "unknown");
     assert_eq!(Capture::Armed.label(), "armed");
+    assert_eq!(Capture::ScanOnly.label(), "scan only");
     assert_eq!(Capture::Refused.label(), "refused");
     assert_eq!(Capture::Retired.label(), "retired");
     assert_eq!(Capture::CoverageLost.label(), "coverage lost");
@@ -121,7 +123,10 @@ fn state_vocab_is_the_plans_exact_wording() {
         Activity::InFlight.label(),
         "operation initialized / in flight"
     );
+    assert_eq!(Activity::Used.label(), "used (recency unknown)");
     assert_eq!(Activity::Quiet.label(), "quiet");
+    assert_eq!(Activity::Lossy.label(), "unknown (lossy)");
+    assert_eq!(Activity::Uncovered.label(), "unknown (not covered)");
     assert_eq!(Activity::Unknown.label(), "unknown");
 }
 
@@ -138,10 +143,11 @@ fn refused_but_quiet_renders_both_states_not_one_merged_label() {
     assert_eq!(refused.len(), 1, "exactly the refused edge");
     let edge = refused[0];
     // Capture refusal is not application inactivity: the refused edge
-    // is mapped and quiet, and renders all three states.
+    // is mapped, refused, and its activity is unknown (nothing covers
+    // its usage) — never quiet.
     assert_eq!(edge.presence, Presence::Mapped);
     assert_eq!(edge.capture, Capture::Refused);
-    assert_eq!(edge.activity, Activity::Quiet);
+    assert_eq!(edge.activity, Activity::Uncovered);
     let snapshot = render_snapshot(&presentation);
     let line = snapshot
         .lines()
@@ -155,7 +161,7 @@ fn refused_but_quiet_renders_both_states_not_one_merged_label() {
         .unwrap();
     assert!(line.contains("presence mapped"), "{line}");
     assert!(line.contains("capture refused"), "{line}");
-    assert!(line.contains("activity quiet"), "{line}");
+    assert!(line.contains("activity unknown (not covered)"), "{line}");
     // The JSON agrees the module refused while the mapping stayed live.
     let edge_json = document["edges"]
         .as_array()
@@ -183,7 +189,15 @@ fn quiet_is_not_unloaded() {
     };
     harness.stage_scale(&spec);
     harness.commit();
-    // Baseline: mapped and quiet.
+    // Baseline: mapped, watched, and quiet.
+    let watcher = harness.coordinator().adapter().live_id(71_000).unwrap();
+    let since = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_coverage(
+        watcher,
+        &scale_key(0),
+        CoverageNote::Watched { since_ns: since },
+    );
+    harness.commit();
     let document = harness.render();
     let presentation = capture_for(&harness, &document);
     assert_eq!(presentation.edges[0].presence, Presence::Mapped);
@@ -270,7 +284,14 @@ fn activity_splits_in_flight_from_recent_from_quiet() {
     let now = harness.now_ns();
     let c0 = harness.coordinator().adapter().live_id(72_000).unwrap();
     let c1 = harness.coordinator().adapter().live_id(72_001).unwrap();
-    // c0: entries observed now (recent). c1: in flight. c2: silent.
+    // c0: entries observed now (recent). c1: in flight. c2: watched
+    // and silent.
+    let c2 = harness.coordinator().adapter().live_id(72_002).unwrap();
+    harness.coordinator_mut().registry_mut().note_coverage(
+        c2,
+        &scale_key(2),
+        CoverageNote::Watched { since_ns: now },
+    );
     harness
         .coordinator_mut()
         .registry_mut()
@@ -293,7 +314,6 @@ fn activity_splits_in_flight_from_recent_from_quiet() {
     };
     assert_eq!(activity(c0), Activity::RecentlyObserved);
     assert_eq!(activity(c1), Activity::InFlight);
-    let c2 = harness.coordinator().adapter().live_id(72_002).unwrap();
     assert_eq!(activity(c2), Activity::Quiet);
     // An old entry outside the window reads as quiet, not recent.
     let stale = Presentation::capture(
@@ -356,6 +376,18 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
             "budgets {row}: {budgets}"
         );
     }
+    assert!(
+        budgets.ends_with(&format!(
+            " | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {}",
+            document["budgets"]["inventory_endpoints"]["occupied"],
+            document["budgets"]["inventory_endpoints"]["limit"],
+            document["budgets"]["inventory_endpoints"]["refused"],
+            document["budgets"]["inventory_attach_modules"]["occupied"],
+            document["budgets"]["inventory_attach_modules"]["limit"],
+            document["budgets"]["inventory_attach_modules"]["refused"],
+        )),
+        "budgets inventory_endpoints: {budgets}"
+    );
     assert!(
         budgets.contains(&format!(
             "counters observed {} saturated {}",
@@ -459,6 +491,27 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
             line.contains(&format!("capture {}", edge_view.capture.label())),
             "{line}"
         );
+        // Coverage: the JSON state and the snapshot label render the
+        // same view; the scan lane reads unknown with its reason.
+        assert_eq!(
+            edge_json["entries"]["coverage"]["state"],
+            edge_view.coverage.state(),
+            "{line}"
+        );
+        // New fields append at the line end; older fields keep their
+        // positions.
+        assert!(
+            line.ends_with(&format!(
+                " coverage {}",
+                coverage_label(&edge_view.coverage)
+            )),
+            "{line}"
+        );
+        let reason = edge_json["entries"]["coverage"]["reason"].as_str().unwrap();
+        assert!(
+            reason == "scan_only" || reason == "not_admitted",
+            "scan-lane coverage reason: {reason}"
+        );
         assert!(
             line.contains(&format!("activity {}", edge_view.activity.label())),
             "{line}"
@@ -557,9 +610,15 @@ fn mapping_columns_never_report_calls() {
     let quiet_mapped: Vec<&EdgeView> = presentation
         .edges
         .iter()
-        .filter(|edge| edge.presence == Presence::Mapped && edge.activity == Activity::Quiet)
+        .filter(|edge| {
+            edge.presence == Presence::Mapped
+                && !matches!(
+                    edge.activity,
+                    Activity::RecentlyObserved | Activity::InFlight
+                )
+        })
         .collect();
-    assert!(!quiet_mapped.is_empty(), "varied fixture has quiet edges");
+    assert!(!quiet_mapped.is_empty(), "varied fixture has silent edges");
     for edge in quiet_mapped {
         assert_eq!(edge.entry_count, 0);
         let line = snapshot
@@ -585,4 +644,496 @@ fn mapping_columns_never_report_calls() {
             "{line}"
         );
     }
+}
+
+/// One live caller (pid 73_000) mapping `modules` scale modules.
+fn single_caller_harness(name: &'static str, modules: usize) -> (Harness, CallerId) {
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name,
+        callers: 1,
+        modules,
+        edges_per_caller: modules,
+        endpoints_per_module: 4,
+        first_pid: 73_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let caller = harness.coordinator().adapter().live_id(73_000).unwrap();
+    (harness, caller)
+}
+
+fn edge_line<'a>(snapshot: &'a str, edge: &EdgeView) -> &'a str {
+    snapshot
+        .lines()
+        .find(|line| {
+            line.starts_with(&format!(
+                "edge {} -> {} ",
+                edge.caller.label(),
+                edge.module.label()
+            ))
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_witnessed_edge_is_never_idle_in_any_output_even_after_exit() {
+    let (mut harness, caller) = single_caller_harness("present-witness", 2);
+    harness.advance(10_000);
+    let now = harness.now_ns();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_witness(caller, &scale_key(0), now);
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let witnessed = &presentation.edges[0];
+    assert_eq!(witnessed.coverage.state(), "witnessed");
+    // Witnessed use is never quiet: "used (recency unknown)".
+    assert_eq!(witnessed.activity, Activity::Used);
+    assert_eq!(presentation.edges[1].activity, Activity::Uncovered);
+    let entries = &document["edges"][0]["entries"];
+    assert_eq!(entries["count"], 0);
+    assert_eq!(
+        entries["observation"],
+        "unknown (count unavailable; use witnessed)"
+    );
+    assert_eq!(entries["coverage"]["state"], "witnessed");
+    assert_eq!(entries["coverage"]["first_ns"], now);
+    assert!(entries["coverage"]["since_ns"].is_null());
+    assert!(
+        entries["last_seen_ns"].is_null(),
+        "no recency from a witness"
+    );
+    let snapshot = render_snapshot(&presentation);
+    let line = edge_line(&snapshot, witnessed);
+    assert!(line.contains("activity used (recency unknown)"), "{line}");
+    assert!(!line.contains("activity quiet"), "{line}");
+    assert!(
+        line.contains(&format!("coverage used, count unavailable (first {now})")),
+        "{line}"
+    );
+    assert_eq!(entries_display(witnessed), "?");
+    // The caller exits: the edge ends, the witness stands, and the
+    // activity still says used — never quiet, never erased.
+    harness.source().kill(73_000);
+    harness.advance(10);
+    let now = harness.now_ns();
+    let events = harness.coordinator_mut().adapter_mut().reconcile(
+        &BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        now,
+    );
+    harness
+        .coordinator_mut()
+        .apply_reconcile_events(&events, now);
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let witnessed = &presentation.edges[0];
+    assert_eq!(witnessed.mapping, MappingState::Ended);
+    assert_eq!(witnessed.coverage.state(), "witnessed");
+    assert_eq!(witnessed.activity, Activity::Used);
+    assert_eq!(
+        document["edges"][0]["entries"]["coverage"]["state"],
+        "witnessed"
+    );
+    // Exhaustively: whatever the mapping, a witnessed edge renders used
+    // unless a counted recency or a live call outranks it.
+    for mapping in [
+        MappingState::Mapped,
+        MappingState::Ended,
+        MappingState::Uncertain,
+    ] {
+        let witnessed = UseCoverage::Witnessed { first_ns: 1 };
+        assert_eq!(
+            Activity::for_edge(mapping, false, false, false, &witnessed),
+            Activity::Used
+        );
+        assert_eq!(
+            Activity::for_edge(mapping, true, false, false, &witnessed),
+            Activity::InFlight
+        );
+    }
+}
+
+#[test]
+fn partial_attach_renders_no_use_since_and_unknown_side_by_side() {
+    let (mut harness, caller) = single_caller_harness("present-partial", 2);
+    let now = harness.now_ns();
+    let refused = refused_module_info(0);
+    let refused_key = refused.key.clone();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_mapping(caller, 73_000, refused, now);
+    harness.commit();
+    harness.advance(10);
+    let since = harness.now_ns();
+    {
+        let registry = harness.coordinator_mut().registry_mut();
+        registry.set_uncovered_reason(UnknownReason::NotAttached);
+        registry.note_coverage(
+            caller,
+            &scale_key(0),
+            CoverageNote::Watched { since_ns: since },
+        );
+        registry.note_coverage(
+            caller,
+            &refused_key,
+            CoverageNote::Watched { since_ns: since },
+        );
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let snapshot = render_snapshot(&presentation);
+    let by_path = |path: &str| {
+        let module = document["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["paths"][0] == path)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let index = presentation
+            .edges
+            .iter()
+            .position(|edge| edge.module.label() == module)
+            .unwrap();
+        (index, &presentation.edges[index])
+    };
+    let (attached_index, attached) = by_path("/scale/m0.so");
+    let attached_json = &document["edges"][attached_index]["entries"];
+    assert_eq!(attached_json["count"], 0);
+    assert_eq!(attached_json["observation"], "observed");
+    assert_eq!(attached_json["coverage"]["state"], "watched_no_use");
+    assert_eq!(attached_json["coverage"]["since_ns"], since);
+    assert!(
+        edge_line(&snapshot, attached).contains(&format!("coverage no use since {since}")),
+        "{snapshot}"
+    );
+    assert_eq!(entries_display(attached), "0");
+    let (refused_index, refused) = by_path("/scale/refused0.so");
+    let refused_json = &document["edges"][refused_index]["entries"];
+    assert_eq!(refused_json["count"], 0);
+    assert_eq!(refused_json["observation"], "unknown (not admitted)");
+    assert_eq!(refused_json["coverage"]["state"], "unknown");
+    assert_eq!(refused_json["coverage"]["reason"], "not_admitted");
+    assert!(
+        edge_line(&snapshot, refused).contains("coverage unknown (not admitted)"),
+        "{snapshot}"
+    );
+    assert_eq!(entries_display(refused), "?");
+    let (other_index, other) = by_path("/scale/m1.so");
+    assert_eq!(
+        document["edges"][other_index]["entries"]["coverage"]["reason"],
+        "not_attached"
+    );
+    assert!(
+        edge_line(&snapshot, other).contains("coverage unknown (not attached)"),
+        "{snapshot}"
+    );
+    assert_eq!(
+        document["observation"]["usage_feed"], true,
+        "derived summary"
+    );
+}
+
+#[test]
+fn a_module_admitted_after_a_first_refusal_never_reads_refused() {
+    // I2 through the presentation: the first pass refused the module,
+    // the attach set admitted it later; every output reads admitted,
+    // the capture state is no longer refused, and the change is kept.
+    let (mut harness, caller) = single_caller_harness("present-i2", 1);
+    let now = harness.now_ns();
+    let refused = refused_module_info(5);
+    let key = refused.key.clone();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_mapping(caller, 73_000, refused.clone(), now);
+    harness.commit();
+    let presentation = capture_for(&harness, &harness.render());
+    assert!(
+        presentation
+            .edges
+            .iter()
+            .any(|edge| edge.capture == Capture::Refused)
+    );
+    harness.advance(10);
+    let later = harness.now_ns();
+    let admitted = ModuleInfo {
+        admission: AdmissionState::Admitted,
+        admission_class: Some("exact".into()),
+        admission_endpoints: Some(544),
+        admission_reasons: Vec::new(),
+        ..refused
+    };
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_mapping(caller, 73_000, admitted, later);
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let module_id = harness
+        .coordinator()
+        .registry()
+        .module_id_for(&key)
+        .unwrap();
+    let module_json = document["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|module| module["id"] == module_id.label())
+        .unwrap();
+    assert_eq!(module_json["admission"]["state"], "admitted");
+    assert_eq!(module_json["admission"]["endpoints"], 544);
+    assert_eq!(
+        module_json["admission"]["history"],
+        serde_json::json!([{"from": "refused", "to": "admitted", "at_ns": later}])
+    );
+    assert!(
+        presentation
+            .edges
+            .iter()
+            .all(|edge| edge.capture != Capture::Refused),
+        "an instrumented module never reads refused"
+    );
+    let snapshot = render_snapshot(&presentation);
+    assert!(
+        snapshot.contains(&format!(
+            "({}) admission history refused->admitted@{later}",
+            "admitted"
+        )),
+        "{snapshot}"
+    );
+    assert!(
+        document["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["subject"] == "module admission changed"),
+        "{document}"
+    );
+}
+
+#[test]
+fn budgets_carry_the_inventory_attach_set_endpoints() {
+    let harness = varied_harness();
+    let document = harness.render();
+    let row = &document["budgets"]["inventory_endpoints"];
+    assert_eq!(row["limit"], 4096, "the coordinator's Inventory budget");
+    assert_eq!(
+        row["occupied"],
+        harness.coordinator().attach_set().len(),
+        "occupancy is the attach set's endpoint count"
+    );
+    let presentation = capture_for(&harness, &document);
+    assert_eq!(presentation.budgets.inventory_endpoints_limit, 4096);
+    assert_eq!(document["budgets"]["inventory_endpoints"]["refused"], 0);
+    assert_eq!(
+        document["budgets"]["inventory_attach_modules"],
+        serde_json::json!({"limit": 4096, "occupied": 0, "refused": 0})
+    );
+    let snapshot = render_snapshot(&presentation);
+    let budgets = snapshot.lines().nth(1).unwrap();
+    assert!(
+        budgets.ends_with(
+            " | inventory_endpoints 0/4096 refused 0 | inventory_attach_modules 0/4096 refused 0"
+        ),
+        "{budgets}"
+    );
+}
+
+#[test]
+fn snapshot_gap_lines_escape_target_controlled_control_characters() {
+    // DR-11: gap subjects and reasons carry target-controlled strings
+    // (paths, error text). The pager snapshot escapes them like every
+    // other field; the JSON keeps them verbatim.
+    let (mut harness, _caller) = single_caller_harness("present-gap-escape", 1);
+    let hostile_subject = "/tmp/evil\u{1b}[2J\u{1b}]0;owned\u{7}.so";
+    let hostile_reason = "unreadable\r\nfake line\u{9b}31m";
+    for budget in [
+        None,
+        Some(crate::discovery::caller_registry::BudgetRefusal {
+            resource: "callers",
+            limit: 1,
+            requested: 2,
+        }),
+    ] {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(4242),
+                subject: hostile_subject.into(),
+                reason: hostile_reason.into(),
+                budget,
+            });
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let snapshot = render_snapshot(&presentation);
+    for raw in ['\u{1b}', '\u{7}', '\r', '\u{9b}'] {
+        assert!(
+            !snapshot.contains(raw),
+            "raw {raw:?} in snapshot:\n{snapshot:?}"
+        );
+    }
+    let gap_lines: Vec<&str> = snapshot
+        .lines()
+        .filter(|line| line.starts_with("gap ["))
+        .collect();
+    assert_eq!(
+        gap_lines.len(),
+        2,
+        "one line per gap, no injected line:\n{snapshot}"
+    );
+    let subject = crate::render::escape_controls(hostile_subject).into_owned();
+    let reason = crate::render::escape_controls(hostile_reason).into_owned();
+    assert_eq!(gap_lines[0], format!("gap [{subject}] {reason}"));
+    assert_eq!(
+        gap_lines[1],
+        format!("gap [{subject}] {reason} (budget callers: limit 1, requested 2)")
+    );
+    assert!(!snapshot.contains("\nfake line"), "{snapshot:?}");
+    // JSON is unaffected: the verbatim strings, escaped by JSON itself.
+    let gaps = document["gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter()
+            .any(|gap| gap["subject"] == hostile_subject && gap["reason"] == hostile_reason)
+    );
+}
+
+#[test]
+fn uncovered_edges_read_neither_idle_nor_armed() {
+    // I3 (review): quiet is a fact only under a loss-free count or a
+    // watch; armed only where usage is actually covered. Every other
+    // live edge reads an explicit unknown activity and a capture state
+    // that says why (scan only, or coverage lost with the reason in
+    // `entries.coverage`).
+    let (mut harness, caller) = single_caller_harness("present-uncovered", 6);
+    harness.advance(10_000_000_000);
+    let now = harness.now_ns();
+    let refused = refused_module_info(9);
+    let refused_key = refused.key.clone();
+    {
+        let registry = harness.coordinator_mut().registry_mut();
+        registry.note_mapping(caller, 73_000, refused, now);
+        // m0 scan only (no note). m1 watched. m2 counted, loss-free and
+        // old. m3 counted, then lossy. m4 attach failed. m5 witnessed.
+        registry.note_coverage(
+            caller,
+            &scale_key(1),
+            CoverageNote::Watched { since_ns: 10 },
+        );
+        registry.note_coverage(
+            caller,
+            &scale_key(3),
+            CoverageNote::Counted { since_ns: 10 },
+        );
+        registry.note_coverage(
+            caller,
+            &scale_key(4),
+            CoverageNote::Unknown(UnknownReason::AttachFailed),
+        );
+        registry.note_witness(caller, &scale_key(5), 30);
+    }
+    harness.commit();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_capture_loss("EVENTS ring lost 2 records".into());
+    harness.commit();
+    // m2: a counting feed that started after the loss: loss-free, old.
+    {
+        let registry = harness.coordinator_mut().registry_mut();
+        registry.note_coverage(
+            caller,
+            &scale_key(2),
+            CoverageNote::Counted { since_ns: 10 },
+        );
+        registry.observe_entries(caller, &scale_key(2), 2, 20);
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = Presentation::capture(
+        harness.coordinator(),
+        "workload",
+        0,
+        now,
+        2,
+        now,
+        DASHBOARD_ACTIVITY_WINDOW_NS,
+    );
+    let view = |key: &ModuleKey| {
+        let id = harness.coordinator().registry().module_id_for(key).unwrap();
+        presentation
+            .edges
+            .iter()
+            .find(|edge| edge.module == id)
+            .unwrap()
+            .clone()
+    };
+    let expect = [
+        (scale_key(0), Capture::ScanOnly, Activity::Uncovered),
+        (scale_key(1), Capture::Armed, Activity::Quiet),
+        (scale_key(2), Capture::Armed, Activity::Quiet),
+        (scale_key(3), Capture::Armed, Activity::Lossy),
+        (scale_key(4), Capture::CoverageLost, Activity::Uncovered),
+        (scale_key(5), Capture::Armed, Activity::Used),
+        (refused_key, Capture::Refused, Activity::Uncovered),
+    ];
+    let snapshot = render_snapshot(&presentation);
+    for (key, capture, activity) in expect {
+        let edge = view(&key);
+        assert_eq!(
+            (edge.capture, edge.activity),
+            (capture, activity),
+            "{key:?}: {:?}",
+            edge.coverage
+        );
+        let line = edge_line(&snapshot, &edge);
+        assert!(
+            line.contains(&format!(
+                "capture {} activity {} ",
+                capture.label(),
+                activity.label()
+            )),
+            "{line}"
+        );
+    }
+    // The attach failure's reason rides in the coverage, in every form.
+    let failed = view(&scale_key(4));
+    assert!(
+        edge_line(&snapshot, &failed).ends_with("coverage unknown (attach failed)"),
+        "{snapshot}"
+    );
+    let failed_json = document["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["module"] == failed.module.label())
+        .unwrap();
+    assert_eq!(
+        failed_json["entries"]["coverage"]["reason"],
+        "attach_failed"
+    );
+    assert!(failed_json["entries"]["coverage"]["lossy"].is_null());
+    // `lossy` is a boolean exactly for counted coverage.
+    let lossy_json = document["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["module"] == view(&scale_key(3)).module.label())
+        .unwrap();
+    assert_eq!(lossy_json["entries"]["coverage"]["lossy"], true);
 }

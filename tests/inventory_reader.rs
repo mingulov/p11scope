@@ -4,9 +4,10 @@
 //! Reads ONLY the `inventory` output document (via CLI invocation on
 //! owned fixture processes — no private-harness shortcuts) and asserts
 //! every expected module, caller, edge, and gap is present with the
-//! right identity/state/reason, including the refused NSS/closure cases,
-//! the same-path dance pair, and the hardlink alias pair. Also pins the
-//! negative contracts: no record reports a mapping as an observed call.
+//! right identity/state/reason, including the NSS/closure shapes that only
+//! the Inventory endpoint budget admits, the same-path dance pair, and the
+//! hardlink alias pair. Also pins the negative contracts: no record reports
+//! a mapping as an observed call.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -174,9 +175,9 @@ impl Drop for FixtureGuard {
 
 /// Strict-admission asserts hold only when ambient processes stay
 /// memory-unreadable: ptrace_scope >= 1 and unprivileged. Any other
-/// machine shape relaxes admission *state* only — identity, callers,
-/// edges, and the structural NSS/closure refusals stay strict
-/// everywhere.
+/// machine shape relaxes admission *state* only — ambient providers then
+/// compete for the same Inventory endpoint budget — while identity,
+/// callers and edges stay strict everywhere.
 fn strict_admission() -> bool {
     if unsafe { libc::getuid() } == 0 {
         return false;
@@ -428,18 +429,39 @@ fn inventory_contract_modules_callers_edges_gaps() {
         doc["gaps"]
     );
 
-    // The refused pair: present with refusal reasons, zero invented
-    // calls. Structural refusals hold on every machine shape.
-    for (name, so_name) in [("N", "ir-nss.so"), ("C", "ir-close.so")] {
+    // The pair past the 512-slot Detailed ceiling that `inspect --system`
+    // refuses (catalog_reader): inventory judges admission against its
+    // 4096-endpoint Inventory budget, so on a strict machine both are
+    // admitted whole — N's 8 tables x 68 targets, C's 65 x 8 own targets
+    // plus 12 shared stubs. Elsewhere ambient providers compete for that
+    // budget, and a refusal must at least name its reason. Zero invented
+    // calls either way.
+    for (name, so_name, endpoints) in [
+        ("N", "ir-nss.so", 8 * 68),
+        ("C", "ir-close.so", 65 * 8 + 12),
+    ] {
         let module = module_for(doc, so_name);
-        assert_eq!(module["admission"]["state"], "refused");
-        assert!(
-            !module["admission"]["reasons"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "{so_name} must carry refusal reasons"
-        );
+        let admitted = module["admission"]["state"] == "admitted";
+        if strict_admission() || admitted {
+            assert_eq!(
+                module["admission"]["state"], "admitted",
+                "{so_name}: {}",
+                module["admission"]
+            );
+            assert_eq!(module["admission"]["endpoints"], endpoints);
+            assert_eq!(module["admission"]["reasons"], serde_json::json!([]));
+        } else {
+            assert_eq!(module["admission"]["state"], "refused");
+            let reasons = module["admission"]["reasons"].as_array().unwrap();
+            assert!(!reasons.is_empty(), "{so_name} must carry refusal reasons");
+            // Never the Detailed ceiling `inspect` judges by.
+            for reason in reasons {
+                assert!(
+                    !reason.as_str().unwrap().contains("512 attach slots"),
+                    "{so_name}: {reason}"
+                );
+            }
+        }
         let caller = caller_for(doc, pid_of(&dance.pids, name));
         let edge = edge_for(
             doc,
@@ -449,7 +471,14 @@ fn inventory_contract_modules_callers_edges_gaps() {
         assert_eq!(edge["mapping"]["state"], "mapped");
         assert_eq!(edge["entries"]["count"], 0);
         assert!(edge["entries"]["last_seen_ns"].is_null());
-        assert_eq!(edge["entries"]["observation"], "unknown (not admitted)");
+        assert_eq!(
+            edge["entries"]["observation"],
+            if admitted {
+                "unknown (usage observation unavailable)"
+            } else {
+                "unknown (not admitted)"
+            }
+        );
     }
 
     // The alias pair: one module record under two paths, two edges.

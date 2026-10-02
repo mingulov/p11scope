@@ -2632,6 +2632,27 @@ pub fn build_from_sources_for_policy(
     )
 }
 
+/// Builds an initial plan under an explicit immutable admission policy and
+/// admission scope. The `inspect --system` catalog lowers Detailed and the
+/// inventory catalog lowers Inventory through this one entry point, so the
+/// two differ only in the policy they pass.
+pub fn build_from_sources_for_policy_scoped(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+    admission_policy: AdmissionPolicy,
+    admission_scope: AdmissionScope,
+) -> AttachPlan {
+    build_from_sources_with_policy(
+        scanned,
+        manifests,
+        pinned,
+        false,
+        admission_policy,
+        admission_scope,
+    )
+}
+
 fn build_from_sources_with_policy(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
@@ -4810,6 +4831,40 @@ mod tests {
             (0..admitted + growth).map(|index| u64::from(index) * 8),
         );
         (plan, grown)
+    }
+
+    /// Inventory admission in a shared scope keeps the GT-5 reserve: an
+    /// uncorroborated provider may take at most 3072 of the 4096 Inventory
+    /// endpoints (the inventory catalog's lowering shape); a named scope has
+    /// no reserve.
+    #[test]
+    fn inventory_shared_scope_keeps_the_uncorroborated_reserve() {
+        let policy = AdmissionPolicy::Inventory(
+            crate::capacity::InventoryBudget::new(4096, 4096 * 8).unwrap(),
+        );
+        let lower = |endpoints: u64, scope: AdmissionScope| {
+            build_from_sources_for_policy_scoped(
+                &[scanned_with(
+                    scanned_key(PinnedObjectId(7)),
+                    "/opt/heuristic.so",
+                    (0..endpoints).map(|index| index * 8),
+                )],
+                &[],
+                &PinnedObjects::empty(),
+                policy,
+                scope,
+            )
+        };
+        assert_eq!(shared_scope_reserve(4096), 1024);
+        let fits = lower(3072, AdmissionScope::Shared);
+        assert_eq!(fits.refused_modules().count(), 0);
+        assert_eq!(fits.slots.len(), 3072);
+        let over = lower(3073, AdmissionScope::Shared);
+        assert_eq!(over.refused_modules().count(), 1);
+        assert!(over.slots.is_empty());
+        let named = lower(3073, AdmissionScope::Named);
+        assert_eq!(named.refused_modules().count(), 0);
+        assert_eq!(named.slots.len(), 3073);
     }
 
     /// G-03 (owner decision 2026-09-23): an admitted provider that grows past

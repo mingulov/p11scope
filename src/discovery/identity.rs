@@ -166,6 +166,59 @@ impl RetainedInventoryTarget {
         }
         Ok(unchanged)
     }
+
+    /// The raw mapping key this object was first retained under.
+    pub(crate) fn object_key(&self) -> ObjectKey {
+        self.entry.raw.key
+    }
+
+    /// The retained pathname, for messages only.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &str {
+        &self.entry.path
+    }
+
+    pub(crate) fn content_key(&self) -> PinnedContentKey {
+        PinnedContentKey {
+            pin: self.entry.pin,
+            sha256: self.entry.sha256.clone(),
+        }
+    }
+
+    /// Whether `id` in a later, separately built pin store is this retained
+    /// object: equal non-empty digest, equal pin, and either the same opened
+    /// mapping or the same kernel file behind both fds. Numeric IDs and raw
+    /// keys are never compared; an fstat pair runs only when the mappings
+    /// differ (one file seen through two mounts).
+    pub(crate) fn same_object_as(&self, pins: &PinnedObjects, id: PinnedObjectId) -> bool {
+        pins.by_id.get(&id).is_some_and(|current| {
+            !self.entry.sha256.is_empty()
+                && self.entry.sha256 == current.sha256
+                && self.entry.pin == current.pin
+                && (self.entry.mapping == current.mapping
+                    || same_kernel_file(&self.entry.file, &current.file))
+        })
+    }
+
+    /// Whether `id`'s opened file is the kernel file this object retains
+    /// (an fstat pair on the two fds), whatever its pin or digest says. An
+    /// in-place rewrite keeps the kernel file; a raw maps key reused for
+    /// another file (an anonymous overlay device recycled after a container
+    /// exits) does not.
+    pub(crate) fn same_kernel_file_as(&self, pins: &PinnedObjects, id: PinnedObjectId) -> bool {
+        pins.by_id
+            .get(&id)
+            .is_some_and(|current| same_kernel_file(&self.entry.file, &current.file))
+    }
+}
+
+/// The content half of one opened identity — the pin taken at open plus the
+/// whole-file digest. Two openings of one physical file agree on it, so it
+/// narrows a cross-store lookup; it never proves sameness on its own.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PinnedContentKey {
+    pin: Pin,
+    sha256: String,
 }
 
 /// Capture-private ownership key for causal timing. Numeric pin/module IDs and
@@ -465,6 +518,16 @@ impl PinnedObjects {
         self.by_id
             .get(&id)
             .map_or_else(|| Arc::from(Vec::new()), |entry| entry.exports.clone())
+    }
+
+    /// The content lookup key of a pinned object; `None` when it is not
+    /// pinned here or carries no digest (never comparable).
+    pub(crate) fn content_key(&self, id: PinnedObjectId) -> Option<PinnedContentKey> {
+        let entry = self.by_id.get(&id)?;
+        (!entry.sha256.is_empty()).then(|| PinnedContentKey {
+            pin: entry.pin,
+            sha256: entry.sha256.clone(),
+        })
     }
 
     pub(crate) fn retain_inventory_target(
@@ -2170,6 +2233,51 @@ pub(crate) mod test_fixture {
             result.insert_entry(entry, &mut Vec::new());
         }
         result
+    }
+
+    /// A scan pin over a real file: the pin and the mapping's device and
+    /// inode come from the opened file itself, so retention,
+    /// `check_unchanged` and the same-kernel-file proof behave as for a real
+    /// scan pin. `key` overrides the raw maps key (one file seen through an
+    /// overlay view); `sha256` is the digest the caller asserts for the bytes.
+    pub(crate) fn real_scan_pin(
+        path: &Path,
+        key: Option<ObjectKey>,
+        mount_id: u64,
+        sha256: &str,
+    ) -> PinnedObjects {
+        let file = std::fs::File::open(path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let fd_key = ObjectKey {
+            device: Device {
+                major: u64::from(libc::major(metadata.dev())),
+                minor: u64::from(libc::minor(metadata.dev())),
+            },
+            inode: metadata.ino(),
+        };
+        let key = key.unwrap_or(fd_key);
+        let path = path.to_str().unwrap();
+        let raw = RawObjectInstance::scanned(&module(key), key, path).unwrap();
+        let entry = Entry {
+            mapping: MappingFileKey {
+                mount_id,
+                device_major: fd_key.device.major,
+                device_minor: fd_key.device.minor,
+                inode: fd_key.inode,
+            },
+            raw,
+            pin: pin_of(&file).unwrap(),
+            file: Arc::new(file),
+            path: path.into(),
+            sha256: sha256.into(),
+            build_id: None,
+            abi: ElfAbi::Lp64,
+            exports: Arc::from(Vec::new()),
+            overlay: false,
+        };
+        let mut pins = PinnedObjects::empty();
+        pins.insert_entry(entry, &mut Vec::new());
+        pins
     }
 
     /// Objects opened through a container's overlay mount — the shape this is about.

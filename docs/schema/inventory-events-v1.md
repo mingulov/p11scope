@@ -29,8 +29,12 @@ Every line carries the same envelope plus its `kind`-specific `event`:
 ## Event kinds
 
 - `started`: `{scope, clock: {basis, unit}, started_ns, limits:
-  {callers, modules, edges, endpoints, semantic_state,
-  retained_history}}`. First event of every run.
+  {callers, modules, edges, endpoints, inventory_endpoints,
+  inventory_attach_modules, semantic_state, retained_history}}`.
+  First event of every run. `inventory_endpoints` and
+  `inventory_attach_modules` (additive within v1) are the run's
+  Inventory attach-set limits (`budgets.inventory_endpoints.limit`,
+  `budgets.inventory_attach_modules.limit`).
 - `caller_event`: one caller-incarnation turnover —
   `{event: admitted, caller}`, `{event: exited, caller, reason}`,
   `{event: exec_retired, old, new}`, `{event: reused, old, new}`, or
@@ -47,7 +51,17 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   snapshot record shapes (test/sync emission; production emits
   incrementally instead). `edge_observed` adds the three derived
   presentation states `presence`, `capture`, `activity` — computed
-  from the same model the dashboard renders, never new capture.
+  from the same model the dashboard renders, never new capture. Its
+  `entries` object is the snapshot's verbatim, including the additive
+  `entries.coverage` (see `inventory-v1.md`). `capture` is `armed`
+  (usage actually covered: counted, witnessed, or watched), `scan
+  only` (a live mapping no usage producer instruments), `refused`,
+  `retired`, or `coverage lost` (the reason is in
+  `entries.coverage`). `activity` is `recently observed`, `operation
+  initialized / in flight`, `used (recency unknown)` (witnessed use),
+  `quiet` (only under a loss-free count or a watch — a fact),
+  `unknown (lossy)`, `unknown (not covered)` (nothing covers the
+  edge's usage), or `unknown` (no live mapping).
 - `snapshot`: `{scope, passes, budgets, gaps_suppressed}` (test/sync
   emission marker).
 - `rotated`: `{prior_file, prior_events, prior_bytes, rotation_seq}` —
@@ -96,7 +110,9 @@ document pass for pass.
 {"schema": "p11scope/inventory-events/v1", "seq": 0, "at_ns": 100, "kind": "started",
  "event": {"scope": "pid:4242", "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
            "started_ns": 100, "limits": {"callers": 4096, "modules": 4096, "edges": 32768,
-           "endpoints": 1048576, "semantic_state": 32768, "retained_history": 1024}}}
+           "endpoints": 1048576, "inventory_endpoints": 4096,
+           "inventory_attach_modules": 4096, "semantic_state": 32768,
+           "retained_history": 1024}}}
 {"schema": "p11scope/inventory-events/v1", "seq": 1, "at_ns": 110, "kind": "caller_event",
  "event": {"event": "admitted", "caller": "c0"}}
 {"schema": "p11scope/inventory-events/v1", "seq": 2, "at_ns": 110, "kind": "pass_committed",

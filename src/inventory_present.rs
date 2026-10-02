@@ -10,16 +10,21 @@
 //!
 //! Dashboard vocabulary is the plan's exact wording (no synonyms):
 //! presence `mapped | unloaded | process exited | unknown`; capture
-//! `armed | refused | retired | coverage lost`; activity
-//! `recently observed | operation initialized / in flight | quiet |
+//! `armed | scan only | refused | retired | coverage lost`; activity
+//! `recently observed | operation initialized / in flight | used
+//! (recency unknown) | quiet | unknown (lossy) | unknown (not covered) |
 //! unknown`. Quiet is not unloaded; capture refusal is not application
-//! inactivity. The mapping from registry state is documented on each
-//! enum and pinned by tests.
+//! inactivity; witnessed use is never quiet; an edge whose usage nothing
+//! covers is neither quiet nor armed (Task 6 C2 review I3).
+//! The mapping from registry state is documented on each enum and
+//! pinned by tests. Per-edge usage coverage ([`UseCoverage`]) renders
+//! through [`coverage_label`] in snapshots and dashboard frames and as
+//! `entries.coverage` in JSON.
 
 use crate::discovery::caller_registry::{
-    AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord, ExeIdentity,
-    ImageAuthority, MappingState, ModuleId, ModuleLifecycle, ModuleRecord, ProcessSource,
-    SEMANTIC_UNKNOWN,
+    AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
+    ExeIdentity, ImageAuthority, MappingState, ModuleId, ModuleLifecycle, ModuleRecord,
+    ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
 };
 use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::render::escape_controls;
@@ -80,12 +85,15 @@ impl Presence {
 /// it. Refusal is admission/budget (the observer was not allowed to
 /// capture); retirement is a proven end (caller retired, edge ended);
 /// coverage loss is missing evidence (unresolved admission, uncertain
-/// mapping, unknown lifecycles); armed is everything known and live.
-/// Scan-only mapping capture without a usage feed is still armed —
-/// the missing usage column affects activity, not capture.
+/// mapping, unknown lifecycles, or usage coverage that was lost or never
+/// reached the edge — attach failure, not attached, health loss,
+/// capacity; the edge's `entries.coverage` names the reason); scan only
+/// is a live mapping no usage producer instruments; armed is a live edge
+/// whose usage is actually covered (counted, witnessed, or watched).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Capture {
     Armed,
+    ScanOnly,
     Refused,
     Retired,
     CoverageLost,
@@ -95,6 +103,7 @@ impl Capture {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Armed => "armed",
+            Self::ScanOnly => "scan only",
             Self::Refused => "refused",
             Self::Retired => "retired",
             Self::CoverageLost => "coverage lost",
@@ -105,6 +114,7 @@ impl Capture {
         caller: &CallerRecord,
         module: &ModuleRecord,
         mapping: MappingState,
+        coverage: &UseCoverage,
     ) -> Self {
         if module.admission == AdmissionState::Refused {
             Self::Refused
@@ -117,7 +127,13 @@ impl Capture {
         {
             Self::CoverageLost
         } else {
-            Self::Armed
+            match coverage {
+                UseCoverage::Counted { .. }
+                | UseCoverage::Witnessed { .. }
+                | UseCoverage::WatchedNoUse { .. } => Self::Armed,
+                UseCoverage::Unknown(UnknownReason::ScanOnly) => Self::ScanOnly,
+                UseCoverage::Unknown(_) => Self::CoverageLost,
+            }
         }
     }
 }
@@ -125,11 +141,14 @@ impl Capture {
 /// Activity of one association: recency of observed entries, never a
 /// sticky bit. In-flight wins — a call inside the API now OR a live
 /// operation machine (S1 genuine operation state, not recency alone);
-/// then recent last-seen inside the window; then quiet (a live mapping
-/// with no recent entries — even when the entry columns read unknown,
-/// quiet is about observed entries, not feed availability, so a
-/// refused-but-quiet edge renders both states); anything without a
-/// live mapping reads as unknown. Quiet is not unloaded: unloaded
+/// then recent last-seen inside the window (counted coverage is the only
+/// recency source); then used (witnessed use with no count or recency —
+/// never quiet, whatever the mapping); anything without a live mapping
+/// reads as unknown; then, for a live mapping, quiet only where the
+/// quiet is a fact — a loss-free counting feed or a watched module with
+/// no recent entry; a lossy feed reads unknown (lossy); and an edge no
+/// usage producer covers (scan only, refused, not attached, lost) reads
+/// unknown (not covered) — never idle. Quiet is not unloaded: unloaded
 /// edges are never mapped, so they never read as quiet.
 /// The three "right now" inputs (recent call, initialized operation,
 /// in-flight API call) stay distinct facts in the JSON; this label is
@@ -138,7 +157,10 @@ impl Capture {
 pub(crate) enum Activity {
     RecentlyObserved,
     InFlight,
+    Used,
     Quiet,
+    Lossy,
+    Uncovered,
     Unknown,
 }
 
@@ -147,7 +169,10 @@ impl Activity {
         match self {
             Self::RecentlyObserved => "recently observed",
             Self::InFlight => "operation initialized / in flight",
+            Self::Used => "used (recency unknown)",
             Self::Quiet => "quiet",
+            Self::Lossy => "unknown (lossy)",
+            Self::Uncovered => "unknown (not covered)",
             Self::Unknown => "unknown",
         }
     }
@@ -155,22 +180,34 @@ impl Activity {
     /// `recent` comes from the registry's recency predicate (the
     /// same window math the historical "active" flag uses); this maps
     /// states, never recomputes windows. `op_active` is genuine S1
-    /// operation state (a live machine), never recency.
+    /// operation state (a live machine), never recency. `coverage` is
+    /// the edge's usage coverage: it decides whether a silent live edge
+    /// is quiet (a fact) or uncovered.
     pub(crate) fn for_edge(
         mapping: MappingState,
         in_flight: bool,
         recent: bool,
         op_active: bool,
+        coverage: &UseCoverage,
     ) -> Self {
         if in_flight || op_active {
             return Self::InFlight;
         }
         if recent {
-            Self::RecentlyObserved
-        } else if mapping == MappingState::Mapped {
-            Self::Quiet
-        } else {
-            Self::Unknown
+            return Self::RecentlyObserved;
+        }
+        if coverage.is_witnessed() {
+            return Self::Used;
+        }
+        if mapping != MappingState::Mapped {
+            return Self::Unknown;
+        }
+        match coverage {
+            UseCoverage::Counted { lossy: false, .. } | UseCoverage::WatchedNoUse { .. } => {
+                Self::Quiet
+            }
+            UseCoverage::Counted { lossy: true, .. } => Self::Lossy,
+            UseCoverage::Witnessed { .. } | UseCoverage::Unknown(_) => Self::Uncovered,
         }
     }
 }
@@ -207,6 +244,7 @@ pub(crate) struct ModuleView {
     pub admission_class: Option<String>,
     pub admission_endpoints: Option<usize>,
     pub admission_reasons: Vec<String>,
+    pub admission_history: Vec<AdmissionChange>,
     pub lifecycle: ModuleLifecycle,
     pub unloaded_observed: bool,
 }
@@ -276,6 +314,7 @@ pub(crate) struct EdgeView {
     pub entry_last_seen_ns: Option<u64>,
     pub entry_in_flight: bool,
     pub entry_observation: &'static str,
+    pub coverage: UseCoverage,
     pub presence: Presence,
     pub capture: Capture,
     pub activity: Activity,
@@ -308,6 +347,18 @@ pub(crate) struct BudgetView {
     pub endpoints_limit: usize,
     pub endpoints_occupied: usize,
     pub endpoints_refused: u64,
+    /// The run's Inventory attach set: its capture-lifetime endpoint
+    /// budget and the endpoints it holds (IDs are never reused, so
+    /// occupancy only grows).
+    pub inventory_endpoints_limit: usize,
+    pub inventory_endpoints_occupied: usize,
+    /// Per-pass module refusals on the attach set's endpoint budget.
+    pub inventory_endpoints_refused: u64,
+    /// The attach set's module records (capped at its endpoint budget).
+    pub inventory_modules_limit: usize,
+    pub inventory_modules_occupied: usize,
+    /// Per-pass module refusals on the module-record cap.
+    pub inventory_modules_refused: u64,
     pub counters_observed: usize,
     pub counters_saturated: usize,
     pub semantic_limit: usize,
@@ -339,6 +390,7 @@ pub(crate) struct Presentation {
     pub started_ns: u64,
     pub ended_ns: u64,
     pub passes: u64,
+    /// Derived summary only: some edge holds non-unknown coverage.
     pub usage_feed: bool,
     pub callers: Vec<CallerView>,
     pub modules: Vec<ModuleView>,
@@ -421,6 +473,7 @@ impl Presentation {
                 admission_class: record.admission_class.clone(),
                 admission_endpoints: record.admission_endpoints,
                 admission_reasons: record.admission_reasons.clone(),
+                admission_history: record.admission_history.clone(),
                 lifecycle: record.lifecycle,
                 unloaded_observed: record.unloaded_observed,
             });
@@ -442,7 +495,10 @@ impl Presentation {
             let module_record = registry
                 .module(*module_id)
                 .expect("every captured edge module resolves in the registry");
-            let recent = registry.entry_recent_within(edge, now_ns, window_ns);
+            let coverage = registry.coverage(edge);
+            // Recency comes only from counted coverage.
+            let recent = matches!(coverage, UseCoverage::Counted { .. })
+                && registry.entry_recent_within(edge, now_ns, window_ns);
             let semantics = semantics_view(edge.semantics.as_ref());
             let op_active = edge
                 .semantics
@@ -463,8 +519,15 @@ impl Presentation {
                 entry_in_flight: edge.entry_in_flight,
                 entry_observation: registry.entry_observation(edge).label(),
                 presence: Presence::for_edge(caller_record, module_record, edge.mapping),
-                capture: Capture::for_edge(caller_record, module_record, edge.mapping),
-                activity: Activity::for_edge(edge.mapping, edge.entry_in_flight, recent, op_active),
+                capture: Capture::for_edge(caller_record, module_record, edge.mapping, &coverage),
+                activity: Activity::for_edge(
+                    edge.mapping,
+                    edge.entry_in_flight,
+                    recent,
+                    op_active,
+                    &coverage,
+                ),
+                coverage,
                 semantics,
             });
         }
@@ -509,6 +572,18 @@ impl Presentation {
                 endpoints_limit: limits.max_endpoints,
                 endpoints_occupied: registry.endpoints_total(),
                 endpoints_refused: registry.endpoints_refused(),
+                inventory_endpoints_limit: usize::try_from(
+                    coordinator.attach_set().budget().endpoint_limit(),
+                )
+                .unwrap_or(usize::MAX),
+                inventory_endpoints_occupied: coordinator.attach_set().len(),
+                inventory_endpoints_refused: coordinator.attach_set().endpoint_refusals(),
+                inventory_modules_limit: usize::try_from(
+                    coordinator.attach_set().budget().endpoint_limit(),
+                )
+                .unwrap_or(usize::MAX),
+                inventory_modules_occupied: coordinator.attach_set().module_records(),
+                inventory_modules_refused: coordinator.attach_set().module_record_refusals(),
                 counters_observed: observed_edges,
                 counters_saturated: saturated_edges,
                 semantic_limit: limits.max_semantic_states,
@@ -648,6 +723,63 @@ fn snapshot_semantics(edge: &EdgeView) -> String {
     )
 }
 
+/// One edge's coverage in words: ONE wording shared by pager snapshots
+/// and dashboard frames (JSON carries the structured
+/// `entries.coverage`). Never says "observed" for a zero it cannot
+/// prove: witnessed use is "used", an unknown names its reason.
+pub(crate) fn coverage_label(coverage: &UseCoverage) -> String {
+    match coverage {
+        UseCoverage::Counted {
+            since_ns,
+            lossy: false,
+        } => format!("counted since {since_ns}"),
+        UseCoverage::Counted {
+            since_ns,
+            lossy: true,
+        } => format!("counted since {since_ns} (lossy)"),
+        UseCoverage::Witnessed { first_ns } => {
+            format!("used, count unavailable (first {first_ns})")
+        }
+        UseCoverage::WatchedNoUse { since_ns } => format!("no use since {since_ns}"),
+        UseCoverage::Unknown(reason) => format!("unknown ({})", reason.text()),
+    }
+}
+
+/// The dashboard's compact entry count: the number only where it is a
+/// fact (a counted or watched edge, or a positive count — `+` marks a
+/// lossy lower bound), `?` where the count is unavailable (unknown
+/// coverage, or witnessed use without a count). A zero never reads as a
+/// fact the coverage cannot back.
+pub(crate) fn entries_display(edge: &EdgeView) -> String {
+    match &edge.coverage {
+        UseCoverage::Counted { lossy: true, .. } if edge.entry_count > 0 => {
+            format!("{}+", edge.entry_count)
+        }
+        UseCoverage::Counted { lossy: false, .. } | UseCoverage::WatchedNoUse { .. } => {
+            edge.entry_count.to_string()
+        }
+        _ if edge.entry_count > 0 => edge.entry_count.to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// One module's admission history in words (`refused->admitted@200`),
+/// empty when the first verdict still stands.
+pub(crate) fn admission_history_label(history: &[AdmissionChange]) -> String {
+    history
+        .iter()
+        .map(|change| {
+            format!(
+                "{}->{}@{}",
+                change.from.label(),
+                change.to.label(),
+                change.at_ns
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Semantic budget status: `withheld` while no edge holds semantic
 /// state, `observed` once any does. ONE computation shared by the JSON
 /// document, pager snapshots, and dashboard headers.
@@ -695,7 +827,7 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
     );
     let _ = writeln!(
         out,
-        "budgets: callers {}/{} refused {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {}",
+        "budgets: callers {}/{} refused {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {}",
         budgets.callers_occupied,
         budgets.callers_limit,
         budgets.callers_refused,
@@ -718,6 +850,12 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
         budgets.retained,
         budgets.retained_limit,
         budgets.retained_suppressed,
+        budgets.inventory_endpoints_occupied,
+        budgets.inventory_endpoints_limit,
+        budgets.inventory_endpoints_refused,
+        budgets.inventory_modules_occupied,
+        budgets.inventory_modules_limit,
+        budgets.inventory_modules_refused,
     );
     for caller in &presentation.callers {
         let exe = caller
@@ -737,9 +875,17 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
     }
     for module in &presentation.modules {
         let path = module.paths.first().map(String::as_str).unwrap_or("?");
+        let history = if module.admission_history.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " admission history {}",
+                admission_history_label(&module.admission_history)
+            )
+        };
         let _ = writeln!(
             out,
-            "module {} {} {} ({})",
+            "module {} {} {} ({}){history}",
             module.id.label(),
             escape_controls(path),
             module.lifecycle.label(),
@@ -758,7 +904,7 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
         );
         let _ = writeln!(
             out,
-            "edge {} -> {} mapping {} entries {} ({}{}) presence {} capture {} activity {} semantics {}",
+            "edge {} -> {} mapping {} entries {} ({}{}) presence {} capture {} activity {} semantics {} coverage {}",
             edge.caller.label(),
             edge.module.label(),
             edge.mapping.label(),
@@ -769,19 +915,24 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
             edge.capture.label(),
             edge.activity.label(),
             snapshot_semantics(edge),
+            escape_controls(&coverage_label(&edge.coverage)),
         );
     }
     for gap in &presentation.gaps {
+        // Subjects and reasons carry target-controlled strings (paths,
+        // error text): escaped like every other snapshot field (DR-11).
+        let subject = escape_controls(&gap.subject);
+        let reason = escape_controls(&gap.reason);
         match gap.budget {
             Some(refusal) => {
                 let _ = writeln!(
                     out,
-                    "gap [{}] {} (budget {}: limit {}, requested {})",
-                    gap.subject, gap.reason, refusal.resource, refusal.limit, refusal.requested,
+                    "gap [{subject}] {reason} (budget {}: limit {}, requested {})",
+                    refusal.resource, refusal.limit, refusal.requested,
                 );
             }
             None => {
-                let _ = writeln!(out, "gap [{}] {}", gap.subject, gap.reason);
+                let _ = writeln!(out, "gap [{subject}] {reason}");
             }
         }
     }

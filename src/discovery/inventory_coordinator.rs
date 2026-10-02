@@ -29,8 +29,12 @@ use super::inventory::{
 use super::*;
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
-    AdmissionState, CallerAdapter, CallerEvent, CallerId, CallerRegistry, ImageAuthority,
-    MappingState, ModuleInfo, ModuleKey, ProcessSource, RegistryGap, RegistryLimits,
+    AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
+    ImageAuthority, MappingState, ModuleInfo, ModuleKey, ProcessSource, RegistryGap,
+    RegistryLimits,
+};
+use crate::discovery::inventory_attach_set::{
+    AttachModuleKey, AttachVerdict, InventoryAttachSet, TargetDelta,
 };
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
@@ -118,11 +122,17 @@ impl AuthorityResolver<'_> {
 }
 
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
-/// the caller registry behind one batch boundary.
+/// the caller registry behind one batch boundary, plus the attach set the
+/// catalog's Inventory lowering feeds every pass.
 pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     engine: Engine,
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
+    attach_set: InventoryAttachSet,
+    /// Endpoints and objects the attach set added since the capture facade
+    /// last took them. Bounded by the endpoint budget: every endpoint
+    /// enters exactly once.
+    pending_targets: TargetDelta,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
     scanned_owners: BTreeSet<ProcessViewId>,
@@ -130,6 +140,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     next_window: u64,
     passes: u64,
     authority_gap_recorded: bool,
+}
+
+/// The capture-lifetime Inventory endpoint budget: the engine's admission
+/// policy and the attach set's bound are this one value.
+fn default_inventory_budget() -> Result<InventoryBudget> {
+    InventoryBudget::new(4096, 4096 * 8).map_err(anyhow::Error::msg)
 }
 
 fn default_inventory_config() -> Result<InventoryDiscoveryConfig> {
@@ -142,7 +158,7 @@ fn default_inventory_config() -> Result<InventoryDiscoveryConfig> {
     Ok(InventoryDiscoveryConfig::new(
         work,
         InventoryOwnerLimits::new(1024, 8, 32768).map_err(anyhow::Error::msg)?,
-        InventoryBudget::new(4096, 4096 * 8).map_err(anyhow::Error::msg)?,
+        default_inventory_budget()?,
     ))
 }
 
@@ -162,6 +178,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             engine: Engine::inventory(default_inventory_config()?, scope, hooks, hints)?,
             adapter,
             registry: CallerRegistry::new(registry_limits),
+            attach_set: InventoryAttachSet::new(default_inventory_budget()?),
+            pending_targets: TargetDelta::default(),
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
             scanned_owners: BTreeSet::new(),
@@ -189,8 +207,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.registry
     }
 
+    // Test seam: production stages only through `scan_pass` (and, from
+    // Task 6 C5, the native staging call).
+    #[cfg(test)]
     pub(crate) fn registry_mut(&mut self) -> &mut CallerRegistry {
         &mut self.registry
+    }
+
+    /// The run's attach set (read side): presentation reports its
+    /// endpoint budget and occupancy.
+    pub(crate) fn attach_set(&self) -> &InventoryAttachSet {
+        &self.attach_set
+    }
+
+    /// Takes what the attach set added since the last take: new endpoints
+    /// in ID order plus newly retained objects, never a whole plan. The
+    /// capture facade (Task 6 C3) is the production consumer; until it
+    /// lands only tests take.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_target_delta(&mut self) -> TargetDelta {
+        std::mem::take(&mut self.pending_targets)
     }
 
     #[cfg(test)]
@@ -248,18 +284,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         deadline_ns: u64,
         now_ns: u64,
     ) -> Result<PassReport> {
-        let catalog = match scope {
+        // The catalog lowers its admission under the Inventory policy and
+        // budget the attach set enforces, never the Detailed slot ceiling
+        // `inspect` reports.
+        let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
+        let mut catalog = match scope {
             InventoryScope::Pid(pid) => crate::inspect_system::collect_pid(
                 *pid,
                 &self.engine.module_hints,
                 &self.engine.hooks,
+                policy,
             )?,
             InventoryScope::System => crate::inspect_system::collect(
                 &self.engine.module_hints,
                 &self.engine.hooks,
                 max_scan_pids,
+                policy,
             )?,
         };
+        // Absorb at once: the aggregate pins and their fds drop here, never
+        // living across reconcile or the native owner scans below.
+        let verdicts = self.absorb_lowering(catalog.lowering.take());
         let observed: BTreeSet<u32> = catalog
             .processes
             .iter()
@@ -301,7 +346,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     if commit.refresh_pending {
                         pending_refresh.push(*caller);
                     }
-                    self.project_native_commit(*caller, *owner, &commit, now_ns);
+                    self.project_native_commit(*caller, *owner, &commit, &verdicts, now_ns);
                 }
                 Err(error) => {
                     self.registry.record_gap(RegistryGap {
@@ -318,7 +363,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Scan-lane projection for every inventoried member, including
         // native callers (the catalog carries admission verdicts the
         // registry needs either way).
-        self.project_catalog(&catalog, now_ns);
+        self.project_catalog(&catalog, &verdicts, now_ns);
         // Owners that never committed a complete receipt cannot back
         // absence claims: absences for their callers stay uncertain, and
         // the gap says so.
@@ -603,6 +648,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         caller: CallerId,
         owner: ProcessViewId,
         commit: &InventoryCommit,
+        verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
         now_ns: u64,
     ) {
         let pid = self
@@ -618,6 +664,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .filter_map(|module| {
                 let summary = self.engine.pinned.summary(module.object)?;
                 let sha256 = summary.sha256.to_string();
+                let verdict = verdicts.get(&AttachModuleKey {
+                    object: module.scanned.key,
+                    sha256: sha256.clone(),
+                });
                 let key = ModuleKey::physical(
                     module.scanned.key.device.major,
                     module.scanned.key.device.minor,
@@ -625,7 +675,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     Some(sha256),
                     &module.scanned.path,
                 );
-                Some((key.clone(), native_module_info(&self.engine, module, key)))
+                Some((
+                    key.clone(),
+                    native_module_info(&self.engine, module, key, verdict),
+                ))
             })
             .collect();
         for (_, info) in &modules {
@@ -663,11 +716,57 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// Project one catalog pass into the registry: per-member mappings,
-    /// per-member absences (authoritative only for complete member
-    /// scans), unscanned-member uncertainty, and catalog gaps.
-    fn project_catalog(&mut self, catalog: &crate::inspect_system::Catalog, now_ns: u64) {
+    /// The attach set absorbs one pass's Inventory lowering: its delta
+    /// joins the pending targets, its gaps stage in the registry, and its
+    /// verdicts return for the catalog projection. The lowering — the
+    /// aggregate pins and their fds included — drops on return; the set
+    /// keeps only the objects it retained.
+    fn absorb_lowering(
+        &mut self,
+        lowering: Option<crate::inspect_system::CatalogLowering>,
+    ) -> BTreeMap<AttachModuleKey, AttachVerdict> {
+        let Some(lowering) = lowering else {
+            return BTreeMap::new();
+        };
+        let absorbed = self.attach_set.absorb(&lowering.plan, &lowering.pins);
+        drop(lowering);
+        self.pending_targets.append(absorbed.delta);
+        for gap in absorbed.gaps {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: gap.subject,
+                reason: gap.reason,
+                budget: gap
+                    .budget
+                    .map(|(resource, limit, requested)| BudgetRefusal {
+                        resource,
+                        limit,
+                        requested,
+                    }),
+            });
+        }
+        absorbed.verdicts
+    }
+
+    /// Project one catalog pass into the registry: per-member mappings
+    /// carrying the attach set's admission verdicts, per-member absences
+    /// (authoritative only for complete member scans), unscanned-member
+    /// uncertainty, and catalog gaps.
+    fn project_catalog(
+        &mut self,
+        catalog: &crate::inspect_system::Catalog,
+        verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
+        now_ns: u64,
+    ) {
         for object in &catalog.objects {
+            let verdict = object.sha256.as_ref().and_then(|sha256| {
+                verdicts.get(&AttachModuleKey {
+                    object: object.key,
+                    sha256: sha256.clone(),
+                })
+            });
             // One mapping note per observation (not per object path):
             // aliased objects are observed under several paths and the
             // registry accumulates every spelling.
@@ -675,7 +774,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let Some(caller) = self.adapter.live_id(observation.pid) else {
                     continue;
                 };
-                let mut info = catalog_module_info(object);
+                let mut info = catalog_module_info(object, verdict);
                 info.path = observation.path.clone();
                 info.double_loaded = observation.double_loaded;
                 self.registry
@@ -751,52 +850,44 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 }
 
-/// Admission verdict for one natively committed module, from the
-/// committed plan: the same refused/admitted split the catalog reports.
-/// Inventory never consults manifests, so the verdict carries the
-/// scan-only note like the catalog's.
-fn native_module_info(engine: &Engine, module: &ReconciledModule, key: ModuleKey) -> ModuleInfo {
-    let refused: BTreeMap<PinnedObjectId, &Skipped> = engine.plan.refused_modules().collect();
-    let (admission, class, endpoints, reasons) = match refused.get(&module.object) {
-        Some(skip) => (
-            AdmissionState::Refused,
-            Some("refused".to_string()),
-            None,
-            vec![skip.reason.clone()],
-        ),
-        None => {
-            let endpoints = engine
-                .plan
-                .modules
-                .iter()
-                .find(|summary| summary.object == module.object)
-                .map(|summary| {
-                    engine
-                        .plan
-                        .slots
-                        .iter()
-                        .filter(|slot| {
-                            engine.plan.is_active(slot.index)
-                                && slot.module_ids.contains(&summary.id)
-                        })
-                        .count()
-                });
-            match endpoints {
-                Some(count) => (
-                    AdmissionState::Admitted,
-                    Some("exact".to_string()),
-                    Some(count),
-                    Vec::new(),
-                ),
-                None => (
-                    AdmissionState::Unresolved,
-                    None,
-                    None,
-                    vec!["object reached no admission verdict".to_string()],
-                ),
-            }
+/// The run's attach set is the ONE admission source the inventory output
+/// shows (Task 6 C2 review I1): its verdict replaces any other, and an
+/// object it never judged has no admitted verdict. `None` here means "not
+/// judged".
+fn attach_admission(
+    verdict: Option<&AttachVerdict>,
+) -> Option<(AdmissionState, Option<usize>, Vec<String>)> {
+    match verdict? {
+        AttachVerdict::Admitted { endpoints, reasons } => {
+            Some((AdmissionState::Admitted, Some(*endpoints), reasons.clone()))
         }
-    };
+        AttachVerdict::Refused { reason } => {
+            Some((AdmissionState::Refused, None, vec![reason.clone()]))
+        }
+    }
+}
+
+const UNJUDGED_REASON: &str = "the inventory attach set did not judge this object (no comparable \
+     pin or digest in this pass's lowering); it is not instrumented";
+
+/// One natively committed module's registry record. Admission comes only
+/// from the attach set's verdict for the same physical module; the
+/// engine's own plan is never an admission source (it is lowered for the
+/// native owner lane, not for what this run instruments). Unjudged reads
+/// unresolved.
+fn native_module_info(
+    engine: &Engine,
+    module: &ReconciledModule,
+    key: ModuleKey,
+    verdict: Option<&AttachVerdict>,
+) -> ModuleInfo {
+    let (admission, endpoints, reasons) = attach_admission(verdict).unwrap_or_else(|| {
+        (
+            AdmissionState::Unresolved,
+            None,
+            vec![UNJUDGED_REASON.to_string()],
+        )
+    });
     let summary = engine.pinned.summary(module.object);
     ModuleInfo {
         path: module.scanned.path.clone(),
@@ -805,7 +896,7 @@ fn native_module_info(engine: &Engine, module: &ReconciledModule, key: ModuleKey
         build_id: summary.and_then(|summary| summary.build_id.map(str::to_string)),
         identity_source: summary.map(|summary| summary.identity_source.to_string()),
         admission,
-        admission_class: class,
+        admission_class: None,
         admission_endpoints: endpoints,
         admission_reasons: reasons,
     }
@@ -821,12 +912,29 @@ fn catalog_module_key(object: &crate::inspect_system::CatalogObject) -> ModuleKe
     )
 }
 
-fn catalog_module_info(object: &crate::inspect_system::CatalogObject) -> ModuleInfo {
-    let (admission, endpoints) = match object.admission.state() {
-        "admitted" => (AdmissionState::Admitted, object.admission.endpoints()),
-        "refused" => (AdmissionState::Refused, None),
-        _ => (AdmissionState::Unresolved, None),
-    };
+/// One catalog object's registry record. `verdict` is the attach set's
+/// Inventory verdict and is the admission source. An object the attach set
+/// did not judge keeps the catalog's refusal or unresolved verdict (true:
+/// nothing attaches), but never its `admitted` — that object is not
+/// instrumented, so it reads unresolved.
+fn catalog_module_info(
+    object: &crate::inspect_system::CatalogObject,
+    verdict: Option<&AttachVerdict>,
+) -> ModuleInfo {
+    let (admission, endpoints, reasons) =
+        attach_admission(verdict).unwrap_or_else(|| match object.admission.state() {
+            "refused" => (AdmissionState::Refused, None, object.admission.reasons()),
+            "admitted" => (
+                AdmissionState::Unresolved,
+                None,
+                vec![UNJUDGED_REASON.to_string()],
+            ),
+            _ => {
+                let mut reasons = object.admission.reasons();
+                reasons.push(UNJUDGED_REASON.to_string());
+                (AdmissionState::Unresolved, None, reasons)
+            }
+        });
     ModuleInfo {
         path: object.path.clone(),
         key: catalog_module_key(object),
@@ -838,7 +946,7 @@ fn catalog_module_info(object: &crate::inspect_system::CatalogObject) -> ModuleI
         admission,
         admission_class: object.admission.class().map(str::to_string),
         admission_endpoints: endpoints,
-        admission_reasons: object.admission.reasons(),
+        admission_reasons: reasons,
     }
 }
 
@@ -1344,5 +1452,214 @@ mod tests {
         assert_eq!(edge["entries"]["last_seen_ns"], t3);
         assert_eq!(edge["entries"]["first_seen_ns"], t1);
         assert!(edge["entries"]["in_flight"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn scan_passes_feed_the_attach_set_once_under_the_inventory_budget() {
+        // Owned fixture: a driver child mapping the NSS-shaped provider,
+        // whose 8 interface-linked tables of 68 distinct targets are 544
+        // endpoints — past the Detailed 512-slot ceiling, inside the
+        // 4096-endpoint Inventory budget.
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join("coordinator-attach-set");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            &dir,
+            "as-nss.so",
+            &manifest.join("tests/fixtures/catalog-nss/provider.c"),
+            &[
+                "-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-fPIC", "-shared",
+            ],
+            &[],
+        );
+        let driver = gcc(
+            &dir,
+            "as-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let ready = dir.join("A.ready");
+        let child = std::process::Command::new(&driver)
+            .arg("--ready")
+            .arg(&ready)
+            .arg(&provider)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let driver_pid = child.id();
+        let _reaper = ChildReaper(child);
+        wait_ready(&ready);
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(driver_pid),
+            HookRegistry::builtin(),
+            vec![provider.clone()],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        for pass in 0..2u64 {
+            coordinator
+                .scan_pass(
+                    &InventoryScope::Pid(driver_pid),
+                    None,
+                    &mut UnavailableImageGuard,
+                    |_| None,
+                    u64::MAX,
+                    crate::discovery::caller_registry::now_ns(),
+                )
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let delta = coordinator.take_target_delta();
+            if pass == 0 {
+                assert_eq!(
+                    delta
+                        .endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.id.0)
+                        .collect::<Vec<_>>(),
+                    (0..544).collect::<Vec<u32>>()
+                );
+                assert_eq!(delta.objects.len(), 1, "one physical provider object");
+            } else {
+                assert!(delta.is_empty(), "a rescan adds nothing: {delta:?}");
+            }
+            assert_eq!(coordinator.attach_set().len(), 544);
+        }
+        let provider_name = provider.file_name().unwrap().to_string_lossy().into_owned();
+        let record = coordinator
+            .registry()
+            .modules()
+            .find(|module| {
+                module
+                    .paths
+                    .iter()
+                    .any(|path| path.ends_with(&provider_name))
+            })
+            .expect("the hinted scan maps the fixture provider");
+        assert_eq!(record.admission, AdmissionState::Admitted);
+        assert_eq!(record.admission_endpoints, Some(544));
+        assert!(record.admission_reasons.is_empty());
+        assert!(
+            !coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject.starts_with("inventory attach")),
+            "{:?}",
+            coordinator.registry().gaps()
+        );
+    }
+
+    #[test]
+    fn native_and_catalog_projections_take_admission_only_from_the_attach_set() {
+        // I1 (review): the engine plan admits `a`, the run's attach set
+        // refused it. Both projections note the module each pass; the
+        // attach set is the one admission source, so the module reads
+        // refused — never a false `refused->admitted` rise.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let module = fx::module(&pins, &a, &fx::offsets(3));
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        coordinator.engine.plan = fx::lower_named(std::slice::from_ref(&module), &pins, policy);
+        assert_eq!(
+            coordinator.engine.plan.refused_modules().count(),
+            0,
+            "the engine plan admits the module"
+        );
+        let refused = AttachVerdict::Refused {
+            reason: "a.so needs 3 more endpoints; the attach set is full".into(),
+        };
+        let path = a.to_str().unwrap();
+        let key = ModuleKey::physical(
+            module.scanned.key.device.major,
+            module.scanned.key.device.minor,
+            module.scanned.key.inode,
+            Some("sha-a".into()),
+            path,
+        );
+        let object = crate::inspect_system::CatalogObject {
+            path: path.into(),
+            key: module.scanned.key,
+            sha256: Some("sha-a".into()),
+            build_id: None,
+            identity_source: Some("mountinfo"),
+            note: None,
+            mappings: Vec::new(),
+            observations: Vec::new(),
+            admission: crate::inspect_system::AdmissionRecord::Admitted {
+                class: "exact",
+                endpoints: 3,
+            },
+        };
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        for pass in 0..2u64 {
+            let native =
+                native_module_info(&coordinator.engine, &module, key.clone(), Some(&refused));
+            let catalog = catalog_module_info(&object, Some(&refused));
+            assert_eq!(native.admission, AdmissionState::Refused, "native note");
+            assert_eq!(catalog.admission, AdmissionState::Refused, "catalog note");
+            // scan_pass order: the native projection first, then the catalog.
+            coordinator
+                .registry
+                .note_mapping(caller, pid, native, 100 + pass);
+            coordinator
+                .registry
+                .note_mapping(caller, pid, catalog, 100 + pass);
+            coordinator.registry.publish();
+        }
+        let id = coordinator.registry.module_id_for(&key).unwrap();
+        let record = coordinator.registry.module(id).unwrap();
+        assert_eq!(record.admission, AdmissionState::Refused);
+        assert!(
+            record.admission_history.is_empty(),
+            "{:?}",
+            record.admission_history
+        );
+        assert!(
+            !coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "module admission changed"),
+            "{:?}",
+            coordinator.registry.gaps()
+        );
+        // An object the attach set never judged: the native note has no
+        // opinion and the catalog's own `admitted` is not taken over —
+        // both read unresolved, never admitted.
+        let native = native_module_info(&coordinator.engine, &module, key.clone(), None);
+        assert_eq!(native.admission, AdmissionState::Unresolved);
+        let catalog = catalog_module_info(&object, None);
+        assert_eq!(catalog.admission, AdmissionState::Unresolved);
+        assert_eq!(catalog.admission_endpoints, None);
+        assert!(
+            catalog.admission_reasons[0].contains("did not judge"),
+            "{:?}",
+            catalog.admission_reasons
+        );
+        // A catalog refusal the attach set did not judge stays a refusal.
+        let refused_object = crate::inspect_system::CatalogObject {
+            admission: crate::inspect_system::AdmissionRecord::Refused {
+                class: "closure-array",
+                reason: "closure arrays are not attached".into(),
+            },
+            ..object
+        };
+        let catalog = catalog_module_info(&refused_object, None);
+        assert_eq!(catalog.admission, AdmissionState::Refused);
     }
 }

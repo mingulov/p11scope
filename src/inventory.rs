@@ -13,7 +13,8 @@
 use crate::attach::Scope;
 use crate::cli::InspectScope;
 use crate::discovery::caller_registry::{
-    CallerEvent, ImageAuthority, OsProcessSource, ProcessSource, RegistryLimits, now_ns,
+    CallerEvent, ImageAuthority, OsProcessSource, ProcessSource, RegistryLimits, UseCoverage,
+    now_ns,
 };
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory_coordinator::{
@@ -154,9 +155,9 @@ fn run_with_writer(
         OsProcessSource,
         registry_limits(max_gaps),
     )?;
-    // The scan lane stages no entries: entry columns read unknown. Only a
-    // BPF usage feed (the privileged lane) may flip this.
-    coordinator.registry_mut().set_usage_feed(false);
+    // The scan lane stages no usage coverage: every edge reads
+    // `unknown (scan only)`. Only native producers (Task 6 C3-C6) stage
+    // per-edge coverage notes.
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
     if dashboard && stdout_tty {
@@ -335,7 +336,12 @@ fn scan_one_pass(
         Ok(report) => Ok((report, None)),
         Err(error) if coordinator.passes() == 0 => Err(error).with_context(|| scope_context),
         Err(error) => {
-            let warning = format!("p11scope: pass failed, continuing without its scan: {error:#}");
+            // The error text can carry target-controlled strings (paths):
+            // escaped once here for stderr and the dashboard log alike.
+            let warning = format!(
+                "p11scope: pass failed, continuing without its scan: {}",
+                crate::render::escape_controls(&format!("{error:#}"))
+            );
             let report =
                 coordinator.observe_empty_pass(guard, no_native_images, &format!("{error:#}"), now);
             Ok((report, Some(warning)))
@@ -698,7 +704,11 @@ fn progress_lines<Source: ProcessSource>(
                 format!("caller {} admitted (pid {pid})", id.label())
             }
             CallerEvent::Exited { id, reason } => {
-                format!("caller {} exited: {reason}", id.label())
+                format!(
+                    "caller {} exited: {}",
+                    id.label(),
+                    crate::render::escape_controls(reason)
+                )
             }
             CallerEvent::ExecRetired { old, new } => {
                 format!("caller {} exec-retired, now {}", old.label(), new.label())
@@ -707,7 +717,11 @@ fn progress_lines<Source: ProcessSource>(
                 format!("caller {} reused, now {}", old.label(), new.label())
             }
             CallerEvent::AdmitFailed { pid, reason, .. } => {
-                format!("caller admission failed for pid {pid}: {reason}")
+                // The reason carries error text (paths, OS messages).
+                format!(
+                    "caller admission failed for pid {pid}: {}",
+                    crate::render::escape_controls(reason)
+                )
             }
         };
         lines.push(format!("p11scope: pass {}: {line}", report.pass));
@@ -780,6 +794,13 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
             "endpoints": record.admission_endpoints,
             "reasons": record.admission_reasons,
             "note": crate::inspect_system::SCAN_ONLY_NOTE,
+            // Additive (v1): admission-state changes after the first
+            // verdict, in order; `[]` while the first verdict stands.
+            "history": record.admission_history.iter().map(|change| serde_json::json!({
+                "from": change.from.label(),
+                "to": change.to.label(),
+                "at_ns": change.at_ns,
+            })).collect::<Vec<_>>(),
         },
         "lifecycle": record.lifecycle.label(),
         "unloaded_observed": record.unloaded_observed,
@@ -805,6 +826,7 @@ fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json::Value {
             "last_seen_ns": edge.entry_last_seen_ns,
             "in_flight": edge.entry_in_flight,
             "observation": edge.entry_observation,
+            "coverage": coverage_json(&edge.coverage),
         },
         // S1: the summary label (`observed`, or the `unknown` reason),
         // plus — only when the edge holds claims — the mechanism rows
@@ -813,6 +835,30 @@ fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json::Value {
         "semantics": edge.semantics.label,
         "mechanisms": mechanisms_json(&edge.semantics.mechanisms),
         "operations": operations_json(edge.semantics.operations.as_ref()),
+    })
+}
+
+/// Additive (v1) per-edge usage coverage: the state, its instant
+/// (`since_ns` for counted and watched, `first_ns` for witnessed), the
+/// lossy flag (counted only; `null` otherwise), and — for unknown — the reason code plus
+/// its detail. Every key is always present (`null` when it does not
+/// apply), so consumers see one shape.
+fn coverage_json(coverage: &UseCoverage) -> serde_json::Value {
+    let (since_ns, first_ns, lossy, reason, detail) = match coverage {
+        UseCoverage::Counted { since_ns, lossy } => {
+            (Some(*since_ns), None, Some(*lossy), None, None)
+        }
+        UseCoverage::Witnessed { first_ns } => (None, Some(*first_ns), None, None, None),
+        UseCoverage::WatchedNoUse { since_ns } => (Some(*since_ns), None, None, None, None),
+        UseCoverage::Unknown(reason) => (None, None, None, Some(reason.code()), reason.detail()),
+    };
+    serde_json::json!({
+        "state": coverage.state(),
+        "since_ns": since_ns,
+        "first_ns": first_ns,
+        "lossy": lossy,
+        "reason": reason,
+        "detail": detail,
     })
 }
 
@@ -995,6 +1041,19 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             "occupied": budgets.endpoints_occupied,
             "refused": budgets.endpoints_refused,
         },
+        // Additive (v1): the run's Inventory attach set — the
+        // capture-lifetime endpoint budget its admission verdicts are
+        // judged against, and the endpoints it holds.
+        "inventory_endpoints": {
+            "limit": budgets.inventory_endpoints_limit,
+            "occupied": budgets.inventory_endpoints_occupied,
+            "refused": budgets.inventory_endpoints_refused,
+        },
+        "inventory_attach_modules": {
+            "limit": budgets.inventory_modules_limit,
+            "occupied": budgets.inventory_modules_occupied,
+            "refused": budgets.inventory_modules_refused,
+        },
         "counters": {
             "cap": crate::discovery::caller_registry::MAX_EDGE_ENTRY_COUNT,
             "observed_edges": budgets.counters_observed,
@@ -1131,5 +1190,40 @@ mod tests {
         assert_eq!(set.max_edges, absent.max_edges);
         assert_eq!(set.max_endpoints, absent.max_endpoints);
         assert_eq!(set.max_semantic_states, absent.max_semantic_states);
+    }
+
+    #[test]
+    fn progress_lines_escape_target_controlled_reasons() {
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        let coordinator = coordinator();
+        let report = PassReport {
+            pass: 3,
+            scanned: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: vec![
+                CallerEvent::AdmitFailed {
+                    pid: 7,
+                    reason: "cannot pin /tmp/evil\u{1b}[2J\u{7}".into(),
+                    budget: None,
+                },
+                CallerEvent::Exited {
+                    id: crate::discovery::caller_registry::CallerId(4),
+                    reason: "gone\r\nfake".into(),
+                },
+            ],
+        };
+        let lines = progress_lines(&coordinator, &report);
+        for line in &lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("cannot pin /tmp/evil\\u{1b}[2J\\u{7}")),
+            "{lines:?}"
+        );
     }
 }

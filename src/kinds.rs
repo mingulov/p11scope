@@ -18,6 +18,14 @@ pub fn function_id(name: &str) -> Option<u32> {
         .map(|index| index as u32)
 }
 
+/// Pure object-policy lookup through the canonical function ID. This does not
+/// change the active capture descriptors or authorize a runtime read.
+pub fn object_descriptor(
+    name: &str,
+) -> Option<p11scope_ebpf_common::object_policy::ObjectCaptureDescriptor> {
+    p11scope_ebpf_common::object_policy::object_descriptor(function_id(name)?)
+}
+
 /// Fixed capture-independent descriptors. Index zero is count-only; each
 /// canonical published function follows at `function_id(name) + 1`.
 pub static DESCRIPTORS: LazyLock<[SlotSemantics; MAX_DESCRIPTORS as usize]> = LazyLock::new(|| {
@@ -378,6 +386,50 @@ pub fn descriptor(name: &str) -> Option<SlotSemantics> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mutation caught: a host/native catalog ordinal mismatch granting the
+    /// wrong shared policy, or a name alias bypassing the exact catalog lookup.
+    #[test]
+    fn s2s3_object_policy_lookup_uses_the_same_closed_catalog() {
+        use p11scope_ebpf_common::object_policy as policy;
+        let fields = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+            .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS);
+        let mut permitted = 0;
+        for (id, field) in fields.enumerate() {
+            assert_eq!(pkcs11_module::function_name(id), Some(field.name));
+            assert_eq!(function_id(field.name), Some(id as u32));
+            assert_eq!(
+                object_descriptor(field.name),
+                policy::object_descriptor(id as u32)
+            );
+            permitted += usize::from(object_descriptor(field.name).is_some());
+        }
+        assert_eq!(permitted, 25);
+        for name in [
+            "",
+            "C_NotAStandardFunction",
+            "C_DeriveKeyVendor",
+            "c_DeriveKey",
+            "C_DeriveKey\0",
+            " C_DeriveKey",
+            "C_DeriveKey ",
+            "C_UnwrapKeyAuthenticated",
+            "C_EncapsulateKey",
+            "C_FindObjectsInit",
+        ] {
+            assert_eq!(object_descriptor(name), None, "{name:?}");
+        }
+        let pair = object_descriptor("C_GenerateKeyPair").unwrap();
+        assert_eq!(pair.action, policy::ObjectAction::GeneratePair);
+        assert_eq!(pair.result_pointer_args, [6, 7]);
+        let derive = object_descriptor("C_DeriveKey").unwrap();
+        assert_eq!(
+            derive.result_protocol_guard,
+            policy::ResultProtocolGuard::ScalarDeriveMechanism
+        );
+    }
 
     #[test]
     fn every_published_32_slot_has_an_explicit_safe_descriptor() {

@@ -1,10 +1,11 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
-//! Types shared verbatim between the BPF programs and userspace. Every
-//! type is `#[repr(C)]` with no padding surprises: both sides read the
-//! same bytes out of the same map.
+//! Wire types and pure policies shared between the BPF programs and userspace.
+//! Map wire types use `#[repr(C)]` so both sides read the same bytes. Pure
+//! policy types, including `object_policy`, are not map or event layouts.
 #![no_std]
 
 pub mod inventory_callers;
+pub mod object_policy;
 
 pub use pkcs11_module::layout::LinuxLayout;
 

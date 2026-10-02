@@ -13,20 +13,28 @@
 use crate::attach::Scope;
 use crate::cli::InspectScope;
 use crate::discovery::caller_registry::{
-    CallerEvent, CallerId, ImageAuthority, ModuleId, ModuleKey, OsProcessSource, ProcessSource,
-    RegistryLimits, now_ns,
+    CallerEvent, ImageAuthority, OsProcessSource, ProcessSource, RegistryLimits, now_ns,
 };
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, InventoryScope, PassReport,
 };
 use crate::discovery::hooks::HookRegistry;
+use crate::inventory_dashboard::{
+    DashboardState, DisplayHandoff, Key, LogTail, REDRAW_INTERVAL, RESCAN_INTERVAL, RawModeGuard,
+    StopFlag, TerminalGuard, Viewport, poll_key, render_frame, stdout_terminal,
+};
+use crate::inventory_events::{
+    EventWriter, caller_event_payload, ended_payload, gap_payload, pass_payload, started_payload,
+};
+use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, render_snapshot};
 use crate::output::AtomicFile;
-use crate::render::escape_controls;
 use anyhow::{Context as _, Result};
 use p11scope_ebpf_common::ImageIdentity;
 use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DOC_ID: &str = "p11scope/inventory/v1";
@@ -40,8 +48,13 @@ fn no_native_images(_: u32) -> Option<ImageIdentity> {
 
 /// `p11scope inventory` — observe, render, report. Exit 0 with the text
 /// summary (or the JSON document under `--json`) on stdout; `-o` writes
-/// the JSON document atomically. Hard failures (an unreadable target, an
-/// unwritable `-o`) are errors, never empty-success reports.
+/// the JSON document atomically. `--dashboard` runs the live read-only
+/// dashboard when stdout is a terminal and degrades honestly to
+/// snapshots/JSON on a pipe, never ANSI. `--event-log` appends the
+/// JSONL observation-event stream. Hard failures (an unreadable
+/// target, an unwritable `-o` or event stream) are errors, never
+/// empty-success reports.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     scope: InspectScope,
     modules: &[PathBuf],
@@ -50,7 +63,12 @@ pub fn run(
     max_scan_pids: Option<usize>,
     duration: Option<Duration>,
     out: Option<&Path>,
+    dashboard: bool,
+    event_log: Option<&Path>,
+    event_rotate_bytes: Option<u64>,
+    event_max_files: Option<usize>,
 ) -> Result<i32> {
+    let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
     run_with_writer(
         scope,
         modules,
@@ -59,6 +77,11 @@ pub fn run(
         max_scan_pids,
         duration,
         out,
+        dashboard,
+        event_log,
+        event_rotate_bytes,
+        event_max_files,
+        stdout_tty,
         &mut std::io::stdout().lock(),
     )
 }
@@ -72,14 +95,32 @@ fn run_with_writer(
     max_scan_pids: Option<usize>,
     duration: Option<Duration>,
     out: Option<&Path>,
+    dashboard: bool,
+    event_log: Option<&Path>,
+    event_rotate_bytes: Option<u64>,
+    event_max_files: Option<usize>,
+    stdout_tty: bool,
     stdout: &mut dyn std::io::Write,
 ) -> Result<i32> {
-    // Fail fast before scanning: an unwritable `-o` must not cost a pass.
+    // Fail fast before scanning: an unwritable `-o` or event stream
+    // must not cost a pass.
     let sink = match out {
         Some(path) => Some(
             AtomicFile::create(path)
                 .map_err(|error| anyhow::anyhow!("{error}"))
                 .with_context(|| format!("opening inventory report {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let mut stream = match event_log {
+        Some(path) => Some(
+            crate::inventory_events::EventWriter::create(
+                path,
+                event_rotate_bytes.unwrap_or(crate::inventory_events::DEFAULT_ROTATE_BYTES),
+                event_max_files.unwrap_or(crate::inventory_events::DEFAULT_MAX_FILES),
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .with_context(|| format!("opening inventory event stream {}", path.display()))?,
         ),
         None => None,
     };
@@ -102,49 +143,86 @@ fn run_with_writer(
     // The scan lane stages no entries: entry columns read unknown. Only a
     // BPF usage feed (the privileged lane) may flip this.
     coordinator.registry_mut().set_usage_feed(false);
+    // Interactive dashboard takes over stdout's terminal; a pipe
+    // degrades honestly to snapshots/JSON below (never ANSI).
+    if dashboard && stdout_tty {
+        return run_dashboard_loop(
+            scope,
+            inventory_scope,
+            scope_label,
+            started_ns,
+            coordinator,
+            max_scan_pids,
+            duration.map(|window| Instant::now() + window),
+            sink,
+            stream,
+            json,
+            stdout,
+        );
+    }
+    if dashboard {
+        eprintln!(
+            "p11scope: --dashboard needs a terminal on stdout; degraded to {} (no ANSI emitted)",
+            if json {
+                "the JSON document"
+            } else {
+                "pager snapshots"
+            }
+        );
+    }
+    if let Some(writer) = stream.as_mut() {
+        let prologue = Presentation::capture(
+            &coordinator,
+            &scope_label,
+            started_ns,
+            started_ns,
+            0,
+            started_ns,
+            0,
+        );
+        writer
+            .append(
+                "started",
+                started_payload(&scope_label, started_ns, &prologue),
+                started_ns,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    let mut stream_state = StreamState::new();
     let mut guard = UnavailableImageGuard;
     let deadline = duration.map(|window| Instant::now() + window);
     loop {
         let now = now_ns();
-        let pass_deadline = match deadline {
-            Some(end) => {
-                let remaining = end.saturating_duration_since(Instant::now());
-                now.saturating_add(remaining.as_nanos().min(u128::from(u64::MAX)) as u64)
-            }
-            None => u64::MAX,
-        };
-        let scope_context = match scope {
-            InspectScope::Pid(pid) => format!("inventory --pid {pid}"),
-            InspectScope::System => "inventory --system".to_string(),
-        };
-        let report = match coordinator.scan_pass(
+        let (report, warning) = scan_one_pass(
+            &mut coordinator,
             &inventory_scope,
+            scope,
             max_scan_pids,
             &mut guard,
-            no_native_images,
-            pass_deadline,
+            deadline,
             now,
-        ) {
-            Ok(report) => report,
-            // A failed first pass is a hard error (nothing was ever
-            // observed); a later failure is an empty pass — lifecycle
-            // still reconciles, and the observation survives its
-            // target's death.
-            Err(error) if coordinator.passes() == 0 => {
-                return Err(error).with_context(|| scope_context);
-            }
-            Err(error) => {
-                eprintln!("p11scope: pass failed, continuing without its scan: {error:#}");
-                coordinator.observe_empty_pass(
-                    &mut guard,
-                    no_native_images,
-                    &format!("{error:#}"),
-                    now,
-                )
-            }
-        };
+        )?;
         coordinator.commit_batch(report.engine_changed)?;
-        report_progress(&coordinator, &report);
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+        for line in progress_lines(&coordinator, &report) {
+            eprintln!("{line}");
+        }
+        if let Some(writer) = stream.as_mut() {
+            let window_ns = now.saturating_sub(started_ns);
+            let presentation = Presentation::capture(
+                &coordinator,
+                &scope_label,
+                started_ns,
+                now,
+                coordinator.passes(),
+                now,
+                window_ns,
+            );
+            emit_pass_events(writer, &mut stream_state, &report, &presentation, now)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
         match deadline {
             None => break,
             Some(end) => {
@@ -158,7 +236,38 @@ fn run_with_writer(
     }
     let ended_ns = now_ns();
     let passes = coordinator.passes();
-    let document = render_json(&coordinator, &scope_label, started_ns, ended_ns, passes);
+    let window_ns = ended_ns.saturating_sub(started_ns);
+    let presentation = Presentation::capture(
+        &coordinator,
+        &scope_label,
+        started_ns,
+        ended_ns,
+        passes,
+        ended_ns,
+        window_ns,
+    );
+    finish_output(sink, stream.as_mut(), &presentation, json, false, stdout)
+}
+
+/// Final sinks, shared by the classic and dashboard paths: the event
+/// stream's `ended` marker, the atomic `-o` report, then stdout (the
+/// JSON document under `--json`, the pager snapshot otherwise —
+/// silent in dashboard mode, whose live view already showed it).
+fn finish_output(
+    sink: Option<AtomicFile>,
+    stream: Option<&mut EventWriter>,
+    presentation: &Presentation,
+    json: bool,
+    silent_text: bool,
+    stdout: &mut dyn std::io::Write,
+) -> Result<i32> {
+    let document = render_json_from_presentation(presentation);
+    if let Some(writer) = stream {
+        let payload = ended_payload(presentation, presentation.ended_ns, writer);
+        writer
+            .finish(payload, presentation.ended_ns)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
     if let Some(mut sink) = sink {
         serde_json::to_writer_pretty(sink.file(), &document)?;
         // Same bytes stdout carries: the pretty document plus its
@@ -170,25 +279,343 @@ fn run_with_writer(
     if json {
         let text = serde_json::to_string_pretty(&document)?;
         writeln!(stdout, "{text}")?;
-    } else {
-        write!(
-            stdout,
-            "{}",
-            render_text(&coordinator, &scope_label, started_ns, ended_ns, passes)
-        )?;
+    } else if !silent_text {
+        write!(stdout, "{}", render_snapshot(presentation))?;
     }
     Ok(0)
 }
 
-/// Per-pass progress on stderr (stdout stays parseable): what the pass
+/// One scan pass with the shared failure policy: a failed FIRST pass
+/// is a hard error (nothing was ever observed); a later failure is an
+/// empty pass plus a warning line the caller routes (stderr on the
+/// classic path, the log tail on the dashboard) — lifecycle still
+/// reconciles, and the observation survives its target's death.
+fn scan_one_pass(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    inventory_scope: &InventoryScope,
+    scope: InspectScope,
+    max_scan_pids: Option<usize>,
+    guard: &mut UnavailableImageGuard,
+    deadline: Option<Instant>,
+    now: u64,
+) -> Result<(PassReport, Option<String>)> {
+    let pass_deadline = match deadline {
+        Some(end) => {
+            let remaining = end.saturating_duration_since(Instant::now());
+            now.saturating_add(remaining.as_nanos().min(u128::from(u64::MAX)) as u64)
+        }
+        None => u64::MAX,
+    };
+    let scope_context = match scope {
+        InspectScope::Pid(pid) => format!("inventory --pid {pid}"),
+        InspectScope::System => "inventory --system".to_string(),
+    };
+    match coordinator.scan_pass(
+        inventory_scope,
+        max_scan_pids,
+        guard,
+        no_native_images,
+        pass_deadline,
+        now,
+    ) {
+        Ok(report) => Ok((report, None)),
+        Err(error) if coordinator.passes() == 0 => Err(error).with_context(|| scope_context),
+        Err(error) => {
+            let warning = format!("p11scope: pass failed, continuing without its scan: {error:#}");
+            let report =
+                coordinator.observe_empty_pass(guard, no_native_images, &format!("{error:#}"), now);
+            Ok((report, Some(warning)))
+        }
+    }
+}
+
+/// Incremental stream position: gaps are push-only until the bound,
+/// so an index plus the suppressed counter replays exactly the new
+/// loss on every pass.
+struct StreamState {
+    emitted_gaps: usize,
+    emitted_suppressed: u64,
+}
+
+impl StreamState {
+    fn new() -> Self {
+        Self {
+            emitted_gaps: 0,
+            emitted_suppressed: 0,
+        }
+    }
+}
+
+/// Append one committed pass to the event stream: caller turnover,
+/// every new gap verbatim, then the pass marker with this pass's loss
+/// accounting. A refused capture produces stream gaps identical in
+/// meaning to snapshot gaps (same subject/reason/budget).
+fn emit_pass_events(
+    writer: &mut EventWriter,
+    state: &mut StreamState,
+    report: &PassReport,
+    presentation: &Presentation,
+    now_ns: u64,
+) -> Result<(), String> {
+    for event in &report.events {
+        writer.append("caller_event", caller_event_payload(event), now_ns)?;
+    }
+    let fresh = presentation.gaps.len().saturating_sub(state.emitted_gaps);
+    for gap in presentation.gaps.iter().skip(state.emitted_gaps) {
+        writer.append("gap_recorded", gap_payload(gap), now_ns)?;
+    }
+    state.emitted_gaps = presentation.gaps.len();
+    let suppressed_delta = presentation
+        .gaps_suppressed
+        .saturating_sub(state.emitted_suppressed);
+    state.emitted_suppressed = presentation.gaps_suppressed;
+    writer.append(
+        "pass_committed",
+        pass_payload(report, presentation, fresh, suppressed_delta),
+        now_ns,
+    )
+}
+
+/// The interactive dashboard loop: rescan at 1 Hz, offer immutable
+/// snapshots through the bounded handoff, redraw coalesced at ~3 Hz.
+/// Keys scroll (stdin TTY only — a pipe never blocks the loop);
+/// `--duration`, `q`/Ctrl-C/ESC, or SIGINT/SIGTERM/SIGHUP ends it.
+/// Every exit path drops the guards first (terminal restored) and
+/// only then touches the final sinks.
+#[allow(clippy::too_many_arguments)]
+fn run_dashboard_loop(
+    scope: InspectScope,
+    inventory_scope: InventoryScope,
+    scope_label: String,
+    started_ns: u64,
+    mut coordinator: InventoryCoordinator<OsProcessSource>,
+    max_scan_pids: Option<usize>,
+    deadline: Option<Instant>,
+    sink: Option<AtomicFile>,
+    mut stream: Option<EventWriter>,
+    json: bool,
+    stdout: &mut dyn std::io::Write,
+) -> Result<i32> {
+    let mut term = stdout_terminal().with_context(|| "opening the dashboard terminal")?;
+    let _term_guard =
+        TerminalGuard::enter(&term).with_context(|| "entering the dashboard screen")?;
+    let raw_guard = RawModeGuard::enter_stdin().with_context(|| "entering dashboard input mode")?;
+    let keys_live = raw_guard.is_some();
+    let stop = StopFlag::install();
+    let handoff = DisplayHandoff::new();
+    let mut tail = LogTail::bounded();
+    let mut state = DashboardState::new();
+    let mut last_frame: Option<crate::inventory_dashboard::DisplayFrame> = None;
+    let mut stream_state = StreamState::new();
+    if let Some(writer) = stream.as_mut() {
+        let prologue = Presentation::capture(
+            &coordinator,
+            &scope_label,
+            started_ns,
+            started_ns,
+            0,
+            started_ns,
+            0,
+        );
+        writer
+            .append(
+                "started",
+                started_payload(&scope_label, started_ns, &prologue),
+                started_ns,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    tail.push(&format!(
+        "p11scope inventory {scope_label}: dashboard started (rescan 1 Hz, redraw ~3 Hz{})",
+        if keys_live {
+            ""
+        } else {
+            "; stdin is not a terminal, keys unavailable"
+        }
+    ));
+    let mut guard = UnavailableImageGuard;
+    let mut next_rescan = Instant::now();
+    let mut next_redraw = Instant::now();
+    loop {
+        if keys_live {
+            while let Some(key) = poll_key() {
+                match key {
+                    Key::Quit => {
+                        tail.push("p11scope: quit requested");
+                        return finish_dashboard(
+                            scope_label.clone(),
+                            started_ns,
+                            coordinator,
+                            &handoff,
+                            sink,
+                            stream,
+                            json,
+                            stdout,
+                            _term_guard,
+                            raw_guard,
+                        );
+                    }
+                    Key::Up => state.scroll_up(),
+                    Key::Down => {
+                        let total = last_frame
+                            .as_ref()
+                            .map(|frame| frame.presentation.edges.len())
+                            .unwrap_or(0);
+                        state.scroll_down(total);
+                    }
+                }
+                // Keys redraw immediately (scrolling stays responsive
+                // inside the coalesced cadence).
+                next_redraw = Instant::now();
+            }
+        }
+        if stop.stopped() {
+            tail.push("p11scope: stop signal received");
+            return finish_dashboard(
+                scope_label.clone(),
+                started_ns,
+                coordinator,
+                &handoff,
+                sink,
+                stream,
+                json,
+                stdout,
+                _term_guard,
+                raw_guard,
+            );
+        }
+        if let Some(end) = deadline
+            && Instant::now() >= end
+        {
+            return finish_dashboard(
+                scope_label.clone(),
+                started_ns,
+                coordinator,
+                &handoff,
+                sink,
+                stream,
+                json,
+                stdout,
+                _term_guard,
+                raw_guard,
+            );
+        }
+        let tick = Instant::now();
+        if tick >= next_rescan {
+            next_rescan = tick + RESCAN_INTERVAL;
+            let now = now_ns();
+            let (report, warning) = scan_one_pass(
+                &mut coordinator,
+                &inventory_scope,
+                scope,
+                max_scan_pids,
+                &mut guard,
+                deadline,
+                now,
+            )?;
+            coordinator.commit_batch(report.engine_changed)?;
+            if let Some(warning) = warning {
+                tail.push(&warning);
+            }
+            for line in progress_lines(&coordinator, &report) {
+                tail.push(&line);
+            }
+            // Dashboard frames read activity through the trailing
+            // window (a growing observation window would pin every
+            // historical entry as "recent" forever); the stream ignores
+            // activity, so sharing this capture is exact for both.
+            let presentation = Presentation::capture(
+                &coordinator,
+                &scope_label,
+                started_ns,
+                now,
+                coordinator.passes(),
+                now,
+                DASHBOARD_ACTIVITY_WINDOW_NS,
+            );
+            if let Some(writer) = stream.as_mut() {
+                emit_pass_events(writer, &mut stream_state, &report, &presentation, now)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+            }
+            handoff.offer(Arc::new(presentation), tail.snapshot());
+        }
+        if tick >= next_redraw {
+            next_redraw = tick + REDRAW_INTERVAL;
+            if let Some(frame) = handoff.take() {
+                last_frame = Some(frame);
+            }
+            if let Some(frame) = last_frame.as_ref() {
+                state.clamp(frame.presentation.edges.len());
+                let viewport = Viewport::from_fd(term.as_raw_fd()).unwrap_or(Viewport {
+                    width: 80,
+                    height: 24,
+                });
+                let bytes = render_frame(frame, viewport, &state);
+                term.write_all(&bytes)
+                    .with_context(|| "writing the dashboard frame")?;
+                term.flush()
+                    .with_context(|| "flushing the dashboard frame")?;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Dashboard exit: drop the terminal guards FIRST (restoring cursor,
+/// screen, and input mode on every path), then write the final sinks
+/// exactly like the classic path — silent text, since the live view
+/// already showed it.
+#[allow(clippy::too_many_arguments)]
+fn finish_dashboard(
+    scope_label: String,
+    started_ns: u64,
+    coordinator: InventoryCoordinator<OsProcessSource>,
+    handoff: &DisplayHandoff,
+    sink: Option<AtomicFile>,
+    mut stream: Option<EventWriter>,
+    json: bool,
+    stdout: &mut dyn std::io::Write,
+    _term_guard: TerminalGuard,
+    _raw_guard: Option<RawModeGuard>,
+) -> Result<i32> {
+    drop(_raw_guard);
+    drop(_term_guard);
+    let ended_ns = now_ns();
+    let passes = coordinator.passes();
+    let window_ns = ended_ns.saturating_sub(started_ns);
+    let presentation = Presentation::capture(
+        &coordinator,
+        &scope_label,
+        started_ns,
+        ended_ns,
+        passes,
+        ended_ns,
+        window_ns,
+    );
+    eprintln!(
+        "p11scope: dashboard exited after {passes} pass{}",
+        if passes == 1 { "" } else { "es" }
+    );
+    eprintln!(
+        "p11scope: dashboard frames: {} offered, {} consumed, {} shed (shed frames are obsolete display work; capture is unaffected)",
+        handoff.offered(),
+        handoff.consumed(),
+        handoff.dropped_frames(),
+    );
+    finish_output(sink, stream.as_mut(), &presentation, json, true, stdout)
+}
+
+/// Per-pass progress lines (stdout stays parseable): what the pass
 /// scanned, which caller incarnations turned over, and what the pass
 /// cost — gaps, budget refusals, and suppressed gaps are reported, so a
-/// refused or partial run can never look clean on stderr.
-fn report_progress<Source: ProcessSource>(
+/// refused or partial run can never look clean. ONE computation with
+/// two sinks: stderr on the classic path, the sanitized log tail on
+/// the dashboard (which must never scribble beside its screen).
+fn progress_lines<Source: ProcessSource>(
     coordinator: &InventoryCoordinator<Source>,
     report: &PassReport,
-) {
-    eprintln!(
+) -> Vec<String> {
+    let mut lines = vec![format!(
         "p11scope: pass {}: {} scanned ({} native, {} scan-pinned){}",
         report.pass,
         report.scanned,
@@ -199,7 +626,7 @@ fn report_progress<Source: ProcessSource>(
         } else {
             format!("; {} refresh pending", report.pending_refresh.len())
         }
-    );
+    )];
     let gaps = coordinator.registry().gaps().len();
     let suppressed = coordinator.registry().gaps_suppressed();
     if gaps > 0 || suppressed > 0 {
@@ -209,7 +636,7 @@ fn report_progress<Source: ProcessSource>(
             .iter()
             .filter(|gap| gap.budget.is_some())
             .count();
-        eprintln!(
+        lines.push(format!(
             "p11scope: pass {}: {} gap{} ({} budget refusal{}, {} suppressed)",
             report.pass,
             gaps,
@@ -217,7 +644,7 @@ fn report_progress<Source: ProcessSource>(
             refusals,
             if refusals == 1 { "" } else { "s" },
             suppressed,
-        );
+        ));
     }
     for event in &report.events {
         let line = match event {
@@ -242,18 +669,13 @@ fn report_progress<Source: ProcessSource>(
                 format!("caller admission failed for pid {pid}: {reason}")
             }
         };
-        eprintln!("p11scope: pass {}: {line}", report.pass);
+        lines.push(format!("p11scope: pass {}: {line}", report.pass));
     }
+    lines
 }
 
-fn caller_json<Source: ProcessSource>(
-    coordinator: &InventoryCoordinator<Source>,
-    id: CallerId,
-) -> serde_json::Value {
-    let record = coordinator
-        .adapter()
-        .record(id)
-        .expect("rendered callers are adapter records");
+fn caller_json(caller: &crate::inventory_present::CallerView) -> serde_json::Value {
+    let record = caller;
     let (task_cookie, exec_id) = match record.authority {
         ImageAuthority::NativeExact {
             task_cookie,
@@ -274,7 +696,7 @@ fn caller_json<Source: ProcessSource>(
         })
     });
     serde_json::json!({
-        "id": id.label(),
+        "id": record.id.label(),
         "pid": record.pid,
         "start_time": record.start_time,
         "start_time_unit": "clock_ticks_since_boot",
@@ -294,37 +716,19 @@ fn caller_json<Source: ProcessSource>(
     })
 }
 
-fn module_json<Source: ProcessSource>(
-    coordinator: &InventoryCoordinator<Source>,
-    id: ModuleId,
-) -> serde_json::Value {
-    let record = coordinator
-        .registry()
-        .module(id)
-        .expect("rendered modules are registry records");
-    let (dev_major, dev_minor, ino, sha256) = match &record.key {
-        ModuleKey::Physical {
-            dev_major,
-            dev_minor,
-            ino,
-            sha256,
-        } => (
-            *dev_major,
-            *dev_minor,
-            *ino,
-            sha256
-                .clone()
-                .map(serde_json::Value::from)
-                .unwrap_or_default(),
-        ),
-        ModuleKey::Unidentified { .. } => (0, 0, 0, serde_json::Value::Null),
-    };
+fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Value {
+    let record = module;
+    let sha256 = record
+        .sha256
+        .clone()
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
     serde_json::json!({
-        "id": id.label(),
+        "id": record.id.label(),
         "paths": record.paths.iter().collect::<Vec<_>>(),
         "identity": {
-            "device": {"major": dev_major, "minor": dev_minor},
-            "inode": ino,
+            "device": {"major": record.device_major, "minor": record.device_minor},
+            "inode": record.inode,
             "sha256": sha256,
             "build_id": record.build_id,
             "source": record.identity_source,
@@ -341,18 +745,10 @@ fn module_json<Source: ProcessSource>(
     })
 }
 
-fn edge_json<Source: ProcessSource>(
-    coordinator: &InventoryCoordinator<Source>,
-    caller: CallerId,
-    module: ModuleId,
-) -> serde_json::Value {
-    let registry = coordinator.registry();
-    let edge = registry
-        .edge(caller, module)
-        .expect("rendered edges are registry records");
+fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json::Value {
     serde_json::json!({
-        "caller": caller.label(),
-        "module": module.label(),
+        "caller": edge.caller.label(),
+        "module": edge.module.label(),
         "mapping": {
             "state": edge.mapping.label(),
             "reason": edge.mapping_reason,
@@ -367,19 +763,100 @@ fn edge_json<Source: ProcessSource>(
             "first_seen_ns": edge.entry_first_seen_ns,
             "last_seen_ns": edge.entry_last_seen_ns,
             "in_flight": edge.entry_in_flight,
-            "observation": registry.entry_observation(edge).label(),
+            "observation": edge.entry_observation,
         },
-        // Semantic capture stays withheld (S-track): the column reads
-        // unknown on every edge, never an invented state.
-        "semantics": crate::discovery::caller_registry::SEMANTIC_UNKNOWN,
+        // S1: the summary label (`observed`, or the `unknown` reason),
+        // plus — only when the edge holds claims — the mechanism rows
+        // and operation aggregates. Unknown edges keep the exact U0
+        // label with null details, never an invented state.
+        "semantics": edge.semantics.label,
+        "mechanisms": mechanisms_json(&edge.semantics.mechanisms),
+        "operations": operations_json(edge.semantics.operations.as_ref()),
     })
 }
 
-/// Render the published snapshot as `p11scope/inventory/v1`. Every edge
-/// endpoint resolves: a dangling reference is a coordinator bug, and the
-/// debug assertion names it instead of emitting a partial document.
-/// Generic over the process source so scripted scale workloads render
-/// through this same path — never a second renderer.
+/// S1 mechanism rows: verbatim ids (+ hex), registered names (null
+/// for vendor/unregistered ids), operation categories, counts,
+/// recency, and provenance. `null` when no mechanism was attributed
+/// (unknown edges, or operation-only evidence) — never `[]`-as-fact.
+fn mechanisms_json(mechanisms: &[crate::inventory_present::MechanismView]) -> serde_json::Value {
+    if mechanisms.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::Value::Array(
+        mechanisms
+            .iter()
+            .map(|mech| {
+                serde_json::json!({
+                    "mechanism": mech.id,
+                    "mechanism_hex": format!("0x{:x}", mech.id),
+                    "name": mech.name,
+                    "operations": mech.operations,
+                    "calls": mech.calls,
+                    "errors": mech.errors,
+                    "last_seen_ns": mech.last_seen_ns,
+                    "evidence": {
+                        "functions": mech.functions,
+                        "returns": mech.returns.iter().map(|rv| serde_json::json!({
+                            "rv": rv,
+                            "rv_hex": format!("0x{rv:x}"),
+                            "name": crate::semantics_edge::rv_name(*rv),
+                        })).collect::<Vec<_>>(),
+                        "truncated": mech.truncated,
+                    },
+                })
+            })
+            .collect(),
+    )
+}
+
+/// S1 operation aggregates: separate API-call and operation counts,
+/// explicit end states, unknown-origin orphans, bound refusals, and
+/// the live machines. `null` exactly when the edge holds no claims.
+fn operations_json(
+    operations: Option<&crate::inventory_present::OperationsView>,
+) -> serde_json::Value {
+    let Some(operations) = operations else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "calls": operations.calls,
+        "started": operations.started,
+        "completed": operations.completed,
+        "cancelled": operations.cancelled,
+        "failed": operations.failed,
+        "unknown": operations.unknown,
+        "orphans": operations.orphans,
+        "dropped": operations.dropped,
+        "last_seen_ns": operations.last_seen_ns,
+        "active": operations.active.iter().map(|op| serde_json::json!({
+            "category": op.category,
+            "state": op.state,
+            "count": op.count,
+        })).collect::<Vec<_>>(),
+        "evidence": {
+            "state_reconciliations": operations.evidence.state_reconciliations,
+            "session_cancel_ambiguities": operations.evidence.session_cancel_ambiguities,
+            "session_cancel_unknown_flags": operations.evidence.session_cancel_unknown_flags,
+            "operation_state_imports": operations.evidence.operation_state_imports,
+            "auth_state_ambiguities": operations.evidence.auth_state_ambiguities,
+            "semantic_capture_failures": operations.evidence.semantic_capture_failures,
+            "async_duplicates": operations.evidence.async_duplicates,
+            "async_evictions": operations.evidence.async_evictions,
+            "unmatched_closes": operations.evidence.unmatched_closes,
+        },
+    })
+}
+
+/// Render the published snapshot as `p11scope/inventory/v1` from the
+/// ONE presentation model. Every edge endpoint resolves: a dangling
+/// reference is a coordinator bug, and the debug assertion names it
+/// instead of emitting a partial document. Generic over the process
+/// source so scripted scale workloads render through this same path —
+/// never a second renderer. Test-gated: the in-crate harness renders
+/// through here; production captures once and renders JSON, snapshot,
+/// dashboard, and stream from the shared [`Presentation`].
+#[cfg(test)]
 pub(crate) fn render_json<Source: ProcessSource>(
     coordinator: &InventoryCoordinator<Source>,
     scope_label: &str,
@@ -387,33 +864,32 @@ pub(crate) fn render_json<Source: ProcessSource>(
     ended_ns: u64,
     passes: u64,
 ) -> serde_json::Value {
-    let mut callers: Vec<CallerId> = coordinator
-        .adapter()
-        .records()
-        .map(|record| record.id)
-        .collect();
-    callers.sort();
-    let mut modules: Vec<ModuleId> = coordinator
-        .registry()
-        .modules()
-        .map(|module| module.id)
-        .collect();
-    modules.sort();
-    let mut edges: Vec<(CallerId, ModuleId)> = coordinator
-        .registry()
-        .edges()
-        .map(|edge| (edge.caller, edge.module))
-        .collect();
-    edges.sort();
-    debug_assert!(
-        edges
-            .iter()
-            .all(|(caller, _)| coordinator.adapter().record(*caller).is_some()),
-        "every rendered edge caller resolves in the adapter"
+    let window_ns = ended_ns.saturating_sub(started_ns);
+    let presentation = Presentation::capture(
+        coordinator,
+        scope_label,
+        started_ns,
+        ended_ns,
+        passes,
+        ended_ns,
+        window_ns,
     );
-    let gaps: Vec<serde_json::Value> = coordinator
-        .registry()
-        .gaps()
+    render_json_from_presentation(&presentation)
+}
+
+/// The JSON document from an already-captured presentation: the same
+/// bytes `render_json` emits, callable wherever a snapshot is already
+/// in hand (dashboard agreement checks, event emission).
+pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serde_json::Value {
+    debug_assert!(
+        presentation.edges.iter().all(|edge| presentation
+            .callers
+            .iter()
+            .any(|caller| caller.id == edge.caller)),
+        "every rendered edge caller resolves in the presentation"
+    );
+    let gaps: Vec<serde_json::Value> = presentation
+        .gaps
         .iter()
         .map(|gap| {
             serde_json::json!({
@@ -432,75 +908,76 @@ pub(crate) fn render_json<Source: ProcessSource>(
         .collect();
     serde_json::json!({
         "schema": DOC_ID,
-        "scope": scope_label,
+        "scope": presentation.scope_label,
         "clock": {
             "basis": crate::discovery::caller_registry::CLOCK_BASIS,
             "unit": crate::discovery::caller_registry::CLOCK_UNIT,
         },
         "observation": {
-            "started_ns": started_ns,
-            "ended_ns": ended_ns,
-            "passes": passes,
-            "usage_feed": coordinator.registry().usage_feed(),
+            "started_ns": presentation.started_ns,
+            "ended_ns": presentation.ended_ns,
+            "passes": presentation.passes,
+            "usage_feed": presentation.usage_feed,
         },
-        "budgets": budgets_json(coordinator),
-        "callers": callers.iter().map(|caller| caller_json(coordinator, *caller)).collect::<Vec<_>>(),
-        "modules": modules.iter().map(|module| module_json(coordinator, *module)).collect::<Vec<_>>(),
-        "edges": edges.iter().map(|(caller, module)| edge_json(coordinator, *caller, *module)).collect::<Vec<_>>(),
+        "budgets": budgets_json(&presentation.budgets),
+        "callers": presentation.callers.iter().map(caller_json).collect::<Vec<_>>(),
+        "modules": presentation.modules.iter().map(module_json).collect::<Vec<_>>(),
+        "edges": presentation.edges.iter().map(edge_json).collect::<Vec<_>>(),
         "gaps": gaps,
-        "gaps_suppressed": coordinator.registry().gaps_suppressed(),
+        "gaps_suppressed": presentation.gaps_suppressed,
     })
 }
 
 /// Every budgeted resource with its own limit, occupancy source, and
-/// loss counter. Semantic state renders its budget with zero occupancy:
-/// capture stays withheld, so every semantic column reads unknown.
-fn budgets_json<Source: ProcessSource>(
-    coordinator: &InventoryCoordinator<Source>,
-) -> serde_json::Value {
-    let registry = coordinator.registry();
-    let limits = registry.limits();
-    let (observed_edges, saturated_edges) = registry.counter_census();
+/// loss counter. Semantic state renders its real occupancy: zero with
+/// `withheld` status while the scan lane runs alone, held states with
+/// `observed` status once the semantic feed materializes any.
+fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::Value {
     serde_json::json!({
         "callers": {
-            "limit": limits.max_callers,
-            "occupied": coordinator.adapter().len(),
-            "refused": coordinator.adapter().admit_refused().saturating_add(registry.callers_refused()),
+            "limit": budgets.callers_limit,
+            "occupied": budgets.callers_occupied,
+            "refused": budgets.callers_refused,
         },
         "modules": {
-            "limit": limits.max_modules,
-            "occupied": registry.module_count(),
-            "refused": registry.modules_refused(),
+            "limit": budgets.modules_limit,
+            "occupied": budgets.modules_occupied,
+            "refused": budgets.modules_refused,
         },
         "edges": {
-            "limit": limits.max_edges,
-            "occupied": registry.edge_count(),
-            "refused": registry.edges_refused(),
+            "limit": budgets.edges_limit,
+            "occupied": budgets.edges_occupied,
+            "refused": budgets.edges_refused,
         },
         "endpoints": {
-            "limit": limits.max_endpoints,
-            "occupied": registry.endpoints_total(),
-            "refused": registry.endpoints_refused(),
+            "limit": budgets.endpoints_limit,
+            "occupied": budgets.endpoints_occupied,
+            "refused": budgets.endpoints_refused,
         },
         "counters": {
             "cap": crate::discovery::caller_registry::MAX_EDGE_ENTRY_COUNT,
-            "observed_edges": observed_edges,
-            "saturated_edges": saturated_edges,
+            "observed_edges": budgets.counters_observed,
+            "saturated_edges": budgets.counters_saturated,
         },
         "semantic_state": {
-            "limit": limits.max_semantic_states,
-            "occupied": 0,
-            "status": "withheld",
-            "unknown_edges": registry.edge_count(),
+            "limit": budgets.semantic_limit,
+            "occupied": budgets.semantic_occupied,
+            "status": crate::inventory_present::semantic_status(budgets),
+            "unknown_edges": budgets.semantic_unknown_edges,
+            "refused": budgets.semantic_refused,
         },
         "retained_history": {
-            "limit": limits.max_gaps,
-            "retained": registry.gaps().len(),
-            "suppressed": registry.gaps_suppressed(),
+            "limit": budgets.retained_limit,
+            "retained": budgets.retained,
+            "suppressed": budgets.retained_suppressed,
         },
     })
 }
 
+/// Test-gated companion to [`render_json`]: the pager snapshot from a
+/// live coordinator. Production renders from the shared
+/// [`Presentation`] via [`render_snapshot`].
+#[cfg(test)]
 pub(crate) fn render_text<Source: ProcessSource>(
     coordinator: &InventoryCoordinator<Source>,
     scope_label: &str,
@@ -508,99 +985,27 @@ pub(crate) fn render_text<Source: ProcessSource>(
     ended_ns: u64,
     passes: u64,
 ) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let callers: Vec<_> = coordinator.adapter().records().collect();
-    let modules: Vec<_> = coordinator.registry().modules().collect();
-    let edges: Vec<_> = coordinator.registry().edges().collect();
-    let _ = writeln!(
-        out,
-        "inventory {scope_label} ({} pass{}, {} caller{}, {} module{}, {} edge{})",
-        passes,
-        if passes == 1 { "" } else { "es" },
-        callers.len(),
-        if callers.len() == 1 { "" } else { "s" },
-        modules.len(),
-        if modules.len() == 1 { "" } else { "s" },
-        edges.len(),
-        if edges.len() == 1 { "" } else { "s" },
-    );
-    for record in &callers {
-        let exe = record
-            .exe
-            .as_ref()
-            .and_then(|exe| exe.path.as_deref())
-            .unwrap_or("?");
-        let _ = writeln!(
-            out,
-            "caller {} pid {} incarnation {} {} ({})",
-            record.id.label(),
-            record.pid,
-            record.incarnation,
-            record.lifecycle.label(),
-            escape_controls(exe)
-        );
-    }
-    for module in &modules {
-        let path = module
-            .paths
-            .iter()
-            .next()
-            .map(String::as_str)
-            .unwrap_or("?");
-        let _ = writeln!(
-            out,
-            "module {} {} {} ({})",
-            module.id.label(),
-            escape_controls(path),
-            module.lifecycle.label(),
-            module.admission.label()
-        );
-    }
-    // "Active now" for the text summary means an entry observed during
-    // this observation (or in flight at its end) — recency, not a sticky
-    // bit. The JSON keeps the raw last-seen so readers choose their own
-    // window.
+    // The pager-friendly snapshot IS the text summary: the same
+    // presentation model the JSON renders, in diffable text form.
     let window_ns = ended_ns.saturating_sub(started_ns);
-    for edge in &edges {
-        let registry = coordinator.registry();
-        let observation = registry.entry_observation(edge).label();
-        let active = registry.entry_active_within(edge, ended_ns, window_ns);
-        let _ = writeln!(
-            out,
-            "edge {} -> {} mapping {} entries {} ({observation}{})",
-            edge.caller.label(),
-            edge.module.label(),
-            edge.mapping.label(),
-            edge.entry_count,
-            if active { ", active" } else { "" }
-        );
-    }
-    for gap in coordinator.registry().gaps() {
-        match gap.budget {
-            Some(refusal) => {
-                let _ = writeln!(
-                    out,
-                    "gap [{}] {} (budget {}: limit {}, requested {})",
-                    gap.subject, gap.reason, refusal.resource, refusal.limit, refusal.requested,
-                );
-            }
-            None => {
-                let _ = writeln!(out, "gap [{}] {}", gap.subject, gap.reason);
-            }
-        }
-    }
-    let suppressed = coordinator.registry().gaps_suppressed();
-    if suppressed > 0 {
-        let _ = writeln!(out, "gaps suppressed: {suppressed}");
-    }
-    out
+    let presentation = Presentation::capture(
+        coordinator,
+        scope_label,
+        started_ns,
+        ended_ns,
+        passes,
+        ended_ns,
+        window_ns,
+    );
+    render_snapshot(&presentation)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::caller_registry::{AdmissionState, ModuleInfo, ModuleKey};
+    use crate::discovery::caller_registry::{
+        AdmissionState, ImageAuthority, ModuleInfo, ModuleKey,
+    };
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
         InventoryCoordinator::new(

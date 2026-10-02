@@ -19,6 +19,7 @@
 //! inventory facts cross the same batch boundary as discovery facts.
 
 use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
+use crate::semantics_edge::{EdgeSemantics, SemanticCall};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
@@ -669,7 +670,7 @@ impl EntryObservation {
 }
 
 /// One caller/module edge: mapping evidence plus cumulative usage.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct EdgeRecord {
     pub caller: CallerId,
     pub module: ModuleId,
@@ -685,6 +686,12 @@ pub(crate) struct EdgeRecord {
     pub entry_first_seen_ns: Option<u64>,
     pub entry_last_seen_ns: Option<u64>,
     pub entry_in_flight: bool,
+    /// Per-edge semantic state (S1): `None` while semantic capture
+    /// stays withheld (the scan lane never materializes it), `Some`
+    /// once the semantic feed observes this edge. Materialization is
+    /// budgeted by `max_semantic_states`; retirement never deletes
+    /// the state (its claims are retained evidence).
+    pub semantics: Option<EdgeSemantics>,
 }
 
 /// One module instance: static facts plus lifecycle.
@@ -835,6 +842,14 @@ enum Mutation {
         module: ModuleKey,
         in_flight: bool,
     },
+    ObserveSemantic {
+        caller: CallerId,
+        module: ModuleKey,
+        call: SemanticCall,
+    },
+    NoteSemanticLoss {
+        reason: String,
+    },
     RetireCaller {
         caller: CallerId,
         reason: String,
@@ -877,6 +892,12 @@ pub(crate) struct CallerRegistry {
     modules_refused: u64,
     edges_refused: u64,
     endpoints_refused: u64,
+    /// Edges with materialized semantic state (monotonic: edges are
+    /// never deleted and state is never withdrawn).
+    semantic_occupied: usize,
+    /// Semantic keys refused: materializations past
+    /// `max_semantic_states` plus per-edge keys past the S1 bounds.
+    semantic_refused: u64,
 }
 
 impl CallerRegistry {
@@ -900,6 +921,8 @@ impl CallerRegistry {
             modules_refused: 0,
             edges_refused: 0,
             endpoints_refused: 0,
+            semantic_occupied: 0,
+            semantic_refused: 0,
         }
     }
 
@@ -995,6 +1018,31 @@ impl CallerRegistry {
         self.endpoints_refused
     }
 
+    /// Edges with materialized semantic state (the `semantic_state`
+    /// budget occupancy). Zero while capture stays withheld.
+    pub(crate) fn semantic_occupied(&self) -> usize {
+        self.semantic_occupied
+    }
+
+    /// Edges lacking semantic claims: withheld edges plus tracked
+    /// edges whose feed established no mechanism/operation claim.
+    pub(crate) fn semantic_unknown_edges(&self) -> usize {
+        self.edges
+            .values()
+            .filter(|edge| {
+                edge.semantics
+                    .as_ref()
+                    .is_none_or(|state| !state.has_claims())
+            })
+            .count()
+    }
+
+    /// Semantic keys refused past budget (the `semantic_state` loss
+    /// counter — exact even when gap retention overflows).
+    pub(crate) fn semantic_refused(&self) -> u64 {
+        self.semantic_refused
+    }
+
     /// Counter budget census: edges with observed entries (count or
     /// in-flight), and edges whose counter saturated at the cap.
     pub(crate) fn counter_census(&self) -> (usize, usize) {
@@ -1032,16 +1080,30 @@ impl CallerRegistry {
 
     /// Recency answers "active now" from entry last-seen, not from any
     /// sticky bit: true when an entry was observed within `window_ns` of
-    /// `now_ns`, or an entry is in flight.
+    /// `now_ns`, or an entry is in flight. Test-gated: unit tests pin
+    /// the combined predicate; production splits it through
+    /// [`Self::entry_recent_within`] plus the in-flight flag.
+    #[cfg(test)]
     pub(crate) fn entry_active_within(
         &self,
         edge: &EdgeRecord,
         now_ns: u64,
         window_ns: u64,
     ) -> bool {
-        if edge.entry_in_flight {
-            return true;
-        }
+        edge.entry_in_flight || self.entry_recent_within(edge, now_ns, window_ns)
+    }
+
+    /// The last-seen half of [`Self::entry_active_within`]: true when an
+    /// entry was observed within `window_ns` of `now_ns`, regardless of
+    /// in-flight state. The presentation layer splits in-flight from
+    /// recent for the dashboard activity column; both share this
+    /// predicate, never two window implementations.
+    pub(crate) fn entry_recent_within(
+        &self,
+        edge: &EdgeRecord,
+        now_ns: u64,
+        window_ns: u64,
+    ) -> bool {
         edge.entry_last_seen_ns
             .is_some_and(|last| now_ns.saturating_sub(last) <= window_ns && last <= now_ns)
     }
@@ -1089,6 +1151,33 @@ impl CallerRegistry {
             module: module.clone(),
             in_flight,
         });
+    }
+
+    /// Stage one observed semantic call for an edge. The call's facts
+    /// come from the existing trusted-slot mechanism path; the feed
+    /// boundary copies them, never invents. Fed by the privileged
+    /// semantic lane; the scan lane stages no semantic calls.
+    #[allow(dead_code)] // Privileged semantic-feed seam; unit tests pin the semantics.
+    pub(crate) fn observe_semantic(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        call: SemanticCall,
+    ) {
+        self.staged.push(Mutation::ObserveSemantic {
+            caller,
+            module: module.clone(),
+            call,
+        });
+    }
+
+    /// Stage one pass-wide semantic capture-loss boundary: every live
+    /// operation on every semantically-tracked edge ends unknown with
+    /// explicit accounting, and the loss itself is a gap — never
+    /// silent completion, never silent loss.
+    #[allow(dead_code)] // Privileged semantic-feed seam; unit tests pin the semantics.
+    pub(crate) fn note_capture_loss(&mut self, reason: String) {
+        self.staged.push(Mutation::NoteSemanticLoss { reason });
     }
 
     /// Stage one caller retirement: the caller's edges end with the
@@ -1178,6 +1267,26 @@ impl CallerRegistry {
                     edge.entry_in_flight = in_flight;
                 }
             }
+            Mutation::ObserveSemantic {
+                caller,
+                module,
+                call,
+            } => self.apply_semantic(caller, &module, &call),
+            Mutation::NoteSemanticLoss { reason } => {
+                for edge in self.edges.values_mut() {
+                    if let Some(state) = edge.semantics.as_mut() {
+                        state.invalidate();
+                    }
+                }
+                self.push_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "semantic capture loss".into(),
+                    reason,
+                    budget: None,
+                });
+            }
             Mutation::RetireCaller {
                 caller,
                 reason,
@@ -1201,6 +1310,12 @@ impl CallerRegistry {
                         "member was not scanned this pass; the mapping is neither confirmed nor refuted"
                             .into(),
                     );
+                    // Lifecycle evidence is missing: "right now"
+                    // operation claims no longer have a proven edge
+                    // beneath them, so they end unknown (C2).
+                    if let Some(state) = edge.semantics.as_mut() {
+                        state.invalidate();
+                    }
                     modules.insert(edge.module);
                 }
                 for module in modules {
@@ -1386,6 +1501,7 @@ impl CallerRegistry {
                         entry_first_seen_ns: None,
                         entry_last_seen_ns: None,
                         entry_in_flight: false,
+                        semantics: None,
                     },
                 );
             }
@@ -1443,6 +1559,81 @@ impl CallerRegistry {
         EntryOutcome::Recorded
     }
 
+    /// Feed one semantic call to its edge's reducer. Retired callers
+    /// are frozen (the call is dropped, like late entries); calls
+    /// without mapping evidence never invent edges (a named gap);
+    /// first observation materializes the edge's state within the
+    /// `max_semantic_states` budget (past it: a refusal gap plus the
+    /// loss counter, never an eviction of retained state).
+    fn apply_semantic(&mut self, caller: CallerId, module: &ModuleKey, call: &SemanticCall) {
+        if self.retired.contains_key(&caller) {
+            return;
+        }
+        let Some(id) = self.modules_by_key.get(module).copied() else {
+            self.push_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: None,
+                subject: "semantic call without mapping evidence".into(),
+                reason: "observed calls never invent mappings; the call was dropped".into(),
+                budget: None,
+            });
+            return;
+        };
+        if !self.edges.contains_key(&(caller, id)) {
+            self.push_gap(RegistryGap {
+                caller: Some(caller),
+                module: Some(id),
+                pid: None,
+                subject: "semantic call without mapping evidence".into(),
+                reason: "observed calls never invent mappings; the call was dropped".into(),
+                budget: None,
+            });
+            return;
+        }
+        let needs_materialize = self
+            .edges
+            .get(&(caller, id))
+            .is_some_and(|edge| edge.semantics.is_none());
+        if needs_materialize {
+            if self.semantic_occupied >= self.limits.max_semantic_states {
+                self.semantic_refused = self.semantic_refused.saturating_add(1);
+                let refusal = BudgetRefusal {
+                    resource: "semantic_state",
+                    limit: self.limits.max_semantic_states,
+                    requested: self.semantic_occupied + 1,
+                };
+                self.push_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: Some(id),
+                    pid: None,
+                    subject: "semantic state capacity exhausted".into(),
+                    reason: format!(
+                        "the registry retains at most {} semantic states (requested state {}); the call was dropped",
+                        refusal.limit, refusal.requested,
+                    ),
+                    budget: Some(refusal),
+                });
+                return;
+            }
+            self.edges
+                .get_mut(&(caller, id))
+                .expect("edge resolved above")
+                .semantics = Some(EdgeSemantics::default());
+            self.semantic_occupied = self.semantic_occupied.saturating_add(1);
+        }
+        let edge = self
+            .edges
+            .get_mut(&(caller, id))
+            .expect("edge resolved above");
+        let refused = edge
+            .semantics
+            .as_mut()
+            .expect("semantic state materialized above")
+            .observe(call);
+        self.semantic_refused = self.semantic_refused.saturating_add(refused);
+    }
+
     fn apply_retire(&mut self, caller: CallerId, reason: String, at_ns: u64) {
         let _ = at_ns;
         self.retired.insert(caller, reason.clone());
@@ -1453,6 +1644,12 @@ impl CallerRegistry {
         }) {
             edge.mapping = MappingState::Ended;
             edge.mapping_reason = Some(reason.clone());
+            // A retired edge keeps its claims (retained evidence) but
+            // its live operations end unknown (C2) — retirement proves
+            // an end, never a completion.
+            if let Some(state) = edge.semantics.as_mut() {
+                state.invalidate();
+            }
             modules.insert(edge.module);
         }
         for module in modules {
@@ -1515,6 +1712,11 @@ impl CallerRegistry {
                 edge.mapping = MappingState::Ended;
                 edge.mapping_reason =
                     Some("the module was absent from a complete rescan of the live caller".into());
+            }
+            // Absence ends "right now": ended or uncertain, the live
+            // operations lose their proven edge and end unknown (C2).
+            if let Some(state) = edge.semantics.as_mut() {
+                state.invalidate();
             }
         }
         // The module unloaded only when no edge still maps it or could:

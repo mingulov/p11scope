@@ -85,6 +85,10 @@ fn run() -> Result<i32> {
                 a.max_scan_pids,
                 a.duration,
                 a.out.as_deref(),
+                a.dashboard,
+                a.event_log.as_deref(),
+                a.event_rotate_bytes,
+                a.event_max_files,
             )
             .with_context(|| scope)
         }

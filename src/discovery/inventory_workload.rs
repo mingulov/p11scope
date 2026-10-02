@@ -44,6 +44,8 @@ use crate::discovery::engine::inventory_coordinator::{
 #[cfg(test)]
 use crate::discovery::hooks::HookRegistry;
 #[cfg(test)]
+use crate::semantics_edge::SemanticCall;
+#[cfg(test)]
 use anyhow::Result;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -873,6 +875,29 @@ impl Harness {
             self.advance(10);
         }
         (admitted, events)
+    }
+
+    /// Stage one semantic call for an edge through the production
+    /// batch boundary: the S-track reuses this SAME harness — no new
+    /// seam. Invisible until [`Harness::commit`].
+    pub(crate) fn observe_semantic(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        call: SemanticCall,
+    ) {
+        self.coordinator
+            .registry_mut()
+            .observe_semantic(caller, module, call);
+    }
+
+    /// Stage one pass-wide semantic capture-loss boundary (S1/C2):
+    /// every live operation ends unknown and the loss is a gap.
+    /// Invisible until [`Harness::commit`].
+    pub(crate) fn note_semantic_loss(&mut self, reason: &str) {
+        self.coordinator
+            .registry_mut()
+            .note_capture_loss(reason.to_string());
     }
 
     /// One pass with no observation behind it (discovery loss): the

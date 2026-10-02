@@ -39,9 +39,13 @@ mod first_use_probe;
 pub mod inspect;
 pub mod inspect_system;
 pub mod inventory;
+pub mod inventory_dashboard;
+pub mod inventory_events;
+pub mod inventory_present;
 pub mod kinds;
 pub mod longrun;
 pub mod manifest_input;
+pub mod mechanism_names;
 pub mod metrics;
 pub mod output;
 pub mod plan;
@@ -50,6 +54,7 @@ pub mod render;
 pub(crate) mod run;
 pub mod scope;
 pub mod semantics;
+pub mod semantics_edge;
 pub mod shapes;
 pub(crate) mod sink;
 pub mod timing;
@@ -77,3 +82,5 @@ pub static EBPF_INVENTORY_CALLERS_OBJECT: &[u8] =
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-inventory-callers"));
 
 pub(crate) mod history;
+#[cfg(test)]
+mod s1_tests;

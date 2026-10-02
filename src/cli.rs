@@ -137,10 +137,22 @@ pub struct InventoryArgs {
     /// Only `--system` scans more than one member, so only it reads this.
     pub max_scan_pids: Option<usize>,
     /// `--duration`: keep observing (rescanning) until the deadline;
-    /// None ⇒ a single snapshot pass.
+    /// None ⇒ a single snapshot pass (or, with `--dashboard`, until quit).
     pub duration: Option<Duration>,
     /// `-o`: write the JSON inventory document to this file (atomic).
     pub out: Option<PathBuf>,
+    /// `--dashboard`: live read-only dashboard on stdout when it is a
+    /// terminal (scrollable edge table, coverage header, log tail);
+    /// degraded honestly to snapshots/JSON on a pipe, never ANSI.
+    pub dashboard: bool,
+    /// `--event-log`: append the JSONL observation-event stream
+    /// (`p11scope/inventory-events/v1`) to this file, with rotation.
+    pub event_log: Option<PathBuf>,
+    /// `--event-rotate-bytes`: rotation threshold; None ⇒ 1 MiB default.
+    pub event_rotate_bytes: Option<u64>,
+    /// `--event-max-files`: live file plus retained rotations;
+    /// None ⇒ 5 default.
+    pub event_max_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,8 +227,8 @@ pub const USAGE: &str = "usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
@@ -404,8 +416,8 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// shared notes footer. Every line is verbatim from [`USAGE`]; update
 /// both together when the CLI changes.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -777,6 +789,10 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut max_scan_pids: Option<usize> = None;
     let mut duration: Option<Duration> = None;
     let mut out: Option<PathBuf> = None;
+    let mut dashboard = false;
+    let mut event_log: Option<PathBuf> = None;
+    let mut event_rotate_bytes: Option<u64> = None;
+    let mut event_max_files: Option<usize> = None;
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inventory)),
@@ -790,6 +806,35 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             "--module" => modules.push(require_path(&mut args, "--module")?),
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
+            "--dashboard" => dashboard = true,
+            "--event-log" => {
+                if event_log.is_some() {
+                    return Err(usage_err("--event-log given twice"));
+                }
+                event_log = Some(require_path(&mut args, "--event-log")?);
+            }
+            "--event-rotate-bytes" => {
+                if event_rotate_bytes.is_some() {
+                    return Err(usage_err("--event-rotate-bytes given twice"));
+                }
+                let v = require_value(&mut args, "--event-rotate-bytes")?;
+                event_rotate_bytes = Some(parse_event_bytes(&v).map_err(|e| {
+                    usage_err(format!("--event-rotate-bytes: invalid value {v:?}: {e}"))
+                })?);
+            }
+            "--event-max-files" => {
+                if event_max_files.is_some() {
+                    return Err(usage_err("--event-max-files given twice"));
+                }
+                let v = require_value(&mut args, "--event-max-files")?;
+                let value = v
+                    .parse::<usize>()
+                    .map_err(|_| usage_err(format!("--event-max-files: invalid number {v:?}")))?;
+                if value == 0 {
+                    return Err(usage_err("--event-max-files must be greater than zero"));
+                }
+                event_max_files = Some(value);
+            }
             "--max-scan-pids" => {
                 if max_scan_pids.is_some() {
                     return Err(usage_err("--max-scan-pids given twice"));
@@ -840,6 +885,11 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
              the report requires a file)",
         ));
     }
+    if event_log.is_none() && (event_rotate_bytes.is_some() || event_max_files.is_some()) {
+        return Err(usage_err(
+            "--event-rotate-bytes/--event-max-files require --event-log <f.jsonl>",
+        ));
+    }
     Ok(InventoryArgs {
         scope,
         modules,
@@ -848,6 +898,10 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         max_scan_pids,
         duration,
         out,
+        dashboard,
+        event_log,
+        event_rotate_bytes,
+        event_max_files,
     })
 }
 
@@ -1131,6 +1185,31 @@ pub fn parse_ring_bytes(s: &str) -> Result<u32, String> {
         return Err(format!("size {s:?} is not a power of two"));
     }
     Ok(bytes as u32)
+}
+
+/// Parses an event-stream rotation threshold as plain bytes or with a
+/// single trailing `K`/`M` suffix — `"4096"`, `"256K"`, `"1M"`. Any
+/// positive value fits (rotation needs no power-of-two alignment).
+pub fn parse_event_bytes(s: &str) -> Result<u64, String> {
+    if s.is_empty() {
+        return Err("empty size".to_string());
+    }
+    let (digits, mult) = match s.as_bytes()[s.len() - 1] {
+        b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
+        b'M' | b'm' => (&s[..s.len() - 1], 1024u64 * 1024),
+        _ => (s, 1u64),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid size {s:?}"));
+    }
+    let bytes: u64 = digits.parse().map_err(|_| format!("invalid size {s:?}"))?;
+    let bytes = bytes
+        .checked_mul(mult)
+        .ok_or_else(|| format!("size {s:?} overflows"))?;
+    if bytes == 0 {
+        return Err(format!("size {s:?} must be greater than zero"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -1516,6 +1595,95 @@ mod tests {
             parse(args(&["inventory", "--system", "--bogus"])),
             Err(CliError::Usage(m)) if m.contains("unknown argument: --bogus")
         ));
+    }
+
+    #[test]
+    fn inventory_parses_dashboard_and_event_stream_options() {
+        let Command::Inventory(i) = parse(args(&[
+            "inventory",
+            "--pid",
+            "7",
+            "--dashboard",
+            "--event-log",
+            "events.jsonl",
+            "--event-rotate-bytes",
+            "64K",
+            "--event-max-files",
+            "3",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert!(i.dashboard);
+        assert_eq!(i.event_log, Some(PathBuf::from("events.jsonl")));
+        assert_eq!(i.event_rotate_bytes, Some(65536));
+        assert_eq!(i.event_max_files, Some(3));
+        // Defaults are unset (the runner applies them).
+        let Command::Inventory(plain) = parse(args(&["inventory", "--pid", "7"])).unwrap() else {
+            panic!("expected inventory")
+        };
+        assert!(!plain.dashboard);
+        assert_eq!(plain.event_log, None);
+        assert_eq!(plain.event_rotate_bytes, None);
+        assert_eq!(plain.event_max_files, None);
+    }
+
+    #[test]
+    fn inventory_refuses_dangling_event_options_and_bad_sizes() {
+        // Rotation/retention without a stream file is refused, never
+        // silently ignored.
+        for argv in [
+            vec!["inventory", "--pid", "7", "--event-rotate-bytes", "1M"],
+            vec!["inventory", "--pid", "7", "--event-max-files", "3"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m))
+                    if m.contains("require --event-log")),
+                "{argv:?}"
+            );
+        }
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--pid", "7",
+                "--event-log", "e.jsonl",
+                "--event-rotate-bytes", "0",
+            ])),
+            Err(CliError::Usage(m)) if m.contains("--event-rotate-bytes: invalid value")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--pid", "7",
+                "--event-log", "e.jsonl",
+                "--event-max-files", "0",
+            ])),
+            Err(CliError::Usage(m)) if m.contains("--event-max-files must be greater than zero")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--pid", "7",
+                "--event-log", "a",
+                "--event-log", "b",
+            ])),
+            Err(CliError::Usage(m)) if m.contains("--event-log given twice")
+        ));
+    }
+
+    #[test]
+    fn event_bytes_accepts_plain_and_suffixed_sizes() {
+        for (input, want) in [
+            ("1", 1u64),
+            ("4096", 4096),
+            ("1000", 1000),
+            ("256K", 262144),
+            ("256k", 262144),
+            ("1M", 1048576),
+            ("64M", 67108864),
+        ] {
+            assert_eq!(parse_event_bytes(input), Ok(want), "input {input}");
+        }
+        for input in ["0", "0K", "1G", "1.5M", "abc", ""] {
+            assert!(parse_event_bytes(input).is_err(), "input {input} must fail");
+        }
     }
 
     #[test]
@@ -2097,8 +2265,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 3850);
-        assert_eq!(hash, 0x4e220551_08f90df3);
+        assert_eq!(USAGE.len(), 4038);
+        assert_eq!(hash, 0x82762f78_b4903ab7);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

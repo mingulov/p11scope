@@ -541,3 +541,185 @@ fn out_file_matches_stdout_document() {
     assert_eq!(doc["observation"]["passes"], 1);
     drop(guard);
 }
+
+// ---------------------------------------------------------------------------
+// S1/D4: mechanism/operation context at command level.
+// ---------------------------------------------------------------------------
+
+/// An owned provider-mapping fixture process, terminated and reaped
+/// on drop (a failed assert cannot leak sleepers or zombies).
+struct LiveDriver {
+    child: Option<std::process::Child>,
+    pid: u32,
+}
+
+impl LiveDriver {
+    fn spawn(dir: &Path, name: &str, providers: &[&str]) -> Self {
+        let driver = gcc(
+            dir,
+            &format!("{name}-driver"),
+            &fixture_source("catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let mut libs = Vec::new();
+        for soname in providers {
+            libs.push(gcc(
+                dir,
+                soname,
+                &matrix_source(),
+                &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+                &[],
+            ));
+        }
+        let ready = dir.join(format!("{name}.ready"));
+        let _ = std::fs::remove_file(&ready);
+        let mut child = Command::new(&driver)
+            .arg("--ready")
+            .arg(&ready)
+            .arg("--sleep")
+            .arg("120")
+            .args(&libs)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&ready)
+                && let Some(pid) = text.split_whitespace().nth(1)
+            {
+                break pid.parse::<u32>().unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture {name} never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(pid, child.id(), "ready pid is the spawned driver");
+        let _ = child.try_wait().unwrap();
+        Self {
+            child: Some(child),
+            pid,
+        }
+    }
+}
+
+impl Drop for LiveDriver {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn observe(pid: u32, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .arg("inventory")
+        .arg("--pid")
+        .arg(pid.to_string())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn s1_command_json_carries_semantic_schema_with_honest_unknowns() {
+    // Multi-module workload through the real binary over owned
+    // fixtures: production is scan-only (no semantic feed), so the
+    // S1-extended schema renders with honest withheld unknowns at
+    // command level — the fields exist, nothing is invented.
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-s1");
+    let driver = LiveDriver::spawn(&dir, "s1", &["s1-p1.so", "s1-p2.so"]);
+    let output = observe(driver.pid, &["--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "s1 observe failed: {stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "stderr stays panic-free: {stderr}"
+    );
+    let doc: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    assert_eq!(doc["scope"], format!("pid:{}", driver.pid));
+    for soname in ["s1-p1.so", "s1-p2.so"] {
+        let module = module_for(&doc, soname);
+        let module_id = module["id"].as_str().unwrap();
+        let callers = caller_for(&doc, u64::from(driver.pid));
+        assert_eq!(callers.len(), 1, "one incarnation for the driver");
+        let edges = edges_for(&doc, callers[0]["id"].as_str().unwrap(), module_id);
+        assert_eq!(edges.len(), 1, "expected edge -> {soname}");
+        assert_eq!(edges[0]["mapping"]["state"], "mapped");
+        // The additive S1 keys exist with honest withheld values.
+        let mut keys: Vec<&str> = edges[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "caller",
+                "entries",
+                "mapping",
+                "mechanisms",
+                "module",
+                "operations",
+                "semantics"
+            ],
+            "{soname}"
+        );
+        assert_eq!(
+            edges[0]["semantics"], "unknown (semantic capture withheld)",
+            "{soname}"
+        );
+        assert!(edges[0]["mechanisms"].is_null(), "{soname}");
+        assert!(edges[0]["operations"].is_null(), "{soname}");
+    }
+    let budget = &doc["budgets"]["semantic_state"];
+    assert_eq!(budget["occupied"], 0);
+    assert_eq!(budget["status"], "withheld");
+    assert_eq!(budget["refused"], 0);
+    assert_eq!(
+        budget["unknown_edges"],
+        doc["edges"].as_array().unwrap().len() as u64
+    );
+}
+
+#[test]
+fn s1_command_degraded_run_keeps_stderr_honest() {
+    // A refused run (dashboard forced onto a pipe) degrades with an
+    // honest stderr notice; the snapshot it emits instead carries the
+    // S1 semantic budget line and withheld columns.
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-s1-degrade");
+    let driver = LiveDriver::spawn(&dir, "s1d", &["s1d-p1.so"]);
+    let output = observe(driver.pid, &["--dashboard"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "degraded run exits 0: {stderr}");
+    assert!(
+        stderr.contains("degraded to pager snapshots") && !stderr.contains("panicked"),
+        "honest degrade notice: {stderr}"
+    );
+    assert!(
+        !output.stdout.contains(&0x1b),
+        "no ANSI on the degraded pipe"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("semantic_state withheld held 0/"),
+        "snapshot semantic budget: {stdout}"
+    );
+    assert!(
+        stdout.contains("unknown (semantic capture withheld)"),
+        "snapshot withheld columns: {stdout}"
+    );
+}

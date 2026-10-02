@@ -578,11 +578,20 @@ kind of workload without a manifest and ends `68`/`0` instead.
   and lifecycle. `--json` prints the `p11scope/inventory/v1` document
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
-  report requires a file). Scan-only like inspect: entry columns read
-  unknown unless an entry feed observed them, mappings are never reported
-  as observed calls, and every coverage loss is an explicit gap. A target
-  no scan inventoried is a hard error (one stderr line, exit 1), never an
-  empty-success report.
+  report requires a file). `--dashboard` runs the live read-only
+  dashboard on stdout when it is a terminal (scrollable edge table with
+  presence/capture/activity states, coverage header, bounded log tail;
+  `q` quits, `--duration` bounds the run); on a pipe it degrades
+  honestly to snapshots (or JSON under `--json`), never ANSI.
+  `--event-log <f.jsonl>` appends the versioned JSONL
+  observation-event stream (see
+  `docs/schema/inventory-events-v1.md`), rotating past
+  `--event-rotate-bytes` (default 1M) and retaining `--event-max-files`
+  (default 5) with explicit loss accounting. Scan-only like inspect:
+  entry columns read unknown unless an entry feed observed them, mappings
+  are never reported as observed calls, and every coverage loss is an
+  explicit gap. A target no scan inventoried is a hard error (one stderr
+  line, exit 1), never an empty-success report.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
   refusal is deliberate: on affected kernels a uretprobe on a confined target

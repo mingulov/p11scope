@@ -1963,7 +1963,9 @@ const CKF_UNWRAP: u64 = 0x0004_0000;
 const CKF_DERIVE: u64 = 0x0008_0000;
 const CKF_ENCAPSULATE: u64 = 0x1000_0000;
 const CKF_DECAPSULATE: u64 = 0x2000_0000;
-const KNOWN_CANCEL_FLAGS: u64 = CKF_MESSAGE_ENCRYPT
+/// Known `C_SessionCancel` flag bits — shared with the per-edge
+/// reducer so unknown-flag detection cannot diverge.
+pub(crate) const KNOWN_CANCEL_FLAGS: u64 = CKF_MESSAGE_ENCRYPT
     | CKF_MESSAGE_DECRYPT
     | CKF_MESSAGE_SIGN
     | CKF_MESSAGE_VERIFY
@@ -1989,13 +1991,27 @@ fn pid_of(ev: &Event) -> u32 {
     (ev.pid_tgid >> 32) as u32
 }
 
-fn operation_bits(mask: u16) -> impl Iterator<Item = (u16, &'static str)> {
+/// Operation bits in a mask with their category names — shared with
+/// the per-edge reducer like [`operation_name`].
+pub(crate) fn operation_bits(mask: u16) -> impl Iterator<Item = (u16, &'static str)> {
     OPERATIONS
         .into_iter()
         .filter(move |(bit, _)| mask & bit != 0)
 }
 
-fn direct_name(value: u8) -> Option<&'static str> {
+/// Operation category name for one `operation::*` bit — the SAME
+/// names the capture-wide reducer records in `MechStat::ops`, shared
+/// so the per-edge reducer (S1) cannot drift into a divergent
+/// vocabulary. `None` for an unknown bit (never invented).
+pub(crate) fn operation_name(bit: u16) -> Option<&'static str> {
+    OPERATIONS
+        .into_iter()
+        .find_map(|(known, name)| (known == bit).then_some(name))
+}
+
+/// Direct-operation category name (`"generate_key"`, `"wrap"`, ...) —
+/// shared with the per-edge reducer like [`operation_name`].
+pub(crate) fn direct_name(value: u8) -> Option<&'static str> {
     match value {
         direct::GENERATE_KEY => Some("generate_key"),
         direct::GENERATE_KEY_PAIR => Some("generate_key_pair"),
@@ -2010,7 +2026,9 @@ fn direct_name(value: u8) -> Option<&'static str> {
     }
 }
 
-fn direct_cancel_flag(value: u8) -> u64 {
+/// `C_SessionCancel` flag bit for one `direct::*` kind — shared with
+/// the per-edge reducer like [`operation_name`].
+pub(crate) fn direct_cancel_flag(value: u8) -> u64 {
     match value {
         direct::GENERATE_KEY => CKF_GENERATE,
         direct::GENERATE_KEY_PAIR => CKF_GENERATE_KEY_PAIR,
@@ -2023,7 +2041,9 @@ fn direct_cancel_flag(value: u8) -> u64 {
     }
 }
 
-fn cancel_operation_mask(flags: u64) -> u16 {
+/// `C_SessionCancel` flags → operation mask — shared with the
+/// per-edge reducer like [`operation_name`].
+pub(crate) fn cancel_operation_mask(flags: u64) -> u16 {
     let mut mask = 0;
     for (flag, operation) in [
         (CKF_MESSAGE_ENCRYPT, operation::MESSAGE_ENCRYPT),

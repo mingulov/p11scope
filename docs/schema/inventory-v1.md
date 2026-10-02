@@ -53,6 +53,71 @@ never a changed meaning for an existing field.
   observation is not a fact about usage; a caller with zero observed
   entries is "mapped, quiet", never "active". Recency ("active now")
   is last-seen plus in-flight state, never a sticky bit.
+- `edges[].semantics` (S1): the per-edge semantic summary label —
+  `observed` iff the edge holds at least one mechanism or operation
+  claim, otherwise the reason no claim exists:
+  `unknown (semantic capture withheld)` (no semantic feed ever
+  observed this edge — the scan lane alone), `unknown
+  (unauthoritative module)`, `unknown (ambiguous descriptor)`
+  (aliased/ambiguous producing descriptors),
+  `unknown (count-only slot)` (count-only or unrecognized producing
+  slots), or `unknown (no operation evidence)` (an authorized feed
+  observed only lifecycle traffic, failed `Init`s, or orphan calls
+  that establish no claim). Unsupported or ambiguous semantics
+  render `unknown`, never invented.
+- `edges[].mechanisms` (S1, `null` when no mechanism was
+  attributed): one row per attributed mechanism id, sorted by id,
+  each with exactly these keys: `mechanism` (the verbatim `u64` id —
+  vendor ids survive unchanged), `mechanism_hex` (`0x…`), `name`
+  (the registered `CKM_*` name, or `null` for vendor/unregistered
+  ids — never guessed), `operations` (sorted operation categories
+  this id was seen initializing, from the `*Init` function names:
+  `sign`, `encrypt`, …, `message_sign`, …, `generate_key`, …),
+  `calls` (API calls attributed to this id), `errors` (attributed
+  calls with `rv != CKR_OK`), `last_seen_ns` (last attributed call),
+  and `evidence` with `functions` (sorted verbatim function names
+  that established claims here), `returns` (sorted `{rv, rv_hex,
+  name}` rows — `name` is the registered `CKR_*` name or `null`),
+  and `truncated` (true when a provenance set hit its bound and
+  stopped growing). A mechanism label never implies more than the
+  label: `CKM_AES_GCM` carries no key size, `CKM_RSA_PKCS_PSS`
+  carries no size or parameters, `CKM_ECDSA` carries no curve —
+  there are no size/curve/parameter keys in S1 output.
+- `edges[].operations` (S1, `null` when the edge holds no claims):
+  the per-edge operation aggregates with exactly these keys:
+  `calls` (authorized calls with semantic content),
+  `started` (`*Init`-created operations plus completed-direct
+  calls), `completed`/`cancelled`/`failed`/`unknown` (explicit end
+  states — completed ⟺ ended by an `OK` return; cancelled ⟺ ended
+  by cancel, replacement, or scope end; failed ⟺ ended by an error
+  return; unknown ⟺ invalidated by loss, retirement, or a
+  contradicted model — never silently completed, never silently
+  dropped), `orphans` (calls/completions unattributable to a
+  tracked operation — unknown-origin evidence, never invented
+  joins), `dropped` (keys refused past the per-edge bounds),
+  `last_seen_ns`, `active` (live machines as sorted
+  `{category, state, count}` rows; `state` is `initialized` or
+  `in_progress`), and `evidence` (small ambiguity counters:
+  `state_reconciliations`, `session_cancel_ambiguities`,
+  `session_cancel_unknown_flags`, `operation_state_imports`,
+  `auth_state_ambiguities`, `semantic_capture_failures`,
+  `async_duplicates`, `async_evictions`, `unmatched_closes`).
+  API-call counts and operation counts are separate counters: a
+  retry loop is N calls, one operation. "Right now" stays three
+  distinct facts — recent call (`entries.last_seen_ns`), operation
+  initialized (`operations.active`), API call in flight
+  (`entries.in_flight`) — never merged. Raw session handles are
+  never serialized; only per-edge aggregates leave the reducer.
+  Completions apply on the completing session only, so a
+  cross-session async completion orphans rather than joining
+  across sessions; fork-inherited sessions read as
+  unknown-origin on the child's edge. Capture-loss boundaries,
+  retired edges, and uncertain mappings end affected operations
+  as `unknown` (the `semantic capture loss` gap names pass-wide
+  loss); per-edge bound overflows refuse with `dropped` plus the
+  budget `refused` counter, never by evicting retained facts
+  (async pending/detached records are the one oldest-evicted
+  exception, counted in `async_evictions`).
 - `gaps[]`: every explicit coverage loss — unadmitted members,
   unreadable pids, deferred scans, unknown identities — with subject
   and reason. Absence from the document is never evidence of
@@ -66,11 +131,14 @@ never a changed meaning for an existing field.
   retained attach-endpoint census: the sum of admitted per-module
   endpoint counts), `counters` (per-edge entry counts: the `cap`
   plus `observed_edges` and `saturated_edges`), `semantic_state`
-  (`limit`, `occupied`, `status`, and `unknown_edges`; capture stays
-  withheld, so `occupied` is always 0, every edge's `semantics`
-  column reads `unknown (semantic capture withheld)` (never an
-  invented state), and `unknown_edges` counts the edges lacking
-  semantic state — the whole edge census while withheld),
+  (`limit`, `occupied`, `status`, `unknown_edges`, and `refused`;
+  `status` is `withheld` while no edge holds semantic state — the
+  scan lane alone, where `occupied` is 0 and every edge reads
+  `unknown (semantic capture withheld)` — and `observed` once the
+  semantic feed materializes any; `unknown_edges` counts the edges
+  lacking semantic claims; `refused` counts semantic keys refused
+  past budget — materializations past `limit` (each also a named
+  budget gap) plus per-edge keys past the S1 bounds),
   and `retained_history` (`limit`, `retained`, `suppressed` — the gap
   retention cap and its eviction marker). Refusal never erases
   retained evidence: over-budget members are dropped with a named
@@ -90,7 +158,7 @@ never a changed meaning for an existing field.
     "edges": {"limit": 32768, "occupied": 1, "refused": 0},
     "endpoints": {"limit": 1048576, "occupied": 68, "refused": 0},
     "counters": {"cap": 18446744073709551615, "observed_edges": 0, "saturated_edges": 0},
-    "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1},
+    "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1, "refused": 0},
     "retained_history": {"limit": 1024, "retained": 1, "suppressed": 0}
   },
   "callers": [
@@ -121,7 +189,9 @@ never a changed meaning for an existing field.
       "entries": {"count": 0, "saturated": false, "cap": 18446744073709551615,
                  "first_seen_ns": null, "last_seen_ns": null, "in_flight": false,
                  "observation": "unknown (usage observation unavailable)"},
-      "semantics": "unknown (semantic capture withheld)"
+      "semantics": "unknown (semantic capture withheld)",
+      "mechanisms": null,
+      "operations": null
     }
   ],
   "gaps": [
@@ -131,5 +201,32 @@ never a changed meaning for an existing field.
      "budget": null}
   ],
   "gaps_suppressed": 0
+}
+```
+
+An observed edge (S1, abridged to the semantic keys) carries the
+label plus the mechanism rows and operation aggregates:
+
+```json
+{
+  "caller": "c0", "module": "m0",
+  "semantics": "observed",
+  "mechanisms": [
+    {"mechanism": 4225, "mechanism_hex": "0x1081", "name": "CKM_AES_ECB",
+     "operations": ["encrypt"], "calls": 3, "errors": 0, "last_seen_ns": 190,
+     "evidence": {"functions": ["C_EncryptInit", "C_EncryptUpdate"],
+                 "returns": [{"rv": 0, "rv_hex": "0x0", "name": "CKR_OK"}],
+                 "truncated": false}}
+  ],
+  "operations": {
+    "calls": 3, "started": 1, "completed": 0, "cancelled": 0,
+    "failed": 0, "unknown": 0, "orphans": 0, "dropped": 0,
+    "last_seen_ns": 190,
+    "active": [{"category": "encrypt", "state": "in_progress", "count": 1}],
+    "evidence": {"state_reconciliations": 0, "session_cancel_ambiguities": 0,
+               "session_cancel_unknown_flags": 0, "operation_state_imports": 0,
+               "auth_state_ambiguities": 0, "semantic_capture_failures": 0,
+               "async_duplicates": 0, "async_evictions": 0, "unmatched_closes": 0}
+  }
 }
 ```

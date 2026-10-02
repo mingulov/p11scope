@@ -70,10 +70,15 @@ never a changed meaning for an existing field.
   (unauthoritative module)`, `unknown (ambiguous descriptor)`
   (aliased/ambiguous producing descriptors),
   `unknown (count-only slot)` (count-only or unrecognized producing
-  slots), or `unknown (no operation evidence)` (an authorized feed
+  slots), `unknown (no operation evidence)` (an authorized feed
   observed only lifecycle traffic, failed `Init`s, or orphan calls
-  that establish no claim). Unsupported or ambiguous semantics
-  render `unknown`, never invented.
+  that establish no claim), or `unknown (same-file double-load)`
+  (scan evidence shows the object loaded twice in the caller's
+  process — duplicate executable file-offset coverage — so no
+  observed call can attribute to one instance and every call voids;
+  the `same-file double-load detected` gap names the edge).
+  Unsupported or ambiguous semantics render `unknown`, never
+  invented.
 - `edges[].mechanisms` (S1, `null` when no mechanism was
   attributed): one row per attributed mechanism id, sorted by id,
   each with exactly these keys: `mechanism` (the verbatim `u64` id —
@@ -123,9 +128,11 @@ never a changed meaning for an existing field.
   cross-session async completion orphans rather than joining
   across sessions; fork-inherited sessions read as
   unknown-origin on the child's edge. Capture-loss boundaries,
-  retired edges, and uncertain mappings end affected operations
-  as `unknown` (the `semantic capture loss` gap names pass-wide
-  loss); per-edge bound overflows refuse with `dropped` plus the
+  retired edges, uncertain mappings, and same-file double-load
+  detection end affected operations as `unknown` (the
+  `semantic capture loss` gap names pass-wide loss; the
+  `same-file double-load detected` gap names double-loaded edges);
+  per-edge bound overflows refuse with `dropped` plus the
   budget `refused` counter, never by evicting retained facts
   (async pending/detached records are the one oldest-evicted
   exception, counted in `async_evictions`).

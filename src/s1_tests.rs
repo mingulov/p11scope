@@ -612,6 +612,7 @@ fn d2_same_inode_distinct_instances_never_join() {
     let info_for = |key: ModuleKey, path: &str| ModuleInfo {
         path: path.into(),
         key,
+        double_loaded: false,
         build_id: None,
         identity_source: Some("workload".into()),
         admission: crate::discovery::caller_registry::AdmissionState::Admitted,
@@ -671,21 +672,26 @@ fn d2_same_inode_distinct_instances_never_join() {
 
 #[test]
 fn d2_same_file_double_load_merges_boundary_for_s2() {
-    // F7b path (3): S1 BOUNDARY PIN — an actual same-file double-load
-    // (two mappings of one file, one (dev, ino, sha) key) merges into
-    // ONE module and ONE edge, and overlapping numeric session handles
-    // from the two instances join in that edge's single session
-    // namespace. No detection exists either: no gap names the
-    // double-load. This test pins the S1 boundary — S2's instance
-    // authority MUST replace it with a separation regression (see
-    // docs/notes/s2-instance-authority.md).
+    // F7b BOUNDARY PIN (merge WITHOUT scan evidence): two same-key
+    // notes whose mapping evidence carries no double-load verdict —
+    // the `dlopen` re-scan shape, a second loader spelling — merge
+    // into ONE module and ONE edge, and overlapping numeric session
+    // handles join in that edge's single session namespace with no
+    // gap. The merge-by-construction stands (for `dlopen` in one
+    // namespace it is CORRECT: same file → same loaded object → one
+    // PKCS#11 session namespace); detection rides the scan verdict,
+    // not note multiplicity (see the owned-`dlmopen` regression
+    // below, which stages a flagged note and fails closed). S2's
+    // instance authority MUST replace this pin with a separation
+    // regression (see docs/notes/s2-instance-authority.md).
     //
-    // Why neither separation (1) nor fail-closed detection (2) is
-    // achievable at this layer — the merge happens five times over,
-    // every layer below S1:
+    // Where the merge happens below S1, and what each layer can see:
     // - scan: `candidate_groups` (discovery/scan.rs) groups every
     //   mapping by ObjectKey (device, inode); one ScannedModule per
-    //   group. MapEntry addresses never survive ObjectKey::of.
+    //   group — but the group keeps full MapEntry refs, so duplicate
+    //   executable file-offset coverage IS visible here and rides
+    //   `ScannedModule::double_loaded` (fix round 3 corrected the
+    //   round-2 claim that addresses never survive grouping).
     // - identity: `insert_entry_with_aliases` (discovery/identity.rs)
     //   pins same-file observations to one pinned object.
     // - observation: uprobes attach by (path, absolute file offset)
@@ -694,12 +700,10 @@ fn d2_same_file_double_load_merges_boundary_for_s2() {
     // - feed: `SemanticCall` carries no instance field, and
     //   `observe_semantic` routes by (caller, ModuleKey).
     // - registry: `apply_mapping` merges same-key notes into one
-    //   module/edge (caller_registry.rs).
-    // For dlopen in one namespace the merge is CORRECT (same file →
-    // same loaded object → one PKCS#11 session namespace); the blind
-    // case is a dlmopen private-namespace double-load (distinct
-    // objects and namespaces, identical file), which no layer here
-    // can see. R0 doctrine binds this: a pathname/hash alone cannot
+    //   module/edge; a FLAGGED note latches that edge closed instead
+    //   (unknown semantics + the named gap), an unflagged one merges
+    //   silently, as pinned here.
+    // R0 doctrine binds the framing: a pathname/hash alone cannot
     // prove a semantic module instance.
     let mut harness = harness();
     let spec = ScaleSpec {
@@ -724,6 +728,7 @@ fn d2_same_file_double_load_merges_boundary_for_s2() {
         ModuleInfo {
             path: "/scale/m0-second-load.so".into(),
             key: key.clone(),
+            double_loaded: false,
             build_id: None,
             identity_source: Some("workload".into()),
             admission: crate::discovery::caller_registry::AdmissionState::Admitted,
@@ -758,9 +763,244 @@ fn d2_same_file_double_load_merges_boundary_for_s2() {
     assert_eq!(edges[0]["operations"]["started"], 2);
     assert_eq!(edges[0]["operations"]["completed"], 2);
     assert_eq!(edges[0]["operations"]["orphans"], 0);
-    // No detection exists either: the double-load leaves no gap at
-    // all, let alone a named instance-ambiguity gap.
+    // No scan verdict rides these notes, so no detection fires: the
+    // merge leaves no gap at all. (A flagged note fails closed
+    // instead — see the owned-`dlmopen` regression below.)
     assert_eq!(document["gaps"].as_array().unwrap().len(), 0);
+}
+
+/// The owned double-loader: compiled from C, killed on drop.
+struct DoubleLoadChild {
+    child: std::process::Child,
+}
+
+impl Drop for DoubleLoadChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn d2_same_file_double_load_with_scan_evidence_forces_unknown_with_named_gap() {
+    // F7b path (2): an OWNED `dlmopen` double-load — the fixture
+    // driver loads one provider object in two new namespaces with
+    // overlapping lifetime — detected from the child's REAL scan
+    // mapping evidence (real maps → real `candidate_groups` → the
+    // real `duplicate_exec_coverage` verdict), failing the merged
+    // edge closed: unknown semantics + the named gap, never a silent
+    // join. A later single-load note unlatches and later calls
+    // attribute; the one gap stands as the window's history.
+    use sha2::Digest as _;
+    let dir = tempfile::tempdir().unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/s1-dlmopen-double-load.c");
+    let provider = dir.path().join("s1-dlmopen-provider.so");
+    let driver = dir.path().join("s1-dlmopen-driver");
+    for (output, extra) in [
+        (
+            &provider,
+            &["-shared", "-fPIC", "-DS1_DLMOPEN_PROVIDER"][..],
+        ),
+        (&driver, &[][..]),
+    ] {
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                .args(extra)
+                .arg(&source)
+                .arg("-o")
+                .arg(output)
+                .arg("-ldl")
+                .status()
+                .expect("compile the owned double-load fixture")
+                .success()
+        );
+    }
+    let mut spawned = std::process::Command::new(&driver)
+        .arg(&provider)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start the owned double-loader");
+    // Bounded READY read: the loader acks or the test fails loud.
+    let stdout = spawned.stdout.take().unwrap();
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let _ = ack_tx.send(lines.next().map(|line| line.unwrap_or_default()));
+    });
+    let child = DoubleLoadChild { child: spawned };
+    let ack = ack_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the double-loader acks within 10s")
+        .expect("the double-loader's stdout stays open through READY");
+    let ack: Vec<&str> = ack.split_whitespace().collect();
+    assert_eq!(ack.len(), 4, "READY shape");
+    assert_eq!(ack[0], "READY");
+    assert_eq!(
+        ack[1].parse::<u32>().unwrap(),
+        child.child.id(),
+        "the ack names the owned child"
+    );
+    assert_ne!(ack[2], "0x0", "the first namespace handle is loaded");
+    assert_ne!(ack[3], "0x0", "the second namespace handle is loaded");
+    assert_ne!(ack[2], ack[3], "two namespaces, two handles");
+    // Scan evidence: the child's REAL maps through the REAL grouping
+    // and the REAL detector.
+    let maps_text = std::fs::read(format!("/proc/{}/maps", child.child.id()))
+        .expect("read the owned child's maps while both loads live");
+    let maps = p11scope_manifest::maps::parse_maps(&maps_text).unwrap();
+    let groups = crate::discovery::scan::candidate_groups(&maps);
+    let provider_name = b"s1-dlmopen-provider.so";
+    let provider_key = maps
+        .iter()
+        .find(|entry| {
+            entry
+                .raw_path
+                .as_ref()
+                .is_some_and(|path| path.ends_with(provider_name))
+        })
+        .map(p11scope_manifest::maps::ObjectKey::of)
+        .expect("the provider maps in the owned child");
+    let provider_group = groups.get(&provider_key).unwrap();
+    let exec_starts: Vec<u64> = provider_group
+        .iter()
+        .filter(|entry| entry.permissions[2] == b'x')
+        .map(|entry| entry.start)
+        .collect();
+    assert!(
+        exec_starts.len() >= 2,
+        "two executable mappings of one file: {exec_starts:x?}"
+    );
+    let detected =
+        crate::discovery::scan::duplicate_exec_coverage(provider_group);
+    assert!(detected, "scan evidence shows the double-load");
+    // Control: the driver's own executable loads once — no duplicate.
+    let driver_bytes = driver.as_os_str().as_encoded_bytes();
+    let driver_key = maps
+        .iter()
+        .find(|entry| entry.raw_path.as_deref() == Some(driver_bytes))
+        .map(p11scope_manifest::maps::ObjectKey::of)
+        .expect("the driver maps in the owned child");
+    assert!(
+        !crate::discovery::scan::duplicate_exec_coverage(
+            groups.get(&driver_key).unwrap()
+        ),
+        "a single load shows no duplicate"
+    );
+    // The registry fact keys the REAL file: the maps identity the
+    // scan saw, the SHA-256 of the provider bytes, its real path —
+    // and the detector's own verdict staged as the note's evidence.
+    let provider_bytes = std::fs::read(&provider).unwrap();
+    let mut digest = sha2::Sha256::new();
+    digest.update(&provider_bytes);
+    let sha256: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let key = ModuleKey::physical(
+        provider_key.device.major,
+        provider_key.device.minor,
+        provider_key.inode,
+        Some(sha256),
+        provider.to_str().unwrap(),
+    );
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "s1-double-load",
+        callers: 1,
+        modules: 0,
+        edges_per_caller: 0,
+        endpoints_per_module: 1,
+        first_pid: 9960,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .set_usage_feed(true);
+    let caller = caller_of(&harness, 9960);
+    let now = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_mapping(
+        caller,
+        child.child.id(),
+        ModuleInfo {
+            path: provider.to_str().unwrap().into(),
+            key: key.clone(),
+            double_loaded: detected,
+            build_id: None,
+            identity_source: Some("workload".into()),
+            admission: crate::discovery::caller_registry::AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        },
+        now,
+    );
+    harness.commit();
+    // Overlapping numeric handle 7 on both instances, different
+    // mechanisms and categories — the shape that joined silently
+    // before detection.
+    harness.observe_semantic(caller, &key, init("C_SignInit", 7, RSA_PSS, 100));
+    harness.observe_semantic(caller, &key, op("C_Sign", 7, 110));
+    harness.observe_semantic(caller, &key, init("C_EncryptInit", 7, AES_GCM, 120));
+    harness.observe_semantic(caller, &key, op("C_Encrypt", 7, 130));
+    let document = render(&mut harness);
+    // The merge stands (one key, one module, one edge) but fails
+    // closed: no claims, the double-load label, exactly the named gap.
+    assert_eq!(document["modules"].as_array().unwrap().len(), 1);
+    let edges = document["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["semantics"], "unknown (same-file double-load)");
+    assert!(edges[0]["mechanisms"].is_null());
+    assert!(edges[0]["operations"].is_null());
+    let gaps = document["gaps"].as_array().unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["subject"], "same-file double-load detected");
+    assert_eq!(gaps[0]["caller"], "c0");
+    assert_eq!(gaps[0]["module"], "m0");
+    assert_eq!(gaps[0]["pid"], child.child.id());
+    assert_eq!(document["budgets"]["semantic_state"]["occupied"], 1);
+    assert_eq!(document["budgets"]["semantic_state"]["unknown_edges"], 1);
+    let presentation = presentation_for(&harness, &document);
+    assert_four_way_semantic_agreement(&document, &presentation);
+    // Resolution: a later single-load note unlatches and later calls
+    // attribute; the one gap stands as the window's history.
+    let now = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_mapping(
+        caller,
+        child.child.id(),
+        ModuleInfo {
+            path: provider.to_str().unwrap().into(),
+            key: key.clone(),
+            double_loaded: false,
+            build_id: None,
+            identity_source: Some("workload".into()),
+            admission: crate::discovery::caller_registry::AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        },
+        now,
+    );
+    harness.observe_semantic(caller, &key, init("C_SignInit", 7, RSA_PSS, 200));
+    harness.observe_semantic(caller, &key, op("C_Sign", 7, 210));
+    let document = render(&mut harness);
+    let edge = edge_json(&document, "c0", "m0");
+    assert_eq!(edge["semantics"], "observed");
+    assert_eq!(edge["operations"]["started"], 1);
+    assert_eq!(edge["operations"]["completed"], 1);
+    assert_eq!(document["gaps"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        document["gaps"][0]["subject"],
+        "same-file double-load detected"
+    );
 }
 
 #[test]
@@ -820,6 +1060,7 @@ fn d2_successive_lifetimes_never_merge() {
         crate::discovery::caller_registry::ModuleInfo {
             path: "/scale/m0.so".into(),
             key: scale_key(0),
+            double_loaded: false,
             build_id: None,
             identity_source: Some("workload".into()),
             admission: crate::discovery::caller_registry::AdmissionState::Admitted,

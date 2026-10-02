@@ -24,6 +24,7 @@ fn module(
 ) -> p11scope::discovery::scan::ScannedModule {
     use p11scope::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
     ScannedModule {
+        double_loaded: false,
         view: ProcessViewId(inode as u32),
         mount_namespace: MountNamespaceId { device: 1, inode },
         key: key(inode),

@@ -3264,6 +3264,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let module = ReconciledModule {
         exports: Default::default(),
         scanned: ScannedModule {
+            double_loaded: false,
             view: ProcessViewId(0),
             mount_namespace: namespace,
             key,
@@ -3321,6 +3322,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let small = ReconciledModule {
         exports: Default::default(),
         scanned: ScannedModule {
+            double_loaded: false,
             view: ProcessViewId(0),
             mount_namespace: namespace,
             key,

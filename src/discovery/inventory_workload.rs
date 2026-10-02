@@ -950,6 +950,7 @@ fn scale_module_info(index: usize, endpoints: usize) -> ModuleInfo {
             Some(format!("sha{index:06}")),
             &path,
         ),
+        double_loaded: false,
         build_id: None,
         identity_source: Some("workload".into()),
         admission: AdmissionState::Admitted,

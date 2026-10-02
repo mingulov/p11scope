@@ -30,6 +30,7 @@ fn refused_module_info(index: usize) -> ModuleInfo {
             Some(format!("dsha{index:06}")),
             &path,
         ),
+        double_loaded: false,
         build_id: None,
         identity_source: Some("workload".into()),
         admission: AdmissionState::Refused,

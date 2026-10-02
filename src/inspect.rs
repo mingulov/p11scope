@@ -701,6 +701,7 @@ mod tests {
     fn sample() -> ScanOutcome {
         ScanOutcome::Scanned {
             modules: vec![ScannedModule {
+                double_loaded: false,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,
@@ -808,6 +809,7 @@ mod tests {
         let outcome = ScanOutcome::Unavailable {
             reason: "ptrace",
             modules: vec![ScannedModule {
+                double_loaded: false,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,

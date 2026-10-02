@@ -774,6 +774,7 @@ fn module_info(index: usize, admission: AdmissionState, endpoints: Option<usize>
             Some(format!("bsha{index:06}")),
             &path,
         ),
+        double_loaded: false,
         build_id: None,
         identity_source: Some("workload".into()),
         admission,

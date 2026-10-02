@@ -3131,6 +3131,7 @@ pub(crate) mod tests {
             object,
             entry_objects: vec![vec![object, object], vec![object]],
             scanned: ScannedModule {
+                double_loaded: false,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,
@@ -3235,6 +3236,7 @@ pub(crate) mod tests {
             object: crate::plan::TEST_PINNED_OBJECT,
             entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
             scanned: ScannedModule {
+                double_loaded: false,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,

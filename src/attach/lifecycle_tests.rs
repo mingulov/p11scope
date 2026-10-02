@@ -148,6 +148,7 @@ impl Fixture {
             inode: mapping.inode,
         };
         let module = ScannedModule {
+            double_loaded: false,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key,

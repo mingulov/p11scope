@@ -550,6 +550,10 @@ pub(crate) struct Observation {
     pub exports: Vec<String>,
     pub tables: Vec<crate::discovery::scan::ScannedTable>,
     pub interfaces: Vec<crate::discovery::scan::ScannedInterface>,
+    /// Scan evidence (F7b): this member's mappings of the object show
+    /// duplicate executable file-offset coverage (a same-file
+    /// double-load in this process).
+    pub double_loaded: bool,
 }
 
 /// One catalog object: every pinned physical object the machine maps —
@@ -953,6 +957,7 @@ fn observation_of(pid: u32, scanned: &ScannedModule) -> Observation {
         exports: scanned.exports.clone(),
         tables: scanned.tables.clone(),
         interfaces: scanned.interfaces.clone(),
+        double_loaded: scanned.double_loaded,
     }
 }
 
@@ -1593,6 +1598,7 @@ mod tests {
                 path: path.into(),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![table((2, 40), 2)],
+                double_loaded: false,
                 interfaces: vec![ScannedInterface {
                     index: 0,
                     name_class: "exact_standard",
@@ -1955,6 +1961,7 @@ mod tests {
             path: "/opt/b.so".into(),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![table((2, 40), 2)],
+            double_loaded: false,
             interfaces: Vec::new(),
         });
         let relationships = build_relationships(std::slice::from_ref(&aliased));

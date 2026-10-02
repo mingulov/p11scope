@@ -1033,6 +1033,7 @@ mod tests {
             ModuleInfo {
                 path: "/lib/a.so".into(),
                 key: key.clone(),
+                double_loaded: false,
                 build_id: None,
                 identity_source: Some("mountinfo".into()),
                 admission: AdmissionState::Admitted,

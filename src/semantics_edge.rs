@@ -98,6 +98,11 @@ pub(crate) struct SemanticCall {
     pub unambiguous: bool,
     /// The effective slot semantics were forced `COUNT_ONLY`.
     pub count_only: bool,
+    /// The call attributes to exactly one module instance. The
+    /// registry clears this on same-file double-loaded edges (F7b),
+    /// where two instances share every file identity and no call can
+    /// name its instance.
+    pub attributable: bool,
     /// Observation time (the edge's clock, nanoseconds).
     pub ts_ns: u64,
 }
@@ -118,6 +123,7 @@ impl Default for SemanticCall {
             authorized: true,
             unambiguous: true,
             count_only: false,
+            attributable: true,
             ts_ns: 0,
         }
     }
@@ -280,6 +286,7 @@ pub(crate) struct EdgeSemantics {
     unauthorized_calls: u64,
     ambiguous_calls: u64,
     count_only_calls: u64,
+    unattributable_calls: u64,
     /// Any fully-authorized call with effective semantic content.
     seen_claim_capable: bool,
 }
@@ -293,6 +300,7 @@ pub(crate) const SEMANTIC_UNKNOWN_UNAUTHORIZED: &str = "unknown (unauthoritative
 pub(crate) const SEMANTIC_UNKNOWN_AMBIGUOUS: &str = "unknown (ambiguous descriptor)";
 pub(crate) const SEMANTIC_UNKNOWN_COUNT_ONLY: &str = "unknown (count-only slot)";
 pub(crate) const SEMANTIC_UNKNOWN_NO_EVIDENCE: &str = "unknown (no operation evidence)";
+pub(crate) const SEMANTIC_UNKNOWN_DOUBLE_LOAD: &str = "unknown (same-file double-load)";
 
 /// How one tracked operation ended. Completed ⟺ ended by an `OK`
 /// return; cancelled ⟺ ended by cancel/replacement/scope end;
@@ -336,6 +344,13 @@ impl EdgeSemantics {
     /// is counted by cause (the unknown-reason memory) and ignored —
     /// a downgraded call establishes no claim.
     fn gate(&mut self, call: &SemanticCall) -> Option<SlotSemantics> {
+        // Instance unattributability dominates the call-level causes:
+        // on a double-loaded edge no call can name its instance,
+        // whatever its own authority.
+        if !call.attributable {
+            self.unattributable_calls = self.unattributable_calls.saturating_add(1);
+            return None;
+        }
         if !call.authorized {
             self.unauthorized_calls = self.unauthorized_calls.saturating_add(1);
             return None;
@@ -1156,6 +1171,11 @@ impl EdgeSemantics {
         if self.has_claims() {
             return SEMANTIC_OBSERVED;
         }
+        // The edge-level attribution failure names the label before
+        // any call-level cause (mirrors the gate order above).
+        if self.unattributable_calls > 0 {
+            return SEMANTIC_UNKNOWN_DOUBLE_LOAD;
+        }
         if self.seen_claim_capable {
             return SEMANTIC_UNKNOWN_NO_EVIDENCE;
         }
@@ -1607,6 +1627,44 @@ mod tests {
         edge.observe(&count_only);
         edge.observe(&unauthorized);
         assert_eq!(edge.label(), SEMANTIC_UNKNOWN_UNAUTHORIZED);
+    }
+
+    #[test]
+    fn unattributable_calls_establish_no_claim_and_name_the_double_load() {
+        // F7b: calls the edge cannot attribute to one instance (the
+        // registry clears `attributable` on double-loaded edges)
+        // establish no claim and render the double-load label.
+        let mut edge = EdgeSemantics::default();
+        let mut first = init("C_SignInit", 7, RSA_PSS, 100);
+        first.attributable = false;
+        edge.observe(&first);
+        let mut second = init("C_EncryptInit", 7, AES_GCM, 120);
+        second.attributable = false;
+        edge.observe(&second);
+        assert_eq!(edge.calls(), 0);
+        assert!(!edge.has_claims());
+        assert_eq!(edge.label(), SEMANTIC_UNKNOWN_DOUBLE_LOAD);
+        // Precedence: the edge-level attribution failure wins over
+        // every call-level cause, in both orders.
+        let mut unauthorized = init("C_SignInit", 7, RSA_PSS, 100);
+        unauthorized.authorized = false;
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&unauthorized);
+        edge.observe(&first);
+        assert_eq!(edge.label(), SEMANTIC_UNKNOWN_DOUBLE_LOAD);
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&first);
+        edge.observe(&unauthorized);
+        assert_eq!(edge.label(), SEMANTIC_UNKNOWN_DOUBLE_LOAD);
+        // History stands: claims established before detection keep
+        // the observed label (loss parity), while new calls void.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&init("C_SignInit", 7, RSA_PSS, 100));
+        edge.observe(&op("C_Sign", 7, 110));
+        assert_eq!(edge.label(), SEMANTIC_OBSERVED);
+        edge.observe(&second);
+        assert_eq!(edge.label(), SEMANTIC_OBSERVED);
+        assert_eq!((edge.started(), edge.completed()), (1, 1));
     }
 
     #[test]

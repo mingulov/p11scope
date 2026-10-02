@@ -1624,6 +1624,14 @@ pub struct ScannedModule {
     pub view: ProcessViewId,
     pub mount_namespace: MountNamespaceId,
     pub key: ObjectKey,
+    /// Scan evidence (F7b): this object's candidate group covers a
+    /// shared executable file offset from two mappings at different
+    /// addresses — a second load of the same file in this process
+    /// (notably a `dlmopen` private-namespace double-load). Set by
+    /// [`duplicate_exec_coverage`] at scan time; modules synthesized
+    /// without group evidence (heap-lowered records, loader prearm,
+    /// single-mapping projections) carry `false`.
+    pub double_loaded: bool,
     pub path: String,
     /// ABI used by the userspace memory decoder. Present only when this module
     /// came from `scan_process_view`; mapping and kernel-record projections do
@@ -2607,13 +2615,48 @@ fn read_mapping(
 }
 
 /// File-backed mappings grouped by object, keeping groups that carry code.
-fn candidate_groups(maps: &[MapEntry]) -> BTreeMap<ObjectKey, Vec<&MapEntry>> {
+pub(crate) fn candidate_groups(maps: &[MapEntry]) -> BTreeMap<ObjectKey, Vec<&MapEntry>> {
     let mut groups: BTreeMap<ObjectKey, Vec<&MapEntry>> = BTreeMap::new();
     for entry in maps.iter().filter(|entry| entry.inode != 0) {
         groups.entry(ObjectKey::of(entry)).or_default().push(entry);
     }
     groups.retain(|_, group| group.iter().any(|entry| entry.permissions[2] == b'x'));
     groups
+}
+
+/// Duplicate executable file-offset coverage within one candidate
+/// group (F7b): two executable mappings covering a shared file
+/// offset at different addresses. One loader load maps each segment
+/// once, so a duplicate evidences a second load of the same file in
+/// this process — notably a `dlmopen` private-namespace
+/// double-load, whose objects own distinct PKCS#11 session
+/// namespaces under one file identity. uprobes attach by (path,
+/// file offset), so calls from the two instances are
+/// unattributable; the registry fails such edges closed (unknown
+/// semantics + a named gap) rather than joining them. Data-only
+/// duplicates are not evidence (no call surface attaches there),
+/// and neither are disjoint ranges; same-address pairs are the one
+/// mapping, never a duplicate.
+pub(crate) fn duplicate_exec_coverage(group: &[&MapEntry]) -> bool {
+    let exec: Vec<&&MapEntry> = group
+        .iter()
+        .filter(|entry| entry.permissions[2] == b'x')
+        .collect();
+    for (index, first) in exec.iter().enumerate() {
+        let first_len = first.end.saturating_sub(first.start);
+        let first_end = first.file_offset.saturating_add(first_len);
+        for second in exec.iter().skip(index + 1) {
+            if first.start == second.start {
+                continue;
+            }
+            let second_len = second.end.saturating_sub(second.start);
+            let second_end = second.file_offset.saturating_add(second_len);
+            if first.file_offset < second_end && second.file_offset < first_end {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Opens an object as the *target* sees it (spec §4.5: needs only `PTRACE_MODE_READ`;
@@ -3386,6 +3429,7 @@ fn scan_process_view_with_io_mode(
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key,
+            double_loaded: duplicate_exec_coverage(&group),
             path,
             decoder_abi: Some(abi),
             exports: exports.into_iter().map(|(name, _)| name).collect(),
@@ -4416,6 +4460,79 @@ mod tests {
             ],
             "the full-walk set is exactly the known ABI bounds"
         );
+    }
+
+    /// One group from maps text: the group's entries in map order, as
+    /// the scan loop sees them.
+    fn group_of(text: &[u8], inode: u64) -> Vec<MapEntry> {
+        let maps = parse_maps(text).unwrap();
+        let groups = candidate_groups(&maps);
+        assert_eq!(groups.len(), 1);
+        groups
+            .iter()
+            .find(|(key, _)| key.inode == inode)
+            .unwrap_or_else(|| panic!("missing group for inode {inode}"))
+            .1
+            .iter()
+            .map(|entry| (*entry).clone())
+            .collect()
+    }
+
+    fn group_refs(entries: &[MapEntry]) -> Vec<&MapEntry> {
+        entries.iter().collect()
+    }
+
+    #[test]
+    fn double_load_detector_fires_only_on_duplicate_executable_coverage() {
+        // One load: each segment once — no duplicate.
+        let single = group_of(
+            b"1000-2000 r--p 00000000 08:01 7 /lib/provider.so\n\
+              2000-3000 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              3000-4000 r--p 00002000 08:01 7 /lib/provider.so\n\
+              4000-5000 rw-p 00003000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert!(!duplicate_exec_coverage(&group_refs(&single)));
+        // A dlmopen double-load: the r-x file range mapped twice at
+        // different addresses (shape observed from a real double-load).
+        let double = group_of(
+            b"a000-a100 r--p 00000000 08:01 7 /lib/provider.so\n\
+              a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b000-b100 r--p 00000000 08:01 7 /lib/provider.so\n\
+              b100-b200 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert!(duplicate_exec_coverage(&group_refs(&double)));
+        // Disjoint executable ranges (two segments, one load each).
+        let disjoint = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b200 r-xp 00002000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert!(!duplicate_exec_coverage(&group_refs(&disjoint)));
+        // Data-only duplicates: no call surface, no evidence.
+        let data = group_of(
+            b"a000-a100 r--p 00000000 08:01 7 /lib/provider.so\n\
+              a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b000-b100 r--p 00000000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert!(!duplicate_exec_coverage(&group_refs(&data)));
+        // Partial executable overlap still shares offsets.
+        let overlap = group_of(
+            b"a100-a300 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b300 r-xp 00001100 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert!(duplicate_exec_coverage(&group_refs(&overlap)));
+        // The same mapping listed twice is the one mapping, never a
+        // duplicate (defensive: real maps never repeat a line).
+        let repeated = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert!(!duplicate_exec_coverage(&group_refs(&repeated)));
     }
 
     #[test]

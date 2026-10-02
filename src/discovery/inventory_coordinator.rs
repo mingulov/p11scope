@@ -677,6 +677,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 };
                 let mut info = catalog_module_info(object);
                 info.path = observation.path.clone();
+                info.double_loaded = observation.double_loaded;
                 self.registry
                     .note_mapping(caller, observation.pid, info, now_ns);
             }
@@ -800,6 +801,7 @@ fn native_module_info(engine: &Engine, module: &ReconciledModule, key: ModuleKey
     ModuleInfo {
         path: module.scanned.path.clone(),
         key,
+        double_loaded: module.scanned.double_loaded,
         build_id: summary.and_then(|summary| summary.build_id.map(str::to_string)),
         identity_source: summary.map(|summary| summary.identity_source.to_string()),
         admission,
@@ -828,6 +830,9 @@ fn catalog_module_info(object: &crate::inspect_system::CatalogObject) -> ModuleI
     ModuleInfo {
         path: object.path.clone(),
         key: catalog_module_key(object),
+        // Per-observation evidence: the projection loop below
+        // overwrites this with the observing member's verdict.
+        double_loaded: false,
         build_id: object.build_id.clone(),
         identity_source: object.identity_source.map(str::to_string),
         admission,
@@ -1167,6 +1172,7 @@ mod tests {
             ModuleInfo {
                 path: "/lib/a.so".into(),
                 key: key.clone(),
+                double_loaded: false,
                 build_id: None,
                 identity_source: Some("mountinfo".into()),
                 admission: AdmissionState::Admitted,

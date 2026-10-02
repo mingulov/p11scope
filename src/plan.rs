@@ -3165,6 +3165,7 @@ mod tests {
             object,
             entry_objects: vec![vec![object; entries.len()]],
             scanned: ScannedModule {
+                double_loaded: false,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,

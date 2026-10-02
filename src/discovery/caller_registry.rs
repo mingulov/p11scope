@@ -545,16 +545,22 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
 /// A same-file double-load (two loader mappings of one file — notably
 /// a `dlmopen` private-namespace double-load, whose objects own
 /// distinct PKCS#11 session namespaces) carries one key and merges
-/// into one module and one edge, and overlapping numeric session
-/// handles from the two instances join there; no layer below S1 can
-/// see the second load (scan groups mappings by (device, inode),
-/// uprobes attach by (path, file offset), events carry no mapping
-/// discriminator), so neither separation nor double-load detection
-/// exists here. For `dlopen` in one namespace the merge is correct
-/// (same file → same loaded object → one session namespace). Pinned by
-/// `d2_same_file_double_load_merges_boundary_for_s2`; S2's instance
-/// authority must replace that pin with a separation regression (see
-/// `docs/notes/s2-instance-authority.md`).
+/// into one module and one edge. The merge-by-construction stands:
+/// same-key notes without scan evidence (a `dlopen` re-scan, a second
+/// spelling) still merge, and for `dlopen` in one namespace the merge
+/// is correct (same file → same loaded object → one session
+/// namespace). What changed is the blind case: scan evidence now
+/// carries the double-load verdict (`ScannedModule::double_loaded`,
+/// from duplicate executable file-offset coverage), and a flagged
+/// note fails the edge closed — live operations end unknown, later
+/// calls void, and the `same-file double-load detected` gap names
+/// the edge — instead of joining the instances' overlapping numeric
+/// session handles. Per-call instance attribution (which instance a
+/// call came from) still needs S2's entry-IP capture + mapping join.
+/// Pinned by `d2_same_file_double_load_merges_boundary_for_s2`
+/// (merge without evidence) and the owned-`dlmopen` detection
+/// regression; S2's instance authority must replace both with
+/// separation (see `docs/notes/s2-instance-authority.md`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ModuleKey {
     Physical {
@@ -616,6 +622,14 @@ impl AdmissionState {
 pub(crate) struct ModuleInfo {
     pub path: String,
     pub key: ModuleKey,
+    /// Scan evidence (F7b): the mapping evidence behind this note
+    /// shows this object loaded twice in the noting process
+    /// (duplicate executable file-offset coverage — notably a
+    /// `dlmopen` private-namespace double-load). Both projection
+    /// paths (native and catalog) carry the scan's verdict, so the
+    /// edge latch follows the latest note; synthetic notes without
+    /// mapping evidence carry `false`.
+    pub double_loaded: bool,
     pub build_id: Option<String>,
     pub identity_source: Option<String>,
     pub admission: AdmissionState,
@@ -707,6 +721,12 @@ pub(crate) struct EdgeRecord {
     /// budgeted by `max_semantic_states`; retirement never deletes
     /// the state (its claims are retained evidence).
     pub semantics: Option<EdgeSemantics>,
+    /// Same-file double-load latch (F7b): the latest mapping note's
+    /// scan evidence showed this object loaded twice in the caller's
+    /// process. While set, observed calls establish no claim (they
+    /// cannot attribute to one instance); the latch follows the
+    /// latest note, so a resolved double-load unlatches.
+    pub double_loaded: bool,
 }
 
 /// One module instance: static facts plus lifecycle.
@@ -1525,6 +1545,7 @@ impl CallerRegistry {
                         entry_last_seen_ns: None,
                         entry_in_flight: false,
                         semantics: None,
+                        double_loaded: false,
                     },
                 );
             }
@@ -1533,6 +1554,48 @@ impl CallerRegistry {
         if let Some(record) = self.modules.get_mut(&module) {
             record.lifecycle = ModuleLifecycle::Mapped;
         }
+        self.apply_double_load(caller, module, pid, info.double_loaded);
+    }
+
+    /// Same-file double-load evidence (F7b): the mapping note's scan
+    /// evidence shows this object loaded twice in the caller's
+    /// process. The merged edge stands (one key, one module — the
+    /// `dlopen` shape stays correct), but its semantics fail closed:
+    /// live operations end unknown and the latch voids future claims
+    /// until a later note shows one load again. The named gap fires
+    /// on the false→true transition only, so a steady double-load
+    /// never spams the gap retention.
+    fn apply_double_load(
+        &mut self,
+        caller: CallerId,
+        module: ModuleId,
+        pid: u32,
+        double_loaded: bool,
+    ) {
+        let Some(edge) = self.edges.get_mut(&(caller, module)) else {
+            return;
+        };
+        if !double_loaded {
+            edge.double_loaded = false;
+            return;
+        }
+        if edge.double_loaded {
+            return;
+        }
+        edge.double_loaded = true;
+        if let Some(state) = edge.semantics.as_mut() {
+            state.invalidate();
+        }
+        let gap = RegistryGap {
+            caller: Some(caller),
+            module: Some(module),
+            pid: Some(pid),
+            subject: "same-file double-load detected".into(),
+            reason: "this object is mapped twice with duplicate executable file offsets; observed calls cannot attribute to one instance and establish no claim"
+                .into(),
+            budget: None,
+        };
+        self.push_gap(gap);
     }
 
     fn apply_entries(
@@ -1649,6 +1712,18 @@ impl CallerRegistry {
             .edges
             .get_mut(&(caller, id))
             .expect("edge resolved above");
+        // Same-file double-load (F7b): the call happened, but no one
+        // instance can own it — it establishes no claim.
+        let unattributed;
+        let call = if edge.double_loaded {
+            unattributed = SemanticCall {
+                attributable: false,
+                ..call.clone()
+            };
+            &unattributed
+        } else {
+            call
+        };
         let refused = edge
             .semantics
             .as_mut()
@@ -1896,6 +1971,7 @@ mod tests {
         ModuleInfo {
             path: path.into(),
             key: ModuleKey::physical(8, 1, ino, Some(format!("sha{ino:04}")), path),
+            double_loaded: false,
             build_id: None,
             identity_source: Some("mountinfo".into()),
             admission,
@@ -2164,6 +2240,72 @@ mod tests {
             EntryObservation::UnknownUnavailable
         );
         assert!(!registry.entry_active_within(edge, 500, 1_000_000));
+    }
+
+    #[test]
+    fn double_load_notes_latch_fail_closed_gap_once_and_unlatch() {
+        // F7b: a double-loaded mapping note latches the edge (later
+        // calls void), pushes the named gap exactly once per
+        // false→true transition, and a later single-load note
+        // unlatches so calls attribute again.
+        fn sign_init() -> SemanticCall {
+            SemanticCall {
+                function: "C_SignInit".into(),
+                rv: 0,
+                session: 7,
+                mechanism: 0x000d,
+                capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                    | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                ts_ns: 100,
+                ..SemanticCall::default()
+            }
+        }
+        let mut registry = registry();
+        registry.set_usage_feed(true);
+        let mut info = module_info("/lib/nss.so", 12, AdmissionState::Admitted);
+        let key = info.key.clone();
+        info.double_loaded = true;
+        registry.note_mapping(CallerId(0), 50, info, 100);
+        registry.publish();
+        let id = registry.module_id_for(&key).unwrap();
+        assert!(registry.edge(CallerId(0), id).unwrap().double_loaded);
+        registry.observe_semantic(CallerId(0), &key, sign_init());
+        registry.publish();
+        let edge = registry.edge(CallerId(0), id).unwrap();
+        let state = edge.semantics.as_ref().expect("materialized feed");
+        assert!(!state.has_claims());
+        assert_eq!(
+            state.label(),
+            crate::semantics_edge::SEMANTIC_UNKNOWN_DOUBLE_LOAD
+        );
+        let gaps = registry.gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].subject, "same-file double-load detected");
+        assert_eq!(gaps[0].caller, Some(CallerId(0)));
+        assert_eq!(gaps[0].module, Some(id));
+        // A steady double-load re-note: still latched, no second gap.
+        let mut info = module_info("/lib/nss.so", 12, AdmissionState::Admitted);
+        info.double_loaded = true;
+        registry.note_mapping(CallerId(0), 50, info, 200);
+        registry.publish();
+        assert!(registry.edge(CallerId(0), id).unwrap().double_loaded);
+        assert_eq!(registry.gaps().len(), 1);
+        // A resolved double-load unlatches; later calls attribute.
+        let info = module_info("/lib/nss.so", 12, AdmissionState::Admitted);
+        registry.note_mapping(CallerId(0), 50, info, 300);
+        registry.publish();
+        assert!(!registry.edge(CallerId(0), id).unwrap().double_loaded);
+        assert_eq!(registry.gaps().len(), 1);
+        registry.observe_semantic(CallerId(0), &key, sign_init());
+        registry.publish();
+        let state = registry
+            .edge(CallerId(0), id)
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap();
+        assert!(state.has_claims());
+        assert_eq!(state.started(), 1);
     }
 
     #[test]

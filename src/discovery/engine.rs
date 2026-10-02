@@ -6503,6 +6503,15 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     if existing.decoder_abi.is_none() {
         existing.decoder_abi = incoming.decoder_abi;
     }
+    // Same-file double-load evidence unions (F7d): an incomplete,
+    // revalidated memory rescan merges newly found modules into
+    // retained ones, and neither side may drop the other's positive
+    // verdict — a partial pass that sees one load is not fresh
+    // evidence of one load, and a newly detected double-load must
+    // land on its retained module. Clearing happens only by
+    // complete-scan replacement (fresh `found` evidence rebuilds
+    // the view's modules outright), never by union.
+    existing.double_loaded |= incoming.double_loaded;
     for export in incoming.exports.drain(..) {
         if !existing.exports.contains(&export) {
             existing.exports.push(export);

@@ -16242,6 +16242,48 @@ fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
     );
 }
 
+#[test]
+fn incomplete_rescan_preserves_double_load_detection() {
+    // F7d: the revalidated-rescan union preserves positive
+    // double-load evidence in both directions — a retained `true`
+    // survives an incoming `false` (a partial pass is not fresh
+    // evidence of one load), and an incoming `true` lands on a
+    // retained `false` (a scan-detected double-load is not lost).
+    // Clearing happens only by complete-scan replacement, never by
+    // union; `false`+`false` stays `false` (no invention).
+    let module = |double_loaded| ScannedModule {
+        double_loaded,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    for (retained, incoming, expected) in [
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+        (false, false, false),
+    ] {
+        let mut merged = vec![module(retained)];
+        merge_scanned_module(&mut merged, module(incoming));
+        assert_eq!(merged.len(), 1, "same module unions, not twins");
+        assert_eq!(
+            merged[0].double_loaded, expected,
+            "retained={retained} incoming={incoming}"
+        );
+    }
+}
+
 /// The valid self-export fixture: a retained view of this process, its own
 /// `/proc/self/maps`, and one structurally valid FUNCTION_LIST record whose
 /// table owner is a file-backed readable data mapping of the test

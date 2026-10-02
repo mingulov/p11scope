@@ -1017,6 +1017,101 @@ fn d2_same_file_double_load_with_scan_evidence_forces_unknown_with_named_gap() {
 }
 
 #[test]
+fn double_load_after_existing_claims_forces_unknown_across_outputs() {
+    // F7c: claims established BEFORE detection keep their counters,
+    // but the label reads unknown from detection on — in JSON, the
+    // pager snapshot, the dashboard, and the event stream (one
+    // capture point, no divergent computation). Later calls void;
+    // a later single-load note unlatches and claims read observed
+    // again.
+    let (mut harness, caller, key) = single_edge();
+    harness.observe_semantic(caller, &key, init("C_SignInit", 7, RSA_PSS, 100));
+    harness.observe_semantic(caller, &key, op("C_Sign", 7, 110));
+    let document = render(&mut harness);
+    let edge = edge_json(&document, "c0", "m0");
+    assert_eq!(edge["semantics"], "observed");
+    assert_eq!(edge["operations"]["started"], 1);
+    assert_eq!(edge["operations"]["completed"], 1);
+    // Detection lands with no further call: the very next render —
+    // every output — already reads unknown, counters retained.
+    let now = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_mapping(
+        caller,
+        9000,
+        ModuleInfo {
+            path: "/scale/m0.so".into(),
+            key: key.clone(),
+            double_loaded: true,
+            build_id: None,
+            identity_source: Some("workload".into()),
+            admission: crate::discovery::caller_registry::AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        },
+        now,
+    );
+    let document = render(&mut harness);
+    let edge = edge_json(&document, "c0", "m0");
+    assert_eq!(edge["semantics"], "unknown (same-file double-load)");
+    assert_eq!(
+        edge["mechanisms"].as_array().unwrap().len(),
+        1,
+        "the mechanism row stands as history"
+    );
+    assert_eq!(edge["operations"]["calls"], 2);
+    assert_eq!(edge["operations"]["started"], 1);
+    assert_eq!(edge["operations"]["completed"], 1);
+    assert_eq!(
+        document["gaps"][0]["subject"],
+        "same-file double-load detected"
+    );
+    let presentation = presentation_for(&harness, &document);
+    assert_four_way_semantic_agreement(&document, &presentation);
+    // Subsequent calls void at the gate: the label stands unknown
+    // and the retained counters do not move.
+    harness.observe_semantic(caller, &key, init("C_EncryptInit", 7, AES_GCM, 120));
+    harness.observe_semantic(caller, &key, op("C_Encrypt", 7, 130));
+    let document = render(&mut harness);
+    let edge = edge_json(&document, "c0", "m0");
+    assert_eq!(edge["semantics"], "unknown (same-file double-load)");
+    assert_eq!(edge["mechanisms"].as_array().unwrap().len(), 1);
+    assert_eq!(edge["operations"]["calls"], 2);
+    assert_eq!(edge["operations"]["started"], 1);
+    assert_eq!(edge["operations"]["completed"], 1);
+    let presentation = presentation_for(&harness, &document);
+    assert_four_way_semantic_agreement(&document, &presentation);
+    // Resolution: a later single-load note unlatches; later calls
+    // attribute and the claims read observed again.
+    let now = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_mapping(
+        caller,
+        9000,
+        ModuleInfo {
+            path: "/scale/m0.so".into(),
+            key: key.clone(),
+            double_loaded: false,
+            build_id: None,
+            identity_source: Some("workload".into()),
+            admission: crate::discovery::caller_registry::AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        },
+        now,
+    );
+    harness.observe_semantic(caller, &key, init("C_SignInit", 7, RSA_PSS, 200));
+    harness.observe_semantic(caller, &key, op("C_Sign", 7, 210));
+    let document = render(&mut harness);
+    let edge = edge_json(&document, "c0", "m0");
+    assert_eq!(edge["semantics"], "observed");
+    assert_eq!(edge["operations"]["started"], 2);
+    assert_eq!(edge["operations"]["completed"], 2);
+    let presentation = presentation_for(&harness, &document);
+    assert_four_way_semantic_agreement(&document, &presentation);
+}
+
+#[test]
 fn d2_successive_lifetimes_never_merge() {
     let mut harness = harness();
     let spec = ScaleSpec {

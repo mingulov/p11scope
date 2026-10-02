@@ -1285,8 +1285,7 @@ fn dashboard_gap_scroll_survives_redraw() {
         let mut collapsed = state;
         collapsed.clamp(presentation.edges.len());
         assert_eq!(
-            collapsed.scroll,
-            0,
+            collapsed.scroll, 0,
             "edges={edges_per_caller} the edge-count clamp strands gap 4/4"
         );
         // The production redraw clamp preserves the gaps scroll.
@@ -1409,7 +1408,9 @@ fn gaps_page_exposes_multiframe_gap_at_80x14() {
         tall_frames[0].2
     );
     assert!(
-        tall_frames.iter().any(|frame| frame.2.contains("lines above)")),
+        tall_frames
+            .iter()
+            .any(|frame| frame.2.contains("lines above)")),
         "a mid frame names the skipped lines"
     );
     assert!(
@@ -1428,15 +1429,15 @@ fn gaps_page_exposes_multiframe_gap_at_80x14() {
     // follows the tall one whole.
     for (scroll, _, text) in &frames {
         assert!(
-            text.contains(&format!("--- gaps {}-{} of 2 [gaps]", scroll + 1, scroll + 1)),
+            text.contains(&format!(
+                "--- gaps {}-{} of 2 [gaps]",
+                scroll + 1,
+                scroll + 1
+            )),
             "{text}"
         );
     }
-    assert!(
-        last.2.contains("gap 2/2 caller * module *"),
-        "{}",
-        last.2
-    );
+    assert!(last.2.contains("gap 2/2 caller * module *"), "{}", last.2);
     assert!(
         last.2.contains("the record after the tall one"),
         "{}",
@@ -1453,6 +1454,141 @@ fn gaps_page_exposes_multiframe_gap_at_80x14() {
     assert_eq!((state.scroll, state.gap_line), (0, 0));
     let text = frame_text(&render_frame(&frame, viewport, &state));
     assert!(text.contains("gap 1/2 caller * module *"), "{text}");
+}
+
+#[test]
+fn gap_continuation_offset_clamps_after_reflow_or_shrink() {
+    // F6e: the footer names the EFFECTIVE within-record offset — the
+    // stored offset clamped to the record's wrapped body at the live
+    // width — so a stale offset (a wider reflow, or a rescan that
+    // shrank the record) can never disagree with the continuation
+    // head. The old footer printed the raw stored offset.
+    /// Footer offset: the `line +N` in the `scroll …` footer, if any.
+    fn footer_offset(text: &str) -> Option<usize> {
+        let marker = "line +";
+        let at = text.find(marker)?;
+        text[at + marker.len()..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+    /// Continuation-head offset: the `(+N lines above)` head, if any.
+    fn head_offset(text: &str) -> Option<usize> {
+        let marker = "(+";
+        let at = text.find(marker)?;
+        let rest = &text[at + marker.len()..];
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        assert!(
+            rest[digits.len()..].starts_with(" lines above)"),
+            "the `(+` marker always opens a continuation head: {text}"
+        );
+        digits.parse().ok()
+    }
+    fn record_reason(harness: &mut Harness, subject: &str, reason: &str) {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: subject.into(),
+                reason: reason.into(),
+                budget: None,
+            });
+    }
+    let words: Vec<String> = (0..100).map(|index| format!("seg{index:03}")).collect();
+    let tall_reason = words.join(" ");
+    let mut tall_harness = harness();
+    let spec = ScaleSpec {
+        name: "dash-stale-offset",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 0,
+        endpoints_per_module: 1,
+        first_pid: 86_000,
+    };
+    tall_harness.stage_scale(&spec);
+    tall_harness.commit();
+    record_reason(&mut tall_harness, "tall probe gap", &tall_reason);
+    tall_harness.commit();
+    let tall = capture_presentation(&tall_harness);
+    assert_eq!(tall.gaps.len(), 1);
+    // A rescan that shrank the record: same ledger position, a short
+    // replacement reason.
+    let mut rescan = harness();
+    let rescan_spec = ScaleSpec {
+        name: "dash-shrunk-offset",
+        first_pid: 87_000,
+        ..spec
+    };
+    rescan.stage_scale(&rescan_spec);
+    rescan.commit();
+    record_reason(
+        &mut rescan,
+        "shrunk probe gap",
+        "the replacement record after the rescan is much shorter than the tall probe it replaced",
+    );
+    rescan.commit();
+    let shrunk = capture_presentation(&rescan);
+    assert_eq!(shrunk.gaps.len(), 1);
+    let narrow = Viewport {
+        width: 80,
+        height: 14,
+    };
+    // Baseline: a production Down walk names the same offset in the
+    // head and the footer (the fix must not disturb the sane path).
+    let mut state = DashboardState::new();
+    state.next_detail();
+    state.next_detail();
+    assert_eq!(state.detail, DetailPage::Gaps);
+    for _ in 0..2 {
+        state.scroll_gaps_down(&tall, narrow.width);
+    }
+    assert_eq!((state.scroll, state.gap_line), (0, 2));
+    let text = frame_text(&render_frame(&frame_for(&tall), narrow, &state));
+    assert_eq!(text.lines().count(), 14, "{text}");
+    assert_eq!(head_offset(&text), Some(2), "{text}");
+    assert_eq!(footer_offset(&text), Some(2), "{text}");
+    // Reflow: the offset was valid at width 80 (the walk above keeps
+    // stepping there), but the same stored offset overruns the
+    // rewrapped body at width 200. Direct assignment simulates the
+    // pre-resize navigation — the production handler can never
+    // produce a stale offset by itself.
+    state.gap_line = 6;
+    let wide = Viewport {
+        width: 200,
+        height: 14,
+    };
+    let text = frame_text(&render_frame(&frame_for(&tall), wide, &state));
+    assert_eq!(text.lines().count(), 14, "{text}");
+    let head = head_offset(&text).expect("a continuation head names the offset");
+    assert!(
+        head < 6,
+        "the reflow clamps the stale offset 6 to {head}: {text}"
+    );
+    assert_eq!(footer_offset(&text), Some(head), "{text}");
+    assert!(!text.contains("line +6"), "{text}");
+    // Shrink: the same stale offset against the rescanned short
+    // record clamps to its body, head and footer agreeing.
+    let text = frame_text(&render_frame(&frame_for(&shrunk), narrow, &state));
+    assert_eq!(text.lines().count(), 14, "{text}");
+    let head = head_offset(&text).expect("a continuation head names the offset");
+    assert!(
+        head < 6,
+        "the shrinkage clamps the stale offset 6 to {head}: {text}"
+    );
+    assert_eq!(footer_offset(&text), Some(head), "{text}");
+    assert!(!text.contains("line +6"), "{text}");
+    // Clamp to zero: a one-body-line record leaves no offset to
+    // name — the footer drops `line +` and the head is plain.
+    let text = frame_text(&render_frame(&frame_for(&shrunk), wide, &state));
+    assert_eq!(text.lines().count(), 14, "{text}");
+    assert_eq!(head_offset(&text), None, "{text}");
+    assert_eq!(footer_offset(&text), None, "{text}");
+    assert!(!text.contains("lines above"), "{text}");
 }
 
 #[test]

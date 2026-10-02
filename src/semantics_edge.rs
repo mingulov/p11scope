@@ -287,13 +287,23 @@ pub(crate) struct EdgeSemantics {
     ambiguous_calls: u64,
     count_only_calls: u64,
     unattributable_calls: u64,
+    /// Same-file double-load detection latch (F7c): set when scan
+    /// evidence proves this edge's object loaded twice, cleared when
+    /// a later mapping note shows one load again. While set, the
+    /// label reads unknown even though the historical counters
+    /// stand — no retained claim can name its instance. Unlike the
+    /// downgrade memory above (which never clears), this mirrors
+    /// the CURRENT detection verdict.
+    double_load_detected: bool,
     /// Any fully-authorized call with effective semantic content.
     seen_claim_capable: bool,
 }
 
 /// Published per-edge semantic labels. `observed` iff the edge holds
-/// at least one mechanism or operation claim; otherwise the reason no
-/// claim exists (B3: unsupported or ambiguous semantics render
+/// at least one mechanism or operation claim AND no double-load
+/// detection stands; otherwise the reason no claim exists — or the
+/// reason retained claims cannot name their instance (B3/F7c:
+/// unsupported, ambiguous, or unattributable semantics render
 /// `unknown`, never invented).
 pub(crate) const SEMANTIC_OBSERVED: &str = "observed";
 pub(crate) const SEMANTIC_UNKNOWN_UNAUTHORIZED: &str = "unknown (unauthoritative module)";
@@ -907,6 +917,24 @@ impl EdgeSemantics {
         self.open.clear();
     }
 
+    /// Same-file double-load detection (F7b/F7c): live operations end
+    /// unknown (shared with loss — "right now" is unattributable),
+    /// and the detection latch forces the label unknown from this
+    /// moment on. Historical claims (mechanism rows, counters) stand
+    /// — detection voids attribution, not the observed past — and
+    /// the registry voids every later call at the gate.
+    pub(crate) fn mark_double_load(&mut self) {
+        self.invalidate();
+        self.double_load_detected = true;
+    }
+
+    /// A later mapping note shows one load again: the latch clears
+    /// and labeling returns to claims-or-memory. Downgrade memories
+    /// (including past unattributable calls) stand as history.
+    pub(crate) fn clear_double_load(&mut self) {
+        self.double_load_detected = false;
+    }
+
     /// Async lifecycle, mirroring `observe_async` minus the
     /// cross-process machinery (one caller incarnation per edge: no
     /// second claimant, no tombstone). Unroutable async evidence
@@ -1165,9 +1193,16 @@ impl EdgeSemantics {
     }
 
     /// The edge's semantic label: `observed`, or the reason no claim
-    /// exists. Total: a materialized edge either holds claims, has
-    /// seen an authorized content call, or has counted a downgrade.
+    /// exists — or the reason retained claims are unattributable.
+    /// Total: a materialized edge either holds claims, has seen an
+    /// authorized content call, or has counted a downgrade. The
+    /// double-load latch dominates history (F7c): from detection
+    /// on, the label reads unknown even though the historical
+    /// counters stand — no retained claim can name its instance.
     pub(crate) fn label(&self) -> &'static str {
+        if self.double_load_detected {
+            return SEMANTIC_UNKNOWN_DOUBLE_LOAD;
+        }
         if self.has_claims() {
             return SEMANTIC_OBSERVED;
         }
@@ -1656,15 +1691,23 @@ mod tests {
         edge.observe(&first);
         edge.observe(&unauthorized);
         assert_eq!(edge.label(), SEMANTIC_UNKNOWN_DOUBLE_LOAD);
-        // History stands: claims established before detection keep
-        // the observed label (loss parity), while new calls void.
+        // Detection dominates history (F7c): claims established
+        // before detection keep their COUNTERS, but the label reads
+        // unknown from detection on — no retained claim can name its
+        // instance. A later single-load note clears the latch and
+        // the claims read observed again.
         let mut edge = EdgeSemantics::default();
         edge.observe(&init("C_SignInit", 7, RSA_PSS, 100));
         edge.observe(&op("C_Sign", 7, 110));
         assert_eq!(edge.label(), SEMANTIC_OBSERVED);
-        edge.observe(&second);
-        assert_eq!(edge.label(), SEMANTIC_OBSERVED);
+        edge.mark_double_load();
+        assert_eq!(edge.label(), SEMANTIC_UNKNOWN_DOUBLE_LOAD);
         assert_eq!((edge.started(), edge.completed()), (1, 1));
+        edge.observe(&second);
+        assert_eq!(edge.label(), SEMANTIC_UNKNOWN_DOUBLE_LOAD);
+        assert_eq!((edge.started(), edge.completed()), (1, 1));
+        edge.clear_double_load();
+        assert_eq!(edge.label(), SEMANTIC_OBSERVED);
     }
 
     #[test]

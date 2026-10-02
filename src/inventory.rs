@@ -473,10 +473,7 @@ fn run_dashboard_loop(
                             // renderer — tall records page line by
                             // line before records advance.
                             if let Some(frame) = last_frame.as_ref() {
-                                state.scroll_gaps_down(
-                                    &frame.presentation,
-                                    last_viewport.width,
-                                );
+                                state.scroll_gaps_down(&frame.presentation, last_viewport.width);
                             }
                         } else {
                             let total = last_frame

@@ -382,9 +382,10 @@ impl DashboardState {
         }
         // A rescan may have shrunk the ledger under the scroll.
         self.scroll = self.scroll.min(total - 1);
-        let body_lines = gap_block_lines(&presentation.gaps[self.scroll], self.scroll, total, width)
-            .len()
-            .saturating_sub(1);
+        let body_lines =
+            gap_block_lines(&presentation.gaps[self.scroll], self.scroll, total, width)
+                .len()
+                .saturating_sub(1);
         if self.gap_line + 1 < body_lines {
             self.gap_line += 1;
         } else if self.scroll + 1 < total {
@@ -612,7 +613,9 @@ fn render_full(
     let (mut edge_lines, shown) = match state.detail {
         DetailPage::Summary => render_edge_window(presentation, width, edge_room, scroll, false),
         DetailPage::Evidence => render_edge_window(presentation, width, edge_room, scroll, true),
-        DetailPage::Gaps => render_gap_window(presentation, width, edge_room, scroll, state.gap_line),
+        DetailPage::Gaps => {
+            render_gap_window(presentation, width, edge_room, scroll, state.gap_line)
+        }
     };
     let (first, last) = visible_item_range(shown, total, scroll);
     lines.push(truncate_cell(
@@ -657,9 +660,21 @@ fn render_full(
     lines.extend(tail);
     let max_scroll = total.saturating_sub(1);
     // Within-record paging (F6d) names its line offset: two frames
-    // mid-record would otherwise carry identical footers.
-    let position = if state.detail == DetailPage::Gaps && state.gap_line > 0 {
-        format!("scroll {scroll}/{max_scroll} line +{}", state.gap_line)
+    // mid-record would otherwise carry identical footers. The footer
+    // names the EFFECTIVE offset (F6e) — the stored offset clamped
+    // to the record's wrapped body at the live width, the SAME clamp
+    // the continuation head uses — so a stale offset (a resize, or a
+    // rescan that shrank the record) can never disagree with the
+    // head. A clamp to zero drops the suffix: the head is plain.
+    let gap_offset = if state.detail == DetailPage::Gaps && state.gap_line > 0 {
+        presentation.gaps.get(scroll).map_or(0, |gap| {
+            effective_gap_line(gap, scroll, total, width, state.gap_line)
+        })
+    } else {
+        0
+    };
+    let position = if gap_offset > 0 {
+        format!("scroll {scroll}/{max_scroll} line +{gap_offset}")
     } else {
         format!("scroll {scroll}/{max_scroll}")
     };
@@ -830,8 +845,7 @@ fn render_gap_window(
             // A paged record consumes the window: the next frame (or
             // the next record) comes from scrolling. Only a record
             // shown whole lets later records pack behind it.
-            match render_first_gap_record(&mut lines, gap, index, total, width, budget, gap_line)
-            {
+            match render_first_gap_record(&mut lines, gap, index, total, width, budget, gap_line) {
                 FirstGapOutcome::Whole => {
                     shown += 1;
                 }
@@ -1266,6 +1280,25 @@ enum FirstGapOutcome {
     Unshown,
 }
 
+/// Effective within-record offset (F6e): the stored offset clamped
+/// to the record's wrapped body at the live width, measured with the
+/// SAME block construction the renderer uses. The continuation head
+/// AND the footer both use this, so a stale offset — a resize that
+/// rewrapped the body shorter, or a rescan that replaced the record
+/// under the scroll — renders identically in both places.
+fn effective_gap_line(
+    gap: &crate::inventory_present::GapView,
+    index: usize,
+    total: usize,
+    width: usize,
+    gap_line: usize,
+) -> usize {
+    let body = gap_block_lines(gap, index, total, width)
+        .len()
+        .saturating_sub(1);
+    gap_line.min(body.saturating_sub(1))
+}
+
 /// Render the FIRST visible gap record (F6d): whole when it fits at
 /// offset zero (later records pack behind it, exactly as before),
 /// else a within-record page — the head (or an explicit
@@ -1294,7 +1327,7 @@ fn render_first_gap_record(
     if budget < 2 {
         return FirstGapOutcome::Unshown;
     }
-    let offset = gap_line.min(body.len().saturating_sub(1));
+    let offset = effective_gap_line(gap, index, total, width, gap_line);
     if offset == 0 {
         lines.push(head.clone());
     } else {
@@ -1309,7 +1342,7 @@ fn render_first_gap_record(
         ));
     }
     let remaining = body.len() - offset;
-    if remaining + 1 <= budget {
+    if remaining < budget {
         // Tail page: the head plus every remaining body line.
         lines.extend(body[offset..].iter().cloned());
         return FirstGapOutcome::Paged;
@@ -1360,12 +1393,7 @@ fn gap_block_lines(
     total: usize,
     width: usize,
 ) -> Vec<String> {
-    let head = format!(
-        "gap {}/{} {}",
-        index + 1,
-        total,
-        gap_head_attribution(gap),
-    );
+    let head = format!("gap {}/{} {}", index + 1, total, gap_head_attribution(gap),);
     let mut block = vec![truncate_cell(&head, width)];
     for line in wrap_words(&gap_item(gap), width.saturating_sub(2).max(1)) {
         block.push(truncate_cell(&format!("  {line}"), width));

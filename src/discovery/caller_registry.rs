@@ -1557,14 +1557,16 @@ impl CallerRegistry {
         self.apply_double_load(caller, module, pid, info.double_loaded);
     }
 
-    /// Same-file double-load evidence (F7b): the mapping note's scan
-    /// evidence shows this object loaded twice in the caller's
+    /// Same-file double-load evidence (F7b/F7c): the mapping note's
+    /// scan evidence shows this object loaded twice in the caller's
     /// process. The merged edge stands (one key, one module — the
     /// `dlopen` shape stays correct), but its semantics fail closed:
-    /// live operations end unknown and the latch voids future claims
-    /// until a later note shows one load again. The named gap fires
-    /// on the false→true transition only, so a steady double-load
-    /// never spams the gap retention.
+    /// live operations end unknown, the latch forces the label
+    /// unknown from detection on (retained counters stand as
+    /// history), and every later call voids at the gate — until a
+    /// later note shows one load again. The named gap fires on the
+    /// false→true transition only, so a steady double-load never
+    /// spams the gap retention.
     fn apply_double_load(
         &mut self,
         caller: CallerId,
@@ -1577,6 +1579,9 @@ impl CallerRegistry {
         };
         if !double_loaded {
             edge.double_loaded = false;
+            if let Some(state) = edge.semantics.as_mut() {
+                state.clear_double_load();
+            }
             return;
         }
         if edge.double_loaded {
@@ -1584,7 +1589,7 @@ impl CallerRegistry {
         }
         edge.double_loaded = true;
         if let Some(state) = edge.semantics.as_mut() {
-            state.invalidate();
+            state.mark_double_load();
         }
         let gap = RegistryGap {
             caller: Some(caller),

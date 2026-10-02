@@ -1,0 +1,1946 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Independent oracle for the installed `p11scope inventory` acceptance (Task 6 C8).
+
+Ground truth is the per-process ledger printed by
+tests/fixtures/public-cli/inventory-ledger.c, never p11scope state. The oracle
+reads a run directory written by scripts/qualify-inventory-native.sh:
+
+  RUNDIR/run.json        the run manifest (MANIFEST_ID): providers, cells, observer runs
+  RUNDIR/<ledger files>  workload stdout (IDENT/MAPPED/LEDGER/HELD/RETURNED/EXEC/ZOMBIE/DONE)
+  RUNDIR/<run outputs>   per observer run: -o JSON, --event-log JSONL, optional PTY bytes
+
+and checks, per observer run, that every ledgered (process image, provider) use
+INSIDE THAT RUN'S CAPTURE WINDOW appears on the right caller and module with
+coverage consistent with what the lane could observe, that an image idle during
+the window holds no positive, that nothing is cross-attributed (also not by a
+foreign process on a workload-private module), and that the JSON, the JSONL
+stream and the dashboard frames agree. Every expectation and every output
+string the oracle parses is a table in the TABLES block below, keyed on the
+documented semantics of docs/schema/inventory-v1.md and inventory-events-v1.md
+(SCHEMAS): a schema or dashboard revision (Task 7) edits tables, not logic.
+
+Statuses: pass | fail | absent | unbound | nonqualifying | skip.
+  absent         a native-only assertion found no native lane: FAIL when the run
+                 expects the native lane, otherwise non-qualifying.
+  unbound        a ledgered use accepted only as a module-level unbound positive
+                 (plan §3.3); allowed for the roles/exec steps that table permits.
+  nonqualifying  the run is incomplete by declaration (e.g. dashboard skipped).
+Exit codes (EXIT): 0 qualified (no fail, no absent, no nonqualifying); 1 any
+fail; 2 no fail but non-qualifying (absent or nonqualifying rows, e.g. a
+`--lane scan` plumbing run); 64 usage. A run with zero passing assertions fails.
+
+Clock assumption: ledger t0/t1 and p11scope's *_ns are both CLOCK_MONOTONIC and
+are compared directly, which holds only while workload and observer share one
+time namespace (host, vng guest). A container lane with its own time namespace
+must translate ledger times by the namespace offset before running this oracle.
+
+usage:
+  inventory-native-oracle.py check RUNDIR        full oracle (exit codes above)
+  inventory-native-oracle.py ledgers RUNDIR      ledger self-consistency only
+  inventory-native-oracle.py count-kind JSONL KIND   events of KIND (EVENT_KINDS key) so far
+  inventory-native-oracle.py probe-help          read `p11scope --help` on stdin, print FLAG=0|1
+  inventory-native-oracle.py record-pty OUT ROWS COLS BUDGET_S STOP_AFTER_S -- ARGV...
+  inventory-native-oracle.py --self-test         synthetic pass + must-fail fixtures
+"""
+
+import json
+import os
+import re
+import sys
+import tempfile
+from dataclasses import dataclass, field
+
+# ===========================================================================
+# TABLES — every expectation and every parsed output string lives here.
+# ===========================================================================
+
+ORACLE_ID = "p11scope-c8-oracle/2"
+MANIFEST_ID = "p11scope-c8-run/2"
+SCHEMAS = {
+    "inventory": "p11scope/inventory/v1",
+    "events": "p11scope/inventory-events/v1",
+}
+EXIT = {"qualified": 0, "failed": 1, "nonqualifying": 2, "usage": 64}
+
+# --- inventory-v1 snapshot ---------------------------------------------------
+# Seven keys since Task 6 C3: `until_ns` is null while capture runs and, after a
+# stop, the frozen end of a watched interval (`since_ns..until_ns`).
+COVERAGE_KEYS = frozenset({"state", "since_ns", "until_ns", "first_ns", "lossy", "reason", "detail"})
+COVERAGE_STATES = frozenset({"counted", "witnessed", "watched_no_use", "unknown"})
+WATCH_STATE = "watched_no_use"
+UNKNOWN_STATE = "unknown"
+SCAN_ONLY_REASON = "scan_only"
+OBSERVATION_OBSERVED = "observed"
+OBSERVATION_LOSSY_ZERO = "unknown (usage observation lossy)"
+SEMANTICS_OBSERVED = "observed"
+# The documented reasons no semantic claim exists (edges[].semantics).
+SEMANTICS_UNKNOWN_LABELS = frozenset({
+    "unknown (semantic capture withheld)",
+    "unknown (unauthoritative module)",
+    "unknown (ambiguous descriptor)",
+    "unknown (count-only slot)",
+    "unknown (no operation evidence)",
+    "unknown (same-file double-load)",
+})
+CALLER_LIVE_LIFECYCLE = "mapped"
+MAPPING_LIVE = "mapped"
+MAPPING_ENDED = "ended"
+# A counted feed that lost records must say so in gaps[] (plan §3.5 note_capture_loss).
+LOSS_GAP = re.compile(r"\bloss\b|\blost\b|lossy", re.I)
+# Unbound positive (plan §3.3, "used by an unidentified caller image").
+UNBOUND_GAP = re.compile(r"unidentified caller|unbound (caller|witness)", re.I)
+# A gap field naming when the unbound use happened (first match wins).
+UNBOUND_GAP_TIME_KEYS = ("first_ns", "t0_ns", "witness_ns")
+# The --system deep-scan selection bound (inventory --max-scan-pids).
+SCAN_LIMIT_GAP = re.compile(r"selected \d+ for deep scanning", re.I)
+# Retirement settlement after a stop (plan C5: "retirement: unsettled";
+# activation `terminal_unsettled`). Path -> {document value: verdict}.
+SETTLEMENT_PATHS = [
+    (("observation", "retirement"), {"unsettled": "unsettled", "settled": "settled", "complete": "settled"}),
+    (("observation", "settlement"), {"unsettled": "unsettled", "settled": "settled", "complete": "settled"}),
+    (("observation", "terminal_unsettled"), {True: "unsettled", False: "settled"}),
+    (("retirement",), {"unsettled": "unsettled", "settled": "settled", "complete": "settled"}),
+]
+# An object-shaped settlement value (e.g. {"state": "unsettled", "reason": ...})
+# carries its verdict under the first of these keys; any other shape is rejected.
+SETTLEMENT_OBJECT_KEYS = ("state", "verdict", "status", "settlement")
+SETTLEMENT_GAPS = [(re.compile(r"\bunsettled\b", re.I), "unsettled")]
+# Under the current contract Inventory has no quiescence protocol: a stop with a
+# call still held must read unsettled (plan §1 activation, §6).
+HELD_STOP_REQUIRES = "unsettled"
+STOP_OK_RC = frozenset({0})
+RUN_OK_RC = frozenset({0})
+
+# --- inventory-events-v1 stream ----------------------------------------------
+EVENT_KINDS = {
+    "started": "started",
+    "ended": "ended",
+    "gap": "gap_recorded",
+    "pass": "pass_committed",
+    "caller": "caller_event",
+    "edge": "edge_observed",
+    "rotated": "rotated",
+    "evicted": "retention_evicted",
+}
+# caller_event sub-kind -> field naming the incarnation it mints.
+CALLER_EVENT_MINTS = {"admitted": "caller", "exec_retired": "new", "reused": "new"}
+
+# --- presentation: dashboard frames and edge_observed derived states ---------
+ACTIVITY = {
+    "recent": "recently observed",
+    "inflight": "operation initialized / in flight",
+    "used": "used (recency unknown)",
+    "quiet": "quiet",
+    "lossy": "unknown (lossy)",
+    "uncovered": "not covered",
+    "unknown": "unknown",
+}
+CAPTURE = {
+    "armed": "armed", "scan_only": "scan only", "refused": "refused",
+    "retired": "retired", "lost": "coverage lost",
+}
+# inventory_present.rs DASHBOARD_ACTIVITY_WINDOW_NS: recency is judged against
+# the frame's now; a counted edge seen within this of the run end may read recent.
+DASHBOARD_RECENT_WINDOW_NS = 5_000_000_000
+FRAME = {
+    "repaint": b"\x1b[H",
+    "alt_on": b"\x1b[?1049h",
+    "alt_off": b"\x1b[?1049l",
+    "coverage_marker": b"coverage:",
+    "ansi": re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]"),
+    "header": re.compile(r"^p11scope inventory (\S+) \| (\d+) passes \| (\d+) callers (\d+) modules (\d+) edges"),
+    "coverage": re.compile(r"^coverage: (\d+) gaps"),
+    "identity": re.compile(r"^(c\d+) pid (\d+) \((.*)\) -> (m\d+) \((.*)\)$"),
+    "item_indent": "  ",
+    "item_sep": " | ",
+    "section": "---",
+}
+# Frame item key -> how the oracle derives the expected value.
+FRAME_ITEMS = ("capture", "activity", "entries", "semantics")
+
+# --- CLI probe ----------------------------------------------------------------
+HELP_PROBE = {"usage": "p11scope inventory", "flags": {"capture": "--capture", "manifest": "--manifest"}}
+
+# --- workload roles -------------------------------------------------------------
+@dataclass(frozen=True)
+class Role:
+    bind: str  # required | optional: may a used image fall back to an unbound gap?
+    scan_presence: str  # required: a scan document must hold the live edge
+    native_states: frozenset  # coverage allowed on the role's in-window used edges
+    require_counted_when_attested: bool
+    what: str
+
+
+USED = frozenset({"counted", "witnessed"})
+IDLE = frozenset({WATCH_STATE, UNKNOWN_STATE})
+ROLES = {
+    "P1": Role("required", "required", USED, True, "attested provider A with Digest/AES-GCM/HMAC"),
+    "P2": Role("required", "required", USED, False, "byte-identical copy B, distinct inode, unattested"),
+    "P3": Role("required", "required", IDLE, False, "maps A and C, never calls them"),
+    "P4": Role("optional", "optional", USED, False, "~100 ms CLI calling A"),
+    "P5": Role("optional", "optional", USED, False, "exec chain (bind per EXEC_HOW_BIND)"),
+    "P6": Role("required", "required", USED, False, "held call in the held provider, SIGINT"),
+    "P7": Role("required", "required", USED, True, "late dlopen of A after capture start"),
+    "LX": Role("optional", "optional", USED, False, "leader pthread_exit, worker keeps calling"),
+}
+# Exec chain: how an image was reached decides whether it must bind (plan §3.3:
+# a leader exec is an exact exec_id transition; a non-leader exec changes the
+# cookie answer and may leave the row unbound).
+EXEC_HOW_BIND = {"initial": "required", "leader": "required", "thread": "optional"}
+# Optional-bind cells must still bind at least one image per run.
+OPTIONAL_CELL_MIN_BOUND = 1
+# Counted = a counting feed: only the Detailed subset for operator-attested
+# providers in this release. Flip if per-pair BPF counts (plan C7/D2) ship.
+COUNTED_NEEDS_ATTESTED = True
+# Runs the qualification needs, and the roles each must cover.
+REQUIRED_RUNS = {
+    "system": frozenset({"P1", "P2", "P3", "P4", "P5", "P7", "LX"}),
+    "stop": frozenset({"P6"}),
+    "dashboard": frozenset({"P1", "P2", "P3", "P7"}),
+}
+# Runs whose absence the manifest may declare (then the run is non-qualifying).
+SKIPPABLE_RUNS = frozenset({"dashboard"})
+
+# --- ledger -----------------------------------------------------------------------
+SYMBOL_ENTRY_FUNCTIONS = frozenset({"C_GetFunctionList"})
+WITNESS_SLACK_NS = 20_000_000
+EXEC_GAP_MIN_NS = 4 * WITNESS_SLACK_NS
+OP_CATEGORY = {
+    "C_DigestInit": "digest", "C_EncryptInit": "encrypt", "C_DecryptInit": "decrypt",
+    "C_SignInit": "sign", "C_VerifyInit": "verify", "C_GenerateKey": "generate_key",
+}
+MAIN_PLAN = [("C_DigestInit", "0x250"), ("C_Digest", "0x250"), ("C_GenerateKey", "0x1080"),
+             ("C_EncryptInit", "0x1087"), ("C_Encrypt", "0x1087"), ("C_GenerateKey", "0x350"),
+             ("C_SignInit", "0x251"), ("C_Sign", "0x251")]
+SETUP_FNS = ["C_GetFunctionList", "C_Initialize", "C_GetSlotList", "C_OpenSession", "C_Login"]
+TEARDOWN_FNS = ["C_Logout", "C_CloseSession", "C_Finalize"]
+LEDGER_KINDS = ("IDENT", "MAPPED", "LEDGER", "HELD", "RETURNED", "EXEC", "ZOMBIE", "DONE", "READY",
+                "LEDGER_UNFLUSHED")
+ZOMBIE_STATE = "Z"
+
+# ===========================================================================
+# Results
+# ===========================================================================
+
+STATUSES = ("pass", "fail", "absent", "unbound", "nonqualifying", "skip")
+
+
+class Results:
+    def __init__(self, expect_lane):
+        self.expect_lane = expect_lane
+        self.rows = []
+
+    def add(self, run, cell, check, status, detail):
+        assert status in STATUSES, status
+        if status == "absent" and self.expect_lane == "native":
+            status, detail = "fail", "native lane absent: " + detail
+        elif status == "absent":
+            detail = "native lane absent (expected lane: scan): " + detail
+        self.rows.append({"run": run, "cell": cell, "check": check, "status": status, "detail": detail})
+
+    def ok(self, run, cell, check, cond, detail_fail, detail_pass="ok"):
+        self.add(run, cell, check, "pass" if cond else "fail", detail_pass if cond else detail_fail)
+        return cond
+
+    def failed(self):
+        return [r for r in self.rows if r["status"] == "fail"]
+
+    def summary(self):
+        counts = {}
+        for r in self.rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        return counts
+
+    def exit_code(self):
+        if self.failed():
+            return EXIT["failed"]
+        if any(r["status"] in ("absent", "nonqualifying") for r in self.rows):
+            return EXIT["nonqualifying"]
+        return EXIT["qualified"]
+
+
+# ===========================================================================
+# Ledger
+# ===========================================================================
+
+@dataclass
+class Image:
+    cell: str
+    pid: int
+    start: int
+    gen: int
+    exe: str
+    mapped: dict = field(default_factory=dict)
+    entries: list = field(default_factory=list)
+    done: str = ""
+    held_t: int = None
+    returned_t: int = None
+    execs: list = field(default_factory=list)
+    zombie: str = ""
+    unflushed: bool = False
+
+
+def parse_kv(line):
+    parts = line.split()
+    out = {}
+    for token in parts[1:]:
+        if "=" not in token:
+            raise ValueError(f"malformed token {token!r}")
+        k, v = token.split("=", 1)
+        out[k] = v
+    return parts[0], out
+
+
+def parse_ledger(text, errors):
+    images = {}
+    for raw in text.splitlines():
+        if not raw or raw.split(" ", 1)[0] not in LEDGER_KINDS:
+            continue
+        try:
+            kind, kv = parse_kv(raw)
+            if kind == "LEDGER_UNFLUSHED":
+                errors.append(f"workload died with its ledger lock held: {raw!r}")
+                continue
+            key = (kv["cell"], int(kv["pid"]), int(kv["start"]), int(kv["gen"]))
+        except (ValueError, KeyError) as error:
+            errors.append(f"unparseable ledger line {raw!r}: {error}")
+            continue
+        image = images.get(key)
+        if image is None:
+            image = images[key] = Image(key[0], key[1], key[2], key[3], kv.get("exe", ""))
+        if kind == "MAPPED":
+            image.mapped[kv["module"]] = int(kv["ino"])
+        elif kind == "LEDGER":
+            image.entries.append({
+                "module": kv["module"], "fn": kv["fn"], "mech": kv["mech"], "n": int(kv["n"]),
+                "bad": int(kv["bad"]), "phase": kv["phase"], "t0": int(kv["t0"]), "t1": int(kv["t1"]),
+            })
+        elif kind == "HELD":
+            image.held_t = int(kv["t"])
+        elif kind == "RETURNED":
+            image.returned_t = int(kv["t"])
+        elif kind == "EXEC":
+            image.execs.append((kv["how"], kv["next"]))
+        elif kind == "ZOMBIE":
+            image.zombie = kv["state"]
+        elif kind == "DONE":
+            image.done = kv["status"]
+    return images
+
+
+@dataclass
+class Use:
+    """One image's ledgered use of one provider, clipped to a capture window."""
+    lines: list  # lines overlapping the window
+    definite: list  # lines entirely inside the window
+    t_first: int
+    t_last: int
+    mechs: dict
+
+    @property
+    def table_calls(self):
+        return sum(e["n"] for e in self.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS)
+
+
+def use_in(image, provider_path, window):
+    """The image's use of the provider inside window=(start, end), or None."""
+    start, end = window
+    lines = [e for e in image.entries if e["module"] == provider_path and e["n"] > 0
+             and e["t1"] >= start and e["t0"] <= end]
+    if not lines:
+        return None
+    definite = [e for e in lines if e["t0"] >= start and e["t1"] <= end]
+    mechs = {}
+    for e in definite:
+        if e["mech"] != "-" and e["fn"] in OP_CATEGORY:
+            mechs.setdefault(int(e["mech"], 16), set()).add(OP_CATEGORY[e["fn"]])
+    return Use(lines, definite, max(start, min(e["t0"] for e in lines)), min(end, max(e["t1"] for e in lines)), mechs)
+
+
+def window_count(use, since_ns, window):
+    """(lo, hi) calls a counting feed covering [max(since, start), end] must report."""
+    start, end = max(since_ns, window[0]), window[1]
+    lo = hi = 0
+    for e in use.lines:
+        if e["t1"] < start or e["t0"] > end:
+            continue
+        hi += e["n"]
+        if e["t0"] >= start and e["t1"] <= end and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS:
+            lo += e["n"]
+    return lo, hi
+
+
+def reached_by(images, image):
+    """How this image was reached: initial, or the predecessor's EXEC how."""
+    if image.gen == 0:
+        return "initial"
+    prev = images.get((image.cell, image.pid, image.start, image.gen - 1))
+    return prev.execs[-1][0] if prev and prev.execs else "unknown"
+
+
+def check_ledgers(manifest, images_by_cell, res, run="ledger"):
+    providers = manifest["providers"]
+    path_role = {p["path"]: role for role, p in providers.items()}
+    for cell, spec in manifest["cells"].items():
+        images = sorted(images_by_cell.get(cell, {}).values(), key=lambda i: (i.pid, i.gen))
+        mode = spec["mode"]
+        if not res.ok(run, cell, "LEDGER-PRESENT", bool(images), "no ledger image for the cell"):
+            continue
+        expected_images = spec.get("instances", 1) * (len(spec.get("chain", [])) + 1)
+        res.ok(run, cell, "LEDGER-IMAGES", len(images) == expected_images,
+               f"{len(images)} ledger images, expected {expected_images}")
+        for image in images:
+            tag = f"pid={image.pid} gen={image.gen}"
+            finished = image.done == "ok" or (mode == "held" and image.held_t is not None)
+            res.ok(run, cell, "LEDGER-DONE", finished, f"{tag}: image did not finish (DONE={image.done or 'missing'})")
+            bad = [e for e in image.entries if e["bad"]]
+            res.ok(run, cell, "LEDGER-RV", not bad,
+                   f"{tag}: {len(bad)} ledger lines with rv != CKR_OK: {[(e['fn'], e['bad']) for e in bad][:4]}")
+            stray = [m for m in image.mapped if m not in path_role or path_role[m] not in spec["providers"]]
+            res.ok(run, cell, "LEDGER-MODULES", not stray, f"{tag}: undeclared modules mapped: {stray}")
+            res.ok(run, cell, "LEDGER-MAPPED",
+                   all(providers[r]["path"] in image.mapped for r in spec["providers"]),
+                   f"{tag}: a declared provider was never mapped ({sorted(image.mapped)})")
+            timing = [e for e in image.entries if e["t0"] > e["t1"]]
+            res.ok(run, cell, "LEDGER-TIME", not timing, f"{tag}: t0 > t1 on {len(timing)} lines")
+            if mode == "map":
+                res.ok(run, cell, "LEDGER-UNUSED", not image.entries,
+                       f"{tag}: map-only image made {len(image.entries)} ledgered calls")
+                continue
+            if mode == "held":
+                held = [e for e in image.entries if e["phase"] == "held"]
+                res.ok(run, cell, "LEDGER-HELD", len(held) == 1 and held[0]["n"] == 1 and image.held_t is not None,
+                       f"{tag}: expected exactly one held C_WaitForSlotEvent entry and a HELD line")
+                continue
+            if mode == "leader-exit":
+                res.ok(run, cell, "LEDGER-LX-ZOMBIE", image.zombie == ZOMBIE_STATE,
+                       f"{tag}: worker saw leader state {image.zombie or 'missing'!r}, want {ZOMBIE_STATE!r}")
+            for k, role in enumerate(spec["providers"]):
+                path = providers[role]["path"]
+                if mode == "mech":
+                    iters = spec["iters"] * (k + 1)
+                elif mode == "exec-chain":
+                    iters = spec["iters"] * (image.gen + 1)
+                else:
+                    iters = spec["iters"]
+                counts, phases = {}, {}
+                for e in image.entries:
+                    if e["module"] != path:
+                        continue
+                    key = (e["phase"], e["fn"], e["mech"])
+                    counts[key] = counts.get(key, 0) + e["n"]
+                    lo, hi = phases.get(e["phase"], (e["t0"], e["t1"]))
+                    phases[e["phase"]] = (min(lo, e["t0"]), max(hi, e["t1"]))
+                want = {("main", fn, mech): iters for fn, mech in MAIN_PLAN}
+                want[("main", "C_DestroyObject", "-")] = 2 * iters
+                want.update({("setup", fn, "-"): 1 for fn in SETUP_FNS})
+                want.update({("teardown", fn, "-"): 1 for fn in TEARDOWN_FNS})
+                res.ok(run, cell, "LEDGER-COUNTS", counts == want,
+                       f"{tag} {role}: counts differ from the deterministic plan: "
+                       f"{sorted(set(want.items()) ^ set(counts.items()))[:6]}")
+                order = [phases.get(p) for p in ("setup", "main", "teardown")]
+                res.ok(run, cell, "LEDGER-PHASES",
+                       None not in order and order[0][1] <= order[1][0] and order[1][1] <= order[2][0],
+                       f"{tag} {role}: phases overlap or are missing: {order}")
+        if mode == "exec-chain":
+            ordered = sorted(images, key=lambda i: i.gen)
+            gens = [i.gen for i in ordered]
+            same = len({(i.pid, i.start) for i in images}) == 1
+            exes = [i.exe for i in ordered]
+            steps = [s.split(":", 1) for s in spec["chain"]]
+            want_exes = [spec["exe"]] + [exe for _how, exe in steps]
+            hows = [reached_by(images_by_cell[cell], i) for i in ordered]
+            want_hows = ["initial"] + [how for how, _exe in steps]
+            res.ok(run, cell, "LEDGER-CHAIN",
+                   same and gens == list(range(len(want_exes))) and exes == want_exes and hows == want_hows,
+                   f"chain images gens={gens} one-process={same} exes={exes} hows={hows} "
+                   f"want exes={want_exes} hows={want_hows}")
+            gaps = []
+            for a, b in zip(ordered, ordered[1:]):
+                if a.entries and b.entries:
+                    gaps.append(min(e["t0"] for e in b.entries) - max(e["t1"] for e in a.entries))
+            res.ok(run, cell, "LEDGER-CHAIN-GAP", bool(gaps) and min(gaps) >= EXEC_GAP_MIN_NS,
+                   f"inter-image quiet gaps {gaps} ns < {EXEC_GAP_MIN_NS}: the exec cross-attribution "
+                   "check cannot discriminate (raise the chain --delay-ms)")
+
+
+# ===========================================================================
+# Documents
+# ===========================================================================
+
+def load_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_jsonl(path):
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def dig(doc, path):
+    cur = doc
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def coverage(edge):
+    return edge.get("entries", {}).get("coverage") or {}
+
+
+def coverage_ok(edge):
+    """The documented seven keys, a known state, and an interval whose non-null
+    until_ns lies strictly after since_ns."""
+    cov = edge.get("entries", {}).get("coverage")
+    if not (isinstance(cov, dict) and set(cov) == COVERAGE_KEYS and cov.get("state") in COVERAGE_STATES):
+        return False
+    since, until = cov.get("since_ns"), cov.get("until_ns")
+    if until is not None:
+        if not isinstance(until, int) or (since is not None and until <= since):
+            return False
+    return True
+
+
+def doc_lane(doc):
+    """native once any native producer speaks; scan when every (well-formed)
+    edge reads unknown; malformed when any coverage object breaks the schema."""
+    if any(not coverage_ok(e) for e in doc.get("edges", [])):
+        return "malformed"
+    if any(coverage(e)["state"] != UNKNOWN_STATE for e in doc.get("edges", [])):
+        return "native"
+    if doc.get("observation", {}).get("usage_feed"):
+        return "native"
+    if any(c.get("image", {}).get("authority") == "native_exact" for c in doc.get("callers", [])):
+        return "native"
+    return "scan"
+
+
+def positive(edge):
+    cov = coverage(edge)
+    if cov.get("state") == "witnessed":
+        return True
+    return cov.get("state") == "counted" and edge["entries"].get("count", 0) > 0
+
+
+def positive_first_ns(edge):
+    cov = coverage(edge)
+    if cov.get("state") == "witnessed":
+        return cov.get("first_ns")
+    return edge["entries"].get("first_seen_ns")
+
+
+def expected_capture(caller, module, edge):
+    """inventory-events-v1 `capture`, re-derived from the snapshot record."""
+    adm = module.get("admission", {}).get("state")
+    mapping = edge.get("mapping", {}).get("state")
+    cov = coverage(edge)
+    if adm == "refused":
+        return CAPTURE["refused"]
+    if caller.get("retired") or mapping == MAPPING_ENDED:
+        return CAPTURE["retired"]
+    if adm == "unresolved" or mapping == "uncertain" or caller.get("lifecycle") == "unknown" \
+            or module.get("lifecycle") == "unknown":
+        return CAPTURE["lost"]
+    if cov.get("state") in ("counted", "witnessed", WATCH_STATE):
+        return CAPTURE["armed"]
+    if cov.get("reason") == SCAN_ONLY_REASON:
+        return CAPTURE["scan_only"]
+    return CAPTURE["lost"]
+
+
+def expected_activity(edge, end_ns):
+    """inventory-events-v1 `activity` from the snapshot; recency (counted only)
+    may additionally read recent when last_seen is within the dashboard window."""
+    entries = edge["entries"]
+    cov = coverage(edge)
+    if entries.get("in_flight") or (edge.get("operations") or {}).get("active"):
+        return {ACTIVITY["inflight"]}
+    if cov.get("state") == "witnessed":
+        base = ACTIVITY["used"]
+    elif edge.get("mapping", {}).get("state") != MAPPING_LIVE:
+        base = ACTIVITY["unknown"]
+    elif (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
+        base = ACTIVITY["quiet"]
+    elif cov.get("state") == "counted":
+        base = ACTIVITY["lossy"]
+    else:
+        base = ACTIVITY["uncovered"]
+    allowed = {base}
+    last = entries.get("last_seen_ns")
+    if cov.get("state") == "counted" and last is not None and end_ns - last <= DASHBOARD_RECENT_WINDOW_NS:
+        allowed.add(ACTIVITY["recent"])
+    return allowed
+
+
+def expected_entries_display(edge):
+    cov = coverage(edge)
+    count = edge["entries"].get("count", 0)
+    if cov.get("state") == "counted" and cov.get("lossy") and count > 0:
+        return f"{count}+"
+    if (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
+        return str(count)
+    return str(count) if count > 0 else "?"
+
+
+def settlement_verdict(doc):
+    """(verdict, source); verdict is settled | unsettled | None, or `malformed`
+    for a settlement value of an unrecognized shape (never a crash)."""
+    for path, values in SETTLEMENT_PATHS:
+        value = dig(doc, path)
+        if value is None:
+            continue
+        where = ".".join(path)
+        if isinstance(value, dict):
+            inner = next((value[k] for k in SETTLEMENT_OBJECT_KEYS if isinstance(value.get(k), (str, bool))), None)
+            if inner is None or inner not in values:
+                return "malformed", f"{where} is an object without a known {SETTLEMENT_OBJECT_KEYS} value: {value!r}"
+            return values[inner], f"{where}={value!r}"
+        if not isinstance(value, (str, bool)):
+            return "malformed", f"{where} has unsupported shape {type(value).__name__}: {value!r}"
+        if value in values:
+            return values[value], f"{where}={value!r}"
+    text = " ".join(f"{g.get('subject', '')} {g.get('reason', '')}" for g in doc.get("gaps", []))
+    for pattern, verdict in SETTLEMENT_GAPS:
+        if pattern.search(text):
+            return verdict, f"gap matching {pattern.pattern!r}"
+    return None, "no settlement statement"
+
+
+class RunView:
+    def __init__(self, manifest, run, rundir):
+        self.manifest = manifest
+        self.run = run
+        self.name = run["name"]
+        self.doc = None
+        self.events = None
+        self.errors = []
+        for key, loader, attr in (("json", load_json, "doc"), ("jsonl", load_jsonl, "events")):
+            path = run.get(key) and os.path.join(rundir, run[key])
+            if path and os.path.exists(path):
+                try:
+                    setattr(self, attr, loader(path))
+                except (OSError, ValueError) as error:
+                    self.errors.append(f"{key} unreadable: {error}")
+        self.frames_path = os.path.join(rundir, run["frames"]) if run.get("frames") else None
+        self.callers, self.modules, self.edges = {}, {}, {}
+        if isinstance(self.doc, dict):
+            self.callers = {c["id"]: c for c in self.doc.get("callers", [])}
+            self.modules = {m["id"]: m for m in self.doc.get("modules", [])}
+            self.edges = {(e["caller"], e["module"]): e for e in self.doc.get("edges", [])}
+            obs = self.doc.get("observation", {})
+            self.window = (obs.get("started_ns") or 0, obs.get("ended_ns") or 0)
+
+    def kind(self, name):
+        return [e for e in self.events or [] if e.get("kind") == EVENT_KINDS[name]]
+
+
+def check_streams(view, res):
+    run, doc = view.name, view.doc
+    res.ok(run, "*", "DOC-SCHEMA", doc.get("schema") == SCHEMAS["inventory"],
+           f"schema {doc.get('schema')!r} != {SCHEMAS['inventory']!r} (oracle tables need review)")
+    malformed = [k for k, e in view.edges.items() if not coverage_ok(e)]
+    res.ok(run, "*", "COVERAGE-SHAPE", not malformed,
+           f"{len(malformed)} edges lack the coverage keys {sorted(COVERAGE_KEYS)}, a known state, or "
+           f"until_ns > since_ns: {malformed[:4]}")
+    if view.events is None:
+        res.add(run, "*", "STREAM", "fail", "no --event-log JSONL to compare")
+        return
+    events = view.events
+    res.ok(run, "*", "STREAM-SCHEMA", all(e.get("schema") == SCHEMAS["events"] for e in events),
+           "a JSONL line carries a different schema id")
+    rotated = view.kind("rotated") + view.kind("evicted")
+    if not res.ok(run, "*", "STREAM-ROTATED", not rotated,
+                  f"the stream rotated or evicted ({len(rotated)} markers): the run must pass a rotate bound "
+                  "larger than the stream, or its agreement checks would read a partial stream"):
+        return
+    seqs = [e.get("seq") for e in events]
+    res.ok(run, "*", "STREAM-SEQ", seqs == list(range(len(seqs))), f"seq not contiguous from 0: {seqs[:5]}..")
+    kinds = [e.get("kind") for e in events]
+    if not res.ok(run, "*", "STREAM-ENDED",
+                  bool(kinds) and kinds[0] == EVENT_KINDS["started"] and kinds[-1] == EVENT_KINDS["ended"],
+                  f"stream must open with started and close with ended: {kinds[:1]}..{kinds[-1:]}"):
+        return
+    ended = events[-1]["event"]
+    res.ok(run, "*", "AGREE-BUDGETS", ended.get("budgets") == doc.get("budgets"),
+           "ended.budgets differs from the snapshot budgets")
+    res.ok(run, "*", "AGREE-PASSES", ended.get("passes") == doc.get("observation", {}).get("passes"),
+           f"ended.passes {ended.get('passes')} != observation.passes {doc.get('observation', {}).get('passes')}")
+    res.ok(run, "*", "AGREE-SUPPRESSED", ended.get("gaps_suppressed") == doc.get("gaps_suppressed"),
+           "gaps_suppressed differs between stream and snapshot")
+    # Retention mirrors the snapshot pass for pass: past the bound new gaps are
+    # suppressed, never emitted, so the lists stay equal.
+    stream_gaps = [e["event"] for e in view.kind("gap")]
+    passes = [e["event"] for e in view.kind("pass")]
+    res.ok(run, "*", "AGREE-GAPS", stream_gaps == doc.get("gaps", []),
+           f"stream gaps ({len(stream_gaps)}) != snapshot gaps ({len(doc.get('gaps', []))})")
+    new = sum(p.get("new_gaps", 0) for p in passes)
+    suppressed = sum(p.get("suppressed_delta", 0) for p in passes)
+    res.ok(run, "*", "AGREE-GAP-ACCOUNTING", new == len(stream_gaps) and suppressed == doc.get("gaps_suppressed"),
+           f"pass accounting new_gaps={new} suppressed={suppressed} vs {len(stream_gaps)} streamed, "
+           f"{doc.get('gaps_suppressed')} suppressed")
+    minted = set()
+    for e in view.kind("caller"):
+        field_name = CALLER_EVENT_MINTS.get(e["event"].get("event"))
+        if field_name:
+            minted.add(e["event"].get(field_name))
+    res.ok(run, "*", "AGREE-CALLERS", minted == set(view.callers),
+           f"stream-minted only {sorted(minted - set(view.callers))[:5]} / snapshot-only "
+           f"{sorted(set(view.callers) - minted)[:5]}")
+    want = {"callers": len(view.callers), "modules": len(view.modules), "edges": len(view.edges)}
+    totals = passes[-1].get("totals") if passes else None
+    res.ok(run, "*", "AGREE-TOTALS", totals == want, f"last pass totals {totals} != snapshot {want}")
+    edge_events = view.kind("edge")
+    if edge_events:
+        last = {}
+        for e in edge_events:
+            last[(e["event"].get("caller"), e["event"].get("module"))] = e["event"]
+        bad = []
+        for key, ev in last.items():
+            edge = view.edges.get(key)
+            if edge is None:
+                bad.append((key, "not in snapshot"))
+                continue
+            caller, module = view.callers[key[0]], view.modules[key[1]]
+            if ev.get("entries") != edge.get("entries"):
+                bad.append((key, "entries"))
+            if ev.get("capture") != expected_capture(caller, module, edge):
+                bad.append((key, f"capture {ev.get('capture')!r}"))
+            if ev.get("activity") not in expected_activity(edge, view.window[1]):
+                bad.append((key, f"activity {ev.get('activity')!r}"))
+        res.ok(run, "*", "AGREE-EDGE-EVENTS", not bad, f"edge_observed disagrees with the snapshot: {bad[:4]}",
+               f"{len(last)} edge_observed records agree")
+    else:
+        # Production emits edge_observed only under #[cfg(test)] today, so a real
+        # stream cannot prove edge-level JSONL agreement: never a pass.
+        res.add(run, "*", "AGREE-EDGE-EVENTS", "nonqualifying",
+                "the stream carries no edge_observed records, so edge-level JSON/JSONL agreement is unproven "
+                "(the product emits them only in test builds; follow-up for C5 public wiring)")
+
+
+def resolve_providers(view, res, needed):
+    """provider role -> module id, by (inode, path or sha256); never by path alone."""
+    out = {}
+    for role, prov in view.manifest["providers"].items():
+        hits = [m["id"] for m in view.modules.values()
+                if m.get("identity", {}).get("inode") == prov["ino"]
+                and (prov["path"] in m.get("paths", []) or m.get("identity", {}).get("sha256") == prov.get("sha256"))]
+        if len(hits) > 1:
+            res.add(view.name, role, "PROV-RESOLVE", "fail", f"provider {role} matches modules {hits}")
+        if hits:
+            out[role] = hits[0]
+        elif role in needed:
+            res.add(view.name, role, "PROV-RESOLVE", "fail",
+                    f"provider {role} ({prov['path']}) is mapped by a live cell but is not a module"
+                    + scan_limit_note(view))
+    a, b = out.get("A"), out.get("B")
+    if a and b:
+        res.ok(view.name, "A/B", "PROV-DISTINCT", a != b, f"byte-identical copies merged into one module {a}")
+    return out
+
+
+def scan_limit_note(view):
+    hit = next((g for g in (view.doc or {}).get("gaps", []) if SCAN_LIMIT_GAP.search(g.get("reason", ""))), None)
+    return f"; the run hit the --system deep-scan bound ({hit['reason'][:120]})" if hit else ""
+
+
+def candidates(view, image):
+    return [c for c in view.callers.values() if c.get("pid") == image.pid and c.get("start_time") == image.start]
+
+
+def in_window(ns, use):
+    return ns is not None and use.t_first <= ns <= use.t_last + WITNESS_SLACK_NS
+
+
+def edge_interval(view, edge):
+    """The claimed coverage interval: since_ns (not before the caller existed) up
+    to the frozen until_ns and/or the edge's end, whichever comes first."""
+    caller = view.callers[edge["caller"]]
+    cov = coverage(edge)
+    start = max(cov.get("since_ns") or 0, caller.get("first_seen_ns") or 0)
+    mapping = edge.get("mapping", {})
+    ends = [cov.get("until_ns"), mapping.get("last_seen_ns") if mapping.get("state") == MAPPING_ENDED else None]
+    ends = [e for e in ends if e is not None]
+    return start, (min(ends) if ends else None)
+
+
+def unbound_gap_for(view, mid, image, use, consumed):
+    for index, gap in enumerate(view.doc.get("gaps", [])):
+        if index in consumed or gap.get("module") != mid:
+            continue
+        if not UNBOUND_GAP.search(f"{gap.get('subject', '')} {gap.get('reason', '')}"):
+            continue
+        when = next((gap[k] for k in UNBOUND_GAP_TIME_KEYS if isinstance(gap.get(k), int)), None)
+        if gap.get("pid") == image.pid or (when is not None and in_window(when, use)):
+            consumed.add(index)
+            return gap
+    return None
+
+
+class CellPass:
+    """Per-run bookkeeping shared by the cell checks."""
+
+    def __init__(self):
+        self.justified = set()  # positive (caller, module) edges a ledgered in-window use accounts for
+        self.consumed_gaps = set()
+        self.bound_by_cell = {}
+        self.used_by_cell = {}
+        self.exec_bound = {}  # cell -> [(gen, how, caller, first_seen)]
+        self.used_modules = set()
+
+
+def check_cells(view, images_by_cell, res):
+    run, man = view.name, view.manifest
+    lane = doc_lane(view.doc)
+    expect = man["expect_lane"]
+    if expect == "native":
+        res.ok(run, "*", "LANE", lane == "native",
+               f"native lane absent: document lane is {lane!r} (every edge unknown/scan_only, or malformed coverage)")
+    else:
+        res.ok(run, "*", "LANE", lane == "scan", f"expected the scan lane but the document lane is {lane!r}")
+    settle = view.run.get("settle_passes")
+    if settle is not None:
+        res.ok(run, "*", "WINDOW-SETTLED", settle >= 2,
+               f"the observer committed only {settle} passes after the last cell settled (need 2: one full "
+               "pass must start after every exit/dlopen); widen DURATION")
+    win = view.window
+    res.ok(run, "*", "WINDOW", 0 < win[0] < win[1], f"observation window {win} is not a capture window")
+    run_cells = view.run["cells"]
+    needed = set()
+    for cell in run_cells:
+        spec = man["cells"][cell]
+        for image in images_by_cell.get(cell, {}).values():
+            alive = spec.get("hold", False) and image.gen == len(spec.get("chain", []))
+            for prole in spec["providers"]:
+                if alive or use_in(image, man["providers"][prole]["path"], win):
+                    needed.add(prole)
+    mod = resolve_providers(view, res, needed)
+    attested_delivery = bool(man.get("attested_delivery"))
+    if any(p.get("attested") for p in man["providers"].values()) and not attested_delivery:
+        res.add(run, "*", "ATTESTED-DELIVERY", "absent",
+                "an attested provider exists but the run could not pass its manifest "
+                f"({man.get('attested_note', 'no inventory --manifest')}); attested cells are judged unattested")
+    state = CellPass()
+    for cell in run_cells:
+        spec = man["cells"][cell]
+        role = ROLES[spec["role"]]
+        images = images_by_cell.get(cell, {})
+        for image in sorted(images.values(), key=lambda i: (i.pid, i.gen)):
+            check_image(view, cell, spec, role, images, image, mod, lane, attested_delivery, state, res)
+        if lane == "native" and role.bind == "optional" and state.used_by_cell.get(cell):
+            res.ok(run, cell, "BOUND-INSTANCE", state.bound_by_cell.get(cell, 0) >= OPTIONAL_CELL_MIN_BOUND,
+                   f"{state.used_by_cell[cell]} in-window used images, none bound to its own caller: "
+                   "an unbound gap may excuse an instance, never a whole cell")
+        if spec["mode"] == "exec-chain" and state.used_by_cell.get(cell):
+            if lane == "native":
+                check_exec_split(view, cell, state.exec_bound.get(cell, []), images, man, mod, res)
+            else:
+                res.add(run, cell, "EXEC-SPLIT", "absent",
+                        "same-binary re-exec and non-leader exec are invisible to exe-identity scan pins")
+    check_positives(view, images_by_cell, mod, state, res)
+
+
+def check_image(view, cell, spec, role, images, image, mod, lane, attested_delivery, state, res):
+    run, man, win = view.name, view.manifest, view.window
+    tag = f"pid={image.pid} gen={image.gen}"
+    cands = candidates(view, image)
+    exe_ids = {c["id"] for c in cands if c.get("image", {}).get("exe", {}).get("path") == image.exe}
+    alive_at_end = spec.get("hold", False) and image.gen == len(spec.get("chain", []))
+    how = reached_by(images, image)
+    bind = EXEC_HOW_BIND.get(how, "required") if spec["mode"] == "exec-chain" else role.bind
+    for prole in spec["providers"]:
+        prov = man["providers"][prole]
+        mid = mod.get(prole)
+        use = use_in(image, prov["path"], win)
+        ctag = f"{tag} {prole}"
+        edges = [view.edges[(c["id"], mid)] for c in cands if mid and (c["id"], mid) in view.edges]
+        if lane != "native":
+            if role.scan_presence == "required" and alive_at_end:
+                res.ok(run, cell, "EDGE-PRESENT", bool(edges),
+                       f"{ctag}: live mapping of {prov['path']} has no edge (callers {[c['id'] for c in cands]})"
+                       + scan_limit_note(view))
+            for e in edges:
+                cov = coverage(e)
+                res.ok(run, cell, "SCAN-ONLY",
+                       cov.get("state") == UNKNOWN_STATE and e["entries"].get("observation") != OBSERVATION_OBSERVED,
+                       f"{ctag}: scan-lane edge claims usage coverage {cov}")
+            if use and use.definite:
+                state.used_by_cell[cell] = state.used_by_cell.get(cell, 0) + 1
+                res.add(run, cell, "USED-POSITIVE", "absent",
+                        f"{ctag}: {use.table_calls} in-window ledgered calls; the scan lane observes no use")
+                if prov.get("attested") and attested_delivery:
+                    res.add(run, cell, "SEMANTICS-ATTESTED", "absent",
+                            f"{ctag}: attested mechanisms {sorted(hex(m) for m in use.mechs)} need native capture")
+            continue
+        if mid is None:
+            continue
+        for e in edges:
+            if use and coverage(e).get("state") == WATCH_STATE:
+                s, end = edge_interval(view, e)
+                overlaps = s <= use.t_last and (end is None or end >= use.t_first)
+                res.ok(run, cell, "USED-NOT-WATCHED", not overlaps,
+                       f"{ctag}: edge {e['caller']}->{mid} reads watched_no_use since {s} over ledgered "
+                       f"in-window use {use.t_first}..{use.t_last}")
+        if use is None:
+            # Never called, or idle for the whole window (e.g. --hold cells of a later run).
+            what = "never-called" if not any(e["module"] == prov["path"] for e in image.entries) else "idle-in-window"
+            for e in edges:
+                cov = coverage(e)
+                res.ok(run, cell, "IDLE-NOT-POSITIVE",
+                       not positive(e) and e["entries"].get("count", 0) == 0
+                       and cov.get("state") in IDLE and e.get("semantics") != SEMANTICS_OBSERVED,
+                       f"{ctag}: {what} edge {e['caller']}->{mid} claims use: {cov}")
+            if alive_at_end and role.scan_presence == "required":
+                res.ok(run, cell, "EDGE-PRESENT", bool(edges), f"{ctag}: live mapped provider has no edge"
+                       + scan_limit_note(view))
+            continue
+        state.used_modules.add(mid)
+        if not use.definite:
+            res.add(run, cell, "USED-POSITIVE", "skip",
+                    f"{ctag}: ledgered use straddles the window edge; a positive is allowed, not required")
+            for e in edges:
+                if positive(e) and in_window(positive_first_ns(e), use) and e["caller"] in exe_ids:
+                    state.justified.add((e["caller"], e["module"]))
+            continue
+        state.used_by_cell[cell] = state.used_by_cell.get(cell, 0) + 1
+        bound = [e for e in edges if positive(e) and in_window(positive_first_ns(e), use) and e["caller"] in exe_ids]
+        if len(bound) > 1:
+            res.add(run, cell, "NO-DOUBLE-BIND", "fail",
+                    f"{ctag}: one image's use bound to {len(bound)} callers {[e['caller'] for e in bound]}")
+        check = "USED-POSITIVE" if alive_at_end else "RETAINED"
+        if bound:
+            e = bound[0]
+            state.justified.add((e["caller"], e["module"]))
+            state.bound_by_cell[cell] = state.bound_by_cell.get(cell, 0) + 1
+            if spec["mode"] == "exec-chain":
+                state.exec_bound.setdefault(cell, []).append(
+                    (image.gen, how, e["caller"], view.callers[e["caller"]].get("first_seen_ns") or 0))
+            res.add(run, cell, check, "pass", f"{ctag}: bound to {e['caller']} ({coverage(e).get('state')})")
+            check_bound_edge(view, cell, ctag, role, prov, e, use, attested_delivery, res)
+            if not alive_at_end:
+                caller = view.callers[e["caller"]]
+                res.ok(run, cell, "RETIRED-LIFECYCLE",
+                       caller.get("lifecycle") != CALLER_LIVE_LIFECYCLE or caller.get("retired"),
+                       f"{ctag}: exited image's caller {caller['id']} still reads mapped")
+            continue
+        gap = unbound_gap_for(view, mid, image, use, state.consumed_gaps) if bind == "optional" else None
+        if gap is not None:
+            res.add(run, cell, check, "unbound",
+                    f"{ctag} (reached by {how}): module-level unbound positive {gap.get('subject')!r} pid={gap.get('pid')}")
+        else:
+            res.add(run, cell, check, "fail",
+                    f"{ctag} (reached by {how}, bind {bind}): {use.table_calls} in-window ledgered calls in "
+                    f"{use.t_first}..{use.t_last} have no positive edge on this image's caller "
+                    f"({sorted(exe_ids)}) and no unbound gap naming this pid or this window")
+
+
+def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery, res):
+    run = view.name
+    cov = coverage(edge)
+    st = cov.get("state")
+    allowed = set(role.native_states)
+    attested = bool(prov.get("attested")) and attested_delivery
+    if COUNTED_NEEDS_ATTESTED and not attested:
+        allowed.discard("counted")
+    if role.require_counted_when_attested and attested:
+        allowed = {"counted"}
+    res.ok(run, cell, "COVERAGE-ALLOWED", st in allowed,
+           f"{ctag}: coverage {st} not in {sorted(allowed)} (attested={attested})")
+    if st == "counted":
+        until = cov.get("until_ns")
+        window = (view.window[0], min(view.window[1], until)) if until is not None else view.window
+        lo, hi = window_count(use, cov.get("since_ns") or 0, window)
+        count = edge["entries"].get("count", 0)
+        if cov.get("lossy"):
+            loss_gaps = [g for g in view.doc.get("gaps", [])
+                         if LOSS_GAP.search(f"{g.get('subject', '')} {g.get('reason', '')}")]
+            label = edge["entries"].get("observation")
+            res.ok(run, cell, "COUNT-LOSSY",
+                   bool(loss_gaps) and count <= hi and (count > 0 or label == OBSERVATION_LOSSY_ZERO),
+                   f"{ctag}: lossy count {count} (upper bound {hi}) needs a loss gap "
+                   f"({len(loss_gaps)} found) and, at zero, observation {OBSERVATION_LOSSY_ZERO!r} (got {label!r})")
+        else:
+            res.ok(run, cell, "COUNT-WINDOW", lo <= count <= hi,
+                   f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}")
+    if st == "witnessed":
+        res.ok(run, cell, "WITNESS-COUNT", edge["entries"].get("count", 0) == 0
+               and edge["entries"].get("observation") != OBSERVATION_OBSERVED,
+               f"{ctag}: witnessed edge claims a count/observation {edge['entries'].get('count')}")
+    if attested:
+        mechs = {m.get("mechanism"): set(m.get("operations") or []) for m in edge.get("mechanisms") or []}
+        missing = {hex(k): sorted(v - mechs.get(k, set())) for k, v in use.mechs.items() if not v <= mechs.get(k, set())}
+        extra = sorted(hex(k) for k in mechs if k not in use.mechs)
+        res.ok(run, cell, "SEMANTICS-ATTESTED",
+               edge.get("semantics") == SEMANTICS_OBSERVED and not missing and not extra,
+               f"{ctag}: semantics {edge.get('semantics')!r}; missing mechanism/ops {missing}; unledgered {extra}")
+
+
+def check_exec_split(view, cell, bound, images, man, mod, res):
+    """Leader-reached images bind to distinct callers minted in exec order."""
+    run = view.name
+    required = []
+    for image in sorted(images.values(), key=lambda i: i.gen):
+        how = reached_by(images, image)
+        used = any(use_in(image, man["providers"][p]["path"], view.window) for p in man["cells"][cell]["providers"])
+        if used and EXEC_HOW_BIND.get(how, "required") == "required":
+            required.append(image.gen)
+    by_gen = {gen: (caller, first) for gen, _how, caller, first in bound}
+    missing = [g for g in required if g not in by_gen]
+    callers = [by_gen[g][0] for g in sorted(by_gen)]
+    order = [by_gen[g][1] for g in sorted(by_gen)]
+    res.ok(run, cell, "EXEC-SPLIT",
+           not missing and len(set(callers)) == len(callers) and order == sorted(order),
+           f"exec images must each bind to their own incarnation in order: required gens {required}, "
+           f"unbound {missing}, bound (gen->caller) {dict((g, c) for g, (c, _f) in sorted(by_gen.items()))}",
+           f"bound (gen->caller): {dict((g, c) for g, (c, _f) in sorted(by_gen.items()))}")
+
+
+def check_positives(view, images_by_cell, mod, state, res):
+    """Every positive edge is in the window, and none is unjustified where the
+    ledger is the whole truth: ledgered processes and workload-private modules."""
+    run, man, win = view.name, view.manifest, view.window
+    ledgered = {}
+    for cell in view.run["cells"]:
+        for image in images_by_cell.get(cell, {}).values():
+            ledgered.setdefault((image.pid, image.start), cell)
+    private = {mod[r]: r for r, p in man["providers"].items() if p.get("private") and r in mod}
+    for edge in view.edges.values():
+        if not positive(edge):
+            continue
+        first = positive_first_ns(edge)
+        caller = view.callers.get(edge["caller"], {})
+        res.ok(run, "*", "POSITIVE-IN-WINDOW", first is not None and win[0] <= first <= win[1],
+               f"positive edge {edge['caller']}->{edge['module']} dated {first}, outside the capture window {win}")
+        owner = ledgered.get((caller.get("pid"), caller.get("start_time")))
+        justified = (edge["caller"], edge["module"]) in state.justified
+        if owner:
+            res.ok(run, owner, "NO-CROSS-ATTRIBUTION", justified,
+                   f"positive edge {edge['caller']}->{edge['module']} (first {first}) on pid {caller.get('pid')} "
+                   "is not justified by any in-window ledgered use of that provider by that image")
+        elif edge["module"] in private:
+            res.add(run, private[edge["module"]], "FOREIGN-POSITIVE", "fail",
+                    f"workload-private provider {private[edge['module']]} has a positive edge from "
+                    f"non-ledgered caller {edge['caller']} (pid {caller.get('pid')})")
+        if edge["module"] not in state.used_modules and edge["module"] in private:
+            res.add(run, private[edge["module"]], "NEVER-CALLED-POSITIVE", "fail",
+                    f"provider {private[edge['module']]} has no in-window ledgered use but edge "
+                    f"{edge['caller']}->{edge['module']} is positive")
+    for prole, prov in man["providers"].items():
+        mid = mod.get(prole)
+        if mid is None or (prov.get("attested") and man.get("attested_delivery")):
+            continue
+        claims = [e for e in view.edges.values() if e["module"] == mid and (
+            e.get("semantics") not in SEMANTICS_UNKNOWN_LABELS or e.get("mechanisms") or e.get("operations"))]
+        res.ok(run, prole, "SEMANTICS-WITHHELD", not claims,
+               f"unattested provider {prole}: edges outside the documented unknown labels or with claims "
+               f"{[(e['caller'], e.get('semantics')) for e in claims][:4]}")
+
+
+def check_stop(view, images_by_cell, res):
+    stop = view.run.get("stop")
+    if not stop:
+        return
+    run, rc = view.name, view.run.get("rc")
+    held = [i for cell in view.run["cells"] for i in images_by_cell.get(cell, {}).values() if i.held_t is not None]
+    sent = stop.get("sent_ns") or 0
+    for image in held:
+        entry = min((e["t0"] for e in image.entries if e["phase"] == "held"), default=None)
+        still = entry is not None and entry <= sent and (image.returned_t is None or image.returned_t > sent)
+        res.ok(run, image.cell, "STOP-HELD-AT-SIGINT", still,
+               f"pid={image.pid}: held entry {entry}, returned {image.returned_t}, SIGINT at {sent}: the fixture "
+               "did not hold the call across the stop", f"held from {entry} past SIGINT {sent}")
+    committed = isinstance(view.doc, dict) and bool(view.events) and view.events[-1].get("kind") == EVENT_KINDS["ended"]
+    latency = (stop.get("exited_ns") or 0) - sent
+    if not committed and (view.doc is None or doc_lane(view.doc) != "native"):
+        res.add(run, "*", "STOP-COMMIT", "absent",
+                f"SIGINT stop left rc={rc}, JSON={'yes' if view.doc else 'no'}, ended={'yes' if committed else 'no'} "
+                f"after {latency} ns: the classic loop's stop handling is a C5 deliverable")
+        return
+    res.ok(run, "*", "STOP-COMMIT", committed and rc in STOP_OK_RC,
+           f"SIGINT stop: rc={rc} (want {sorted(STOP_OK_RC)}), JSON={'yes' if view.doc else 'no'}, "
+           f"stream ended={'yes' if committed else 'no'}", f"committed, rc={rc}, stop latency {latency} ns")
+    if doc_lane(view.doc) != "native":
+        res.add(run, "*", "STOP-SETTLEMENT", "absent", "no native retirement to settle")
+        return
+    verdict, source = settlement_verdict(view.doc)
+    if held:
+        res.ok(run, "*", "STOP-SETTLEMENT", verdict == HELD_STOP_REQUIRES,
+               f"a call was held across the stop, so retirement must read {HELD_STOP_REQUIRES!r}; got "
+               f"{verdict!r} ({source})", f"{verdict} ({source})")
+    else:
+        res.ok(run, "*", "STOP-SETTLEMENT", verdict is not None, f"a native stop must state its settlement ({source})")
+
+
+# ===========================================================================
+# Dashboard frames
+# ===========================================================================
+
+def parse_frames(data):
+    body = data.split(FRAME["alt_off"], 1)[0]
+    frames = []
+    for chunk in body.split(FRAME["repaint"])[1:]:
+        text = FRAME["ansi"].sub(b"", chunk).replace(b"\r", b"").decode("utf-8", "replace")
+        lines = text.split("\n")
+        if lines and FRAME["header"].match(lines[0]):
+            frames.append(lines)
+    return frames
+
+
+def frame_edges(lines):
+    edges, current = {}, None
+    indent = FRAME["item_indent"]
+    for line in lines:
+        m = FRAME["identity"].match(line)
+        if m:
+            current = (m.group(1), m.group(4))
+            edges[current] = {"pid": int(m.group(2)), "items": {}}
+            continue
+        if current and line.startswith(indent) and not line.startswith(indent + " "):
+            for item in line.strip().split(FRAME["item_sep"]):
+                key, _, value = item.partition(" ")
+                edges[current]["items"].setdefault(key, value)
+        elif line.startswith(FRAME["section"]) or not line.strip():
+            current = None
+    return edges
+
+
+def check_dashboard(view, images_by_cell, res):
+    if not view.frames_path:
+        return
+    run = view.name
+    try:
+        with open(view.frames_path, "rb") as handle:
+            data = handle.read()
+    except OSError as error:
+        res.add(run, "*", "DASH-FRAME", "fail", f"pty transcript unreadable: {error}")
+        return
+    frames = parse_frames(data)
+    if not res.ok(run, "*", "DASH-FRAME",
+                  bool(frames) and FRAME["alt_on"] in data and FRAME["alt_off"] in data
+                  and FRAME["coverage_marker"] in data,
+                  f"{len(frames)} full frames; alternate screen entered/exited and coverage header required"):
+        return
+    last = frames[-1]
+    head = FRAME["header"].match(last[0])
+    passes, ncallers, nmodules, nedges = (int(head.group(i)) for i in (2, 3, 4, 5))
+    pass_events = [e["event"] for e in view.kind("pass")]
+    at = next((p for p in pass_events if p.get("pass") == passes - 1), None)
+    gaps_line = next((FRAME["coverage"].match(line) for line in last if FRAME["coverage"].match(line)), None)
+    if at is None:
+        res.add(run, "*", "DASH-TOTALS", "fail", f"final frame claims {passes} passes; the stream has no such pass")
+    else:
+        cumulative = sum(p.get("new_gaps", 0) for p in pass_events if p.get("pass", 0) <= passes - 1)
+        got = (ncallers, nmodules, nedges, int(gaps_line.group(1)) if gaps_line else None)
+        want = (at["totals"]["callers"], at["totals"]["modules"], at["totals"]["edges"], cumulative)
+        res.ok(run, "*", "DASH-TOTALS", got == want,
+               f"final frame (callers, modules, edges, gaps) {got} != stream pass {passes - 1} {want}")
+    shown = frame_edges(last)
+    mine = {}
+    for cell in view.run["cells"]:
+        for image in images_by_cell.get(cell, {}).values():
+            mine[(image.pid, image.start)] = cell
+    compared = 0
+    for key, frame_edge in shown.items():
+        edge = view.edges.get(key)
+        if edge is None:
+            res.add(run, "*", "DASH-EDGE-LABELS", "fail", f"frame edge {key} is not in the snapshot")
+            continue
+        caller, module = view.callers[key[0]], view.modules[key[1]]
+        items = frame_edge["items"]
+        want = {"capture": {expected_capture(caller, module, edge)},
+                "entries": {expected_entries_display(edge)},
+                "semantics": {edge.get("semantics")},
+                "activity": expected_activity(edge, view.window[1])}
+        wrong = {k: (items.get(k), sorted(v)) for k, v in want.items() if items.get(k) not in v}
+        if (caller.get("pid"), caller.get("start_time")) in mine:
+            compared += 1
+        res.ok(run, "*", "DASH-EDGE-LABELS", not wrong, f"frame {key} disagrees with the snapshot: {wrong}")
+    missing = [k for k, e in view.edges.items()
+               if (view.callers[k[0]].get("pid"), view.callers[k[0]].get("start_time")) in mine and k not in shown]
+    res.ok(run, "*", "DASH-VISIBLE", compared > 0 and not missing,
+           f"{compared} ledgered cell edges compared; not visible in the final frame: {missing[:6]} "
+           "(enlarge the pty or narrow with --module)", f"{compared} ledgered cell edges compared")
+
+
+# ===========================================================================
+# Driver
+# ===========================================================================
+
+def load_images(manifest, rundir, res):
+    images_by_cell = {}
+    for cell, spec in manifest["cells"].items():
+        errors = []
+        try:
+            with open(os.path.join(rundir, spec["ledger"]), encoding="utf-8") as handle:
+                parsed = parse_ledger(handle.read(), errors)
+        except OSError as error:
+            errors.append(f"ledger unreadable: {error}")
+            parsed = {}
+        for error in errors:
+            res.add("ledger", cell, "LEDGER-PARSE", "fail", error)
+        images_by_cell[cell] = {k: v for k, v in parsed.items() if k[0] == cell}
+    return images_by_cell
+
+
+def check_completeness(manifest, res):
+    roles = {spec["role"] for spec in manifest["cells"].values()}
+    res.ok("manifest", "*", "ROLES-COMPLETE", roles >= set(ROLES),
+           f"cells cover roles {sorted(roles)}; missing {sorted(set(ROLES) - roles)}")
+    runs = {r["name"]: r for r in manifest.get("runs", [])}
+    for name, need in REQUIRED_RUNS.items():
+        if name not in runs:
+            if name in SKIPPABLE_RUNS and name in manifest.get("skipped_runs", []):
+                res.add("manifest", "*", "RUNS-COMPLETE", "nonqualifying",
+                        f"run {name!r} was skipped by the operator: the qualification is incomplete")
+            else:
+                res.add("manifest", "*", "RUNS-COMPLETE", "fail", f"required run {name!r} is missing")
+            continue
+        got = {manifest["cells"][c]["role"] for c in runs[name]["cells"] if c in manifest["cells"]}
+        res.ok("manifest", "*", "RUNS-COMPLETE", got >= need,
+               f"run {name!r} covers roles {sorted(got)}; missing {sorted(need - got)}")
+
+
+def oracle(rundir, ledgers_only=False):
+    manifest = load_json(os.path.join(rundir, "run.json"))
+    if manifest.get("manifest") != MANIFEST_ID:
+        raise SystemExit(f"run.json manifest {manifest.get('manifest')!r} != {MANIFEST_ID!r}")
+    res = Results(manifest["expect_lane"])
+    for cell, spec in manifest["cells"].items():
+        if spec["role"] not in ROLES:
+            res.add("ledger", cell, "ROLE", "fail", f"unknown role {spec['role']!r}")
+    images_by_cell = load_images(manifest, rundir, res)
+    check_ledgers(manifest, images_by_cell, res)
+    if ledgers_only:
+        return res
+    check_completeness(manifest, res)
+    for run in manifest.get("runs", []):
+        view = RunView(manifest, run, rundir)
+        for error in view.errors:
+            res.add(view.name, "*", "DOC-READ", "fail", error)
+        if run.get("stop"):
+            check_stop(view, images_by_cell, res)
+            if not isinstance(view.doc, dict):
+                continue
+        elif not isinstance(view.doc, dict):
+            res.add(view.name, "*", "DOC-READ", "fail", f"no -o JSON (rc={run.get('rc')})")
+            continue
+        else:
+            res.ok(view.name, "*", "RUN-RC", run.get("rc") in RUN_OK_RC, f"observer exited rc={run.get('rc')}")
+        check_streams(view, res)
+        check_cells(view, images_by_cell, res)
+        check_dashboard(view, images_by_cell, res)
+        if not any(r["status"] == "pass" and r["run"] == view.name and r["check"] not in ("DOC-SCHEMA",)
+                   for r in res.rows):
+            res.add(view.name, "*", "NON-VACUOUS", "fail", "no assertion passed for this run")
+    return res
+
+
+def report(res, out_path=None, ledgers_only=False):
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as handle:
+            for row in res.rows:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+    for row in res.rows:
+        if row["status"] != "pass":
+            print(f"{row['status'].upper():13} {row['run']}/{row['cell']} {row['check']}: {row['detail']}")
+    code = res.exit_code()
+    verdict = {0: "QUALIFIED", 1: "FAILED", 2: "NON-QUALIFYING"}[code]
+    if ledgers_only:
+        verdict = "LEDGERS-FAILED" if code == EXIT["failed"] else "LEDGERS-CONSISTENT"
+    print(f"{ORACLE_ID} expect_lane={res.expect_lane} verdict={verdict} summary={json.dumps(res.summary(), sort_keys=True)}")
+    return code
+
+
+def count_kind(path, kind):
+    want = EVENT_KINDS[kind]
+    count = 0
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    count += json.loads(line).get("kind") == want
+                except ValueError:
+                    pass  # a line being written right now
+    except OSError:
+        pass
+    print(count)
+    return 0
+
+
+def probe_help(text):
+    usage = "\n".join(line for line in text.splitlines() if HELP_PROBE["usage"] in line)
+    for name, flag in HELP_PROBE["flags"].items():
+        print(f"{name}={1 if flag in usage else 0}")
+    return 0
+
+
+def record_pty(argv):
+    """record-pty OUT ROWS COLS BUDGET_S STOP_AFTER_S -- ARGV...: run ARGV on a pty sized
+    ROWS x COLS, keep every byte in OUT, send `q` after STOP_AFTER_S (0 = never), kill
+    at BUDGET_S. Prints `rc=<exit code>` (128+signal when killed)."""
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
+    import time
+
+    out, rows, cols, budget, stop_after = argv[0], int(argv[1]), int(argv[2]), float(argv[3]), float(argv[4])
+    if argv[5] != "--":
+        raise SystemExit("record-pty: expected -- before the command")
+    command = argv[6:]
+    child, master = pty.fork()
+    if child == 0:
+        os.execv(command[0], command)
+        os._exit(127)
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    data = bytearray()
+    start = time.monotonic()
+    sent_q = False
+    status = None
+
+    def drain(timeout):
+        ready, _, _ = select.select([master], [], [], timeout)
+        if not ready:
+            return False
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            return False
+        data.extend(chunk)
+        return bool(chunk)
+
+    while time.monotonic() - start < budget:
+        done, code = os.waitpid(child, os.WNOHANG)
+        if done:
+            status = code
+            break
+        if stop_after > 0 and not sent_q and time.monotonic() - start >= stop_after:
+            try:
+                os.write(master, b"q")
+            except OSError:
+                pass
+            sent_q = True
+        drain(0.2)
+    if status is None:
+        os.kill(child, 9)
+        _, status = os.waitpid(child, 0)
+    while drain(0.2):
+        pass
+    os.close(master)
+    with open(out, "wb") as handle:
+        handle.write(bytes(data))
+    rc = os.waitstatus_to_exitcode(status)
+    print(f"rc={rc if rc >= 0 else 128 - rc}")
+    return 0
+
+
+# ===========================================================================
+# Self-test: synthetic fixtures (no root, no p11scope, no SoftHSM2)
+# ===========================================================================
+
+T0 = 1_000_000_000_000
+MS = 1_000_000
+
+
+def _deep(value):
+    return json.loads(json.dumps(value))
+
+
+class Synth:
+    """A consistent synthetic qualification: system, dashboard and stop runs.
+    Cases mutate one document (or the manifest) and expect one check to fail."""
+
+    def __init__(self, lane, expect_lane=None):
+        self.lane = lane
+        self.expect_lane = expect_lane or lane
+        self.providers = {
+            "A": {"path": "/prov/a/libsofthsm2.so", "ino": 101, "sha256": "aa" * 32, "attested": True, "private": False},
+            "B": {"path": "/prov/b/libsofthsm2.so", "ino": 102, "sha256": "aa" * 32, "attested": False, "private": True},
+            "C": {"path": "/prov/c/libsofthsm2.so", "ino": 103, "sha256": "aa" * 32, "attested": False, "private": True},
+            "BLK": {"path": "/prov/held.so", "ino": 104, "sha256": "bb" * 32, "attested": False, "private": True},
+        }
+        self.cells = {
+            "P1": {"role": "P1", "mode": "mech", "providers": ["A"], "iters": 3, "hold": True},
+            "P2": {"role": "P2", "mode": "mech", "providers": ["B"], "iters": 2, "hold": True},
+            "P3": {"role": "P3", "mode": "map", "providers": ["A", "C"], "iters": 0, "hold": True},
+            "P4": {"role": "P4", "mode": "mech", "providers": ["A"], "iters": 1, "hold": False, "instances": 2},
+            "P5": {"role": "P5", "mode": "exec-chain", "providers": ["A"], "iters": 1, "hold": False,
+                   "exe": "/wl/ledger", "chain": ["leader:/wl/ledger", "leader:/wl/ledger2", "thread:/wl/ledger"]},
+            "P6": {"role": "P6", "mode": "held", "providers": ["BLK"], "iters": 0, "hold": True},
+            "P7": {"role": "P7", "mode": "mech", "providers": ["A"], "iters": 2, "hold": True},
+            "LX": {"role": "LX", "mode": "leader-exit", "providers": ["A"], "iters": 2, "hold": False},
+        }
+        self.ledgers, self.images = {}, []
+        self.clock = T0 + 1000 * MS
+        pid = 5000
+        for cell, spec in self.cells.items():
+            text = []
+            for _inst in range(spec.get("instances", 1)):
+                pid += 1
+                start = 777 + pid
+                steps = [("initial", spec.get("exe", "/wl/ledger"))] + [tuple(s.split(":", 1)) for s in spec.get("chain", [])]
+                for gen, (_how, exe) in enumerate(steps):
+                    nxt = steps[gen + 1] if gen + 1 < len(steps) else None
+                    text.extend(self.image_lines(cell, spec, pid, start, gen, exe, nxt))
+                    self.clock += 300 * MS
+            self.ledgers[cell] = "\n".join(text) + "\n"
+        self.run_end = self.clock + 2000 * MS
+        self.doc = self.build_doc()
+        self.dash_start = self.run_end + 1000 * MS
+        self.dash_doc = self.build_dash_doc()
+        self.stop_sent = self.held_t + 3000 * MS
+
+    def image_lines(self, cell, spec, pid, start, gen, exe, nxt):
+        head = f"cell={cell} pid={pid} start={start} gen={gen} exe={exe}"
+        lines = [f"IDENT {head}"]
+        uses = {}
+        for role in spec["providers"]:
+            lines.append(f"MAPPED {head} module={self.providers[role]['path']} ino={self.providers[role]['ino']}")
+        if spec["mode"] == "map":
+            lines.append(f"DONE {head} status=ok")
+        elif spec["mode"] == "held":
+            path, t = self.providers["BLK"]["path"], self.clock
+            lines.append(f"LEDGER {head} module={path} fn=C_GetFunctionList mech=- n=1 bad=0 phase=setup t0={t} t1={t}")
+            lines.append(f"LEDGER {head} module={path} fn=C_WaitForSlotEvent mech=- n=1 bad=0 phase=held t0={t + MS} t1={t + MS}")
+            lines.append(f"HELD {head} module={path} fn=C_WaitForSlotEvent t={t + 2 * MS}")
+            self.held_t = t + MS
+            self.held_head = head
+            uses["BLK"] = (t, t + MS, 1)
+            self.clock += 5 * MS
+        else:
+            if spec["mode"] == "leader-exit":
+                lines.append(f"ZOMBIE {head} state=Z t={self.clock}")
+            for k, role in enumerate(spec["providers"]):
+                path = self.providers[role]["path"]
+                mult = (k + 1) if spec["mode"] == "mech" else (gen + 1) if spec["mode"] == "exec-chain" else 1
+                iters = spec["iters"] * mult
+                plan = [("setup", fn, "-", 1) for fn in SETUP_FNS]
+                plan += [("main", fn, mech, iters) for fn, mech in MAIN_PLAN]
+                plan += [("main", "C_DestroyObject", "-", 2 * iters)]
+                plan += [("teardown", fn, "-", 1) for fn in TEARDOWN_FNS]
+                first, table = self.clock, 0
+                for phase, fn, mech, n in plan:
+                    t0 = self.clock
+                    self.clock += 2 * MS
+                    lines.append(f"LEDGER {head} module={path} fn={fn} mech={mech} n={n} bad=0 phase={phase} "
+                                 f"t0={t0} t1={self.clock}")
+                    self.clock += MS
+                    if fn not in SYMBOL_ENTRY_FUNCTIONS:
+                        table += n
+                uses[role] = (first, self.clock, table)
+            lines.append(f"DONE {head} status=ok")
+            if nxt:
+                lines.append(f"EXEC {head} how={nxt[0]} next={nxt[1]}")
+        self.images.append((cell, pid, start, gen, exe, spec, uses))
+        return lines
+
+    def modules(self):
+        mid, out = {}, []
+        for i, (role, p) in enumerate(self.providers.items()):
+            mid[role] = f"m{i}"
+            out.append({"id": f"m{i}", "paths": [p["path"]],
+                        "identity": {"device": {"major": 0, "minor": 35}, "inode": p["ino"], "sha256": p["sha256"],
+                                     "build_id": None, "source": "mountinfo"},
+                        "admission": {"state": "admitted", "class": "exact", "endpoints": 68, "reasons": [],
+                                      "note": "", "history": []},
+                        "lifecycle": "mapped", "unloaded_observed": False})
+        self.mid = mid
+        return out
+
+    @staticmethod
+    def edge(cid, mid, alive, first, end):
+        return {"caller": cid, "module": mid,
+                "mapping": {"state": "mapped" if alive else "ended", "reason": None,
+                            "first_seen_ns": first, "last_seen_ns": end, "interruptions": 0},
+                "entries": {"count": 0, "saturated": False, "cap": 2**64 - 1, "first_seen_ns": None,
+                            "last_seen_ns": None, "in_flight": False,
+                            "observation": "unknown (usage observation unavailable)",
+                            "coverage": {"state": "unknown", "since_ns": None, "until_ns": None, "first_ns": None, "lossy": None,
+                                         "reason": "scan_only", "detail": None}},
+                "semantics": "unknown (semantic capture withheld)", "mechanisms": None, "operations": None}
+
+    def caller(self, cid, pid, start, gen, exe, native, lifecycle, first, end, retired):
+        return {"id": cid, "pid": pid, "start_time": start, "start_time_unit": "clock_ticks_since_boot",
+                "incarnation": gen, "image": {"authority": "native_exact" if native else "scan_pinned",
+                                              "exe": {"path": exe}, "exec_observed": True},
+                "lifecycle": lifecycle, "lifecycle_reason": None, "first_seen_ns": first,
+                "last_seen_ns": end, "retired": retired}
+
+    def finish(self, callers, modules, edges, gaps, start, end, native):
+        return {"schema": SCHEMAS["inventory"], "scope": "system",
+                "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+                "observation": {"started_ns": start, "ended_ns": end, "passes": 9, "usage_feed": native},
+                "budgets": {"callers": {"limit": 4096, "occupied": len(callers), "refused": 0}},
+                "callers": callers, "modules": modules, "edges": edges,
+                "gaps": [{"caller": None, "module": None, "pid": None, "subject": "exact image authority unavailable",
+                          "reason": "synthetic", "budget": None}] + gaps,
+                "gaps_suppressed": 0}
+
+    def build_doc(self):
+        native = self.lane == "native"
+        modules = self.modules()
+        callers, edges, gaps = [], [], []
+        self.ids = {}
+        for cell, pid, start, gen, exe, spec, uses in self.images:
+            if cell == "P6":
+                continue
+            final = gen == len(spec.get("chain", []))
+            alive = spec.get("hold") and final
+            if not native and not alive:
+                continue
+            # The thread-reached exec image stays unbound (exercises the gap path).
+            if native and spec["mode"] == "exec-chain" and gen == 3:
+                gaps.append({"caller": None, "module": self.mid["A"], "pid": pid,
+                             "subject": "used by an unidentified caller image", "reason": "synthetic", "budget": None})
+                continue
+            cid = f"c{len(callers)}"
+            self.ids[(cell, pid, gen)] = cid
+            first_use = min([u[0] for u in uses.values()] or [self.clock])
+            lifecycle = "mapped" if alive else ("exec_retired" if not final else "exited")
+            callers.append(self.caller(cid, pid, start, gen, exe, native, lifecycle, first_use - 50 * MS,
+                                       self.run_end, not alive))
+            for role in spec["providers"]:
+                edge = self.edge(cid, self.mid[role], alive, first_use, self.run_end)
+                use = uses.get(role)
+                if native:
+                    self.native_coverage(edge, role, use, T0)
+                edges.append(edge)
+        return self.finish(callers, modules, edges, gaps, T0, self.run_end, native)
+
+    def native_coverage(self, edge, role, use, since):
+        cov = edge["entries"]["coverage"]
+        if use and self.providers[role]["attested"]:
+            cov.update(state="counted", since_ns=since, lossy=False, reason=None)
+            edge["entries"].update(count=use[2], first_seen_ns=use[0] + MS, last_seen_ns=use[1], observation="observed")
+            edge["semantics"] = "observed"
+            edge["mechanisms"] = [
+                {"mechanism": m, "mechanism_hex": hex(m), "name": None, "operations": ops, "calls": 1, "errors": 0,
+                 "last_seen_ns": use[1], "evidence": {}}
+                for m, ops in [(0x250, ["digest"]), (0x251, ["sign"]), (0x350, ["generate_key"]),
+                               (0x1080, ["generate_key"]), (0x1087, ["encrypt"])]]
+            edge["operations"] = {"calls": 1, "active": []}
+        elif use:
+            cov.update(state="witnessed", first_ns=use[0] + MS, reason=None)
+            edge["entries"]["observation"] = "unknown (count unavailable; use witnessed)"
+        else:
+            cov.update(state=WATCH_STATE, since_ns=since, reason=None)
+            edge["entries"]["observation"] = "observed"
+
+    def build_dash_doc(self):
+        """A later --system run over the held, now idle, cells P1 P2 P3 P7."""
+        native = self.lane == "native"
+        modules = self.modules()
+        start, end = self.dash_start, self.dash_start + 15000 * MS
+        callers, edges = [], []
+        self.dash_ids = {}
+        for cell, pid, st, gen, exe, spec, _uses in self.images:
+            if cell not in ("P1", "P2", "P3", "P7"):
+                continue
+            cid = f"c{len(callers)}"
+            self.dash_ids[cell] = cid
+            callers.append(self.caller(cid, pid, st, gen, exe, native, "mapped", start + MS, end, False))
+            for role in spec["providers"]:
+                edge = self.edge(cid, self.mid[role], True, start + MS, end)
+                if native:
+                    self.native_coverage(edge, role, None, start + 2 * MS)
+                edges.append(edge)
+        return self.finish(callers, modules, edges, [], start, end, native)
+
+    def stop_doc(self, verdict="unsettled"):
+        if self.lane == "scan":
+            return None
+        modules = self.modules()
+        cell, pid, st, gen, exe, _spec, uses = next(i for i in self.images if i[0] == "P6")
+        start, end = self.held_t - 1000 * MS, self.stop_sent + 200 * MS
+        callers = [self.caller("c0", pid, st, gen, exe, True, "mapped", start + MS, end, False)]
+        edge = self.edge("c0", self.mid["BLK"], True, start + MS, end)
+        self.native_coverage(edge, "BLK", uses["BLK"], start)
+        doc = self.finish(callers, modules, [edge], [], start, end, True)
+        if verdict:
+            doc["observation"]["retirement"] = verdict
+        return doc
+
+    def events(self, doc, edge_events=False, extra=None):
+        rows = [("started", {"scope": doc["scope"]})]
+        rows += [("caller_event", {"event": "admitted", "caller": c["id"]}) for c in doc["callers"]]
+        rows += [("gap_recorded", g) for g in doc["gaps"]]
+        if edge_events:
+            callers = {c["id"]: c for c in doc["callers"]}
+            modules = {m["id"]: m for m in doc["modules"]}
+            for e in doc["edges"]:
+                ev = dict(_deep(e), capture=expected_capture(callers[e["caller"]], modules[e["module"]], e),
+                          activity=sorted(expected_activity(e, doc["observation"]["ended_ns"]))[0])
+                rows.append(("edge_observed", ev))
+        rows += extra or []
+        rows.append(("pass_committed", {"pass": doc["observation"]["passes"] - 1, "new_gaps": len(doc["gaps"]),
+                                        "suppressed_delta": doc["gaps_suppressed"],
+                                        "totals": {"callers": len(doc["callers"]), "modules": len(doc["modules"]),
+                                                   "edges": len(doc["edges"])}}))
+        rows.append(("ended", {"ended_ns": doc["observation"]["ended_ns"], "passes": doc["observation"]["passes"],
+                               "budgets": doc["budgets"], "gaps_suppressed": doc["gaps_suppressed"]}))
+        return [{"schema": SCHEMAS["events"], "seq": i, "at_ns": T0 + i, "kind": k, "event": e}
+                for i, (k, e) in enumerate(rows)]
+
+    def frames(self, doc, overrides=None):
+        callers = {c["id"]: c for c in doc["callers"]}
+        modules = {m["id"]: m for m in doc["modules"]}
+        lines = [f"p11scope inventory system | {doc['observation']['passes']} passes | {len(doc['callers'])} callers "
+                 f"{len(doc['modules'])} modules {len(doc['edges'])} edges",
+                 f"coverage: {len(doc['gaps'])} gaps 0 refusals 0 suppressed", "budgets: ...",
+                 "--- edges 1-2 of 2 [summary] ---"]
+        for e in doc["edges"]:
+            c, m = callers[e["caller"]], modules[e["module"]]
+            activity = sorted(expected_activity(e, doc["observation"]["ended_ns"]))[0]
+            activity = (overrides or {}).get((e["caller"], e["module"]), activity)
+            lines.append(f"{e['caller']} pid {c['pid']} ({c['image']['exe']['path']}) -> {e['module']} ({m['paths'][0]})")
+            lines.append(f"  mapping {e['mapping']['state']} | presence mapped | capture {expected_capture(c, m, e)} | "
+                         f"activity {activity} | entries {expected_entries_display(e)} | semantics {e['semantics']}")
+        frame = "\x1b[H" + "\n".join(line + "\x1b[K" for line in lines)
+        return ("\x1b[?1049h" + frame + frame + "\x1b[?25h\x1b[?1049l").encode()
+
+    def write(self, root, doc=None, dash_doc=None, stop_doc="default", events=None, dash_events=None,
+              frames=None, ledgers=None, settle=3, manifest_edit=None, edge_events=True):
+        doc = self.doc if doc is None else doc
+        dash_doc = self.dash_doc if dash_doc is None else dash_doc
+        sdoc = self.stop_doc() if stop_doc == "default" else stop_doc
+        os.makedirs(os.path.join(root, "ledgers"))
+        cells = {}
+        for cell, spec in self.cells.items():
+            name = f"ledgers/{cell}.out"
+            text = (ledgers or {}).get(cell, self.ledgers[cell])
+            if cell == "P6" and "RETURNED" not in text:
+                text += f"RETURNED {self.held_head} fn=C_WaitForSlotEvent t={self.stop_sent + 500 * MS} rv=0x0\n"
+            with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
+                handle.write(text)
+            cells[cell] = dict(spec, ledger=name)
+
+        def dump(name, value, lines=False):
+            with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
+                if lines:
+                    handle.writelines(json.dumps(row) + "\n" for row in value)
+                else:
+                    json.dump(value, handle)
+
+        dump("system.json", doc)
+        dump("system.jsonl", events if events is not None else self.events(doc, edge_events), lines=True)
+        dump("dashboard.json", dash_doc)
+        dump("dashboard.jsonl", dash_events if dash_events is not None else self.events(dash_doc, edge_events),
+             lines=True)
+        with open(os.path.join(root, "dashboard.pty"), "wb") as handle:
+            handle.write(frames if frames is not None else self.frames(dash_doc))
+        runs = [
+            {"name": "system", "cells": [c for c in self.cells if c != "P6"], "json": "system.json",
+             "jsonl": "system.jsonl", "frames": None, "rc": 0, "stop": None, "settle_passes": settle},
+            {"name": "dashboard", "cells": ["P1", "P2", "P3", "P7"], "json": "dashboard.json",
+             "jsonl": "dashboard.jsonl", "frames": "dashboard.pty", "rc": 0, "stop": None, "settle_passes": None},
+            {"name": "stop", "cells": ["P6"], "json": "stop.json" if sdoc else None,
+             "jsonl": "stop.jsonl" if sdoc else None, "frames": None, "rc": 0 if sdoc else 130,
+             "stop": {"signal": "INT", "sent_ns": self.stop_sent, "exited_ns": self.stop_sent + 100 * MS},
+             "settle_passes": None},
+        ]
+        if sdoc:
+            dump("stop.json", sdoc)
+            dump("stop.jsonl", self.events(sdoc, edge_events), lines=True)
+        manifest = {"manifest": MANIFEST_ID, "expect_lane": self.expect_lane, "attested_delivery": True,
+                    "providers": self.providers, "cells": cells, "runs": runs, "skipped_runs": []}
+        if manifest_edit:
+            manifest_edit(manifest)
+        dump("run.json", manifest)
+        return root
+
+
+def _edge(doc, caller, module):
+    return next(e for e in doc["edges"] if e["caller"] == caller and e["module"] == module)
+
+
+def self_test():
+    failures = []
+    with tempfile.TemporaryDirectory(prefix="c8-oracle-") as tmp:
+        counter = [0]
+
+        def run_case(name, root, want):
+            res = oracle(root)
+            failed = {r["check"] for r in res.failed()}
+            if want is None:
+                ok = not failed and res.summary().get("pass", 0) > 0
+                detail = f"unexpected failures {sorted(failed)}: {[r['detail'][:160] for r in res.failed()][:3]}"
+            elif isinstance(want, int):
+                ok = res.exit_code() == want
+                detail = f"exit {res.exit_code()} != {want}; failed={sorted(failed)}"
+            else:
+                ok = want in failed
+                detail = f"expected {want} to fail; failed={sorted(failed)}"
+            print(f"self-test {'ok  ' if ok else 'FAIL'} {name}" + ("" if ok else f": {detail}"))
+            if not ok:
+                failures.append(name)
+            return res
+
+        def case(name, want, mutate=None, lane="native", expect=None):
+            counter[0] += 1
+            s = Synth(lane, expect)
+            doc, dash = _deep(s.doc), _deep(s.dash_doc)
+            kw = (mutate(s, doc, dash) if mutate else None) or {}
+            return run_case(name, s.write(os.path.join(tmp, f"{counter[0]:02d}-{name}"), doc=doc, dash_doc=dash, **kw), want)
+
+        def cid(s, cell, gen=0, idx=0):
+            keys = sorted(k for k in s.ids if k[0] == cell and k[2] == gen)
+            return s.ids[keys[idx]]
+
+        # --- passing runs -------------------------------------------------------
+        res = case("native-pass", None)
+        if not any(r["status"] == "unbound" for r in res.rows):
+            failures.append("native-pass-exercises-unbound")
+        if not any(r["check"] == "AGREE-EDGE-EVENTS" and r["status"] == "pass" for r in res.rows):
+            failures.append("native-pass-exercises-edge-events")
+        if not any(r["check"] == "IDLE-NOT-POSITIVE" and r["run"] == "dashboard" for r in res.rows):
+            failures.append("native-pass-exercises-idle-dashboard")
+        if not any(r["check"] == "DASH-TOTALS" and r["status"] == "pass" for r in res.rows):
+            failures.append("native-pass-dash-totals-not-skipped")
+        res = case("scan-nonqualifying", EXIT["nonqualifying"], lane="scan")
+        if res.failed() or not any(r["status"] == "absent" for r in res.rows):
+            failures.append("scan-absent-rows")
+        # --- capture window -----------------------------------------------------
+        def dash_positive(s, d, dash):
+            e = _edge(dash, s.dash_ids["P1"], s.mid["A"])
+            e["entries"]["coverage"].update(state="witnessed", first_ns=s.dash_start + 5 * MS, since_ns=None)
+        case("idle-cell-positive-in-later-run", "IDLE-NOT-POSITIVE", dash_positive)
+
+        def before_start(s, d, dash):
+            e = _edge(d, cid(s, "P2"), s.mid["B"])
+            d["observation"]["started_ns"] = e["entries"]["coverage"]["first_ns"] + MS
+        case("positive-before-capture-start", "POSITIVE-IN-WINDOW", before_start)
+        # --- binding --------------------------------------------------------------
+        def exec_merged(s, d, dash):
+            gone = {cid(s, "P5", g) for g in (1, 2)}
+            d["callers"] = [c for c in d["callers"] if c["id"] not in gone]
+            d["edges"] = [e for e in d["edges"] if e["caller"] not in gone]
+            d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
+                              "subject": "used by an unidentified caller image", "reason": "x", "budget": None})
+        case("exec-merged-plus-gap", "EXEC-SPLIT", exec_merged)
+
+        def all_optional_lost(s, d, dash):
+            gone = {v for k, v in s.ids.items() if k[0] in ("P4",)}
+            d["callers"] = [c for c in d["callers"] if c["id"] not in gone]
+            d["edges"] = [e for e in d["edges"] if e["caller"] not in gone]
+            for _ in range(2):
+                d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
+                                  "subject": "used by an unidentified caller image", "reason": "x", "budget": None})
+        case("optional-cell-all-unbound", "RETAINED", all_optional_lost)
+
+        def p4_pid_gaps(s, d, dash):
+            gone = {v for k, v in s.ids.items() if k[0] == "P4"}
+            pids = [k[1] for k in s.ids if k[0] == "P4"]
+            d["callers"] = [c for c in d["callers"] if c["id"] not in gone]
+            d["edges"] = [e for e in d["edges"] if e["caller"] not in gone]
+            for pid in pids:
+                d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": pid,
+                                  "subject": "used by an unidentified caller image", "reason": "x", "budget": None})
+        case("optional-cell-no-bound-instance", "BOUND-INSTANCE", p4_pid_gaps)
+
+        def exec_cross(s, d, dash):
+            g0, g1 = _edge(d, cid(s, "P5", 0), s.mid["A"]), _edge(d, cid(s, "P5", 1), s.mid["A"])
+            g1["entries"]["first_seen_ns"] = g0["entries"]["first_seen_ns"]
+        case("exec-cross-attribution", "NO-CROSS-ATTRIBUTION", exec_cross)
+        case("watched-on-used", "USED-NOT-WATCHED", lambda s, d, dash: _edge(d, cid(s, "P2"), s.mid["B"])["entries"]
+             ["coverage"].update(state=WATCH_STATE, since_ns=T0, first_ns=None))
+
+        def cross(s, d, dash):
+            e = _deep(_edge(d, cid(s, "P2"), s.mid["B"]))
+            e["caller"] = cid(s, "P1")
+            d["edges"].append(e)
+        case("cross-provider", "NO-CROSS-ATTRIBUTION", cross)
+        case("p3-used", "IDLE-NOT-POSITIVE", lambda s, d, dash: _edge(d, cid(s, "P3"), s.mid["C"])["entries"]
+             ["coverage"].update(state="witnessed", first_ns=T0 + 5, since_ns=None))
+
+        def foreign(s, d, dash):
+            d["callers"].append(s.caller("c999", 99999, 1, 0, "/usr/bin/x", True, "mapped", T0, s.run_end, False))
+            for role in ("B", "C"):
+                e = _deep(_edge(d, cid(s, "P2"), s.mid["B"]))
+                e.update(caller="c999", module=s.mid[role])
+                d["edges"].append(e)
+            return {"events": s.events(d, True)}
+        case("foreign-positive-private", "FOREIGN-POSITIVE", foreign)
+        case("never-called-positive", "NEVER-CALLED-POSITIVE", foreign)
+        # --- coverage / semantics -------------------------------------------------------
+        def semantics_b(s, d, dash):
+            e = _edge(d, cid(s, "P2"), s.mid["B"])
+            e["semantics"] = "partial"
+        case("unattested-semantics-label", "SEMANTICS-WITHHELD", semantics_b)
+        case("count-outside-window", "COUNT-WINDOW",
+             lambda s, d, dash: _edge(d, cid(s, "P1"), s.mid["A"])["entries"].update(count=10_000))
+
+        def lossy(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["count"] = 1
+            e["entries"]["coverage"]["lossy"] = True
+        case("lossy-without-loss-gap", "COUNT-LOSSY", lossy)
+        case("attested-only-witnessed", "COVERAGE-ALLOWED", lambda s, d, dash: _edge(d, cid(s, "P1"), s.mid["A"])
+             ["entries"]["coverage"].update(state="witnessed", first_ns=_edge(d, cid(s, "P1"), s.mid["A"])
+                                            ["entries"]["first_seen_ns"], since_ns=None))
+
+        def no_cov(s, d, dash):
+            for e in d["edges"]:
+                del e["entries"]["coverage"]
+        case("coverage-key-missing", "COVERAGE-SHAPE", no_cov)
+
+        def six_keys(s, d, dash):
+            for e in d["edges"]:
+                del e["entries"]["coverage"]["until_ns"]
+        case("coverage-six-keys-pre-c3", "COVERAGE-SHAPE", six_keys)
+
+        def until_before_since(s, d, dash):
+            cov = _edge(d, cid(s, "P3"), s.mid["C"])["entries"]["coverage"]
+            cov["until_ns"] = cov["since_ns"]
+        case("coverage-until-not-after-since", "COVERAGE-SHAPE", until_before_since)
+
+        def watch_ending_before_use(until_offset):
+            def mutate(s, d, dash):
+                e = _edge(d, cid(s, "P2"), s.mid["B"])
+                first = e["entries"]["coverage"]["first_ns"]
+                until = None if until_offset is None else first + until_offset
+                e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=until, first_ns=None)
+            return mutate
+        # A frozen watch that ended before the ledgered use claims nothing about it ...
+        res = case("watch-until-before-use", "USED-POSITIVE", watch_ending_before_use(-50 * MS))
+        if any(r["check"] == "USED-NOT-WATCHED" and r["status"] == "fail" for r in res.rows):
+            failures.append("watch-until-before-use-judged-past-until")
+        # ... while the same watch reaching over the use is a false "no use".
+        case("watch-until-after-use", "USED-NOT-WATCHED", watch_ending_before_use(+50 * MS))
+
+        def empty(s, d, dash):
+            d["callers"], d["edges"], d["modules"] = [], [], []
+        case("empty-document", "PROV-RESOLVE", empty)
+        case("empty-document-scan", "PROV-RESOLVE", empty, lane="scan")
+
+        def merged_copies(s, d, dash):
+            for m in d["modules"]:
+                if m["id"] == s.mid["B"]:
+                    m["identity"]["inode"] = s.providers["A"]["ino"]
+                    m["paths"] = [s.providers["A"]["path"]]
+        case("copies-merged", "PROV-RESOLVE", merged_copies)
+        # --- stream agreement --------------------------------------------------------------
+        def gaps(s, d, dash):
+            return {"events": [e for e in s.events(d, True) if e["kind"] != "gap_recorded"]}
+        case("jsonl-gap-mismatch", "AGREE-GAPS", gaps)
+
+        def callers_mismatch(s, d, dash):
+            return {"events": [e for e in s.events(d, True)
+                               if not (e["kind"] == "caller_event" and e["event"]["caller"] == "c0")]}
+        case("jsonl-callers-mismatch", "AGREE-CALLERS", callers_mismatch)
+
+        def totals(s, d, dash):
+            ev = s.events(d, True)
+            next(e for e in ev if e["kind"] == "pass_committed")["event"]["totals"]["edges"] += 1
+            return {"events": ev}
+        case("jsonl-totals-mismatch", "AGREE-TOTALS", totals)
+
+        def budgets(s, d, dash):
+            ev = s.events(d, True)
+            ev[-1]["event"]["budgets"] = {"callers": {"limit": 1}}
+            return {"events": ev}
+        case("jsonl-budgets-mismatch", "AGREE-BUDGETS", budgets)
+
+        def edge_event(s, d, dash):
+            ev = s.events(d, True)
+            row = next(e for e in ev if e["kind"] == "edge_observed")
+            row["event"]["entries"]["count"] += 5
+            return {"events": ev}
+        case("jsonl-edge-event-mismatch", "AGREE-EDGE-EVENTS", edge_event)
+
+        def rotation(s, d, dash):
+            ev = s.events(d, True, extra=[("rotated", {"prior_file": "x.jsonl.1", "prior_events": 3,
+                                                       "prior_bytes": 9, "rotation_seq": 1})])
+            return {"events": ev}
+        case("jsonl-rotated", "STREAM-ROTATED", rotation)
+        # --- runs and manifest ----------------------------------------------------------------
+        case("no-runs", "RUNS-COMPLETE", lambda s, d, dash: {"manifest_edit": lambda m: m.update(runs=[])})
+        case("system-run-missing", "RUNS-COMPLETE", lambda s, d, dash: {
+            "manifest_edit": lambda m: m.update(runs=[r for r in m["runs"] if r["name"] != "system"])})
+        case("system-run-only-P1", "RUNS-COMPLETE", lambda s, d, dash: {
+            "manifest_edit": lambda m: m["runs"][0].update(cells=["P1"])})
+
+        def skip_dash(m):
+            m["runs"] = [r for r in m["runs"] if r["name"] != "dashboard"]
+            m["skipped_runs"] = ["dashboard"]
+        case("dashboard-skipped", EXIT["nonqualifying"], lambda s, d, dash: {"manifest_edit": skip_dash})
+        case("window-unsettled", "WINDOW-SETTLED", lambda s, d, dash: {"settle": 1})
+        case("native-absent", "LANE", lane="scan", expect="native")
+        case("scan-claims-usage", "LANE", lane="native", expect="scan")
+        # --- stop / settlement ------------------------------------------------------------------
+        case("held-stop-settled", "STOP-SETTLEMENT", lambda s, d, dash: {"stop_doc": s.stop_doc("settled")})
+        case("held-stop-unstated", "STOP-SETTLEMENT", lambda s, d, dash: {"stop_doc": s.stop_doc(None)})
+
+        def settlement_object(verdict):
+            def mutate(s, d, dash):
+                sd = s.stop_doc(None)
+                sd["observation"]["retirement"] = verdict
+                return {"stop_doc": sd}
+            return mutate
+        case("held-stop-object-unsettled", None, settlement_object({"state": "unsettled", "reason": "deadline"}))
+        case("held-stop-object-settled", "STOP-SETTLEMENT", settlement_object({"state": "settled"}))
+        case("held-stop-object-unknown-shape", "STOP-SETTLEMENT", settlement_object({"foo": 1}))
+        case("held-stop-list-shape", "STOP-SETTLEMENT", settlement_object(["unsettled"]))
+        # A real-shaped stream (production: no edge_observed) can never qualify.
+        res = case("real-stream-without-edge-events", EXIT["nonqualifying"],
+                   lambda s, d, dash: {"edge_events": False})
+        if not any(r["check"] == "AGREE-EDGE-EVENTS" and r["status"] == "nonqualifying" for r in res.rows):
+            failures.append("real-stream-edge-events-row")
+
+        def released_early(s, d, dash):
+            s.stop_sent = s.held_t + 3000 * MS
+            led = dict(s.ledgers)
+            led["P6"] = led["P6"] + f"RETURNED {s.held_head} fn=C_WaitForSlotEvent t={s.held_t + MS} rv=0x0\n"
+            return {"ledgers": led}
+        case("held-call-released-before-sigint", "STOP-HELD-AT-SIGINT", released_early)
+        # --- dashboard ----------------------------------------------------------------------------
+        case("dashboard-p3-used", "DASH-EDGE-LABELS", lambda s, d, dash: {
+            "frames": s.frames(dash, {(s.dash_ids["P3"], s.mid["C"]): ACTIVITY["used"]})})
+
+        def dash_hidden(s, d, dash):
+            shown = _deep(dash)
+            shown["edges"] = [e for e in shown["edges"] if e["caller"] != s.dash_ids["P2"]]
+            return {"frames": s.frames(shown).replace(
+                f"{len(shown['edges'])} edges".encode(), f"{len(dash['edges'])} edges".encode())}
+        case("dashboard-edge-hidden", "DASH-VISIBLE", dash_hidden)
+
+        def dash_totals(s, d, dash):
+            return {"frames": s.frames(dash).replace(b" callers ", b"0 callers ")}
+        case("dashboard-totals", "DASH-TOTALS", dash_totals)
+        # --- ledger ------------------------------------------------------------------------------------
+        case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
+            "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})
+        case("ledger-count", "LEDGER-COUNTS", lambda s, d, dash: {"ledgers": {"P2": s.ledgers["P2"].replace(
+            "fn=C_Digest mech=0x250 n=2", "fn=C_Digest mech=0x250 n=1")}})
+        case("ledger-leader-not-zombie", "LEDGER-LX-ZOMBIE", lambda s, d, dash: {"ledgers": {
+            "LX": s.ledgers["LX"].replace("state=Z", "state=S")}})
+        case("ledger-unflushed", "LEDGER-PARSE", lambda s, d, dash: {"ledgers": {
+            "P1": s.ledgers["P1"] + "LEDGER_UNFLUSHED cell=P1 pid=1 reason=lock-held\n"}})
+    if failures:
+        print(f"{ORACLE_ID} self-test FAILED: {failures}")
+        return 1
+    print(f"{ORACLE_ID} self-test passed")
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["--self-test"]:
+        return self_test()
+    if len(argv) == 2 and argv[0] in ("check", "ledgers"):
+        res = oracle(argv[1], ledgers_only=argv[0] == "ledgers")
+        return report(res, os.path.join(argv[1], f"oracle-{argv[0]}.jsonl"), argv[0] == "ledgers")
+    if len(argv) == 3 and argv[0] == "count-kind" and argv[2] in EVENT_KINDS:
+        return count_kind(argv[1], argv[2])
+    if argv == ["probe-help"]:
+        return probe_help(sys.stdin.read())
+    if argv[:1] == ["record-pty"]:
+        return record_pty(argv[1:])
+    print(__doc__, file=sys.stderr)
+    return EXIT["usage"]
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -26,6 +26,9 @@ rm -rf tokens; mkdir -p tokens
 printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$OUT" > softhsm2.conf
 softhsm2-util --init-token --free --label qual --so-pin 5678 --pin 1234 >/dev/null || { echo "token init failed" >&2; exit 65; }
 chown -R "$RUNUID:$RUNGID" tokens; chmod 644 softhsm2.conf
+# Positive control: a reset background SIGINT must be deliverable here (exit 130).
+env --default-signal=INT sh -c 'kill -INT $$' >/dev/null 2>&1 & wait $!
+[ $? = 130 ] || { echo "positive control failed: background SIGINT not deliverable (env --default-signal needs coreutils >= 8.31)" >&2; exit 65; }
 asuser() { exec setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups env SOFTHSM2_CONF="$SOFTHSM2_CONF" "$@"; }
 result() { python3 -c 'import json,sys; print(json.dumps({"cell":sys.argv[1],"pass":sys.argv[2]=="1","detail":sys.argv[3]}))' "$1" "$2" "$3" | tee -a results.jsonl; }
 waitfor() { local f=$1 pat=$2 t=${3:-60}; for _ in $(seq $((t*10))); do grep -qa -- "$pat" "$f" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
@@ -103,7 +106,9 @@ hsm=$(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); print(json.dumps(s
 result system $(python3 -c 'import json,sys; c=json.loads(sys.argv[1]); n=int(sys.argv[2]); print(1 if c.count(n)>=6 else 0)' "$hsm" $ITERS) "rc=$(cat system.rc) calls=$hsm modules=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("modules"))' "$s") $(grep -a 'module refused' system.stderr | head -2 | tr '\n' ' ')"
 # 9 SIGINT mid-capture
 asuser "$FIX/gated" "$MODULE" 100000000 1000 - > sig.wl 2>&1 & wl=$!; waitfor sig.wl READY 30
-"$P" profile --pid $wl --duration 120 -o $OUT/sigint.json > sig.stdout 2> sig.stderr & pp=$!; waitfor sig.stderr "p11scope: capturing:" 180; sleep 1; kill -INT $pp; wait $pp; rc=$?; kill -TERM $wl; wait $wl 2>/dev/null
+# Background jobs of a non-interactive shell inherit SIGINT ignored; reset it so the
+# cell proves SIGINT delivery instead of relying on p11scope installing its own handler.
+env --default-signal=INT "$P" profile --pid $wl --duration 120 -o $OUT/sigint.json > sig.stdout 2> sig.stderr & pp=$!; waitfor sig.stderr "p11scope: capturing:" 180; sleep 1; kill -INT $pp; wait $pp; rc=$?; kill -TERM $wl; wait $wl 2>/dev/null
 result sigint $([ $rc = 0 ] && python3 -c 'import json; json.load(open("sigint.json"))' 2>/dev/null && echo 1 || echo 0) "rc=$rc"
 # 10 -o FIFO must be refused and left intact (B RB-1); never uses /dev
 rm -f fifo; mkfifo fifo; asuser "$FIX/gated" "$MODULE" 100000000 1000 - > fifo.wl 2>&1 & wl=$!; waitfor fifo.wl READY 30

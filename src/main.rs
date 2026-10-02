@@ -83,6 +83,7 @@ fn run() -> Result<i32> {
                 &a.hooks,
                 a.json,
                 a.max_scan_pids,
+                a.max_gaps,
                 a.duration,
                 a.out.as_deref(),
                 a.dashboard,

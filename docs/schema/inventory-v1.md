@@ -158,7 +158,8 @@ never a changed meaning for an existing field.
   past budget — materializations past `limit` (each also a named
   budget gap) plus per-edge keys past the S1 bounds),
   and `retained_history` (`limit`, `retained`, `suppressed` — the gap
-  retention cap and its eviction marker). Refusal never erases
+  retention cap and its eviction marker; `limit` is the `--max-gaps`
+  bound, 1024 unless the operator overrode it). Refusal never erases
   retained evidence: over-budget members are dropped with a named
   gap while catalog entries and previously observed use stay.
 

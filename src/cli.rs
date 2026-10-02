@@ -3,6 +3,7 @@
 //! trace, durations with suffixes, hints for removed flags.
 
 use crate::attach::BackendSelection;
+use crate::discovery::caller_registry::MAX_MAX_GAPS;
 use crate::discovery::hooks::HookRegistry;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -136,6 +137,8 @@ pub struct InventoryArgs {
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
     /// Only `--system` scans more than one member, so only it reads this.
     pub max_scan_pids: Option<usize>,
+    /// `--max-gaps`: retained gap history bound; None ⇒ 1024 default.
+    pub max_gaps: Option<usize>,
     /// `--duration`: keep observing (rescanning) until the deadline;
     /// None ⇒ a single snapshot pass (or, with `--dashboard`, until quit).
     pub duration: Option<Duration>,
@@ -227,8 +230,8 @@ pub const USAGE: &str = "usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
@@ -416,8 +419,8 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// shared notes footer. Every line is verbatim from [`USAGE`]; update
 /// both together when the CLI changes.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -787,6 +790,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
     let mut max_scan_pids: Option<usize> = None;
+    let mut max_gaps: Option<usize> = None;
     let mut duration: Option<Duration> = None;
     let mut out: Option<PathBuf> = None;
     let mut dashboard = false;
@@ -848,6 +852,24 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                 }
                 max_scan_pids = Some(value);
             }
+            "--max-gaps" => {
+                if max_gaps.is_some() {
+                    return Err(usage_err("--max-gaps given twice"));
+                }
+                let v = require_value(&mut args, "--max-gaps")?;
+                let value = v
+                    .parse::<usize>()
+                    .map_err(|_| usage_err(format!("--max-gaps: invalid number {v:?}")))?;
+                if value == 0 {
+                    return Err(usage_err("--max-gaps must be greater than zero"));
+                }
+                if value > MAX_MAX_GAPS {
+                    return Err(usage_err(format!(
+                        "--max-gaps must not exceed {MAX_MAX_GAPS}"
+                    )));
+                }
+                max_gaps = Some(value);
+            }
             "--duration" => {
                 if duration.is_some() {
                     return Err(usage_err("--duration given twice"));
@@ -896,6 +918,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         hooks,
         json,
         max_scan_pids,
+        max_gaps,
         duration,
         out,
         dashboard,
@@ -1564,6 +1587,55 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn inventory_max_gaps_defaults_to_none_and_parses_when_set() {
+        // Absent ⇒ None; the runner applies the 1024 default.
+        let Command::Inventory(plain) = parse(args(&["inventory", "--pid", "7"])).unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(plain.max_gaps, None);
+        let Command::Inventory(i) = parse(args(&[
+            "inventory",
+            "--system",
+            "--json",
+            "--max-gaps",
+            "4096",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(i.max_gaps, Some(4096));
+    }
+
+    #[test]
+    fn inventory_refuses_bad_max_gaps() {
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "--max-gaps", "0"])),
+            Err(CliError::Usage(m)) if m.contains("--max-gaps must be greater than zero")
+        ));
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "--max-gaps", "many"])),
+            Err(CliError::Usage(m)) if m.contains("--max-gaps: invalid number")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--pid", "7", "--max-gaps", "8", "--max-gaps", "9"
+            ])),
+            Err(CliError::Usage(m)) if m.contains("--max-gaps given twice")
+        ));
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "--max-gaps", "65537"])),
+            Err(CliError::Usage(m)) if m.contains("--max-gaps must not exceed 65536")
+        ));
+        // The ceiling itself parses.
+        let Command::Inventory(i) =
+            parse(args(&["inventory", "--pid", "7", "--max-gaps", "65536"])).unwrap()
+        else {
+            panic!("expected inventory")
+        };
+        assert_eq!(i.max_gaps, Some(65536));
     }
 
     #[test]
@@ -2265,8 +2337,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 4038);
-        assert_eq!(hash, 0x82762f78_b4903ab7);
+        assert_eq!(USAGE.len(), 4072);
+        assert_eq!(hash, 0x523b23f2_6c11f725);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

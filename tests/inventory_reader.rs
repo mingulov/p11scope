@@ -212,23 +212,33 @@ impl Dance {
 }
 
 /// Run the observe script once. `json_out` selects the JSON dance
-/// (strict asserts) or the text dance (rendering asserts).
-fn dance(fixtures: &FixtureSet, json_out: bool) -> Dance {
+/// (strict asserts) or the text dance (rendering asserts). `max_gaps`
+/// passes an explicit `--max-gaps` bound; None keeps the 1024 default.
+fn dance(fixtures: &FixtureSet, json_out: bool, max_gaps: Option<usize>) -> Dance {
     let _ = std::fs::remove_dir_all(&fixtures.ready);
     std::fs::create_dir_all(&fixtures.ready).unwrap();
     let out = fixtures
         .dir
         .join(if json_out { "out.json" } else { "out.txt" });
     let _ = std::fs::remove_file(&out);
+    let mut extra = if json_out {
+        vec![
+            "--json".to_string(),
+            "--max-scan-pids".to_string(),
+            "4096".to_string(),
+        ]
+    } else {
+        vec!["--max-scan-pids".to_string(), "4096".to_string()]
+    };
+    if let Some(bound) = max_gaps {
+        extra.push("--max-gaps".to_string());
+        extra.push(bound.to_string());
+    }
     let script = fixture_source("inventory-observe.sh");
     let child = Command::new("sh")
         .arg(&script)
         .arg("--system")
-        .args(if json_out {
-            vec!["--json", "--max-scan-pids", "4096"]
-        } else {
-            vec!["--max-scan-pids", "4096"]
-        })
+        .args(&extra)
         .env("INV_DRIVER", &fixtures.driver)
         .env("INV_SET", "contract")
         .env("INV_V1", &fixtures.v1)
@@ -343,7 +353,11 @@ fn inventory_contract_modules_callers_edges_gaps() {
     let _guard = serial_guard();
     let dir = tmp("inventory-reader-contract");
     let fixtures = build_fixtures(&dir);
-    let mut dance = dance(&fixtures, true);
+    // Explicit gap bound with full `--system` scope unchanged and the
+    // same assertions: measured ambient on a loaded host is ~1464-1477
+    // total gaps, so 4096 (~2.8x headroom) keeps owned gaps retained
+    // without narrowing what the contract observes.
+    let mut dance = dance(&fixtures, true, Some(4096));
     let doc = dance.json.as_ref().unwrap();
 
     // Document basics: the exact schema id, scope, clock, observation.
@@ -558,7 +572,7 @@ fn inventory_text_dance_renders() {
     let _guard = serial_guard();
     let dir = tmp("inventory-reader-text");
     let fixtures = build_fixtures(&dir);
-    let mut dance = dance(&fixtures, false);
+    let mut dance = dance(&fixtures, false, None);
     let text = dance.text.as_ref().unwrap();
     assert!(text.starts_with("inventory system ("), "{text}");
     assert!(text.contains("caller c"), "{text}");

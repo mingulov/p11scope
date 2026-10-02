@@ -590,8 +590,10 @@ kind of workload without a manifest and ends `68`/`0` instead.
   (default 5) with explicit loss accounting. Scan-only like inspect:
   entry columns read unknown unless an entry feed observed them, mappings
   are never reported as observed calls, and every coverage loss is an
-  explicit gap. A target no scan inventoried is a hard error (one stderr
-  line, exit 1), never an empty-success report.
+  explicit gap. `--max-gaps <n>` sets the retained gap history bound
+  (1..=65536; 1024 when absent); gaps past the bound count in
+  `gaps_suppressed`, never silently. A target no scan inventoried is a
+  hard error (one stderr line, exit 1), never an empty-success report.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default
   refusal is deliberate: on affected kernels a uretprobe on a confined target

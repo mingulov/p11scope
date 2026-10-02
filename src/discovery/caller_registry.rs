@@ -784,6 +784,13 @@ pub(crate) const DEFAULT_MAX_CALLERS: usize = 4096;
 pub(crate) const DEFAULT_MAX_MODULES: usize = 4096;
 pub(crate) const DEFAULT_MAX_EDGES: usize = 32768;
 pub(crate) const DEFAULT_MAX_GAPS: usize = 1024;
+/// Hard ceiling for the `--max-gaps` CLI knob (CLI input guard only;
+/// [`RegistryLimits::new`] still accepts any non-zero bound). This caps
+/// the retained RECORD COUNT, not bytes: subjects keep full /proc paths
+/// and reasons are short templates, so worst-case bytes scale with path
+/// length (low tens of megabytes at typical short paths). 65_536 exceeds
+/// any plausible ambient flood (measured ~1.5K) by 40x.
+pub(crate) const MAX_MAX_GAPS: usize = 65_536;
 /// Default bound on the retained attach-endpoint census: the sum of
 /// admitted per-module endpoint counts. A retained-census bound, not an
 /// attach bound — 4096 modules at up to 256 endpoints each.
@@ -2401,6 +2408,36 @@ mod tests {
         // The retained module is untouched: no eviction rewrote history.
         let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
         assert!(registry.module_id_for(&key).is_some());
+    }
+
+    #[test]
+    fn tiny_gap_bound_keeps_first_n_and_counts_the_rest_exactly() {
+        // The `--max-gaps 3` shape: retention is first-N-wins and the
+        // suppression counter accounts every gap past the bound, so
+        // retained + suppressed always equals total evidence.
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 3, 1 << 20, 64).unwrap());
+        for n in 0..10 {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(100 + n),
+                subject: format!("subject-{n}"),
+                reason: format!("reason-{n}"),
+                budget: None,
+            });
+        }
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 3);
+        assert_eq!(registry.gaps_suppressed(), 7);
+        assert_eq!(
+            registry
+                .gaps()
+                .iter()
+                .map(|gap| gap.pid)
+                .collect::<Vec<_>>(),
+            vec![Some(100), Some(101), Some(102)]
+        );
     }
 
     #[test]

@@ -46,6 +46,17 @@ fn no_native_images(_: u32) -> Option<ImageIdentity> {
     None
 }
 
+/// Resolve the registry gap bound: the `--max-gaps` override when the
+/// operator passed one, else the unchanged 1024 default. Every other
+/// limit stays at its default either way.
+fn registry_limits(max_gaps: Option<usize>) -> RegistryLimits {
+    let mut limits = RegistryLimits::default_limits();
+    if let Some(max_gaps) = max_gaps {
+        limits.max_gaps = max_gaps;
+    }
+    limits
+}
+
 /// `p11scope inventory` — observe, render, report. Exit 0 with the text
 /// summary (or the JSON document under `--json`) on stdout; `-o` writes
 /// the JSON document atomically. `--dashboard` runs the live read-only
@@ -61,6 +72,7 @@ pub fn run(
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
+    max_gaps: Option<usize>,
     duration: Option<Duration>,
     out: Option<&Path>,
     dashboard: bool,
@@ -75,6 +87,7 @@ pub fn run(
         hooks,
         json,
         max_scan_pids,
+        max_gaps,
         duration,
         out,
         dashboard,
@@ -93,6 +106,7 @@ fn run_with_writer(
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
+    max_gaps: Option<usize>,
     duration: Option<Duration>,
     out: Option<&Path>,
     dashboard: bool,
@@ -138,7 +152,7 @@ fn run_with_writer(
         hooks.clone(),
         modules.to_vec(),
         OsProcessSource,
-        RegistryLimits::default_limits(),
+        registry_limits(max_gaps),
     )?;
     // The scan lane stages no entries: entry columns read unknown. Only a
     // BPF usage feed (the privileged lane) may flip this.
@@ -1100,5 +1114,22 @@ mod tests {
             text.starts_with("inventory system (2 passes, 0 callers, 0 modules, 0 edges)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn gap_bound_defaults_to_1024_and_honors_the_override() {
+        use crate::discovery::caller_registry::DEFAULT_MAX_GAPS;
+        let absent = registry_limits(None);
+        assert_eq!(absent, RegistryLimits::default_limits());
+        assert_eq!(absent.max_gaps, DEFAULT_MAX_GAPS);
+        assert_eq!(absent.max_gaps, 1024);
+        // The override touches only the gap bound.
+        let set = registry_limits(Some(3));
+        assert_eq!(set.max_gaps, 3);
+        assert_eq!(set.max_callers, absent.max_callers);
+        assert_eq!(set.max_modules, absent.max_modules);
+        assert_eq!(set.max_edges, absent.max_edges);
+        assert_eq!(set.max_endpoints, absent.max_endpoints);
+        assert_eq!(set.max_semantic_states, absent.max_semantic_states);
     }
 }

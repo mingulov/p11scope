@@ -732,3 +732,32 @@ fn s1_command_degraded_run_keeps_stderr_honest() {
         "snapshot withheld columns: {stdout}"
     );
 }
+
+#[test]
+fn max_gaps_knob_defaults_to_1024_and_binds_retention() {
+    // End-to-end wiring: the enforced gap bound renders in
+    // budgets.retained_history, 1024 when the flag is absent, the
+    // override when set; retained/suppressed always agree with the
+    // gaps array and its counter.
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-max-gaps");
+    let driver = LiveDriver::spawn(&dir, "mg", &["mg-p1.so"]);
+    for (args, expected_limit) in [
+        (vec!["--json"], 1024),
+        (vec!["--json", "--max-gaps", "3"], 3),
+    ] {
+        let output = observe(driver.pid, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "observe {args:?} failed: {stderr}");
+        let doc: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+        let history = &doc["budgets"]["retained_history"];
+        assert_eq!(history["limit"], expected_limit, "args {args:?}");
+        let gaps = doc["gaps"].as_array().unwrap();
+        assert_eq!(history["retained"], gaps.len() as u64, "args {args:?}");
+        assert_eq!(
+            history["suppressed"], doc["gaps_suppressed"],
+            "args {args:?}"
+        );
+        assert!(gaps.len() as u64 <= expected_limit, "args {args:?}");
+    }
+}

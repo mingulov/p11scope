@@ -982,3 +982,25 @@ fn pty_large_inventory_renders_through_bounded_views() {
     assert!(text.contains("4096 edges"), "{text}");
     assert!(text.contains("^ +"), "{text}");
 }
+
+#[test]
+fn starved_windows_stay_honest_about_showing_nothing() {
+    // A room too small for even the minimal block shows the honest
+    // line (never bare markers), and the range names 0-0 (never an
+    // edge the frame does not show).
+    let presentation = varied_presentation();
+    assert!(!presentation.edges.is_empty());
+    let (lines, shown) = render_edge_window(&presentation, 80, 2, 0);
+    assert_eq!(shown, 0);
+    assert_eq!(
+        lines,
+        vec!["(no edges fit here; scroll or enlarge the terminal)".to_string()]
+    );
+    assert_eq!(visible_edge_range(0, 13, 3), (0, 0));
+    assert_eq!(visible_edge_range(0, 0, 0), (0, 0));
+    // The normal path is unchanged: counts, not scroll arithmetic.
+    assert_eq!(visible_edge_range(2, 13, 1), (2, 3));
+    // Sanity: the same fixture shows edges once the room suffices.
+    let (_, shown) = render_edge_window(&presentation, 80, 7, 0);
+    assert!(shown > 0);
+}

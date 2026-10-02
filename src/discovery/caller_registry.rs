@@ -540,6 +540,21 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
 /// against in-place replacement between passes. Two callers mapping
 /// different objects at the same path are distinct instances; the path is
 /// an attribute, never identity.
+///
+/// Boundary (F7b, S1): file identity is NOT load-instance authority.
+/// A same-file double-load (two loader mappings of one file — notably
+/// a `dlmopen` private-namespace double-load, whose objects own
+/// distinct PKCS#11 session namespaces) carries one key and merges
+/// into one module and one edge, and overlapping numeric session
+/// handles from the two instances join there; no layer below S1 can
+/// see the second load (scan groups mappings by (device, inode),
+/// uprobes attach by (path, file offset), events carry no mapping
+/// discriminator), so neither separation nor double-load detection
+/// exists here. For `dlopen` in one namespace the merge is correct
+/// (same file → same loaded object → one session namespace). Pinned by
+/// `d2_same_file_double_load_merges_boundary_for_s2`; S2's instance
+/// authority must replace that pin with a separation regression (see
+/// `docs/notes/s2-instance-authority.md`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ModuleKey {
     Physical {
@@ -1157,6 +1172,14 @@ impl CallerRegistry {
     /// come from the existing trusted-slot mechanism path; the feed
     /// boundary copies them, never invents. Fed by the privileged
     /// semantic lane; the scan lane stages no semantic calls.
+    ///
+    /// D4-positive (an owned multi-mechanism workload through the real
+    /// `p11scope inventory` binary showing observed mechanism/operation
+    /// context) is EXPLICITLY OPEN: p11scope observes calls only via
+    /// eBPF uprobes, which need privilege, so routing trusted events
+    /// here belongs to the controller's privileged BPF capture lane
+    /// (inventory uprobe activation under `attach::inventory`, decoded
+    /// via `events::decode`) — not to this unprivileged scan lane.
     #[allow(dead_code)] // Privileged semantic-feed seam; unit tests pin the semantics.
     pub(crate) fn observe_semantic(
         &mut self,

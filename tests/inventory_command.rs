@@ -544,6 +544,15 @@ fn out_file_matches_stdout_document() {
 
 // ---------------------------------------------------------------------------
 // S1/D4: mechanism/operation context at command level.
+//
+// D4-positive (an owned multi-mechanism workload through the real
+// binary showing OBSERVED mechanism/operation context) is EXPLICITLY
+// OPEN: trusted per-call events need the privileged BPF capture lane
+// (see `observe_semantic`), which this unprivileged suite cannot run.
+// These two tests pin the scan lane's honest contract instead — the
+// S1-extended schema renders with withheld unknowns, stderr stays
+// honest on degraded runs — so the privileged lane inherits a
+// documented baseline, not a silent gap.
 // ---------------------------------------------------------------------------
 
 /// An owned provider-mapping fixture process, terminated and reaped

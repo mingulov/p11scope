@@ -589,11 +589,13 @@ fn d2_identical_handles_across_modules_never_merge() {
 
 #[test]
 fn d2_same_inode_distinct_instances_never_join() {
-    // F7b (option a): two module INSTANCES sharing one inode (same
+    // F7b companion: two module INSTANCES sharing one inode (same
     // device + inode, distinct content hashes — in-place replacement
     // generations, distinct ModuleKeys per the file-identity
     // contract) in ONE process, using overlapping numeric session
-    // handles: their operations never join.
+    // handles: their operations never join. (The same-FILE case —
+    // identical key — merges; see
+    // d2_same_file_double_load_merges_boundary_for_s2.)
     let mut harness = harness();
     let spec = ScaleSpec {
         name: "s1-same-inode",
@@ -665,6 +667,100 @@ fn d2_same_inode_distinct_instances_never_join() {
     }
     mechs.sort_unstable();
     assert_eq!(mechs, vec![RSA_PSS, AES_GCM]);
+}
+
+#[test]
+fn d2_same_file_double_load_merges_boundary_for_s2() {
+    // F7b path (3): S1 BOUNDARY PIN — an actual same-file double-load
+    // (two mappings of one file, one (dev, ino, sha) key) merges into
+    // ONE module and ONE edge, and overlapping numeric session handles
+    // from the two instances join in that edge's single session
+    // namespace. No detection exists either: no gap names the
+    // double-load. This test pins the S1 boundary — S2's instance
+    // authority MUST replace it with a separation regression (see
+    // docs/notes/s2-instance-authority.md).
+    //
+    // Why neither separation (1) nor fail-closed detection (2) is
+    // achievable at this layer — the merge happens five times over,
+    // every layer below S1:
+    // - scan: `candidate_groups` (discovery/scan.rs) groups every
+    //   mapping by ObjectKey (device, inode); one ScannedModule per
+    //   group. MapEntry addresses never survive ObjectKey::of.
+    // - identity: `insert_entry_with_aliases` (discovery/identity.rs)
+    //   pins same-file observations to one pinned object.
+    // - observation: uprobes attach by (path, absolute file offset)
+    //   (attach.rs `slot_attach_point`), so one probe fires for every
+    //   same-file mapping; `Event` carries no mapping discriminator.
+    // - feed: `SemanticCall` carries no instance field, and
+    //   `observe_semantic` routes by (caller, ModuleKey).
+    // - registry: `apply_mapping` merges same-key notes into one
+    //   module/edge (caller_registry.rs).
+    // For dlopen in one namespace the merge is CORRECT (same file →
+    // same loaded object → one PKCS#11 session namespace); the blind
+    // case is a dlmopen private-namespace double-load (distinct
+    // objects and namespaces, identical file), which no layer here
+    // can see. R0 doctrine binds this: a pathname/hash alone cannot
+    // prove a semantic module instance.
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "s1-double-load",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 9950,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let caller = caller_of(&harness, 9950);
+    let key = scale_key(0);
+    // The second load of the SAME file: identical key (same device,
+    // inode, bytes), a distinct loader mapping the scan evidence
+    // cannot distinguish from a re-scan of the first.
+    let now = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_mapping(
+        caller,
+        9950,
+        ModuleInfo {
+            path: "/scale/m0-second-load.so".into(),
+            key: key.clone(),
+            build_id: None,
+            identity_source: Some("workload".into()),
+            admission: crate::discovery::caller_registry::AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        },
+        now,
+    );
+    harness.commit();
+    // The merge: one module, one edge — separation would mint two of
+    // each (asserting 2 fails with left 1; see the fix-round-2
+    // report for the retained RED run).
+    assert_eq!(harness.render()["modules"].as_array().unwrap().len(), 1);
+    assert_eq!(harness.render()["edges"].as_array().unwrap().len(), 1);
+    // Overlapping numeric handle 7 on BOTH instances, different
+    // mechanisms and categories: every call joins the one edge's
+    // single session namespace.
+    harness.observe_semantic(caller, &key, init("C_SignInit", 7, RSA_PSS, 100));
+    harness.observe_semantic(caller, &key, op("C_Sign", 7, 110));
+    harness.observe_semantic(caller, &key, init("C_EncryptInit", 7, AES_GCM, 120));
+    harness.observe_semantic(caller, &key, op("C_Encrypt", 7, 130));
+    let document = render(&mut harness);
+    assert_eq!(document["modules"].as_array().unwrap().len(), 1);
+    let edges = document["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    // The join is silent AND total: the merged edge is
+    // indistinguishable from one instance doing sign-then-encrypt —
+    // both mechanisms attributed, both operations completed, zero
+    // orphans.
+    assert_eq!(edges[0]["mechanisms"].as_array().unwrap().len(), 2);
+    assert_eq!(edges[0]["operations"]["started"], 2);
+    assert_eq!(edges[0]["operations"]["completed"], 2);
+    assert_eq!(edges[0]["operations"]["orphans"], 0);
+    // No detection exists either: the double-load leaves no gap at
+    // all, let alone a named instance-ambiguity gap.
+    assert_eq!(document["gaps"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -947,11 +1043,12 @@ fn d3_canonical_churn_storm_stays_withheld_and_agrees() {
     assert_four_way_semantic_agreement(&document, &presentation);
 }
 
-#[test]
-fn d3_divergent_edges_compare_per_edge_across_all_outputs() {
-    // F6 focused regression: several edges with deliberately different
-    // counts, categories, recencies, returns, and gaps — each
-    // dashboard edge's facts must match its own JSON edge.
+/// The F6 divergent fixture: 7 edges with deliberately different
+/// counts, categories, recencies, returns, and gaps, plus 3 gaps
+/// with distinct subjects. Staged and fed; the caller renders.
+/// Shared by the four-way proof and the 80x14 display leg so both
+/// validate the SAME fixture.
+fn divergent_harness() -> Harness {
     let mut harness = harness();
     let spec = ScaleSpec {
         name: "s1-divergent",
@@ -1032,6 +1129,15 @@ fn d3_divergent_edges_compare_per_edge_across_all_outputs() {
         .coordinator_mut()
         .registry_mut()
         .observe_entries(caller, &scale_key(99), 5, now);
+    harness
+}
+
+#[test]
+fn d3_divergent_edges_compare_per_edge_across_all_outputs() {
+    // F6 focused regression: several edges with deliberately different
+    // counts, categories, recencies, returns, and gaps — each
+    // dashboard edge's facts must match its own JSON edge.
+    let mut harness = divergent_harness();
     let document = render(&mut harness);
     let edge = |module: &str| edge_json(&document, "c0", module);
     assert_eq!(edge("m0")["operations"]["started"], 2);
@@ -1055,6 +1161,199 @@ fn d3_divergent_edges_compare_per_edge_across_all_outputs() {
     assert_eq!(document["gaps"].as_array().unwrap().len(), 3);
     let presentation = presentation_for(&harness, &document);
     assert_four_way_semantic_agreement(&document, &presentation);
+}
+
+#[test]
+fn d3_divergent_fixture_displays_at_80x14_with_honest_budgets() {
+    // F6 display leg: the SAME divergent fixture at the minimal full
+    // viewport (80x14, 7-row edge window). Every edge is reachable via
+    // scroll with its identity, states, counts, and operations; the
+    // tight room shaves expandable detail (mechanism rows, evidence
+    // counters, gap rows) with explicit markers instead of rejecting
+    // whole blocks. Exact item matches pin the 80-column fit (a
+    // truncated item could never match whole).
+    let mut harness = divergent_harness();
+    let document = render(&mut harness);
+    let presentation = presentation_for(&harness, &document);
+    let frame = crate::inventory_dashboard::DisplayFrame {
+        presentation: std::sync::Arc::new(presentation.clone()),
+        log: crate::inventory_dashboard::LogTail::bounded().snapshot(),
+    };
+    let edges = document["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 7, "the divergent fixture has seven edges");
+    let gaps = document["gaps"].as_array().unwrap();
+    for (index, edge_json) in edges.iter().enumerate() {
+        let caller = edge_json["caller"].as_str().unwrap();
+        let module = edge_json["module"].as_str().unwrap();
+        let mut state = DashboardState::new();
+        for _ in 0..index {
+            state.scroll_down(edges.len());
+        }
+        let bytes = render_frame(
+            &frame,
+            Viewport {
+                width: 80,
+                height: 14,
+            },
+            &state,
+        );
+        let text = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+        assert_eq!(text.lines().count(), 14, "scroll {index} fills 80x14");
+        assert!(
+            !text.contains("no edges fit"),
+            "scroll {index} shows its edge: {text}"
+        );
+        let blocks = dashboard_edge_blocks(&text);
+        assert_eq!(blocks.len(), 1, "scroll {index} shows one block: {text}");
+        let block = blocks
+            .get(&(caller.to_string(), module.to_string()))
+            .unwrap_or_else(|| panic!("scroll {index} shows {caller}->{module}: {text}"));
+        let view = presentation
+            .edges
+            .iter()
+            .find(|edge| edge.caller.label() == caller && edge.module.label() == module)
+            .unwrap();
+        for (state, name) in [
+            (view.presence.label(), "presence"),
+            (view.capture.label(), "capture"),
+            (view.activity.label(), "activity"),
+        ] {
+            assert!(
+                block.contains(&format!("{name} {state}")),
+                "scroll {index} {name}: {block}"
+            );
+        }
+        assert!(
+            block.contains(&format!(
+                "mapping {}",
+                edge_json["mapping"]["state"].as_str().unwrap()
+            )),
+            "scroll {index} mapping: {block}"
+        );
+        assert!(
+            block.contains(&format!("entries {}", edge_json["entries"]["count"])),
+            "scroll {index} entries: {block}"
+        );
+        let label = edge_json["semantics"].as_str().unwrap();
+        assert!(
+            block.contains(&format!("semantics {label}")),
+            "scroll {index} label: {block}"
+        );
+        let items = dashboard_items(block);
+        // Riding gaps hide behind an explicitly counted marker.
+        let riding = gaps
+            .iter()
+            .filter(|gap| {
+                (gap["caller"].is_null() || gap["caller"].as_str() == Some(caller))
+                    && (gap["module"].is_null() || gap["module"].as_str() == Some(module))
+            })
+            .count();
+        assert!(
+            riding > 0,
+            "the divergent fixture names every edge in a gap"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item == &format!("gaps +{riding} hidden")),
+            "scroll {index} gap marker: {block}"
+        );
+        assert!(
+            !block.contains("gap ["),
+            "scroll {index} shows no gap rows: {block}"
+        );
+        if edge_json["operations"].is_null() {
+            assert!(
+                !block.contains("mechs ")
+                    && !block.contains("ops ")
+                    && !block.contains("active ")
+                    && !block.contains("ev ")
+                    && !block.contains("evidence "),
+                "scroll {index} bare label: {block}"
+            );
+        } else {
+            // Mechanism rows shave to zero; the count and the hidden
+            // rows stay explicit.
+            let mechs = edge_json["mechanisms"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0);
+            if mechs == 0 {
+                assert!(
+                    items.iter().any(|item| item == "mechs 0: none"),
+                    "scroll {index} empty mechs: {block}"
+                );
+            } else {
+                assert!(
+                    items.iter().any(|item| item == &format!("mechs {mechs}")),
+                    "scroll {index} mech count: {block}"
+                );
+                assert!(
+                    items
+                        .iter()
+                        .any(|item| item == &format!("+{mechs} more mechs")),
+                    "scroll {index} mech marker: {block}"
+                );
+            }
+            assert!(
+                !block.contains("mech ["),
+                "scroll {index} shows no mech rows: {block}"
+            );
+            // Operations render whole; evidence hides counted.
+            let ops = &edge_json["operations"];
+            for expected in [
+                format!(
+                    "ops calls={} started={} completed={} cancelled={}",
+                    ops["calls"], ops["started"], ops["completed"], ops["cancelled"],
+                ),
+                format!(
+                    "ops failed={} unknown={} orphans={} dropped={} last={}",
+                    ops["failed"],
+                    ops["unknown"],
+                    ops["orphans"],
+                    ops["dropped"],
+                    ops["last_seen_ns"],
+                ),
+            ] {
+                assert!(
+                    items.iter().any(|item| item == &expected),
+                    "scroll {index} {expected}: {block}"
+                );
+            }
+            assert!(
+                items.iter().any(|item| item == "active none"),
+                "scroll {index} idle active: {block}"
+            );
+            assert!(
+                items.iter().any(|item| item == "evidence +9 hidden"),
+                "scroll {index} evidence marker: {block}"
+            );
+            assert!(
+                !block.contains("ev "),
+                "scroll {index} shows no ev rows: {block}"
+            );
+        }
+        // The header range names exactly the shown edge; markers point
+        // both directions except at the ends.
+        assert!(
+            text.contains(&format!("--- edges {}-{} of 7", index + 1, index + 1)),
+            "scroll {index} honest range: {text}"
+        );
+        assert!(
+            text.contains(&format!("scroll {index}/6")),
+            "scroll {index} honest footer: {text}"
+        );
+        assert_eq!(
+            text.contains("more above"),
+            index > 0,
+            "scroll {index} above marker: {text}"
+        );
+        assert_eq!(
+            text.contains("more below"),
+            index + 1 < edges.len(),
+            "scroll {index} below marker: {text}"
+        );
+    }
 }
 
 /// Parse the dashboard's per-edge blocks: identity lines start at
@@ -1099,6 +1398,51 @@ fn dashboard_edge_blocks(dashboard: &str) -> BTreeMap<(String, String), String> 
     }
     flush(&mut current);
     blocks
+}
+
+/// One dashboard gap row as the renderer formats it: the snapshot
+/// gap line verbatim (subject, reason, budget clause), built here
+/// from the JSON gap independently of the renderer.
+fn dashboard_gap_line(gap: &serde_json::Value) -> String {
+    let mut line = format!(
+        "gap [{}] {}",
+        gap["subject"].as_str().unwrap(),
+        gap["reason"].as_str().unwrap()
+    );
+    if !gap["budget"].is_null() {
+        line.push_str(&format!(
+            " (budget {}: limit {}, requested {})",
+            gap["budget"]["resource"].as_str().unwrap(),
+            gap["budget"]["limit"],
+            gap["budget"]["requested"],
+        ));
+    }
+    line
+}
+
+/// Split a dashboard edge block into its exact pieces: the identity
+/// line, then every wrapped item. Item lines rejoin with `|` because
+/// the renderer wraps BETWEEN items without repeating the separator;
+/// the wrap never splits mid-item, so every piece is whole. Counter
+/// assertions match whole pieces, so `ev reconc=0` can never match a
+/// `reconc=10`. (Item text in these fixtures carries no `|`; gap rows
+/// assert via `contains`, not via this splitter.)
+fn dashboard_items(block: &str) -> Vec<String> {
+    // Blocks carry the frame's own `\x1b[K` line ends; strip those
+    // (and only those) before splitting into exact items.
+    let clean = block.replace("\x1b[K", "");
+    let mut lines = clean.lines();
+    let mut pieces = Vec::new();
+    if let Some(identity) = lines.next() {
+        pieces.push(identity.trim().to_string());
+    }
+    let rest: String = lines.collect::<Vec<_>>().join("|");
+    pieces.extend(
+        rest.split('|')
+            .map(|piece| piece.trim().to_string())
+            .filter(|piece| !piece.is_empty()),
+    );
+    pieces
 }
 
 /// JSON vs snapshot vs dashboard vs stream on one capture (F6/C1/D3):
@@ -1230,8 +1574,42 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
         assert_eq!(streamed["event"]["presence"], view.presence.label());
         assert_eq!(streamed["event"]["capture"], view.capture.label());
         assert_eq!(streamed["event"]["activity"], view.activity.label());
+        // Riding gaps (every edge, including unknown ones): the
+        // dashboard block shows each gap that names this edge — global
+        // gaps ride all blocks, caller gaps their caller's blocks,
+        // module-qualified gaps exactly their edge — as the snapshot
+        // gap line verbatim. Coverage holes are edge-relevant
+        // regardless of semantic state.
+        let riding: Vec<&serde_json::Value> = document["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|gap| {
+                (gap["caller"].is_null() || gap["caller"].as_str() == Some(caller))
+                    && (gap["module"].is_null() || gap["module"].as_str() == Some(module))
+            })
+            .collect();
+        for gap in &riding {
+            assert!(
+                block.contains(&dashboard_gap_line(gap)),
+                "dashboard gap [{}] for {caller}->{module}: {block}",
+                gap["subject"].as_str().unwrap(),
+            );
+        }
+        assert_eq!(
+            block.matches("gap [").count(),
+            riding.len(),
+            "dashboard gap rows for {caller}->{module}: {block}"
+        );
+        // Proof viewports are roomy: nothing hides behind a marker.
+        assert!(
+            !block.contains("hidden"),
+            "dashboard full detail for {caller}->{module}: {block}"
+        );
         if edge_json["operations"].is_null() {
-            // Unknown edge: the bare label everywhere, no detail rows.
+            // Unknown edge: the bare semantic label everywhere, no
+            // semantic detail rows (gaps above are coverage rows, not
+            // semantic detail).
             assert!(
                 snapshot_line.ends_with(&format!("semantics {label}")),
                 "snapshot bare label for {caller}->{module}: {snapshot_line}"
@@ -1240,7 +1618,9 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
                 !block.contains("mechs ")
                     && !block.contains("mech [")
                     && !block.contains("ops ")
-                    && !block.contains("active "),
+                    && !block.contains("active ")
+                    && !block.contains("ev ")
+                    && !block.contains("hidden"),
                 "dashboard bare label for {caller}->{module}: {block}"
             );
             continue;
@@ -1332,7 +1712,8 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             );
         }
         // Operation aggregates: every counter plus recency, active
-        // machines, and (snapshot) the evidence counters.
+        // machines, and the nine evidence counters — in the snapshot
+        // segment and the dashboard's own block.
         let ops = &edge_json["operations"];
         assert!(
             snapshot_line.contains(&format!(
@@ -1349,21 +1730,24 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             )),
             "snapshot ops for {caller}->{module}: {snapshot_line}"
         );
-        assert!(
-            block.contains(&format!(
-                "ops {} calls {} started {} completed {} cancelled {} failed {} unknown {} orphans {} dropped last_seen {}",
-                ops["calls"],
-                ops["started"],
-                ops["completed"],
-                ops["cancelled"],
-                ops["failed"],
-                ops["unknown"],
-                ops["orphans"],
-                ops["dropped"],
-                ops["last_seen_ns"],
-            )),
-            "dashboard ops for {caller}->{module}: {block}"
-        );
+        // Operation aggregates: two whole items with correct labels
+        // (each label names its own counter), matched exactly.
+        let items = dashboard_items(block);
+        for expected in [
+            format!(
+                "ops calls={} started={} completed={} cancelled={}",
+                ops["calls"], ops["started"], ops["completed"], ops["cancelled"],
+            ),
+            format!(
+                "ops failed={} unknown={} orphans={} dropped={} last={}",
+                ops["failed"], ops["unknown"], ops["orphans"], ops["dropped"], ops["last_seen_ns"],
+            ),
+        ] {
+            assert!(
+                items.iter().any(|item| item == &expected),
+                "dashboard {expected} for {caller}->{module}: {block}"
+            );
+        }
         let active = ops["active"]
             .as_array()
             .unwrap()
@@ -1409,6 +1793,25 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             )),
             "snapshot evidence for {caller}->{module}: {snapshot_line}"
         );
+        // Dashboard evidence: the same nine counters as compact `ev`
+        // items (full JSON key → short dashboard key), matched whole.
+        for (full, short) in [
+            ("state_reconciliations", "reconc"),
+            ("session_cancel_ambiguities", "cancel_amb"),
+            ("session_cancel_unknown_flags", "cancel_flags"),
+            ("operation_state_imports", "op_imports"),
+            ("auth_state_ambiguities", "auth_amb"),
+            ("semantic_capture_failures", "cap_fail"),
+            ("async_duplicates", "async_dup"),
+            ("async_evictions", "async_evict"),
+            ("unmatched_closes", "unmatch_close"),
+        ] {
+            let expected = format!("ev {short}={}", evidence[full]);
+            assert!(
+                items.iter().any(|item| item == &expected),
+                "dashboard {expected} for {caller}->{module}: {block}"
+            );
+        }
     }
     // Totals, budgets, and gaps across all outputs.
     let scope = document["scope"].as_str().unwrap();
@@ -1622,6 +2025,7 @@ fn d5_matched_runs_report_identical_totals_with_measured_overhead() {
             .registry_mut()
             .set_usage_feed(true);
         let now = harness.now_ns();
+        let mut fed = 0u64;
         for (index, (caller_index, module_index)) in spec.layout().iter().enumerate() {
             let pid = spec.first_pid + *caller_index as u32;
             let caller = caller_of(&harness, pid);
@@ -1633,16 +2037,20 @@ fn d5_matched_runs_report_identical_totals_with_measured_overhead() {
                 now,
             );
             if semantic {
-                feed_semantic_script(&mut harness, caller, &key, index);
+                fed += feed_semantic_script(&mut harness, caller, &key, index);
             }
         }
         let started = std::time::Instant::now();
         harness.commit();
         let document = harness.render();
-        (document, started.elapsed())
+        (document, started.elapsed(), fed)
     };
-    let (base, base_elapsed) = run(false);
-    let (sem, sem_elapsed) = run(true);
+    let (base, base_elapsed, _) = run(false);
+    let (sem, sem_elapsed, fed) = run(true);
+    // The scripted denominator, pinned against the script (F8): 64
+    // edges × the 4-class script (2 + 2 + 1 + 1 calls) = 96 fed.
+    assert_eq!(spec.layout().len(), 64);
+    assert_eq!(fed, 96);
     // Capture totals identical modulo the semantic extension.
     assert_eq!(
         base["callers"].as_array().unwrap().len(),
@@ -1688,23 +2096,32 @@ fn d5_matched_runs_report_identical_totals_with_measured_overhead() {
             > 0
     );
     eprintln!(
-        "S1 overhead over {} edges: baseline {base_elapsed:?}, semantic {sem_elapsed:?}",
+        "S1 overhead over {} edges ({} semantic calls fed): baseline {base_elapsed:?}, semantic {sem_elapsed:?}",
         spec.layout().len(),
+        fed,
     );
 }
 
 /// Deterministic per-edge semantic script (D5): completed signs,
-/// in-flight encrypts, failed Inits, and unauthorized feeds.
-fn feed_semantic_script(harness: &mut Harness, caller: CallerId, key: &ModuleKey, index: usize) {
+/// in-flight encrypts, failed Inits, and unauthorized feeds. Returns
+/// the number of calls fed (2 + 2 + 1 + 1 per 4 edges).
+fn feed_semantic_script(
+    harness: &mut Harness,
+    caller: CallerId,
+    key: &ModuleKey,
+    index: usize,
+) -> u64 {
     let ts = 1000 + index as u64;
     match index % 4 {
         0 => {
             harness.observe_semantic(caller, key, init("C_SignInit", 7, RSA_PSS, ts));
             harness.observe_semantic(caller, key, op("C_Sign", 7, ts + 1));
+            2
         }
         1 => {
             harness.observe_semantic(caller, key, init("C_EncryptInit", 7, AES_GCM, ts));
             harness.observe_semantic(caller, key, op("C_EncryptUpdate", 7, ts + 1));
+            2
         }
         2 => {
             let failed = SemanticCall {
@@ -1712,11 +2129,13 @@ fn feed_semantic_script(harness: &mut Harness, caller: CallerId, key: &ModuleKey
                 ..init("C_SignInit", 7, RSA_PSS, ts)
             };
             harness.observe_semantic(caller, key, failed);
+            1
         }
         _ => {
             let mut unauthorized = init("C_SignInit", 7, RSA_PSS, ts);
             unauthorized.authorized = false;
             harness.observe_semantic(caller, key, unauthorized);
+            1
         }
     }
 }

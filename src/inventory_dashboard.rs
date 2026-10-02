@@ -490,7 +490,17 @@ fn render_full(
         ),
     ];
     // Log rows adapt to short terminals; the edge table takes the rest.
-    let log_rows: usize = if height >= 20 { 4 } else { 2 };
+    // At the minimal full height (14) the log yields its second row so
+    // the edge window keeps a 5-row middle budget: one observed edge
+    // (identity, states, counts, operations) plus both scroll markers.
+    // The log still shows its latest line and the drop counts below.
+    let log_rows: usize = if height >= 20 {
+        4
+    } else if height >= 15 {
+        2
+    } else {
+        1
+    };
     // Header (3) + edge-table header (1) + log header (1) + log rows + footer (1).
     let edge_room = height.saturating_sub(3 + 1 + 1 + log_rows + 1).max(2);
     let (mut edge_lines, shown) = render_edge_window(presentation, width, edge_room, scroll);
@@ -546,10 +556,31 @@ fn render_full(
     lines
 }
 
+/// Per-edge detail budget: how much of an edge's expandable detail
+/// (mechanism rows, evidence counters, gap rows) its block may show.
+/// [`fit_edge_block`] shaves this budget stage by stage until the
+/// block fits the window's remaining room — every hidden fact stays
+/// explicitly counted by a marker, never silently dropped.
+#[derive(Debug, Clone, Copy)]
+struct BlockBudget {
+    /// Mechanism rows shown (of the edge's total; the rest collapse
+    /// into the `+N more mechs` marker).
+    mech_rows: usize,
+    /// Whether the nine `ev …` counters render (else an
+    /// `evidence +N hidden` marker counts them).
+    show_evidence: bool,
+    /// Whether riding gap rows render (else a `gaps +N hidden`
+    /// marker counts them).
+    show_gaps: bool,
+}
+
 /// Render the visible edge window as whole edge blocks: `^ +K more
 /// above` when scrolled, then blocks, then `v +M more below` when the
 /// room runs out. Every block carries full exact state labels (items
-/// wrap on ` | ` boundaries, never mid-label).
+/// wrap on ` | ` boundaries, never mid-label); expandable detail
+/// shaves to the remaining room via [`fit_edge_block`], so a short
+/// viewport narrows detail — always with explicit markers — instead
+/// of rejecting whole edges.
 /// Returns the window lines plus the count of edge blocks actually
 /// emitted (the header range derives from this count, never from
 /// re-parsing rendered text).
@@ -571,16 +602,29 @@ fn render_edge_window(
     }
     let mut shown = 0;
     for edge in presentation.edges.iter().skip(scroll) {
-        let block = render_edge_block(presentation, edge, width);
+        let remaining_after = total - scroll - shown - 1;
         // Reserve one line for the `more below` marker when edges
         // remain after this block.
-        let remaining_after = total - scroll - shown - 1;
-        let need = block.len() + usize::from(remaining_after > 0);
-        if lines.len() + need > room {
+        let reserve = usize::from(remaining_after > 0);
+        let budget = room.saturating_sub(lines.len() + reserve);
+        let Some(block) = fit_edge_block(presentation, edge, width, budget) else {
             break;
-        }
+        };
         shown += 1;
         lines.extend(block);
+    }
+    if shown == 0 {
+        // Nothing fits at this scroll position (tight room, tall
+        // minimal blocks): say so honestly instead of showing bare
+        // markers under a range that claims an edge. The footer keeps
+        // the scroll position, so this line can never strand a reader.
+        return (
+            vec![truncate_cell(
+                "(no edges fit here; scroll or enlarge the terminal)",
+                width,
+            )],
+            0,
+        );
     }
     let hidden_below = total.saturating_sub(scroll + shown);
     if hidden_below > 0 {
@@ -592,27 +636,77 @@ fn render_edge_window(
             ));
         }
     }
-    if lines.is_empty() {
-        lines.push(truncate_cell("(no edges fit; enlarge the terminal)", width));
-    }
     (lines, shown)
 }
 
+/// Render one edge's block within `budget` rows, shaving expandable
+/// detail until it fits: mechanism rows shrink 8→0 first (the longest,
+/// least dense rows), then evidence hides, then gaps hide — each
+/// stage with explicit markers. `None` when even the minimal block
+/// (identity, states, counts, operations, markers) exceeds the budget;
+/// the window then stops honestly instead of cropping a block.
+/// The full-detail stage renders first, so roomy viewports pay
+/// exactly one render; only tight rooms walk the shave stages.
+fn fit_edge_block(
+    presentation: &Presentation,
+    edge: &crate::inventory_present::EdgeView,
+    width: usize,
+    budget: usize,
+) -> Option<Vec<String>> {
+    let full = BlockBudget {
+        mech_rows: DASHBOARD_MAX_MECHS,
+        show_evidence: true,
+        show_gaps: true,
+    };
+    let block = render_edge_block(presentation, edge, width, full);
+    if block.len() <= budget {
+        return Some(block);
+    }
+    for mech_rows in (0..DASHBOARD_MAX_MECHS).rev() {
+        let stage = BlockBudget {
+            mech_rows,
+            show_evidence: true,
+            show_gaps: true,
+        };
+        let block = render_edge_block(presentation, edge, width, stage);
+        if block.len() <= budget {
+            return Some(block);
+        }
+    }
+    for (show_evidence, show_gaps) in [(false, true), (false, false)] {
+        let stage = BlockBudget {
+            mech_rows: 0,
+            show_evidence,
+            show_gaps,
+        };
+        let block = render_edge_block(presentation, edge, width, stage);
+        if block.len() <= budget {
+            return Some(block);
+        }
+    }
+    None
+}
+
 /// Dashboard mechanism facts: the count plus one item per mechanism
-/// (bounded by [`DASHBOARD_MAX_MECHS`], with an explicit `+N more
-/// mechs` marker past the cap — bounded, never silent). Each shown
-/// mech mirrors its snapshot segment — verbatim id, name, operation
-/// categories, counts, recency, provenance — so every dashboard
-/// edge's facts compare against its JSON edge (F6/C1).
+/// (bounded by the block budget — full detail shows
+/// [`DASHBOARD_MAX_MECHS`], tight rooms shave toward zero — with an
+/// explicit `+N more mechs` marker past the shown rows: bounded,
+/// never silent). Each shown mech mirrors its snapshot segment —
+/// verbatim id, name, operation categories, counts, recency,
+/// provenance — so every dashboard edge's facts compare against its
+/// JSON edge (F6/C1).
 pub(crate) const DASHBOARD_MAX_MECHS: usize = 8;
 
-fn semantic_mech_items(mechanisms: &[crate::inventory_present::MechanismView]) -> Vec<String> {
+fn semantic_mech_items(
+    mechanisms: &[crate::inventory_present::MechanismView],
+    mech_rows: usize,
+) -> Vec<String> {
     let mut items = vec![if mechanisms.is_empty() {
         "mechs 0: none".to_string()
     } else {
         format!("mechs {}", mechanisms.len())
     }];
-    for mech in mechanisms.iter().take(DASHBOARD_MAX_MECHS) {
+    for mech in mechanisms.iter().take(mech_rows) {
         let id = match mech.name {
             Some(name) => format!("{name}/0x{:x}", mech.id),
             None => format!("0x{:x}", mech.id),
@@ -633,18 +727,89 @@ fn semantic_mech_items(mechanisms: &[crate::inventory_present::MechanismView]) -
             if mech.truncated { " truncated" } else { "" },
         ));
     }
-    let hidden = mechanisms.len().saturating_sub(DASHBOARD_MAX_MECHS);
+    let hidden = mechanisms.len().saturating_sub(mech_rows);
     if hidden > 0 {
         items.push(format!("+{hidden} more mechs"));
     }
     items
 }
 
+/// The nine operation-evidence counters as compact `ev {short}={n}`
+/// items — one item per counter so narrow viewports wrap instead of
+/// truncating. Short keys (legend; full JSON key → dashboard key):
+/// `state_reconciliations` → `reconc`,
+/// `session_cancel_ambiguities` → `cancel_amb`,
+/// `session_cancel_unknown_flags` → `cancel_flags`,
+/// `operation_state_imports` → `op_imports`,
+/// `auth_state_ambiguities` → `auth_amb`,
+/// `semantic_capture_failures` → `cap_fail`,
+/// `async_duplicates` → `async_dup`,
+/// `async_evictions` → `async_evict`,
+/// `unmatched_closes` → `unmatch_close`.
+fn evidence_items(operations: &crate::inventory_present::OperationsView) -> Vec<String> {
+    let evidence = operations.evidence;
+    [
+        ("reconc", evidence.state_reconciliations),
+        ("cancel_amb", evidence.session_cancel_ambiguities),
+        ("cancel_flags", evidence.session_cancel_unknown_flags),
+        ("op_imports", evidence.operation_state_imports),
+        ("auth_amb", evidence.auth_state_ambiguities),
+        ("cap_fail", evidence.semantic_capture_failures),
+        ("async_dup", evidence.async_duplicates),
+        ("async_evict", evidence.async_evictions),
+        ("unmatch_close", evidence.unmatched_closes),
+    ]
+    .iter()
+    .map(|(short, value)| format!("ev {short}={value}"))
+    .collect()
+}
+
+/// Gaps that name this edge: global gaps (no caller/module) ride
+/// every block, caller gaps ride their caller's blocks, and
+/// module-qualified gaps ride exactly their edge. Coverage holes are
+/// edge-relevant regardless of semantic state, so unknown edges show
+/// them too — the bare semantic label stays bare; gaps are coverage
+/// rows, not semantic detail.
+fn riding_gaps<'a>(
+    presentation: &'a Presentation,
+    edge: &crate::inventory_present::EdgeView,
+) -> Vec<&'a crate::inventory_present::GapView> {
+    presentation
+        .gaps
+        .iter()
+        .filter(|gap| {
+            gap.caller.is_none_or(|caller| caller == edge.caller)
+                && gap.module.is_none_or(|module| module == edge.module)
+        })
+        .collect()
+}
+
+/// One gap as its snapshot line verbatim (`gap [{subject}] {reason}`
+/// plus the budget clause when the gap records a refusal),
+/// control-escaped for the terminal.
+fn gap_item(gap: &crate::inventory_present::GapView) -> String {
+    let subject = escape_controls(&gap.subject);
+    let reason = escape_controls(&gap.reason);
+    match gap.budget {
+        Some(refusal) => format!(
+            "gap [{subject}] {reason} (budget {}: limit {}, requested {})",
+            refusal.resource, refusal.limit, refusal.requested,
+        ),
+        None => format!("gap [{subject}] {reason}"),
+    }
+}
+
 /// One edge as an identity line plus wrapped exact state items.
+/// Item order is stable: base states, mechanism facts, evidence
+/// counters, riding gaps, operation aggregates, active machines.
+/// Expandable detail (mech rows, evidence, gaps) follows `budget`;
+/// hidden detail counts itself in a marker in the same slot its rows
+/// would occupy, so shaved blocks pack like full ones.
 fn render_edge_block(
     presentation: &Presentation,
     edge: &crate::inventory_present::EdgeView,
     width: usize,
+    budget: BlockBudget,
 ) -> Vec<String> {
     let caller_exe = presentation
         .callers
@@ -685,13 +850,32 @@ fn render_edge_block(
         format!("semantics {}", edge.semantics.label),
     ];
     if let Some(operations) = edge.semantics.operations.as_ref() {
-        items.extend(semantic_mech_items(&edge.semantics.mechanisms));
+        items.extend(semantic_mech_items(
+            &edge.semantics.mechanisms,
+            budget.mech_rows,
+        ));
+        let evidence = evidence_items(operations);
+        if budget.show_evidence {
+            items.extend(evidence);
+        } else {
+            items.push(format!("evidence +{} hidden", evidence.len()));
+        }
+    }
+    let riding = riding_gaps(presentation, edge);
+    if budget.show_gaps {
+        items.extend(riding.iter().map(|gap| gap_item(gap)));
+    } else if !riding.is_empty() {
+        items.push(format!("gaps +{} hidden", riding.len()));
+    }
+    if let Some(operations) = edge.semantics.operations.as_ref() {
+        // Two items (not one long line) so 80-column viewports wrap
+        // instead of truncating; each label names its own counter.
         items.push(format!(
-            "ops {} calls {} started {} completed {} cancelled {} failed {} unknown {} orphans {} dropped last_seen {}",
-            operations.calls,
-            operations.started,
-            operations.completed,
-            operations.cancelled,
+            "ops calls={} started={} completed={} cancelled={}",
+            operations.calls, operations.started, operations.completed, operations.cancelled,
+        ));
+        items.push(format!(
+            "ops failed={} unknown={} orphans={} dropped={} last={}",
             operations.failed,
             operations.unknown,
             operations.orphans,
@@ -744,14 +928,12 @@ fn render_edge_block(
 /// Derived from the emitted-block COUNT the window returns, not from
 /// arithmetic over the scroll or by re-parsing rendered text — the
 /// header can never claim edges the frame does not show, and a
-/// future reformat cannot silently degrade the range.
+/// future reformat cannot silently degrade the range. An empty window
+/// names 0-0 (nothing shown) alongside the window's honest message;
+/// the footer still carries the scroll position.
 fn visible_edge_range(shown: usize, total: usize, scroll: usize) -> (usize, usize) {
-    if total == 0 {
+    if total == 0 || shown == 0 {
         return (0, 0);
-    }
-    if shown == 0 {
-        let at = scroll.min(total.saturating_sub(1)) + 1;
-        return (at, at);
     }
     (scroll + 1, scroll + shown)
 }

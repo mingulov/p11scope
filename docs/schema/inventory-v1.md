@@ -42,6 +42,15 @@ never a changed meaning for an existing field.
   was not consulted. `lifecycle` is `mapped`, `unloaded` (a complete
   rescan proved it gone; sticky in `unloaded_observed` even across a
   reload), or `unknown` (no live mapping evidence remains).
+  Boundary: the key is file identity, not load-instance authority —
+  a same-file double-load (two loader mappings of one file, notably
+  a `dlmopen` private-namespace double-load whose objects own
+  distinct PKCS#11 session namespaces) merges into one record and
+  one edge per caller, joining the instances' session namespaces
+  with no marking gap. For `dlopen` in one namespace the merge is
+  correct (same file → same loaded object → one session namespace);
+  the `dlmopen` case is S2 scope (instance authority — see
+  `docs/notes/s2-instance-authority.md`).
 - `edges[]`: one record per (caller incarnation, module instance)
   pair. `mapping` is scan evidence (state `mapped`, `ended`, or
   `uncertain`, with first/last seen and an interruption count of

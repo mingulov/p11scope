@@ -60,6 +60,27 @@ impl PreparedInventory {
     ) -> Result<Self> {
         Self::prepare_inner_flavor(
             scope,
+            None,
+            endpoint_budget,
+            backend,
+            InventoryFlavor::Callers(caller_budget),
+            #[cfg(test)]
+            |_, _| Ok(()),
+        )
+    }
+
+    /// The capture facade's caller preparation: PID scope keeps the custody
+    /// the facade already opened and checked, instead of opening another.
+    pub(crate) fn prepare_callers_pinned(
+        scope: Scope,
+        pin: Option<PidPin>,
+        endpoint_budget: InventoryBudget,
+        caller_budget: CallerBudget,
+        backend: AttachBackend,
+    ) -> Result<Self> {
+        Self::prepare_inner_flavor(
+            scope,
+            pin,
             endpoint_budget,
             backend,
             InventoryFlavor::Callers(caller_budget),
@@ -84,6 +105,7 @@ impl PreparedInventory {
     ) -> Result<Self> {
         Self::prepare_inner_flavor(
             scope,
+            None,
             budget,
             backend,
             InventoryFlavor::Global,
@@ -94,6 +116,7 @@ impl PreparedInventory {
 
     fn prepare_inner_flavor(
         scope: Scope,
+        pinned: Option<PidPin>,
         budget: InventoryBudget,
         backend: AttachBackend,
         flavor: InventoryFlavor,
@@ -106,12 +129,25 @@ impl PreparedInventory {
                 "caller endpoint budget differs from Inventory budget"
             );
         }
-        let pid_pin = match &scope {
-            Scope::Pid(pid) => {
+        let pid_pin = match (&scope, pinned) {
+            (Scope::Pid(pid), pinned) => {
                 NonZeroU32::new(*pid).context("Inventory PID must be non-zero")?;
-                Some(PidPin::open(*pid).map_err(anyhow::Error::msg)?)
+                match pinned {
+                    Some(pin) => {
+                        ensure!(
+                            pin.pid() == *pid,
+                            "Inventory PID custody names pid {} instead of {pid}",
+                            pin.pid()
+                        );
+                        Some(pin)
+                    }
+                    None => Some(PidPin::open(*pid).map_err(anyhow::Error::msg)?),
+                }
             }
-            Scope::Cgroup { .. } | Scope::System => None,
+            (Scope::Cgroup { .. } | Scope::System, None) => None,
+            (Scope::Cgroup { .. } | Scope::System, Some(_)) => {
+                bail!("Inventory PID custody supplied for a non-PID scope")
+            }
         };
         let btf = Btf::from_sys_fs().context("loading required vmlinux BTF for Inventory")?;
         let state = PreparingInventory {
@@ -688,3 +724,4 @@ mod tests;
 
 mod activation;
 mod callers;
+pub(crate) mod capture;

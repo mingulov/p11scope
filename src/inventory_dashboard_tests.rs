@@ -1697,7 +1697,7 @@ fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
     harness
         .coordinator_mut()
         .registry_mut()
-        .note_health_regression("CALLER_EVIDENCE rose", at + 5);
+        .note_health_regression("CALLER_EVIDENCE rose", at + 5, at + 5);
     harness.commit();
     harness.advance(10);
     let at2 = harness.now_ns();
@@ -1729,7 +1729,7 @@ fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
         [
             "counted",
             "witnessed",
-            "unknown/loss",
+            "watched_no_use",
             "unknown/loss",
             "watched_no_use",
             "unknown/not_admitted",
@@ -1856,10 +1856,13 @@ fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
             }
         }
     }
-    // The sticky demotion keeps m2 unknown although it was re-watched.
-    assert_eq!(edges_json[2]["entries"]["coverage"]["reason"], "loss");
+    // The demotion keeps m3's interval unknown; m2's re-watch is a new
+    // interval that starts after the regression, never inside it.
+    assert_eq!(edges_json[3]["entries"]["coverage"]["reason"], "loss");
     assert_eq!(
-        edges_json[2]["entries"]["coverage"]["detail"],
+        edges_json[3]["entries"]["coverage"]["detail"],
         "CALLER_EVIDENCE rose"
     );
+    assert_eq!(edges_json[2]["entries"]["coverage"]["since_ns"], at2);
+    assert!(edges_json[2]["entries"]["coverage"]["until_ns"].is_null());
 }

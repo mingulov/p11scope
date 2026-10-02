@@ -740,7 +740,14 @@ pub(crate) fn coverage_label(coverage: &UseCoverage) -> String {
         UseCoverage::Witnessed { first_ns } => {
             format!("used, count unavailable (first {first_ns})")
         }
-        UseCoverage::WatchedNoUse { since_ns } => format!("no use since {since_ns}"),
+        UseCoverage::WatchedNoUse {
+            since_ns,
+            until_ns: None,
+        } => format!("no use since {since_ns}"),
+        UseCoverage::WatchedNoUse {
+            since_ns,
+            until_ns: Some(until_ns),
+        } => format!("no use from {since_ns} to {until_ns}"),
         UseCoverage::Unknown(reason) => format!("unknown ({})", reason.text()),
     }
 }

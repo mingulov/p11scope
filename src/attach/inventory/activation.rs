@@ -6,6 +6,7 @@ use super::{AttachBackend, InventoryBudget, InventoryFlavor, PreparedInventory, 
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, RetainedInventoryTarget};
 use crate::events::{DiscoveryItem, OwnedDiscoveryDrain};
 use crate::plan::{AdmissionPolicy, AttachPlan};
+use crate::process::PidPin;
 use anyhow::{Context as _, Result, bail, ensure};
 use aya::Ebpf;
 use aya::maps::{Array, PerCpuArray};
@@ -26,7 +27,7 @@ use retirement::{
     RetirementWork, abandon_and_reclaim_with,
 };
 
-struct InventoryTargets {
+pub(super) struct InventoryTargets {
     budget: InventoryBudget,
     allocated: Vec<u32>,
     entries: Vec<InventoryEndpoint>,
@@ -34,11 +35,12 @@ struct InventoryTargets {
     changed: Cell<bool>,
 }
 
-struct InventoryEndpoint {
-    id: u32,
-    object: PinnedObjectId,
-    file_offset: u64,
-    abi: ElfAbi,
+#[derive(Clone, Copy)]
+pub(super) struct InventoryEndpoint {
+    pub(super) id: u32,
+    pub(super) object: PinnedObjectId,
+    pub(super) file_offset: u64,
+    pub(super) abi: ElfAbi,
 }
 
 impl InventoryTargets {
@@ -82,6 +84,67 @@ impl InventoryTargets {
         Ok(targets)
     }
 
+    /// An empty table the capture facade grows one attach-set delta at a
+    /// time. Its object keys are the attach set's capture-lifetime object
+    /// indices (published as ENDPOINT_OBJECT object IDs); like every
+    /// `PinnedObjectId` they mean nothing outside this table.
+    pub(super) fn for_capture(budget: InventoryBudget) -> Self {
+        Self {
+            budget,
+            allocated: Vec::new(),
+            entries: Vec::new(),
+            pins: BTreeMap::new(),
+            changed: Cell::new(false),
+        }
+    }
+
+    pub(super) fn budget(&self) -> InventoryBudget {
+        self.budget
+    }
+
+    pub(super) fn holds_object(&self, object: PinnedObjectId) -> bool {
+        self.pins.contains_key(&object)
+    }
+
+    pub(super) fn object_abi(&self, object: PinnedObjectId) -> Option<ElfAbi> {
+        self.pins.get(&object).map(RetainedInventoryTarget::abi)
+    }
+
+    /// Takes custody of one object's retained pin (a shared clone of the
+    /// attach set's opened file: no reopen, no new descriptor).
+    pub(super) fn retain_object(&mut self, object: PinnedObjectId, pin: RetainedInventoryTarget) {
+        self.pins.entry(object).or_insert(pin);
+    }
+
+    /// Records one attempted endpoint at its sorted position (the bounded
+    /// per-ID pin lookups binary-search this table). IDs may arrive in any
+    /// order — a deferred backlog after a newer delta — but never twice.
+    pub(super) fn record_entry(&mut self, entry: InventoryEndpoint) -> Result<()> {
+        let at = self
+            .entries
+            .partition_point(|recorded| recorded.id < entry.id);
+        ensure!(
+            self.entries
+                .get(at)
+                .is_none_or(|recorded| recorded.id != entry.id),
+            "Inventory endpoint {} is already recorded",
+            entry.id
+        );
+        self.allocated.push(entry.id);
+        self.entries.insert(at, entry);
+        Ok(())
+    }
+
+    /// The recorded entry IDs, in table order.
+    #[cfg(test)]
+    pub(super) fn entry_ids(&self) -> Vec<u32> {
+        self.entries.iter().map(|entry| entry.id).collect()
+    }
+
+    pub(super) fn check_object(&self, object: PinnedObjectId) -> Result<()> {
+        self.check_pin(object)
+    }
+
     fn check_unchanged(&self) -> Result<()> {
         for id in self.pins.keys() {
             self.check_pin(*id)?;
@@ -113,6 +176,53 @@ fn validate_activation(
         !matches!(scope, Scope::Pid(_)),
         "Inventory PID activation requires generation-safe I2c scope"
     );
+    validate_activation_common(backend, budget, targets)
+}
+
+/// The capture facade's activation: the one path that admits PID scope.
+/// Its entries attach with `UProbeScope::OneProcess` and the retained
+/// original pidfd must be live, so a reused PID can never be selected.
+pub(super) fn validate_capture_activation(
+    scope: &Scope,
+    pin: Option<&PidPin>,
+    backend: AttachBackend,
+    budget: InventoryBudget,
+    targets: &InventoryTargets,
+) -> Result<()> {
+    match scope {
+        Scope::Pid(pid) => {
+            let pin = pin.context("Inventory PID capture requires retained PID custody")?;
+            ensure!(
+                pin.pid() == *pid,
+                "Inventory PID capture custody names pid {} instead of {pid}",
+                pin.pid()
+            );
+            require_live_pid_custody(pin)?;
+        }
+        Scope::System => {}
+        Scope::Cgroup { .. } => bail!("Inventory capture does not offer cgroup scope yet"),
+    }
+    validate_activation_common(backend, budget, targets)
+}
+
+/// PID custody the capture facade accepts: the original pidfd (never the
+/// start-time fallback) whose process has not exited.
+pub(super) fn require_live_pid_custody(pin: &PidPin) -> Result<()> {
+    pin.pidfd()
+        .context("Inventory PID capture requires the original pidfd, not a start-time pin")?;
+    ensure!(
+        !pin.original_exited().map_err(anyhow::Error::msg)?,
+        "Inventory PID capture target {} exited; its PID may already name another process",
+        pin.pid()
+    );
+    Ok(())
+}
+
+fn validate_activation_common(
+    backend: AttachBackend,
+    budget: InventoryBudget,
+    targets: &InventoryTargets,
+) -> Result<()> {
     ensure!(
         backend == AttachBackend::Singles,
         "Inventory I3a activation supports Singles only"
@@ -124,7 +234,7 @@ fn validate_activation(
     targets.check_unchanged()
 }
 
-enum InventoryAttachRequest<'a> {
+pub(super) enum InventoryAttachRequest<'a> {
     Lifecycle {
         program: &'static str,
         tracepoint: &'static str,
@@ -137,7 +247,7 @@ enum InventoryAttachRequest<'a> {
     },
 }
 
-trait InventoryLinkIo {
+pub(super) trait InventoryLinkIo {
     type Link;
     fn publish_endpoint(&mut self, endpoint: u32, object: PinnedObjectId) -> Result<()>;
     fn attach(&mut self, request: InventoryAttachRequest<'_>) -> Result<Self::Link>;
@@ -148,28 +258,28 @@ trait InventoryLinkIo {
 }
 
 #[derive(Debug, Default)]
-struct InventoryCleanupReceipt {
-    attempted: usize,
-    closed: usize,
-    failures: Vec<InventoryDetachFailure>,
+pub(super) struct InventoryCleanupReceipt {
+    pub(super) attempted: usize,
+    pub(super) closed: usize,
+    pub(super) failures: Vec<InventoryDetachFailure>,
     callback_quiescence_proven: bool,
 }
 
 #[derive(Debug)]
-struct InventoryDetachFailure {
-    target: InventoryLinkIdentity,
-    error: anyhow::Error,
+pub(super) struct InventoryDetachFailure {
+    pub(super) target: InventoryLinkIdentity,
+    pub(super) error: anyhow::Error,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InventoryLinkIdentity {
+pub(super) enum InventoryLinkIdentity {
     Lifecycle(&'static str),
     Entry(u32),
 }
 
-struct InventoryLinked<L> {
-    target: InventoryLinkIdentity,
-    handle: L,
+pub(super) struct InventoryLinked<L> {
+    pub(super) target: InventoryLinkIdentity,
+    pub(super) handle: L,
 }
 
 struct InventoryAttachFailure<L> {
@@ -193,69 +303,15 @@ fn attach_inventory_with<I: InventoryLinkIo>(
         targets.check_unchanged()?;
         // Validate every immutable target before the first lifecycle link too.
         for entry in &targets.entries {
-            let pin = targets
-                .pins
-                .get(&entry.object)
-                .context("missing Inventory target pin")?;
-            ensure!(
-                entry.abi == pin.abi(),
-                "Inventory target ABI differs from retained pin"
-            );
-            ensure!(
-                u64::from(entry.id) < targets.budget.endpoint_limit(),
-                "Inventory endpoint ID exceeds N"
-            );
+            validate_entry(targets, entry)?;
         }
         for entry in &targets.entries {
             io.publish_endpoint(entry.id, entry.object)
                 .with_context(|| format!("publishing Inventory endpoint {}", entry.id))?;
         }
-        for program in ["sched_process_exec", "sched_process_exit"] {
-            let handle = io
-                .attach(InventoryAttachRequest::Lifecycle {
-                    program,
-                    tracepoint: program,
-                })
-                .with_context(|| format!("attaching Inventory lifecycle {program}"))?;
-            links.push(InventoryLinked {
-                target: InventoryLinkIdentity::Lifecycle(program),
-                handle,
-            });
-            if let Some(error) = io.attachment_error(&links.last().unwrap().handle) {
-                bail!(error);
-            }
-        }
+        attach_roots_with(io, &mut links)?;
         for entry in &targets.entries {
-            let pin = &targets.pins[&entry.object];
-            targets
-                .check_pin(entry.object)
-                .with_context(|| format!("before Inventory entry {}", entry.id))?;
-            let program = match entry.abi {
-                ElfAbi::Lp64 => "p11_usage_entry_lp64",
-                ElfAbi::Ilp32 => "p11_usage_entry_ia32",
-            };
-            let path = pin.attach_path();
-            let cookie =
-                (u64::from(p11scope_ebpf_common::INVENTORY_COOKIE_TAG) << 32) | u64::from(entry.id);
-            let handle = io
-                .attach(InventoryAttachRequest::Entry {
-                    program,
-                    path: &path,
-                    file_offset: entry.file_offset,
-                    cookie,
-                })
-                .with_context(|| format!("attaching Inventory entry {}", entry.id))?;
-            // Register immediately, before any post-attach check can fail.
-            links.push(InventoryLinked {
-                target: InventoryLinkIdentity::Entry(entry.id),
-                handle,
-            });
-            if let Some(error) = io.attachment_error(&links.last().unwrap().handle) {
-                bail!(error);
-            }
-            targets
-                .check_pin(entry.object)
-                .with_context(|| format!("during Inventory entry {} attachment", entry.id))?;
+            attach_published_entry_with(io, targets, entry, &mut links)?;
         }
         targets.check_unchanged()
     })();
@@ -269,6 +325,93 @@ fn attach_inventory_with<I: InventoryLinkIo>(
             links,
         }),
     }
+}
+
+/// One entry's immutable checks: a retained pin, the pin's ABI, and an ID
+/// below the prepared object's endpoint capacity N.
+pub(super) fn validate_entry(targets: &InventoryTargets, entry: &InventoryEndpoint) -> Result<()> {
+    let pin = targets
+        .pins
+        .get(&entry.object)
+        .context("missing Inventory target pin")?;
+    ensure!(
+        entry.abi == pin.abi(),
+        "Inventory target ABI differs from retained pin"
+    );
+    ensure!(
+        u64::from(entry.id) < targets.budget.endpoint_limit(),
+        "Inventory endpoint ID exceeds N"
+    );
+    Ok(())
+}
+
+/// The two lifecycle roots, attached once per object. Each link enters
+/// custody before its post-acquisition check can fail.
+pub(super) fn attach_roots_with<I: InventoryLinkIo>(
+    io: &mut I,
+    links: &mut Vec<InventoryLinked<I::Link>>,
+) -> Result<()> {
+    for program in ["sched_process_exec", "sched_process_exit"] {
+        let handle = io
+            .attach(InventoryAttachRequest::Lifecycle {
+                program,
+                tracepoint: program,
+            })
+            .with_context(|| format!("attaching Inventory lifecycle {program}"))?;
+        links.push(InventoryLinked {
+            target: InventoryLinkIdentity::Lifecycle(program),
+            handle,
+        });
+        if let Some(error) = io.attachment_error(&links.last().unwrap().handle) {
+            bail!(error);
+        }
+    }
+    Ok(())
+}
+
+/// Attaches one entry whose ENDPOINT_OBJECT binding is already published:
+/// pin unchanged before, the link registered immediately, then the
+/// post-acquisition custody check and the pin unchanged after. A failure
+/// leaves any acquired link in `links`.
+pub(super) fn attach_published_entry_with<I: InventoryLinkIo>(
+    io: &mut I,
+    targets: &InventoryTargets,
+    entry: &InventoryEndpoint,
+    links: &mut Vec<InventoryLinked<I::Link>>,
+) -> Result<()> {
+    let pin = targets
+        .pins
+        .get(&entry.object)
+        .context("missing Inventory target pin")?;
+    targets
+        .check_pin(entry.object)
+        .with_context(|| format!("before Inventory entry {}", entry.id))?;
+    let program = match entry.abi {
+        ElfAbi::Lp64 => "p11_usage_entry_lp64",
+        ElfAbi::Ilp32 => "p11_usage_entry_ia32",
+    };
+    let path = pin.attach_path();
+    let cookie =
+        (u64::from(p11scope_ebpf_common::INVENTORY_COOKIE_TAG) << 32) | u64::from(entry.id);
+    let handle = io
+        .attach(InventoryAttachRequest::Entry {
+            program,
+            path: &path,
+            file_offset: entry.file_offset,
+            cookie,
+        })
+        .with_context(|| format!("attaching Inventory entry {}", entry.id))?;
+    // Register immediately, before any post-attach check can fail.
+    links.push(InventoryLinked {
+        target: InventoryLinkIdentity::Entry(entry.id),
+        handle,
+    });
+    if let Some(error) = io.attachment_error(&links.last().unwrap().handle) {
+        bail!(error);
+    }
+    targets
+        .check_pin(entry.object)
+        .with_context(|| format!("during Inventory entry {} attachment", entry.id))
 }
 
 fn stop_inventory_links_with<I: InventoryLinkIo>(
@@ -299,13 +442,13 @@ fn stop_inventory_links_with<I: InventoryLinkIo>(
     receipt
 }
 
-struct InventoryReadWindow {
+pub(super) struct InventoryReadWindow {
     max_cells: usize,
     deadline: Instant,
 }
 
 impl InventoryReadWindow {
-    fn new(max_cells: usize, deadline: Instant) -> Result<Self> {
+    pub(super) fn new(max_cells: usize, deadline: Instant) -> Result<Self> {
         if max_cells == 0 {
             bail!("Inventory read window must permit a positive number of cells");
         }
@@ -389,7 +532,7 @@ struct InventoryUsageRead {
 
 /// Ordinary cookies require Aya's fd-backed perf link path. Keep an unexpected
 /// representation or registry-transfer error owned and explicitly quarantined.
-enum KernelInventoryLink {
+pub(super) enum KernelInventoryLink {
     Fds(Vec<FdLink>),
     UnexpectedUProbe(UProbeLink),
     RegistryUncertain {
@@ -398,12 +541,18 @@ enum KernelInventoryLink {
     },
 }
 
-struct AyaInventoryLinkIo<'a> {
+pub(super) struct AyaInventoryLinkIo<'a> {
     ebpf: &'a mut Ebpf,
     caller: bool,
+    /// `OneProcess` only for the capture facade's PID scope; every other
+    /// path is process-wide with BPF scoping.
+    entry_scope: UProbeScope,
     #[cfg(test)]
-    before_attach: &'a mut dyn FnMut(&InventoryAttachRequest<'_>) -> Result<()>,
+    before_attach: Option<&'a mut BeforeAttach<'a>>,
 }
+
+#[cfg(test)]
+type BeforeAttach<'a> = dyn FnMut(&InventoryAttachRequest<'_>) -> Result<()> + 'a;
 
 impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
     type Link = KernelInventoryLink;
@@ -418,7 +567,9 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
 
     fn attach(&mut self, request: InventoryAttachRequest<'_>) -> Result<Self::Link> {
         #[cfg(test)]
-        (self.before_attach)(&request)?;
+        if let Some(hook) = self.before_attach.as_mut() {
+            hook(&request)?;
+        }
         match request {
             InventoryAttachRequest::Lifecycle {
                 program,
@@ -453,7 +604,7 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
                     location: UProbeAttachLocation::AbsoluteOffset(file_offset),
                     cookie: Some(cookie),
                 };
-                let id = probe.attach([point], path, UProbeScope::AllProcesses)?;
+                let id = probe.attach([point], path, self.entry_scope)?;
                 Ok(match probe.take_link(id) {
                     Ok(link) => match link.into_fd_links() {
                         Ok(links) => KernelInventoryLink::Fds(links),
@@ -505,7 +656,7 @@ fn close_inventory_fds(links: &mut Vec<FdLink>) -> Result<()> {
 }
 
 /// Field custody and Drop keep links ahead of programs, maps and exact pins.
-struct InventoryState {
+pub(super) struct InventoryState {
     links: Vec<InventoryLinked<KernelInventoryLink>>,
     discovery: Option<OwnedDiscoveryDrain>,
     prepared: PreparedInventory,
@@ -686,6 +837,78 @@ impl InventoryState {
     }
 }
 
+/// Read-side accessors the capture facade uses. None of them hands out
+/// links, programs, or a mutable object.
+impl InventoryState {
+    pub(super) fn ebpf(&self) -> &Ebpf {
+        &self.prepared.ebpf
+    }
+
+    pub(super) fn pid_pin(&self) -> Option<&PidPin> {
+        self.prepared.pid_pin.as_ref()
+    }
+
+    pub(super) fn endpoint_capacity(&self) -> u32 {
+        self.prepared.capacity.get()
+    }
+
+    pub(super) fn health(&mut self, deadline: Instant) -> InventoryHealthSnapshot {
+        let health =
+            read_inventory_health_flavor(&self.prepared.ebpf, deadline, self.prepared.flavor);
+        self.health_read_failures = self
+            .health_read_failures
+            .saturating_add(health.failures.len() as u64);
+        health
+    }
+
+    /// Rechecks at most `max` held object pins after `after`, in object
+    /// order (`fstat` of each retained fd, no reopen): `Ok(true)`
+    /// unchanged, `Ok(false)` modified in place, `Err` unreadable. Returns
+    /// the cursor for the next call (`None` once the end was reached).
+    #[allow(clippy::type_complexity)]
+    pub(super) fn recheck_pins(
+        &mut self,
+        after: Option<PinnedObjectId>,
+        max: usize,
+    ) -> (
+        Vec<(PinnedObjectId, std::result::Result<bool, String>)>,
+        Option<PinnedObjectId>,
+    ) {
+        use std::ops::Bound;
+        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut checked = Vec::new();
+        for (object, pin) in self.targets.pins.range((lower, Bound::Unbounded)).take(max) {
+            let verdict = pin.check_unchanged();
+            match verdict {
+                Ok(true) => {}
+                Ok(false) => self.targets.changed.set(true),
+                Err(_) => self.pin_check_failures = self.pin_check_failures.saturating_add(1),
+            }
+            checked.push((*object, verdict));
+        }
+        let next = (checked.len() == max)
+            .then(|| checked.last().map(|(object, _)| *object))
+            .flatten();
+        (checked, next)
+    }
+
+    pub(super) fn malformed_discovery(&self) -> u64 {
+        self.malformed_discovery
+    }
+
+    pub(super) fn pin_check_failures(&self) -> u64 {
+        self.pin_check_failures
+    }
+
+    pub(super) fn live_links(&self) -> usize {
+        self.links.len()
+    }
+
+    pub(super) fn dequeue_discovery(&mut self) -> Result<Option<DiscoveryRecord>> {
+        self.discovery_dequeue()
+    }
+}
+
 impl Drop for InventoryState {
     fn drop(&mut self) {
         if self.links.is_empty() {
@@ -706,19 +929,19 @@ impl Drop for InventoryState {
     }
 }
 
-struct ActiveInventory {
+pub(super) struct ActiveInventory {
     state: InventoryState,
 }
 
-struct RetiredInventory {
+pub(super) struct RetiredInventory {
     state: InventoryState,
-    cleanup: InventoryCleanupReceipt,
+    pub(super) cleanup: InventoryCleanupReceipt,
 }
 
 /// A deadline returns control with this same owned capability intact. Dropping
 /// it is a blocking, explicitly abandoned reclamation path, not bounded stop.
 #[must_use]
-struct RetiringInventory {
+pub(super) struct RetiringInventory {
     state: Option<InventoryState>,
     job: Option<RetirementJob<Vec<FdLink>>>,
     unstarted: Option<RetirementWork<Vec<FdLink>>>,
@@ -766,7 +989,7 @@ impl RetiringInventory {
         retiring
     }
 
-    fn poll_completion(&mut self, deadline: Instant) -> Result<bool> {
+    pub(super) fn poll_completion(&mut self, deadline: Instant) -> Result<bool> {
         if self.cleanup.is_some() {
             return Ok(true);
         }
@@ -797,7 +1020,7 @@ impl RetiringInventory {
         }
     }
 
-    fn service_discovery(
+    pub(super) fn service_discovery(
         &mut self,
         max_records: usize,
         deadline: Instant,
@@ -819,7 +1042,20 @@ impl RetiringInventory {
         self.state.as_ref().unwrap().fallback.clone()
     }
 
-    fn try_finish(mut self) -> std::result::Result<RetiredInventory, Box<Self>> {
+    /// The retained state, until `try_finish` transfers it.
+    pub(super) fn state(&self) -> Option<&InventoryState> {
+        self.state.as_ref()
+    }
+
+    pub(super) fn state_mut(&mut self) -> Option<&mut InventoryState> {
+        self.state.as_mut()
+    }
+
+    pub(super) fn control_error(&self) -> Option<&str> {
+        self.control_error.as_deref()
+    }
+
+    pub(super) fn try_finish(mut self) -> std::result::Result<RetiredInventory, Box<Self>> {
         let Some(cleanup) = self.cleanup.take() else {
             return Err(Box::new(self));
         };
@@ -854,16 +1090,16 @@ impl Drop for RetiringInventory {
 }
 
 #[derive(Default, Debug)]
-struct InventoryDiscoveryService {
-    dispatched: usize,
-    record_bound_reached: bool,
-    deadline_reached: bool,
+pub(super) struct InventoryDiscoveryService {
+    pub(super) dispatched: usize,
+    pub(super) record_bound_reached: bool,
+    pub(super) deadline_reached: bool,
 }
 
-struct InventoryDispatchFailure {
-    record: Option<Box<DiscoveryRecord>>,
-    error: anyhow::Error,
-    dispatched: usize,
+pub(super) struct InventoryDispatchFailure {
+    pub(super) record: Option<Box<DiscoveryRecord>>,
+    pub(super) error: anyhow::Error,
+    pub(super) dispatched: usize,
 }
 
 impl fmt::Debug for InventoryDispatchFailure {
@@ -876,7 +1112,7 @@ impl fmt::Debug for InventoryDispatchFailure {
     }
 }
 
-fn service_inventory_discovery_with(
+pub(super) fn service_inventory_discovery_with(
     max_records: usize,
     deadline: Instant,
     mut dequeue: impl FnMut() -> Result<Option<DiscoveryRecord>>,
@@ -921,9 +1157,9 @@ fn service_inventory_discovery_with(
     Ok(service)
 }
 
-struct InventoryActivationFailure {
-    error: anyhow::Error,
-    retiring: Box<RetiringInventory>,
+pub(super) struct InventoryActivationFailure {
+    pub(super) error: anyhow::Error,
+    pub(super) retiring: Box<RetiringInventory>,
 }
 
 impl fmt::Display for InventoryActivationFailure {
@@ -997,8 +1233,10 @@ impl PreparedInventory {
         let mut io = AyaInventoryLinkIo {
             ebpf: &mut state.prepared.ebpf,
             caller: matches!(state.prepared.flavor, InventoryFlavor::Callers(_)),
+            // validate_activation refused PID scope: process-wide only.
+            entry_scope: UProbeScope::AllProcesses,
             #[cfg(test)]
-            before_attach: &mut before_attach,
+            before_attach: Some(&mut before_attach),
         };
         match attach_inventory_with(&mut io, &state.targets) {
             Ok(links) => {
@@ -1016,7 +1254,116 @@ impl PreparedInventory {
     }
 }
 
+impl PreparedInventory {
+    /// The capture facade's one-time activation: validation (the PID-scope
+    /// path), the retained DISCOVERY reader, and the two lifecycle roots.
+    /// Entries attach later through `ActiveInventory::with_entry_io`. A
+    /// failure keeps every acquired link with the retirement capability.
+    pub(super) fn activate_roots(
+        self,
+        targets: InventoryTargets,
+    ) -> std::result::Result<ActiveInventory, InventoryActivationFailure> {
+        let mut state = InventoryState {
+            history: InventoryUsageHistory::new(Vec::new()),
+            links: vec![],
+            discovery: None,
+            prepared: self,
+            targets,
+            malformed_discovery: 0,
+            health_read_failures: 0,
+            pin_check_failures: 0,
+            fallback: RetirementFallbackEvidence::default(),
+        };
+        let ready = (|| -> Result<()> {
+            validate_capture_activation(
+                &state.prepared.scope,
+                state.prepared.pid_pin.as_ref(),
+                state.prepared.backend,
+                state.prepared.budget,
+                &state.targets,
+            )?;
+            state.discovery = Some(OwnedDiscoveryDrain::for_session(
+                &state.prepared.ebpf,
+                &state.prepared.discovery_domain,
+            )?);
+            Ok(())
+        })();
+        if let Err(error) = ready {
+            return Err(InventoryActivationFailure {
+                error,
+                retiring: Box::new(RetiringInventory::begin(state)),
+            });
+        }
+        let roots = {
+            let mut io = AyaInventoryLinkIo {
+                ebpf: &mut state.prepared.ebpf,
+                caller: matches!(state.prepared.flavor, InventoryFlavor::Callers(_)),
+                entry_scope: capture_entry_scope(&state.prepared.scope),
+                #[cfg(test)]
+                before_attach: None,
+            };
+            attach_roots_with(&mut io, &mut state.links)
+        };
+        match roots {
+            Ok(()) => Ok(ActiveInventory { state }),
+            Err(error) => Err(InventoryActivationFailure {
+                error,
+                retiring: Box::new(RetiringInventory::begin(state)),
+            }),
+        }
+    }
+}
+
+/// The capture facade's entry scope: `OneProcess` for PID scope (the same
+/// seam Detailed uses), so the kernel binds each entry to the original
+/// task and a reused PID never fires it; process-wide otherwise.
+fn capture_entry_scope(scope: &Scope) -> UProbeScope {
+    match scope {
+        Scope::Pid(pid) => match std::num::NonZeroU32::new(*pid) {
+            Some(pid) => UProbeScope::OneProcess(pid),
+            // prepare refused a zero PID; never widen to every process.
+            None => UProbeScope::CallingProcess,
+        },
+        Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses,
+    }
+}
+
 impl ActiveInventory {
+    /// The incremental entry seam: the real link IO plus the target table
+    /// and the link custody vector. Links never leave this object.
+    pub(super) fn with_entry_io<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut AyaInventoryLinkIo<'_>,
+            &mut InventoryTargets,
+            &mut Vec<InventoryLinked<KernelInventoryLink>>,
+            Option<&PidPin>,
+        ) -> R,
+    ) -> R {
+        let state = &mut self.state;
+        let mut io = AyaInventoryLinkIo {
+            ebpf: &mut state.prepared.ebpf,
+            caller: matches!(state.prepared.flavor, InventoryFlavor::Callers(_)),
+            entry_scope: capture_entry_scope(&state.prepared.scope),
+            #[cfg(test)]
+            before_attach: None,
+        };
+        f(
+            &mut io,
+            &mut state.targets,
+            &mut state.links,
+            state.prepared.pid_pin.as_ref(),
+        )
+    }
+
+    pub(super) fn state(&self) -> &InventoryState {
+        &self.state
+    }
+
+    pub(super) fn state_mut(&mut self) -> &mut InventoryState {
+        &mut self.state
+    }
+
     fn usage_snapshot(&mut self, window: InventoryReadWindow) -> InventoryUsageSnapshot {
         self.state.usage_snapshot(window, false)
     }
@@ -1025,12 +1372,20 @@ impl ActiveInventory {
         self.state.discovery_dequeue()
     }
 
-    fn begin_stop(self) -> RetiringInventory {
+    pub(super) fn begin_stop(self) -> RetiringInventory {
         RetiringInventory::begin(self.state)
     }
 }
 
 impl RetiredInventory {
+    pub(super) fn state(&self) -> &InventoryState {
+        &self.state
+    }
+
+    pub(super) fn state_mut(&mut self) -> &mut InventoryState {
+        &mut self.state
+    }
+
     fn usage_snapshot(&mut self, window: InventoryReadWindow) -> InventoryUsageSnapshot {
         self.state.usage_snapshot(window, true)
     }
@@ -1041,14 +1396,14 @@ impl RetiredInventory {
 }
 
 #[derive(Debug, Default)]
-struct InventoryHealthSnapshot {
-    discovery_counters: Option<[u64; 5]>,
-    evidence: Option<[u64; 9]>,
-    usage_evidence: Option<[u64; 3]>,
-    owner: Option<ThreadOwnerControl>,
-    caller_evidence: Option<[u64; 4]>,
-    caller_control: Option<p11scope_ebpf_common::ImageIdentityControl>,
-    failures: Vec<String>,
+pub(super) struct InventoryHealthSnapshot {
+    pub(super) discovery_counters: Option<[u64; 5]>,
+    pub(super) evidence: Option<[u64; 9]>,
+    pub(super) usage_evidence: Option<[u64; 3]>,
+    pub(super) owner: Option<ThreadOwnerControl>,
+    pub(super) caller_evidence: Option<[u64; 4]>,
+    pub(super) caller_control: Option<p11scope_ebpf_common::ImageIdentityControl>,
+    pub(super) failures: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1132,6 +1487,6 @@ fn read_inventory_health_flavor(
 }
 
 #[cfg(test)]
-mod privileged_tests;
+pub(super) mod privileged_tests;
 #[cfg(test)]
 mod tests;

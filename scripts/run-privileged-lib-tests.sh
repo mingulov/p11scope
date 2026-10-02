@@ -44,7 +44,7 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (55 ignored tests in the default-feature lib binary): 45 run by
+# Curation (60 ignored tests in the default-feature lib binary): 50 run by
 # default, 4 run only with --include-long, 6 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -85,6 +85,16 @@ attach::inventory::activation::privileged_tests::privileged_task4_inventory_n511
 attach::inventory::activation::privileged_tests::privileged_task4_inventory_n512_lp64
 attach::inventory::activation::privileged_tests::privileged_task4_inventory_n513_lp64
 attach::inventory::activation::privileged_tests::privileged_task4_inventory_physical_identity_controls
+# Task 6 C3 capture facade cells (each a few seconds, owned fixtures only):
+# late-provider extend, PID scope vs foreign and reused-PID callers (writes
+# /proc/sys/kernel/ns_last_pid to reuse the target's PID), pidfd cookie
+# query across a nonleader exec, stop with a held call, and the leader-exit
+# probe (leader pthread_exit while a worker keeps calling).
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_leader_exit_probe_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_with_held_call_reports_unsettled_lp64
 attach::inventory::privileged_tests::privileged_inventory_caller_preparation_faults_release_exact_resources
 attach::inventory::privileged_tests::privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_binding
 attach::inventory::privileged_tests::privileged_inventory_preparation_failure_releases_owned_resources

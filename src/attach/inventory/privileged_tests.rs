@@ -515,6 +515,7 @@ fn privileged_inventory_caller_preparation_faults_release_exact_resources() -> R
         let mut ids = OwnedIds::default();
         let error = PreparedInventory::prepare_inner_flavor(
             Scope::System,
+            None,
             endpoint,
             AttachBackend::Singles,
             InventoryFlavor::Callers(caller),

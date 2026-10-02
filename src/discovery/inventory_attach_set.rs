@@ -58,6 +58,37 @@ pub(crate) struct EndpointId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct AttachObjectId(u32);
 
+impl AttachObjectId {
+    /// The capture-lifetime index the capture facade publishes as the
+    /// ENDPOINT_OBJECT object ID (so CALLER_USE rows name this object).
+    pub(crate) const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// What the set knows about the endpoints one admitted module needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModuleMembers<'a> {
+    /// The module's admitted endpoints, in ID order. Coverage may claim
+    /// the module is watched only when every one is attached.
+    Known(&'a [EndpointId]),
+    /// Admitted, but the membership table was full when it was recorded:
+    /// completeness cannot be shown (`inventory_attach_memberships`).
+    Unrecorded,
+}
+
+/// The membership table's resource name, when its bound is reached.
+pub(crate) const MEMBERSHIP_RESOURCE: &str = "inventory_attach_memberships";
+/// Membership entries per endpoint of budget. A target two modules claim
+/// is one endpoint but two memberships; real providers share few targets.
+const MEMBERSHIP_FACTOR: usize = 4;
+
+#[derive(Debug, Clone)]
+struct ModuleRecord {
+    endpoints: usize,
+    members: Option<Vec<EndpointId>>,
+}
+
 /// One retained physical endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttachEndpoint {
@@ -155,8 +186,11 @@ pub(crate) struct InventoryAttachSet {
     /// endpoint budget.
     aliases: usize,
     by_content: BTreeMap<PinnedContentKey, Vec<AttachObjectId>>,
-    /// Endpoints each admitted module was last admitted with.
-    modules: BTreeMap<AttachModuleKey, usize>,
+    /// Endpoints each admitted module was last admitted with, and which
+    /// (bounded: `memberships` entries in all, at most
+    /// `MEMBERSHIP_FACTOR` per endpoint of budget).
+    modules: BTreeMap<AttachModuleKey, ModuleRecord>,
+    memberships: usize,
     /// `(module, refusal kind)` pairs already recorded as a gap, bounded
     /// by the endpoint budget; past the bound one overflow gap is
     /// recorded and further refusals live in module verdicts only.
@@ -177,6 +211,7 @@ impl InventoryAttachSet {
             aliases: 0,
             by_content: BTreeMap::new(),
             modules: BTreeMap::new(),
+            memberships: 0,
             reported: BTreeSet::new(),
             reported_overflow: false,
             endpoint_refusals: 0,
@@ -234,7 +269,19 @@ impl InventoryAttachSet {
     /// Endpoints the module was last admitted with, or `None` when it never
     /// was.
     pub(crate) fn module_endpoints(&self, module: &AttachModuleKey) -> Option<usize> {
-        self.modules.get(module).copied()
+        self.modules.get(module).map(|record| record.endpoints)
+    }
+
+    /// The endpoints one admitted module holds, or `None` when the set
+    /// never admitted it. The capture coverage producer (Task 6 C3) reads
+    /// this to tell a completely attached module from a partial one.
+    pub(crate) fn module_members(&self, module: &AttachModuleKey) -> Option<ModuleMembers<'_>> {
+        self.modules
+            .get(module)
+            .map(|record| match &record.members {
+                Some(members) => ModuleMembers::Known(members),
+                None => ModuleMembers::Unrecorded,
+            })
     }
 }
 
@@ -311,8 +358,8 @@ impl InventoryAttachSet {
             let Some(key) = module_key(pins, *object) else {
                 continue;
             };
-            let verdict = match self.modules.get(&key) {
-                Some(&kept) if kept > 0 => AttachVerdict::Admitted {
+            let verdict = match self.modules.get(&key).map(|record| record.endpoints) {
+                Some(kept) if kept > 0 => AttachVerdict::Admitted {
                     endpoints: kept,
                     reasons: vec![format!(
                         "this pass's Inventory lowering refused the module ({reason}); \
@@ -551,7 +598,8 @@ impl InventoryAttachSet {
         }) = refusal
         else {
             let endpoints = kept + fresh.len();
-            self.modules.insert(key.clone(), endpoints);
+            let members = self.members_of(wanted, resolved);
+            self.record_module(key, endpoints, members);
             return AttachVerdict::Admitted {
                 endpoints,
                 reasons: Vec::new(),
@@ -559,11 +607,9 @@ impl InventoryAttachSet {
         };
         // Partial coverage belongs only to a module this set admitted
         // before: `kept` alone can count targets another module added.
-        let admitted_before = self.modules.get_mut(key);
-        let verdict = if kept > 0
-            && let Some(record) = admitted_before
-        {
-            *record = kept;
+        let verdict = if kept > 0 && self.modules.contains_key(key) {
+            let members = self.members_of(wanted, resolved);
+            self.record_module(key, kept, members);
             // The plan's growth-omission prefix, so
             // `plan::growth_omitted_count` reads the omitted count.
             AttachVerdict::Admitted {
@@ -687,6 +733,43 @@ impl InventoryAttachSet {
 
     fn limit(&self) -> usize {
         usize::try_from(self.budget.endpoint_limit()).unwrap_or(usize::MAX)
+    }
+
+    /// The endpoint IDs a module's demand maps to right now, in ID order:
+    /// its retained targets (kept and just added), never its refused ones.
+    fn members_of(
+        &self,
+        wanted: &BTreeSet<(PinnedObjectId, u64)>,
+        resolved: &BTreeMap<PinnedObjectId, Resolution>,
+    ) -> Vec<EndpointId> {
+        let mut members: Vec<EndpointId> = wanted
+            .iter()
+            .filter_map(|(object, offset)| match resolved.get(object) {
+                Some(Resolution::Known(retained)) => {
+                    self.by_endpoint.get(&(*retained, *offset)).copied()
+                }
+                _ => None,
+            })
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        members
+    }
+
+    /// Replaces one module's record. Past the membership bound the module
+    /// stays admitted with its count, but its membership is unrecorded.
+    fn record_module(&mut self, key: &AttachModuleKey, endpoints: usize, members: Vec<EndpointId>) {
+        let previous = self
+            .modules
+            .get(key)
+            .and_then(|record| record.members.as_ref())
+            .map_or(0, Vec::len);
+        let bound = self.limit().saturating_mul(MEMBERSHIP_FACTOR);
+        let others = self.memberships - previous;
+        let members = (others + members.len() <= bound).then_some(members);
+        self.memberships = others + members.as_ref().map_or(0, Vec::len);
+        self.modules
+            .insert(key.clone(), ModuleRecord { endpoints, members });
     }
 }
 
@@ -1274,6 +1357,75 @@ pub(crate) mod tests {
                 .filter(|gap| gap.subject == CHANGED_SUBJECT)
                 .collect();
             assert_eq!(changed.len(), usize::from(pass == 0), "{:?}", outcome.gaps);
+        }
+    }
+
+    #[test]
+    fn module_members_name_each_admitted_modules_endpoints_and_stay_bounded() {
+        // Budget 8: membership bound 32. P holds 8 endpoints; seven
+        // forwarders each target all eight (8 memberships each).
+        let dir = tempfile::tempdir().unwrap();
+        let p = provider(&dir, "p.so", "provider-p");
+        let forwarders: Vec<PathBuf> = (0..7)
+            .map(|index| provider(&dir, &format!("f{index}.so"), &format!("forwarder-{index}")))
+            .collect();
+        let mut set = InventoryAttachSet::new(budget(8));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let mut files: Vec<(&Path, String)> = vec![(p.as_path(), "sha-p".into())];
+        files.extend(
+            forwarders
+                .iter()
+                .enumerate()
+                .map(|(index, path)| (path.as_path(), format!("sha-f{index}"))),
+        );
+        let borrowed: Vec<(&Path, &str)> = files
+            .iter()
+            .map(|(path, sha)| (*path, sha.as_str()))
+            .collect();
+        let pins = pass_pins(&borrowed);
+        let targets: Vec<(&Path, u64)> = offsets(8).into_iter().map(|o| (p.as_path(), o)).collect();
+        let mut modules = vec![module(&pins, &p, &offsets(8))];
+        modules.extend(
+            forwarders
+                .iter()
+                .map(|path| module_with_targets(&pins, path, &targets)),
+        );
+        let outcome = set.absorb(&lower_named(&modules, &pins, policy), &pins);
+        assert_eq!(set.len(), 8, "shared targets are one endpoint each");
+        let all: Vec<EndpointId> = (0..8).map(EndpointId).collect();
+        assert_eq!(
+            set.module_members(&key_in(&pins, &p)),
+            Some(ModuleMembers::Known(&all))
+        );
+        let recorded = forwarders
+            .iter()
+            .filter(|path| {
+                matches!(
+                    set.module_members(&key_in(&pins, path)),
+                    Some(ModuleMembers::Known(members)) if members == all.as_slice()
+                )
+            })
+            .count();
+        let unrecorded = forwarders
+            .iter()
+            .filter(|path| {
+                set.module_members(&key_in(&pins, path)) == Some(ModuleMembers::Unrecorded)
+            })
+            .count();
+        assert_eq!(
+            (recorded, unrecorded),
+            (3, 4),
+            "32 memberships fit, then none"
+        );
+        assert!(set.memberships <= 32);
+        for path in &forwarders {
+            assert!(
+                matches!(
+                    outcome.verdicts.get(&key_in(&pins, path)),
+                    Some(AttachVerdict::Admitted { endpoints: 8, reasons }) if reasons.is_empty()
+                ),
+                "an unrecorded membership never changes admission"
+            );
         }
     }
 

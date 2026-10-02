@@ -105,7 +105,7 @@ never a changed meaning for an existing field.
   comes only from counted entries.
 - `edges[].entries.coverage` (additive within v1): what this edge's
   usage columns can claim, per edge — never a run-wide flag. Always
-  the six keys `{state, since_ns, first_ns, lossy, reason, detail}`
+  the seven keys `{state, since_ns, until_ns, first_ns, lossy, reason, detail}`
   (`null` where a key does not apply: `lossy` is a boolean only for
   `counted`). `state` is:
   - `counted`: a counting feed (actual call observations) covers the
@@ -119,11 +119,15 @@ never a changed meaning for an existing field.
   - `watched_no_use`: every endpoint of the module is attached for
     this caller since `since_ns` with clean health, and no use was
     seen: the zero is a fact (`observation` `observed`). `since_ns`
-    never precedes the last health regression (a watch noted later
-    starts at the regression). The watched interval ends when the edge
-    does — caller retirement or a complete-absence unload
-    (`mapping.state` `ended`, `mapping.last_seen_ns`); the state then
-    reads as the frozen fact for that interval.
+    never precedes the last health regression's detecting read (a
+    watch noted later starts there). `until_ns` is `null` while the
+    native capture runs; when it stops, every watch ends at the last
+    witness read that proved clean health and held scope custody, and
+    `since_ns..until_ns` stays a frozen fact (a watch no clean read
+    proved reads `unknown`/`loss` instead). The watched interval also
+    ends when the edge does — caller retirement or a complete-absence
+    unload (`mapping.state` `ended`, `mapping.last_seen_ns`); the state
+    then reads as the frozen fact for that interval.
   - `unknown`: nothing can be claimed; `reason` is one of
     `scan_only` (no native usage producer runs — every edge of a
     scan-only run), `not_admitted`, `not_attached`, `attach_failed`,
@@ -134,13 +138,16 @@ never a changed meaning for an existing field.
   `counted`. Positive coverage (`counted` entries, `witnessed`) is
   monotonic history: it survives loss, caller retirement, and module
   unload. A global health regression (a native identity, pair, or
-  usage evidence counter rising) demotes every `watched_no_use` edge
-  to `unknown`/`loss`, sticky for the run, and is recorded as a
-  `usage coverage health regression` gap. The demotion is
+  usage evidence counter rising) demotes every `watched_no_use`
+  interval that reaches past the last clean read before the rise to
+  `unknown`/`loss`, and is recorded as a `usage coverage health
+  regression` gap. The demoted interval stays demoted; a new interval
+  may start only from the read that detected the rise. The demotion is
   conservative: it also demotes edges whose watched interval had
   already ended (retired callers, unloaded modules) before the
   regression, because the failure cannot be localized in time per
-  edge. Coverage notes that cannot apply are gaps, once per (caller,
+  edge; only an interval frozen at capture stop before the rise
+  stands. Coverage notes that cannot apply are gaps, once per (caller,
   module): `usage coverage without mapping evidence` (no such edge)
   and `coverage for an unadmitted module` (a counting or watch note
   for a module not `admitted`; its usage stays unknown). `observation.usage_feed` is
@@ -307,7 +314,7 @@ never a changed meaning for an existing field.
       "entries": {"count": 0, "saturated": false, "cap": 18446744073709551615,
                  "first_seen_ns": null, "last_seen_ns": null, "in_flight": false,
                  "observation": "unknown (usage observation unavailable)",
-                 "coverage": {"state": "unknown", "since_ns": null, "first_ns": null,
+                 "coverage": {"state": "unknown", "since_ns": null, "until_ns": null, "first_ns": null,
                               "lossy": null, "reason": "scan_only", "detail": null}},
       "semantics": "unknown (semantic capture withheld)",
       "mechanisms": null,

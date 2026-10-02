@@ -140,6 +140,17 @@ pub(crate) struct RetainedInventoryTarget {
 }
 
 impl RetainedInventoryTarget {
+    /// A second owner of this retained object: the same opened file (one
+    /// shared `Arc`, no reopen, no new descriptor), the same canonical
+    /// identity, and the sticky changed evidence observed so far. The
+    /// capture facade holds these so its links never borrow the attach set.
+    pub(crate) fn share(&self) -> Self {
+        Self {
+            entry: self.entry.clone(),
+            changed: std::cell::Cell::new(self.changed.get()),
+        }
+    }
+
     pub(crate) fn retirement_lease(&self) -> Arc<std::fs::File> {
         // The retirement worker needs only custody of the already-open file.
         // Identity and sticky mutation checks stay with the main target owner.

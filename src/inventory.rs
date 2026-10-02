@@ -838,23 +838,29 @@ fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json::Value {
     })
 }
 
-/// Additive (v1) per-edge usage coverage: the state, its instant
-/// (`since_ns` for counted and watched, `first_ns` for witnessed), the
-/// lossy flag (counted only; `null` otherwise), and — for unknown — the reason code plus
-/// its detail. Every key is always present (`null` when it does not
-/// apply), so consumers see one shape.
+/// Additive (v1) per-edge usage coverage: the state, its instants
+/// (`since_ns` for counted and watched, `until_ns` for a watch that
+/// ended — the last proven-clean instant — and `first_ns` for
+/// witnessed), the lossy flag (counted only; `null` otherwise), and —
+/// for unknown — the reason code plus its detail. Every key is always
+/// present (`null` when it does not apply), so consumers see one shape.
 fn coverage_json(coverage: &UseCoverage) -> serde_json::Value {
-    let (since_ns, first_ns, lossy, reason, detail) = match coverage {
+    let (since_ns, until_ns, first_ns, lossy, reason, detail) = match coverage {
         UseCoverage::Counted { since_ns, lossy } => {
-            (Some(*since_ns), None, Some(*lossy), None, None)
+            (Some(*since_ns), None, None, Some(*lossy), None, None)
         }
-        UseCoverage::Witnessed { first_ns } => (None, Some(*first_ns), None, None, None),
-        UseCoverage::WatchedNoUse { since_ns } => (Some(*since_ns), None, None, None, None),
-        UseCoverage::Unknown(reason) => (None, None, None, Some(reason.code()), reason.detail()),
+        UseCoverage::Witnessed { first_ns } => (None, None, Some(*first_ns), None, None, None),
+        UseCoverage::WatchedNoUse { since_ns, until_ns } => {
+            (Some(*since_ns), *until_ns, None, None, None, None)
+        }
+        UseCoverage::Unknown(reason) => {
+            (None, None, None, None, Some(reason.code()), reason.detail())
+        }
     };
     serde_json::json!({
         "state": coverage.state(),
         "since_ns": since_ns,
+        "until_ns": until_ns,
         "first_ns": first_ns,
         "lossy": lossy,
         "reason": reason,

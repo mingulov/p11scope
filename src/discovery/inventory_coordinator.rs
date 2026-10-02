@@ -27,14 +27,16 @@ use super::inventory::{
     ScanReceipt,
 };
 use super::*;
+use crate::attach::capture::{ExtendReceipt, ScopeCustody, ScopeIncarnation, WitnessBatch};
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
     AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
-    ImageAuthority, MappingState, ModuleInfo, ModuleKey, ProcessSource, RegistryGap,
-    RegistryLimits,
+    CoverageNote, ImageAuthority, MappingState, ModuleInfo, ModuleKey, ProcessSource, RegistryGap,
+    RegistryLimits, UnknownReason,
 };
 use crate::discovery::inventory_attach_set::{
-    AttachModuleKey, AttachVerdict, InventoryAttachSet, TargetDelta,
+    AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
+    InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
@@ -133,6 +135,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// last took them. Bounded by the endpoint budget: every endpoint
     /// enters exactly once.
     pending_targets: TargetDelta,
+    /// What the capture facade's receipts say per endpoint, once native
+    /// capture runs (Task 6 C3); `None` in the scan lane.
+    capture: Option<CaptureCoverage>,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
     scanned_owners: BTreeSet<ProcessViewId>,
@@ -180,6 +185,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             registry: CallerRegistry::new(registry_limits),
             attach_set: InventoryAttachSet::new(default_inventory_budget()?),
             pending_targets: TargetDelta::default(),
+            capture: None,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
             scanned_owners: BTreeSet::new(),
@@ -227,6 +233,272 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_target_delta(&mut self) -> TargetDelta {
         std::mem::take(&mut self.pending_targets)
+    }
+
+    /// Native capture starts: from now on each scan projection stages a
+    /// coverage note per mapped edge from the capture's attach receipts.
+    /// `scope` is the capture's PID incarnation (`None` for the machine):
+    /// only a caller of that pid whose start time matches, and the first
+    /// such caller (image) only, is in scope — a reused pid never is.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 starts native capture.
+    pub(crate) fn begin_capture_coverage(&mut self, scope: Option<ScopeIncarnation>) {
+        self.capture = Some(CaptureCoverage {
+            scope,
+            bound: None,
+            attached_at: BTreeMap::new(),
+            failed: BTreeSet::new(),
+            unproven: None,
+            changed_objects: BTreeSet::new(),
+            health_unproven: None,
+            last_clean_ns: None,
+            stopped: false,
+        });
+    }
+
+    /// Absorbs one extend receipt: attached endpoints with their instants,
+    /// failed endpoints (sticky), and the scope custody.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards receipts.
+    pub(crate) fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        for attached in &receipt.attached {
+            capture.attached_at.insert(attached.id, attached.at_ns);
+        }
+        for failed in &receipt.failed {
+            capture.attached_at.remove(&failed.id);
+            capture.failed.insert(failed.id);
+        }
+        if let Some(custody) = &receipt.custody {
+            self.note_capture_custody(custody);
+        }
+    }
+
+    /// Absorbs the capture's scope custody (`InventoryCapture::custody`,
+    /// receipts, witness batches). The first unproven or lost custody
+    /// stages one timestamped watch demotion — watches staged earlier in
+    /// the same batch demote with the rest — and no watch is staged after.
+    /// After stop it stages nothing: ended intervals are frozen facts.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards custody.
+    pub(crate) fn note_capture_custody(&mut self, custody: &ScopeCustody) {
+        let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
+            return;
+        };
+        let (at_ns, reason) = match custody {
+            ScopeCustody::System | ScopeCustody::PidHeld => return,
+            ScopeCustody::PidUnproven { at_ns, reason } => (*at_ns, reason.clone()),
+            ScopeCustody::PidLost { at_ns, reason } => (*at_ns, reason.clone()),
+        };
+        if capture.unproven.is_some() {
+            return;
+        }
+        capture.unproven = Some(reason.clone());
+        self.registry
+            .note_watch_demotion("native capture scope custody unproven", reason, at_ns);
+    }
+
+    /// Absorbs one witness batch's health and custody: a counter rise
+    /// demotes every watch (dated at the batch's health baseline, the
+    /// earliest instant of the drop) and lets a new watch start only from
+    /// the detecting read on; an unproven health withholds watches until a
+    /// batch proves it again; changed objects make their modules unknown
+    /// from now on. A batch with proven health, no rise, and held custody
+    /// is the latest proven-clean instant: its `health_read_ns`, but never
+    /// past its custody proof (`custody_proven_ns`, the last held poll).
+    /// After stop it stages nothing: forward the terminal read before
+    /// `end_capture_coverage`.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards batches.
+    pub(crate) fn note_witness_batch(&mut self, batch: &WitnessBatch) {
+        let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
+            return;
+        };
+        capture.health_unproven = batch.health_unproven.clone();
+        capture
+            .changed_objects
+            .extend(batch.changed_objects.iter().copied());
+        let custody_held = matches!(batch.custody, ScopeCustody::System | ScopeCustody::PidHeld);
+        if batch.health_unproven.is_none()
+            && batch.health_regression.is_none()
+            && custody_held
+            && capture.unproven.is_none()
+        {
+            let clean_ns = batch
+                .health_read_ns
+                .min(batch.custody_proven_ns.unwrap_or(u64::MAX));
+            capture.last_clean_ns = Some(
+                capture
+                    .last_clean_ns
+                    .map_or(clean_ns, |last| last.max(clean_ns)),
+            );
+        }
+        if let Some(reason) = &batch.health_regression {
+            self.registry.note_health_regression(
+                reason.clone(),
+                batch.health_baseline_ns,
+                batch.health_read_ns,
+            );
+        }
+        self.note_capture_custody(&batch.custody);
+    }
+
+    /// Native capture stops (stop begins or producers detach): no watch
+    /// starts afterwards, and every ongoing watch ends at the last
+    /// proven-clean witness read — its interval stays a frozen fact
+    /// (`WatchedNoUse{since, until}`). A watch no clean read proved after
+    /// its start reads unknown. A terminal read with unproven health is
+    /// not clean, so it never extends an interval.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 stops native capture.
+    pub(crate) fn end_capture_coverage(&mut self, at_ns: u64) {
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        if capture.stopped {
+            return;
+        }
+        capture.stopped = true;
+        let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
+        self.registry.note_watch_end(
+            "native capture stopped before a clean health read proved the watch",
+            until,
+        );
+    }
+
+    /// Whether `caller` (at `pid`) is the capture's scope incarnation.
+    /// Binds the first matching caller.
+    fn capture_scope_verdict(&mut self, caller: CallerId, pid: u32) -> ScopeVerdict {
+        let Some(capture) = self.capture.as_mut() else {
+            return ScopeVerdict::Outside;
+        };
+        let Some(scope) = capture.scope else {
+            return ScopeVerdict::Inside;
+        };
+        if scope.pid != pid {
+            return ScopeVerdict::Outside;
+        }
+        let start_time = self
+            .adapter
+            .record(caller)
+            .and_then(|record| record.start_time);
+        match (scope.start_time, start_time) {
+            (Some(expected), Some(actual)) if expected != actual => return ScopeVerdict::Outside,
+            (Some(_), Some(_)) => {}
+            _ => return ScopeVerdict::Unproven,
+        }
+        match capture.bound {
+            None => {
+                capture.bound = Some(caller);
+                ScopeVerdict::Inside
+            }
+            Some(bound) if bound == caller => ScopeVerdict::Inside,
+            // Same incarnation, later image: an exec the entries may not
+            // follow (custody reports it too).
+            Some(_) => ScopeVerdict::LaterImage,
+        }
+    }
+
+    /// The coverage note one mapped observation earns from the capture's
+    /// receipts, or `None` (no native capture, the caller is outside the
+    /// capture's scope, the module is not admitted — the registry then
+    /// derives the edge's unknown reason itself — or health is unproven
+    /// this pass, which withholds a watch without demoting one).
+    ///
+    /// `Watched` needs every endpoint the attach set admitted for the
+    /// module attached, none failed, no member object modified in place, a
+    /// whole (not partial) admission, scope custody intact, and the
+    /// capture not stopped; `since` is the last of those attaches.
+    fn capture_coverage_note(
+        &self,
+        scope: ScopeVerdict,
+        key: &AttachModuleKey,
+        verdict: Option<&AttachVerdict>,
+    ) -> Option<CoverageNote> {
+        let capture = self.capture.as_ref()?;
+        let Some(AttachVerdict::Admitted { reasons, .. }) = verdict else {
+            return None;
+        };
+        let unknown = |reason| Some(CoverageNote::Unknown(reason));
+        let loss = |reason: &str| unknown(UnknownReason::Loss(reason.into()));
+        match scope {
+            ScopeVerdict::Outside => return None,
+            ScopeVerdict::Unproven => return unknown(UnknownReason::IdentityUnavailable),
+            ScopeVerdict::LaterImage => {
+                return loss(
+                    "a later image of the PID target: its scope custody covers the first image only",
+                );
+            }
+            ScopeVerdict::Inside => {}
+        }
+        if let Some(reason) = &capture.unproven {
+            return loss(reason);
+        }
+        if capture.stopped {
+            // Ended watches are frozen facts: stage nothing over them.
+            return None;
+        }
+        if !reasons.is_empty() {
+            return if reasons
+                .iter()
+                .any(|reason| crate::plan::growth_omitted_count(reason).is_some())
+            {
+                unknown(UnknownReason::CapacityLimited(ENDPOINT_RESOURCE))
+            } else {
+                unknown(UnknownReason::NotAttached)
+            };
+        }
+        let members = match self.attach_set.module_members(key) {
+            Some(ModuleMembers::Known(members)) => members,
+            Some(ModuleMembers::Unrecorded) => {
+                return unknown(UnknownReason::CapacityLimited(MEMBERSHIP_RESOURCE));
+            }
+            // The verdict came from this set, so it holds the module.
+            None => return unknown(UnknownReason::NotAttached),
+        };
+        if members.iter().any(|member| capture.failed.contains(member)) {
+            return unknown(UnknownReason::AttachFailed);
+        }
+        if members.iter().any(|member| {
+            self.attach_set
+                .endpoint(*member)
+                .is_some_and(|endpoint| capture.changed_objects.contains(&endpoint.object))
+        }) {
+            return loss("the provider was modified in place after it was attached");
+        }
+        let mut since_ns: Option<u64> = None;
+        for member in members {
+            let Some(&at_ns) = capture.attached_at.get(member) else {
+                // Admitted, not attached yet (deferred to a later extend).
+                return unknown(UnknownReason::NotAttached);
+            };
+            since_ns = Some(since_ns.map_or(at_ns, |since| since.max(at_ns)));
+        }
+        match since_ns {
+            Some(_) if capture.health_unproven.is_some() => None,
+            Some(since_ns) => Some(CoverageNote::Watched { since_ns }),
+            // Admitted with no endpoint: nothing could observe its use.
+            None => unknown(UnknownReason::NotAttached),
+        }
+    }
+
+    /// Stages the capture coverage note for one mapped edge, right after
+    /// its mapping note (so the edge exists when the batch applies it).
+    fn stage_capture_coverage(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        key: &ModuleKey,
+        attach_key: Option<&AttachModuleKey>,
+        verdict: Option<&AttachVerdict>,
+    ) {
+        let Some(attach_key) = attach_key else {
+            return;
+        };
+        if self.capture.is_none() {
+            return;
+        }
+        let scope = self.capture_scope_verdict(caller, pid);
+        if let Some(note) = self.capture_coverage_note(scope, attach_key, verdict) {
+            self.registry.note_coverage(caller, key, note);
+        }
     }
 
     #[cfg(test)]
@@ -656,7 +928,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .record(caller)
             .map(|record| record.pid)
             .unwrap_or(0);
-        let modules: Vec<(ModuleKey, ModuleInfo)> = self
+        let modules: Vec<(ModuleKey, ModuleInfo, AttachModuleKey)> = self
             .engine
             .modules
             .iter()
@@ -664,10 +936,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .filter_map(|module| {
                 let summary = self.engine.pinned.summary(module.object)?;
                 let sha256 = summary.sha256.to_string();
-                let verdict = verdicts.get(&AttachModuleKey {
+                let attach_key = AttachModuleKey {
                     object: module.scanned.key,
                     sha256: sha256.clone(),
-                });
+                };
+                let verdict = verdicts.get(&attach_key);
                 let key = ModuleKey::physical(
                     module.scanned.key.device.major,
                     module.scanned.key.device.minor,
@@ -678,16 +951,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Some((
                     key.clone(),
                     native_module_info(&self.engine, module, key, verdict),
+                    attach_key,
                 ))
             })
             .collect();
-        for (_, info) in &modules {
+        for (key, info, attach_key) in &modules {
             self.registry
                 .note_mapping(caller, pid, info.clone(), now_ns);
+            let verdict = verdicts.get(attach_key);
+            self.stage_capture_coverage(caller, pid, key, Some(attach_key), verdict);
         }
         // Absences are evaluated against the last published snapshot:
         // edges the commit no longer shows, for this caller only.
-        let committed: BTreeSet<ModuleKey> = modules.iter().map(|(key, _)| key.clone()).collect();
+        let committed: BTreeSet<ModuleKey> =
+            modules.iter().map(|(key, _, _)| key.clone()).collect();
         let mut absent = false;
         for edge in self
             .registry
@@ -761,12 +1038,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         now_ns: u64,
     ) {
         for object in &catalog.objects {
-            let verdict = object.sha256.as_ref().and_then(|sha256| {
-                verdicts.get(&AttachModuleKey {
-                    object: object.key,
-                    sha256: sha256.clone(),
-                })
+            let attach_key = object.sha256.as_ref().map(|sha256| AttachModuleKey {
+                object: object.key,
+                sha256: sha256.clone(),
             });
+            let verdict = attach_key.as_ref().and_then(|key| verdicts.get(key));
             // One mapping note per observation (not per object path):
             // aliased objects are observed under several paths and the
             // registry accumulates every spelling.
@@ -777,8 +1053,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let mut info = catalog_module_info(object, verdict);
                 info.path = observation.path.clone();
                 info.double_loaded = observation.double_loaded;
+                let key = info.key.clone();
                 self.registry
                     .note_mapping(caller, observation.pid, info, now_ns);
+                self.stage_capture_coverage(
+                    caller,
+                    observation.pid,
+                    &key,
+                    attach_key.as_ref(),
+                    verdict,
+                );
             }
         }
         for process in &catalog.processes {
@@ -848,6 +1132,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             registry_applied,
         })
     }
+}
+
+/// Per-endpoint attach state from the capture facade's receipts. Bounded by
+/// the endpoint budget N: each endpoint is attached or failed at most once.
+struct CaptureCoverage {
+    scope: Option<ScopeIncarnation>,
+    /// The first caller proven to be the scope incarnation.
+    bound: Option<CallerId>,
+    attached_at: BTreeMap<EndpointId, u64>,
+    /// Sticky: a failed endpoint is never retried, so its modules never
+    /// read watched.
+    failed: BTreeSet<EndpointId>,
+    /// Sticky: coverage is unproven from here on (PID custody lost, an
+    /// exec or leader exit of the PID target, lifecycle loss).
+    unproven: Option<String>,
+    /// Sticky: objects modified in place after they were attached.
+    changed_objects: BTreeSet<AttachObjectId>,
+    /// The last witness batch's unproven health (not sticky).
+    health_unproven: Option<String>,
+    /// The latest witness read with proven health, no rise, and held
+    /// custody: where a watch ends at stop.
+    last_clean_ns: Option<u64>,
+    stopped: bool,
+}
+
+/// Whether one mapped caller is the capture's scope incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeVerdict {
+    Inside,
+    /// Another process (a different pid, or a reused one).
+    Outside,
+    /// The pid matches but a start time is unreadable: unprovable.
+    Unproven,
+    /// The scope incarnation's later image (after an exec).
+    LaterImage,
 }
 
 /// The run's attach set is the ONE admission source the inventory output
@@ -1668,5 +1987,798 @@ mod tests {
         let catalog = catalog_module_info(&refused_object, None);
         assert_eq!(catalog.admission, AdmissionState::Refused);
         assert_eq!(catalog.admission_class, None);
+    }
+
+    /// One catalog object per path, each observed by `pid`, plus that
+    /// member's complete scan record.
+    fn capture_catalog(
+        pins: &crate::discovery::identity::PinnedObjects,
+        paths: &[&std::path::Path],
+        pid: u32,
+    ) -> crate::inspect_system::Catalog {
+        let objects = paths
+            .iter()
+            .map(|path| {
+                let summary = pins
+                    .pinned()
+                    .find(|summary| summary.path == path.to_str().unwrap())
+                    .unwrap();
+                crate::inspect_system::CatalogObject {
+                    path: summary.path.to_string(),
+                    key: summary.key,
+                    sha256: Some(summary.sha256.to_string()),
+                    build_id: None,
+                    identity_source: Some("mountinfo"),
+                    note: None,
+                    mappings: Vec::new(),
+                    observations: vec![crate::inspect_system::Observation {
+                        pid,
+                        path: summary.path.to_string(),
+                        exports: Vec::new(),
+                        tables: Vec::new(),
+                        interfaces: Vec::new(),
+                        double_loaded: false,
+                    }],
+                    admission: crate::inspect_system::AdmissionRecord::Admitted {
+                        class: "exact",
+                        endpoints: 3,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        crate::inspect_system::Catalog {
+            scan_status: "complete",
+            lowering: None,
+            enumerated: 1,
+            selected: 1,
+            scanned: 1,
+            cap: 1,
+            scan_ms: 0,
+            processes: vec![crate::inspect_system::ProcessRecord {
+                pid,
+                status: crate::inspect_system::MemberStatus::Scanned,
+                objects: (0..objects.len()).collect(),
+            }],
+            objects,
+            relationships: Vec::new(),
+            admission: crate::inspect_system::AdmissionSummary {
+                uncorroborated_candidates: 0,
+                module_ambiguous: 0,
+                admitted: paths.len(),
+                refused: 0,
+                unresolved: 0,
+            },
+            skipped: Vec::new(),
+            notes: Vec::new(),
+            explanation: None,
+        }
+    }
+
+    #[test]
+    fn capture_receipts_stage_watched_only_for_completely_attached_modules() {
+        use crate::attach::capture::{AttachedEndpoint, EndpointFailure, ExtendReceipt};
+        use crate::discovery::caller_registry::UseCoverage;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let b = fx::provider(&dir, "b.so", "provider-b");
+        let c = fx::provider(&dir, "c.so", "provider-c");
+        let pins = fx::pass_pins(&[(&a, "sha-a"), (&b, "sha-b"), (&c, "sha-c")]);
+        let modules = [
+            fx::module(&pins, &a, &fx::offsets(3)),
+            fx::module(&pins, &b, &fx::offsets(2)),
+            fx::module(&pins, &c, &fx::offsets(1)),
+        ];
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let plan = fx::lower_named(&modules, &pins, policy);
+        let absorbed = coordinator.attach_set.absorb(&plan, &pins);
+        let ids: Vec<u32> = absorbed.delta.endpoints.iter().map(|e| e.id.0).collect();
+        assert_eq!(ids, [0, 1, 2, 3, 4, 5]);
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let catalog = capture_catalog(&pins, &[&a, &b, &c], pid);
+        let coverage_of = |coordinator: &InventoryCoordinator<_>, path: &std::path::Path| {
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && coordinator
+                            .registry
+                            .module(edge.module)
+                            .is_some_and(|module| module.paths.contains(path.to_str().unwrap()))
+                })
+                .unwrap();
+            coordinator.registry.coverage(edge)
+        };
+
+        // Scan lane: no capture, every edge stays scan-only.
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        assert_eq!(
+            coverage_of(&coordinator, &a),
+            UseCoverage::Unknown(UnknownReason::ScanOnly)
+        );
+
+        // A capture scoped to another process stages nothing for this one.
+        coordinator.begin_capture_coverage(Some(ScopeIncarnation {
+            pid: pid + 1,
+            start_time: crate::process::process_start_time(pid).ok(),
+        }));
+        coordinator.project_catalog(&catalog, &verdicts, 70);
+        coordinator.registry.publish();
+        assert_eq!(
+            coverage_of(&coordinator, &a),
+            UseCoverage::Unknown(UnknownReason::ScanOnly)
+        );
+
+        coordinator.begin_capture_coverage(Some(ScopeIncarnation {
+            pid,
+            start_time: crate::process::process_start_time(pid).ok(),
+        }));
+        let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
+        let attached = |id: u32, at_ns: u64| AttachedEndpoint {
+            id: endpoint(id).id,
+            object: endpoint(id).object,
+            at_ns,
+        };
+        // a.so complete (0..2), b.so one failed (3) one attached (4),
+        // c.so (5) deferred.
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![attached(0, 100), attached(2, 120), attached(4, 130)],
+            failed: vec![EndpointFailure {
+                id: endpoint(3).id,
+                object: endpoint(3).object,
+                reason: "kernel refused".into(),
+                link_retained: false,
+            }],
+            ..ExtendReceipt::default()
+        });
+        coordinator.project_catalog(&catalog, &verdicts, 140);
+        coordinator.registry.publish();
+        assert_eq!(
+            coverage_of(&coordinator, &a),
+            UseCoverage::Unknown(UnknownReason::NotAttached),
+            "one of a.so's endpoints is not attached yet"
+        );
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![attached(1, 110)],
+            ..ExtendReceipt::default()
+        });
+        coordinator.project_catalog(&catalog, &verdicts, 150);
+        coordinator.registry.publish();
+        assert_eq!(
+            coverage_of(&coordinator, &a),
+            UseCoverage::WatchedNoUse {
+                since_ns: 120,
+                until_ns: None
+            },
+            "since is the last of the module's attaches"
+        );
+        assert_eq!(
+            coverage_of(&coordinator, &b),
+            UseCoverage::Unknown(UnknownReason::AttachFailed)
+        );
+        assert_eq!(
+            coverage_of(&coordinator, &c),
+            UseCoverage::Unknown(UnknownReason::NotAttached)
+        );
+
+        // An exec of the PID target makes coverage unproven, sticky.
+        coordinator.note_capture_custody(&ScopeCustody::PidUnproven {
+            at_ns: 160,
+            reason: "an exec of the PID target was observed".into(),
+        });
+        coordinator.note_capture_custody(&ScopeCustody::PidHeld);
+        coordinator.project_catalog(&catalog, &verdicts, 170);
+        coordinator.registry.publish();
+        assert!(
+            matches!(
+                coverage_of(&coordinator, &a),
+                UseCoverage::Unknown(UnknownReason::Loss(ref reason)) if reason.contains("exec")
+            ),
+            "{:?}",
+            coverage_of(&coordinator, &a)
+        );
+    }
+
+    #[test]
+    fn partial_or_unrecorded_admission_is_never_watched() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let module = fx::module(&pins, &a, &fx::offsets(2));
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(std::slice::from_ref(&module), &pins, policy),
+            &pins,
+        );
+        let key = absorbed.verdicts.keys().next().unwrap().clone();
+        coordinator.begin_capture_coverage(None);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: absorbed
+                .delta
+                .endpoints
+                .iter()
+                .map(|endpoint| crate::attach::capture::AttachedEndpoint {
+                    id: endpoint.id,
+                    object: endpoint.object,
+                    at_ns: 10,
+                })
+                .collect(),
+            ..ExtendReceipt::default()
+        });
+        let whole = AttachVerdict::Admitted {
+            endpoints: 2,
+            reasons: Vec::new(),
+        };
+        assert_eq!(
+            coordinator.capture_coverage_note(ScopeVerdict::Inside, &key, Some(&whole)),
+            Some(CoverageNote::Watched { since_ns: 10 })
+        );
+        let partial = AttachVerdict::Admitted {
+            endpoints: 2,
+            reasons: vec![
+                "admitted module needs 3 more; the set is full — 3 endpoints not added; kept its 2 retained endpoints"
+                    .into(),
+            ],
+        };
+        assert_eq!(
+            coordinator.capture_coverage_note(ScopeVerdict::Inside, &key, Some(&partial)),
+            Some(CoverageNote::Unknown(UnknownReason::CapacityLimited(
+                ENDPOINT_RESOURCE
+            )))
+        );
+        let refused = AttachVerdict::Refused {
+            reason: "no".into(),
+        };
+        assert_eq!(
+            coordinator.capture_coverage_note(ScopeVerdict::Inside, &key, Some(&refused)),
+            None
+        );
+        assert_eq!(
+            coordinator.capture_coverage_note(ScopeVerdict::Inside, &key, None),
+            None
+        );
+    }
+
+    // ---- C3 review fixes: incarnation-scoped, demotable capture coverage ----
+
+    /// A coordinator over a scripted process source, its attach set holding
+    /// one provider with `endpoints` entries, and that provider's catalog
+    /// for `pid`.
+    struct CaptureScene {
+        _dir: tempfile::TempDir,
+        source: crate::discovery::caller_registry::tests::ScriptedSource,
+        coordinator: InventoryCoordinator<crate::discovery::caller_registry::tests::ScriptedSource>,
+        delta: TargetDelta,
+        verdicts: BTreeMap<AttachModuleKey, AttachVerdict>,
+        pins: crate::discovery::identity::PinnedObjects,
+        path: PathBuf,
+    }
+
+    impl CaptureScene {
+        fn new(endpoints: u64) -> Self {
+            use crate::discovery::inventory_attach_set::tests as fx;
+            let dir = tempfile::tempdir().unwrap();
+            let path = fx::provider(&dir, "a.so", "provider-a");
+            let pins = fx::pass_pins(&[(&path, "sha-a")]);
+            let module = fx::module(&pins, &path, &fx::offsets(endpoints));
+            let source = crate::discovery::caller_registry::tests::ScriptedSource::default();
+            let mut coordinator = InventoryCoordinator::new(
+                Scope::Pid(std::process::id()),
+                HookRegistry::builtin(),
+                Vec::new(),
+                source.clone(),
+                RegistryLimits::default_limits(),
+            )
+            .unwrap();
+            let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+            let absorbed = coordinator.attach_set.absorb(
+                &fx::lower_named(std::slice::from_ref(&module), &pins, policy),
+                &pins,
+            );
+            Self {
+                _dir: dir,
+                source,
+                coordinator,
+                delta: absorbed.delta,
+                verdicts: absorbed.verdicts,
+                pins,
+                path,
+            }
+        }
+
+        fn attach_all(&mut self, at_ns: u64, custody: ScopeCustody) {
+            let receipt = ExtendReceipt {
+                attached: self
+                    .delta
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| crate::attach::capture::AttachedEndpoint {
+                        id: endpoint.id,
+                        object: endpoint.object,
+                        at_ns,
+                    })
+                    .collect(),
+                custody: Some(custody),
+                ..ExtendReceipt::default()
+            };
+            self.coordinator.note_extend_receipt(&receipt);
+        }
+
+        fn project(&mut self, pid: u32, now_ns: u64) {
+            let catalog = capture_catalog(&self.pins, &[&self.path], pid);
+            self.coordinator
+                .project_catalog(&catalog, &self.verdicts, now_ns);
+        }
+
+        fn coverage(&self, caller: CallerId) -> crate::discovery::caller_registry::UseCoverage {
+            let registry = &self.coordinator.registry;
+            let edge = registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the caller has an edge");
+            registry.coverage(edge)
+        }
+    }
+
+    fn watched(coverage: &crate::discovery::caller_registry::UseCoverage) -> bool {
+        matches!(
+            coverage,
+            crate::discovery::caller_registry::UseCoverage::WatchedNoUse { .. }
+        )
+    }
+
+    fn lost_with(coverage: &crate::discovery::caller_registry::UseCoverage, needle: &str) -> bool {
+        matches!(
+            coverage,
+            crate::discovery::caller_registry::UseCoverage::Unknown(UnknownReason::Loss(reason))
+                if reason.contains(needle)
+        )
+    }
+
+    fn incarnation(pid: u32, start_time: u64) -> Option<ScopeIncarnation> {
+        Some(ScopeIncarnation {
+            pid,
+            start_time: Some(start_time),
+        })
+    }
+
+    fn witness_batch() -> WitnessBatch {
+        WitnessBatch {
+            domain: crate::attach::capture::NativeDomainId::mint(),
+            phase: crate::attach::capture::CapturePhase::Active,
+            rows: Vec::new(),
+            integrity: Vec::new(),
+            integrity_total: 0,
+            visited: 0,
+            sweep_completed: true,
+            sweeps_completed: 1,
+            row_bound_reached: false,
+            deadline_reached: false,
+            read_failures: Vec::new(),
+            unrecorded_rows: 0,
+            sweep_gaps: false,
+            seen_rows: 0,
+            pair_limit: 64,
+            health: crate::attach::capture::CaptureHealth::default(),
+            health_regression: None,
+            health_unproven: None,
+            health_baseline_ns: 0,
+            health_read_ns: 150,
+            changed_objects: Vec::new(),
+            custody: ScopeCustody::PidHeld,
+            custody_proven_ns: None,
+            unsettled: false,
+        }
+    }
+
+    #[test]
+    fn pid_reuse_within_a_pass_is_never_watched_and_demotes_the_original() {
+        // I2/M10: coverage is scoped by incarnation (pid + start time), and
+        // a custody loss demotes watches already staged in the same batch.
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let original = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(7, 500));
+        scene.attach_all(100, ScopeCustody::PidHeld);
+        scene.project(7, 120);
+        scene.coordinator.registry.publish();
+        assert_eq!(
+            scene.coverage(original),
+            crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+                since_ns: 100,
+                until_ns: None
+            }
+        );
+
+        // Within the next pass the original exits and pid 7 is reused.
+        scene.source.kill(7);
+        scene.source.spawn(7, 600);
+        let observed: BTreeSet<u32> = [7].into();
+        let events = scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            130,
+        );
+        let reused = match events.as_slice() {
+            [crate::discovery::caller_registry::CallerEvent::Reused { old, new }] => {
+                assert_eq!(*old, original);
+                *new
+            }
+            other => panic!("expected one reuse, got {other:?}"),
+        };
+        // The pass stages the reused pid's edge, then (later in the same
+        // batch) the facade's custody poll reports the loss.
+        scene.project(7, 140);
+        assert_eq!(
+            scene.coordinator.capture_scope_verdict(reused, 7),
+            ScopeVerdict::Outside,
+            "a reused pid is another incarnation"
+        );
+        scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidLost {
+                at_ns: 125,
+                reason: "PID custody lost: the PID target exited".into(),
+            });
+        scene.coordinator.registry.publish();
+        assert!(
+            !watched(&scene.coverage(reused)),
+            "{:?}",
+            scene.coverage(reused)
+        );
+        assert!(
+            lost_with(&scene.coverage(original), "PID target exited"),
+            "{:?}",
+            scene.coverage(original)
+        );
+        assert!(
+            scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native capture scope custody unproven"),
+        );
+        // A later pass still never watches the reused incarnation.
+        scene.project(7, 160);
+        scene.coordinator.registry.publish();
+        assert!(!watched(&scene.coverage(reused)));
+    }
+
+    #[test]
+    fn a_nonleader_exec_before_the_first_pass_never_reads_watched() {
+        // I2/M10: the exec record arrives after the first projection staged
+        // a watch in the same batch; the demotion wins, and every later
+        // pass reads the exec loss.
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(9, 700);
+        scene.source.exec(9, 200, "/bin/successor");
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(9, 700));
+        scene.attach_all(100, ScopeCustody::PidHeld);
+        scene.project(9, 120);
+        scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidUnproven {
+                at_ns: 90,
+                reason: "an exec of the PID target was observed".into(),
+            });
+        scene.coordinator.registry.publish();
+        assert!(
+            lost_with(&scene.coverage(caller), "exec"),
+            "{:?}",
+            scene.coverage(caller)
+        );
+        scene.project(9, 140);
+        scene.coordinator.registry.publish();
+        assert!(lost_with(&scene.coverage(caller), "exec"));
+        // A start time that cannot be proven never matches either.
+        let mut blind = CaptureScene::new(1);
+        blind.source.spawn(11, 800);
+        let other = blind
+            .coordinator
+            .adapter
+            .admit(11, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        blind
+            .coordinator
+            .begin_capture_coverage(Some(ScopeIncarnation {
+                pid: 11,
+                start_time: None,
+            }));
+        assert_eq!(
+            blind.coordinator.capture_scope_verdict(other, 11),
+            ScopeVerdict::Unproven
+        );
+    }
+
+    #[test]
+    fn a_second_image_of_the_scope_incarnation_is_not_the_bound_caller() {
+        let mut scene = CaptureScene::new(1);
+        scene.source.spawn(5, 300);
+        let first = scene
+            .coordinator
+            .adapter
+            .admit(5, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(5, 300));
+        assert_eq!(
+            scene.coordinator.capture_scope_verdict(first, 5),
+            ScopeVerdict::Inside
+        );
+        scene.source.exec(5, 201, "/bin/next");
+        let observed: BTreeSet<u32> = [5].into();
+        let events =
+            scene
+                .coordinator
+                .adapter
+                .reconcile(&observed, &mut |_| ImageAuthority::ScanPinned, 60);
+        let [crate::discovery::caller_registry::CallerEvent::ExecRetired { new, .. }] =
+            events.as_slice()
+        else {
+            panic!("expected an exec retirement: {events:?}");
+        };
+        assert_eq!(
+            scene.coordinator.capture_scope_verdict(*new, 5),
+            ScopeVerdict::LaterImage
+        );
+    }
+
+    #[test]
+    fn health_and_changed_objects_withhold_demote_or_restart_watches() {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(7, 500));
+        // I5: unproven health withholds the first watch; it is not sticky.
+        let mut unproven = witness_batch();
+        unproven.health_unproven = Some("native capture health was unreadable".into());
+        scene.coordinator.note_witness_batch(&unproven);
+        scene.attach_all(100, ScopeCustody::PidHeld);
+        scene.project(7, 120);
+        scene.coordinator.registry.publish();
+        assert!(!watched(&scene.coverage(caller)));
+        scene.coordinator.note_witness_batch(&witness_batch());
+        scene.project(7, 130);
+        scene.coordinator.registry.publish();
+        assert!(watched(&scene.coverage(caller)));
+        // Closure 2: a rise demotes the interval (dated at the baseline);
+        // a new interval starts only from the detecting read.
+        let mut rose = witness_batch();
+        rose.health_regression =
+            Some("native capture health counters rose: EVIDENCE[3] 0->1".into());
+        rose.health_baseline_ns = 125;
+        rose.health_read_ns = 160;
+        scene.coordinator.note_witness_batch(&rose);
+        scene.coordinator.registry.publish();
+        assert!(lost_with(&scene.coverage(caller), "EVIDENCE[3]"));
+        scene.project(7, 170);
+        scene.coordinator.registry.publish();
+        assert_eq!(
+            scene.coverage(caller),
+            crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+                since_ns: 160,
+                until_ns: None
+            },
+            "the restarted watch never covers the baseline..detection window"
+        );
+        // M8: a provider modified in place makes its module unknown.
+        let mut changed = witness_batch();
+        changed.changed_objects = vec![scene.delta.endpoints[0].object];
+        scene.coordinator.note_witness_batch(&changed);
+        scene.project(7, 180);
+        scene.coordinator.registry.publish();
+        assert!(
+            lost_with(&scene.coverage(caller), "modified in place"),
+            "{:?}",
+            scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn stop_freezes_watches_at_the_last_clean_read() {
+        // Closure 1/4: stop never wipes no-use; each watch ends at the last
+        // proven-clean read, an unproven terminal read never extends it,
+        // and a watch no clean read proved reads unknown.
+        let mut scene = CaptureScene::new(1);
+        scene.source.spawn(8, 510);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(8, 510));
+        scene.attach_all(100, ScopeCustody::PidHeld);
+        scene.project(8, 120);
+        let mut clean = witness_batch();
+        clean.health_read_ns = 200;
+        scene.coordinator.note_witness_batch(&clean);
+        let mut terminal = witness_batch();
+        terminal.health_read_ns = 280;
+        terminal.health_unproven = Some("native capture health was unreadable".into());
+        terminal.unsettled = true;
+        scene.coordinator.note_witness_batch(&terminal);
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        let frozen = crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+            since_ns: 100,
+            until_ns: Some(200),
+        };
+        assert_eq!(scene.coverage(caller), frozen);
+        scene.project(8, 320);
+        scene.coordinator.registry.publish();
+        assert_eq!(
+            scene.coverage(caller),
+            frozen,
+            "nothing restarts after stop"
+        );
+
+        let mut unproved = CaptureScene::new(1);
+        unproved.source.spawn(9, 520);
+        let caller = unproved
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        unproved
+            .coordinator
+            .begin_capture_coverage(incarnation(9, 520));
+        unproved.attach_all(100, ScopeCustody::PidHeld);
+        unproved.project(9, 120);
+        unproved.coordinator.end_capture_coverage(300);
+        unproved.coordinator.registry.publish();
+        assert!(
+            lost_with(&unproved.coverage(caller), "clean health read"),
+            "{:?}",
+            unproved.coverage(caller)
+        );
+    }
+
+    /// A scene with one caller watched since 100 and a clean read at 200.
+    fn watched_scene(pid: u32, start: u64) -> (CaptureScene, CallerId) {
+        let mut scene = CaptureScene::new(1);
+        scene.source.spawn(pid, start);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(pid, start));
+        scene.attach_all(100, ScopeCustody::PidHeld);
+        scene.project(pid, 120);
+        let mut clean = witness_batch();
+        clean.health_read_ns = 200;
+        scene.coordinator.note_witness_batch(&clean);
+        (scene, caller)
+    }
+
+    fn last_clean(scene: &CaptureScene) -> Option<u64> {
+        scene.coordinator.capture.as_ref().unwrap().last_clean_ns
+    }
+
+    #[test]
+    fn nothing_noted_after_stop_touches_a_frozen_interval() {
+        // Closure 2 I-1: the normal end of a --pid run. The target exits
+        // after stop; the terminal batch carries the lost custody, dated
+        // at the last held poll (before the clean read's stamp).
+        let (mut scene, caller) = watched_scene(7, 500);
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        let frozen = crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+            since_ns: 100,
+            until_ns: Some(200),
+        };
+        assert_eq!(scene.coverage(caller), frozen);
+        let mut terminal = witness_batch();
+        terminal.health_read_ns = 310;
+        terminal.health_regression =
+            Some("native capture health counters rose: EVIDENCE[0] 0->1".into());
+        terminal.health_baseline_ns = 150;
+        terminal.custody = ScopeCustody::PidLost {
+            at_ns: 199,
+            reason: "PID custody lost: the PID target exited".into(),
+        };
+        scene.coordinator.note_witness_batch(&terminal);
+        scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidUnproven {
+                at_ns: 150,
+                reason: "an exec of the PID target was observed".into(),
+            });
+        scene.coordinator.note_extend_receipt(&ExtendReceipt {
+            custody: Some(ScopeCustody::PidLost {
+                at_ns: 199,
+                reason: "PID custody lost".into(),
+            }),
+            ..ExtendReceipt::default()
+        });
+        scene.project(7, 320);
+        scene.coordinator.registry.publish();
+        assert_eq!(scene.coverage(caller), frozen, "a post-stop note wiped it");
+        assert_eq!(last_clean(&scene), Some(200));
+    }
+
+    #[test]
+    fn a_clean_read_never_claims_past_its_custody_proof() {
+        // Closure 2 I-1(b): the custody poll precedes the health stamp.
+        let (mut scene, _) = watched_scene(7, 500);
+        let mut read = witness_batch();
+        read.health_read_ns = 260;
+        read.custody_proven_ns = Some(240);
+        scene.coordinator.note_witness_batch(&read);
+        assert_eq!(last_clean(&scene), Some(240));
+    }
+
+    #[test]
+    fn each_clean_read_gate_blocks_the_clean_instant() {
+        // Closure 2 M-1: unproven health, a rise, unheld custody, and an
+        // already-unproven capture each keep the last clean instant.
+        let gated: [fn(&mut WitnessBatch); 3] = [
+            |batch| batch.health_unproven = Some("unreadable".into()),
+            |batch| batch.health_regression = Some("EVIDENCE[1] 0->1".into()),
+            |batch| {
+                batch.custody = ScopeCustody::PidUnproven {
+                    at_ns: 250,
+                    reason: "leader exited".into(),
+                }
+            },
+        ];
+        for gate in gated {
+            let (mut scene, _) = watched_scene(7, 500);
+            let mut read = witness_batch();
+            read.health_read_ns = 260;
+            gate(&mut read);
+            scene.coordinator.note_witness_batch(&read);
+            assert_eq!(last_clean(&scene), Some(200), "{read:?}");
+        }
+        let (mut scene, _) = watched_scene(7, 500);
+        scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidUnproven {
+                at_ns: 210,
+                reason: "ring loss".into(),
+            });
+        let mut read = witness_batch();
+        read.health_read_ns = 260;
+        scene.coordinator.note_witness_batch(&read);
+        assert_eq!(
+            last_clean(&scene),
+            Some(200),
+            "an unproven capture is never clean again"
+        );
     }
 }

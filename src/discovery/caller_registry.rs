@@ -786,17 +786,29 @@ impl UnknownReason {
 ///   and recency are unavailable. Never rendered idle.
 /// - `WatchedNoUse`: every endpoint of the module is attached for this
 ///   caller since `since_ns` with clean health, and no use was seen — the
-///   zero is a fact.
+///   zero is a fact; `until_ns` is the last proven-clean instant once the
+///   producer stopped (`None` while it runs).
 /// - `Unknown`: nothing can be claimed, with the reason.
 ///
 /// Positives (`Counted` entries, `Witnessed`) are monotonic history:
 /// they survive loss, retirement, and unload. A global health regression
-/// demotes every `WatchedNoUse` edge to `Unknown`, sticky.
+/// demotes every ongoing `WatchedNoUse` interval to `Unknown`; a new
+/// interval may start only from the detecting read on. When the producer
+/// stops, each watch ends at the last proven-clean instant (`until_ns`)
+/// and stays a frozen fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UseCoverage {
-    Counted { since_ns: u64, lossy: bool },
-    Witnessed { first_ns: u64 },
-    WatchedNoUse { since_ns: u64 },
+    Counted {
+        since_ns: u64,
+        lossy: bool,
+    },
+    Witnessed {
+        first_ns: u64,
+    },
+    WatchedNoUse {
+        since_ns: u64,
+        until_ns: Option<u64>,
+    },
     Unknown(UnknownReason),
 }
 
@@ -837,6 +849,9 @@ enum Watch {
     Unset,
     Watching {
         since_ns: u64,
+        /// The last proven-clean instant once the producer stopped; the
+        /// interval is then a frozen fact.
+        until_ns: Option<u64>,
     },
     Unknown(UnknownReason),
 }
@@ -849,8 +864,9 @@ pub(crate) struct EdgeCoverage {
     lossy: bool,
     witnessed_first_ns: Option<u64>,
     watch: Watch,
-    /// Sticky: a global health regression demoted this edge's watch; it
-    /// never reads `WatchedNoUse` again.
+    /// The current watch state is a demotion (a health regression or an
+    /// unproven interval): later unknown notes keep its reason. A later
+    /// watch note starts a new interval and clears it.
     demoted: bool,
 }
 
@@ -1082,6 +1098,12 @@ enum Mutation {
         note: CoverageNote,
     },
     NoteHealthRegression {
+        subject: &'static str,
+        reason: Arc<str>,
+        at_ns: u64,
+        detected_ns: u64,
+    },
+    EndWatches {
         reason: Arc<str>,
         at_ns: u64,
     },
@@ -1122,9 +1144,11 @@ pub(crate) struct CallerRegistry {
     /// Why an edge no producer covered reads unknown: `ScanOnly` until a
     /// native usage producer runs (Task 6 C5 sets `NotAttached`).
     uncovered_reason: UnknownReason,
-    /// Instant of the last staged global health regression: no watch
-    /// starts before it.
+    /// Detection instant of the last global health regression: a new
+    /// watch interval never starts before it.
     last_health_regression_ns: Option<u64>,
+    /// The producer stopped: every watch ended here and none starts.
+    watches_ended_ns: Option<u64>,
     /// Coverage-note gaps already recorded, once per (caller, module,
     /// subject); bounded by the gap retention bound (past it the gap
     /// list is full and further gaps only count as suppressed).
@@ -1159,6 +1183,7 @@ impl CallerRegistry {
             staged: Vec::new(),
             uncovered_reason: UnknownReason::ScanOnly,
             last_health_regression_ns: None,
+            watches_ended_ns: None,
             coverage_gap_memo: BTreeSet::new(),
             facts_revision: 1,
             published_revision: 0,
@@ -1346,8 +1371,9 @@ impl CallerRegistry {
             return UseCoverage::Unknown(UnknownReason::NotAdmitted);
         }
         match &coverage.watch {
-            Watch::Watching { since_ns } => UseCoverage::WatchedNoUse {
+            Watch::Watching { since_ns, until_ns } => UseCoverage::WatchedNoUse {
                 since_ns: *since_ns,
+                until_ns: *until_ns,
             },
             Watch::Unknown(reason) => UseCoverage::Unknown(reason.clone()),
             Watch::Unset => UseCoverage::Unknown(self.uncovered_reason.clone()),
@@ -1505,14 +1531,55 @@ impl CallerRegistry {
     }
 
     /// Stage one global health regression (a native identity, pair, or
-    /// usage evidence counter rose). The failure cannot be localized, so
-    /// every `WatchedNoUse` edge demotes to `Unknown`, sticky; positives
-    /// stand. The regression itself is a gap.
+    /// usage evidence counter rose between `at_ns`, the last clean read,
+    /// and `detected_ns`, the read that saw it). The failure cannot be
+    /// localized, so every watch interval that reaches past `at_ns`
+    /// demotes to `Unknown`; positives stand. A new interval may start
+    /// only from `detected_ns` on. The regression itself is a gap.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 health reads.
-    pub(crate) fn note_health_regression(&mut self, reason: impl Into<Arc<str>>, at_ns: u64) {
+    pub(crate) fn note_health_regression(
+        &mut self,
+        reason: impl Into<Arc<str>>,
+        at_ns: u64,
+        detected_ns: u64,
+    ) {
         self.staged.push(Mutation::NoteHealthRegression {
+            subject: "usage coverage health regression",
             reason: reason.into(),
             at_ns,
+            detected_ns,
+        });
+    }
+
+    /// Stage the end of every watch: the producer stops. Each ongoing
+    /// watch freezes as `since..at_ns` (`at_ns` is the last proven-clean
+    /// instant); a watch with no clean instant after its start reads
+    /// unknown; no watch starts afterwards.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 stops native capture.
+    pub(crate) fn note_watch_end(&mut self, reason: impl Into<Arc<str>>, at_ns: u64) {
+        self.staged.push(Mutation::EndWatches {
+            reason: reason.into(),
+            at_ns,
+        });
+    }
+
+    /// Stage one watch demotion that is not a health counter: the native
+    /// capture's scope custody became unproven, or the capture stopped.
+    /// Same mechanics as `note_health_regression` (every watched edge,
+    /// including one staged earlier in this batch, demotes sticky; later
+    /// watches clamp to `at_ns`), under its own gap subject.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards custody and stop.
+    pub(crate) fn note_watch_demotion(
+        &mut self,
+        subject: &'static str,
+        reason: impl Into<Arc<str>>,
+        at_ns: u64,
+    ) {
+        self.staged.push(Mutation::NoteHealthRegression {
+            subject,
+            reason: reason.into(),
+            at_ns,
+            detected_ns: at_ns,
         });
     }
 
@@ -1655,14 +1722,46 @@ impl CallerRegistry {
                 module,
                 note,
             } => self.apply_coverage(caller, &module, note),
-            Mutation::NoteHealthRegression { reason, at_ns } => {
+            Mutation::EndWatches { reason, at_ns } => {
+                if self.watches_ended_ns.is_none() {
+                    self.watches_ended_ns = Some(at_ns);
+                    for edge in self.edges.values_mut() {
+                        if let Watch::Watching {
+                            since_ns,
+                            until_ns: None,
+                        } = edge.coverage.watch
+                        {
+                            edge.coverage.watch = if at_ns > since_ns {
+                                Watch::Watching {
+                                    since_ns,
+                                    until_ns: Some(at_ns),
+                                }
+                            } else {
+                                // No clean instant proved any of it.
+                                edge.coverage.demoted = true;
+                                Watch::Unknown(UnknownReason::Loss(reason.clone()))
+                            };
+                        }
+                    }
+                }
+            }
+            Mutation::NoteHealthRegression {
+                subject,
+                reason,
+                at_ns,
+                detected_ns,
+            } => {
+                let restart = detected_ns.max(at_ns);
                 self.last_health_regression_ns = Some(
                     self.last_health_regression_ns
-                        .map_or(at_ns, |last| last.max(at_ns)),
+                        .map_or(restart, |last| last.max(restart)),
                 );
                 let mut demoted = 0usize;
                 for edge in self.edges.values_mut() {
-                    if matches!(edge.coverage.watch, Watch::Watching { .. }) {
+                    // An interval frozen before the drop window stands.
+                    if matches!(edge.coverage.watch, Watch::Watching { until_ns, .. }
+                        if until_ns.is_none_or(|until| until > at_ns))
+                    {
                         edge.coverage.watch = Watch::Unknown(UnknownReason::Loss(reason.clone()));
                         edge.coverage.demoted = true;
                         demoted += 1;
@@ -1672,9 +1771,9 @@ impl CallerRegistry {
                     caller: None,
                     module: None,
                     pid: None,
-                    subject: "usage coverage health regression".into(),
+                    subject: subject.into(),
                     reason: format!(
-                        "{reason}; the failure cannot be localized, so {demoted} watched no-use {} demoted to unknown for the rest of the capture",
+                        "{reason}; the failure cannot be localized, so {demoted} watched no-use {} demoted to unknown (a new watch may start only from the detecting read on)",
                         if demoted == 1 { "edge was" } else { "edges were" }
                     ),
                     budget: None,
@@ -2015,6 +2114,7 @@ impl CallerRegistry {
             .is_some_and(|record| record.admission == AdmissionState::Admitted);
         let module_id = self.modules_by_key.get(module).copied();
         let regression = self.last_health_regression_ns;
+        let ended = self.watches_ended_ns.is_some();
         let positive = matches!(
             note,
             CoverageNote::Counted { .. } | CoverageNote::Watched { .. }
@@ -2057,18 +2157,30 @@ impl CallerRegistry {
                 );
             }
             CoverageNote::Watched { since_ns } => {
-                if coverage.demoted || matches!(coverage.watch, Watch::Watching { .. }) {
-                    // Sticky health demotion: never "no use" again. An
-                    // ongoing watch keeps its earliest start.
+                if ended || matches!(coverage.watch, Watch::Watching { .. }) {
+                    // An ongoing watch keeps its earliest start; a frozen
+                    // one is a fact; after the end nothing starts.
                 } else {
-                    // A watch never starts before the last regression:
-                    // only the clean interval after it is watched.
+                    // A new interval (also after a demotion: the demoted
+                    // interval stays demoted) never starts before the
+                    // last regression's detecting read.
                     let since_ns = regression.map_or(since_ns, |at| since_ns.max(at));
-                    coverage.watch = Watch::Watching { since_ns };
+                    coverage.watch = Watch::Watching {
+                        since_ns,
+                        until_ns: None,
+                    };
+                    coverage.demoted = false;
                 }
             }
             CoverageNote::Unknown(reason) => {
-                if !coverage.demoted {
+                let frozen = matches!(
+                    coverage.watch,
+                    Watch::Watching {
+                        until_ns: Some(_),
+                        ..
+                    }
+                );
+                if !coverage.demoted && !frozen {
                     coverage.watch = Watch::Unknown(reason);
                 }
             }
@@ -2399,7 +2511,7 @@ impl CallerRegistry {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -2424,7 +2536,7 @@ mod tests {
     /// never observed from the host. Pins capture the start-time they
     /// opened, exactly like the `ProcStat` fallback.
     #[derive(Debug, Clone, Default)]
-    struct ScriptedSource {
+    pub(crate) struct ScriptedSource {
         state: Rc<RefCell<ScriptedState>>,
     }
 
@@ -2433,7 +2545,7 @@ mod tests {
             self.state.borrow_mut().processes.insert(pid, process);
         }
 
-        fn spawn(&self, pid: u32, start_time: u64) {
+        pub(crate) fn spawn(&self, pid: u32, start_time: u64) {
             self.set(
                 pid,
                 ScriptedProcess {
@@ -2457,13 +2569,13 @@ mod tests {
             }
         }
 
-        fn kill(&self, pid: u32) {
+        pub(crate) fn kill(&self, pid: u32) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.alive = false;
             }
         }
 
-        fn exec(&self, pid: u32, ino: u64, path: &str) {
+        pub(crate) fn exec(&self, pid: u32, ino: u64, path: &str) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.exe = Some(ExeIdentity {
                     dev: 1,
@@ -3151,7 +3263,10 @@ mod tests {
         assert_eq!(a.entry_count, 0);
         assert_eq!(
             registry.coverage(a),
-            UseCoverage::WatchedNoUse { since_ns: 150 }
+            UseCoverage::WatchedNoUse {
+                since_ns: 150,
+                until_ns: None
+            }
         );
         assert_eq!(registry.entry_observation(a), EntryObservation::Observed);
         let b = edge_of(&registry, CallerId(0), &keys[1]);
@@ -3185,7 +3300,7 @@ mod tests {
     }
 
     #[test]
-    fn a_health_regression_demotes_every_watched_edge_sticky_and_keeps_positives() {
+    fn a_health_regression_demotes_every_watched_interval_and_keeps_positives() {
         let mut registry = registry();
         let keys = mapped(
             &mut registry,
@@ -3217,9 +3332,12 @@ mod tests {
         registry.publish();
         assert_eq!(
             registry.coverage(edge_of(&registry, CallerId(0), &keys[1])),
-            UseCoverage::WatchedNoUse { since_ns: 130 }
+            UseCoverage::WatchedNoUse {
+                since_ns: 130,
+                until_ns: None
+            }
         );
-        registry.note_health_regression("COOKIE_CTL.create_failures rose from 0 to 2", 200);
+        registry.note_health_regression("COOKIE_CTL.create_failures rose from 0 to 2", 200, 200);
         registry.publish();
         for key in &keys[..2] {
             let edge = edge_of(&registry, CallerId(0), key);
@@ -3251,17 +3369,33 @@ mod tests {
             .filter(|gap| gap.subject == "usage coverage health regression")
             .count();
         assert_eq!(regressions, 1, "{:?}", registry.gaps());
-        // Sticky: a later watch note never restores "no use since".
+        // The demoted interval stays demoted; a later watch is a new
+        // interval, starting no earlier than the detecting read (200).
         registry.note_coverage(
             CallerId(0),
             &keys[0],
+            CoverageNote::Watched { since_ns: 150 },
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
             CoverageNote::Watched { since_ns: 500 },
         );
         registry.publish();
-        assert!(matches!(
+        assert_eq!(
             registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
-            UseCoverage::Unknown(UnknownReason::Loss(_))
-        ));
+            UseCoverage::WatchedNoUse {
+                since_ns: 200,
+                until_ns: None
+            }
+        );
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[1])),
+            UseCoverage::WatchedNoUse {
+                since_ns: 500,
+                until_ns: None
+            }
+        );
     }
 
     #[test]
@@ -3311,7 +3445,7 @@ mod tests {
         let b = registry.module_id_for(&keys[1]).unwrap();
         registry.note_module_absent(CallerId(0), b, true, 150);
         registry.note_capture_loss("EVENTS ring lost 4 records".into());
-        registry.note_health_regression("USAGE_EVIDENCE rose", 158);
+        registry.note_health_regression("USAGE_EVIDENCE rose", 158, 158);
         registry.retire_caller(CallerId(0), "process exited".into(), 160);
         // A row read after exit is still use: a late witness for the
         // retired caller lands, and moves first-seen earlier only.
@@ -3437,7 +3571,10 @@ mod tests {
         registry.publish();
         assert_eq!(
             registry.coverage(edge_of(&registry, CallerId(0), &keys[1])),
-            UseCoverage::WatchedNoUse { since_ns: 300 }
+            UseCoverage::WatchedNoUse {
+                since_ns: 300,
+                until_ns: None
+            }
         );
     }
 
@@ -3590,7 +3727,7 @@ mod tests {
                 ("/lib/c.so", 13, AdmissionState::Admitted),
             ],
         );
-        registry.note_health_regression("CALLER_EVIDENCE rose", 200);
+        registry.note_health_regression("CALLER_EVIDENCE rose", 200, 200);
         registry.publish();
         // A later batch, a watch whose start predates the regression.
         registry.note_coverage(
@@ -3601,7 +3738,10 @@ mod tests {
         registry.publish();
         assert_eq!(
             registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
-            UseCoverage::WatchedNoUse { since_ns: 200 }
+            UseCoverage::WatchedNoUse {
+                since_ns: 200,
+                until_ns: None
+            }
         );
         // One batch: a watch, the regression, then another watch.
         registry.note_coverage(
@@ -3609,7 +3749,7 @@ mod tests {
             &keys[1],
             CoverageNote::Watched { since_ns: 250 },
         );
-        registry.note_health_regression("COOKIE_CTL.unavailable rose", 300);
+        registry.note_health_regression("COOKIE_CTL.unavailable rose", 300, 300);
         registry.note_coverage(
             CallerId(0),
             &keys[2],
@@ -3622,7 +3762,10 @@ mod tests {
         ));
         assert_eq!(
             registry.coverage(edge_of(&registry, CallerId(0), &keys[2])),
-            UseCoverage::WatchedNoUse { since_ns: 300 }
+            UseCoverage::WatchedNoUse {
+                since_ns: 300,
+                until_ns: None
+            }
         );
         // The earlier watch was demoted by the second regression too.
         assert!(matches!(
@@ -3737,6 +3880,135 @@ mod tests {
         assert_eq!(
             registry.coverage(edge),
             UseCoverage::Witnessed { first_ns: 140 }
+        );
+    }
+
+    #[test]
+    fn ending_watches_freezes_intervals_and_starts_no_new_watch() {
+        // C3 closure 1: stopping the producer ends every watch at the last
+        // proven-clean instant; the interval stays a frozen fact.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+                ("/lib/c.so", 13, AdmissionState::Admitted),
+            ],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        // A watch no clean instant proved after its start.
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Watched { since_ns: 400 },
+        );
+        registry.note_watch_end("stopped before a clean read", 300);
+        registry.publish();
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::WatchedNoUse {
+                since_ns: 100,
+                until_ns: Some(300)
+            }
+        );
+        assert_eq!(
+            registry.entry_observation(edge_of(&registry, CallerId(0), &keys[0])),
+            EntryObservation::Observed
+        );
+        assert!(matches!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[1])),
+            UseCoverage::Unknown(UnknownReason::Loss(reason)) if reason.contains("clean read")
+        ));
+        // Nothing starts or overwrites a frozen interval afterwards.
+        for note in [
+            CoverageNote::Watched { since_ns: 500 },
+            CoverageNote::Unknown(UnknownReason::NotAttached),
+        ] {
+            registry.note_coverage(CallerId(0), &keys[0], note.clone());
+            registry.note_coverage(CallerId(0), &keys[2], note.clone());
+            registry.publish();
+            assert_eq!(
+                registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+                UseCoverage::WatchedNoUse {
+                    since_ns: 100,
+                    until_ns: Some(300)
+                },
+                "{note:?}"
+            );
+            assert!(
+                !matches!(
+                    registry.coverage(edge_of(&registry, CallerId(0), &keys[2])),
+                    UseCoverage::WatchedNoUse { .. }
+                ),
+                "no watch starts after the end: {note:?}"
+            );
+        }
+        // A regression whose window starts after the frozen end leaves it.
+        registry.note_health_regression("EVIDENCE rose", 350, 360);
+        registry.publish();
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::WatchedNoUse {
+                since_ns: 100,
+                until_ns: Some(300)
+            }
+        );
+    }
+
+    #[test]
+    fn a_regression_demotes_its_interval_and_restarts_only_from_the_detecting_read() {
+        // C3 closure 2: the demoted interval stays demoted; a new interval
+        // may start only from the detecting read, never inside the window
+        // (baseline..detection) where the drop happened.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let edge =
+            |registry: &CallerRegistry| registry.coverage(edge_of(registry, CallerId(0), &keys[0]));
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.note_health_regression("EVIDENCE[3] rose", 125, 160);
+        registry.publish();
+        assert!(matches!(
+            edge(&registry),
+            UseCoverage::Unknown(UnknownReason::Loss(_))
+        ));
+        // An Unknown note does not overwrite the demotion's reason.
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Unknown(UnknownReason::NotAttached),
+        );
+        registry.publish();
+        assert!(matches!(
+            edge(&registry),
+            UseCoverage::Unknown(UnknownReason::Loss(_))
+        ));
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.publish();
+        assert_eq!(
+            edge(&registry),
+            UseCoverage::WatchedNoUse {
+                since_ns: 160,
+                until_ns: None
+            },
+            "a new interval starts at the detecting read, not the baseline"
         );
     }
 }

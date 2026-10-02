@@ -39,13 +39,13 @@ fn window() -> InventoryReadWindow {
     InventoryReadWindow::new(576, Instant::now() + Duration::from_secs(3)).unwrap()
 }
 
-struct OwnedFixture {
+pub(in crate::attach::inventory) struct OwnedFixture {
     _directory: tempfile::TempDir,
-    path: PathBuf,
+    pub(in crate::attach::inventory) path: PathBuf,
     pins: PinnedObjects,
-    plan: AttachPlan,
+    pub(in crate::attach::inventory) plan: AttachPlan,
     expected_key: ObjectKey,
-    expected_sha256: String,
+    pub(in crate::attach::inventory) expected_sha256: String,
     expected_abi: ElfAbi,
 }
 
@@ -61,7 +61,7 @@ impl OwnedFixture {
         Self::build_n(ia32, 576)
     }
 
-    fn build_n(ia32: bool, endpoints: u32) -> Result<Self> {
+    pub(in crate::attach::inventory) fn build_n(ia32: bool, endpoints: u32) -> Result<Self> {
         Self::build_n_with_alias(ia32, endpoints, false)
     }
 
@@ -430,7 +430,7 @@ int main(int argc, char **argv) {
     fn targets(&self) -> Result<InventoryTargets> {
         InventoryTargets::from_plan(&self.plan, &self.pins)
     }
-    fn spawn(&self) -> Result<OwnedCaller> {
+    pub(in crate::attach::inventory) fn spawn(&self) -> Result<OwnedCaller> {
         self.spawn_inner(false)
     }
 
@@ -813,9 +813,9 @@ fn task4_identity_alias_command_uses_second_table_field_after_go() -> Result<()>
     Ok(())
 }
 
-struct OwnedCaller {
-    child: Child,
-    pin: Option<PidPin>,
+pub(in crate::attach::inventory) struct OwnedCaller {
+    pub(in crate::attach::inventory) child: Child,
+    pub(in crate::attach::inventory) pin: Option<PidPin>,
     input: ChildStdin,
     output: ChildStdout,
     observed: Vec<String>,
@@ -943,7 +943,11 @@ impl OwnedCaller {
         Ok(())
     }
 
-    fn start_held_worker(&mut self, command: &str, id: u32) -> Result<u32> {
+    pub(in crate::attach::inventory) fn start_held_worker(
+        &mut self,
+        command: &str,
+        id: u32,
+    ) -> Result<u32> {
         ensure!(["ABANDON", "NONLEADER_EXEC"].contains(&command));
         writeln!(self.input, "{command} {id}")?;
         self.input.flush()?;
@@ -969,7 +973,7 @@ impl OwnedCaller {
         await_task_released(self.child.id(), tid, Duration::from_secs(5))
     }
 
-    fn release_held_worker_exec(&mut self) -> Result<()> {
+    pub(in crate::attach::inventory) fn release_held_worker_exec(&mut self) -> Result<()> {
         writeln!(self.input, "EXEC_THREAD")?;
         self.input.flush()?;
         ensure!(
@@ -979,7 +983,7 @@ impl OwnedCaller {
         Ok(())
     }
 
-    fn calls(&mut self, id: u32, calls: u32) -> Result<()> {
+    pub(in crate::attach::inventory) fn calls(&mut self, id: u32, calls: u32) -> Result<()> {
         self.start_calls(id, calls)?;
         self.finish_calls(id, calls)
     }
@@ -1082,7 +1086,7 @@ impl OwnedCaller {
         Ok(())
     }
 
-    fn exec_self(&mut self) -> Result<()> {
+    pub(in crate::attach::inventory) fn exec_self(&mut self) -> Result<()> {
         writeln!(self.input, "EXEC")?;
         self.input.flush()?;
         ensure!(self.line()? == format!("READY {}", self.child.id()));
@@ -1097,7 +1101,11 @@ impl OwnedCaller {
         Ok(())
     }
 
-    fn hold_call_in_body(&mut self, id: u32, calls: u32) -> Result<()> {
+    pub(in crate::attach::inventory) fn hold_call_in_body(
+        &mut self,
+        id: u32,
+        calls: u32,
+    ) -> Result<()> {
         ensure!(calls != 0);
         writeln!(self.input, "ARM {id}")?;
         self.input.flush()?;
@@ -1124,14 +1132,14 @@ impl OwnedCaller {
         Ok(())
     }
 
-    fn resume_body(&mut self, id: u32) -> Result<()> {
+    pub(in crate::attach::inventory) fn resume_body(&mut self, id: u32) -> Result<()> {
         writeln!(self.input, "RESUME")?;
         self.input.flush()?;
         ensure!(self.line()? == format!("RESUMED {id}"));
         Ok(())
     }
 
-    fn finish_calls(&mut self, id: u32, calls: u32) -> Result<()> {
+    pub(in crate::attach::inventory) fn finish_calls(&mut self, id: u32, calls: u32) -> Result<()> {
         let sum = u64::from(calls) * u64::from(id)
             + u64::from(calls) * u64::from(calls.saturating_sub(1)) / 2;
         let ledger = self.line()?;
@@ -1143,7 +1151,7 @@ impl OwnedCaller {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<()> {
+    pub(in crate::attach::inventory) fn finish(&mut self) -> Result<()> {
         writeln!(self.input, "EXIT")?;
         self.input.flush()?;
         ensure!(

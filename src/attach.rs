@@ -43,6 +43,7 @@ use std::sync::Arc;
 mod inventory;
 #[allow(unused_imports)]
 pub(crate) use inventory::PreparedInventory;
+pub(crate) use inventory::capture;
 mod stop_gate;
 pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
 mod cleanup_worker;
@@ -627,13 +628,7 @@ fn root_affiliation_element_with(
         }
         RootElementOperation::Read => {
             let mut readback = 0u64;
-            let attr = BpfMapElementAttr {
-                map_fd: map_fd.as_raw_fd() as u32,
-                key: (&key as *const i32) as u64,
-                value: (&mut readback as *mut u64) as u64,
-                ..BpfMapElementAttr::default()
-            };
-            syscall(BPF_MAP_LOOKUP_ELEM, &attr, size_of_val(&attr))
+            pidfd_task_storage_lookup_with(map_fd, pidfd, &mut readback, &mut syscall)
                 .context("reading back ROOT_AFFILIATION through original pidfd")?;
             if readback != ROOT_AFFILIATION_POSITIVE {
                 bail!(
@@ -645,21 +640,49 @@ fn root_affiliation_element_with(
     Ok(())
 }
 
+/// One u64 task-storage element looked up through a pidfd key (flags 0):
+/// the kernel resolves the pidfd to its current task, so the answer is for
+/// the process generation that descriptor retains. Shared by the
+/// ROOT_AFFILIATION readback and the capture facade's TASK_COOKIE query.
+/// ENOENT (no element) is returned unchanged for the caller to classify.
+fn pidfd_task_storage_lookup_with(
+    map_fd: BorrowedFd<'_>,
+    pidfd: BorrowedFd<'_>,
+    value: &mut u64,
+    mut syscall: impl FnMut(u32, &BpfMapElementAttr, usize) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let key = pidfd.as_raw_fd();
+    let attr = BpfMapElementAttr {
+        map_fd: map_fd.as_raw_fd() as u32,
+        key: (&key as *const i32) as u64,
+        value: (value as *mut u64) as u64,
+        ..BpfMapElementAttr::default()
+    };
+    syscall(BPF_MAP_LOOKUP_ELEM, &attr, size_of_val(&attr))
+}
+
+/// The real map-element syscall behind the `_with` seams.
+fn bpf_map_element_syscall(
+    command: u32,
+    attr: &BpfMapElementAttr,
+    size: usize,
+) -> std::io::Result<()> {
+    // SAFETY: the typed key/value and complete zero-reserved attr remain live
+    // for this exact map-element syscall invocation.
+    let rc = unsafe { libc::syscall(libc::SYS_bpf, command, attr, size) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn root_affiliation_element(
     map_fd: BorrowedFd<'_>,
     pidfd: BorrowedFd<'_>,
     operation: RootElementOperation,
 ) -> Result<()> {
-    root_affiliation_element_with(map_fd, pidfd, operation, |command, attr, size| {
-        // SAFETY: the typed key/value and complete zero-reserved attr remain live
-        // for this exact map-element syscall invocation.
-        let rc = unsafe { libc::syscall(libc::SYS_bpf, command, attr, size) };
-        if rc == -1 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    })
+    root_affiliation_element_with(map_fd, pidfd, operation, bpf_map_element_syscall)
 }
 
 fn program_array_lookup_result(
@@ -2071,7 +2094,7 @@ fn slot_attach_point(slot: &Slot) -> UProbeAttachPoint<'static> {
 
 /// True when the attach error chain bottoms out at EMFILE: the fd table is
 /// full, so every further link would fail identically.
-fn is_fd_exhaustion(error: &anyhow::Error) -> bool {
+pub(crate) fn is_fd_exhaustion(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<io::Error>(),

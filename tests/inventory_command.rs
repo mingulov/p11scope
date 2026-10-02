@@ -682,6 +682,7 @@ fn assert_scan_only_entries(edge: &Value, name: &str) {
         serde_json::json!({
             "state": "unknown",
             "since_ns": null,
+            "until_ns": null,
             "first_ns": null,
             "lossy": null,
             "reason": "scan_only",

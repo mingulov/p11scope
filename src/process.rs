@@ -746,6 +746,12 @@ impl PidPin {
         self.pid
     }
 
+    /// The `/proc` start time retained at `open` (clock ticks since boot),
+    /// the same basis caller incarnations carry; `None` when unreadable.
+    pub(crate) fn start_time(&self) -> Option<u64> {
+        self.start_time
+    }
+
     /// False when the process exited or the pid was reused since `open`.
     pub fn still_the_same(&self) -> bool {
         match &self.pidfd {

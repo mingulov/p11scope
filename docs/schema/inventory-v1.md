@@ -87,7 +87,9 @@ never a changed meaning for an existing field.
   the per-edge operation aggregates with exactly these keys:
   `calls` (authorized calls with semantic content),
   `started` (`*Init`-created operations plus completed-direct
-  calls), `completed`/`cancelled`/`failed`/`unknown` (explicit end
+  calls — an OK `*Init` with an unreadable mechanism still creates
+  its operation with the mechanism unknown, contributing no
+  `mechanisms` row), `completed`/`cancelled`/`failed`/`unknown` (explicit end
   states — completed ⟺ ended by an `OK` return; cancelled ⟺ ended
   by cancel, replacement, or scope end; failed ⟺ ended by an error
   return; unknown ⟺ invalidated by loss, retirement, or a

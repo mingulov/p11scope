@@ -9,7 +9,7 @@
 //! asserts calls ≠ operations counts plus the exact end state. D4
 //! (public-command matrix) lives in `tests/inventory_command.rs`.
 
-use crate::discovery::caller_registry::{CallerId, ModuleKey, RegistryLimits};
+use crate::discovery::caller_registry::{CallerId, ModuleInfo, ModuleKey, RegistryLimits};
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::inventory_dashboard::{DashboardState, Viewport, render_frame};
 use crate::inventory_events::{EventWriter, emit_snapshot_as_events};
@@ -17,7 +17,7 @@ use crate::inventory_present::{Presentation, render_snapshot};
 use crate::semantics_edge::SemanticCall;
 use p11scope_ebpf_common::{SESSION_NONE, capture};
 use pkcs11_types::CkRv;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const AES_GCM: u64 = 0x1087;
 const RSA_PSS: u64 = 0x000d;
@@ -155,6 +155,26 @@ fn d1_init_success_completes_with_exact_mechanism_row() {
     assert_eq!(document["budgets"]["semantic_state"]["occupied"], 1);
     assert_eq!(document["budgets"]["semantic_state"]["status"], "observed");
     assert_eq!(document["budgets"]["semantic_state"]["unknown_edges"], 0);
+}
+
+#[test]
+fn d1_unreadable_mechanism_init_reports_operation_without_mechanism_row() {
+    // F5 at JSON level: one operation, completed, with null
+    // mechanisms — the unknown mechanism invents no row.
+    let (mut harness, caller, key) = single_edge();
+    let mut unreadable = init("C_SignInit", 7, 0, 100);
+    unreadable.capture = capture::MECHANISM_UNREADABLE | capture::OUTPUT_NON_NULL;
+    harness.observe_semantic(caller, &key, unreadable);
+    harness.observe_semantic(caller, &key, op("C_Sign", 7, 110));
+    let document = render(&mut harness);
+    let edge = edge_json(&document, "c0", "m0");
+    assert_eq!(edge["semantics"], "observed");
+    assert!(edge["mechanisms"].is_null(), "no invented mechanism row");
+    let ops = &edge["operations"];
+    assert_eq!(ops["calls"], 2);
+    assert_eq!(ops["started"], 1);
+    assert_eq!(ops["completed"], 1);
+    assert_eq!(ops["orphans"], 0);
 }
 
 #[test]
@@ -568,6 +588,86 @@ fn d2_identical_handles_across_modules_never_merge() {
 }
 
 #[test]
+fn d2_same_inode_distinct_instances_never_join() {
+    // F7b (option a): two module INSTANCES sharing one inode (same
+    // device + inode, distinct content hashes — in-place replacement
+    // generations, distinct ModuleKeys per the file-identity
+    // contract) in ONE process, using overlapping numeric session
+    // handles: their operations never join.
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "s1-same-inode",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 9900,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let caller = caller_of(&harness, 9900);
+    let first = scale_key(0);
+    let info_for = |key: ModuleKey, path: &str| ModuleInfo {
+        path: path.into(),
+        key,
+        build_id: None,
+        identity_source: Some("workload".into()),
+        admission: crate::discovery::caller_registry::AdmissionState::Admitted,
+        admission_class: Some("exact".into()),
+        admission_endpoints: Some(1),
+        admission_reasons: Vec::new(),
+    };
+    // Contrast anchor: re-mapping the IDENTICAL key merges — one
+    // object, one module, one edge, one session namespace.
+    let now = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_mapping(
+        caller,
+        9900,
+        info_for(first.clone(), "/scale/m0.so"),
+        now,
+    );
+    harness.commit();
+    assert_eq!(harness.render()["modules"].as_array().unwrap().len(), 1);
+    // The replacement generation: same device + inode, different
+    // bytes — a distinct instance with its own edge.
+    let second = ModuleKey::physical(
+        8,
+        1,
+        100_000,
+        Some("sha9ffff9".into()),
+        "/scale/m0-replacement.so",
+    );
+    assert_ne!(first, second);
+    let now = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_mapping(
+        caller,
+        9900,
+        info_for(second.clone(), "/scale/m0-replacement.so"),
+        now,
+    );
+    // Overlapping numeric handle 7 on both instances, different
+    // mechanisms and categories.
+    harness.observe_semantic(caller, &first, init("C_SignInit", 7, RSA_PSS, 100));
+    harness.observe_semantic(caller, &first, op("C_Sign", 7, 110));
+    harness.observe_semantic(caller, &second, init("C_EncryptInit", 7, AES_GCM, 120));
+    harness.observe_semantic(caller, &second, op("C_Encrypt", 7, 130));
+    let document = render(&mut harness);
+    assert_eq!(document["modules"].as_array().unwrap().len(), 2);
+    assert_eq!(document["edges"].as_array().unwrap().len(), 2);
+    let mut mechs: Vec<u64> = Vec::new();
+    for edge in document["edges"].as_array().unwrap() {
+        let rows = edge["mechanisms"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "no foreign mechanism joins this edge");
+        mechs.push(rows[0]["mechanism"].as_u64().unwrap());
+        assert_eq!(edge["operations"]["started"], 1);
+        assert_eq!(edge["operations"]["completed"], 1);
+        assert_eq!(edge["operations"]["orphans"], 0);
+    }
+    mechs.sort_unstable();
+    assert_eq!(mechs, vec![RSA_PSS, AES_GCM]);
+}
+
+#[test]
 fn d2_successive_lifetimes_never_merge() {
     let mut harness = harness();
     let spec = ScaleSpec {
@@ -847,9 +947,164 @@ fn d3_canonical_churn_storm_stays_withheld_and_agrees() {
     assert_four_way_semantic_agreement(&document, &presentation);
 }
 
-/// JSON vs snapshot vs dashboard vs stream on one capture: every
-/// edge's semantic label in all four, and every mechanism row and
-/// operation aggregate of observed edges in all four.
+#[test]
+fn d3_divergent_edges_compare_per_edge_across_all_outputs() {
+    // F6 focused regression: several edges with deliberately different
+    // counts, categories, recencies, returns, and gaps — each
+    // dashboard edge's facts must match its own JSON edge.
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "s1-divergent",
+        callers: 1,
+        modules: 7,
+        edges_per_caller: 7,
+        endpoints_per_module: 1,
+        first_pid: 9800,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .set_usage_feed(true);
+    let caller = caller_of(&harness, 9800);
+    let now = harness.now_ns();
+    // m0: two mechanisms completed, one with a retry error.
+    harness.observe_semantic(caller, &scale_key(0), init("C_SignInit", 7, RSA_PSS, 100));
+    harness.observe_semantic(caller, &scale_key(0), op("C_Sign", 7, 110));
+    harness.observe_semantic(
+        caller,
+        &scale_key(0),
+        init("C_EncryptInit", 8, AES_GCM, 120),
+    );
+    let mut retry = op("C_EncryptUpdate", 8, 130);
+    retry.rv = CkRv::BUFFER_TOO_SMALL.0;
+    harness.observe_semantic(caller, &scale_key(0), retry);
+    harness.observe_semantic(caller, &scale_key(0), op("C_EncryptUpdate", 8, 140));
+    harness.observe_semantic(caller, &scale_key(0), op("C_EncryptFinal", 8, 150));
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .observe_entries(caller, &scale_key(0), 3, now);
+    // m1: a live decrypt, ended unknown by the pass-wide loss below.
+    harness.observe_semantic(caller, &scale_key(1), init("C_DecryptInit", 7, ECDSA, 200));
+    harness.observe_semantic(caller, &scale_key(1), op("C_DecryptUpdate", 7, 210));
+    // m2: a failed verify plus an unmatched close.
+    harness.observe_semantic(caller, &scale_key(2), init("C_VerifyInit", 7, RSA_PSS, 300));
+    harness.observe_semantic(
+        caller,
+        &scale_key(2),
+        call("C_Verify", 7, CkRv::SIGNATURE_INVALID.0, 310),
+    );
+    harness.observe_semantic(
+        caller,
+        &scale_key(2),
+        call("C_CloseSession", 7, CkRv::OK.0, 320),
+    );
+    // m3: an unauthoritative feed — materialized, unknown, no claims.
+    let mut unauthorized = init("C_SignInit", 7, RSA_PSS, 400);
+    unauthorized.authorized = false;
+    harness.observe_semantic(caller, &scale_key(3), unauthorized);
+    // m4: bare — never fed, withheld.
+    // m5: an unknown-mechanism operation (F5): operations without rows.
+    let mut unreadable = init("C_SignInit", 7, 0, 500);
+    unreadable.capture = capture::MECHANISM_UNREADABLE | capture::OUTPUT_NON_NULL;
+    harness.observe_semantic(caller, &scale_key(5), unreadable);
+    harness.observe_semantic(caller, &scale_key(5), op("C_SignUpdate", 7, 510));
+    harness.observe_semantic(caller, &scale_key(5), op("C_SignFinal", 7, 520));
+    // m6: nine single-use mechanisms — past the dashboard's per-edge
+    // cap, so the cap marker itself is pinned per edge.
+    for index in 0..9 {
+        let session = 20 + index as u64;
+        let ts = 600 + index as u64 * 2;
+        harness.observe_semantic(
+            caller,
+            &scale_key(6),
+            init("C_SignInit", session, 0x2000 + index as u64, ts),
+        );
+        harness.observe_semantic(caller, &scale_key(6), op("C_Sign", session, ts + 1));
+    }
+    // Three gaps with distinct subjects: capture loss, a semantic
+    // call without mapping evidence, entries without mapping evidence.
+    harness.note_semantic_loss("divergent replay loss");
+    harness.observe_semantic(caller, &scale_key(99), init("C_SignInit", 7, RSA_PSS, 700));
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .observe_entries(caller, &scale_key(99), 5, now);
+    let document = render(&mut harness);
+    let edge = |module: &str| edge_json(&document, "c0", module);
+    assert_eq!(edge("m0")["operations"]["started"], 2);
+    assert_eq!(edge("m0")["operations"]["completed"], 2);
+    assert_eq!(edge("m0")["mechanisms"].as_array().unwrap().len(), 2);
+    assert_eq!(edge("m0")["entries"]["count"], 3);
+    assert_eq!(edge("m1")["operations"]["unknown"], 1);
+    assert_eq!(edge("m1")["operations"]["active"], serde_json::json!([]));
+    assert_eq!(edge("m2")["operations"]["failed"], 1);
+    assert_eq!(edge("m2")["operations"]["evidence"]["unmatched_closes"], 1);
+    assert_eq!(edge("m3")["semantics"], "unknown (unauthoritative module)");
+    assert!(edge("m3")["operations"].is_null());
+    assert_eq!(
+        edge("m4")["semantics"],
+        "unknown (semantic capture withheld)"
+    );
+    assert!(edge("m5")["mechanisms"].is_null());
+    assert_eq!(edge("m5")["operations"]["completed"], 1);
+    assert_eq!(edge("m6")["mechanisms"].as_array().unwrap().len(), 9);
+    assert_eq!(edge("m6")["operations"]["completed"], 9);
+    assert_eq!(document["gaps"].as_array().unwrap().len(), 3);
+    let presentation = presentation_for(&harness, &document);
+    assert_four_way_semantic_agreement(&document, &presentation);
+}
+
+/// Parse the dashboard's per-edge blocks: identity lines start at
+/// column 0 (`{caller} pid {pid} ({exe}) -> {module} ({path})`) while
+/// item lines are indented, so each block's facts attribute to exactly
+/// one edge (F6: no global substring can satisfy another edge).
+fn dashboard_edge_blocks(dashboard: &str) -> BTreeMap<(String, String), String> {
+    fn parse_identity(line: &str) -> Option<(String, String)> {
+        let (left, right) = line.rsplit_once(" -> ")?;
+        let mut left_tokens = left.split_whitespace();
+        let caller = left_tokens.next()?;
+        if left_tokens.next() != Some("pid") {
+            return None;
+        }
+        let module = right.split_whitespace().next()?;
+        if !caller.starts_with('c') || !module.starts_with('m') {
+            return None;
+        }
+        Some((caller.to_string(), module.to_string()))
+    }
+    let mut blocks: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut current: Option<((String, String), Vec<&str>)> = None;
+    let mut flush = |current: &mut Option<((String, String), Vec<&str>)>| {
+        if let Some((key, lines)) = current.take() {
+            blocks.insert(key, lines.join("\n"));
+        }
+    };
+    for line in dashboard.lines() {
+        if !line.starts_with(' ') && !line.is_empty() {
+            match parse_identity(line) {
+                Some(key) => {
+                    flush(&mut current);
+                    current = Some((key, vec![line]));
+                }
+                None => flush(&mut current),
+            }
+            continue;
+        }
+        if let Some((_, lines)) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    flush(&mut current);
+    blocks
+}
+
+/// JSON vs snapshot vs dashboard vs stream on one capture (F6/C1/D3):
+/// every edge's identities, states, and semantic facts in all four —
+/// each dashboard edge's facts against its corresponding JSON edge —
+/// plus the replay's totals, budgets, and gaps across all outputs.
 fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation: &Presentation) {
     let snapshot = render_snapshot(presentation);
     let frame = crate::inventory_dashboard::DisplayFrame {
@@ -879,21 +1134,76 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
+    let blocks = dashboard_edge_blocks(&dashboard);
+    assert_eq!(
+        blocks.len(),
+        document["edges"].as_array().unwrap().len(),
+        "one dashboard block per JSON edge"
+    );
     for edge_json in document["edges"].as_array().unwrap() {
         let caller = edge_json["caller"].as_str().unwrap();
         let module = edge_json["module"].as_str().unwrap();
         let label = edge_json["semantics"].as_str().unwrap();
+        let view = presentation
+            .edges
+            .iter()
+            .find(|edge| edge.caller.label() == caller && edge.module.label() == module)
+            .unwrap_or_else(|| panic!("missing presentation edge for {caller}->{module}"));
         let snapshot_line = snapshot
             .lines()
             .find(|line| line.starts_with(&format!("edge {caller} -> {module} ")))
             .unwrap_or_else(|| panic!("missing snapshot line for {caller}->{module}"));
+        let block = blocks
+            .get(&(caller.to_string(), module.to_string()))
+            .unwrap_or_else(|| panic!("missing dashboard block for {caller}->{module}"));
+        // Identities and states in all four.
+        assert!(
+            snapshot_line.contains(&format!(
+                "mapping {}",
+                edge_json["mapping"]["state"].as_str().unwrap()
+            )),
+            "snapshot mapping for {caller}->{module}: {snapshot_line}"
+        );
+        assert!(
+            snapshot_line.contains(&format!("entries {}", edge_json["entries"]["count"])),
+            "snapshot entries for {caller}->{module}: {snapshot_line}"
+        );
+        assert!(
+            snapshot_line.contains(edge_json["entries"]["observation"].as_str().unwrap()),
+            "snapshot entry observation for {caller}->{module}: {snapshot_line}"
+        );
+        for (state, name) in [
+            (view.presence.label(), "presence"),
+            (view.capture.label(), "capture"),
+            (view.activity.label(), "activity"),
+        ] {
+            assert!(
+                snapshot_line.contains(&format!("{name} {state}")),
+                "snapshot {name} for {caller}->{module}: {snapshot_line}"
+            );
+            assert!(
+                block.contains(&format!("{name} {state}")),
+                "dashboard {name} for {caller}->{module}: {block}"
+            );
+        }
+        assert!(
+            block.contains(&format!(
+                "mapping {}",
+                edge_json["mapping"]["state"].as_str().unwrap()
+            )),
+            "dashboard mapping for {caller}->{module}: {block}"
+        );
+        assert!(
+            block.contains(&format!("entries {}", edge_json["entries"]["count"])),
+            "dashboard entries for {caller}->{module}: {block}"
+        );
         assert!(
             snapshot_line.contains(label),
             "snapshot label for {caller}->{module}: {snapshot_line}"
         );
         assert!(
-            dashboard.contains(&format!("semantics {label}")),
-            "dashboard label for {caller}->{module}"
+            block.contains(&format!("semantics {label}")),
+            "dashboard label for {caller}->{module}: {block}"
         );
         let streamed = events
             .iter()
@@ -903,95 +1213,389 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
                     && event["event"]["module"] == module
             })
             .unwrap_or_else(|| panic!("missing stream event for {caller}->{module}"));
-        assert_eq!(streamed["event"]["semantics"], label);
-        assert_eq!(streamed["event"]["mechanisms"], edge_json["mechanisms"]);
-        assert_eq!(streamed["event"]["operations"], edge_json["operations"]);
+        for key in [
+            "caller",
+            "module",
+            "mapping",
+            "entries",
+            "semantics",
+            "mechanisms",
+            "operations",
+        ] {
+            assert_eq!(
+                streamed["event"][key], edge_json[key],
+                "stream {key} for {caller}->{module}"
+            );
+        }
+        assert_eq!(streamed["event"]["presence"], view.presence.label());
+        assert_eq!(streamed["event"]["capture"], view.capture.label());
+        assert_eq!(streamed["event"]["activity"], view.activity.label());
         if edge_json["operations"].is_null() {
+            // Unknown edge: the bare label everywhere, no detail rows.
+            assert!(
+                snapshot_line.ends_with(&format!("semantics {label}")),
+                "snapshot bare label for {caller}->{module}: {snapshot_line}"
+            );
+            assert!(
+                !block.contains("mechs ")
+                    && !block.contains("mech [")
+                    && !block.contains("ops ")
+                    && !block.contains("active "),
+                "dashboard bare label for {caller}->{module}: {block}"
+            );
             continue;
         }
-        // Observed edge: every mechanism name and operation fact in
-        // the snapshot and the dashboard too.
-        for mech in edge_json["mechanisms"].as_array().unwrap() {
-            let name = mech["name"].as_str().unwrap_or("null");
-            let hex = mech["mechanism_hex"].as_str().unwrap();
-            let tag = if name == "null" {
-                hex.to_string()
-            } else {
-                format!("{name}/{hex}")
+        // Observed edge: every mechanism row's exact facts — id, name,
+        // categories, counts, recency, provenance — in the snapshot
+        // segment and the dashboard's own block. (`mechanisms` is null
+        // — never `[]` — when operations exist without attributed
+        // mechanisms, e.g. unknown-mechanism Inits.)
+        let empty;
+        let mechs: &[serde_json::Value] = if edge_json["mechanisms"].is_null() {
+            empty = Vec::new();
+            &empty
+        } else {
+            edge_json["mechanisms"].as_array().unwrap()
+        };
+        if mechs.is_empty() {
+            assert!(
+                snapshot_line.contains("mechs  ops ["),
+                "snapshot empty mechs for {caller}->{module}: {snapshot_line}"
+            );
+            assert!(
+                block.contains("mechs 0: none"),
+                "dashboard empty mechs for {caller}->{module}: {block}"
+            );
+        } else {
+            assert!(
+                block.contains(&format!("mechs {}", mechs.len())),
+                "dashboard mech count for {caller}->{module}: {block}"
+            );
+        }
+        for (index, mech) in mechs.iter().enumerate() {
+            let id = match mech["name"].as_str() {
+                Some(name) => format!("{name}/{}", mech["mechanism_hex"].as_str().unwrap()),
+                None => mech["mechanism_hex"].as_str().unwrap().to_string(),
             };
-            assert!(
-                snapshot_line.contains(&tag),
-                "snapshot mech {tag} for {caller}->{module}: {snapshot_line}"
+            let categories = mech["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|category| category.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join(",");
+            let by = mech["evidence"]["functions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|function| function.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join(",");
+            let rv = mech["evidence"]["returns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| format!("0x{:x}", row["rv"].as_u64().unwrap()))
+                .collect::<Vec<_>>()
+                .join(",");
+            let segment = format!(
+                "[{id} {categories} calls={} errors={} last={} by=[{by}] rv=[{rv}]{}]",
+                mech["calls"],
+                mech["errors"],
+                mech["last_seen_ns"],
+                if mech["evidence"]["truncated"].as_bool().unwrap() {
+                    " truncated"
+                } else {
+                    ""
+                },
             );
             assert!(
-                dashboard.contains(name) || dashboard.contains(hex),
-                "dashboard mech {tag} for {caller}->{module}"
+                snapshot_line.contains(&segment),
+                "snapshot mech {id} for {caller}->{module}: {snapshot_line}"
             );
-            for function in mech["evidence"]["functions"].as_array().unwrap() {
+            // The dashboard shows the first 8 mechs per edge, then an
+            // explicit marker — both pinned against this edge's block.
+            if index < crate::inventory_dashboard::DASHBOARD_MAX_MECHS {
                 assert!(
-                    snapshot_line.contains(function.as_str().unwrap()),
-                    "snapshot provenance for {caller}->{module}: {snapshot_line}"
+                    block.contains(&format!("mech {segment}")),
+                    "dashboard mech {id} for {caller}->{module}: {block}"
                 );
             }
         }
+        if mechs.len() > crate::inventory_dashboard::DASHBOARD_MAX_MECHS {
+            assert!(
+                block.contains(&format!(
+                    "+{} more mechs",
+                    mechs.len() - crate::inventory_dashboard::DASHBOARD_MAX_MECHS
+                )),
+                "dashboard mech cap marker for {caller}->{module}: {block}"
+            );
+        }
+        // Operation aggregates: every counter plus recency, active
+        // machines, and (snapshot) the evidence counters.
         let ops = &edge_json["operations"];
-        for text in [
-            format!("calls={}", ops["calls"]),
-            format!("started={}", ops["started"]),
-            format!("completed={}", ops["completed"]),
-            format!("orphans={}", ops["orphans"]),
-        ] {
-            assert!(
-                snapshot_line.contains(&text),
-                "snapshot {text} for {caller}->{module}: {snapshot_line}"
-            );
-        }
         assert!(
-            dashboard.contains(&format!("{} calls", ops["calls"])),
-            "dashboard calls for {caller}->{module}"
+            snapshot_line.contains(&format!(
+                "ops [calls={} started={} completed={} cancelled={} failed={} unknown={} orphans={} dropped={} last={}]",
+                ops["calls"],
+                ops["started"],
+                ops["completed"],
+                ops["cancelled"],
+                ops["failed"],
+                ops["unknown"],
+                ops["orphans"],
+                ops["dropped"],
+                ops["last_seen_ns"],
+            )),
+            "snapshot ops for {caller}->{module}: {snapshot_line}"
         );
-        for active in ops["active"].as_array().unwrap() {
-            let tag = format!(
-                "{}:{}",
-                active["category"].as_str().unwrap(),
-                active["state"].as_str().unwrap()
-            );
+        assert!(
+            block.contains(&format!(
+                "ops {} calls {} started {} completed {} cancelled {} failed {} unknown {} orphans {} dropped last_seen {}",
+                ops["calls"],
+                ops["started"],
+                ops["completed"],
+                ops["cancelled"],
+                ops["failed"],
+                ops["unknown"],
+                ops["orphans"],
+                ops["dropped"],
+                ops["last_seen_ns"],
+            )),
+            "dashboard ops for {caller}->{module}: {block}"
+        );
+        let active = ops["active"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}:{}x{}",
+                    row["category"].as_str().unwrap(),
+                    row["state"].as_str().unwrap(),
+                    row["count"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            snapshot_line.contains(&format!("active [{active}]")),
+            "snapshot active for {caller}->{module}: {snapshot_line}"
+        );
+        if active.is_empty() {
             assert!(
-                snapshot_line.contains(&tag),
-                "snapshot active {tag} for {caller}->{module}"
+                block.contains("active none"),
+                "dashboard idle active for {caller}->{module}: {block}"
             );
+        } else {
             assert!(
-                dashboard.contains(&tag),
-                "dashboard active {tag} for {caller}->{module}"
+                block.contains(&format!("active {active}")),
+                "dashboard active for {caller}->{module}: {block}"
             );
         }
+        let evidence = &ops["evidence"];
+        assert!(
+            snapshot_line.contains(&format!(
+                "evidence [state_reconciliations={} session_cancel_ambiguities={} session_cancel_unknown_flags={} operation_state_imports={} auth_state_ambiguities={} semantic_capture_failures={} async_duplicates={} async_evictions={} unmatched_closes={}]",
+                evidence["state_reconciliations"],
+                evidence["session_cancel_ambiguities"],
+                evidence["session_cancel_unknown_flags"],
+                evidence["operation_state_imports"],
+                evidence["auth_state_ambiguities"],
+                evidence["semantic_capture_failures"],
+                evidence["async_duplicates"],
+                evidence["async_evictions"],
+                evidence["unmatched_closes"],
+            )),
+            "snapshot evidence for {caller}->{module}: {snapshot_line}"
+        );
     }
-    // Snapshot and dashboard budgets mirror the JSON semantic row.
+    // Totals, budgets, and gaps across all outputs.
+    let scope = document["scope"].as_str().unwrap();
+    let passes = document["observation"]["passes"].as_u64().unwrap();
+    let callers = document["callers"].as_array().unwrap().len();
+    let modules = document["modules"].as_array().unwrap().len();
+    let edges = document["edges"].as_array().unwrap().len();
+    let plural = |count: usize, single: &str, plural: &str| {
+        if count == 1 {
+            format!("1 {single}")
+        } else {
+            format!("{count} {plural}")
+        }
+    };
     assert!(
         snapshot.contains(&format!(
-            "semantic_state {} held {}/{} unknown {} refused {}",
-            document["budgets"]["semantic_state"]["status"]
-                .as_str()
-                .unwrap(),
-            document["budgets"]["semantic_state"]["occupied"],
-            document["budgets"]["semantic_state"]["limit"],
-            document["budgets"]["semantic_state"]["unknown_edges"],
-            document["budgets"]["semantic_state"]["refused"],
+            "inventory {} ({} pass{}, {}, {}, {})",
+            scope,
+            passes,
+            if passes == 1 { "" } else { "es" },
+            plural(callers, "caller", "callers"),
+            plural(modules, "module", "modules"),
+            plural(edges, "edge", "edges"),
         )),
-        "snapshot semantic budget"
+        "snapshot totals"
+    );
+    let budgets = &document["budgets"];
+    let row = |resource: &str| {
+        format!(
+            "{}/{} refused {}",
+            budgets[resource]["occupied"], budgets[resource]["limit"], budgets[resource]["refused"],
+        )
+    };
+    assert!(
+        snapshot.contains(&format!(
+            "budgets: callers {} | modules {} | edges {} | endpoints {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {}",
+            row("callers"),
+            row("modules"),
+            row("edges"),
+            row("endpoints"),
+            budgets["counters"]["observed_edges"],
+            budgets["counters"]["saturated_edges"],
+            budgets["semantic_state"]["status"].as_str().unwrap(),
+            budgets["semantic_state"]["occupied"],
+            budgets["semantic_state"]["limit"],
+            budgets["semantic_state"]["unknown_edges"],
+            budgets["semantic_state"]["refused"],
+            budgets["retained_history"]["retained"],
+            budgets["retained_history"]["limit"],
+            budgets["retained_history"]["suppressed"],
+        )),
+        "snapshot budgets"
     );
     assert!(
         dashboard.contains(&format!(
-            "semantic {} ({} held, {} unknown, {} refused)",
-            document["budgets"]["semantic_state"]["status"]
-                .as_str()
-                .unwrap(),
-            document["budgets"]["semantic_state"]["occupied"],
-            document["budgets"]["semantic_state"]["unknown_edges"],
-            document["budgets"]["semantic_state"]["refused"],
+            "p11scope inventory {scope} | {passes} passes | {callers} callers {modules} modules {edges} edges"
         )),
-        "dashboard semantic budget"
+        "dashboard totals"
     );
+    let refusals = ["callers", "modules", "edges", "endpoints"]
+        .iter()
+        .map(|resource| budgets[resource]["refused"].as_u64().unwrap())
+        .sum::<u64>();
+    let gaps = document["gaps"].as_array().unwrap();
+    let suppressed = document["gaps_suppressed"].as_u64().unwrap();
+    assert!(
+        dashboard.contains(&format!(
+            "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{} | semantic {} ({} held, {} unknown, {} refused)",
+            gaps.len(),
+            refusals,
+            suppressed,
+            budgets["endpoints"]["occupied"],
+            budgets["endpoints"]["limit"],
+            budgets["semantic_state"]["status"].as_str().unwrap(),
+            budgets["semantic_state"]["occupied"],
+            budgets["semantic_state"]["unknown_edges"],
+            budgets["semantic_state"]["refused"],
+        )),
+        "dashboard coverage"
+    );
+    assert!(
+        dashboard.contains(&format!(
+            "budgets: callers {} | modules {} | edges {} | counters observed {} saturated {} | retained {}/{} suppressed {}",
+            row("callers"),
+            row("modules"),
+            row("edges"),
+            budgets["counters"]["observed_edges"],
+            budgets["counters"]["saturated_edges"],
+            budgets["retained_history"]["retained"],
+            budgets["retained_history"]["limit"],
+            budgets["retained_history"]["suppressed"],
+        )),
+        "dashboard budgets"
+    );
+    for gap in gaps {
+        let mut expected = format!(
+            "gap [{}] {}",
+            gap["subject"].as_str().unwrap(),
+            gap["reason"].as_str().unwrap()
+        );
+        if !gap["budget"].is_null() {
+            expected.push_str(&format!(
+                " (budget {}: limit {}, requested {})",
+                gap["budget"]["resource"].as_str().unwrap(),
+                gap["budget"]["limit"],
+                gap["budget"]["requested"],
+            ));
+        }
+        assert!(snapshot.contains(&expected), "snapshot gap: {expected}");
+    }
+    if suppressed > 0 {
+        assert!(
+            snapshot.contains(&format!("gaps suppressed: {suppressed}")),
+            "snapshot suppressed gaps"
+        );
+    } else {
+        assert!(
+            !snapshot.contains("gaps suppressed:"),
+            "snapshot hides a zero suppression count"
+        );
+    }
+    let gap_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "gap_recorded")
+        .collect();
+    assert_eq!(gap_events.len(), gaps.len(), "one stream gap per JSON gap");
+    for (event, gap) in gap_events.iter().zip(gaps.iter()) {
+        assert_eq!(event["event"], *gap, "stream gap payload");
+    }
+    let streamed_snapshot = events
+        .iter()
+        .find(|event| event["kind"] == "snapshot")
+        .expect("stream snapshot summary");
+    assert_eq!(streamed_snapshot["event"]["scope"], scope);
+    assert_eq!(streamed_snapshot["event"]["passes"], passes);
+    assert_eq!(streamed_snapshot["event"]["budgets"], *budgets);
+    assert_eq!(streamed_snapshot["event"]["gaps_suppressed"], suppressed);
+    let caller_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "caller_observed")
+        .collect();
+    let module_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["kind"] == "module_observed")
+        .collect();
+    assert_eq!(
+        caller_events.len(),
+        callers,
+        "one stream caller per JSON caller"
+    );
+    assert_eq!(
+        module_events.len(),
+        modules,
+        "one stream module per JSON module"
+    );
+    for (event, row) in caller_events
+        .iter()
+        .zip(document["callers"].as_array().unwrap().iter())
+    {
+        assert_eq!(event["event"], *row, "stream caller payload");
+    }
+    for (event, row) in module_events
+        .iter()
+        .zip(document["modules"].as_array().unwrap().iter())
+    {
+        assert_eq!(event["event"], *row, "stream module payload");
+    }
+    for row in document["callers"].as_array().unwrap() {
+        assert!(
+            snapshot.contains(&format!(
+                "caller {} pid {}",
+                row["id"].as_str().unwrap(),
+                row["pid"].as_u64().unwrap()
+            )),
+            "snapshot caller row"
+        );
+    }
+    for row in document["modules"].as_array().unwrap() {
+        assert!(
+            snapshot.contains(&format!(
+                "module {} {}",
+                row["id"].as_str().unwrap(),
+                row["paths"].as_array().unwrap()[0].as_str().unwrap()
+            )),
+            "snapshot module row"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

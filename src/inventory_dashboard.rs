@@ -598,30 +598,46 @@ fn render_edge_window(
     (lines, shown)
 }
 
-/// Dashboard mechanism summary: the count plus up to
-/// [`DASHBOARD_MAX_MECH_NAMES`] registered names (verbatim hex for
-/// unregistered ids), with an explicit `+N more` marker past the cap —
-/// bounded, never silent.
-pub(crate) const DASHBOARD_MAX_MECH_NAMES: usize = 8;
+/// Dashboard mechanism facts: the count plus one item per mechanism
+/// (bounded by [`DASHBOARD_MAX_MECHS`], with an explicit `+N more
+/// mechs` marker past the cap — bounded, never silent). Each shown
+/// mech mirrors its snapshot segment — verbatim id, name, operation
+/// categories, counts, recency, provenance — so every dashboard
+/// edge's facts compare against its JSON edge (F6/C1).
+pub(crate) const DASHBOARD_MAX_MECHS: usize = 8;
 
-fn semantic_mechs_item(mechanisms: &[crate::inventory_present::MechanismView]) -> String {
-    if mechanisms.is_empty() {
-        return "mechs 0: none".to_string();
+fn semantic_mech_items(mechanisms: &[crate::inventory_present::MechanismView]) -> Vec<String> {
+    let mut items = vec![if mechanisms.is_empty() {
+        "mechs 0: none".to_string()
+    } else {
+        format!("mechs {}", mechanisms.len())
+    }];
+    for mech in mechanisms.iter().take(DASHBOARD_MAX_MECHS) {
+        let id = match mech.name {
+            Some(name) => format!("{name}/0x{:x}", mech.id),
+            None => format!("0x{:x}", mech.id),
+        };
+        let by = escape_controls(&mech.functions.join(",")).into_owned();
+        let rv = mech
+            .returns
+            .iter()
+            .map(|rv| format!("0x{rv:x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        items.push(format!(
+            "mech [{id} {} calls={} errors={} last={} by=[{by}] rv=[{rv}]{}]",
+            mech.operations.join(","),
+            mech.calls,
+            mech.errors,
+            mech.last_seen_ns,
+            if mech.truncated { " truncated" } else { "" },
+        ));
     }
-    let mut names: Vec<String> = mechanisms
-        .iter()
-        .take(DASHBOARD_MAX_MECH_NAMES)
-        .map(|mech| {
-            mech.name
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("0x{:x}", mech.id))
-        })
-        .collect();
-    let hidden = mechanisms.len().saturating_sub(names.len());
+    let hidden = mechanisms.len().saturating_sub(DASHBOARD_MAX_MECHS);
     if hidden > 0 {
-        names.push(format!("+{hidden} more"));
+        items.push(format!("+{hidden} more mechs"));
     }
-    format!("mechs {}: {}", mechanisms.len(), names.join(", "))
+    items
 }
 
 /// One edge as an identity line plus wrapped exact state items.
@@ -661,6 +677,7 @@ fn render_edge_block(
         width,
     )];
     let mut items = vec![
+        format!("mapping {}", edge.mapping.label()),
         format!("presence {}", edge.presence.label()),
         format!("capture {}", edge.capture.label()),
         format!("activity {}", edge.activity.label()),
@@ -668,9 +685,9 @@ fn render_edge_block(
         format!("semantics {}", edge.semantics.label),
     ];
     if let Some(operations) = edge.semantics.operations.as_ref() {
-        items.push(semantic_mechs_item(&edge.semantics.mechanisms));
+        items.extend(semantic_mech_items(&edge.semantics.mechanisms));
         items.push(format!(
-            "ops {} calls {} started {} completed {} cancelled {} failed {} unknown {} orphans {} dropped",
+            "ops {} calls {} started {} completed {} cancelled {} failed {} unknown {} orphans {} dropped last_seen {}",
             operations.calls,
             operations.started,
             operations.completed,
@@ -679,6 +696,7 @@ fn render_edge_block(
             operations.unknown,
             operations.orphans,
             operations.dropped,
+            operations.last_seen_ns,
         ));
         let active = if operations.active.is_empty() {
             "active none".to_string()

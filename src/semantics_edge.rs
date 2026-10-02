@@ -31,6 +31,16 @@
 //! Fork-inherited sessions read as unknown-origin on the child's edge
 //! (no cross-edge copying — that is S2 scope), never as invented
 //! operations.
+//!
+//! Deliberate differences from the capture-wide reducer (fix round
+//! 1): (F2) async records bind to their ORIGINATING operation
+//! lifetime — the capture-wide `complete_pending` replays against
+//! current bindings, so a completion can finish an unrelated
+//! replacement operation; here a completion whose affected bits no
+//! longer hold the queue-time machine generation orphans instead of
+//! joining. (F5) a trusted OK `*Init` with an unreadable mechanism
+//! still starts its operation (mechanism unknown) under A1, where the
+//! capture-wide reducer drops the binding.
 
 use crate::semantics::{cancel_operation_mask, direct_cancel_flag};
 use p11scope_ebpf_common::{
@@ -139,26 +149,50 @@ impl OpState {
 
 #[derive(Debug, Clone)]
 struct OpMachine {
-    mechanism: u64,
+    /// The bound mechanism id, or `None` when a trusted OK `*Init`
+    /// carried no usable mechanism (F5): the operation is tracked —
+    /// category and initialized state are established by the OK
+    /// return — but no mechanism is ever attributed or named.
+    mechanism: Option<u64>,
     state: OpState,
+    /// Edge-wide unique lifetime id from [`EdgeSemantics::machine_seq`]:
+    /// no two machines — live or dead — share one, so an async
+    /// record's captured generation identifies its originating
+    /// machine exactly, across sessions (F2).
+    generation: u64,
+}
+
+/// An async record's bind to its originating operation lifetime (F2):
+/// one (operation bit, queue-time machine generation) pair per
+/// affected bit. A `None` generation means no machine was live at
+/// queue time — so a machine found at completion is a REPLACEMENT
+/// (mismatch), never a match. Empty for calls with no operation bits
+/// (direct, lifecycle-only): nothing to bind, completions apply.
+#[derive(Debug, Clone, Default)]
+struct CallOrigin {
+    bits: Vec<(u16, Option<u64>)>,
 }
 
 /// A `CKR_PENDING` call awaiting its `C_AsyncComplete`: the pending
-/// call's facts plus a sequence for oldest-first eviction.
+/// call's facts, its originating operation lifetime (F2), plus a
+/// sequence for oldest-first eviction.
 #[derive(Debug, Clone)]
 struct PendingCall {
     call: SemanticCall,
+    origin: CallOrigin,
     sequence: u64,
 }
 
 /// An issued async id: which session holds it (`None` floats —
 /// joinable, a live state, not a dead one) plus the detached call
-/// itself, so a later completion replays it exactly like the
-/// capture-wide reducer replays `Detached.pending`.
+/// itself and its queue-time operation lifetime (F2, carried over
+/// from the pending record — never re-snapshotted, so a completion
+/// cannot adopt a machine created after the call was queued).
 #[derive(Debug, Clone)]
 struct AsyncId {
     owner: Option<u64>,
     call: SemanticCall,
+    origin: CallOrigin,
     sequence: u64,
 }
 
@@ -219,6 +253,9 @@ pub(crate) struct EdgeSemantics {
     /// different edges).
     detached: BTreeMap<(u64, u32, u64), AsyncId>,
     sequence: u64,
+    /// Next operation-machine generation (F2): every machine takes a
+    /// fresh value, so generations identify lifetimes edge-wide.
+    machine_seq: u64,
     /// Authorized calls with effective semantic content (every `*Init`,
     /// operational, direct, lifecycle, cancel, and async call that
     /// passed the downgrade gates — NOT a synonym for operations).
@@ -476,9 +513,22 @@ impl EdgeSemantics {
                 }
             }
             lifecycle::CLOSE_ALL_SESSIONS if call.rv == CkRv::OK.0 => {
-                // Only this edge's sessions on that PKCS#11 slot id:
-                // sessions the capture never saw opening have no
-                // proven slot and are left alone, never guessed away.
+                // Tracked sessions with NO observed open have no proven
+                // slot (computed BEFORE the proven path mutates `open`):
+                // the close-all may or may not have ended them, so
+                // their slot uncertainty ends them unknown below —
+                // never continued definite activity, never a proven
+                // cancel. Sessions proven on other slots stay live.
+                let unproven: BTreeSet<u64> = self
+                    .active
+                    .keys()
+                    .map(|(session, _)| *session)
+                    .chain(self.pending.keys().map(|(session, _)| *session))
+                    .chain(self.detached.values().filter_map(|id| id.owner))
+                    .filter(|session| !self.open.contains_key(session))
+                    .collect();
+                // This edge's sessions on that PKCS#11 slot id end by
+                // observed close — a proven scope end, hence cancelled.
                 let owned: Vec<u64> = self
                     .open
                     .iter()
@@ -490,6 +540,9 @@ impl EdgeSemantics {
                     self.end_session_machines(session, EndState::Cancelled);
                     self.pending.retain(|(owner, _), _| *owner != session);
                     self.float_session_async(session);
+                }
+                for session in unproven {
+                    self.retire_session(session, EndState::Unknown);
                 }
             }
             lifecycle::FINALIZE if call.rv == CkRv::OK.0 => {
@@ -596,53 +649,70 @@ impl EdgeSemantics {
         });
     }
 
-    /// `*Init` OK: bind each operation bit to the captured mechanism,
-    /// mirroring `apply_init`. A failed `Init` never reaches here (no
-    /// operation); a competing `Init` cancels the machine it replaces;
-    /// a `NULL`/unreadable mechanism binds nothing (and counts a
-    /// capture failure for `NULL` unless the descriptor declares
-    /// null-cancel).
+    /// `*Init` OK: bind each operation bit, mirroring `apply_init`
+    /// EXCEPT (F5) a trusted OK `Init` with an unreadable mechanism
+    /// still starts its operation with the mechanism unknown — the OK
+    /// return establishes category and initialized state under A1 —
+    /// where the capture-wide reducer drops the binding. A failed
+    /// `Init` never reaches here (no operation); a competing `*Init`
+    /// cancels the machine it replaces; `NULL` with the descriptor's
+    /// null-cancel flag stays a genuine cancel (no machine), while
+    /// `NULL` without the flag tracks unknown and counts the capture
+    /// failure.
     fn apply_init(&mut self, call: &SemanticCall, descriptor: &SlotSemantics) {
         if call.rv != CkRv::OK.0 || call.session == SESSION_NONE {
             return;
         }
         for (bit, _) in crate::semantics::operation_bits(descriptor.operations) {
-            let key = (call.session, bit);
             match call.mechanism_capture() {
                 capture::MECHANISM_VALUE => {
-                    if !self.active.contains_key(&key) && self.active.len() >= MAX_EDGE_ACTIVE_OPS {
-                        self.dropped = self.dropped.saturating_add(1);
-                        continue;
-                    }
-                    if self
-                        .active
-                        .insert(
-                            key,
-                            OpMachine {
-                                mechanism: call.mechanism,
-                                state: OpState::Initialized,
-                            },
-                        )
-                        .is_some()
-                    {
-                        // Competing `Init`: the old machine ended by
-                        // replacement, never completed.
-                        self.cancelled = self.cancelled.saturating_add(1);
-                    }
-                    self.started = self.started.saturating_add(1);
+                    self.start_machine(call.session, bit, Some(call.mechanism));
+                }
+                capture::MECHANISM_NULL
+                    if descriptor.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL != 0 =>
+                {
+                    self.end_machine(call.session, bit, EndState::Cancelled);
                 }
                 capture::MECHANISM_NULL => {
-                    self.end_machine(call.session, bit, EndState::Cancelled);
-                    if descriptor.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL == 0 {
-                        self.evidence.semantic_capture_failures =
-                            self.evidence.semantic_capture_failures.saturating_add(1);
-                    }
+                    self.evidence.semantic_capture_failures =
+                        self.evidence.semantic_capture_failures.saturating_add(1);
+                    self.start_machine(call.session, bit, None);
                 }
                 _ => {
-                    self.end_machine(call.session, bit, EndState::Cancelled);
+                    self.start_machine(call.session, bit, None);
                 }
             }
         }
+    }
+
+    /// Start (or replace) one operation machine: bound-checked,
+    /// generation-stamped (F2); the replaced machine ends cancelled
+    /// by replacement — never completed.
+    fn start_machine(&mut self, session: u64, bit: u16, mechanism: Option<u64>) {
+        let key = (session, bit);
+        if !self.active.contains_key(&key) && self.active.len() >= MAX_EDGE_ACTIVE_OPS {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        self.machine_seq = self.machine_seq.wrapping_add(1);
+        let generation = self.machine_seq;
+        if self
+            .active
+            .insert(
+                key,
+                OpMachine {
+                    mechanism,
+                    state: OpState::Initialized,
+                    generation,
+                },
+            )
+            .is_some()
+        {
+            // Competing `Init`: the old machine ended by
+            // replacement, never completed.
+            self.cancelled = self.cancelled.saturating_add(1);
+        }
+        self.started = self.started.saturating_add(1);
     }
 
     /// Operational call: attribute to each bound mechanism (or count
@@ -650,13 +720,17 @@ impl EdgeSemantics {
     /// never an invented operation), then run the transition, mirroring
     /// `apply_operations` including its exact retain rules. Retained
     /// machines advance to in-progress; ended machines complete iff
-    /// the ending call returned `OK`.
+    /// the ending call returned `OK`. Machines with an unknown
+    /// mechanism (F5) advance and end normally but attribute to
+    /// nothing — no invented mechanism id.
     fn apply_operations(&mut self, call: &SemanticCall, descriptor: &SlotSemantics) {
         let mut mechanisms = BTreeSet::new();
         for (bit, _) in crate::semantics::operation_bits(descriptor.operations) {
             match self.active.get(&(call.session, bit)) {
                 Some(machine) => {
-                    mechanisms.insert(machine.mechanism);
+                    if let Some(mechanism) = machine.mechanism {
+                        mechanisms.insert(mechanism);
+                    }
                 }
                 None => self.orphans = self.orphans.saturating_add(1),
             }
@@ -802,11 +876,20 @@ impl EdgeSemantics {
 
     /// Capture-loss boundary / retirement / eviction (C2): every live
     /// machine ends unknown with explicit accounting — never silently
-    /// completed, never silently dropped. Historical claims (mechanism
-    /// rows, counters) stand: loss invalidates "right now", not the
-    /// observed past.
+    /// completed, never silently dropped — and outstanding custody
+    /// dies with the boundary (F3): pending calls, detached async ids,
+    /// and session-slot bindings. A pending Init must not recreate
+    /// definite state after loss, a detached completion must not
+    /// replay, and bindings lose their proof (a missed close would
+    /// leave them stale) — post-loss lifecycle re-proves via observed
+    /// opens, exactly like mid-life attach. Historical claims
+    /// (mechanism rows, counters) stand: loss invalidates "right
+    /// now", not the observed past.
     pub(crate) fn invalidate(&mut self) {
         self.end_session_machines_all(EndState::Unknown);
+        self.pending.clear();
+        self.detached.clear();
+        self.open.clear();
     }
 
     /// Async lifecycle, mirroring `observe_async` minus the
@@ -830,7 +913,7 @@ impl EdgeSemantics {
                     return;
                 }
                 if let Some(pending) = self.pending.remove(&(call.session, call.target_function)) {
-                    self.complete_pending(call, pending.call);
+                    self.complete_pending(call, pending.call, &pending.origin);
                     return;
                 }
                 let detached_key = self.detached.iter().find_map(|(key, id)| {
@@ -845,7 +928,7 @@ impl EdgeSemantics {
                     self.orphans = self.orphans.saturating_add(1);
                     return;
                 };
-                self.complete_pending(call, id.call);
+                self.complete_pending(call, id.call, &id.origin);
             }
             lifecycle::ASYNC_GET_ID if call.rv == CkRv::OK.0 => {
                 let Some(slot) = self.open.get(&call.session).copied() else {
@@ -866,6 +949,7 @@ impl EdgeSemantics {
                         AsyncId {
                             owner: Some(call.session),
                             call: pending.call,
+                            origin: pending.origin,
                             sequence,
                         },
                     )
@@ -916,12 +1000,14 @@ impl EdgeSemantics {
         }
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
+        let origin = self.capture_origin(call.session, &descriptor);
         if self
             .pending
             .insert(
                 (call.session, function_id),
                 PendingCall {
                     call: call.clone(),
+                    origin,
                     sequence,
                 },
             )
@@ -932,12 +1018,58 @@ impl EdgeSemantics {
         self.evict_async_if_needed();
     }
 
-    /// Apply a completion to the pending record it named: the pending
-    /// call's facts with the completion's return, session, and time —
-    /// mirroring `complete_pending` (which also routes completions
-    /// against CURRENT bindings, as this does by re-running the
-    /// pipeline).
-    fn complete_pending(&mut self, completion: &SemanticCall, pending: SemanticCall) {
+    /// Snapshot the live-machine generations a pending call binds to
+    /// (F2): one entry per affected operation bit, `None` where no
+    /// machine is live.
+    fn capture_origin(&self, session: u64, descriptor: &SlotSemantics) -> CallOrigin {
+        let bits = crate::semantics::operation_bits(descriptor.operations)
+            .map(|(bit, _)| {
+                (
+                    bit,
+                    self.active
+                        .get(&(session, bit))
+                        .map(|machine| machine.generation),
+                )
+            })
+            .collect();
+        CallOrigin { bits }
+    }
+
+    /// Whether the completing session still holds every originating
+    /// machine lifetime (F2): each bound bit's live generation must
+    /// equal the queue-time generation — including `None == None` (no
+    /// machine then, none now). Any replacement, end, or new machine
+    /// since queue time is a mismatch: the completion is stale.
+    fn origin_matches(&self, session: u64, origin: &CallOrigin) -> bool {
+        origin.bits.iter().all(|(bit, generation)| {
+            self.active
+                .get(&(session, *bit))
+                .map(|machine| machine.generation)
+                == *generation
+        })
+    }
+
+    /// Apply a completion to the record it named: the pending call's
+    /// facts with the completion's return, session, and time — but
+    /// ONLY when the completing session still holds the originating
+    /// operation lifetime on every affected bit (F2). A stale
+    /// completion (replaced, ended, or never-related machine — notably
+    /// a joined completion landing on the receiver's own operation)
+    /// orphans per affected bit instead of joining, like any other
+    /// unattributable evidence. This deliberately differs from the
+    /// capture-wide `complete_pending`, which replays against current
+    /// bindings.
+    fn complete_pending(
+        &mut self,
+        completion: &SemanticCall,
+        pending: SemanticCall,
+        origin: &CallOrigin,
+    ) {
+        if !self.origin_matches(completion.session, origin) {
+            let unattributed = origin.bits.len().max(1) as u64;
+            self.orphans = self.orphans.saturating_add(unattributed);
+            return;
+        }
         let mut completed = pending;
         completed.rv = completion.rv;
         completed.session = completion.session;
@@ -949,7 +1081,12 @@ impl EdgeSemantics {
 
     /// Oldest-first async eviction past the bound, mirroring
     /// `evict_pending_if_needed` (the one place retained async facts
-    /// drop, and every drop is counted).
+    /// drop, and every drop is counted) — plus the affected
+    /// operation's end (F3/C2): when the evicted record's originating
+    /// machine is still live (same generation), it ends unknown with
+    /// explicit accounting, since its outstanding call history is now
+    /// lost. A newer machine on the same key is a different lifetime
+    /// and is left alone.
     fn evict_async_if_needed(&mut self) {
         if self.pending.len() + self.detached.len() <= MAX_EDGE_PENDING {
             return;
@@ -964,21 +1101,41 @@ impl EdgeSemantics {
             .iter()
             .min_by_key(|(_, value)| value.sequence)
             .map(|(key, value)| (*key, value.sequence));
-        match (pending, detached) {
+        let evicted: Option<(u64, CallOrigin)> = match (pending, detached) {
             (Some(key), Some((detached_key, detached_sequence))) => {
                 if self.pending[&key].sequence <= detached_sequence {
-                    self.pending.remove(&key);
+                    self.pending
+                        .remove(&key)
+                        .map(|record| (key.0, record.origin))
                 } else {
-                    self.detached.remove(&detached_key);
+                    self.detached
+                        .remove(&detached_key)
+                        .map(|id| (id.call.session, id.origin))
                 }
             }
-            (Some(key), None) => {
-                self.pending.remove(&key);
-            }
-            (None, Some((key, _))) => {
-                self.detached.remove(&key);
-            }
+            (Some(key), None) => self
+                .pending
+                .remove(&key)
+                .map(|record| (key.0, record.origin)),
+            (None, Some((key, _))) => self
+                .detached
+                .remove(&key)
+                .map(|id| (id.call.session, id.origin)),
             (None, None) => return,
+        };
+        let Some((session, origin)) = evicted else {
+            return;
+        };
+        for (bit, generation) in &origin.bits {
+            let live_matches = generation.is_some()
+                && self
+                    .active
+                    .get(&(session, *bit))
+                    .map(|machine| machine.generation)
+                    == *generation;
+            if live_matches {
+                self.end_machine(session, *bit, EndState::Unknown);
+            }
         }
         self.evidence.async_evictions = self.evidence.async_evictions.saturating_add(1);
     }
@@ -1192,6 +1349,54 @@ mod tests {
     }
 
     #[test]
+    fn init_with_unreadable_mechanism_tracks_an_unknown_mechanism_operation() {
+        // F5: a trusted OK Init with an unreadable mechanism still
+        // establishes one operation (category + initialized state);
+        // its Update/completion advance it with no invented mechanism.
+        let mut edge = EdgeSemantics::default();
+        let mut unreadable = init("C_SignInit", 7, 0, 100);
+        unreadable.capture = capture::MECHANISM_UNREADABLE | capture::OUTPUT_NON_NULL;
+        edge.observe(&unreadable);
+        assert_eq!(edge.started(), 1);
+        assert!(edge.has_live_operations());
+        assert!(edge.mechanisms().is_empty(), "no invented mechanism ID");
+        assert_eq!(edge.label(), SEMANTIC_OBSERVED);
+        edge.observe(&op("C_SignUpdate", 7, 110));
+        assert_eq!(
+            edge.active_summary(),
+            vec![("sign".to_string(), OpState::InProgress, 1)]
+        );
+        edge.observe(&op("C_SignFinal", 7, 120));
+        assert_eq!((edge.started(), edge.completed()), (1, 1));
+        assert!(edge.mechanisms().is_empty());
+        assert_eq!(edge.orphans(), 0);
+    }
+
+    #[test]
+    fn null_mechanism_init_cancels_only_for_null_cancel_descriptors() {
+        // `C_SignInit` declares null-cancel: NULL stays a genuine
+        // cancel (no machine), exactly as before.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&init("C_SignInit", 7, RSA_PSS, 100));
+        let mut null = init("C_SignInit", 7, 0, 110);
+        null.capture = capture::MECHANISM_NULL | capture::OUTPUT_NON_NULL;
+        edge.observe(&null);
+        assert_eq!(edge.started(), 1);
+        assert_eq!(edge.cancelled(), 1);
+        assert!(!edge.has_live_operations());
+        // `C_MessageSignInit` does not: NULL tracks unknown and counts
+        // the capture failure.
+        let mut edge = EdgeSemantics::default();
+        let mut null = init("C_MessageSignInit", 7, 0, 100);
+        null.capture = capture::MECHANISM_NULL | capture::OUTPUT_NON_NULL;
+        edge.observe(&null);
+        assert_eq!(edge.started(), 1);
+        assert!(edge.has_live_operations());
+        assert!(edge.mechanisms().is_empty());
+        assert_eq!(edge.evidence().semantic_capture_failures, 1);
+    }
+
+    #[test]
     fn cross_session_update_never_joins() {
         let mut edge = EdgeSemantics::default();
         edge.observe(&init("C_SignInit", 7, RSA_PSS, 100));
@@ -1248,6 +1453,32 @@ mod tests {
     }
 
     #[test]
+    fn close_all_without_observed_open_ends_machines_unknown() {
+        // F4: an Init observed after mid-life attach creates a machine
+        // with no proven slot; a successful CloseAllSessions then ends
+        // it unknown (slot uncertainty) — never left definitely live,
+        // never a proven cancel.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&init("C_SignInit", 7, RSA_PSS, 100));
+        assert!(edge.has_live_operations());
+        edge.observe(&call("C_CloseAllSessions", SESSION_NONE, CkRv::OK.0, 110));
+        assert!(!edge.has_live_operations());
+        assert_eq!(edge.unknown(), 1);
+        assert_eq!(edge.cancelled(), 0);
+        assert_eq!(edge.completed(), 0);
+        // A session proven on ANOTHER slot is proven unaffected and
+        // stays live through this slot's close-all.
+        let mut edge = EdgeSemantics::default();
+        let mut open = call("C_OpenSession", 8, CkRv::OK.0, 90);
+        open.slot_id = 1;
+        edge.observe(&open);
+        edge.observe(&init("C_SignInit", 8, RSA_PSS, 100));
+        edge.observe(&call("C_CloseAllSessions", SESSION_NONE, CkRv::OK.0, 110));
+        assert!(edge.has_live_operations());
+        assert_eq!(edge.unknown(), 0);
+    }
+
+    #[test]
     fn failed_cancel_with_two_flags_clears_and_counts_ambiguity() {
         let mut edge = EdgeSemantics::default();
         edge.observe(&init("C_SignInit", 7, RSA_PSS, 100));
@@ -1274,6 +1505,75 @@ mod tests {
         // Historical claims stand; only "right now" was invalidated.
         assert_eq!(edge.label(), SEMANTIC_OBSERVED);
         assert_eq!(edge.mechanisms()[&RSA_PSS].calls, 2);
+    }
+
+    #[test]
+    fn pending_init_across_loss_cannot_recreate_definite_state() {
+        // F3: a pending Init queued before a loss boundary must not
+        // establish an operation when its completion lands after it.
+        let mut edge = EdgeSemantics::default();
+        let mut pending = init("C_SignInit", 7, RSA_PSS, 100);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        edge.invalidate();
+        let mut complete = call("C_AsyncComplete", 7, CkRv::OK.0, 110);
+        complete.target_function = crate::kinds::function_id("C_SignInit").unwrap();
+        edge.observe(&complete);
+        assert_eq!(edge.started(), 0, "no operation from pre-loss custody");
+        assert_eq!(edge.orphans(), 1);
+        assert!(!edge.has_live_operations());
+        assert!(edge.mechanisms().is_empty());
+    }
+
+    #[test]
+    fn detached_completion_across_loss_orphans() {
+        // F3: a detached pending Init (GetID issued, completion still
+        // outstanding) is custody too: loss kills it, the late
+        // completion orphans instead of establishing an operation.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&call("C_OpenSession", 7, CkRv::OK.0, 90));
+        let mut pending = init("C_SignInit", 7, RSA_PSS, 100);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        let init_id = crate::kinds::function_id("C_SignInit").unwrap();
+        let mut get_id = call("C_AsyncGetID", 7, CkRv::OK.0, 110);
+        get_id.target_function = init_id;
+        get_id.async_value = 7;
+        edge.observe(&get_id);
+        edge.invalidate();
+        let mut complete = call("C_AsyncComplete", 7, CkRv::OK.0, 120);
+        complete.target_function = init_id;
+        edge.observe(&complete);
+        assert_eq!(edge.started(), 0, "no operation from pre-loss custody");
+        assert_eq!(edge.orphans(), 1);
+        assert!(!edge.has_live_operations());
+    }
+
+    #[test]
+    fn pending_eviction_ends_the_live_owning_machine_unknown() {
+        // F3/C2: evicting a pending call whose owning machine is still
+        // live ends that machine unknown (its outstanding history is
+        // lost) — `async_evictions` alone is not the accounting.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&init("C_SignInit", 1, RSA_PSS, 100));
+        let mut first = op("C_Sign", 1, 110);
+        first.rv = CkRv::PENDING.0;
+        edge.observe(&first);
+        for session in 2..=(MAX_EDGE_PENDING as u64 + 1) {
+            let mut extra = op("C_Sign", session, 110);
+            extra.rv = CkRv::PENDING.0;
+            edge.observe(&extra);
+        }
+        assert_eq!(edge.evidence().async_evictions, 1);
+        assert_eq!(edge.unknown(), 1, "the owning machine ends unknown");
+        assert_eq!(edge.completed(), 0);
+        assert!(!edge.has_live_operations());
+        // The evicted call's late completion is unattributable now.
+        let mut complete = call("C_AsyncComplete", 1, CkRv::OK.0, 200);
+        complete.target_function = crate::kinds::function_id("C_Sign").unwrap();
+        edge.observe(&complete);
+        assert_eq!(edge.orphans(), 1);
+        assert_eq!(edge.completed(), 0);
     }
 
     #[test]
@@ -1343,6 +1643,47 @@ mod tests {
     }
 
     #[test]
+    fn pending_init_creates_its_operation_at_completion() {
+        let mut edge = EdgeSemantics::default();
+        let mut pending = init("C_SignInit", 7, RSA_PSS, 100);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        // A pending Init is not an operation yet: no machine, no
+        // mechanism claim — the outcome is still unknown.
+        assert_eq!(edge.started(), 0);
+        assert!(edge.mechanisms().is_empty());
+        assert!(!edge.has_live_operations());
+        let mut complete = call("C_AsyncComplete", 7, CkRv::OK.0, 110);
+        complete.target_function = crate::kinds::function_id("C_SignInit").unwrap();
+        edge.observe(&complete);
+        assert_eq!((edge.calls(), edge.started()), (2, 1));
+        assert!(edge.has_live_operations());
+        assert_eq!(edge.mechanisms()[&RSA_PSS].calls, 1);
+        // An error completion is a failed Init: still no operation.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&pending);
+        let mut failed = call("C_AsyncComplete", 7, CkRv::GENERAL_ERROR.0, 110);
+        failed.target_function = crate::kinds::function_id("C_SignInit").unwrap();
+        edge.observe(&failed);
+        assert_eq!((edge.calls(), edge.started()), (2, 0));
+        assert!(edge.mechanisms().is_empty());
+    }
+
+    #[test]
+    fn pending_direct_completes_at_completion() {
+        let mut edge = EdgeSemantics::default();
+        let mut pending = init("C_GenerateKey", 7, AES_GCM, 100);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        assert_eq!((edge.started(), edge.completed()), (0, 0));
+        let mut complete = call("C_AsyncComplete", 7, CkRv::OK.0, 110);
+        complete.target_function = crate::kinds::function_id("C_GenerateKey").unwrap();
+        edge.observe(&complete);
+        assert_eq!((edge.calls(), edge.started(), edge.completed()), (2, 1, 1));
+        assert!(edge.mechanisms()[&AES_GCM].ops.contains("generate_key"));
+    }
+
+    #[test]
     fn async_join_moves_custody_across_sessions() {
         let mut edge = EdgeSemantics::default();
         edge.observe(&call("C_OpenSession", 7, CkRv::OK.0, 90));
@@ -1396,6 +1737,70 @@ mod tests {
         bogus.async_value = 44;
         edge.observe(&bogus);
         assert_eq!(edge.orphans(), 2);
+    }
+
+    #[test]
+    fn completion_after_replacement_init_orphans_rather_than_joining() {
+        // F2: Init(M1) → Sign(PENDING) → competing Init(M2) →
+        // AsyncComplete(Sign, OK). The stale completion must not
+        // finish or attribute to M2's replacement operation.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&init("C_SignInit", 7, RSA_PSS, 100));
+        let mut pending = op("C_Sign", 7, 110);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        edge.observe(&init("C_SignInit", 7, AES_GCM, 120));
+        assert_eq!(edge.cancelled(), 1, "replacement cancels M1");
+        let mut complete = call("C_AsyncComplete", 7, CkRv::OK.0, 130);
+        complete.target_function = crate::kinds::function_id("C_Sign").unwrap();
+        edge.observe(&complete);
+        assert_eq!(edge.completed(), 0, "stale completion finishes nothing");
+        assert_eq!(edge.orphans(), 1, "stale completion is counted");
+        assert!(edge.has_live_operations(), "M2's machine stays live");
+        // M2's machine completes only via its own call — and the stale
+        // call was never attributed to either mechanism.
+        edge.observe(&op("C_Sign", 7, 140));
+        assert_eq!(edge.completed(), 1);
+        assert_eq!(edge.mechanisms()[&AES_GCM].calls, 2);
+        assert_eq!(edge.mechanisms()[&RSA_PSS].calls, 1);
+    }
+
+    #[test]
+    fn joined_completion_into_busy_receiver_orphans() {
+        // F2: session 7 detaches a pending Sign; session 8 holds its OWN
+        // initialized Sign; session 8 joins, then completes. The joined
+        // completion must not consume 8's unrelated machine.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&call("C_OpenSession", 7, CkRv::OK.0, 90));
+        edge.observe(&call("C_OpenSession", 8, CkRv::OK.0, 95));
+        edge.observe(&init("C_SignInit", 7, RSA_PSS, 100));
+        let mut pending = op("C_Sign", 7, 110);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        let sign_id = crate::kinds::function_id("C_Sign").unwrap();
+        let mut get_id = call("C_AsyncGetID", 7, CkRv::OK.0, 120);
+        get_id.target_function = sign_id;
+        get_id.async_value = 42;
+        edge.observe(&get_id);
+        edge.observe(&init("C_SignInit", 8, AES_GCM, 130));
+        let mut join = call("C_AsyncJoin", 8, CkRv::OK.0, 140);
+        join.target_function = sign_id;
+        join.async_value = 42;
+        edge.observe(&join);
+        let mut complete = call("C_AsyncComplete", 8, CkRv::OK.0, 150);
+        complete.target_function = sign_id;
+        edge.observe(&complete);
+        assert_eq!(edge.completed(), 0, "joined completion consumes nothing");
+        assert_eq!(edge.orphans(), 1);
+        assert_eq!(
+            edge.active_summary(),
+            vec![("sign".to_string(), OpState::Initialized, 2)],
+            "both sessions' machines stay live"
+        );
+        // Each session ends its own operation normally afterwards.
+        edge.observe(&op("C_Sign", 7, 160));
+        edge.observe(&op("C_Sign", 8, 170));
+        assert_eq!(edge.completed(), 2);
     }
 
     #[test]

@@ -8,8 +8,9 @@
 //! acceptable, losing capture facts is not. Narrowing the VIEW
 //! (scroll position) never narrows the totals shown.
 //!
-//! Read-only: scrolling only — no filtering/selection (U2), no
-//! capture control. ANSI stays on the terminal stream; JSON paths
+//! Read-only: scrolling and detail paging only — no
+//! filtering/selection (U2), no capture control. ANSI stays on the
+//! terminal stream; JSON paths
 //! never see an escape byte. The log tail holds SANITIZED observer
 //! diagnostics with explicit truncation accounting (bytes/lines
 //! dropped shown, never silent). Small terminals degrade to a stated
@@ -263,32 +264,145 @@ impl Viewport {
     }
 }
 
-/// Read-only view state: the scroll position only. There is no
-/// filtering/selection (U2) and no capture control.
+/// Read-only detail page (F6): which bounded view the edge window
+/// shows. Paging is view navigation like scrolling — every page
+/// covers all of its items, with no selection or filtering (U2).
+/// Tight viewports that shave summary detail keep every fact
+/// reachable: evidence counters on the evidence page, gap rows (and
+/// the gaps that name no edge) on the gaps page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DetailPage {
+    /// Per-edge summary blocks (identities, states, mechanisms,
+    /// operations, riding gaps) with adaptive detail budgets.
+    #[default]
+    Summary,
+    /// Per-edge operation-evidence counters (all nine per observed
+    /// edge; the bare semantic label otherwise).
+    Evidence,
+    /// The coverage ledger: every gap with its caller/module
+    /// attribution, including gaps that ride no edge block.
+    Gaps,
+}
+
+impl DetailPage {
+    /// The header tag naming the page (`[summary]` …).
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::Evidence => "evidence",
+            Self::Gaps => "gaps",
+        }
+    }
+}
+
+/// Read-only view state: the scroll position and the detail page.
+/// There is no filtering/selection (U2) and no capture control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DashboardState {
-    /// Index of the first visible edge.
+    /// Index of the first visible item (edge or gap, per page).
     pub scroll: usize,
+    /// Which detail page the window shows.
+    pub detail: DetailPage,
+    /// Wrapped body-line offset within the scrolled-to gap record
+    /// (F6d): tall gap records span frames on the gaps page, one
+    /// body line per Down key, before scrolling advances to the
+    /// next record. Meaningless (always zero) off the gaps page.
+    pub gap_line: usize,
 }
 
 impl DashboardState {
     pub(crate) fn new() -> Self {
-        Self { scroll: 0 }
+        Self {
+            scroll: 0,
+            detail: DetailPage::Summary,
+            gap_line: 0,
+        }
     }
 
-    pub(crate) fn scroll_down(&mut self, total_edges: usize) {
+    /// Items the current page scrolls over: edges, or gaps on the
+    /// gaps page.
+    pub(crate) fn items_total(&self, presentation: &Presentation) -> usize {
+        match self.detail {
+            DetailPage::Gaps => presentation.gaps.len(),
+            DetailPage::Summary | DetailPage::Evidence => presentation.edges.len(),
+        }
+    }
+
+    /// Cycle summary → evidence → gaps → summary (the Tab key).
+    /// Callers clamp the scroll to the new page's total. The
+    /// within-record offset resets: it belongs to one gaps-page
+    /// record, never to a page switch.
+    pub(crate) fn next_detail(&mut self) {
+        self.detail = match self.detail {
+            DetailPage::Summary => DetailPage::Evidence,
+            DetailPage::Evidence => DetailPage::Gaps,
+            DetailPage::Gaps => DetailPage::Summary,
+        };
+        self.gap_line = 0;
+    }
+
+    pub(crate) fn scroll_down(&mut self, total_items: usize) {
         self.scroll = self
             .scroll
             .saturating_add(1)
-            .min(total_edges.saturating_sub(1));
+            .min(total_items.saturating_sub(1));
     }
 
     pub(crate) fn scroll_up(&mut self) {
         self.scroll = self.scroll.saturating_sub(1);
     }
 
-    pub(crate) fn clamp(&mut self, total_edges: usize) {
-        self.scroll = self.scroll.min(total_edges.saturating_sub(1));
+    pub(crate) fn clamp(&mut self, total_items: usize) {
+        self.scroll = self.scroll.min(total_items.saturating_sub(1));
+    }
+
+    /// Clamp the scroll to the CURRENT page's item total (F6c): the
+    /// gaps page scrolls over gaps, not edges. Every production
+    /// clamp (key-driven page switches, redraws) funnels through
+    /// here so a redraw can never drag a gaps-page scroll back to
+    /// the edge count and strand later gaps.
+    pub(crate) fn clamp_to_presentation(&mut self, presentation: &Presentation) {
+        self.clamp(self.items_total(presentation));
+    }
+
+    /// Gaps-page Down (F6d): step one wrapped body line deeper into
+    /// the scrolled-to record while it has lines below the offset,
+    /// else advance to the next record. Line steps can never skip
+    /// a line (the renderer shows a multi-line slice per frame),
+    /// so repeated Down exposes every line of every record. The
+    /// body length comes from the SAME block construction the
+    /// renderer uses, at the live viewport width, so paging and
+    /// rendering can never disagree about record boundaries.
+    pub(crate) fn scroll_gaps_down(&mut self, presentation: &Presentation, width: usize) {
+        let total = presentation.gaps.len();
+        if total == 0 {
+            self.scroll = 0;
+            self.gap_line = 0;
+            return;
+        }
+        // A rescan may have shrunk the ledger under the scroll.
+        self.scroll = self.scroll.min(total - 1);
+        let body_lines = gap_block_lines(&presentation.gaps[self.scroll], self.scroll, total, width)
+            .len()
+            .saturating_sub(1);
+        if self.gap_line + 1 < body_lines {
+            self.gap_line += 1;
+        } else if self.scroll + 1 < total {
+            self.scroll += 1;
+            self.gap_line = 0;
+        }
+        // Else the last line of the last record: stay (bottom).
+    }
+
+    /// Gaps-page Up (F6d): step one wrapped body line back toward
+    /// the record head, else to the previous record. Width-free:
+    /// stepping back can never overshoot line zero.
+    pub(crate) fn scroll_gaps_up(&mut self) {
+        if self.gap_line > 0 {
+            self.gap_line -= 1;
+        } else {
+            self.scroll_up();
+        }
     }
 }
 
@@ -439,7 +553,7 @@ fn render_full(
 ) -> Vec<String> {
     let presentation = frame.presentation.as_ref();
     let budgets = &presentation.budgets;
-    let total = presentation.edges.len();
+    let total = state.items_total(presentation);
     let scroll = state.scroll.min(total.saturating_sub(1));
     let mut lines = vec![
         truncate_cell(
@@ -489,24 +603,20 @@ fn render_full(
             width,
         ),
     ];
-    // Log rows adapt to short terminals; the edge table takes the rest.
-    // At the minimal full height (14) the log yields its second row so
-    // the edge window keeps a 5-row middle budget: one observed edge
-    // (identity, states, counts, operations) plus both scroll markers.
-    // The log still shows its latest line and the drop counts below.
-    let log_rows: usize = if height >= 20 {
-        4
-    } else if height >= 15 {
-        2
-    } else {
-        1
+    let edge_room = detail_room(height);
+    let log_rows = detail_log_rows(height);
+    let kind = match state.detail {
+        DetailPage::Gaps => "gaps",
+        DetailPage::Summary | DetailPage::Evidence => "edges",
     };
-    // Header (3) + edge-table header (1) + log header (1) + log rows + footer (1).
-    let edge_room = height.saturating_sub(3 + 1 + 1 + log_rows + 1).max(2);
-    let (mut edge_lines, shown) = render_edge_window(presentation, width, edge_room, scroll);
-    let (first, last) = visible_edge_range(shown, total, scroll);
+    let (mut edge_lines, shown) = match state.detail {
+        DetailPage::Summary => render_edge_window(presentation, width, edge_room, scroll, false),
+        DetailPage::Evidence => render_edge_window(presentation, width, edge_room, scroll, true),
+        DetailPage::Gaps => render_gap_window(presentation, width, edge_room, scroll, state.gap_line),
+    };
+    let (first, last) = visible_item_range(shown, total, scroll);
     lines.push(truncate_cell(
-        &format!("--- edges {first}-{last} of {total} (scroll narrows this view only; totals above cover everything) ---"),
+        &format!("--- {kind} {first}-{last} of {total} [{}] (scroll narrows this view only; totals above cover everything) ---", state.detail.label()),
         width,
     ));
     lines.append(&mut edge_lines);
@@ -546,14 +656,45 @@ fn render_full(
     }
     lines.extend(tail);
     let max_scroll = total.saturating_sub(1);
+    // Within-record paging (F6d) names its line offset: two frames
+    // mid-record would otherwise carry identical footers.
+    let position = if state.detail == DetailPage::Gaps && state.gap_line > 0 {
+        format!("scroll {scroll}/{max_scroll} line +{}", state.gap_line)
+    } else {
+        format!("scroll {scroll}/{max_scroll}")
+    };
     lines.push(truncate_cell(
-        &format!(
-            "scroll {scroll}/{max_scroll} | showing edges {first}-{last} of {total} | up/down j/k scroll, q quit"
-        ),
+        &format!("{position} | showing {kind} {first}-{last} of {total} | j/k scroll, tab details, q quit"),
         width,
     ));
     lines.truncate(height);
     lines
+}
+
+/// Observer-log rows for a full-layout height: the log adapts to
+/// short terminals and the detail window takes the rest. At the
+/// minimal full height (14) the log yields its second row so the
+/// window keeps a 5-row middle budget: one observed edge (identity,
+/// states, counts, operations) plus both scroll markers. The log
+/// still shows its latest line and the drop counts below.
+fn detail_log_rows(height: usize) -> usize {
+    if height >= 20 {
+        4
+    } else if height >= 15 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Detail-window rows for a full-layout height: header (3) +
+/// table header (1) + log header (1) + log rows + footer (1) come
+/// off the top, at least two rows remain. Full layout needs
+/// height >= 14, so production rooms are always >= 7.
+fn detail_room(height: usize) -> usize {
+    height
+        .saturating_sub(3 + 1 + 1 + detail_log_rows(height) + 1)
+        .max(2)
 }
 
 /// Per-edge detail budget: how much of an edge's expandable detail
@@ -577,10 +718,12 @@ struct BlockBudget {
 /// Render the visible edge window as whole edge blocks: `^ +K more
 /// above` when scrolled, then blocks, then `v +M more below` when the
 /// room runs out. Every block carries full exact state labels (items
-/// wrap on ` | ` boundaries, never mid-label); expandable detail
-/// shaves to the remaining room via [`fit_edge_block`], so a short
-/// viewport narrows detail — always with explicit markers — instead
-/// of rejecting whole edges.
+/// wrap on ` | ` boundaries, never mid-label); summary expandable
+/// detail shaves to the remaining room via [`fit_edge_block`], so a
+/// short viewport narrows detail — always with explicit markers —
+/// instead of rejecting whole edges. The evidence page renders the
+/// compact counter blocks instead (shaved summary facts stay
+/// reachable there).
 /// Returns the window lines plus the count of edge blocks actually
 /// emitted (the header range derives from this count, never from
 /// re-parsing rendered text).
@@ -589,6 +732,7 @@ fn render_edge_window(
     width: usize,
     room: usize,
     scroll: usize,
+    evidence: bool,
 ) -> (Vec<String>, usize) {
     let total = presentation.edges.len();
     let mut lines = Vec::new();
@@ -607,7 +751,12 @@ fn render_edge_window(
         // remain after this block.
         let reserve = usize::from(remaining_after > 0);
         let budget = room.saturating_sub(lines.len() + reserve);
-        let Some(block) = fit_edge_block(presentation, edge, width, budget) else {
+        let block = if evidence {
+            fit_evidence_block(presentation, edge, width, budget)
+        } else {
+            fit_edge_block(presentation, edge, width, budget)
+        };
+        let Some(block) = block else {
             break;
         };
         shown += 1;
@@ -621,6 +770,89 @@ fn render_edge_window(
         return (
             vec![truncate_cell(
                 "(no edges fit here; scroll or enlarge the terminal)",
+                width,
+            )],
+            0,
+        );
+    }
+    let hidden_below = total.saturating_sub(scroll + shown);
+    if hidden_below > 0 {
+        // The reservation above guarantees this fits.
+        if lines.len() < room {
+            lines.push(truncate_cell(
+                &format!("v +{hidden_below} more below (scroll down)"),
+                width,
+            ));
+        }
+    }
+    (lines, shown)
+}
+
+/// Render the visible gaps window as whole gap blocks over the
+/// coverage ledger: every gap in presentation order with its
+/// caller/module attribution. Same packing and honesty rules as
+/// [`render_edge_window`]: directional markers, whole blocks only,
+/// and an honest line when nothing fits or no gap exists — except
+/// the FIRST visible record, which pages within itself (F6d): when
+/// its wrapped block exceeds the budget, or the state holds a
+/// within-record offset, the window shows the head (or an explicit
+/// continuation head) plus a body slice with an explicit
+/// continuation marker, consuming the window for that frame. Tall
+/// records thus span frames instead of vanishing behind "no gaps
+/// fit", and every line stays reachable by repeated Down.
+fn render_gap_window(
+    presentation: &Presentation,
+    width: usize,
+    room: usize,
+    scroll: usize,
+    gap_line: usize,
+) -> (Vec<String>, usize) {
+    let total = presentation.gaps.len();
+    let mut lines = Vec::new();
+    if total == 0 {
+        lines.push(truncate_cell("(no coverage gaps)", width));
+        return (lines, 0);
+    }
+    let above = scroll.min(total);
+    if above > 0 {
+        lines.push(truncate_cell(&format!("^ +{above} more above"), width));
+    }
+    let mut shown = 0;
+    let mut first = true;
+    for (index, gap) in presentation.gaps.iter().enumerate().skip(scroll) {
+        let remaining_after = total - scroll - shown - 1;
+        // Reserve one line for the `more below` marker when gaps
+        // remain after this block.
+        let reserve = usize::from(remaining_after > 0);
+        let budget = room.saturating_sub(lines.len() + reserve);
+        if first {
+            first = false;
+            // A paged record consumes the window: the next frame (or
+            // the next record) comes from scrolling. Only a record
+            // shown whole lets later records pack behind it.
+            match render_first_gap_record(&mut lines, gap, index, total, width, budget, gap_line)
+            {
+                FirstGapOutcome::Whole => {
+                    shown += 1;
+                }
+                FirstGapOutcome::Paged => {
+                    shown += 1;
+                    break;
+                }
+                FirstGapOutcome::Unshown => break,
+            }
+            continue;
+        }
+        let Some(block) = fit_gap_block(gap, index, total, width, budget) else {
+            break;
+        };
+        shown += 1;
+        lines.extend(block);
+    }
+    if shown == 0 {
+        return (
+            vec![truncate_cell(
+                "(no gaps fit here; scroll or enlarge the terminal)",
                 width,
             )],
             0,
@@ -799,18 +1031,13 @@ fn gap_item(gap: &crate::inventory_present::GapView) -> String {
     }
 }
 
-/// One edge as an identity line plus wrapped exact state items.
-/// Item order is stable: base states, mechanism facts, evidence
-/// counters, riding gaps, operation aggregates, active machines.
-/// Expandable detail (mech rows, evidence, gaps) follows `budget`;
-/// hidden detail counts itself in a marker in the same slot its rows
-/// would occupy, so shaved blocks pack like full ones.
-fn render_edge_block(
+/// One edge's column-0 identity line, shared by the summary and
+/// evidence pages so blocks attribute identically on both.
+fn edge_identity_line(
     presentation: &Presentation,
     edge: &crate::inventory_present::EdgeView,
     width: usize,
-    budget: BlockBudget,
-) -> Vec<String> {
+) -> String {
     let caller_exe = presentation
         .callers
         .iter()
@@ -825,7 +1052,7 @@ fn render_edge_block(
         .and_then(|module| module.paths.first())
         .map(String::as_str)
         .unwrap_or("?");
-    let mut lines = vec![truncate_cell(
+    truncate_cell(
         &format!(
             "{} pid {} ({}) -> {} ({})",
             edge.caller.label(),
@@ -840,7 +1067,53 @@ fn render_edge_block(
             escape_controls(module_path),
         ),
         width,
-    )];
+    )
+}
+
+/// Greedy wrap on item boundaries; no item is split mid-label.
+/// Overlong single items truncate with the cell marker (gap text
+/// that must survive whole uses [`wrap_words`] on the gaps page).
+fn wrap_items(width: usize, items: &[String]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::from("  ");
+    for item in items {
+        let piece = if current.len() > 2 {
+            format!(" | {item}")
+        } else {
+            item.clone()
+        };
+        if current.len() + piece.len() <= width {
+            current.push_str(&piece);
+        } else {
+            if current.len() > 2 {
+                lines.push(truncate_cell(&current, width));
+            }
+            current = format!("  {item}");
+            if current.len() > width {
+                lines.push(truncate_cell(&current, width));
+                current = String::from("  ");
+            }
+        }
+    }
+    if current.len() > 2 {
+        lines.push(truncate_cell(&current, width));
+    }
+    lines
+}
+
+/// One edge as an identity line plus wrapped exact state items.
+/// Item order is stable: base states, mechanism facts, evidence
+/// counters, riding gaps, operation aggregates, active machines.
+/// Expandable detail (mech rows, evidence, gaps) follows `budget`;
+/// hidden detail counts itself in a marker in the same slot its rows
+/// would occupy, so shaved blocks pack like full ones.
+fn render_edge_block(
+    presentation: &Presentation,
+    edge: &crate::inventory_present::EdgeView,
+    width: usize,
+    budget: BlockBudget,
+) -> Vec<String> {
+    let mut lines = vec![edge_identity_line(presentation, edge, width)];
     let mut items = vec![
         format!("mapping {}", edge.mapping.label()),
         format!("presence {}", edge.presence.label()),
@@ -897,41 +1170,233 @@ fn render_edge_block(
         };
         items.push(active);
     }
-    // Greedy wrap on item boundaries; no item is split mid-label.
-    let mut current = String::from("  ");
-    for item in &items {
-        let piece = if current.len() > 2 {
-            format!(" | {item}")
-        } else {
-            item.clone()
-        };
-        if current.len() + piece.len() <= width {
-            current.push_str(&piece);
-        } else {
-            if current.len() > 2 {
-                lines.push(truncate_cell(&current, width));
-            }
-            current = format!("  {item}");
-            if current.len() > width {
-                lines.push(truncate_cell(&current, width));
-                current = String::from("  ");
-            }
-        }
-    }
-    if current.len() > 2 {
-        lines.push(truncate_cell(&current, width));
+    lines.extend(wrap_items(width, &items));
+    lines
+}
+
+/// One edge's evidence block: the identity line plus all nine
+/// operation-evidence counters (or the bare semantic label when the
+/// edge holds no operations). Operation aggregates stay on the
+/// summary page, which already shows them at 80x14 — this page
+/// answers the counters alone, so its blocks fit tight rooms.
+fn render_evidence_block(
+    presentation: &Presentation,
+    edge: &crate::inventory_present::EdgeView,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = vec![edge_identity_line(presentation, edge, width)];
+    match edge.semantics.operations.as_ref() {
+        Some(operations) => lines.extend(wrap_items(width, &evidence_items(operations))),
+        None => lines.extend(wrap_items(
+            width,
+            &[format!("semantics {}", edge.semantics.label)],
+        )),
     }
     lines
 }
 
-/// The 1-based visible edge range named in the table header/footer.
-/// Derived from the emitted-block COUNT the window returns, not from
-/// arithmetic over the scroll or by re-parsing rendered text — the
-/// header can never claim edges the frame does not show, and a
-/// future reformat cannot silently degrade the range. An empty window
-/// names 0-0 (nothing shown) alongside the window's honest message;
-/// the footer still carries the scroll position.
-fn visible_edge_range(shown: usize, total: usize, scroll: usize) -> (usize, usize) {
+/// One evidence block within `budget` rows, or `None` when even the
+/// compact block exceeds it (the window then stops honestly instead
+/// of cropping a block).
+fn fit_evidence_block(
+    presentation: &Presentation,
+    edge: &crate::inventory_present::EdgeView,
+    width: usize,
+    budget: usize,
+) -> Option<Vec<String>> {
+    let block = render_evidence_block(presentation, edge, width);
+    (block.len() <= budget).then_some(block)
+}
+
+/// Greedy word-wrap for gap text: words pack to `width` chars,
+/// overlong words split on char boundaries. Always returns at
+/// least one line; every line fits `width` chars.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let push_word = |lines: &mut Vec<String>, current: &mut String, word: &str| {
+        if current.is_empty() {
+            current.push_str(word);
+            return;
+        }
+        if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+            return;
+        }
+        lines.push(std::mem::take(current));
+        current.push_str(word);
+    };
+    for word in text.split_whitespace() {
+        if word.chars().count() <= width {
+            push_word(&mut lines, &mut current, word);
+            continue;
+        }
+        // An overlong word: flush the line, then split the word on
+        // char boundaries.
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        let mut chunk = String::new();
+        for ch in word.chars() {
+            if chunk.chars().count() >= width {
+                lines.push(std::mem::take(&mut chunk));
+            }
+            chunk.push(ch);
+        }
+        current = chunk;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// How the first visible gap record rendered: whole (later
+/// records may pack behind it), paged (a head plus a body slice —
+/// the record consumes the window), or unshown (the budget cannot
+/// even name the record — the window stops honestly).
+enum FirstGapOutcome {
+    Whole,
+    Paged,
+    Unshown,
+}
+
+/// Render the FIRST visible gap record (F6d): whole when it fits at
+/// offset zero (later records pack behind it, exactly as before),
+/// else a within-record page — the head (or an explicit
+/// continuation head naming the skipped lines) plus a body slice,
+/// plus an explicit continuation marker when body remains below.
+/// The offset clamps defensively (a rescan may have replaced the
+/// record under the scroll). Appends at most `budget` lines.
+/// `Unshown` only when the budget holds no head line at all.
+fn render_first_gap_record(
+    lines: &mut Vec<String>,
+    gap: &crate::inventory_present::GapView,
+    index: usize,
+    total: usize,
+    width: usize,
+    budget: usize,
+    gap_line: usize,
+) -> FirstGapOutcome {
+    let block = gap_block_lines(gap, index, total, width);
+    // The block always holds a head plus at least one body line
+    // (`wrap_words` never returns empty).
+    let (head, body) = block.split_first().expect("a gap block names its gap");
+    if gap_line == 0 && block.len() <= budget {
+        lines.extend(block);
+        return FirstGapOutcome::Whole;
+    }
+    if budget < 2 {
+        return FirstGapOutcome::Unshown;
+    }
+    let offset = gap_line.min(body.len().saturating_sub(1));
+    if offset == 0 {
+        lines.push(head.clone());
+    } else {
+        lines.push(truncate_cell(
+            &format!(
+                "gap {}/{} (+{offset} lines above) {}",
+                index + 1,
+                total,
+                gap_head_attribution(gap),
+            ),
+            width,
+        ));
+    }
+    let remaining = body.len() - offset;
+    if remaining + 1 <= budget {
+        // Tail page: the head plus every remaining body line.
+        lines.extend(body[offset..].iter().cloned());
+        return FirstGapOutcome::Paged;
+    }
+    // Middle page: the head, a body slice, and the continuation
+    // marker. Production budgets are always >= 5 here (rooms >= 7
+    // minus at most two marker/reserve lines), so the slice always
+    // advances; a degenerate budget still terminates (the Down
+    // handler steps at least one line per key).
+    let take = budget.saturating_sub(2);
+    lines.extend(body[offset..offset + take].iter().cloned());
+    let below = remaining - take;
+    lines.push(truncate_cell(
+        &format!("(continued: +{below} more lines below in this gap; scroll down)"),
+        width,
+    ));
+    FirstGapOutcome::Paged
+}
+
+/// One gap's full ledger block: a column-0 attribution line
+/// (position, caller, module, pid) plus the snapshot gap line
+/// verbatim, word-wrapped — never truncated, so every gap's full
+/// text stays reachable. Always at least two lines (head + body:
+/// `wrap_words` never returns empty). The gaps-page Down handler
+/// measures record boundaries with this SAME construction, so
+/// paging and rendering always agree.
+/// The attribution tail shared by a gap head and its
+/// continuation head (`caller … module …[ pid …]`).
+fn gap_head_attribution(gap: &crate::inventory_present::GapView) -> String {
+    let caller = gap
+        .caller
+        .map(|caller| caller.label())
+        .unwrap_or_else(|| "*".to_string());
+    let module = gap
+        .module
+        .map(|module| module.label())
+        .unwrap_or_else(|| "*".to_string());
+    let mut attribution = format!("caller {caller} module {module}");
+    if let Some(pid) = gap.pid {
+        attribution.push_str(&format!(" pid {pid}"));
+    }
+    attribution
+}
+
+fn gap_block_lines(
+    gap: &crate::inventory_present::GapView,
+    index: usize,
+    total: usize,
+    width: usize,
+) -> Vec<String> {
+    let head = format!(
+        "gap {}/{} {}",
+        index + 1,
+        total,
+        gap_head_attribution(gap),
+    );
+    let mut block = vec![truncate_cell(&head, width)];
+    for line in wrap_words(&gap_item(gap), width.saturating_sub(2).max(1)) {
+        block.push(truncate_cell(&format!("  {line}"), width));
+    }
+    block
+}
+
+/// One gap's ledger block within `budget` rows. `None` when the
+/// wrapped block exceeds `budget` (the window then stops honestly
+/// instead of cropping). Only non-first records use this: the
+/// first visible record pages within itself (F6d) instead.
+fn fit_gap_block(
+    gap: &crate::inventory_present::GapView,
+    index: usize,
+    total: usize,
+    width: usize,
+    budget: usize,
+) -> Option<Vec<String>> {
+    let block = gap_block_lines(gap, index, total, width);
+    (block.len() <= budget).then_some(block)
+}
+
+/// The 1-based visible item range named in the table header/footer
+/// (edges, or gaps on the gaps page). Derived from the
+/// emitted-block COUNT the window returns, not from arithmetic over
+/// the scroll or by re-parsing rendered text — the header can never
+/// claim items the frame does not show, and a future reformat cannot
+/// silently degrade the range. An empty window names 0-0 (nothing
+/// shown) alongside the window's honest message; the footer still
+/// carries the scroll position.
+fn visible_item_range(shown: usize, total: usize, scroll: usize) -> (usize, usize) {
     if total == 0 || shown == 0 {
         return (0, 0);
     }
@@ -1009,17 +1474,19 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Dashboard keys: scrolling plus quit. Everything else is ignored.
+/// Dashboard keys: scrolling, detail paging, plus quit.
+/// Everything else is ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Key {
     Up,
     Down,
+    Detail,
     Quit,
 }
 
 /// Non-blocking key poll on stdin (100 ms VTIME slices when raw;
 /// immediate EOF/absence otherwise). Arrow escape sequences parse as
-/// scrolling; `q`/`Q`/Ctrl-C/ESC quit.
+/// scrolling; Tab pages the detail views; `q`/`Q`/Ctrl-C/ESC quit.
 pub(crate) fn poll_key() -> Option<Key> {
     poll_key_from(&mut read_stdin_byte)
 }
@@ -1035,6 +1502,7 @@ fn poll_key_from(read: &mut dyn FnMut(&mut [u8]) -> bool) -> Option<Key> {
         b'q' | b'Q' | 0x03 => Some(Key::Quit),
         b'k' => Some(Key::Up),
         b'j' => Some(Key::Down),
+        b'\t' => Some(Key::Detail),
         0x1b => {
             // Arrow keys arrive as ESC [ A/B; a lone ESC quits.
             let mut rest = [0u8; 2];

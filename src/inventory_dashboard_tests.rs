@@ -6,10 +6,12 @@
 
 use super::*;
 use crate::discovery::caller_registry::{
-    AdmissionState, ImageAuthority, ModuleInfo, ModuleKey, RegistryLimits,
+    AdmissionState, BudgetRefusal, CallerId, ImageAuthority, ModuleInfo, ModuleKey, RegistryGap,
+    RegistryLimits,
 };
 use crate::discovery::inventory_workload::{ChurnSpec, Harness, ScaleSpec};
 use crate::inventory_present::Presentation;
+use crate::semantics_edge::SemanticCall;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
@@ -587,6 +589,7 @@ fn key_parsing_maps_arrows_quit_and_nothing_else() {
     assert_eq!(scripted(b""), None);
     assert_eq!(scripted(b"x"), None);
     assert_eq!(scripted(b"\x1b[C"), None);
+    assert_eq!(scripted(b"\t"), Some(Key::Detail));
 }
 
 #[test]
@@ -991,17 +994,517 @@ fn starved_windows_stay_honest_about_showing_nothing() {
     // edge the frame does not show).
     let presentation = varied_presentation();
     assert!(!presentation.edges.is_empty());
-    let (lines, shown) = render_edge_window(&presentation, 80, 2, 0);
+    let (lines, shown) = render_edge_window(&presentation, 80, 2, 0, false);
     assert_eq!(shown, 0);
     assert_eq!(
         lines,
         vec!["(no edges fit here; scroll or enlarge the terminal)".to_string()]
     );
-    assert_eq!(visible_edge_range(0, 13, 3), (0, 0));
-    assert_eq!(visible_edge_range(0, 0, 0), (0, 0));
+    assert_eq!(visible_item_range(0, 13, 3), (0, 0));
+    assert_eq!(visible_item_range(0, 0, 0), (0, 0));
     // The normal path is unchanged: counts, not scroll arithmetic.
-    assert_eq!(visible_edge_range(2, 13, 1), (2, 3));
+    assert_eq!(visible_item_range(2, 13, 1), (2, 3));
     // Sanity: the same fixture shows edges once the room suffices.
-    let (_, shown) = render_edge_window(&presentation, 80, 7, 0);
+    let (_, shown) = render_edge_window(&presentation, 80, 7, 0, false);
     assert!(shown > 0);
+}
+
+/// Capture the harness state as a presentation (the varied tail,
+/// factored for the detail-page fixtures).
+fn capture_presentation(harness: &Harness) -> Presentation {
+    let document = harness.render();
+    let started = document["observation"]["started_ns"].as_u64().unwrap();
+    let ended = document["observation"]["ended_ns"].as_u64().unwrap();
+    let passes = document["observation"]["passes"].as_u64().unwrap();
+    Presentation::capture(
+        harness.coordinator(),
+        "workload",
+        started,
+        ended,
+        passes,
+        ended,
+        ended.saturating_sub(started),
+    )
+}
+
+/// One caller, one edge, one completed sign: the observed edge the
+/// detail pages page over. Returns the presentation plus the
+/// evidence counters the JSON carries (the pages must match them).
+fn observed_presentation() -> Presentation {
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "dash-detail",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 81_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .set_usage_feed(true);
+    let caller = harness.coordinator().adapter().live_id(81_000).unwrap();
+    let key = ModuleKey::physical(8, 1, 100_000, Some("sha000000".into()), "/scale/m0.so");
+    let init = SemanticCall {
+        function: "C_SignInit".into(),
+        rv: 0,
+        session: 7,
+        mechanism: 0x1087,
+        capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+            | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+        ts_ns: 100,
+        ..SemanticCall::default()
+    };
+    let op = SemanticCall {
+        function: "C_Sign".into(),
+        rv: 0,
+        session: 7,
+        capture: p11scope_ebpf_common::capture::MECHANISM_NONE
+            | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+        ts_ns: 110,
+        ..SemanticCall::default()
+    };
+    harness.observe_semantic(caller, &key, init);
+    harness.observe_semantic(caller, &key, op);
+    harness.coordinator_mut().registry_mut().record_gap(RegistryGap {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "detail probe gap".into(),
+        reason: "the gaps page must show this row verbatim even when it wraps across two eighty-column terminal lines".into(),
+        budget: None,
+    });
+    harness.commit();
+    capture_presentation(&harness)
+}
+
+/// The gaps-page content lines for gap `head` (the `gap i/n …`
+/// line), whitespace-normalized the way word-wrap reflows: words in
+/// order, single spaces. Equals the snapshot gap line when the page
+/// shows the gap whole.
+fn normalized_gap_content(text: &str, head: &str) -> String {
+    let clean = text.replace("\x1b[K", "");
+    let mut lines = clean.lines().skip_while(|line| *line != head);
+    assert_eq!(lines.next(), Some(head));
+    let content: Vec<&str> = lines.take_while(|line| line.starts_with(' ')).collect();
+    assert!(!content.is_empty(), "gap {head} shows its text");
+    content
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn detail_pages_keep_shaved_facts_reachable_at_80x14() {
+    // F6: the summary shaves counters and gap rows behind explicit
+    // markers at 80x14; the evidence page shows all nine counters
+    // and the gaps page the wrapped gap row — every fact reachable
+    // across frames, every frame honest about its window.
+    let presentation = observed_presentation();
+    assert_eq!(presentation.edges.len(), 1);
+    assert_eq!(presentation.gaps.len(), 1);
+    let frame = frame_for(&presentation);
+    let viewport = Viewport {
+        width: 80,
+        height: 14,
+    };
+    let mut summary = DashboardState::new();
+    assert_eq!(summary.detail, DetailPage::Summary);
+    let text = frame_text(&render_frame(&frame, viewport, &summary));
+    assert!(text.contains("evidence +9 hidden"), "{text}");
+    // The gap row fits but truncates mid-reason: the summary names
+    // the gap, the gaps page below carries its whole text.
+    assert!(text.contains("gap [detail probe gap]"), "{text}");
+    assert!(!text.contains("eighty-column terminal lines"), "{text}");
+    assert!(text.contains("--- edges 1-1 of 1 [summary]"), "{text}");
+    assert!(
+        text.contains("scroll 0/0 | showing edges 1-1 of 1 | j/k scroll, tab details, q quit"),
+        "{text}"
+    );
+    summary.next_detail();
+    assert_eq!(summary.detail, DetailPage::Evidence);
+    let text = frame_text(&render_frame(&frame, viewport, &summary));
+    assert!(!text.contains("no edges fit"), "{text}");
+    assert_eq!(text.matches("ev ").count(), 9, "{text}");
+    for short in [
+        "reconc",
+        "cancel_amb",
+        "cancel_flags",
+        "op_imports",
+        "auth_amb",
+        "cap_fail",
+        "async_dup",
+        "async_evict",
+        "unmatch_close",
+    ] {
+        assert!(text.contains(&format!("ev {short}=0")), "{text}");
+    }
+    assert!(!text.contains("hidden"), "{text}");
+    assert!(text.contains("--- edges 1-1 of 1 [evidence]"), "{text}");
+    summary.next_detail();
+    assert_eq!(summary.detail, DetailPage::Gaps);
+    let text = frame_text(&render_frame(&frame, viewport, &summary));
+    assert!(text.contains("gap 1/1 caller * module *"), "{text}");
+    assert_eq!(
+        normalized_gap_content(&text, "gap 1/1 caller * module *"),
+        "gap [detail probe gap] the gaps page must show this row verbatim even when it wraps across two eighty-column terminal lines",
+    );
+    assert!(text.contains("--- gaps 1-1 of 1 [gaps]"), "{text}");
+    assert!(
+        text.contains("scroll 0/0 | showing gaps 1-1 of 1 | j/k scroll, tab details, q quit"),
+        "{text}"
+    );
+    summary.next_detail();
+    assert_eq!(summary.detail, DetailPage::Summary);
+}
+
+#[test]
+fn gaps_page_lists_gaps_that_name_no_edge() {
+    // F6: a caller-qualified gap for a caller with no edge rides no
+    // summary block; the gaps ledger lists it with attribution.
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "dash-orphan-gap",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 82_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+        caller: Some(CallerId(7)),
+        module: None,
+        pid: Some(82_009),
+        subject: "caller capacity exhausted".into(),
+        reason:
+            "the registry retains at most 3 callers (requested caller 4); the mapping was dropped"
+                .into(),
+        budget: Some(BudgetRefusal {
+            resource: "callers",
+            limit: 3,
+            requested: 4,
+        }),
+    });
+    harness.commit();
+    let presentation = capture_presentation(&harness);
+    assert_eq!(presentation.edges.len(), 1);
+    assert_eq!(presentation.gaps.len(), 1);
+    let frame = frame_for(&presentation);
+    let viewport = Viewport {
+        width: 80,
+        height: 14,
+    };
+    let summary = DashboardState::new();
+    let text = frame_text(&render_frame(&frame, viewport, &summary));
+    assert!(
+        !text.contains("caller capacity exhausted"),
+        "no summary block rides an edgeless gap: {text}"
+    );
+    let mut gaps = DashboardState::new();
+    gaps.next_detail();
+    gaps.next_detail();
+    assert_eq!(gaps.detail, DetailPage::Gaps);
+    let text = frame_text(&render_frame(&frame, viewport, &gaps));
+    assert!(
+        text.contains("gap 1/1 caller c7 module * pid 82009"),
+        "{text}"
+    );
+    assert_eq!(
+        normalized_gap_content(&text, "gap 1/1 caller c7 module * pid 82009"),
+        "gap [caller capacity exhausted] the registry retains at most 3 callers (requested caller 4); the mapping was dropped (budget callers: limit 3, requested 4)",
+    );
+}
+
+#[test]
+fn dashboard_gap_scroll_survives_redraw() {
+    // F6c: the production redraw clamp runs through the page-aware
+    // helper — a gaps-page scroll stays put across redraws even
+    // when the edge count is smaller (the old edge-count clamp
+    // dragged every such scroll back to gap zero, and stranded
+    // every later gap when no edge existed at all).
+    for edges_per_caller in [0, 1] {
+        let mut harness = harness();
+        let spec = ScaleSpec {
+            name: "dash-gap-clamp",
+            callers: 1,
+            modules: 1,
+            edges_per_caller,
+            endpoints_per_module: 1,
+            first_pid: 84_000,
+        };
+        harness.stage_scale(&spec);
+        harness.commit();
+        for index in 0..4 {
+            harness
+                .coordinator_mut()
+                .registry_mut()
+                .record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: format!("gap probe {index}"),
+                    reason: format!("retained gap {index} of the redraw-clamp probe"),
+                    budget: None,
+                });
+        }
+        harness.commit();
+        let presentation = capture_presentation(&harness);
+        assert_eq!(presentation.edges.len(), edges_per_caller);
+        assert_eq!(presentation.gaps.len(), 4);
+        let frame = frame_for(&presentation);
+        let viewport = Viewport {
+            width: 80,
+            height: 14,
+        };
+        let mut state = DashboardState::new();
+        state.next_detail();
+        state.next_detail();
+        assert_eq!(state.detail, DetailPage::Gaps);
+        // Scroll to the last gap exactly like the production key
+        // handler (page total, not the edge count).
+        for _ in 0..3 {
+            state.scroll_down(state.items_total(&presentation));
+        }
+        assert_eq!(state.scroll, 3);
+        let text = frame_text(&render_frame(&frame, viewport, &state));
+        assert!(
+            text.contains("gap 4/4"),
+            "edges={edges_per_caller} last gap reachable: {text}"
+        );
+        // The old redraw clamp, for contrast: with fewer edges than
+        // gaps it collapses the scroll (the reported defect).
+        let mut collapsed = state;
+        collapsed.clamp(presentation.edges.len());
+        assert_eq!(
+            collapsed.scroll,
+            0,
+            "edges={edges_per_caller} the edge-count clamp strands gap 4/4"
+        );
+        // The production redraw clamp preserves the gaps scroll.
+        state.clamp_to_presentation(&presentation);
+        assert_eq!(
+            state.scroll, 3,
+            "edges={edges_per_caller} redraw keeps gap 4/4"
+        );
+        let text = frame_text(&render_frame(&frame, viewport, &state));
+        assert!(
+            text.contains("gap 4/4"),
+            "edges={edges_per_caller} last gap still shown: {text}"
+        );
+        assert!(text.contains("--- gaps 4-4 of 4 [gaps]"), "{text}");
+    }
+}
+
+#[test]
+fn gaps_page_exposes_multiframe_gap_at_80x14() {
+    // F6d: a 600+ character gap reason exceeds the seven content
+    // rows at 80x14 and pages within its record — repeated
+    // production Down steps expose every line across frames (the
+    // old whole-block fit rejected the record outright behind "no
+    // gaps fit"), then reach the next record.
+    let words: Vec<String> = (0..100).map(|index| format!("seg{index:03}")).collect();
+    let reason = words.join(" ");
+    assert!(
+        reason.chars().count() >= 600,
+        "the probe reason exceeds one frame: {} chars",
+        reason.chars().count()
+    );
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "dash-tall-gap",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 0,
+        endpoints_per_module: 1,
+        first_pid: 85_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "tall probe gap".into(),
+            reason: reason.clone(),
+            budget: None,
+        });
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "short trailer gap".into(),
+            reason: "the record after the tall one".into(),
+            budget: None,
+        });
+    harness.commit();
+    let presentation = capture_presentation(&harness);
+    assert_eq!(presentation.edges.len(), 0);
+    assert_eq!(presentation.gaps.len(), 2);
+    let frame = frame_for(&presentation);
+    let viewport = Viewport {
+        width: 80,
+        height: 14,
+    };
+    // Walk the production Down handler to the bottom, one frame per
+    // step; the walk must terminate (no paging stall).
+    let mut state = DashboardState::new();
+    state.next_detail();
+    state.next_detail();
+    assert_eq!(state.detail, DetailPage::Gaps);
+    let mut frames = Vec::new();
+    for _ in 0..64 {
+        let text = frame_text(&render_frame(&frame, viewport, &state));
+        assert_eq!(text.lines().count(), 14, "every frame fills 80x14");
+        frames.push((state.scroll, state.gap_line, text));
+        let before = (state.scroll, state.gap_line);
+        state.scroll_gaps_down(&presentation, viewport.width);
+        if (state.scroll, state.gap_line) == before {
+            break;
+        }
+    }
+    let last = frames.last().expect("at least one frame");
+    assert_eq!(
+        (last.0, last.1),
+        (1, 0),
+        "the walk ends on the last record's head"
+    );
+    assert!(frames.len() < 64, "the walk terminates far below the bound");
+    // The tall record spans frames: more than one frame holds
+    // scroll 0, and none of them hides behind "no gaps fit".
+    let tall_frames: Vec<&(usize, usize, String)> =
+        frames.iter().filter(|frame| frame.0 == 0).collect();
+    assert!(
+        tall_frames.len() >= 2,
+        "the tall record spans frames: {} states",
+        frames.len()
+    );
+    for (_, _, text) in &frames {
+        assert!(!text.contains("no gaps fit"), "{text}");
+    }
+    // The first frame names the record and its continuation; a mid
+    // frame names the lines above and the footer its offset.
+    assert!(
+        tall_frames[0].2.contains("gap 1/2 caller * module *"),
+        "{}",
+        tall_frames[0].2
+    );
+    assert!(
+        tall_frames[0].2.contains("(continued: +"),
+        "{}",
+        tall_frames[0].2
+    );
+    assert!(
+        tall_frames.iter().any(|frame| frame.2.contains("lines above)")),
+        "a mid frame names the skipped lines"
+    );
+    assert!(
+        tall_frames.iter().any(|frame| frame.2.contains("line +")),
+        "the footer names the within-record offset"
+    );
+    // Every word of the reason is readable in some frame.
+    for word in &words {
+        assert!(
+            frames.iter().any(|frame| frame.2.contains(word)),
+            "word {word} reachable across {} frames",
+            frames.len()
+        );
+    }
+    // Ranges stay honest while paging, and the trailer record
+    // follows the tall one whole.
+    for (scroll, _, text) in &frames {
+        assert!(
+            text.contains(&format!("--- gaps {}-{} of 2 [gaps]", scroll + 1, scroll + 1)),
+            "{text}"
+        );
+    }
+    assert!(
+        last.2.contains("gap 2/2 caller * module *"),
+        "{}",
+        last.2
+    );
+    assert!(
+        last.2.contains("the record after the tall one"),
+        "{}",
+        last.2
+    );
+    assert!(!last.2.contains("(continued:"), "{}", last.2);
+    // Up walks back to the first record's head, line by line.
+    for _ in 0..64 {
+        if (state.scroll, state.gap_line) == (0, 0) {
+            break;
+        }
+        state.scroll_gaps_up();
+    }
+    assert_eq!((state.scroll, state.gap_line), (0, 0));
+    let text = frame_text(&render_frame(&frame, viewport, &state));
+    assert!(text.contains("gap 1/2 caller * module *"), "{text}");
+}
+
+#[test]
+fn each_detail_page_scrolls_its_own_items_with_clamped_ranges() {
+    // Two edges, one gap: the edge pages scroll over two items, the
+    // gaps page over one; switching pages clamps the scroll.
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "dash-pages",
+        callers: 2,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 83_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "detail probe gap".into(),
+            reason: "one gap".into(),
+            budget: None,
+        });
+    harness.commit();
+    let presentation = capture_presentation(&harness);
+    assert_eq!(presentation.edges.len(), 2);
+    assert_eq!(presentation.gaps.len(), 1);
+    let mut state = DashboardState::new();
+    assert_eq!(state.items_total(&presentation), 2);
+    state.scroll_down(2);
+    state.scroll_down(2);
+    assert_eq!(state.scroll, 1, "scroll clamps to the last edge");
+    state.next_detail();
+    assert_eq!(state.items_total(&presentation), 2);
+    state.next_detail();
+    assert_eq!(state.detail, DetailPage::Gaps);
+    assert_eq!(state.items_total(&presentation), 1);
+    state.clamp(state.items_total(&presentation));
+    assert_eq!(state.scroll, 0, "page switches clamp the scroll");
+    let frame = frame_for(&presentation);
+    let text = frame_text(&render_frame(
+        &frame,
+        Viewport {
+            width: 80,
+            height: 14,
+        },
+        &state,
+    ));
+    assert!(text.contains("showing gaps 1-1 of 1"), "{text}");
 }

@@ -11,7 +11,7 @@
 
 use crate::discovery::caller_registry::{CallerId, ModuleInfo, ModuleKey, RegistryLimits};
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
-use crate::inventory_dashboard::{DashboardState, Viewport, render_frame};
+use crate::inventory_dashboard::{DashboardState, DetailPage, Viewport, render_frame};
 use crate::inventory_events::{EventWriter, emit_snapshot_as_events};
 use crate::inventory_present::{Presentation, render_snapshot};
 use crate::semantics_edge::SemanticCall;
@@ -23,6 +23,22 @@ const AES_GCM: u64 = 0x1087;
 const RSA_PSS: u64 = 0x000d;
 const ECDSA: u64 = 0x1041;
 const VENDOR: u64 = 0x8000_1042;
+
+/// The nine operation-evidence counters as (full JSON key, short
+/// dashboard key) — the `evidence_items` legend, asserted whole on
+/// the summary page (proof viewports) and the evidence page (every
+/// viewport, including 80x14).
+const EVIDENCE_SHORT_KEYS: [(&str, &str); 9] = [
+    ("state_reconciliations", "reconc"),
+    ("session_cancel_ambiguities", "cancel_amb"),
+    ("session_cancel_unknown_flags", "cancel_flags"),
+    ("operation_state_imports", "op_imports"),
+    ("auth_state_ambiguities", "auth_amb"),
+    ("semantic_capture_failures", "cap_fail"),
+    ("async_duplicates", "async_dup"),
+    ("async_evictions", "async_evict"),
+    ("unmatched_closes", "unmatch_close"),
+];
 
 fn harness() -> Harness {
     Harness::new(RegistryLimits::default_limits()).unwrap()
@@ -876,8 +892,7 @@ fn d2_same_file_double_load_with_scan_evidence_forces_unknown_with_named_gap() {
         exec_starts.len() >= 2,
         "two executable mappings of one file: {exec_starts:x?}"
     );
-    let detected =
-        crate::discovery::scan::duplicate_exec_coverage(provider_group);
+    let detected = crate::discovery::scan::duplicate_exec_coverage(provider_group);
     assert!(detected, "scan evidence shows the double-load");
     // Control: the driver's own executable loads once — no duplicate.
     let driver_bytes = driver.as_os_str().as_encoded_bytes();
@@ -887,9 +902,7 @@ fn d2_same_file_double_load_with_scan_evidence_forces_unknown_with_named_gap() {
         .map(p11scope_manifest::maps::ObjectKey::of)
         .expect("the driver maps in the owned child");
     assert!(
-        !crate::discovery::scan::duplicate_exec_coverage(
-            groups.get(&driver_key).unwrap()
-        ),
+        !crate::discovery::scan::duplicate_exec_coverage(groups.get(&driver_key).unwrap()),
         "a single load shows no duplicate"
     );
     // The registry fact keys the REAL file: the maps identity the
@@ -1411,8 +1424,10 @@ fn d3_divergent_fixture_displays_at_80x14_with_honest_budgets() {
     // scroll with its identity, states, counts, and operations; the
     // tight room shaves expandable detail (mechanism rows, evidence
     // counters, gap rows) with explicit markers instead of rejecting
-    // whole blocks. Exact item matches pin the 80-column fit (a
-    // truncated item could never match whole).
+    // whole blocks — and every shaved fact stays reachable across
+    // frames: the evidence page carries the nine counters per edge,
+    // the gaps page every gap's whole line. Exact item matches pin
+    // the 80-column fit (a truncated item could never match whole).
     let mut harness = divergent_harness();
     let document = render(&mut harness);
     let presentation = presentation_for(&harness, &document);
@@ -1595,6 +1610,276 @@ fn d3_divergent_fixture_displays_at_80x14_with_honest_budgets() {
             "scroll {index} below marker: {text}"
         );
     }
+    // Evidence page: the same 80x14 viewport, scrolled per edge —
+    // the nine counters the summary hides behind `evidence +9
+    // hidden`, matched whole against each shown block's OWN JSON
+    // edge. Compact blocks may pack two per frame; the range names
+    // exactly the shown run.
+    for index in 0..edges.len() {
+        let state = DashboardState {
+            scroll: index,
+            detail: DetailPage::Evidence,
+            gap_line: 0,
+        };
+        let bytes = render_frame(
+            &frame,
+            Viewport {
+                width: 80,
+                height: 14,
+            },
+            &state,
+        );
+        let text = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+        assert_eq!(
+            text.lines().count(),
+            14,
+            "evidence scroll {index} fills 80x14"
+        );
+        assert!(
+            !text.contains("no edges fit"),
+            "evidence scroll {index} shows its edge: {text}"
+        );
+        let blocks = dashboard_edge_blocks(&text);
+        assert!(!blocks.is_empty(), "evidence scroll {index}: {text}");
+        let shown_keys: Vec<(String, String)> = blocks.keys().cloned().collect();
+        let expected_keys: Vec<(String, String)> = edges[index..index + blocks.len()]
+            .iter()
+            .map(|edge| {
+                (
+                    edge["caller"].as_str().unwrap().to_string(),
+                    edge["module"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown_keys, expected_keys,
+            "evidence scroll {index} shows one contiguous run: {text}"
+        );
+        for ((caller, module), block) in &blocks {
+            let edge_json = edges
+                .iter()
+                .find(|edge| {
+                    edge["caller"].as_str() == Some(caller)
+                        && edge["module"].as_str() == Some(module)
+                })
+                .unwrap();
+            let items = dashboard_items(block);
+            if edge_json["operations"].is_null() {
+                let label = edge_json["semantics"].as_str().unwrap();
+                assert!(
+                    items
+                        .iter()
+                        .any(|item| item == &format!("semantics {label}")),
+                    "evidence {caller}->{module} bare label: {block}"
+                );
+                assert!(
+                    !block.contains("ev ") && !block.contains("hidden"),
+                    "evidence {caller}->{module} shows no counters: {block}"
+                );
+            } else {
+                let evidence = &edge_json["operations"]["evidence"];
+                for (full, short) in EVIDENCE_SHORT_KEYS {
+                    let expected = format!("ev {short}={}", evidence[full]);
+                    assert!(
+                        items.iter().any(|item| item == &expected),
+                        "evidence {caller}->{module} {expected}: {block}"
+                    );
+                }
+                assert!(
+                    !block.contains("hidden"),
+                    "evidence {caller}->{module} shows all counters: {block}"
+                );
+            }
+        }
+        let last = index + blocks.len();
+        assert!(
+            text.contains(&format!("--- edges {}-{last} of 7 [evidence]", index + 1)),
+            "evidence scroll {index} honest range: {text}"
+        );
+        assert!(
+            text.contains(&format!("scroll {index}/6")),
+            "evidence scroll {index} honest footer: {text}"
+        );
+        assert_eq!(
+            text.contains("more above"),
+            index > 0,
+            "evidence scroll {index} above marker: {text}"
+        );
+        assert_eq!(
+            text.contains("more below"),
+            last < edges.len(),
+            "evidence scroll {index} below marker: {text}"
+        );
+    }
+    // Gaps page: the same 80x14 viewport, scrolled per gap — every
+    // gap's whole snapshot line with exact attribution, including
+    // the rows the summary hides behind `gaps +N hidden`.
+    for index in 0..gaps.len() {
+        let state = DashboardState {
+            scroll: index,
+            detail: DetailPage::Gaps,
+            gap_line: 0,
+        };
+        let bytes = render_frame(
+            &frame,
+            Viewport {
+                width: 80,
+                height: 14,
+            },
+            &state,
+        );
+        let text = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+        assert_eq!(text.lines().count(), 14, "gaps scroll {index} fills 80x14");
+        assert!(
+            !text.contains("no gaps fit"),
+            "gaps scroll {index} shows its gap: {text}"
+        );
+        let ledger = dashboard_gap_blocks(&text);
+        assert!(!ledger.is_empty(), "gaps scroll {index}: {text}");
+        for (offset, gap) in gaps[index..].iter().enumerate().take(ledger.len()) {
+            let head = dashboard_gap_head(index + offset, gaps.len(), gap);
+            assert_eq!(
+                ledger
+                    .get(&head)
+                    .unwrap_or_else(|| panic!("gaps scroll {index} shows {head}: {text}")),
+                &dashboard_gap_line(gap),
+                "gaps scroll {index} whole text for {head}"
+            );
+        }
+        let last = index + ledger.len();
+        assert!(
+            text.contains(&format!(
+                "--- gaps {}-{last} of {} [gaps]",
+                index + 1,
+                gaps.len()
+            )),
+            "gaps scroll {index} honest range: {text}"
+        );
+        assert!(
+            text.contains(&format!("scroll {index}/{}", gaps.len() - 1)),
+            "gaps scroll {index} honest footer: {text}"
+        );
+        assert_eq!(
+            text.contains("more above"),
+            index > 0,
+            "gaps scroll {index} above marker: {text}"
+        );
+        assert_eq!(
+            text.contains("more below"),
+            last < gaps.len(),
+            "gaps scroll {index} below marker: {text}"
+        );
+    }
+}
+
+#[test]
+fn d3_refused_caller_gap_without_edge_matches_all_outputs() {
+    // F6: a caller-capacity refusal produces a caller-qualified gap
+    // with NO edge (the refused caller never admits, so the gap
+    // rides no summary block). The gap still matches across all
+    // outputs: JSON, snapshot, the dashboard gaps ledger (proof
+    // viewport and 80x14 alike), and the stream.
+    let mut limits = RegistryLimits::default_limits();
+    limits.max_callers = 1;
+    let mut harness = Harness::new(limits).unwrap();
+    // The adapter admits the live caller, but the registry — which
+    // retains retired incarnations forever — is already full. That
+    // is the production churn shape (live admission past retained
+    // callers), staged deterministically via divergent bounds.
+    harness.coordinator_mut().adapter_mut().set_max_callers(2);
+    let spec = ScaleSpec {
+        name: "s1-refused-caller",
+        callers: 2,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 9970,
+    };
+    harness.stage_scale(&spec);
+    let document = render(&mut harness);
+    // Both callers are live-admitted (the adapter view); the
+    // registry retained only the first, so the second owns no edge
+    // and its mapping died in the gap below.
+    assert_eq!(document["callers"].as_array().unwrap().len(), 2);
+    assert_eq!(document["edges"].as_array().unwrap().len(), 1);
+    assert!(
+        document["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|edge| edge["caller"] != "c1"),
+        "the refused caller owns no edge"
+    );
+    let gaps = document["gaps"].as_array().unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["subject"], "caller capacity exhausted");
+    assert_eq!(gaps[0]["caller"], "c1");
+    assert!(gaps[0]["module"].is_null());
+    assert_eq!(gaps[0]["pid"], 9971);
+    assert_eq!(gaps[0]["budget"]["resource"], "callers");
+    assert_eq!(gaps[0]["budget"]["limit"], 1);
+    assert_eq!(gaps[0]["budget"]["requested"], 2);
+    assert_eq!(document["budgets"]["callers"]["refused"], 1);
+    let presentation = presentation_for(&harness, &document);
+    assert_four_way_semantic_agreement(&document, &presentation);
+    // The summary names the gap in its coverage counts but no edge
+    // block rides it; the gaps ledger shows it whole, at both
+    // viewports.
+    let frame = crate::inventory_dashboard::DisplayFrame {
+        presentation: std::sync::Arc::new(presentation.clone()),
+        log: crate::inventory_dashboard::LogTail::bounded().snapshot(),
+    };
+    let summary = render_frame(
+        &frame,
+        Viewport {
+            width: 200,
+            height: 60,
+        },
+        &DashboardState::new(),
+    );
+    let summary = String::from_utf8_lossy(&summary);
+    assert!(summary.contains("coverage: 1 gaps"), "{summary}");
+    assert!(
+        !summary.contains("caller capacity exhausted"),
+        "no summary block rides an edgeless gap: {summary}"
+    );
+    for viewport in [
+        Viewport {
+            width: 200,
+            height: 60,
+        },
+        Viewport {
+            width: 80,
+            height: 14,
+        },
+    ] {
+        let bytes = render_frame(
+            &frame,
+            viewport,
+            &DashboardState {
+                scroll: 0,
+                detail: DetailPage::Gaps,
+                gap_line: 0,
+            },
+        );
+        let page = String::from_utf8_lossy(&bytes);
+        let ledger = dashboard_gap_blocks(&page);
+        let head = dashboard_gap_head(0, 1, &gaps[0]);
+        assert_eq!(
+            head, "gap 1/1 caller c1 module * pid 9971",
+            "exact ledger attribution"
+        );
+        assert_eq!(
+            ledger.get(&head).unwrap_or_else(|| panic!(
+                "gaps page at {}x{} shows {head}: {page}",
+                viewport.width, viewport.height,
+            )),
+            &dashboard_gap_line(&gaps[0]),
+            "whole gap text at {}x{}",
+            viewport.width,
+            viewport.height,
+        );
+    }
 }
 
 /// Parse the dashboard's per-edge blocks: identity lines start at
@@ -1659,6 +1944,63 @@ fn dashboard_gap_line(gap: &serde_json::Value) -> String {
         ));
     }
     line
+}
+
+/// One gaps-page block head as the renderer formats it: position,
+/// caller/module attribution (`*` when the gap names none), and the
+/// pid when the gap carries one — built here from the JSON gap.
+fn dashboard_gap_head(index: usize, total: usize, gap: &serde_json::Value) -> String {
+    let caller = gap["caller"].as_str().unwrap_or("*");
+    let module = gap["module"].as_str().unwrap_or("*");
+    let mut head = format!(
+        "gap {}/{} caller {} module {}",
+        index + 1,
+        total,
+        caller,
+        module
+    );
+    if let Some(pid) = gap["pid"].as_u64() {
+        head.push_str(&format!(" pid {pid}"));
+    }
+    head
+}
+
+/// Parse the dashboard gaps page into head → normalized content:
+/// column-0 `gap …` heads with their indented word-wrapped content
+/// rejoined (words in order, single spaces — the wrap reflow, so the
+/// joined text equals the snapshot gap line when the page shows the
+/// gap whole). Edge blocks never parse here (their identity lines
+/// name callers, and their gap rows are indented).
+fn dashboard_gap_blocks(dashboard: &str) -> BTreeMap<String, String> {
+    let clean = dashboard.replace("\x1b[K", "");
+    let mut blocks: BTreeMap<String, String> = BTreeMap::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    let mut flush = |current: &mut Option<(String, Vec<String>)>| {
+        if let Some((head, lines)) = current.take() {
+            let normalized = lines
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            blocks.insert(head, normalized);
+        }
+    };
+    for line in clean.lines() {
+        if !line.starts_with(' ') && !line.is_empty() {
+            if line.starts_with("gap ") {
+                flush(&mut current);
+                current = Some((line.to_string(), Vec::new()));
+            } else {
+                flush(&mut current);
+            }
+            continue;
+        }
+        if let Some((_, lines)) = current.as_mut() {
+            lines.push(line.to_string());
+        }
+    }
+    flush(&mut current);
+    blocks
 }
 
 /// Split a dashboard edge block into its exact pieces: the identity
@@ -2036,17 +2378,7 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
         );
         // Dashboard evidence: the same nine counters as compact `ev`
         // items (full JSON key → short dashboard key), matched whole.
-        for (full, short) in [
-            ("state_reconciliations", "reconc"),
-            ("session_cancel_ambiguities", "cancel_amb"),
-            ("session_cancel_unknown_flags", "cancel_flags"),
-            ("operation_state_imports", "op_imports"),
-            ("auth_state_ambiguities", "auth_amb"),
-            ("semantic_capture_failures", "cap_fail"),
-            ("async_duplicates", "async_dup"),
-            ("async_evictions", "async_evict"),
-            ("unmatched_closes", "unmatch_close"),
-        ] {
+        for (full, short) in EVIDENCE_SHORT_KEYS {
             let expected = format!("ev {short}={}", evidence[full]);
             assert!(
                 items.iter().any(|item| item == &expected),
@@ -2162,6 +2494,39 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             ));
         }
         assert!(snapshot.contains(&expected), "snapshot gap: {expected}");
+    }
+    // Gaps-page ledger completeness: every JSON gap appears once on
+    // the dashboard gaps page with its exact attribution head and
+    // its whole snapshot line (word-wrapped, never truncated) —
+    // including gaps that ride no edge block.
+    let gaps_bytes = render_frame(
+        &frame,
+        Viewport {
+            width: 200,
+            height: presentation
+                .edges
+                .len()
+                .saturating_mul(12)
+                .saturating_add(40),
+        },
+        &DashboardState {
+            scroll: 0,
+            detail: DetailPage::Gaps,
+            gap_line: 0,
+        },
+    );
+    let gaps_page = String::from_utf8_lossy(&gaps_bytes);
+    let ledger = dashboard_gap_blocks(&gaps_page);
+    assert_eq!(ledger.len(), gaps.len(), "one gaps-page block per JSON gap");
+    for (index, gap) in gaps.iter().enumerate() {
+        let head = dashboard_gap_head(index, gaps.len(), gap);
+        assert_eq!(
+            ledger
+                .get(&head)
+                .unwrap_or_else(|| panic!("missing gaps-page block {head} in {gaps_page}")),
+            &dashboard_gap_line(gap),
+            "gaps-page text for {head}"
+        );
     }
     if suppressed > 0 {
         assert!(

@@ -21,8 +21,8 @@ use crate::discovery::engine::inventory_coordinator::{
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::inventory_dashboard::{
-    DashboardState, DisplayHandoff, Key, LogTail, REDRAW_INTERVAL, RESCAN_INTERVAL, RawModeGuard,
-    StopFlag, TerminalGuard, Viewport, poll_key, render_frame, stdout_terminal,
+    DashboardState, DetailPage, DisplayHandoff, Key, LogTail, REDRAW_INTERVAL, RESCAN_INTERVAL,
+    RawModeGuard, StopFlag, TerminalGuard, Viewport, poll_key, render_frame, stdout_terminal,
 };
 use crate::inventory_events::{
     EventWriter, caller_event_payload, ended_payload, gap_payload, pass_payload, started_payload,
@@ -405,6 +405,10 @@ fn run_dashboard_loop(
     let handoff = DisplayHandoff::new();
     let mut tail = LogTail::bounded();
     let mut state = DashboardState::new();
+    let mut last_viewport = Viewport {
+        width: 80,
+        height: 24,
+    };
     let mut last_frame: Option<crate::inventory_dashboard::DisplayFrame> = None;
     let mut stream_state = StreamState::new();
     if let Some(writer) = stream.as_mut() {
@@ -455,13 +459,38 @@ fn run_dashboard_loop(
                             raw_guard,
                         );
                     }
-                    Key::Up => state.scroll_up(),
+                    Key::Up => {
+                        if state.detail == DetailPage::Gaps {
+                            state.scroll_gaps_up();
+                        } else {
+                            state.scroll_up();
+                        }
+                    }
                     Key::Down => {
-                        let total = last_frame
-                            .as_ref()
-                            .map(|frame| frame.presentation.edges.len())
-                            .unwrap_or(0);
-                        state.scroll_down(total);
+                        if state.detail == DetailPage::Gaps {
+                            // Within-record paging (F6d) wraps at the
+                            // live viewport width, exactly like the
+                            // renderer — tall records page line by
+                            // line before records advance.
+                            if let Some(frame) = last_frame.as_ref() {
+                                state.scroll_gaps_down(
+                                    &frame.presentation,
+                                    last_viewport.width,
+                                );
+                            }
+                        } else {
+                            let total = last_frame
+                                .as_ref()
+                                .map(|frame| state.items_total(&frame.presentation))
+                                .unwrap_or(0);
+                            state.scroll_down(total);
+                        }
+                    }
+                    Key::Detail => {
+                        state.next_detail();
+                        if let Some(frame) = last_frame.as_ref() {
+                            state.clamp_to_presentation(&frame.presentation);
+                        }
                     }
                 }
                 // Keys redraw immediately (scrolling stays responsive
@@ -545,11 +574,12 @@ fn run_dashboard_loop(
                 last_frame = Some(frame);
             }
             if let Some(frame) = last_frame.as_ref() {
-                state.clamp(frame.presentation.edges.len());
+                state.clamp_to_presentation(&frame.presentation);
                 let viewport = Viewport::from_fd(term.as_raw_fd()).unwrap_or(Viewport {
                     width: 80,
                     height: 24,
                 });
+                last_viewport = viewport;
                 let bytes = render_frame(frame, viewport, &state);
                 term.write_all(&bytes)
                     .with_context(|| "writing the dashboard frame")?;

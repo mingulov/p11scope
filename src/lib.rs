@@ -55,6 +55,7 @@ pub(crate) mod run;
 pub mod scope;
 pub mod semantics;
 pub mod semantics_edge;
+pub(crate) mod semantics_objects;
 pub mod shapes;
 pub(crate) mod sink;
 pub mod timing;
@@ -84,3 +85,5 @@ pub static EBPF_INVENTORY_CALLERS_OBJECT: &[u8] =
 pub(crate) mod history;
 #[cfg(test)]
 mod s1_tests;
+#[cfg(test)]
+mod s2s3_tests;

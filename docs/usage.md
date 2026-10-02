@@ -594,7 +594,7 @@ kind of workload without a manifest and ends `68`/`0` instead.
   (`entries.coverage`): this scan-only build reports `unknown` with the
   reason `scan_only` (or `not_admitted`), never a zero as fact; the
   dashboard shows such counts as `entries ?`, such edges as `capture
-  scan only` and `activity unknown (not covered)` — never armed, never
+  scan only` and `activity not covered` — never armed, never
   quiet — and the full coverage on its evidence page. Admission
   verdicts come only from the run's attach set; an object it did not
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound

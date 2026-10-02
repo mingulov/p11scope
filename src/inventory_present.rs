@@ -12,7 +12,7 @@
 //! presence `mapped | unloaded | process exited | unknown`; capture
 //! `armed | scan only | refused | retired | coverage lost`; activity
 //! `recently observed | operation initialized / in flight | used
-//! (recency unknown) | quiet | unknown (lossy) | unknown (not covered) |
+//! (recency unknown) | quiet | unknown (lossy) | not covered |
 //! unknown`. Quiet is not unloaded; capture refusal is not application
 //! inactivity; witnessed use is never quiet; an edge whose usage nothing
 //! covers is neither quiet nor armed (Task 6 C2 review I3).
@@ -148,7 +148,7 @@ impl Capture {
 /// quiet is a fact — a loss-free counting feed or a watched module with
 /// no recent entry; a lossy feed reads unknown (lossy); and an edge no
 /// usage producer covers (scan only, refused, not attached, lost) reads
-/// unknown (not covered) — never idle. Quiet is not unloaded: unloaded
+/// not covered — never idle. Quiet is not unloaded: unloaded
 /// edges are never mapped, so they never read as quiet.
 /// The three "right now" inputs (recent call, initialized operation,
 /// in-flight API call) stay distinct facts in the JSON; this label is
@@ -172,7 +172,7 @@ impl Activity {
             Self::Used => "used (recency unknown)",
             Self::Quiet => "quiet",
             Self::Lossy => "unknown (lossy)",
-            Self::Uncovered => "unknown (not covered)",
+            Self::Uncovered => "not covered",
             Self::Unknown => "unknown",
         }
     }

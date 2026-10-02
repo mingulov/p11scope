@@ -944,7 +944,9 @@ fn catalog_module_info(
         build_id: object.build_id.clone(),
         identity_source: object.identity_source.map(str::to_string),
         admission,
-        admission_class: object.admission.class().map(str::to_string),
+        // The catalog class describes its own lowering; without an attach-set
+        // verdict it would contradict the `unresolved` admission above.
+        admission_class: verdict.and(object.admission.class()).map(str::to_string),
         admission_endpoints: endpoints,
         admission_reasons: reasons,
     }
@@ -1646,6 +1648,10 @@ mod tests {
         let catalog = catalog_module_info(&object, None);
         assert_eq!(catalog.admission, AdmissionState::Unresolved);
         assert_eq!(catalog.admission_endpoints, None);
+        // No attach-set verdict: no catalog class either, matching the
+        // native note, so the class cannot flip within one pass.
+        assert_eq!(catalog.admission_class, None);
+        assert_eq!(native.admission_class, None);
         assert!(
             catalog.admission_reasons[0].contains("did not judge"),
             "{:?}",
@@ -1661,5 +1667,6 @@ mod tests {
         };
         let catalog = catalog_module_info(&refused_object, None);
         assert_eq!(catalog.admission, AdmissionState::Refused);
+        assert_eq!(catalog.admission_class, None);
     }
 }

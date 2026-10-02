@@ -60,7 +60,7 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `entries.coverage`). `activity` is `recently observed`, `operation
   initialized / in flight`, `used (recency unknown)` (witnessed use),
   `quiet` (only under a loss-free count or a watch — a fact),
-  `unknown (lossy)`, `unknown (not covered)` (nothing covers the
+  `unknown (lossy)`, `not covered` (nothing covers the
   edge's usage), or `unknown` (no live mapping).
 - `snapshot`: `{scope, passes, budgets, gaps_suppressed}` (test/sync
   emission marker).

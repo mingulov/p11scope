@@ -126,7 +126,7 @@ fn state_vocab_is_the_plans_exact_wording() {
     assert_eq!(Activity::Used.label(), "used (recency unknown)");
     assert_eq!(Activity::Quiet.label(), "quiet");
     assert_eq!(Activity::Lossy.label(), "unknown (lossy)");
-    assert_eq!(Activity::Uncovered.label(), "unknown (not covered)");
+    assert_eq!(Activity::Uncovered.label(), "not covered");
     assert_eq!(Activity::Unknown.label(), "unknown");
 }
 
@@ -161,7 +161,7 @@ fn refused_but_quiet_renders_both_states_not_one_merged_label() {
         .unwrap();
     assert!(line.contains("presence mapped"), "{line}");
     assert!(line.contains("capture refused"), "{line}");
-    assert!(line.contains("activity unknown (not covered)"), "{line}");
+    assert!(line.contains("activity not covered"), "{line}");
     // The JSON agrees the module refused while the mapping stayed live.
     let edge_json = document["edges"]
         .as_array()

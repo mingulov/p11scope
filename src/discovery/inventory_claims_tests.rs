@@ -105,8 +105,8 @@ fn receipt_at(
 
 /// Tables are synthetic. Process pins, executable mappings, open file identity,
 /// reconciliation, deduplication, and plan construction are the production path.
-fn mapped_providers(view: &ProcessView, count: usize) -> Vec<ScannedModule> {
-    let modules: Vec<_> = mapped_provider_candidates(view)
+fn mapped_providers(owner: &OwnedMapper, view: &ProcessView, count: usize) -> Vec<ScannedModule> {
+    let modules: Vec<_> = mapped_provider_candidates(owner, view)
         .into_iter()
         .take(count)
         .map(|(mapping, path)| provider_module(view, &mapping, &path, mapping.file_offset))
@@ -115,11 +115,15 @@ fn mapped_providers(view: &ProcessView, count: usize) -> Vec<ScannedModule> {
     modules
 }
 
-fn mapped_provider_candidates(view: &ProcessView) -> Vec<(MapEntry, PathBuf)> {
+fn mapped_provider_candidates(owner: &OwnedMapper, view: &ProcessView) -> Vec<(MapEntry, PathBuf)> {
+    assert_eq!(
+        view.pid(),
+        owner.pid(),
+        "mapping view must belong to the owned fixture"
+    );
     let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
     let maps = parse_maps(&bytes).unwrap();
     let index = MapIndex::new(&maps).unwrap();
-    let executable = std::env::current_exe().unwrap();
     let mut seen = BTreeSet::new();
     maps.iter()
         .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
@@ -131,9 +135,7 @@ fn mapped_provider_candidates(view: &ProcessView) -> Vec<(MapEntry, PathBuf)> {
             else {
                 return None;
             };
-            // Avoid hashing the large Rust test executable when shared ELF
-            // objects provide the same physical-identity fixture.
-            if path == executable || !seen.insert(ObjectKey::of(mapping)) {
+            if !seen.insert(ObjectKey::of(mapping)) {
                 return None;
             }
             Some((mapping.clone(), path))
@@ -168,11 +170,13 @@ fn shared_pair_selector_searches_past_unrelated_prefix_by_exact_object_key() {
 }
 
 fn shared_provider_pair(
+    own_subject: &OwnedMapper,
     own_view: &ProcessView,
+    peer_subject: &OwnedMapper,
     peer_view: &ProcessView,
 ) -> Option<(ScannedModule, ScannedModule)> {
-    let own = mapped_provider_candidates(own_view);
-    let peer = mapped_provider_candidates(peer_view);
+    let own = mapped_provider_candidates(own_subject, own_view);
+    let peer = mapped_provider_candidates(peer_subject, peer_view);
     let own_keys: Vec<_> = own
         .iter()
         .map(|(mapping, _)| ObjectKey::of(mapping))
@@ -219,9 +223,10 @@ fn seed_claims(engine: &mut Engine, owner: ProcessViewId, modules: &[ScannedModu
 
 #[test]
 fn inventory_partial_third_provider_keeps_both_existing_claims() {
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let providers = mapped_providers(&engine.views[0], 3);
+    let owner = open_owner(&mut engine, subject.pid());
+    let providers = mapped_providers(&subject, &engine.views[0], 3);
     seed_claims(&mut engine, owner, &providers[..2]);
     let retained_slots = engine.plan.slots.clone();
     let scanned = receipt(&mut engine, owner, providers[2..].to_vec(), true);
@@ -311,55 +316,105 @@ fn inventory_generic_refresh_is_not_exec_authority() {
     );
 }
 
-struct OwnedMapper(std::process::Child);
-
-impl OwnedMapper {
-    fn ready() -> Self {
-        use std::io::Read as _;
-        use std::os::fd::AsRawFd as _;
-        use std::process::{Command, Stdio};
-
-        // Spawn returns at exec, before the dynamic loader necessarily maps
-        // libc. A userspace handshake makes the shared mapping deterministic.
-        // The shell blocks in its read builtin; it creates no descendant.
-        let mut child = Self(
-            Command::new("sh")
-                .args(["-c", "printf 'ready\\n'; read -r ignored"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
-        let mut stdout = child.0.stdout.take().unwrap();
-        let mut poll = libc::pollfd {
-            fd: stdout.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one initialized pollfd is valid for the bounded poll call.
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
-        let mut ready = [0; 6];
-        stdout.read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"ready\n");
-        child
-    }
+#[test]
+fn owned_mapper_waits_for_a_stopped_image_and_reaps_on_drop() {
+    let child = OwnedMapper::ready();
+    let pid = child.0.id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let state = status
+        .lines()
+        .find(|line| line.starts_with("State:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(1);
+    assert_eq!(state, Some("T"), "the fixture must acknowledge its stop");
+    let before = std::fs::read(format!("/proc/{pid}/maps")).unwrap();
+    let foreign = E07Provider::dlopen();
+    assert_eq!(std::fs::read(format!("/proc/{pid}/maps")).unwrap(), before);
+    drop(foreign);
+    assert_eq!(std::fs::read(format!("/proc/{pid}/maps")).unwrap(), before);
+    drop(child);
+    assert_owned_child_reaped(&view);
 }
 
-impl Drop for OwnedMapper {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+#[test]
+#[should_panic(expected = "mapping view must belong to the owned fixture")]
+fn owned_mapper_rejects_an_unowned_mapping_view() {
+    let child = OwnedMapper::ready();
+    let parent = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let _ = mapped_provider_candidates(&child, &parent);
+}
+
+#[test]
+fn inventory_fixture_keeps_real_claims_after_foreign_parent_provider_removal() {
+    let subject = OwnedMapper::ready();
+    let foreign = E07Provider::dlopen();
+    let foreign_path = foreign.path.clone();
+    let parent_maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    let parent_index = MapIndex::new(&parent_maps).unwrap();
+    let foreign_key = parent_maps
+        .iter()
+        .find_map(|mapping| match parent_index.resolve(mapping.start) {
+            Resolved::File {
+                path: MappedPath::Usable(path),
+                ..
+            } if path == foreign_path => Some(ObjectKey::of(mapping)),
+            _ => None,
+        })
+        .expect("the control provider really belongs to the parent maps");
+    let mut engine = inventory_engine(2);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 3);
+    let child_exe = std::fs::read_link(format!("/proc/{}/exe", subject.pid())).unwrap();
+    assert!(
+        modules
+            .iter()
+            .any(|module| Path::new(&module.path) == child_exe)
+    );
+    assert!(modules.iter().all(|module| module.key != foreign_key));
+    let selected: BTreeSet<_> = modules.iter().map(|module| module.key).collect();
+    drop(foreign);
+    assert_eq!(
+        std::fs::metadata(foreign_path).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    seed_claims(&mut engine, owner, &modules);
+    assert_eq!(engine.pinned.pinned().count(), 3);
+    assert_eq!(
+        engine
+            .pinned
+            .view_claims(owner)
+            .unwrap()
+            .pins
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3,
+        "raw, module and entry references retain three distinct physical pins"
+    );
+    assert_eq!(engine.plan.slots.len(), 3);
+    assert_eq!(
+        engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.key)
+            .collect::<BTreeSet<_>>(),
+        selected
+    );
 }
 
 #[test]
 fn inventory_one_mapper_removal_preserves_other_mapper_and_physical_slot() {
+    let subject = OwnedMapper::ready();
     let child = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let own = open_owner(&mut engine, std::process::id());
-    let peer = open_owner(&mut engine, child.0.id());
-    let (own_module, peer_module) = shared_provider_pair(&engine.views[0], &engine.views[1])
-        .expect("the two real processes share an executable ELF object");
+    let own = open_owner(&mut engine, subject.pid());
+    let peer = open_owner(&mut engine, child.pid());
+    let (own_module, peer_module) =
+        shared_provider_pair(&subject, &engine.views[0], &child, &engine.views[1])
+            .expect("the two real processes share an executable ELF object");
     let mut peer_module = peer_module;
     peer_module.tables[0].entries[0].file_offset = own_module.tables[0].entries[0].file_offset;
     seed_claims(&mut engine, own, &[own_module]);
@@ -391,9 +446,10 @@ fn inventory_one_mapper_removal_preserves_other_mapper_and_physical_slot() {
 
 #[test]
 fn inventory_unavailable_image_cannot_retire_committed_claims() {
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let modules = mapped_providers(&engine.views[0], 2);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 2);
     seed_claims(&mut engine, owner, &modules);
     let scanned = receipt(&mut engine, owner, Vec::new(), false);
     let plan = engine.plan.clone();
@@ -421,9 +477,10 @@ fn inventory_changed_image_after_candidate_build_cannot_publish_absence() {
             }
         }
     }
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let modules = mapped_providers(&engine.views[0], 2);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 2);
     seed_claims(&mut engine, owner, &modules);
     let scanned = receipt(&mut engine, owner, Vec::new(), false);
     let plan = engine.plan.clone();
@@ -440,9 +497,10 @@ fn inventory_changed_image_after_candidate_build_cannot_publish_absence() {
 
 #[test]
 fn inventory_unavailable_scan_keeps_old_claims_and_is_not_empty_complete() {
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let modules = mapped_providers(&engine.views[0], 2);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 2);
     seed_claims(&mut engine, owner, &modules);
     let lease = engine.acquire_inventory_scan(owner).unwrap();
     let scanned = engine
@@ -464,9 +522,10 @@ fn inventory_unavailable_scan_keeps_old_claims_and_is_not_empty_complete() {
 
 #[test]
 fn inventory_lease_release_changes_no_claims_history_contexts_or_plan() {
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let modules = mapped_providers(&engine.views[0], 2);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 2);
     seed_claims(&mut engine, owner, &modules);
     engine.publish_current_capture_facts().unwrap();
     engine.exploratory_dirty.insert(owner);
@@ -498,9 +557,10 @@ fn inventory_lease_release_changes_no_claims_history_contexts_or_plan() {
 
 #[test]
 fn inventory_publication_revalidation_rejects_late_image_uncertainty() {
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let modules = mapped_providers(&engine.views[0], 2);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 2);
     seed_claims(&mut engine, owner, &modules);
     let scanned = receipt(&mut engine, owner, Vec::new(), false);
     let prepared = engine
@@ -518,9 +578,10 @@ fn inventory_publication_revalidation_rejects_late_image_uncertainty() {
 
 #[test]
 fn inventory_clock_uncertainty_produces_additions_only_and_preserves_claims() {
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let modules = mapped_providers(&engine.views[0], 2);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 2);
     seed_claims(&mut engine, owner, &modules);
     let lease = engine.acquire_inventory_scan(owner).unwrap();
     let window = engine
@@ -553,9 +614,10 @@ fn inventory_clock_uncertainty_produces_additions_only_and_preserves_claims() {
 
 #[test]
 fn inventory_pinning_loss_cannot_turn_complete_scan_into_absence_authority() {
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let modules = mapped_providers(&engine.views[0], 3);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 3);
     seed_claims(&mut engine, owner, &modules[..2]);
     let mut unreadable = modules[2].clone();
     unreadable.key.inode = u64::MAX;
@@ -570,9 +632,10 @@ fn inventory_pinning_loss_cannot_turn_complete_scan_into_absence_authority() {
 
 #[test]
 fn inventory_repeated_partial_receipts_do_not_accumulate_identical_pin_claims() {
+    let subject = OwnedMapper::ready();
     let mut engine = inventory_engine(2);
-    let owner = open_owner(&mut engine, std::process::id());
-    let modules = mapped_providers(&engine.views[0], 1);
+    let owner = open_owner(&mut engine, subject.pid());
+    let modules = mapped_providers(&subject, &engine.views[0], 1);
     seed_claims(&mut engine, owner, &modules);
     let mut first_count = None;
     for window in 1..=4 {
@@ -601,13 +664,20 @@ fn inventory_repeated_partial_receipts_do_not_accumulate_identical_pin_claims() 
 /// legacy seed helper would already add stale derived refs before the test.
 fn two_owner_claim_fixture(
     claim_capacity: usize,
-) -> (Engine, OwnedMapper, [ProcessViewId; 2], [ScannedModule; 2]) {
+) -> (
+    Engine,
+    [OwnedMapper; 2],
+    [ProcessViewId; 2],
+    [ScannedModule; 2],
+) {
+    let subject = OwnedMapper::ready();
     let child = OwnedMapper::ready();
     let mut engine = inventory_engine_with_claim_capacity(2, claim_capacity);
-    let own = open_owner(&mut engine, std::process::id());
-    let peer = open_owner(&mut engine, child.0.id());
-    let (own_module, mut peer_module) = shared_provider_pair(&engine.views[0], &engine.views[1])
-        .expect("the two real processes share an executable ELF object");
+    let own = open_owner(&mut engine, subject.pid());
+    let peer = open_owner(&mut engine, child.pid());
+    let (own_module, mut peer_module) =
+        shared_provider_pair(&subject, &engine.views[0], &child, &engine.views[1])
+            .expect("the two real processes share an executable ELF object");
     peer_module.tables[0].entries[0].file_offset = own_module.tables[0].entries[0].file_offset;
     let modules = [own_module, peer_module];
     let mut pins = engine.pinned.clone();
@@ -627,7 +697,7 @@ fn two_owner_claim_fixture(
     engine.pinned = candidate.pinned;
     engine.modules = candidate.modules;
     assert_eq!(engine.plan.slots.len(), 1, "one shared physical endpoint");
-    (engine, child, [own, peer], modules)
+    (engine, [subject, child], [own, peer], modules)
 }
 
 #[test]

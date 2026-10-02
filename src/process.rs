@@ -1355,4 +1355,504 @@ mod tests {
         assert_eq!(tracker.identify(u32::MAX).key, second);
         assert_ne!(first, second);
     }
+
+    /// Real `pidfd_open` denial through a kernel seccomp filter. The filter
+    /// checks the native x86-64 syscall ABI, so the regression is x86-64 only.
+    #[cfg(target_arch = "x86_64")]
+    mod pidfd_denial {
+        use super::*;
+
+        const PIDFD_DENIAL_HELPER: &str = "process::tests::pidfd_denial::pidfd_denial_helper";
+        const PIDFD_DENIAL_ERRNO: &str = "P11SCOPE_TEST_PIDFD_DENIAL_ERRNO";
+        const PIDFD_DENIAL_TARGET: &str = "P11SCOPE_TEST_PIDFD_DENIAL_TARGET";
+        const PIDFD_DENIAL_START: &str = "P11SCOPE_TEST_PIDFD_DENIAL_START";
+        const PIDFD_DENIAL_TOKEN: &str = "P11SCOPE_TEST_PIDFD_DENIAL_TOKEN";
+        const PIDFD_DENIAL_ACK: &str = "pidfd-denial-ack";
+        const PIDFD_DENIAL_DEADLINE: Duration = Duration::from_secs(30);
+
+        /// Kills and reaps an owned child on every path that has not already
+        /// consumed its wait status, so a failed assertion leaks no process.
+        struct ReapOnDrop(Option<std::process::Child>);
+
+        impl ReapOnDrop {
+            fn child(&mut self) -> &mut std::process::Child {
+                self.0.as_mut().expect("the child is still owned")
+            }
+
+            fn reap(&mut self) -> std::process::ExitStatus {
+                let status = self.child().wait().expect("reap the owned child");
+                self.0 = None;
+                status
+            }
+        }
+
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        /// Makes `pidfd_open` fail with `errno` for the calling thread and the
+        /// threads it creates. Every other native syscall is allowed. A non-x86-64
+        /// audit arch such as i386 kills the process; x32 shares the x86-64 audit
+        /// arch and is not distinguished, which this helper never uses.
+        fn deny_pidfd_open(errno: i32) -> io::Result<()> {
+            const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+            // `struct seccomp_data` field offsets.
+            const NR: u32 = 0;
+            const ARCH: u32 = 4;
+            let errno = u32::try_from(errno)
+                .ok()
+                .filter(|errno| *errno <= libc::SECCOMP_RET_DATA)
+                .ok_or_else(|| io::Error::other(format!("errno {errno} does not fit seccomp")))?;
+            let stmt = |code: u32, k: u32| libc::sock_filter {
+                code: code as u16,
+                jt: 0,
+                jf: 0,
+                k,
+            };
+            let jump = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt,
+                jf,
+                k,
+            };
+            // Jump offsets are relative to the next instruction.
+            let mut filter = [
+                stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, ARCH),
+                jump(AUDIT_ARCH_X86_64, 1, 0),
+                stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_KILL_PROCESS),
+                stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, NR),
+                jump(libc::SYS_pidfd_open as u32, 0, 1),
+                stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ERRNO | errno),
+                stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_mut_ptr(),
+            };
+            // SAFETY: constant prctl option; it restricts only this thread and
+            // its future children.
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `program` points at `filter`, which outlives the call; the
+            // kernel copies the program before returning.
+            let installed = unsafe {
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER,
+                    0,
+                    &raw const program,
+                )
+            };
+            if installed != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// One field of this thread's status, `None` when the kernel lacks it
+        /// (`Seccomp_filters` appeared in Linux 5.9).
+        fn thread_status_field(field: &str) -> Option<String> {
+            std::fs::read_to_string("/proc/thread-self/status")
+                .expect("read this thread's status")
+                .lines()
+                .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+                .map(|value| value.trim().to_string())
+        }
+
+        fn assert_fallback_has_no_signal_authority(pin: &PidPin) {
+            let refused = "process pin has no original pidfd signal authority";
+            assert_eq!(pin.probe_signal_authority().unwrap_err(), refused);
+            assert_eq!(pin.send_signal(0).unwrap_err(), refused);
+            assert_eq!(pin.pidfd().unwrap_err().kind(), io::ErrorKind::Other);
+            assert_eq!(
+                pin.wait_ready(Some(Duration::ZERO)).unwrap_err().kind(),
+                io::ErrorKind::Other
+            );
+        }
+
+        /// The confined half of the pidfd-denial regression. It runs in a fresh
+        /// exec of this test binary so the seccomp filter never reaches the
+        /// parent, and reports each verified phase back with the parent's token.
+        #[test]
+        #[ignore = "private seccomp helper; invoked by real_pidfd_denial_preserves_proc_identity_without_signal_authority"]
+        fn pidfd_denial_helper() {
+            let env = |name: &str| {
+                std::env::var(name).unwrap_or_else(|_| panic!("the parent test supplies {name}"))
+            };
+            let errno: i32 = env(PIDFD_DENIAL_ERRNO).parse().unwrap();
+            let target: u32 = env(PIDFD_DENIAL_TARGET).parse().unwrap();
+            let start: u64 = env(PIDFD_DENIAL_START).parse().unwrap();
+            let token = env(PIDFD_DENIAL_TOKEN);
+            assert!(
+                [libc::EPERM, libc::ENOSYS].contains(&errno),
+                "unexpected denial errno {errno}"
+            );
+            let ack = |phase: &str| {
+                use std::io::Write as _;
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "{PIDFD_DENIAL_ACK} {token} {errno} {phase}").unwrap();
+                stdout.flush().unwrap();
+            };
+            let await_phase = |phase: &str| {
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .expect("read the parent's next phase");
+                assert_eq!(
+                    line.trim_end(),
+                    format!("{token} {phase}"),
+                    "the parent must request the {phase} phase"
+                );
+            };
+
+            // The runner may already be confined (a container's default
+            // profile); require this filter on top rather than none before it.
+            let filters = || {
+                thread_status_field("Seccomp_filters")
+                    .map(|count| count.parse::<u64>().expect("a filter count"))
+            };
+            let before = filters();
+            deny_pidfd_open(errno).expect("install the pidfd_open seccomp filter");
+            assert_eq!(
+                thread_status_field("Seccomp").as_deref(),
+                Some("2"),
+                "the filter confines this thread"
+            );
+            assert_eq!(
+                filters(),
+                before.map(|count| count + 1),
+                "exactly this filter was added"
+            );
+            // SAFETY: scalar pid/flags; a descriptor returned despite the filter
+            // is never used and dies with this helper.
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, target, 0) };
+            assert_eq!(
+                (raw, io::Error::last_os_error().raw_os_error()),
+                (-1, Some(errno)),
+                "the raw pidfd_open canary must receive the selected errno"
+            );
+            assert_eq!(
+                process_start_time(target).expect("/proc/PID/stat stays readable"),
+                start,
+                "the helper reads the target's real start time"
+            );
+
+            // Production code, not a substituted pin or reader.
+            let view = ProcessView::open(ProcessViewId(1), target)
+                .expect("the /proc fallback admits a live target without a pidfd");
+            assert!(
+                view.pin.pidfd.is_none(),
+                "denied pidfd_open retains no pidfd"
+            );
+            assert_eq!(view.pin.start_time, Some(start));
+            assert!(view.still_the_same());
+            assert_eq!(view.original_exited(), Ok(false));
+            assert_eq!(
+                view.original_generation_state(),
+                Ok(OriginalGenerationState::Current)
+            );
+            assert_fallback_has_no_signal_authority(&view.pin);
+            let pin = PidPin::open(target).expect("PidPin falls back to /proc identity");
+            assert!(pin.pidfd.is_none());
+            assert_eq!(pin.start_time, Some(start));
+            assert_fallback_has_no_signal_authority(&pin);
+            ack("live");
+
+            // The parent proved exit without reaping. The /proc fallback cannot
+            // tell this zombie from its live generation, so it must keep
+            // answering "same generation": a cleanup oracle built on it then
+            // rejects the unreaped child instead of reporting it cleaned up.
+            await_phase("zombie");
+            assert!(process_is_zombie(target), "the parent killed the target");
+            assert_eq!(process_start_time(target).ok(), Some(start));
+            assert!(view.still_the_same());
+            assert_eq!(view.original_exited(), Ok(false));
+            assert_eq!(
+                view.original_generation_state(),
+                Ok(OriginalGenerationState::Current)
+            );
+            assert_fallback_has_no_signal_authority(&view.pin);
+            ack("zombie");
+
+            await_phase("reaped");
+            assert!(
+                !view.still_the_same(),
+                "a reaped generation is not retained"
+            );
+            assert_eq!(view.original_exited(), Ok(true));
+            assert_eq!(stale_view_ids(std::slice::from_ref(&view)), [view.id()]);
+            match process_start_time(target) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    assert_eq!(
+                        view.original_generation_state(),
+                        Ok(OriginalGenerationState::Exited)
+                    );
+                    assert!(
+                        PidPin::open(target).is_err(),
+                        "no pidfd and no /proc entry leaves nothing to pin"
+                    );
+                }
+                // A new process took the PID between reap and this check.
+                Ok(current) if current != start => assert_eq!(
+                    view.original_generation_state(),
+                    Ok(OriginalGenerationState::Reused)
+                ),
+                other => panic!("the reaped target's /proc identity persisted: {other:?}"),
+            }
+            assert_fallback_has_no_signal_authority(&view.pin);
+            ack("reaped");
+        }
+
+        /// The parent half: owns the target and the confined helper, drives the
+        /// target through live, exited-unreaped and reaped, and requires every
+        /// phase acknowledgement before the helper may exit successfully.
+        struct PidfdDenialHelper {
+            child: ReapOnDrop,
+            lines: std::sync::mpsc::Receiver<String>,
+            transcript: Vec<String>,
+            stderr: std::fs::File,
+            token: String,
+            errno: i32,
+        }
+
+        impl PidfdDenialHelper {
+            fn spawn(errno: i32, target: u32, start: u64) -> Self {
+                use std::process::Stdio;
+
+                let token = format!(
+                    "{}-{target}-{errno}-{}",
+                    std::process::id(),
+                    crate::attach::monotonic_ns().expect("a monotonic token suffix")
+                );
+                let stderr = tempfile::tempfile().expect("a helper stderr capture");
+                let mut child = ReapOnDrop(Some(
+                    Command::new(std::env::current_exe().expect("this test binary"))
+                        .args([
+                            "--exact",
+                            PIDFD_DENIAL_HELPER,
+                            "--ignored",
+                            "--nocapture",
+                            "--test-threads=1",
+                        ])
+                        .env_clear()
+                        .env(PIDFD_DENIAL_ERRNO, errno.to_string())
+                        .env(PIDFD_DENIAL_TARGET, target.to_string())
+                        .env(PIDFD_DENIAL_START, start.to_string())
+                        .env(PIDFD_DENIAL_TOKEN, &token)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(stderr.try_clone().expect("share the stderr capture"))
+                        .spawn()
+                        .expect("re-exec the pidfd-denial helper"),
+                ));
+                let stdout = child.child().stdout.take().expect("piped helper stdout");
+                let (sender, lines) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    use std::io::BufRead as _;
+                    for line in std::io::BufReader::new(stdout).lines() {
+                        let Ok(line) = line else { return };
+                        if sender.send(line).is_err() {
+                            return;
+                        }
+                    }
+                });
+                Self {
+                    child,
+                    lines,
+                    transcript: Vec::new(),
+                    stderr,
+                    token,
+                    errno,
+                }
+            }
+
+            fn failure(&mut self, why: &str) -> String {
+                use std::io::{Read as _, Seek as _};
+
+                let mut stderr = String::new();
+                let _ = self.stderr.rewind();
+                let _ = self.stderr.read_to_string(&mut stderr);
+                format!(
+                    "pidfd-denial helper (errno {}): {why}\nstdout:\n{}\nstderr:\n{stderr}",
+                    self.errno,
+                    self.transcript.join("\n")
+                )
+            }
+
+            fn next_line(&mut self, deadline: Instant) -> Option<String> {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match self.lines.recv_timeout(wait) {
+                    Ok(line) => {
+                        self.transcript.push(line.clone());
+                        Some(line)
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let why = "timed out waiting for helper output";
+                        panic!("{}", self.failure(why))
+                    }
+                }
+            }
+
+            fn expect_ack(&mut self, phase: &str) {
+                let expected = format!("{PIDFD_DENIAL_ACK} {} {} {phase}", self.token, self.errno);
+                let deadline = Instant::now() + PIDFD_DENIAL_DEADLINE;
+                loop {
+                    let Some(line) = self.next_line(deadline) else {
+                        let why = format!("helper output ended before the {phase} acknowledgement");
+                        panic!("{}", self.failure(&why));
+                    };
+                    // `--nocapture` prints the first acknowledgement after
+                    // libtest's unterminated `test NAME ... ` prefix.
+                    if let Some(at) = line.find(PIDFD_DENIAL_ACK) {
+                        if line[at..] != expected {
+                            let why = format!("expected `{expected}`, got `{line}`");
+                            panic!("{}", self.failure(&why));
+                        }
+                        return;
+                    }
+                }
+            }
+
+            fn request(&mut self, phase: &str) {
+                use std::io::Write as _;
+
+                let line = format!("{} {phase}\n", self.token);
+                let stdin = self
+                    .child
+                    .child()
+                    .stdin
+                    .as_mut()
+                    .expect("piped helper stdin");
+                if let Err(error) = stdin
+                    .write_all(line.as_bytes())
+                    .and_then(|()| stdin.flush())
+                {
+                    let why = format!("cannot request the {phase} phase: {error}");
+                    panic!("{}", self.failure(&why));
+                }
+            }
+
+            /// Requires the helper's own test harness to report exactly one
+            /// passing test, then a successful exit, within the deadline.
+            fn finish(mut self) {
+                let deadline = Instant::now() + PIDFD_DENIAL_DEADLINE;
+                while self.next_line(deadline).is_some() {}
+                let summary = "test result: ok. 1 passed; 0 failed";
+                if !self.transcript.iter().any(|line| line.starts_with(summary)) {
+                    panic!(
+                        "{}",
+                        self.failure("the helper did not run exactly one test")
+                    );
+                }
+                loop {
+                    match self.child.child().try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Ok(None) => panic!("{}", self.failure("the helper did not exit")),
+                        Err(error) => panic!("{}", self.failure(&format!("try_wait: {error}"))),
+                    }
+                }
+                let status = self.child.reap();
+                if !status.success() {
+                    panic!("{}", self.failure(&format!("helper exited with {status}")));
+                }
+            }
+        }
+
+        /// Without exiting or reaping: `Some(si_code)` once the owned child has
+        /// exited, `None` while it still runs.
+        fn exited_unreaped(pid: u32) -> io::Result<Option<i32>> {
+            loop {
+                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                // SAFETY: valid output for an owned child. WNOHANG cannot block
+                // and WNOWAIT leaves the wait status for Child::wait.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        info.as_mut_ptr(),
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                if result < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                // SAFETY: zero-initialized storage, filled by successful waitid.
+                let info = unsafe { info.assume_init() };
+                return Ok((unsafe { info.si_pid() } == pid as i32).then_some(info.si_code));
+            }
+        }
+
+        fn run_pidfd_denial_case(errno: i32) {
+            use std::process::Stdio;
+
+            // `cat` blocks on its owned stdin: spawn returns after exec, so the
+            // target is ready without any sleep.
+            let mut target = ReapOnDrop(Some(
+                Command::new("cat")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .expect("spawn the ready target"),
+            ));
+            let pid = target.child().id();
+            let start = process_start_time(pid).expect("the parent reads the real start time");
+            let exit_witness =
+                pidfd_open(pid).expect("the parent stays unconfined and can open a pidfd");
+
+            let mut helper = PidfdDenialHelper::spawn(errno, pid, start);
+            helper.expect_ack("live");
+            assert_eq!(
+                exited_unreaped(pid).unwrap(),
+                None,
+                "the confined helper must not have signalled the target"
+            );
+
+            target.child().kill().expect("SIGKILL the owned target");
+            let deadline_ms = PIDFD_DENIAL_DEADLINE.as_millis() as i32;
+            assert!(
+                pidfd_ready_with_timeout(&exit_witness, deadline_ms).unwrap(),
+                "the target must exit within the deadline"
+            );
+            assert_eq!(exited_unreaped(pid).unwrap(), Some(libc::CLD_KILLED));
+            helper.request("zombie");
+            helper.expect_ack("zombie");
+
+            let status = target.reap();
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            assert_eq!(
+                exited_unreaped(pid).unwrap_err().raw_os_error(),
+                Some(libc::ECHILD),
+                "the target is reaped"
+            );
+            helper.request("reaped");
+            helper.expect_ack("reaped");
+            helper.finish();
+        }
+
+        /// Real `pidfd_open` denial, not an injected pin: a confined helper
+        /// receives EPERM, then ENOSYS, from a kernel seccomp filter and must
+        /// still pin the target through production `/proc` identity, follow it
+        /// through exit and reaping, and never gain signal authority. ENOSYS
+        /// models a missing syscall; it does not claim coverage of old kernels.
+        #[test]
+        fn real_pidfd_denial_preserves_proc_identity_without_signal_authority() {
+            for errno in [libc::EPERM, libc::ENOSYS] {
+                run_pidfd_denial_case(errno);
+            }
+        }
+    }
 }

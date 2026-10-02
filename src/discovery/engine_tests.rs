@@ -1,6 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use super::session_fixture::ScriptedSession;
 use super::*;
+use crate::discovery::test_subject::{OwnedMapper, poll_fd as system_scope_poll_fd};
 
 #[path = "inventory_claims_tests.rs"]
 mod inventory_claims;
@@ -12546,6 +12547,125 @@ fn static_seed_preflight_refusal_keeps_accepted_plan_and_links_unchanged() {
     assert!(session.detached_slots.is_empty());
 }
 
+fn assert_owned_child_reaped(view: &ProcessView) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: valid output; WNOHANG cannot block and WNOWAIT cannot reap
+        // a child if cleanup regresses. This probe never sends a signal.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                view.pid(),
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(result, -1, "the fixture child is still owned and waitable");
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            assert!(std::time::Instant::now() < deadline);
+            continue;
+        }
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ECHILD),
+            "the fixture child must have been reaped"
+        );
+        assert!(!view.still_the_same(), "the fixture child must have exited");
+        return;
+    }
+}
+
+#[test]
+fn owned_mapper_cleanup_oracle_rejects_an_exited_unreaped_child() {
+    let mut child = OwnedMapper::ready();
+    let pid = child.pid();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let fallback =
+        crate::process::start_time_pinned_process_view_for_test(ProcessViewId(0), pid).unwrap();
+    child.0.kill().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: valid output for the owned child. WNOWAIT observes exit
+        // without consuming Child's wait status or allowing PID reuse.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                assert!(std::time::Instant::now() < deadline);
+                continue;
+            }
+            panic!("observe owned child exit: {error}");
+        }
+        // SAFETY: zero-initialized storage, filled by successful waitid.
+        let info = unsafe { info.assume_init() };
+        if unsafe { info.si_pid() } == pid as i32 {
+            assert_eq!(info.si_code, libc::CLD_KILLED);
+            assert_eq!(unsafe { info.si_status() }, libc::SIGKILL);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // The WNOWAIT observation above proves exit without reaping on either
+    // backend. The /proc fallback still recognizes this zombie's generation.
+    let refused = std::panic::catch_unwind(|| assert_owned_child_reaped(&view));
+    let fallback_refused = std::panic::catch_unwind(|| assert_owned_child_reaped(&fallback));
+    drop(child);
+    assert_owned_child_reaped(&view);
+    assert_owned_child_reaped(&fallback);
+    assert!(refused.is_err(), "the cleanup oracle must reject a zombie");
+    assert!(
+        fallback_refused.is_err(),
+        "the cleanup oracle must reject a zombie on the /proc fallback"
+    );
+}
+
+#[test]
+fn owned_mapper_rejects_bad_readiness_and_reaps_the_child() {
+    use std::process::{Command, Stdio};
+
+    let child = Command::new("sh")
+        .args(["-c", "printf 'wrong\\n'; read -r ignored"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
+    let error = OwnedMapper::from_child(child, std::time::Duration::from_secs(5))
+        .err()
+        .expect("a foreign acknowledgement must be rejected");
+    assert!(error.contains("unexpected fixture readiness"), "{error}");
+    assert_owned_child_reaped(&view);
+}
+
+#[test]
+fn owned_mapper_bounds_partial_readiness_and_reaps_the_child() {
+    use std::process::{Command, Stdio};
+
+    let child = Command::new("sh")
+        .args(["-c", "printf 'rea'; read -r ignored"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
+    let error = OwnedMapper::from_child(child, std::time::Duration::from_millis(50))
+        .err()
+        .expect("an incomplete acknowledgement must reach its deadline");
+    assert!(error.contains("readiness deadline"), "{error}");
+    assert_owned_child_reaped(&view);
+}
+
 /// Two provider modules over two distinct executable objects the live
 /// child really mapped.
 fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
@@ -20345,9 +20465,11 @@ fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
 fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
     use std::os::unix::fs::MetadataExt as _;
 
-    let exe = std::env::current_exe().unwrap();
+    let subject = OwnedMapper::ready();
+    let pid = subject.pid();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
     let inode = std::fs::metadata(&exe).unwrap().ino();
-    let maps_bytes = std::fs::read("/proc/self/maps").unwrap();
+    let maps_bytes = std::fs::read(format!("/proc/{pid}/maps")).unwrap();
     let maps = p11scope_manifest::maps::parse_maps(&maps_bytes).unwrap();
     let scan_bytes: u64 = maps
         .iter()
@@ -20373,14 +20495,15 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
     let scan_pass = maps_bytes.len() as u64 * 2 + scan_bytes;
     // The ELF snapshot is read once per capture: the second scan reuses the first
     // scan's cached export facts, so only one copy is budgeted here.
-    let mut budget = CaptureWorkBudget::new(ScanLimits {
+    let limits = ScanLimits {
         per_object_bytes: scan_bytes.max(hash_bytes),
         total_bytes: scan_pass * 2 + elf_snapshot_bytes + hash_bytes,
-    });
+    };
+    let mut budget = CaptureWorkBudget::new(limits);
     let hints = vec![exe];
     let hooks = HookRegistry::builtin();
     let mut counters = DiscoveryCounters::default();
-    let first_view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let first_view = ProcessView::open(ProcessViewId(0), pid).unwrap();
     let mut stage = crate::timing::StageTimings::new();
     let (_, first) = scan_and_pin(
         &first_view,
@@ -20392,7 +20515,7 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
         &mut stage,
     )
     .unwrap();
-    let second_view = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
+    let second_view = ProcessView::open(ProcessViewId(1), pid).unwrap();
     let (_, second) = scan_and_pin(
         &second_view,
         &hints,
@@ -20403,7 +20526,14 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
         &mut stage,
     )
     .unwrap();
-    assert_eq!(first.pinned().count(), 1);
+    assert_eq!(
+        first.pinned().count(),
+        1,
+        "first pin: attempted_io={} stop={:?} skips={:?}",
+        budget.attempted_io_bytes(),
+        budget.stopped_reason(),
+        counters.object_skips
+    );
     assert_eq!(
         second.pinned().count(),
         0,
@@ -20416,6 +20546,29 @@ fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
             .any(|skip| skip.reason.contains("capture attempted-I/O ceiling")),
         "budget exhaustion must remain explicit: {:?}",
         counters.object_skips
+    );
+    let mut fresh_budget = CaptureWorkBudget::new(limits);
+    let mut fresh_counters = DiscoveryCounters::default();
+    let fresh_view = ProcessView::open(ProcessViewId(2), pid).unwrap();
+    let (_, fresh) = scan_and_pin(
+        &fresh_view,
+        &hints,
+        &hooks,
+        &mut fresh_budget,
+        &mut fresh_counters,
+        false,
+        &mut stage,
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.pinned().count(),
+        1,
+        "the same exact limits permit a first pin: {:?}",
+        fresh_counters.object_skips
+    );
+    assert_eq!(
+        std::fs::read(format!("/proc/{pid}/maps")).unwrap(),
+        maps_bytes
     );
 }
 
@@ -22410,34 +22563,6 @@ impl Drop for SystemScopeChildGuard {
         if self.live {
             let _ = self.child.kill();
             let _ = self.child.wait();
-        }
-    }
-}
-
-fn system_scope_poll_fd(fd: i32, timeout: std::time::Duration) -> std::io::Result<bool> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: pollfd names one initialized descriptor for this process.
-        let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-        if result > 0 {
-            return Ok(true);
-        }
-        if result == 0 {
-            return Ok(false);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(false);
         }
     }
 }

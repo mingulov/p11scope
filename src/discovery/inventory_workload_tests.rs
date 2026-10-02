@@ -18,9 +18,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
-/// FD and RSS measurements are process-global: tests that assert them
-/// hold this guard so a parallel test's transient FDs or allocations
-/// cannot perturb the census.
+/// Serialize this module's owned-pidfd workloads. Global FD measurements run
+/// in exact private workers; this mutex cannot constrain unrelated lib tests.
 fn serial_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
@@ -33,27 +32,414 @@ fn harness() -> Harness {
     Harness::new(RegistryLimits::default_limits()).unwrap()
 }
 
-/// Retry a deterministic injection body against process-global FD
-/// measurement noise: parallel suite threads can hold FDs across a
-/// whole sampling window. The bodies are single-threaded and
-/// deterministic, so a real leak fails every attempt identically while
-/// noise fails sporadically — three attempts, then the last panic
-/// resumes. (The isolated RSS worker re-runs the same bodies without
-/// retries: single test per process, no noise to tolerate.)
-fn retry_against_fd_noise(body: fn()) {
-    let mut attempts = 0;
-    loop {
-        match std::panic::catch_unwind(body) {
-            Ok(()) => return,
-            Err(payload) => {
-                attempts += 1;
-                if attempts >= 3 {
-                    std::panic::resume_unwind(payload);
+struct WorkloadWorker {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl Drop for WorkloadWorker {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // SAFETY: Command::process_group(0) created this worker's own
+            // group. Its unreaped leader reserves the identity until wait.
+            unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct WorkloadWorkerResult {
+    pid: u32,
+    result: Result<String, String>,
+}
+
+fn run_workload_worker(mode: &str, timeout: std::time::Duration) -> WorkloadWorkerResult {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let stdout_path = dir.path().join("stdout");
+    let stderr_path = dir.path().join("stderr");
+    let nonce = dir.path().file_name().unwrap().to_str().unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "discovery::inventory_workload::tests::workload_fd_worker",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("P11SCOPE_WORKLOAD_FD_WORKER", mode)
+        .env("P11SCOPE_WORKLOAD_FD_NONCE", nonce)
+        .env("P11SCOPE_WORKLOAD_RSS_WORKER", "1")
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut owned = WorkloadWorker {
+        child,
+        reaped: false,
+    };
+    let result = (|| {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: valid output for the retained child; do not reap before
+            // checking completion, so failed workers retain group custody.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(format!("worker wait failed: {error}"));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+            } else {
+                // SAFETY: zero-initialized output, filled by successful waitid.
+                let info = unsafe { info.assume_init() };
+                if unsafe { info.si_pid() } == pid as i32 {
+                    let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+                    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+                    if info.si_code != libc::CLD_EXITED || unsafe { info.si_status() } != 0 {
+                        return Err(format!("worker failed:\n{stdout}\n{stderr}"));
+                    }
+                    let marker = format!("WORKLOAD_FD_DONE {mode} {nonce} {pid}");
+                    if stdout.lines().filter(|line| *line == marker).count() != 1 {
+                        return Err(format!(
+                            "worker completion marker missing:\n{stdout}\n{stderr}"
+                        ));
+                    }
+                    let status = owned.child.wait().map_err(|error| error.to_string())?;
+                    owned.reaped = true;
+                    assert!(status.success());
+                    return Ok(stdout);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+                return Err(format!("worker deadline expired:\n{stdout}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    })();
+    drop(owned);
+    WorkloadWorkerResult { pid, result }
+}
+
+fn assert_workload_worker_reaped(pid: u32) {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: non-consuming, non-signaling check after our child guard settled.
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+fn isolated_workload(mode: &str) {
+    let outcome = run_workload_worker(mode, std::time::Duration::from_secs(60));
+    assert_workload_worker_reaped(outcome.pid);
+    assert!(outcome.result.is_ok(), "{}", outcome.result.unwrap_err());
+}
+
+#[test]
+fn workload_fd_worker() {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+
+    let Ok(mode) = std::env::var("P11SCOPE_WORKLOAD_FD_WORKER") else {
+        return;
+    };
+    let nonce = std::env::var("P11SCOPE_WORKLOAD_FD_NONCE").unwrap();
+    println!("WORKLOAD_FD_START {mode} {nonce} {}", std::process::id());
+    std::io::stdout().flush().unwrap();
+    match mode.as_str() {
+        "admission" => inject_admission_failures(),
+        "mutation" => inject_provider_mutation(),
+        "discovery-loss" => inject_discovery_loss(),
+        "churn" => run_churn_storm(),
+        "shutdown" => interrupt_shutdown(),
+        "rss" => workload_rss_worker(),
+        "oracle-clean" => {
+            let owned_directory = std::fs::File::open("/proc/self/fd").unwrap();
+            let scope = FdScope::open("isolated clean baseline");
+            assert!(scope.before.contains_key(&owned_directory.as_raw_fd()));
+            for fd in scope.before.keys() {
+                // SAFETY: query a borrowed descriptor without changing ownership.
+                assert!(unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0);
+            }
+            scope.assert_delta(0);
+            let accounted = std::fs::File::open("/dev/zero").unwrap();
+            scope.assert_delta(1);
+            drop(accounted);
+            scope.assert_delta(0);
+        }
+        "oracle-retained" => {
+            let scope = FdScope::open("isolated retained File");
+            let retained = std::fs::File::open("/dev/zero").unwrap();
+            scope.assert_delta(0);
+            std::hint::black_box(&retained);
+        }
+        "oracle-duplicate" => {
+            let baseline = std::fs::File::open("/dev/null").unwrap();
+            let scope = FdScope::open("isolated retained duplicate");
+            let retained = baseline.try_clone().unwrap();
+            scope.assert_delta(0);
+            std::hint::black_box(&retained);
+        }
+        "oracle-compensated" => {
+            let foreign = std::fs::File::open("/dev/null").unwrap();
+            let scope = FdScope::open("isolated compensated retention");
+            let retained = std::fs::File::open("/dev/zero").unwrap();
+            drop(foreign);
+            scope.assert_delta(0);
+            std::hint::black_box(&retained);
+        }
+        "oracle-replaced" => {
+            let original = std::fs::File::open("/dev/null").unwrap();
+            let original_fd = original.as_raw_fd();
+            let scope = FdScope::open("isolated distinct resource replacement");
+            drop(original);
+            let replacement = std::fs::File::open("/dev/zero").unwrap();
+            assert_eq!(replacement.as_raw_fd(), original_fd);
+            scope.assert_delta(0);
+            std::hint::black_box(&replacement);
+        }
+        "missing-marker" => return,
+        "deadline" => std::thread::sleep(std::time::Duration::from_secs(60)),
+        _ => panic!("unknown workload worker mode: {mode}"),
+    }
+    println!("WORKLOAD_FD_DONE {mode} {nonce} {}", std::process::id());
+}
+
+#[test]
+fn workload_fd_oracle_rejects_compensating_foreign_close() {
+    let outcome = run_workload_worker("oracle-compensated", std::time::Duration::from_secs(10));
+    assert_workload_worker_reaped(outcome.pid);
+    let error = outcome
+        .result
+        .expect_err("retention must not cancel baseline loss");
+    assert!(error.contains("baseline FD"), "{error}");
+}
+
+#[test]
+fn workload_fd_oracle_detects_retention_and_distinct_resource_replacement() {
+    isolated_workload("oracle-clean");
+    for (mode, reason) in [
+        ("oracle-retained", "FD delta"),
+        ("oracle-duplicate", "FD delta"),
+        ("oracle-replaced", "baseline FD"),
+    ] {
+        let outcome = run_workload_worker(mode, std::time::Duration::from_secs(10));
+        assert_workload_worker_reaped(outcome.pid);
+        let error = outcome
+            .result
+            .expect_err("unaccounted resource must refuse");
+        assert!(error.contains(reason), "{mode}: {error}");
+    }
+}
+
+#[test]
+fn workload_fd_worker_requires_execution_and_reaps_failures() {
+    for (mode, reason) in [
+        ("unknown", "unknown workload worker mode"),
+        ("missing-marker", "worker completion marker missing"),
+        ("deadline", "worker deadline expired"),
+    ] {
+        let outcome = run_workload_worker(mode, std::time::Duration::from_secs(2));
+        assert_workload_worker_reaped(outcome.pid);
+        let error = outcome.result.expect_err("invalid execution must refuse");
+        assert!(error.contains(reason), "{mode}: {error}");
+        assert!(
+            error.contains("WORKLOAD_FD_START"),
+            "worker must execute: {error}"
+        );
+    }
+}
+
+#[test]
+fn workload_fd_deadline_guard_terminates_an_acknowledged_descendant() {
+    use crate::process::PidPin;
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+
+    struct Descendant(PidPin);
+    impl Drop for Descendant {
+        fn drop(&mut self) {
+            // The retained original pidfd provides independent cleanup even
+            // when a negative control breaks the worker's group termination.
+            let _ = self.0.send_signal(libc::SIGKILL);
+            let exited = self.0.wait_ready(Some(Duration::from_secs(5)));
+            eprintln!(
+                "WORKLOAD_DESCENDANT_CLEANUP pid={} exited={exited:?}",
+                self.0.pid()
+            );
+        }
+    }
+
+    let child = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "sleep 60 & descendant=$!; printf '%s\\n' \"$descendant\"; wait \"$descendant\"",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut worker = WorkloadWorker {
+        child,
+        reaped: false,
+    };
+    let worker_pid = worker.child.id();
+    let acquired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut output = worker.child.stdout.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut acknowledgement = Vec::new();
+        while !acknowledgement.ends_with(b"\n") {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero() && acknowledgement.len() < 32);
+            assert!(
+                crate::discovery::test_subject::poll_fd(output.as_raw_fd(), remaining).unwrap()
+            );
+            let mut byte = [0];
+            output.read_exact(&mut byte).unwrap();
+            acknowledgement.push(byte[0]);
+        }
+        let pid: u32 = std::str::from_utf8(&acknowledgement)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pin = PidPin::open(pid).unwrap();
+        pin.pidfd().expect("the control retains an original pidfd");
+        pin.probe_signal_authority().unwrap();
+        // SAFETY: observe the acknowledged child while its owning worker and
+        // group leader are still retained, without sending any numeric signal.
+        assert_eq!(unsafe { libc::getpgid(pid as i32) }, worker_pid as i32);
+        eprintln!("WORKLOAD_DESCENDANT_READY leader={worker_pid} descendant={pid}");
+        Descendant(pin)
+    }));
+    let descendant = match acquired {
+        Ok(descendant) => descendant,
+        Err(panic) => {
+            // SAFETY: setup failed before independent pin custody; the exact
+            // newly created group leader is still owned and unreaped here.
+            unsafe { libc::kill(-(worker_pid as i32), libc::SIGKILL) };
+            std::panic::resume_unwind(panic);
+        }
+    };
+    assert!(
+        !descendant
+            .0
+            .wait_ready(Some(Duration::from_millis(20)))
+            .unwrap(),
+        "a live descendant must survive to the bounded deadline"
+    );
+    // Exercise the same guard used when run_workload_worker reaches its
+    // deadline; its separate launcher control covers that error branch.
+    drop(worker);
+    assert_workload_worker_reaped(worker_pid);
+    assert!(
+        descendant
+            .0
+            .wait_ready(Some(Duration::from_secs(2)))
+            .unwrap(),
+        "worker cleanup left its acknowledged descendant alive"
+    );
+}
+
+#[test]
+fn workload_fd_workers_preserve_mutation_under_parent_churn_and_concurrent_rss() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct Churn {
+        stop: std::sync::Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    }
+    impl Drop for Churn {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
             }
         }
     }
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let cycles = std::sync::Arc::new(AtomicU64::new(0));
+    let worker_stop = stop.clone();
+    let worker_cycles = cycles.clone();
+    let mut churn = Churn {
+        stop,
+        worker: Some(std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                let file = std::fs::File::open("/dev/null")?;
+                let sockets = std::os::unix::net::UnixStream::pair()?;
+                std::hint::black_box((&file, &sockets));
+                worker_cycles.fetch_add(1, Ordering::AcqRel);
+                std::thread::yield_now();
+            }
+            Ok(())
+        })),
+    };
+    let before = cycles.load(Ordering::Acquire);
+    let (mutation, rss) = std::thread::scope(|scope| {
+        let mutation =
+            scope.spawn(|| run_workload_worker("mutation", std::time::Duration::from_secs(60)));
+        let rss = scope.spawn(|| run_workload_worker("rss", std::time::Duration::from_secs(60)));
+        (mutation.join().unwrap(), rss.join().unwrap())
+    });
+    churn.stop.store(true, Ordering::Release);
+    churn.worker.take().unwrap().join().unwrap().unwrap();
+    let after = cycles.load(Ordering::Acquire);
+    assert!(
+        after > before,
+        "parent FD churn must execute during worker lifetime"
+    );
+    assert_workload_worker_reaped(mutation.pid);
+    assert_workload_worker_reaped(rss.pid);
+    let mutation = mutation.result.unwrap();
+    let rss = rss.result.unwrap();
+    let directory = |output: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix("WORKLOAD_MUTATION_DIR "))
+            .unwrap()
+            .to_string()
+    };
+    let mutation_dir = directory(&mutation);
+    let rss_dir = directory(&rss);
+    assert_ne!(
+        mutation_dir, rss_dir,
+        "concurrent invocations own distinct fixtures"
+    );
+    assert!(!Path::new(&mutation_dir).exists());
+    assert!(!Path::new(&rss_dir).exists());
+    assert!(rss.contains("WORKLOAD_RSS_HWM_BYTES "));
+    eprintln!(
+        "WORKLOAD_FD_CONTROL parent_churn_cycles={} mutation_dir={} rss_dir={}",
+        after - before,
+        mutation_dir,
+        rss_dir
+    );
 }
 
 fn limited(
@@ -455,11 +841,11 @@ fn inventory_projection_at_t7_cardinality_8192() {
 #[test]
 fn native_owner_growth_to_257_over_owned_sleepers() {
     let _serial = serial_guard();
-    retry_against_fd_noise(grow_native_owners_to_257);
+    grow_native_owners_to_257();
 }
 
 /// 257 native owners through the real growth path, callable from the
-/// test above (with FD-noise retries under parallelism).
+/// test above with its owned-pidfd accounting.
 fn grow_native_owners_to_257() {
     // 257 owned sleepers: the pids behind 257 native owners through the
     // real `open_inventory_owner` growth path.
@@ -1174,8 +1560,7 @@ fn refusal_preserves_previously_observed_entry_counts() {
 
 #[test]
 fn admission_failures_gap_exactly_with_zero_fd_delta() {
-    let _serial = serial_guard();
-    retry_against_fd_noise(inject_admission_failures);
+    isolated_workload("admission");
 }
 
 /// Admission/growth failure injection, callable from the test above
@@ -1253,11 +1638,11 @@ fn inject_admission_failures() {
 #[test]
 fn native_owner_growth_failure_accounts_loss_exactly() {
     let _serial = serial_guard();
-    retry_against_fd_noise(inject_native_owner_growth_failure);
+    inject_native_owner_growth_failure();
 }
 
 /// Native-owner growth-path failure injection, callable from the test
-/// above (with FD-noise retries under parallelism).
+/// above with its owned-pidfd accounting.
 fn inject_native_owner_growth_failure() {
     fn some_image(pid: u32) -> Option<ImageIdentity> {
         Some(owner_image(pid))
@@ -1375,8 +1760,7 @@ fn inject_native_owner_growth_failure() {
 
 #[test]
 fn provider_mutation_mid_run_splits_module_instances() {
-    let _serial = serial_guard();
-    retry_against_fd_noise(inject_provider_mutation);
+    isolated_workload("mutation");
 }
 
 /// Provider-mutation injection (dlclose/dlopen of a changed `.so`),
@@ -1385,26 +1769,29 @@ fn inject_provider_mutation() {
     let base = std::env::var_os("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("workload-mutate");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let owned_dir = tempfile::Builder::new()
+        .prefix("workload-mutate-")
+        .tempdir_in(base)
+        .unwrap();
+    let dir = owned_dir.path();
+    println!("WORKLOAD_MUTATION_DIR {}", dir.display());
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let v1 = gcc(
-        &dir,
+        dir,
         "mut-v1.so",
         &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
         &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
         &[],
     );
     let v2 = gcc(
-        &dir,
+        dir,
         "mut-v2.so",
         &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
         &["-shared", "-fPIC", "-DLEGACY_MINOR=41"],
         &[],
     );
     let driver = gcc(
-        &dir,
+        dir,
         "mutate-driver",
         &manifest.join("tests/fixtures/inventory-mutate-driver.c"),
         &["-O2", "-Wall", "-Wextra", "-Werror"],
@@ -1430,8 +1817,9 @@ fn inject_provider_mutation() {
         .spawn()
         .unwrap();
     let driver_pid = child.id();
-    let _reaper = ChildReaper(child);
+    let reaper = ChildReaper(child);
     wait_for(&ready, "mutate ready");
+    let coordinator_scope = FdScope::open("provider mutation coordinator lifetime");
     let mut coordinator = InventoryCoordinator::new(
         Scope::Pid(driver_pid),
         HookRegistry::builtin(),
@@ -1529,12 +1917,15 @@ fn inject_provider_mutation() {
     assert!(old_edge["mapping"]["reason"].is_string());
     assert_eq!(new_edge["mapping"]["state"], "mapped");
     assert_eq!(new_edge["entries"]["count"], 0);
+    drop(coordinator);
+    coordinator_scope.assert_delta(0);
+    drop(reaper);
+    assert_workload_worker_reaped(driver_pid);
 }
 
 #[test]
 fn discovery_loss_marks_uncertain_with_exact_gaps() {
-    let _serial = serial_guard();
-    retry_against_fd_noise(inject_discovery_loss);
+    isolated_workload("discovery-loss");
 }
 
 /// Event/discovery-loss injection, callable from the test above and
@@ -1606,8 +1997,7 @@ fn inject_discovery_loss() {
 
 #[test]
 fn caller_churn_storm_settles_with_exact_ledger() {
-    let _serial = serial_guard();
-    retry_against_fd_noise(run_churn_storm);
+    isolated_workload("churn");
 }
 
 /// Caller churn (spawn/exit storm), callable from the test above and
@@ -1666,8 +2056,7 @@ fn run_churn_storm() {
 
 #[test]
 fn interrupted_shutdown_drops_the_batch_whole_never_partial() {
-    let _serial = serial_guard();
-    retry_against_fd_noise(interrupt_shutdown);
+    isolated_workload("shutdown");
 }
 
 /// Interrupted-shutdown injection (coordinator dropped mid-batch),
@@ -1840,25 +2229,11 @@ fn workload_rss_worker() {
 
 #[test]
 fn injected_workloads_stay_within_rss_bound() {
-    let exe = std::env::current_exe().unwrap();
-    let output = std::process::Command::new(exe)
-        .arg("discovery::inventory_workload::tests::workload_rss_worker")
-        .arg("--exact")
-        .arg("--nocapture")
-        .env("P11SCOPE_WORKLOAD_RSS_WORKER", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap()
-        .wait_with_output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "the RSS worker runs every injection green: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let output = run_workload_worker("rss", std::time::Duration::from_secs(60));
+    assert_workload_worker_reaped(output.pid);
+    let stdout = output
+        .result
+        .expect("the RSS worker runs every injection green");
     let hwm: u64 = stdout
         .lines()
         .find_map(|line| line.strip_prefix("WORKLOAD_RSS_HWM_BYTES ")?.parse().ok())

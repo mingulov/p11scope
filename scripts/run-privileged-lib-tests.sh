@@ -28,7 +28,8 @@
 #     non-ignored synthetic replay tests, optional with a tempdir default;
 #     the runner never executes those tests and does not set these.
 #   P11SCOPE_I3A_RETIREMENT_* (retirement churn test), P11SCOPE_TEST_DISCOVERY_*
-#     (manifest helper; set by its own fixture), P11SCOPE_ALIAS_COLLISION_*
+#     (manifest helper; set by its own fixture), P11SCOPE_TEST_PIDFD_DENIAL_*
+#     (pidfd-denial helper; set by its parent test), P11SCOPE_ALIAS_COLLISION_*
 #     (cross-device scan test), P11SCOPE_FIRST_USE_PROBE_CONFIG (first-use
 #     probe), P11SCOPE_ROOT_RUNTIME_STAGE (root fence): each belongs to a
 #     test on the static SKIP list below, which the script cannot provide a
@@ -43,8 +44,8 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (51 ignored tests in the default-feature lib binary): 42 run by
-# default, 4 run only with --include-long, 5 are statically skipped with a
+# Curation (52 ignored tests in the default-feature lib binary): 42 run by
+# default, 4 run only with --include-long, 6 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
 # never be silently dropped and a renamed one can never silently pass.
@@ -114,6 +115,7 @@ attach::inventory::activation::privileged_tests::privileged_inventory_retirement
 discovery::engine::tests::lifecycle_manifest_helper_entrypoint
 discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path
 first_use_probe::native::system_capture_observer_facts
+process::tests::pidfd_denial::pidfd_denial_helper
 run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending
 )
 SKIP_REASONS=(
@@ -121,6 +123,7 @@ SKIP_REASONS=(
 "private helper re-executed by DiscoveryLifecycleFixture with P11SCOPE_TEST_DISCOVERY_PROVIDER/MANIFEST; its own docs say it is not a separate passing test"
 "needs a live root-owned target with two private cross-device mounts (same inode, distinct dev) plus P11SCOPE_ALIAS_COLLISION_PID/HINT/TARGET/HARDLINK"
 "needs a frozen supervisor config via P11SCOPE_FIRST_USE_PROBE_CONFIG plus an exclusive BPF lane; its verdict requires an external owned oracle"
+"private seccomp helper re-executed by real_pidfd_denial_preserves_proc_identity_without_signal_authority with P11SCOPE_TEST_PIDFD_DENIAL_*; that unprivileged test is its only passing form"
 "needs a separately reviewed native stage via P11SCOPE_ROOT_RUNTIME_STAGE (provider.so, driver, provider.json); the test documents no runtime skip"
 )
 

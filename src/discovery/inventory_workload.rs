@@ -51,7 +51,7 @@ use anyhow::Result;
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(test)]
 use std::rc::Rc;
 
@@ -479,24 +479,117 @@ pub fn count_owned_pidfds(pids: &BTreeSet<u32>) -> usize {
     owned
 }
 
-/// An FD-measurement scope: open before the injection, assert the exact
-/// delta after. Most injections hold no FDs and assert zero; growth
-/// that retains pins by design asserts its accounted cost.
-///
-/// The census is process-global, so a parallel test thread can park a
-/// transient FD inside any single sample. Both ends sample the FLOOR
-/// over a short window instead: transients only inflate single
-/// samples, so the floor is the true retained count, while a retained
-/// leak persists in every sample and still fails.
+/// An FD-measurement scope for an owned, quiescent process: retain the
+/// baseline resources and assert the exact number of added descriptors.
+/// Callers must exclude concurrent FD mutation, including unrelated tests.
+/// Stable resource fingerprints do not prove open-file-description identity;
+/// closing and reopening the same resource may be indistinguishable.
 pub struct FdScope {
-    before: usize,
+    before: BTreeMap<i32, FdResource>,
     label: &'static str,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FdResource {
+    link: std::path::PathBuf,
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    rdev: u64,
+    pidfd_target: Option<i32>,
+}
+
+fn fd_resources() -> std::io::Result<BTreeMap<i32, FdResource>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns the one opendir result.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    // SAFETY: a static terminated path; ownership moves immediately to guard.
+    let raw = unsafe { libc::opendir(c"/proc/self/fd".as_ptr()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let directory = Directory(raw);
+    // SAFETY: the directory is live and remains owned through enumeration.
+    let census_fd = unsafe { libc::dirfd(directory.0) };
+    if census_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut descriptors = BTreeSet::new();
+    loop {
+        // SAFETY: errno is thread-local; readdir uses this live DIR and its
+        // returned entry remains valid until the next call on this DIR.
+        let entry = unsafe {
+            *libc::__errno_location() = 0;
+            libc::readdir(directory.0)
+        };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) {
+                return Err(error);
+            }
+            break;
+        }
+        // SAFETY: readdir returned a valid, terminated d_name.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let fd = name
+            .to_str()
+            .ok()
+            .and_then(|name| name.parse::<i32>().ok())
+            .ok_or_else(|| std::io::Error::other("non-descriptor in /proc/self/fd"))?;
+        if fd != census_fd && !descriptors.insert(fd) {
+            return Err(std::io::Error::other("duplicate descriptor in FD census"));
+        }
+    }
+    // Finish enumeration before temporary fdinfo readers can affect it. Only
+    // the positively identified directory FD was excluded; every other entry
+    // must resolve, with no concurrent descriptor owner changing this process.
+    descriptors
+        .into_iter()
+        .map(|fd| {
+            let path = format!("/proc/self/fd/{fd}");
+            let link = std::fs::read_link(&path)?;
+            let metadata = std::fs::metadata(&path)?;
+            let pidfd_target = if link == std::path::Path::new("anon_inode:[pidfd]") {
+                let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+                Some(
+                    info.lines()
+                        .find_map(|line| line.strip_prefix("Pid:"))
+                        .and_then(|pid| pid.trim().parse().ok())
+                        .ok_or_else(|| {
+                            std::io::Error::other("pidfd census lacks target identity")
+                        })?,
+                )
+            } else {
+                None
+            };
+            Ok((
+                fd,
+                FdResource {
+                    link,
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                    mode: metadata.mode(),
+                    rdev: metadata.rdev(),
+                    pidfd_target,
+                },
+            ))
+        })
+        .collect()
+}
+
 /// The retained-FD floor: the minimum census over ten 10ms samples.
-/// Millisecond transients from parallel threads never survive the
-/// window; genuinely retained FDs appear in all ten. Multi-step
-/// accountings (unit cost, then total) sample this at each step.
+/// This is a sampling statistic, not ownership evidence: unrelated resources
+/// can survive the whole window. Use FdScope only with its isolation premise,
+/// or the owned-pidfd census when that narrower obligation is sufficient.
 pub fn count_fds_floor() -> usize {
     let mut floor = usize::MAX;
     for _ in 0..10 {
@@ -521,22 +614,28 @@ pub fn count_owned_pidfds_floor(pids: &BTreeSet<u32>) -> usize {
 impl FdScope {
     pub fn open(label: &'static str) -> Self {
         Self {
-            before: count_fds_floor(),
+            before: fd_resources().expect("complete baseline FD census"),
             label,
         }
     }
 
     pub fn assert_delta(&self, expected: usize) {
-        let target = self.before.saturating_add(expected);
-        for _ in 0..20 {
-            if count_fds_floor() == target {
-                return;
-            }
+        let after = fd_resources().expect("complete final FD census");
+        for (fd, resource) in &self.before {
+            assert_eq!(
+                after.get(fd),
+                Some(resource),
+                "baseline FD {fd} changed across {}",
+                self.label,
+            );
         }
         assert_eq!(
-            count_fds_floor(),
-            target,
-            "FD delta across {} (no quiescence in 2s)",
+            after.len(),
+            self.before
+                .len()
+                .checked_add(expected)
+                .expect("FD count bound"),
+            "FD delta across {}",
             self.label,
         );
     }

@@ -12,3 +12,6 @@ pub mod noise;
 pub(crate) mod pause;
 pub mod scan;
 pub(crate) mod scheduler;
+
+#[cfg(test)]
+mod test_subject;

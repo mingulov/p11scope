@@ -1269,6 +1269,9 @@ enum Mutation {
         reason: Arc<str>,
         at_ns: u64,
         detected_ns: u64,
+        /// The producer may watch again from `detected_ns` on (a health
+        /// rise); false when it never does (a sticky demotion, C5.2 D4).
+        restartable: bool,
     },
     EndWatches {
         reason: Arc<str>,
@@ -1813,6 +1816,7 @@ impl CallerRegistry {
             reason: reason.into(),
             at_ns,
             detected_ns,
+            restartable: true,
         });
     }
 
@@ -1829,11 +1833,12 @@ impl CallerRegistry {
     }
 
     /// Stage one watch demotion that is not a health counter: the native
-    /// capture's scope custody became unproven, or the capture stopped.
+    /// capture lost system-scope lifecycle evidence (C5.2 D4).
     /// Same mechanics as `note_health_regression` (every watched edge,
     /// including one staged earlier in this batch, demotes sticky; later
-    /// watches clamp to `at_ns`), under its own gap subject.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards custody and stop.
+    /// watches clamp to `at_ns`), under its own gap subject, whose text
+    /// says no watch starts again: the producer stops watching for good.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards lifecycle loss.
     pub(crate) fn note_watch_demotion(
         &mut self,
         subject: &'static str,
@@ -1845,6 +1850,7 @@ impl CallerRegistry {
             reason: reason.into(),
             at_ns,
             detected_ns: at_ns,
+            restartable: false,
         });
     }
 
@@ -2034,6 +2040,7 @@ impl CallerRegistry {
                 reason,
                 at_ns,
                 detected_ns,
+                restartable,
             } => {
                 let restart = detected_ns.max(at_ns);
                 self.last_health_regression_ns = Some(
@@ -2057,8 +2064,13 @@ impl CallerRegistry {
                     pid: None,
                     subject: subject.into(),
                     reason: format!(
-                        "{reason}; the failure cannot be localized, so {demoted} watched no-use {} demoted to unknown (a new watch may start only from the detecting read on)",
-                        if demoted == 1 { "edge was" } else { "edges were" }
+                        "{reason}; the failure cannot be localized, so {demoted} watched no-use {} demoted to unknown ({})",
+                        if demoted == 1 { "edge was" } else { "edges were" },
+                        if restartable {
+                            "a new watch may start only from the detecting read on"
+                        } else {
+                            "no watch starts again in this capture"
+                        }
                     ),
                     budget: None,
                 });

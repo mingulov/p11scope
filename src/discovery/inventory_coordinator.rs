@@ -28,8 +28,8 @@ use super::inventory::{
 };
 use super::*;
 use crate::attach::capture::{
-    DiscoveryBatch, ExtendReceipt, NativeDomainId, ScopeCustody, ScopeIncarnation, WitnessBatch,
-    WitnessRow,
+    DiscoveryBatch, ExtendReceipt, LifecycleLoss, NativeDomainId, ScopeCustody, ScopeIncarnation,
+    WitnessBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
@@ -284,6 +284,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             unproven: None,
             changed_objects: BTreeSet::new(),
             health_unproven: None,
+            pairs_unproven: None,
             last_clean_ns: None,
             stopped: false,
         });
@@ -313,9 +314,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Absorbs the capture's scope custody (`InventoryCapture::custody`,
-    /// receipts, witness batches). The first unproven or lost custody
-    /// stages one timestamped watch demotion — watches staged earlier in
-    /// the same batch demote with the rest — and no watch is staged after.
+    /// receipts, witness batches). The first unproven or lost custody ends
+    /// every watch before stop (C5.2 D2): each ongoing interval freezes at
+    /// `min(custody at_ns, last clean read)` — watches staged earlier in
+    /// the same batch freeze with the rest, and one no clean read proved
+    /// reads unknown — the loss is a gap, and no watch starts after.
     /// After stop it stages nothing: ended intervals are frozen facts.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards custody.
     pub(crate) fn note_capture_custody(&mut self, custody: &ScopeCustody) {
@@ -331,8 +334,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         capture.unproven = Some(reason.clone());
-        self.registry
-            .note_watch_demotion("native capture scope custody unproven", reason, at_ns);
+        let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
+        self.registry.note_watch_end(
+            format!(
+                "no clean read proved the watch before native capture scope custody became unproven: {reason}"
+            ),
+            until,
+        );
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "native capture scope custody unproven".into(),
+            reason: format!(
+                "{reason}; every watched no-use interval ends at the earlier of the custody instant and the last clean read; a watch starting at or after that instant reads unknown, and no watch starts again"
+            ),
+            budget: None,
+        });
     }
 
     /// Absorbs one witness batch's health and custody: a counter rise
@@ -340,9 +358,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// earliest instant of the drop) and lets a new watch start only from
     /// the detecting read on; an unproven health withholds watches until a
     /// batch proves it again; changed objects make their modules unknown
-    /// from now on. A batch with proven health, no rise, and held custody
-    /// is the latest proven-clean instant: its `health_read_ns`, but never
-    /// past its custody proof (`custody_proven_ns`, the last held poll).
+    /// from now on. The pair precondition (`pair_precondition_failure`,
+    /// sticky) withholds every watch without demoting one. A batch with
+    /// proven health, the pair precondition intact, no rise, and held
+    /// custody is the latest proven-clean instant: its `health_read_ns`, but never
+    /// past its custody proof (`custody_proven_ns`, the last held poll) or
+    /// its lifecycle drain horizon (`lifecycle_proven_ns`: any lifecycle
+    /// loss found later dates at or after it, so it never falls inside an
+    /// interval — what makes "nothing after stop" sound).
+    /// A system-scope lifecycle loss is a sticky demotion (C5.2 D4): see
+    /// `note_lifecycle_loss`; a batch carrying one is never clean.
     /// After stop it stages nothing: forward the terminal read before
     /// `end_capture_coverage`.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards batches.
@@ -351,18 +376,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         };
         capture.health_unproven = batch.health_unproven.clone();
+        if capture.pairs_unproven.is_none() {
+            capture.pairs_unproven = pair_precondition_failure(batch);
+        }
         capture
             .changed_objects
             .extend(batch.changed_objects.iter().copied());
         let custody_held = matches!(batch.custody, ScopeCustody::System | ScopeCustody::PidHeld);
         if batch.health_unproven.is_none()
+            && capture.pairs_unproven.is_none()
             && batch.health_regression.is_none()
             && custody_held
+            && batch.lifecycle_loss.is_none()
             && capture.unproven.is_none()
         {
             let clean_ns = batch
                 .health_read_ns
-                .min(batch.custody_proven_ns.unwrap_or(u64::MAX));
+                .min(batch.custody_proven_ns.unwrap_or(u64::MAX))
+                .min(batch.lifecycle_proven_ns);
             capture.last_clean_ns = Some(
                 capture
                     .last_clean_ns
@@ -376,7 +407,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 batch.health_read_ns,
             );
         }
+        if let Some(loss) = &batch.lifecycle_loss {
+            self.note_lifecycle_loss(loss);
+        }
         self.note_capture_custody(&batch.custody);
+    }
+
+    /// System scope: lifecycle evidence was lost (C5.2 D4). A lost exec or
+    /// exit record may belong to any watched caller and cannot be
+    /// localized, so every watch interval reaching past `at_ns` demotes to
+    /// unknown, the loss is a gap, and — sticky — no watch starts again in
+    /// this capture. Only the first loss stages anything.
+    fn note_lifecycle_loss(&mut self, loss: &LifecycleLoss) {
+        let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
+            return;
+        };
+        if capture.unproven.is_some() {
+            return;
+        }
+        capture.unproven = Some(loss.reason.clone());
+        self.registry.note_watch_demotion(
+            "native capture lifecycle evidence lost",
+            loss.reason.clone(),
+            loss.at_ns,
+        );
     }
 
     /// Native capture stops (stop begins or producers detach): no watch
@@ -510,7 +564,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             since_ns = Some(since_ns.map_or(at_ns, |since| since.max(at_ns)));
         }
         match since_ns {
-            Some(_) if capture.health_unproven.is_some() => None,
+            Some(_) if capture.health_unproven.is_some() || capture.pairs_unproven.is_some() => {
+                None
+            }
             Some(since_ns) => Some(CoverageNote::Watched { since_ns }),
             // Admitted with no endpoint: nothing could observe its use.
             None => unknown(UnknownReason::NotAttached),
@@ -1615,16 +1671,48 @@ struct CaptureCoverage {
     /// read watched.
     failed: BTreeSet<EndpointId>,
     /// Sticky: coverage is unproven from here on (PID custody lost, an
-    /// exec or leader exit of the PID target, lifecycle loss).
+    /// exec or leader exit of the PID target, lifecycle loss — PID or
+    /// system scope).
     unproven: Option<String>,
     /// Sticky: objects modified in place after they were attached.
     changed_objects: BTreeSet<AttachObjectId>,
     /// The last witness batch's unproven health (not sticky).
     health_unproven: Option<String>,
+    /// Sticky: the WatchedNoUse pair precondition failed (the seen set is
+    /// full, or a row went unrecorded): no read proves no-use again, so
+    /// no watch starts and no read extends one (C5.2).
+    pairs_unproven: Option<String>,
     /// The latest witness read with proven health, no rise, and held
     /// custody: where a watch ends at stop.
     last_clean_ns: Option<u64>,
     stopped: bool,
+}
+
+/// The WatchedNoUse pair precondition (C3 open item, C5.2): the userspace
+/// seen set below its bound and no row unrecorded past it. A full set
+/// cannot report a later first use, and an unrecorded row is a use nobody
+/// will ever bind, so no-use is no longer provable.
+///
+/// Withholding (not demoting) is sound only because the seen-set bound
+/// equals the capacity of the insert-only CALLER_USE map
+/// (`attach::inventory::callers::seen_limit`, pinned by a test): the set
+/// fills exactly when the map does, so every first use before saturation
+/// was reported, and every later one either was too or failed its insert
+/// into CALLER_EVIDENCE, whose rise demotes every watch.
+fn pair_precondition_failure(batch: &WitnessBatch) -> Option<String> {
+    if batch.unrecorded_rows > 0 {
+        Some(format!(
+            "{} CALLER_USE row(s) went unrecorded past the pair limit {}: no-use is unprovable",
+            batch.unrecorded_rows, batch.pair_limit
+        ))
+    } else if batch.seen_rows >= batch.pair_limit {
+        Some(format!(
+            "the CALLER_USE seen set is full ({}/{} pairs): a later first use could go unrecorded",
+            batch.seen_rows, batch.pair_limit
+        ))
+    } else {
+        None
+    }
 }
 
 /// Whether one mapped caller is the capture's scope incarnation.
@@ -2878,6 +2966,8 @@ mod tests {
             changed_objects: Vec::new(),
             custody: ScopeCustody::PidHeld,
             custody_proven_ns: None,
+            lifecycle_proven_ns: u64::MAX,
+            lifecycle_loss: None,
             unsettled: false,
         }
     }
@@ -2885,7 +2975,8 @@ mod tests {
     #[test]
     fn pid_reuse_within_a_pass_is_never_watched_and_demotes_the_original() {
         // I2/M10: coverage is scoped by incarnation (pid + start time), and
-        // a custody loss demotes watches already staged in the same batch.
+        // a custody loss ends watches already staged in the same batch (no
+        // clean read proved them, so they read unknown; C5.2 D2).
         let mut scene = CaptureScene::new(2);
         scene.source.spawn(7, 500);
         let original = scene
@@ -2965,8 +3056,8 @@ mod tests {
     #[test]
     fn a_nonleader_exec_before_the_first_pass_never_reads_watched() {
         // I2/M10: the exec record arrives after the first projection staged
-        // a watch in the same batch; the demotion wins, and every later
-        // pass reads the exec loss.
+        // a watch in the same batch; the custody end wins (no clean read
+        // proved the watch), and every later pass reads the exec loss.
         let mut scene = CaptureScene::new(2);
         scene.source.spawn(9, 700);
         scene.source.exec(9, 200, "/bin/successor");
@@ -3281,6 +3372,238 @@ mod tests {
             Some(200),
             "an unproven capture is never clean again"
         );
+    }
+
+    // ---- Task 6 C5.2: settle native reads at stop ----
+
+    fn frozen(since_ns: u64, until_ns: u64) -> crate::discovery::caller_registry::UseCoverage {
+        crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+            since_ns,
+            until_ns: Some(until_ns),
+        }
+    }
+
+    #[test]
+    fn a_custody_loss_before_stop_freezes_watches_at_the_last_clean_read() {
+        // C5.2 D2: watch at 100, clean read at 200, custody lost at 250,
+        // stop at 300 → `WatchedNoUse{100, Some(200)}`, not a demotion.
+        let (mut scene, caller) = watched_scene(7, 500);
+        scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidLost {
+                at_ns: 250,
+                reason: "PID custody lost: the PID target exited".into(),
+            });
+        scene.coordinator.registry.publish();
+        assert_eq!(scene.coverage(caller), frozen(100, 200));
+        assert!(
+            scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native capture scope custody unproven"
+                    && gap.reason.contains("PID target exited")
+                    && gap
+                        .reason
+                        .contains("earlier of the custody instant and the last clean read")),
+            "the custody loss is disclosed with what it ends"
+        );
+        scene.project(7, 280);
+        scene.coordinator.end_capture_coverage(300);
+        scene.project(7, 320);
+        scene.coordinator.registry.publish();
+        assert_eq!(scene.coverage(caller), frozen(100, 200), "stop keeps it");
+
+        // A loss dated before the last clean read (an exec record serviced
+        // after that read) ends the interval at the loss.
+        let (mut scene, caller) = watched_scene(9, 510);
+        scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidUnproven {
+                at_ns: 150,
+                reason: "an exec of the PID target was observed".into(),
+            });
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        assert_eq!(scene.coverage(caller), frozen(100, 150));
+
+        // Review fix 1: an undecodable record dated at the last proven
+        // drain (60, before the watch) leaves no clean interval at all.
+        let (mut scene, caller) = watched_scene(11, 520);
+        scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidUnproven {
+                at_ns: 60,
+                reason: "a lifecycle record was lost: short DISCOVERY record".into(),
+            });
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        assert!(
+            lost_with(&scene.coverage(caller), "short DISCOVERY record")
+                && lost_with(
+                    &scene.coverage(caller),
+                    "no clean read proved the watch before native capture scope custody became unproven"
+                ),
+            "{:?}",
+            scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_clean_read_never_claims_past_the_lifecycle_drain_horizon() {
+        // C5.2 closure I-1: drained at 1000, a record reserved at 1010,
+        // clean terminal read at 1020, stop at 1030: the interval ends at
+        // 1000, so the loss found after stop (dated >= 1000) is outside it.
+        let (mut scene, caller) = watched_scene(7, 500);
+        let mut terminal = witness_batch();
+        terminal.health_read_ns = 1020;
+        terminal.lifecycle_proven_ns = 1000;
+        scene.coordinator.note_witness_batch(&terminal);
+        assert_eq!(last_clean(&scene), Some(1000));
+        scene.coordinator.end_capture_coverage(1030);
+        scene.coordinator.registry.publish();
+        assert_eq!(scene.coverage(caller), frozen(100, 1000));
+
+        // D2, PID: the only clean read is capped at a drain at 60, before
+        // the watch began, so a later exit at 200 never freezes {100, 200}.
+        let mut scene = CaptureScene::new(1);
+        scene.source.spawn(9, 510);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(9, 510));
+        scene.attach_all(100, ScopeCustody::PidHeld);
+        scene.project(9, 120);
+        let mut read = witness_batch();
+        read.health_read_ns = 200;
+        read.lifecycle_proven_ns = 60;
+        scene.coordinator.note_witness_batch(&read);
+        assert_eq!(last_clean(&scene), Some(60));
+        scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidLost {
+                at_ns: 200,
+                reason: "PID custody lost: the PID target exited".into(),
+            });
+        scene.coordinator.registry.publish();
+        assert!(
+            lost_with(&scene.coverage(caller), "PID target exited"),
+            "{:?}",
+            scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_system_lifecycle_loss_is_a_sticky_demotion() {
+        // C5.2 D4: DISCOVERY loss in system scope may hide an exec or exit
+        // of any watched caller: every watch demotes, and none restarts.
+        let mut scene = CaptureScene::new(1);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.coordinator.begin_capture_coverage(None);
+        scene.attach_all(100, ScopeCustody::System);
+        scene.project(7, 120);
+        let mut clean = witness_batch();
+        clean.custody = ScopeCustody::System;
+        clean.health_read_ns = 200;
+        scene.coordinator.note_witness_batch(&clean);
+        scene.coordinator.registry.publish();
+        assert!(watched(&scene.coverage(caller)));
+        let mut lost = witness_batch();
+        lost.custody = ScopeCustody::System;
+        lost.health_read_ns = 260;
+        lost.lifecycle_loss = Some(crate::attach::capture::LifecycleLoss {
+            at_ns: 200,
+            reason: "the lifecycle ring lost records (DISCOVERY ring loss 0 -> 3)".into(),
+        });
+        scene.coordinator.note_witness_batch(&lost);
+        scene.coordinator.registry.publish();
+        assert!(
+            lost_with(&scene.coverage(caller), "ring loss"),
+            "{:?}",
+            scene.coverage(caller)
+        );
+        assert_eq!(last_clean(&scene), Some(200), "a lossy read is not clean");
+        assert!(
+            scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(
+                    |gap| gap.subject == "native capture lifecycle evidence lost"
+                        && gap.reason.contains("no watch starts again in this capture")
+                        && !gap.reason.contains("may start")
+                ),
+            "{:?}",
+            scene.coordinator.registry.gaps()
+        );
+        // Sticky: a later clean read and projection never restart a watch.
+        let mut later = witness_batch();
+        later.custody = ScopeCustody::System;
+        later.health_read_ns = 280;
+        scene.coordinator.note_witness_batch(&later);
+        scene.project(7, 290);
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        assert!(
+            lost_with(&scene.coverage(caller), "ring loss"),
+            "{:?}",
+            scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_saturated_pair_set_withholds_the_watch() {
+        // C5.2 pair precondition: once the seen set is full, or a row went
+        // unrecorded, no read proves no-use: no watch starts and no read
+        // extends one.
+        let saturations: [fn(&mut WitnessBatch); 2] = [
+            |batch| batch.seen_rows = batch.pair_limit,
+            |batch| batch.unrecorded_rows = 1,
+        ];
+        for saturate in saturations {
+            let (mut scene, caller) = watched_scene(7, 500);
+            let mut read = witness_batch();
+            read.health_read_ns = 260;
+            saturate(&mut read);
+            scene.coordinator.note_witness_batch(&read);
+            assert_eq!(last_clean(&scene), Some(200), "{read:?}");
+            scene.coordinator.end_capture_coverage(300);
+            scene.coordinator.registry.publish();
+            assert_eq!(scene.coverage(caller), frozen(100, 200), "{read:?}");
+
+            let mut scene = CaptureScene::new(1);
+            scene.source.spawn(8, 510);
+            let caller = scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 50)
+                .unwrap();
+            scene
+                .coordinator
+                .begin_capture_coverage(incarnation(8, 510));
+            let mut read = witness_batch();
+            saturate(&mut read);
+            scene.coordinator.note_witness_batch(&read);
+            scene.attach_all(100, ScopeCustody::PidHeld);
+            scene.project(8, 120);
+            scene.coordinator.registry.publish();
+            assert!(
+                !watched(&scene.coverage(caller)),
+                "{read:?}: {:?}",
+                scene.coverage(caller)
+            );
+        }
     }
 
     // ---- Task 6 C4: native witness binding through the coordinator ----

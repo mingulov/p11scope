@@ -59,12 +59,17 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `entries.coverage` (see `inventory-v1.md`). `capture` is `armed`
   (usage actually covered: counted, witnessed, or watched), `scan
   only` (a live mapping no usage producer instruments), `refused`,
-  `retired`, or `coverage lost` (the reason is in
-  `entries.coverage`). `activity` is `recently observed`, `operation
-  initialized / in flight`, `used (recency unknown)` (witnessed use),
-  `quiet` (only under a loss-free count or a watch — a fact),
-  `unknown (lossy)`, `not covered` (nothing covers the
-  edge's usage), or `unknown` (no live mapping).
+  `retired`, `coverage lost` (the reason is in
+  `entries.coverage`), or `watch ended` (a `watched_no_use` frozen
+  when native capture stopped or its scope custody was lost before
+  stop: `until_ns` is set, so the watch is a fact about
+  `since_ns..until_ns` only, never `armed`). `activity` is `recently
+  observed`, `operation initialized / in flight`, `used (recency
+  unknown)` (witnessed use), `quiet` (only under a loss-free count or
+  an ongoing watch — a fact), `unknown (lossy)`, `not covered`
+  (nothing covers the edge's usage), or `unknown` (no live mapping, or
+  a watch that ended: its interval stays in `entries.coverage`). The
+  dashboard shows a watch that ended as `entries ?`.
 - `snapshot`: `{scope, passes, budgets, gaps_suppressed}` (test/sync
   emission marker).
 - `rotated`: `{prior_file, prior_events, prior_bytes, rotation_seq}` —

@@ -171,7 +171,7 @@ impl PreparedInventory {
                                 .map_max_entries("ENDPOINT_OBJECT", capacity.get())
                                 .map_max_entries(
                                     "CALLER_USE",
-                                    u32::try_from(caller_budget.pair_limit())?,
+                                    callers::caller_use_capacity(caller_budget)?,
                                 );
                             crate::EBPF_INVENTORY_CALLERS_OBJECT
                         }

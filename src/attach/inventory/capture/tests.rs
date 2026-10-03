@@ -542,6 +542,30 @@ fn the_default_caller_budget_is_p_65536_with_exact_payload() {
     assert_eq!(callers.additional_payload_bytes(), 4096 * 8 + 65_536 * 56);
 }
 
+#[test]
+fn the_seen_set_bound_is_exactly_the_caller_use_capacity() {
+    // C5.2 review fix 3: the coordinator withholds (never demotes) on a
+    // full seen set only because the set fills exactly when the
+    // insert-only CALLER_USE map does.
+    use super::super::callers::{caller_use_capacity, seen_limit};
+    for callers in [
+        default_caller_budget(budget(4096)).unwrap(),
+        CallerBudget::new(budget(4), 5, 4 * 8 + 5 * 56).unwrap(),
+    ] {
+        let capacity = caller_use_capacity(callers).unwrap();
+        assert_eq!(u64::from(capacity), callers.pair_limit());
+        assert_eq!(seen_limit(callers).unwrap(), capacity as usize);
+        let mut book = test_book(4, seen_limit(callers).unwrap(), None);
+        let batch = read_witnesses_from(
+            None,
+            &mut book,
+            CapturePhase::Active,
+            ReadWindow::new(1, Instant::now()).unwrap(),
+        );
+        assert_eq!(batch.pair_limit, capacity as usize);
+    }
+}
+
 /// A scripted CALLER_USE map in BTreeMap key order.
 #[derive(Default)]
 struct FakeRows {
@@ -1229,10 +1253,64 @@ fn pid_scope_lifecycle_loss_makes_custody_unproven() {
         ScopeCustody::PidUnproven { ref reason, .. } if reason.contains("short DISCOVERY record")
     ));
 
-    // System scope leaves lifecycle loss to C4/C5.
+    // System scope has no custody: its loss rides the batches instead.
     let mut system = test_book(8, 8, None);
     system.observe_lifecycle(&ring);
     assert_eq!(system.custody(), ScopeCustody::System);
+}
+
+#[test]
+fn a_system_lifecycle_loss_rides_every_later_batch() {
+    // C5.2 D4: system scope has no custody, but a lost exec or exit record
+    // may belong to any watched caller: the earliest loss is sticky on
+    // every later batch. PID scope keeps reporting it as unproven custody.
+    let window = || ReadWindow::new(1, Instant::now()).unwrap();
+    let ring = |loss| CaptureHealth {
+        discovery_counters: Some([loss, 0, 0, 0, 0]),
+        ..CaptureHealth::default()
+    };
+    let mut system = test_book(8, 8, None);
+    system.observe_lifecycle(&ring(0));
+    let batch = read_witnesses_from(None, &mut system, CapturePhase::Active, window());
+    assert_eq!(batch.lifecycle_loss, None);
+    system.health_ns = 170;
+    system.observe_lifecycle(&ring(2));
+    system.health_ns = 190;
+    system.observe_lifecycle(&ring(3));
+    for _ in 0..2 {
+        let batch = read_witnesses_from(None, &mut system, CapturePhase::Active, window());
+        assert!(
+            matches!(&batch.lifecycle_loss, Some(LifecycleLoss { at_ns: 170, reason })
+                if reason.contains("ring loss 0 -> 2")),
+            "{:?}",
+            batch.lifecycle_loss
+        );
+        assert_eq!(batch.custody, ScopeCustody::System);
+    }
+
+    let mut system = test_book(8, 8, None);
+    let failed = service_with(&mut system, window(), |_, _, _| {
+        let failure = super::super::activation::InventoryDispatchFailure {
+            record: None,
+            error: anyhow::anyhow!("short DISCOVERY record"),
+            dispatched: 0,
+        };
+        (Err(failure), true)
+    });
+    assert!(failed.failure.is_some());
+    let batch = read_witnesses_from(None, &mut system, CapturePhase::Active, window());
+    assert!(
+        matches!(&batch.lifecycle_loss, Some(LifecycleLoss { at_ns: 100, reason })
+            if reason.contains("short DISCOVERY record")),
+        "{:?}",
+        batch.lifecycle_loss
+    );
+
+    let mut pid = test_book(8, 8, Some(40));
+    pid.observe_lifecycle(&ring(2));
+    let batch = read_witnesses_from(None, &mut pid, CapturePhase::Active, window());
+    assert_eq!(batch.lifecycle_loss, None);
+    assert!(matches!(batch.custody, ScopeCustody::PidUnproven { .. }));
 }
 
 #[test]
@@ -1452,4 +1530,331 @@ fn a_quantum_ending_at_a_busy_head_is_tagged_and_not_drained() {
         (Ok(service), true)
     });
     assert!(!batch.head_pending && !batch.drained());
+}
+
+/// A live child to pin, killed and reaped by `end`.
+struct PinnedChild(std::process::Child);
+
+impl PinnedChild {
+    fn spawn() -> Self {
+        Self(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep"),
+        )
+    }
+
+    fn pin(&self) -> PidPin {
+        PidPin::open(self.0.id()).expect("pin the child")
+    }
+
+    fn end(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for PinnedChild {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+#[test]
+fn reads_after_stop_repoll_custody_instead_of_reusing_the_last_poll() {
+    // C5.2 M-3: a retiring or retired read reports custody as of its own
+    // poll: a held poll advances the proof instant past the last active
+    // poll, and an exit after stop reads lost, never a stale `PidHeld`.
+    let window = || ReadWindow::new(1, Instant::now()).unwrap();
+    let mut child = PinnedChild::spawn();
+    let pid = child.0.id();
+    let mut retiring = RetiringCapture {
+        inner: RetiringInner::Unactivated(Some(child.pin())),
+        book: test_book(8, 8, Some(pid)),
+        failure: None,
+    };
+    let batch = retiring.read_witnesses(window());
+    assert_eq!(batch.custody, ScopeCustody::PidHeld);
+    assert!(
+        batch.custody_proven_ns.is_some_and(|proven| proven > 100),
+        "the retiring read reused the active poll: {:?}",
+        batch.custody_proven_ns
+    );
+    child.end();
+    let batch = retiring.read_witnesses(window());
+    assert!(
+        matches!(&batch.custody, ScopeCustody::PidLost { reason, .. } if reason.contains("exited")),
+        "{:?}",
+        batch.custody
+    );
+
+    let mut child = PinnedChild::spawn();
+    let pid = child.0.id();
+    let mut retired = RetiredCapture {
+        inner: None,
+        unactivated_pin: Some(child.pin()),
+        book: test_book(8, 8, Some(pid)),
+        cleanup: CleanupSummary::default(),
+        failure: None,
+    };
+    let batch = retired.read_witnesses(window());
+    assert_eq!(batch.custody, ScopeCustody::PidHeld);
+    assert!(
+        batch.custody_proven_ns.is_some_and(|proven| proven > 100),
+        "the retired read reused the active poll: {:?}",
+        batch.custody_proven_ns
+    );
+    child.end();
+    let batch = retired.read_witnesses(window());
+    assert!(
+        matches!(&batch.custody, ScopeCustody::PidLost { reason, .. } if reason.contains("exited")),
+        "{:?}",
+        batch.custody
+    );
+}
+
+/// A drained discovery quantum at `at_ns` (scripted clock).
+fn drained_service(book: &mut CaptureBook, at_ns: u64) {
+    use super::super::activation::InventoryDiscoveryService;
+    let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
+    let batch = service_with_clock(book, window, &mut || at_ns, |_, _, _| {
+        (Ok(InventoryDiscoveryService::default()), false)
+    });
+    assert!(batch.drained());
+}
+
+/// The C5.2 review scenario up to the clean health read: the ring was
+/// last proven drained at 60; a nonleader exec at 150 left a malformed
+/// record that is still in the ring when health reads clean at 200.
+fn book_with_a_pending_bad_record(scope_pid: Option<u32>) -> CaptureBook {
+    let mut book = CaptureBook::new(
+        budget(8),
+        8,
+        scope_pid.map(|pid| ScopeIncarnation {
+            pid,
+            start_time: None,
+        }),
+        50,
+    );
+    drained_service(&mut book, 60);
+    book.observe_lifecycle(&CaptureHealth {
+        discovery_counters: Some([0; 5]),
+        ..CaptureHealth::default()
+    });
+    book.health_ns = 200;
+    book
+}
+
+#[test]
+fn an_undatable_lifecycle_loss_is_dated_at_the_last_proven_drain() {
+    // C5.2 review fix 1: a record that cannot be decoded (or decodes as
+    // malformed) carries no instant and may have sat in the ring before
+    // the last clean health read. It is dated at the start of the last
+    // drain that emptied the ring, never at that health read.
+    let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
+    for scope in [Some(40), None] {
+        // The service at 220 cannot decode the pending record.
+        let mut book = book_with_a_pending_bad_record(scope);
+        let failed = service_with_clock(&mut book, window, &mut || 220, |_, _, _| {
+            let failure = super::super::activation::InventoryDispatchFailure {
+                record: None,
+                error: anyhow::anyhow!("short DISCOVERY record"),
+                dispatched: 0,
+            };
+            (Err(failure), true)
+        });
+        assert!(failed.failure.is_some());
+        let at = match (book.custody(), book.lifecycle_loss()) {
+            (ScopeCustody::PidUnproven { at_ns, .. }, None) => at_ns,
+            (ScopeCustody::System, Some(loss)) => loss.at_ns,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(at, 60, "{scope:?}: dated past the last proven drain");
+
+        // The drain at 220 dequeues it as malformed; health at 260 sees
+        // the count. The drain at 220 itself proves nothing about it.
+        let mut book = book_with_a_pending_bad_record(scope);
+        drained_service(&mut book, 220);
+        book.observe_lifecycle(&CaptureHealth {
+            discovery_counters: Some([0; 5]),
+            malformed_discovery: 1,
+            ..CaptureHealth::default()
+        });
+        let at = match (book.custody(), book.lifecycle_loss()) {
+            (ScopeCustody::PidUnproven { at_ns, .. }, None) => at_ns,
+            (ScopeCustody::System, Some(loss)) => loss.at_ns,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(at, 60, "{scope:?}: dated past the drain before the read");
+    }
+    // Ring loss is a producer counter: it rose after the last health read
+    // that saw it lower, so that read still dates it.
+    let mut book = book_with_a_pending_bad_record(Some(40));
+    book.observe_lifecycle(&CaptureHealth {
+        discovery_counters: Some([3, 0, 0, 0, 0]),
+        ..CaptureHealth::default()
+    });
+    assert!(matches!(
+        book.custody(),
+        ScopeCustody::PidUnproven { at_ns: 200, .. }
+    ));
+}
+
+/// A discovery quantum that fails to decode a record at `at_ns`.
+fn failed_service(book: &mut CaptureBook, at_ns: u64) {
+    let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
+    let batch = service_with_clock(book, window, &mut || at_ns, |_, _, _| {
+        let failure = super::super::activation::InventoryDispatchFailure {
+            record: None,
+            error: anyhow::anyhow!("short DISCOVERY record"),
+            dispatched: 0,
+        };
+        (Err(failure), true)
+    });
+    assert!(batch.failure.is_some());
+}
+
+fn loss_at(book: &CaptureBook) -> u64 {
+    match (book.custody(), book.lifecycle_loss()) {
+        (ScopeCustody::PidUnproven { at_ns, .. } | ScopeCustody::PidLost { at_ns, .. }, None) => {
+            at_ns
+        }
+        (ScopeCustody::System, Some(loss)) => loss.at_ns,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_read_carries_the_lifecycle_drain_horizon() {
+    // C5.2 closure I-1: the last pass drains the ring at 1000; a record
+    // reserved at 1010 is still pending at the clean terminal read at
+    // 1020 and is dequeued only after stop. The read is capped at the
+    // drain horizon, and the loss found later dates at or after it.
+    let window = || ReadWindow::new(1, Instant::now()).unwrap();
+    for scope in [Some(40), None] {
+        let mut book = CaptureBook::new(
+            budget(8),
+            8,
+            scope.map(|pid| ScopeIncarnation {
+                pid,
+                start_time: None,
+            }),
+            50,
+        );
+        let batch = read_witnesses_from(None, &mut book, CapturePhase::Active, window());
+        assert_eq!(batch.lifecycle_proven_ns, 50, "no producer before creation");
+        drained_service(&mut book, 1000);
+        let terminal = read_witnesses_from(None, &mut book, CapturePhase::Retired, window());
+        assert_eq!(terminal.lifecycle_proven_ns, 1000);
+        failed_service(&mut book, 1040);
+        assert!(loss_at(&book) >= terminal.lifecycle_proven_ns);
+    }
+}
+
+#[test]
+fn a_book_keeps_the_earliest_loss_instant() {
+    // C5.2 closure I-1(b), L-2: a later-found loss dated earlier wins, and a
+    // lost custody never hides an earlier-dated unproven one (probe B):
+    // drained at 60, held poll at 200, an undecodable record at 220, then
+    // the target exits.
+    let mut book = book_with_a_pending_bad_record(Some(40));
+    book.absorb_poll(CustodyPoll::Held, 200);
+    failed_service(&mut book, 220);
+    book.absorb_poll(CustodyPoll::Lost("the PID target exited".into()), 250);
+    assert!(
+        matches!(book.custody(), ScopeCustody::PidLost { at_ns: 60, ref reason } if reason.contains("exited")),
+        "{:?}",
+        book.custody()
+    );
+    let mut book = test_book(8, 8, Some(40));
+    book.mark_unproven(150, "an exec of the PID target was observed".into());
+    book.mark_unproven(120, "a lifecycle record was lost".into());
+    book.mark_unproven(130, "later".into());
+    assert!(matches!(
+        book.custody(),
+        ScopeCustody::PidUnproven { at_ns: 120, ref reason } if reason.contains("record was lost")
+    ));
+    // Probe A: a ring-loss rise and a malformed rise in one observation
+    // date at the earlier of the two (the malformed record's floor).
+    for scope in [Some(40), None] {
+        let mut book = book_with_a_pending_bad_record(scope);
+        book.observe_lifecycle(&CaptureHealth {
+            discovery_counters: Some([3, 0, 0, 0, 0]),
+            malformed_discovery: 1,
+            ..CaptureHealth::default()
+        });
+        assert_eq!(loss_at(&book), 60, "{scope:?}");
+    }
+}
+
+#[test]
+fn only_a_complete_drain_moves_the_undatable_floor_and_from_its_start() {
+    // C5.2 closure M-1: a quantum that stops at its bound, its deadline, or
+    // a busy head leaves records in the ring, so it proves nothing.
+    use super::super::activation::InventoryDiscoveryService;
+    let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
+    let partials: [(InventoryDiscoveryService, bool); 3] = [
+        (
+            InventoryDiscoveryService {
+                record_bound_reached: true,
+                ..InventoryDiscoveryService::default()
+            },
+            false,
+        ),
+        (
+            InventoryDiscoveryService {
+                deadline_reached: true,
+                ..InventoryDiscoveryService::default()
+            },
+            false,
+        ),
+        (InventoryDiscoveryService::default(), true),
+    ];
+    for (service, head_pending) in partials {
+        let mut book = book_with_a_pending_bad_record(Some(40));
+        let batch = service_with_clock(&mut book, window, &mut || 150, |_, _, _| {
+            (Ok(service), head_pending)
+        });
+        assert!(!batch.drained());
+        failed_service(&mut book, 220);
+        assert_eq!(loss_at(&book), 60, "a partial quantum moved the floor");
+    }
+    // A drain that runs from 300 to 340 proves records before 300 only.
+    let mut book = book_with_a_pending_bad_record(Some(40));
+    let clock = std::cell::Cell::new(300);
+    let batch = service_with_clock(
+        &mut book,
+        window,
+        &mut || {
+            let now = clock.get();
+            clock.set(now + 40);
+            now
+        },
+        |_, _, _| (Ok(InventoryDiscoveryService::default()), false),
+    );
+    assert!(batch.drained() && batch.finished_ns == 340);
+    failed_service(&mut book, 400);
+    assert_eq!(loss_at(&book), 300);
+}
+
+#[test]
+fn a_clock_failure_never_becomes_the_undatable_floor() {
+    // C5.2 closure L-1: CLOCK_MONOTONIC failure stamps u64::MAX, safe for a
+    // read stamp but not for a floor.
+    let mut book = book_with_a_pending_bad_record(Some(40));
+    drained_service(&mut book, u64::MAX);
+    failed_service(&mut book, 220);
+    assert_eq!(loss_at(&book), 60);
+    let mut book = CaptureBook::new(
+        budget(8),
+        8,
+        Some(ScopeIncarnation {
+            pid: 40,
+            start_time: None,
+        }),
+        u64::MAX,
+    );
+    failed_service(&mut book, 220);
+    assert_eq!(loss_at(&book), 0, "an unstamped creation proves no drain");
 }

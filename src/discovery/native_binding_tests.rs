@@ -100,6 +100,8 @@ fn read_at(
         changed_objects: Vec::new(),
         custody: ScopeCustody::System,
         custody_proven_ns: None,
+        lifecycle_proven_ns: u64::MAX,
+        lifecycle_loss: None,
         unsettled: false,
     }
 }

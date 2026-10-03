@@ -215,9 +215,21 @@ PID namespaces.
     never precedes the last health regression's detecting read (a
     watch noted later starts there). `until_ns` is `null` while the
     native capture runs; when it stops, every watch ends at the last
-    witness read that proved clean health and held scope custody, and
+    witness read that proved clean health and held scope custody —
+    never past the start of the last discovery read before it that
+    drained the lifecycle ring, so a lifecycle loss found later (even
+    after stop) can never fall inside the interval — and
     `since_ns..until_ns` stays a frozen fact (a watch no clean read
-    proved reads `unknown`/`loss` instead). The watched interval also
+    proved reads `unknown`/`loss` instead). A PID scope custody that
+    becomes unproven or lost before stop (an exec of the target, its
+    leader exiting, its exit, lost lifecycle evidence) ends every watch
+    the same way, at the earlier of the custody instant and the last
+    clean read, records a `native capture scope custody unproven` gap,
+    and no watch starts after it. A watch also needs the capture's
+    `CALLER_USE` seen set below its pair limit with no row unrecorded
+    past it: once either fails, no watch starts and no read extends one
+    (an ongoing interval ends at stop at the last read before). The
+    watched interval also
     ends when the edge does — caller retirement or a complete-absence
     unload (`mapping.state` `ended`, `mapping.last_seen_ns`); the state
     then reads as the frozen fact for that interval.
@@ -240,7 +252,15 @@ PID namespaces.
   already ended (retired callers, unloaded modules) before the
   regression, because the failure cannot be localized in time per
   edge; only an interval frozen at capture stop before the rise
-  stands. Coverage notes that cannot apply are gaps, once per (caller,
+  stands. In system scope, lost lifecycle evidence (DISCOVERY ring
+  loss, a malformed lifecycle record, a failed discovery read: a lost
+  exec or exit of any caller) demotes the same way, under a `native capture lifecycle
+  evidence lost` gap, and is sticky: no watch starts again in that
+  capture. A lifecycle loss is dated at the earliest instant it can
+  date from: a ring-loss rise at the last health read that saw the
+  counter lower; a record that failed to decode or decoded malformed
+  (it carries no instant and may have waited in the ring) at the start
+  of the last discovery read proven to drain the ring before it. Coverage notes that cannot apply are gaps, once per (caller,
   module): `usage coverage without mapping evidence` (no such edge)
   and `coverage for an unadmitted module` (a counting or watch note
   for a module not `admitted`; its usage stays unknown). `observation.usage_feed` is

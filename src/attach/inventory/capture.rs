@@ -23,13 +23,16 @@
 //!   original pidfd custody, and a custody check after every attached
 //!   entry: a link acquired after the original exited may name a reused
 //!   PID, so the capture fails and retires instead of extending further.
-//!   Custody is re-polled on every `custody()` and witness read. A
+//!   Custody is re-polled on every `custody()` and witness read, in every
+//!   phase (retiring and retired reads too). A
 //!   thread-group leader that exited while other threads run (its
 //!   `/proc/<pid>/stat` state reads `Z`) silences the OneProcess entries
 //!   although the pidfd stays live (privileged probe
 //!   `privileged_inventory_capture_pid_scope_leader_exit_probe_lp64`), so
 //!   it, an observed exec, and any lifecycle loss (ring loss, a malformed
 //!   record, a failed discovery quantum) make custody `PidUnproven`.
+//!   System scope has no custody: the earliest lifecycle loss rides every
+//!   later witness batch as a sticky `lifecycle_loss` instead.
 //! - (f) Singles only; Multi stays refused.
 //! - (g) Health: a counter rise is a `health_regression` (once per rise);
 //!   unreadable health or a poisoned OWNER_CTL is a non-sticky
@@ -497,6 +500,16 @@ pub(crate) enum CapturePhase {
     Retired,
 }
 
+/// System-scope lifecycle evidence that was lost: `at_ns` is the earliest
+/// instant the loss can date from — the last readable health read before
+/// a ring-loss rise, or the last proven drain before an undecodable or
+/// malformed record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LifecycleLoss {
+    pub at_ns: u64,
+    pub reason: String,
+}
+
 /// One bounded witness read plus a health snapshot.
 #[derive(Debug)]
 pub(crate) struct WitnessBatch {
@@ -554,6 +567,17 @@ pub(crate) struct WitnessBatch {
     /// live (`None` for the machine). A read is clean no later than this,
     /// whatever its `health_read_ns`.
     pub custody_proven_ns: Option<u64>,
+    /// The start of the last discovery quantum proven to drain the
+    /// lifecycle ring before this read (the book's creation before any
+    /// drain): every lifecycle record reserved before it was dequeued, so
+    /// any lifecycle loss found later dates at or after it. A read is
+    /// clean no later than this (C5.2 closure I-1).
+    pub lifecycle_proven_ns: u64,
+    /// System scope: the earliest-dated lifecycle loss (DISCOVERY ring loss, a
+    /// malformed record, a failed discovery quantum), sticky on every
+    /// later batch. A lost exec or exit record may belong to any watched
+    /// caller. PID scope reports the same loss as unproven custody.
+    pub lifecycle_loss: Option<LifecycleLoss>,
     /// Read after stop began, after a failure, or with unproven health:
     /// never a settled terminal read (FD closure is not a
     /// callback-quiescence protocol, and unproven health proves nothing).
@@ -676,11 +700,23 @@ struct CaptureBook {
     custody_lost: Option<(u64, String)>,
     /// First reason PID-scope coverage became unproven (sticky).
     unproven: Option<(u64, String)>,
+    /// System scope: the earliest-dated lifecycle loss (sticky).
+    lifecycle_lost: Option<(u64, String)>,
     /// The last instant a custody poll proved the pidfd and leader live.
     held_ns: u64,
-    /// The last readable health read; ring loss and malformed records
-    /// found after it are dated here.
+    /// The last readable health read; a ring-loss rise (a producer
+    /// counter) found after it is dated here.
     health_ns: u64,
+    /// The start of the last discovery quantum that drained the ring
+    /// (`DiscoveryBatch::drained`; the book's creation before any
+    /// producer exists): every record produced before it was dequeued.
+    drained_ns: u64,
+    /// `drained_ns` as of the previous lifecycle observation. A record
+    /// that fails to decode or decodes malformed carries no instant and
+    /// may have sat in the ring past any health read, so such a loss is
+    /// dated at the last drain proven before it was dequeued (C5.2
+    /// review fix 1), never at a health read.
+    undatable_floor_ns: u64,
     ring_loss: u64,
     malformed: u64,
     cursor: CallerUseCursor,
@@ -710,8 +746,13 @@ impl CaptureBook {
             failed: BTreeMap::new(),
             custody_lost: None,
             unproven: None,
+            lifecycle_lost: None,
             held_ns: now_ns,
             health_ns: now_ns,
+            // No producer exists yet; an unstamped creation (clock failure)
+            // proves no drain at all, so it floors at 0 (fail safe).
+            drained_ns: drain_stamp(now_ns).unwrap_or(0),
+            undatable_floor_ns: drain_stamp(now_ns).unwrap_or(0),
             ring_loss: 0,
             malformed: 0,
             cursor: CallerUseCursor::new(pair_limit),
@@ -737,10 +778,18 @@ impl CaptureBook {
         if self.scope.is_none() {
             return ScopeCustody::System;
         }
-        if let Some((at_ns, reason)) = &self.custody_lost {
-            return ScopeCustody::PidLost {
-                at_ns: *at_ns,
-                reason: reason.clone(),
+        if let Some((lost_ns, lost)) = &self.custody_lost {
+            // Lost custody never hides an earlier-dated unproven one: the
+            // earliest instant coverage stopped being proven stands.
+            return match &self.unproven {
+                Some((at_ns, reason)) if at_ns < lost_ns => ScopeCustody::PidLost {
+                    at_ns: *at_ns,
+                    reason: format!("{lost}; unproven since {at_ns}: {reason}"),
+                },
+                _ => ScopeCustody::PidLost {
+                    at_ns: *lost_ns,
+                    reason: lost.clone(),
+                },
             };
         }
         match &self.unproven {
@@ -752,11 +801,31 @@ impl CaptureBook {
         }
     }
 
-    /// PID scope only; the first reason (and its instant) stands.
+    /// PID scope only; the earliest instant (and its reason) stands, so a
+    /// later-found loss dated earlier is never masked (C5.2 closure I-1b).
     fn mark_unproven(&mut self, at_ns: u64, reason: String) {
-        if self.scope.is_some() && self.unproven.is_none() {
-            self.unproven = Some((at_ns, reason));
+        if self.scope.is_some() {
+            keep_earliest(&mut self.unproven, at_ns, reason);
         }
+    }
+
+    /// Lifecycle evidence was lost: PID scope's custody is unproven from
+    /// `at_ns`; the machine records the earliest loss for every batch.
+    fn mark_lifecycle_loss(&mut self, at_ns: u64, reason: String) {
+        if self.scope.is_some() {
+            self.mark_unproven(at_ns, reason);
+        } else {
+            keep_earliest(&mut self.lifecycle_lost, at_ns, reason);
+        }
+    }
+
+    fn lifecycle_loss(&self) -> Option<LifecycleLoss> {
+        self.lifecycle_lost
+            .as_ref()
+            .map(|(at_ns, reason)| LifecycleLoss {
+                at_ns: *at_ns,
+                reason: reason.clone(),
+            })
     }
 
     fn mark_lost(&mut self, reason: String) {
@@ -791,28 +860,37 @@ impl CaptureBook {
         }
     }
 
-    /// Lifecycle loss under PID scope: an exec record may be among what
-    /// was lost, so custody since the last clean health read is unproven.
+    /// Lifecycle loss: under PID scope an exec record may be among what
+    /// was lost, so custody since the last clean health read is unproven;
+    /// under system scope the loss may hide any caller's exec or exit.
     fn observe_lifecycle(&mut self, health: &CaptureHealth) {
+        let hidden = if self.scope.is_some() {
+            "an exec of the PID target"
+        } else {
+            "an exec or exit of a watched caller"
+        };
         let ring_loss = health.discovery_counters.map(|counters| counters[0]);
         if let Some(ring_loss) = ring_loss
             && ring_loss > self.ring_loss
         {
             let reason = format!(
-                "the lifecycle ring lost records (DISCOVERY ring loss {} -> {ring_loss}): an exec of the PID target may be among them",
+                "the lifecycle ring lost records (DISCOVERY ring loss {} -> {ring_loss}): {hidden} may be among them",
                 self.ring_loss
             );
-            self.mark_unproven(self.health_ns, reason);
+            self.mark_lifecycle_loss(self.health_ns, reason);
             self.ring_loss = ring_loss;
         }
         if health.malformed_discovery > self.malformed {
             let reason = format!(
-                "{} malformed lifecycle record(s): an exec of the PID target may be among them",
+                "{} malformed lifecycle record(s): {hidden} may be among them",
                 health.malformed_discovery - self.malformed
             );
-            self.mark_unproven(self.health_ns, reason);
+            self.mark_lifecycle_loss(self.undatable_floor_ns, reason);
             self.malformed = health.malformed_discovery;
         }
+        // Any malformed record counted after this observation was dequeued
+        // after it, so after every drain proven so far.
+        self.undatable_floor_ns = self.drained_ns;
     }
 
     fn fail(
@@ -829,6 +907,19 @@ impl CaptureBook {
             reason,
             link_retained,
         });
+    }
+}
+
+/// A clock reading usable as a drain floor: `u64::MAX` marks a failed
+/// CLOCK_MONOTONIC read (`monotonic_ns`).
+fn drain_stamp(ns: u64) -> Option<u64> {
+    (ns != u64::MAX).then_some(ns)
+}
+
+/// A sticky loss record: the earliest instant (and its reason) stands.
+fn keep_earliest(slot: &mut Option<(u64, String)>, at_ns: u64, reason: String) {
+    if slot.as_ref().is_none_or(|(was, _)| at_ns < *was) {
+        *slot = Some((at_ns, reason));
     }
 }
 
@@ -1151,7 +1242,8 @@ impl InventoryCapture {
         // precedent): raise first, then prove N + 3 + reserve fit.
         let soft_limit = crate::process::raise_nofile().context("reading RLIMIT_NOFILE")?;
         fd_preflight(endpoints.endpoint_limit(), soft_limit as u64, fds_in_use()?)?;
-        let pair_limit = usize::try_from(callers.pair_limit()).unwrap_or(usize::MAX);
+        // The seen set's bound IS the CALLER_USE capacity (pair precondition).
+        let pair_limit = super::callers::seen_limit(callers)?;
         let prepared =
             PreparedInventory::prepare_callers_pinned(scope, pin, endpoints, callers, backend)?;
         Ok(Self {
@@ -1180,12 +1272,18 @@ impl InventoryCapture {
     }
 
     fn poll_custody(&mut self) {
-        if self.book.scope.is_none() || self.book.custody_lost.is_some() {
-            return;
-        }
-        let pin = pid_pin_of(&self.state);
-        poll_into(&mut self.book, &mut monotonic_ns, || poll_custody(pin));
+        poll_book(&mut self.book, pid_pin_of(&self.state));
     }
+}
+
+/// One custody poll of the book's PID scope through `pin` (none for the
+/// machine, or once custody is lost). Every read polls first, whatever
+/// the phase, so its custody and proof instant are its own.
+fn poll_book(book: &mut CaptureBook, pin: Option<&PidPin>) {
+    if book.scope.is_none() || book.custody_lost.is_some() {
+        return;
+    }
+    poll_into(book, &mut monotonic_ns, || poll_custody(pin));
 }
 
 fn pid_pin_of(state: &CaptureState) -> Option<&PidPin> {
@@ -1397,8 +1495,12 @@ impl InventoryCapture {
         let Self { state, mut book } = self;
         book.stopping = true;
         let (inner, failure) = match state {
-            // Never activated: no producer ever existed.
-            CaptureState::Prepared(_) | CaptureState::Moving => (RetiringInner::Unactivated, None),
+            // Never activated: no producer ever existed. The PID pin stays
+            // held so a read after stop still polls custody.
+            CaptureState::Prepared(prepared) => {
+                (RetiringInner::Unactivated(prepared.pid_pin), None)
+            }
+            CaptureState::Moving => (RetiringInner::Unactivated(None), None),
             CaptureState::Active(active) => {
                 (RetiringInner::Retiring(Box::new(active.begin_stop())), None)
             }
@@ -1415,7 +1517,8 @@ impl InventoryCapture {
 }
 
 enum RetiringInner {
-    Unactivated,
+    /// Never activated; holds the prepared PID pin, if any.
+    Unactivated(Option<PidPin>),
     Retiring(Box<RetiringInventory>),
 }
 
@@ -1441,14 +1544,14 @@ impl RetiringCapture {
     /// True once every link has had its close attempt.
     pub(crate) fn poll_completion(&mut self, deadline: Instant) -> Result<bool> {
         match &mut self.inner {
-            RetiringInner::Unactivated => Ok(true),
+            RetiringInner::Unactivated(_) => Ok(true),
             RetiringInner::Retiring(retiring) => retiring.poll_completion(deadline),
         }
     }
 
     pub(crate) fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
         match &mut self.inner {
-            RetiringInner::Unactivated => DiscoveryBatch::empty(self.book.domain),
+            RetiringInner::Unactivated(_) => DiscoveryBatch::empty(self.book.domain),
             RetiringInner::Retiring(retiring) => {
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
                     let result = retiring.service_discovery(max, deadline, dispatch);
@@ -1458,9 +1561,18 @@ impl RetiringCapture {
         }
     }
 
+    /// A read after stop began: custody is re-polled first (C5.2 M-3), so
+    /// the terminal read never reports the last active poll's verdict.
     pub(crate) fn read_witnesses(&mut self, window: ReadWindow) -> WitnessBatch {
+        // A retiring capture with no state holds no pin: the poll reads
+        // lost (the pin is no longer held).
+        let pin = match &self.inner {
+            RetiringInner::Unactivated(pin) => pin.as_ref(),
+            RetiringInner::Retiring(retiring) => retiring.state().and_then(InventoryState::pid_pin),
+        };
+        poll_book(&mut self.book, pin);
         let state = match &mut self.inner {
-            RetiringInner::Unactivated => None,
+            RetiringInner::Unactivated(_) => None,
             RetiringInner::Retiring(retiring) => retiring.state_mut(),
         };
         read_witnesses_from(state, &mut self.book, CapturePhase::Retiring, window)
@@ -1468,7 +1580,7 @@ impl RetiringCapture {
 
     pub(crate) fn query_cookie(&self, pin: &PidPin) -> CookieQuery {
         let ebpf = match &self.inner {
-            RetiringInner::Unactivated => None,
+            RetiringInner::Unactivated(_) => None,
             RetiringInner::Retiring(retiring) => retiring.state().map(InventoryState::ebpf),
         };
         query_cookie_in(ebpf, self.book.domain, pin)
@@ -1482,8 +1594,9 @@ impl RetiringCapture {
             failure,
         } = self;
         match inner {
-            RetiringInner::Unactivated => Ok(RetiredCapture {
+            RetiringInner::Unactivated(pin) => Ok(RetiredCapture {
                 inner: None,
+                unactivated_pin: pin,
                 book,
                 cleanup: CleanupSummary::default(),
                 failure,
@@ -1503,6 +1616,7 @@ impl RetiringCapture {
                     };
                     let mut retired = RetiredCapture {
                         inner: Some(Box::new(retired)),
+                        unactivated_pin: None,
                         book,
                         cleanup,
                         failure,
@@ -1526,6 +1640,8 @@ impl RetiringCapture {
 /// A retired capture: maps and pins stay readable until it drops.
 pub(crate) struct RetiredCapture {
     inner: Option<Box<RetiredInventory>>,
+    /// The prepared PID pin of a capture that was never activated.
+    unactivated_pin: Option<PidPin>,
     book: CaptureBook,
     cleanup: CleanupSummary,
     failure: Option<String>,
@@ -1544,7 +1660,13 @@ impl RetiredCapture {
         self.failure.as_deref()
     }
 
+    /// The terminal read: custody is re-polled first (C5.2 M-3).
     pub(crate) fn read_witnesses(&mut self, window: ReadWindow) -> WitnessBatch {
+        let pin = match &self.inner {
+            Some(inner) => inner.state().pid_pin(),
+            None => self.unactivated_pin.as_ref(),
+        };
+        poll_book(&mut self.book, pin);
         let state = self.inner.as_mut().map(|inner| inner.state_mut());
         read_witnesses_from(state, &mut self.book, CapturePhase::Retired, window)
     }
@@ -1590,6 +1712,26 @@ fn service_with(
         bool,
     ),
 ) -> DiscoveryBatch {
+    service_with_clock(book, window, &mut monotonic_ns, service)
+}
+
+/// `service_with` over an injected CLOCK_MONOTONIC (tests script it).
+fn service_with_clock(
+    book: &mut CaptureBook,
+    window: ReadWindow,
+    clock: &mut dyn FnMut() -> u64,
+    service: impl FnOnce(
+        usize,
+        Instant,
+        Dispatch<'_>,
+    ) -> (
+        std::result::Result<
+            super::activation::InventoryDiscoveryService,
+            super::activation::InventoryDispatchFailure,
+        >,
+        bool,
+    ),
+) -> DiscoveryBatch {
     let mut records = Vec::new();
     let mut dispatch = |record: DiscoveryRecord| {
         records.push(record);
@@ -1597,21 +1739,22 @@ fn service_with(
     };
     // `head_pending` is read after the service returns, so it reflects the
     // ring at (or after) the read that came back empty.
-    let started_ns = monotonic_ns();
+    let started_ns = clock();
     let (result, head_pending) = service(window.max_rows, window.deadline, &mut dispatch);
-    let finished_ns = monotonic_ns();
+    let finished_ns = clock();
     for record in &records {
         book.observe_record(record);
     }
     if let Err(failure) = &result {
         // A record that could not be decoded may have been an exec of the
-        // PID target: custody since the last clean health read is unproven.
-        book.mark_unproven(
-            book.health_ns,
+        // PID target, produced at any instant since the last drain that
+        // emptied the ring: custody since then is unproven.
+        book.mark_lifecycle_loss(
+            book.drained_ns,
             format!("a lifecycle record was lost: {:#}", failure.error),
         );
     }
-    match result {
+    let batch = match result {
         Ok(service) => DiscoveryBatch {
             domain: book.domain,
             started_ns,
@@ -1641,7 +1784,15 @@ fn service_with(
                 head_pending: false,
             }
         }
+    };
+    // A clock failure (`u64::MAX`) is safe for a read stamp, never for a
+    // floor: it would date every later undatable loss past any interval.
+    if batch.drained()
+        && let Some(started) = drain_stamp(batch.started_ns)
+    {
+        book.drained_ns = started;
     }
+    batch
 }
 
 fn read_witnesses_from(
@@ -1675,6 +1826,8 @@ fn read_witnesses_from(
         changed_objects: Vec::new(),
         custody: book.custody(),
         custody_proven_ns: book.scope.map(|_| book.held_ns),
+        lifecycle_proven_ns: book.drained_ns,
+        lifecycle_loss: book.lifecycle_loss(),
         unsettled: book.stopping,
     };
     let Some(state) = state else {
@@ -1717,6 +1870,8 @@ fn read_witnesses_from(
     absorb_rows(book, &mut batch, read);
     batch.custody = book.custody();
     batch.custody_proven_ns = book.scope.map(|_| book.held_ns);
+    batch.lifecycle_proven_ns = book.drained_ns;
+    batch.lifecycle_loss = book.lifecycle_loss();
     batch
 }
 

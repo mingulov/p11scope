@@ -138,7 +138,7 @@ ACTIVITY = {
 }
 CAPTURE = {
     "armed": "armed", "scan_only": "scan only", "refused": "refused",
-    "retired": "retired", "lost": "coverage lost",
+    "retired": "retired", "lost": "coverage lost", "ended": "watch ended",
 }
 # inventory_present.rs DASHBOARD_ACTIVITY_WINDOW_NS: recency is judged against
 # the frame's now; a counted edge seen within this of the run end may read recent.
@@ -545,6 +545,9 @@ def expected_capture(caller, module, edge):
     if adm == "unresolved" or mapping == "uncertain" or caller.get("lifecycle") == "unknown" \
             or module.get("lifecycle") == "unknown":
         return CAPTURE["lost"]
+    if frozen_watch(edge):
+        # A frozen watch: a fact about since..until only (C5.2 M-2, review fix 2).
+        return CAPTURE["ended"]
     if cov.get("state") in ("counted", "witnessed", WATCH_STATE):
         return CAPTURE["armed"]
     if cov.get("reason") == SCAN_ONLY_REASON:
@@ -561,7 +564,7 @@ def expected_activity(edge, end_ns):
         return {ACTIVITY["inflight"]}
     if cov.get("state") == "witnessed":
         base = ACTIVITY["used"]
-    elif edge.get("mapping", {}).get("state") != MAPPING_LIVE:
+    elif edge.get("mapping", {}).get("state") != MAPPING_LIVE or frozen_watch(edge):
         base = ACTIVITY["unknown"]
     elif (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
         base = ACTIVITY["quiet"]
@@ -576,12 +579,19 @@ def expected_activity(edge, end_ns):
     return allowed
 
 
+def frozen_watch(edge):
+    """A watch that ended (until_ns set): a fact about since..until only."""
+    cov = coverage(edge)
+    return cov.get("state") == WATCH_STATE and cov.get("until_ns") is not None
+
+
 def expected_entries_display(edge):
     cov = coverage(edge)
     count = edge["entries"].get("count", 0)
     if cov.get("state") == "counted" and cov.get("lossy") and count > 0:
         return f"{count}+"
-    if (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
+    if (cov.get("state") == "counted" and not cov.get("lossy")) or \
+            (cov.get("state") == WATCH_STATE and not frozen_watch(edge)):
         return str(count)
     return str(count) if count > 0 else "?"
 
@@ -1810,6 +1820,64 @@ def self_test():
             failures.append("watch-until-before-use-judged-past-until")
         # ... while the same watch reaching over the use is a false "no use".
         case("watch-until-after-use", "USED-NOT-WATCHED", watch_ending_before_use(+50 * MS))
+
+        # C5.2 M-2: a frozen watch (until_ns set: capture stop, or a custody loss
+        # before it) is a fact about since..until, so it renders `watch ended`,
+        # never `armed`.
+        def freeze(doc, caller, module):
+            cov = _edge(doc, caller, module)["entries"]["coverage"]
+            cov["until_ns"] = cov["since_ns"] + 10 * MS
+
+        def frozen_ended(s, d, dash):
+            freeze(d, cid(s, "P3"), s.mid["C"])
+            freeze(dash, s.dash_ids["P3"], s.mid["C"])
+        res = case("frozen-watch-capture-ended", None, frozen_ended)
+        if not any(r["check"] == "AGREE-EDGE-EVENTS" and r["status"] == "pass" for r in res.rows):
+            failures.append("frozen-watch-edge-events-not-compared")
+
+        def frozen_armed_event(s, d, dash):
+            freeze(d, cid(s, "P3"), s.mid["C"])
+            ev = s.events(d, True)
+            for row in ev:
+                if row["kind"] == "edge_observed" and row["event"]["entries"]["coverage"].get("until_ns"):
+                    row["event"]["capture"] = CAPTURE["armed"]
+            return {"events": ev}
+        case("frozen-watch-event-armed", "AGREE-EDGE-EVENTS", frozen_armed_event)
+
+        def frozen_armed_frame(s, d, dash):
+            freeze(dash, s.dash_ids["P3"], s.mid["C"])
+            frames = s.frames(dash)
+            ended = f"capture {expected_capture({}, {}, _edge(dash, s.dash_ids['P3'], s.mid['C']))} |".encode()
+            return {"frames": frames.replace(ended, f"capture {CAPTURE['armed']} |".encode())}
+        case("frozen-watch-frame-armed", "DASH-EDGE-LABELS", frozen_armed_frame)
+
+        # C5.2 review fix 2: a frozen watch is never quiet now, and its zero is
+        # no current fact (`?`); the interval survives in entries.coverage.
+        def frozen_frame_claims(old_item):
+            def mutate(s, d, dash):
+                freeze(dash, s.dash_ids["P3"], s.mid["C"])
+                edge = _edge(dash, s.dash_ids["P3"], s.mid["C"])
+                frames = s.frames(dash)
+                item, value = old_item
+                now = {"activity": sorted(expected_activity(edge, dash["observation"]["ended_ns"]))[0],
+                       "entries": expected_entries_display(edge)}
+                items = f"capture {expected_capture({}, {}, edge)} | activity {now['activity']} | " \
+                        f"entries {now['entries']} |"
+                assert items.encode() in frames
+                claimed = items.replace(f"{item} {now[item]} |", f"{item} {value} |")
+                return {"frames": frames.replace(items.encode(), claimed.encode())}
+            return mutate
+        case("frozen-watch-frame-quiet", "DASH-EDGE-LABELS", frozen_frame_claims(("activity", ACTIVITY["quiet"])))
+        case("frozen-watch-frame-zero", "DASH-EDGE-LABELS", frozen_frame_claims(("entries", "0")))
+
+        def frozen_quiet_event(s, d, dash):
+            freeze(d, cid(s, "P3"), s.mid["C"])
+            ev = s.events(d, True)
+            for row in ev:
+                if row["kind"] == "edge_observed" and row["event"]["entries"]["coverage"].get("until_ns"):
+                    row["event"]["activity"] = ACTIVITY["quiet"]
+            return {"events": ev}
+        case("frozen-watch-event-quiet", "AGREE-EDGE-EVENTS", frozen_quiet_event)
 
         def empty(s, d, dash):
             d["callers"], d["edges"], d["modules"] = [], [], []

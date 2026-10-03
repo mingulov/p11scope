@@ -18,13 +18,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::time::Instant;
 
+/// CALLER_USE's capacity: the pair limit P. The map is insert-only
+/// (`BPF_NOEXIST` in BPF, never deleted by either side), so it never holds
+/// more than P distinct rows, and the facade's seen set is bounded by this
+/// same value (`seen_limit`): a full seen set means a full map, whose
+/// further inserts fail into CALLER_EVIDENCE. The coordinator's pair
+/// precondition relies on this equality.
+pub(super) fn caller_use_capacity(budget: CallerBudget) -> Result<u32> {
+    Ok(u32::try_from(budget.pair_limit())?)
+}
+
+/// The facade's CALLER_USE seen-set bound: exactly the map's capacity.
+pub(super) fn seen_limit(budget: CallerBudget) -> Result<usize> {
+    Ok(usize::try_from(caller_use_capacity(budget)?)?)
+}
+
 pub(super) fn validate_caller_maps(
     actual: &BTreeMap<String, (InventoryMapKind, ExactMapMetadata)>,
     budget: CallerBudget,
 ) -> Result<()> {
     use InventoryMapKind as K;
     let n = inventory_capacity(budget.endpoint_budget())?;
-    let p = u32::try_from(budget.pair_limit())?;
+    let p = caller_use_capacity(budget)?;
     let mut expected = inventory_maps(n);
     expected.extend([
         (

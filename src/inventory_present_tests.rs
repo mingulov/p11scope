@@ -118,6 +118,7 @@ fn state_vocab_is_the_plans_exact_wording() {
     assert_eq!(Capture::Refused.label(), "refused");
     assert_eq!(Capture::Retired.label(), "retired");
     assert_eq!(Capture::CoverageLost.label(), "coverage lost");
+    assert_eq!(Capture::WatchEnded.label(), "watch ended");
     assert_eq!(Activity::RecentlyObserved.label(), "recently observed");
     assert_eq!(
         Activity::InFlight.label(),
@@ -226,6 +227,68 @@ fn quiet_is_not_unloaded() {
     let snapshot = render_snapshot(&presentation);
     assert!(snapshot.contains("presence unloaded"), "{snapshot}");
     assert!(!snapshot.contains("activity quiet"), "{snapshot}");
+}
+
+#[test]
+fn a_frozen_watch_renders_watch_ended_never_armed_or_quiet() {
+    // C5.2 M-2 and review fix 2: a frozen watch (capture stop, or a custody
+    // loss before it) is a fact about `since..until` only: never armed,
+    // never quiet now, and its zero is no current fact. The interval
+    // survives in the coverage label.
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "present-frozen",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 72_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let watcher = harness.coordinator().adapter().live_id(72_000).unwrap();
+    let since = harness.now_ns();
+    harness.coordinator_mut().registry_mut().note_coverage(
+        watcher,
+        &scale_key(0),
+        CoverageNote::Watched { since_ns: since },
+    );
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    assert_eq!(presentation.edges[0].capture, Capture::Armed, "ongoing");
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_watch_end("native capture stopped", since + 10);
+    harness.commit();
+    let document = harness.render();
+    assert_eq!(
+        document["edges"][0]["entries"]["coverage"]["until_ns"],
+        since + 10
+    );
+    let presentation = capture_for(&harness, &document);
+    let edge = &presentation.edges[0];
+    assert_eq!(
+        edge.coverage,
+        UseCoverage::WatchedNoUse {
+            since_ns: since,
+            until_ns: Some(since + 10)
+        }
+    );
+    assert_eq!(edge.capture, Capture::WatchEnded);
+    assert_eq!(edge.activity, Activity::Unknown);
+    assert_eq!(entries_display(edge), "?");
+    let snapshot = render_snapshot(&presentation);
+    let line = edge_line(&snapshot, edge);
+    assert!(
+        line.contains("capture watch ended activity unknown "),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!("no use from {since} to {}", since + 10)),
+        "{line}"
+    );
 }
 
 #[test]

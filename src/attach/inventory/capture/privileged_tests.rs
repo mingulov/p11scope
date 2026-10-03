@@ -750,3 +750,43 @@ fn privileged_inventory_capture_pid_scope_leader_exit_probe_lp64() -> Result<()>
     let _ = stop(capture)?;
     Ok(())
 }
+
+#[test]
+#[ignore = "root-owned live BPF lane; a PID capture stopped before activation keeps its pin and re-polls custody"]
+fn privileged_inventory_capture_stop_before_activation_repolls_custody_lp64() -> Result<()> {
+    // C5.2 review fix 4: `begin_stop` from Prepared keeps the prepared PID
+    // pin, so retiring and retired reads report custody as of their own
+    // poll (held while the target lives, lost after it exits).
+    let mut target = std::process::Command::new("sleep").arg("30").spawn()?;
+    let pid = target.id();
+    let pin = PidPin::open(pid).map_err(anyhow::Error::msg)?;
+    let capture = prepare(CaptureScope::Pid(pin))?;
+    let mut retiring = capture.begin_stop();
+    let first = retiring.read_witnesses(read_window());
+    let second = retiring.read_witnesses(read_window());
+    ensure!(
+        first.custody == ScopeCustody::PidHeld && second.custody == ScopeCustody::PidHeld,
+        "{:?} {:?}",
+        first.custody,
+        second.custody
+    );
+    ensure!(
+        second.custody_proven_ns > first.custody_proven_ns,
+        "the retiring read did not re-poll: {:?} then {:?}",
+        first.custody_proven_ns,
+        second.custody_proven_ns
+    );
+    let mut retired = retiring
+        .try_finish()
+        .map_err(|_| anyhow::anyhow!("an unactivated capture retires at once"))?;
+    target.kill()?;
+    target.wait()?;
+    let terminal = retired.read_witnesses(read_window());
+    ensure!(
+        matches!(&terminal.custody, ScopeCustody::PidLost { reason, .. } if reason.contains("exited")),
+        "{:?}",
+        terminal.custody
+    );
+    eprintln!("C5_2_STOP_BEFORE_ACTIVATION custody=held,held,lost");
+    Ok(())
+}

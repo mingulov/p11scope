@@ -10,7 +10,7 @@
 //!
 //! Dashboard vocabulary is the plan's exact wording (no synonyms):
 //! presence `mapped | unloaded | process exited | unknown`; capture
-//! `armed | scan only | refused | retired | coverage lost`; activity
+//! `armed | scan only | refused | retired | coverage lost | watch ended`; activity
 //! `recently observed | operation initialized / in flight | used
 //! (recency unknown) | quiet | unknown (lossy) | not covered |
 //! unknown`. Quiet is not unloaded; capture refusal is not application
@@ -89,7 +89,11 @@ impl Presence {
 /// reached the edge — attach failure, not attached, health loss,
 /// capacity; the edge's `entries.coverage` names the reason); scan only
 /// is a live mapping no usage producer instruments; armed is a live edge
-/// whose usage is actually covered (counted, witnessed, or watched).
+/// whose usage is actually covered (counted, witnessed, or watched);
+/// watch ended is a watch frozen at capture stop or at a scope custody
+/// loss before it (`WatchedNoUse{until: Some}`): a fact about a past
+/// interval, never armed (C5.2 M-2; its activity reads unknown and its
+/// dashboard count `?`, the interval stays in the coverage label).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Capture {
     Armed,
@@ -97,6 +101,7 @@ pub(crate) enum Capture {
     Refused,
     Retired,
     CoverageLost,
+    WatchEnded,
 }
 
 impl Capture {
@@ -107,6 +112,7 @@ impl Capture {
             Self::Refused => "refused",
             Self::Retired => "retired",
             Self::CoverageLost => "coverage lost",
+            Self::WatchEnded => "watch ended",
         }
     }
 
@@ -128,6 +134,9 @@ impl Capture {
             Self::CoverageLost
         } else {
             match coverage {
+                UseCoverage::WatchedNoUse {
+                    until_ns: Some(_), ..
+                } => Self::WatchEnded,
                 UseCoverage::Counted { .. }
                 | UseCoverage::Witnessed { .. }
                 | UseCoverage::WatchedNoUse { .. } => Self::Armed,
@@ -144,8 +153,9 @@ impl Capture {
 /// then recent last-seen inside the window (counted coverage is the only
 /// recency source); then used (witnessed use with no count or recency —
 /// never quiet, whatever the mapping); anything without a live mapping
-/// reads as unknown; then, for a live mapping, quiet only where the
-/// quiet is a fact — a loss-free counting feed or a watched module with
+/// reads as unknown, as does a watch that ended (a fact about its
+/// interval only); then, for a live mapping, quiet only where the
+/// quiet is a fact — a loss-free counting feed or an ongoing watch with
 /// no recent entry; a lossy feed reads unknown (lossy); and an edge no
 /// usage producer covers (scan only, refused, not attached, lost) reads
 /// not covered — never idle. Quiet is not unloaded: unloaded
@@ -203,6 +213,11 @@ impl Activity {
             return Self::Unknown;
         }
         match coverage {
+            // A frozen watch is a fact about `since..until` only (the
+            // coverage label keeps it): nothing says the edge is quiet now.
+            UseCoverage::WatchedNoUse {
+                until_ns: Some(_), ..
+            } => Self::Unknown,
             UseCoverage::Counted { lossy: false, .. } | UseCoverage::WatchedNoUse { .. } => {
                 Self::Quiet
             }
@@ -767,18 +782,18 @@ pub(crate) fn coverage_label(coverage: &UseCoverage) -> String {
 }
 
 /// The dashboard's compact entry count: the number only where it is a
-/// fact (a counted or watched edge, or a positive count — `+` marks a
-/// lossy lower bound), `?` where the count is unavailable (unknown
-/// coverage, or witnessed use without a count). A zero never reads as a
+/// fact (a counted or ongoing watched edge, or a positive count — `+`
+/// marks a lossy lower bound), `?` where the count is unavailable
+/// (unknown coverage, witnessed use without a count, or a frozen watch,
+/// whose zero holds only for its interval). A zero never reads as a
 /// fact the coverage cannot back.
 pub(crate) fn entries_display(edge: &EdgeView) -> String {
     match &edge.coverage {
         UseCoverage::Counted { lossy: true, .. } if edge.entry_count > 0 => {
             format!("{}+", edge.entry_count)
         }
-        UseCoverage::Counted { lossy: false, .. } | UseCoverage::WatchedNoUse { .. } => {
-            edge.entry_count.to_string()
-        }
+        UseCoverage::Counted { lossy: false, .. }
+        | UseCoverage::WatchedNoUse { until_ns: None, .. } => edge.entry_count.to_string(),
         _ if edge.entry_count > 0 => edge.entry_count.to_string(),
         _ => "?".to_string(),
     }

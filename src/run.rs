@@ -585,6 +585,98 @@ unsafe fn last_errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
 
+/// Closes every descriptor from 3 up except `keep`, then marks the kept ones
+/// close-on-exec, in a fork child before it can block (DR-RUN-FD).
+///
+/// Close-on-exec alone is not enough before the exec. A child waiting behind
+/// its release barrier, or stopped there, never execs, and until it does it
+/// pins whatever the parent had open at the fork: in particular the handoff
+/// pipes of a sibling another thread was spawning at that moment. That
+/// sibling's exec EOF then never arrives, and its release runs into the
+/// deadline although its command is already running.
+///
+/// Async-signal-safe: stack data and raw syscalls only. Keep entries below 3
+/// (stdio was closed when the observer started) are never closed anyway.
+unsafe fn close_inherited_descriptors<const N: usize>(
+    mut keep: [i32; N],
+    use_close_range: bool,
+) -> std::result::Result<(), i32> {
+    // Insertion sort: N is tiny and this runs after fork.
+    for index in 1..N {
+        let mut at = index;
+        while at > 0 && keep[at - 1] > keep[at] {
+            keep.swap(at - 1, at);
+            at -= 1;
+        }
+    }
+    let mut first = 3u32;
+    for fd in keep {
+        let Ok(fd) = u32::try_from(fd) else {
+            continue;
+        };
+        if fd < first {
+            continue;
+        }
+        if fd > first {
+            unsafe { close_descriptor_range(first, fd - 1, use_close_range) }?;
+        }
+        first = fd + 1;
+    }
+    unsafe { close_descriptor_range(first, u32::MAX, use_close_range) }?;
+    for fd in keep {
+        if fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(unsafe { last_errno() });
+        }
+    }
+    Ok(())
+}
+
+/// Closes `first..=last`. A fork child has a private descriptor table, so
+/// plain `close_range` (no CLOSE_RANGE_UNSHARE) closes exactly this child's
+/// copies. Where `close_range` is denied (a seccomp policy answering ENOSYS
+/// or EPERM), close one by one up to the soft RLIMIT_NOFILE, which bounds
+/// every descriptor this process could have opened at its current limit.
+unsafe fn close_descriptor_range(
+    first: u32,
+    last: u32,
+    use_close_range: bool,
+) -> std::result::Result<(), i32> {
+    if use_close_range {
+        if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } == 0 {
+            return Ok(());
+        }
+        let errno = unsafe { last_errno() };
+        if errno != libc::ENOSYS && errno != libc::EPERM {
+            return Err(errno);
+        }
+    }
+    let mut limit = libc::rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe {
+        libc::syscall(
+            libc::SYS_prlimit64,
+            0,
+            libc::RLIMIT_NOFILE,
+            std::ptr::null::<libc::rlimit64>(),
+            &mut limit,
+        )
+    } != 0
+    {
+        return Err(unsafe { last_errno() });
+    }
+    // fs.nr_open caps descriptor numbers at 2^20 by default.
+    let end = limit.rlim_cur.min(1 << 20) as u32;
+    let mut fd = first;
+    while fd < end && fd <= last {
+        // EBADF for a free slot is expected; Linux close never needs a retry.
+        unsafe { libc::close(fd as i32) };
+        fd += 1;
+    }
+    Ok(())
+}
+
 unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(), i32> {
     if unsafe { libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
         || unsafe {
@@ -689,9 +781,26 @@ unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(),
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once in the parent right after the next fork on this thread,
+    /// while the new child's handoff pipe ends are still open here: the
+    /// window in which a concurrent sibling fork inherits them.
+    static AFTER_FORK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_fork_hook() {
+    if let Some(hook) = AFTER_FORK_HOOK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// Owns exactly one fork generation until it is reaped or deliberately handed
 /// back still running. The child enters a private session before blocking on
-/// the CLOEXEC pre-exec barrier.
+/// the CLOEXEC pre-exec barrier, holding no inherited descriptor but its own
+/// handoff pipes and launch file.
 pub(crate) struct OwnedChild {
     pid: u32,
     pin: std::sync::Arc<PidPin>,
@@ -770,8 +879,6 @@ impl OwnedChild {
         }
         if pid == 0 {
             unsafe {
-                libc::close(release_writer.as_raw_fd());
-                libc::close(exec_reader.as_raw_fd());
                 // The observer's stop handlers belong to the observer, and the
                 // command inherits exactly what the observer inherited:
                 // restore the startup dispositions captured in `main`, so
@@ -794,16 +901,24 @@ impl OwnedChild {
                 if libc::sigaction(libc::SIGPIPE, &default_action, std::ptr::null_mut()) != 0 {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
                 }
-                if libc::setsid() < 0 {
-                    child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
+                // Before setsid and before anything can block: keep only
+                // stdio, this child's two pipe ends and the launch file
+                // (this also drops the parent's ends of both pipes). A
+                // session leader has closed everything else, so a stop sent
+                // once the child leads its session cannot freeze inherited
+                // descriptors in it. After the dispositions above, so the
+                // inherited window for observer handlers is unchanged.
+                if let Err(errno) = close_inherited_descriptors(
+                    [
+                        release_reader.as_raw_fd(),
+                        exec_writer.as_raw_fd(),
+                        launch_file.as_raw_fd(),
+                    ],
+                    true,
+                ) {
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                 }
-                if libc::syscall(
-                    libc::SYS_close_range,
-                    3u32,
-                    u32::MAX,
-                    libc::CLOSE_RANGE_CLOEXEC,
-                ) != 0
-                {
+                if libc::setsid() < 0 {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
                 }
                 if let Err(errno) = harden_owned_child(identity) {
@@ -829,6 +944,8 @@ impl OwnedChild {
             }
         }
 
+        #[cfg(test)]
+        run_after_fork_hook();
         drop(release_reader);
         drop(exec_writer);
         let pid = pid as u32;
@@ -7815,6 +7932,186 @@ mod tests {
         assert!(!marker.exists(), "owned child inherited an unrelated fd");
     }
 
+    /// Descriptors numbered 3 and up that `pid` holds right now.
+    fn open_descriptors_above_stdio(pid: u32) -> Vec<(i32, std::path::PathBuf)> {
+        let mut open: Vec<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let fd: i32 = entry.file_name().to_str().unwrap().parse().unwrap();
+                (fd, std::fs::read_link(entry.path()).unwrap_or_default())
+            })
+            .filter(|(fd, _)| *fd > 2)
+            .collect();
+        open.sort();
+        open
+    }
+
+    /// DR-RUN-FD regression. A sibling forked while another child's handoff
+    /// pipes are still open in the parent inherits them. Marking them
+    /// close-on-exec is not enough: an unreleased (here also stopped)
+    /// sibling never execs, so it kept the first child's exec pipe open and
+    /// that child's release ran into its deadline although it had exec'd.
+    #[test]
+    fn a_sibling_forked_inside_a_handoff_window_does_not_delay_that_release() {
+        let sibling = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = sibling.clone();
+        AFTER_FORK_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let sibling = spawn("/bin/sh", &["-c", "exit 0"]);
+                wait_for_session_leader(&sibling);
+                sibling.pin().send_signal(libc::SIGSTOP).unwrap();
+                *slot.borrow_mut() = Some(sibling);
+            }));
+        });
+        let mut first = spawn("/bin/sh", &["-c", "exit 7"]);
+        let sibling = sibling
+            .borrow_mut()
+            .take()
+            .expect("the hook forks the sibling inside the first handoff window");
+        let outside = duplicate_fd(sibling.pin().pidfd().unwrap());
+        wait_until(
+            || original_child_is_stopped(outside.as_fd()),
+            "the sibling never stopped behind its barrier",
+        );
+
+        let started = Instant::now();
+        let released = first.release();
+        let elapsed = started.elapsed();
+        assert!(
+            released.is_ok(),
+            "{released:?} after {elapsed:?}: an unreleased sibling held the exec pipe"
+        );
+        assert_eq!(
+            first.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(7)
+        );
+        drop(sibling);
+    }
+
+    /// Forks, runs the closer with `keep`, and reports every descriptor from
+    /// 3 up still open in the fork child as (fd, close-on-exec).
+    fn descriptors_left_by_closer(use_close_range: bool) -> (Vec<(i32, bool)>, Vec<i32>) {
+        let (mut reader, writer) = pipe_pair();
+        let null = File::open("/dev/null").unwrap();
+        let unrelated: Vec<File> = (0..3).map(|_| File::open("/dev/null").unwrap()).collect();
+        // SAFETY: dup of a live descriptor returns a new owned, inheritable one.
+        let kept = unsafe { OwnedFd::from_raw_fd(libc::dup(null.as_raw_fd())) };
+        let trailing = File::open("/dev/null").unwrap();
+        // Unsorted, with a stdio entry the closer must leave alone.
+        let keep = [kept.as_raw_fd(), 1, writer.as_raw_fd()];
+        // SAFETY: the child runs only raw syscalls on stack data, then _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: as above; every descriptor named here is live or probed.
+            unsafe {
+                let code = match close_inherited_descriptors(keep, use_close_range) {
+                    Ok(()) => 0,
+                    Err(errno) => errno,
+                };
+                let mut report = [0i32; 64];
+                let mut used = 0;
+                for fd in 3..8192 {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 && used < report.len() {
+                        report[used] = fd * 2 + i32::from(flags & libc::FD_CLOEXEC != 0);
+                        used += 1;
+                    }
+                }
+                libc::write(
+                    writer.as_raw_fd(),
+                    report.as_ptr().cast(),
+                    used * std::mem::size_of::<i32>(),
+                );
+                libc::_exit(code);
+            }
+        }
+        drop(writer);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        let status = reap_blocking(pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "closer failed: status {status:#x}"
+        );
+        let left = bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_ne_bytes(chunk.try_into().unwrap()))
+            .map(|entry| (entry / 2, entry % 2 == 1))
+            .collect();
+        let mut expected = vec![kept.as_raw_fd(), keep[2]];
+        expected.sort();
+        drop((null, unrelated, trailing));
+        (left, expected)
+    }
+
+    #[test]
+    fn the_closer_keeps_exactly_its_keep_set_close_on_exec() {
+        for use_close_range in [true, false] {
+            let (left, expected) = descriptors_left_by_closer(use_close_range);
+            assert_eq!(
+                left,
+                expected.iter().map(|fd| (*fd, true)).collect::<Vec<_>>(),
+                "use_close_range={use_close_range}"
+            );
+        }
+    }
+
+    /// The pre-exec child keeps exactly its two handoff pipe ends and the
+    /// launch file; every other inherited descriptor is closed before it
+    /// waits, and the command itself still starts with stdio only.
+    #[test]
+    fn an_unreleased_child_holds_only_its_handoff_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let listing = directory.path().join("fds");
+        let (reader, writer) = super::pipe_pair().unwrap();
+        let script = format!(
+            "n=3; while [ $n -lt 1024 ]; do \
+               if [ -e /proc/$$/fd/$n ]; then printf '%s ' $n >> {0}; fi; \
+               n=$((n+1)); done; printf end >> {0}",
+            listing.display()
+        );
+        let mut child = spawn("/bin/sh", &["-c", &script]);
+        wait_for_session_leader(&child);
+
+        let held = open_descriptors_above_stdio(child.pid());
+        assert_eq!(held.len(), 3, "pre-exec child holds {held:?}");
+        let unrelated =
+            std::fs::read_link(format!("/proc/self/fd/{}", reader.as_raw_fd())).unwrap();
+        assert!(
+            held.iter().all(|(_, target)| *target != unrelated),
+            "pre-exec child holds the unrelated pipe: {held:?}"
+        );
+        assert_eq!(
+            held.iter()
+                .filter(|(_, target)| target.to_string_lossy().starts_with("pipe:["))
+                .count(),
+            2,
+            "pre-exec child keeps exactly its two handoff pipe ends: {held:?}"
+        );
+        // The unreleased child does not hold the unrelated pipe's write end.
+        // A concurrent test's fork may hold it for the instant before its
+        // own close, so wait a generous bound; the old close-on-exec-only
+        // child held it until its release, which never comes here.
+        drop(writer);
+        let mut pollfd = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd is one live entry for this call.
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 5_000) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLHUP, 0, "write end still held");
+
+        child.release().unwrap();
+        assert_eq!(
+            child.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(0)
+        );
+        assert_eq!(std::fs::read_to_string(&listing).unwrap(), "end");
+    }
+
     #[test]
     fn exec_errno_exit_status_and_signal_status_are_exact() {
         assert_eq!(
@@ -13016,6 +13313,18 @@ mod tests {
     /// diagnostic line and exits with a distinct code instead of unwinding
     /// into the harness. Exit 0 with the `OK` line on success; 11-19 fail
     /// phase 1, 21-29 phase 2.
+    /// A raw fork of this multi-threaded test binary inherits every sibling
+    /// test's descriptors, an OwnedChild handoff pipe in flight included,
+    /// and holds them for as long as it runs (DR-RUN-FD). Keep stdio and the
+    /// report pipe only.
+    fn close_inherited_in_test_fork(writer: &File) {
+        // SAFETY: called first in the fork child; raw syscalls on stack data.
+        if let Err(errno) = unsafe { close_inherited_descriptors([writer.as_raw_fd()], true) } {
+            // SAFETY: _exit runs no destructors and flushes nothing.
+            unsafe { libc::_exit(100 + errno.clamp(0, 27)) };
+        }
+    }
+
     fn isolated_fidelity_observer(writer: File, sleeper: &Path, phase: u8) -> ! {
         use std::os::fd::AsRawFd as _;
 
@@ -13238,6 +13547,7 @@ mod tests {
             assert!(observer >= 0, "forking the isolated observer");
             if observer == 0 {
                 drop(reader);
+                close_inherited_in_test_fork(&writer);
                 isolated_fidelity_observer(writer, &sleeper, phase);
             }
             drop(writer);
@@ -13337,6 +13647,7 @@ mod tests {
         assert!(observer >= 0, "forking the fresh-registry observer");
         if observer == 0 {
             drop(reader);
+            close_inherited_in_test_fork(&writer);
             isolated_fidelity_observer(writer, std::path::Path::new(&sleeper), phase);
         }
         drop(writer);
@@ -13585,6 +13896,7 @@ mod tests {
         assert!(parent >= 0, "forking the probe intermediate");
         if parent == 0 {
             drop(reader);
+            close_inherited_in_test_fork(&writer);
             sigkill_probe_intermediate(writer, &sleeper);
         }
         drop(writer);

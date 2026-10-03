@@ -52,6 +52,8 @@ pub(crate) use cleanup_worker::{
 };
 
 #[cfg(test)]
+mod continuation_guard_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;

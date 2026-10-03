@@ -2534,6 +2534,72 @@ mod c1b {
         assert!(reason.contains("1 confirm_unreadable"), "{reason}");
     }
 
+    fn join_refusal_reason(document: &serde_json::Value) -> String {
+        document["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gap| gap["subject"] == "caller generation join refused")
+            .expect("the refused join is one counted gap")["reason"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The deep-scan lane refuses an image other than the admitted one
+    /// when both were read, exactly as the maps lane does.
+    #[test]
+    fn the_deep_scan_lane_refuses_an_exec_both_sides_read() {
+        let mut harness = spawned();
+        let mut exec = driver();
+        exec.ino = 101;
+        harness.apply_catalog(catalog(
+            &[],
+            &[(
+                REP,
+                Some(MemberGeneration {
+                    start_time: Some(start(REP)),
+                    exe: Some(exec),
+                }),
+            )],
+        ));
+        let document = harness.render();
+        assert!(
+            edge_of(&document, REP).is_none(),
+            "the deep scan must not project"
+        );
+        assert!(edge_of(&document, REP + 1).is_some());
+        let reason = join_refusal_reason(&document);
+        assert!(reason.contains("1 exec_changed"), "{reason}");
+    }
+
+    /// A start time neither the collection nor the admission could read
+    /// joins nothing, in the deep-scan lane too: `None == None` is no
+    /// proof of one generation.
+    #[test]
+    fn the_deep_scan_lane_refuses_a_start_time_neither_side_read() {
+        let mut harness = spawned();
+        harness.source().blind(REP);
+        harness.apply_catalog(catalog(
+            &[],
+            &[(
+                REP,
+                Some(MemberGeneration {
+                    start_time: None,
+                    exe: None,
+                }),
+            )],
+        ));
+        let document = harness.render();
+        assert!(
+            edge_of(&document, REP).is_none(),
+            "the deep scan must not project"
+        );
+        assert!(edge_of(&document, REP + 1).is_some());
+        let reason = join_refusal_reason(&document);
+        assert!(reason.contains("1 generation_changed"), "{reason}");
+    }
+
     #[test]
     fn budget_refusals_past_the_cap_aggregate_into_one_gap_per_pass() {
         let limits = RegistryLimits::new(100, 4096, 32768, 1024, 1_048_576, 32768).unwrap();

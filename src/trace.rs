@@ -186,8 +186,9 @@ pub fn capture_line(policy: CapturePolicy) -> String {
 }
 
 /// Final machine-readable evidence record for a normally stopped trace.
-/// Detaching perf links does not prove already-running callbacks quiesced, so
-/// this record must remain PARTIAL and must not claim a proven final drain.
+/// Detaching perf links does not prove already-running callbacks quiesced;
+/// only the stop gate's proven quiescence does (`ev.drain_proven`, owner
+/// ruling B). Without it this record stays PARTIAL with `final_drain: false`.
 pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy, truncated: bool) -> String {
     let mut value = render::versioned_evidence(ev);
     let object = value
@@ -197,12 +198,19 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy, truncated: bo
         "privacy_mode".into(),
         serde_json::Value::String(policy.privacy_mode().into()),
     );
+    // The sealed verdict, re-gated on the latch so an unsealed snapshot
+    // can never publish COMPLETE: only a proven stop-gate drain (owner
+    // ruling B) makes the final drain, and with it COMPLETE, true.
+    let complete = ev.drain_proven && ev.completeness == "COMPLETE";
     object.insert(
         "completeness".into(),
-        serde_json::Value::String("PARTIAL".into()),
+        serde_json::Value::String(if complete { "COMPLETE" } else { "PARTIAL" }.into()),
     );
     object.insert("capture_aborted".into(), serde_json::Value::Null);
-    object.insert("final_drain".into(), serde_json::Value::Bool(false));
+    object.insert(
+        "final_drain".into(),
+        serde_json::Value::Bool(ev.drain_proven),
+    );
     object.insert("counters_available".into(), serde_json::Value::Bool(true));
     object.insert("trace_truncated".into(), serde_json::Value::Bool(truncated));
     format!("EVIDENCE {value}")
@@ -634,6 +642,7 @@ mod tests {
             module_unresolved_slots: 0,
             provider_changed: false,
             scheduling: render::SchedulingEvidence::default(),
+            stop_quiescence: Default::default(),
             drain_proven: false,
             verdict_detail: render::VERDICT_CONCRETE_GAP,
             gap_classes: render::GapClasses::default(),
@@ -676,6 +685,40 @@ mod tests {
             value["interface_selection"]["tuples"],
             serde_json::json!([])
         );
+    }
+
+    // SG-T7B (owner ruling B): the trace terminal record carries the sealed
+    // verdict. A proven stop-gate drain is COMPLETE with `final_drain:
+    // true`; anything less stays PARTIAL with `final_drain: false`.
+    #[test]
+    fn final_evidence_line_carries_a_proven_drain_and_its_sealed_verdict() {
+        use crate::render::{QuiescenceState, StopQuiescence};
+        let line_for = |stop: StopQuiescence| {
+            let mut evidence = crate::render::tests::evidence();
+            evidence.apply_stop_quiescence(stop);
+            evidence.settle_terminal(true);
+            let line = evidence_line(&evidence, CapturePolicy::Allowlisted, false);
+            serde_json::from_str::<serde_json::Value>(line.strip_prefix("EVIDENCE ").unwrap())
+                .unwrap()
+        };
+        let proven = line_for(StopQuiescence {
+            state: QuiescenceState::Proven,
+            ..Default::default()
+        });
+        assert_eq!(proven["completeness"], "COMPLETE");
+        assert_eq!(proven["final_drain"], true);
+        assert_eq!(proven["drain_proven"], true);
+        assert_eq!(proven["verdict_detail"], "clean_proven");
+        assert_eq!(proven["stop_quiescence"]["state"], "proven");
+        let post_q = line_for(StopQuiescence {
+            state: QuiescenceState::Proven,
+            post_q_events: true,
+            post_q_discovery: false,
+        });
+        assert_eq!(post_q["completeness"], "PARTIAL");
+        assert_eq!(post_q["final_drain"], false);
+        assert_eq!(post_q["verdict_detail"], "clean_but_unproven");
+        assert_eq!(post_q["stop_quiescence"]["post_q_events"], true);
     }
 
     #[test]

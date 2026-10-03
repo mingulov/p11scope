@@ -74,6 +74,7 @@ impl OwnedFixture {
         let view =
             ProcessView::open(ProcessViewId(0), std::process::id()).map_err(anyhow::Error::msg)?;
         let module = ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: view.id(),
             mount_namespace: view.mount_namespace(),

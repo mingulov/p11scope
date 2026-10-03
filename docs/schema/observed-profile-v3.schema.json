@@ -49,7 +49,7 @@
         "semantic_state_drops", "session_cancel_ambiguities",
         "session_cancel_unknown_flags", "shape_decode_failures",
         "shape_decode_total_failures", "skipped", "slots",
-        "start_insert_failures", "state_reconciliations", "surfaces",
+        "start_insert_failures", "state_reconciliations", "stop_quiescence", "surfaces",
         "table_entries", "task_uprobe_link_losses", "template_tail_failures",
         "templates_truncated", "unmatched_closes", "unmatched_returns",
         "unprotected_live_windows",
@@ -81,6 +81,16 @@
         "discovery_uncorroborated": {"type": "integer", "minimum": 0},
         "discovery_uncorroborated_candidates": {"type": "integer", "minimum": 0},
         "drain_proven": {"type": "boolean"},
+        "stop_quiescence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "post_q_events", "post_q_discovery"],
+          "properties": {
+            "state": {"enum": ["not_reached", "proven", "unproven"]},
+            "post_q_events": {"type": "boolean"},
+            "post_q_discovery": {"type": "boolean"}
+          }
+        },
         "event_loss": {"type": "integer", "minimum": 0},
         "fork_state_ambiguities": {"type": "integer", "minimum": 0},
         "handoff_child_pid": {"type": ["integer", "null"], "minimum": 1},

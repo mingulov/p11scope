@@ -12,7 +12,8 @@ profile. All profile fields documented by
 [`observed-profile-v2.md`](observed-profile-v2.md) remain unchanged except for
 the profile identifier, the `lane` discriminator, the six original additions
 below, the five residual additions (`drain_proven`, `verdict_detail`,
-`uretprobe_override`, `handoff_child_pid`, `p11scope_env`), the verdict
+`uretprobe_override`, `handoff_child_pid`, `p11scope_env`), the stop-gate
+outcome (`stop_quiescence`), the verdict
 classes (`gap_classes` and its three published inputs), and row identity
 (`functions[].target`, `functions[].ordinals`, table linkage `exports`).
 
@@ -180,10 +181,20 @@ These fields are always present in every v3 profile, v3-metrics, and terminal
 trace evidence object. Historical documents predate them (see Migration).
 
 - `drain_proven` (boolean) is the terminal-drain settlement latch. It is
-  false in every document until a bounded quiescence/settlement experiment
-  proves the terminal drain saw every in-flight callback; the producer's
-  terminal seal forces `PARTIAL` while it is false, and the oracle refuses
-  any `COMPLETE` without it.
+  true only when the Detailed stop gate proved quiescence (no admitted BPF
+  callback still running), both terminal drains read to the ring positions
+  observed at that point, neither drain saw a record past them, and the
+  build is x86_64 (owner ruling B, 2026-09-25); other architectures keep it
+  false. The producer's terminal seal forces `PARTIAL` while it is false, and
+  the oracle refuses any `COMPLETE` without it.
+- `stop_quiescence` is `{state, post_q_events, post_q_discovery}`, the
+  terminal stop gate's outcome the latch is derived from. `state` is
+  `proven` (quiescence observed), `unproven` (the 5 s stop budget expired
+  first; stderr names `QuiescenceUnproven`), or `not_reached` (no terminal
+  stop gate ran). `post_q_events` / `post_q_discovery` are true when the
+  EVENTS / DISCOVERY ring held a record past its quiescence position — an
+  ungated writer, also named on stderr; either keeps `drain_proven` false
+  and only occurs with `state: proven`.
 - `verdict_detail` is exactly `clean_proven` (no gap, latch set),
   `clean_but_unproven` (no gap, latch unset — the terminal `PARTIAL` with
   nothing concrete behind it), `attribution_only` (counts are exact; only a
@@ -191,7 +202,8 @@ trace evidence object. Historical documents predate them (see Migration).
   example every scan-found slot is count-only), or `concrete_gap` (an
   observation loss or degraded semantics forced `PARTIAL`). It is a function
   of `gap_classes` alone. Clean, names-withheld, and lossy runs no longer
-  share one signal; `completeness` is `PARTIAL` for all but `clean_proven`.
+  share one signal; `completeness` is `PARTIAL` for all but `clean_proven`,
+  which is `COMPLETE`.
 - `gap_classes` is `{observation, attribution, semantics, open_calls,
   settlement, stdout_data_sink}`. Each of the first three is `{status,
   causes}`: `causes` lists, in a fixed order, the evidence fields that put the
@@ -292,8 +304,9 @@ nonzero descendant gap, nonzero rebuild gap, or nonzero
 `evidence.completeness` to `PARTIAL`. The ordinary terminal trace
 `EVIDENCE` object carries the same profile-lane fields and rules, plus five
 terminal-only keys: `privacy_mode` (string), `capture_aborted` (always
-`null` on the normal path), `final_drain` (always `false`: detaching perf
-links proves nothing about quiescence), `counters_available` (always
+`null` on the normal path), `final_drain` (equal to `drain_proven`:
+detaching perf links proves nothing about quiescence, only the stop gate's
+proven quiescence does), `counters_available` (always
 `true`), and `trace_truncated` (boolean). Individual trace
 event lines never contain request/result selection data.
 
@@ -312,9 +325,9 @@ v2 profiles remain historical. Metrics consumers must dispatch live output on
 `p11scope/observed-profile/v2-metrics` documents remain readable as a
 separate compatibility shape. That shape predates — and therefore lacks —
 `task_uprobe_link_losses`, `abi_refusals`, `semantic_history_drops`,
-`scheduling`, `active_slots` (U-14), and the five residual fields above
+`scheduling`, `active_slots` (U-14), the five residual fields above
 (`drain_proven`, `verdict_detail`, `uretprobe_override`, `handoff_child_pid`,
-`p11scope_env`).
+`p11scope_env`), and `stop_quiescence`.
 
 A machine-readable JSON Schema for live v3 documents ships beside this file
 (`observed-profile-v3.schema.json`); it pins the closed evidence key sets

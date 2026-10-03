@@ -65,12 +65,42 @@ fn exe() -> ExeIdentity {
     }
 }
 
-/// Every object passes both checks unless scripted otherwise.
+/// The `vm_file` identity scripted `map_files` reads return by default: one
+/// file per inode on a subvolume-style device (never the maps device, as
+/// on btrfs).
+fn vm_file(inode: u64) -> FileIdentity {
+    FileIdentity {
+        dev: 37,
+        ino: inode,
+    }
+}
+
+/// The objects a deep scan of `entries` examined: every provider
+/// candidate, with its self-mapped `vm_file` identity.
+fn examined_of<'a>(entries: impl IntoIterator<Item = &'a MapEntry>) -> Vec<ExaminedObject> {
+    entries
+        .into_iter()
+        .filter(|entry| is_provider_mapping(entry))
+        .map(|entry| ExaminedObject {
+            key: ObjectKey::of(entry),
+            identity: vm_file(entry.inode),
+            key_is_identity: false,
+        })
+        .collect()
+}
+
+/// Every object passes every check unless scripted otherwise. The held
+/// object's self-mapped identity defaults to the provider's `vm_file`;
+/// `identities` overrides it (an `Err` is an unreadable `map_files`).
 #[derive(Default)]
 struct Checks {
     nonunique: BTreeMap<PinnedObjectId, &'static str>,
     changed: BTreeSet<PinnedObjectId>,
     checked: RefCell<Vec<PinnedObjectId>>,
+    identities: BTreeMap<PinnedObjectId, Result<FileIdentity, String>>,
+    /// The filesystem magic of an object's self-mapping (default: none
+    /// read, so every key keeps the per-range proof).
+    fs_magic: BTreeMap<PinnedObjectId, u64>,
 }
 
 impl ObjectChecks for Checks {
@@ -82,6 +112,18 @@ impl ObjectChecks for Checks {
         self.checked.borrow_mut().push(object);
         Ok(!self.changed.contains(&object))
     }
+
+    fn mapped_identity(&self, object: PinnedObjectId) -> Result<MappedFile, String> {
+        let identity = self
+            .identities
+            .get(&object)
+            .cloned()
+            .unwrap_or(Ok(vm_file(PROVIDER)))?;
+        Ok(MappedFile {
+            identity,
+            fs_magic: self.fs_magic.get(&object).copied(),
+        })
+    }
 }
 
 /// Scripted confirmations: by default each pid confirms its phase-1
@@ -90,6 +132,12 @@ struct Probe {
     snapshots: HashMap<u32, Vec<MapEntry>>,
     overrides: HashMap<u32, Confirmation>,
     calls: Vec<u32>,
+    /// `map_files` overrides by pid, served to both `confirm` (for the
+    /// requested keys) and `stat_ranges`. Any other range reads its entry's
+    /// default `vm_file`; `denied` makes every read of a pid EPERM.
+    mapped: HashMap<u32, MappedIdentities>,
+    denied: BTreeSet<u32>,
+    stat_calls: Vec<u32>,
 }
 
 impl Probe {
@@ -98,21 +146,81 @@ impl Probe {
             snapshots: sweep.iter().cloned().collect(),
             overrides: HashMap::new(),
             calls: Vec::new(),
+            mapped: HashMap::new(),
+            denied: BTreeSet::new(),
+            stat_calls: Vec::new(),
         }
     }
 }
 
+impl Probe {
+    fn identities(
+        &self,
+        pid: u32,
+        ranges: impl IntoIterator<Item = (u64, u64)>,
+    ) -> MappedIdentities {
+        let known = self.mapped.get(&pid);
+        let entries = self.snapshots.get(&pid);
+        ranges
+            .into_iter()
+            .map(|range| {
+                if self.denied.contains(&pid) {
+                    return (range, Err("Operation not permitted (os error 1)".into()));
+                }
+                let found = known
+                    .and_then(|mapped| mapped.get(&range))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        entries
+                            .and_then(|entries| {
+                                entries
+                                    .iter()
+                                    .find(|entry| (entry.start, entry.end) == range)
+                            })
+                            .map(|entry| vm_file(entry.inode))
+                            .ok_or_else(|| "No such file or directory (os error 2)".into())
+                    });
+                (range, found)
+            })
+            .collect()
+    }
+}
+
 impl MemberProbe for Probe {
-    fn confirm(&mut self, pid: u32, _: &mut CaptureWorkBudget) -> Confirmation {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        _: &mut CaptureWorkBudget,
+    ) -> Confirmation {
         self.calls.push(pid);
         if let Some(scripted) = self.overrides.get(&pid) {
             return scripted.clone();
         }
+        let entries = self.snapshots.get(&pid).cloned().unwrap_or_default();
+        let mapped = self.identities(
+            pid,
+            entries
+                .iter()
+                .filter(|entry| is_provider_mapping(entry) && prove.contains(&ObjectKey::of(entry)))
+                .map(|entry| (entry.start, entry.end)),
+        );
         Confirmation::Confirmed(ConfirmedRead {
             start_time: 5_000 + u64::from(pid),
             exe: exe(),
-            entries: self.snapshots.get(&pid).cloned().unwrap_or_default(),
+            entries,
+            mapped,
         })
+    }
+
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        _: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        self.stat_calls.push(pid);
+        self.identities(pid, ranges.iter().copied())
     }
 }
 
@@ -123,7 +231,13 @@ const OBJECT: PinnedObjectId = PinnedObjectId(3);
 fn provider_index(checks: &Checks) -> KnownKeyIndex {
     let rep = provider_caller();
     let match_keys = BTreeMap::from([(key(PROVIDER), OBJECT)]);
-    KnownKeyIndex::build([(key(PROVIDER), Some(OBJECT))], &match_keys, &rep, checks).0
+    KnownKeyIndex::build(
+        [(key(PROVIDER), Some(OBJECT))],
+        &match_keys,
+        examined_of(&rep),
+        checks,
+    )
+    .0
 }
 
 fn run(
@@ -172,7 +286,7 @@ fn cap_448_with_300_identical_callers_attributes_all_300() {
     let (index, refused) = KnownKeyIndex::build(
         [(key(PROVIDER), Some(OBJECT))],
         &match_keys,
-        examined,
+        examined_of(examined),
         &checks,
     );
     assert!(refused.is_empty());
@@ -222,7 +336,7 @@ fn groups_past_the_cap_leave_unexamined_keys_and_no_match() {
         .flat_map(|(_, entries)| entries)
         .collect();
     let checks = Checks::default();
-    let (index, _) = KnownKeyIndex::build([], &BTreeMap::new(), examined, &checks);
+    let (index, _) = KnownKeyIndex::build([], &BTreeMap::new(), examined_of(examined), &checks);
     let mut probe = Probe::over(&sweep);
     let attribution = run(&sweep, &selected, &index, &mut probe);
     assert!(attribution.members.is_empty());
@@ -278,7 +392,7 @@ fn index_keys_only_one_pinned_non_rejected_object_bound_this_pass() {
             (key(5), None),
         ],
         &match_keys,
-        &examined,
+        examined_of(&examined),
         &checks,
     );
     assert_eq!(index.classify(key(1)), KeyClass::Match(PinnedObjectId(1)));
@@ -301,7 +415,7 @@ fn nonunique_inode_filesystems_refuse_sweep_matching_with_a_named_object() {
     };
     let match_keys = BTreeMap::from([(key(PROVIDER), OBJECT)]);
     let (index, refused) =
-        KnownKeyIndex::build([(key(PROVIDER), Some(OBJECT))], &match_keys, &[], &checks);
+        KnownKeyIndex::build([(key(PROVIDER), Some(OBJECT))], &match_keys, [], &checks);
     assert_eq!(
         refused,
         vec![RefusedObject {
@@ -327,7 +441,7 @@ fn ineligible_keys_are_counted_losses_never_matches() {
     let (index, _) = KnownKeyIndex::build(
         [(key(PROVIDER), Some(OBJECT))],
         &BTreeMap::new(),
-        &provider_caller(),
+        examined_of(&provider_caller()),
         &checks,
     );
     let sweep = vec![(10_001, provider_caller()), (10_002, provider_caller())];
@@ -499,7 +613,10 @@ fn double_load_evidence_comes_from_the_confirmed_entries() {
 
 #[test]
 fn changed_objects_drop_their_sweep_attributions_once_checked() {
-    let checks = Checks::default();
+    let checks = Checks {
+        identities: BTreeMap::from([(PinnedObjectId(4), Ok(vm_file(77)))]),
+        ..Checks::default()
+    };
     let match_keys = BTreeMap::from([(key(PROVIDER), OBJECT), (key(77), PinnedObjectId(4))]);
     let (index, _) = KnownKeyIndex::build(
         [
@@ -507,7 +624,7 @@ fn changed_objects_drop_their_sweep_attributions_once_checked() {
             (key(77), Some(PinnedObjectId(4))),
         ],
         &match_keys,
-        &[],
+        [],
         &checks,
     );
     let mut both = provider_caller();
@@ -559,6 +676,8 @@ struct Io {
     exes: RefCell<Vec<Option<ExeIdentity>>>,
     maps: Result<Vec<MapEntry>, String>,
     gone: bool,
+    /// `map_files` identity by range start.
+    mapped: BTreeMap<u64, Result<FileIdentity, String>>,
 }
 
 impl Io {
@@ -570,12 +689,20 @@ impl Io {
             exes: RefCell::new(vec![Some(exe()), Some(exe())]),
             maps: Ok(provider_caller()),
             gone: false,
+            mapped: BTreeMap::new(),
         }
     }
 }
 
 impl ConfirmIo for Io {
     type Pin = u64;
+
+    fn mapped_file(&self, _: u32, start: u64, _: u64) -> Result<FileIdentity, String> {
+        self.mapped
+            .get(&start)
+            .cloned()
+            .unwrap_or_else(|| Err("Operation not permitted (os error 1)".into()))
+    }
 
     fn open(&mut self, _: u32) -> Result<u64, String> {
         self.open.clone()
@@ -608,7 +735,12 @@ impl ConfirmIo for Io {
 }
 
 fn confirm(mut io: Io) -> Confirmation {
-    confirm_with(&mut io, 10_001, &mut CaptureWorkBudget::default())
+    confirm_with(
+        &mut io,
+        10_001,
+        &BTreeSet::new(),
+        &mut CaptureWorkBudget::default(),
+    )
 }
 
 #[test]
@@ -619,6 +751,7 @@ fn confirmation_requires_the_pin_to_hold_and_the_exe_to_stay() {
             start_time: 4_242,
             exe: exe(),
             entries: provider_caller(),
+            mapped: MappedIdentities::new(),
         })
     );
     // The pin no longer names the generation (and the pid is not gone).
@@ -716,4 +849,349 @@ fn loss_labels_are_stable_and_distinct() {
     assert_eq!(labels.len(), AttributionLoss::ALL.len());
     assert!(labels.contains("deleted_mapping"));
     assert!(labels.contains("inode_not_unique"));
+}
+
+// ---- Review fix (Critical 1): a maps key is not one file ----
+
+/// The `map_files` identities of every provider range of `entries` with
+/// `inode`, all reading `identity`.
+fn ranges_reading(entries: &[MapEntry], inode: u64, identity: FileIdentity) -> MappedIdentities {
+    entries
+        .iter()
+        .filter(|entry| entry.inode == inode)
+        .map(|entry| ((entry.start, entry.end), Ok(identity)))
+        .collect()
+}
+
+/// btrfs: maps renders one device for every subvolume and inode numbers
+/// repeat across subvolumes, so another subvolume's file can carry the
+/// provider's exact maps key. Its `vm_file` is another file: never a match.
+#[test]
+fn a_colliding_maps_key_naming_another_file_is_an_identity_mismatch() {
+    let checks = Checks::default();
+    let index = provider_index(&checks);
+    let sweep = vec![(10_001, provider_caller()), (10_002, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    // Same maps key (8:1, PROVIDER); another subvolume's file.
+    let other_subvolume = FileIdentity {
+        dev: 47,
+        ino: PROVIDER,
+    };
+    probe.mapped.insert(
+        10_001,
+        ranges_reading(&provider_caller(), PROVIDER, other_subvolume),
+    );
+    let attribution = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_002], "only the real caller is attributed");
+    assert_eq!(
+        attribution.losses,
+        BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)])
+    );
+    let (loss, detail) = &attribution.member_losses[&10_001];
+    assert_eq!(*loss, AttributionLoss::IdentityMismatch);
+    assert!(detail.contains("maps key collision"), "{detail}");
+}
+
+/// One range of the group being another file is enough to refuse: the
+/// whole group shares one key, so every range must be the held file.
+#[test]
+fn every_range_of_a_matched_group_must_be_the_held_file() {
+    let checks = Checks::default();
+    let index = provider_index(&checks);
+    let sweep = vec![(10_001, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    let text = provider_caller()
+        .into_iter()
+        .find(|entry| entry.inode == PROVIDER && entry.permissions[2] == b'x')
+        .unwrap();
+    probe.mapped.insert(
+        10_001,
+        MappedIdentities::from([(
+            (text.start, text.end),
+            Ok(FileIdentity {
+                dev: 47,
+                ino: PROVIDER,
+            }),
+        )]),
+    );
+    let attribution = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert!(attribution.members.is_empty());
+    assert_eq!(
+        attribution.losses,
+        BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)])
+    );
+}
+
+/// Pre-6.8 overlayfs installs the BACKING file in the VMA: the target's
+/// `map_files` names the backing file (here 0:21 inode 712355) while an fd
+/// opened through the overlay path would `fstat` as the overlay file
+/// (0:43). The pinned side is the held fd's own self-mapping, which the
+/// same kernel path also backs with the backing file — like for like, so
+/// the healthy container caller is attributed. `fstat` is never consulted.
+#[test]
+fn a_pre_6_8_overlay_caller_matches_the_self_mapped_backing_file() {
+    let backing = FileIdentity {
+        dev: 0x15,
+        ino: 712_355,
+    };
+    let checks = Checks {
+        identities: BTreeMap::from([(OBJECT, Ok(backing))]),
+        ..Checks::default()
+    };
+    let index = provider_index(&checks);
+    let sweep = vec![(10_001, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    probe.mapped.insert(
+        10_001,
+        ranges_reading(&provider_caller(), PROVIDER, backing),
+    );
+    let attribution = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_001]);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+}
+
+/// Without `CAP_SYS_ADMIN`/`CAP_CHECKPOINT_RESTORE` nothing is proven:
+/// an unreadable target range, or an unreadable held self-mapping, is a
+/// named `map_files_unavailable` loss — never a match by key alone.
+#[test]
+fn unreadable_map_files_fail_closed_on_either_side() {
+    let checks = Checks::default();
+    let index = provider_index(&checks);
+    let sweep = vec![(10_001, provider_caller()), (10_002, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    probe.denied.insert(10_001);
+    let attribution = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_002]);
+    assert_eq!(
+        attribution.losses,
+        BTreeMap::from([(AttributionLoss::MapFilesUnavailable, 1)])
+    );
+
+    let unreadable = Checks {
+        identities: BTreeMap::from([(OBJECT, Err("Operation not permitted".into()))]),
+        ..Checks::default()
+    };
+    let index = provider_index(&unreadable);
+    assert_eq!(
+        index.classify(key(PROVIDER)),
+        KeyClass::Ineligible(AttributionLoss::MapFilesUnavailable)
+    );
+    let mut probe = Probe::over(&sweep);
+    let attribution = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert!(attribution.members.is_empty());
+    assert_eq!(
+        attribution.losses,
+        BTreeMap::from([(AttributionLoss::MapFilesUnavailable, 2)])
+    );
+    assert_eq!(probe.calls, Vec::<u32>::new(), "nothing to confirm");
+}
+
+/// An examined key counts as examined in another process only when every
+/// one of its ranges is a file a deep scan examined under that key.
+#[test]
+fn an_examined_key_counts_only_when_its_ranges_are_an_examined_file() {
+    let checks = Checks::default();
+    let index = provider_index(&checks);
+    let sweep = vec![
+        (20_001, idle(None)),
+        (20_002, idle(None)),
+        (20_003, idle(None)),
+    ];
+    let mut probe = Probe::over(&sweep);
+    // 20_002: another subvolume's file under libc's key; 20_003: no
+    // privilege. 20_001 reads the examined libc file.
+    probe.mapped.insert(
+        20_002,
+        ranges_reading(&idle(None), LIBC, FileIdentity { dev: 47, ino: LIBC }),
+    );
+    probe.denied.insert(20_003);
+    let attribution = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert_eq!(
+        attribution.unexamined,
+        BTreeMap::from([(20_002, 1), (20_003, 1)])
+    );
+    assert_eq!(attribution.unexamined_keys(), 1);
+    assert!(attribution.losses.is_empty(), "unexamined is not a loss");
+    assert_eq!(
+        probe.calls,
+        Vec::<u32>::new(),
+        "no pin for examined-only proofs"
+    );
+    assert_eq!(probe.stat_calls, vec![20_001, 20_002, 20_003]);
+}
+
+/// The confirmation reads `map_files` only for the requested keys, inside
+/// the pin: a generation change after those reads still loses the member.
+#[test]
+fn the_confirmation_reads_map_files_for_requested_keys_inside_the_pin() {
+    let provider_ranges: Vec<(u64, u64)> = provider_caller()
+        .iter()
+        .filter(|entry| entry.inode == PROVIDER)
+        .map(|entry| (entry.start, entry.end))
+        .collect();
+    let mut io = Io::healthy();
+    for (start, _) in &provider_ranges {
+        io.mapped.insert(*start, Ok(vm_file(PROVIDER)));
+    }
+    let prove = BTreeSet::from([key(PROVIDER)]);
+    let Confirmation::Confirmed(read) =
+        confirm_with(&mut io, 10_001, &prove, &mut CaptureWorkBudget::default())
+    else {
+        panic!("a healthy confirmation");
+    };
+    let read_ranges: Vec<(u64, u64)> = read.mapped.keys().copied().collect();
+    assert_eq!(read_ranges, provider_ranges, "libc was not requested");
+    assert!(
+        read.mapped
+            .values()
+            .all(|identity| identity == &Ok(vm_file(PROVIDER)))
+    );
+
+    let mut turned = Io {
+        same: false,
+        ..Io::healthy()
+    };
+    assert!(matches!(
+        confirm_with(
+            &mut turned,
+            10_001,
+            &prove,
+            &mut CaptureWorkBudget::default()
+        ),
+        Confirmation::Lost(AttributionLoss::GenerationChanged, _)
+    ));
+}
+
+/// A deep-scanned representative maps the provider at its path; another
+/// process maps a different file at that same path. Only `(device,
+/// inode)` and the `vm_file` proof decide: the copy stays unexamined.
+#[test]
+fn a_same_path_different_file_never_matches_beside_a_deep_scanned_rep() {
+    let checks = Checks::default();
+    let index = provider_index(&checks);
+    let mut copy = object(
+        0x1000_0000,
+        PROVIDER + 100,
+        "/usr/lib/softhsm/libsofthsm2.so",
+    );
+    copy.extend(object(0x2000_0000, LIBC, "/usr/lib/libc.so.6"));
+    let sweep = vec![(10_000, provider_caller()), (10_001, copy)];
+    let mut probe = Probe::over(&sweep);
+    let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
+    assert!(attribution.members.is_empty(), "{:?}", attribution.members);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+    assert_eq!(attribution.unexamined, BTreeMap::from([(10_001, 1)]));
+}
+
+/// The maps key `8:1` as a `stat` device.
+fn key_device_identity(inode: u64) -> FileIdentity {
+    FileIdentity {
+        dev: libc::makedev(8, 1),
+        ino: inode,
+    }
+}
+
+const EXT4_MAGIC: u64 = 0xef53;
+/// tmpfs, btrfs, overlayfs, bcachefs, FUSE, NFS: never on the allowlist.
+const ALWAYS_PROVE_MAGICS: [u64; 6] = [
+    0x0102_1994,
+    0x9123_683e,
+    0x794c_7630,
+    0xca45_1a4e,
+    0x6573_5546,
+    0x6969,
+];
+
+/// DR-C1b-3: a matched key that is its held file's identity on an
+/// allowlisted filesystem skips the per-range `map_files` stat (here every
+/// stat would be EPERM); the same identity on tmpfs, btrfs, overlayfs,
+/// bcachefs, FUSE or NFS always proves and so fails closed.
+#[test]
+fn an_identity_key_skips_the_range_proof_only_on_an_allowlisted_filesystem() {
+    let sweep = vec![(10_001, provider_caller())];
+    let checks_on = |magic| Checks {
+        identities: BTreeMap::from([(OBJECT, Ok(key_device_identity(PROVIDER)))]),
+        fs_magic: BTreeMap::from([(OBJECT, magic)]),
+        ..Checks::default()
+    };
+
+    let index = provider_index(&checks_on(EXT4_MAGIC));
+    assert_eq!(index.map_files_keys(), BTreeSet::from([key(LIBC)]));
+    let mut probe = Probe::over(&sweep);
+    probe.denied.insert(10_001);
+    let attribution = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_001]);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+
+    for magic in ALWAYS_PROVE_MAGICS {
+        let index = provider_index(&checks_on(magic));
+        assert_eq!(
+            index.map_files_keys(),
+            BTreeSet::from([key(PROVIDER), key(LIBC)]),
+            "{magic:#x}"
+        );
+        let mut probe = Probe::over(&sweep);
+        probe.denied.insert(10_001);
+        let attribution = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+        assert!(attribution.members.is_empty(), "{magic:#x}");
+        assert_eq!(
+            attribution.losses,
+            BTreeMap::from([(AttributionLoss::MapFilesUnavailable, 1)]),
+            "{magic:#x}"
+        );
+    }
+
+    // On ext4 but the identity is not the key (btrfs-style anon device):
+    // still proves.
+    let other = Checks {
+        fs_magic: BTreeMap::from([(OBJECT, EXT4_MAGIC)]),
+        ..Checks::default()
+    };
+    let index = provider_index(&other);
+    assert!(index.map_files_keys().contains(&key(PROVIDER)));
+}
+
+/// An examined key that is its file's identity on an allowlisted
+/// filesystem counts as examined without a stat; any other examined key
+/// still needs every range to stat to an examined file.
+#[test]
+fn an_examined_identity_key_needs_no_stat() {
+    let sweep = vec![(20_001, idle(None))];
+    let build = |key_is_identity| {
+        KnownKeyIndex::build(
+            [(key(PROVIDER), Some(OBJECT))],
+            &BTreeMap::from([(key(PROVIDER), OBJECT)]),
+            [ExaminedObject {
+                key: key(LIBC),
+                identity: key_device_identity(LIBC),
+                key_is_identity,
+            }],
+            &Checks::default(),
+        )
+        .0
+    };
+
+    let mut probe = Probe::over(&sweep);
+    probe.denied.insert(20_001);
+    let attribution = run(&sweep, &BTreeSet::new(), &build(true), &mut probe);
+    assert!(
+        attribution.unexamined.is_empty(),
+        "{:?}",
+        attribution.unexamined
+    );
+    assert_eq!(
+        probe.stat_calls,
+        Vec::<u32>::new(),
+        "no stat for an identity key"
+    );
+
+    let mut probe = Probe::over(&sweep);
+    probe.denied.insert(20_001);
+    let attribution = run(&sweep, &BTreeSet::new(), &build(false), &mut probe);
+    assert_eq!(attribution.unexamined, BTreeMap::from([(20_001, 1)]));
+    assert_eq!(probe.stat_calls, vec![20_001]);
 }

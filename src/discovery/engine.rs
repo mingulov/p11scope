@@ -6237,6 +6237,7 @@ fn lower_publication_record(
         _ => Vec::new(),
     };
     let module = ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
@@ -6472,6 +6473,7 @@ fn lower_heap_publication_record(
         _ => Vec::new(),
     };
     let module = ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
@@ -7445,6 +7447,7 @@ fn validate_loader_record_context<'a>(
 
 fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> ScannedModule {
     ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
@@ -12868,6 +12871,7 @@ impl Engine {
         )
         .map_err(anyhow::Error::msg)?;
         let loader_module = ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: view_id,
             mount_namespace: self.views[position].mount_namespace(),

@@ -313,11 +313,19 @@ def exact_role_counts(description):
     }, description
 
 
+def sealed_completeness(ev):
+    """COMPLETE only behind a proven stop-gate drain and a clean verdict
+    (owner ruling B, SG-T7B); every other terminal document is PARTIAL."""
+    if ev.get("drain_proven") is True and ev.get("verdict_detail") == "clean_proven":
+        return "COMPLETE"
+    return "PARTIAL"
+
+
 def profile_terminal(doc, schema="p11scope/observed-profile/v3"):
     assert doc["schema"] == schema, doc["schema"]
     ev = doc["evidence"]
     assert "secret_selection_payload" not in ev, ev
-    assert ev["completeness"] == "PARTIAL", ev
+    assert ev["completeness"] == sealed_completeness(ev), ev
     assert isinstance(ev["task_uprobe_link_losses"], int) and not isinstance(
         ev["task_uprobe_link_losses"], bool
     ) and 0 <= ev["task_uprobe_link_losses"] <= (1 << 64) - 1, ev
@@ -340,9 +348,9 @@ def trace_terminal(text, privacy):
                and 0 <= value <= (1 << 64) - 1 for value in count.values()), count
     ev = json.loads(lines[evidence[0]].removeprefix("EVIDENCE "))
     assert ev["privacy_mode"] == privacy, ev
-    assert ev["completeness"] == "PARTIAL", ev
+    assert ev["completeness"] == sealed_completeness(ev), ev
     assert ev["capture_aborted"] is None, ev
-    assert ev["final_drain"] is False, ev
+    assert ev["final_drain"] is (ev.get("drain_proven") is True), ev
     assert ev["counters_available"] is True, ev
     selection_terminal(ev)
     return ev
@@ -1420,6 +1428,17 @@ def main(argv=None):
             attach_mechanisms=[], pid_descendant_gaps=0, multi_rebuild_gaps=0,
         )
         assert_safe_profile(v3)
+        # SG-T7B: COMPLETE needs the proven latch and a clean verdict.
+        proven = json.loads(json.dumps(v3))
+        proven["evidence"].update(
+            completeness="COMPLETE", drain_proven=True, verdict_detail="clean_proven",
+        )
+        assert_safe_profile(proven)
+        for unproven in ({"drain_proven": False}, {"verdict_detail": "clean_but_unproven"}):
+            forged = json.loads(json.dumps(proven))
+            forged["evidence"].update(unproven)
+            reject(f"COMPLETE without a proven drain {unproven}",
+                   lambda forged=forged: assert_safe_profile(forged))
         reject("v3 missing interface selection", lambda: assert_safe_profile({
             **v3, "evidence": {
                 key: value for key, value in v3["evidence"].items()

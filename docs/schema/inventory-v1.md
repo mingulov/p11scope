@@ -38,7 +38,8 @@ never a changed meaning for an existing field.
   as a caller on every pass, whatever `--max-scan-pids` is: a process
   the deep-scan cap left unselected registers when its `/proc/<pid>/maps`
   shows, by exact `(device, inode)`, a provider object a deep scan of
-  another process pinned in the same pass (a *maps match*, below). The
+  another process pinned in the same pass, and every such mapped range
+  is proven to be that very file (a *maps match*, below). The
   cap bounds only how many processes are deep-scanned, i.e. the
   discovery of objects no process seen so far maps. A collected member's
   mappings project onto a caller only when its generation joins the
@@ -110,11 +111,35 @@ never a changed meaning for an existing field.
   `uncertain`, with first/last seen and an interruption count of
   observed mapped→absent→mapped transitions). `mapping.evidence` says
   how the latest mapping observation was established: `deep_scan` (a
-  deep scan of the caller decoded it) or `maps_match` (the caller's
-  maps, re-read under a pidfd/start-time pin with its exe identity
-  unchanged across the read, show the object by exact `(device, inode)`
-  while the object a deep scan pinned this pass is held open — the
-  caller itself was not decoded). Absence is authoritative (`ended`)
+  deep scan of the caller decoded it) or `maps_match` (the caller itself
+  was not decoded: its maps, re-read under a pidfd/start-time pin with
+  its exe identity unchanged across the read, show the object's
+  `(device, inode)`, and — because a maps key is not one file (btrfs
+  renders one device for every subvolume while inode numbers repeat
+  across subvolumes) — each such range's `/proc/<pid>/map_files` entry,
+  read while the pin holds, is the same kernel file as a self-mapping
+  of the object the deep scan pinned and still holds open. Both sides
+  are the kernel's mapped file as procfs renders it, never `fstat`
+  (overlayfs has installed the backing file in the mapping since Linux
+  4.19; before about 6.8 procfs renders that backing file, which
+  `fstat` of the overlay path never shows, and from then on it renders
+  the overlay file). Following `map_files` needs `CAP_SYS_ADMIN` or
+  `CAP_CHECKPOINT_RESTORE`; without it nothing is attributed by maps).
+  Two races are accepted, and both can affect only whether the
+  inventory is marked complete, never an edge: the per-range
+  `map_files` stats of processes that match no pinned object run
+  without a pidfd/start-time pin, and the identities of examined
+  (scanned, not-a-provider) objects come from the deep scan's read and
+  are not held open afterwards.
+  The per-range `map_files` stat is skipped for one kind of key: the
+  held object's own self-mapped identity equals the key's
+  `(device, inode)` and that mapping's filesystem is ext2/3/4, XFS,
+  squashfs or EROFS, where one device and inode numbers that no two
+  live files share make the key that file everywhere. tmpfs (32-bit
+  wrapping inode numbers without `inode64`), btrfs, overlayfs (as
+  rendered from 6.8 on), bcachefs, FUSE and network filesystems always
+  prove every range.
+  Absence is authoritative (`ended`)
   only after a complete deep scan of the live caller: a module missing
   from a maps match reads `uncertain`. A maps match never comes from a
   ` (deleted)` mapping, an overlay-collapsed or aliased key, a rejected
@@ -266,10 +291,16 @@ never a changed meaning for an existing field.
   `maps attribution` gaps count attribution losses by category
   (`generation_changed`, `exec_changed`, `confirm_unreadable`,
   `deleted_mapping`, `object_changed`, `key_rejected`,
-  `inode_not_unique`, `budget`) and name a matched caller that also
-  maps shared objects no deep scan examined; an object whose sweep
-  matching was refused (non-unique inodes) or dropped (it changed
-  after the confirmation reads) is a gap under its path. Admission
+  `inode_not_unique`, `budget`, `identity_mismatch` — a range at the
+  key is another file —, `map_files_unavailable` — the proof could not
+  be read) and name a matched caller that also
+  maps shared objects no deep scan examined. A shared object counts as
+  examined only where a complete deep scan's own maps read opened it
+  and found no provider, and the other process's ranges are proven,
+  the same way, to be that file. An object whose sweep matching was
+  refused (non-unique inodes; only where a process past the cap maps
+  it) or dropped (it changed after the confirmation reads) is a gap
+  under its path. Admission
   failures record one `caller admission failed` gap per pass and kind:
   a single failure keeps its pid and exact reason; several aggregate
   with a count (`N admissions refused this pass: caller budget

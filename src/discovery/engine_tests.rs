@@ -7837,6 +7837,7 @@ fn evidence_verdict(
         provider_changed: false,
         discovery: discovery_evidence(plan, pinned, counters),
         scheduling: render::SchedulingEvidence::default(),
+        stop_quiescence: Default::default(),
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
         gap_classes: render::GapClasses::default(),
@@ -16306,6 +16307,7 @@ fn refresh_continues_second_view_after_first_loader_arm_error() {
 #[test]
 fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
     let module = |name_lossy, decoder_abi| ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),
         mount_namespace: crate::process::MountNamespaceId {
@@ -16372,6 +16374,7 @@ fn incomplete_rescan_preserves_double_load_detection() {
     // Clearing happens only by complete-scan replacement, never by
     // union; `false`+`false` stays `false` (no invention).
     let module = |double_loaded| ScannedModule {
+        mapped_identity: None,
         double_loaded,
         view: ProcessViewId(0),
         mount_namespace: crate::process::MountNamespaceId {
@@ -19079,6 +19082,7 @@ fn valid_manifest_for(paths: &[PathBuf], targets: &[u32]) -> Manifest {
 fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedModule {
     let facts: Vec<_> = paths.iter().map(|path| object_facts(path)).collect();
     ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
@@ -19965,6 +19969,7 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
@@ -20193,6 +20198,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view,
             mount_namespace: current_mount_namespace(),
@@ -20280,6 +20286,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
         object: PinnedObjectId(200),
         entry_objects: vec![vec![PinnedObjectId(200)]],
         scanned: ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view,
             mount_namespace: current_mount_namespace(),
@@ -20347,6 +20354,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: ProcessViewId(0),
             mount_namespace: current_mount_namespace(),
@@ -20425,6 +20433,7 @@ fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
     let key = object_facts(&exe).0;
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let modules = vec![ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
@@ -20780,6 +20789,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         provider_changed: false,
         discovery,
         scheduling: render::SchedulingEvidence::default(),
+        stop_quiescence: Default::default(),
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
         gap_classes: render::GapClasses::default(),
@@ -21379,6 +21389,7 @@ fn scan_view_does_not_choose_the_first_byte_identical_ordinary_file() {
         let file = p11scope_manifest::identity::open_object(path).unwrap();
         let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
         ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: ProcessViewId(0),
             mount_namespace: current_mount_namespace(),
@@ -21464,6 +21475,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
@@ -21633,6 +21645,7 @@ fn retargeting_only_adopts_the_matched_scanned_object() {
     // The same bytes pinned under an identity the scan did not see must not be
     // adopted: a decoy module the matched scan never named.
     let decoy = ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
@@ -24469,6 +24482,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
         exports: Default::default(),
         object: PinnedObjectId(7),
         scanned: ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: view_id,
             mount_namespace,
@@ -24555,6 +24569,7 @@ fn view_pin_revalidation_detects_replaced_files() {
     let rooted = PathBuf::from(format!("/proc/{pid}/root{}", path.display()));
     let (_, key) = open_view_object(&view, &rooted, &mut budget).unwrap();
     let module = ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: view.id(),
         mount_namespace: view.mount_namespace(),

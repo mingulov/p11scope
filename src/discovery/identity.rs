@@ -305,6 +305,260 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
     Ok(nonunique_inode_kind(f_type))
 }
 
+/// The identity of the file the kernel installed in one mapping (the VMA's
+/// `vm_file`), read by following `/proc/<pid>/map_files/<start>-<end>`:
+/// `(st_dev, st_ino)` of exactly that file.
+///
+/// Which identity each side of a C1b comparison uses, and why — this is
+/// the fourth time this project has had to get it right:
+///
+/// - A maps key `(device, inode)` is NOT one file. Maps renders
+///   `i_sb->s_dev`: on btrfs one device for every subvolume, while inode
+///   numbers repeat across subvolumes (observed here: two unrelated files
+///   both rendered `00:23 45598`).
+/// - `fstat` of an opened fd is NOT comparable with maps either (1786658:
+///   btrfs `st_dev` is the subvolume's anonymous device, 0:37, never the
+///   maps device). And since 4.19 (stacked file operations) overlayfs
+///   `mmap` installs the BACKING file in the VMA (`ovl_mmap` ->
+///   `backing_file_mmap` -> `vma_set_file(realfile)`); what changed around
+///   6.8 is only what procfs renders for it. Before, maps and `map_files`
+///   show the backing file itself (observed on 6.1 and 6.6, 5498046); from
+///   then on they render the user-visible overlay file (`file_user_inode`
+///   in `show_map_vma`, `file_user_path` in `map_files_get_link`; read in
+///   the 6.17 source). An fd opened through the overlay path `fstat`s as
+///   the overlay file, so comparing `map_files` against `fstat` would
+///   refuse every pre-6.8 container.
+/// - So both sides use the kernel's own `vm_file`: the candidate side
+///   stats the target's `map_files` range; the pinned side mmaps the held
+///   fd itself (one private read-only page, like `KernelSelfMappingProbe`)
+///   and stats `/proc/self/map_files` for that mapping. The same kernel
+///   path installs both VMAs and the same procfs code renders both
+///   (overlay or not, before or after 6.8), so equal identities are the
+///   same kernel file: on btrfs the subvolume's `(anon dev, ino)`, unique;
+///   on pre-6.8 overlay both render the backing file; on 6.8+ overlay both
+///   render the overlay file of the same backing file.
+/// - Following a `map_files` link needs `CAP_SYS_ADMIN` or
+///   `CAP_CHECKPOINT_RESTORE` in the initial user namespace (`EPERM`
+///   otherwise), for `/proc/self` too. Without it nothing is proven and
+///   C1b fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// A provider-candidate object a complete deep scan opened, identified,
+/// and found to export no wanted symbol: examined, not a provider. Carries
+/// the held fd's `vm_file` identity (see [`FileIdentity`]); an object
+/// whose identity could not be read is not recorded as examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ExaminedObject {
+    pub key: ObjectKey,
+    pub identity: FileIdentity,
+    /// [`MappedFile::key_is_identity`] for `key`: any range under the key
+    /// is this file, with no per-range `map_files` stat.
+    pub key_is_identity: bool,
+}
+
+/// Filesystems on which a maps key is one file: one superblock renders one
+/// device in maps and `stat` alike, and no two simultaneously live inodes
+/// of the superblock share an inode number. A positive allowlist; the
+/// question for each entry is "can two live inodes in one superblock
+/// share a number?":
+///
+/// - ext2/3/4: the number is the inode's slot in the on-disk inode table.
+///   A slot is freed only when the last reference to the inode (a mapping
+///   holds one) is dropped, so a mapped file's number is not reused.
+/// - XFS: the number encodes the inode's on-disk location (AG, block,
+///   offset), also with `inode32`; freed only as for ext4.
+/// - squashfs: read-only; numbers are fixed in the image by mksquashfs.
+/// - EROFS: read-only; the number is the on-disk nid (on 64-bit `ino_t`
+///   it is not folded; this project is x86-64-first).
+///
+/// Absent, so always proving per range: tmpfs (without `inode64`, the
+/// default, numbers come from a wrapping 32-bit counter — global
+/// `get_next_ino` before 5.9, per superblock after — so after ~4G
+/// allocations a new file can take a live file's number), btrfs (one maps
+/// device for every subvolume), overlayfs as rendered from 6.8 on,
+/// bcachefs, FUSE and network filesystems.
+///
+/// The device half: a matched key is checked against an object whose fd
+/// this pass holds, and the held fd keeps its superblock alive, so its
+/// device (a block device, or an anonymous one) cannot be released and
+/// reused by another superblock meanwhile; at any instant one live
+/// superblock owns a device. An examined object is not held after its
+/// scan, so an unmount and device reuse (e.g. a loop device re-attached
+/// to another image) could make its key name another file: that is the
+/// accepted unpinned-examined-identity race, which can only change the
+/// `complete` bit, never an edge.
+pub(crate) const KEY_IS_IDENTITY_FILESYSTEMS: &[(u64, &str)] = &[
+    (0xef53, "ext2/ext3/ext4"),
+    (0x5846_5342, "xfs"),
+    (0x7371_7368, "squashfs"),
+    (0xe0f5_e1e2, "erofs"),
+];
+
+/// A held fd's self-mapped `vm_file`: its identity and the filesystem
+/// magic of the same `map_files` entry (`statfs`, `None` if unreadable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappedFile {
+    pub identity: FileIdentity,
+    pub fs_magic: Option<u64>,
+}
+
+impl MappedFile {
+    /// Whether the maps key `key` is this file's identity, so a range
+    /// rendered under it in any process is this file: the identity equals
+    /// `(makedev(key.device), key.inode)` AND the filesystem is on
+    /// [`KEY_IS_IDENTITY_FILESYSTEMS`]. Either failing keeps the per-range
+    /// `map_files` proof.
+    pub(crate) fn key_is_identity(&self, key: ObjectKey) -> bool {
+        let (Ok(major), Ok(minor)) = (
+            u32::try_from(key.device.major),
+            u32::try_from(key.device.minor),
+        ) else {
+            return false;
+        };
+        let device = libc::makedev(major, minor);
+        self.identity
+            == (FileIdentity {
+                dev: device,
+                ino: key.inode,
+            })
+            && self.fs_magic.is_some_and(|magic| {
+                KEY_IS_IDENTITY_FILESYSTEMS
+                    .iter()
+                    .any(|(allowed, _)| *allowed == magic)
+            })
+    }
+}
+
+/// The `vm_file` identity of `[start, end)` in `pid` (see
+/// [`FileIdentity`]). Metadata only: nothing is opened or read.
+pub(crate) fn map_files_identity(pid: u32, start: u64, end: u64) -> std::io::Result<FileIdentity> {
+    map_files_entry_identity(&format!("/proc/{pid}/map_files/{start:x}-{end:x}"))
+}
+
+fn map_files_entry_identity(entry: &str) -> std::io::Result<FileIdentity> {
+    let metadata = std::fs::metadata(entry)?;
+    Ok(FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+/// [`map_files_entry_identity`] plus the filesystem magic of the same
+/// entry, read with `statfs` (which follows the link like `stat`).
+fn map_files_entry_file(entry: &str) -> std::io::Result<MappedFile> {
+    let identity = map_files_entry_identity(entry)?;
+    let fs_magic = std::ffi::CString::new(entry).ok().and_then(|path| {
+        let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `statfs` fills `buf` for a valid C path; read only on success.
+        (unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) } == 0).then(|| {
+            // SAFETY: initialized by the successful `statfs`. `f_type` is
+            // signed on some ABIs; the magic numbers are 32-bit values.
+            (unsafe { buf.assume_init().f_type }) as u64 & 0xffff_ffff
+        })
+    });
+    Ok(MappedFile { identity, fs_magic })
+}
+
+/// The `vm_file` identity of a held fd: mmap one page (`PROT_READ`,
+/// `MAP_PRIVATE`, never `PROT_EXEC`, unmapped on every path) and stat this
+/// process's own `map_files` entry for it. Like-for-like with
+/// [`map_files_identity`] of a target that maps the same file.
+pub(crate) fn self_mapped_identity(file: &std::fs::File) -> Result<FileIdentity, String> {
+    self_mapped_file(file).map(|mapped| mapped.identity)
+}
+
+/// [`self_mapped_identity`] plus the filesystem magic of the same
+/// `/proc/self/map_files` entry, read while the self-mapping exists.
+pub(crate) fn self_mapped_file(file: &std::fs::File) -> Result<MappedFile, String> {
+    if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
+        return Err("an empty file cannot be mapped".into());
+    }
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let len = usize::try_from(page).unwrap_or(4096).max(1);
+    // SAFETY: one private read-only page of a borrowed valid fd at offset
+    // 0; never PROT_EXEC; unmapped by the guard below.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err(format!(
+            "mapping the held object failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let _mapping = SelfMapping { base, len };
+    let start = base as u64;
+    let end = start + len as u64;
+    match map_files_entry_file(&format!("/proc/self/map_files/{start:x}-{end:x}")) {
+        Ok(mapped) => Ok(mapped),
+        // The kernel merged the page into a neighbouring VMA: find the
+        // VMA that contains it and stat that entry instead.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let maps = std::fs::read_to_string("/proc/self/maps").map_err(|e| e.to_string())?;
+            let range = maps
+                .lines()
+                .filter_map(|line| line.split_ascii_whitespace().next())
+                .find(|range| {
+                    range.split_once('-').is_some_and(|(low, high)| {
+                        u64::from_str_radix(low, 16).is_ok_and(|low| low <= start)
+                            && u64::from_str_radix(high, 16).is_ok_and(|high| end <= high)
+                    })
+                })
+                .ok_or("the held object's self-mapping was not found")?;
+            map_files_entry_file(&format!("/proc/self/map_files/{range}"))
+                .map_err(|e| format!("map_files of the held object: {e}"))
+        }
+        Err(error) => Err(format!("map_files of the held object: {error}")),
+    }
+}
+
+/// The pin reopens the scanned object by path, and on btrfs a path swapped
+/// between the scan and the pin to another subvolume's file with the same
+/// inode number keeps the maps key. When both `vm_file` identities were
+/// readable they must be equal; an unreadable pin side keeps the key check
+/// as the proof, exactly as before.
+fn check_same_scanned_file(
+    scanned: FileIdentity,
+    pinned: Result<FileIdentity, String>,
+) -> Result<(), String> {
+    match pinned {
+        Ok(pinned) if pinned != scanned => Err(format!(
+            "identity_mismatch: the pinned file (st_dev {} st_ino {}) is not the file the scan \
+             read (st_dev {} st_ino {})",
+            pinned.dev, pinned.ino, scanned.dev, scanned.ino
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// One private read-only page of a held fd, unmapped on drop.
+struct SelfMapping {
+    base: *mut libc::c_void,
+    len: usize,
+}
+
+impl Drop for SelfMapping {
+    fn drop(&mut self) {
+        // SAFETY: exactly this range was mapped with mmap, is owned here
+        // exclusively, and Drop runs once.
+        unsafe {
+            libc::munmap(self.base, self.len);
+        }
+    }
+}
+
 impl Entry {
     fn new(
         file: std::fs::File,
@@ -782,6 +1036,17 @@ impl PinnedObjects {
             .get(&id)
             .ok_or_else(|| format!("object {id:?} was not pinned"))?;
         filesystem_without_unique_inodes(entry.file.as_raw_fd())
+    }
+
+    /// The held object's `vm_file` identity ([`self_mapped_identity`]):
+    /// what another process's `map_files` range must equal before a maps
+    /// key may stand for this object there (C1b sweep matching).
+    pub(crate) fn object_mapped_identity(&self, id: PinnedObjectId) -> Result<MappedFile, String> {
+        let entry = self
+            .by_id
+            .get(&id)
+            .ok_or_else(|| format!("object {id:?} was not pinned"))?;
+        self_mapped_file(&entry.file)
     }
 
     /// Every pinned object, for `discovery[]`.
@@ -1987,9 +2252,27 @@ pub fn pin_scanned_view_objects(
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
+    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_identity)
+}
+
+/// Reads a pinned fd's `vm_file` identity ([`self_mapped_identity`]).
+type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<FileIdentity, String>;
+
+/// [`pin_scanned_view_objects`] with the pinned fd's `vm_file` identity
+/// read through `pinned_identity` (a seam: following `map_files` needs
+/// privilege, so tests script it).
+fn pin_scanned_view_objects_with(
+    view: &ProcessView,
+    modules: &[ScannedModule],
+    budget: &mut CaptureWorkBudget,
+    pinned_identity: ReadPinnedIdentity<'_>,
+) -> Result<(PinnedObjects, Vec<Skipped>), String> {
     // Both the table-owning modules and every object a table entry points into: an
     // entry may land in a dependency the module itself only forwards to.
     let mut wanted = BTreeSet::new();
+    // The `vm_file` identity each module's own scan read, where readable:
+    // the pin must reopen exactly that file.
+    let mut scanned_files: BTreeMap<RawObjectInstance, FileIdentity> = BTreeMap::new();
     let mut skipped = Vec::new();
     for module in modules {
         if module.view != view.id() || module.mount_namespace != view.mount_namespace() {
@@ -1997,6 +2280,9 @@ pub fn pin_scanned_view_objects(
         }
         match RawObjectInstance::scanned(module, module.key, &module.path) {
             Some(raw) => {
+                if let Some(identity) = module.mapped_identity {
+                    scanned_files.insert(raw.clone(), identity);
+                }
                 wanted.insert(raw);
             }
             None => skipped.push(Skipped {
@@ -2032,7 +2318,14 @@ pub fn pin_scanned_view_objects(
         if !view.still_the_same() {
             return Err(exited());
         }
-        let candidate = pin_scanned_object(view, raw.clone(), &mut mounts, budget);
+        let scanned = scanned_files.get(&raw).copied();
+        let candidate = pin_scanned_object(
+            view,
+            raw.clone(),
+            scanned.map(|scanned| (scanned, pinned_identity)),
+            &mut mounts,
+            budget,
+        );
         record_scanned_candidate(&mut pinned, view.id(), raw, candidate, &mut skipped);
     }
     if !view.still_the_same() {
@@ -2217,6 +2510,7 @@ pub fn reconcile_scanned_modules(
 fn pin_scanned_object(
     view: &ProcessView,
     raw: RawObjectInstance,
+    scanned: Option<(FileIdentity, ReadPinnedIdentity<'_>)>,
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
@@ -2245,6 +2539,9 @@ fn pin_scanned_object(
             raw.path,
             object_key(found),
         ));
+    }
+    if let Some((scanned, pinned_identity)) = scanned {
+        check_same_scanned_file(scanned, pinned_identity(&file))?;
     }
     let before = pin_of(&file)?;
     // The per-file rule can be decided from metadata. Aggregate admission happens
@@ -2321,6 +2618,7 @@ pub(crate) mod test_fixture {
 
     pub(crate) fn module(key: ObjectKey) -> ScannedModule {
         ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: ProcessViewId(key.device.minor as u32),
             mount_namespace: MountNamespaceId {
@@ -3165,6 +3463,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
@@ -3219,6 +3518,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
@@ -3292,6 +3592,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            mapped_identity: None,
             double_loaded: false,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
@@ -4495,6 +4796,166 @@ mod tests {
             rejected.sweep_match_keys().is_empty(),
             "a rejected key never matches"
         );
+    }
+
+    /// The held side of the C1b comparison is the kernel's `vm_file` of a
+    /// self-mapping, never `fstat`: with the privilege it equals the
+    /// `map_files` identity of any other mapping of the same file (on
+    /// btrfs `fstat` agrees too; on pre-6.8 overlayfs it would not, which
+    /// is why it is not used); without it, both sides fail closed.
+    #[test]
+    fn a_key_is_its_files_identity_only_on_an_allowlisted_filesystem() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 42,
+        };
+        let on = |identity, fs_magic| MappedFile { identity, fs_magic }.key_is_identity(key);
+        let same = FileIdentity {
+            dev: libc::makedev(8, 1),
+            ino: 42,
+        };
+        // ext2/3/4, XFS, squashfs, EROFS: exactly the allowlist.
+        for magic in [0xef53, 0x5846_5342, 0x7371_7368, 0xe0f5_e1e2] {
+            assert!(on(same, Some(magic)), "{magic:#x}");
+        }
+        assert_eq!(KEY_IS_IDENTITY_FILESYSTEMS.len(), 4);
+        // tmpfs (wrapping 32-bit inode numbers without inode64), btrfs,
+        // overlayfs, bcachefs, FUSE, NFS, an unknown and an unread magic
+        // always prove per range.
+        for magic in [
+            Some(0x0102_1994),
+            Some(0x9123_683e),
+            Some(0x794c_7630),
+            Some(0xca45_1a4e),
+            Some(0x6573_5546),
+            Some(0x6969),
+            Some(0x1234_5678),
+            None,
+        ] {
+            assert!(!on(same, magic), "{magic:?}");
+        }
+        // The identity must be the key: another device or inode proves.
+        assert!(!on(FileIdentity { dev: 37, ino: 42 }, Some(0xef53)));
+        assert!(!on(
+            FileIdentity {
+                dev: libc::makedev(8, 1),
+                ino: 43
+            },
+            Some(0xef53)
+        ));
+    }
+
+    #[test]
+    fn the_pin_refuses_a_reopened_file_that_is_not_the_one_the_scan_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libpinned.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let read = FileIdentity { dev: 37, ino: 9 };
+        let module = |mapped_identity| ScannedModule {
+            mapped_identity,
+            double_loaded: false,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key: ObjectKey {
+                device: Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            },
+            path: path.display().to_string(),
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        };
+        let pin = |module: ScannedModule, pinned: Result<FileIdentity, String>| {
+            let mut budget = CaptureWorkBudget::default();
+            let (objects, skipped) = pin_scanned_view_objects_with(
+                &view,
+                std::slice::from_ref(&module),
+                &mut budget,
+                &|_| pinned.clone(),
+            )
+            .unwrap();
+            (objects.pinned().count(), skipped)
+        };
+
+        // Same maps key, but the path now resolves to another subvolume's
+        // file (btrfs): refused, never pinned as the scanned object.
+        let (count, skipped) = pin(module(Some(read)), Ok(FileIdentity { dev: 47, ino: 9 }));
+        assert_eq!(count, 0);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0].reason.contains("identity_mismatch"),
+            "{skipped:?}"
+        );
+        // The file the scan read: pinned.
+        let (count, skipped) = pin(module(Some(read)), Ok(read));
+        assert_eq!((count, skipped.len()), (1, 0), "{skipped:?}");
+        // An unreadable pin side keeps the key check as the proof.
+        let (count, skipped) = pin(module(Some(read)), Err("EPERM".into()));
+        assert_eq!((count, skipped.len()), (1, 0), "{skipped:?}");
+        // No scanned identity (map_files unreadable at scan time): key only.
+        let (count, skipped) = pin(module(None), Ok(FileIdentity { dev: 47, ino: 9 }));
+        assert_eq!((count, skipped.len()), (1, 0), "{skipped:?}");
+    }
+
+    #[test]
+    fn the_held_side_is_the_self_mapped_vm_file_and_fails_closed_unprivileged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libheld.so");
+        std::fs::write(&path, vec![0x5au8; 8192]).unwrap();
+        let held = std::fs::File::open(&path).unwrap();
+        let empty_path = dir.path().join("empty.so");
+        std::fs::write(&empty_path, b"").unwrap();
+        assert!(self_mapped_identity(&std::fs::File::open(&empty_path).unwrap()).is_err());
+        // An independent mapping of the same file, as a target would hold.
+        let other = std::fs::File::open(&path).unwrap();
+        // SAFETY: a private read-only page of a valid fd, unmapped below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                other.as_raw_fd(),
+                4096,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let _guard = SelfMapping { base, len: 4096 };
+        let start = base as u64;
+        let target = map_files_identity(std::process::id(), start, start + 4096);
+        match self_mapped_identity(&held) {
+            Ok(identity) => {
+                assert_eq!(target.unwrap(), identity, "one file, one vm_file identity");
+                let metadata = held.metadata().unwrap();
+                assert_eq!(identity.ino, metadata.ino());
+                // The same entry's statfs is the held file's filesystem.
+                let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                // SAFETY: a valid fd; `buf` is read only on success.
+                assert_eq!(
+                    unsafe { libc::fstatfs(held.as_raw_fd(), buf.as_mut_ptr()) },
+                    0
+                );
+                // SAFETY: initialized by the successful `fstatfs`.
+                let magic = (unsafe { buf.assume_init().f_type }) as u64 & 0xffff_ffff;
+                assert_eq!(self_mapped_file(&held).unwrap().fs_magic, Some(magic));
+            }
+            Err(error) => {
+                // Unprivileged: following map_files is EPERM on both sides.
+                assert!(error.contains("Operation not permitted"), "{error}");
+                assert_eq!(
+                    target.unwrap_err().raw_os_error(),
+                    Some(libc::EPERM),
+                    "the target side fails closed the same way"
+                );
+            }
+        }
     }
 
     #[test]

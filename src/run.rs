@@ -3603,6 +3603,9 @@ struct CaptureConsumers<'state> {
     tracer: Option<&'state mut trace::Tracer>,
     malformed_records: &'state mut u64,
     scheduling: &'state mut SchedulingAccumulator,
+    /// The terminal stop-gate outcome; the terminal drains set its post-Q
+    /// flags and the snapshot seals the verdict from it.
+    stop_quiescence: render::StopQuiescence,
 }
 
 type ProfileTickContext<'tick, 'owned> = (
@@ -3777,6 +3780,36 @@ pub(crate) const POST_Q_RECORD_REASON: &str =
 /// unproven marker; the reason says which ring broke quiescence.
 fn report_post_q_record(ring: &str) {
     eprintln!("p11scope: terminal {ring} drain: {POST_Q_RECORD_REASON}");
+}
+
+/// Routes one ring's post-Q result into the terminal evidence: the named
+/// stderr reason plus the published flag that keeps `drain_proven` false
+/// (owner ruling B). The flag is sticky: a later clean quantum never
+/// clears it.
+fn note_post_q_record(flag: &mut bool, ring: &str, crossed: bool) {
+    if crossed {
+        report_post_q_record(ring);
+        *flag = true;
+    }
+}
+
+/// The terminal quiesce step's outcome: the Q positions (proven Q only)
+/// and the published stop-gate evidence.
+type QuiesceOutcome = (Option<TerminalQuiescence>, render::StopQuiescence);
+
+/// The published stop-gate outcome for a terminal `StopState`. Only
+/// `Quiesced` is a proven Q; the post-Q flags start clear and the
+/// terminal drains set them.
+pub(crate) fn stop_quiescence_for(state: StopState) -> render::StopQuiescence {
+    render::StopQuiescence {
+        state: match state {
+            StopState::Quiesced { .. } => render::QuiescenceState::Proven,
+            StopState::QuiescenceUnproven { .. } => render::QuiescenceState::Unproven,
+            StopState::Running | StopState::StopRequested => render::QuiescenceState::NotReached,
+        },
+        post_q_events: false,
+        post_q_discovery: false,
+    }
 }
 
 /// The operator-visible line for unproven quiescence: the stop waited
@@ -4012,6 +4045,7 @@ fn capture_profile(
                 tracer: None,
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence: Default::default(),
             };
             let frame_tick = &mut frames;
             let snapshot_cache = &mut last_snapshot;
@@ -4231,7 +4265,7 @@ fn capture_profile(
     // settles like a capture-loop failure (owned settlement with the
     // loop's real end, then detach): a bare `?` here would skip both and
     // SIGKILL a child `--duration` should hand back alive.
-    let quiesced = match (|| -> Result<Option<TerminalQuiescence>> {
+    let quiesce_outcome = match (|| -> Result<QuiesceOutcome> {
         let mut service_error: Option<anyhow::Error> = None;
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
@@ -4294,13 +4328,14 @@ fn capture_profile(
             }
             StopState::Running | StopState::StopRequested => None,
         };
+        let stop_quiescence = stop_quiescence_for(stop_state);
         if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
             let plan = engine.plan();
             state.sync_plan(plan);
         }
-        Ok(quiesced)
+        Ok((quiesced, stop_quiescence))
     })() {
-        Ok(quiesced) => quiesced,
+        Ok(outcome) => outcome,
         Err(error) => {
             let mut settle_context = (&mut *engine, &mut *session, &mut owned);
             return Err(finish_quiesce_error(
@@ -4320,6 +4355,7 @@ fn capture_profile(
             ));
         }
     };
+    let (quiesced, stop_quiescence) = quiesce_outcome;
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     finish_capture_with(
         &mut finish_context,
@@ -4354,6 +4390,7 @@ fn capture_profile(
                 tracer: None,
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence,
             };
             drain_capture_terminal_with(
                 &mut terminal_context,
@@ -4373,9 +4410,11 @@ fn capture_profile(
                         )?,
                         None => context.0.drain_discovery_terminal(context.1)?,
                     };
-                    if post_q_discovery {
-                        report_post_q_record("DISCOVERY");
-                    }
+                    note_post_q_record(
+                        &mut consumers.stop_quiescence.post_q_discovery,
+                        "DISCOVERY",
+                        post_q_discovery,
+                    );
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
@@ -4424,9 +4463,11 @@ fn capture_profile(
                                 None => EventsDrainBound::Terminal,
                             },
                         )?;
-                        if post_q_record {
-                            report_post_q_record("EVENTS");
-                        }
+                        note_post_q_record(
+                            &mut consumers.stop_quiescence.post_q_events,
+                            "EVENTS",
+                            post_q_record,
+                        );
                     }
                     collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
@@ -4503,7 +4544,8 @@ fn capture_profile(
                             .as_deref()
                             .and_then(|owned| owned.still_running.then_some(owned.pid)),
                     );
-                    ev.mark_terminal_drain_unproven();
+                    ev.apply_stop_quiescence(consumers.stop_quiescence);
+                    ev.settle_terminal(profile);
                     let facts = context.0.capture_facts();
                     let frame = render::live(
                         &reports,
@@ -4700,6 +4742,7 @@ fn capture_trace(
                 tracer: Some(&mut tracer),
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence: Default::default(),
             };
             let frame_tick = &mut frames;
             let frame_clock = &mut last_frame;
@@ -4879,7 +4922,7 @@ fn capture_trace(
     // settles like a capture-loop failure (owned settlement with the
     // loop's real end, then detach): a bare `?` here would skip both and
     // SIGKILL a child `--duration` should hand back alive.
-    let quiesced = match (|| -> Result<Option<TerminalQuiescence>> {
+    let quiesce_outcome = match (|| -> Result<QuiesceOutcome> {
         let mut service_error: Option<anyhow::Error> = None;
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
@@ -4941,14 +4984,15 @@ fn capture_trace(
             }
             StopState::Running | StopState::StopRequested => None,
         };
+        let stop_quiescence = stop_quiescence_for(stop_state);
         if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
             let plan = engine.plan();
             state.sync_plan(plan);
             tracer.sync_plan(plan);
         }
-        Ok(quiesced)
+        Ok((quiesced, stop_quiescence))
     })() {
-        Ok(quiesced) => quiesced,
+        Ok(outcome) => outcome,
         Err(error) => {
             let mut settle_context = (&mut *engine, &mut *session, &mut owned);
             return Err(finish_quiesce_error(
@@ -4968,6 +5012,7 @@ fn capture_trace(
             ));
         }
     };
+    let (quiesced, stop_quiescence) = quiesce_outcome;
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     finish_capture_with(
         &mut finish_context,
@@ -5004,6 +5049,7 @@ fn capture_trace(
                 tracer: Some(&mut tracer),
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence,
             };
             drain_capture_terminal_with(
                 &mut terminal_context,
@@ -5023,9 +5069,11 @@ fn capture_trace(
                         )?,
                         None => context.0.drain_discovery_terminal(context.1)?,
                     };
-                    if post_q_discovery {
-                        report_post_q_record("DISCOVERY");
-                    }
+                    note_post_q_record(
+                        &mut consumers.stop_quiescence.post_q_discovery,
+                        "DISCOVERY",
+                        post_q_discovery,
+                    );
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::Discovery, phase_start.elapsed());
@@ -5083,9 +5131,11 @@ fn capture_trace(
                             None => EventsDrainBound::Terminal,
                         },
                     )?;
-                    if post_q_record {
-                        report_post_q_record("EVENTS");
-                    }
+                    note_post_q_record(
+                        &mut consumers.stop_quiescence.post_q_events,
+                        "EVENTS",
+                        post_q_record,
+                    );
                     collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
                 },
@@ -5177,8 +5227,8 @@ fn capture_trace(
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
                     evidence.stdout_data_sink = context.7.is_none();
-                    evidence.verdict_with_selection(true);
-                    evidence.mark_terminal_drain_unproven();
+                    evidence.apply_stop_quiescence(consumers.stop_quiescence);
+                    evidence.settle_terminal(true);
                     if *consumers.malformed_records > 0 {
                         eprintln!(
                             "p11scope: {} malformed ring-buffer records discarded this capture",
@@ -6600,6 +6650,7 @@ fn evidence_for(
             .count(),
         discovery: facts.discovery().clone(),
         scheduling,
+        stop_quiescence: Default::default(),
         drain_proven: false,
         verdict_detail: render::VERDICT_CONCRETE_GAP,
         gap_classes: render::GapClasses::default(),
@@ -12076,7 +12127,8 @@ mod tests {
             assert!(!proven.contains("drain_discovery_terminal(context.1)"));
             assert!(after_none.contains("context.0.drain_discovery_terminal(context.1)?"));
             assert!(!after_none.contains("to_position"));
-            assert!(discovery.contains("report_post_q_record(\"DISCOVERY\")"));
+            assert!(discovery.contains("note_post_q_record("));
+            assert!(discovery.contains("consumers.stop_quiescence.post_q_discovery"));
         }
     }
 
@@ -12125,6 +12177,79 @@ mod tests {
                     .count(),
                 1,
                 "{function} must report QuiescenceUnproven with waited and in_flight"
+            );
+        }
+    }
+
+    /// SG-T7B (owner ruling B): both terminal paths publish the stop-gate
+    /// outcome from their own `StopState`, route both rings' post-Q flags
+    /// into it, and derive the latch from it before the seal. The loops
+    /// only run live, so the wiring is pinned statically like the
+    /// quiescence report above; the behaviour behind each call is covered
+    /// by `an_injected_post_q_write_keeps_the_terminal_document_partial`.
+    #[test]
+    fn terminal_paths_seal_the_verdict_from_the_stop_gate_outcome() {
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, body) in [("capture_profile", profile), ("capture_trace", trace)] {
+            let derived = body
+                .find("let stop_quiescence = stop_quiescence_for(stop_state);")
+                .unwrap_or_else(|| panic!("{function} derives the outcome from its StopState"));
+            let handed = body
+                .find("                stop_quiescence,\n            };\n            drain_capture_terminal_with(")
+                .unwrap_or_else(|| panic!("{function} hands the outcome to the terminal consumers"));
+            assert!(derived < handed, "{function}");
+            for (field, ring) in [
+                ("post_q_discovery", "\"DISCOVERY\""),
+                ("post_q_events", "\"EVENTS\""),
+            ] {
+                let call = format!("&mut consumers.stop_quiescence.{field},");
+                let at = body
+                    .find(&call)
+                    .unwrap_or_else(|| panic!("{function} routes {field}"));
+                assert!(
+                    body[..at].ends_with("note_post_q_record(\n                        ")
+                        || body[..at]
+                            .ends_with("note_post_q_record(\n                            "),
+                    "{function}: {field} goes through note_post_q_record"
+                );
+                assert!(body[at..].starts_with(&format!("{call}\n")), "{function}");
+                assert!(
+                    body[at..at + 200].contains(ring),
+                    "{function}: {field} names {ring}"
+                );
+            }
+            assert_eq!(
+                body.matches("report_post_q_record(").count(),
+                0,
+                "{function}: every post-Q report also sets its published flag"
+            );
+            let applied = body
+                .find(".apply_stop_quiescence(consumers.stop_quiescence);")
+                .unwrap_or_else(|| panic!("{function} derives the latch before the seal"));
+            let sealed = body[applied..]
+                .find(".settle_terminal(")
+                .unwrap_or_else(|| panic!("{function} seals after deriving the latch"));
+            assert!(
+                !body[applied..applied + sealed].contains("mark_terminal_drain_unproven"),
+                "{function}: no seal between the latch and settle_terminal"
+            );
+            assert!(
+                !body.contains("drain_proven = true"),
+                "{function}: the latch has one setter"
             );
         }
     }

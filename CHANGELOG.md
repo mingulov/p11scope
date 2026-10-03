@@ -7,38 +7,19 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [Unreleased]
 
-### Inventory and system catalog
+### Changed
 
-- `inventory --system` and `inspect --system` no longer drop callers past
-  `--max-scan-pids` (DR-C8-1). The cap still bounds how many processes are
-  deep-scanned, one per provider group; every other process whose
-  `/proc/<pid>/maps` shows, by exact `(device, inode)`, a provider object a
-  deep scan pinned in the same pass is attributed to it after a confirmation
-  read (pidfd and start-time pin, maps re-read, exe identity unchanged) taken
-  while the pinned object is held open. Only the deep-scan cap's discovery of
-  objects no other process maps remains bounded.
-- `inspect --system`: processes past the cap read `maps_matched` (attributed)
-  or `not_selected` (with the loss reason when a known provider object could
-  not be attributed); observations carry `evidence` (`deep_scan` or
-  `maps_match`; a maps match decodes nothing, so its exports, tables, and
-  interfaces are empty) and maps-matched mappings have a `null` view. The
-  `scan` block is now `{status, enumerated, limit, selected, deep_scanned,
-  maps_matched, unexamined, unexamined_objects, snapshots_unavailable,
-  attribution_losses, scan_ms}`: `limit` replaces `max_scan_pids` and
-  `deep_scanned` replaces `scanned`.
-- The flat scan-cap gap is replaced by `discovery capped` (a loss, only when
-  some process maps a shared object no deep scan examined or had no maps
-  snapshot) or an `attribution complete` note. Attribution losses are counted
-  by category in a `maps attribution` gap. `scan.status` reads `complete` past
-  the cap when nothing was left unexamined and nothing was lost.
-- `inventory`: `edges[].mapping.evidence` (`deep_scan` or `maps_match`); a
-  module missing from a maps-matched caller reads `uncertain`, never `ended`.
-  Both lanes join the collected generation (start time; exe identity) to the
-  caller incarnation before projecting. Caller admission failures aggregate
-  into one gap per pass and kind with a count. The event stream's
-  `pass_committed` gains `maps_matched`.
-- `P11SCOPE_STAGE_TIMINGS=1` prints per-pass stage timings (sweep, select,
-  deep scan, confirm, assemble, absorb, reconcile, project) to stderr.
+- A written capture can now be `COMPLETE`. On stop, a Detailed capture's
+  stop gate refuses new BPF callbacks and waits for admitted ones to finish;
+  when that quiescence is proven, both terminal drains reach the ring
+  positions read at that point with no record past them, and the build is
+  x86_64, `evidence.drain_proven` is true and a clean run reports `COMPLETE`
+  (`verdict_detail: "clean_proven"`). Every other terminal document stays
+  `PARTIAL` as before (owner ruling B, 2026-09-25). New
+  `evidence.stop_quiescence` (`state`: `proven` / `unproven` / `not_reached`,
+  plus `post_q_events` / `post_q_discovery`) publishes the stop-gate outcome
+  that used to reach stderr only. The trace terminal `EVIDENCE` record now
+  carries the sealed verdict, and its `final_drain` equals `drain_proven`.
 
 ## [0.1.0]
 

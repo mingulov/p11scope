@@ -636,6 +636,7 @@ mod tests {
             entry_objects: vec![vec![object; 3]],
             exports: Default::default(),
             scanned: ScannedModule {
+                mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {

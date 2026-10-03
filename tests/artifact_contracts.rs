@@ -8563,6 +8563,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             terminal_drain_bound: 65536,
             ..Default::default()
         },
+        stop_quiescence: Default::default(),
         drain_proven: false,
         verdict_detail: p11scope::render::VERDICT_CONCRETE_GAP,
         gap_classes: p11scope::render::GapClasses::default(),

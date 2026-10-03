@@ -892,6 +892,7 @@ pub(crate) mod tests {
             object,
             entry_objects: vec![entry_objects],
             scanned: ScannedModule {
+                mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {

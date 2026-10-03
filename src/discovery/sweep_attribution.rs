@@ -15,9 +15,18 @@
 //! - Each phase-1 match is confirmed while the aggregate pins (and their
 //!   fds) are held: a pidfd/start-time pin, the exe identity read before
 //!   and after, a maps re-read, and `still_the_same()`. Only the
-//!   confirmation snapshot attributes. A held fd keeps the inode and its
-//!   superblock allocated, so the confirmed `(device, inode)` cannot name
-//!   another file.
+//!   confirmation snapshot attributes.
+//! - A maps key is not one file (btrfs renders one device for every
+//!   subvolume while inode numbers repeat across them), and `fstat` of the
+//!   held fd is not comparable with maps (btrfs anon devices; pre-6.8
+//!   overlayfs installs the backing file in the VMA). So every matched
+//!   range must have the same kernel `vm_file` as the held object, both
+//!   read through `map_files` — the target's range, read while the pin
+//!   holds, and a self-mapping of the held fd (see
+//!   `identity::FileIdentity` for why each side uses what). A different
+//!   file is an `identity_mismatch` loss; an unprovable one (no
+//!   `CAP_SYS_ADMIN`/`CAP_CHECKPOINT_RESTORE`) a `map_files_unavailable`
+//!   loss. "Examined" keys need the same proof to count as examined.
 //! - ` (deleted)` (and otherwise unusable) mapping paths never match.
 //! - After the confirmations, each matched object is rechecked once
 //!   (`object_unchanged`); a changed object drops its sweep attributions.
@@ -27,13 +36,13 @@
 //! [`MemberProbe`], so the decisions are unit-testable.
 //!
 //! Privacy (allowlist-v1, "filesystem mapping names/metadata"): this reads
-//! only maps, a pidfd, the start time, and exe metadata — the facts the
-//! caller adapter already reads. Paths come only from matched provider
-//! mappings.
+//! only maps, a pidfd, the start time, exe metadata, and the
+//! `(st_dev, st_ino)` of mapped provider-candidate ranges — metadata, never
+//! file contents. Paths come only from matched provider mappings.
 
 use crate::discovery::caller_registry::ExeIdentity;
 use crate::discovery::engine::is_provider_mapping;
-use crate::discovery::identity::PinnedObjectId;
+use crate::discovery::identity::{ExaminedObject, FileIdentity, MappedFile, PinnedObjectId};
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, MAPS_CEILING_REASON, MAPS_ENTRY_CEILING_REASON,
     SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON, duplicate_exec_coverage,
@@ -68,10 +77,16 @@ pub(crate) enum AttributionLoss {
     InodeNotUnique,
     /// The confirmation read hit a capture work, I/O, or deadline ceiling.
     Budget,
+    /// The key matched, but a mapped range at it is another file (a maps
+    /// key collision: btrfs subvolumes, overlayfs).
+    IdentityMismatch,
+    /// The key needs the `map_files` proof and it could not be read (no
+    /// `CAP_SYS_ADMIN`/`CAP_CHECKPOINT_RESTORE`, or the range vanished).
+    MapFilesUnavailable,
 }
 
 impl AttributionLoss {
-    pub(crate) const ALL: [AttributionLoss; 8] = [
+    pub(crate) const ALL: [AttributionLoss; 10] = [
         Self::GenerationChanged,
         Self::ExecChanged,
         Self::ConfirmUnreadable,
@@ -80,6 +95,8 @@ impl AttributionLoss {
         Self::KeyRejected,
         Self::InodeNotUnique,
         Self::Budget,
+        Self::IdentityMismatch,
+        Self::MapFilesUnavailable,
     ];
 
     /// Stable category label (`scan.attribution_losses` keys).
@@ -93,6 +110,8 @@ impl AttributionLoss {
             Self::KeyRejected => "key_rejected",
             Self::InodeNotUnique => "inode_not_unique",
             Self::Budget => "budget",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::MapFilesUnavailable => "map_files_unavailable",
         }
     }
 }
@@ -126,6 +145,11 @@ pub(crate) trait ObjectChecks {
     fn nonunique_inodes(&self, object: PinnedObjectId) -> Result<Option<&'static str>, String>;
     /// `Ok(true)` while the object still matches its pin.
     fn unchanged(&self, object: PinnedObjectId) -> Result<bool, String>;
+    /// The held object's self-mapped `vm_file`: its identity is what
+    /// another process's `map_files` range must equal before a maps key
+    /// stands for it, unless the key is that identity on an allowlisted
+    /// filesystem ([`MappedFile::key_is_identity`]).
+    fn mapped_identity(&self, object: PinnedObjectId) -> Result<MappedFile, String>;
 }
 
 impl ObjectChecks for crate::discovery::identity::PinnedObjects {
@@ -136,30 +160,42 @@ impl ObjectChecks for crate::discovery::identity::PinnedObjects {
     fn unchanged(&self, object: PinnedObjectId) -> Result<bool, String> {
         self.object_unchanged(object)
     }
+
+    fn mapped_identity(&self, object: PinnedObjectId) -> Result<MappedFile, String> {
+        self.object_mapped_identity(object)
+    }
 }
 
 /// This pass's attributable keys: exact maps keys a deep scan bound to one
-/// pinned object, the keys a deep scan saw as modules that cannot
-/// attribute, and the provider-candidate keys complete deep scans
-/// examined without finding a module. Built once per pass from this
-/// pass's deep scans only — there is no cross-pass state.
+/// pinned object (with that object's `vm_file` identity), the keys
+/// a deep scan saw as modules that cannot attribute, and the
+/// provider-candidate keys complete deep scans opened and found to export
+/// nothing wanted. Built once per pass from this pass's deep scans only —
+/// there is no cross-pass state.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct KnownKeyIndex {
-    by_key: BTreeMap<ObjectKey, PinnedObjectId>,
+    by_key: BTreeMap<ObjectKey, (PinnedObjectId, FileIdentity)>,
     ineligible: BTreeMap<ObjectKey, AttributionLoss>,
-    examined: BTreeSet<ObjectKey>,
+    /// Examined keys with every `vm_file` identity a deep scan examined
+    /// under them (a key may name several files).
+    examined: BTreeMap<ObjectKey, BTreeSet<FileIdentity>>,
+    /// Matchable or examined keys that are their file's identity on an
+    /// allowlisted filesystem: any range under them is that file, so they
+    /// skip the per-range `map_files` stat (DR-C1b-3).
+    identity_keys: BTreeSet<ObjectKey>,
 }
 
 impl KnownKeyIndex {
     /// `modules`: every deep-scanned module's maps key with the pinned
     /// object it bound to (`None`: no comparable pin). `match_keys`: the
-    /// aggregate's `sweep_match_keys`. `examined`: the phase-1 entries of
-    /// deep-scanned members whose scan completed. Returns the index plus
-    /// the objects refused on filesystems without unique inode numbers.
-    pub(crate) fn build<'a>(
+    /// aggregate's `sweep_match_keys`. `examined`: the objects complete
+    /// deep scans examined, from their own scan reads. Returns the index
+    /// plus the objects refused on filesystems without unique inode
+    /// numbers.
+    pub(crate) fn build(
         modules: impl IntoIterator<Item = (ObjectKey, Option<PinnedObjectId>)>,
         match_keys: &BTreeMap<ObjectKey, PinnedObjectId>,
-        examined: impl IntoIterator<Item = &'a MapEntry>,
+        examined: impl IntoIterator<Item = ExaminedObject>,
         checks: &dyn ObjectChecks,
     ) -> (Self, Vec<RefusedObject>) {
         let mut bound: BTreeMap<ObjectKey, BTreeSet<Option<PinnedObjectId>>> = BTreeMap::new();
@@ -178,9 +214,7 @@ impl KnownKeyIndex {
                 continue;
             };
             match checks.nonunique_inodes(object) {
-                Ok(None) => {
-                    index.by_key.insert(*key, object);
-                }
+                Ok(None) => {}
                 Ok(Some(filesystem)) => {
                     index
                         .ineligible
@@ -190,34 +224,86 @@ impl KnownKeyIndex {
                         key: *key,
                         filesystem,
                     });
+                    continue;
                 }
                 // Unclassifiable: fail closed, never match by key alone.
                 Err(_) => {
                     index.ineligible.insert(*key, AttributionLoss::KeyRejected);
+                    continue;
+                }
+            }
+            match checks.mapped_identity(object) {
+                Ok(mapped) => {
+                    if mapped.key_is_identity(*key) {
+                        index.identity_keys.insert(*key);
+                    }
+                    index.by_key.insert(*key, (object, mapped.identity));
+                }
+                // No privilege to read map_files: nothing can be proven.
+                Err(_) => {
+                    index
+                        .ineligible
+                        .insert(*key, AttributionLoss::MapFilesUnavailable);
                 }
             }
         }
-        index.examined = examined
-            .into_iter()
-            .filter(|entry| is_provider_mapping(entry))
-            .map(ObjectKey::of)
-            .filter(|key| !bound.contains_key(key))
-            .collect();
+        for object in examined {
+            if bound.contains_key(&object.key) {
+                continue;
+            }
+            if object.key_is_identity {
+                index.identity_keys.insert(object.key);
+            }
+            index
+                .examined
+                .entry(object.key)
+                .or_default()
+                .insert(object.identity);
+        }
         (index, refused)
     }
 
     pub(crate) fn classify(&self, key: ObjectKey) -> KeyClass {
-        if let Some(object) = self.by_key.get(&key) {
+        if let Some((object, _)) = self.by_key.get(&key) {
             KeyClass::Match(*object)
         } else if let Some(loss) = self.ineligible.get(&key) {
             KeyClass::Ineligible(*loss)
-        } else if self.examined.contains(&key) {
+        } else if self.examined.contains_key(&key) {
             KeyClass::Examined
         } else {
             KeyClass::Unexamined
         }
     }
+
+    /// The keys whose ranges need the `map_files` proof in another
+    /// process: every matchable and every examined key that is not its
+    /// file's identity.
+    pub(crate) fn map_files_keys(&self) -> BTreeSet<ObjectKey> {
+        self.by_key
+            .keys()
+            .chain(self.examined.keys())
+            .filter(|key| !self.identity_keys.contains(key))
+            .copied()
+            .collect()
+    }
+
+    /// Whether any range under `key` is its file without a per-range stat.
+    fn key_is_identity(&self, key: ObjectKey) -> bool {
+        self.identity_keys.contains(&key)
+    }
+
+    fn match_identity(&self, key: ObjectKey) -> Option<FileIdentity> {
+        self.by_key.get(&key).map(|(_, identity)| *identity)
+    }
+
+    fn examined_identities(&self, key: ObjectKey) -> Option<&BTreeSet<FileIdentity>> {
+        self.examined.get(&key)
+    }
 }
+
+/// `map_files` identities read for the mapped ranges that needed them,
+/// keyed by `(start, end)`.
+pub(crate) type MappedIdentities = BTreeMap<(u64, u64), Result<FileIdentity, String>>;
 
 /// A confirmation read that held: the generation the pin proved and the
 /// maps snapshot read while it held, between two equal exe reads.
@@ -226,6 +312,9 @@ pub(crate) struct ConfirmedRead {
     pub start_time: u64,
     pub exe: ExeIdentity,
     pub entries: Vec<MapEntry>,
+    /// The `map_files` identity of every confirmed provider-candidate
+    /// range whose key needs that proof, read while the pin held.
+    pub mapped: MappedIdentities,
 }
 
 /// What one confirmation concluded.
@@ -239,7 +328,24 @@ pub(crate) enum Confirmation {
 
 /// The `/proc` side of the confirmation, behind a seam.
 pub(crate) trait MemberProbe {
-    fn confirm(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Confirmation;
+    /// Confirm `pid`, statting the `map_files` entry of every confirmed
+    /// provider-candidate range whose key is in `prove`.
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation;
+    /// The `map_files` identities of `ranges` for a process with no match
+    /// to confirm: only examined keys are being proven, so no pin is
+    /// needed — a range that does not stat to an examined identity counts
+    /// as unexamined.
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities;
 }
 
 /// One object an unselected process was attributed to.
@@ -324,6 +430,40 @@ struct Classified<'a> {
     matches: Vec<(ObjectKey, PinnedObjectId, Vec<&'a MapEntry>)>,
     ineligible: Vec<(ObjectKey, AttributionLoss)>,
     unexamined: BTreeSet<ObjectKey>,
+    /// Examined keys whose ranges still need the `map_files` proof.
+    examined_pending: Vec<(ObjectKey, Vec<&'a MapEntry>)>,
+}
+
+impl Classified<'_> {
+    /// The ranges of pending examined keys that need a stat, for an
+    /// unpinned stat.
+    fn pending_ranges(&self, index: &KnownKeyIndex) -> Vec<(u64, u64)> {
+        self.examined_pending
+            .iter()
+            .filter(|(key, _)| !index.key_is_identity(*key))
+            .flat_map(|(_, group)| group.iter().map(|entry| (entry.start, entry.end)))
+            .collect()
+    }
+
+    /// Settle the pending examined keys against `mapped`: a key whose
+    /// every range stats to an identity a deep scan examined is examined;
+    /// any other becomes unexamined.
+    fn settle_examined(&mut self, index: &KnownKeyIndex, mapped: &MappedIdentities) {
+        for (key, group) in std::mem::take(&mut self.examined_pending) {
+            let proven = index.key_is_identity(key)
+                || index.examined_identities(key).is_some_and(|files| {
+                    group.iter().all(|entry| {
+                        matches!(
+                            mapped.get(&(entry.start, entry.end)),
+                            Some(Ok(identity)) if files.contains(identity)
+                        )
+                    })
+                });
+            if !proven {
+                self.unexamined.insert(key);
+            }
+        }
+    }
 }
 
 fn classify_snapshot<'a>(index: &KnownKeyIndex, entries: &'a [MapEntry]) -> Classified<'a> {
@@ -332,13 +472,60 @@ fn classify_snapshot<'a>(index: &KnownKeyIndex, entries: &'a [MapEntry]) -> Clas
         match index.classify(key) {
             KeyClass::Match(object) => classified.matches.push((key, object, group)),
             KeyClass::Ineligible(loss) => classified.ineligible.push((key, loss)),
-            KeyClass::Examined => {}
+            KeyClass::Examined => classified.examined_pending.push((key, group)),
             KeyClass::Unexamined => {
                 classified.unexamined.insert(key);
             }
         }
     }
     classified
+}
+
+/// Whether every range of a matched group is the held object's file.
+fn prove_match(
+    expected: FileIdentity,
+    group: &[&MapEntry],
+    mapped: &MappedIdentities,
+) -> Result<(), (AttributionLoss, String)> {
+    for entry in group {
+        match mapped.get(&(entry.start, entry.end)) {
+            Some(Ok(identity)) if *identity == expected => {}
+            Some(Ok(identity)) => {
+                return Err((
+                    AttributionLoss::IdentityMismatch,
+                    format!(
+                        "the range {:x}-{:x} maps another file (st_dev {} st_ino {}, the \
+                         pinned object is st_dev {} st_ino {}): a maps key collision",
+                        entry.start,
+                        entry.end,
+                        identity.dev,
+                        identity.ino,
+                        expected.dev,
+                        expected.ino
+                    ),
+                ));
+            }
+            Some(Err(error)) => {
+                return Err((
+                    AttributionLoss::MapFilesUnavailable,
+                    format!(
+                        "the map_files identity of {:x}-{:x} could not be read: {error}",
+                        entry.start, entry.end
+                    ),
+                ));
+            }
+            None => {
+                return Err((
+                    AttributionLoss::MapFilesUnavailable,
+                    format!(
+                        "the map_files identity of {:x}-{:x} was not read",
+                        entry.start, entry.end
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn key_detail(key: ObjectKey) -> String {
@@ -361,6 +548,7 @@ pub(crate) fn attribute_unselected(
     budget: &mut CaptureWorkBudget,
 ) -> SweepAttribution {
     let mut out = SweepAttribution::default();
+    let prove = index.map_files_keys();
     for (pid, phase_one) in sweep {
         let pid = *pid;
         if selected.contains(&pid) {
@@ -371,7 +559,7 @@ pub(crate) fn attribute_unselected(
             continue;
         }
         let mut seen = BTreeSet::new();
-        let first = classify_snapshot(index, phase_one);
+        let mut first = classify_snapshot(index, phase_one);
         // Ineligible known keys are attribution losses either way: the
         // process maps a provider object it cannot be attributed to.
         let note_ineligible =
@@ -414,11 +602,20 @@ pub(crate) fn attribute_unselected(
                 );
             }
             note_ineligible(&mut out, &mut seen, &first.ineligible);
+            // No pin is needed to prove examined keys: a range that does
+            // not stat to an examined identity only counts as unexamined.
+            let ranges = first.pending_ranges(index);
+            let mapped = if ranges.is_empty() {
+                MappedIdentities::new()
+            } else {
+                probe.stat_ranges(pid, &ranges, budget)
+            };
+            first.settle_examined(index, &mapped);
             out.note_unexamined(pid, &first.unexamined);
             continue;
         }
         out.probed += 1;
-        let read = match probe.confirm(pid, budget) {
+        let read = match probe.confirm(pid, &prove, budget) {
             Confirmation::Confirmed(read) => read,
             Confirmation::Exited => {
                 out.exited.insert(pid);
@@ -426,14 +623,34 @@ pub(crate) fn attribute_unselected(
             }
             Confirmation::Lost(loss, detail) => {
                 out.note_loss(pid, loss, detail, &mut seen);
+                // Nothing was proven: pending examined keys are unexamined.
+                first.settle_examined(index, &MappedIdentities::new());
                 out.note_unexamined(pid, &first.unexamined);
                 continue;
             }
         };
-        let confirmed = classify_snapshot(index, &read.entries);
+        let mut confirmed = classify_snapshot(index, &read.entries);
+        confirmed.settle_examined(index, &read.mapped);
         note_ineligible(&mut out, &mut seen, &confirmed.ineligible);
         let mut objects = Vec::new();
         for (key, object, group) in &confirmed.matches {
+            let proven = match index.match_identity(*key) {
+                Some(_) if index.key_is_identity(*key) => Ok(()),
+                Some(expected) => prove_match(expected, group, &read.mapped),
+                None => Err((
+                    AttributionLoss::KeyRejected,
+                    "the key lost its proof".into(),
+                )),
+            };
+            if let Err((loss, detail)) = proven {
+                out.note_loss(
+                    pid,
+                    loss,
+                    format!("{}: {detail}", key_detail(*key)),
+                    &mut seen,
+                );
+                continue;
+            }
             match usable_path(group) {
                 Ok(path) => objects.push(MatchedObject {
                     key: *key,
@@ -578,6 +795,8 @@ pub(crate) fn budget_refusal(reason: &str) -> bool {
 /// decision order is unit-testable.
 pub(crate) trait ConfirmIo {
     type Pin;
+    /// The `map_files` identity of `[start, end)` in `pid`.
+    fn mapped_file(&self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String>;
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String>;
     fn start_time(&self, pin: &Self::Pin) -> Option<u64>;
     fn still_the_same(&self, pin: &Self::Pin) -> bool;
@@ -591,6 +810,7 @@ pub(crate) trait ConfirmIo {
 pub(crate) fn confirm_with<Io: ConfirmIo>(
     io: &mut Io,
     pid: u32,
+    prove: &BTreeSet<ObjectKey>,
     budget: &mut CaptureWorkBudget,
 ) -> Confirmation {
     let lost = |io: &Io, loss: AttributionLoss, detail: String| {
@@ -618,6 +838,22 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
         }
         Err(reason) => return lost(io, AttributionLoss::ConfirmUnreadable, reason),
     };
+    // The map_files proof is read while the pin holds; `still_the_same`
+    // below proves it was this generation's mapping.
+    let mut mapped = MappedIdentities::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| is_provider_mapping(entry) && prove.contains(&ObjectKey::of(entry)))
+    {
+        let range = (entry.start, entry.end);
+        if mapped.contains_key(&range) {
+            continue;
+        }
+        if let Err(reason) = budget.spend(1) {
+            return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
+        }
+        mapped.insert(range, io.mapped_file(pid, entry.start, entry.end));
+    }
     let after = io.exe(pid);
     if !io.still_the_same(&pin) {
         return lost(
@@ -652,6 +888,7 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
         start_time,
         exe: before,
         entries,
+        mapped,
     })
 }
 
@@ -661,6 +898,10 @@ pub(crate) struct OsConfirmIo;
 
 impl ConfirmIo for OsConfirmIo {
     type Pin = crate::process::PidPin;
+
+    fn mapped_file(&self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        crate::discovery::identity::map_files_identity(pid, start, end).map_err(|e| e.to_string())
+    }
 
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
         crate::process::PidPin::open(pid)
@@ -692,8 +933,33 @@ impl ConfirmIo for OsConfirmIo {
 pub(crate) struct OsMemberProbe;
 
 impl MemberProbe for OsMemberProbe {
-    fn confirm(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Confirmation {
-        confirm_with(&mut OsConfirmIo, pid, budget)
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        confirm_with(&mut OsConfirmIo, pid, prove, budget)
+    }
+
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        let mut mapped = MappedIdentities::new();
+        for &(start, end) in ranges {
+            if mapped.contains_key(&(start, end)) {
+                continue;
+            }
+            // Out of budget: the rest stay unproven (unexamined).
+            if budget.spend(1).is_err() {
+                break;
+            }
+            mapped.insert((start, end), OsConfirmIo.mapped_file(pid, start, end));
+        }
+        mapped
     }
 }
 

@@ -7,7 +7,7 @@
 //! authority the offline helper uses — so a scanned offset equals a manifest offset.
 
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::{Pin, pin_of};
+use crate::discovery::identity::{ExaminedObject, Pin, pin_of};
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::{InspectedObject, open_object};
@@ -1620,6 +1620,11 @@ pub struct Skipped {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedModule {
+    /// The kernel `vm_file` identity of the file this scan opened and read
+    /// (`identity::self_mapped_identity`), when `map_files` was readable:
+    /// the later pin must reopen exactly this file (a maps key alone is
+    /// not one file on btrfs). `None` when unreadable or not scanned.
+    pub mapped_identity: Option<crate::discovery::identity::FileIdentity>,
     /// Capture-local owner of every table and target contribution in this module.
     pub view: ProcessViewId,
     pub mount_namespace: MountNamespaceId,
@@ -2779,6 +2784,52 @@ fn opened_file_identity_guard(
     ))
 }
 
+/// Physical proof that the opened path is the mapped file. A maps key is
+/// not one file — on btrfs every subvolume renders the filesystem-wide
+/// device while inode numbers repeat across subvolumes — so
+/// `opened_file_identity_guard` cannot tell the opened path from another
+/// file with the same key. When `map_files` can be followed (`CAP_SYS_ADMIN`
+/// or `CAP_CHECKPOINT_RESTORE`), every mapped range's `vm_file` must equal
+/// the opened fd's own self-mapped `vm_file` — like for like, never
+/// `fstat` (see `identity::FileIdentity`: pre-6.8 overlayfs maps the
+/// backing file). Best effort by design: without the privilege, or for a
+/// range unmapped since, the path open and key match stay the proof,
+/// exactly as before; only a proven different file refuses.
+fn mapped_file_guard(
+    io: &mut impl ScanIo,
+    view: &ProcessView,
+    scanned: Option<crate::discovery::identity::FileIdentity>,
+    key: ObjectKey,
+    group: &[&MapEntry],
+) -> Result<(), String> {
+    let Some(expected) = scanned else {
+        return Ok(());
+    };
+    for entry in group {
+        let mapped = io.range_identity(view, entry.start, entry.end)?;
+        match mapped {
+            Ok(identity) if identity == expected => {}
+            Ok(identity) => {
+                return Err(format!(
+                    "mapped range {:x}-{:x} is another file (st_dev {} st_ino {}) than the opened \
+                     object (st_dev {} st_ino {}): maps key {}:{} inode {} names more than one file",
+                    entry.start,
+                    entry.end,
+                    identity.dev,
+                    identity.ino,
+                    expected.dev,
+                    expected.ino,
+                    key.device.major,
+                    key.device.minor,
+                    key.inode
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
     match error.raw_os_error() {
         Some(libc::EACCES | libc::EPERM) => ("ptrace", true),
@@ -2986,6 +3037,22 @@ trait ScanIo {
     fn maps_now(&self) -> Option<u64> {
         crate::attach::monotonic_ns()
     }
+    /// The opened object's own `vm_file`, when `map_files` is readable
+    /// (`identity::self_mapped_file`).
+    fn held_identity(&mut self, file: &File) -> Option<crate::discovery::identity::MappedFile> {
+        crate::discovery::identity::self_mapped_file(file).ok()
+    }
+    /// A target range's `vm_file` identity, read while the generation holds.
+    fn range_identity(
+        &mut self,
+        view: &ProcessView,
+        start: u64,
+        end: u64,
+    ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+        view.run_while_same(|| {
+            crate::discovery::identity::map_files_identity(view.pid(), start, end)
+        })
+    }
 }
 
 struct ProcScanIo;
@@ -3188,6 +3255,37 @@ fn scan_process_view_with_io(
     scan_process_view_with_io_mode(request, view, budget, io, true)
 }
 
+/// [`scan_process_view`] plus the objects this scan examined: opened,
+/// identified, and found to export nothing wanted, read from this scan's
+/// own maps snapshot (never an earlier sweep's). Empty when the scan's
+/// final bracket failed. C1b uses them to call a key examined.
+pub(crate) fn scan_process_view_examined(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+    let result = scan_view_with_examined(request, view, budget, &mut ProcScanIo, true);
+    #[cfg(test)]
+    {
+        let probe = result
+            .as_ref()
+            .map(|(outcome, _)| outcome.clone())
+            .map_err(Clone::clone);
+        crate::first_use_probe::scan_returned(view, true, budget, &probe);
+    }
+    result
+}
+
+fn scan_process_view_with_io_mode(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+    scan_memory: bool,
+) -> Result<ScanOutcome, String> {
+    scan_view_with_examined(request, view, budget, io, scan_memory).map(|(outcome, _)| outcome)
+}
+
 /// Post-read pin check: the export facts read after `before` are trusted only
 /// when a fresh pin still matches it. A mismatch refuses with the changed-file
 /// retry message; a failed re-pin refuses with the pin's own I/O message so a
@@ -3200,13 +3298,13 @@ fn check_pin_after_read(after: Result<Pin, String>, before: &Pin) -> Result<(), 
     }
 }
 
-fn scan_process_view_with_io_mode(
+fn scan_view_with_examined(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
     io: &mut impl ScanIo,
     scan_memory: bool,
-) -> Result<ScanOutcome, String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
     }
@@ -3223,11 +3321,14 @@ fn scan_process_view_with_io_mode(
         if capture_scan_reason(&reason) {
             skipped.push(scan_skip("capture discovery", reason));
         }
-        ScanOutcome::Scanned {
-            modules: Vec::new(),
-            skipped,
-            scan_ms: started.elapsed().as_millis() as u64,
-        }
+        (
+            ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped,
+                scan_ms: started.elapsed().as_millis() as u64,
+            },
+            Vec::new(),
+        )
     };
     let maps = match acquire_scan_maps(view, budget, io) {
         Ok(maps) => maps,
@@ -3238,6 +3339,7 @@ fn scan_process_view_with_io_mode(
         Err(reason) => return Ok(refused_initial(reason)),
     };
     let mut modules = Vec::new();
+    let mut examined: Vec<ExaminedObject> = Vec::new();
     let mut dependencies = BTreeMap::new();
     let mut skipped = Vec::new();
     // Group construction also consumes the capture's existing work allowance.
@@ -3350,6 +3452,12 @@ fn scan_process_view_with_io_mode(
             skipped.push(Skipped { subject, reason });
             continue;
         }
+        let held = io.held_identity(&file);
+        let scanned_identity = held.map(|held| held.identity);
+        if let Err(reason) = mapped_file_guard(io, view, scanned_identity, key, &group) {
+            skipped.push(Skipped { subject, reason });
+            continue;
+        }
         // Corroborate an inode-only match before attributing the object to the hint.
         let mut refusal = None;
         let attributable = matched.iter().any(|(index, kind)| {
@@ -3423,9 +3531,18 @@ fn scan_process_view_with_io_mode(
         };
         let layout = target_layout(abi);
         if request.hints.is_empty() && exports.is_empty() {
+            // Opened, identified, and read: examined, and not a provider.
+            if let Some(held) = held {
+                examined.push(ExaminedObject {
+                    key,
+                    identity: held.identity,
+                    key_is_identity: held.key_is_identity(key),
+                });
+            }
             continue;
         }
         let mut module = ScannedModule {
+            mapped_identity: scanned_identity,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key,
@@ -3616,6 +3733,7 @@ fn scan_process_view_with_io_mode(
                 ));
             }
             modules.clear();
+            examined.clear();
         }
     }
 
@@ -3631,7 +3749,7 @@ fn scan_process_view_with_io_mode(
             skipped,
         },
     };
-    Ok(outcome)
+    Ok((outcome, examined))
 }
 
 #[cfg(test)]
@@ -3682,6 +3800,12 @@ mod tests {
         fail_read_b: bool,
         fail_generation: bool,
         expire_at_b: bool,
+        /// Scripted `vm_file` identities (held fd, every target range); `None`
+        /// reads the real ones.
+        mapped: Option<(
+            crate::discovery::identity::FileIdentity,
+            crate::discovery::identity::FileIdentity,
+        )>,
     }
 
     struct BracketMemory {
@@ -3745,6 +3869,28 @@ mod tests {
                 Some(u64::MAX)
             } else {
                 crate::attach::monotonic_ns()
+            }
+        }
+        fn held_identity(&mut self, file: &File) -> Option<crate::discovery::identity::MappedFile> {
+            match self.mapped {
+                Some((held, _)) => Some(crate::discovery::identity::MappedFile {
+                    identity: held,
+                    fs_magic: None,
+                }),
+                None => crate::discovery::identity::self_mapped_file(file).ok(),
+            }
+        }
+        fn range_identity(
+            &mut self,
+            view: &ProcessView,
+            start: u64,
+            end: u64,
+        ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+            match self.mapped {
+                Some((_, range)) => Ok(Ok(range)),
+                None => view.run_while_same(|| {
+                    crate::discovery::identity::map_files_identity(view.pid(), start, end)
+                }),
             }
         }
         fn final_generation(&mut self, view: &ProcessView) -> Result<(), String> {
@@ -3847,6 +3993,7 @@ mod tests {
                 fail_read_b: false,
                 fail_generation: false,
                 expire_at_b: false,
+                mapped: None,
             }
         }
 
@@ -3890,6 +4037,47 @@ mod tests {
                 outcome.skipped()
             );
         }
+    }
+
+    #[test]
+    fn a_mapped_range_of_another_file_with_the_same_key_refuses_the_object() {
+        use crate::discovery::identity::FileIdentity;
+        let read = FileIdentity { dev: 37, ino: 9 };
+
+        // Every range is the opened file: scanned, and the module carries the
+        // identity the later pin must reopen.
+        let mut same = BracketFixture::new(8, true);
+        same.mapped = Some((read, read));
+        let outcome = same.run(&mut CaptureWorkBudget::default()).unwrap();
+        let module = outcome
+            .modules()
+            .iter()
+            .find(|module| module.path == same.path.display().to_string())
+            .unwrap_or_else(|| panic!("{:?}", outcome.skipped()));
+        assert_eq!(module.mapped_identity, Some(read));
+        assert!(!module.tables.is_empty(), "{:?}", outcome.skipped());
+
+        // Same maps key, but the target maps another subvolume's file
+        // (btrfs): the object is refused, never scanned as the opened path.
+        let mut other = BracketFixture::new(8, true);
+        other.mapped = Some((read, FileIdentity { dev: 47, ino: 9 }));
+        let outcome = other.run(&mut CaptureWorkBudget::default()).unwrap();
+        assert!(
+            outcome
+                .modules()
+                .iter()
+                .all(|module| module.path != other.path.display().to_string()),
+            "{:?}",
+            outcome.modules()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("names more than one file")),
+            "{:?}",
+            outcome.skipped()
+        );
     }
 
     #[test]
@@ -5461,7 +5649,15 @@ mod tests {
         for decision in [
             "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
             "if hinted && !attributable {",
-            "if request.hints.is_empty() && exports.is_empty() {\n            continue;\n        }",
+            "if request.hints.is_empty() && exports.is_empty() {\n            \
+             // Opened, identified, and read: examined, and not a provider.\n            \
+             if let Some(held) = held {\n                \
+             examined.push(ExaminedObject {\n                    \
+             key,\n                    \
+             identity: held.identity,\n                    \
+             key_is_identity: held.key_is_identity(key),\n                \
+             });\n            }\n            \
+             continue;\n        }",
         ] {
             assert!(
                 scan_body.contains(decision),

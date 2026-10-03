@@ -460,7 +460,8 @@ uncertainty that forces `PARTIAL`.
 
 **Historical pre-terminal-drain output**, `profile --mode metrics` against a
 SoftHSM2 workload (`scripts/verify-attach-e2e.sh`). Current written captures
-end `PARTIAL` even with zero concrete gaps, as explained below:
+end `COMPLETE` only when the stop gate proves the final drain, as explained
+below:
 
 ```
 FUNCTION                        CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
@@ -478,7 +479,8 @@ for a clean scan-only capture (`verdict_detail: "attribution_only"`: counts
 are exact, only semantic interpretation is withheld), or
 `→ PARTIAL: observation lossy (12 events lost)` for a lossy one
 (`"concrete_gap"`). `→ PARTIAL: terminal drain unproven` means nothing
-concrete is behind the verdict (`"clean_but_unproven"`).
+concrete is behind the verdict (`"clean_but_unproven"`): the stop gate did
+not prove the final drain (see `evidence.stop_quiescence`).
 
 **Historical pre-terminal-drain output**, `trace` against the same workload
 (`scripts/verify-attach-e2e.sh`'s harness, captured while writing this doc —
@@ -723,7 +725,13 @@ temporary session after preflighting exec/exit lifecycle links and every
 requested PID/cgroup scope. T3/T4 come only from those observed operations;
 they are never inferred from uid, seccomp mode, sysctls, or capabilities.
 `CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN`,
-`CAP_PERFMON`, `CAP_BPF`, and `CAP_CHECKPOINT_RESTORE` are diagnostic rows only.
+`CAP_PERFMON`, `CAP_BPF`, and `CAP_CHECKPOINT_RESTORE` are diagnostic rows
+for the tier. One inventory proof does depend on them: `inventory --system`
+attributes a caller past `--max-scan-pids` by its maps only after proving
+each mapped range with `/proc/<pid>/map_files`. Following `map_files` needs
+`CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`; without either, those past-cap
+callers are counted as `map_files_unavailable` losses and discovery stays
+incomplete rather than guessed.
 There is no `CAP_SYS_RESOURCE` or `RLIMIT_MEMLOCK` requirement claim.
 
 The attach floor is backend-dependent. In `auto` mode the product attempts
@@ -964,15 +972,26 @@ failure to report, so "found something" is part of the verdict rather than
 something a reader has to check separately. The schema document lists every
 field and the explicitly informational exceptions.
 
-**In a written profile you will not see `COMPLETE`.** Detaching a perf link
-stops new probe invocations but does not wait for BPF callbacks already
-running on another CPU, so a terminal snapshot cannot honestly claim it
-drained everything, and the final document is downgraded to `PARTIAL` on the
-way out. The verdict above still governs the live display during capture.
-What a clean run looks like is `PARTIAL` with every concrete gap counter at
-zero — that is exactly what the release lanes assert, via
-`scripts/check-capture-evidence.py: terminal_capture_is_clean`. If you are
-diffing against older notes that record `COMPLETE` rows, this is the reason.
+**A written capture is `COMPLETE` only behind a proven stop.** Detaching a
+perf link stops new probe invocations but does not wait for BPF callbacks
+already running on another CPU, so the terminal snapshot is taken behind the
+stop gate instead: on stop, p11scope refuses new callbacks, waits up to 5 s
+for every admitted one to finish (quiescence), then drains both rings to the
+positions read at that point and publishes before it detaches. When
+quiescence is proven, neither ring holds a record past those positions, and
+the build is x86_64, `evidence.drain_proven` is true and a clean run is
+`COMPLETE` (`verdict_detail: "clean_proven"`). Otherwise the final document is
+downgraded to `PARTIAL` on the way out: `evidence.stop_quiescence` says
+whether quiescence was `proven`, `unproven` (stderr also prints
+`QuiescenceUnproven`, with the calls still in flight), or `not_reached`, and
+whether a post-quiescence record reached either ring (an ungated writer,
+also named on stderr). Other architectures always keep the terminal
+`PARTIAL`: the proof relies on x86's fully ordered atomic add. The verdict
+above still governs the live display during capture. A clean run whose drain
+stayed unproven is `PARTIAL` with every concrete gap counter at zero — the
+release lanes accept either clean outcome via
+`scripts/check-capture-evidence.py: terminal_capture_is_clean`, which
+requires `COMPLETE` exactly when the drain is proven.
 
 `COMPLETE` describes the completeness of the accepted capture window. It is
 not a claim that deliberately malicious native provider code truthfully

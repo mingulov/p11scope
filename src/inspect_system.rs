@@ -27,18 +27,18 @@ use crate::attach::Scope;
 use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
 use crate::discovery::engine::{
-    MAX_SCAN_PIDS, scope_pids, select_deep_scan_candidates, sweep_process_maps,
-    unreadable_member_skip,
+    MAX_SCAN_PIDS, is_provider_mapping, scope_pids, select_deep_scan_candidates,
+    sweep_process_maps, unreadable_member_skip,
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
-    PinnedObjectId, PinnedObjects, ReconciledModule, bind_scanned_modules,
+    ExaminedObject, PinnedObjectId, PinnedObjects, ReconciledModule, bind_scanned_modules,
     canonicalize_scanned_overlays, pin_scanned_view_objects,
 };
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
-    scan_skip_truncates,
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped,
+    scan_process_view_examined, scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
     AttributionLoss, KnownKeyIndex, MatchedObject, MemberProbe, ObjectChecks, OsMemberProbe,
@@ -48,7 +48,7 @@ use crate::plan::{self, AdmissionPolicy, AdmissionScope};
 use crate::process::{ProcessView, ProcessViewId, generation_gone};
 use crate::timing::{StageKind, StageTimings};
 use anyhow::Result;
-use p11scope_manifest::maps::MapEntry;
+use p11scope_manifest::maps::{MapEntry, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -226,6 +226,9 @@ struct MemberResult {
     status: MemberStatus,
     generation: Option<MemberGeneration>,
     modules: Vec<ScannedModule>,
+    /// Objects this member's own deep scan examined without finding a
+    /// module (C1b "examined" keys; empty unless the scan completed).
+    examined: Vec<ExaminedObject>,
     pins: PinnedObjects,
     gaps: Vec<PidGap>,
     scan_ms: u64,
@@ -410,9 +413,12 @@ fn scan_member(
             gaps,
         );
     }
-    let outcome = match scan_process_view(&ScanRequest { pid, hints, hooks }, &view_handle, budget)
-    {
-        Ok(outcome) => outcome,
+    let (outcome, examined) = match scan_process_view_examined(
+        &ScanRequest { pid, hints, hooks },
+        &view_handle,
+        budget,
+    ) {
+        Ok(scanned) => scanned,
         Err(error) => {
             return member_not_scanned(
                 pid,
@@ -476,6 +482,7 @@ fn scan_member(
         status,
         generation: Some(generation),
         modules,
+        examined,
         pins,
         gaps,
         scan_ms,
@@ -507,6 +514,7 @@ fn member_not_scanned(
         status,
         generation: None,
         modules: Vec::new(),
+        examined: Vec::new(),
         pins: PinnedObjects::empty(),
         gaps,
         scan_ms: 0,
@@ -946,13 +954,25 @@ fn attribute_sweep(
         })
         .map(|member| member.pid)
         .collect();
+    // Examined objects come from each complete deep scan's own maps read
+    // (never the earlier sweep snapshot, which a later unload would make
+    // stale), each with the proof another process needs for its key.
     let examined = collection
+        .members
+        .iter()
+        .filter(|member| complete.contains(&member.pid))
+        .flat_map(|member| member.examined.iter().copied());
+    let (index, mut refused) = KnownKeyIndex::build(modules, &match_keys, examined, checks);
+    let selected: BTreeSet<u32> = collection.selected.iter().copied().collect();
+    // A refused object is a loss only where an unselected process maps it.
+    let unselected_keys: BTreeSet<ObjectKey> = collection
         .sweep
         .iter()
-        .filter(|(pid, _)| complete.contains(pid))
-        .flat_map(|(_, entries)| entries);
-    let (index, refused) = KnownKeyIndex::build(modules, &match_keys, examined, checks);
-    let selected: BTreeSet<u32> = collection.selected.iter().copied().collect();
+        .filter(|(pid, _)| !selected.contains(pid))
+        .flat_map(|(_, entries)| entries.iter().filter(|entry| is_provider_mapping(entry)))
+        .map(ObjectKey::of)
+        .collect();
+    refused.retain(|object| unselected_keys.contains(&object.key));
     eprintln!(
         "p11scope: attributing {} unselected processes by maps identity...",
         collection.sweep.len().saturating_sub(selected.len())
@@ -2168,7 +2188,8 @@ mod tests {
     mod c1b {
         use super::super::*;
         use crate::discovery::identity::test_fixture::{PATH, SHA, module, view_pin};
-        use crate::discovery::sweep_attribution::{Confirmation, ConfirmedRead};
+        use crate::discovery::identity::{FileIdentity, MappedFile};
+        use crate::discovery::sweep_attribution::{Confirmation, ConfirmedRead, MappedIdentities};
         use p11scope_manifest::maps::{Device, ObjectKey};
         use std::collections::HashMap;
 
@@ -2176,6 +2197,20 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode: 4_242,
         };
+        /// The `vm_file` identities the scripted `map_files` reads return:
+        /// one file per inode (a subvolume-style device, never the maps one).
+        const PROVIDER_FILE: FileIdentity = FileIdentity {
+            dev: 37,
+            ino: 4_242,
+        };
+        const LIBC_FILE: FileIdentity = FileIdentity { dev: 37, ino: 11 };
+
+        fn vm_file(entry: &MapEntry) -> FileIdentity {
+            FileIdentity {
+                dev: 37,
+                ino: entry.inode,
+            }
+        }
 
         fn entry(start: u64, perms: &[u8; 4], inode: u64, path: &str) -> MapEntry {
             MapEntry {
@@ -2218,15 +2253,44 @@ mod tests {
         struct Probe(HashMap<u32, Vec<MapEntry>>, HashMap<u32, Confirmation>);
 
         impl MemberProbe for Probe {
-            fn confirm(&mut self, pid: u32, _: &mut CaptureWorkBudget) -> Confirmation {
+            fn confirm(
+                &mut self,
+                pid: u32,
+                _: &BTreeSet<ObjectKey>,
+                _: &mut CaptureWorkBudget,
+            ) -> Confirmation {
                 if let Some(scripted) = self.1.get(&pid) {
                     return scripted.clone();
                 }
+                let entries = self.0.get(&pid).cloned().unwrap_or_default();
+                let mapped = entries
+                    .iter()
+                    .map(|entry| ((entry.start, entry.end), Ok(vm_file(entry))))
+                    .collect();
                 Confirmation::Confirmed(ConfirmedRead {
                     start_time: 9_000 + u64::from(pid),
                     exe: exe(),
-                    entries: self.0.get(&pid).cloned().unwrap_or_default(),
+                    entries,
+                    mapped,
                 })
+            }
+
+            fn stat_ranges(
+                &mut self,
+                pid: u32,
+                ranges: &[(u64, u64)],
+                _: &mut CaptureWorkBudget,
+            ) -> MappedIdentities {
+                let entries = self.0.get(&pid).cloned().unwrap_or_default();
+                ranges
+                    .iter()
+                    .filter_map(|range| {
+                        entries
+                            .iter()
+                            .find(|entry| (entry.start, entry.end) == *range)
+                            .map(|entry| (*range, Ok(vm_file(entry))))
+                    })
+                    .collect()
             }
         }
 
@@ -2234,14 +2298,22 @@ mod tests {
         /// whose real metadata never matches the forged pin.
         struct Checks {
             changed: bool,
+            /// Scripts every object onto a filesystem without unique inodes.
+            nonunique: Option<&'static str>,
         }
 
         impl ObjectChecks for Checks {
             fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
-                Ok(None)
+                Ok(self.nonunique)
             }
             fn unchanged(&self, _: PinnedObjectId) -> Result<bool, String> {
                 Ok(!self.changed)
+            }
+            fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
+                Ok(MappedFile {
+                    identity: PROVIDER_FILE,
+                    fs_magic: None,
+                })
             }
         }
 
@@ -2260,6 +2332,12 @@ mod tests {
                     exe: Some(exe()),
                 }),
                 modules,
+                // Each deep scan examined libc and found no provider.
+                examined: vec![ExaminedObject {
+                    key: ObjectKey::of(&libc()[0]),
+                    identity: LIBC_FILE,
+                    key_is_identity: false,
+                }],
                 pins,
                 gaps: Vec::new(),
                 scan_ms: 1,
@@ -2306,9 +2384,115 @@ mod tests {
             let snapshots: HashMap<u32, Vec<MapEntry>> = collection.sweep.iter().cloned().collect();
             let bound = bind_collection(&mut collection);
             let mut probe = Probe(snapshots, overrides);
-            let attributed =
-                attribute_sweep(&mut collection, &bound, &mut probe, &Checks { changed });
+            let checks = Checks {
+                changed,
+                nonunique: None,
+            };
+            let attributed = attribute_sweep(&mut collection, &bound, &mut probe, &checks);
             assemble(collection, bound, attributed, AdmissionPolicy::detailed())
+        }
+
+        fn catalog_with(mut collection: Collection, checks: &Checks) -> Catalog {
+            let snapshots: HashMap<u32, Vec<MapEntry>> = collection.sweep.iter().cloned().collect();
+            let bound = bind_collection(&mut collection);
+            let mut probe = Probe(snapshots, HashMap::new());
+            let attributed = attribute_sweep(&mut collection, &bound, &mut probe, checks);
+            assemble(collection, bound, attributed, AdmissionPolicy::detailed())
+        }
+
+        fn capped_gaps(catalog: &Catalog) -> Vec<&PidGap> {
+            catalog
+                .skipped
+                .iter()
+                .filter(|gap| gap.subject == "discovery capped")
+                .collect()
+        }
+
+        fn attribution_complete(catalog: &Catalog) -> bool {
+            catalog
+                .notes
+                .iter()
+                .any(|note| note.reason.starts_with("attribution complete"))
+        }
+
+        /// Review fix (Important 2): "examined" comes from the deep scan's
+        /// own read. The representative's phase-1 snapshot still showed
+        /// `libunknown.so`, but its deep scan did not examine it (unloaded
+        /// in between): another process mapping it is unexamined, so the
+        /// pass is capped, never complete.
+        #[test]
+        fn a_key_only_the_representatives_sweep_snapshot_showed_stays_unexamined() {
+            let other = vec![
+                entry(0x5000_0000, b"r--p", 77, "/opt/vendor/libunknown.so"),
+                entry(0x5000_1000, b"r-xp", 77, "/opt/vendor/libunknown.so"),
+            ];
+            let catalog = catalog_of(
+                over_cap(&[(20_000, other.clone()), (20_005, other)]),
+                HashMap::new(),
+                false,
+            );
+            assert_eq!(catalog.scan_status, "partial");
+            assert_eq!((catalog.unexamined, catalog.unexamined_objects), (1, 1));
+            assert_eq!(capped_gaps(&catalog).len(), 1, "{:?}", catalog.skipped);
+            assert!(!attribution_complete(&catalog));
+        }
+
+        /// Review fix (Minor 3): a process past the cap with no maps
+        /// snapshot leaves the pass capped even when nothing is unexamined.
+        #[test]
+        fn an_unavailable_snapshot_alone_keeps_discovery_capped() {
+            let mut collection = over_cap(&[]);
+            if let Some((_, entries)) = collection.sweep.iter_mut().find(|(pid, _)| *pid == 20_100)
+            {
+                entries.clear();
+            }
+            collection.sweep_unavailable.insert(20_100);
+            let catalog = catalog_of(collection, HashMap::new(), false);
+            assert_eq!(catalog.unexamined, 0);
+            assert_eq!(catalog.scan_status, "partial");
+            let capped = capped_gaps(&catalog);
+            assert_eq!(capped.len(), 1, "{:?}", catalog.skipped);
+            assert!(
+                capped[0]
+                    .reason
+                    .ends_with("; 1 processes past the cap had no maps snapshot"),
+                "{}",
+                capped[0].reason
+            );
+            assert!(!attribution_complete(&catalog));
+        }
+
+        /// Review fix (Minor 5): an object refused for non-unique inodes is
+        /// a gap only when a process past the cap maps it.
+        #[test]
+        fn a_refused_nonunique_inode_object_is_a_gap_only_where_unselected_processes_map_it() {
+            let fuse = Checks {
+                changed: false,
+                nonunique: Some("fuse"),
+            };
+            let refused_gap = |catalog: &Catalog| {
+                catalog
+                    .skipped
+                    .iter()
+                    .any(|gap| gap.reason.starts_with("on a fuse filesystem"))
+            };
+            let mapped = catalog_with(over_cap(&[]), &fuse);
+            assert!(refused_gap(&mapped), "{:?}", mapped.skipped);
+            assert_eq!(
+                mapped.attribution_losses[&AttributionLoss::InodeNotUnique],
+                299
+            );
+
+            let mut alone = over_cap(&[]);
+            alone
+                .sweep
+                .retain(|(pid, _)| !(10_001..10_300).contains(pid));
+            alone
+                .enumerated
+                .retain(|pid| !(10_001..10_300).contains(pid));
+            let alone = catalog_with(alone, &fuse);
+            assert!(!refused_gap(&alone), "{:?}", alone.skipped);
+            assert_eq!(alone.scan_status, "complete", "{:?}", alone.skipped);
         }
 
         fn statuses(catalog: &Catalog) -> BTreeMap<&'static str, usize> {
@@ -2594,6 +2778,7 @@ mod tests {
                             .into(),
                     },
                     modules: Vec::new(),
+                    examined: Vec::new(),
                     pins: PinnedObjects::empty(),
                     gaps: Vec::new(),
                     scan_ms: 0,
@@ -2604,6 +2789,7 @@ mod tests {
                     status: MemberStatus::Exited,
                     generation: None,
                     modules: Vec::new(),
+                    examined: Vec::new(),
                     pins: PinnedObjects::empty(),
                     gaps: Vec::new(),
                     scan_ms: 0,

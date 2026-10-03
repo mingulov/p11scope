@@ -123,6 +123,56 @@ pub const VERDICT_CONCRETE_GAP: &str = "concrete_gap";
 /// (review answer (a)). Still `PARTIAL`.
 pub const VERDICT_ATTRIBUTION_ONLY: &str = "attribution_only";
 
+/// How the terminal stop gate ended (owner ruling B, 2026-09-25).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuiescenceState {
+    /// No terminal stop gate ran: a live snapshot, or a path that never
+    /// reached the terminal drain.
+    #[default]
+    NotReached,
+    /// The stop gate observed quiescence (Q): no admitted BPF body was
+    /// still running, and both terminal drains ran to the positions read
+    /// at Q.
+    Proven,
+    /// The owner budget expired without Q (`QuiescenceUnproven`).
+    Unproven,
+}
+
+/// Terminal stop-gate evidence: the quiescence outcome and the two post-Q
+/// invariant flags (a record past the Q position on either ring means an
+/// ungated writer). Published so the reason a drain stayed unproven is in
+/// the document, not only on stderr.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct StopQuiescence {
+    pub state: QuiescenceState,
+    pub post_q_events: bool,
+    pub post_q_discovery: bool,
+}
+
+impl StopQuiescence {
+    /// Owner ruling B: a proven Q plus a drain to the Q positions proves
+    /// the terminal drain, on x86_64 only. Either post-Q flag, an unproven
+    /// or missing Q, or another architecture keeps it unproven.
+    pub fn proves_drain(&self) -> bool {
+        self.proves_drain_on(DRAIN_PROOF_ARCH)
+    }
+
+    /// The ruling with the architecture decision injected, so the arm64
+    /// cell is testable on an x86_64 host.
+    pub(crate) fn proves_drain_on(&self, arch_proves: bool) -> bool {
+        arch_proves
+            && self.state == QuiescenceState::Proven
+            && !self.post_q_events
+            && !self.post_q_discovery
+    }
+}
+
+/// Whether this build's architecture carries the quiescence proof. The
+/// argument rests on x86's lock-prefixed add being a full barrier; arm64
+/// JITs the non-fetch add without barriers, so it stays unproven there.
+pub(crate) const DRAIN_PROOF_ARCH: bool = cfg!(target_arch = "x86_64");
+
 /// The skip reason of a NULL function-table entry. A NULL pointer can never
 /// be called, so no call can be missed through it: it is a published fact,
 /// never an observation gap.
@@ -767,11 +817,13 @@ pub struct Evidence {
     pub discovery: DiscoveryEvidence,
     /// Consumer-scheduling evidence: which bound broke, and phase timings.
     pub scheduling: SchedulingEvidence,
-    /// Terminal drain settlement latch (SYSPLAN residual F-02). False until
-    /// a bounded quiescence/settlement experiment proves the terminal drain
-    /// saw every in-flight callback. The terminal seal forces PARTIAL while
-    /// false, so a future COMPLETE requires this latch — never call-site
-    /// discipline.
+    /// The terminal stop gate's outcome and post-Q flags (owner ruling B).
+    pub stop_quiescence: StopQuiescence,
+    /// Terminal drain settlement latch (SYSPLAN residual F-02). Set only by
+    /// [`Evidence::apply_stop_quiescence`] from a proven stop-gate Q with
+    /// both drains run to the Q positions and no post-Q record, on x86_64
+    /// (owner ruling B). The terminal seal forces PARTIAL while false, so a
+    /// COMPLETE requires this latch — never call-site discipline.
     pub drain_proven: bool,
     /// Which terminal story `completeness` tells: [`VERDICT_CLEAN_PROVEN`],
     /// [`VERDICT_CLEAN_BUT_UNPROVEN`], [`VERDICT_ATTRIBUTION_ONLY`], or
@@ -1430,15 +1482,24 @@ impl Evidence {
         self.mark_terminal_drain_unproven();
     }
 
+    /// Records the terminal stop gate's outcome and derives the
+    /// `drain_proven` latch from it — the latch's only setter. Run before
+    /// the terminal seal: a post-Q flag or an unproven Q leaves the latch
+    /// false, so the seal keeps PARTIAL.
+    pub(crate) fn apply_stop_quiescence(&mut self, stop: StopQuiescence) {
+        self.stop_quiescence = stop;
+        self.drain_proven = stop.proves_drain();
+    }
+
     /// A detached perf link stops new invocations but does not wait for BPF
-    /// callbacks already executing on another CPU. Until capture has a real
-    /// kernel quiescence barrier, a terminal snapshot cannot be COMPLETE —
-    /// and from here on that gate is the `drain_proven` latch, not this
-    /// function's unconditional assignment: a future settlement experiment
-    /// sets the latch, and only then may a terminal COMPLETE survive the
-    /// seal. Nothing sets the latch today, so every terminal document stays
-    /// PARTIAL — but clean-but-unproven and concrete-gap runs now say which
-    /// they are (SYSPLAN residual F-02). PARTIAL is split, never deleted.
+    /// callbacks already executing on another CPU. Only the stop gate's
+    /// proven quiescence closes that window, and that proof reaches the
+    /// verdict as the `drain_proven` latch, never as this function's
+    /// unconditional assignment: [`Evidence::apply_stop_quiescence`] sets
+    /// the latch, and only then may a terminal COMPLETE survive the seal.
+    /// Without it every terminal document stays PARTIAL, and clean-but-
+    /// unproven and concrete-gap runs say which they are (SYSPLAN residual
+    /// F-02). PARTIAL is split, never deleted.
     pub fn mark_terminal_drain_unproven(&mut self) {
         if self.drain_proven {
             return;
@@ -2439,6 +2500,7 @@ pub(crate) mod tests {
                 ..DiscoveryEvidence::default()
             },
             scheduling: SchedulingEvidence::default(),
+            stop_quiescence: Default::default(),
             drain_proven: false,
             verdict_detail: VERDICT_CONCRETE_GAP,
             gap_classes: GapClasses::default(),
@@ -3131,6 +3193,7 @@ pub(crate) mod tests {
             object,
             entry_objects: vec![vec![object, object], vec![object]],
             scanned: ScannedModule {
+                mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
@@ -3236,6 +3299,7 @@ pub(crate) mod tests {
             object: crate::plan::TEST_PINNED_OBJECT,
             entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
             scanned: ScannedModule {
+                mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
@@ -6060,6 +6124,100 @@ pub(crate) mod tests {
         let value = versioned_evidence(&proven);
         assert_eq!(value["drain_proven"], true);
         assert_eq!(value["verdict_detail"], "clean_proven");
+    }
+
+    fn stop(state: QuiescenceState, post_q_events: bool, post_q_discovery: bool) -> StopQuiescence {
+        StopQuiescence {
+            state,
+            post_q_events,
+            post_q_discovery,
+        }
+    }
+
+    // SG-T7B (owner ruling B, 2026-09-25): a proven Q plus a drain to the
+    // Q positions sets the latch, so a clean Detailed x86_64 terminal
+    // document is COMPLETE / clean_proven, with the stop-gate outcome
+    // published beside it.
+    #[test]
+    fn a_proven_quiescence_seals_a_clean_terminal_document_complete() {
+        let mut ev = evidence();
+        ev.apply_stop_quiescence(stop(QuiescenceState::Proven, false, false));
+        ev.settle_terminal(true);
+        // The ordinary suite runs on x86_64, the architecture the proof covers.
+        assert!(ev.drain_proven);
+        assert_eq!(ev.completeness, "COMPLETE");
+        assert_eq!(ev.verdict_detail, VERDICT_CLEAN_PROVEN);
+        let value = versioned_evidence(&ev);
+        assert_eq!(value["completeness"], "COMPLETE");
+        assert_eq!(value["drain_proven"], true);
+        assert_eq!(value["gap_classes"]["settlement"], "proven");
+        assert_eq!(
+            value["stop_quiescence"],
+            serde_json::json!({
+                "state": "proven",
+                "post_q_events": false,
+                "post_q_discovery": false,
+            })
+        );
+        assert_eq!(verdict_reasons(&ev), "");
+    }
+
+    // Ruling B's conditions: either post-Q flag, an unproven Q, or no
+    // terminal Q forces the latch false before the seal, so a clean run
+    // stays PARTIAL / clean_but_unproven and says why in the document.
+    #[test]
+    fn post_q_flags_and_unproven_quiescence_keep_a_clean_terminal_partial() {
+        for (name, cell) in [
+            ("post-Q EVENTS", stop(QuiescenceState::Proven, true, false)),
+            (
+                "post-Q DISCOVERY",
+                stop(QuiescenceState::Proven, false, true),
+            ),
+            ("both post-Q", stop(QuiescenceState::Proven, true, true)),
+            ("unproven Q", stop(QuiescenceState::Unproven, false, false)),
+            ("no Q", stop(QuiescenceState::NotReached, false, false)),
+        ] {
+            let mut ev = evidence();
+            ev.drain_proven = true; // a stale latch must not survive
+            ev.apply_stop_quiescence(cell);
+            ev.settle_terminal(true);
+            assert!(!ev.drain_proven, "{name}");
+            assert_eq!(ev.completeness, "PARTIAL", "{name}");
+            assert_eq!(ev.verdict_detail, VERDICT_CLEAN_BUT_UNPROVEN, "{name}");
+            let value = versioned_evidence(&ev);
+            assert_eq!(value["gap_classes"]["settlement"], "unproven", "{name}");
+            assert_eq!(
+                value["stop_quiescence"]["post_q_events"], cell.post_q_events,
+                "{name}"
+            );
+            assert_eq!(
+                value["stop_quiescence"]["post_q_discovery"], cell.post_q_discovery,
+                "{name}"
+            );
+        }
+    }
+
+    // A proven drain never hides a concrete gap: loss stays PARTIAL with
+    // its own detail.
+    #[test]
+    fn a_proven_quiescence_keeps_a_lossy_terminal_partial() {
+        let mut ev = evidence();
+        ev.event_loss = 1;
+        ev.apply_stop_quiescence(stop(QuiescenceState::Proven, false, false));
+        ev.settle_terminal(true);
+        assert!(ev.drain_proven);
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+    }
+
+    // arm64 keeps the unconditional PARTIAL: the architecture without the
+    // barrier argument never proves the drain, whatever the gate saw.
+    #[test]
+    fn the_drain_proof_is_scoped_to_the_x86_64_architecture() {
+        let clean = stop(QuiescenceState::Proven, false, false);
+        assert!(clean.proves_drain_on(true));
+        assert!(!clean.proves_drain_on(false), "arm64 keeps PARTIAL");
+        assert_eq!(clean.proves_drain(), cfg!(target_arch = "x86_64"));
     }
 
     #[test]

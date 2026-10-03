@@ -328,6 +328,46 @@ class VerdictRecompute(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.checker["exact_terminal_verdict"](evidence)
 
+    def proven(self, **stop):
+        """A clean document whose drain the stop gate proved (ruling B)."""
+        evidence = self.evidence()
+        evidence["stop_quiescence"] = dict(
+            {"state": "proven", "post_q_events": False, "post_q_discovery": False}, **stop
+        )
+        evidence["drain_proven"] = True
+        self.checker["settle_fixture_verdict"](evidence)
+        evidence["completeness"] = self.checker["expected_terminal_completeness"](evidence)
+        return evidence
+
+    def test_a_proven_clean_drain_is_complete(self):
+        evidence = self.proven()
+        self.assertEqual(evidence["verdict_detail"], "clean_proven")
+        self.assertEqual(evidence["completeness"], "COMPLETE")
+        self.checker["exact_terminal_verdict"](evidence)
+        partial = dict(evidence, completeness="PARTIAL")
+        with self.assertRaises(AssertionError):
+            self.checker["exact_terminal_verdict"](partial)
+
+    def test_the_latch_needs_a_proven_quiescence_without_post_q_records(self):
+        for stop in (
+            {"post_q_events": True},
+            {"post_q_discovery": True},
+            {"state": "unproven"},
+            {"state": "not_reached"},
+        ):
+            with self.subTest(stop=stop), self.assertRaises(AssertionError):
+                self.checker["exact_terminal_verdict"](self.proven(**stop))
+
+    def test_a_post_q_flag_needs_a_proven_quiescence(self):
+        evidence = self.evidence()
+        evidence["stop_quiescence"] = {
+            "state": "unproven", "post_q_events": True, "post_q_discovery": False,
+        }
+        with self.assertRaises(AssertionError):
+            self.checker["exact_terminal_verdict"](evidence)
+        evidence["stop_quiescence"]["state"] = "proven"
+        self.checker["exact_terminal_verdict"](evidence)
+
     def test_withheld_names_alone_are_attribution_only(self):
         evidence = self.evidence(semantic_unverified_slots=68)
         self.assertEqual(evidence["verdict_detail"], "attribution_only")

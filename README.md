@@ -373,10 +373,12 @@ report format.
 - A trace is evidence about the observed window only; the profile includes an
   explicit evidence-quality/completeness section (attach failures, aliased
   functions, event loss) — `COMPLETE`/`PARTIAL`, never silently confident.
-  **A terminal snapshot is always `PARTIAL`**: detaching a perf link stops new
-  invocations but does not wait for BPF callbacks already running on another
-  CPU, so a completed capture cannot honestly claim a proven final drain.
-  `evidence.verdict_detail` says what is behind a `PARTIAL`:
+  **A terminal snapshot is `COMPLETE` only behind a proven stop**: detaching a
+  perf link does not wait for BPF callbacks already running on another CPU,
+  so the final drain counts as proven (`evidence.drain_proven`) only when the
+  stop gate observed quiescence and no record arrived past it, on x86_64
+  (`evidence.stop_quiescence` says which); otherwise the terminal verdict is
+  `PARTIAL`. `evidence.verdict_detail` says what is behind a `PARTIAL`:
   `clean_but_unproven` (no gap; only the final drain is unproven),
   `attribution_only` (counts are exact; a name, owner, mechanism or semantic
   interpretation is withheld, as for every count-only scanned slot), or

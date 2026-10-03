@@ -358,6 +358,7 @@ fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_mod
                 tracer: trace_mode.then_some(&mut tracer),
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence: Default::default(),
             };
             drain_capture_terminal_with(
                 &mut context,
@@ -521,6 +522,7 @@ fn terminal_absent_and_cancelled_roots_retain_pending_state() {
                 tracer: None,
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence: Default::default(),
             };
             drain_capture_terminal_with(
                 &mut context,
@@ -592,6 +594,7 @@ fn terminal_deferred_trace_writer_error_retires_then_skips_later_phases() {
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         drain_capture_terminal_with(
             &mut context,
@@ -665,6 +668,7 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
                 tracer: None,
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence: Default::default(),
             };
             drain_capture_terminal_with(
                 &mut context,
@@ -733,6 +737,7 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
             tracer: None,
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         drain_capture_terminal_with(
             &mut context,
@@ -780,6 +785,7 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         let snapshot = drain_capture_terminal_with(
             &mut context,
@@ -810,6 +816,7 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         let snapshot = drain_capture_terminal_with(
             &mut context,
@@ -892,6 +899,7 @@ fn capture_tick_syncs_new_and_downgraded_slots_before_reduction() {
                 tracer: trace_mode.then_some(&mut tracer),
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence: Default::default(),
             };
             let tick = capture_tick_with(
                 &mut context,
@@ -927,6 +935,7 @@ fn capture_tick_syncs_new_and_downgraded_slots_before_reduction() {
                 tracer: trace_mode.then_some(&mut tracer),
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence: Default::default(),
             };
             let tick = capture_tick_with(
                 &mut context,
@@ -984,6 +993,7 @@ fn capture_tick_limit_skips_live_snapshot_and_check_but_terminal_reduces_remaind
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         capture_tick_with(
             &mut context,
@@ -1022,6 +1032,7 @@ fn capture_tick_limit_skips_live_snapshot_and_check_but_terminal_reduces_remaind
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         drain_capture_terminal_with(
             &mut context,
@@ -1080,6 +1091,7 @@ fn capture_tick_snapshots_reduced_state_before_retained_check_failure() {
             tracer: None,
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         capture_tick_with(
             &mut context,
@@ -1128,6 +1140,7 @@ fn capture_tick_short_circuits_end_and_errors_after_required_sync() {
                 tracer: Some(&mut tracer),
                 malformed_records: &mut malformed_records,
                 scheduling: &mut scheduling,
+                stop_quiescence: Default::default(),
             };
             capture_tick_with(
                 &mut context,
@@ -1188,6 +1201,7 @@ fn capture_tick_short_circuits_end_and_errors_after_required_sync() {
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         capture_tick_with(
             &mut context,
@@ -1744,4 +1758,110 @@ fn quiesced_profile_drain_reduces_pre_q_events_and_excludes_post_q_writes() {
             "post_q_write={post_q_write}"
         );
     }
+}
+
+/// SG-T7B (owner ruling B) regression: an injected post-Q write on either
+/// ring, routed exactly as the terminal drains route it, keeps a clean
+/// terminal document PARTIAL; the same drain without the write proves
+/// the drain and the document is COMPLETE.
+#[test]
+fn an_injected_post_q_write_keeps_the_terminal_document_partial() {
+    use crate::events::{BoundedRecordSource as _, DiscoveryDrain};
+    use std::ops::ControlFlow;
+
+    let domain = crate::events::EventsDomain::test_standin(7);
+    let plan = open_plan();
+    for (ring, post_q_write) in [
+        ("EVENTS", false),
+        ("EVENTS", true),
+        ("DISCOVERY", false),
+        ("DISCOVERY", true),
+    ] {
+        let mut stop = stop_quiescence_for(StopState::Quiesced { at: Instant::now() });
+        if ring == "EVENTS" {
+            let mut state = semantics::State::for_capture(
+                &plan,
+                crate::attach::CapturePolicy::Allowlisted,
+                domain.clone(),
+            );
+            let mut tracker = process::Tracker::for_producer(domain.clone(), 16);
+            let mut script = ScriptedRecords::events([open_event(1)], usize::MAX);
+            let q = script.positions().producer;
+            if post_q_write {
+                script.push_event(&open_event(2));
+            }
+            let mut drain = EventDrain::over_test_domain(script, 1);
+            let (_, post_q) = drain_profile_events_to_position(
+                &mut drain,
+                q,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(7),
+            )
+            .unwrap();
+            note_post_q_record(&mut stop.post_q_events, ring, post_q);
+        } else {
+            let mut script = ScriptedRecords::records([discovery_bytes(11)], usize::MAX);
+            let q = script.positions().producer;
+            if post_q_write {
+                // Only the moved producer position matters past Q.
+                script.push_event(&open_event(2));
+            }
+            let mut drain = DiscoveryDrain::over(script);
+            let (post_q, backlog) = crate::events::poll_discovery_to_position(
+                &mut drain,
+                q,
+                Some(crate::events::TERMINAL_DRAIN_BOUND),
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap();
+            assert!(!backlog);
+            note_post_q_record(&mut stop.post_q_discovery, ring, post_q);
+        }
+        let mut ev = crate::render::tests::evidence();
+        ev.apply_stop_quiescence(stop);
+        ev.settle_terminal(true);
+        let case = format!("{ring} post_q_write={post_q_write}");
+        assert_eq!(ev.drain_proven, !post_q_write, "{case}");
+        assert_eq!(
+            ev.completeness,
+            if post_q_write { "PARTIAL" } else { "COMPLETE" },
+            "{case}"
+        );
+        let value = crate::render::versioned_evidence(&ev);
+        let flag = if ring == "EVENTS" {
+            "post_q_events"
+        } else {
+            "post_q_discovery"
+        };
+        assert_eq!(value["stop_quiescence"][flag], post_q_write, "{case}");
+    }
+}
+
+/// Only a proven Q starts a terminal drain proof; the post-Q flags are
+/// sticky once a ring crossed.
+#[test]
+fn stop_quiescence_maps_only_a_proven_q_and_keeps_post_q_flags_sticky() {
+    use crate::render::QuiescenceState;
+    assert_eq!(
+        stop_quiescence_for(StopState::Quiesced { at: Instant::now() }).state,
+        QuiescenceState::Proven
+    );
+    assert_eq!(
+        stop_quiescence_for(StopState::QuiescenceUnproven {
+            waited: Duration::from_secs(5)
+        })
+        .state,
+        QuiescenceState::Unproven
+    );
+    for state in [StopState::Running, StopState::StopRequested] {
+        assert_eq!(
+            stop_quiescence_for(state).state,
+            QuiescenceState::NotReached
+        );
+    }
+    let mut flag = false;
+    note_post_q_record(&mut flag, "EVENTS", true);
+    note_post_q_record(&mut flag, "EVENTS", false);
+    assert!(flag, "a later clean quantum must not clear the flag");
 }

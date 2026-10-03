@@ -165,9 +165,13 @@ U16_MAX = (1 << 16) - 1
 PROFILE_SCHEMA = "p11scope/observed-profile/v3"
 METRICS_SCHEMA = "p11scope/observed-profile/v3-metrics"
 # SYSPLAN residual F-02: the terminal verdict split. `drain_proven` is the
-# settlement latch (a future COMPLETE requires it set); `verdict_detail`
-# says which terminal story `completeness` tells.
+# settlement latch (COMPLETE requires it set); `verdict_detail` says which
+# terminal story `completeness` tells.
 VERDICT_DETAILS = {"clean_proven", "clean_but_unproven", "attribution_only", "concrete_gap"}
+# SG-T7B (owner ruling B): the terminal stop gate's outcome. Only a proven
+# quiescence with no post-Q record may set `drain_proven`.
+STOP_QUIESCENCE_KEYS = {"state", "post_q_events", "post_q_discovery"}
+STOP_QUIESCENCE_STATES = {"not_reached", "proven", "unproven"}
 # Review answer (a): the closed gap classes behind the verdict, published so
 # the oracle can recompute `verdict_detail` from the counters instead of
 # trusting it. The three gate inputs that used to be unserialized are
@@ -211,6 +215,8 @@ PROFILE_V3_FIELDS = {
 RESIDUAL_EVIDENCE_KEYS = {
     # F-02: settlement latch + terminal verdict detail.
     "drain_proven", "verdict_detail",
+    # SG-T7B: the stop-gate outcome the latch is derived from.
+    "stop_quiescence",
     # Review answer (a): the classes and gate inputs behind the verdict.
     *VERDICT_CLASS_KEYS,
     # F-01: durable uretprobe/hazard override (flag + reason), null when clean.
@@ -1272,14 +1278,43 @@ def settle_fixture_verdict(document):
     return document
 
 
+def expected_terminal_completeness(evidence):
+    """The sealed terminal verdict: COMPLETE exactly for a clean document
+    whose drain the stop gate proved (owner ruling B), PARTIAL otherwise."""
+    if evidence.get("drain_proven") is True and evidence.get("verdict_detail") == "clean_proven":
+        return "COMPLETE"
+    return "PARTIAL"
+
+
+def exact_stop_quiescence(evidence):
+    """SG-T7B: `drain_proven` may only come from a proven quiescence with
+    neither post-Q flag set; a post-Q flag only exists after a proven Q."""
+    stop = evidence["stop_quiescence"]
+    require(isinstance(stop, dict), f"invalid stop_quiescence: {stop!r}")
+    exact_keys(stop, STOP_QUIESCENCE_KEYS, "stop_quiescence")
+    require(stop["state"] in STOP_QUIESCENCE_STATES, f"invalid stop_quiescence.state: {stop!r}")
+    for flag in ("post_q_events", "post_q_discovery"):
+        require(stop[flag] is True or stop[flag] is False, f"invalid stop_quiescence.{flag}: {stop!r}")
+        require(
+            not stop[flag] or stop["state"] == "proven",
+            f"stop_quiescence.{flag} without a proven quiescence: {stop!r}",
+        )
+    if evidence["drain_proven"] is True:
+        require(
+            stop["state"] == "proven" and not stop["post_q_events"] and not stop["post_q_discovery"],
+            f"drain_proven needs a proven quiescence with no post-Q record: {stop!r}",
+        )
+
+
 def exact_terminal_verdict(evidence):
     """SYSPLAN residual terminal split (F-02) + durable override (F-01),
     handoff PID (F-15), and environment snapshot (F-26).
 
-    The oracle gates any future COMPLETE on the settlement latch exactly
-    like the producer's terminal seal: COMPLETE requires `drain_proven`
-    and `clean_proven`; anything else is PARTIAL with the detail saying
-    whether the run was clean-but-unproven or had a concrete gap.
+    The oracle gates COMPLETE on the settlement latch exactly like the
+    producer's terminal seal: COMPLETE requires `drain_proven` and
+    `clean_proven`; anything else is PARTIAL with the detail saying
+    whether the run was clean-but-unproven or had a concrete gap. The
+    latch itself must come from a proven stop-gate quiescence (SG-T7B).
     """
     require(
         evidence["completeness"] in {"COMPLETE", "PARTIAL"},
@@ -1291,7 +1326,12 @@ def exact_terminal_verdict(evidence):
     )
     detail = evidence["verdict_detail"]
     require(detail in VERDICT_DETAILS, f"invalid verdict_detail: {detail!r}")
+    exact_stop_quiescence(evidence)
     exact_verdict_classes(evidence)
+    require(
+        evidence["completeness"] == expected_terminal_completeness(evidence),
+        f"completeness disagrees with the sealed verdict: {evidence['completeness']!r}",
+    )
     if evidence["completeness"] == "COMPLETE":
         require(
             evidence["drain_proven"] is True,
@@ -1964,7 +2004,11 @@ def exact_common(
             exact_sources(object_)
     require(evidence["modules_skipped"] == [], f"modules refused: {evidence['modules_skipped']}")
     require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
-    require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
+    # A clean lane is COMPLETE only behind a proven stop-gate drain.
+    require(
+        evidence["completeness"] == expected_terminal_completeness(evidence),
+        evidence["completeness"],
+    )
 
 
 # The four counters the schema documents as informational, and therefore
@@ -1986,10 +2030,11 @@ def terminal_capture_is_clean(evidence, *, uncorroborated=0):
     """Normal terminal evidence for a lane with its own call oracle.
 
     A detached perf link does not wait for BPF callbacks already running on
-    another CPU, so a terminal snapshot is PARTIAL by construction. "Clean"
-    therefore means exactly what COMPLETE used to mean, minus that one
-    unprovable drain: no attach failure, alias, skip, or in-flight call, and
-    every *concrete* gap counter zero. The documented informational counters
+    another CPU; only the stop gate's proven quiescence proves the terminal
+    drain (owner ruling B), and only then is a clean document COMPLETE.
+    "Clean" therefore means no attach failure, alias, skip, or in-flight
+    call, and every *concrete* gap counter zero, whichever way the drain
+    settled. The documented informational counters
     are not gaps and are not constrained here; a lane that can prove an exact
     value for them should assert it directly with exact_counters.
 
@@ -2633,7 +2678,7 @@ def validate_canary(lane, document, target_bits=64):
     if trace:
         require(evidence["privacy_mode"] == privacy, evidence["privacy_mode"])
         require(evidence["capture_aborted"] is None, evidence["capture_aborted"])
-        require(evidence["final_drain"] is False, evidence["final_drain"])
+        require(evidence["final_drain"] is evidence["drain_proven"], evidence["final_drain"])
         require(evidence["counters_available"] is True, evidence["counters_available"])
     else:
         schema = METRICS_SCHEMA if kind == "metrics" else PROFILE_SCHEMA
@@ -2991,6 +3036,9 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         # SYSPLAN residual: unproven drain, concrete gap, clean preflight,
         # no handoff, no env switches live.
         "drain_proven": False,
+        "stop_quiescence": {
+            "state": "unproven", "post_q_events": False, "post_q_discovery": False,
+        },
         "verdict_detail": "concrete_gap",
         "semantic_unverified_slots": 0,
         "unprotected_live_windows": 0,
@@ -4603,7 +4651,14 @@ def self_test():
             copy.deepcopy(clean["evidence"]), uncorroborated=1
         )
     )
-    print("terminal capture predicate is PARTIAL with no concrete gap: OK")
+    # SG-T7B (owner ruling B): a clean lane whose drain the stop gate proved
+    # is COMPLETE, and only then; PARTIAL behind a proven drain is refused.
+    proven = copy.deepcopy(corroborated["evidence"])
+    proven.update(drain_proven=True, verdict_detail="clean_proven", completeness="COMPLETE")
+    terminal_capture_is_clean(proven)
+    stale = dict(proven, completeness="PARTIAL")
+    rejected(lambda: terminal_capture_is_clean(stale))
+    print("terminal capture predicate is COMPLETE exactly behind a proven drain: OK")
 
     # v2 discovery oracles. A document that discovered nothing, was authorized
     # by something else, refused a module, or names a provider its evidence does

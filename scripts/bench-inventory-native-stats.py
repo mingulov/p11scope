@@ -19,16 +19,23 @@ Absent or zero samples are INVALID, never fast: a run without a lock or a load
 record, with load1 above the bound or a Cargo build running when it started,
 with fewer stage-timed passes than required, with a pass whose stages sum to
 zero, with a missing or zero resource sample, with a native capture lacking
-any native span, or with exec churn below 90% of its target or with failed
-execs is refused with its reasons. Failed and invalid runs stay on disk; this
-script only reports them.
+a native span or a native lane statement, or with exec churn below 90% of its
+target or with failed execs is refused with its reasons. Failed and invalid
+runs stay on disk; this script only reports them.
+
+A native capture proves itself two ways: every pass carries the full
+inventory span set (completeness), and each inventory.json states
+observation.lane "native" (C5.1 writes lane/settlement/retirement only in
+the native lane). Census counters are read by exact path and reported
+missing when absent, never silently zero.
 
 Usage:
   python3 -I scripts/bench-inventory-native-stats.py check RUN_DIR...
   python3 -I scripts/bench-inventory-native-stats.py summary RUN_DIR...
   python3 -I scripts/bench-inventory-native-stats.py --self-test
 Options (before the command): --max-load1 X (default 4), --min-passes N
-(default 3), --native-spans a,b,c (default extend,service,read,stage,present).
+(default 3), --native-spans a,b,c (default
+deep_scan,assemble,confirm,absorb,reconcile,project).
 
 `check` exits 0 when every run is valid and 1 otherwise; `summary` prints the
 valid runs grouped by cell (capture, processes, callers, churn, kind) as
@@ -46,14 +53,27 @@ from pathlib import Path
 DEFAULTS = {
     "max_load1": 4.0,
     "min_passes": 3,
-    "native_spans": ("extend", "service", "read", "stage", "present"),
+    # The inventory spans every pass emits (C5.1, first-recorded order):
+    # catalog deep_scan/assemble/confirm plus coordinator
+    # absorb/reconcile/project. sweep/select are conditional (over the pid
+    # cap only) and never required.
+    "native_spans": ("deep_scan", "assemble", "confirm", "absorb", "reconcile", "project"),
     "min_resource_samples": 3,
     "churn_floor": 0.9,
 }
 PASS_LINE = re.compile(r"p11scope: pass (\d+): stage timings: (.*)")
 OP = re.compile(r"([A-Za-z_][\w.-]*) ([\d.]+)ms")
-# Named counters read from the -o document wherever they appear (M3/M4).
-COUNTER_KEYS = ("lifecycle_loss", "health_unproven", "native_witnesses", "demotions")
+# Census counters (M3/M4 oracle inputs) read by exact path from the -o
+# document: bare-key search would mix unrelated same-named fields
+# (caller-level "rows" vs. the binder census "rows").
+COUNTER_PATHS = (
+    ("native_rows", ("observation", "native_witnesses", "rows")),
+    ("native_bound", ("observation", "native_witnesses", "bound")),
+    ("native_unbound", ("observation", "native_witnesses", "unbound")),
+    ("native_pending", ("observation", "native_witnesses", "pending")),
+    ("native_integrity", ("observation", "native_witnesses", "integrity")),
+    ("lifecycle_loss", ("observation", "native_witnesses", "unbound_reasons", "lifecycle_loss")),
+)
 
 
 def read_kv(path):
@@ -111,17 +131,25 @@ def pct(values, q):
     return values[min(len(values) - 1, max(0, round(q * (len(values) - 1))))]
 
 
-def find_counters(document, found=None):
-    found = {} if found is None else found
-    if isinstance(document, dict):
-        for key, value in document.items():
-            if key in COUNTER_KEYS and isinstance(value, (int, float)):
-                found[key] = found.get(key, 0) + value
-            else:
-                find_counters(value, found)
-    elif isinstance(document, list):
-        for item in document:
-            find_counters(item, found)
+def read_census(document):
+    """Counter values by oracle name; None when the path is absent or not a
+    number. A present census with no lifecycle_loss entry means zero loss
+    (the binder only inserts reasons it counted)."""
+    found = dict.fromkeys((name for name, _ in COUNTER_PATHS))
+    if not isinstance(document, dict):
+        return found
+    for name, path in COUNTER_PATHS:
+        node = document
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, (int, float)):
+            found[name] = node
+    observation = document.get("observation")
+    census = observation.get("native_witnesses") if isinstance(observation, dict) else None
+    if found["lifecycle_loss"] is None and isinstance(census, dict):
+        found["lifecycle_loss"] = 0
     return found
 
 
@@ -184,7 +212,12 @@ def check_sample(sample, meta, limits, reasons):
             reasons.append(f"{where}: pass {number} has a zero stage sample")
     if meta.get("capture") == "native" and passes:
         for span in limits["native_spans"]:
-            if not any(ops.get(span, 0) > 0 for ops in passes.values()):
+            if not any(span in ops for ops in passes.values()):
+                reasons.append(
+                    f"{where}: native span {span} absent from stage timings "
+                    "(the binary emits no such span)"
+                )
+            elif not any(ops.get(span, 0) > 0 for ops in passes.values()):
                 reasons.append(f"{where}: native span {span} never sampled")
     rows = parse_resources(sample / "resources.tsv")
     if len(rows) < limits["min_resource_samples"]:
@@ -194,13 +227,28 @@ def check_sample(sample, meta, limits, reasons):
     churn = int(meta.get("churn_rate", 0) or 0)
     if churn and meta.get("churn_scope", "sample") == "sample":
         check_churn(parse_churn(sample / "churn.ledger"), churn, where, limits, reasons)
-    counters = {}
+    counters = dict.fromkeys((name for name, _ in COUNTER_PATHS))
     document = sample / "inventory.json"
+    parsed = None
     if document.is_file():
         try:
-            counters = find_counters(json.loads(document.read_text()))
+            parsed = json.loads(document.read_text())
         except ValueError:
             reasons.append(f"{where}: inventory.json is not JSON")
+        if parsed is not None:
+            counters = read_census(parsed)
+    if meta.get("capture") == "native":
+        if parsed is None and document.is_file():
+            pass  # already refused above as not JSON
+        elif parsed is None:
+            reasons.append(f"{where}: native capture wrote no inventory.json (no lane proof)")
+        else:
+            observation = parsed.get("observation") if isinstance(parsed, dict) else None
+            lane = observation.get("lane") if isinstance(observation, dict) else None
+            if lane is None:
+                reasons.append(f"{where}: inventory.json states no observation lane (want 'native')")
+            elif lane != "native":
+                reasons.append(f"{where}: observation lane is {lane!r}, want 'native'")
     steady = [sum(ops.values()) for number, ops in passes.items() if number > 1]
     good_rows = [row for row in rows if row and len(row) >= 4]
     return {
@@ -293,9 +341,24 @@ def summary(runs, limits, out):
             print(f"  {op:>12} p95 ms: {spread([s['stage_p95_ms'].get(op) for s in group])}", file=out)
         print(f"  rss max kb:  {spread([s['rss_max_kb'] for s in group])}", file=out)
         print(f"  fds max:     {spread([s['fds_max'] for s in group])}", file=out)
-        counters = sorted({key for sample in group for key in sample["counters"]})
-        for counter in counters:
-            print(f"  {counter}: {spread([s['counters'].get(counter) for s in group])}", file=out)
+        for counter, _ in COUNTER_PATHS:
+            values = [sample["counters"].get(counter) for sample in group]
+            present = [value for value in values if value is not None]
+            missing = len(values) - len(present)
+            if not present:
+                plural = "s" if len(values) != 1 else ""
+                print(
+                    f"  {counter}: missing in all {len(values)} sample{plural} (zero or unreported)",
+                    file=out,
+                )
+            elif missing:
+                print(
+                    f"  {counter}: {spread(present)} "
+                    f"(missing in {missing}/{len(values)}: zero or unreported)",
+                    file=out,
+                )
+            else:
+                print(f"  {counter}: {spread(values)}", file=out)
     for run, reasons in invalid:
         print(f"INVALID {run}:", file=out)
         for reason in reasons:
@@ -360,7 +423,23 @@ def write_run(root, name, *, capture="native", churn=0, passes=4, spans=None):
                 f"exec_fail=0 nonzero=0 signaled=0 unreaped=0 late_ticks=0 late_max_us=0 "
                 f"dropped_ticks=0 achieved_rate={float(churn)}\n"
             )
-        (sample / "inventory.json").write_text(json.dumps({"health": {"lifecycle_loss": 0}}))
+        # The C5.1 document shape: the census always renders (zeros in the
+        # scan lane, whose unbound_reasons omits zero counts); lane,
+        # settlement and retirement only in the native lane.
+        if capture == "native":
+            census = {
+                "rows": 4, "bound": 3, "unbound": 1, "pending": 0, "integrity": 0,
+                "unbound_reasons": {"lifecycle_loss": 1},
+            }
+            observation = {"lane": "native", "settlement": "unsettled",
+                           "retirement": "closed", "native_witnesses": census}
+        else:
+            census = {
+                "rows": 0, "bound": 0, "unbound": 0, "pending": 0, "integrity": 0,
+                "unbound_reasons": {},
+            }
+            observation = {"native_witnesses": census}
+        (sample / "inventory.json").write_text(json.dumps({"observation": observation}))
     return run
 
 
@@ -419,8 +498,33 @@ def self_test():
             stderr.read_text() + "p11scope: pass 5: stage timings: sweep 0.000ms, read 0.000ms\n"
         )
         expect(run, "pass 5 has a zero stage sample")
-        run = write_run(root, "native-span-missing", spans=("extend", "service", "read", "stage"))
-        expect(run, "native span present never sampled")
+        run = write_run(
+            root, "native-span-missing",
+            spans=tuple(span for span in DEFAULTS["native_spans"] if span != "project"),
+        )
+        expect(run, "native span project absent from stage timings")
+        run = write_run(root, "native-span-zero")
+        stderr = run / "sample-1-cold" / "stderr"
+        stderr.write_text(stderr.read_text().replace("confirm 1.500ms", "confirm 0.000ms"))
+        stderr = run / "sample-2-warm" / "stderr"
+        stderr.write_text(stderr.read_text().replace("confirm 1.500ms", "confirm 0.000ms"))
+        expect(run, "native span confirm never sampled")
+        run = write_run(root, "native-no-lane")
+        for sample in run.glob("sample-*"):
+            document = json.loads((sample / "inventory.json").read_text())
+            del document["observation"]["lane"]
+            (sample / "inventory.json").write_text(json.dumps(document))
+        expect(run, "states no observation lane")
+        run = write_run(root, "native-no-document")
+        for sample in run.glob("sample-*"):
+            (sample / "inventory.json").unlink()
+        expect(run, "wrote no inventory.json")
+        run = write_run(root, "native-wrong-lane")
+        for sample in run.glob("sample-*"):
+            document = json.loads((sample / "inventory.json").read_text())
+            document["observation"]["lane"] = "scan"
+            (sample / "inventory.json").write_text(json.dumps(document))
+        expect(run, "observation lane is 'scan'")
         run = write_run(root, "no-resources")
         (run / "sample-1-cold" / "resources.tsv").unlink()
         expect(run, "0 resource samples")
@@ -470,10 +574,25 @@ def self_test():
             def write(self, text):
                 self.text += text
 
+        run = write_run(root, "no-census")
+        for sample in run.glob("sample-*"):
+            document = json.loads((sample / "inventory.json").read_text())
+            del document["observation"]["native_witnesses"]
+            (sample / "inventory.json").write_text(json.dumps(document))
+        expect(run, None)
         sink = Sink()
         assert summary([root / "valid-native", root / "no-lock"], limits, sink) == 1
         assert "cell capture=native processes=448" in sink.text, sink.text
         assert "INVALID" in sink.text and "no lock record" in sink.text, sink.text
+        assert "native_rows: 4.000" in sink.text, sink.text
+        sink = Sink()
+        assert summary([root / "no-census"], limits, sink) == 0, sink.text
+        assert "native_rows: missing in all 1 sample " in sink.text, sink.text
+        assert "lifecycle_loss: missing in all 1 sample " in sink.text, sink.text
+        sink = Sink()
+        assert summary([root / "valid-scan"], limits, sink) == 0, sink.text
+        # A present census without the entry means zero loss, not missing.
+        assert "lifecycle_loss: 0.000" in sink.text, sink.text
         sink = Sink()
         assert check([root / "valid-native", root / "valid-churn"], limits, sink) == 0, sink.text
     print("bench-inventory-native-stats: self-test ok")

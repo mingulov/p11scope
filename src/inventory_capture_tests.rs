@@ -15,7 +15,7 @@ use crate::discovery::inventory_attach_set::AttachEndpoint;
 use crate::discovery::inventory_attach_set::tests as fx;
 use crate::discovery::native_binding::UnboundReason;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -70,6 +70,16 @@ struct ScriptedLane {
     retired: bool,
     /// The first this many reads cannot prove health.
     unproven_reads: usize,
+    /// Reads (1-based) that stop mid-sweep.
+    partial_reads: HashSet<usize>,
+    /// How long each read takes.
+    read_delay: Duration,
+    /// After this many reads, the next `.1` discovery quanta stop at their
+    /// record bound (the ring still holds records).
+    undrained_after_reads: Option<(usize, usize)>,
+    /// The start of the last complete lifecycle drain (the facade's
+    /// `lifecycle_proven_ns`).
+    drained_ns: u64,
 }
 
 impl ScriptedLane {
@@ -92,6 +102,10 @@ impl ScriptedLane {
             retire_after: Some(1),
             retired: false,
             unproven_reads: 0,
+            partial_reads: HashSet::new(),
+            read_delay: Duration::ZERO,
+            undrained_after_reads: None,
+            drained_ns: 0,
         }
     }
 
@@ -169,11 +183,23 @@ impl CaptureLane<Pin> for ScriptedLane {
 
     fn service_discovery(&mut self, _: ReadWindow) -> DiscoveryBatch {
         self.note("service");
-        DiscoveryBatch::scripted(self.domain, Vec::new(), self.stamps.next())
+        let mut batch = DiscoveryBatch::scripted(self.domain, Vec::new(), self.stamps.next());
+        if let Some((after, left)) = self.undrained_after_reads.as_mut()
+            && self.read_stamps.len() >= *after
+            && *left > 0
+        {
+            *left -= 1;
+            batch.record_bound_reached = true;
+        }
+        if batch.drained() {
+            self.drained_ns = batch.started_ns;
+        }
+        batch
     }
 
     fn read_witnesses(&mut self, _: ReadWindow) -> WitnessBatch {
         self.note("read");
+        std::thread::sleep(self.read_delay);
         let health_read_ns = self.stamps.next();
         self.read_stamps.push(health_read_ns);
         let rows = self
@@ -208,7 +234,7 @@ impl CaptureLane<Pin> for ScriptedLane {
             integrity: Vec::new(),
             integrity_total: 0,
             visited: 0,
-            sweep_completed: true,
+            sweep_completed: !self.partial_reads.contains(&self.read_stamps.len()),
             sweeps_completed: 1,
             row_bound_reached: false,
             deadline_reached: false,
@@ -217,6 +243,8 @@ impl CaptureLane<Pin> for ScriptedLane {
             sweep_gaps: false,
             seen_rows: 0,
             pair_limit: 64,
+            lifecycle_loss: None,
+            lifecycle_proven_ns: self.drained_ns,
             health: CaptureHealth {
                 discovery_counters: Some([0; 5]),
                 ..CaptureHealth::default()
@@ -599,9 +627,12 @@ fn pass(extend: &str) -> Vec<String> {
     .to_vec()
 }
 
-const STOP: [&str; 13] = [
+const STOP: [&str; 15] = [
     // Two endpoints: the 200 ms base and 50 ms for each.
     "publish:retiring 2 300",
+    // A complete lifecycle drain right before the terminal read.
+    "service",
+    "stage:lifecycle",
     "read",
     "stage:witness",
     "end_capture_coverage",
@@ -664,7 +695,8 @@ fn a_row_of_the_first_pass_binds_because_activation_precedes_the_scan() {
 }
 
 /// Invariant 4.2: the terminal read is staged before the coverage ends, so a
-/// watch runs until that read's clean health instant, not the pass before.
+/// watch runs until that read's clean instant (capped at the terminal
+/// drain's start), not the pass before.
 #[test]
 fn a_watch_ends_at_the_terminal_read_staged_before_coverage_ends() {
     let log = Log::default();
@@ -678,7 +710,14 @@ fn a_watch_ends_at_the_terminal_read_staged_before_coverage_ends() {
         panic!("{:?}", scene.coverage());
     };
     assert!(since_ns < stamps[1], "watched from the attaches on");
-    assert_eq!(until_ns, Some(stamps[2]), "{stamps:?}");
+    // The terminal read's clean instant, capped at the start of the full
+    // lifecycle drain right before it (`lifecycle_proven_ns`): past the
+    // pass-2 read, never past the terminal read.
+    let until = until_ns.expect("frozen");
+    assert!(
+        stamps[1] < until && until <= stamps[2],
+        "{until} {stamps:?}"
+    );
 }
 
 /// Invariant 4.6: Finish decides what the last read left waiting (no later
@@ -805,6 +844,103 @@ fn a_missed_retirement_budget_reads_unsettled_with_a_gap() {
         ]
     );
     assert!(!stopped.capture.retired);
+}
+
+/// The entries between the retiring notice and the end of coverage: the
+/// terminal reads.
+fn terminal_reads(log: &[String]) -> Vec<&str> {
+    let from = log
+        .iter()
+        .position(|e| e.starts_with("publish:retiring"))
+        .unwrap();
+    let to = log
+        .iter()
+        .position(|e| e == "end_capture_coverage")
+        .unwrap();
+    log[from + 1..to]
+        .iter()
+        .map(String::as_str)
+        .filter(|e| *e != "service" && *e != "stage:lifecycle")
+        .collect()
+}
+
+/// C5.2 closure I-1: stop drains the lifecycle ring completely right
+/// before the terminal read and forwards each quantum before the coverage
+/// ends, so a loss still in the ring is seen before the watch freezes.
+#[test]
+fn a_stop_drains_the_lifecycle_ring_before_the_terminal_read() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // The pass reads once; then two quanta stop at their record bound.
+    lane.undrained_after_reads = Some((1, 2));
+    run(&mut scene, lane, 1);
+    let log = entries(&log);
+    let from = log
+        .iter()
+        .position(|e| e.starts_with("publish:retiring"))
+        .unwrap();
+    let to = log
+        .iter()
+        .position(|e| e == "end_capture_coverage")
+        .unwrap();
+    assert_eq!(
+        log[from + 1..to]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "service",
+            "stage:lifecycle",
+            "service",
+            "stage:lifecycle",
+            "service",
+            "stage:lifecycle",
+            "read",
+            "stage:witness"
+        ]
+    );
+}
+
+/// C5.1 carry (C5.2 review): a bounded terminal read that stops mid-sweep
+/// proves no clean instant, so stop keeps reading (each read staged before
+/// the coverage ends) until a CALLER_USE sweep completes.
+#[test]
+fn a_stop_keeps_reading_until_the_terminal_sweep_completes() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // Read 1 is the pass's; reads 2 and 3 stop mid-sweep, read 4 completes.
+    lane.partial_reads.extend([2, 3]);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert_eq!(
+        terminal_reads(&entries(&log)),
+        [
+            "read",
+            "stage:witness",
+            "read",
+            "stage:witness",
+            "read",
+            "stage:witness"
+        ]
+    );
+    assert_eq!(stopped.capture.read_stamps.len(), 5);
+}
+
+/// The terminal sweep is bounded: a sweep that never completes stops
+/// reading at the budget and the stop goes on (its reads are not clean).
+#[test]
+fn a_terminal_sweep_that_never_completes_is_bounded() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // 10 ms reads, partial up to read 300: the 500 ms budget allows ~50.
+    lane.partial_reads.extend(2..=300);
+    lane.read_delay = Duration::from_millis(10);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    let reads = terminal_reads(&entries(&log)).len() / 2;
+    assert!((1..150).contains(&reads), "{reads}");
+    assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
 }
 
 /// Each Singles link pays its own kernel detach (about 73 ms on host 7.0,

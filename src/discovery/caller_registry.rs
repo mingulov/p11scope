@@ -852,6 +852,10 @@ pub(crate) enum UnknownReason {
     Loss(Arc<str>),
     /// The caller retired before any coverage reached the edge.
     RetiredBeforeCoverage,
+    /// A CALLER_USE row from this caller's pid was not bound to it (often
+    /// a use before its admission): the pair's only row exists, so later
+    /// use leaves no row and a watch could not see it (R-C51-1). Sticky.
+    UseBeforeAdmission,
 }
 
 impl UnknownReason {
@@ -866,6 +870,7 @@ impl UnknownReason {
             Self::CapacityLimited(_) => "capacity_limited",
             Self::Loss(_) => "loss",
             Self::RetiredBeforeCoverage => "retired_before_coverage",
+            Self::UseBeforeAdmission => "use_before_admission",
         }
     }
 
@@ -890,6 +895,7 @@ impl UnknownReason {
             Self::CapacityLimited(resource) => format!("capacity limited: {resource}"),
             Self::Loss(reason) => format!("loss: {reason}"),
             Self::RetiredBeforeCoverage => "retired before coverage".into(),
+            Self::UseBeforeAdmission => "use before admission".into(),
         }
     }
 }
@@ -987,6 +993,10 @@ pub(crate) struct EdgeCoverage {
     /// unproven interval): later unknown notes keep its reason. A later
     /// watch note starts a new interval and clears it.
     demoted: bool,
+    /// Sticky (R-C51-1): an unbound CALLER_USE row named this caller's
+    /// pid, so no watch of this edge can be a fact; it reads
+    /// `use_before_admission` and no watch starts again.
+    use_before_admission: bool,
 }
 
 /// One admission-state change of a retained module (`from` → `to`).
@@ -1284,6 +1294,14 @@ enum Mutation {
         reason: UnboundReason,
     },
     NoteUnresolvedWitness,
+    NoteUseBeforeAdmission {
+        caller: CallerId,
+        /// `None`: every edge of the caller.
+        module: Option<ModuleKey>,
+        /// `UseBeforeAdmission`, or `Loss` for a row lifecycle loss left
+        /// unbound.
+        reason: UnknownReason,
+    },
     NoteWitnessCensus {
         census: BindingCensus,
     },
@@ -1815,6 +1833,37 @@ impl CallerRegistry {
         self.staged.push(Mutation::NoteUnresolvedWitness);
     }
 
+    /// Stage R-C51-1 for `caller`'s edge on `module` (`None`: every edge
+    /// of the caller): an unbound CALLER_USE row named its pid. The edge's
+    /// watch (ongoing or frozen) reads unknown `use_before_admission`, and
+    /// none starts again; positive history stays.
+    pub(crate) fn note_use_before_admission(
+        &mut self,
+        caller: CallerId,
+        module: Option<ModuleKey>,
+    ) {
+        self.staged.push(Mutation::NoteUseBeforeAdmission {
+            caller,
+            module,
+            reason: UnknownReason::UseBeforeAdmission,
+        });
+    }
+
+    /// The same sticky downgrade for a row lifecycle loss left unbound
+    /// (R-C51-3): the edge reads unknown `loss` with `reason`.
+    pub(crate) fn note_unbound_row_loss(
+        &mut self,
+        caller: CallerId,
+        module: Option<ModuleKey>,
+        reason: &str,
+    ) {
+        self.staged.push(Mutation::NoteUseBeforeAdmission {
+            caller,
+            module,
+            reason: UnknownReason::Loss(reason.into()),
+        });
+    }
+
     /// Stage the native binder's census (the unbound-witness measurement).
     pub(crate) fn note_witness_census(&mut self, census: BindingCensus) {
         self.staged.push(Mutation::NoteWitnessCensus { census });
@@ -2078,6 +2127,31 @@ impl CallerRegistry {
                 shared => self.apply_shared_endpoint(shared, reason.text()),
             },
             Mutation::NoteUnresolvedWitness => self.witness_placement.unresolved += 1,
+            Mutation::NoteUseBeforeAdmission {
+                caller,
+                module,
+                reason,
+            } => {
+                // A key no module holds names no edge (`Some(None)`).
+                let module = module.map(|key| self.modules_by_key.get(&key).copied());
+                for ((_, id), edge) in self.edges.range_mut((caller, ModuleId(0))..) {
+                    if edge.caller != caller {
+                        break;
+                    }
+                    if module.is_some_and(|wanted| wanted != Some(*id)) {
+                        continue;
+                    }
+                    edge.coverage.use_before_admission = true;
+                    // A demotion's loss reason (a regression or lifecycle
+                    // loss already made the watch unknown) stays: the
+                    // flag alone keeps any watch from starting again.
+                    if !(edge.coverage.demoted && matches!(edge.coverage.watch, Watch::Unknown(_)))
+                    {
+                        edge.coverage.demoted = true;
+                        edge.coverage.watch = Watch::Unknown(reason.clone());
+                    }
+                }
+            }
             Mutation::NoteWitnessCensus { census } => self.witness_census = census,
             Mutation::NoteCoverage {
                 caller,
@@ -2676,7 +2750,10 @@ impl CallerRegistry {
                 );
             }
             CoverageNote::Watched { since_ns } => {
-                if ended || matches!(coverage.watch, Watch::Watching { .. }) {
+                if ended
+                    || coverage.use_before_admission
+                    || matches!(coverage.watch, Watch::Watching { .. })
+                {
                     // An ongoing watch keeps its earliest start; a frozen
                     // one is a fact; after the end nothing starts.
                 } else {
@@ -4309,6 +4386,85 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(registry.entry_observation(b), EntryObservation::Observed);
+    }
+
+    /// R-C51-1 after a loss demotion: the loss reason stands, and the
+    /// flag still keeps a watch from starting again.
+    #[test]
+    fn use_before_admission_keeps_a_loss_reason_and_blocks_restarts() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 120 },
+        );
+        registry.note_watch_demotion("lifecycle lost", "ring loss", 150);
+        registry.publish();
+        registry.note_use_before_admission(CallerId(0), Some(keys[0].clone()));
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 900 },
+        );
+        registry.publish();
+        assert!(matches!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::Unknown(UnknownReason::Loss(_))
+        ));
+    }
+
+    /// R-C51-1: the downgrade replaces an ongoing or frozen watch, blocks
+    /// every later watch note, and leaves positive history alone; a watch
+    /// a loss already demoted keeps its loss reason.
+    #[test]
+    fn use_before_admission_is_a_sticky_downgrade_of_the_watch_only() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+                ("/lib/c.so", 13, AdmissionState::Admitted),
+            ],
+        );
+        for key in &keys {
+            registry.note_coverage(CallerId(0), key, CoverageNote::Watched { since_ns: 120 });
+        }
+        registry.note_witness(CallerId(0), &keys[2], 140);
+        registry.publish();
+        // a: an ongoing watch is replaced, and no later note restarts one.
+        registry.note_use_before_admission(CallerId(0), Some(keys[0].clone()));
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 500 },
+        );
+        registry.publish();
+        // b's watch is a frozen fact; the downgrade still replaces it.
+        registry.note_watch_end("stopped", 400);
+        registry.publish();
+        registry.note_use_before_admission(CallerId(0), Some(keys[1].clone()));
+        registry.note_use_before_admission(CallerId(0), Some(keys[2].clone()));
+        registry.publish();
+        let unknown = UseCoverage::Unknown(UnknownReason::UseBeforeAdmission);
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            unknown
+        );
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[1])),
+            unknown
+        );
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[2])),
+            UseCoverage::Witnessed { first_ns: 140 }
+        );
     }
 
     #[test]

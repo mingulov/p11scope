@@ -72,6 +72,14 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   additive `final: true`, the last pass's `pass` number and zero scan
   counts, so `new_gaps` still sums to every streamed gap. Absent `final`
   means a scan pass.
+  Every `pass_committed` also carries `unbound_rows`: the native
+  witness rows staged since the previous marker that bound to no caller
+  incarnation, as `[{module, reason, rows}]` in (module, reason) order —
+  the per-pass delta of the snapshot's `modules[].unbound_use.reasons`
+  (`reason` is an unbound code such as `no_live_caller` or
+  `before_admission`). It never names a pid. At most 256 entries are
+  listed; the rows of the rest are summed in `unbound_rows_truncated`
+  (0 when nothing was cut). A scan-lane run always reads `[]` and 0.
 - `caller_observed` / `module_observed` / `edge_observed`: full
   snapshot record shapes (test/sync emission; production emits
   incrementally instead). `edge_observed` adds the three derived

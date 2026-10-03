@@ -92,6 +92,24 @@ LOSS_GAP = re.compile(r"\bloss\b|\blost\b|lossy", re.I)
 UNBOUND_GAP = re.compile(r"unidentified caller|unbound (caller|witness)", re.I)
 # A gap field naming when the unbound use happened (first match wins).
 UNBOUND_GAP_TIME_KEYS = ("first_ns", "t0_ns", "witness_ns")
+# R-C51-2 (controller, 2026-10-03): an image whose use bound to no caller is
+# covered by a pid-less unbound gap of its module plus one row of the pass
+# markers' `unbound_rows` counts (the product names no pid for never-admitted
+# processes), from a pass committed at or after the image's first call. A
+# short-lived image's row is sighted with no live caller.
+COUNTED_SHORT_LIVED_REASONS = ("no_live_caller",)
+# R-C51-1: an image that used the module before its caller's admission leaves
+# the pair's only row unbound (read before the admission: no_live_caller;
+# after: before_admission); the product then reads its caller's edge unknown
+# `use_before_admission`, never a positive or a watch.
+USE_BEFORE_ADMISSION = "use_before_admission"
+SCAN_ONLY_REASON = "scan_only"
+# The only unknown reasons a scan-lane document gives (an unadmitted module
+# reads not_admitted in either lane).
+SCAN_LANE_REASONS = frozenset({SCAN_ONLY_REASON, "not_admitted", None})
+# Preference order (UnboundPool.claim): before_admission rows serve only
+# pre-admission images.
+COUNTED_PREADMISSION_REASONS = ("before_admission", "no_live_caller")
 # The --system deep-scan selection bound (inventory --max-scan-pids).
 SCAN_LIMIT_GAP = re.compile(r"selected \d+ for deep scanning", re.I)
 # Retirement settlement after a stop (plan C5: "retirement: unsettled";
@@ -508,10 +526,21 @@ def coverage_ok(edge):
 
 def doc_lane(doc):
     """native once any native producer speaks; scan when every (well-formed)
-    edge reads unknown; malformed when any coverage object breaks the schema."""
+    edge reads unknown with a scan-lane reason and nothing states a native
+    lane; malformed when any coverage object breaks the schema, or a stated
+    native lane has a scan_only edge (C5.1: a native run states
+    `observation.lane`, and its uncovered edges read not_attached)."""
     if any(not coverage_ok(e) for e in doc.get("edges", [])):
         return "malformed"
+    stated = doc.get("observation", {}).get("lane")
+    reasons = {coverage(e).get("reason") for e in doc.get("edges", []) if coverage(e)["state"] == UNKNOWN_STATE}
+    if stated == "native":
+        return "malformed" if SCAN_ONLY_REASON in reasons else "native"
     if any(coverage(e)["state"] != UNKNOWN_STATE for e in doc.get("edges", [])):
+        return "native"
+    # Every edge unknown: a reason only a native producer gives (loss,
+    # not_attached, use_before_admission, ...) still names the native lane.
+    if reasons - SCAN_LANE_REASONS:
         return "native"
     if doc.get("observation", {}).get("usage_feed"):
         return "native"
@@ -814,10 +843,85 @@ def unbound_gap_for(view, mid, image, use, consumed):
     return None
 
 
+class UnboundPool:
+    """The pass markers' per-pass unbound row counts (R-C51-2), consumed
+    one row per covered image: the earliest pass committed at or after the
+    image's first call with a row of an allowed reason left (the eligible
+    passes of every image are a suffix, so earliest-fit is a maximum
+    matching in any order)."""
+
+    def __init__(self, view):
+        self.rows = []  # [at_ns, module, reason, left]
+        for ev in view.kind("pass"):
+            for item in (ev.get("event") or {}).get("unbound_rows") or []:
+                if isinstance(item, dict) and isinstance(item.get("rows"), int) and item["rows"] > 0:
+                    self.rows.append([ev.get("at_ns") or 0, item.get("module"), item.get("reason"), item["rows"]])
+        self.rows.sort(key=lambda row: row[0])
+
+    def claim(self, mid, reasons, first_call_ns):
+        """`reasons` in preference order: a reason only one kind of image
+        may use comes first, so a shared reason's rows stay for the others
+        (review L-4); earliest-fit within each reason."""
+        for reason in reasons:
+            for row in self.rows:
+                if row[1] == mid and row[2] == reason and row[0] >= first_call_ns and row[3] > 0:
+                    row[3] -= 1
+                    return row
+        return None
+
+
+def pidless_unbound_gap(view, mid, reasons):
+    """The module's pid-less unbound statement: its gap, or — when gap
+    retention dropped that gap — the module's own `unbound_use` counting a
+    row of one of `reasons` (never a pid either)."""
+    gap = next((g for g in view.doc.get("gaps", []) if g.get("module") == mid and g.get("pid") is None
+                and UNBOUND_GAP.search(f"{g.get('subject', '')} {g.get('reason', '')}")), None)
+    if gap is not None:
+        return gap
+    # The fallback stands in for a gap only when gap retention provably
+    # dropped gaps (review L-5).
+    if not view.doc.get("gaps_suppressed"):
+        return None
+    unbound = (view.modules.get(mid) or {}).get("unbound_use") or {}
+    if any((unbound.get("reasons") or {}).get(reason, 0) > 0 for reason in reasons):
+        return {"subject": f"modules[{mid}].unbound_use", "pid": None}
+    return None
+
+
+def image_began_ns(images, image):
+    """A lower bound of when `image` began: 0 for an initial image, else the
+    predecessor's last ledgered instant (its exec followed it)."""
+    if image.gen == 0:
+        return 0
+    prev = next((i for i in images.values() if i.pid == image.pid and i.gen == image.gen - 1), None)
+    stamps = [e["t1"] for e in (prev.entries if prev else [])]
+    return max(stamps) if stamps else 0
+
+
+def first_call_ns(image, provider_path):
+    calls = [e["t0"] for e in image.entries if e["module"] == provider_path and e["n"] > 0]
+    return min(calls) if calls else None
+
+
+def preadmission_edge(view, edges, exe_ids, first_ns):
+    """R-C51-1: the image's own caller edge reads unknown use_before_admission
+    and the ledger shows a call before that caller's admission."""
+    for e in edges:
+        cov = coverage(e)
+        caller = view.callers.get(e["caller"], {})
+        if (e["caller"] in exe_ids and cov.get("state") == UNKNOWN_STATE and cov.get("reason") == USE_BEFORE_ADMISSION
+                and first_ns is not None and first_ns < (caller.get("first_seen_ns") or 0)):
+            return e
+    return None
+
+
 class CellPass:
     """Per-run bookkeeping shared by the cell checks."""
 
-    def __init__(self):
+    def __init__(self, view=None):
+        self.pool = UnboundPool(view) if view is not None else None
+        self.counted_by_cell = {}  # images covered by R-C51-1/-2 counts
+        self.exec_counted = {}  # cell -> {gen}
         self.justified = set()  # positive (caller, module) edges a ledgered in-window use accounts for
         self.consumed_gaps = set()
         self.bound_by_cell = {}
@@ -857,7 +961,7 @@ def check_cells(view, images_by_cell, res):
         res.add(run, "*", "ATTESTED-DELIVERY", "absent",
                 "an attested provider exists but the run could not pass its manifest "
                 f"({man.get('attested_note', 'no inventory --manifest')}); attested cells are judged unattested")
-    state = CellPass()
+    state = CellPass(view)
     for cell in run_cells:
         spec = man["cells"][cell]
         role = ROLES[spec["role"]]
@@ -865,12 +969,18 @@ def check_cells(view, images_by_cell, res):
         for image in sorted(images.values(), key=lambda i: (i.pid, i.gen)):
             check_image(view, cell, spec, role, images, image, mod, lane, attested_delivery, state, res)
         if lane == "native" and role.bind == "optional" and state.used_by_cell.get(cell):
-            res.ok(run, cell, "BOUND-INSTANCE", state.bound_by_cell.get(cell, 0) >= OPTIONAL_CELL_MIN_BOUND,
-                   f"{state.used_by_cell[cell]} in-window used images, none bound to its own caller: "
+            bound, counted = state.bound_by_cell.get(cell, 0), state.counted_by_cell.get(cell, 0)
+            # A pid-naming gap excuses an instance, never a whole cell; a
+            # cell whose every used image is bound or count-covered (R-C51-2)
+            # is fully accounted.
+            res.ok(run, cell, "BOUND-INSTANCE",
+                   bound >= OPTIONAL_CELL_MIN_BOUND or (counted > 0 and bound + counted >= state.used_by_cell[cell]),
+                   f"{state.used_by_cell[cell]} in-window used images, {bound} bound and {counted} count-covered: "
                    "an unbound gap may excuse an instance, never a whole cell")
         if spec["mode"] == "exec-chain" and state.used_by_cell.get(cell):
             if lane == "native":
-                check_exec_split(view, cell, state.exec_bound.get(cell, []), images, man, mod, res)
+                check_exec_split(view, cell, state.exec_bound.get(cell, []), images, man, mod, res,
+                                 state.exec_counted.get(cell, set()))
             else:
                 res.add(run, cell, "EXEC-SPLIT", "absent",
                         "same-binary re-exec and non-leader exec are invisible to exe-identity scan pins")
@@ -961,9 +1071,38 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
                        f"{ctag}: exited image's caller {caller['id']} still reads mapped")
             continue
         gap = unbound_gap_for(view, mid, image, use, state.consumed_gaps) if bind == "optional" else None
+        counted = None
+        if gap is None and state.pool is not None:
+            first_ns = first_call_ns(image, prov["path"])
+            early = preadmission_edge(view, edges, exe_ids, first_ns)
+            pidless = pidless_unbound_gap(view, mid, COUNTED_SHORT_LIVED_REASONS)
+            # R-C51-2 covers never-admitted images only: one whose caller was
+            # admitted at or before its first call must bind (review M-1).
+            # The image began at its exec (after the predecessor's last
+            # ledgered call): an earlier image's caller of the same binary
+            # is not this image's.
+            began = image_began_ns(images, image)
+            admitted = first_ns is not None and any(
+                (c.get("first_seen_ns") is not None and began <= c["first_seen_ns"] <= first_ns)
+                for c in candidates(view, image) if c["id"] in exe_ids)
+            if early is not None:
+                row = state.pool.claim(mid, COUNTED_PREADMISSION_REASONS, first_ns)
+                if row is not None:
+                    counted = (f"{ctag} (reached by {how}): used before its caller {early['caller']} was admitted; "
+                               f"edge reads unknown/{USE_BEFORE_ADMISSION}, row counted {row[2]} in the pass at {row[0]}")
+            elif pidless is not None and first_ns is not None and not admitted:
+                row = state.pool.claim(mid, COUNTED_SHORT_LIVED_REASONS, first_ns)
+                if row is not None:
+                    counted = (f"{ctag} (reached by {how}): pid-less {pidless.get('subject')!r} covered by an "
+                               f"unbound_rows {row[2]} count in the pass at {row[0]}")
         if gap is not None:
             res.add(run, cell, check, "unbound",
                     f"{ctag} (reached by {how}): module-level unbound positive {gap.get('subject')!r} pid={gap.get('pid')}")
+        elif counted is not None:
+            state.counted_by_cell[cell] = state.counted_by_cell.get(cell, 0) + 1
+            if spec["mode"] == "exec-chain":
+                state.exec_counted.setdefault(cell, set()).add(image.gen)
+            res.add(run, cell, check, "unbound", counted)
         else:
             res.add(run, cell, check, "fail",
                     f"{ctag} (reached by {how}, bind {bind}): {use.table_calls} in-window ledgered calls in "
@@ -1012,8 +1151,10 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery,
                f"{ctag}: semantics {edge.get('semantics')!r}; missing mechanism/ops {missing}; unledgered {extra}")
 
 
-def check_exec_split(view, cell, bound, images, man, mod, res):
-    """Leader-reached images bind to distinct callers minted in exec order."""
+def check_exec_split(view, cell, bound, images, man, mod, res, counted=frozenset()):
+    """Leader-reached images bind to distinct callers minted in exec order; a
+    required image whose row is count-covered (R-C51-1/-2) is accounted
+    without a caller (never merged into another's)."""
     run = view.name
     required = []
     for image in sorted(images.values(), key=lambda i: i.gen):
@@ -1022,7 +1163,7 @@ def check_exec_split(view, cell, bound, images, man, mod, res):
         if used and EXEC_HOW_BIND.get(how, "required") == "required":
             required.append(image.gen)
     by_gen = {gen: (caller, first) for gen, _how, caller, first in bound}
-    missing = [g for g in required if g not in by_gen]
+    missing = [g for g in required if g not in by_gen and g not in counted]
     callers = [by_gen[g][0] for g in sorted(by_gen)]
     order = [by_gen[g][1] for g in sorted(by_gen)]
     res.ok(run, cell, "EXEC-SPLIT",
@@ -1777,6 +1918,156 @@ def self_test():
                 d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": pid,
                                   "subject": "used by an unidentified caller image", "reason": "x", "budget": None, "repeats": 1})
         case("optional-cell-no-bound-instance", "BOUND-INSTANCE", p4_pid_gaps)
+
+        # --- R-C51-1/-2: count-covered unbound rows (controller 2026-10-03) ---
+        def counted(s, d, rows, at=None):
+            """The system stream with `rows` ({module, reason, rows}) on its last
+            pass marker, committed at `at` (default: the run's end)."""
+            ev = s.events(d)
+            for e in ev:
+                if e["kind"] in ("pass_committed", "ended"):
+                    e["at_ns"] = (at if at is not None else s.run_end) + e["seq"]
+            next(e for e in ev if e["kind"] == "pass_committed")["event"]["unbound_rows"] = rows
+            return {"events": ev}
+
+        def drop(s, d, cell, gens=(0,)):
+            gone = {v for k, v in s.ids.items() if k[0] == cell and k[2] in gens}
+            d["callers"] = [c for c in d["callers"] if c["id"] not in gone]
+            d["edges"] = [e for e in d["edges"] if e["caller"] not in gone]
+
+        def pidless(s, d):
+            d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
+                              "subject": "used by an unidentified caller image", "reason": "x", "budget": None})
+
+        def p4_counted(n, at=None):
+            def mutate(s, d, dash):
+                drop(s, d, "P4")
+                pidless(s, d)
+                return counted(s, d, [{"module": s.mid["A"], "reason": "no_live_caller", "rows": n}], at)
+            return mutate
+        res = case("short-lived-count-covered", None, p4_counted(2))
+        if not any(r["cell"] == "P4" and r["status"] == "unbound" for r in res.rows):
+            failures.append("short-lived-count-covered-exercised")
+        case("short-lived-count-short", "RETAINED", p4_counted(1))
+        case("short-lived-count-before-use", "RETAINED", p4_counted(2, at=T0 + 100))
+
+        def p4_wrong_reason(s, d, dash):
+            drop(s, d, "P4")
+            pidless(s, d)
+            return counted(s, d, [{"module": s.mid["A"], "reason": "lifecycle_loss", "rows": 2}])
+        case("short-lived-count-other-reason", "RETAINED", p4_wrong_reason)
+
+        def p4_no_gap(s, d, dash):
+            drop(s, d, "P4")
+            return counted(s, d, [{"module": s.mid["A"], "reason": "no_live_caller", "rows": 2}])
+        case("short-lived-count-without-pidless-gap", "RETAINED", p4_no_gap)
+
+        def p4_module_statement(reason):
+            def mutate(s, d, dash):
+                drop(s, d, "P4")
+                m = next(m for m in d["modules"] if m["id"] == s.mid["A"])
+                m["unbound_use"] = {"first_ns": T0, "rows": 2, "reasons": {reason: 2}}
+                return counted(s, d, [{"module": s.mid["A"], "reason": "no_live_caller", "rows": 2}])
+            return mutate
+        def p4_module_statement_retained(suppressed):
+            inner = p4_module_statement("no_live_caller")
+
+            def mutate(s, d, dash):
+                d["gaps_suppressed"] = suppressed
+                return inner(s, d, dash)
+            return mutate
+        case("short-lived-count-module-statement", None, p4_module_statement_retained(3))
+        case("short-lived-count-module-statement-other-reason", "RETAINED", p4_module_statement("lifecycle_loss"))
+        # Review L-5: without proven gap suppression the gap itself is required.
+        case("short-lived-count-module-statement-unsuppressed", "RETAINED", p4_module_statement_retained(0))
+
+        # Review M-1: an image whose caller was admitted and live before its
+        # first call must bind; count coverage never excuses it.
+        def admitted_live_counted(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"].update(state="unknown", first_ns=None, since_ns=None, reason="not_attached")
+            e["entries"]["observation"] = "unknown (usage observation unavailable)"
+            caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
+            first = min(u[0] for c, _p, _s, _g, _e, _sp, uses in s.images if c == "P1" for u in uses.values())
+            caller["first_seen_ns"] = first - MS
+            pidless(s, d)
+            return counted(s, d, [{"module": s.mid["A"], "reason": "no_live_caller", "rows": 1}])
+        case("admitted-live-caller-counted", "USED-POSITIVE", admitted_live_counted)
+
+
+        def p5_counted(n):
+            def mutate(s, d, dash):
+                drop(s, d, "P5", gens=(1, 2))
+                pidless(s, d)
+                return counted(s, d, [{"module": s.mid["A"], "reason": "no_live_caller", "rows": n}])
+            return mutate
+        case("exec-images-count-covered", None, p5_counted(2))
+        case("exec-images-count-short", "EXEC-SPLIT", p5_counted(1))
+
+        def p1_preadmission(n, admitted_early=False):
+            def mutate(s, d, dash):
+                e = _edge(d, cid(s, "P1"), s.mid["A"])
+                e["entries"]["coverage"].update(state="unknown", first_ns=None, since_ns=None,
+                                                reason="use_before_admission")
+                e["entries"]["observation"] = "unknown (usage observation unavailable)"
+                caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
+                first = min(u[0] for c, _p, _s, _g, _e, _sp, uses in s.images if c == "P1" for u in uses.values())
+                caller["first_seen_ns"] = first - MS if admitted_early else first + MS
+                pidless(s, d)
+                rows = [{"module": s.mid["A"], "reason": "before_admission", "rows": n}] if n else []
+                return counted(s, d, rows)
+            return mutate
+        res = case("use-before-admission-counted", None, p1_preadmission(1))
+        if not any(r["cell"] == "P1" and r["status"] == "unbound" for r in res.rows):
+            failures.append("use-before-admission-exercised")
+        case("use-before-admission-uncounted", "USED-POSITIVE", p1_preadmission(0))
+        case("use-before-admission-but-admitted-first", "USED-POSITIVE", p1_preadmission(1, admitted_early=True))
+
+        # Review L-4: a pre-admission image prefers a before_admission row,
+        # so the no_live_caller rows stay for the short-lived images.
+        def preadmission_and_short_lived(s, d, dash):
+            drop(s, d, "P4")
+            kw = p1_preadmission(1)(s, d, dash)
+            ev = kw["events"]
+            marker = next(e for e in ev if e["kind"] == "pass_committed")["event"]
+            marker["unbound_rows"] = [{"module": s.mid["A"], "reason": "no_live_caller", "rows": 2},
+                                      {"module": s.mid["A"], "reason": "before_admission", "rows": 1}]
+            return kw
+        case("preadmission-prefers-its-own-reason", None, preadmission_and_short_lived)
+
+        # A native run whose every edge reads unknown (lifecycle loss, use
+        # before admission) is still the native lane: it states it, and its
+        # reasons are native-only.
+        def all_unknown(stated, reason):
+            def mutate(s, d, dash):
+                for e in d["edges"]:
+                    e["entries"]["coverage"].update(state="unknown", since_ns=None, until_ns=None, first_ns=None,
+                                                    lossy=None, reason=reason, detail=None)
+                    e["entries"].update(count=0, first_seen_ns=None, last_seen_ns=None,
+                                        observation="unknown (usage observation unavailable)")
+                    e.update(semantics="unknown (semantic capture withheld)", mechanisms=None, operations=None)
+                d["observation"]["usage_feed"] = False
+                for c in d["callers"]:
+                    c["image"]["authority"] = "scan_pinned"
+                if stated:
+                    d["observation"]["lane"] = stated
+            return mutate
+
+        def lane_row(res):
+            return next((r for r in res.rows if r["run"] == "system" and r["check"] == "LANE"), {})
+        for name, stated, reason, want in (("all-unknown-stated-native", "native", "not_admitted", "pass"),
+                                           ("all-unknown-loss-unstated", None, "loss", "pass"),
+                                           ("all-unknown-scan-only-unstated", None, "scan_only", "fail"),
+                                           ("stated-native-with-scan-only-edges", "native", "scan_only", "fail")):
+            counter[0] += 1
+            synth = Synth("native", None)
+            doc, dash = _deep(synth.doc), _deep(synth.dash_doc)
+            all_unknown(stated, reason)(synth, doc, dash)
+            res = oracle(synth.write(os.path.join(tmp, f"{counter[0]:02d}-{name}"), doc=doc, dash_doc=dash))
+            ok = lane_row(res).get("status") == want
+            print(f"self-test {'ok  ' if ok else 'FAIL'} {name}" + ("" if ok else f": LANE {lane_row(res)}"))
+            if not ok:
+                failures.append(name)
 
         def exec_cross(s, d, dash):
             g0, g1 = _edge(d, cid(s, "P5", 0), s.mid["A"]), _edge(d, cid(s, "P5", 1), s.mid["A"])

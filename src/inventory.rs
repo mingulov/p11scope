@@ -14,8 +14,8 @@
 use crate::attach::Scope;
 use crate::cli::{CaptureMode, InspectScope};
 use crate::discovery::caller_registry::{
-    CallerEvent, ImageAuthority, OsProcessSource, ProcessSource, RegistryLimits, UseCoverage,
-    now_ns,
+    CallerEvent, ImageAuthority, ModuleId, OsProcessSource, ProcessSource, RegistryLimits,
+    UseCoverage, now_ns,
 };
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory_coordinator::{
@@ -38,6 +38,7 @@ use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, rende
 use crate::output::AtomicFile;
 use crate::process::PidPin;
 use anyhow::{Context as _, Result};
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
@@ -558,6 +559,9 @@ fn scan_one_pass(
 struct StreamState {
     emitted_gaps: usize,
     emitted_suppressed: u64,
+    /// Unbound witness rows per (module, reason) already counted on a
+    /// pass marker.
+    emitted_unbound: BTreeMap<(ModuleId, &'static str), u64>,
 }
 
 impl StreamState {
@@ -565,8 +569,66 @@ impl StreamState {
         Self {
             emitted_gaps: 0,
             emitted_suppressed: 0,
+            emitted_unbound: BTreeMap::new(),
         }
     }
+}
+
+/// (module, reason) entries one pass marker lists before it sums the rest
+/// as `unbound_rows_truncated`.
+const UNBOUND_ROWS_PER_PASS: usize = 256;
+
+/// R-C51-2: the unbound witness rows staged since the previous pass
+/// marker, per (module, reason) — the delta of the modules' cumulative
+/// `unbound_use.reasons` — listed up to `limit` entries in (module,
+/// reason) order, the rest summed as truncated. Rows never name a pid.
+fn unbound_rows_delta<'a>(
+    state: &mut StreamState,
+    modules: impl Iterator<Item = (ModuleId, &'a crate::discovery::caller_registry::UnboundUse)>,
+    limit: usize,
+) -> (Vec<serde_json::Value>, u64) {
+    let mut listed = Vec::new();
+    let mut truncated = 0u64;
+    for (id, unbound) in modules {
+        for (&reason, &count) in &unbound.reasons {
+            let emitted = state.emitted_unbound.entry((id, reason)).or_default();
+            let delta = count.saturating_sub(*emitted);
+            *emitted = (*emitted).max(count);
+            if delta == 0 {
+                continue;
+            }
+            if listed.len() < limit {
+                listed.push(serde_json::json!({
+                    "module": id.label(),
+                    "reason": reason,
+                    "rows": delta,
+                }));
+            } else {
+                truncated = truncated.saturating_add(delta);
+            }
+        }
+    }
+    (listed, truncated)
+}
+
+/// Adds this pass's unbound witness rows to a pass marker.
+fn add_unbound_rows(
+    payload: &mut serde_json::Value,
+    state: &mut StreamState,
+    presentation: &Presentation,
+) {
+    let (rows, truncated) = unbound_rows_delta(
+        state,
+        presentation.modules.iter().filter_map(|module| {
+            module
+                .unbound_use
+                .as_ref()
+                .map(|unbound| (module.id, unbound))
+        }),
+        UNBOUND_ROWS_PER_PASS,
+    );
+    payload["unbound_rows"] = serde_json::Value::from(rows);
+    payload["unbound_rows_truncated"] = serde_json::Value::from(truncated);
 }
 
 /// Append one committed pass to the event stream: caller turnover,
@@ -592,11 +654,9 @@ fn emit_pass_events(
         .gaps_suppressed
         .saturating_sub(state.emitted_suppressed);
     state.emitted_suppressed = presentation.gaps_suppressed;
-    writer.append(
-        "pass_committed",
-        pass_payload(report, presentation, fresh, suppressed_delta),
-        now_ns,
-    )
+    let mut payload = pass_payload(report, presentation, fresh, suppressed_delta);
+    add_unbound_rows(&mut payload, state, presentation);
+    writer.append("pass_committed", payload, now_ns)
 }
 
 /// Append the native stop's commit to the event stream: the incarnation
@@ -635,6 +695,7 @@ fn emit_stop_events(
         .saturating_sub(state.emitted_suppressed);
     state.emitted_suppressed = presentation.gaps_suppressed;
     let mut payload = pass_payload(&report, presentation, fresh, suppressed_delta);
+    add_unbound_rows(&mut payload, state, presentation);
     payload["final"] = serde_json::Value::Bool(true);
     writer.append("pass_committed", payload, now_ns)
 }
@@ -1673,6 +1734,49 @@ mod tests {
     /// C5.1: the native stop's commit reaches the stream as its events, its
     /// fresh gaps, and one `pass_committed` marked `final` whose `new_gaps`
     /// counts them, so pass accounting still sums to the streamed gaps.
+    /// R-C51-2: each pass marker carries this pass's unbound witness rows
+    /// per (module, reason) — the cumulative module counts' delta since
+    /// the previous marker — bounded, with the rest summed as truncated.
+    #[test]
+    fn pass_markers_count_this_passes_unbound_rows_per_module_and_reason() {
+        use crate::discovery::caller_registry::UnboundUse;
+        let unbound = |pairs: &[(&'static str, u64)]| UnboundUse {
+            first_ns: 1,
+            rows: pairs.iter().map(|(_, n)| n).sum(),
+            reasons: pairs.iter().copied().collect(),
+        };
+        let mut state = StreamState::new();
+        let first = [(ModuleId(3), unbound(&[("no_live_caller", 2)]))];
+        let (rows, truncated) =
+            unbound_rows_delta(&mut state, first.iter().map(|(id, u)| (*id, u)), 8);
+        assert_eq!(
+            serde_json::Value::from(rows),
+            serde_json::json!([{"module": "m3", "reason": "no_live_caller", "rows": 2}])
+        );
+        assert_eq!(truncated, 0);
+        let second = [
+            (
+                ModuleId(3),
+                unbound(&[("before_admission", 1), ("no_live_caller", 3)]),
+            ),
+            (ModuleId(4), unbound(&[("no_live_caller", 5)])),
+        ];
+        let (rows, truncated) =
+            unbound_rows_delta(&mut state, second.iter().map(|(id, u)| (*id, u)), 2);
+        assert_eq!(
+            serde_json::Value::from(rows),
+            serde_json::json!([
+                {"module": "m3", "reason": "before_admission", "rows": 1},
+                {"module": "m3", "reason": "no_live_caller", "rows": 1},
+            ])
+        );
+        assert_eq!(truncated, 5);
+        // Nothing new: an empty list.
+        let (rows, truncated) =
+            unbound_rows_delta(&mut state, second.iter().map(|(id, u)| (*id, u)), 2);
+        assert!(rows.is_empty() && truncated == 0);
+    }
+
     #[test]
     fn the_stop_commit_streams_its_events_and_gaps_under_a_final_pass() {
         let mut coordinator = coordinator();

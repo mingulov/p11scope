@@ -277,8 +277,25 @@ caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
     `scan_only` (no native usage producer runs — every edge of a
     scan-only run), `not_admitted`, `not_attached`, `attach_failed`,
     `identity_unavailable`, `capacity_limited` (`detail` names the
-    resource), `loss` (`detail` says what was lost), or
-    `retired_before_coverage`.
+    resource), `loss` (`detail` says what was lost),
+    `retired_before_coverage`, or `use_before_admission`.
+  - `use_before_admission` (native lane): a `CALLER_USE` row whose pid
+    is this caller's pid was not bound to it — typically a use before
+    the caller's admission (`before_admission`), or any other unbound
+    reason. The kernel records only the first use of each (image,
+    module) pair and never deletes it, so a later use leaves no row and
+    no watch of that module can be a fact. The edge reads unknown for
+    good: an ongoing or frozen watch is replaced, none starts again,
+    and it holds whichever is read first, the row or the admission.
+    Fail-safe by pid: a row of an earlier process that held the same
+    pid also downgrades the watch. Past a bound of 4096 (pid, module)
+    pairs every watch of the capture reads `use_before_admission`, with
+    a `native pre-admission rows past their bound` gap. Positive
+    history (`counted`, `witnessed`) is never downgraded, and a watch a
+    loss already demoted keeps `loss` (no watch starts again either way).
+    A row that lifecycle loss left unbound (`lifecycle_loss`) downgrades
+    the same way but reads `loss` (`detail`: the lost lifecycle
+    evidence), since the loss, not an early use, is what it shows.
   A zero reads `observed` only under `watched_no_use` or a loss-free
   `counted`. Positive coverage (`counted` entries, `witnessed`) is
   monotonic history: it survives loss, caller retirement, and module

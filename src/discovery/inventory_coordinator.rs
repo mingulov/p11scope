@@ -42,7 +42,7 @@ use crate::discovery::inventory_attach_set::{
     InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::native_binding::{
-    BinderLimits, Binding, Decision, ExecTransition, NativeBinder, NativeIdentity,
+    BinderLimits, Binding, Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
 };
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
@@ -286,6 +286,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             health_unproven: None,
             pairs_unproven: None,
             last_clean_ns: None,
+            sweep_began_ns: None,
+            preadmission: PreadmissionStash::new(PREADMISSION_STASH_LIMIT),
             stopped: false,
         });
     }
@@ -348,9 +350,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         capture.unproven = Some(reason.clone());
         let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
         self.registry.note_watch_end(
-            format!(
-                "no clean read proved the watch before native capture scope custody became unproven: {reason}"
-            ),
+            format!("native capture scope custody unproven before a clean read proved the watch: {reason}"),
             until,
         );
         self.registry.record_gap(RegistryGap {
@@ -359,7 +359,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pid: None,
             subject: "native capture scope custody unproven".into(),
             reason: format!(
-                "{reason}; every watched no-use interval ends at the earlier of the custody instant and the last clean read; a watch starting at or after that instant reads unknown, and no watch starts again"
+                "{reason}; every watched no-use interval ends at the last clean read before it"
             ),
             budget: None,
         });
@@ -371,13 +371,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// the detecting read on; an unproven health withholds watches until a
     /// batch proves it again; changed objects make their modules unknown
     /// from now on. The pair precondition (`pair_precondition_failure`,
-    /// sticky) withholds every watch without demoting one. A batch with
-    /// proven health, the pair precondition intact, no rise, and held
-    /// custody is the latest proven-clean instant: its `health_read_ns`, but never
-    /// past its custody proof (`custody_proven_ns`, the last held poll) or
-    /// its lifecycle drain horizon (`lifecycle_proven_ns`: any lifecycle
-    /// loss found later dates at or after it, so it never falls inside an
-    /// interval — what makes "nothing after stop" sound).
+    /// sticky) withholds every watch without demoting one. A batch that
+    /// completes a gap-free CALLER_USE sweep with proven health, the pair
+    /// precondition intact, no rise, and held custody is the latest
+    /// proven-clean instant: the `health_read_ns` of the batch that sweep
+    /// began in, but never past its custody proof (`custody_proven_ns`, the
+    /// last held poll).
     /// A system-scope lifecycle loss is a sticky demotion (C5.2 D4): see
     /// `note_lifecycle_loss`; a batch carrying one is never clean.
     /// After stop it stages nothing: forward the terminal read before
@@ -395,17 +394,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .changed_objects
             .extend(batch.changed_objects.iter().copied());
         let custody_held = matches!(batch.custody, ScopeCustody::System | ScopeCustody::PidHeld);
-        if batch.health_unproven.is_none()
+        // Only a completed, gap-free CALLER_USE sweep has visited every row
+        // present when it began, so it proves that sweep's first health
+        // read; a bounded read that stopped mid-sweep proves nothing.
+        let sweep_began_ns = *capture.sweep_began_ns.get_or_insert(batch.health_read_ns);
+        if batch.sweep_completed {
+            capture.sweep_began_ns = None;
+        }
+        if batch.sweep_completed
+            && !batch.sweep_gaps
+            && batch.health_unproven.is_none()
             && capture.pairs_unproven.is_none()
             && batch.health_regression.is_none()
             && custody_held
             && batch.lifecycle_loss.is_none()
             && capture.unproven.is_none()
         {
-            let clean_ns = batch
-                .health_read_ns
-                .min(batch.custody_proven_ns.unwrap_or(u64::MAX))
-                .min(batch.lifecycle_proven_ns);
+            let clean_ns = sweep_began_ns.min(batch.custody_proven_ns.unwrap_or(u64::MAX));
             capture.last_clean_ns = Some(
                 capture
                     .last_clean_ns
@@ -602,6 +607,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         let scope = self.capture_scope_verdict(caller, pid);
+        if let Some(loss) = self.preadmission_holds(pid, key) {
+            self.downgrade(caller, Some(key.clone()), loss);
+            return;
+        }
         if let Some(note) = self.capture_coverage_note(scope, attach_key, verdict) {
             self.registry.note_coverage(caller, key, note);
         }
@@ -1518,18 +1527,129 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// module.
     fn stage_witness(&mut self, decision: Decision) -> Result<(), String> {
         let Decision { row, binding } = decision;
-        let modules = self.witness_modules(&row)?;
+        let modules = match self.witness_modules(&row) {
+            Ok(modules) => modules,
+            Err(reason) => {
+                if let Binding::Unbound(unbound) = binding {
+                    self.note_preadmission(row.host_tgid, &[None], unbound);
+                }
+                return Err(reason);
+            }
+        };
         match binding {
             Binding::Bound(caller) => {
                 self.registry
                     .note_bound_witness(caller, modules, row.recorded_at_ns)
             }
             Binding::Unbound(reason) => {
+                let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
+                self.note_preadmission(row.host_tgid, &keys, reason);
                 self.registry
                     .note_unbound_witness(modules, row.recorded_at_ns, reason)
             }
         }
         Ok(())
+    }
+
+    /// R-C51-1 (fail-safe): an unbound CALLER_USE row of `pid` — refused
+    /// as `before_admission` or unmatched for any other reason — is the
+    /// pair's only row ever (BPF inserts it `NOEXIST` and never deletes
+    /// it), so a later use of that module by `pid` leaves no row and no
+    /// watch of it can be a fact. Every caller record of `pid` (live or
+    /// retired: a reused pid also downgrades, failing safe) reads
+    /// `use_before_admission` on those modules, and so does any caller
+    /// admitted with `pid` later (`stage_capture_coverage`). Past the
+    /// stash bound every caller of the scope reads it, with a gap. A row
+    /// left unbound by lifecycle loss downgrades the same way but reads
+    /// `loss` (R-C51-3): the loss, not an early use, is what it shows.
+    fn note_preadmission(
+        &mut self,
+        pid: u32,
+        modules: &[Option<ModuleKey>],
+        unbound: UnboundReason,
+    ) {
+        let loss = unbound == UnboundReason::LifecycleLoss;
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        let stash = &mut capture.preadmission;
+        if stash.overflowed {
+            return;
+        }
+        let mut fresh: Vec<Option<ModuleKey>> = Vec::new();
+        for module in modules {
+            let held = stash
+                .entries
+                .get(&pid)
+                .is_some_and(|held| held.contains_key(module) || held.contains_key(&None));
+            if held {
+                continue;
+            }
+            if stash.len >= stash.limit {
+                stash.overflowed = true;
+                self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "native pre-admission rows past their bound".into(),
+                    reason: format!(
+                        "more than {} (pid, module) pairs of unbound CALLER_USE rows: a caller's \
+                         use before its admission can no longer be told apart, so every watch \
+                         of this capture reads unknown use_before_admission",
+                        stash.limit
+                    ),
+                    budget: None,
+                });
+                let callers: Vec<CallerId> =
+                    self.adapter.records().map(|record| record.id).collect();
+                for caller in callers {
+                    self.registry.note_use_before_admission(caller, None);
+                }
+                return;
+            }
+            stash
+                .entries
+                .entry(pid)
+                .or_default()
+                .insert(module.clone(), loss);
+            stash.len += 1;
+            fresh.push(module.clone());
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let callers: Vec<CallerId> = self
+            .adapter
+            .records()
+            .filter(|record| record.pid == pid)
+            .map(|record| record.id)
+            .collect();
+        for caller in callers {
+            for module in &fresh {
+                self.downgrade(caller, module.clone(), loss);
+            }
+        }
+    }
+
+    fn downgrade(&mut self, caller: CallerId, module: Option<ModuleKey>, loss: bool) {
+        if loss {
+            self.registry
+                .note_unbound_row_loss(caller, module, UNBOUND_ROW_LOSS);
+        } else {
+            self.registry.note_use_before_admission(caller, module);
+        }
+    }
+
+    /// Whether R-C51-1 downgrades `pid`'s edge on `key`: `Some(loss)`.
+    fn preadmission_holds(&self, pid: u32, key: &ModuleKey) -> Option<bool> {
+        let stash = &self.capture.as_ref()?.preadmission;
+        if stash.overflowed {
+            return Some(false);
+        }
+        let held = stash.entries.get(&pid)?;
+        held.get(&None)
+            .or_else(|| held.get(&Some(key.clone())))
+            .copied()
     }
 
     /// The registry modules a row witnesses: every admitted module whose
@@ -1697,7 +1817,46 @@ struct CaptureCoverage {
     /// The latest witness read with proven health, no rise, and held
     /// custody: where a watch ends at stop.
     last_clean_ns: Option<u64>,
+    /// The health read of the batch the open CALLER_USE sweep began in
+    /// (`None`: the next batch begins one).
+    sweep_began_ns: Option<u64>,
+    /// Pids of unbound CALLER_USE rows (R-C51-1): their callers' watches
+    /// on the rows' modules read `use_before_admission`, whichever is
+    /// staged first, the row or the caller's admission.
+    preadmission: PreadmissionStash,
     stopped: bool,
+}
+
+/// The loss detail of an edge whose caller's use row lifecycle loss left
+/// unbound (R-C51-3).
+const UNBOUND_ROW_LOSS: &str =
+    "lifecycle evidence was lost before this caller's use row could bind";
+
+/// (pid, module) pairs the stash holds before it overflows.
+const PREADMISSION_STASH_LIMIT: usize = 4096;
+
+/// The (pid, module) pairs of every unbound CALLER_USE row, bounded. A
+/// `None` module is a row whose endpoint resolved to no module: every
+/// module of that pid. Past the bound the whole scope reads
+/// `use_before_admission` (sticky).
+#[derive(Debug)]
+struct PreadmissionStash {
+    /// pid -> module -> whether lifecycle loss left the row unbound.
+    entries: BTreeMap<u32, BTreeMap<Option<ModuleKey>, bool>>,
+    len: usize,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl PreadmissionStash {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            len: 0,
+            limit,
+            overflowed: false,
+        }
+    }
 }
 
 /// The WatchedNoUse pair precondition (C3 open item, C5.2): the userspace
@@ -2978,7 +3137,6 @@ mod tests {
             changed_objects: Vec::new(),
             custody: ScopeCustody::PidHeld,
             custody_proven_ns: None,
-            lifecycle_proven_ns: u64::MAX,
             lifecycle_loss: None,
             unsettled: false,
         }
@@ -3415,11 +3573,8 @@ mod tests {
                 .gaps()
                 .iter()
                 .any(|gap| gap.subject == "native capture scope custody unproven"
-                    && gap.reason.contains("PID target exited")
-                    && gap
-                        .reason
-                        .contains("earlier of the custody instant and the last clean read")),
-            "the custody loss is disclosed with what it ends"
+                    && gap.reason.contains("PID target exited")),
+            "the custody loss is disclosed"
         );
         scene.project(7, 280);
         scene.coordinator.end_capture_coverage(300);
@@ -3452,59 +3607,7 @@ mod tests {
         scene.coordinator.end_capture_coverage(300);
         scene.coordinator.registry.publish();
         assert!(
-            lost_with(&scene.coverage(caller), "short DISCOVERY record")
-                && lost_with(
-                    &scene.coverage(caller),
-                    "no clean read proved the watch before native capture scope custody became unproven"
-                ),
-            "{:?}",
-            scene.coverage(caller)
-        );
-    }
-
-    #[test]
-    fn a_clean_read_never_claims_past_the_lifecycle_drain_horizon() {
-        // C5.2 closure I-1: drained at 1000, a record reserved at 1010,
-        // clean terminal read at 1020, stop at 1030: the interval ends at
-        // 1000, so the loss found after stop (dated >= 1000) is outside it.
-        let (mut scene, caller) = watched_scene(7, 500);
-        let mut terminal = witness_batch();
-        terminal.health_read_ns = 1020;
-        terminal.lifecycle_proven_ns = 1000;
-        scene.coordinator.note_witness_batch(&terminal);
-        assert_eq!(last_clean(&scene), Some(1000));
-        scene.coordinator.end_capture_coverage(1030);
-        scene.coordinator.registry.publish();
-        assert_eq!(scene.coverage(caller), frozen(100, 1000));
-
-        // D2, PID: the only clean read is capped at a drain at 60, before
-        // the watch began, so a later exit at 200 never freezes {100, 200}.
-        let mut scene = CaptureScene::new(1);
-        scene.source.spawn(9, 510);
-        let caller = scene
-            .coordinator
-            .adapter
-            .admit(9, ImageAuthority::ScanPinned, 50)
-            .unwrap();
-        scene
-            .coordinator
-            .begin_capture_coverage(incarnation(9, 510));
-        scene.attach_all(100, ScopeCustody::PidHeld);
-        scene.project(9, 120);
-        let mut read = witness_batch();
-        read.health_read_ns = 200;
-        read.lifecycle_proven_ns = 60;
-        scene.coordinator.note_witness_batch(&read);
-        assert_eq!(last_clean(&scene), Some(60));
-        scene
-            .coordinator
-            .note_capture_custody(&ScopeCustody::PidLost {
-                at_ns: 200,
-                reason: "PID custody lost: the PID target exited".into(),
-            });
-        scene.coordinator.registry.publish();
-        assert!(
-            lost_with(&scene.coverage(caller), "PID target exited"),
+            lost_with(&scene.coverage(caller), "short DISCOVERY record"),
             "{:?}",
             scene.coverage(caller)
         );
@@ -3551,13 +3654,7 @@ mod tests {
                 .registry
                 .gaps()
                 .iter()
-                .any(
-                    |gap| gap.subject == "native capture lifecycle evidence lost"
-                        && gap.reason.contains("no watch starts again in this capture")
-                        && !gap.reason.contains("may start")
-                ),
-            "{:?}",
-            scene.coordinator.registry.gaps()
+                .any(|gap| gap.subject == "native capture lifecycle evidence lost"),
         );
         // Sticky: a later clean read and projection never restart a watch.
         let mut later = witness_batch();
@@ -3643,7 +3740,6 @@ mod tests {
 
     use crate::attach::capture::{CookieQuery, DomainCookie, ExecCoverage};
     use crate::discovery::caller_registry::{UnboundUse, UseCoverage};
-    use crate::discovery::native_binding::UnboundReason;
 
     /// Facade stamps for scripted native batches: strictly increasing, so
     /// each batch follows the one staged before it.
@@ -4282,5 +4378,244 @@ mod tests {
             native.scene.coverage(caller),
             UseCoverage::Witnessed { first_ns: 210 }
         );
+    }
+
+    /// C5.1 carry (C5.2 review): a read proves a clean instant only when it
+    /// completes a gap-free CALLER_USE sweep, and that instant is the health
+    /// read of the batch the sweep began in — a bounded read that stopped
+    /// mid-sweep may have left a use dated before its stamp unvisited.
+    #[test]
+    fn only_a_completed_gap_free_sweep_proves_a_clean_read() {
+        let (mut scene, caller) = watched_scene(7, 500);
+        assert_eq!(last_clean(&scene), Some(200));
+        // A sweep begins at 250 and stops at its row bound.
+        let mut partial = witness_batch();
+        partial.health_read_ns = 250;
+        partial.sweep_completed = false;
+        partial.row_bound_reached = true;
+        scene.coordinator.note_witness_batch(&partial);
+        assert_eq!(last_clean(&scene), Some(200));
+        // It completes at 280: every row present at 250 was visited.
+        let mut rest = witness_batch();
+        rest.health_read_ns = 280;
+        scene.coordinator.note_witness_batch(&rest);
+        assert_eq!(last_clean(&scene), Some(250));
+        // A sweep that completes with skipped rows proves nothing.
+        let mut gaps = witness_batch();
+        gaps.health_read_ns = 290;
+        gaps.sweep_gaps = true;
+        scene.coordinator.note_witness_batch(&gaps);
+        assert_eq!(last_clean(&scene), Some(250));
+        // A terminal read that stopped mid-sweep never extends the interval.
+        let mut terminal = witness_batch();
+        terminal.health_read_ns = 295;
+        terminal.sweep_completed = false;
+        terminal.deadline_reached = true;
+        scene.coordinator.note_witness_batch(&terminal);
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        assert_eq!(
+            scene.coverage(caller),
+            crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+                since_ns: 100,
+                until_ns: Some(250),
+            }
+        );
+    }
+
+    // ---- R-C51-1: an unbound row of a watched caller's pid ----
+
+    /// A system-scope native lane with pid 7 (start 500) admitted at 50,
+    /// every endpoint attached at 100, and its edge watched since 120.
+    fn watched_native() -> (NativeScene, CallerId) {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.coordinator.begin_capture_coverage(None);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::System);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(watched(&native.scene.coverage(caller)));
+        (native, caller)
+    }
+
+    fn use_before_admission(coverage: &UseCoverage) -> bool {
+        matches!(
+            coverage,
+            UseCoverage::Unknown(UnknownReason::UseBeforeAdmission)
+        )
+    }
+
+    #[test]
+    fn a_row_from_before_admission_downgrades_the_watch_for_good() {
+        // Read after the admission: the row predates it (t0 40 < 50).
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 40, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            census.unbound.get(&UnboundReason::BeforeAdmission),
+            Some(&1)
+        );
+        assert!(
+            use_before_admission(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        // Sticky: later passes and the stop never restore a watch.
+        native.scene.project(7, 2_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.end_capture_coverage(3_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(use_before_admission(&native.scene.coverage(caller)));
+    }
+
+    #[test]
+    fn a_row_read_before_its_callers_admission_downgrades_the_later_watch() {
+        // Read before the admission: pid 9 holds no caller yet.
+        let (mut native, _) = watched_native();
+        let row = native.row(77, 1, 9, 1_000, 1);
+        native.witness(vec![row]);
+        native.scene.source.spawn(9, 900);
+        let later = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 1_500)
+            .unwrap();
+        native.scene.project(9, 1_600);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            use_before_admission(&native.scene.coverage(later)),
+            "{:?}",
+            native.scene.coverage(later)
+        );
+    }
+
+    #[test]
+    fn a_full_preadmission_stash_degrades_the_scope_with_a_gap() {
+        let (mut native, caller) = watched_native();
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .unwrap()
+            .preadmission
+            .limit = 1;
+        let rows = vec![
+            native.row(77, 1, 9, 1_000, 0),
+            native.row(78, 1, 11, 1_000, 0),
+        ];
+        native.witness(rows);
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"native pre-admission rows past their bound".to_string()),
+            "{:?}",
+            native.gap_subjects()
+        );
+        // pid 7 had no unbound row, yet its watch degrades with the scope.
+        assert!(
+            use_before_admission(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        native.scene.project(7, 2_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(use_before_admission(&native.scene.coverage(caller)));
+        // A caller admitted after the overflow, with no row of its own.
+        native.scene.source.spawn(13, 1_300);
+        let later = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(13, ImageAuthority::ScanPinned, 2_100)
+            .unwrap();
+        native.scene.project(13, 2_200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            use_before_admission(&native.scene.coverage(later)),
+            "{:?}",
+            native.scene.coverage(later)
+        );
+    }
+
+    #[test]
+    fn a_bound_row_of_the_same_pid_keeps_the_caller_witnessed() {
+        // Positives stay positives: the rule only replaces a watch.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        native.witness(vec![row]);
+        assert!(native.scene.coverage(caller).is_witnessed());
+        assert!(
+            native
+                .scene
+                .coordinator
+                .capture
+                .as_ref()
+                .unwrap()
+                .preadmission
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_row_decided_after_stop_still_downgrades_a_frozen_watch() {
+        let (mut native, caller) = watched_native();
+        // A clean read at 1_010, then the stop freezes the watch there.
+        native.read(Vec::new());
+        native.scene.coordinator.end_capture_coverage(1_100);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(watched(&native.scene.coverage(caller)));
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 40, 0);
+        native.witness(vec![row]);
+        assert!(
+            use_before_admission(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    /// R-C51-3: a row lifecycle loss left unbound downgrades the same way,
+    /// sticky, but the edge reads unknown `loss` — never watched, and not
+    /// `use_before_admission`.
+    #[test]
+    fn a_row_lifecycle_loss_left_unbound_reads_loss() {
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        let mut batch = native.stamps.read(native.domain, vec![row]);
+        let NativeBatch::Witness(read) = &mut batch else {
+            unreachable!()
+        };
+        // The ring lost a record before this read: the binder dates a loss.
+        read.health.discovery_counters = Some([1, 0, 0, 0, 0]);
+        native.stage(batch);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.unbound.get(&UnboundReason::LifecycleLoss), Some(&1));
+        assert!(
+            lost_with(&native.scene.coverage(caller), "use row could bind"),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        native.scene.project(7, 2_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(lost_with(
+            &native.scene.coverage(caller),
+            "use row could bind"
+        ));
     }
 }

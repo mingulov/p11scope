@@ -69,6 +69,10 @@ pub(crate) struct LaneWindows {
     /// endpoint (every Singles link pays its own kernel detach), up to the
     /// cap.
     pub retirement_base: Duration,
+    /// How long stop keeps draining the lifecycle ring before its terminal
+    /// read, and then keeps reading for a terminal CALLER_USE sweep to
+    /// complete (a read that stops mid-sweep proves no clean instant).
+    pub terminal_sweep_budget: Duration,
     pub retirement_per_endpoint: Duration,
     pub retirement_cap: Duration,
 }
@@ -84,6 +88,7 @@ impl LaneWindows {
         pass_quanta: 64,
         // Host 7.0 detached 68 links in 4.9 s (about 73 ms each).
         retirement_base: Duration::from_secs(5),
+        terminal_sweep_budget: Duration::from_millis(500),
         retirement_per_endpoint: Duration::from_millis(250),
         retirement_cap: Duration::from_secs(120),
     };
@@ -414,16 +419,46 @@ impl<L> NativeLane<L> {
     {
         debug_assert!(self.passes > 0, "stop before any pass after activation");
         let mut events = std::mem::take(&mut self.pending_events);
-        // The terminal read's coverage half counts only before the end.
-        let terminal = self.capture.read_witnesses(self.windows.witness());
-        events.extend(
-            host.stage_native(
-                NativeBatch::Witness(Box::new(terminal)),
-                &mut self.capture,
-                now_ns(),
-            )
-            .events,
-        );
+        // Drain the lifecycle ring completely (bounded) right before the
+        // terminal read, each quantum staged before the coverage ends: a
+        // loss still in the ring then reaches the watch before it freezes
+        // (C5.2 closure I-1). A failed quantum is a loss the coordinator
+        // dates; retrying it would not drain more.
+        let drain_deadline = Instant::now() + self.windows.terminal_sweep_budget;
+        loop {
+            let batch = self.capture.service_discovery(self.windows.discovery());
+            let done = batch.drained() || batch.failure.is_some();
+            let head_pending = batch.head_pending;
+            events.extend(
+                host.stage_native(NativeBatch::Lifecycle(batch), &mut self.capture, now_ns())
+                    .events,
+            );
+            if done || Instant::now() >= drain_deadline {
+                break;
+            }
+            if head_pending {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // The terminal read's coverage half counts only before the end, and
+        // only a completed sweep proves it clean: read on (bounded) until
+        // one completes.
+        let sweep_deadline = Instant::now() + self.windows.terminal_sweep_budget;
+        loop {
+            let terminal = self.capture.read_witnesses(self.windows.witness());
+            let swept = terminal.sweep_completed;
+            events.extend(
+                host.stage_native(
+                    NativeBatch::Witness(Box::new(terminal)),
+                    &mut self.capture,
+                    now_ns(),
+                )
+                .events,
+            );
+            if swept || Instant::now() >= sweep_deadline {
+                break;
+            }
+        }
         host.end_capture_coverage(now_ns());
         self.capture.begin_stop();
         let budget = self.windows.retirement_budget(self.attached);

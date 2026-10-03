@@ -610,10 +610,10 @@ unsafe fn close_inherited_descriptors<const N: usize>(
             at -= 1;
         }
     }
-    // The fallback enumerates the child's own table from this handle (opened
-    // here, in the child). A negative handle degrades each gap to the
-    // bounded sweep.
-    let enum_dir = unsafe { open_own_fd_enumeration(&keep) };
+    let mut closer = GapCloser {
+        use_close_range,
+        enum_dir: ENUM_DIR_UNOPENED,
+    };
     let mut first = 3u32;
     for fd in keep {
         let Ok(fd) = u32::try_from(fd) else {
@@ -623,11 +623,11 @@ unsafe fn close_inherited_descriptors<const N: usize>(
             continue;
         }
         if fd > first {
-            unsafe { close_descriptor_range(first, fd - 1, use_close_range, enum_dir) }?;
+            unsafe { closer.close(first, fd - 1, &keep) }?;
         }
         first = fd + 1;
     }
-    unsafe { close_descriptor_range(first, u32::MAX, use_close_range, enum_dir) }?;
+    unsafe { closer.close(first, u32::MAX, &keep) }?;
     for fd in keep {
         if fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(unsafe { last_errno() });
@@ -635,10 +635,62 @@ unsafe fn close_inherited_descriptors<const N: usize>(
     }
     // The enumeration handle is this close's own tool, not a kept pipe: the
     // pre-exec child must not hold it at its barrier.
-    if enum_dir > 2 {
-        unsafe { libc::close(enum_dir) };
+    if closer.enum_dir > 2 {
+        unsafe { libc::close(closer.enum_dir) };
     }
     Ok(())
+}
+
+/// `GapCloser::enum_dir` before the fallback first needs it.
+const ENUM_DIR_UNOPENED: i32 = -2;
+
+/// The closer's per-run state, on the fork child's stack. `close_range` is
+/// tried until it is refused; from then on every gap uses the fallback, so a
+/// later `close_range` success can never close the enumeration handle. That
+/// handle opens only on the first refusal: the common path costs no
+/// `/proc` lookup per spawn.
+struct GapCloser {
+    use_close_range: bool,
+    /// The child's own `/proc/self/fd` handle: `ENUM_DIR_UNOPENED` until the
+    /// fallback first runs, then the handle or -1 (unavailable: each gap
+    /// degrades to the bounded sweep).
+    enum_dir: i32,
+}
+
+impl GapCloser {
+    /// Closes `first..=last`. A fork child has a private descriptor table, so
+    /// plain `close_range` (no CLOSE_RANGE_UNSHARE) closes exactly this
+    /// child's copies. Where `close_range` is unavailable (ENOSYS before
+    /// Linux 5.9) or denied (a seccomp policy answering EPERM), close exactly
+    /// the enumerated open descriptors in range: a bounded sweep to the soft
+    /// RLIMIT_NOFILE would miss inheritable descriptors above the current
+    /// limit (opened before the limit was lowered) and leak them into the
+    /// workload. Only when `/proc` is unavailable, sweep one by one to the
+    /// hard limit. Async-signal-safe: raw syscalls and stack data only.
+    unsafe fn close(
+        &mut self,
+        first: u32,
+        last: u32,
+        keep: &[i32],
+    ) -> std::result::Result<(), i32> {
+        if self.use_close_range {
+            if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } == 0 {
+                return Ok(());
+            }
+            let errno = unsafe { last_errno() };
+            if errno != libc::ENOSYS && errno != libc::EPERM {
+                return Err(errno);
+            }
+            self.use_close_range = false;
+        }
+        if self.enum_dir == ENUM_DIR_UNOPENED {
+            self.enum_dir = unsafe { open_own_fd_enumeration(keep) };
+        }
+        if unsafe { close_enumerated_range(first, last, self.enum_dir) } {
+            return Ok(());
+        }
+        unsafe { close_sweep_range(first, last) }
+    }
 }
 
 /// Opens the fork child's own `/proc/self/fd` for the fallback enumeration.
@@ -650,7 +702,7 @@ unsafe fn close_inherited_descriptors<const N: usize>(
 /// number first. Async-signal-safe: raw syscalls and stack data only, no
 /// allocation. Returns -1 when `/proc` is unavailable or no number can be
 /// freed, in which case the fallback degrades to the bounded sweep.
-unsafe fn open_own_fd_enumeration<const N: usize>(keep: &[i32; N]) -> i32 {
+unsafe fn open_own_fd_enumeration(keep: &[i32]) -> i32 {
     // "/proc/self/fd" with its NUL, passed to raw open without allocation.
     const SELF_FD: &[u8; 14] = b"/proc/self/fd\0";
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
@@ -706,10 +758,12 @@ unsafe fn open_own_fd_enumeration<const N: usize>(keep: &[i32; N]) -> i32 {
 /// itself, listed from the child's own `/proc/self/fd` handle with raw
 /// `getdents64` into a stack buffer (the way glibc's closefrom does it).
 /// Async-signal-safe: raw syscalls and stack data only, no allocation.
-/// Collects the whole in-range set before closing anything: closing while
-/// scanning shifts the directory offset and would skip entries. Returns
-/// false on any enumeration error or an overfull set, so the caller falls
-/// back to the bounded sweep.
+/// Collects the whole in-range set before closing anything. procfs positions
+/// this directory by descriptor number, so closing mid-scan would not skip
+/// entries there; collecting first just keeps the scan independent of that
+/// filesystem detail, at the price of a bounded set. Returns false on any
+/// enumeration error or an overfull set (more than 8192 in range), so the
+/// caller falls back to the bounded sweep.
 unsafe fn close_enumerated_range(first: u32, last: u32, enum_dir: i32) -> bool {
     if enum_dir < 0 {
         return false;
@@ -830,35 +884,6 @@ unsafe fn close_sweep_range(first: u32, last: u32) -> std::result::Result<(), i3
         fd += 1;
     }
     Ok(())
-}
-
-/// Closes `first..=last`. A fork child has a private descriptor table, so
-/// plain `close_range` (no CLOSE_RANGE_UNSHARE) closes exactly this child's
-/// copies. Where `close_range` is unavailable (ENOSYS before Linux 5.9) or
-/// denied (a seccomp policy answering EPERM), close exactly the enumerated
-/// open descriptors in range: a bounded sweep to the soft RLIMIT_NOFILE
-/// would miss inheritable descriptors above the current limit (opened before
-/// the limit was lowered) and leak them into the workload. Only when `/proc`
-/// is unavailable, sweep one by one to the hard limit.
-unsafe fn close_descriptor_range(
-    first: u32,
-    last: u32,
-    use_close_range: bool,
-    enum_dir: i32,
-) -> std::result::Result<(), i32> {
-    if use_close_range {
-        if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } == 0 {
-            return Ok(());
-        }
-        let errno = unsafe { last_errno() };
-        if errno != libc::ENOSYS && errno != libc::EPERM {
-            return Err(errno);
-        }
-    }
-    if unsafe { close_enumerated_range(first, last, enum_dir) } {
-        return Ok(());
-    }
-    unsafe { close_sweep_range(first, last) }
 }
 
 unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(), i32> {
@@ -8173,9 +8198,13 @@ mod tests {
         drop(sibling);
     }
 
+    /// What a fork-child closer probe reports: every descriptor from 3 up
+    /// still open as (fd, close-on-exec), and the expected keep set.
+    type CloserReport = (Vec<(i32, bool)>, Vec<i32>);
+
     /// Forks, runs the closer with `keep`, and reports every descriptor from
     /// 3 up still open in the fork child as (fd, close-on-exec).
-    fn descriptors_left_by_closer(use_close_range: bool) -> (Vec<(i32, bool)>, Vec<i32>) {
+    fn descriptors_left_by_closer(use_close_range: bool) -> CloserReport {
         let (mut reader, writer) = pipe_pair();
         let null = File::open("/dev/null").unwrap();
         let unrelated: Vec<File> = (0..3).map(|_| File::open("/dev/null").unwrap()).collect();
@@ -8244,23 +8273,42 @@ mod tests {
         }
     }
 
-    /// Like `descriptors_left_by_closer`, but with hundreds of unrelated
-    /// descriptors open and the fork child lowering its own RLIMIT_NOFILE
-    /// below them first (per-process: the parent's limits are untouched).
-    /// `hard` pins the child's hard limit, or keeps the current one. The
-    /// child exits 120 when its own limit setup fails.
-    fn descriptors_left_by_closer_above_limit(
-        soft: u64,
-        hard: Option<u64>,
-    ) -> (Vec<(i32, bool)>, Vec<i32>) {
+    /// A close-on-exec duplicate of `file` at the lowest free number from
+    /// `at` up. Places a descriptor high without opening hundreds below it:
+    /// parallel tests share one soft RLIMIT_NOFILE, often 1024. Unlike
+    /// `dup2` onto a fixed number, F_DUPFD_CLOEXEC never replaces a
+    /// descriptor a concurrent test holds there.
+    fn duplicate_at_or_above(file: &File, at: i32) -> OwnedFd {
+        // SAFETY: F_DUPFD_CLOEXEC of a live descriptor returns a new owned one.
+        let duplicated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, at) };
+        assert!(
+            duplicated >= at,
+            "placing a descriptor at or above {at}: {} (the soft RLIMIT_NOFILE must exceed it)",
+            io::Error::last_os_error()
+        );
+        // SAFETY: as above.
+        unsafe { OwnedFd::from_raw_fd(duplicated) }
+    }
+
+    /// Like `descriptors_left_by_closer`, but with unrelated descriptors
+    /// placed above `soft` and the fork child lowering its own
+    /// RLIMIT_NOFILE below them first (per-process: the parent's limits are
+    /// untouched). `hard` pins the child's hard limit, or keeps the current
+    /// one. The child exits 120 when its own limit setup fails.
+    fn descriptors_left_by_closer_above_limit(soft: u64, hard: Option<u64>) -> CloserReport {
         let (mut reader, writer) = pipe_pair();
         let null = File::open("/dev/null").unwrap();
-        let unrelated: Vec<File> = (0..600).map(|_| File::open("/dev/null").unwrap()).collect();
+        let low: Vec<File> = (0..3).map(|_| File::open("/dev/null").unwrap()).collect();
+        let soft_fd = i32::try_from(soft).unwrap();
+        let unrelated = [
+            duplicate_at_or_above(&null, soft_fd + 88),
+            duplicate_at_or_above(&null, soft_fd + 388),
+        ];
         // SAFETY: dup of a live descriptor returns a new owned, inheritable one.
         let kept = unsafe { OwnedFd::from_raw_fd(libc::dup(null.as_raw_fd())) };
         let highest = unrelated
             .iter()
-            .map(|file| file.as_raw_fd() as u64)
+            .map(|fd| fd.as_raw_fd() as u64)
             .max()
             .unwrap_or(0);
         assert!(
@@ -8288,7 +8336,7 @@ mod tests {
             io::Error::last_os_error()
         );
         assert!(
-            current.rlim_cur >= highest + 1,
+            current.rlim_cur > highest,
             "this test needs room for its own descriptors, soft limit is {}",
             current.rlim_cur
         );
@@ -8357,7 +8405,7 @@ mod tests {
             .collect();
         let mut expected = vec![kept.as_raw_fd(), keep[2]];
         expected.sort();
-        drop((null, unrelated));
+        drop((null, low, unrelated));
         (left, expected)
     }
 
@@ -8394,11 +8442,35 @@ mod tests {
     #[test]
     fn the_bounded_sweep_reaches_past_the_soft_limit() {
         let (mut reader, writer) = pipe_pair();
-        let unrelated: Vec<File> = (0..600).map(|_| File::open("/dev/null").unwrap()).collect();
-        let target = unrelated.iter().map(|file| file.as_raw_fd()).max().unwrap();
+        let null = File::open("/dev/null").unwrap();
+        let high = duplicate_at_or_above(&null, 600);
+        let target = high.as_raw_fd();
+        let mut current = libc::rlimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: prlimit64 get on pid 0 with a live out-param.
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_prlimit64,
+                0,
+                libc::RLIMIT_NOFILE,
+                std::ptr::null::<libc::rlimit64>(),
+                &mut current,
+            )
+        };
+        assert_eq!(
+            read,
+            0,
+            "reading RLIMIT_NOFILE: {}",
+            io::Error::last_os_error()
+        );
+        // The child's hard limit must still admit the target: the sweep
+        // reaches it only through the hard limit.
+        let hard = current.rlim_max.min(4096);
         assert!(
-            target > 512,
-            "the setup must push a descriptor above the lowered soft limit, highest is {target}"
+            hard > target as u64,
+            "the hard limit {hard} must exceed the high descriptor {target}"
         );
         let writer_fd = writer.as_raw_fd();
         // SAFETY: the child runs only raw syscalls on stack data, then _exit.
@@ -8408,7 +8480,7 @@ mod tests {
             unsafe {
                 let lowered = libc::rlimit64 {
                     rlim_cur: 512,
-                    rlim_max: 4096,
+                    rlim_max: hard,
                 };
                 if libc::syscall(
                     libc::SYS_prlimit64,
@@ -8456,18 +8528,19 @@ mod tests {
             &[0, 1],
             "the sweep must close the high target and leave the pipe"
         );
-        drop(unrelated);
+        drop((null, high));
     }
 
-    /// One dense-table attempt: fills every number below the soft limit the
-    /// child then pins, proves the density with a probe open (EMFILE), and
-    /// runs the closer. Returns `None` when parallel churn opened a hole
-    /// before the fork (the probe succeeds), so the caller retries; the
-    /// closer result otherwise.
-    fn dense_table_attempt() -> Option<(Vec<(i32, bool)>, Vec<i32>)> {
+    /// One dense-table attempt: pins the child's limits at the parent's
+    /// first free number, so every number below them is occupied, proves the
+    /// density with a probe open (EMFILE), and runs the closer. Returns
+    /// `None` when parallel churn opened a hole before the fork (the probe
+    /// succeeds), so the caller retries; the closer result otherwise.
+    fn dense_table_attempt() -> Option<CloserReport> {
         let (mut reader, writer) = pipe_pair();
         let null = File::open("/dev/null").unwrap();
-        let unrelated: Vec<File> = (0..600).map(|_| File::open("/dev/null").unwrap()).collect();
+        // SAFETY: dup of a live descriptor returns a new owned, inheritable one.
+        let kept = unsafe { OwnedFd::from_raw_fd(libc::dup(null.as_raw_fd())) };
         // First free number: everything below is occupied, so pinning the
         // limits there leaves the child no free number at all.
         let mut edge = 3u32;
@@ -8476,15 +8549,13 @@ mod tests {
             edge += 1;
         }
         // Doomed descriptors at and above the edge: the bounded sweep stops
-        // below them, so only the victim-fed enumeration passes. Lowest-free
-        // allocation lands them here unless parallel churn freed a lower
-        // number after the scan (then this attempt retries).
-        let high: Vec<File> = (0..64).map(|_| File::open("/dev/null").unwrap()).collect();
-        if high.iter().any(|file| (file.as_raw_fd() as u32) < edge) {
-            return None;
-        }
-        // SAFETY: dup of a live descriptor returns a new owned, inheritable one.
-        let kept = unsafe { OwnedFd::from_raw_fd(libc::dup(null.as_raw_fd())) };
+        // below them, so only the victim-fed enumeration passes.
+        let edge_fd = edge as i32;
+        let high = [
+            duplicate_at_or_above(&null, edge_fd),
+            duplicate_at_or_above(&null, edge_fd + 40),
+            duplicate_at_or_above(&null, edge_fd + 200),
+        ];
         // Unsorted, with a stdio entry the closer must leave alone.
         let keep = [kept.as_raw_fd(), 1, writer.as_raw_fd()];
         // SAFETY: the child runs only raw syscalls on stack data, then _exit.
@@ -8569,7 +8640,7 @@ mod tests {
             .collect();
         let mut expected = vec![kept.as_raw_fd(), keep[2]];
         expected.sort();
-        drop((null, unrelated, high));
+        drop((null, high));
         Some((left, expected))
     }
 
@@ -8596,15 +8667,23 @@ mod tests {
         );
     }
 
+    /// Outcome of one refused-close_range fork: the filter-install errno,
+    /// the closer errno, the descriptors left, the expected keeps, and
+    /// sample unrelated numbers (proving the negative arm closed nothing).
+    struct RefusedCloseOutcome {
+        install: i32,
+        closer: i32,
+        left: Vec<(i32, bool)>,
+        expected: Vec<i32>,
+        sample: Vec<i32>,
+    }
+
     /// Forks, installs a one-rule seccomp filter failing `close_range` with
-    /// `refuse_errno` in the child, runs the closer over low descriptors,
-    /// and reports (filter-install errno, closer errno, descriptors left,
-    /// expected keeps, sample unrelated numbers). The child exits 0 on every
-    /// reported path; install failures are data, so the caller can skip when
-    /// the kernel cannot install filters (ENOSYS/EPERM) and fail otherwise.
-    fn closer_with_refused_close_range(
-        refuse_errno: i32,
-    ) -> (i32, i32, Vec<(i32, bool)>, Vec<i32>, Vec<i32>) {
+    /// `refuse_errno` in the child, and runs the closer over low
+    /// descriptors. The child exits 0 on every reported path; install
+    /// failures are data, so the caller can skip when the kernel cannot
+    /// install filters (ENOSYS/EPERM) and fail otherwise.
+    fn closer_with_refused_close_range(refuse_errno: i32) -> RefusedCloseOutcome {
         let (mut reader, writer) = pipe_pair();
         let null = File::open("/dev/null").unwrap();
         let unrelated: Vec<File> = (0..3).map(|_| File::open("/dev/null").unwrap()).collect();
@@ -8655,18 +8734,22 @@ mod tests {
                     len: filter.len() as u16,
                     filter: filter.as_mut_ptr(),
                 };
-                let mut install_errno = 0;
-                if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    install_errno = last_errno();
-                } else if libc::syscall(
-                    libc::SYS_seccomp,
-                    libc::SECCOMP_SET_MODE_FILTER,
-                    0,
-                    &program,
-                ) != 0
-                {
-                    install_errno = last_errno();
-                }
+                // Short-circuit: when either call fails, errno still names
+                // that call (no syscall runs between it and the read).
+                let prctl_ok =
+                    libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0;
+                let seccomp_ok = prctl_ok
+                    && libc::syscall(
+                        libc::SYS_seccomp,
+                        libc::SECCOMP_SET_MODE_FILTER,
+                        0,
+                        &program,
+                    ) == 0;
+                let install_errno = if prctl_ok && seccomp_ok {
+                    0
+                } else {
+                    last_errno()
+                };
                 let mut report = [0i32; 66];
                 report[0] = install_errno;
                 let mut used = 2;
@@ -8720,21 +8803,32 @@ mod tests {
         let mut expected = vec![kept.as_raw_fd(), keep[2]];
         expected.sort();
         drop((null, unrelated, trailing));
-        (report[0], report[1], left, expected, sample)
+        RefusedCloseOutcome {
+            install: report[0],
+            closer: report[1],
+            left,
+            expected,
+            sample,
+        }
     }
 
     /// Returns false (after noting why) when the seccomp filter cannot be
     /// installed here, so the refused-close_range tests skip instead of
-    /// failing where the kernel forbids them.
+    /// failing where the kernel forbids them. The note goes to the real
+    /// stderr, not through `eprintln!`, which libtest captures and shows
+    /// only for failing tests: a skipped test passes, so a captured note
+    /// would hide that its coverage never ran.
     fn close_range_refusal_available(install_errno: i32) -> bool {
         if install_errno == 0 {
             return true;
         }
         if install_errno == libc::ENOSYS || install_errno == libc::EPERM {
-            eprintln!(
-                "skipping: this kernel cannot install the close_range refusal filter: {}",
+            let note = format!(
+                "SKIPPED run::tests close_range refusal: this kernel cannot install the seccomp filter: {}\n",
                 io::Error::from_raw_os_error(install_errno)
             );
+            // Best effort: a failed note must not fail the skip itself.
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), note.as_bytes());
             return false;
         }
         panic!(
@@ -8748,15 +8842,18 @@ mod tests {
     #[test]
     fn the_fallback_engages_when_close_range_is_refused() {
         for refuse_errno in [libc::EPERM, libc::ENOSYS] {
-            let (install, closer, left, expected, _) =
-                closer_with_refused_close_range(refuse_errno);
-            if !close_range_refusal_available(install) {
+            let outcome = closer_with_refused_close_range(refuse_errno);
+            if !close_range_refusal_available(outcome.install) {
                 return;
             }
-            assert_eq!(closer, 0, "refuse errno {refuse_errno}");
+            assert_eq!(outcome.closer, 0, "refuse errno {refuse_errno}");
             assert_eq!(
-                left,
-                expected.iter().map(|fd| (*fd, true)).collect::<Vec<_>>(),
+                outcome.left,
+                outcome
+                    .expected
+                    .iter()
+                    .map(|fd| (*fd, true))
+                    .collect::<Vec<_>>(),
                 "refuse errno {refuse_errno}"
             );
         }
@@ -8766,15 +8863,16 @@ mod tests {
     /// closer reports it and closes nothing.
     #[test]
     fn a_close_range_failure_other_than_enosys_or_eperm_is_an_error() {
-        let (install, closer, left, _, sample) = closer_with_refused_close_range(libc::EINVAL);
-        if !close_range_refusal_available(install) {
+        let outcome = closer_with_refused_close_range(libc::EINVAL);
+        if !close_range_refusal_available(outcome.install) {
             return;
         }
-        assert_eq!(closer, libc::EINVAL);
-        for fd in sample {
+        assert_eq!(outcome.closer, libc::EINVAL);
+        for fd in outcome.sample {
             assert!(
-                left.iter().any(|(open, _)| *open == fd),
-                "fd {fd} was closed without the fallback: {left:?}"
+                outcome.left.iter().any(|(open, _)| *open == fd),
+                "fd {fd} was closed without the fallback: {:?}",
+                outcome.left
             );
         }
     }

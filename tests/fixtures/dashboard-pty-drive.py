@@ -62,7 +62,9 @@ def main() -> int:
         # The two-provider fixture yields 2 edges (footer "scroll 0/1"):
         # one `j` must advance the marker to "scroll 1/1", proving the
         # live stdin→poll_key→scroll→render path end to end.
-        if b"scroll 0/1" not in output:
+        # A frame can arrive in several reads under load: wait for the
+        # footer rather than testing the read that held the header.
+        if not read_until(b"scroll 0/1"):
             return fail("fixture is not a 2-edge scrollable view", output, child)
         try:
             os.write(master, b"j")

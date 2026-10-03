@@ -14,6 +14,11 @@
  *       m  mmap+munmap an unrelated file                 -> UNRELATED
  *       p  mmap one page of the provider file and keep it -> PMAP
  *       P  munmap that page                              -> PUNMAP
+ *       D  MADV_DONTNEED that page (no VMA change)        -> PDONTNEED
+ *       F  MAP_FIXED anonymous memory over that page      -> PFIXED
+ *       q  mmap two provider pages                        -> P2MAP
+ *       s  mprotect the second one PROT_NONE (VMA split)  -> PSPLIT
+ *       Q  munmap the pair                                -> P2UNMAP
  *       R  start a racing caller thread (tag 0x72000000 + gen) -> RACING
  *       S  stop it and print its per-generation ledger    -> RACED gen:n,...
  *       x  exit
@@ -141,6 +146,7 @@ static int cmd_mode(const char *provider)
     void *handle = dlopen(provider, RTLD_NOW | RTLD_LOCAL);
     void *sibling = NULL;
     void *page = NULL;
+    void *split = NULL;
     unsigned gen = 0;
     struct stat st;
     char info[256];
@@ -269,6 +275,50 @@ static int cmd_mode(const char *provider)
                 munmap(page, 4096);
             page = NULL;
             printf("PUNMAP\n");
+            break;
+        case 'D':
+            /* MADV_DONTNEED of a provider mapping: drops private pages
+             * but changes no VMA (no witness event expected). */
+            if (!page || madvise(page, 4096, MADV_DONTNEED) != 0)
+                die("madvise provider");
+            printf("PDONTNEED\n");
+            break;
+        case 'F': {
+            /* MAP_FIXED anonymous memory over the provider page: the file
+             * VMA is replaced in place (a watched removal). */
+            void *fixed;
+            if (!page)
+                die("MAP_FIXED without page");
+            fixed = mmap(page, 4096, PROT_READ, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (fixed != page)
+                die("MAP_FIXED over provider");
+            munmap(fixed, 4096);
+            page = NULL;
+            printf("PFIXED\n");
+            break;
+        }
+        case 'q': {
+            int fd = open(provider, O_RDONLY);
+            if (fd < 0 || split)
+                die("open provider for split");
+            split = mmap(NULL, 8192, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (split == MAP_FAILED)
+                die("mmap provider pair");
+            printf("P2MAP\n");
+            break;
+        }
+        case 's':
+            /* A split-inducing mprotect of the second provider page. */
+            if (!split || mprotect((char *)split + 4096, 4096, PROT_NONE) != 0)
+                die("split mprotect");
+            printf("PSPLIT\n");
+            break;
+        case 'Q':
+            if (split)
+                munmap(split, 8192);
+            split = NULL;
+            printf("P2UNMAP\n");
             break;
         default:
             continue;

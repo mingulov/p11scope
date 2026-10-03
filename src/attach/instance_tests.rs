@@ -622,6 +622,95 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
     Ok(())
 }
 
+/// Decision §3c mapping controls that reach the provider file: each must
+/// end the old incarnation (new ID) or leave the mapping set unchanged; no
+/// control may produce a coverage fault (a range the hooks did not see).
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_mapping_controls_never_join_old_state() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile(directory.path(), true)?;
+    ensure!(
+        std::fs::metadata(&provider)?.len() > 8192,
+        "provider too small for the split control"
+    );
+    let driver = compile(directory.path(), false)?;
+    let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()], &[])?;
+    let ready = target.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let mut call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
+        target.command(b'c')?;
+        single_join(&pump_until(harness, target, 1)?)
+    };
+    let bumps = |harness: &Harness| -> Result<u64> {
+        Ok(harness.session.instance_maps().counters()?.local_bumps)
+    };
+
+    let a = call(&mut harness, &mut target)?;
+    target.command(b'p')?;
+    let b = call(&mut harness, &mut target)?;
+    ensure!(b != a, "extra provider mapping kept the instance");
+    // MADV_DONTNEED changes no VMA: no witness event, same incarnation.
+    let before = bumps(&harness)?;
+    target.command(b'D')?;
+    ensure!(bumps(&harness)? == before, "MADV_DONTNEED bumped the epoch");
+    let after_dontneed = call(&mut harness, &mut target)?;
+    ensure!(after_dontneed == b, "MADV_DONTNEED changed the instance");
+    // MAP_FIXED anonymous memory over the provider page.
+    let before = bumps(&harness)?;
+    target.command(b'F')?;
+    ensure!(
+        bumps(&harness)? > before,
+        "MAP_FIXED replacement was not witnessed"
+    );
+    let after_fixed = call(&mut harness, &mut target)?;
+    ensure!(after_fixed != b, "MAP_FIXED replacement kept the instance");
+    // A split-inducing mprotect of a provider mapping.
+    target.command(b'q')?;
+    let paired = call(&mut harness, &mut target)?;
+    ensure!(
+        paired != after_fixed,
+        "provider pair mapping kept the instance"
+    );
+    let before = bumps(&harness)?;
+    target.command(b's')?;
+    let split_bumps = bumps(&harness)? - before;
+    let after_split = call(&mut harness, &mut target)?;
+    ensure!(
+        after_split != paired || split_bumps == 0,
+        "inconsistent split outcome"
+    );
+    target.command(b'Q')?;
+    let after_pair = call(&mut harness, &mut target)?;
+    ensure!(
+        after_pair != after_split,
+        "provider pair unmap kept the instance"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "T3A_CONTROLS ids={:?} split_bumps={split_bumps} counters={counters:?} scans={:?}",
+        [
+            a,
+            b,
+            after_dontneed,
+            after_fixed,
+            paired,
+            after_split,
+            after_pair
+        ],
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(
+        harness.session.instance_maps().sticky()? == 0,
+        "a control produced a coverage fault"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "privileged: same-address reload race against a second calling thread"]
 fn privileged_instance_reload_race_has_zero_false_joins() -> Result<()> {

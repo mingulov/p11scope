@@ -59,7 +59,7 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (81 ignored tests in the default-feature lib binary): 67 run by
+# Curation (82 ignored tests in the default-feature lib binary): 68 run by
 # default, 4 run only with --include-long, 10 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -72,6 +72,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # Default campaign: every ignored test except the long cells and the static
 # skips. Order is the binary's --list order; each runs in its own process.
 DEFAULT_TESTS=(
+attach::instance_tests::privileged_instance_mapping_controls_never_join_old_state
 attach::instance_tests::privileged_instance_reload_race_has_zero_false_joins
 attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and_mutation
 # DR-CLASSIC-PID0: classic --pid sessions (auto, singles, forced multi)

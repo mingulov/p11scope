@@ -659,8 +659,10 @@ Limits that matter in pods:
   capture that fails before that leaves it as it was, and removes a file it
   had only just created; where the filesystem supports `O_TMPFILE`, a new
   trace file has no name at all until the capture has attached, so a
-  failed start never leaves or removes anything at the name. To keep no
-  report file, leave out `-o`.
+  failed start never leaves or removes anything at the name. That file is
+  named through `/proc/self/fd`, so an observer whose `/proc` does not serve
+  its own process (`nsenter -m` without `-p`) is refused before attaching.
+  To keep no report file, leave out `-o`.
   `-o -` means stdout for trace (including `run --trace`), whose lines
   already stream to stdout when `-o` is omitted; profile (including `run`
   without `--trace`) refuses `-o -` because its report requires a file —
@@ -772,6 +774,8 @@ Limits that matter in pods:
   still stops at 10,000,000 events: the cap is a default, not unbounded
   streaming, and the no-duration notice says so. The `TRUNCATED` line cites
   the effective cap and names `--max-events` only when the operator passed it.
+  A truncated trace is always `PARTIAL` (observation cause `trace_truncated`),
+  even when its stop drain was proven.
 
 ### Environment (`P11SCOPE_*`)
 

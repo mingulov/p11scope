@@ -144,6 +144,9 @@ versioned separately and are opaque, exact dispatch keys.
   plus `post_q_events` / `post_q_discovery`) publishes the stop-gate outcome
   that used to reach stderr only. The trace terminal `EVIDENCE` record now
   carries the sealed verdict, and its `final_drain` equals `drain_proven`.
+  A trace stopped by its event cap (`--max-events` or the default cap) stays
+  `PARTIAL` even behind a proven drain, with the observation cause
+  `trace_truncated`.
 - Every profile `mechanisms[]` row whose `params` is `null` now says why in
   `params_omitted`: `policy` (the default `allowlisted` policy), `no_shape` or
   `decode_failed`, so a policy omission no longer reads like "no parameters".

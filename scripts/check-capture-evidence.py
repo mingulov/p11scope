@@ -1182,6 +1182,9 @@ def expected_gap_classes(evidence):
                 "scheduling.sink_dropped_bytes",
                 stdout_data_sink and scheduling["sink_dropped_bytes"] > 0,
             ),
+            # DR-RETRO-C6-1: only the terminal trace record carries the key;
+            # a capped line stream is short even behind a proven drain.
+            ("trace_truncated", evidence.get("trace_truncated") is True),
         ],
         "attribution": [
             ("semantic_unverified_slots", evidence["semantic_unverified_slots"] > 0),
@@ -1287,8 +1290,13 @@ def settle_fixture_verdict(document):
 
 def expected_terminal_completeness(evidence):
     """The sealed terminal verdict: COMPLETE exactly for a clean document
-    whose drain the stop gate proved (owner ruling B), PARTIAL otherwise."""
-    if evidence.get("drain_proven") is True and evidence.get("verdict_detail") == "clean_proven":
+    whose drain the stop gate proved (owner ruling B), PARTIAL otherwise.
+    A truncated trace is never COMPLETE (DR-RETRO-C6-1)."""
+    if (
+        evidence.get("drain_proven") is True
+        and evidence.get("verdict_detail") == "clean_proven"
+        and evidence.get("trace_truncated") is not True
+    ):
         return "COMPLETE"
     return "PARTIAL"
 
@@ -2211,7 +2219,22 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     require(evidence["provider_changed"] is False, "a pinned provider object changed")
     require(evidence["authority"] == "hash-pinned", evidence["authority"])
     require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
-    require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
+    # DR-RETRO-C6-2: completeness is the product's own sealed verdict, never
+    # a literal. COMPLETE is accepted exactly when the product may claim it
+    # (a clean document behind a proven stop-gate drain, never a truncated
+    # trace); `exact_metrics_schema` has already recomputed the classes.
+    require(
+        evidence["completeness"] == expected_terminal_completeness(evidence),
+        f"completeness disagrees with the sealed verdict: {evidence['completeness']!r}",
+    )
+    # The cause that keeps this lane PARTIAL even behind a proven drain: it
+    # is manifest-free, so no slot's semantics are attested (measured on the
+    # live lane: 478 of 478 slots), and attribution is always withheld.
+    require(
+        evidence["semantic_unverified_slots"] == evidence["slots"],
+        f"manifest-free proxy lane attested slot semantics: "
+        f"{evidence['semantic_unverified_slots']} of {evidence['slots']} unverified",
+    )
     require(evidence["modules_skipped"] == [], evidence["modules_skipped"])
     require(evidence["skipped"] == [], evidence["skipped"])
 
@@ -3791,6 +3814,7 @@ def self_test():
         attached_probes=2 * (68 + PROXY_ADMITTED_SLOTS),
         discovery_uncorroborated_candidates=PROXY_SPILL,
         skipped=[],
+        semantic_unverified_slots=68 + PROXY_ADMITTED_SLOTS,
     )
     soft_names = [[f"C_Fixture{index:02d}"] for index in range(68)]
     proxy["functions"] = function_items(
@@ -3799,7 +3823,30 @@ def self_test():
         [(["unknown"], 1)] + [(["unknown"], 0)] * (PROXY_ADMITTED_SLOTS - 1),
         identity=proxy_id,
     )
+    settle_fixture_verdict(proxy)
     validate_proxy_capacity_fallback(proxy, module_path=soft_path)
+    # DR-RETRO-C6-2: completeness is derived, not a literal. Behind a proven
+    # stop-gate drain the lane stays PARTIAL for its stated attribution cause
+    # (attribution_only), so COMPLETE there is refused, and so is a document
+    # that attested any slot's semantics.
+    proven_proxy = copy.deepcopy(proxy)
+    proven_proxy["evidence"].update(
+        drain_proven=True,
+        stop_quiescence={"state": "proven", "post_q_events": False, "post_q_discovery": False},
+    )
+    settle_fixture_verdict(proven_proxy)
+    require(proven_proxy["evidence"]["verdict_detail"] == "attribution_only",
+            proven_proxy["evidence"]["verdict_detail"])
+    validate_proxy_capacity_fallback(proven_proxy, module_path=soft_path)
+    for mutate in (
+        lambda d: d["evidence"].update(completeness="COMPLETE"),
+        lambda d: d["evidence"].update(semantic_unverified_slots=PROXY_ADMITTED_SLOTS),
+    ):
+        bad = copy.deepcopy(proven_proxy)
+        mutate(bad)
+        if bad["evidence"]["completeness"] != "COMPLETE":
+            settle_fixture_verdict(bad)
+        rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad, module_path=soft_path))
     # The lane pins its own module by exact path, so a capture that attached
     # some other SoftHSM2 build is not this lane's evidence.
     rejected(
@@ -3878,8 +3925,10 @@ def self_test():
             table_entries=68 + PROXY_TABLES * entries,
             slots=68 + admitted,
             attached_probes=2 * (68 + admitted),
+            semantic_unverified_slots=68 + admitted,
         )
         older["functions"] = older["functions"][: 68 + admitted]
+        settle_fixture_verdict(older)
         validate_proxy_capacity_fallback(older)
         # ... but the pin stays exact per shape: a mixed build, a version
         # with the wrong entry count, an undeclared version, the wrong
@@ -4710,6 +4759,30 @@ def self_test():
     stale = dict(proven, completeness="PARTIAL")
     rejected(lambda: terminal_capture_is_clean(stale))
     print("terminal capture predicate is COMPLETE exactly behind a proven drain: OK")
+    # DR-RETRO-C6-1: a trace truncated behind a proven drain is PARTIAL with
+    # the `trace_truncated` observation cause. COMPLETE there is refused, and
+    # so is a truncated record whose classes omit the cause.
+    proven_trace = dict(
+        copy.deepcopy(proven), privacy_mode="allowlisted", capture_aborted=None,
+        final_drain=True, counters_available=True, trace_truncated=False,
+        stop_quiescence={"state": "proven", "post_q_events": False, "post_q_discovery": False},
+    )
+    settle_fixture_verdict(proven_trace)
+    require(proven_trace["verdict_detail"] == "clean_proven", "the untruncated control is clean")
+    exact_terminal_verdict(proven_trace)
+    truncated_trace = copy.deepcopy(proven_trace)
+    truncated_trace["trace_truncated"] = True
+    require(expected_terminal_completeness(truncated_trace) == "PARTIAL",
+            "a truncated trace is never COMPLETE, whatever its stated classes")
+    rejected(lambda: exact_terminal_verdict(truncated_trace))
+    settle_fixture_verdict(truncated_trace)
+    require(truncated_trace["gap_classes"]["observation"]["causes"] == ["trace_truncated"]
+            and truncated_trace["verdict_detail"] == "concrete_gap",
+            "trace truncation must classify as observation loss")
+    rejected(lambda: exact_terminal_verdict(truncated_trace))
+    truncated_trace["completeness"] = "PARTIAL"
+    exact_terminal_verdict(truncated_trace)
+    print("a truncated trace is PARTIAL even behind a proven drain: OK")
 
     # v2 discovery oracles. A document that discovered nothing, was authorized
     # by something else, refused a module, or names a provider its evidence does

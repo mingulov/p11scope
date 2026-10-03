@@ -2696,18 +2696,29 @@ fn cleanup_interrupted(error: &anyhow::Error) -> bool {
 
 /// Keeps a second-signal abandon typed when it is the secondary failure:
 /// the combined error carries it as an outer context so `main` still exits
-/// 130, while the primary failure keeps its message.
-fn keep_cleanup_interruption(combined: anyhow::Error, secondary: &anyhow::Error) -> anyhow::Error {
-    if cleanup_interrupted(secondary) && !cleanup_interrupted(&combined) {
-        combined.context(crate::attach::CleanupInterrupted)
-    } else {
-        combined
-    }
-}
-
+/// 130, while the primary failure keeps its message. That outer context
+/// already names the abandon, so the secondary's rendering drops it rather
+/// than print it twice (DR-RETRO-C6-2).
 fn also_failed(primary: anyhow::Error, secondary: anyhow::Error, what: &str) -> anyhow::Error {
-    let combined = primary.context(format!("{what} also failed: {secondary:#}"));
-    keep_cleanup_interruption(combined, &secondary)
+    if !cleanup_interrupted(&secondary) {
+        return primary.context(format!("{what} also failed: {secondary:#}"));
+    }
+    let abandon = crate::attach::CleanupInterrupted.to_string();
+    let rest: Vec<String> = secondary
+        .chain()
+        .map(ToString::to_string)
+        .filter(|layer| *layer != abandon)
+        .collect();
+    let combined = if rest.is_empty() {
+        primary.context(format!("{what} also failed"))
+    } else {
+        primary.context(format!("{what} also failed: {}", rest.join(": ")))
+    };
+    if cleanup_interrupted(&combined) {
+        combined
+    } else {
+        combined.context(crate::attach::CleanupInterrupted)
+    }
 }
 
 fn combine_handoff_failure(primary: anyhow::Error, abort: Result<()>) -> anyhow::Error {
@@ -5617,6 +5628,10 @@ fn capture_trace(
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
                     evidence.stdout_data_sink = context.7.is_none();
+                    // DR-RETRO-C6-1: a capped trace printed no line for the
+                    // events drained after the cap, so truncation is an
+                    // observation cause even behind a proven drain.
+                    evidence.trace_truncated = trace_truncated;
                     evidence.apply_stop_quiescence(consumers.stop_quiescence);
                     evidence.settle_terminal(true);
                     if *consumers.malformed_records > 0 {
@@ -5628,7 +5643,6 @@ fn capture_trace(
                     emit_trace_terminal_accounted(
                         &mut evidence,
                         policy,
-                        trace_truncated,
                         trace_limit,
                         max_events.is_some(),
                         &reports,
@@ -5706,7 +5720,6 @@ fn resolve_terminal_sink_total(
 fn emit_trace_terminal_accounted<W: Write>(
     evidence: &mut render::Evidence,
     policy: CapturePolicy,
-    trace_truncated: bool,
     trace_limit: u64,
     trace_limit_explicit: bool,
     reports: &[metrics::SlotReport],
@@ -5716,7 +5729,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
 ) -> Result<()> {
-    if trace_truncated {
+    if evidence.trace_truncated {
         emit_trace_line(
             &trace::truncated_line(trace_limit, trace_limit_explicit),
             stdout,
@@ -5728,7 +5741,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     // copy) go through the shared terminal emitter, best-effort under
     // loss; the file receives COUNT now and its finalized EVIDENCE
     // record after the terminal flush below.
-    let stdout_line = trace::evidence_line(evidence, policy, trace_truncated);
+    let stdout_line = trace::evidence_line(evidence, policy);
     let stdout_line_len = stdout_line.len() + 1; // trailing newline
     emit_trace_terminal(
         reports,
@@ -5761,7 +5774,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     let counted = evidence.scheduling.sink_dropped_bytes;
     let total = resolve_terminal_sink_total(counted, stdout_line_len, |candidate| {
         evidence.scheduling.sink_dropped_bytes = candidate;
-        trace::evidence_line(evidence, policy, trace_truncated).len() + 1
+        trace::evidence_line(evidence, policy).len() + 1
     });
     evidence.scheduling.sink_dropped_bytes = total;
     // F-4: the terminal flush's own drops landed after the verdict. Judge the
@@ -5770,12 +5783,8 @@ fn emit_trace_terminal_accounted<W: Write>(
     // length and the byte-exact total above stays exact.
     evidence.settle_terminal(true);
     if let Some(file) = out_file.as_mut() {
-        writeln!(
-            file,
-            "{}",
-            trace::evidence_line(evidence, policy, trace_truncated)
-        )
-        .context("writing trace output file")?;
+        writeln!(file, "{}", trace::evidence_line(evidence, policy))
+            .context("writing trace output file")?;
         file.flush().context("flushing trace output file")?;
     }
     Ok(())
@@ -7045,6 +7054,7 @@ fn evidence_for(
         verdict_detail: render::VERDICT_CONCRETE_GAP,
         gap_classes: render::GapClasses::default(),
         stdout_data_sink: false,
+        trace_truncated: false,
         uretprobe_override,
         handoff_child_pid,
         pid_namespace: crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
@@ -10621,14 +10631,42 @@ mod tests {
                 !failure_already_reported(&error),
                 "{name}: the primary failure still needs its line: {error:#}"
             );
-            assert!(
-                format!("{error:#}").contains("second SIGINT"),
+            // DR-RETRO-C6-2: the abandon is named once, never repeated by
+            // the typed outer context that keeps exit 130.
+            assert_eq!(
+                format!("{error:#}").matches("second SIGINT").count(),
+                1,
                 "{name}: {error:#}"
             );
         }
         let ordinary = combine_detach::<()>(Ok(()), Err(anyhow!("detach failed"))).unwrap_err();
         assert_eq!(failure_exit_code(&ordinary), 1);
         assert!(!failure_already_reported(&ordinary));
+    }
+
+    /// The abandon's own context survives the de-duplication; only its
+    /// repeated text is dropped.
+    #[test]
+    fn also_failed_names_a_second_signal_abandon_once_and_keeps_its_context() {
+        let secondary =
+            anyhow::Error::new(crate::attach::CleanupInterrupted).context("closing 3 links");
+        let combined = also_failed(anyhow!("loop failed"), secondary, "detaching");
+        let rendered = format!("{combined:#}");
+        assert_eq!(rendered.matches("second SIGINT").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("detaching also failed: closing 3 links: loop failed"),
+            "{rendered}"
+        );
+        assert_eq!(failure_exit_code(&combined), 130);
+        let bare = also_failed(
+            anyhow!("loop failed"),
+            anyhow::Error::new(crate::attach::CleanupInterrupted),
+            "detaching",
+        );
+        assert!(
+            format!("{bare:#}").ends_with("detaching also failed: loop failed"),
+            "{bare:#}"
+        );
     }
 
     #[test]
@@ -13025,7 +13063,6 @@ mod tests {
         emit_trace_terminal_accounted(
             &mut evidence,
             CapturePolicy::AggregateOnly,
-            false,
             DEFAULT_TRACE_MAX_EVENTS,
             false,
             &[],
@@ -13088,7 +13125,6 @@ mod tests {
         emit_trace_terminal_accounted(
             &mut evidence,
             CapturePolicy::AggregateOnly,
-            false,
             DEFAULT_TRACE_MAX_EVENTS,
             false,
             &[],
@@ -13174,7 +13210,7 @@ mod tests {
         emit_trace_terminal(
             &[],
             &tracer,
-            &trace::evidence_line(&evidence, CapturePolicy::AggregateOnly, false),
+            &trace::evidence_line(&evidence, CapturePolicy::AggregateOnly),
             &mut sink,
             &mut stdout_open,
             &mut file,
@@ -13530,6 +13566,32 @@ mod tests {
                 "{function}: the latch has one setter"
             );
         }
+    }
+
+    // DR-RETRO-C6-1: the trace terminal hands its truncation to the
+    // evidence before the seal, so a capped trace's verdict carries the
+    // `trace_truncated` cause and can never seal COMPLETE.
+    #[test]
+    fn the_trace_terminal_seals_its_truncation_into_the_verdict() {
+        let source = include_str!("run.rs");
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        let derived = trace
+            .find("let trace_truncated = end == CaptureEnd::LimitReached || *context.3 == Some(0);")
+            .expect("the trace terminal derives its truncation from the loop end");
+        let handed = trace
+            .find("evidence.trace_truncated = trace_truncated;")
+            .expect("the truncation reaches the evidence");
+        let sealed = trace[handed..]
+            .find("evidence.settle_terminal(true);")
+            .expect("the evidence is sealed after the truncation lands");
+        assert!(derived < handed);
+        assert!(!trace[handed..handed + sealed].contains("trace_truncated = false"));
     }
 
     #[test]
@@ -14965,7 +15027,7 @@ mod tests {
                 )["evidence"]
                     .clone();
                 let terminal: serde_json::Value = serde_json::from_str(
-                    trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false)
+                    trace::evidence_line(&evidence, CapturePolicy::Allowlisted)
                         .strip_prefix("EVIDENCE ")
                         .unwrap(),
                 )
@@ -15029,7 +15091,7 @@ mod tests {
         let profile = render::versioned_evidence(&evidence);
         let metrics = render::json(&[], &evidence, &capture)["evidence"].clone();
         let terminal: serde_json::Value = serde_json::from_str(
-            trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false)
+            trace::evidence_line(&evidence, CapturePolicy::Allowlisted)
                 .strip_prefix("EVIDENCE ")
                 .unwrap(),
         )
@@ -15078,7 +15140,7 @@ mod tests {
         assert_eq!(profile["pid_descendant_gaps"], 0);
         assert_eq!(profile["multi_rebuild_gaps"], 0);
         assert_eq!(profile["process_tracking_failures"], 1);
-        let terminal = trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false);
+        let terminal = trace::evidence_line(&evidence, CapturePolicy::Allowlisted);
         assert!(terminal.contains("\"pid_descendant_gaps\":0"), "{terminal}");
         assert!(terminal.contains("\"multi_rebuild_gaps\":0"), "{terminal}");
         assert!(

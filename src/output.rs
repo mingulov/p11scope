@@ -415,6 +415,9 @@ fn create_private_stream_with(path: &Path, unnamed: bool) -> Result<PrivateStrea
     let (file, origin) = openat_stream(&directory, &final_name, unnamed)
         .map_err(|error| format!("opening output {} failed: {error}", final_path.display()))?;
     let identity = check_stream_file(&file, &final_path)?;
+    if origin == StreamOrigin::Unnamed {
+        check_link_source(&unnamed_link_source(&file), identity, &final_path)?;
+    }
     Ok(PrivateStream {
         directory,
         identity,
@@ -743,15 +746,55 @@ fn openat_tmpfile(directory: &std::fs::File) -> std::io::Result<std::fs::File> {
     }
 }
 
+/// The path `linkat_unnamed` names an unnamed file by.
+fn unnamed_link_source(file: &std::fs::File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// DR-RETRO-C6-2: an unnamed file is linked at its name only after the
+/// capture attached, through `/proc/self/fd`. Under a `/proc` that does not
+/// serve this process (`nsenter -m` without `-p`) that path is ENOENT, so
+/// prove at preflight, before anything attaches, that it names this very
+/// file. Failing here is deliberately preferred to an `AT_EMPTY_PATH`
+/// link: that needs `CAP_DAC_READ_SEARCH` on older kernels, and an observer
+/// whose `/proc` cannot resolve itself cannot run its other self-checks
+/// either, so the capture would fail later, after attaching, anyway.
+fn check_link_source(
+    source: &Path,
+    identity: FileIdentity,
+    final_path: &Path,
+) -> Result<(), String> {
+    let resolved = std::fs::metadata(source).map_err(|error| {
+        format!(
+            "output {}: this observer's /proc cannot name its own files ({}: {error}); \
+             trace -o links its file through /proc/self/fd, so mount a procfs of this \
+             observer's PID namespace (nsenter: -p with -m) or omit -o",
+            final_path.display(),
+            source.display()
+        )
+    })?;
+    if FileIdentity::from_metadata(&resolved) != identity {
+        return Err(format!(
+            "output {}: {} does not name this observer's output file, so this /proc does \
+             not serve this process; mount a procfs of this observer's PID namespace \
+             (nsenter: -p with -m) or omit -o",
+            final_path.display(),
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Links an unnamed `O_TMPFILE` file at `name` in `directory`; EEXIST when
 /// the name exists. Through `/proc/self/fd`, which needs no
-/// `CAP_DAC_READ_SEARCH` (unlike `AT_EMPTY_PATH`).
+/// `CAP_DAC_READ_SEARCH` (unlike `AT_EMPTY_PATH`); the preflight proved it
+/// resolves ([`check_link_source`]).
 fn linkat_unnamed(
     file: &std::fs::File,
     directory: &std::fs::File,
     name: &CString,
 ) -> std::io::Result<()> {
-    let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    let source = CString::new(unnamed_link_source(file).as_os_str().as_bytes())
         .expect("a descriptor path has no NUL");
     if unsafe {
         libc::linkat(
@@ -1044,6 +1087,67 @@ mod tests {
         std::fs::write(&path, b"written meanwhile").unwrap();
         drop(stream);
         assert_eq!(std::fs::read(&path).unwrap(), b"written meanwhile");
+    }
+
+    /// DR-RETRO-C6-2 (review C4): an unbegun drop removes only a name the
+    /// stream itself created. An unnamed stream never created one, so even a
+    /// name that came to hold its very inode is left alone.
+    #[test]
+    fn an_unbegun_unnamed_stream_never_unlinks_a_name_it_did_not_create() {
+        let dir = private_tempdir();
+        let path = dir.path().join("trace.log");
+        let stream = create_private_stream(&path).unwrap();
+        if stream.origin != StreamOrigin::Unnamed {
+            eprintln!("skipped: this filesystem has no O_TMPFILE");
+            return;
+        }
+        // Someone else named the same inode (through its descriptor link).
+        linkat_unnamed(
+            stream.file.as_ref().unwrap(),
+            &stream.directory,
+            &stream.final_name,
+        )
+        .unwrap();
+        drop(stream);
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "an unnamed stream's drop unlinked a name it never created"
+        );
+    }
+
+    /// DR-RETRO-C6-2: the descriptor link an unnamed file is named through
+    /// is proven at preflight, so a `/proc` that does not serve this process
+    /// fails before attach with the reason, not after it with ENOENT.
+    #[test]
+    fn an_unresolvable_link_source_fails_the_preflight_by_name() {
+        let dir = private_tempdir();
+        let path = dir.path().join("trace.log");
+        let ours = dir.path().join("ours");
+        std::fs::write(&ours, b"").unwrap();
+        let identity = FileIdentity::from_metadata(&std::fs::metadata(&ours).unwrap());
+        check_link_source(&ours, identity, &path).unwrap();
+        let missing = check_link_source(&dir.path().join("fd/7"), identity, &path).unwrap_err();
+        assert!(missing.contains("cannot name its own files"), "{missing}");
+        assert!(missing.contains("nsenter: -p with -m"), "{missing}");
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"").unwrap();
+        let elsewhere = check_link_source(&other, identity, &path).unwrap_err();
+        assert!(elsewhere.contains("does not name"), "{elsewhere}");
+        // The preflight checks the very path the link uses, for every
+        // unnamed stream.
+        let source = include_str!("output.rs");
+        let preflight = source
+            .split_once("fn create_private_stream_with(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(preflight.contains(
+            "if origin == StreamOrigin::Unnamed {\n        check_link_source(&unnamed_link_source(&file), identity, &final_path)?;"
+        ));
+        let link = source.split_once("fn linkat_unnamed(").unwrap().1;
+        assert!(link[..400].contains("CString::new(unnamed_link_source(file)"));
     }
 
     /// The fallback for a filesystem without `O_TMPFILE`: the file is
@@ -1513,6 +1617,13 @@ mod tests {
     fn final_name_is_only_stated_through_the_retained_directory() {
         let source = include_str!("output.rs");
         let production = source.split_once("mod tests").unwrap().0;
+        // The one exemption: `check_link_source` resolves the procfs
+        // descriptor link `linkat_unnamed` will use (DR-RETRO-C6-2). That is
+        // this process's own fd, never the output name or its directory.
+        let (before, exempt) = production.split_once("fn check_link_source(").unwrap();
+        let after = exempt.split_once("\n}\n").unwrap().1;
+        assert_eq!(exempt.matches("fs::metadata(source)").count(), 1);
+        let production = format!("{before}{after}");
         for path_lookup in [
             "fs::metadata(",
             "fs::symlink_metadata(",

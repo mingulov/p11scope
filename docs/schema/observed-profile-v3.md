@@ -332,8 +332,12 @@ terminal-only keys: `privacy_mode` (string), `capture_aborted` (always
 `null` on the normal path), `final_drain` (equal to `drain_proven`:
 detaching perf links proves nothing about quiescence, only the stop gate's
 proven quiescence does), `counters_available` (always
-`true`), and `trace_truncated` (boolean). Individual trace
-event lines never contain request/result selection data.
+`true`), and `trace_truncated` (boolean). A truncated trace (`trace_truncated:
+true`, from `--max-events` or the default event cap) is `PARTIAL` even when
+`drain_proven` is true: the drain still counts the events past the cap, but
+no line was printed for them. Its `gap_classes.observation.causes` then
+include `trace_truncated` (so `verdict_detail` is `concrete_gap`). Individual
+trace event lines never contain request/result selection data.
 
 The v3 profile evidence object and v3-metrics evidence object each have a
 closed exact key set. Unknown fields are rejected. Historical v2-metrics

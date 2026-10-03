@@ -837,6 +837,14 @@ pub struct Evidence {
     /// `-o` capture's stdout carries display frames only.
     #[serde(skip)]
     pub stdout_data_sink: bool,
+    /// Whether a trace stopped at its event cap (`--max-events` or the
+    /// default cap) and printed no line for the events drained after it.
+    /// An observation cause on its own (DR-RETRO-C6-1): the line stream is
+    /// short even behind a proven drain, so truncation always forces
+    /// `PARTIAL`. Only the trace lane sets it; the trace terminal record
+    /// publishes it as `trace_truncated`, so it is not a profile field.
+    #[serde(skip)]
+    pub trace_truncated: bool,
     /// The uretprobe/hazard override behind this capture, if any (SYSPLAN
     /// residual F-01). `None` exactly when the preflight proceeded clean.
     pub uretprobe_override: Option<UretprobeOverride>,
@@ -1364,6 +1372,7 @@ impl Evidence {
             "scheduling.sink_dropped_bytes",
             self.stdout_data_sink && self.scheduling.sink_dropped_bytes > 0,
         );
+        cause(o, "trace_truncated", self.trace_truncated);
         if include_selection {
             cause(
                 o,
@@ -1755,6 +1764,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "abi_refusals" => count(ev.abi_refusals, "ABI probe hits refused"),
             "malformed_records" => count(ev.malformed_records, "malformed records"),
             "provider_changed" => "provider changed".to_string(),
+            "trace_truncated" => "trace truncated at its event cap".to_string(),
             "proc_namespace_mismatch" => {
                 "/proc numbering foreign: kernel PIDs unresolvable".to_string()
             }
@@ -2545,6 +2555,7 @@ pub(crate) mod tests {
             verdict_detail: VERDICT_CONCRETE_GAP,
             gap_classes: GapClasses::default(),
             stdout_data_sink: false,
+            trace_truncated: false,
             uretprobe_override: None,
             handoff_child_pid: None,
             pid_namespace: crate::pidns::PidNamespaceEvidence::of(
@@ -4237,7 +4248,7 @@ pub(crate) mod tests {
         assert_eq!(value["evidence"]["semantic_history_drops"], 1);
         assert_eq!(value["evidence"]["completeness"], "PARTIAL");
         assert!(
-            crate::trace::evidence_line(&ev, CapturePolicy::Allowlisted, false)
+            crate::trace::evidence_line(&ev, CapturePolicy::Allowlisted)
                 .contains("\"semantic_history_drops\":1")
         );
         assert!(
@@ -5482,7 +5493,7 @@ pub(crate) mod tests {
     ];
 
     fn trace_evidence_object(ev: &Evidence) -> serde_json::Value {
-        let line = crate::trace::evidence_line(ev, CapturePolicy::Allowlisted, false);
+        let line = crate::trace::evidence_line(ev, CapturePolicy::Allowlisted);
         serde_json::from_str(line.strip_prefix("EVIDENCE ").expect("EVIDENCE prefix"))
             .expect("the final trace evidence record is one JSON object")
     }

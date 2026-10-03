@@ -7878,6 +7878,7 @@ fn evidence_verdict(
         verdict_detail: render::VERDICT_CONCRETE_GAP,
         gap_classes: render::GapClasses::default(),
         stdout_data_sink: false,
+        trace_truncated: false,
         uretprobe_override: None,
         handoff_child_pid: None,
         pid_namespace: crate::pidns::PidNamespaceEvidence::of(
@@ -20869,6 +20870,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         verdict_detail: render::VERDICT_CONCRETE_GAP,
         gap_classes: render::GapClasses::default(),
         stdout_data_sink: false,
+        trace_truncated: false,
         uretprobe_override: None,
         handoff_child_pid: None,
         pid_namespace: crate::pidns::PidNamespaceEvidence::of(
@@ -20899,7 +20901,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         ..profile_capture
     };
     let metrics = render::json(&[], &evidence, &metrics_capture);
-    let trace = trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false);
+    let trace = trace::evidence_line(&evidence, CapturePolicy::Allowlisted);
 
     for rendered in [
         serde_json::to_string(&profile).unwrap(),

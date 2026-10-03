@@ -189,7 +189,9 @@ pub fn capture_line(policy: CapturePolicy) -> String {
 /// Detaching perf links does not prove already-running callbacks quiesced;
 /// only the stop gate's proven quiescence does (`ev.drain_proven`, owner
 /// ruling B). Without it this record stays PARTIAL with `final_drain: false`.
-pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy, truncated: bool) -> String {
+/// A truncated trace (`ev.trace_truncated`) is PARTIAL even behind a proven
+/// drain: its line stream is short (DR-RETRO-C6-1).
+pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
     let mut value = render::versioned_evidence(ev);
     let object = value
         .as_object_mut()
@@ -198,10 +200,11 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy, truncated: bo
         "privacy_mode".into(),
         serde_json::Value::String(policy.privacy_mode().into()),
     );
-    // The sealed verdict, re-gated on the latch so an unsealed snapshot
-    // can never publish COMPLETE: only a proven stop-gate drain (owner
-    // ruling B) makes the final drain, and with it COMPLETE, true.
-    let complete = ev.drain_proven && ev.completeness == "COMPLETE";
+    // The sealed verdict, re-gated on the latch and on truncation so an
+    // unsealed snapshot can never publish COMPLETE: only a proven stop-gate
+    // drain (owner ruling B) makes the final drain true, and only an
+    // untruncated one may with it be COMPLETE.
+    let complete = ev.drain_proven && !ev.trace_truncated && ev.completeness == "COMPLETE";
     object.insert(
         "completeness".into(),
         serde_json::Value::String(if complete { "COMPLETE" } else { "PARTIAL" }.into()),
@@ -212,7 +215,10 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy, truncated: bo
         serde_json::Value::Bool(ev.drain_proven),
     );
     object.insert("counters_available".into(), serde_json::Value::Bool(true));
-    object.insert("trace_truncated".into(), serde_json::Value::Bool(truncated));
+    object.insert(
+        "trace_truncated".into(),
+        serde_json::Value::Bool(ev.trace_truncated),
+    );
     format!("EVIDENCE {value}")
 }
 
@@ -647,6 +653,7 @@ mod tests {
             verdict_detail: render::VERDICT_CONCRETE_GAP,
             gap_classes: render::GapClasses::default(),
             stdout_data_sink: false,
+            trace_truncated: false,
             uretprobe_override: None,
             handoff_child_pid: None,
             pid_namespace: crate::pidns::PidNamespaceEvidence::of(
@@ -660,7 +667,7 @@ mod tests {
     #[test]
     fn final_evidence_line_is_machine_readable_and_never_claims_a_proven_drain() {
         let evidence = empty_evidence();
-        let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted, false);
+        let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted);
         let value: serde_json::Value =
             serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
         assert_eq!(value["semantic_state_drops"], 0);
@@ -701,7 +708,7 @@ mod tests {
             let mut evidence = crate::render::tests::evidence();
             evidence.apply_stop_quiescence(stop);
             evidence.settle_terminal(true);
-            let line = evidence_line(&evidence, CapturePolicy::Allowlisted, false);
+            let line = evidence_line(&evidence, CapturePolicy::Allowlisted);
             serde_json::from_str::<serde_json::Value>(line.strip_prefix("EVIDENCE ").unwrap())
                 .unwrap()
         };
@@ -725,6 +732,57 @@ mod tests {
         assert_eq!(post_q["stop_quiescence"]["post_q_events"], true);
     }
 
+    // DR-RETRO-C6-1: truncation forces PARTIAL even behind a proven drain
+    // (observed-profile-v3, "Any truncation … forces PARTIAL"). The
+    // unproven fixture above cannot show this: it is PARTIAL anyway. The
+    // cause is in the sealed classes too, so `verdict_detail` agrees with
+    // `completeness` and a consumer of either sees the gap.
+    #[test]
+    #[cfg(target_arch = "x86_64")] // the drain proof applies on x86_64 only
+    fn a_truncated_trace_with_a_proven_drain_is_partial() {
+        use crate::render::{QuiescenceState, StopQuiescence};
+        let mut evidence = crate::render::tests::evidence();
+        evidence.trace_truncated = true;
+        evidence.apply_stop_quiescence(StopQuiescence {
+            state: QuiescenceState::Proven,
+            ..Default::default()
+        });
+        evidence.settle_terminal(true);
+        let line = evidence_line(&evidence, CapturePolicy::Allowlisted);
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert_eq!(value["trace_truncated"], true);
+        assert_eq!(value["final_drain"], true);
+        assert_eq!(value["drain_proven"], true);
+        assert_eq!(value["completeness"], "PARTIAL");
+        assert_eq!(value["verdict_detail"], "concrete_gap");
+        assert_eq!(
+            value["gap_classes"]["observation"],
+            serde_json::json!({"status": "lossy", "causes": ["trace_truncated"]})
+        );
+        assert_eq!(evidence.completeness, "PARTIAL");
+    }
+
+    // The record re-gates on truncation itself, like it re-gates on the
+    // latch: an unsealed snapshot that still reads COMPLETE never prints it.
+    #[test]
+    fn an_unsealed_truncated_snapshot_never_prints_complete() {
+        let mut evidence = empty_evidence();
+        evidence.drain_proven = true;
+        evidence.completeness = "COMPLETE";
+        evidence.trace_truncated = true;
+        let line = evidence_line(&evidence, CapturePolicy::Allowlisted);
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert_eq!(value["completeness"], "PARTIAL");
+        evidence.trace_truncated = false;
+        let line = evidence_line(&evidence, CapturePolicy::Allowlisted);
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert_eq!(value["completeness"], "COMPLETE", "the control");
+        assert_eq!(value["trace_truncated"], false);
+    }
+
     #[test]
     fn selection_evidence_is_terminal_only() {
         for line in [
@@ -736,7 +794,7 @@ mod tests {
             assert!(!line.contains("selection_truncated"));
         }
         assert!(
-            evidence_line(&empty_evidence(), CapturePolicy::Allowlisted, false)
+            evidence_line(&empty_evidence(), CapturePolicy::Allowlisted)
                 .contains("\"interface_selection\"")
         );
         let plan = test_plan();
@@ -757,12 +815,20 @@ mod tests {
             truncated_line(1, false),
             "TRUNCATED at 1 events (default cap; pass --max-events <n> to change it)"
         );
-        let evidence = empty_evidence();
-        let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted, true);
+        let mut evidence = empty_evidence();
+        evidence.trace_truncated = true;
+        evidence.settle_terminal(true);
+        let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted);
         let value: serde_json::Value =
             serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
         assert_eq!(value["trace_truncated"], true);
         assert_eq!(value["completeness"], "PARTIAL");
+        assert!(
+            value["gap_classes"]["observation"]["causes"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("trace_truncated"))
+        );
     }
 
     #[test]

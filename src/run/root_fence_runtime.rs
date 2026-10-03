@@ -266,11 +266,7 @@ fn document(
         "static fixture must retain partial evidence"
     );
     writeln!(io::stdout(), "root-runtime {label} {output}")?;
-    Ok(trace::evidence_line(
-        &evidence,
-        session.capture_policy(),
-        false,
-    ))
+    Ok(trace::evidence_line(&evidence, session.capture_policy()))
 }
 
 fn scenario(

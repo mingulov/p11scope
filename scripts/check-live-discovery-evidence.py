@@ -218,6 +218,27 @@ def fail(message):
     raise RuntimeError(message)
 
 
+def expected_row_completeness(row):
+    """The completeness the product may publish for this row (DR-RETRO-C6-2).
+
+    COMPLETE is legitimate only behind a proven stop-gate drain
+    (`drain_proven`, owner ruling B) with no remaining verdict cause the row
+    states. An initial-set capture of `none`, a loader timing that is not
+    proven (`unproven` on the primary path, `none` behind the
+    `dlopen_return` fallback), or an active fallback is the observation
+    cause `loader_discovery`; a truncated trace is `trace_truncated`. Each
+    forces PARTIAL. Every passing v1 row has `initial_set_capture: none`,
+    so every passing v1 row is PARTIAL, by this rule rather than a literal.
+    """
+    if row.get("drain_proven") is not True or row.get("trace_truncated") is True:
+        return "PARTIAL"
+    if row.get("initial_set_capture") == "none" or "fallback" in row:
+        return "PARTIAL"
+    if row.get("timing") in ("unproven", "none"):
+        return "PARTIAL"
+    return "COMPLETE"
+
+
 def check(claims):
     for okay, message in claims:
         if not okay:
@@ -1566,7 +1587,11 @@ def validate_row(row, manifest, label):
                 row.get("initial_set_capture") == "none",
                 f"{label}: initial-set capture must be none",
             ),
-            (row.get("completeness") == "PARTIAL", f"{label}: completeness must stay PARTIAL"),
+            (
+                row.get("completeness") == expected_row_completeness(row),
+                f"{label}: completeness {row.get('completeness')!r} is not the row's own "
+                f"verdict {expected_row_completeness(row)!r}",
+            ),
             (
                 get(row, "privacy", "scan") == "clean",
                 f"{label}: the row's privacy scan is not clean",
@@ -2086,6 +2111,22 @@ def self_test():
         "-s", str(repo_root() / "tests/python"),
         "-p", "test_live_freeze_prepared_dependencies.py",
     ], check=True)
+    # DR-RETRO-C6-2: completeness is the row's own verdict, never a literal.
+    proven_row = {
+        "drain_proven": True, "initial_set_capture": "pause_protected",
+        "timing": "qualified_pre_constructor", "trace_truncated": False,
+    }
+    for label, row, want in (
+        ("a proven row with no stated cause", proven_row, "COMPLETE"),
+        ("an unproven drain", dict(proven_row, drain_proven=False), "PARTIAL"),
+        ("a missing drain latch", {k: v for k, v in proven_row.items() if k != "drain_proven"}, "PARTIAL"),
+        ("a truncated trace", dict(proven_row, trace_truncated=True), "PARTIAL"),
+        ("an initial set never captured", dict(proven_row, initial_set_capture="none"), "PARTIAL"),
+        ("an unproven loader timing", dict(proven_row, timing="unproven"), "PARTIAL"),
+        ("a dlopen_return fallback", dict(proven_row, fallback={}), "PARTIAL"),
+    ):
+        if expected_row_completeness(row) != want:
+            fail(f"self-test: {label} must be {want}")
     root = repo_root()
     if shutil.which("gcc") is None:
         fail("--self-test builds the frozen fixtures and needs gcc")
@@ -2575,6 +2616,10 @@ def self_test():
                 {never_name: _patch(never, ["initial_set_capture"], "partial")},
             ),
             ("completeness", {never_name: _patch(never, ["completeness"], "COMPLETE")}),
+            (
+                "COMPLETE behind a proven drain with an uncaptured initial set",
+                {never_name: _patch(_patch(never, ["drain_proven"], True), ["completeness"], "COMPLETE")},
+            ),
             ("privacy scan", {never_name: _patch(never, ["privacy", "scan"], "leak")}),
             (
                 "privacy allowlist",

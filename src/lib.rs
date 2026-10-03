@@ -39,6 +39,7 @@ mod first_use_probe;
 pub mod inspect;
 pub mod inspect_system;
 pub mod inventory;
+pub(crate) mod inventory_capture;
 pub mod inventory_dashboard;
 pub mod inventory_events;
 pub mod inventory_present;

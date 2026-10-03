@@ -44,7 +44,7 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (60 ignored tests in the default-feature lib binary): 50 run by
+# Curation (64 ignored tests in the default-feature lib binary): 54 run by
 # default, 4 run only with --include-long, 6 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -115,6 +115,15 @@ discovery::inventory_workload::tests::privileged_inventory_attach_projection_n81
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains
 events::runtime_tests::real_retained_discovery_consumer_owns_one_exact_map
 events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict
+# Task 6 C5.1 native inventory lane cells (production classic loop over owned
+# inventory-ledger workloads; need gcc, softhsm2-util and SoftHSM2 at
+# /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so; about 5-20 s each): --pid
+# stamps + witnessed edge + no foreign caller, --system late dlopen, stop with
+# a held call, SIGINT during activation.
+inventory::privileged_tests::privileged_native_lane_pid_lp64
+inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64
+inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64
+inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
 )
 
 # Long campaign cells: run only with --include-long.

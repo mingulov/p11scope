@@ -65,7 +65,13 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   suppressed_delta, gaps_suppressed}` — what the pass scanned and what
   it cost. `scanned` counts the members observed (deep-scanned plus
   maps-matched); `maps_matched` counts those past the deep-scan cap
-  attributed by exact maps identity (see `inventory-v1.md`).
+  attributed by exact maps identity (see `inventory-v1.md`). A native
+  run's stop commits once more after its last pass (the terminal witness
+  reads, the final lifecycle drain, the binder's finish): that commit's
+  incarnation events and gaps precede one more `pass_committed` with the
+  additive `final: true`, the last pass's `pass` number and zero scan
+  counts, so `new_gaps` still sums to every streamed gap. Absent `final`
+  means a scan pass.
 - `caller_observed` / `module_observed` / `edge_observed`: full
   snapshot record shapes (test/sync emission; production emits
   incrementally instead). `edge_observed` adds the three derived

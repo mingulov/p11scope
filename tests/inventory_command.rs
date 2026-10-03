@@ -952,3 +952,240 @@ fn max_gaps_knob_defaults_to_1024_and_binds_retention() {
         assert!(gaps.len() as u64 <= expected_limit, "args {args:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 6 C5.1: the usage lane flag, the classic stop path, and hard sink
+// failures. Unprivileged: the native lane itself runs in the privileged
+// cells (`inventory_capture`) and the installed qualification.
+// ---------------------------------------------------------------------------
+
+fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// The observation keys the scan lane has always carried; the native lane
+/// adds `lane`, `settlement` and `retirement`.
+const SCAN_OBSERVATION_KEYS: [&str; 5] = [
+    "ended_ns",
+    "native_witnesses",
+    "passes",
+    "started_ns",
+    "usage_feed",
+];
+
+fn observation_keys(doc: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = doc["observation"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// A 0700 directory `-o` trusts (the target dir's ancestors may not be).
+fn private_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
+fn gap_subjects(doc: &Value) -> Vec<String> {
+    doc["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|gap| gap["subject"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn capture_native_without_privilege_is_an_error_naming_why() {
+    if running_as_root() {
+        eprintln!("skipped: root can run the native lane");
+        return;
+    }
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-native-refused");
+    let driver = LiveDriver::spawn(&dir, "nr", &["nr-p1.so"]);
+    let output = observe(driver.pid, &["--capture", "native", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("--capture native: the native usage lane cannot run:"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "no document on a refused lane");
+}
+
+#[test]
+fn capture_auto_without_privilege_falls_back_to_scan_with_a_named_gap() {
+    if running_as_root() {
+        eprintln!("skipped: root runs the native lane under auto");
+        return;
+    }
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-auto-fallback");
+    let driver = LiveDriver::spawn(&dir, "af", &["af-p1.so"]);
+    for args in [vec!["--json"], vec!["--capture", "auto", "--json"]] {
+        let output = observe(driver.pid, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("native usage feed unavailable, continuing with the scan lane"),
+            "{stderr}"
+        );
+        let doc: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+        let gap = doc["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gap| gap["subject"] == "native usage feed unavailable")
+            .unwrap_or_else(|| panic!("{args:?}: {}", doc["gaps"]));
+        assert!(gap["caller"].is_null() && gap["module"].is_null() && gap["pid"].is_null());
+        assert!(!gap["reason"].as_str().unwrap().is_empty());
+        assert_eq!(observation_keys(&doc), SCAN_OBSERVATION_KEYS, "{args:?}");
+        for edge in doc["edges"].as_array().unwrap() {
+            assert_eq!(edge["entries"]["coverage"]["reason"], "scan_only", "{edge}");
+        }
+    }
+}
+
+/// `--capture scan` is today's scan lane: no BPF attempt, no native line on
+/// stderr, no native gap, and the observation shape the scan lane always had.
+#[test]
+fn capture_scan_keeps_the_scan_lane_document() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-scan-lane");
+    let driver = LiveDriver::spawn(&dir, "sl", &["sl-p1.so"]);
+    let output = observe(driver.pid, &["--capture", "scan", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("native usage") && !stderr.contains("native capture"),
+        "{stderr}"
+    );
+    let doc: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(observation_keys(&doc), SCAN_OBSERVATION_KEYS);
+    assert!(
+        !gap_subjects(&doc)
+            .iter()
+            .any(|subject| subject.contains("native")),
+        "{}",
+        doc["gaps"]
+    );
+    assert_eq!(doc["observation"]["usage_feed"], false);
+    let edges = doc["edges"].as_array().unwrap();
+    assert!(!edges.is_empty());
+    for edge in edges {
+        assert_eq!(edge["entries"]["coverage"]["state"], "unknown");
+        assert_eq!(edge["entries"]["coverage"]["reason"], "scan_only");
+    }
+}
+
+/// The classic loop's stop path: SIGINT mid-window still writes the
+/// stream's `ended`, commits `-o`, and exits 0.
+#[test]
+fn a_classic_run_interrupted_by_sigint_commits_its_report_and_stream() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-sigint");
+    let driver = LiveDriver::spawn(&dir, "si", &["si-p1.so"]);
+    let private = private_dir();
+    let out = private.path().join("report.json");
+    let stream = dir.join("events.jsonl");
+    let mut observer = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(["inventory", "--pid", &driver.pid.to_string()])
+        .args(["--capture", "scan", "--duration", "120s", "-o"])
+        .arg(&out)
+        .arg("--event-log")
+        .arg(&stream)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = observer.id();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !std::fs::read_to_string(&stream).is_ok_and(|text| text.contains("\"pass_committed\"")) {
+        if Instant::now() >= deadline {
+            let _ = observer.kill();
+            panic!("the observer never committed a pass");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let sent = Instant::now();
+    // SAFETY: `pid` is our live, unreaped child.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) }, 0);
+    let status = loop {
+        if let Some(status) = observer.try_wait().unwrap() {
+            break status;
+        }
+        if sent.elapsed() > Duration::from_secs(15) {
+            let _ = observer.kill();
+            panic!("SIGINT did not end the classic loop within 15 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = observer.wait_with_output().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert!(doc["observation"]["passes"].as_u64().unwrap() >= 1);
+    let text = std::fs::read_to_string(&stream).unwrap();
+    let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(last["kind"], "ended", "{text}");
+    assert_eq!(last["event"]["passes"], doc["observation"]["passes"]);
+}
+
+/// A reader that went away before the final document is an error (exit 1,
+/// one stderr line), never silent; the `-o` report it follows is committed.
+#[test]
+fn a_closed_stdout_pipe_is_an_error_after_the_report_commits() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-closed-stdout");
+    let driver = LiveDriver::spawn(&dir, "cs", &["cs-p1.so"]);
+    let private = private_dir();
+    let out = private.path().join("report.json");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(["inventory", "--pid", &driver.pid.to_string()])
+        .args(["--capture", "scan", "--json", "-o"])
+        .arg(&out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.starts_with("p11scope: ") && stderr.to_lowercase().contains("broken pipe"),
+        "{stderr}"
+    );
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+}
+
+/// An event stream that cannot be written (a full disk) is an error, never
+/// silent loss.
+#[test]
+fn a_full_event_log_disk_is_an_error() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-full-stream");
+    let driver = LiveDriver::spawn(&dir, "fs", &["fs-p1.so"]);
+    let output = observe(
+        driver.pid,
+        &["--capture", "scan", "--json", "--event-log", "/dev/full"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("No space left on device"), "{stderr}");
+    assert!(output.stdout.is_empty(), "no success document: {stderr}");
+}

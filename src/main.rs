@@ -105,6 +105,7 @@ fn run() -> Result<i32> {
                 a.event_log.as_deref(),
                 a.event_rotate_bytes,
                 a.event_max_files,
+                a.capture,
             )
             .with_context(|| scope)
         }

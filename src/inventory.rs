@@ -6,12 +6,13 @@
 //! caller incarnations, and publishes caller/module/edge facts through
 //! the coordinator batch. The JSON document (`p11scope/inventory/v1`)
 //! carries stable capture-local IDs, timestamps on the capture clock,
-//! lifecycle state, and explicit gaps. Scan-only like inspect: usage
-//! columns read unknown unless an entry feed observed them, and mappings
-//! are never reported as observed calls.
+//! lifecycle state, and explicit gaps. `--capture` picks the usage lane:
+//! the scan lane reads `/proc` only (usage columns read unknown), the
+//! native lane (`inventory_capture`) adds the Inventory BPF object's
+//! witnesses. Mappings are never reported as observed calls.
 
 use crate::attach::Scope;
-use crate::cli::InspectScope;
+use crate::cli::{CaptureMode, InspectScope};
 use crate::discovery::caller_registry::{
     CallerEvent, ImageAuthority, OsProcessSource, ProcessSource, RegistryLimits, UseCoverage,
     now_ns,
@@ -21,16 +22,21 @@ use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, InventoryScope, PassReport,
 };
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::native_binding::ScanOnlyIdentity;
+use crate::discovery::native_binding::{NativeIdentity, ScanOnlyIdentity};
+use crate::inventory_capture::{
+    FacadeLane, LaneSummary, LaneWindows, LoopClock, NativeLane, PassDriver, Publish, SERVICE_TICK,
+    run_classic,
+};
 use crate::inventory_dashboard::{
     DashboardState, DetailPage, DisplayHandoff, Key, LogTail, REDRAW_INTERVAL, RESCAN_INTERVAL,
     RawModeGuard, StopFlag, TerminalGuard, Viewport, poll_key, render_frame, stdout_terminal,
 };
 use crate::inventory_events::{
-    EventWriter, GapEmitter, caller_event_payload, ended_payload, pass_payload, started_payload,
+    EventWriter, caller_event_payload, ended_payload, gap_payload, pass_payload, started_payload,
 };
 use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, render_snapshot};
 use crate::output::AtomicFile;
+use crate::process::PidPin;
 use anyhow::{Context as _, Result};
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
@@ -76,8 +82,12 @@ pub fn run(
     event_log: Option<&Path>,
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
+    capture: CaptureMode,
 ) -> Result<i32> {
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
+    // SIGINT/SIGTERM/SIGHUP end the classic loop through its stop path
+    // (the final sinks are still written); the dashboard installs its own.
+    let stop = StopFlag::install();
     run_with_writer(
         scope,
         modules,
@@ -91,6 +101,8 @@ pub fn run(
         event_log,
         event_rotate_bytes,
         event_max_files,
+        capture,
+        &|| stop.stopped(),
         stdout_tty,
         &mut std::io::stdout().lock(),
     )
@@ -110,6 +122,8 @@ fn run_with_writer(
     event_log: Option<&Path>,
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
+    capture: CaptureMode,
+    stop: &dyn Fn() -> bool,
     stdout_tty: bool,
     stdout: &mut dyn std::io::Write,
 ) -> Result<i32> {
@@ -155,8 +169,9 @@ fn run_with_writer(
     // scope-level gap, that /proc PIDs are not the kernel's here.
     stage_numbering_gap(&mut coordinator, crate::pidns::numbering());
     // The scan lane stages no usage coverage: every edge reads
-    // `unknown (scan only)`. Only native producers (Task 6 C3-C6) stage
-    // per-edge coverage notes.
+    // `unknown (scan only)`. The native lane stages per-edge coverage
+    // notes and witnesses; `auto` falls back to scan with a named gap.
+    let lane = open_native_lane(capture, scope, &mut coordinator, dashboard && stdout_tty)?;
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
     if dashboard && stdout_tty {
@@ -203,50 +218,82 @@ fn run_with_writer(
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     let mut stream_state = StreamState::new();
-    let mut guard = UnavailableImageGuard;
     let deadline = duration.map(|window| Instant::now() + window);
-    loop {
-        let now = now_ns();
-        let (report, warning) = scan_one_pass(
-            &mut coordinator,
-            &inventory_scope,
-            scope,
-            max_scan_pids,
-            &mut guard,
-            deadline,
-            now,
-        )?;
-        coordinator.commit_batch(report.engine_changed)?;
-        if let Some(warning) = warning {
-            eprintln!("{warning}");
-        }
-        for line in progress_lines(&coordinator, &report) {
-            eprintln!("{line}");
-        }
-        if let Some(writer) = stream.as_mut() {
-            let window_ns = now.saturating_sub(started_ns);
-            let presentation = Presentation::capture(
-                &coordinator,
-                &scope_label,
-                started_ns,
-                now,
-                coordinator.passes(),
-                now,
-                window_ns,
-            );
-            emit_pass_events(writer, &mut stream_state, &report, &presentation, now)
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-        }
-        match deadline {
-            None => break,
-            Some(end) => {
-                let now_instant = Instant::now();
-                if now_instant >= end {
-                    break;
+    let mut driver = ClassicDriver {
+        coordinator: &mut coordinator,
+        inventory_scope: &inventory_scope,
+        scope,
+        max_scan_pids,
+        guard: UnavailableImageGuard,
+        deadline,
+    };
+    let clock = LoopClock {
+        deadline,
+        stop,
+        interval: POLL_INTERVAL,
+        tick: SERVICE_TICK,
+    };
+    let stopped = run_classic(
+        &mut driver,
+        lane,
+        &clock,
+        &mut |driver: &mut ClassicDriver<'_>, point| {
+            let coordinator = &*driver.coordinator;
+            match point {
+                Publish::Pass { report, now_ns } => {
+                    for line in progress_lines(coordinator, report) {
+                        eprintln!("{line}");
+                    }
+                    if let Some(writer) = stream.as_mut() {
+                        let window_ns = now_ns.saturating_sub(started_ns);
+                        let presentation = Presentation::capture(
+                            coordinator,
+                            &scope_label,
+                            started_ns,
+                            now_ns,
+                            coordinator.passes(),
+                            now_ns,
+                            window_ns,
+                        );
+                        emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
+                            .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    }
                 }
-                std::thread::sleep(POLL_INTERVAL.min(end - now_instant));
+                Publish::Retiring { attached, budget } => eprintln!(
+                    "p11scope: stopping: detaching the native probes of {attached} endpoints \
+                     (up to {} s)",
+                    budget.as_secs()
+                ),
+                Publish::Stop { events, now_ns } => {
+                    if let Some(writer) = stream.as_mut() {
+                        let window_ns = now_ns.saturating_sub(started_ns);
+                        let presentation = Presentation::capture(
+                            coordinator,
+                            &scope_label,
+                            started_ns,
+                            now_ns,
+                            coordinator.passes(),
+                            now_ns,
+                            window_ns,
+                        );
+                        emit_stop_events(
+                            writer,
+                            &mut stream_state,
+                            events,
+                            coordinator.passes(),
+                            &presentation,
+                            now_ns,
+                        )
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    }
+                }
             }
-        }
+            Ok(())
+        },
+    )?;
+    let summary = stopped.as_ref().map(|stopped| stopped.summary.clone());
+    if let Some(summary) = &summary {
+        eprintln!("{}", stop_line(summary));
     }
     let ended_ns = now_ns();
     let passes = coordinator.passes();
@@ -260,14 +307,157 @@ fn run_with_writer(
         ended_ns,
         window_ns,
     );
-    finish_output(
+    let code = finish_output(
         sink,
         stream.as_mut(),
-        &mut stream_state,
         &presentation,
         json,
         false,
         stdout,
+        summary.as_ref(),
+    );
+    // Only now may an unsettled retirement's drop block (invariant 5).
+    drop(stopped);
+    code
+}
+
+/// The classic loop's pass side over the production coordinator.
+struct ClassicDriver<'a> {
+    coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
+    inventory_scope: &'a InventoryScope,
+    scope: InspectScope,
+    max_scan_pids: Option<usize>,
+    guard: UnavailableImageGuard,
+    deadline: Option<Instant>,
+}
+
+impl PassDriver<PidPin> for ClassicDriver<'_> {
+    type Host = InventoryCoordinator<OsProcessSource>;
+
+    fn host(&mut self) -> &mut Self::Host {
+        self.coordinator
+    }
+
+    fn scan(
+        &mut self,
+        identity: &mut dyn NativeIdentity<PidPin>,
+        now_ns: u64,
+    ) -> Result<PassReport> {
+        let (report, warning) = scan_one_pass(
+            self.coordinator,
+            self.inventory_scope,
+            self.scope,
+            self.max_scan_pids,
+            &mut self.guard,
+            self.deadline,
+            identity,
+            now_ns,
+        )?;
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+        Ok(report)
+    }
+
+    fn commit(&mut self, engine_changed: bool) -> Result<()> {
+        self.coordinator.commit_batch(engine_changed).map(|_| ())
+    }
+}
+
+/// Opens the native usage lane `mode` asks for. `native` that cannot start
+/// is an error naming why; `auto` falls back to the scan lane with the gap
+/// `native usage feed unavailable` (plan ruling D1). The interactive
+/// dashboard does not service a native capture yet, so there `native` is
+/// refused and `auto` falls back. In a foreign PID namespace `--system`
+/// runs native (cookies bind callers, never PID numbers) but no watch is
+/// ever claimed (ruling D1: the run stays lossy).
+fn open_native_lane(
+    mode: CaptureMode,
+    scope: InspectScope,
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    interactive_dashboard: bool,
+) -> Result<Option<NativeLane<FacadeLane>>> {
+    let unavailable =
+        |coordinator: &mut InventoryCoordinator<OsProcessSource>, reason: String| match mode {
+            CaptureMode::Native => Err(anyhow::anyhow!(
+                "--capture native: the native usage lane cannot run: {reason}"
+            )),
+            _ => {
+                eprintln!(
+                    "p11scope: native usage feed unavailable, continuing with the scan lane: {}",
+                    crate::render::escape_controls(&reason)
+                );
+                coordinator.note_scope_gap("native usage feed unavailable".into(), reason);
+                Ok(None)
+            }
+        };
+    if mode == CaptureMode::Scan {
+        return Ok(None);
+    }
+    if interactive_dashboard {
+        return unavailable(
+            coordinator,
+            "the interactive --dashboard does not service the native lane yet".into(),
+        );
+    }
+    let capture_scope = match scope {
+        InspectScope::Pid(pid) => match PidPin::open(pid) {
+            Ok(pin) => crate::attach::capture::CaptureScope::Pid(pin),
+            Err(reason) => return unavailable(coordinator, reason),
+        },
+        InspectScope::System => crate::attach::capture::CaptureScope::System,
+    };
+    let capture = match FacadeLane::prepare(capture_scope, coordinator.attach_set().budget()) {
+        Ok(capture) => capture,
+        Err(error) => return unavailable(coordinator, format!("{error:#}")),
+    };
+    let numbering = crate::pidns::numbering();
+    let lossy = (!numbering.agrees()).then(|| {
+        format!(
+            "observer PID namespace {}, /proc numbering {}: native witnesses bind callers              through pidfd cookies, but a caller's absence of use cannot be proven              (pid_namespace)",
+            numbering.observer.label(),
+            numbering.proc_view.label()
+        )
+    });
+    match NativeLane::start(capture, coordinator, LaneWindows::PROVISIONAL, lossy) {
+        Ok(lane) => {
+            eprintln!("p11scope: native usage lane active (Inventory capture activated)");
+            Ok(Some(lane))
+        }
+        Err((mut capture, reason)) => {
+            crate::inventory_capture::retire_refused(&mut capture, Duration::from_secs(2));
+            drop(capture);
+            unavailable(coordinator, reason)
+        }
+    }
+}
+
+/// The stderr line a native run ends with: what it attached, how its
+/// retirement ended, and its settlement.
+fn stop_line(summary: &LaneSummary) -> String {
+    let retirement = match &summary.retirement {
+        crate::inventory_capture::Retirement::Closed(cleanup) => format!(
+            "retirement closed ({} of {} links closed{})",
+            cleanup.closed,
+            cleanup.attempted,
+            if cleanup.failures.is_empty() {
+                String::new()
+            } else {
+                format!(", {} close failures", cleanup.failures.len())
+            }
+        ),
+        crate::inventory_capture::Retirement::Unsettled(reason) => format!(
+            "retirement unsettled: {}",
+            crate::render::escape_controls(reason)
+        ),
+    };
+    format!(
+        "p11scope: native capture stopped after {} pass{}: {} endpoints attached, {} failed;          {retirement}; settlement {}",
+        summary.passes,
+        if summary.passes == 1 { "" } else { "es" },
+        summary.attached,
+        summary.failed,
+        crate::inventory_capture::SETTLEMENT,
     )
 }
 
@@ -278,20 +468,17 @@ fn run_with_writer(
 fn finish_output(
     sink: Option<AtomicFile>,
     stream: Option<&mut EventWriter>,
-    stream_state: &mut StreamState,
     presentation: &Presentation,
     json: bool,
     silent_text: bool,
     stdout: &mut dyn std::io::Write,
+    native: Option<&LaneSummary>,
 ) -> Result<i32> {
-    let document = render_json_from_presentation(presentation);
+    let mut document = render_json_from_presentation(presentation);
+    if let Some(summary) = native {
+        note_native_observation(&mut document, summary);
+    }
     if let Some(writer) = stream {
-        // Exact repeat counts before `ended`, on every termination path:
-        // the last `gap_repeated` per index then equals the snapshot.
-        stream_state
-            .gaps
-            .emit(writer, &presentation.gaps, true, presentation.ended_ns)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let payload = ended_payload(presentation, presentation.ended_ns, writer);
         writer
             .finish(payload, presentation.ended_ns)
@@ -319,6 +506,7 @@ fn finish_output(
 /// empty pass plus a warning line the caller routes (stderr on the
 /// classic path, the log tail on the dashboard) — lifecycle still
 /// reconciles, and the observation survives its target's death.
+#[allow(clippy::too_many_arguments)]
 fn scan_one_pass(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     inventory_scope: &InventoryScope,
@@ -326,6 +514,7 @@ fn scan_one_pass(
     max_scan_pids: Option<usize>,
     guard: &mut UnavailableImageGuard,
     deadline: Option<Instant>,
+    identity: &mut dyn NativeIdentity<PidPin>,
     now: u64,
 ) -> Result<(PassReport, Option<String>)> {
     let pass_deadline = match deadline {
@@ -343,7 +532,7 @@ fn scan_one_pass(
         inventory_scope,
         max_scan_pids,
         guard,
-        &mut ScanOnlyIdentity,
+        &mut *identity,
         pass_deadline,
         now,
     ) {
@@ -356,12 +545,8 @@ fn scan_one_pass(
                 "p11scope: pass failed, continuing without its scan: {}",
                 crate::render::escape_controls(&format!("{error:#}"))
             );
-            let report = coordinator.observe_empty_pass(
-                guard,
-                &mut ScanOnlyIdentity,
-                &format!("{error:#}"),
-                now,
-            );
+            let report =
+                coordinator.observe_empty_pass(guard, identity, &format!("{error:#}"), now);
             Ok((report, Some(warning)))
         }
     }
@@ -371,14 +556,14 @@ fn scan_one_pass(
 /// so an index plus the suppressed counter replays exactly the new
 /// loss on every pass.
 struct StreamState {
-    gaps: GapEmitter,
+    emitted_gaps: usize,
     emitted_suppressed: u64,
 }
 
 impl StreamState {
     fn new() -> Self {
         Self {
-            gaps: GapEmitter::new(),
+            emitted_gaps: 0,
             emitted_suppressed: 0,
         }
     }
@@ -398,7 +583,11 @@ fn emit_pass_events(
     for event in &report.events {
         writer.append("caller_event", caller_event_payload(event), now_ns)?;
     }
-    let fresh = state.gaps.emit(writer, &presentation.gaps, false, now_ns)?;
+    let fresh = presentation.gaps.len().saturating_sub(state.emitted_gaps);
+    for gap in presentation.gaps.iter().skip(state.emitted_gaps) {
+        writer.append("gap_recorded", gap_payload(gap), now_ns)?;
+    }
+    state.emitted_gaps = presentation.gaps.len();
     let suppressed_delta = presentation
         .gaps_suppressed
         .saturating_sub(state.emitted_suppressed);
@@ -408,6 +597,56 @@ fn emit_pass_events(
         pass_payload(report, presentation, fresh, suppressed_delta),
         now_ns,
     )
+}
+
+/// Append the native stop's commit to the event stream: the incarnation
+/// events and fresh gaps its final staging produced, then one
+/// `pass_committed` marked `final` (it commits after the last pass and
+/// scans nothing), so the stream's gap accounting stays exact.
+fn emit_stop_events(
+    writer: &mut EventWriter,
+    state: &mut StreamState,
+    events: &[CallerEvent],
+    passes: u64,
+    presentation: &Presentation,
+    now_ns: u64,
+) -> Result<(), String> {
+    let report = PassReport {
+        pass: passes.saturating_sub(1),
+        scanned: 0,
+        maps_matched: 0,
+        native_callers: 0,
+        scan_callers: 0,
+        engine_changed: false,
+        pending_refresh: Vec::new(),
+        events: events.to_vec(),
+        timings: crate::timing::StageTimings::new(),
+    };
+    for event in &report.events {
+        writer.append("caller_event", caller_event_payload(event), now_ns)?;
+    }
+    let fresh = presentation.gaps.len().saturating_sub(state.emitted_gaps);
+    for gap in presentation.gaps.iter().skip(state.emitted_gaps) {
+        writer.append("gap_recorded", gap_payload(gap), now_ns)?;
+    }
+    state.emitted_gaps = presentation.gaps.len();
+    let suppressed_delta = presentation
+        .gaps_suppressed
+        .saturating_sub(state.emitted_suppressed);
+    state.emitted_suppressed = presentation.gaps_suppressed;
+    let mut payload = pass_payload(&report, presentation, fresh, suppressed_delta);
+    payload["final"] = serde_json::Value::Bool(true);
+    writer.append("pass_committed", payload, now_ns)
+}
+
+/// A native run's observation statement: the lane, its settlement (always
+/// `unsettled`, ruling D3) and how its retirement ended. Absent in the
+/// scan lane, whose document is unchanged.
+fn note_native_observation(document: &mut serde_json::Value, summary: &LaneSummary) {
+    let observation = &mut document["observation"];
+    observation["lane"] = "native".into();
+    observation["settlement"] = crate::inventory_capture::SETTLEMENT.into();
+    observation["retirement"] = summary.retirement.label().into();
 }
 
 /// The interactive dashboard loop: rescan at 1 Hz, offer immutable
@@ -487,7 +726,6 @@ fn run_dashboard_loop(
                             &handoff,
                             sink,
                             stream,
-                            stream_state,
                             json,
                             stdout,
                             _term_guard,
@@ -539,7 +777,6 @@ fn run_dashboard_loop(
                 &handoff,
                 sink,
                 stream,
-                stream_state,
                 json,
                 stdout,
                 _term_guard,
@@ -556,7 +793,6 @@ fn run_dashboard_loop(
                 &handoff,
                 sink,
                 stream,
-                stream_state,
                 json,
                 stdout,
                 _term_guard,
@@ -574,6 +810,7 @@ fn run_dashboard_loop(
                 max_scan_pids,
                 &mut guard,
                 deadline,
+                &mut ScanOnlyIdentity,
                 now,
             )?;
             coordinator.commit_batch(report.engine_changed)?;
@@ -637,7 +874,6 @@ fn finish_dashboard(
     handoff: &DisplayHandoff,
     sink: Option<AtomicFile>,
     mut stream: Option<EventWriter>,
-    mut stream_state: StreamState,
     json: bool,
     stdout: &mut dyn std::io::Write,
     _term_guard: TerminalGuard,
@@ -670,11 +906,11 @@ fn finish_dashboard(
     finish_output(
         sink,
         stream.as_mut(),
-        &mut stream_state,
         &presentation,
         json,
         true,
         stdout,
+        None,
     )
 }
 
@@ -1068,7 +1304,6 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
                     "limit": refusal.limit,
                     "requested": refusal.requested,
                 })).unwrap_or(serde_json::Value::Null),
-                "repeats": gap.repeats,
             })
         })
         .collect();
@@ -1372,6 +1607,135 @@ mod tests {
         );
     }
 
+    fn lane_summary(retirement: crate::inventory_capture::Retirement) -> LaneSummary {
+        LaneSummary {
+            retirement,
+            passes: 2,
+            attached: 4,
+            failed: 0,
+        }
+    }
+
+    /// C5.1: a native document states its lane, its settlement (always
+    /// unsettled, ruling D3) and how retirement ended, in `-o` and on stdout
+    /// alike; a scan document carries none of the three keys.
+    #[test]
+    fn a_native_document_states_lane_settlement_and_retirement() {
+        use crate::inventory_capture::Retirement;
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1, 2, 1);
+        for (summary, retirement) in [
+            (
+                lane_summary(Retirement::Closed(Default::default())),
+                "closed",
+            ),
+            (
+                lane_summary(Retirement::Unsettled("budget".into())),
+                "unsettled",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(
+                dir.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            let out = dir.path().join("doc.json");
+            let sink = AtomicFile::create(&out).unwrap();
+            let mut stdout = Vec::new();
+            finish_output(
+                Some(sink),
+                None,
+                &presentation,
+                true,
+                false,
+                &mut stdout,
+                Some(&summary),
+            )
+            .unwrap();
+            let file = std::fs::read(&out).unwrap();
+            assert_eq!(file, stdout, "-o and stdout agree");
+            let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            let observation = &document["observation"];
+            assert_eq!(observation["lane"], "native");
+            assert_eq!(observation["settlement"], "unsettled");
+            assert_eq!(observation["retirement"], retirement);
+        }
+        let mut stdout = Vec::new();
+        finish_output(None, None, &presentation, true, false, &mut stdout, None).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        for key in ["lane", "settlement", "retirement"] {
+            assert!(document["observation"].get(key).is_none(), "{key}");
+        }
+    }
+
+    /// C5.1: the native stop's commit reaches the stream as its events, its
+    /// fresh gaps, and one `pass_committed` marked `final` whose `new_gaps`
+    /// counts them, so pass accounting still sums to the streamed gaps.
+    #[test]
+    fn the_stop_commit_streams_its_events_and_gaps_under_a_final_pass() {
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("first".into(), "pass gap".into());
+        coordinator.commit_batch(false).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+        let mut state = StreamState::new();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1, 2, 1);
+        let report = PassReport {
+            pass: 0,
+            scanned: 1,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 1,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        emit_pass_events(&mut writer, &mut state, &report, &presentation, 2).unwrap();
+        coordinator.note_scope_gap("native capture retirement unsettled".into(), "x".into());
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 3, 1, 3, 2);
+        let exited = CallerEvent::Exited {
+            id: crate::discovery::caller_registry::CallerId(4),
+            reason: "gone".into(),
+        };
+        emit_stop_events(&mut writer, &mut state, &[exited], 1, &presentation, 3).unwrap();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "gap_recorded",
+                "pass_committed",
+                "caller_event",
+                "gap_recorded",
+                "pass_committed"
+            ]
+        );
+        assert_eq!(
+            lines[3]["event"]["subject"],
+            "native capture retirement unsettled"
+        );
+        let last = &lines[4]["event"];
+        assert_eq!(last["final"], true);
+        assert_eq!(last["pass"], 0);
+        assert_eq!(last["new_gaps"], 1);
+        assert!(lines[1]["event"].get("final").is_none());
+        let streamed_new: u64 = lines
+            .iter()
+            .filter(|line| line["kind"] == "pass_committed")
+            .map(|line| line["event"]["new_gaps"].as_u64().unwrap())
+            .sum();
+        assert_eq!(streamed_new, 2);
+    }
+
     #[test]
     fn text_summary_names_callers_modules_edges_and_gaps() {
         let coordinator = coordinator();
@@ -1435,163 +1799,8 @@ mod tests {
             "{lines:?}"
         );
     }
-
-    /// DR-K8S-4 through the real per-pass emitter: one identical gap over
-    /// three passes is one `gap_recorded` plus `gap_repeated` deltas, and
-    /// replaying the stream reproduces the snapshot's `repeats` exactly.
-    #[test]
-    fn the_real_pass_emitter_streams_repeats_that_equal_the_snapshot() {
-        use crate::discovery::caller_registry::RegistryGap;
-        use crate::discovery::engine::inventory_coordinator::PassReport;
-        let mut coordinator = coordinator();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("events.jsonl");
-        let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
-        let mut state = StreamState::new();
-        for pass in 1..=3u64 {
-            coordinator.registry_mut().record_gap(RegistryGap {
-                caller: None,
-                module: None,
-                pid: None,
-                subject: "overlay collapse".into(),
-                reason: "two overlay instances map one inode".into(),
-                budget: None,
-            });
-            if pass == 2 {
-                coordinator.registry_mut().record_gap(RegistryGap {
-                    caller: None,
-                    module: None,
-                    pid: Some(9),
-                    subject: "once".into(),
-                    reason: "only on pass 2".into(),
-                    budget: None,
-                });
-            }
-            coordinator.commit_batch(false).unwrap();
-            let report = PassReport {
-                pass,
-                scanned: 0,
-                maps_matched: 0,
-                native_callers: 0,
-                scan_callers: 0,
-                engine_changed: false,
-                pending_refresh: Vec::new(),
-                events: Vec::new(),
-                timings: crate::timing::StageTimings::new(),
-            };
-            let presentation =
-                Presentation::capture(&coordinator, "pid", 0, pass, pass, pass, pass);
-            emit_pass_events(&mut writer, &mut state, &report, &presentation, pass).unwrap();
-        }
-        // The pre-`ended` flush makes the last value per index exact.
-        let last = Presentation::capture(&coordinator, "pid", 0, 3, 3, 3, 3);
-        // Through the real terminal path: flush, then `ended`.
-        let mut sink = Vec::new();
-        finish_output(
-            None,
-            Some(&mut writer),
-            &mut state,
-            &last,
-            false,
-            true,
-            &mut sink,
-        )
-        .unwrap();
-        drop(writer);
-        let document = render_json(&coordinator, "pid", 0, 3, 3);
-        let snapshot = document["gaps"].as_array().unwrap();
-        let mut replayed: Vec<serde_json::Value> = Vec::new();
-        let mut kinds = Vec::new();
-        for line in std::fs::read_to_string(&path).unwrap().lines() {
-            let line: serde_json::Value = serde_json::from_str(line).unwrap();
-            kinds.push(line["kind"].as_str().unwrap().to_string());
-            match line["kind"].as_str().unwrap() {
-                "gap_recorded" => {
-                    let mut gap = line["event"].clone();
-                    assert!(gap.get("repeats").is_none(), "identity only: {gap}");
-                    assert_eq!(gap["index"], replayed.len(), "ordinal index");
-                    gap.as_object_mut().unwrap().remove("index");
-                    gap["repeats"] = 1.into();
-                    replayed.push(gap);
-                }
-                "gap_repeated" => {
-                    let index = line["event"]["index"].as_u64().unwrap() as usize;
-                    replayed[index]["repeats"] = line["event"]["repeats"].clone();
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(snapshot.len(), 2, "{snapshot:?}");
-        assert_eq!(snapshot[0]["repeats"], 3);
-        assert_eq!(replayed, *snapshot, "stream replay == snapshot");
-        assert_eq!(kinds.last().map(String::as_str), Some("ended"));
-        assert_eq!(
-            kinds.iter().rposition(|k| k == "gap_repeated").unwrap() + 1,
-            kinds.len() - 1,
-            "the exact flush sits right before ended: {kinds:?}"
-        );
-        assert_eq!(kinds.iter().filter(|k| *k == "gap_recorded").count(), 2);
-        assert_eq!(kinds.iter().filter(|k| *k == "gap_repeated").count(), 2);
-    }
-
-    /// A gap that recurs on every pass must let the stream go quiet:
-    /// `gap_repeated` only at power-of-two crossings (O(log passes)
-    /// lines), then one exact flush for whatever is outstanding.
-    #[test]
-    fn a_steady_recurring_gap_emits_logarithmic_repeat_lines() {
-        use crate::discovery::caller_registry::RegistryGap;
-        use crate::discovery::engine::inventory_coordinator::PassReport;
-        let mut coordinator = coordinator();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("events.jsonl");
-        let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
-        let mut state = StreamState::new();
-        let passes = 100u64;
-        let mut per_pass = Vec::new();
-        for pass in 1..=passes {
-            coordinator.registry_mut().record_gap(RegistryGap {
-                caller: None,
-                module: None,
-                pid: None,
-                subject: "steady".into(),
-                reason: "every pass".into(),
-                budget: None,
-            });
-            coordinator.commit_batch(false).unwrap();
-            let report = PassReport {
-                pass,
-                scanned: 0,
-                maps_matched: 0,
-                native_callers: 0,
-                scan_callers: 0,
-                engine_changed: false,
-                pending_refresh: Vec::new(),
-                events: Vec::new(),
-                timings: crate::timing::StageTimings::new(),
-            };
-            let presentation =
-                Presentation::capture(&coordinator, "pid", 0, pass, pass, pass, pass);
-            let before = writer.live_events();
-            emit_pass_events(&mut writer, &mut state, &report, &presentation, pass).unwrap();
-            per_pass.push(writer.live_events() - before);
-        }
-        let last = Presentation::capture(&coordinator, "pid", 0, passes, passes, passes, passes);
-        state
-            .gaps
-            .emit(&mut writer, &last.gaps, true, passes)
-            .unwrap();
-        drop(writer);
-        let repeated: Vec<u64> = std::fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .filter(|line| line["kind"] == "gap_repeated")
-            .map(|line| line["event"]["repeats"].as_u64().unwrap())
-            .collect();
-        // Crossings 2,4,8,16,32,64, then the flush's exact 100.
-        assert_eq!(repeated, vec![2, 4, 8, 16, 32, 64, 100]);
-        // A quiet pass is exactly the pass marker (3..=3 means no repeat line).
-        assert_eq!(per_pass[69], 1, "pass 70 is only pass_committed");
-        assert_eq!(per_pass[98], 1, "pass 99 is only pass_committed");
-    }
 }
+
+#[cfg(test)]
+#[path = "inventory_privileged_tests.rs"]
+mod privileged_tests;

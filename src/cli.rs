@@ -126,8 +126,9 @@ pub struct DoctorArgs {
 
 /// What `p11scope inventory` observes: one named process, or every
 /// process on the machine, for one snapshot or across `--duration`.
-/// Scan-only like inspect (no BPF, no manifest reads); usage columns
-/// read unknown unless an entry feed observed them.
+/// The scan lane reads `/proc` only; the native usage lane (`--capture`)
+/// adds the Inventory BPF object's witnesses. Usage columns read unknown
+/// unless a feed observed them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryArgs {
     pub scope: InspectScope,
@@ -156,6 +157,30 @@ pub struct InventoryArgs {
     /// `--event-max-files`: live file plus retained rotations;
     /// None ⇒ 5 default.
     pub event_max_files: Option<usize>,
+    /// `--capture`: which usage lane runs; `auto` by default.
+    pub capture: CaptureMode,
+}
+
+/// `inventory --capture`: the usage lane (Task 6 C5.1, plan §10 ruling D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// Native when it can start; otherwise the scan lane plus a named gap
+    /// (`native usage feed unavailable`).
+    Auto,
+    /// The scan lane only: no BPF, usage stays `unknown (scan only)`.
+    Scan,
+    /// The native usage lane or a hard error (exit 1) naming why not.
+    Native,
+}
+
+impl CaptureMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureMode::Auto => "auto",
+            CaptureMode::Scan => "scan",
+            CaptureMode::Native => "native",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,8 +255,8 @@ pub const USAGE: &str = "usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
@@ -419,8 +444,8 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// shared notes footer. Every line is verbatim from [`USAGE`]; update
 /// both together when the CLI changes.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -797,9 +822,26 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut event_log: Option<PathBuf> = None;
     let mut event_rotate_bytes: Option<u64> = None;
     let mut event_max_files: Option<usize> = None;
+    let mut capture: Option<CaptureMode> = None;
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inventory)),
+            "--capture" => {
+                if capture.is_some() {
+                    return Err(usage_err("--capture given twice"));
+                }
+                let v = require_value(&mut args, "--capture")?;
+                capture = Some(match v.as_str() {
+                    "auto" => CaptureMode::Auto,
+                    "scan" => CaptureMode::Scan,
+                    "native" => CaptureMode::Native,
+                    _ => {
+                        return Err(usage_err(format!(
+                            "--capture: invalid value {v:?}: expected auto, scan or native"
+                        )));
+                    }
+                });
+            }
             "--pid" => {
                 if pid.is_some() {
                     return Err(usage_err("--pid given twice"));
@@ -925,6 +967,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         event_log,
         event_rotate_bytes,
         event_max_files,
+        capture: capture.unwrap_or(CaptureMode::Auto),
     })
 }
 
@@ -1586,6 +1629,60 @@ mod tests {
                     if m.contains("--pid") && m.contains("--system") && m.contains("mutually exclusive")),
                 "{argv:?}"
             );
+        }
+    }
+
+    /// Task 6 C5.1: `--capture auto|scan|native`, default `auto` (plan
+    /// §10 ruling D1); once only; anything else is a usage error.
+    #[test]
+    fn inventory_capture_defaults_to_auto_and_parses_each_lane() {
+        let Command::Inventory(plain) = parse(args(&["inventory", "--system"])).unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(plain.capture, CaptureMode::Auto);
+        for (word, mode) in [
+            ("auto", CaptureMode::Auto),
+            ("scan", CaptureMode::Scan),
+            ("native", CaptureMode::Native),
+        ] {
+            let Command::Inventory(i) =
+                parse(args(&["inventory", "--pid", "7", "--capture", word])).unwrap()
+            else {
+                panic!("expected inventory")
+            };
+            assert_eq!(i.capture, mode, "{word}");
+            assert_eq!(mode.label(), word);
+        }
+        assert!(matches!(
+            parse(args(&["inventory", "--system", "--capture", "bpf"])),
+            Err(CliError::Usage(m)) if m.contains("--capture") && m.contains("auto, scan or native")
+        ));
+        assert!(matches!(
+            parse(args(&["inventory", "--system", "--capture"])),
+            Err(CliError::Usage(m)) if m.contains("--capture")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--system", "--capture", "scan", "--capture", "native"
+            ])),
+            Err(CliError::Usage(m)) if m.contains("--capture given twice")
+        ));
+    }
+
+    /// The C8 harness probes `--capture` on a usage line that names
+    /// `p11scope inventory` (`inventory-native-oracle.py probe-help`): both
+    /// inventory usage lines carry it, in the global and scoped help alike.
+    #[test]
+    fn inventory_usage_lines_carry_the_capture_flag() {
+        for text in [USAGE, INVENTORY_HELP] {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("p11scope inventory"))
+                .collect();
+            assert_eq!(lines.len(), 2, "{text}");
+            for line in lines {
+                assert!(line.contains("[--capture auto|scan|native]"), "{line}");
+            }
         }
     }
 
@@ -2337,8 +2434,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 4072);
-        assert_eq!(hash, 0x523b23f2_6c11f725);
+        assert_eq!(USAGE.len(), 4130);
+        assert_eq!(hash, 0x95db75fe_fe9c7c59);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

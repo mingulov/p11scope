@@ -27,6 +27,46 @@ so a consumer reading only `gaps[]` still sees the incompleteness: callers
 that load a module after a scan pass can be missed. See `docs/usage.md`,
 PID namespaces.
 
+## Usage lane, settlement and retirement
+
+`inventory --capture auto|scan|native` (default `auto`) picks the usage
+lane. The scan lane reads `/proc` only: its document is exactly the one
+this schema always described, every edge's usage coverage reads `unknown`
+(`scan_only` or `not_admitted`), and the three keys below are absent.
+`auto` runs the native lane when it can start and otherwise the scan lane
+plus one scope-level gap (`caller`, `module` and `pid` null, `subject`
+`native usage feed unavailable`, the reason in `reason`).
+
+A native document adds to `observation`:
+
+- `lane`: `"native"`.
+- `settlement`: always `"unsettled"`. The Inventory object has no
+  quiescence protocol, so a call in flight when the capture stopped may
+  have left no witness row: absence of use is claimed only through
+  `watched_no_use` intervals, which end at the last clean read before
+  stop (`until_ns`), never through the stop itself.
+- `retirement`: `"closed"` when every probe link had its close attempt
+  within the stop budget, `"unsettled"` when the budget passed first; then
+  `gaps[]` also holds `subject` `native capture retirement unsettled`, and
+  the probes are reclaimed (blocking) after the document is written.
+
+In the native lane an admitted edge no coverage note reached reads
+`not_attached`, never `scan_only`. When the observer's `/proc` numbering is
+not the kernel's (`pid_namespace`), native `--system` still binds witnesses
+(through pidfd cookies, never PID numbers) but never claims a watch: every
+admitted edge's coverage is `unknown` (`loss`) with a gap saying why.
+
+## Privacy
+
+Owner ruling FB-PRIV (2026-10-03): the document publishes each caller
+incarnation's `pid`, `start_time` and `image.exe` (`dev`, `ino`, `mtime_*`
+and `path`), read from `/proc/<pid>/stat` and `/proc/<pid>/exe` of processes
+whose mappings hold a provider object — reads the scan lane already makes.
+The native lane adds none: its witness rows bind through a pidfd cookie
+query, and no witness gap carries the kernel tgid. No command line,
+environment, `comm` or argument is read or published. See the inventory
+caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
+
 ## Clock and units
 
 - `clock.basis` is always `CLOCK_MONOTONIC`; `clock.unit` is always `ns`.

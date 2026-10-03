@@ -290,6 +290,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
+    /// Forgets a capture coverage whose capture never activated (the
+    /// `--capture auto` fallback): the run is the scan lane again.
+    pub(crate) fn abandon_capture_coverage(&mut self) {
+        self.capture = None;
+    }
+
+    /// The reason an edge no coverage note reached reads (`scan_only` by
+    /// default; the native lane sets `not_attached`).
+    pub(crate) fn set_uncovered_reason(&mut self, reason: UnknownReason) {
+        self.registry.set_uncovered_reason(reason);
+    }
+
     /// Absorbs one extend receipt: attached endpoints with their instants,
     /// failed endpoints (sticky), and the scope custody.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards receipts.

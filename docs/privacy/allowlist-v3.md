@@ -347,8 +347,9 @@ and the dashboard. Public data may contain capture-local IDs, finite labels,
 known/unknown/conflict and lifetime states, observation timestamps, roles,
 existing function/return/mechanism provenance, and bounded counters. It must
 not contain IPs, raw handles, result pointers, attribute pointers, private
-epoch keys or address-derived hashes. This extension adds no raw PID/TID,
-path, caller-name or command-line serialization authority to any surface.
+epoch keys or address-derived hashes. Apart from the inventory caller
+identity row below, this extension adds no raw PID/TID, path, caller-name or
+command-line serialization authority to any surface.
 Existing output-specific rules still govern existing fields. In particular,
 this proposal does not extend v1's trace PID/TID exception.
 
@@ -358,6 +359,17 @@ inventory implementation must document its additive instance/object fields
 in [inventory v1](../schema/inventory-v1.md) and
 [inventory events v1](../schema/inventory-events-v1.md), including unknown
 states, references, budgets and stream-loss behavior, before enabling them.
+
+## Inventory caller identity (owner ruling FB-PRIV)
+
+**Status: PROPOSED row; records the owner ruling of 2026-10-03.** It adds no
+capture: every field comes from `/proc` reads the inventory scan lane
+already makes, and it changes no v1/v2 exclusion (trace, profile and
+inspect outputs are untouched).
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Inventory caller `pid`, `start_time`, `image.exe` (`dev`, `ino`, `mtime_secs`, `mtime_nanos`, `path`) | `/proc/<pid>/stat` starttime and the `/proc/<pid>/exe` link (readlink plus stat) of a process whose maps hold an admitted provider object, read by the scan lane at admission and revalidation. No `cmdline`, `environ`, `comm`, argument or memory read. The native lane adds none: CALLER_USE rows bind through a pidfd TASK_COOKIE query, and their kernel tgid is never published. | Public per caller incarnation in `p11scope/inventory/v1` (`callers[]`), the inventory event stream's caller records, and the inventory dashboard/pager. PIDs are in the observer's `/proc` numbering (`pid_namespace`). `gaps[].pid` repeats the `/proc` pid of the caller or admission subject a gap names; no native witness gap carries a row's kernel tgid. | An unreadable value is `null`, never guessed. The path is the exe link observed at admission, not identity: incarnation identity is the pidfd/start-time pin plus `dev`/`ino`/`mtime`. Documented in [inventory v1](../schema/inventory-v1.md#privacy). |
 
 ## Required evidence before activation
 

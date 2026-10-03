@@ -639,8 +639,10 @@ Limits that matter in pods:
   `concrete_gap`), and `doctor` reports `PID scope unavailable`. Use
   `--cgroup` (the entry script's `--pod-uid`), whose counts stay exact there;
   see [PID namespaces](#pid-namespaces).
-- `inventory` is scan-only in this release: callers and mappings, no usage
-  counts.
+- `inventory` usage is witness-only in this release: the native lane
+  records which caller image used which module (no per-call counts), and
+  needs the observer's BPF privileges; without them `--capture auto`
+  falls back to callers and mappings with a named gap.
 - Results live in the pod's `/tmp` emptyDir: copy them out before a rollout.
   Nothing else persists between observer pods, and a capture running during
   a rollout is lost.
@@ -703,15 +705,32 @@ Limits that matter in pods:
   observation-event stream (see
   `docs/schema/inventory-events-v1.md`), rotating past
   `--event-rotate-bytes` (default 1M) and retaining `--event-max-files`
-  (default 5) with explicit loss accounting. Scan-only like inspect:
-  entry columns read unknown unless an entry feed observed them, mappings
-  are never reported as observed calls, and every coverage loss is an
-  explicit gap. Each edge states its usage coverage
-  (`entries.coverage`): this scan-only build reports `unknown` with the
-  reason `scan_only` (or `not_admitted`), never a zero as fact; the
-  dashboard shows such counts as `entries ?`, such edges as `capture
-  scan only` and `activity not covered` — never armed, never
-  quiet — and the full coverage on its evidence page. Admission
+  (default 5) with explicit loss accounting. Entry columns read unknown
+  unless a usage feed observed them, mappings are never reported as
+  observed calls, and every coverage loss is an explicit gap.
+  `--capture auto|scan|native` selects the usage lane. `scan` reads
+  `/proc` only (no BPF): every edge's usage coverage
+  (`entries.coverage`) reads `unknown` with the reason `scan_only` (or
+  `not_admitted`), never a zero as fact; the dashboard shows such counts
+  as `entries ?`, such edges as `capture scan only` and `activity not
+  covered` — never armed, never quiet — and the full coverage on its
+  evidence page. `native` also loads the Inventory BPF object, attaches
+  every admitted provider entry, and binds each positive use to the exact
+  caller image (`witnessed`) or reports it as module-level use by an
+  unidentified caller; an edge whose provider entries were all attached
+  and whose health stayed proven reads `watched_no_use` over that
+  interval. A native run states `observation.lane: "native"`,
+  `observation.settlement: "unsettled"` (Inventory has no quiescence
+  protocol, so a call in flight at stop may still be unrecorded), and
+  `observation.retirement` (`closed`, or `unsettled` when the probes did
+  not detach within the stop budget — that also records a gap). `native`
+  without the privileges, kernel support or BTF it needs is an error
+  (exit 1) naming why; `auto` (the default) runs `native` when it can
+  start and otherwise falls back to `scan` with the gap `native usage
+  feed unavailable`. The native lane does not run under the interactive
+  `--dashboard` yet: there `native` is refused and `auto` falls back.
+  Ctrl-C, SIGTERM or SIGHUP end a classic run cleanly: the stream's
+  `ended`, the `-o` document and stdout are still written. Admission
   verdicts come only from the run's attach set; an object it did not
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in

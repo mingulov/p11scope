@@ -48,6 +48,29 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Inventory and system catalog
 
+- `inventory --capture auto|scan|native` (default `auto`) runs the native
+  usage lane on the classic path: the Inventory BPF object attaches every
+  admitted provider entry, and each positive use binds to the exact caller
+  image (`witnessed`) or is reported as module-level use by an unidentified
+  caller; an edge whose entries were all attached under proven health reads
+  `watched_no_use` over that interval. A native document states
+  `observation.lane` (`native`), `observation.settlement` (always
+  `unsettled`: Inventory has no quiescence protocol) and
+  `observation.retirement` (`closed`, or `unsettled` plus a gap when the
+  probes did not detach within the stop budget). `native` that cannot start
+  is an error naming why; `auto` falls back to the scan lane with the gap
+  `native usage feed unavailable`; `scan` is unchanged. The interactive
+  `--dashboard` does not service the native lane yet (`native` is refused
+  there, `auto` falls back). In a foreign PID namespace native `--system`
+  binds witnesses but never claims a watch.
+- The classic `inventory` loop now ends cleanly on SIGINT, SIGTERM or SIGHUP:
+  the stream's `ended`, the `-o` document and stdout are still written. A
+  native stop's final commit reaches the event stream under one
+  `pass_committed` with the additive `final: true`.
+- Privacy: inventory publishes caller `pid`, `start_time` and `exe` (owner
+  ruling FB-PRIV); documented in the inventory schema and as a proposed
+  allowlist-v3 row. Nothing new is captured.
+
 - `inventory --system` and `inspect --system` no longer drop callers past
   `--max-scan-pids` (DR-C8-1). The cap still bounds how many processes are
   deep-scanned, one per provider group; every other process whose

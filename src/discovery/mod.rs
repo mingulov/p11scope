@@ -9,6 +9,7 @@ pub mod identity;
 pub(crate) mod inventory_attach_set;
 pub mod inventory_workload;
 pub(crate) mod loader;
+pub(crate) mod native_binding;
 pub mod noise;
 pub(crate) mod pause;
 pub mod scan;

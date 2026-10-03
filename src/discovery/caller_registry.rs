@@ -18,10 +18,11 @@
 //! behind a publication revision and become visible only at `publish`, so
 //! inventory facts cross the same batch boundary as discovery facts.
 
+use crate::discovery::native_binding::{BindingCensus, UnboundReason};
 use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
 use anyhow::{Result, anyhow, bail};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
 
@@ -291,6 +292,44 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.live_by_pid.get(&pid).copied()
     }
 
+    /// The exec-coverage revalidation (Task 6 C4, C1 ruling): live
+    /// incarnations admitted before `cutoff_ns` that still prove the same
+    /// process image now — the pin holds the same generation, the start
+    /// time and the exe identity are readable now and at admission and
+    /// unchanged. Anything unreadable fails: the incarnation is then never
+    /// eligible for native binding. A re-exec of the same binary keeps all
+    /// three and passes (the named boundary in the schema doc).
+    pub(crate) fn revalidate_admitted_before(&self, cutoff_ns: u64) -> HashSet<CallerId> {
+        self.live_by_pid
+            .iter()
+            .filter_map(|(&pid, id)| {
+                let tracked = self.callers.get(id)?;
+                let record = &tracked.record;
+                // `live_by_pid` holds live incarnations only.
+                let same = record.first_seen_ns < cutoff_ns
+                    && tracked
+                        .pin
+                        .as_ref()
+                        .is_some_and(|pin| self.source.still_the_same(pin))
+                    && record
+                        .start_time
+                        .is_some_and(|was| self.source.start_time(pid) == Some(was))
+                    && record
+                        .exe
+                        .as_ref()
+                        .is_some_and(|was| self.source.exe_identity(pid).as_ref() == Some(was));
+                same.then_some(*id)
+            })
+            .collect()
+    }
+
+    /// The live incarnation for `pid` and its retained pin: what the native
+    /// binder queries a task cookie through (Task 6 C4).
+    pub(crate) fn live_pin(&self, pid: u32) -> Option<(&CallerRecord, &Source::Pin)> {
+        let tracked = self.callers.get(self.live_by_pid.get(&pid)?)?;
+        Some((&tracked.record, tracked.pin.as_ref()?))
+    }
+
     fn mint(&mut self) -> Result<CallerId> {
         let id = CallerId(self.next_id);
         self.next_id = self
@@ -412,6 +451,42 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         // evidence are retained.
         tracked.pin = None;
         self.live_by_pid.remove(&tracked.record.pid);
+    }
+
+    /// A natively proven exec transition (Task 6 C4): the live incarnation
+    /// `id`'s image ended while its pin held. It retires exec-retired with
+    /// its evidence and the pid is admitted again as its successor. A
+    /// retired or unknown `id` changes nothing.
+    pub(crate) fn exec_transition(
+        &mut self,
+        id: CallerId,
+        authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
+        now_ns: u64,
+    ) -> Vec<CallerEvent> {
+        let Some(pid) = self
+            .callers
+            .get(&id)
+            .filter(|tracked| !tracked.record.retired)
+            .map(|tracked| tracked.record.pid)
+        else {
+            return Vec::new();
+        };
+        self.retire(
+            id,
+            CallerLifecycle::ExecRetired,
+            "a later image of the same task was witnessed natively (its exec sequence advanced \
+             under its task cookie, or its leader task changed under the held pidfd)"
+                .into(),
+            now_ns,
+        );
+        vec![match self.try_admit(pid, authority_for(pid), now_ns) {
+            Ok(new) => CallerEvent::ExecRetired { old: id, new },
+            Err(failure) => CallerEvent::AdmitFailed {
+                pid,
+                reason: format!("post-exec re-admission failed: {}", failure.reason),
+                budget: failure.budget,
+            },
+        }]
     }
 
     /// Reconcile tracked callers against one scan pass's observed pids:
@@ -961,6 +1036,55 @@ pub(crate) struct ModuleRecord {
     /// True once a complete rescan proved the module gone, even if it
     /// later reloaded: unload evidence is retained.
     pub unloaded_observed: bool,
+    /// Natively witnessed use no caller edge carries (Task 6 C4): rows the
+    /// binder could not bind to a caller incarnation, or bound to one with
+    /// no mapping edge. Positive, monotonic, never attributed by pid.
+    pub unbound_use: Option<UnboundUse>,
+}
+
+/// Module-level positive use from native witness rows that no caller edge
+/// carries, with the count per reason code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnboundUse {
+    /// Earliest first-association instant among the rows.
+    pub first_ns: u64,
+    pub rows: u64,
+    /// Rows per reason code ([`UnboundReason::code`] or
+    /// [`NO_MAPPING_EDGE`]).
+    ///
+    /// [`UnboundReason::code`]: crate::discovery::native_binding::UnboundReason::code
+    pub reasons: BTreeMap<&'static str, u64>,
+}
+
+/// Reason code for a witness bound to a caller incarnation whose edge to
+/// the module is not known (no mapping note reached it).
+pub(crate) const NO_MAPPING_EDGE: &str = "no_mapping_edge";
+
+const UNBOUND_USE_SUBJECT: &str = "used by an unidentified caller image";
+const WITNESS_WITHOUT_MAPPING: &str = "native witness without mapping evidence";
+const WITNESS_UNKNOWN_MODULE: &str = "native witness for an unknown module";
+const WITNESS_SHARED_ENDPOINT: &str = "ambiguous shared endpoint";
+
+/// Where every decided native witness row went, each row exactly once
+/// (C4 review M3): `edge` witnessed one caller edge, `module` became one
+/// module's `unbound_use` row, `ambiguous` named an endpoint several
+/// admitted modules share (no edge, no module-level use), `unresolved`
+/// named no registered module. The sum equals the binder census's
+/// `bound + unbound`, and `module` equals the sum of every module's
+/// `unbound_use.rows`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WitnessPlacement {
+    pub edge: u64,
+    pub module: u64,
+    pub ambiguous: u64,
+    pub unresolved: u64,
+}
+
+impl WitnessPlacement {
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> u64 {
+        self.edge + self.module + self.ambiguous + self.unresolved
+    }
 }
 
 /// One budget refusal, carried structurally so the rendered gap names
@@ -1121,6 +1245,20 @@ enum Mutation {
         module: ModuleKey,
         first_ns: u64,
     },
+    NoteBoundWitness {
+        caller: CallerId,
+        modules: Vec<ModuleKey>,
+        first_ns: u64,
+    },
+    NoteUnboundWitness {
+        modules: Vec<ModuleKey>,
+        first_ns: u64,
+        reason: UnboundReason,
+    },
+    NoteUnresolvedWitness,
+    NoteWitnessCensus {
+        census: BindingCensus,
+    },
     NoteCoverage {
         caller: CallerId,
         module: ModuleKey,
@@ -1182,6 +1320,13 @@ pub(crate) struct CallerRegistry {
     /// subject); bounded by the gap retention bound (past it the gap
     /// list is full and further gaps only count as suppressed).
     coverage_gap_memo: BTreeSet<(CallerId, ModuleKey, &'static str)>,
+    /// Module-level witness gaps already recorded, once per (module,
+    /// subject); bounded like `coverage_gap_memo`.
+    witness_gap_memo: BTreeSet<(ModuleKey, &'static str)>,
+    /// The native binder's latest census (published with the batch).
+    witness_census: BindingCensus,
+    /// Where decided witness rows went (published with the batch).
+    witness_placement: WitnessPlacement,
     facts_revision: u64,
     published_revision: u64,
     endpoints_total: usize,
@@ -1214,6 +1359,9 @@ impl CallerRegistry {
             last_health_regression_ns: None,
             watches_ended_ns: None,
             coverage_gap_memo: BTreeSet::new(),
+            witness_gap_memo: BTreeSet::new(),
+            witness_placement: WitnessPlacement::default(),
+            witness_census: BindingCensus::default(),
             facts_revision: 1,
             published_revision: 0,
             endpoints_total: 0,
@@ -1572,6 +1720,65 @@ impl CallerRegistry {
         });
     }
 
+    /// Stage one witness row the native binder bound to `caller`.
+    /// `modules` are the admitted modules whose endpoint set holds the
+    /// row's witness endpoint. The row witnesses `caller`'s edge only when
+    /// exactly one of them has an edge to `caller`. With none and a single
+    /// module, the use is that module's (`no_mapping_edge`, with a gap
+    /// naming the caller: a witness never invents a mapping). Anything else
+    /// is an `ambiguous shared endpoint` gap and witnesses nothing.
+    pub(crate) fn note_bound_witness(
+        &mut self,
+        caller: CallerId,
+        modules: Vec<ModuleKey>,
+        first_ns: u64,
+    ) {
+        self.staged.push(Mutation::NoteBoundWitness {
+            caller,
+            modules,
+            first_ns,
+        });
+    }
+
+    /// Stage one witness row the native binder could not bind: positive
+    /// module-level use, with the reason and a named gap, when `modules` is
+    /// a single module; an `ambiguous shared endpoint` gap and no use when
+    /// several modules share the endpoint. No tgid is recorded: the row's
+    /// process is exactly what could not be identified.
+    pub(crate) fn note_unbound_witness(
+        &mut self,
+        modules: Vec<ModuleKey>,
+        first_ns: u64,
+        reason: UnboundReason,
+    ) {
+        self.staged.push(Mutation::NoteUnboundWitness {
+            modules,
+            first_ns,
+            reason,
+        });
+    }
+
+    /// Stage one decided witness row whose endpoint resolved to no admitted
+    /// module (the caller records the gap): counted, never shown.
+    pub(crate) fn note_unresolved_witness(&mut self) {
+        self.staged.push(Mutation::NoteUnresolvedWitness);
+    }
+
+    /// Stage the native binder's census (the unbound-witness measurement).
+    pub(crate) fn note_witness_census(&mut self, census: BindingCensus) {
+        self.staged.push(Mutation::NoteWitnessCensus { census });
+    }
+
+    /// The published native binder census.
+    pub(crate) fn witness_census(&self) -> &BindingCensus {
+        &self.witness_census
+    }
+
+    /// Where the published decided witness rows went.
+    pub(crate) fn witness_placement(&self) -> WitnessPlacement {
+        self.witness_placement
+    }
+
     /// Stage one coverage note for an edge from its producer (the capture
     /// facade's attach receipts, the Detailed subset's counting feed).
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C3/C5/C6 producers.
@@ -1776,6 +1983,24 @@ impl CallerRegistry {
                     edge.coverage.witnessed_first_ns = Some(first);
                 }
             }
+            Mutation::NoteBoundWitness {
+                caller,
+                modules,
+                first_ns,
+            } => self.apply_bound_witness(caller, &modules, first_ns),
+            Mutation::NoteUnboundWitness {
+                modules,
+                first_ns,
+                reason,
+            } => match modules.as_slice() {
+                [key] => {
+                    self.apply_unbound_use(key, first_ns, reason.code(), reason.text(), true);
+                }
+                [] => self.witness_placement.unresolved += 1,
+                shared => self.apply_shared_endpoint(shared, reason.text()),
+            },
+            Mutation::NoteUnresolvedWitness => self.witness_placement.unresolved += 1,
+            Mutation::NoteWitnessCensus { census } => self.witness_census = census,
             Mutation::NoteCoverage {
                 caller,
                 module,
@@ -2014,6 +2239,7 @@ impl CallerRegistry {
                         admission_history: Vec::new(),
                         lifecycle: ModuleLifecycle::Mapped,
                         unloaded_observed: false,
+                        unbound_use: None,
                     },
                 );
                 self.modules_by_key.insert(info.key.clone(), id);
@@ -2129,6 +2355,146 @@ impl CallerRegistry {
     /// The edge a coverage note names, or `None` with a gap: coverage
     /// notes never invent edges. Retired callers stay addressable —
     /// positive history survives retirement.
+    fn apply_bound_witness(&mut self, caller: CallerId, modules: &[ModuleKey], first_ns: u64) {
+        let edged: Vec<ModuleId> = modules
+            .iter()
+            .filter_map(|key| self.modules_by_key.get(key).copied())
+            .filter(|id| self.edges.contains_key(&(caller, *id)))
+            .collect();
+        match (edged.as_slice(), modules) {
+            ([id], _) => {
+                let edge = self.edges.get_mut(&(caller, *id)).expect("edged");
+                let first = edge
+                    .coverage
+                    .witnessed_first_ns
+                    .map_or(first_ns, |was| was.min(first_ns));
+                edge.coverage.witnessed_first_ns = Some(first);
+                self.witness_placement.edge += 1;
+            }
+            ([], [key]) => {
+                // The caller is identified; only its mapping is missing.
+                let id = self.modules_by_key.get(key).copied();
+                self.push_coverage_gap(
+                    caller,
+                    key,
+                    id,
+                    WITNESS_WITHOUT_MAPPING,
+                    format!(
+                        "{} has no mapping edge to this module: the witnessed use stays \
+                         module-level; a witness never invents a mapping",
+                        caller.label()
+                    ),
+                );
+                self.apply_unbound_use(
+                    key,
+                    first_ns,
+                    NO_MAPPING_EDGE,
+                    "the bound caller has no mapping edge to the module",
+                    false,
+                );
+            }
+            ([], []) => self.witness_placement.unresolved += 1,
+            _ => self.apply_shared_endpoint(modules, "bound to a caller incarnation"),
+        }
+    }
+
+    /// One row whose endpoint several admitted modules share, with no
+    /// single module (or single caller edge) to carry it: a gap per module,
+    /// no edge, no module-level use.
+    fn apply_shared_endpoint(&mut self, modules: &[ModuleKey], text: &str) {
+        self.witness_placement.ambiguous += 1;
+        for key in modules {
+            let id = self.modules_by_key.get(key).copied();
+            self.push_witness_gap(
+                key,
+                id,
+                WITNESS_SHARED_ENDPOINT,
+                format!(
+                    "a native witness endpoint is shared by {} admitted modules ({text}): \
+                     which module was used is ambiguous, so no edge and no module-level use \
+                     is recorded",
+                    modules.len()
+                ),
+            );
+        }
+    }
+
+    /// One row of module-level use. `unidentified`: the row's caller image
+    /// is unknown (a binder reason), so the module gets the
+    /// unidentified-caller gap; a `no_mapping_edge` row's caller is known
+    /// and its gap names the caller instead.
+    fn apply_unbound_use(
+        &mut self,
+        key: &ModuleKey,
+        first_ns: u64,
+        code: &'static str,
+        text: &str,
+        unidentified: bool,
+    ) {
+        let Some(id) = self.modules_by_key.get(key).copied() else {
+            self.witness_placement.unresolved += 1;
+            self.push_witness_gap(
+                key,
+                None,
+                WITNESS_UNKNOWN_MODULE,
+                format!(
+                    "a native witness names a module no mapping note registered ({text}); \
+                     the use cannot be shown"
+                ),
+            );
+            return;
+        };
+        self.witness_placement.module += 1;
+        let module = self.modules.get_mut(&id).expect("indexed module");
+        let path = module.paths.iter().next().cloned().unwrap_or_default();
+        let unbound = module.unbound_use.get_or_insert(UnboundUse {
+            first_ns,
+            rows: 0,
+            reasons: BTreeMap::new(),
+        });
+        unbound.first_ns = unbound.first_ns.min(first_ns);
+        unbound.rows = unbound.rows.saturating_add(1);
+        let count = unbound.reasons.entry(code).or_default();
+        *count = count.saturating_add(1);
+        if unidentified {
+            self.push_witness_gap(
+                key,
+                Some(id),
+                UNBOUND_USE_SUBJECT,
+                format!(
+                    "{path}: native witness rows of this module were not bound to a caller \
+                     incarnation (first: {text}); module-level positive use only, never \
+                     attributed by pid"
+                ),
+            );
+        }
+    }
+
+    /// One module-level witness gap, once per (module, subject).
+    fn push_witness_gap(
+        &mut self,
+        key: &ModuleKey,
+        module: Option<ModuleId>,
+        subject: &'static str,
+        reason: String,
+    ) {
+        let memo = (key.clone(), subject);
+        if self.witness_gap_memo.contains(&memo) {
+            return;
+        }
+        if self.witness_gap_memo.len() < self.limits.max_gaps {
+            self.witness_gap_memo.insert(memo);
+        }
+        self.push_gap(RegistryGap {
+            caller: None,
+            module,
+            pid: None,
+            subject: subject.into(),
+            reason,
+            budget: None,
+        });
+    }
+
     fn coverage_edge(&mut self, caller: CallerId, module: &ModuleKey) -> Option<&mut EdgeRecord> {
         let id = self.modules_by_key.get(module).copied();
         if let Some(id) = id
@@ -2646,6 +3012,12 @@ pub(crate) mod tests {
             }
         }
 
+        fn hide_exe(&self, pid: u32) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.exe = None;
+            }
+        }
+
         pub(crate) fn exec(&self, pid: u32, ino: u64, path: &str) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.exe = Some(ExeIdentity {
@@ -2897,6 +3269,32 @@ pub(crate) mod tests {
         assert_eq!(old.start_time, new.start_time);
         assert_eq!(new.exe.as_ref().unwrap().ino, 200);
         assert_eq!(new.incarnation, 1);
+    }
+
+    #[test]
+    fn a_native_exec_transition_retires_a_live_caller_and_ignores_a_retired_one() {
+        let (source, mut adapter) = adapter();
+        source.spawn(7, 500);
+        let first = adapter.admit(7, AUTHORITY, 10).unwrap();
+        let events = adapter.exec_transition(first, &mut |_| AUTHORITY, 20);
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(*old, first);
+        let retired = adapter.record(first).unwrap();
+        assert_eq!(retired.lifecycle, CallerLifecycle::ExecRetired);
+        assert!(retired.retired);
+        let successor = adapter.record(*new).unwrap();
+        assert_eq!(successor.first_seen_ns, 20);
+        assert_eq!(adapter.live_id(7), Some(*new));
+        // A second proof for the retired incarnation changes nothing.
+        assert!(
+            adapter
+                .exec_transition(first, &mut |_| AUTHORITY, 30)
+                .is_empty()
+        );
+        assert_eq!(adapter.live_id(7), Some(*new));
+        assert_eq!(adapter.len(), 2);
     }
 
     #[test]
@@ -4131,5 +4529,149 @@ pub(crate) mod tests {
             },
             "a new interval starts at the detecting read, not the baseline"
         );
+    }
+
+    fn witnessed(registry: &CallerRegistry, caller: u32, key: &ModuleKey) -> bool {
+        let id = registry.module_id_for(key).unwrap();
+        registry
+            .edge(CallerId(caller), id)
+            .is_some_and(|edge| edge.coverage.witnessed_first_ns.is_some())
+    }
+
+    fn unbound_rows(registry: &CallerRegistry) -> u64 {
+        registry
+            .modules()
+            .filter_map(|module| module.unbound_use.as_ref())
+            .map(|unbound| unbound.rows)
+            .sum()
+    }
+
+    /// I1/M3 (C4 review): an endpoint two admitted modules share witnesses
+    /// an edge only when exactly one of them has an edge to the bound
+    /// caller, and is module-level use only when it names one module.
+    /// Every decided row lands in exactly one placement.
+    #[test]
+    fn a_shared_endpoint_witnesses_only_an_unambiguous_edge_and_counts_reconcile() {
+        let mut registry = registry();
+        let a = module_info("/lib/a.so", 11, AdmissionState::Admitted);
+        let b = module_info("/lib/b.so", 12, AdmissionState::Admitted);
+        let (ka, kb) = (a.key.clone(), b.key.clone());
+        registry.note_mapping(CallerId(0), 50, a.clone(), 100);
+        registry.note_mapping(CallerId(1), 51, a, 100);
+        registry.note_mapping(CallerId(1), 51, b, 100);
+        registry.publish();
+        let shared = vec![ka.clone(), kb.clone()];
+
+        // Caller 0 maps only A: its edge to A is the one sharer edge.
+        registry.note_bound_witness(CallerId(0), shared.clone(), 200);
+        // Caller 1 maps both: which module it used is ambiguous.
+        registry.note_bound_witness(CallerId(1), shared.clone(), 210);
+        // Caller 2 maps neither: ambiguous, never module-level.
+        registry.note_bound_witness(CallerId(2), shared.clone(), 220);
+        registry.note_unbound_witness(shared, 230, UnboundReason::NoLiveCaller);
+        registry.note_unbound_witness(vec![ka.clone()], 240, UnboundReason::NoLiveCaller);
+        registry.note_unresolved_witness();
+        registry.publish();
+
+        assert!(witnessed(&registry, 0, &ka));
+        assert!(!witnessed(&registry, 1, &ka) && !witnessed(&registry, 1, &kb));
+        let placement = registry.witness_placement();
+        assert_eq!(
+            placement,
+            WitnessPlacement {
+                edge: 1,
+                module: 1,
+                ambiguous: 3,
+                unresolved: 1,
+            }
+        );
+        assert_eq!(placement.total(), 6, "every decided row exactly once");
+        assert_eq!(unbound_rows(&registry), placement.module);
+        let b_id = registry.module_id_for(&kb).unwrap();
+        assert!(registry.module(b_id).unwrap().unbound_use.is_none());
+        let shared_gaps = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == WITNESS_SHARED_ENDPOINT)
+            .count();
+        assert_eq!(shared_gaps, 2, "once per sharing module");
+    }
+
+    /// M4 (C4 review): a bound row without a mapping edge names its caller
+    /// (the caller is identified) and never reads as an unidentified image;
+    /// no witness gap publishes a tgid.
+    #[test]
+    fn a_no_mapping_edge_row_names_its_caller_and_no_gap_carries_a_tgid() {
+        let mut registry = registry();
+        let a = module_info("/lib/a.so", 11, AdmissionState::Admitted);
+        let ka = a.key.clone();
+        registry.note_mapping(CallerId(0), 50, a, 100);
+        registry.publish();
+        registry.note_bound_witness(CallerId(3), vec![ka.clone()], 200);
+        registry.publish();
+        let id = registry.module_id_for(&ka).unwrap();
+        let unbound = registry.module(id).unwrap().unbound_use.clone().unwrap();
+        assert_eq!(unbound.reasons.get(NO_MAPPING_EDGE), Some(&1));
+        let gaps = registry.gaps();
+        assert!(
+            gaps.iter().any(
+                |gap| gap.subject == WITNESS_WITHOUT_MAPPING && gap.caller == Some(CallerId(3))
+            ),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps.iter().all(|gap| gap.subject != UNBOUND_USE_SUBJECT),
+            "the caller is identified: {gaps:?}"
+        );
+
+        registry.note_unbound_witness(vec![ka.clone()], 210, UnboundReason::NoLiveCaller);
+        let ghost = ModuleKey::physical(8, 1, 77, Some("sha0077".into()), "/lib/ghost.so");
+        registry.note_unbound_witness(vec![ghost], 220, UnboundReason::NoLiveCaller);
+        registry.publish();
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == UNBOUND_USE_SUBJECT)
+        );
+        assert!(
+            registry.gaps().iter().all(|gap| gap.pid.is_none()),
+            "{:?}",
+            registry.gaps()
+        );
+        assert_eq!(registry.witness_placement().unresolved, 1);
+    }
+
+    /// C1 (C4 review): the exec-coverage revalidation keeps only live
+    /// incarnations admitted before the cutoff whose pin, start time and
+    /// exe identity still prove the admitted image; anything unreadable
+    /// fails.
+    #[test]
+    fn revalidation_keeps_only_unchanged_incarnations_admitted_before_the_cutoff() {
+        let (source, mut adapter) = adapter();
+        for pid in [1, 2, 3, 4, 5, 6] {
+            source.spawn(pid, 500 + u64::from(pid));
+        }
+        let same = adapter.admit(1, AUTHORITY, 100).unwrap();
+        let exec_d = adapter.admit(2, AUTHORITY, 100).unwrap();
+        let hidden = adapter.admit(3, AUTHORITY, 100).unwrap();
+        let blind = adapter.admit(4, AUTHORITY, 100).unwrap();
+        let dead = adapter.admit(5, AUTHORITY, 100).unwrap();
+        let late = adapter.admit(6, AUTHORITY, 200).unwrap();
+        source.exec(2, 200, "/bin/bar");
+        source.hide_exe(3);
+        source.blind(4);
+        source.kill(5);
+        let kept = adapter.revalidate_admitted_before(200);
+        assert_eq!(kept, HashSet::from([same]));
+        for absent in [exec_d, hidden, blind, dead, late] {
+            assert!(!kept.contains(&absent));
+        }
+        // An incarnation retired by the scan lane is never revalidated.
+        adapter.reconcile(&BTreeSet::from([1, 2, 3, 4, 6]), &mut |_| AUTHORITY, 250);
+        assert!(adapter.record(exec_d).unwrap().retired);
+        let kept = adapter.revalidate_admitted_before(300);
+        assert!(kept.contains(&same) && kept.contains(&late));
+        assert!(!kept.contains(&exec_d), "{kept:?}");
     }
 }

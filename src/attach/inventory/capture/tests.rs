@@ -1215,13 +1215,15 @@ fn pid_scope_lifecycle_loss_makes_custody_unproven() {
     let mut book = test_book(8, 8, Some(40));
     let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
     let batch = service_with(&mut book, window, |_, _, _| {
-        Err(super::super::activation::InventoryDispatchFailure {
+        let failure = super::super::activation::InventoryDispatchFailure {
             record: None,
             error: anyhow::anyhow!("short DISCOVERY record"),
             dispatched: 0,
-        })
+        };
+        (Err(failure), true)
     });
     assert!(batch.failure.is_some());
+    assert!(!batch.head_pending && !batch.drained());
     assert!(matches!(
         book.custody(),
         ScopeCustody::PidUnproven { ref reason, .. } if reason.contains("short DISCOVERY record")
@@ -1418,4 +1420,36 @@ fn a_batch_carries_its_custody_proof_instant() {
     let mut system = test_book(8, 8, None);
     let batch = read_witnesses_from(None, &mut system, CapturePhase::Active, window());
     assert_eq!(batch.custody_proven_ns, None);
+}
+
+#[test]
+fn a_quantum_ending_at_a_busy_head_is_tagged_and_not_drained() {
+    // M1/M2 (C4 review): the facade tags the batch with its own domain and
+    // reports a busy head, so an empty read never passes for a drain.
+    use super::super::activation::InventoryDiscoveryService;
+    let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut book = test_book(8, 8, None);
+    let domain = book.domain;
+
+    let batch = service_with(&mut book, window, |_, _, _| {
+        (Ok(InventoryDiscoveryService::default()), true)
+    });
+    assert_eq!(batch.domain, domain);
+    assert!(batch.head_pending && !batch.drained());
+
+    let batch = service_with(&mut book, window, |_, _, _| {
+        (Ok(InventoryDiscoveryService::default()), false)
+    });
+    assert!(!batch.head_pending && batch.drained());
+
+    // A bound or deadline stop already says "not drained": the flag stays
+    // reserved for an otherwise-empty read.
+    let batch = service_with(&mut book, window, |_, _, _| {
+        let service = InventoryDiscoveryService {
+            deadline_reached: true,
+            ..InventoryDiscoveryService::default()
+        };
+        (Ok(service), true)
+    });
+    assert!(!batch.head_pending && !batch.drained());
 }

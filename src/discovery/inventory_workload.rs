@@ -1005,9 +1005,13 @@ impl Harness {
     /// projection), then the batch commit. No native identity exists.
     pub(crate) fn apply_catalog(&mut self, catalog: crate::inspect_system::Catalog) -> PassReport {
         let mut guard = UnavailableImageGuard;
-        let report =
-            self.coordinator
-                .apply_catalog(catalog, &mut guard, |_| None, u64::MAX, self.now_ns);
+        let report = self.coordinator.apply_catalog(
+            catalog,
+            &mut guard,
+            &mut crate::discovery::native_binding::ScanOnlyIdentity,
+            u64::MAX,
+            self.now_ns,
+        );
         self.commit();
         report
     }
@@ -1016,9 +1020,12 @@ impl Harness {
     /// production empty-pass path, then the batch commit.
     pub(crate) fn observe_loss(&mut self, reason: &str) -> PassReport {
         let mut guard = UnavailableImageGuard;
-        let report = self
-            .coordinator
-            .observe_empty_pass(&mut guard, |_| None, reason, self.now_ns);
+        let report = self.coordinator.observe_empty_pass(
+            &mut guard,
+            &mut crate::discovery::native_binding::ScanOnlyIdentity,
+            reason,
+            self.now_ns,
+        );
         self.commit();
         report
     }

@@ -69,6 +69,27 @@ versioned separately and are opaque, exact dispatch keys.
   maps key (btrfs subvolume inode collisions).
 - `P11SCOPE_STAGE_TIMINGS=1` prints per-pass stage timings (sweep, select,
   deep scan, confirm, assemble, absorb, reconcile, project) to stderr.
+- Native caller binding (Task 6 C4; wired into the command by C5): a
+  native `CALLER_USE` witness binds to a caller incarnation only through a
+  task-cookie query on the incarnation's held pidfd that answers the row's
+  own ticket in its own capture domain, recorded after the admission, with
+  no exec or lifecycle loss since and no competing image; otherwise it is
+  module-level use with a reason. New JSON: `modules[].unbound_use`
+  (`{first_ns, rows, reasons}` or `null`) and
+  `observation.native_witnesses` (`{rows, bound, unbound, pending,
+  integrity, unbound_reasons}`; the unbound-witness ratio), plus the gaps
+  `used by an unidentified caller image`, `native witness without mapping
+  evidence`, `native witness rows failed validation`, and `native witness
+  without a module`. A natively proven exec retires the caller
+  (`exec_retired`) and admits its successor. A caller admitted before a
+  capture's exec coverage began binds only after a later scan pass
+  revalidates it (reason `exec_coverage_gap` otherwise); a same-binary
+  re-exec before coverage stays one incarnation (named boundary). An
+  endpoint several admitted modules share witnesses a caller edge only
+  when exactly one sharer has an edge to the caller (otherwise an
+  `ambiguous shared endpoint` gap); `observation.native_witnesses.placement`
+  (`{edge, module, ambiguous, unresolved}`) accounts for every decided
+  row, and witness gaps carry no tgid.
 
 ### Changed
 

@@ -805,6 +805,16 @@ pub(crate) fn discovery_drain_positions<S: BoundedRecordSource>(
     drain.source.positions()
 }
 
+/// The DISCOVERY ring still holds unconsumed bytes. Read after a dequeue
+/// came back empty, it means the head is reserved but not committed, and
+/// records committed behind it stay invisible: that empty read did not
+/// drain the ring. Only the drain advances `consumer` and `producer` only
+/// grows, so `consumer == producer` proves the ring was empty at the read.
+pub(crate) fn discovery_head_pending<S: BoundedRecordSource>(drain: &DiscoveryDrain<S>) -> bool {
+    let positions = drain.source.positions();
+    positions.producer != positions.consumer
+}
+
 /// Drains one bounded discovery quantum up to the producer `stop`
 /// position read at Q, never consuming past it. Same
 /// `(post_q_record, backlog)` contract as the EVENTS drain, including the
@@ -1081,6 +1091,34 @@ mod tests {
                 None => Ok(BoundedRecord::Pending),
             }
         }
+    }
+
+    /// M1 (C4 review): a reserved-but-uncommitted head makes the dequeue
+    /// return nothing while a committed exec record waits behind it. That
+    /// empty read is not a drain; only `consumer == producer` is.
+    #[test]
+    fn an_empty_read_behind_a_busy_head_is_not_a_drained_ring() {
+        let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+
+        let mut empty = DiscoveryDrain::over(CursorScript::scripted([]));
+        assert!(empty.dequeue().is_none());
+        assert!(!discovery_head_pending(&empty), "an empty ring is drained");
+
+        // One record reserved at the head (producer advanced), not committed.
+        let mut busy = CursorScript::scripted([]);
+        busy.producer = 8;
+        let mut busy = DiscoveryDrain::over(busy);
+        assert!(busy.dequeue().is_none(), "the busy head reads as empty");
+        assert!(discovery_head_pending(&busy), "but the ring is not drained");
+
+        let mut consumed = DiscoveryDrain::over(CursorScript::scripted([discovery_bytes(&exit)]));
+        assert!(matches!(consumed.dequeue(), Some(DiscoveryItem::Record(_))));
+        assert!(consumed.dequeue().is_none());
+        assert!(
+            !discovery_head_pending(&consumed),
+            "consumed to the producer"
+        );
     }
 
     /// E04 correctness gate: one retained consumer serves two quanta; a

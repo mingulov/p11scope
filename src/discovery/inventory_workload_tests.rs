@@ -1695,7 +1695,7 @@ fn inject_native_owner_growth_failure() {
             &InventoryScope::Pid(pid),
             None,
             &mut UnavailableImageGuard,
-            some_image,
+            &mut crate::discovery::native_binding::OwnerImages(some_image),
             u64::MAX,
             t0,
         )
@@ -1847,7 +1847,7 @@ fn inject_provider_mutation() {
             &InventoryScope::Pid(driver_pid),
             None,
             &mut UnavailableImageGuard,
-            |_| None,
+            &mut crate::discovery::native_binding::ScanOnlyIdentity,
             u64::MAX,
             t0,
         )
@@ -1868,7 +1868,7 @@ fn inject_provider_mutation() {
             &InventoryScope::Pid(driver_pid),
             None,
             &mut UnavailableImageGuard,
-            |_| None,
+            &mut crate::discovery::native_binding::ScanOnlyIdentity,
             u64::MAX,
             t1,
         )

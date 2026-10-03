@@ -23,11 +23,14 @@
 //! ordering test pins.
 
 use super::inventory::{
-    ImageGuard, InventoryCommit, InventoryDiscoveryConfig, InventoryOwnerLimits, RefreshCause,
-    ScanReceipt,
+    ExecProof, ImageGuard, InventoryCommit, InventoryDiscoveryConfig, InventoryOwnerLimits,
+    RefreshCause, ScanReceipt,
 };
 use super::*;
-use crate::attach::capture::{ExtendReceipt, ScopeCustody, ScopeIncarnation, WitnessBatch};
+use crate::attach::capture::{
+    DiscoveryBatch, ExtendReceipt, NativeDomainId, ScopeCustody, ScopeIncarnation, WitnessBatch,
+    WitnessRow,
+};
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
     AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
@@ -38,11 +41,13 @@ use crate::discovery::inventory_attach_set::{
     AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
     InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
+use crate::discovery::native_binding::{
+    BinderLimits, Binding, Decision, ExecTransition, NativeBinder, NativeIdentity,
+};
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
-use p11scope_ebpf_common::ImageIdentity;
 use std::path::PathBuf;
 
 /// What one inventory pass scans: one named process, or the machine.
@@ -90,18 +95,22 @@ const DEADLINE_DEFERRED: &str = "inventory scan deadline passed; the scan defers
 /// Per-pid authority resolution with a native open attempt: the open is
 /// the check, so the native path is attempted honestly on every pass
 /// and the scan lane is a recorded fallback, not a compile-time fork.
-struct AuthorityResolver<'a> {
+struct AuthorityResolver<'a, Pin> {
     engine: &'a mut Engine,
     pending: &'a mut BTreeMap<u32, ProcessViewId>,
     guard: &'a mut dyn ImageGuard,
-    native_image: fn(u32) -> Option<ImageIdentity>,
+    identity: &'a mut dyn NativeIdentity<Pin>,
     native_failures: Vec<(u32, String)>,
     scan_pinned: usize,
 }
 
-impl AuthorityResolver<'_> {
+impl<Pin> AuthorityResolver<'_, Pin> {
     fn resolve(&mut self, pid: u32) -> ImageAuthority {
-        match (self.native_image)(pid).filter(|image| image.task_cookie != 0) {
+        match self
+            .identity
+            .owner_image(pid)
+            .filter(|image| image.task_cookie != 0)
+        {
             Some(image) => match self
                 .engine
                 .open_inventory_owner(pid, image, &mut *self.guard)
@@ -145,6 +154,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// What the capture facade's receipts say per endpoint, once native
     /// capture runs (Task 6 C3); `None` in the scan lane.
     capture: Option<CaptureCoverage>,
+    /// The native witness binder (Task 6 C4): every native row enters
+    /// through `stage_native`.
+    binder: NativeBinder,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
     scanned_owners: BTreeSet<ProcessViewId>,
@@ -193,6 +205,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             attach_set: InventoryAttachSet::new(default_inventory_budget()?),
             pending_targets: TargetDelta::default(),
             capture: None,
+            binder: NativeBinder::new(BinderLimits::default()),
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
             scanned_owners: BTreeSet::new(),
@@ -280,6 +293,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// failed endpoints (sticky), and the scope custody.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards receipts.
     pub(crate) fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
+        // Exec coverage is the binder's, whatever capture coverage holds.
+        if let Some(coverage) = receipt.exec_coverage {
+            self.binder.note_exec_coverage(coverage);
+        }
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
@@ -537,7 +554,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn test_open_native_owner(
         &mut self,
         pid: u32,
-        image: ImageIdentity,
+        image: p11scope_ebpf_common::ImageIdentity,
         guard: &mut dyn super::inventory::ImageGuard,
         now_ns: u64,
     ) -> Result<CallerId> {
@@ -565,15 +582,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// (attempting a native owner per newly admitted pid), scan every
     /// native owner through the core, and project scan-lane mappings.
     /// Every staged fact publishes at the next `commit_batch`, never
-    /// before. `native_image` supplies BPF image identity per pid, or
-    /// `None` where no native identity exists (the scan lane). Hints and
-    /// hooks are the engine's, fixed for the run.
+    /// before. `identity` supplies the owner lane's exact image per pid, or
+    /// none (the scan lane: `ScanOnlyIdentity`). Hints and hooks are the
+    /// engine's, fixed for the run.
     pub(crate) fn scan_pass(
         &mut self,
         scope: &InventoryScope,
         max_scan_pids: Option<usize>,
         guard: &mut dyn ImageGuard,
-        native_image: fn(u32) -> Option<ImageIdentity>,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
         deadline_ns: u64,
         now_ns: u64,
     ) -> Result<PassReport> {
@@ -595,7 +612,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 policy,
             )?,
         };
-        Ok(self.apply_catalog(catalog, guard, native_image, deadline_ns, now_ns))
+        Ok(self.apply_catalog(catalog, guard, identity, deadline_ns, now_ns))
     }
 
     /// The pass after collection: absorb the lowering into the attach set,
@@ -607,7 +624,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         mut catalog: crate::inspect_system::Catalog,
         guard: &mut dyn ImageGuard,
-        native_image: fn(u32) -> Option<ImageIdentity>,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
         deadline_ns: u64,
         now_ns: u64,
     ) -> PassReport {
@@ -641,17 +658,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             engine: &mut self.engine,
             pending: &mut self.pending_owners,
             guard,
-            native_image,
+            identity,
             native_failures: Vec::new(),
             scan_pinned: 0,
         };
         let reconcile_start = crate::attach::monotonic_ns();
-        let events = self
-            .adapter
-            .reconcile(&observed, &mut |pid| resolver.resolve(pid), now_ns);
+        let mut events =
+            self.adapter
+                .reconcile(&observed, &mut |pid| resolver.resolve(pid), now_ns);
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
         self.record_authority_gaps(native_failures, scan_pinned);
+        events.extend(self.revalidate_for_exec_coverage(identity, now_ns));
         timings.span(
             crate::timing::StageKind::Projection,
             "reconcile",
@@ -757,7 +775,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn observe_empty_pass(
         &mut self,
         guard: &mut dyn ImageGuard,
-        native_image: fn(u32) -> Option<ImageIdentity>,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
         reason: &str,
         now_ns: u64,
     ) -> PassReport {
@@ -765,16 +783,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             engine: &mut self.engine,
             pending: &mut self.pending_owners,
             guard,
-            native_image,
+            identity,
             native_failures: Vec::new(),
             scan_pinned: 0,
         };
-        let events =
+        let mut events =
             self.adapter
                 .reconcile(&BTreeSet::new(), &mut |pid| resolver.resolve(pid), now_ns);
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
         self.record_authority_gaps(native_failures, scan_pinned);
+        events.extend(self.revalidate_for_exec_coverage(identity, now_ns));
         let live: Vec<CallerId> = self
             .adapter
             .records()
@@ -1311,6 +1330,236 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// The one native staging call (plan §3.6): witness reads, lifecycle
+    /// quanta and the final flush all enter here, before `commit_batch`.
+    /// A witness read also forwards its health and custody to capture
+    /// coverage (`note_witness_batch`); after `end_capture_coverage` that
+    /// half stages nothing, while witnessed use — a positive fact — still
+    /// binds and stages. Rows are decided by the binder (§3.3); decided
+    /// rows stage as edge witnesses or module-level unbound use, and a
+    /// proven exec transition retires its incarnation and admits the
+    /// successor (the receipt carries those events). The binder census is
+    /// staged with every call.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 drives native capture.
+    pub(crate) fn stage_native(
+        &mut self,
+        batch: NativeBatch,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
+        now_ns: u64,
+    ) -> NativeReceipt {
+        match batch {
+            NativeBatch::Witness(batch) => {
+                self.note_witness_batch(&batch);
+                self.record_witness_integrity(&batch);
+                self.binder
+                    .absorb_witnesses(&batch, &self.adapter, &mut *identity);
+            }
+            NativeBatch::Lifecycle(batch) => self.binder.absorb_lifecycle(&batch),
+            NativeBatch::Finish { domain } => self.binder.finish(domain),
+        }
+        self.stage_binder_output(identity, now_ns)
+    }
+
+    /// The exec-coverage revalidation (C1 ruling): for every domain whose
+    /// coverage began no later than this pass started (`pass_start_ns`),
+    /// the incarnations admitted before that coverage that this pass —
+    /// after its reconcile — still finds unchanged. Rows of the others
+    /// become `exec_coverage_gap`. Only the first qualifying pass counts.
+    /// Returns the incarnation events of rows the pass released.
+    fn revalidate_for_exec_coverage(
+        &mut self,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
+        pass_start_ns: u64,
+    ) -> Vec<CallerEvent> {
+        let due = self.binder.revalidation_due(pass_start_ns);
+        if due.is_empty() {
+            return Vec::new();
+        }
+        for (domain, coverage_start) in due {
+            let revalidated = self.adapter.revalidate_admitted_before(coverage_start);
+            self.binder
+                .note_revalidation(domain, pass_start_ns, revalidated);
+        }
+        self.stage_binder_output(identity, pass_start_ns).events
+    }
+
+    /// Stages what the binder decided since the last call: decided rows,
+    /// then proven exec transitions, then the census.
+    fn stage_binder_output(
+        &mut self,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
+        now_ns: u64,
+    ) -> NativeReceipt {
+        let decisions = self.binder.take_decisions();
+        let decided = decisions.len();
+        let mut unresolved: Vec<String> = Vec::new();
+        for decision in decisions {
+            if let Err(reason) = self.stage_witness(decision) {
+                self.registry.note_unresolved_witness();
+                unresolved.push(reason);
+            }
+        }
+        if let Some(first) = unresolved.first() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "native witness without a module".into(),
+                reason: format!(
+                    "{} witness row(s) named no admitted module this batch (first: {first}); \
+                     their use is object-level only and is not shown",
+                    unresolved.len()
+                ),
+                budget: None,
+            });
+        }
+        let mut events = Vec::new();
+        for transition in self.binder.take_transitions() {
+            events.extend(self.apply_exec_transition(transition, &mut *identity, now_ns));
+        }
+        self.apply_reconcile_events(&events, now_ns);
+        self.registry
+            .note_witness_census(self.binder.census().clone());
+        NativeReceipt { events, decided }
+    }
+
+    /// One witness read's integrity rows: never bound, never dropped
+    /// silently — one gap per read that had any.
+    fn record_witness_integrity(&mut self, batch: &WitnessBatch) {
+        let Some(first) = batch.integrity.first() else {
+            return;
+        };
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "native witness rows failed validation".into(),
+            reason: format!(
+                "{} CALLER_USE row(s) failed validation in this read (first: {}); {} so far \
+                 this capture; they are integrity evidence and never bind",
+                batch.integrity.len(),
+                first.reason,
+                batch.integrity_total
+            ),
+            budget: None,
+        });
+    }
+
+    /// Stages one decided row against the modules its witness endpoint is
+    /// admitted for. `Err` names a row whose endpoint resolves to no
+    /// module.
+    fn stage_witness(&mut self, decision: Decision) -> Result<(), String> {
+        let Decision { row, binding } = decision;
+        let modules = self.witness_modules(&row)?;
+        match binding {
+            Binding::Bound(caller) => {
+                self.registry
+                    .note_bound_witness(caller, modules, row.recorded_at_ns)
+            }
+            Binding::Unbound(reason) => {
+                self.registry
+                    .note_unbound_witness(modules, row.recorded_at_ns, reason)
+            }
+        }
+        Ok(())
+    }
+
+    /// The registry modules a row witnesses: every admitted module whose
+    /// recorded membership holds the row's endpoint (the same endpoint set
+    /// a watch negates). The endpoint must be the attach set's, in the
+    /// row's object. No key equality is joined here: endpoints and their
+    /// memberships come from the attach set's retained pins.
+    fn witness_modules(&self, row: &WitnessRow) -> Result<Vec<ModuleKey>, String> {
+        let endpoint = self
+            .attach_set
+            .endpoint(row.endpoint)
+            .ok_or_else(|| format!("endpoint {} is not in the attach set", row.endpoint.0))?;
+        if endpoint.object != row.object {
+            return Err(format!(
+                "endpoint {} belongs to another attach object than the row names",
+                row.endpoint.0
+            ));
+        }
+        // Distinct registry keys: one module never counts as two sharers.
+        let modules: BTreeSet<ModuleKey> = self
+            .attach_set
+            .modules_with_member(row.endpoint)
+            .filter(|key| {
+                key.object.device.major != 0
+                    || key.object.device.minor != 0
+                    || key.object.inode != 0
+            })
+            .map(|key| {
+                ModuleKey::physical(
+                    key.object.device.major,
+                    key.object.device.minor,
+                    key.object.inode,
+                    Some(key.sha256.clone()),
+                    "",
+                )
+            })
+            .collect();
+        if modules.is_empty() {
+            return Err(format!(
+                "no admitted module records endpoint {} as a member",
+                row.endpoint.0
+            ));
+        }
+        Ok(modules.into_iter().collect())
+    }
+
+    /// A proven exec transition: the incarnation's image ended. A still
+    /// live incarnation retires (exec-retired) and its successor is
+    /// admitted; one the scan lane already retired needs nothing. A native
+    /// owner gets the `ExecProof` the transition carries.
+    fn apply_exec_transition(
+        &mut self,
+        transition: ExecTransition,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
+        now_ns: u64,
+    ) -> Vec<CallerEvent> {
+        let caller = transition.caller();
+        // The binder emits a transition only for the live incarnation that
+        // held the row's tgid, so the pid matches by construction; whether
+        // that incarnation is still live is what may have changed since.
+        let live = self
+            .adapter
+            .record(caller)
+            .is_some_and(|record| !record.retired);
+        if !live {
+            return Vec::new();
+        }
+        if let Some(owner) = self.owners.get(&caller).copied()
+            && let Err(error) = self.engine.request_inventory_refresh(
+                owner,
+                RefreshCause::ValidatedExec(ExecProof::from_transition(owner, transition)),
+            )
+        {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(transition.pid()),
+                subject: "native exec proof not applied".into(),
+                reason: format!("{error:#}; the caller incarnation still retires"),
+                budget: None,
+            });
+        }
+        let mut resolver = AuthorityResolver {
+            engine: &mut self.engine,
+            pending: &mut self.pending_owners,
+            guard: &mut super::inventory::UnavailableImageGuard,
+            identity,
+            native_failures: Vec::new(),
+            scan_pinned: 0,
+        };
+        let events = self
+            .adapter
+            .exec_transition(caller, &mut |pid| resolver.resolve(pid), now_ns);
+        let (native_failures, scan_pinned) = resolver.finish();
+        self.record_authority_gaps(native_failures, scan_pinned);
+        events
+    }
+
     /// The I4b batch: the engine tail and the registry publish as one
     /// synchronous step. Facts from every scan since the last commit are
     /// invisible before this returns and visible after — the ordering
@@ -1326,6 +1575,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             registry_applied,
         })
     }
+}
+
+/// One native input for `stage_native` (plan §3.6). S2/S3 add an object
+/// fact variant here.
+#[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 constructs them.
+pub(crate) enum NativeBatch {
+    /// One witness read of a capture domain (rows, health, custody).
+    Witness(Box<WitnessBatch>),
+    /// One lifecycle quantum, tagged by the facade with the domain it was
+    /// drained from and stamped with its own drain instants (the binder
+    /// orders evidence by those stamps, never by call order).
+    Lifecycle(DiscoveryBatch),
+    /// No later lifecycle or health evidence will arrive for `domain` (its
+    /// capture retired): every row of that domain still waiting is decided
+    /// unbound. Pass the retired facade's `domain()`.
+    Finish { domain: NativeDomainId },
+}
+
+/// What one `stage_native` call did.
+#[derive(Debug, Default)]
+#[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 reads it.
+pub(crate) struct NativeReceipt {
+    /// Incarnation changes the native lane made (exec transitions), for the
+    /// event stream; already staged in the registry.
+    pub events: Vec<CallerEvent>,
+    /// Rows decided by this call.
+    pub decided: usize,
 }
 
 /// Per-endpoint attach state from the capture facade's receipts. Bounded by
@@ -1470,6 +1746,8 @@ mod tests {
     use super::super::inventory::{ImageCheck, UnavailableImageGuard};
     use super::*;
     use crate::discovery::caller_registry::OsProcessSource;
+    use crate::discovery::native_binding::{OwnerImages, ScanOnlyIdentity};
+    use p11scope_ebpf_common::ImageIdentity;
     use std::cell::Cell;
 
     // Only the native query is scripted. This never purports to read the
@@ -1551,7 +1829,7 @@ mod tests {
                 &InventoryScope::Pid(pid),
                 None,
                 &mut FixtureImages,
-                fixture_image,
+                &mut OwnerImages(fixture_image),
                 u64::MAX,
                 crate::discovery::caller_registry::now_ns(),
             )
@@ -1592,7 +1870,7 @@ mod tests {
                 &InventoryScope::Pid(pid),
                 None,
                 &mut UnavailableImageGuard,
-                |_| None,
+                &mut ScanOnlyIdentity,
                 u64::MAX,
                 crate::discovery::caller_registry::now_ns(),
             )
@@ -1693,7 +1971,7 @@ mod tests {
                 &InventoryScope::Pid(pid),
                 None,
                 &mut FixtureImages,
-                fixture_image,
+                &mut OwnerImages(fixture_image),
                 1,
                 1_000_000,
             )
@@ -1760,8 +2038,12 @@ mod tests {
         let caller = coordinator.adapter().live_id(pid).unwrap();
         exiter.0.kill().unwrap();
         exiter.0.wait().unwrap();
-        let report =
-            coordinator.observe_empty_pass(&mut UnavailableImageGuard, |_| None, "boom", now + 1);
+        let report = coordinator.observe_empty_pass(
+            &mut UnavailableImageGuard,
+            &mut ScanOnlyIdentity,
+            "boom",
+            now + 1,
+        );
         assert_eq!(report.scanned, 0);
         assert!(report.events.iter().any(|event| matches!(
             event,
@@ -1894,7 +2176,7 @@ mod tests {
                 &InventoryScope::Pid(driver_pid),
                 None,
                 &mut UnavailableImageGuard,
-                |_| None,
+                &mut ScanOnlyIdentity,
                 u64::MAX,
                 started,
             )
@@ -2025,7 +2307,7 @@ mod tests {
                     &InventoryScope::Pid(driver_pid),
                     None,
                     &mut UnavailableImageGuard,
-                    |_| None,
+                    &mut ScanOnlyIdentity,
                     u64::MAX,
                     crate::discovery::caller_registry::now_ns(),
                 )
@@ -2592,6 +2874,7 @@ mod tests {
             health_unproven: None,
             health_baseline_ns: 0,
             health_read_ns: 150,
+            rows_read_ns: 151,
             changed_objects: Vec::new(),
             custody: ScopeCustody::PidHeld,
             custody_proven_ns: None,
@@ -2997,6 +3280,672 @@ mod tests {
             last_clean(&scene),
             Some(200),
             "an unproven capture is never clean again"
+        );
+    }
+
+    // ---- Task 6 C4: native witness binding through the coordinator ----
+
+    type ScriptedPin = (u32, u64);
+
+    /// Scripted cookie answers per (pin, domain); never a host read.
+    #[derive(Default)]
+    struct ScriptedCookies {
+        answers: std::collections::HashMap<(ScriptedPin, NativeDomainId), CookieQuery>,
+    }
+
+    impl NativeIdentity<ScriptedPin> for ScriptedCookies {
+        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+            None
+        }
+
+        fn query_cookie(&mut self, domain: NativeDomainId, pin: &ScriptedPin) -> CookieQuery {
+            self.answers
+                .get(&(*pin, domain))
+                .cloned()
+                .unwrap_or(CookieQuery::NoCookie)
+        }
+    }
+
+    use crate::attach::capture::{CookieQuery, DomainCookie, ExecCoverage};
+    use crate::discovery::caller_registry::{UnboundUse, UseCoverage};
+    use crate::discovery::native_binding::UnboundReason;
+
+    /// Facade stamps for scripted native batches: strictly increasing, so
+    /// each batch follows the one staged before it.
+    struct Stamps(std::cell::Cell<u64>);
+
+    impl Stamps {
+        fn from(start: u64) -> Self {
+            Self(std::cell::Cell::new(start))
+        }
+
+        fn tick(&self) -> u64 {
+            let at = self.0.get() + 10;
+            self.0.set(at);
+            at
+        }
+
+        /// One readable witness read of `domain`: health at the stamp, rows
+        /// read just after it.
+        fn read(&self, domain: NativeDomainId, rows: Vec<WitnessRow>) -> NativeBatch {
+            let at = self.tick();
+            let mut read = witness_batch();
+            read.domain = domain;
+            read.rows = rows;
+            read.health.discovery_counters = Some([0; 5]);
+            read.health_read_ns = at;
+            read.rows_read_ns = at + 1;
+            NativeBatch::Witness(Box::new(read))
+        }
+
+        /// One complete lifecycle drain of `domain`.
+        fn drain(&self, domain: NativeDomainId) -> NativeBatch {
+            NativeBatch::Lifecycle(DiscoveryBatch::scripted(domain, Vec::new(), self.tick()))
+        }
+    }
+
+    struct NativeScene {
+        scene: CaptureScene,
+        domain: NativeDomainId,
+        cookies: ScriptedCookies,
+        stamps: Stamps,
+    }
+
+    impl NativeScene {
+        /// One provider with two endpoints in the attach set, pid 7
+        /// spawned (start 500) and admitted at 50 and mapped.
+        fn new() -> (Self, CallerId) {
+            let mut scene = CaptureScene::new(2);
+            scene.source.spawn(7, 500);
+            let caller = scene
+                .coordinator
+                .adapter
+                .admit(7, ImageAuthority::ScanPinned, 50)
+                .unwrap();
+            scene.project(7, 60);
+            scene.coordinator.commit_batch(false).unwrap();
+            (Self::over(scene, 0), caller)
+        }
+
+        /// A native lane over `scene` whose exec coverage began at
+        /// `coverage_ns`, forwarded the way C5 forwards it: through the
+        /// activating extend receipt.
+        fn over(mut scene: CaptureScene, coverage_ns: u64) -> Self {
+            let domain = NativeDomainId::mint();
+            scene.coordinator.note_extend_receipt(&ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, coverage_ns)),
+                ..ExtendReceipt::default()
+            });
+            Self {
+                scene,
+                domain,
+                cookies: ScriptedCookies::default(),
+                stamps: Stamps::from(1_000),
+            }
+        }
+
+        fn answer(&mut self, pid: u32, start: u64, ticket: u64) {
+            self.cookies.answers.insert(
+                ((pid, start), self.domain),
+                CookieQuery::Cookie(DomainCookie::scripted(self.domain, ticket)),
+            );
+        }
+
+        fn row(&self, ticket: u64, exec: u64, tgid: u32, t0: u64, member: usize) -> WitnessRow {
+            let endpoint = self.scene.delta.endpoints[member];
+            WitnessRow::scripted(
+                self.domain,
+                ticket,
+                exec,
+                endpoint.object,
+                endpoint.id,
+                tgid,
+                t0,
+            )
+        }
+
+        fn stage(&mut self, batch: NativeBatch) -> NativeReceipt {
+            let now = self.stamps.tick();
+            self.scene
+                .coordinator
+                .stage_native(batch, &mut self.cookies, now)
+        }
+
+        fn read(&mut self, rows: Vec<WitnessRow>) -> NativeReceipt {
+            let batch = self.stamps.read(self.domain, rows);
+            self.stage(batch)
+        }
+
+        fn drain(&mut self) -> NativeReceipt {
+            let batch = self.stamps.drain(self.domain);
+            self.stage(batch)
+        }
+
+        /// Read `rows`, then both horizons, then publish.
+        fn witness(&mut self, rows: Vec<WitnessRow>) -> Vec<CallerEvent> {
+            let mut events = self.read(rows).events;
+            events.extend(self.drain().events);
+            events.extend(self.read(Vec::new()).events);
+            self.scene.coordinator.commit_batch(false).unwrap();
+            events
+        }
+
+        fn module_unbound(&self) -> Option<UnboundUse> {
+            self.scene
+                .coordinator
+                .registry
+                .modules()
+                .next()
+                .and_then(|module| module.unbound_use.clone())
+        }
+
+        fn gap_subjects(&self) -> Vec<String> {
+            self.scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .map(|gap| gap.subject.clone())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_bound_witness_marks_its_edge_witnessed() {
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Witnessed { first_ns: 100 }
+        );
+        assert_eq!(native.module_unbound(), None);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.bound, census.pending), (1, 1, 0));
+    }
+
+    #[test]
+    fn exit_before_the_poll_is_module_level_use_with_a_named_gap() {
+        let (mut native, caller) = NativeScene::new();
+        // The row's process (tgid 9) exited before the poll; nothing holds
+        // its tgid.
+        let row = native.row(41, 1, 9, 100, 1);
+        native.witness(vec![row]);
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.first_ns, 100);
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.reasons.get("no_live_caller"), Some(&1));
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"used by an unidentified caller image".to_string()),
+            "{:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            !native.scene.coverage(caller).is_witnessed(),
+            "another caller never inherits it"
+        );
+    }
+
+    #[test]
+    fn a_reused_pid_never_inherits_a_witness_by_pid() {
+        let (mut native, caller) = NativeScene::new();
+        // pid 7 now holds ticket 99; the row's ticket 41 was its previous
+        // owner's.
+        native.answer(7, 500, 99);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        assert!(!native.scene.coverage(caller).is_witnessed());
+        let unbound = native.module_unbound().unwrap();
+        assert_eq!(unbound.reasons.get("cookie_mismatch"), Some(&1));
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.unbound.get(&UnboundReason::CookieMismatch), Some(&1));
+    }
+
+    #[test]
+    fn a_proven_exec_transition_retires_the_caller_and_admits_its_successor() {
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let first = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![first]);
+        let later = native.row(41, 2, 7, 1_100, 1);
+        let events = native.witness(vec![later]);
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(*old, caller);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(*new));
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Witnessed { first_ns: 100 },
+            "the old image keeps its witness"
+        );
+        assert_eq!(
+            native
+                .module_unbound()
+                .unwrap()
+                .reasons
+                .get("exec_transition"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn a_bound_caller_without_a_mapping_edge_stays_module_level() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(8, 600);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 70)
+            .unwrap();
+        native.answer(8, 600, 55);
+        let row = native.row(55, 1, 8, 100, 0);
+        native.witness(vec![row]);
+        let unbound = native.module_unbound().unwrap();
+        assert_eq!(unbound.reasons.get("no_mapping_edge"), Some(&1));
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"native witness without mapping evidence".to_string())
+        );
+        assert_eq!(
+            native.scene.coordinator.registry.edge_count(),
+            1,
+            "a witness never invents a mapping"
+        );
+    }
+
+    #[test]
+    fn witnessed_use_still_binds_after_capture_coverage_ended() {
+        let (mut native, caller) = NativeScene::new();
+        native.scene.coordinator.begin_capture_coverage(None);
+        native.scene.coordinator.end_capture_coverage(90);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Witnessed { first_ns: 100 }
+        );
+    }
+
+    #[test]
+    fn integrity_rows_and_unresolved_endpoints_are_gaps() {
+        let (mut native, _) = NativeScene::new();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.integrity_total = 1;
+        batch
+            .integrity
+            .push(crate::attach::capture::WitnessIntegrity {
+                key: p11scope_ebpf_common::inventory_callers::CallerObjectKey {
+                    image: ImageIdentity {
+                        task_cookie: 1,
+                        exec_id: 1,
+                    },
+                    object_id: 0,
+                    reserved: 0,
+                },
+                value: None,
+                reason: "scripted".into(),
+            });
+        // An endpoint the attach set never admitted.
+        batch.rows.push(WitnessRow::scripted(
+            native.domain,
+            41,
+            1,
+            native.scene.delta.endpoints[0].object,
+            EndpointId(9),
+            9,
+            100,
+        ));
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let subjects = native.gap_subjects();
+        assert!(subjects.contains(&"native witness rows failed validation".to_string()));
+        assert!(subjects.contains(&"native witness without a module".to_string()));
+        assert_eq!(native.module_unbound(), None);
+        assert_eq!(
+            native.scene.coordinator.registry.witness_census().integrity,
+            1
+        );
+        // M3/M4: the unresolved row is counted where it went, the counts
+        // reconcile with the census, and no gap reads as attribution.
+        let registry = &native.scene.coordinator.registry;
+        let census = registry.witness_census();
+        let placement = registry.witness_placement();
+        assert_eq!(placement.unresolved, 1);
+        assert_eq!(placement.total(), census.bound + census.unbound_total());
+        assert!(registry.gaps().iter().all(|gap| gap.pid.is_none()));
+    }
+
+    #[test]
+    fn finish_decides_every_waiting_row_unbound() {
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.read(vec![row]);
+        let receipt = native.stage(NativeBatch::Finish {
+            domain: native.domain,
+        });
+        assert_eq!(receipt.decided, 1);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(!native.scene.coverage(caller).is_witnessed());
+        assert_eq!(
+            native
+                .module_unbound()
+                .unwrap()
+                .reasons
+                .get("evidence_incomplete"),
+            Some(&1)
+        );
+    }
+
+    /// Answers one ticket for every pin of one domain (self-process tests).
+    struct OneTicket {
+        domain: NativeDomainId,
+        ticket: u64,
+    }
+
+    impl NativeIdentity<crate::process::PidPin> for OneTicket {
+        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+            None
+        }
+
+        fn query_cookie(
+            &mut self,
+            domain: NativeDomainId,
+            _: &crate::process::PidPin,
+        ) -> CookieQuery {
+            if domain == self.domain {
+                CookieQuery::Cookie(DomainCookie::scripted(domain, self.ticket))
+            } else {
+                CookieQuery::Unavailable("another domain".into())
+            }
+        }
+    }
+
+    #[test]
+    fn a_native_owner_gets_the_exec_proof_and_its_caller_still_retires() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let now = crate::discovery::caller_registry::now_ns();
+        let caller = coordinator
+            .test_open_native_owner(pid, fixture_image(pid).unwrap(), &mut FixtureImages, now)
+            .unwrap();
+        let domain = NativeDomainId::mint();
+        let mut identity = OneTicket { domain, ticket: 41 };
+        let object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+        let stamps = Stamps::from(now);
+        coordinator
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+        let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                         rows: Vec<WitnessRow>| {
+            let mut events = Vec::new();
+            for batch in [
+                stamps.read(domain, rows),
+                stamps.drain(domain),
+                stamps.read(domain, Vec::new()),
+            ] {
+                events.extend(
+                    coordinator
+                        .stage_native(batch, &mut identity, now + 10)
+                        .events,
+                );
+            }
+            events
+        };
+        let bound = WitnessRow::scripted(domain, 41, 1, object, EndpointId(0), pid, now + 1);
+        assert!(stage(&mut coordinator, vec![bound]).is_empty());
+        let later = WitnessRow::scripted(domain, 41, 2, object, EndpointId(1), pid, now + 2);
+        let events = stage(&mut coordinator, vec![later]);
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+            "{events:?}"
+        );
+        coordinator.commit_batch(false).unwrap();
+        let proof_gap = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .find(|gap| gap.subject == "native exec proof not applied")
+            .expect("the owner lane refuses the proof until its adapter exists");
+        assert!(
+            proof_gap.reason.contains("native lifecycle adapter"),
+            "{proof_gap:?}"
+        );
+        assert!(coordinator.adapter().record(caller).unwrap().retired);
+    }
+
+    #[test]
+    fn a_row_naming_another_object_for_its_endpoint_never_stages() {
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let endpoint = native.scene.delta.endpoints[0];
+        let row = WitnessRow::scripted(
+            native.domain,
+            41,
+            1,
+            crate::discovery::inventory_attach_set::AttachObjectId::scripted(
+                endpoint.object.index() + 1,
+            ),
+            endpoint.id,
+            7,
+            100,
+        );
+        native.witness(vec![row]);
+        assert!(!native.scene.coverage(caller).is_witnessed());
+        assert_eq!(native.module_unbound(), None);
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"native witness without a module".to_string())
+        );
+    }
+
+    #[test]
+    fn a_transition_for_a_caller_the_scan_lane_already_retired_changes_nothing() {
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let first = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![first]);
+        // The later image's row is read while the caller is still live ...
+        let later = native.row(41, 2, 7, 1_100, 1);
+        native.read(vec![later]);
+        // ... then the scan lane sees the exe change and splits first.
+        native.scene.source.exec(7, 200, "/bin/other");
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            1_200,
+        );
+        let [CallerEvent::ExecRetired { new: successor, .. }] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        let successor = *successor;
+        let mut native_events = native.drain().events;
+        native_events.extend(native.read(Vec::new()).events);
+        assert!(native_events.is_empty(), "{native_events:?}");
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(successor));
+        assert_eq!(adapter.len(), 2, "no extra incarnation was minted");
+    }
+
+    #[test]
+    fn an_owner_whose_caller_already_retired_gets_no_exec_proof() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let now = crate::discovery::caller_registry::now_ns();
+        let caller = coordinator
+            .test_open_native_owner(pid, fixture_image(pid).unwrap(), &mut FixtureImages, now)
+            .unwrap();
+        let domain = NativeDomainId::mint();
+        let mut identity = OneTicket { domain, ticket: 41 };
+        let object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+        let stamps = Stamps::from(now);
+        coordinator
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+        let read = |rows: Vec<WitnessRow>| stamps.read(domain, rows);
+        let drain = || stamps.drain(domain);
+        let bound = WitnessRow::scripted(domain, 41, 1, object, EndpointId(0), pid, now + 1);
+        for batch in [read(vec![bound]), drain(), read(Vec::new())] {
+            coordinator.stage_native(batch, &mut identity, now + 10);
+        }
+        // The later image's row is read while the caller is live; then the
+        // caller retires before the row's horizon arrives.
+        let later = WitnessRow::scripted(domain, 41, 2, object, EndpointId(1), pid, now + 2);
+        coordinator.stage_native(read(vec![later]), &mut identity, now + 10);
+        coordinator.adapter_mut().exec_transition(
+            caller,
+            &mut |_| ImageAuthority::ScanPinned,
+            now + 11,
+        );
+        let mut events = Vec::new();
+        for batch in [drain(), read(Vec::new())] {
+            events.extend(
+                coordinator
+                    .stage_native(batch, &mut identity, now + 12)
+                    .events,
+            );
+        }
+        assert!(events.is_empty(), "{events:?}");
+        coordinator.commit_batch(false).unwrap();
+        assert!(
+            !coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native exec proof not applied"),
+            "a retired incarnation's owner is never sent a proof"
+        );
+    }
+
+    /// A scene whose pid 7 (start 500) was admitted and mapped at 100,
+    /// before the native lane's exec coverage began at 200.
+    fn pre_activation_scene() -> (NativeScene, CallerId) {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        scene.project(7, 110);
+        scene.coordinator.commit_batch(false).unwrap();
+        (NativeScene::over(scene, 200), caller)
+    }
+
+    fn empty_pass(native: &mut NativeScene, start_ns: u64) -> PassReport {
+        let report = native.scene.coordinator.observe_empty_pass(
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            "scripted pass",
+            start_ns,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        report
+    }
+
+    /// C1 (C4 review), end to end: X admitted at 100 (foo maps M); T execs
+    /// bar at 150, unrecorded; coverage begins at 200; bar's row at 210
+    /// answers X's ticket. It waits for the revalidation pass, which sees
+    /// bar's exe: the row is a coverage gap and nothing joins X.
+    #[test]
+    fn a_caller_that_exec_d_before_coverage_never_joins_through_the_coordinator() {
+        let (mut native, caller) = pre_activation_scene();
+        native.scene.source.exec(7, 200, "/bin/bar");
+        native.answer(7, 500, 41);
+        let row = native.row(41, 2, 7, 210, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.pending, census.bound), (1, 0), "waits for the pass");
+
+        // A pass that started before the coverage start does not qualify,
+        // even though its reconcile already retired X as exec'd.
+        let report = empty_pass(&mut native, 150);
+        assert!(
+            report.events.iter().any(
+                |event| matches!(event, CallerEvent::ExecRetired { old, .. } if *old == caller)
+            ),
+            "{:?}",
+            report.events
+        );
+        assert_eq!(native.scene.coordinator.binder.census().pending, 1);
+
+        empty_pass(&mut native, 250);
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.pending, census.bound), (0, 0));
+        assert_eq!(
+            census.unbound.get(&UnboundReason::ExecCoverageGap),
+            Some(&1)
+        );
+        assert!(!native.scene.coverage(caller).is_witnessed());
+        let unbound = native.module_unbound().expect("module-level positive use");
+        assert_eq!(unbound.reasons.get("exec_coverage_gap"), Some(&1));
+    }
+
+    /// C1 named boundary, end to end: without an exe change the pass
+    /// revalidates X, and the row binds to it.
+    #[test]
+    fn a_caller_unchanged_since_before_coverage_binds_after_the_pass() {
+        let (mut native, caller) = pre_activation_scene();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 2, 7, 210, 0);
+        native.witness(vec![row]);
+        assert!(!native.scene.coverage(caller).is_witnessed());
+        let report = empty_pass(&mut native, 250);
+        assert!(report.events.is_empty(), "{:?}", report.events);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Witnessed { first_ns: 210 }
+        );
+    }
+
+    /// The revalidation also runs on a full scan pass (`apply_catalog`),
+    /// not only on an observation-less one.
+    #[test]
+    fn a_full_scan_pass_revalidates_a_caller_from_before_coverage() {
+        let (mut native, caller) = pre_activation_scene();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 2, 7, 210, 0);
+        native.witness(vec![row]);
+        assert!(!native.scene.coverage(caller).is_witnessed());
+        let generation = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .map(|record| crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            });
+        let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+        let report = native.scene.coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            250,
+        );
+        assert!(report.events.is_empty(), "{:?}", report.events);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Witnessed { first_ns: 210 }
         );
     }
 }

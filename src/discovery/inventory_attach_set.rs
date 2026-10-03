@@ -64,6 +64,12 @@ impl AttachObjectId {
     pub(crate) const fn index(self) -> u32 {
         self.0
     }
+
+    /// A scripted object index for tests that need no retained object.
+    #[cfg(test)]
+    pub(crate) const fn scripted(index: u32) -> Self {
+        Self(index)
+    }
 }
 
 /// What the set knows about the endpoints one admitted module needs.
@@ -191,6 +197,10 @@ pub(crate) struct InventoryAttachSet {
     /// `MEMBERSHIP_FACTOR` per endpoint of budget).
     modules: BTreeMap<AttachModuleKey, ModuleRecord>,
     memberships: usize,
+    /// The reverse of the recorded memberships: the modules each endpoint
+    /// is admitted for. Exactly the recorded memberships, so bounded the
+    /// same way.
+    by_member: BTreeMap<EndpointId, BTreeSet<AttachModuleKey>>,
     /// `(module, refusal kind)` pairs already recorded as a gap, bounded
     /// by the endpoint budget; past the bound one overflow gap is
     /// recorded and further refusals live in module verdicts only.
@@ -212,6 +222,7 @@ impl InventoryAttachSet {
             by_content: BTreeMap::new(),
             modules: BTreeMap::new(),
             memberships: 0,
+            by_member: BTreeMap::new(),
             reported: BTreeSet::new(),
             reported_overflow: false,
             endpoint_refusals: 0,
@@ -270,6 +281,16 @@ impl InventoryAttachSet {
     /// was.
     pub(crate) fn module_endpoints(&self, module: &AttachModuleKey) -> Option<usize> {
         self.modules.get(module).map(|record| record.endpoints)
+    }
+
+    /// The admitted modules whose recorded membership holds `endpoint`
+    /// (Task 6 C4): what a native witness of that endpoint is use of. A
+    /// module whose membership is unrecorded is never listed.
+    pub(crate) fn modules_with_member(
+        &self,
+        endpoint: EndpointId,
+    ) -> impl Iterator<Item = &AttachModuleKey> {
+        self.by_member.get(&endpoint).into_iter().flatten()
     }
 
     /// The endpoints one admitted module holds, or `None` when the set
@@ -768,6 +789,26 @@ impl InventoryAttachSet {
         let others = self.memberships - previous;
         let members = (others + members.len() <= bound).then_some(members);
         self.memberships = others + members.as_ref().map_or(0, Vec::len);
+        if let Some(previous) = self
+            .modules
+            .get(key)
+            .and_then(|record| record.members.as_ref())
+        {
+            for member in previous {
+                if let Some(modules) = self.by_member.get_mut(member) {
+                    modules.remove(key);
+                    if modules.is_empty() {
+                        self.by_member.remove(member);
+                    }
+                }
+            }
+        }
+        for member in members.iter().flatten() {
+            self.by_member
+                .entry(*member)
+                .or_default()
+                .insert(key.clone());
+        }
         self.modules
             .insert(key.clone(), ModuleRecord { endpoints, members });
     }
@@ -1428,6 +1469,56 @@ pub(crate) mod tests {
                 "an unrecorded membership never changes admission"
             );
         }
+        // The reverse index is exactly the recorded memberships: each
+        // endpoint lists P and the three recorded forwarders, never an
+        // unrecorded one.
+        let recorded_keys: BTreeSet<AttachModuleKey> = std::iter::once(&p)
+            .chain(forwarders.iter())
+            .map(|path| key_in(&pins, path))
+            .filter(|key| matches!(set.module_members(key), Some(ModuleMembers::Known(_))))
+            .collect();
+        assert_eq!(recorded_keys.len(), 4);
+        for endpoint in &all {
+            let listed: BTreeSet<AttachModuleKey> =
+                set.modules_with_member(*endpoint).cloned().collect();
+            assert_eq!(listed, recorded_keys, "endpoint {endpoint:?}");
+        }
+        assert_eq!(set.modules_with_member(EndpointId(8)).count(), 0);
+        // A second pass re-records the same memberships: no duplicates.
+        set.absorb(&lower_named(&modules, &pins, policy), &pins);
+        assert_eq!(set.modules_with_member(EndpointId(0)).count(), 4);
+        assert!(set.memberships <= 32);
+    }
+
+    #[test]
+    fn the_reverse_membership_follows_a_module_whose_demand_shrinks() {
+        // A module re-lowered with fewer targets keeps its endpoints in the
+        // set, but its membership (and so what a witness of the dropped
+        // endpoint is use of) is the current one.
+        let dir = tempfile::tempdir().unwrap();
+        let p = provider(&dir, "p.so", "provider-p");
+        let mut set = InventoryAttachSet::new(budget(8));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let pins = pass_pins(&[(p.as_path(), "sha-p")]);
+        let key = key_in(&pins, &p);
+        let wide = [module(&pins, &p, &offsets(2))];
+        set.absorb(&lower_named(&wide, &pins, policy), &pins);
+        assert_eq!(set.modules_with_member(EndpointId(1)).count(), 1);
+        let narrow = [module(&pins, &p, &offsets(1))];
+        set.absorb(&lower_named(&narrow, &pins, policy), &pins);
+        assert_eq!(
+            set.module_members(&key),
+            Some(ModuleMembers::Known(&[EndpointId(0)]))
+        );
+        assert_eq!(
+            set.modules_with_member(EndpointId(0)).collect::<Vec<_>>(),
+            vec![&key]
+        );
+        assert_eq!(
+            set.modules_with_member(EndpointId(1)).count(),
+            0,
+            "a dropped member never stays indexed"
+        );
     }
 
     #[test]

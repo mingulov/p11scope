@@ -247,6 +247,8 @@ pub(crate) struct ModuleView {
     pub admission_history: Vec<AdmissionChange>,
     pub lifecycle: ModuleLifecycle,
     pub unloaded_observed: bool,
+    /// Natively witnessed use no caller edge carries (Task 6 C4).
+    pub unbound_use: Option<crate::discovery::caller_registry::UnboundUse>,
 }
 
 /// One mechanism id's published facts (S1), owned for rendering.
@@ -393,6 +395,13 @@ pub(crate) struct Presentation {
     pub passes: u64,
     /// Derived summary only: some edge holds non-unknown coverage.
     pub usage_feed: bool,
+    /// The native binder's census: witness rows bound to a caller
+    /// incarnation, unbound per reason, waiting, and failing validation
+    /// (the DR-05 unbound-witness measurement).
+    pub native_witnesses: crate::discovery::native_binding::BindingCensus,
+    /// Where the decided witness rows went (edge, module-level, ambiguous
+    /// shared endpoint, unresolved); sums to `bound + unbound`.
+    pub witness_placement: crate::discovery::caller_registry::WitnessPlacement,
     pub callers: Vec<CallerView>,
     pub modules: Vec<ModuleView>,
     pub edges: Vec<EdgeView>,
@@ -477,6 +486,7 @@ impl Presentation {
                 admission_history: record.admission_history.clone(),
                 lifecycle: record.lifecycle,
                 unloaded_observed: record.unloaded_observed,
+                unbound_use: record.unbound_use.clone(),
             });
         }
         let mut edge_keys: Vec<(CallerId, ModuleId)> = registry
@@ -553,6 +563,8 @@ impl Presentation {
             ended_ns,
             passes,
             usage_feed: registry.usage_feed(),
+            native_witnesses: registry.witness_census().clone(),
+            witness_placement: registry.witness_placement(),
             callers,
             modules,
             edges,

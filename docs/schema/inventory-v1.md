@@ -108,6 +108,21 @@ PID namespaces.
   `lifecycle` is `mapped`, `unloaded` (a complete rescan proved it
   gone; sticky in `unloaded_observed` even across a reload), or
   `unknown` (no live mapping evidence remains).
+  `unbound_use` is `null`, or `{first_ns, rows, reasons}`: native
+  witness rows of this module that no caller edge carries — positive,
+  monotonic module-level use, never attributed to a caller by pid.
+  Only a row whose witness endpoint belongs to this one admitted module
+  counts here; each row counts on at most one module. `first_ns` is the
+  earliest row's first-association instant, `rows` the row count, and
+  `reasons` counts rows per reason code: a binder reason (see
+  `observation.native_witnesses`) or `no_mapping_edge` (the row bound to
+  an identified caller incarnation that has no mapping edge to this
+  module; a witness never invents a mapping). The first binder-reason
+  row of a module records one `used by an unidentified caller image`
+  gap; a `no_mapping_edge` row records instead a `native witness without
+  mapping evidence` gap naming the caller (once per caller and module).
+  Witness gaps never carry a `pid`: an unbound row's tgid is exactly
+  what could not be identified.
   Boundary: the key is file identity, not load-instance authority —
   a same-file double-load (two loader mappings of one file, notably
   a `dlmopen` private-namespace double-load whose objects own
@@ -181,7 +196,19 @@ PID namespaces.
   - `witnessed`: use was witnessed (first at `first_ns`) but nothing
     counts it — `count` stays 0 for old consumers, `observation` reads
     `unknown (count unavailable; use witnessed)`, and the dashboard
-    activity reads `used (recency unknown)`, never quiet.
+    activity reads `used (recency unknown)`, never quiet. A native
+    `CALLER_USE` row witnesses an edge only when the binder binds it
+    to this caller incarnation (see `observation.native_witnesses`);
+    the row is use of the admitted module whose endpoint set holds
+    the row's first entered endpoint (the same endpoint set a watch
+    negates). When several admitted modules share that endpoint, the
+    row witnesses this edge only if this is the only sharing module with
+    an edge to the caller; otherwise it records an `ambiguous shared
+    endpoint` gap per sharing module and witnesses nothing. A row that
+    does not bind is module-level `modules[].unbound_use` (single-module
+    endpoints only), never this edge. A shared endpoint can still read
+    `watched_no_use` for each sharer: a watch negates use of every
+    endpoint the module holds.
   - `watched_no_use`: every endpoint of the module is attached for
     this caller since `since_ns` with clean health, and no use was
     seen: the zero is a fact (`observation` `observed`). `since_ns`
@@ -219,6 +246,59 @@ PID namespaces.
   for a module not `admitted`; its usage stays unknown). `observation.usage_feed` is
   a derived summary: true iff at least one edge holds non-`unknown`
   coverage.
+- `observation.native_witnesses` (Task 6 C4): the native caller binder's
+  census, every witness row once: `{rows, bound, unbound, pending,
+  integrity, unbound_reasons, placement}`. All zero in the scan lane.
+  The unbound ratio is `unbound / rows`. Counts reconcile per row:
+  `rows = bound + unbound + pending`; every decided row lands in exactly
+  one of `placement.{edge, module, ambiguous, unresolved}` (a caller edge
+  witnessed; one module's `unbound_use`; an endpoint shared by several
+  admitted modules with no single carrier; an endpoint that names no
+  registered module), so `bound + unbound` equals their sum, and
+  `placement.module` equals the sum of `modules[].unbound_use.rows`.
+  The census and the module sums differ by design: a bound row without
+  a mapping edge is module-level (`no_mapping_edge`, a reason the census
+  does not carry), and an unbound row on a shared or unresolved endpoint
+  is in no module. A row binds to a caller incarnation only
+  when a task-cookie query through the incarnation's held pidfd
+  answers the row's own ticket in the row's own capture domain (equal
+  ticket values of two loaded objects never join), the row was recorded
+  at or after the incarnation's admission, no exec of that process and
+  no lifecycle-record loss was seen since the admission, and no other
+  image of the ticket competes; the decision waits for a complete
+  lifecycle drain and a readable health read that both started after
+  the row's read finished (`pending` counts rows still waiting). "After"
+  is decided on the capture facade's monotonic stamps, never on the
+  order batches are staged, and per capture domain: a drain that stopped
+  at a reserved-but-uncommitted ring head covers nothing. Exec coverage
+  begins when a capture's lifecycle tracepoint is attached; an
+  incarnation admitted before that instant may have exec'd unrecorded,
+  so its rows wait for the first scan pass that started after coverage
+  began and binds only if that pass finds the same pidfd generation,
+  start time and executable identity (otherwise, or if the capture ends
+  first, `exec_coverage_gap`). Named boundary: a re-exec of the same
+  binary before coverage began changes none of those, so it stays the
+  same incarnation (the scan lane treats it the same way); execs after
+  coverage began split by exec sequence. A bound image is exact and
+  later rows of it bind at once, also after the caller exited. A later
+  exec sequence of a bound ticket (or a changed leader ticket) under the
+  held pidfd retires the incarnation (`exec_retired`) and admits its
+  successor. `unbound_reasons` codes: `no_live_caller` (nothing held the
+  tgid when the row was read: the process exited before the poll),
+  `caller_exited` (it exited during the query), `cookie_unavailable`,
+  `cookie_mismatch` (another ticket or none: pid reuse, a nonleader
+  exec), `before_admission`, `exec_after_admission`, `lifecycle_loss`,
+  `exec_ambiguous`, `exec_transition` (the row proved an exec; the
+  successor was admitted after it), `exec_coverage_gap` (the
+  incarnation predates exec coverage and no later scan pass
+  revalidated it), `evidence_incomplete` (the capture
+  ended before the row's horizon), `capacity` (a binder table bound).
+  `integrity` counts rows that failed validation; each read with any
+  records a `native witness rows failed validation` gap, and rows whose
+  endpoint names no admitted module record a `native witness without a
+  module` gap. Binding never claims the exact-image contract: the
+  current exec sequence is never read from userspace, so
+  `callers[].image.authority` stays `scan_pinned`.
 - `edges[].semantics` (S1): the per-edge semantic summary label —
   `observed` iff the edge holds at least one mechanism or operation
   claim, otherwise the reason no claim exists:
@@ -364,7 +444,11 @@ PID namespaces.
   "schema": "p11scope/inventory/v1",
   "scope": "pid:4242",
   "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
-  "observation": {"started_ns": 100, "ended_ns": 200, "passes": 1, "usage_feed": false},
+  "observation": {"started_ns": 100, "ended_ns": 200, "passes": 1, "usage_feed": false,
+                  "native_witnesses": {"rows": 0, "bound": 0, "unbound": 0, "pending": 0,
+                                       "integrity": 0, "unbound_reasons": {},
+                                       "placement": {"edge": 0, "module": 0,
+                                                     "ambiguous": 0, "unresolved": 0}}},
   "budgets": {
     "callers": {"limit": 4096, "occupied": 1, "refused": 0},
     "modules": {"limit": 4096, "occupied": 1, "refused": 0},
@@ -395,7 +479,7 @@ PID namespaces.
       "admission": {"state": "admitted", "class": "exact", "endpoints": 68, "reasons": [],
                    "note": "scan-only admission: manifest corroboration was not consulted",
                    "history": []},
-      "lifecycle": "mapped", "unloaded_observed": false
+      "lifecycle": "mapped", "unloaded_observed": false, "unbound_use": null
     }
   ],
   "edges": [

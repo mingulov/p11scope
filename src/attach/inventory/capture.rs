@@ -198,7 +198,7 @@ impl ReadWindow {
 /// One loaded object's identity domain. Cookies are tickets inside one
 /// domain only; two domains' cookies are never comparable, so this type
 /// has equality and nothing else (no order, no numeric access).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct NativeDomainId(u64);
 
 static NEXT_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -216,7 +216,7 @@ impl NativeDomainId {
 /// A TASK_COOKIE ticket tagged with the domain that issued it. Equality
 /// only: a cookie is comparable with another of the same domain and with
 /// nothing else, never as a number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DomainCookie {
     domain: NativeDomainId,
     cookie: u64,
@@ -229,6 +229,12 @@ impl DomainCookie {
 
     pub(crate) fn domain(&self) -> NativeDomainId {
         self.domain
+    }
+
+    /// A scripted ticket for binder tests (never a host read).
+    #[cfg(test)]
+    pub(crate) fn scripted(domain: NativeDomainId, cookie: u64) -> Self {
+        Self::new(domain, cookie)
     }
 }
 
@@ -296,12 +302,42 @@ pub(crate) struct EndpointFailure {
     pub link_retained: bool,
 }
 
+/// The instant a BPF domain's lifecycle coverage began: stamped by the
+/// facade on CLOCK_MONOTONIC only after `activate_roots` returned success,
+/// so the exec tracepoint and the DISCOVERY reader were attached before it.
+/// An exec at or after `start_ns` that the scope admits produces a
+/// lifecycle record (or a ring-loss count); an exec before it left none.
+/// Only the facade constructs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecCoverage {
+    domain: NativeDomainId,
+    start_ns: u64,
+}
+
+impl ExecCoverage {
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+
+    pub(crate) fn start_ns(&self) -> u64 {
+        self.start_ns
+    }
+
+    /// A scripted coverage start for binder tests (never a host read).
+    #[cfg(test)]
+    pub(crate) fn scripted(domain: NativeDomainId, start_ns: u64) -> Self {
+        Self { domain, start_ns }
+    }
+}
+
 /// What one `extend` did. Every endpoint of the delta lands in exactly one
 /// of `attached`, `failed`, `known`, or `deferred`.
 #[derive(Debug, Default)]
 pub(crate) struct ExtendReceipt {
     /// This extend activated the object (DISCOVERY reader and roots).
     pub activated_roots: bool,
+    /// Set exactly when `activated_roots`: where exec coverage began.
+    pub exec_coverage: Option<ExecCoverage>,
     pub attached: Vec<AttachedEndpoint>,
     pub failed: Vec<EndpointFailure>,
     /// Already handled by this capture: nothing was done.
@@ -345,6 +381,30 @@ impl WitnessRow {
     /// between rows whose cookies are equal.
     pub(crate) fn exec_id(&self) -> u64 {
         self.image.exec_id
+    }
+
+    /// A scripted row for binder tests (never a host read).
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        cookie: u64,
+        exec_id: u64,
+        object: AttachObjectId,
+        endpoint: EndpointId,
+        host_tgid: u32,
+        recorded_at_ns: u64,
+    ) -> Self {
+        Self {
+            domain,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id,
+            },
+            object,
+            endpoint,
+            host_tgid,
+            recorded_at_ns,
+        }
     }
 }
 
@@ -480,6 +540,10 @@ pub(crate) struct WitnessBatch {
     /// was detected, and — when health is proven, nothing rose, and
     /// custody holds — the latest proven-clean instant.
     pub health_read_ns: u64,
+    /// CLOCK_MONOTONIC after this read's rows were read: every row here was
+    /// inserted before it (`u64::MAX` when the clock read failed, `0`
+    /// when nothing was read).
+    pub rows_read_ns: u64,
     /// Held objects whose retained pin no longer matches (modified in
     /// place) or could not be rechecked, first reported in this batch:
     /// their modules' coverage is unknown from now on.
@@ -512,12 +576,65 @@ pub(crate) enum CookieQuery {
 
 /// One bounded quantum of lifecycle records, in dequeue order.
 pub(crate) struct DiscoveryBatch {
+    /// The BPF domain these records came from, tagged by the facade that
+    /// drained them (never by a caller).
+    pub domain: NativeDomainId,
+    /// CLOCK_MONOTONIC before the first dequeue (`u64::MAX` when the clock
+    /// read failed): a complete drain covers reads finished before it.
+    pub started_ns: u64,
+    /// CLOCK_MONOTONIC after the last dequeue: where a failure is dated.
+    pub finished_ns: u64,
     pub records: Vec<DiscoveryRecord>,
     pub record_bound_reached: bool,
     pub deadline_reached: bool,
     /// A malformed or unreadable record stopped the quantum. Under PID
     /// scope it makes custody unproven (a lifecycle record was lost).
     pub failure: Option<String>,
+    /// The drain stopped at an empty read while the ring still held
+    /// unconsumed bytes (`consumer != producer`): a reserved-but-uncommitted
+    /// head can hide records committed behind it, so this quantum is not a
+    /// complete drain even though no bound, deadline, or failure stopped it.
+    pub head_pending: bool,
+}
+
+impl DiscoveryBatch {
+    fn empty(domain: NativeDomainId) -> Self {
+        let now = monotonic_ns();
+        Self {
+            domain,
+            started_ns: now,
+            finished_ns: now,
+            records: Vec::new(),
+            record_bound_reached: false,
+            deadline_reached: false,
+            failure: None,
+            head_pending: false,
+        }
+    }
+
+    /// A scripted complete drain of `domain` at `at_ns` (binder tests).
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        records: Vec<DiscoveryRecord>,
+        at_ns: u64,
+    ) -> Self {
+        Self {
+            started_ns: at_ns,
+            finished_ns: at_ns,
+            records,
+            ..Self::empty(domain)
+        }
+    }
+
+    /// Every record the ring held when the drain stopped was dequeued: no
+    /// bound, deadline, failure, or busy head ended the quantum.
+    pub(crate) fn drained(&self) -> bool {
+        !self.record_bound_reached
+            && !self.deadline_reached
+            && self.failure.is_none()
+            && !self.head_pending
+    }
 }
 
 impl fmt::Debug for DiscoveryBatch {
@@ -527,6 +644,7 @@ impl fmt::Debug for DiscoveryBatch {
             .field("record_bound_reached", &self.record_bound_reached)
             .field("deadline_reached", &self.deadline_reached)
             .field("failure", &self.failure)
+            .field("head_pending", &self.head_pending)
             .finish()
     }
 }
@@ -1123,6 +1241,12 @@ impl InventoryCapture {
                 Ok(active) => {
                     self.state = CaptureState::Active(Box::new(active));
                     receipt.activated_roots = true;
+                    // Stamped after the roots are proven attached: an exec
+                    // before this instant left no lifecycle record.
+                    receipt.exec_coverage = Some(ExecCoverage {
+                        domain: self.book.domain,
+                        start_ns: monotonic_ns(),
+                    });
                 }
                 Err(failure) => {
                     let error = format!("{:#}", failure.error);
@@ -1247,25 +1371,24 @@ impl InventoryCapture {
             CaptureState::Active(active) => {
                 let state = active.state_mut();
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
-                    service_inventory_discovery_with(
+                    let result = service_inventory_discovery_with(
                         max,
                         deadline,
                         || state.dequeue_discovery(),
                         dispatch,
-                    )
+                    );
+                    (result, state.discovery_head_pending())
                 })
             }
             CaptureState::Failed { retiring, .. } => {
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
-                    retiring.service_discovery(max, deadline, dispatch)
+                    let result = retiring.service_discovery(max, deadline, dispatch);
+                    (result, retiring.discovery_head_pending())
                 })
             }
-            CaptureState::Prepared(_) | CaptureState::Moving => DiscoveryBatch {
-                records: Vec::new(),
-                record_bound_reached: false,
-                deadline_reached: false,
-                failure: None,
-            },
+            CaptureState::Prepared(_) | CaptureState::Moving => {
+                DiscoveryBatch::empty(self.book.domain)
+            }
         }
     }
 
@@ -1325,15 +1448,11 @@ impl RetiringCapture {
 
     pub(crate) fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
         match &mut self.inner {
-            RetiringInner::Unactivated => DiscoveryBatch {
-                records: Vec::new(),
-                record_bound_reached: false,
-                deadline_reached: false,
-                failure: None,
-            },
+            RetiringInner::Unactivated => DiscoveryBatch::empty(self.book.domain),
             RetiringInner::Retiring(retiring) => {
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
-                    retiring.service_discovery(max, deadline, dispatch)
+                    let result = retiring.service_discovery(max, deadline, dispatch);
+                    (result, retiring.discovery_head_pending())
                 })
             }
         }
@@ -1432,21 +1551,17 @@ impl RetiredCapture {
 
     pub(crate) fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
         match self.inner.as_mut() {
-            None => DiscoveryBatch {
-                records: Vec::new(),
-                record_bound_reached: false,
-                deadline_reached: false,
-                failure: None,
-            },
+            None => DiscoveryBatch::empty(self.book.domain),
             Some(inner) => {
                 let state = inner.state_mut();
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
-                    service_inventory_discovery_with(
+                    let result = service_inventory_discovery_with(
                         max,
                         deadline,
                         || state.dequeue_discovery(),
                         dispatch,
-                    )
+                    );
+                    (result, state.discovery_head_pending())
                 })
             }
         }
@@ -1467,17 +1582,24 @@ fn service_with(
         usize,
         Instant,
         Dispatch<'_>,
-    ) -> std::result::Result<
-        super::activation::InventoryDiscoveryService,
-        super::activation::InventoryDispatchFailure,
-    >,
+    ) -> (
+        std::result::Result<
+            super::activation::InventoryDiscoveryService,
+            super::activation::InventoryDispatchFailure,
+        >,
+        bool,
+    ),
 ) -> DiscoveryBatch {
     let mut records = Vec::new();
     let mut dispatch = |record: DiscoveryRecord| {
         records.push(record);
         Ok(())
     };
-    let result = service(window.max_rows, window.deadline, &mut dispatch);
+    // `head_pending` is read after the service returns, so it reflects the
+    // ring at (or after) the read that came back empty.
+    let started_ns = monotonic_ns();
+    let (result, head_pending) = service(window.max_rows, window.deadline, &mut dispatch);
+    let finished_ns = monotonic_ns();
     for record in &records {
         book.observe_record(record);
     }
@@ -1491,10 +1613,16 @@ fn service_with(
     }
     match result {
         Ok(service) => DiscoveryBatch {
+            domain: book.domain,
+            started_ns,
+            finished_ns,
             records,
             record_bound_reached: service.record_bound_reached,
             deadline_reached: service.deadline_reached,
             failure: None,
+            head_pending: head_pending
+                && !service.record_bound_reached
+                && !service.deadline_reached,
         },
         Err(failure) => {
             // Dispatch never fails here, so no consumed record is held back.
@@ -1503,10 +1631,14 @@ fn service_with(
                 records.push(*record);
             }
             DiscoveryBatch {
+                domain: book.domain,
+                started_ns,
+                finished_ns,
                 records,
                 record_bound_reached: false,
                 deadline_reached: false,
                 failure: Some(format!("{:#}", failure.error)),
+                head_pending: false,
             }
         }
     }
@@ -1539,6 +1671,7 @@ fn read_witnesses_from(
         health_unproven: None,
         health_baseline_ns: book.health_ns,
         health_read_ns: 0,
+        rows_read_ns: 0,
         changed_objects: Vec::new(),
         custody: book.custody(),
         custody_proven_ns: book.scope.map(|_| book.held_ns),
@@ -1580,6 +1713,7 @@ fn read_witnesses_from(
         |endpoint| published.get(&endpoint).map(|object| object.index()),
         |_, value| witness_rejection(failed, scope_pid, value),
     );
+    batch.rows_read_ns = monotonic_ns();
     absorb_rows(book, &mut batch, read);
     batch.custody = book.custody();
     batch.custody_proven_ns = book.scope.map(|_| book.held_ns);

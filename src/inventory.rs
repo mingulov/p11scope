@@ -21,6 +21,7 @@ use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, InventoryScope, PassReport,
 };
 use crate::discovery::hooks::HookRegistry;
+use crate::discovery::native_binding::ScanOnlyIdentity;
 use crate::inventory_dashboard::{
     DashboardState, DetailPage, DisplayHandoff, Key, LogTail, REDRAW_INTERVAL, RESCAN_INTERVAL,
     RawModeGuard, StopFlag, TerminalGuard, Viewport, poll_key, render_frame, stdout_terminal,
@@ -31,7 +32,6 @@ use crate::inventory_events::{
 use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, render_snapshot};
 use crate::output::AtomicFile;
 use anyhow::{Context as _, Result};
-use p11scope_ebpf_common::ImageIdentity;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
@@ -42,10 +42,6 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-fn no_native_images(_: u32) -> Option<ImageIdentity> {
-    None
-}
 
 /// Resolve the registry gap bound: the `--max-gaps` override when the
 /// operator passed one, else the unchanged 1024 default. Every other
@@ -332,7 +328,7 @@ fn scan_one_pass(
         inventory_scope,
         max_scan_pids,
         guard,
-        no_native_images,
+        &mut ScanOnlyIdentity,
         pass_deadline,
         now,
     ) {
@@ -345,8 +341,12 @@ fn scan_one_pass(
                 "p11scope: pass failed, continuing without its scan: {}",
                 crate::render::escape_controls(&format!("{error:#}"))
             );
-            let report =
-                coordinator.observe_empty_pass(guard, no_native_images, &format!("{error:#}"), now);
+            let report = coordinator.observe_empty_pass(
+                guard,
+                &mut ScanOnlyIdentity,
+                &format!("{error:#}"),
+                now,
+            );
             Ok((report, Some(warning)))
         }
     }
@@ -835,6 +835,11 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
         },
         "lifecycle": record.lifecycle.label(),
         "unloaded_observed": record.unloaded_observed,
+        "unbound_use": record.unbound_use.as_ref().map(|unbound| serde_json::json!({
+            "first_ns": unbound.first_ns,
+            "rows": unbound.rows,
+            "reasons": unbound.reasons,
+        })),
     })
 }
 
@@ -1055,6 +1060,10 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
             "ended_ns": presentation.ended_ns,
             "passes": presentation.passes,
             "usage_feed": presentation.usage_feed,
+            "native_witnesses": native_witnesses_json(
+                &presentation.native_witnesses,
+                presentation.witness_placement,
+            ),
         },
         "budgets": budgets_json(&presentation.budgets),
         "callers": presentation.callers.iter().map(caller_json).collect::<Vec<_>>(),
@@ -1065,6 +1074,34 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         // Additive (v1, DR-K8S-2): caller PIDs are this observer's /proc
         // numbering; the kernel's are the initial namespace's.
         "pid_namespace": crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
+    })
+}
+
+/// The native binder census (Task 6 C4): every witness row once, bound to a
+/// caller incarnation or unbound with its reason, plus rows still waiting
+/// for their lifecycle horizon and rows that failed validation. All zero in
+/// the scan lane. The unbound ratio is `unbound / rows`.
+fn native_witnesses_json(
+    census: &crate::discovery::native_binding::BindingCensus,
+    placement: crate::discovery::caller_registry::WitnessPlacement,
+) -> serde_json::Value {
+    serde_json::json!({
+        "placement": {
+            "edge": placement.edge,
+            "module": placement.module,
+            "ambiguous": placement.ambiguous,
+            "unresolved": placement.unresolved,
+        },
+        "rows": census.rows,
+        "bound": census.bound,
+        "unbound": census.unbound_total(),
+        "pending": census.pending,
+        "integrity": census.integrity,
+        "unbound_reasons": census
+            .unbound
+            .iter()
+            .map(|(reason, count)| (reason.code().to_string(), serde_json::json!(count)))
+            .collect::<serde_json::Map<_, _>>(),
     })
 }
 
@@ -1258,6 +1295,57 @@ mod tests {
         assert_eq!(document["edges"][0]["entries"]["count"], 0);
         // Mappings are never reported as observed calls.
         assert!(document["edges"][0]["entries"]["last_seen_ns"].is_null());
+        // The scan lane binds no native witness (Task 6 C4).
+        assert_eq!(
+            document["observation"]["native_witnesses"],
+            serde_json::json!({
+                "rows": 0, "bound": 0, "unbound": 0, "pending": 0, "integrity": 0,
+                "unbound_reasons": {},
+                "placement": {"edge": 0, "module": 0, "ambiguous": 0, "unresolved": 0},
+            })
+        );
+        assert!(document["modules"][0]["unbound_use"].is_null());
+        // An unbound witness renders as module-level use with its reason,
+        // and the census renders the unbound ratio's inputs.
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::BeforeAdmission,
+        );
+        let mut census = crate::discovery::native_binding::BindingCensus {
+            rows: 3,
+            bound: 1,
+            pending: 1,
+            ..Default::default()
+        };
+        census.unbound.insert(
+            crate::discovery::native_binding::UnboundReason::BeforeAdmission,
+            1,
+        );
+        coordinator.registry_mut().note_witness_census(census);
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"],
+            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}})
+        );
+        assert_eq!(
+            document["observation"]["native_witnesses"],
+            serde_json::json!({
+                "rows": 3, "bound": 1, "unbound": 1, "pending": 1, "integrity": 0,
+                "unbound_reasons": {"before_admission": 1},
+                "placement": {"edge": 0, "module": 1, "ambiguous": 0, "unresolved": 0},
+            })
+        );
+        assert!(
+            document["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["subject"] == "used by an unidentified caller image"),
+            "{}",
+            document["gaps"]
+        );
     }
 
     #[test]

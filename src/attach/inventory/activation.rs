@@ -907,6 +907,13 @@ impl InventoryState {
     pub(super) fn dequeue_discovery(&mut self) -> Result<Option<DiscoveryRecord>> {
         self.discovery_dequeue()
     }
+
+    /// See [`crate::events::discovery_head_pending`].
+    pub(super) fn discovery_head_pending(&self) -> bool {
+        self.discovery
+            .as_ref()
+            .is_some_and(crate::events::discovery_head_pending)
+    }
 }
 
 impl Drop for InventoryState {
@@ -1036,6 +1043,12 @@ impl RetiringInventory {
 
     fn usage_snapshot(&mut self, window: InventoryReadWindow) -> InventoryUsageSnapshot {
         self.state.as_mut().unwrap().usage_snapshot(window, true)
+    }
+
+    pub(super) fn discovery_head_pending(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(InventoryState::discovery_head_pending)
     }
 
     fn fallback_evidence(&self) -> RetirementFallbackEvidence {

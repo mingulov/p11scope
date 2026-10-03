@@ -83,16 +83,28 @@ impl ImageGuard for UnavailableImageGuard {
     }
 }
 
-/// Opaque until the native lifecycle adapter can prove an exact old/new image
-/// transition. No PID or ordinary refresh API can construct this proof.
-/// Constructed only by the privileged native lane; the scan lane retires
-/// suspected execs through exe-identity comparison instead.
-#[allow(dead_code)] // Privileged native lane constructs the proof; matching is live.
+/// An exact old/new image transition of one owner's task. No PID or
+/// ordinary refresh API can construct this proof: it is built only from an
+/// [`ExecTransition`], which only the native binder constructs (a later
+/// exec sequence under one task cookie, or a changed leader task, under the
+/// incarnation's held pidfd). The scan lane retires suspected execs through
+/// exe-identity comparison instead.
+///
+/// [`ExecTransition`]: crate::discovery::native_binding::ExecTransition
+#[allow(dead_code)] // The fields are evidence for the native lifecycle adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExecProof {
     owner: ProcessViewId,
-    old: ImageIdentity,
-    new: ImageIdentity,
+    transition: crate::discovery::native_binding::ExecTransition,
+}
+
+impl ExecProof {
+    pub(crate) fn from_transition(
+        owner: ProcessViewId,
+        transition: crate::discovery::native_binding::ExecTransition,
+    ) -> Self {
+        Self { owner, transition }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,9 +116,8 @@ pub(crate) enum RefreshCause {
     #[allow(dead_code)] // Privileged live lane only; matching is live.
     TransportRecovery(u64),
     ScopeRecheck,
-    /// Unconstructible until the native lifecycle adapter proves an
-    /// exact old/new image transition (see `ExecProof`).
-    #[allow(dead_code)] // Privileged native lane only; matching is live.
+    /// A natively proven exact image transition (see `ExecProof`).
+    #[allow(dead_code)] // The proof is evidence for the native lifecycle adapter.
     ValidatedExec(ExecProof),
 }
 

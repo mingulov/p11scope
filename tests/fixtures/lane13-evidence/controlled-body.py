@@ -13,6 +13,15 @@ import socket
 import sys
 import time
 
+# The harness passes its resolved scale. SLACK waits (a peer message, a
+# readiness file, a KILLed child's exit) and the body's hold, which must
+# outlast them, scale together; the 200 ms ready-timeout fault is SEMANTIC.
+TIME_SCALE = float(os.environ.get("P11SCOPE_TEST_TIME_SCALE", "1"))
+
+
+def slack(seconds):
+    return seconds * TIME_SCALE
+
 
 def parent_death_signal(value):
     libc = ctypes.CDLL(None, use_errno=True)
@@ -27,7 +36,7 @@ def body(channel, parent, ready, ignore_term, fault):
     if os.getppid() != parent:
         return
     os.setsid()
-    channel.settimeout(5)
+    channel.settimeout(slack(5))
     if channel.recv(16) != b"owned":
         raise RuntimeError("body lacks transferred-handle owner")
     # The test now owns the exact original handle even on abnormal outer exit.
@@ -35,7 +44,7 @@ def body(channel, parent, ready, ignore_term, fault):
     signal.signal(signal.SIGTERM, signal.SIG_IGN if ignore_term else signal.SIG_DFL)
     if fault != "ready-timeout":
         ready.write_text("ready\n")
-    time.sleep(20)
+    time.sleep(slack(20))
 
 
 def run_outer(args):
@@ -45,7 +54,7 @@ def run_outer(args):
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     with socket.socket(fileno=args.control_fd) as control:
-        control.settimeout(5)
+        control.settimeout(slack(5))
         if control.recv(16) != b"start":
             raise RuntimeError("outer lacks original launch owner")
         args.evidence.mkdir(mode=0o700)
@@ -84,7 +93,7 @@ def run_outer(args):
             parent_channel.sendall(b"owned")
             if args.fault == "before-ready":
                 raise RuntimeError("controlled failure before readiness wait")
-            deadline = time.monotonic() + (0.2 if args.fault == "ready-timeout" else 5)
+            deadline = time.monotonic() + (0.2 if args.fault == "ready-timeout" else slack(5))
             while not ready.exists() and time.monotonic() < deadline:
                 if select.select([descriptor], [], [], 0)[0]:
                     raise RuntimeError("controlled body exited before readiness")
@@ -131,7 +140,7 @@ def run_outer(args):
                     # Never reap before this final ownership action. Even an
                     # exited child remains reserved to this parent until waitpid.
                     os.kill(pid, signal.SIGKILL)
-                    deadline = time.monotonic() + 2
+                    deadline = time.monotonic() + slack(2)
                     while os.waitpid(pid, os.WNOHANG)[0] == 0:
                         if time.monotonic() >= deadline:
                             raise RuntimeError("owned child did not settle")

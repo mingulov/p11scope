@@ -3,6 +3,7 @@
 
 import ctypes
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -20,6 +21,37 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests/fixtures/root-recorded-launcher"
 HELPER = ROOT / "scripts/recorded-process-exec.py"
+# SLACK bounds (waits whose expiry can only mean failure, and the default
+# launch deadline for cases that do not assert expiry) scale with
+# P11SCOPE_TEST_TIME_SCALE, as in test_lane13_evidence.py. SEMANTIC deadlines
+# a case asserts set CASE_DEADLINE or their own bound explicitly and stay
+# literal.
+DEFAULT_TIME_SCALE = 5.0
+
+
+def _time_scale():
+    raw = os.environ.get("P11SCOPE_TEST_TIME_SCALE", "").strip()
+    if not raw:
+        return DEFAULT_TIME_SCALE
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 1:
+        raise SystemExit("P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1")
+    return value
+
+
+TIME_SCALE = _time_scale()
+
+
+def slack(seconds):
+    """Scale a wait-until bound whose expiry can only mean failure."""
+    return seconds * TIME_SCALE
+
+
+# recorded-process-exec.py accepts launch deadlines in (0, 8] seconds.
+DEFAULT_CASE_DEADLINE = repr(min(slack(2), 8.0))
 
 
 class RecordedLauncherTests(unittest.TestCase):
@@ -47,6 +79,12 @@ class RecordedLauncherTests(unittest.TestCase):
         (self.bin / "sudo").chmod(0o700)
         self.env = dict(os.environ, CASE_DIR=str(self.work), PATH=f"{self.bin}:{os.environ['PATH']}",
                         REAL_PYTHON=shutil.which("python3"), FIXTURE_DIR=str(FIXTURES))
+        # The driver's 2 s launch deadline is SLACK for every case that does
+        # not set its own: those cases assert a later boundary (an ack hook,
+        # a cleanup hook, a target exit), so the whole launch must beat it.
+        # Under host load ~30 a cleanup-hook case expired first and never
+        # reached the hook it asserts.
+        self.env["CASE_DEADLINE"] = DEFAULT_CASE_DEADLINE
         self.adopted = {}
         self.adopt_none_reasons = {}
         self.direct_children = []
@@ -103,7 +141,7 @@ class RecordedLauncherTests(unittest.TestCase):
     def driver(self, *args, input=b""):
         proc, _ = self.child(["sh", str(FIXTURES / "driver.sh"), *map(str, args)],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate(input, timeout=20)
+        out, err = proc.communicate(input, timeout=slack(20))
         return proc.returncode, out, err
 
     @staticmethod
@@ -316,8 +354,19 @@ class RecordedLauncherTests(unittest.TestCase):
             # Reaping an adopted parent can expose another owned wave. Only
             # an empty census after the completed waits establishes drainage.
 
+    def hook_snapshot(self, driver_stderr):
+        # The hook writes its snapshot only when the launch reaches the hooked
+        # boundary; name why it did not (e.g. an expired launch deadline).
+        path = self.work / "snapshot.json"
+        self.assertTrue(
+            path.exists(),
+            "launch never reached the hooked boundary: "
+            + driver_stderr.decode(errors="replace")[-2048:],
+        )
+        return json.loads(path.read_text())
+
     def wait_path(self, path, timeout=3):
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + slack(timeout)
         while not path.exists():
             self.assertLess(time.monotonic(), deadline, f"missing fixture boundary {path}")
             time.sleep(0.01)
@@ -500,7 +549,7 @@ IFS=:
                                            "sh", FIXTURES / "split-target.sh")
                 finally:
                     self.env["CASE_DIR"] = prior
-                    self.env.pop("CASE_DEADLINE", None)
+                    self.env["CASE_DEADLINE"] = DEFAULT_CASE_DEADLINE
                     self.env.pop("FINALIZE", None)
                 self.assertNotEqual(rc, 0)
                 fields = (case / "fields").read_text().splitlines()
@@ -666,18 +715,18 @@ IFS=:
 
     def test_launcher_fields_are_published_before_ack_failure(self):
         self.env.update(HOOK_OPERATION="ack", HOOK_PHASE="launcher", HOOK_ACTION="fail")
-        rc, _, _ = self.driver("root", "sh", FIXTURES / "target.sh")
+        rc, _, err = self.driver("root", "sh", FIXTURES / "target.sh")
         self.assertNotEqual(rc, 0)
-        snapshot = json.loads((self.work / "snapshot.json").read_text())
+        snapshot = self.hook_snapshot(err)
         self.assertTrue(snapshot["ROOT_LAUNCH_STARTTIME"])
         self.assertEqual(snapshot["ROOT_RECORD_PHASE"], "launcher-acknowledging")
         self.assertFalse((self.work / "sudo.entered").exists())
 
     def test_root_fields_are_published_before_ack_failure(self):
         self.env.update(HOOK_OPERATION="ack", HOOK_PHASE="root", HOOK_ACTION="fail")
-        rc, _, _ = self.driver("root", "sh", FIXTURES / "target.sh")
+        rc, _, err = self.driver("root", "sh", FIXTURES / "target.sh")
         self.assertNotEqual(rc, 0)
-        snapshot = json.loads((self.work / "snapshot.json").read_text())
+        snapshot = self.hook_snapshot(err)
         self.assertTrue(snapshot["ROOT_PROCESS_STARTTIME"])
         self.assertEqual(snapshot["ROOT_RECORD_PHASE"], "root-acknowledging")
         self.assertTrue((self.work / "sudo.entered").exists())
@@ -685,9 +734,9 @@ IFS=:
 
     def test_control_replacement_preserves_authenticated_fields_and_foreign_files(self):
         self.env.update(HOOK_OPERATION="ack", HOOK_PHASE="root", HOOK_ACTION="replace-directory", FINALIZE="1")
-        rc, _, _ = self.driver("root", "sh", FIXTURES / "target.sh")
+        rc, _, err = self.driver("root", "sh", FIXTURES / "target.sh")
         self.assertNotEqual(rc, 0)
-        snapshot = json.loads((self.work / "snapshot.json").read_text())
+        snapshot = self.hook_snapshot(err)
         final = (self.work / "finalized").read_text().splitlines()
         self.assertNotEqual(final[0], "0")
         self.assertEqual(final[3:5], [snapshot["ROOT_PROCESS_PID"], snapshot["ROOT_PROCESS_STARTTIME"]])
@@ -702,9 +751,9 @@ IFS=:
 
     def test_failure_after_root_ack_retains_target_cleanup_authority(self):
         self.env.update(HOOK_OPERATION="cleanup", HOOK_PHASE="", HOOK_ACTION="fail")
-        rc, _, _ = self.driver("root", "sh", FIXTURES / "target.sh")
+        rc, _, err = self.driver("root", "sh", FIXTURES / "target.sh")
         self.assertNotEqual(rc, 0)
-        snapshot = json.loads((self.work / "snapshot.json").read_text())
+        snapshot = self.hook_snapshot(err)
         self.assertTrue(snapshot["ROOT_PROCESS_STARTTIME"])
         self.assertEqual(snapshot["ROOT_RECORD_PHASE"], "root-acknowledged")
         self.wait_path(self.work / "target.entered")

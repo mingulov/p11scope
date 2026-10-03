@@ -80,7 +80,12 @@ int main(int argc, char **argv) {
             signal(SIGINT, on_signal);
             signal(SIGTERM, on_signal);
         }
-        const char *hold = getenv("D2_HOLD_SECONDS");
+        /* A safety lifetime only: the gate's TERM (or the harness's KILL for
+         * a TERM-ignoring hold) ends every passing run first, and an alarm
+         * exit is always nonpass. The harness scales it apart from the
+         * dispatch holds, which share D2_HOLD_SECONDS as the fallback. */
+        const char *hold = getenv("D2_PORT_FORWARD_SECONDS");
+        if (hold == 0) hold = getenv("D2_HOLD_SECONDS");
         alarm(hold == 0 ? 5U : (unsigned int)strtoul(hold, 0, 10));
         if (publish_identity(argc, argv) != 0) return 125;
         for (;;) pause();

@@ -6,6 +6,7 @@ import array
 from contextlib import ExitStack
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -45,11 +46,49 @@ READINESS_DIAGNOSTIC_TAIL_BYTES = 2048
 READINESS_DIAGNOSTIC_FIELD_BYTES = 1024
 READINESS_DIAGNOSTIC_MAX_BYTES = 8192
 READINESS_DIAGNOSTIC_TRUNCATION = "; diagnostic_truncated=1"
-TERMINAL_READINESS_TIMEOUT_SECONDS = 20
+# Wall-clock bounds here are of two kinds. SEMANTIC bounds are what a case
+# asserts (a 0.05 s outer budget, a 200 ms readiness observation, a forced
+# hold that must outlast a short timeout) and stay literal. SLACK bounds only
+# wait for an event that must happen (a marker, an exit, an EOF); their expiry
+# is a failure, so they scale with P11SCOPE_TEST_TIME_SCALE. A passing case
+# never waits a SLACK bound out, so the default costs no time unloaded; it is
+# sized so a full gate run at host load ~20 cannot exhaust it. Lifetimes that
+# must outlast a whole case (decoys, controlled bodies, held port-forwards)
+# scale with the same factor so their ordering against SLACK bounds holds.
+DEFAULT_TIME_SCALE = 5.0
+
+
+def _time_scale():
+    raw = os.environ.get("P11SCOPE_TEST_TIME_SCALE", "").strip()
+    if not raw:
+        return DEFAULT_TIME_SCALE
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 1:
+        raise SystemExit("P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1")
+    return value
+
+
+TIME_SCALE = _time_scale()
+
+
+def slack(seconds):
+    """Scale a wait-until bound whose expiry can only mean failure."""
+    return seconds * TIME_SCALE
+
+
+def scaled_whole_seconds(seconds):
+    """Scale a process lifetime that must outlast SLACK waits; whole seconds."""
+    return str(math.ceil(seconds * TIME_SCALE))
+
+
+TERMINAL_READINESS_TIMEOUT_SECONDS = slack(20)
 # Cleanup keeps the original 2s settle slices but retries them to this total
 # bound: under host load a SIGKILLed child can miss one slice without being
 # wedged. A child unsettled past the bound still fails the same way.
-CLEANUP_SETTLE_SECONDS = 10
+CLEANUP_SETTLE_SECONDS = slack(10)
 
 
 class Lane13InputLedgerTests(unittest.TestCase):
@@ -123,7 +162,7 @@ class Lane13InputLedgerTests(unittest.TestCase):
             },
             text=True,
             capture_output=True,
-            timeout=5,
+            timeout=slack(5),
         )
 
     def test_snapshot_hashes_fixed_tracked_inventory_and_merges_generated_rows(self):
@@ -223,6 +262,7 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.outside_temp = tempfile.TemporaryDirectory(prefix="p11scope-lane13-foreign-")
         self.outside = Path(self.outside_temp.name)
         self.processes = []
+        self.budget_started = None
         self.evidence_roots = []
         self.owned_launches = {}
         self.accepted_sessions = set()
@@ -323,7 +363,12 @@ class Lane13EvidenceTests(unittest.TestCase):
             "D2_RELEASE_FIXTURES": str(self.release_fixtures),
             "D2_CORRUPT_RELEASE_FIXTURES": str(self.corrupt_release_fixtures),
             "D2_ORIGINAL_ROOT": str(ROOT),
+            # Dispatch holds stay literal: a TERMed fixture shell leaves its
+            # sleep behind, and cleanup waits that sleep out.
             "D2_HOLD_SECONDS": "4",
+            # The native port-forward must outlive the body that uses it.
+            "D2_PORT_FORWARD_SECONDS": scaled_whole_seconds(4),
+            "P11SCOPE_TEST_TIME_SCALE": repr(TIME_SCALE),
             "D2_FOREIGN_TARGET": str(self.outside / "foreign-symlink-target"),
             "D2_SENTINEL_OVERWRITE": os.environ.get(
                 "P11SCOPE_LANE13_SENTINEL_VARIANT", "0"
@@ -527,7 +572,9 @@ class Lane13EvidenceTests(unittest.TestCase):
                     pass
 
     def start_decoy(self):
-        process = subprocess.Popen(["/bin/sleep", "20"], start_new_session=True)
+        process = subprocess.Popen(
+            ["/bin/sleep", scaled_whole_seconds(20)], start_new_session=True
+        )
         self.addCleanup(self.close_owned_child, process)
         return process
 
@@ -766,7 +813,7 @@ class Lane13EvidenceTests(unittest.TestCase):
                 pass
             except OSError as error:
                 failures.append(f"kill {record['record_id']}: {error}")
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + slack(2)
         while remaining and time.monotonic() < deadline:
             remaining = [item for item in remaining if self._pidfd_is_live(item[1])]
             if remaining:
@@ -836,14 +883,14 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.settle_recorded()
         for process in reversed(self.processes):
             try:
-                process.communicate(timeout=2)
+                process.communicate(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 try:
                     self.signal_owned_process(process, signal.SIGKILL)
                 except (OSError, ValueError) as error:
                     failures.append(f"direct child {process.pid} kill failed: {error}")
                 try:
-                    process.communicate(timeout=2)
+                    process.communicate(timeout=slack(2))
                 except subprocess.TimeoutExpired:
                     failures.append(f"direct child {process.pid} did not settle")
         failures.extend(self.wait_for_session_writers())
@@ -877,18 +924,28 @@ class Lane13EvidenceTests(unittest.TestCase):
         (self.state / "calls").write_text("")
         (self.state / "git.calls").write_text("")
 
-    def run_owned(self, arguments, env, timeout):
+    def run_owned(self, arguments, env, timeout, hold_marker=None):
         process = self.start_owned(arguments, env)
+        if hold_marker is not None:
+            # A SEMANTIC budget covers the held phase, not setup: start it
+            # only once the fixture has published that it entered its hold.
+            # Setup is a SLACK wait; a missing marker is left for the caller
+            # to assert after the bounded communication below.
+            deadline = time.monotonic() + TERMINAL_READINESS_TIMEOUT_SECONDS
+            while not hold_marker.exists() and process.poll() is None \
+                    and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.budget_started = time.monotonic()
         try:
             stdout, stderr = process.communicate(timeout=timeout)
             return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
         except subprocess.TimeoutExpired as error:
             settlement = self.settle_recorded()
             try:
-                stdout, stderr = process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 self.signal_owned_process(process, signal.SIGKILL)
-                stdout, stderr = process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=slack(2))
             detail = "" if not settlement else "\n" + "\n".join(settlement)
             return subprocess.CompletedProcess(
                 arguments, 124, stdout or error.stdout or "",
@@ -922,7 +979,7 @@ class Lane13EvidenceTests(unittest.TestCase):
         except BaseException:
             try:
                 process.kill()
-                process.communicate(timeout=2)
+                process.communicate(timeout=slack(2))
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
@@ -951,7 +1008,9 @@ class Lane13EvidenceTests(unittest.TestCase):
             raise ValueError("owned launch identity changed before signal")
         signal.pidfd_send_signal(launch["pidfd"], signal_number, None, 0)
 
-    def finish_owned(self, process, timeout, finalize_timeout=2):
+    def finish_owned(self, process, timeout, finalize_timeout=None):
+        if finalize_timeout is None:
+            finalize_timeout = slack(2)
         try:
             return process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
@@ -977,17 +1036,17 @@ class Lane13EvidenceTests(unittest.TestCase):
         self.signal_owned_process(process, signal.SIGSTOP)
         try:
             sender(descriptor, signal.SIGKILL, None, 0)
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + slack(2)
             while self._pidfd_is_live(descriptor) and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertFalse(self._pidfd_is_live(descriptor))
         finally:
             self.signal_owned_process(process, signal.SIGCONT)
-        outer_stdout, outer_stderr = process.communicate(timeout=2)
+        outer_stdout, outer_stderr = process.communicate(timeout=slack(2))
         self.assertEqual(process.returncode, 0, outer_stderr)
         self.assertIn(f"controlled child settled {body['pid']}", outer_stdout)
 
-    def run_lane(self, mode, name=None, timeout=20, extra_env=None):
+    def run_lane(self, mode, name=None, timeout=None, extra_env=None, hold_marker=None):
         self.clear_state()
         evidence = self.root / (name or mode)
         env = self.env | {
@@ -995,7 +1054,11 @@ class Lane13EvidenceTests(unittest.TestCase):
             "P11SCOPE_LANE_EVIDENCE_DIR": str(evidence),
         }
         env.update(extra_env or {})
-        output = self.run_owned(["sh", str(self.gate)], env, timeout)
+        if timeout is None:
+            timeout = slack(20)
+        if hold_marker is not None:
+            hold_marker = self.state / hold_marker
+        output = self.run_owned(["sh", str(self.gate)], env, timeout, hold_marker)
         return output, evidence
 
     def start_controlled_body(self, label, ignore_term=False, fault="none"):
@@ -1006,7 +1069,7 @@ class Lane13EvidenceTests(unittest.TestCase):
             parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             setup.callback(child.close)
             self.addCleanup(parent.close)
-            parent.settimeout(5)
+            parent.settimeout(slack(5))
             argv = ["/usr/bin/python3", "-I", str(FIXTURES / "controlled-body.py"),
                     "outer", "--control-fd", str(child.fileno()),
                     "--evidence", str(evidence), "--gate", str(self.gate),
@@ -1037,10 +1100,10 @@ class Lane13EvidenceTests(unittest.TestCase):
                               "socket": parent, "process": proc}
                 self.controlled_bodies[evidence] = controlled
                 parent.sendall(b"owned")
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + slack(5)
                 while not ready.exists() and time.monotonic() < deadline:
                     if proc.poll() is not None:
-                        stdout, stderr = self.finish_owned(proc, 2)
+                        stdout, stderr = self.finish_owned(proc, slack(2))
                         raise ControlledBodySetupError(
                             f"controlled outer exit={proc.returncode}\n{stdout}\n{stderr}"
                         )
@@ -1061,7 +1124,7 @@ class Lane13EvidenceTests(unittest.TestCase):
                     # needed to terminate it on a setup exception.
                     proc.terminate()
                 finally:
-                    self.finish_owned(proc, 3)
+                    self.finish_owned(proc, slack(3))
                 raise
         return proc, evidence, evidence / ".lane13-body.pid", release, record
 
@@ -1100,7 +1163,7 @@ control.recv(1)
             parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             setup.callback(child.close)
             self.addCleanup(parent.close)
-            parent.settimeout(5)
+            parent.settimeout(slack(5))
             proc = self.start_owned(
                 ["/usr/bin/python3", "-I", "-c", program, str(child.fileno())],
                 self.env | {"P11SCOPE_LANE_EVIDENCE_DIR": str(evidence)},
@@ -1468,7 +1531,7 @@ control.recv(1)
             env=os.environ | {"D2_CANDIDATE_INPUTS": str(candidate_path)},
             check=True,
             stdout=subprocess.PIPE,
-            timeout=5,
+            timeout=slack(5),
         )
         observed = {
             os.fsdecode(item) for item in output.stdout.split(b"\0") if item
@@ -1597,7 +1660,7 @@ exit "$helper_status"
             ["/bin/sh", str(probe), str(work)],
             text=True,
             capture_output=True,
-            timeout=5,
+            timeout=slack(5),
         )
         self.assertTrue((work / "early-write-failure-injected").is_file())
         self.assertTrue((work / "cleanup-continued").is_file())
@@ -1778,7 +1841,7 @@ exit "$helper_status"
                 "--name", "kourier.yaml", "--facts", str(facts),
                 "--calls", str(marker),
             ],
-            cwd=self.project, text=True, capture_output=True, timeout=5,
+            cwd=self.project, text=True, capture_output=True, timeout=slack(5),
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(facts.read_text(encoding="utf-8"), "sentinel=fixed\n")
@@ -1794,7 +1857,7 @@ exit "$helper_status"
                 "--name", "kourier.yaml", "--facts", str(facts),
                 "--calls", str(marker),
             ],
-            cwd=self.project, text=True, capture_output=True, timeout=5,
+            cwd=self.project, text=True, capture_output=True, timeout=slack(5),
         )
         self.assertNotEqual(canonical.returncode, 0)
         self.assertEqual(facts.read_text(encoding="utf-8"), "sentinel=fixed\n")
@@ -1931,7 +1994,7 @@ exit "$helper_status"
             self.signal_owned_process(proc, signal.SIGTERM)
         finally:
             (self.state / "terminal-signal-go").write_text("go\n")
-        stdout, stderr = self.finish_owned(proc, 8)
+        stdout, stderr = self.finish_owned(proc, slack(8))
         self.assertNotEqual(proc.returncode, 0, f"{stdout}\n{stderr}")
         self.assertEqual((evidence / "status").read_text(), "1\n")
         facts = self.facts(evidence)
@@ -1946,7 +2009,7 @@ exit "$helper_status"
             self.env | {"D2_MODE": "sleep-build",
                         "P11SCOPE_LANE_EVIDENCE_DIR": str(evidence)},
         )
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + slack(5)
         while not (self.state / "sleep-build-ready").exists() and time.monotonic() < deadline:
             self.assertIsNone(proc.poll(), "outer signal body exited before WORK")
             time.sleep(0.025)
@@ -1954,11 +2017,11 @@ exit "$helper_status"
         retained_body = self.retain_body_handle(evidence)
         self.assertTrue(self._pidfd_is_live(retained_body["pidfd"]))
         self.signal_owned_process(proc, signal.SIGTERM)
-        self.finish_owned(proc, 5)
+        self.finish_owned(proc, slack(5))
         self.assertTrue((evidence / "status").is_file())
         facts = self.facts(evidence)
         work = next(line.removeprefix("work=") for line in facts.splitlines() if line.startswith("work="))
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + slack(5)
         while self.work_path(work).exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertFalse(self.work_path(work).exists())
@@ -2034,7 +2097,7 @@ time.sleep(20)
                 self.env | {"P11SCOPE_LANE_EVIDENCE_DIR": str(evidence)},
                 pass_fds=(read_fd, relay_read),
             )
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + slack(5)
             while not (evidence / "writer.pid").exists() and time.monotonic() < deadline:
                 self.assertIsNone(parent.poll())
                 time.sleep(0.01)
@@ -2059,7 +2122,7 @@ time.sleep(20)
                     relay_started = True
                     os.write(relay_write, b"go")
                     ready = evidence / "writer-next.pid"
-                    deadline = time.monotonic() + 5
+                    deadline = time.monotonic() + slack(5)
                     while not ready.exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
                     replacement = int(ready.read_text())
@@ -2108,7 +2171,7 @@ time.sleep(20)
         finally:
             os.write(relay_write, b"go")
             if timer is not None:
-                timer.join(timeout=2)
+                timer.join(timeout=slack(2))
             else:
                 os.write(write_fd, b"go")
             for handle in descriptors:
@@ -2132,7 +2195,7 @@ time.sleep(20)
             pidfile.write_bytes(b"{\n")
 
             release.write_text("exit\n")
-            self.finish_owned(proc, 5)
+            self.finish_owned(proc, slack(5))
             transitioned = self.read_process_snapshot(body["pid"])
             self.assertNotEqual(transitioned["identity"]["ppid"], body["ppid"])
             self.assertNotEqual(transitioned["state"], "Z")
@@ -2160,10 +2223,10 @@ time.sleep(20)
                 pidfile.write_bytes(original_record)
             decoy.terminate()
             try:
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 decoy.kill()
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
 
     def test_body_handle_admission_ignores_scheduler_state_only_transition(self):
         proc, evidence, _, release, body = self.start_controlled_body(
@@ -2192,7 +2255,7 @@ time.sleep(20)
             self.assertTrue(self._pidfd_is_live(retained["pidfd"]))
         finally:
             release.write_text("exit\n")
-        self.finish_owned(proc, 5)
+        self.finish_owned(proc, slack(5))
         self.assertEqual(self.settle_recorded(), [])
 
     def test_exit_before_real_term_keeps_published_descriptor_owned(self):
@@ -2201,7 +2264,7 @@ time.sleep(20)
         )
         other_evidence = self.root / "later-owned-settlement"
         other = self.start_owned(
-            ["/bin/sleep", "20"],
+            ["/bin/sleep", scaled_whole_seconds(20)],
             self.env | {"P11SCOPE_LANE_EVIDENCE_DIR": str(other_evidence)},
         )
         decoy = self.start_decoy()
@@ -2240,10 +2303,10 @@ time.sleep(20)
             release.write_text("exit\n")
             decoy.terminate()
             try:
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 decoy.kill()
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
 
     def test_failed_exit_readiness_assertion_resumes_outer_and_reaps_child(self):
         proc, evidence, _, release, body = self.start_controlled_body(
@@ -2261,7 +2324,7 @@ time.sleep(20)
                         proc, control, body, signal.pidfd_send_signal
                     )
             try:
-                outer_stdout, outer_stderr = proc.communicate(timeout=2)
+                outer_stdout, outer_stderr = proc.communicate(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 self.fail("controlled outer remained stopped after readiness failure")
             self.assertEqual(proc.returncode, 0, outer_stderr)
@@ -2273,10 +2336,10 @@ time.sleep(20)
             release.write_text("exit\n")
             decoy.terminate()
             try:
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 decoy.kill()
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
 
     def test_exited_retained_body_ignores_late_numeric_observation(self):
         proc, evidence, _, release, body = self.start_controlled_body(
@@ -2285,12 +2348,12 @@ time.sleep(20)
         decoy = self.start_decoy()
         retained = self.retain_body_handle(evidence)
         signal.pidfd_send_signal(retained["pidfd"], signal.SIGKILL, None, 0)
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + slack(2)
         while self._pidfd_is_live(retained["pidfd"]) and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertFalse(self._pidfd_is_live(retained["pidfd"]))
         release.write_text("exit\n")
-        self.finish_owned(proc, 5)
+        self.finish_owned(proc, slack(5))
         real_snapshot = self.read_process_snapshot
         real_open = os.pidfd_open
         real_send = signal.pidfd_send_signal
@@ -2327,10 +2390,10 @@ time.sleep(20)
             self.assertIsNone(decoy.poll(), label)
         decoy.terminate()
         try:
-            decoy.wait(timeout=2)
+            decoy.wait(timeout=slack(2))
         except subprocess.TimeoutExpired:
             decoy.kill()
-            decoy.wait(timeout=2)
+            decoy.wait(timeout=slack(2))
 
     def test_retained_body_exit_during_late_observation_owns_settlement(self):
         decoy = self.start_decoy()
@@ -2340,7 +2403,7 @@ time.sleep(20)
             )
             retained = self.retain_body_handle(evidence)
             release.write_text("exit\n")
-            self.finish_owned(proc, 3)
+            self.finish_owned(proc, slack(3))
             self.assertTrue(self._pidfd_is_live(retained["pidfd"]))
             real_snapshot = self.read_process_snapshot
             observed = []
@@ -2372,7 +2435,7 @@ time.sleep(20)
         )
         retained = self.retain_body_handle(evidence)
         release.write_text("exit\n")
-        self.finish_owned(proc, 3)
+        self.finish_owned(proc, slack(3))
         self.assertTrue(self._pidfd_is_live(retained["pidfd"]))
         real_snapshot = self.read_process_snapshot
         inspected = []
@@ -2418,7 +2481,7 @@ time.sleep(20)
         ledger.write_text(json.dumps(conflict) + "\n")
         self.assertEqual(self.fixture_records(), [conflict])
         release.write_text("exit\n")
-        self.finish_owned(proc, 3)
+        self.finish_owned(proc, slack(3))
         self.assertTrue(self._pidfd_is_live(retained["pidfd"]))
         failures = self.settle_recorded()
         self.assertFalse(self._pidfd_is_live(retained["pidfd"]),
@@ -2451,7 +2514,7 @@ time.sleep(20)
                 self.assertIn(f"controlled child settled {controlled['pid']}", str(caught.exception))
                 self.assertNotIn("owned child did not settle", str(caught.exception))
                 self.assertFalse((self.root / label / ".lane13-body.pid").exists())
-                self.assertLess(time.monotonic() - started, 5)
+                self.assertLess(time.monotonic() - started, slack(5))
                 self.assertIsNone(decoy.poll())
                 print(f"setup-{fault}: outer exit=1; original exited before return; decoy live")
 
@@ -2483,23 +2546,32 @@ time.sleep(20)
         self.assertEqual(result.errors, [])
         self.assertIsNotNone(owned["decoy"].poll(), "registered decoy cleanup was skipped")
         self.assertFalse(self._pidfd_is_live(owned["rescue"]), "registered original cleanup was skipped")
-        self.finish_owned(owned["outer"], 3)
+        self.finish_owned(owned["outer"], slack(3))
         print("assertion-failure: expected failure retained; original and decoy settled by registered cleanup")
 
     def test_forced_holds_are_bounded_settled_and_preserve_decoy(self):
         decoy = self.start_decoy()
         try:
-            for label, mode, extra in (
-                ("terminal-readiness-failure", "terminal-readiness-failure", {}),
-                ("terminal-communication-timeout", "terminal-communication-timeout", {}),
+            # The 1 s budget starts at each hold marker. The readiness hold is
+            # the dispatch's 4 s D2_HOLD_SECONDS sleep, so the timeout fires
+            # inside it whatever setup took; the communication hold lasts until
+            # settlement releases it.
+            for label, mode, extra, marker in (
+                ("terminal-readiness-failure", "terminal-readiness-failure", {},
+                 "terminal-readiness-hold"),
+                ("terminal-communication-timeout", "terminal-communication-timeout", {},
+                 "terminal-signal-ready"),
             ):
                 with self.subTest(mode=label):
-                    started = time.monotonic()
-                    output, _ = self.run_lane(mode, name=label, timeout=3, extra_env=extra)
+                    output, _ = self.run_lane(
+                        mode, name=label, timeout=1, extra_env=extra, hold_marker=marker
+                    )
                     self.assertNotEqual(output.returncode, 0, output.stderr)
                     self.assertEqual(output.returncode, 124, output.stderr)
                     self.assertIn("native fixture communication timeout", output.stderr)
-                    self.assertLess(time.monotonic() - started, 10)
+                    # Boundedness of the held phase and its settlement; setup
+                    # before the marker is a separate SLACK wait.
+                    self.assertLess(time.monotonic() - self.budget_started, slack(10))
                     if label == "terminal-readiness-failure":
                         self.assertTrue((self.state / "terminal-readiness-hold").exists())
                         self.assertFalse((self.state / "terminal-signal-ready").exists())
@@ -2510,10 +2582,10 @@ time.sleep(20)
         finally:
             decoy.terminate()
             try:
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 decoy.kill()
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
 
     def observe_missing_terminal_readiness(self, launched, proc, evidence):
         # The controlled failure starts only after dispatch has recorded its
@@ -2647,7 +2719,7 @@ time.sleep(20)
                     return
                 replacement = target | decoy_identity | {
                     "pid": decoy.pid,
-                    "argv": ["/bin/sleep", "20"],
+                    "argv": list(decoy.args),
                 }
                 ledger.write_text(json.dumps(replacement, separators=(",", ":")) + "\n")
 
@@ -2671,7 +2743,7 @@ time.sleep(20)
             self.before_pidfd_open = None
             self.acknowledge_settlement_errors()
             self.assertEqual(self.settle_recorded(), [])
-            proc.communicate(timeout=2)
+            proc.communicate(timeout=slack(2))
             self.assertFalse(self._pidfd_is_live(original_fd))
             self.assert_process_absent(target["pid"], target["starttime"])
             self.assertIsNone(decoy.poll())
@@ -2706,14 +2778,14 @@ time.sleep(20)
                     signal.pidfd_send_signal(original_fd, signal.SIGKILL, None, 0)
                 except ProcessLookupError:
                     pass
-            proc.communicate(timeout=2)
+            proc.communicate(timeout=slack(2))
             control.close()
             decoy.terminate()
             try:
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 decoy.kill()
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
         self.assertFalse(self._pidfd_is_live(original_fd), "writer still live at deletion")
         self.assertIsNotNone(proc.returncode, "original direct child was not reaped")
         self.assertIsNotNone(decoy.returncode, "decoy direct child was not reaped")
@@ -2728,13 +2800,13 @@ time.sleep(20)
             self.env | {
                 "D2_MODE": "body-success",
                 "D2_PORT_FORWARD_HOLD": "1",
-                "D2_HOLD_SECONDS": "15",
+                "D2_PORT_FORWARD_SECONDS": scaled_whole_seconds(15),
                 "P11SCOPE_LANE_EVIDENCE_DIR": str(evidence),
             },
         )
         try:
             ready = self.state / "portforward-ready"
-            deadline = time.monotonic() + 12
+            deadline = time.monotonic() + slack(12)
             while not ready.exists() and time.monotonic() < deadline:
                 self.assertIsNone(proc.poll(), "production caller exited before native readiness")
                 time.sleep(0.01)
@@ -2762,10 +2834,10 @@ time.sleep(20)
         finally:
             decoy.terminate()
             try:
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 decoy.kill()
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
 
     def test_finish_owned_allows_outer_to_finalize_after_descendant_settlement(self):
         decoy = self.start_decoy()
@@ -2795,13 +2867,13 @@ raise SystemExit(1)
             [sys.executable, "-c", outer],
             self.env | {
                 "D2_PORT_FORWARD_HOLD": "1",
-                "D2_HOLD_SECONDS": "15",
+                "D2_PORT_FORWARD_SECONDS": scaled_whole_seconds(15),
                 "P11SCOPE_LANE_EVIDENCE_DIR": str(evidence),
             },
         )
         try:
             ready = self.state / "portforward-ready"
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + slack(5)
             while not ready.exists() and time.monotonic() < deadline:
                 self.assertIsNone(proc.poll(), "delayed outer exited before native readiness")
                 time.sleep(0.01)
@@ -2815,7 +2887,7 @@ raise SystemExit(1)
             with self.assertRaisesRegex(
                 OwnedCommunicationTimeout, "native fixture communication timeout"
             ) as caught:
-                self.finish_owned(proc, 0.05, finalize_timeout=10)
+                self.finish_owned(proc, 0.05, finalize_timeout=slack(10))
             self.assertEqual(caught.exception.result.returncode, 124)
             self.assertEqual((evidence / "status").read_text(), "1\n")
             self.assert_process_absent(native["pid"], native["starttime"])
@@ -2824,10 +2896,10 @@ raise SystemExit(1)
         finally:
             decoy.terminate()
             try:
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
             except subprocess.TimeoutExpired:
                 decoy.kill()
-                decoy.wait(timeout=2)
+                decoy.wait(timeout=slack(2))
 
     def test_timeout_and_settlement_errors_remain_observable(self):
         evidence = self.root / "normal-timeout-rescue"
@@ -2858,7 +2930,7 @@ raise SystemExit(1)
 
         sleeper_evidence = self.root / "settlement-error"
         sleeper = self.start_owned(
-            ["/bin/sleep", "20"],
+            ["/bin/sleep", scaled_whole_seconds(20)],
             self.env | {"P11SCOPE_LANE_EVIDENCE_DIR": str(sleeper_evidence)},
         )
         real_sender = signal.pidfd_send_signal
@@ -2875,7 +2947,7 @@ raise SystemExit(1)
             failures = self.settle_recorded()
         self.assertEqual(len(failures), 1, failures)
         self.assertTrue(any("controlled settlement failure" in item for item in failures))
-        sleeper.communicate(timeout=2)
+        sleeper.communicate(timeout=slack(2))
         sticky = tuple(self.settlement_errors)
         self.clear_state()
         self.assertEqual(self.settle_recorded(), [])

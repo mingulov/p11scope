@@ -42,6 +42,28 @@ fn ia32_argument_reader_is_the_exact_scalar_reader_export_requested_by_the_build
 
 static NATIVE_SUITE_GATE: Mutex<()> = Mutex::new(());
 
+/// Default for `P11SCOPE_TEST_TIME_SCALE`, matching the Python harnesses.
+const DEFAULT_TEST_TIME_SCALE: f64 = 5.0;
+
+/// A SLACK hang-guard bound for `timeout(1)`: `seconds` scaled by
+/// `P11SCOPE_TEST_TIME_SCALE`. Use it only where expiry can mean nothing but
+/// failure, so a passing run never waits it out and only a loaded host
+/// approaches it. SEMANTIC bounds (a deadline a case asserts) and
+/// forced-cleanup grace periods stay literal.
+fn slack_timeout(seconds: u64) -> String {
+    let scale = match std::env::var("P11SCOPE_TEST_TIME_SCALE") {
+        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse::<f64>().unwrap_or(f64::NAN),
+        _ => DEFAULT_TEST_TIME_SCALE,
+    };
+    assert!(
+        scale.is_finite() && scale >= 1.0,
+        "P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1"
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scaled = (seconds as f64 * scale).ceil() as u64;
+    format!("{scaled}s")
+}
+
 fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
 }
@@ -6427,10 +6449,12 @@ fn stopped_canary_capture_lifecycle() {
 
 #[test]
 fn task_storage_canary_seed_lifecycle() {
+    // About 9 s alone; the 60 s outer bound is a SLACK hang guard.
+    let bound = slack_timeout(60);
     let output = Command::new("timeout")
         .args([
             "--kill-after=2s",
-            "60s",
+            &bound,
             "python3",
             "-I",
             "tests/python/test_task_storage_canary.py",
@@ -6731,13 +6755,14 @@ aggregate-only-metrics default metrics"
     // The wrapper runs three Python suites plus checker self-tests in sequence.
     // In the parallel workspace gate, the first two suites alone took 52 s;
     // the old 60 s aggregate bound interrupted the still-passing third suite.
-    // Allow 60 s per suite here; individual case and native-width lane bounds
-    // below remain unchanged, as does the final forced-cleanup grace period.
+    // Allow 60 s per suite, scaled like every SLACK hang guard; the 2 s
+    // forced-cleanup grace period stays literal.
+    let lanes_bound = slack_timeout(180);
     let lanes = run_ok(
         "timeout",
         &[
             "--kill-after=2s",
-            "180s",
+            &lanes_bound,
             "sh",
             "scripts/verify-canaries.sh",
             "--self-test",
@@ -6756,11 +6781,14 @@ aggregate-only-metrics default metrics"
     // `TargetWidthPathTests` alone — keep the name and value paired so a
     // future reader can't mistake it for the latter.
     const NATIVE_LANE_15_CLASS_AGGREGATE_FLOOR: usize = 63;
+    // Each native-width lane takes about 30 s unloaded and reached its old
+    // literal 60 s bound at gate load 10-14: a SLACK hang guard, so scale it.
+    let native_lane_bound = slack_timeout(60);
     for bits in ["32", "64"] {
         let output = Command::new("timeout")
             .args([
                 "--kill-after=2s",
-                "60s",
+                &native_lane_bound,
                 "python3",
                 "-I",
                 "tests/python/test_canary_evidence.py",

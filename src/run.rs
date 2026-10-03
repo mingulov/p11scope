@@ -596,7 +596,8 @@ unsafe fn last_errno() -> i32 {
 /// deadline although its command is already running.
 ///
 /// Async-signal-safe: stack data and raw syscalls only. Keep entries below 3
-/// (stdio was closed when the observer started) are never closed anyway.
+/// are ignored: stdio is never closed, and Rust std reopens /dev/null on any
+/// closed fd 0-2 at startup, so a keep below 3 can only name stdio itself.
 unsafe fn close_inherited_descriptors<const N: usize>(
     mut keep: [i32; N],
     use_close_range: bool,
@@ -609,6 +610,10 @@ unsafe fn close_inherited_descriptors<const N: usize>(
             at -= 1;
         }
     }
+    // The fallback enumerates the child's own table from this handle (opened
+    // here, in the child). A negative handle degrades each gap to the
+    // bounded sweep.
+    let enum_dir = unsafe { open_own_fd_enumeration(&keep) };
     let mut first = 3u32;
     for fd in keep {
         let Ok(fd) = u32::try_from(fd) else {
@@ -618,38 +623,189 @@ unsafe fn close_inherited_descriptors<const N: usize>(
             continue;
         }
         if fd > first {
-            unsafe { close_descriptor_range(first, fd - 1, use_close_range) }?;
+            unsafe { close_descriptor_range(first, fd - 1, use_close_range, enum_dir) }?;
         }
         first = fd + 1;
     }
-    unsafe { close_descriptor_range(first, u32::MAX, use_close_range) }?;
+    unsafe { close_descriptor_range(first, u32::MAX, use_close_range, enum_dir) }?;
     for fd in keep {
         if fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(unsafe { last_errno() });
         }
     }
+    // The enumeration handle is this close's own tool, not a kept pipe: the
+    // pre-exec child must not hold it at its barrier.
+    if enum_dir > 2 {
+        unsafe { libc::close(enum_dir) };
+    }
     Ok(())
 }
 
-/// Closes `first..=last`. A fork child has a private descriptor table, so
-/// plain `close_range` (no CLOSE_RANGE_UNSHARE) closes exactly this child's
-/// copies. Where `close_range` is denied (a seccomp policy answering ENOSYS
-/// or EPERM), close one by one up to the soft RLIMIT_NOFILE, which bounds
-/// every descriptor this process could have opened at its current limit.
-unsafe fn close_descriptor_range(
-    first: u32,
-    last: u32,
-    use_close_range: bool,
-) -> std::result::Result<(), i32> {
-    if use_close_range {
-        if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } == 0 {
-            return Ok(());
+/// Opens the fork child's own `/proc/self/fd` for the fallback enumeration.
+/// Runs in the child: a pre-fork handle would view the parent's live table,
+/// which churns under parallelism and diverges as this child closes, so
+/// entries would be missed. When the table is dense under a lowered
+/// RLIMIT_NOFILE and no free number exists (EMFILE), closes one sacrificial
+/// non-keep descriptor below the soft limit — doomed anyway — to free a
+/// number first. Async-signal-safe: raw syscalls and stack data only, no
+/// allocation. Returns -1 when `/proc` is unavailable or no number can be
+/// freed, in which case the fallback degrades to the bounded sweep.
+unsafe fn open_own_fd_enumeration<const N: usize>(keep: &[i32; N]) -> i32 {
+    // "/proc/self/fd" with its NUL, passed to raw open without allocation.
+    const SELF_FD: &[u8; 14] = b"/proc/self/fd\0";
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // SAFETY: raw open of a static path; O_CLOEXEC so the handle never
+    // survives an untimely exec.
+    let dir = unsafe { libc::open(SELF_FD.as_ptr().cast(), flags) };
+    if dir >= 0 {
+        return dir;
+    }
+    if unsafe { last_errno() } != libc::EMFILE {
+        return -1;
+    }
+    let mut limit = libc::rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe {
+        libc::syscall(
+            libc::SYS_prlimit64,
+            0,
+            libc::RLIMIT_NOFILE,
+            std::ptr::null::<libc::rlimit64>(),
+            &mut limit,
+        )
+    } != 0
+    {
+        return -1;
+    }
+    // EMFILE means every number below the soft limit is open, so a victim
+    // is found within a handful of probes (or every one is a keep, and
+    // there is honestly no room).
+    let soft = limit.rlim_cur.min(1 << 20) as u32;
+    let mut victim = 3u32;
+    while victim < soft {
+        if !keep.contains(&(victim as i32)) {
+            // SAFETY: fcntl probe of one number, then its close.
+            if unsafe { libc::fcntl(victim as i32, libc::F_GETFD) } >= 0 {
+                unsafe { libc::close(victim as i32) };
+                break;
+            }
         }
-        let errno = unsafe { last_errno() };
-        if errno != libc::ENOSYS && errno != libc::EPERM {
-            return Err(errno);
+        victim += 1;
+    }
+    if victim >= soft {
+        return -1;
+    }
+    // SAFETY: as above; the freed number below the soft limit is taken.
+    let dir = unsafe { libc::open(SELF_FD.as_ptr().cast(), flags) };
+    if dir >= 0 { dir } else { -1 }
+}
+
+/// Closes exactly the open descriptors in `first..=last` but `enum_dir`
+/// itself, listed from the child's own `/proc/self/fd` handle with raw
+/// `getdents64` into a stack buffer (the way glibc's closefrom does it).
+/// Async-signal-safe: raw syscalls and stack data only, no allocation.
+/// Collects the whole in-range set before closing anything: closing while
+/// scanning shifts the directory offset and would skip entries. Returns
+/// false on any enumeration error or an overfull set, so the caller falls
+/// back to the bounded sweep.
+unsafe fn close_enumerated_range(first: u32, last: u32, enum_dir: i32) -> bool {
+    if enum_dir < 0 {
+        return false;
+    }
+    // Rewind: every gap scans the handle from the start (a previous gap left
+    // it at EOF). A failed rewind degrades to the bounded sweep.
+    // SAFETY: lseek on the live enumeration handle with constant arguments.
+    if unsafe { libc::lseek(enum_dir, 0, libc::SEEK_SET) } != 0 {
+        return false;
+    }
+    let mut listed = [0u32; 8192];
+    let mut count = 0usize;
+    let mut entries = [0u8; 4096];
+    loop {
+        // SAFETY: getdents64 fills the stack buffer; enum_dir is the live
+        // child-owned handle, never closed before this scan.
+        let filled = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                enum_dir,
+                entries.as_mut_ptr(),
+                entries.len(),
+            )
+        };
+        if filled == 0 {
+            break;
+        }
+        if filled < 0 {
+            return false;
+        }
+        let filled = filled as usize;
+        let mut at = 0;
+        while at + 19 < filled {
+            // linux_dirent64: d_ino u64, d_off i64, d_reclen u16 at 16,
+            // d_type u8 at 18, NUL-terminated d_name at 19. Plain byte
+            // reads: the stack buffer is only 1-aligned.
+            let reclen = u16::from_ne_bytes([entries[at + 16], entries[at + 17]]) as usize;
+            if reclen == 0 {
+                return false;
+            }
+            let name = at + 19;
+            let limit = at.saturating_add(reclen).min(filled);
+            let mut end = name;
+            while end < limit && entries[end] != 0 {
+                end += 1;
+            }
+            if end < limit {
+                let mut fd = 0u64;
+                let mut digits = 0u32;
+                for byte in &entries[name..end] {
+                    // Non-numeric names (`.`, `..`) never name a descriptor.
+                    if !byte.is_ascii_digit() {
+                        digits = 0;
+                        break;
+                    }
+                    fd = fd
+                        .saturating_mul(10)
+                        .saturating_add(u64::from(*byte - b'0'));
+                    if fd > u64::from(u32::MAX) {
+                        digits = 0;
+                        break;
+                    }
+                    digits += 1;
+                }
+                if digits > 0 {
+                    let fd = fd as u32;
+                    if fd >= first && fd <= last && fd != enum_dir as u32 {
+                        if count == listed.len() {
+                            return false;
+                        }
+                        listed[count] = fd;
+                        count += 1;
+                    }
+                }
+            }
+            at = at.saturating_add(reclen);
+        }
+        // Well-formed batches tile exactly; a short batch is malformed.
+        if at != filled {
+            return false;
         }
     }
+    for listed in &listed[..count] {
+        // Each number was listed exactly once above; Linux close never
+        // needs a retry.
+        unsafe { libc::close(*listed as i32) };
+    }
+    true
+}
+
+/// Sweeps `first..=last` closed one descriptor at a time, up to the hard
+/// RLIMIT_NOFILE capped at 2^20 (fs.nr_open). Last resort when `/proc` is
+/// unavailable: the hard limit still bounds every number the process could
+/// hold below fs.nr_open, but not an inheritable descriptor above it (only
+/// the enumeration reaches those). Async-signal-safe.
+unsafe fn close_sweep_range(first: u32, last: u32) -> std::result::Result<(), i32> {
     let mut limit = libc::rlimit64 {
         rlim_cur: 0,
         rlim_max: 0,
@@ -666,8 +822,7 @@ unsafe fn close_descriptor_range(
     {
         return Err(unsafe { last_errno() });
     }
-    // fs.nr_open caps descriptor numbers at 2^20 by default.
-    let end = limit.rlim_cur.min(1 << 20) as u32;
+    let end = limit.rlim_max.min(1 << 20) as u32;
     let mut fd = first;
     while fd < end && fd <= last {
         // EBADF for a free slot is expected; Linux close never needs a retry.
@@ -675,6 +830,35 @@ unsafe fn close_descriptor_range(
         fd += 1;
     }
     Ok(())
+}
+
+/// Closes `first..=last`. A fork child has a private descriptor table, so
+/// plain `close_range` (no CLOSE_RANGE_UNSHARE) closes exactly this child's
+/// copies. Where `close_range` is unavailable (ENOSYS before Linux 5.9) or
+/// denied (a seccomp policy answering EPERM), close exactly the enumerated
+/// open descriptors in range: a bounded sweep to the soft RLIMIT_NOFILE
+/// would miss inheritable descriptors above the current limit (opened before
+/// the limit was lowered) and leak them into the workload. Only when `/proc`
+/// is unavailable, sweep one by one to the hard limit.
+unsafe fn close_descriptor_range(
+    first: u32,
+    last: u32,
+    use_close_range: bool,
+    enum_dir: i32,
+) -> std::result::Result<(), i32> {
+    if use_close_range {
+        if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } == 0 {
+            return Ok(());
+        }
+        let errno = unsafe { last_errno() };
+        if errno != libc::ENOSYS && errno != libc::EPERM {
+            return Err(errno);
+        }
+    }
+    if unsafe { close_enumerated_range(first, last, enum_dir) } {
+        return Ok(());
+    }
+    unsafe { close_sweep_range(first, last) }
 }
 
 unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(), i32> {
@@ -8036,8 +8220,10 @@ mod tests {
             "closer failed: status {status:#x}"
         );
         let left = bytes
-            .chunks_exact(4)
-            .map(|chunk| i32::from_ne_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| i32::from_ne_bytes(*chunk))
             .map(|entry| (entry / 2, entry % 2 == 1))
             .collect();
         let mut expected = vec![kept.as_raw_fd(), keep[2]];
@@ -8054,6 +8240,541 @@ mod tests {
                 left,
                 expected.iter().map(|fd| (*fd, true)).collect::<Vec<_>>(),
                 "use_close_range={use_close_range}"
+            );
+        }
+    }
+
+    /// Like `descriptors_left_by_closer`, but with hundreds of unrelated
+    /// descriptors open and the fork child lowering its own RLIMIT_NOFILE
+    /// below them first (per-process: the parent's limits are untouched).
+    /// `hard` pins the child's hard limit, or keeps the current one. The
+    /// child exits 120 when its own limit setup fails.
+    fn descriptors_left_by_closer_above_limit(
+        soft: u64,
+        hard: Option<u64>,
+    ) -> (Vec<(i32, bool)>, Vec<i32>) {
+        let (mut reader, writer) = pipe_pair();
+        let null = File::open("/dev/null").unwrap();
+        let unrelated: Vec<File> = (0..600).map(|_| File::open("/dev/null").unwrap()).collect();
+        // SAFETY: dup of a live descriptor returns a new owned, inheritable one.
+        let kept = unsafe { OwnedFd::from_raw_fd(libc::dup(null.as_raw_fd())) };
+        let highest = unrelated
+            .iter()
+            .map(|file| file.as_raw_fd() as u64)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            highest > soft,
+            "the setup must push descriptors above the lowered soft limit {soft}, highest is {highest}"
+        );
+        let mut current = libc::rlimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: prlimit64 get on pid 0 with a live out-param.
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_prlimit64,
+                0,
+                libc::RLIMIT_NOFILE,
+                std::ptr::null::<libc::rlimit64>(),
+                &mut current,
+            )
+        };
+        assert_eq!(
+            read,
+            0,
+            "reading RLIMIT_NOFILE: {}",
+            io::Error::last_os_error()
+        );
+        assert!(
+            current.rlim_cur >= highest + 1,
+            "this test needs room for its own descriptors, soft limit is {}",
+            current.rlim_cur
+        );
+        let hard_target = hard.unwrap_or(current.rlim_max);
+        assert!(
+            hard_target >= soft,
+            "the child's hard limit {hard_target} must admit its soft limit {soft}"
+        );
+        // Unsorted, with a stdio entry the closer must leave alone.
+        let keep = [kept.as_raw_fd(), 1, writer.as_raw_fd()];
+        // SAFETY: the child runs only raw syscalls on stack data, then _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                let lowered = libc::rlimit64 {
+                    rlim_cur: soft,
+                    rlim_max: hard_target,
+                };
+                if libc::syscall(
+                    libc::SYS_prlimit64,
+                    0,
+                    libc::RLIMIT_NOFILE,
+                    &lowered,
+                    std::ptr::null::<libc::rlimit64>(),
+                ) != 0
+                {
+                    libc::_exit(120);
+                }
+                // SAFETY: as above; every descriptor named here is live or probed.
+                let code = match close_inherited_descriptors(keep, false) {
+                    Ok(()) => 0,
+                    Err(errno) => errno,
+                };
+                let mut report = [0i32; 64];
+                let mut used = 0;
+                for fd in 3..8192 {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 && used < report.len() {
+                        report[used] = fd * 2 + i32::from(flags & libc::FD_CLOEXEC != 0);
+                        used += 1;
+                    }
+                }
+                libc::write(
+                    writer.as_raw_fd(),
+                    report.as_ptr().cast(),
+                    used * std::mem::size_of::<i32>(),
+                );
+                libc::_exit(code);
+            }
+        }
+        drop(writer);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        let status = reap_blocking(pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "closer failed above the lowered limit: status {status:#x} (120 pins the child's own setrlimit)"
+        );
+        let left = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| i32::from_ne_bytes(*chunk))
+            .map(|entry| (entry / 2, entry % 2 == 1))
+            .collect();
+        let mut expected = vec![kept.as_raw_fd(), keep[2]];
+        expected.sort();
+        drop((null, unrelated));
+        (left, expected)
+    }
+
+    /// DR-RUN-FD regression: a fallback bounded by the soft RLIMIT_NOFILE
+    /// misses inheritable descriptors opened before the limit was lowered
+    /// (a shell's `exec 900>f` surviving `ulimit -Sn 512`) and leaks them
+    /// into the workload. The enumeration must close above the soft limit.
+    #[test]
+    fn the_fallback_closes_descriptors_above_the_soft_limit() {
+        let (left, expected) = descriptors_left_by_closer_above_limit(512, None);
+        assert_eq!(
+            left,
+            expected.iter().map(|fd| (*fd, true)).collect::<Vec<_>>(),
+            "the enumeration must close above the soft limit"
+        );
+    }
+
+    /// Only the enumeration reaches above the hard limit (lowered below open
+    /// descriptors by a privileged ancestor): the bounded sweep honestly
+    /// stops there.
+    #[test]
+    fn the_fallback_closes_descriptors_above_the_hard_limit() {
+        let (left, expected) = descriptors_left_by_closer_above_limit(256, Some(256));
+        assert_eq!(
+            left,
+            expected.iter().map(|fd| (*fd, true)).collect::<Vec<_>>(),
+            "only enumeration reaches above the hard limit"
+        );
+    }
+
+    /// The bounded sweep (the no-/proc last resort) reaches past the soft
+    /// limit to the hard one. A single high descriptor past a lowered soft
+    /// limit closes; the out-of-range report pipe is untouched.
+    #[test]
+    fn the_bounded_sweep_reaches_past_the_soft_limit() {
+        let (mut reader, writer) = pipe_pair();
+        let unrelated: Vec<File> = (0..600).map(|_| File::open("/dev/null").unwrap()).collect();
+        let target = unrelated.iter().map(|file| file.as_raw_fd()).max().unwrap();
+        assert!(
+            target > 512,
+            "the setup must push a descriptor above the lowered soft limit, highest is {target}"
+        );
+        let writer_fd = writer.as_raw_fd();
+        // SAFETY: the child runs only raw syscalls on stack data, then _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                let lowered = libc::rlimit64 {
+                    rlim_cur: 512,
+                    rlim_max: 4096,
+                };
+                if libc::syscall(
+                    libc::SYS_prlimit64,
+                    0,
+                    libc::RLIMIT_NOFILE,
+                    &lowered,
+                    std::ptr::null::<libc::rlimit64>(),
+                ) != 0
+                {
+                    libc::_exit(120);
+                }
+                // SAFETY: sweeping one live number; the report pipe is out
+                // of range.
+                let code = match close_sweep_range(target as u32, target as u32) {
+                    Ok(()) => 0,
+                    Err(errno) => errno,
+                };
+                let target_open = i32::from(libc::fcntl(target, libc::F_GETFD) >= 0);
+                let writer_open = i32::from(libc::fcntl(writer_fd, libc::F_GETFD) >= 0);
+                let report = [target_open, writer_open];
+                libc::write(
+                    writer_fd,
+                    report.as_ptr().cast(),
+                    report.len() * std::mem::size_of::<i32>(),
+                );
+                libc::_exit(code);
+            }
+        }
+        drop(writer);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        let status = reap_blocking(pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "sweep failed: status {status:#x} (120 pins the child's own setrlimit)"
+        );
+        let report: Vec<i32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| i32::from_ne_bytes(*chunk))
+            .collect();
+        assert_eq!(
+            report.as_slice(),
+            &[0, 1],
+            "the sweep must close the high target and leave the pipe"
+        );
+        drop(unrelated);
+    }
+
+    /// One dense-table attempt: fills every number below the soft limit the
+    /// child then pins, proves the density with a probe open (EMFILE), and
+    /// runs the closer. Returns `None` when parallel churn opened a hole
+    /// before the fork (the probe succeeds), so the caller retries; the
+    /// closer result otherwise.
+    fn dense_table_attempt() -> Option<(Vec<(i32, bool)>, Vec<i32>)> {
+        let (mut reader, writer) = pipe_pair();
+        let null = File::open("/dev/null").unwrap();
+        let unrelated: Vec<File> = (0..600).map(|_| File::open("/dev/null").unwrap()).collect();
+        // First free number: everything below is occupied, so pinning the
+        // limits there leaves the child no free number at all.
+        let mut edge = 3u32;
+        // SAFETY: fcntl probes of numbers below the soft limit.
+        while unsafe { libc::fcntl(edge as i32, libc::F_GETFD) } >= 0 {
+            edge += 1;
+        }
+        // Doomed descriptors at and above the edge: the bounded sweep stops
+        // below them, so only the victim-fed enumeration passes. Lowest-free
+        // allocation lands them here unless parallel churn freed a lower
+        // number after the scan (then this attempt retries).
+        let high: Vec<File> = (0..64).map(|_| File::open("/dev/null").unwrap()).collect();
+        if high.iter().any(|file| (file.as_raw_fd() as u32) < edge) {
+            return None;
+        }
+        // SAFETY: dup of a live descriptor returns a new owned, inheritable one.
+        let kept = unsafe { OwnedFd::from_raw_fd(libc::dup(null.as_raw_fd())) };
+        // Unsorted, with a stdio entry the closer must leave alone.
+        let keep = [kept.as_raw_fd(), 1, writer.as_raw_fd()];
+        // SAFETY: the child runs only raw syscalls on stack data, then _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                let lowered = libc::rlimit64 {
+                    rlim_cur: u64::from(edge),
+                    rlim_max: u64::from(edge),
+                };
+                if libc::syscall(
+                    libc::SYS_prlimit64,
+                    0,
+                    libc::RLIMIT_NOFILE,
+                    &lowered,
+                    std::ptr::null::<libc::rlimit64>(),
+                ) != 0
+                {
+                    libc::_exit(120);
+                }
+                // Density probe: a raw open must fail with EMFILE (a hole
+                // opened by parallel churn after the scan retries instead).
+                const SELF_FD: &[u8; 14] = b"/proc/self/fd\0";
+                let probe = libc::open(
+                    SELF_FD.as_ptr().cast(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                );
+                let dense = i32::from(probe < 0 && last_errno() == libc::EMFILE);
+                if probe >= 0 {
+                    libc::close(probe);
+                }
+                let mut report = [0i32; 65];
+                report[0] = dense;
+                let mut used = 1;
+                let mut code = 0;
+                if dense == 1 {
+                    // SAFETY: as above; the sweep alone cannot reach the
+                    // descriptors above the pinned edge, so only the
+                    // victim-fed enumeration passes.
+                    code = match close_inherited_descriptors(keep, false) {
+                        Ok(()) => 0,
+                        Err(errno) => errno,
+                    };
+                    for fd in 3..8192 {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags >= 0 && used < report.len() {
+                            report[used] = fd * 2 + i32::from(flags & libc::FD_CLOEXEC != 0);
+                            used += 1;
+                        }
+                    }
+                }
+                libc::write(
+                    writer.as_raw_fd(),
+                    report.as_ptr().cast(),
+                    used * std::mem::size_of::<i32>(),
+                );
+                libc::_exit(code);
+            }
+        }
+        drop(writer);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        let status = reap_blocking(pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "closer failed in a dense table: status {status:#x} (120 pins the child's own setrlimit)"
+        );
+        let report: Vec<i32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| i32::from_ne_bytes(*chunk))
+            .collect();
+        let (dense, entries) = report.split_first().unwrap();
+        if *dense != 1 {
+            return None;
+        }
+        let left = entries
+            .iter()
+            .map(|entry| (entry / 2, entry % 2 == 1))
+            .collect();
+        let mut expected = vec![kept.as_raw_fd(), keep[2]];
+        expected.sort();
+        drop((null, unrelated, high));
+        Some((left, expected))
+    }
+
+    /// A dense table under a lowered limit leaves no free number for the
+    /// enumeration handle itself: the closer frees one sacrificial non-keep
+    /// descriptor and still closes exactly. The pinned edge also sits below
+    /// open descriptors, so the bounded sweep alone cannot pass.
+    #[test]
+    fn the_fallback_frees_a_number_in_a_dense_table() {
+        let mut held = None;
+        for _ in 0..8 {
+            if let Some(result) = dense_table_attempt() {
+                held = Some(result);
+                break;
+            }
+        }
+        let Some((left, expected)) = held else {
+            panic!("the dense-table setup never held for 8 attempts");
+        };
+        assert_eq!(
+            left,
+            expected.iter().map(|fd| (*fd, true)).collect::<Vec<_>>(),
+            "the victim-fed enumeration must close exactly"
+        );
+    }
+
+    /// Forks, installs a one-rule seccomp filter failing `close_range` with
+    /// `refuse_errno` in the child, runs the closer over low descriptors,
+    /// and reports (filter-install errno, closer errno, descriptors left,
+    /// expected keeps, sample unrelated numbers). The child exits 0 on every
+    /// reported path; install failures are data, so the caller can skip when
+    /// the kernel cannot install filters (ENOSYS/EPERM) and fail otherwise.
+    fn closer_with_refused_close_range(
+        refuse_errno: i32,
+    ) -> (i32, i32, Vec<(i32, bool)>, Vec<i32>, Vec<i32>) {
+        let (mut reader, writer) = pipe_pair();
+        let null = File::open("/dev/null").unwrap();
+        let unrelated: Vec<File> = (0..3).map(|_| File::open("/dev/null").unwrap()).collect();
+        // SAFETY: dup of a live descriptor returns a new owned, inheritable one.
+        let kept = unsafe { OwnedFd::from_raw_fd(libc::dup(null.as_raw_fd())) };
+        let trailing = File::open("/dev/null").unwrap();
+        // Unsorted, with a stdio entry the closer must leave alone.
+        let keep = [kept.as_raw_fd(), 1, writer.as_raw_fd()];
+        let sample = vec![
+            null.as_raw_fd(),
+            unrelated[0].as_raw_fd(),
+            trailing.as_raw_fd(),
+        ];
+        // SAFETY: the child runs only raw syscalls on stack data, then _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                // Classic BPF: A is the syscall number (seccomp_data.nr at
+                // offset 0); refuse close_range, allow everything else.
+                let mut filter = [
+                    libc::sock_filter {
+                        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                        jt: 0,
+                        jf: 0,
+                        k: 0,
+                    },
+                    libc::sock_filter {
+                        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                        jt: 0,
+                        jf: 1,
+                        k: libc::SYS_close_range as u32,
+                    },
+                    libc::sock_filter {
+                        code: (libc::BPF_RET | libc::BPF_K) as u16,
+                        jt: 0,
+                        jf: 0,
+                        k: libc::SECCOMP_RET_ERRNO | refuse_errno as u32,
+                    },
+                    libc::sock_filter {
+                        code: (libc::BPF_RET | libc::BPF_K) as u16,
+                        jt: 0,
+                        jf: 0,
+                        k: libc::SECCOMP_RET_ALLOW,
+                    },
+                ];
+                let program = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_mut_ptr(),
+                };
+                let mut install_errno = 0;
+                if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    install_errno = last_errno();
+                } else if libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER,
+                    0,
+                    &program,
+                ) != 0
+                {
+                    install_errno = last_errno();
+                }
+                let mut report = [0i32; 66];
+                report[0] = install_errno;
+                let mut used = 2;
+                if install_errno == 0 {
+                    // SAFETY: as above; every descriptor named here is live
+                    // or probed.
+                    report[1] = match close_inherited_descriptors(keep, true) {
+                        Ok(()) => 0,
+                        Err(errno) => errno,
+                    };
+                    for fd in 3..8192 {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags >= 0 && used < report.len() {
+                            report[used] = fd * 2 + i32::from(flags & libc::FD_CLOEXEC != 0);
+                            used += 1;
+                        }
+                    }
+                } else {
+                    report[1] = -1;
+                }
+                libc::write(
+                    writer.as_raw_fd(),
+                    report.as_ptr().cast(),
+                    used * std::mem::size_of::<i32>(),
+                );
+                libc::_exit(0);
+            }
+        }
+        drop(writer);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        let status = reap_blocking(pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "refused-close_range child failed: status {status:#x}"
+        );
+        let report: Vec<i32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| i32::from_ne_bytes(*chunk))
+            .collect();
+        assert!(
+            report.len() >= 2,
+            "the child reports install and closer errnos first"
+        );
+        let left = report[2..]
+            .iter()
+            .map(|entry| (entry / 2, entry % 2 == 1))
+            .collect();
+        let mut expected = vec![kept.as_raw_fd(), keep[2]];
+        expected.sort();
+        drop((null, unrelated, trailing));
+        (report[0], report[1], left, expected, sample)
+    }
+
+    /// Returns false (after noting why) when the seccomp filter cannot be
+    /// installed here, so the refused-close_range tests skip instead of
+    /// failing where the kernel forbids them.
+    fn close_range_refusal_available(install_errno: i32) -> bool {
+        if install_errno == 0 {
+            return true;
+        }
+        if install_errno == libc::ENOSYS || install_errno == libc::EPERM {
+            eprintln!(
+                "skipping: this kernel cannot install the close_range refusal filter: {}",
+                io::Error::from_raw_os_error(install_errno)
+            );
+            return false;
+        }
+        panic!(
+            "installing the close_range refusal filter failed: {}",
+            io::Error::from_raw_os_error(install_errno)
+        );
+    }
+
+    /// ENOSYS (pre-5.9) and EPERM (a seccomp denial) both engage the
+    /// fallback: the keep set still survives exactly, close-on-exec.
+    #[test]
+    fn the_fallback_engages_when_close_range_is_refused() {
+        for refuse_errno in [libc::EPERM, libc::ENOSYS] {
+            let (install, closer, left, expected, _) =
+                closer_with_refused_close_range(refuse_errno);
+            if !close_range_refusal_available(install) {
+                return;
+            }
+            assert_eq!(closer, 0, "refuse errno {refuse_errno}");
+            assert_eq!(
+                left,
+                expected.iter().map(|fd| (*fd, true)).collect::<Vec<_>>(),
+                "refuse errno {refuse_errno}"
+            );
+        }
+    }
+
+    /// Any other close_range failure is a real error, not a fallback: the
+    /// closer reports it and closes nothing.
+    #[test]
+    fn a_close_range_failure_other_than_enosys_or_eperm_is_an_error() {
+        let (install, closer, left, _, sample) = closer_with_refused_close_range(libc::EINVAL);
+        if !close_range_refusal_available(install) {
+            return;
+        }
+        assert_eq!(closer, libc::EINVAL);
+        for fd in sample {
+            assert!(
+                left.iter().any(|(open, _)| *open == fd),
+                "fd {fd} was closed without the fallback: {left:?}"
             );
         }
     }
@@ -13305,18 +14026,10 @@ mod tests {
         unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 }
     }
 
-    /// One isolated fidelity observer (G7): `phase` 1 plays an observer
-    /// started with every stop signal ignored, `phase` 2 one started
-    /// normally. Panic-free by construction like
-    /// `sigkill_probe_intermediate`: this runs in a fork child that shares
-    /// the test binary's address space, so every failure writes one
-    /// diagnostic line and exits with a distinct code instead of unwinding
-    /// into the harness. Exit 0 with the `OK` line on success; 11-19 fail
-    /// phase 1, 21-29 phase 2.
-    /// A raw fork of this multi-threaded test binary inherits every sibling
-    /// test's descriptors, an OwnedChild handoff pipe in flight included,
-    /// and holds them for as long as it runs (DR-RUN-FD). Keep stdio and the
-    /// report pipe only.
+    /// Close every descriptor a raw fork of this multi-threaded test binary
+    /// inherited but stdio and the report pipe (DR-RUN-FD): a sibling test's
+    /// descriptors, an OwnedChild handoff pipe in flight included, would
+    /// otherwise stay open for as long as the fork child runs.
     fn close_inherited_in_test_fork(writer: &File) {
         // SAFETY: called first in the fork child; raw syscalls on stack data.
         if let Err(errno) = unsafe { close_inherited_descriptors([writer.as_raw_fd()], true) } {
@@ -13325,6 +14038,14 @@ mod tests {
         }
     }
 
+    /// One isolated fidelity observer (G7): `phase` 1 plays an observer
+    /// started with every stop signal ignored, `phase` 2 one started
+    /// normally. Panic-free by construction like
+    /// `sigkill_probe_intermediate`: this runs in a fork child that shares
+    /// the test binary's address space, so every failure writes one
+    /// diagnostic line and exits with a distinct code instead of unwinding
+    /// into the harness. Exit 0 with the `OK` line on success; 11-19 fail
+    /// phase 1, 21-29 phase 2.
     fn isolated_fidelity_observer(writer: File, sleeper: &Path, phase: u8) -> ! {
         use std::os::fd::AsRawFd as _;
 

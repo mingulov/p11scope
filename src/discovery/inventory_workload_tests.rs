@@ -2601,7 +2601,7 @@ mod c1b {
     }
 
     #[test]
-    fn budget_refusals_past_the_cap_aggregate_into_one_gap_per_pass() {
+    fn identical_budget_refusal_aggregates_across_passes_into_one_repeated_gap() {
         let limits = RegistryLimits::new(100, 4096, 32768, 1024, 1_048_576, 32768).unwrap();
         let mut harness = Harness::new(limits).unwrap();
         for pid in (REP..REP + CALLERS).chain(20_000..20_000 + IDLE) {
@@ -2618,11 +2618,13 @@ mod c1b {
             .iter()
             .filter(|gap| gap["subject"] == "caller admission failed")
             .collect();
+        // Two passes publish the identical aggregate: one gap, repeated.
         assert_eq!(
             refusals.len(),
-            2,
-            "one per pass, not one per pid: {refusals:?}"
+            1,
+            "one per distinct aggregate, not per pid or pass: {refusals:?}"
         );
+        assert_eq!(refusals[0]["repeats"], 2, "{refusals:?}");
         for gap in refusals {
             assert!(
                 gap["reason"]

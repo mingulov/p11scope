@@ -41,9 +41,25 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `{event: admit_failed, pid, reason, budget}` where `budget` is
   `{resource, limit, requested}` or null (the same budget shape
   snapshot gaps carry).
-- `gap_recorded`: `{caller, module, pid, subject, reason, budget}` —
-  IDENTICAL in shape and meaning to a snapshot `gaps[]` entry. A
-  refused capture produces stream gaps identical to snapshot gaps.
+- `gap_recorded`: `{index, caller, module, pid, subject, reason,
+  budget}` — a snapshot `gaps[]` entry minus `repeats`, plus its
+  ordinal `index` (equal to its snapshot `gaps[]` index): gap identity
+  only. Gap identity fields equal the snapshot's; `repeats` rides
+  `gap_repeated`. Emitted once per distinct gap, on its first
+  occurrence, in `gaps[]` order.
+- `gap_repeated`: `{index, repeats}` — the gap with that `index` now
+  stands at `repeats` (cumulative, integer >= 2). `index` joins on the
+  `gap_recorded` of the same `index`, so a consumer reading lines
+  independently, or after rotation, resolves it explicitly. Mid-run it
+  is emitted only when a gap's count crosses a power of two (2, 4, 8, …),
+  so a steady recurring gap costs O(log passes) lines per run and the
+  stream goes quiet; mid-run values are lower bounds. One exact flush of
+  every gap whose count differs from its last emitted value is written
+  just before `ended` on every clean termination, so the last
+  `gap_repeated` per index (1 if none) equals the snapshot's
+  `gaps[].repeats`. A stream without `ended` was cut short (an
+  error exit, or a signal on the non-dashboard path); its last
+  values are lower bounds.
 - `pass_committed`: `{pass, scanned, maps_matched, native_callers,
   scan_callers, totals: {callers, modules, edges}, new_gaps,
   suppressed_delta, gaps_suppressed}` — what the pass scanned and what
@@ -108,7 +124,7 @@ is a hard run error, never a silent truncation.
 Privacy bounds and loss accounting apply EXACTLY as to snapshots:
 caller/module payloads carry exactly the snapshot caller/module keys;
 edge payloads add only the three derived states; gap payloads equal
-snapshot gaps; no new capture exists anywhere in the stream. Gap
+snapshot gaps' identity fields (`repeats` replays from `gap_repeated`); no new capture exists anywhere in the stream. Gap
 retention (`gaps_suppressed`) and budget refusals mirror the snapshot
 document pass for pass.
 

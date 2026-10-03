@@ -283,8 +283,24 @@ fn event_stream_command_level_with_rotation_and_conservation() {
         .collect();
     let document_gaps = document["gaps"].as_array().unwrap();
     assert_eq!(stream_gaps.len(), document_gaps.len());
-    for (stream, snapshot) in stream_gaps.iter().zip(document_gaps.iter()) {
-        assert_eq!(stream, &snapshot);
+    // gap_recorded is identity only; `repeats` is replayed from the
+    // gap_repeated deltas and must equal the snapshot's.
+    let mut repeats = vec![1u64; stream_gaps.len()];
+    for line in lines.iter().filter(|line| line["kind"] == "gap_repeated") {
+        let index = line["event"]["index"].as_u64().unwrap() as usize;
+        repeats[index] = line["event"]["repeats"].as_u64().unwrap();
+    }
+    for (position, ((stream, snapshot), repeats)) in stream_gaps
+        .iter()
+        .zip(document_gaps.iter())
+        .zip(repeats)
+        .enumerate()
+    {
+        let mut replayed = (*stream).clone();
+        assert_eq!(replayed["index"], position, "ordinal index");
+        replayed.as_object_mut().unwrap().remove("index");
+        replayed["repeats"] = repeats.into();
+        assert_eq!(&replayed, snapshot);
     }
     // Second: a tiny threshold forces rotation + eviction; exact
     // conservation (retained + accounted == emitted) holds.

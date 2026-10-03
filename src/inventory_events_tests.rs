@@ -110,8 +110,12 @@ fn stream_gaps_are_identical_in_meaning_to_snapshot_gaps() {
         .collect();
     let snapshot_gaps = document["gaps"].as_array().unwrap();
     assert_eq!(stream_gaps.len(), snapshot_gaps.len());
-    for (stream, snapshot) in stream_gaps.iter().zip(snapshot_gaps.iter()) {
-        assert_eq!(stream, &snapshot, "gap event == snapshot gap");
+    for (position, (stream, snapshot)) in stream_gaps.iter().zip(snapshot_gaps.iter()).enumerate() {
+        // gap_recorded is the snapshot entry minus `repeats`.
+        let mut identity = (*snapshot).clone();
+        identity.as_object_mut().unwrap().remove("repeats");
+        identity["index"] = serde_json::json!(position);
+        assert_eq!(**stream, identity, "gap event == snapshot gap identity");
     }
     let refusal = &stream_gaps[0];
     assert_eq!(refusal["budget"]["resource"], "callers");
@@ -368,18 +372,14 @@ fn incremental_pass_events_match_the_final_snapshot() {
     );
     // Emit the pass the way production does (caller turnover, new
     // gaps, pass marker).
-    let mut emitted_gaps = 0;
     for event in &events {
         writer
             .append("caller_event", caller_event_payload(event), now)
             .unwrap();
     }
-    for gap in presentation.gaps.iter().skip(emitted_gaps) {
-        writer
-            .append("gap_recorded", gap_payload(gap), now)
-            .unwrap();
-    }
-    emitted_gaps = presentation.gaps.len();
+    let emitted_gaps = GapEmitter::new()
+        .emit(&mut writer, &presentation.gaps, false, now)
+        .unwrap();
     assert!(emitted_gaps > 0);
     drop(writer);
     let lines = read_stream(dir.path(), "events.jsonl");
@@ -397,8 +397,11 @@ fn incremental_pass_events_match_the_final_snapshot() {
         .collect();
     let snapshot_gaps = document["gaps"].as_array().unwrap();
     assert_eq!(stream_gaps.len(), snapshot_gaps.len());
-    for (stream, snapshot) in stream_gaps.iter().zip(snapshot_gaps.iter()) {
-        assert_eq!(stream, &snapshot);
+    for (position, (stream, snapshot)) in stream_gaps.iter().zip(snapshot_gaps.iter()).enumerate() {
+        let mut identity = (*snapshot).clone();
+        identity.as_object_mut().unwrap().remove("repeats");
+        identity["index"] = serde_json::json!(position);
+        assert_eq!(**stream, identity);
     }
 }
 
@@ -452,5 +455,80 @@ fn rotation_sequences_never_collide_across_runs() {
     // All retained lines still parse (both runs' markers intact).
     for (_, line) in read_stream(dir.path(), "events.jsonl") {
         assert_eq!(line["schema"], EVENT_SCHEMA);
+    }
+}
+
+/// DR-K8S-4: a gap repeated on every pass is one gap with a repeat
+/// count, and the snapshot, the event stream and the presentation the
+/// dashboard renders all agree on both.
+#[test]
+fn snapshot_events_and_dashboard_agree_on_a_repeated_gap() {
+    use crate::discovery::caller_registry::RegistryGap;
+    let mut harness = limited(8);
+    for pass in 0..20 {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "overlay collapse".into(),
+                reason: "two overlay instances map one inode".into(),
+                budget: None,
+            });
+        if pass == 9 {
+            harness
+                .coordinator_mut()
+                .registry_mut()
+                .record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: Some(5),
+                    subject: "distinct".into(),
+                    reason: "seen once".into(),
+                    budget: None,
+                });
+        }
+        harness.commit();
+    }
+    let (presentation, document) = presentation_for(&harness);
+    let json_gaps = document["gaps"].as_array().unwrap();
+    assert_eq!(json_gaps.len(), 2, "{json_gaps:?}");
+    assert_eq!(json_gaps[0]["subject"], "overlay collapse");
+    assert_eq!(json_gaps[0]["repeats"], 20);
+    assert_eq!(json_gaps[1]["repeats"], 1);
+    assert_eq!(document["gaps_suppressed"], 0);
+    // Dashboard/snapshot consumers read the same view.
+    let view: Vec<u64> = presentation.gaps.iter().map(|gap| gap.repeats).collect();
+    assert_eq!(view, vec![20, 1]);
+    // The event stream: one gap_recorded per distinct gap, carrying the
+    // same payload as the snapshot entry.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 4).unwrap();
+    emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    let stream: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "gap_recorded")
+        .map(|(_, line)| &line["event"])
+        .collect();
+    assert_eq!(stream.len(), 2);
+    let repeated: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|(_, line)| line["kind"] == "gap_repeated")
+        .map(|(_, line)| &line["event"])
+        .collect();
+    assert_eq!(
+        repeated,
+        vec![&serde_json::json!({"index": 0, "repeats": 20})]
+    );
+    for (position, (stream, snapshot)) in stream.iter().zip(json_gaps).enumerate() {
+        let mut identity = (*snapshot).clone();
+        identity.as_object_mut().unwrap().remove("repeats");
+        identity["index"] = serde_json::json!(position);
+        assert_eq!(**stream, identity);
     }
 }

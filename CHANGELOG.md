@@ -7,6 +7,23 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [Unreleased]
 
+### Inventory
+
+- `inventory` publishes each distinct gap once per run. An identical gap
+  recorded again (for example the overlay-collapse gap on every pass) no
+  longer adds an entry or consumes `--max-gaps` budget; `gaps[].repeats`
+  (integer >= 1, additive within `p11scope/inventory/v1`) counts the
+  recordings. The event stream emits `gap_recorded` (identity only) on
+  the first occurrence (now with an ordinal `index`) and
+  `gap_repeated{index, repeats}` only when a gap's count crosses a power of
+  two, plus one exact flush before `ended`, so a replayed stream equals the
+  snapshot while a steady recurring gap lets the stream go quiet.
+  A suppressed gap that recurs is counted once in `gaps_suppressed` while
+  the registry remembers it (up to 4096 distinct suppressed gaps; past
+  that a recurrence of an unremembered one counts again, so the counter
+  can over-count; it under-counts only on a 64-bit fingerprint
+  collision, about 2^-40 likely).
+
 ### Kubernetes deployment
 
 - `deploy/k8s` is now a least-privilege node DaemonSet: capabilities

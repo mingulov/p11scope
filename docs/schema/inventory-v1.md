@@ -422,6 +422,28 @@ PID namespaces.
   exhausted…` with the budget, or `N pids could not be admitted this
   pass; first: pid P: …`). Absence from the document is never evidence of
   absence; `gaps_suppressed` counts gaps dropped past the bound.
+  A gap is published once per run: a gap identical to one already
+  published (every published field equal: `caller`, `module`, `pid`,
+  `subject`, `reason`, `budget`; gaps carry no time or pass-specific
+  field) is not added again. `repeats` (integer >= 1, additive within
+  v1) counts the recordings of identical published fields, 1 for a gap seen
+  once. A condition whose published text is identical on every pass is
+  one entry with `repeats` equal to the passes; one whose text changes
+  (an aggregate carrying a per-pass count, "N admissions refused this
+  pass") is a distinct gap each time, and different underlying objects
+  with identical published fields (for example "module capacity
+  exhausted" for several refused modules) share one entry whose
+  `repeats` counts all of their recordings. Repeats consume no `--max-gaps` budget and are never
+  `gaps_suppressed`; only distinct gaps past the bound are, and each
+  distinct suppressed gap counts once however often it recurs. The
+  registry remembers up to 4096 suppressed gaps for this (64-bit
+  keyed-hash fingerprints of the identity fields); past that, a
+  recurrence of an unremembered suppressed gap counts again, so
+  `gaps_suppressed` can then over-count. It under-counts only on a
+  64-bit fingerprint collision (about 2^-40 likely). Gaps
+  about a module absent from the registry name its key (device and inode,
+  or path) in the `reason`, so different modules stay distinct gaps. The first
+  occurrence keeps its position in `gaps[]`.
   A gap that records a budget refusal carries `budget` with the
   `resource`, its `limit`, and the `requested` occupancy; every other
   gap carries `budget: null`. Run-lifetime admission refusals name the
@@ -520,7 +542,7 @@ PID namespaces.
     {"caller": null, "module": null, "pid": null,
      "subject": "exact image authority unavailable",
      "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection",
-     "budget": null}
+     "budget": null, "repeats": 1}
   ],
   "gaps_suppressed": 0
 }

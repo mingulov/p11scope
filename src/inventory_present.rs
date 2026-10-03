@@ -348,6 +348,8 @@ pub(crate) struct GapView {
     pub subject: String,
     pub reason: String,
     pub budget: Option<BudgetRefusal>,
+    /// How many times this identical gap was recorded this run (>= 1).
+    pub repeats: u64,
 }
 
 /// Every budgeted resource with limit, occupancy, and loss counter.
@@ -561,13 +563,15 @@ impl Presentation {
         let gaps = registry
             .gaps()
             .iter()
-            .map(|gap| GapView {
+            .zip(registry.gap_repeats())
+            .map(|(gap, &repeats)| GapView {
                 caller: gap.caller,
                 module: gap.module,
                 pid: gap.pid,
                 subject: gap.subject.clone(),
                 reason: gap.reason.clone(),
                 budget: gap.budget,
+                repeats,
             })
             .collect();
         let limits = registry.limits();

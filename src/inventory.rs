@@ -27,7 +27,7 @@ use crate::inventory_dashboard::{
     RawModeGuard, StopFlag, TerminalGuard, Viewport, poll_key, render_frame, stdout_terminal,
 };
 use crate::inventory_events::{
-    EventWriter, caller_event_payload, ended_payload, gap_payload, pass_payload, started_payload,
+    EventWriter, GapEmitter, caller_event_payload, ended_payload, pass_payload, started_payload,
 };
 use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, render_snapshot};
 use crate::output::AtomicFile;
@@ -260,7 +260,15 @@ fn run_with_writer(
         ended_ns,
         window_ns,
     );
-    finish_output(sink, stream.as_mut(), &presentation, json, false, stdout)
+    finish_output(
+        sink,
+        stream.as_mut(),
+        &mut stream_state,
+        &presentation,
+        json,
+        false,
+        stdout,
+    )
 }
 
 /// Final sinks, shared by the classic and dashboard paths: the event
@@ -270,6 +278,7 @@ fn run_with_writer(
 fn finish_output(
     sink: Option<AtomicFile>,
     stream: Option<&mut EventWriter>,
+    stream_state: &mut StreamState,
     presentation: &Presentation,
     json: bool,
     silent_text: bool,
@@ -277,6 +286,12 @@ fn finish_output(
 ) -> Result<i32> {
     let document = render_json_from_presentation(presentation);
     if let Some(writer) = stream {
+        // Exact repeat counts before `ended`, on every termination path:
+        // the last `gap_repeated` per index then equals the snapshot.
+        stream_state
+            .gaps
+            .emit(writer, &presentation.gaps, true, presentation.ended_ns)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let payload = ended_payload(presentation, presentation.ended_ns, writer);
         writer
             .finish(payload, presentation.ended_ns)
@@ -356,14 +371,14 @@ fn scan_one_pass(
 /// so an index plus the suppressed counter replays exactly the new
 /// loss on every pass.
 struct StreamState {
-    emitted_gaps: usize,
+    gaps: GapEmitter,
     emitted_suppressed: u64,
 }
 
 impl StreamState {
     fn new() -> Self {
         Self {
-            emitted_gaps: 0,
+            gaps: GapEmitter::new(),
             emitted_suppressed: 0,
         }
     }
@@ -383,11 +398,7 @@ fn emit_pass_events(
     for event in &report.events {
         writer.append("caller_event", caller_event_payload(event), now_ns)?;
     }
-    let fresh = presentation.gaps.len().saturating_sub(state.emitted_gaps);
-    for gap in presentation.gaps.iter().skip(state.emitted_gaps) {
-        writer.append("gap_recorded", gap_payload(gap), now_ns)?;
-    }
-    state.emitted_gaps = presentation.gaps.len();
+    let fresh = state.gaps.emit(writer, &presentation.gaps, false, now_ns)?;
     let suppressed_delta = presentation
         .gaps_suppressed
         .saturating_sub(state.emitted_suppressed);
@@ -476,6 +487,7 @@ fn run_dashboard_loop(
                             &handoff,
                             sink,
                             stream,
+                            stream_state,
                             json,
                             stdout,
                             _term_guard,
@@ -527,6 +539,7 @@ fn run_dashboard_loop(
                 &handoff,
                 sink,
                 stream,
+                stream_state,
                 json,
                 stdout,
                 _term_guard,
@@ -543,6 +556,7 @@ fn run_dashboard_loop(
                 &handoff,
                 sink,
                 stream,
+                stream_state,
                 json,
                 stdout,
                 _term_guard,
@@ -623,6 +637,7 @@ fn finish_dashboard(
     handoff: &DisplayHandoff,
     sink: Option<AtomicFile>,
     mut stream: Option<EventWriter>,
+    mut stream_state: StreamState,
     json: bool,
     stdout: &mut dyn std::io::Write,
     _term_guard: TerminalGuard,
@@ -652,7 +667,15 @@ fn finish_dashboard(
         handoff.consumed(),
         handoff.dropped_frames(),
     );
-    finish_output(sink, stream.as_mut(), &presentation, json, true, stdout)
+    finish_output(
+        sink,
+        stream.as_mut(),
+        &mut stream_state,
+        &presentation,
+        json,
+        true,
+        stdout,
+    )
 }
 
 /// Per-pass progress lines (stdout stays parseable): what the pass
@@ -1045,6 +1068,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
                     "limit": refusal.limit,
                     "requested": refusal.requested,
                 })).unwrap_or(serde_json::Value::Null),
+                "repeats": gap.repeats,
             })
         })
         .collect();
@@ -1410,5 +1434,164 @@ mod tests {
                 .any(|line| line.ends_with("cannot pin /tmp/evil\\u{1b}[2J\\u{7}")),
             "{lines:?}"
         );
+    }
+
+    /// DR-K8S-4 through the real per-pass emitter: one identical gap over
+    /// three passes is one `gap_recorded` plus `gap_repeated` deltas, and
+    /// replaying the stream reproduces the snapshot's `repeats` exactly.
+    #[test]
+    fn the_real_pass_emitter_streams_repeats_that_equal_the_snapshot() {
+        use crate::discovery::caller_registry::RegistryGap;
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        let mut coordinator = coordinator();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
+        let mut state = StreamState::new();
+        for pass in 1..=3u64 {
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "overlay collapse".into(),
+                reason: "two overlay instances map one inode".into(),
+                budget: None,
+            });
+            if pass == 2 {
+                coordinator.registry_mut().record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: Some(9),
+                    subject: "once".into(),
+                    reason: "only on pass 2".into(),
+                    budget: None,
+                });
+            }
+            coordinator.commit_batch(false).unwrap();
+            let report = PassReport {
+                pass,
+                scanned: 0,
+                maps_matched: 0,
+                native_callers: 0,
+                scan_callers: 0,
+                engine_changed: false,
+                pending_refresh: Vec::new(),
+                events: Vec::new(),
+                timings: crate::timing::StageTimings::new(),
+            };
+            let presentation =
+                Presentation::capture(&coordinator, "pid", 0, pass, pass, pass, pass);
+            emit_pass_events(&mut writer, &mut state, &report, &presentation, pass).unwrap();
+        }
+        // The pre-`ended` flush makes the last value per index exact.
+        let last = Presentation::capture(&coordinator, "pid", 0, 3, 3, 3, 3);
+        // Through the real terminal path: flush, then `ended`.
+        let mut sink = Vec::new();
+        finish_output(
+            None,
+            Some(&mut writer),
+            &mut state,
+            &last,
+            false,
+            true,
+            &mut sink,
+        )
+        .unwrap();
+        drop(writer);
+        let document = render_json(&coordinator, "pid", 0, 3, 3);
+        let snapshot = document["gaps"].as_array().unwrap();
+        let mut replayed: Vec<serde_json::Value> = Vec::new();
+        let mut kinds = Vec::new();
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            let line: serde_json::Value = serde_json::from_str(line).unwrap();
+            kinds.push(line["kind"].as_str().unwrap().to_string());
+            match line["kind"].as_str().unwrap() {
+                "gap_recorded" => {
+                    let mut gap = line["event"].clone();
+                    assert!(gap.get("repeats").is_none(), "identity only: {gap}");
+                    assert_eq!(gap["index"], replayed.len(), "ordinal index");
+                    gap.as_object_mut().unwrap().remove("index");
+                    gap["repeats"] = 1.into();
+                    replayed.push(gap);
+                }
+                "gap_repeated" => {
+                    let index = line["event"]["index"].as_u64().unwrap() as usize;
+                    replayed[index]["repeats"] = line["event"]["repeats"].clone();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(snapshot.len(), 2, "{snapshot:?}");
+        assert_eq!(snapshot[0]["repeats"], 3);
+        assert_eq!(replayed, *snapshot, "stream replay == snapshot");
+        assert_eq!(kinds.last().map(String::as_str), Some("ended"));
+        assert_eq!(
+            kinds.iter().rposition(|k| k == "gap_repeated").unwrap() + 1,
+            kinds.len() - 1,
+            "the exact flush sits right before ended: {kinds:?}"
+        );
+        assert_eq!(kinds.iter().filter(|k| *k == "gap_recorded").count(), 2);
+        assert_eq!(kinds.iter().filter(|k| *k == "gap_repeated").count(), 2);
+    }
+
+    /// A gap that recurs on every pass must let the stream go quiet:
+    /// `gap_repeated` only at power-of-two crossings (O(log passes)
+    /// lines), then one exact flush for whatever is outstanding.
+    #[test]
+    fn a_steady_recurring_gap_emits_logarithmic_repeat_lines() {
+        use crate::discovery::caller_registry::RegistryGap;
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        let mut coordinator = coordinator();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
+        let mut state = StreamState::new();
+        let passes = 100u64;
+        let mut per_pass = Vec::new();
+        for pass in 1..=passes {
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "steady".into(),
+                reason: "every pass".into(),
+                budget: None,
+            });
+            coordinator.commit_batch(false).unwrap();
+            let report = PassReport {
+                pass,
+                scanned: 0,
+                maps_matched: 0,
+                native_callers: 0,
+                scan_callers: 0,
+                engine_changed: false,
+                pending_refresh: Vec::new(),
+                events: Vec::new(),
+                timings: crate::timing::StageTimings::new(),
+            };
+            let presentation =
+                Presentation::capture(&coordinator, "pid", 0, pass, pass, pass, pass);
+            let before = writer.live_events();
+            emit_pass_events(&mut writer, &mut state, &report, &presentation, pass).unwrap();
+            per_pass.push(writer.live_events() - before);
+        }
+        let last = Presentation::capture(&coordinator, "pid", 0, passes, passes, passes, passes);
+        state
+            .gaps
+            .emit(&mut writer, &last.gaps, true, passes)
+            .unwrap();
+        drop(writer);
+        let repeated: Vec<u64> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| line["kind"] == "gap_repeated")
+            .map(|line| line["event"]["repeats"].as_u64().unwrap())
+            .collect();
+        // Crossings 2,4,8,16,32,64, then the flush's exact 100.
+        assert_eq!(repeated, vec![2, 4, 8, 16, 32, 64, 100]);
+        // A quiet pass is exactly the pass marker (3..=3 means no repeat line).
+        assert_eq!(per_pass[69], 1, "pass 70 is only pass_committed");
+        assert_eq!(per_pass[98], 1, "pass 99 is only pass_committed");
     }
 }

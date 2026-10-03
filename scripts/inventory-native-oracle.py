@@ -117,6 +117,7 @@ EVENT_KINDS = {
     "started": "started",
     "ended": "ended",
     "gap": "gap_recorded",
+    "gap_repeated": "gap_repeated",
     "pass": "pass_committed",
     "caller": "caller_event",
     "edge": "edge_observed",
@@ -683,10 +684,33 @@ def check_streams(view, res):
            "gaps_suppressed differs between stream and snapshot")
     # Retention mirrors the snapshot pass for pass: past the bound new gaps are
     # suppressed, never emitted, so the lists stay equal.
-    stream_gaps = [e["event"] for e in view.kind("gap")]
+    # gap_recorded is the snapshot gap minus repeats plus its ordinal `index`;
+    # repeats ride gap_repeated{index, repeats}. Mid-stream values are lower
+    # bounds (power-of-two crossings); the final flush before `ended` makes
+    # the LAST value per index equal the snapshot's, which is all that is
+    # compared. Order, index and monotonicity are validated too.
+    stream_gaps = []
+    bad_gap_events = []
+    for e in view.events or []:
+        ev = e.get("event") if isinstance(e.get("event"), dict) else {}
+        if e.get("kind") == EVENT_KINDS["gap"]:
+            if type(ev.get("index")) is not int or ev["index"] != len(stream_gaps):
+                bad_gap_events.append(f"gap_recorded index {ev.get('index')!r} != ordinal {len(stream_gaps)}")
+            g = {k: v for k, v in ev.items() if k != "index"}
+            g["repeats"] = 1
+            stream_gaps.append(g)
+        elif e.get("kind") == EVENT_KINDS["gap_repeated"]:
+            index, repeats = ev.get("index"), ev.get("repeats")
+            if type(index) is not int or not 0 <= index < len(stream_gaps):
+                bad_gap_events.append(f"gap_repeated index {index!r} has no earlier gap_recorded")
+            elif type(repeats) is not int or repeats < 2 or repeats < stream_gaps[index]["repeats"]:
+                bad_gap_events.append(f"gap_repeated[{index}] repeats {repeats!r} not >=2 and non-decreasing")
+            else:
+                stream_gaps[index]["repeats"] = repeats
     passes = [e["event"] for e in view.kind("pass")]
-    res.ok(run, "*", "AGREE-GAPS", stream_gaps == doc.get("gaps", []),
-           f"stream gaps ({len(stream_gaps)}) != snapshot gaps ({len(doc.get('gaps', []))})")
+    res.ok(run, "*", "AGREE-GAPS", stream_gaps == doc.get("gaps", []) and not bad_gap_events,
+           f"stream gaps ({len(stream_gaps)}) != snapshot gaps ({len(doc.get('gaps', []))}) "
+           f"or malformed gap events: {bad_gap_events[:3]}")
     new = sum(p.get("new_gaps", 0) for p in passes)
     suppressed = sum(p.get("suppressed_delta", 0) for p in passes)
     res.ok(run, "*", "AGREE-GAP-ACCOUNTING", new == len(stream_gaps) and suppressed == doc.get("gaps_suppressed"),
@@ -1487,7 +1511,7 @@ class Synth:
                 "budgets": {"callers": {"limit": 4096, "occupied": len(callers), "refused": 0}},
                 "callers": callers, "modules": modules, "edges": edges,
                 "gaps": [{"caller": None, "module": None, "pid": None, "subject": "exact image authority unavailable",
-                          "reason": "synthetic", "budget": None}] + gaps,
+                          "reason": "synthetic", "budget": None, "repeats": 1}] + gaps,
                 "gaps_suppressed": 0}
 
     def build_doc(self):
@@ -1505,7 +1529,7 @@ class Synth:
             # The thread-reached exec image stays unbound (exercises the gap path).
             if native and spec["mode"] == "exec-chain" and gen == 3:
                 gaps.append({"caller": None, "module": self.mid["A"], "pid": pid,
-                             "subject": "used by an unidentified caller image", "reason": "synthetic", "budget": None})
+                             "subject": "used by an unidentified caller image", "reason": "synthetic", "budget": None, "repeats": 1})
                 continue
             cid = f"c{len(callers)}"
             self.ids[(cell, pid, gen)] = cid
@@ -1577,7 +1601,10 @@ class Synth:
     def events(self, doc, edge_events=False, extra=None):
         rows = [("started", {"scope": doc["scope"]})]
         rows += [("caller_event", {"event": "admitted", "caller": c["id"]}) for c in doc["callers"]]
-        rows += [("gap_recorded", g) for g in doc["gaps"]]
+        rows += [("gap_recorded", dict({k: v for k, v in g.items() if k != "repeats"}, index=i))
+                 for i, g in enumerate(doc["gaps"])]
+        rows += [("gap_repeated", {"index": i, "repeats": g["repeats"]})
+                 for i, g in enumerate(doc["gaps"]) if g.get("repeats", 1) > 1]
         if edge_events:
             callers = {c["id"]: c for c in doc["callers"]}
             modules = {m["id"]: m for m in doc["modules"]}
@@ -1729,7 +1756,7 @@ def self_test():
             d["callers"] = [c for c in d["callers"] if c["id"] not in gone]
             d["edges"] = [e for e in d["edges"] if e["caller"] not in gone]
             d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
-                              "subject": "used by an unidentified caller image", "reason": "x", "budget": None})
+                              "subject": "used by an unidentified caller image", "reason": "x", "budget": None, "repeats": 1})
         case("exec-merged-plus-gap", "EXEC-SPLIT", exec_merged)
 
         def all_optional_lost(s, d, dash):
@@ -1738,7 +1765,7 @@ def self_test():
             d["edges"] = [e for e in d["edges"] if e["caller"] not in gone]
             for _ in range(2):
                 d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
-                                  "subject": "used by an unidentified caller image", "reason": "x", "budget": None})
+                                  "subject": "used by an unidentified caller image", "reason": "x", "budget": None, "repeats": 1})
         case("optional-cell-all-unbound", "RETAINED", all_optional_lost)
 
         def p4_pid_gaps(s, d, dash):
@@ -1748,7 +1775,7 @@ def self_test():
             d["edges"] = [e for e in d["edges"] if e["caller"] not in gone]
             for pid in pids:
                 d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": pid,
-                                  "subject": "used by an unidentified caller image", "reason": "x", "budget": None})
+                                  "subject": "used by an unidentified caller image", "reason": "x", "budget": None, "repeats": 1})
         case("optional-cell-no-bound-instance", "BOUND-INSTANCE", p4_pid_gaps)
 
         def exec_cross(s, d, dash):
@@ -1894,6 +1921,38 @@ def self_test():
         def gaps(s, d, dash):
             return {"events": [e for e in s.events(d, True) if e["kind"] != "gap_recorded"]}
         case("jsonl-gap-mismatch", "AGREE-GAPS", gaps)
+
+        def repeats_mismatch(s, d, dash):
+            d["gaps"][0]["repeats"] = 3  # snapshot says 3; the stream carries no gap_repeated
+            return {"events": s.events(dict(d, gaps=[dict(g, repeats=1) for g in d["gaps"]]), True)}
+        case("jsonl-gap-repeats-mismatch", "AGREE-GAPS", repeats_mismatch)
+
+        def gap_repeats_replay(s, d, dash):
+            d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
+                              "subject": "second", "reason": "x", "budget": None, "repeats": 5})
+            d["gaps"][0]["repeats"] = 3
+        case("jsonl-gap-repeats-replay-positive", None, gap_repeats_replay)
+
+        def _renumber(rows):
+            return [dict(r, seq=i) for i, r in enumerate(rows)]
+
+        def repeats_bad_index(s, d, dash):
+            d["gaps"][0]["repeats"] = 3
+            rows = s.events(d, True)
+            for r in rows:
+                if r["kind"] == "gap_repeated":
+                    r["event"]["index"] = 99
+            return {"events": rows}
+        case("jsonl-gap-repeated-bad-index", "AGREE-GAPS", repeats_bad_index)
+
+        def repeats_out_of_order(s, d, dash):
+            d["gaps"][0]["repeats"] = 3
+            rows = s.events(d, True)
+            at = next(i for i, r in enumerate(rows) if r["kind"] == "gap_repeated")
+            first = next(i for i, r in enumerate(rows) if r["kind"] == "gap_recorded")
+            rows.insert(first, rows.pop(at))
+            return {"events": _renumber(rows)}
+        case("jsonl-gap-repeated-before-recorded", "AGREE-GAPS", repeats_out_of_order)
 
         def callers_mismatch(s, d, dash):
             return {"events": [e for e in s.events(d, True)

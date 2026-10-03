@@ -22,7 +22,8 @@ use crate::discovery::native_binding::{BindingCensus, UnboundReason};
 use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
 use anyhow::{Result, anyhow, bail};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::BuildHasher as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
 
@@ -681,6 +682,23 @@ impl ModuleKey {
     }
 }
 
+impl ModuleKey {
+    /// The key as a reason suffix for a gap that has no module id (the
+    /// module is not in the registry): gaps for different keys must
+    /// stay distinct, since gap identity is the published fields.
+    fn gap_suffix(&self) -> String {
+        match self {
+            Self::Physical {
+                dev_major,
+                dev_minor,
+                ino,
+                ..
+            } => format!(" [module key: dev {dev_major}:{dev_minor} inode {ino}]"),
+            Self::Unidentified { path } => format!(" [module key: path {path}]"),
+        }
+    }
+}
+
 /// Scan-only admission verdict for one module instance (Phase 1 catalog
 /// semantics, carried over verbatim).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1090,7 +1108,7 @@ impl WitnessPlacement {
 /// One budget refusal, carried structurally so the rendered gap names
 /// the resource, its limit, and the requested occupancy — never a bare
 /// sentence a reader must parse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct BudgetRefusal {
     pub resource: &'static str,
     pub limit: usize,
@@ -1099,7 +1117,7 @@ pub(crate) struct BudgetRefusal {
 
 /// One explicit coverage gap: what is unknown and why. Never silent
 /// absence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RegistryGap {
     pub caller: Option<CallerId>,
     pub module: Option<ModuleId>,
@@ -1117,6 +1135,16 @@ pub(crate) const MAX_EDGE_ENTRY_COUNT: u64 = u64::MAX;
 /// What every edge's semantic column reads while capture stays
 /// withheld (S-track): unknown, never an invented state.
 pub(crate) const SEMANTIC_UNKNOWN: &str = "unknown (semantic capture withheld)";
+
+fn with_key(mut reason: String, module: Option<ModuleId>, key: &ModuleKey) -> String {
+    if module.is_none() {
+        reason.push_str(&key.gap_suffix());
+    }
+    reason
+}
+
+/// Bound on remembered suppressed gaps (see `push_gap`).
+pub(crate) const MAX_SUPPRESSED_GAP_MEMORY: usize = 4096;
 
 const COVERAGE_WITHOUT_MAPPING: &str = "usage coverage without mapping evidence";
 const COVERAGE_UNADMITTED: &str = "coverage for an unadmitted module";
@@ -1309,6 +1337,17 @@ pub(crate) struct CallerRegistry {
     modules_by_key: BTreeMap<ModuleKey, ModuleId>,
     edges: BTreeMap<(CallerId, ModuleId), EdgeRecord>,
     gaps: Vec<RegistryGap>,
+    /// Parallel to `gaps`: how many times each retained gap was recorded
+    /// this run (>= 1).
+    gap_repeats: Vec<u64>,
+    /// Retained gap -> its index in `gaps`: the run-wide dedupe key.
+    gap_index: HashMap<RegistryGap, usize>,
+    /// Distinct gaps already counted as suppressed (bounded by
+    /// `MAX_SUPPRESSED_GAP_MEMORY`), so a suppressed gap that recurs every
+    /// pass is counted once.
+    suppressed_seen: HashSet<u64>,
+    /// Randomly keyed, so a target cannot steer fingerprint collisions.
+    suppressed_hasher: std::hash::RandomState,
     gaps_suppressed: u64,
     staged: Vec<Mutation>,
     /// Why an edge no producer covered reads unknown: `ScanOnly` until a
@@ -1356,6 +1395,10 @@ impl CallerRegistry {
             modules_by_key: BTreeMap::new(),
             edges: BTreeMap::new(),
             gaps: Vec::new(),
+            gap_repeats: Vec::new(),
+            gap_index: HashMap::new(),
+            suppressed_seen: HashSet::new(),
+            suppressed_hasher: std::hash::RandomState::new(),
             gaps_suppressed: 0,
             staged: Vec::new(),
             uncovered_reason: UnknownReason::ScanOnly,
@@ -1434,6 +1477,11 @@ impl CallerRegistry {
 
     pub(crate) fn gaps(&self) -> &[RegistryGap] {
         &self.gaps
+    }
+
+    /// Per-gap record counts, parallel to [`Self::gaps`]; each is >= 1.
+    pub(crate) fn gap_repeats(&self) -> &[u64] {
+        &self.gap_repeats
     }
 
     pub(crate) fn gaps_suppressed(&self) -> u64 {
@@ -1915,12 +1963,36 @@ impl CallerRegistry {
         applied
     }
 
+    /// Publish one gap once per run. Identity is every published field
+    /// (caller, module, pid, subject, reason, budget); gaps carry no
+    /// time or pass-specific field, so none is excluded. A repeat of a
+    /// retained gap bumps its `repeats` and consumes no `--max-gaps`
+    /// budget; only a distinct gap past the bound is suppressed, and each
+    /// distinct suppressed gap counts once. Suppressed gaps are
+    /// remembered up to `MAX_SUPPRESSED_GAP_MEMORY` as 64-bit keyed-hash
+    /// fingerprints of the identity fields (a collision, odds about
+    /// 2^-40 at the bound, would under-count one gap); past that, a
+    /// recurrence of an unremembered suppressed gap counts again (the
+    /// counter then over-counts, never under-counts).
     fn push_gap(&mut self, gap: RegistryGap) {
-        if self.gaps.len() >= self.limits.max_gaps {
-            self.gaps_suppressed = self.gaps_suppressed.saturating_add(1);
+        if let Some(&index) = self.gap_index.get(&gap) {
+            self.gap_repeats[index] = self.gap_repeats[index].saturating_add(1);
             return;
         }
+        if self.gaps.len() >= self.limits.max_gaps {
+            let fingerprint = self.suppressed_hasher.hash_one(&gap);
+            if self.suppressed_seen.contains(&fingerprint) {
+                return;
+            }
+            self.gaps_suppressed = self.gaps_suppressed.saturating_add(1);
+            if self.suppressed_seen.len() < MAX_SUPPRESSED_GAP_MEMORY {
+                self.suppressed_seen.insert(fingerprint);
+            }
+            return;
+        }
+        self.gap_index.insert(gap.clone(), self.gaps.len());
         self.gaps.push(gap);
+        self.gap_repeats.push(1);
     }
 
     fn apply(&mut self, mutation: Mutation) {
@@ -2502,7 +2574,7 @@ impl CallerRegistry {
             module,
             pid: None,
             subject: subject.into(),
-            reason,
+            reason: with_key(reason, module, key),
             budget: None,
         });
     }
@@ -2547,7 +2619,7 @@ impl CallerRegistry {
             module,
             pid: None,
             subject: subject.into(),
-            reason,
+            reason: with_key(reason, module, key),
             budget: None,
         });
     }
@@ -3632,6 +3704,189 @@ pub(crate) mod tests {
         );
     }
 
+    fn collapse_gap() -> RegistryGap {
+        RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "overlay collapse".into(),
+            reason: "two overlay instances map one inode".into(),
+            budget: None,
+        }
+    }
+
+    #[test]
+    fn a_twenty_pass_run_publishes_one_collapse_gap_with_twenty_repeats() {
+        let mut registry = registry();
+        for _ in 0..20 {
+            registry.record_gap(collapse_gap());
+            registry.publish();
+        }
+        assert_eq!(registry.gaps().len(), 1, "{:?}", registry.gaps());
+        assert_eq!(registry.gap_repeats(), &[20]);
+        assert_eq!(registry.gaps_suppressed(), 0);
+    }
+
+    #[test]
+    fn duplicates_within_one_pass_count_too() {
+        let mut registry = registry();
+        registry.record_gap(collapse_gap());
+        registry.record_gap(collapse_gap());
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1);
+        assert_eq!(registry.gap_repeats(), &[2]);
+    }
+
+    #[test]
+    fn distinct_gaps_each_appear_and_count_their_own_repeats() {
+        // Every published field is identity: a gap differing in any one
+        // field is a different gap.
+        let base = collapse_gap();
+        let variants = [
+            RegistryGap {
+                caller: Some(CallerId(1)),
+                ..base.clone()
+            },
+            RegistryGap {
+                module: Some(ModuleId(1)),
+                ..base.clone()
+            },
+            RegistryGap {
+                pid: Some(7),
+                ..base.clone()
+            },
+            RegistryGap {
+                subject: "other".into(),
+                ..base.clone()
+            },
+            RegistryGap {
+                reason: "other".into(),
+                ..base.clone()
+            },
+            RegistryGap {
+                budget: Some(BudgetRefusal {
+                    resource: "callers",
+                    limit: 1,
+                    requested: 2,
+                }),
+                ..base.clone()
+            },
+            RegistryGap {
+                budget: Some(BudgetRefusal {
+                    resource: "callers",
+                    limit: 1,
+                    requested: 3,
+                }),
+                ..base.clone()
+            },
+        ];
+        let mut registry = registry();
+        for pass in 0..3 {
+            registry.record_gap(base.clone());
+            for variant in &variants {
+                registry.record_gap(variant.clone());
+            }
+            registry.publish();
+            assert_eq!(registry.gaps().len(), 1 + variants.len(), "pass {pass}");
+        }
+        assert_eq!(registry.gap_repeats(), &[3; 8]);
+        assert_eq!(registry.gaps()[0], base, "first occurrence keeps its place");
+    }
+
+    #[test]
+    fn duplicates_never_consume_the_gap_budget() {
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 3, 1 << 20, 64).unwrap());
+        for pass in 0..10 {
+            for n in 0..3 {
+                registry.record_gap(RegistryGap {
+                    pid: Some(100 + n),
+                    subject: format!("subject-{n}"),
+                    ..collapse_gap()
+                });
+            }
+            registry.publish();
+            assert_eq!(registry.gaps().len(), 3, "pass {pass}");
+            assert_eq!(registry.gaps_suppressed(), 0, "pass {pass}: duplicates");
+        }
+        assert_eq!(registry.gap_repeats(), &[10, 10, 10]);
+        // A genuinely new gap past the full budget is the only thing
+        // that suppresses.
+        registry.record_gap(RegistryGap {
+            subject: "late".into(),
+            ..collapse_gap()
+        });
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 3);
+        assert_eq!(registry.gaps_suppressed(), 1);
+    }
+
+    #[test]
+    fn a_suppressed_gap_that_recurs_is_counted_once() {
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 2, 1 << 20, 64).unwrap());
+        for n in 0..2 {
+            registry.record_gap(RegistryGap {
+                pid: Some(n),
+                ..collapse_gap()
+            });
+        }
+        registry.publish();
+        for _ in 0..10 {
+            registry.record_gap(collapse_gap());
+            registry.publish();
+        }
+        assert_eq!(registry.gaps().len(), 2);
+        assert_eq!(registry.gaps_suppressed(), 1, "one distinct suppressed gap");
+        registry.record_gap(RegistryGap {
+            subject: "second".into(),
+            ..collapse_gap()
+        });
+        registry.record_gap(collapse_gap());
+        registry.publish();
+        assert_eq!(registry.gaps_suppressed(), 2);
+    }
+
+    #[test]
+    fn suppressed_gap_memory_is_bounded_and_overflow_over_counts() {
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 1, 1 << 20, 64).unwrap());
+        registry.record_gap(collapse_gap());
+        let extra = 10;
+        let distinct = MAX_SUPPRESSED_GAP_MEMORY + extra;
+        for round in 0..2 {
+            for n in 0..distinct {
+                registry.record_gap(RegistryGap {
+                    pid: Some(n as u32 + 1),
+                    ..collapse_gap()
+                });
+            }
+            registry.publish();
+            let expect = distinct + if round == 1 { extra } else { 0 };
+            assert_eq!(registry.gaps_suppressed(), expect as u64, "round {round}");
+        }
+        assert!(registry.suppressed_seen.len() <= MAX_SUPPRESSED_GAP_MEMORY);
+    }
+
+    #[test]
+    fn a_late_distinct_gap_is_retained_after_many_duplicate_passes() {
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 4, 1 << 20, 64).unwrap());
+        for _ in 0..100 {
+            registry.record_gap(collapse_gap());
+            registry.publish();
+        }
+        registry.record_gap(RegistryGap {
+            subject: "late".into(),
+            ..collapse_gap()
+        });
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 2);
+        assert_eq!(registry.gaps()[1].subject, "late");
+        assert_eq!(registry.gap_repeats(), &[100, 1]);
+        assert_eq!(registry.gaps_suppressed(), 0);
+    }
+
     #[test]
     fn complete_absence_unloads_and_reload_recovers_with_history() {
         let mut registry = registry();
@@ -4367,6 +4622,17 @@ pub(crate) mod tests {
             .filter(|gap| gap.subject == "coverage for an unadmitted module")
             .count();
         assert_eq!(gaps, 1, "{:?}", registry.gaps());
+        // The module is in the registry: its gap names it by id, and the
+        // reason carries no key suffix.
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == "coverage for an unadmitted module")
+                .all(|gap| gap.module.is_some() && !gap.reason.contains("[module key")),
+            "{:?}",
+            registry.gaps()
+        );
     }
 
     #[test]
@@ -4387,6 +4653,7 @@ pub(crate) mod tests {
             .filter(|gap| gap.subject == "usage coverage without mapping evidence")
             .count();
         assert_eq!(gaps, 3, "one per (caller, module): {:?}", registry.gaps());
+        assert_eq!(registry.gap_repeats(), &[1, 1, 1]);
     }
 
     #[test]

@@ -2655,8 +2655,12 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
         .filter(|event| event["kind"] == "gap_recorded")
         .collect();
     assert_eq!(gap_events.len(), gaps.len(), "one stream gap per JSON gap");
-    for (event, gap) in gap_events.iter().zip(gaps.iter()) {
-        assert_eq!(event["event"], *gap, "stream gap payload");
+    for (position, (event, gap)) in gap_events.iter().zip(gaps.iter()).enumerate() {
+        // gap_recorded is identity only; `repeats` rides gap_repeated.
+        let mut identity = gap.clone();
+        identity.as_object_mut().unwrap().remove("repeats");
+        identity["index"] = position.into();
+        assert_eq!(event["event"], identity, "stream gap payload");
     }
     let streamed_snapshot = events
         .iter()

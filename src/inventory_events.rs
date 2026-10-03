@@ -450,9 +450,7 @@ pub(crate) fn emit_snapshot_as_events(
         enriched["activity"] = serde_json::Value::from(edge_view.activity.label());
         writer.append("edge_observed", enriched, at_ns)?;
     }
-    for gap in document["gaps"].as_array().expect("gaps array") {
-        writer.append("gap_recorded", gap.clone(), at_ns)?;
-    }
+    GapEmitter::new().emit(writer, &presentation.gaps, true, at_ns)?;
     writer.append(
         "snapshot",
         serde_json::json!({
@@ -467,8 +465,9 @@ pub(crate) fn emit_snapshot_as_events(
 
 /// One gap as a `gap_recorded` payload: the IDENTICAL caller/module/
 /// pid/subject/reason/budget shape snapshot gaps carry.
-pub(crate) fn gap_payload(gap: &GapView) -> serde_json::Value {
+pub(crate) fn gap_payload(index: usize, gap: &GapView) -> serde_json::Value {
     serde_json::json!({
+        "index": index,
         "caller": gap.caller.map(|caller| caller.label()),
         "module": gap.module.map(|module| module.label()),
         "pid": gap.pid,
@@ -480,6 +479,73 @@ pub(crate) fn gap_payload(gap: &GapView) -> serde_json::Value {
             "requested": refusal.requested,
         })).unwrap_or(serde_json::Value::Null),
     })
+}
+
+/// A `gap_repeated` payload: gap `index` (its position in `gap_recorded`
+/// order, equal to its `gaps[]` index) now stands at `repeats` recordings.
+pub(crate) fn gap_repeated_payload(index: usize, repeats: u64) -> serde_json::Value {
+    serde_json::json!({"index": index, "repeats": repeats})
+}
+
+/// The single place gap events are written. **Every emitter that appends
+/// gap events (the per-pass emitter, the stop-time emitter, the final
+/// flush before `ended`, the snapshot sync emitter) must call
+/// [`GapEmitter::emit`]; never append `gap_recorded` or `gap_repeated`
+/// directly**, or the replayed stream diverges from the snapshot.
+///
+/// `gap_recorded{index, ...identity}` goes out once per distinct gap, in
+/// `gaps[]` order. `gap_repeated{index, repeats}` goes out mid-run only
+/// when a gap's cumulative count crosses a power of two (live signal,
+/// O(gaps * log passes) lines per run, so a steady recurring gap lets the
+/// stream go quiet); values seen mid-run are lower bounds. The `flush`
+/// call, made once before `ended` on every clean termination, emits the
+/// exact count of every gap whose count differs from its last emitted
+/// value, so the last value per index equals the snapshot. A stream that
+/// was cut short has no `ended`, and its last values are lower bounds.
+#[derive(Debug, Default)]
+pub(crate) struct GapEmitter {
+    /// Per retained gap, the `repeats` the stream last carried.
+    emitted: Vec<u64>,
+}
+
+impl GapEmitter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Emit new gaps and power-of-two repeat crossings (`flush` false), or
+    /// every outstanding exact count (`flush` true). Returns the number
+    /// of new `gap_recorded` events.
+    pub(crate) fn emit(
+        &mut self,
+        writer: &mut EventWriter,
+        gaps: &[GapView],
+        flush: bool,
+        at_ns: u64,
+    ) -> Result<usize, String> {
+        let fresh = gaps.len().saturating_sub(self.emitted.len());
+        for (index, gap) in gaps.iter().enumerate().skip(self.emitted.len()) {
+            writer.append("gap_recorded", gap_payload(index, gap), at_ns)?;
+            self.emitted.push(1);
+        }
+        for (index, gap) in gaps.iter().enumerate() {
+            let last = self.emitted[index];
+            let due = if flush {
+                gap.repeats != last
+            } else {
+                gap.repeats > last && gap.repeats.ilog2() > last.ilog2()
+            };
+            if due {
+                writer.append(
+                    "gap_repeated",
+                    gap_repeated_payload(index, gap.repeats),
+                    at_ns,
+                )?;
+                self.emitted[index] = gap.repeats;
+            }
+        }
+        Ok(fresh)
+    }
 }
 
 /// One committed pass as a `pass_committed` payload: what the pass

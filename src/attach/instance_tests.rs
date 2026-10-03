@@ -641,7 +641,7 @@ fn privileged_instance_mapping_controls_never_join_old_state() -> Result<()> {
     ensure!(ready.starts_with("READY"), "{ready}");
     let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
     let mut harness = Harness::start(&plan, target.pid(), &pins)?;
-    let mut call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
+    let call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
         target.command(b'c')?;
         single_join(&pump_until(harness, target, 1)?)
     };

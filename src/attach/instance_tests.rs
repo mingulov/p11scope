@@ -623,7 +623,8 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
 }
 
 /// Decision §3c mapping controls that reach the provider file: each must
-/// end the old incarnation (new ID) or leave the mapping set unchanged; no
+/// end the old incarnation (new ID) when witnessed, or keep it only when no
+/// witness event fired and the mapping set is unchanged; no
 /// control may produce a coverage fault (a range the hooks did not see).
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
@@ -652,12 +653,17 @@ fn privileged_instance_mapping_controls_never_join_old_state() -> Result<()> {
     target.command(b'p')?;
     let b = call(&mut harness, &mut target)?;
     ensure!(b != a, "extra provider mapping kept the instance");
-    // MADV_DONTNEED changes no VMA: no witness event, same incarnation.
+    // MADV_DONTNEED changes no VMA, but the kernel's zap path calls
+    // `uprobe_munmap` for file VMAs: a conservative spurious incarnation
+    // (decision §3b), never a join to the old one.
     let before = bumps(&harness)?;
     target.command(b'D')?;
-    ensure!(bumps(&harness)? == before, "MADV_DONTNEED bumped the epoch");
+    let dontneed_bumps = bumps(&harness)? - before;
     let after_dontneed = call(&mut harness, &mut target)?;
-    ensure!(after_dontneed == b, "MADV_DONTNEED changed the instance");
+    ensure!(
+        (dontneed_bumps == 0) == (after_dontneed == b),
+        "MADV_DONTNEED outcome inconsistent with its {dontneed_bumps} bumps"
+    );
     // MAP_FIXED anonymous memory over the provider page.
     let before = bumps(&harness)?;
     target.command(b'F')?;
@@ -690,7 +696,7 @@ fn privileged_instance_mapping_controls_never_join_old_state() -> Result<()> {
     );
     let counters = harness.session.instance_maps().counters()?;
     eprintln!(
-        "T3A_CONTROLS ids={:?} split_bumps={split_bumps} counters={counters:?} scans={:?}",
+        "T3A_CONTROLS ids={:?} dontneed_bumps={dontneed_bumps} split_bumps={split_bumps} counters={counters:?} scans={:?}",
         [
             a,
             b,

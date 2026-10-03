@@ -14,7 +14,7 @@
  *       m  mmap+munmap an unrelated file                 -> UNRELATED
  *       p  mmap one page of the provider file and keep it -> PMAP
  *       P  munmap that page                              -> PUNMAP
- *       D  MADV_DONTNEED that page (no VMA change)        -> PDONTNEED
+ *       D  MADV_DONTNEED that page                        -> PDONTNEED
  *       F  MAP_FIXED anonymous memory over that page      -> PFIXED
  *       q  mmap two provider pages                        -> P2MAP
  *       s  mprotect the second one PROT_NONE (VMA split)  -> PSPLIT
@@ -277,8 +277,8 @@ static int cmd_mode(const char *provider)
             printf("PUNMAP\n");
             break;
         case 'D':
-            /* MADV_DONTNEED of a provider mapping: drops private pages
-             * but changes no VMA (no witness event expected). */
+            /* MADV_DONTNEED of a provider mapping: drops private pages and
+             * changes no VMA (the zap path still reaches uprobe_munmap). */
             if (!page || madvise(page, 4096, MADV_DONTNEED) != 0)
                 die("madvise provider");
             printf("PDONTNEED\n");

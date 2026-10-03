@@ -200,6 +200,13 @@ fn ip_must_lie_in_one_executable_partition_at_the_attached_offset() {
         r.route(wrong),
         Route::Unknown(UnknownReason::OffsetMismatch)
     );
+    // An unknown attached offset cannot be matched: it never joins.
+    let mut unknown_offset = call(6, s, ip_in(BASE_A));
+    unknown_offset.attached_offset = None;
+    assert_eq!(
+        r.route(unknown_offset),
+        Route::Unknown(UnknownReason::OffsetMismatch)
+    );
     joined(r.route(call(5, s, ip_in(BASE_A))));
 }
 

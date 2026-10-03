@@ -5047,10 +5047,11 @@ fn frozen_policy_inventory_matches_embedded_object() {
         (true, false) => ("wide-default", "wide-diagnostic", "default"),
         (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
     };
+    // Task 3 Stage A adds eight instance maps and three VMA hook programs.
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (26, 18)
+        (34, 21)
     } else {
-        (24, 13)
+        (32, 16)
     };
     let report = run_ok(
         "python3",

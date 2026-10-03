@@ -775,10 +775,9 @@ fn route_ip(observed: &Observed, facts: &CallFacts) -> Route {
     if !range.executable {
         return Route::Unknown(U::NotExecutable);
     }
-    if let Some(offset) = facts.attached_offset {
-        if ip - range.start + range.file_offset != offset {
-            return Route::Unknown(U::OffsetMismatch);
-        }
+    // An unknown attached offset cannot be matched: fail closed.
+    if facts.attached_offset != Some(ip - range.start + range.file_offset) {
+        return Route::Unknown(U::OffsetMismatch);
     }
     match observed
         .partitions

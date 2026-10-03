@@ -1,0 +1,500 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* instance-continuity: owned Task 3 Stage A continuity workloads.
+ *
+ * Built with -DINSTANCE_PROVIDER -shared -fPIC this file is a tiny provider
+ * whose C_GetSlotInfo returns CKR_SLOT_ID_INVALID (3) for every tag. Built
+ * plainly it is the driver (link -ldl -lpthread):
+ *
+ *   instance-continuity cmd PROVIDER
+ *       Single-byte commands on stdin, one reply line each on stdout:
+ *       c  call C_GetSlotInfo(0x70000000 + gen) through the current handle
+ *       C  call it through the dlmopen sibling, tag 0x71000000 + gen
+ *       r  reload: dlclose then dlopen (gen += 1)        -> RELOAD gen old new
+ *       d  dlmopen(LM_ID_NEWLM) a sibling copy           -> SIBLING base
+ *       m  mmap+munmap an unrelated file                 -> UNRELATED
+ *       p  mmap one page of the provider file and keep it -> PMAP
+ *       P  munmap that page                              -> PUNMAP
+ *       R  start a racing caller thread (tag 0x72000000 + gen) -> RACING
+ *       S  stop it and print its per-generation ledger    -> RACED gen:n,...
+ *       x  exit
+ *       Reloads take a write lock that racing calls hold for reading, so a
+ *       racing call never executes in an unmapped image; calls still race
+ *       every stamp, scan and reload boundary.
+ *   instance-continuity churn PROVIDER UNRELATED_FILE UNRELATED_SO SECONDS RATE
+ *       SoftHSM2 long-lived key workload (C_Initialize, login as user 1234,
+ *       one AES-256 session key, then tagged C_GetSlotInfo + C_Encrypt calls
+ *       every millisecond) while one churn thread runs RATE unrelated mapping
+ *       operations per second for SECONDS seconds (op mix: anonymous 256 KiB
+ *       mmap/munmap, realloc through mremap, MAP_FIXED over anonymous memory,
+ *       anonymous mprotect, unrelated file mmap/munmap, unrelated dlopen/
+ *       dlclose, identical-flag mprotect of provider text).
+ *
+ * Every line is this process's own ledger; it never reads observer state.
+ * The generation tag is the C_GetSlotInfo slot argument, which the observer
+ * captures as the call's slot_id, so each observed call names the mapping
+ * generation it ran in independently of any routing decision. */
+#define _GNU_SOURCE
+#ifdef INSTANCE_PROVIDER
+typedef unsigned long CK_ULONG;
+/* Some text before the endpoint so it does not sit at the segment start. */
+__attribute__((noinline)) CK_ULONG instance_continuity_pad(CK_ULONG v)
+{
+    return v * 2654435761UL ^ (v >> 7);
+}
+CK_ULONG C_GetSlotInfo(CK_ULONG slot, void *info)
+{
+    (void)info;
+    return instance_continuity_pad(slot) == 1 ? 0 : 3;
+}
+#else
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <link.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sched.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef unsigned long CK_ULONG;
+typedef CK_ULONG (*slot_info_fn)(CK_ULONG, void *);
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* A CLONE_VM non-thread child (posix_spawn/vfork shape) that maps and
+ * unmaps one provider page in the shared mm, then exits. */
+static const char *sharer_provider;
+static int sharer_child(void *unused)
+{
+    (void)unused;
+    int fd = open(sharer_provider, O_RDONLY);
+    if (fd < 0)
+        return 1;
+    void *p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED)
+        return 2;
+    munmap(p, 4096);
+    return 0;
+}
+
+static uintptr_t base_of(void *handle)
+{
+    struct link_map *map = NULL;
+    if (!handle || dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 || !map)
+        return 0;
+    return (uintptr_t)map->l_addr;
+}
+
+static void die(const char *what)
+{
+    fprintf(stdout, "FAIL %s %s\n", what, dlerror() ? dlerror() : strerror(errno));
+    fflush(stdout);
+    exit(2);
+}
+
+#define RACE_GENS 4096
+static pthread_rwlock_t image_lock = PTHREAD_RWLOCK_INITIALIZER;
+static void *race_handle;
+static atomic_uint race_gen;
+static atomic_int race_stop;
+static unsigned long race_counts[RACE_GENS];
+
+static void *racer(void *unused)
+{
+    char info[256];
+    (void)unused;
+    while (!atomic_load(&race_stop)) {
+        pthread_rwlock_rdlock(&image_lock);
+        unsigned gen = atomic_load(&race_gen);
+        slot_info_fn call = (slot_info_fn)dlsym(race_handle, "C_GetSlotInfo");
+        if (call && gen < RACE_GENS) {
+            call(0x72000000UL + gen, info);
+            race_counts[gen]++;
+        }
+        pthread_rwlock_unlock(&image_lock);
+        /* About 5k calls/s: dense around every boundary, bounded ring load. */
+        struct timespec pause = { 0, 200000 };
+        nanosleep(&pause, NULL);
+    }
+    return NULL;
+}
+
+static int cmd_mode(const char *provider)
+{
+    pthread_t race_thread;
+    int racing = 0;
+    void *handle = dlopen(provider, RTLD_NOW | RTLD_LOCAL);
+    void *sibling = NULL;
+    void *page = NULL;
+    unsigned gen = 0;
+    struct stat st;
+    char info[256];
+    int unrelated;
+    char path[] = "/proc/self/exe";
+
+    if (!handle)
+        die("dlopen");
+    if (stat(provider, &st) != 0)
+        die("stat");
+    printf("READY %d %lx\n", getpid(), (unsigned long)base_of(handle));
+    fflush(stdout);
+    for (;;) {
+        int command = getchar();
+        if (command == EOF || command == 'x')
+            return 0;
+        switch (command) {
+        case 'c': {
+            slot_info_fn call = (slot_info_fn)dlsym(handle, "C_GetSlotInfo");
+            if (!call)
+                die("dlsym");
+            printf("CALL %u %lu\n", gen, call(0x70000000UL + gen, info));
+            break;
+        }
+        case 'C': {
+            slot_info_fn call = sibling ? (slot_info_fn)dlsym(sibling, "C_GetSlotInfo") : NULL;
+            if (!call)
+                die("sibling dlsym");
+            printf("SCALL %u %lu\n", gen, call(0x71000000UL + gen, info));
+            break;
+        }
+        case 'r': {
+            uintptr_t old = base_of(handle);
+            pthread_rwlock_wrlock(&image_lock);
+            if (dlclose(handle) != 0)
+                die("dlclose");
+            handle = dlopen(provider, RTLD_NOW | RTLD_LOCAL);
+            if (!handle)
+                die("reopen");
+            gen += 1;
+            race_handle = handle;
+            atomic_store(&race_gen, gen);
+            pthread_rwlock_unlock(&image_lock);
+            printf("RELOAD %u %lx %lx\n", gen, (unsigned long)old,
+                   (unsigned long)base_of(handle));
+            break;
+        }
+        case 'R':
+            race_handle = handle;
+            atomic_store(&race_gen, gen);
+            atomic_store(&race_stop, 0);
+            if (racing || pthread_create(&race_thread, NULL, racer, NULL) != 0)
+                die("racer");
+            racing = 1;
+            printf("RACING\n");
+            break;
+        case 'S':
+            if (!racing)
+                die("not racing");
+            atomic_store(&race_stop, 1);
+            pthread_join(race_thread, NULL);
+            racing = 0;
+            printf("RACED");
+            for (unsigned g = 0; g < RACE_GENS; g++)
+                if (race_counts[g])
+                    printf(" %u:%lu", g, race_counts[g]);
+            printf("\n");
+            break;
+        case 'd':
+            sibling = dlmopen(LM_ID_NEWLM, provider, RTLD_NOW | RTLD_LOCAL);
+            if (!sibling)
+                die("dlmopen");
+            printf("SIBLING %lx\n", (unsigned long)base_of(sibling));
+            break;
+        case 'm':
+            unrelated = open(path, O_RDONLY);
+            if (unrelated < 0)
+                die("open unrelated");
+            page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, unrelated, 0);
+            if (page == MAP_FAILED)
+                die("mmap unrelated");
+            munmap(page, 4096);
+            page = NULL;
+            close(unrelated);
+            printf("UNRELATED\n");
+            break;
+        case 'p': {
+            int fd = open(provider, O_RDONLY);
+            if (fd < 0)
+                die("open provider");
+            page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (page == MAP_FAILED)
+                die("mmap provider");
+            printf("PMAP\n");
+            break;
+        }
+        case 'v': {
+            static char stack[64 * 1024] __attribute__((aligned(16)));
+            int status = 0;
+            sharer_provider = provider;
+            pid_t child = clone(sharer_child, stack + sizeof(stack), CLONE_VM | SIGCHLD, NULL);
+            if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+                WEXITSTATUS(status) != 0)
+                die("CLONE_VM sharer");
+            printf("SHARER\n");
+            break;
+        }
+        case 'M': {
+            /* Move the provider page (mremap -> copy_vma). MREMAP_DONTUNMAP
+             * keeps the old VMA, so the move itself reaches no munmap hook;
+             * the old page is unmapped separately afterwards. */
+            void *moved;
+            if (!page)
+                die("mremap without page");
+            moved = mremap(page, 4096, 4096, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+            if (moved == MAP_FAILED)
+                die("mremap provider");
+            munmap(page, 4096);
+            page = moved;
+            printf("PMOVE\n");
+            break;
+        }
+        case 'P':
+            if (page)
+                munmap(page, 4096);
+            page = NULL;
+            printf("PUNMAP\n");
+            break;
+        default:
+            continue;
+        }
+        fflush(stdout);
+    }
+}
+
+/* ---- churn mode: SoftHSM2 long-lived key workload under unrelated churn ---- */
+
+typedef struct {
+    CK_ULONG type;
+    void *value;
+    CK_ULONG len;
+} attribute;
+typedef struct {
+    CK_ULONG mechanism;
+    void *parameter;
+    CK_ULONG len;
+} mechanism;
+typedef CK_ULONG (*initialize_fn)(void *);
+typedef CK_ULONG (*slot_list_fn)(unsigned char, CK_ULONG *, CK_ULONG *);
+typedef CK_ULONG (*open_session_fn)(CK_ULONG, CK_ULONG, void *, void *, CK_ULONG *);
+typedef CK_ULONG (*login_fn)(CK_ULONG, CK_ULONG, const char *, CK_ULONG);
+typedef CK_ULONG (*generate_key_fn)(CK_ULONG, mechanism *, attribute *, CK_ULONG, CK_ULONG *);
+typedef CK_ULONG (*encrypt_init_fn)(CK_ULONG, mechanism *, CK_ULONG);
+typedef CK_ULONG (*encrypt_fn)(CK_ULONG, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG *);
+typedef CK_ULONG (*finalize_fn)(void *);
+
+static atomic_int stop_churn;
+static const char *churn_file;
+static const char *churn_so;
+static int churn_rate;
+static uintptr_t text_start, text_end;
+static unsigned long op_counts[7];
+static unsigned long op_errors;
+
+static int find_text(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)size;
+    if (!info->dlpi_name || !strstr(info->dlpi_name, (const char *)data))
+        return 0;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        if (phdr->p_type == PT_LOAD && (phdr->p_flags & PF_X)) {
+            uintptr_t start = info->dlpi_addr + phdr->p_vaddr;
+            uintptr_t end = start + phdr->p_memsz;
+            text_start = start & ~(uintptr_t)4095;
+            text_end = (end + 4095) & ~(uintptr_t)4095;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void churn_op(unsigned index)
+{
+    void *p;
+    switch (index % 7) {
+    case 0:
+        p = mmap(NULL, 256 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) { op_errors++; return; }
+        ((volatile char *)p)[0] = 1;
+        munmap(p, 256 * 1024);
+        break;
+    case 1: {
+        char *q = malloc(1 << 20);
+        if (!q) { op_errors++; return; }
+        q[0] = 1;
+        char *r = realloc(q, 3 << 20); /* mmapped chunk: grows through mremap */
+        if (!r) { free(q); op_errors++; return; }
+        r[(3 << 20) - 1] = 1;
+        free(r);
+        break;
+    }
+    case 2:
+        p = mmap(NULL, 64 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) { op_errors++; return; }
+        if (mmap(p, 64 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                 -1, 0) == MAP_FAILED)
+            op_errors++;
+        munmap(p, 64 * 1024);
+        break;
+    case 3:
+        p = mmap(NULL, 64 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) { op_errors++; return; }
+        if (mprotect(p, 64 * 1024, PROT_READ) != 0)
+            op_errors++;
+        munmap(p, 64 * 1024);
+        break;
+    case 4: {
+        int fd = open(churn_file, O_RDONLY);
+        if (fd < 0) { op_errors++; return; }
+        p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (p == MAP_FAILED) { op_errors++; return; }
+        munmap(p, 4096);
+        break;
+    }
+    case 5: {
+        void *h = dlopen(churn_so, RTLD_NOW | RTLD_LOCAL);
+        if (!h) { op_errors++; return; }
+        dlclose(h);
+        break;
+    }
+    case 6:
+        if (!text_start || mprotect((void *)text_start, text_end - text_start,
+                                    PROT_READ | PROT_EXEC) != 0)
+            op_errors++;
+        break;
+    }
+    op_counts[index % 7]++;
+}
+
+static void *churn_thread(void *unused)
+{
+    (void)unused;
+    if (churn_rate <= 0)
+        return NULL;
+    uint64_t period = 1000000000ULL / (uint64_t)churn_rate;
+    uint64_t next = now_ns();
+    for (unsigned i = 0; !atomic_load(&stop_churn); i++) {
+        churn_op(i);
+        next += period;
+        uint64_t now = now_ns();
+        if (next > now) {
+            struct timespec ts = { (time_t)((next - now) / 1000000000ULL),
+                                   (long)((next - now) % 1000000000ULL) };
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
+#define SYM(type, name) type name = (type)dlsym(handle, #name); if (!name) die(#name)
+
+static int churn_mode(int argc, char **argv)
+{
+    if (argc != 7) {
+        fprintf(stderr, "usage: churn PROVIDER UNRELATED_FILE UNRELATED_SO SECONDS RATE\n");
+        return 64;
+    }
+    const char *provider = argv[2];
+    churn_file = argv[3];
+    churn_so = argv[4];
+    int seconds = atoi(argv[5]);
+    churn_rate = atoi(argv[6]);
+    void *handle = dlopen(provider, RTLD_NOW | RTLD_LOCAL);
+    if (!handle)
+        die("dlopen provider");
+    SYM(initialize_fn, C_Initialize);
+    SYM(slot_list_fn, C_GetSlotList);
+    SYM(open_session_fn, C_OpenSession);
+    SYM(login_fn, C_Login);
+    SYM(generate_key_fn, C_GenerateKey);
+    SYM(encrypt_init_fn, C_EncryptInit);
+    SYM(encrypt_fn, C_Encrypt);
+    SYM(slot_info_fn, C_GetSlotInfo);
+    SYM(finalize_fn, C_Finalize);
+    const char *leaf = strrchr(provider, '/');
+    dl_iterate_phdr(find_text, (void *)(leaf ? leaf + 1 : provider));
+    CK_ULONG slots[8], count = 8, session = 0, key = 0, rv;
+    if ((rv = C_Initialize(NULL)) != 0) { printf("FAIL C_Initialize %lu\n", rv); return 2; }
+    if ((rv = C_GetSlotList(1, slots, &count)) != 0 || count == 0) {
+        printf("FAIL C_GetSlotList %lu %lu\n", rv, count); return 2;
+    }
+    if ((rv = C_OpenSession(slots[0], 0x4 | 0x2, NULL, NULL, &session)) != 0) {
+        printf("FAIL C_OpenSession %lu\n", rv); return 2;
+    }
+    if ((rv = C_Login(session, 1, "1234", 4)) != 0) { printf("FAIL C_Login %lu\n", rv); return 2; }
+    CK_ULONG value_len = 32;
+    unsigned char yes = 1, no = 0;
+    attribute tmpl[] = { { 0x161, &value_len, sizeof(value_len) },
+                         { 0x104, &yes, 1 }, { 0x1, &no, 1 } };
+    mechanism keygen = { 0x1080, NULL, 0 }, ecb = { 0x1081, NULL, 0 };
+    if ((rv = C_GenerateKey(session, &keygen, tmpl, 3, &key)) != 0) {
+        printf("FAIL C_GenerateKey %lu\n", rv); return 2;
+    }
+    uintptr_t base = base_of(handle);
+    printf("READY %d %lx %lx %lx\n", getpid(), (unsigned long)base,
+           (unsigned long)text_start, (unsigned long)text_end);
+    printf("KEY session=%lu key=%lu\n", session, key);
+    fflush(stdout);
+    /* Wait for the observer to finish attaching. */
+    if (getchar() != 'g')
+        return 3;
+    pthread_t churner;
+    if (pthread_create(&churner, NULL, churn_thread, NULL) != 0)
+        die("pthread_create");
+    uint64_t deadline = now_ns() + (uint64_t)seconds * 1000000000ULL;
+    unsigned long calls = 0, encrypts = 0, bad = 0;
+    char info[256];
+    unsigned char in[16] = { 0 }, out[64];
+    while (now_ns() < deadline) {
+        C_GetSlotInfo(0x70000000UL, info);
+        calls++;
+        CK_ULONG out_len = sizeof(out);
+        if (C_EncryptInit(session, &ecb, key) != 0 || C_Encrypt(session, in, 16, out, &out_len) != 0)
+            bad++;
+        encrypts++;
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    atomic_store(&stop_churn, 1);
+    pthread_join(churner, NULL);
+    printf("LEDGER calls=%lu encrypts=%lu bad=%lu key=%lu base_start=%lx base_end=%lx\n", calls,
+           encrypts, bad, key, (unsigned long)base, (unsigned long)base_of(handle));
+    printf("OPS anon=%lu mremap=%lu fixed=%lu mprotect=%lu file=%lu dl=%lu ptext=%lu errors=%lu\n",
+           op_counts[0], op_counts[1], op_counts[2], op_counts[3], op_counts[4], op_counts[5],
+           op_counts[6], op_errors);
+    fflush(stdout);
+    /* Hold until the observer has drained, then finish. */
+    if (getchar() != 'x')
+        return 4;
+    C_Finalize(NULL);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    if (argc >= 3 && strcmp(argv[1], "cmd") == 0)
+        return cmd_mode(argv[2]);
+    if (argc >= 2 && strcmp(argv[1], "churn") == 0)
+        return churn_mode(argc, argv);
+    fprintf(stderr, "usage: instance-continuity cmd PROVIDER | churn ...\n");
+    return 64;
+}
+#endif

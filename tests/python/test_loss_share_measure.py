@@ -156,12 +156,14 @@ class BurstParseTests(unittest.TestCase):
 
 
 class EventPathTests(unittest.TestCase):
-    def test_ring_capacity_pins_336_byte_records(self):
+    def test_ring_capacity_pins_376_byte_records(self):
+        # 368-byte EventRecord (328-byte Event plus the 40-byte private
+        # continuity tail) plus the 8-byte ring header.
         capacity = MEASURE["ring_capacity_records"]
-        self.assertEqual(capacity(256 * 1024), 780)
-        self.assertEqual(capacity(64 * 1024), 195)
-        self.assertEqual(capacity(1024 * 1024), 3120)
-        self.assertEqual(capacity(4 * 1024 * 1024), 12483)
+        self.assertEqual(capacity(256 * 1024), 697)
+        self.assertEqual(capacity(64 * 1024), 174)
+        self.assertEqual(capacity(1024 * 1024), 2788)
+        self.assertEqual(capacity(4 * 1024 * 1024), 11155)
         self.assertIsNone(capacity(None))
 
     def test_predicted_burst_loss_is_floor_at_zero(self):
@@ -215,8 +217,8 @@ class EventPathTests(unittest.TestCase):
                      event_loss=19226, semantic_capture_failures=0,
                      call_lines=None, raw_calls=None,
                      ring_bytes=256 * 1024, burst_wall_s=0.5)
-        self.assertEqual(path["ring_capacity_records"], 780)
-        self.assertEqual(path["predicted_burst_loss"], 19226)
+        self.assertEqual(path["ring_capacity_records"], 697)
+        self.assertEqual(path["predicted_burst_loss"], 19309)
         self.assertAlmostEqual(path["burst_rate_per_s"], 40012.0)
 
 

@@ -386,6 +386,8 @@ def decode_map_definitions(records, section, data):
 
 REQUIRED_GLOBAL_HELPERS = frozenset({
     "p11_link_current_identity", "p11_link_emit_fork", "p11_link_fork_allowed",
+    # Task 3 Stage A: scalar/stack-out continuity stamp and exec hook.
+    "p11_instance_entry", "p11_instance_return", "p11_instance_exec",
 })
 REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_lease", "p11_owner_refund"})
 REQUIRED_GLOBAL_SCALAR_HELPERS = frozenset({"p11_read_ia32_arg"})
@@ -402,6 +404,9 @@ EXACT_PROGRAM_SECTIONS = {
     "task_newtask": "tp_btf/task_newtask",
     "sched_process_exec": "raw_tp/sched_process_exec",
     "sched_process_exit": "raw_tp/sched_process_exit",
+    "p11_inst_vma_map": "fentry/uprobe_mmap",
+    "p11_inst_vma_unmap": "fentry/uprobe_munmap",
+    "p11_inst_vma_copy": "fexit/copy_vma",
 }
 
 DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
@@ -1522,6 +1527,15 @@ SAFE_MAPS = {
         "STOP_GATE": (2, 4, 8, 1, 1024),
         "TAIL_CALLS": (3, 4, 4, 2),
         "STACK_GUARD": (3, 4, 4, 1),
+        # Task 3 Stage A continuity witness (native instance_epoch.c).
+        "WATCHED_FILES": (1, 16, 4, 1_024, 128),
+        "SLOT_FILE": (2, 4, 4, 512, 128),
+        "PROC_EPOCH": (29, 4, 144, 0, 1),
+        "G_EPOCH": (2, 4, 8, 1_024),
+        "INSTANCE_GEN": (2, 4, 8, 3, 1024),
+        "INSTANCE_CALIB": (2, 4, 40, 1),
+        "INSTANCE_COUNTERS": (2, 4, 80, 1),
+        "INSTANCE_START": (9, 16, 24, 16_384),
     }.items()
 }
 UNSAFE_MAPS = SAFE_MAPS | {
@@ -1531,6 +1545,7 @@ UNSAFE_MAPS = SAFE_MAPS | {
 WIDE_MAPS = SAFE_MAPS | {
     "STATS": map_def(6, 4, 296, 2_112),
     "RV_COUNTS": map_def(5, 16, 8, 8_192),
+    "SLOT_FILE": map_def(2, 4, 4, 2_112, 128),
 }
 WIDE_UNSAFE_MAPS = WIDE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
@@ -1550,7 +1565,11 @@ SAFE_PROGRAMS = {
     "interface_return",
     "sched_process_exec",
     "sched_process_exit",
+    "p11_inst_vma_map",
+    "p11_inst_vma_unmap",
+    "p11_inst_vma_copy",
 }
+INSTANCE_PROGRAMS = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"}
 UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
     "p11_entry_ia32",
     "p11_entry_template", "p11_entry_template_pair",
@@ -1569,13 +1588,15 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": map_def(6, 4, 8, 3),
 }
-INVENTORY_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return", "task_newtask"}) | {
+INVENTORY_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return", "task_newtask"}
+                      - INSTANCE_PROGRAMS) | {
     "p11_usage_entry_lp64", "p11_usage_entry_ia32",
 }
 INVENTORY_FORBIDDEN_MAPS = {
     "STATS", "START", "RV_COUNTS", "EVENTS", "DESCRIPTORS", "MECH_SHAPE",
     "ASYNC_FUNCTIONS", "ATTR_BOOL_BITS", "PAUSE_PIDS", "TASK_COOKIE", "COOKIE_CTL",
-    "ROOT_AFFILIATION", "ROOT_CTL",
+    "ROOT_AFFILIATION", "ROOT_CTL", "WATCHED_FILES", "SLOT_FILE", "PROC_EPOCH", "G_EPOCH",
+    "INSTANCE_GEN", "INSTANCE_CALIB", "INSTANCE_COUNTERS", "INSTANCE_START",
 }
 INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "ENDPOINT_OBJECT": map_def(2, 4, 8, 1, 128),
@@ -1644,7 +1665,8 @@ def validate_inventory(variant, maps, programs, symbols):
         allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity"} if callers else set()
         forbidden = {name for name in symbols if name not in allowed and
                      (name in INVENTORY_FORBIDDEN_MAPS
-                      or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_")))}
+                      or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_",
+                                          "p11_inst")))}
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
@@ -1694,12 +1716,13 @@ def self_test():
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
     assert "PAIR_CALLS" not in SAFE_MAPS
     assert "PAIR_CALLS" not in INVENTORY_MAPS
-    assert len(SAFE_MAPS) == 24
-    assert len(UNSAFE_MAPS) == 26
-    assert len(WIDE_MAPS) == 24
-    assert len(WIDE_UNSAFE_MAPS) == 26
-    assert len(SAFE_PROGRAMS) == 13
-    assert len(UNSAFE_PROGRAMS) == 18
+    assert len(SAFE_MAPS) == 32
+    assert len(UNSAFE_MAPS) == 34
+    assert len(WIDE_MAPS) == 32
+    assert len(WIDE_UNSAFE_MAPS) == 34
+    assert len(SAFE_PROGRAMS) == 16
+    assert len(UNSAFE_PROGRAMS) == 21
+    assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)
     diagnostic = (
         UNSAFE_MAPS,
@@ -1742,6 +1765,7 @@ def self_test():
     ]
     assert rejected(validate_inventory, "wide-default", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
+        "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
     ]
     assert rejected(validate_inventory, "default", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [

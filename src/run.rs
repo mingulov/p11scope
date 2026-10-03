@@ -3889,7 +3889,7 @@ fn capture_end(
 /// frame (F-T4-2).
 /// Margin: one full timeout at the fastest measured unpaced burst
 /// (A2b, 127648/s) admits 256 records, far under the default
-/// 12483-record ring — but that bounds the REQUESTED wait only, never
+/// 11155-record ring (368-byte records) — but that bounds the REQUESTED wait only, never
 /// the OS scheduling delay, which the ring must also absorb.
 pub(crate) const READY_IDLE_POLL: Duration = Duration::from_millis(2);
 
@@ -12718,7 +12718,7 @@ mod tests {
     fn ready_idle_timeout_margin_at_default_ring() {
         const FASTEST_BURST_PER_S: u128 = 128_000;
         const RECORD_BYTES: u128 =
-            (core::mem::size_of::<p11scope_ebpf_common::Event>() + 8) as u128;
+            (core::mem::size_of::<p11scope_ebpf_common::EventRecord>() + 8) as u128;
         let capacity = u128::from(p11scope_ebpf_common::RING_BYTES) / RECORD_BYTES;
         let worst_case = READY_IDLE_POLL.as_millis() * FASTEST_BURST_PER_S / 1000;
         assert!(

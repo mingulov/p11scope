@@ -28,6 +28,11 @@ struct thread_owner_value {
     unsigned char bytes[544];
 };
 
+/* Task 3 Stage A `struct instance_record` (crates/ebpf/native/instance_epoch.h). */
+struct proc_epoch_value {
+    unsigned char bytes[144];
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __type(key, u32);
@@ -51,6 +56,17 @@ struct {
     __uint(max_entries, 0);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } ROOT_AFFILIATION SEC(".maps");
+
+/* Owned captures only. The frozen three-map qualification surface disables
+ * this map's creation and the program that reads it, so that object load
+ * still creates and reads nothing beyond the seeded three maps. */
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __type(key, u32);
+    __type(value, struct proc_epoch_value);
+    __uint(max_entries, 0);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} PROC_EPOCH SEC(".maps");
 
 static void *(*bpf_task_storage_get)(void *, struct task_struct *, void *, u64) =
     (void *)156;
@@ -117,6 +133,26 @@ int dump_task_storage(struct bpf_iter__task *ctx)
     if (emit(ctx->meta->seq, task, &THREAD_OWNER, 1, 544))
         return 0;
     if (emit(ctx->meta->seq, task, &ROOT_AFFILIATION, 2, 8))
+        return 0;
+    return 0;
+}
+
+/* The full owned inventory: the same three maps, then PROC_EPOCH. Same 0-only
+ * return contract as dump_task_storage above. */
+SEC("iter/task")
+int dump_task_storage_epoch(struct bpf_iter__task *ctx)
+{
+    struct task_struct *task = ctx->task;
+
+    if (!task)
+        return 0;
+    if (emit(ctx->meta->seq, task, &TASK_COOKIE, 0, 8))
+        return 0;
+    if (emit(ctx->meta->seq, task, &THREAD_OWNER, 1, 544))
+        return 0;
+    if (emit(ctx->meta->seq, task, &ROOT_AFFILIATION, 2, 8))
+        return 0;
+    if (emit(ctx->meta->seq, task, &PROC_EPOCH, 3, 144))
         return 0;
     return 0;
 }

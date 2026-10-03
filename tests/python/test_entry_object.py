@@ -247,7 +247,7 @@ class EntryObjectTests(unittest.TestCase):
             ("p11_entry_template_second", site('unsafe', 'p11_entry_template_second', 'r4\\ =\\ r9'), "r4 = r10"),
             ("p11_return", 1435, "if r8 != 0x1 goto +0x19"),
             ("p11_return", 1446, "r2 = 0x8"),
-            ("p11_return", 1607, "r3 = *(u64 *)(r10 - 0xf8)"),
+            ("p11_return", 1612, "r3 = *(u64 *)(r10 - 0xf8)"),
         ]
         for function, pc, new in cases:
             with self.subTest(function=function, pc=pc):

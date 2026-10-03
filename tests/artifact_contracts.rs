@@ -5912,6 +5912,70 @@ fn image_identity_native_control_refuses_invalid_and_exhausted_tickets() {
     );
 }
 
+/// Regression (first host load, 7.0): an unflavored partial `task_struct`
+/// in the instance unit was conflated after bitcode linking with
+/// image_identity.h's shape, so CO-RE resolved `current->mm` to another
+/// field and every own-mm mutation counted as remote. Every kernel shape the
+/// instance unit defines must carry its own CO-RE flavor.
+#[test]
+fn instance_epoch_kernel_shapes_are_flavored_apart_from_other_units() {
+    let source = read("crates/ebpf/native/instance_epoch.c");
+    let mut shapes = 0;
+    for line in source.lines() {
+        let Some(rest) = line.strip_prefix("struct ") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix(" {") else {
+            continue;
+        };
+        shapes += 1;
+        assert!(
+            name.ends_with("___p11inst"),
+            "instance_epoch.c defines unflavored kernel shape struct {name}"
+        );
+    }
+    assert_eq!(
+        shapes, 6,
+        "the six CO-RE shapes moved; review this contract"
+    );
+    assert!(source.contains("\nstruct task_struct; /* "));
+}
+
+#[test]
+fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
+    let directory = tempfile::tempdir().expect("temporary native instance test");
+    let binary = directory.path().join("instance-epoch-tests");
+    let compile = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/instance-epoch/helper_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("execute clang-18 for native instance regression");
+    assert!(
+        compile.status.success(),
+        "native compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(binary)
+        .output()
+        .expect("execute native instance regression");
+    assert!(
+        run.status.success(),
+        "native instance regression failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 #[test]
 fn call_start_initializer_is_straight_line_and_caller_owned() {
     let source = read("crates/ebpf/src/main.rs");
@@ -11113,7 +11177,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
     // fork path stops honoring the policy.
     let ebpf = read("crates/ebpf/src/main.rs");
     assert_eq!(
-        ebpf.matches("EVENTS.reserve::<Event>(0)").count(),
+        ebpf.matches("EVENTS.reserve::<EventRecord>(0)").count(),
         2,
         "a new EVENTS submit site must be gated for aggregate policy too"
     );
@@ -11124,7 +11188,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         "#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn p11_link_fork_allowed",
     );
     assert_eq!(
-        returned.matches("EVENTS.reserve::<Event>(0)").count(),
+        returned.matches("EVENTS.reserve::<EventRecord>(0)").count(),
         1,
         "the return path must hold exactly one EVENTS reserve"
     );
@@ -11132,7 +11196,7 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         .find("if flags & FLAG_POLICY_AGGREGATE != 0")
         .expect("return path must gate aggregate policy");
     let reserve = returned
-        .find("EVENTS.reserve::<Event>(0)")
+        .find("EVENTS.reserve::<EventRecord>(0)")
         .expect("return path must hold its EVENTS reserve");
     assert!(
         gate < reserve,
@@ -11218,6 +11282,7 @@ const LICENSE_C_FIXTURES: &[&str] = &[
     "tests/fixtures/ia32-lifecycle/capability-xattr.c", // tests/python/test_ia32_lifecycle.py
     "tests/fixtures/ia32-lifecycle/guard-target.c", // tests/python/test_ia32_lifecycle.py
     "tests/fixtures/image-identity/helper_tests.c", // tests/artifact_contracts.rs (image_identity_native_control_*)
+    "tests/fixtures/instance-epoch/helper_tests.c", // tests/artifact_contracts.rs (instance_epoch_native_hooks_*)
     "tests/fixtures/lane13-evidence/port-forward.c", // tests/python/test_lane13_evidence.py
     "tests/fixtures/live-discovery-driver.c",       // tests/discovery_scan.rs
     "tests/fixtures/live-discovery-provider.c", // tests/python/test_live_freeze_prepared_dependencies.py
@@ -11865,4 +11930,62 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
         );
         license_write_fixture(root.path(), path, b"# no legacy text\n");
     }
+}
+
+/// Task 3 Stage A privacy contract: the private entry IP and the continuity
+/// stamps are read from CALL records only by the instance router plumbing and
+/// its tests. A renderer, reducer, or report that names them is a leak path.
+#[test]
+fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
+    let allowed = [
+        "src/attach/instance.rs",
+        "src/attach/instance_tests.rs",
+        "src/events.rs",
+        "src/run/capture_loop_tests.rs",
+    ];
+    // `decode_record`/`poll_records` hand the whole record only to the
+    // router; every other consumer gets the bare `Event` from `decode`.
+    let events = read("src/events.rs");
+    assert!(events.contains("decode_record(bytes).map(|record| record.event)"));
+    let mut stack = vec![std::path::PathBuf::from("src")];
+    let mut users = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("walk src") {
+            let path = entry.expect("src entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read source");
+            if [
+                "entry_ip",
+                "entry_stamp",
+                "return_stamp",
+                ".continuity",
+                "poll_records",
+                "decode_record",
+            ]
+            .iter()
+            .any(|field| source.contains(field))
+            {
+                users.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    users.sort();
+    for user in &users {
+        assert!(
+            allowed.contains(&user.as_str()),
+            "{user} reads the private entry IP or continuity stamps"
+        );
+    }
+    assert!(
+        users
+            .iter()
+            .any(|user| user == "src/run/capture_loop_tests.rs"),
+        "the rendering sentinel regression must stay in place"
+    );
 }

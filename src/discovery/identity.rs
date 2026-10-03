@@ -906,6 +906,24 @@ impl PinnedObjects {
         self.by_id.get(&id).map(|entry| entry.file.as_ref())
     }
 
+    /// Every maps-visible key this capture-local object is retained under
+    /// (scan aliases included), sorted and deduplicated. Task 3 Stage A
+    /// selects the object's ranges in `/proc/PID/maps` by these.
+    pub(crate) fn raw_keys_for(&self, id: PinnedObjectId) -> Vec<ObjectKey> {
+        let mut keys: Vec<ObjectKey> = self
+            .raw_to_id
+            .iter()
+            .filter(|(_, owner)| **owner == id)
+            .map(|(raw, _)| raw.key)
+            .collect();
+        if let Some(entry) = self.by_id.get(&id) {
+            keys.push(entry.raw.key);
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     pub(crate) fn abi_for(&self, id: PinnedObjectId) -> Option<ElfAbi> {
         self.by_id.get(&id).map(|entry| entry.abi)
     }

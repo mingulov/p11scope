@@ -1866,3 +1866,86 @@ fn stop_quiescence_maps_only_a_proven_q_and_keeps_post_q_flags_sticky() {
     note_post_q_record(&mut flag, "EVENTS", false);
     assert!(flag, "a later clean quantum must not clear the flag");
 }
+/// Task 3 Stage A privacy: the private entry IP and the continuity stamps
+/// travel in every `EVENTS` record but must never reach any rendered output.
+/// The tail is dropped at decode; this pins that the trace path, fed whole
+/// records with sentinel continuity, renders none of it.
+#[test]
+fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
+    const IP: u64 = 0x7E5C_A1AB_1E5E_C0DE;
+    const EPOCH: u32 = 0x5EC1_7A11;
+    const GLOBAL: u32 = 0x6A0B_A15E;
+    const FAULT: u32 = 0x7AFF_0FF1;
+    let stamp = p11scope_ebpf_common::InstanceStamp {
+        epoch: EPOCH,
+        global: GLOBAL,
+        fault: FAULT,
+        file_slot_plus1: 0x3A5D,
+        flags: p11scope_ebpf_common::instance::STAMP_VALID,
+    };
+    let record = p11scope_ebpf_common::EventRecord {
+        event: open_event(11),
+        continuity: p11scope_ebpf_common::InstanceContinuity {
+            entry_ip: IP,
+            entry_stamp: stamp,
+            return_stamp: stamp,
+        },
+    };
+    let plan = open_plan();
+    let mut state = semantics::State::new(&plan);
+    let mut tracker = tracker();
+    let mut tracer = trace::Tracer::new(&plan);
+    let mut malformed_records = 0;
+    let mut context = context(plan, []);
+    context.drain = EventDrain::over_test_domain(
+        ScriptedRecords::records([crate::events::record_bytes(&record)], usize::MAX),
+        1,
+    );
+    {
+        let mut scheduling = SchedulingAccumulator::default();
+        let mut consumers = CaptureConsumers {
+            state: &mut state,
+            tracker: &mut tracker,
+            tracer: Some(&mut tracer),
+            malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
+        };
+        capture_tick_with(
+            &mut context,
+            &mut consumers,
+            |context: &mut TickContext, _| Ok((true, true, &context.plan)),
+            |_| Ok(None),
+            |context, consumers| {
+                drain_tick(context, consumers)?;
+                Ok(None)
+            },
+            |_, consumers| Ok(consumers.state.sessions().opened),
+            |_| Ok(()),
+        )
+        .unwrap();
+    }
+    assert_eq!(malformed_records, 0);
+    assert_eq!(state.sessions().opened, 1, "the record was reduced");
+    let rendered = String::from_utf8_lossy(&context.stdout).to_ascii_lowercase();
+    assert!(
+        rendered.contains(" c_opensession "),
+        "the call was rendered"
+    );
+    for word in [
+        IP,
+        IP >> 32,
+        IP & 0xffff_ffff,
+        u64::from(EPOCH),
+        u64::from(GLOBAL),
+        u64::from(FAULT),
+        0x3A5D,
+    ] {
+        for form in [format!("{word:x}"), word.to_string()] {
+            assert!(
+                !rendered.contains(&form),
+                "private continuity word {form} rendered"
+            );
+        }
+    }
+}
+

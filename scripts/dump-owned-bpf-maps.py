@@ -25,7 +25,25 @@ TASK_STORAGE_MAGIC = b"P11TSV1\0"
 TASK_STORAGE_HEADER = struct.Struct("<8sIIIII")
 TASK_STORAGE_RECORD = 1
 TASK_STORAGE_EOF = 2
-TASK_STORAGE_NAMES = ("TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION")
+TASK_STORAGE_NAMES = ("TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION", "PROC_EPOCH")
+# The frozen Task 2 D2 qualification surface: the seed fixture creates and
+# seeds exactly these three maps, and the reader serves it without PROC_EPOCH
+# (its iterator object then neither creates nor reads that map). Every owned
+# capture uses the full TASK_STORAGE_NAMES inventory; reconcile requires it.
+TASK_STORAGE_QUALIFICATION_NAMES = TASK_STORAGE_NAMES[:3]
+TASK_STORAGE_VALUE_SIZES = {
+    "TASK_COOKIE": 8, "THREAD_OWNER": 544, "ROOT_AFFILIATION": 8, "PROC_EPOCH": 144,
+}
+# Task 3 Stage A per-process mutation record (`struct instance_record`,
+# crates/ebpf/native/instance_epoch.h): u64 slot_plus1[8], u64 epoch[8],
+# u64 flags, u64 exec_attach_gen. Kernel metadata counters only.
+PROC_EPOCH_RECORD = struct.Struct("<8Q8QQQ")
+PROC_EPOCH_RECORD_SLOTS = 8
+PROC_EPOCH_FILE_SLOTS = 1024
+PROC_EPOCH_SHARED_MM = 1 << 2
+PROC_EPOCH_OVERFLOW = 1 << 3
+PROC_EPOCH_LOCAL_FAULT = 1 << 4
+PROC_EPOCH_FLAG_MASK = PROC_EPOCH_SHARED_MM | PROC_EPOCH_OVERFLOW | PROC_EPOCH_LOCAL_FAULT
 
 
 def idle_owner_value(raw):
@@ -41,7 +59,7 @@ TASK_STORAGE_MAX_BYTES = 64 * 1024 * 1024
 TASK_STORAGE_TIMEOUT_SECONDS = 8
 STOPPED_SNAPSHOT_CONTRACT = "p11scope/stopped-task-storage/v1"
 SNAPSHOT_MAP_ORACLES = {
-    "hash": "dump", "array": "dump", "prog_array": "dump",
+    "hash": "dump", "lru_hash": "dump", "array": "dump", "prog_array": "dump",
     "cgroup_array": "refused-lookup",
     "percpu_hash": "dump", "percpu_array": "dump",
     "ringbuf": "mmap", "task_storage": "task-storage",
@@ -626,14 +644,45 @@ def write_binary_receipt(path, value):
         raise
 
 
+def proc_epoch_value_valid(raw):
+    """Structural shape of one leader's instance_record.
+
+    Cells are claimed 0 -> slot+1 by CAS and never change afterwards, in
+    order, so occupied cells are a distinct prefix; an epoch only moves
+    after its cell is claimed; OVERFLOW is only set once every cell is held
+    by another file. Population is optional: no record means epoch zero.
+    """
+    if type(raw) is not bytes or len(raw) != PROC_EPOCH_RECORD.size:
+        return False
+    words = PROC_EPOCH_RECORD.unpack(raw)
+    slots = words[:PROC_EPOCH_RECORD_SLOTS]
+    epochs = words[PROC_EPOCH_RECORD_SLOTS:2 * PROC_EPOCH_RECORD_SLOTS]
+    flags = words[2 * PROC_EPOCH_RECORD_SLOTS]
+    occupied = [slot for slot in slots if slot]
+    if any(slot > PROC_EPOCH_FILE_SLOTS for slot in slots):
+        return False
+    if len(set(occupied)) != len(occupied) or list(slots[:len(occupied)]) != occupied:
+        return False
+    if any(epoch and not slot for slot, epoch in zip(slots, epochs)):
+        return False
+    if flags & ~PROC_EPOCH_FLAG_MASK:
+        return False
+    if flags & PROC_EPOCH_OVERFLOW and len(occupied) != PROC_EPOCH_RECORD_SLOTS:
+        return False
+    return True
+
+
 def task_storage_specs(maps):
+    """The exact owned inventory, or exactly the frozen qualification surface."""
     by_name = {item.get("name"): item for item in maps}
-    if set(by_name) != set(TASK_STORAGE_NAMES) or len(maps) != len(TASK_STORAGE_NAMES):
+    surface = next((names for names in (TASK_STORAGE_NAMES, TASK_STORAGE_QUALIFICATION_NAMES)
+                    if set(by_name) == set(names) and len(maps) == len(names)), None)
+    if surface is None:
         raise RuntimeError(
             f"expected exact task-storage maps {list(TASK_STORAGE_NAMES)}, "
             f"got {sorted(str(name) for name in by_name)}"
         )
-    ordered = [by_name[name] for name in TASK_STORAGE_NAMES]
+    ordered = [by_name[name] for name in surface]
     if len({item.get("id") for item in ordered}) != len(ordered):
         raise RuntimeError("task-storage maps do not have distinct map ids")
     for item in ordered:
@@ -641,7 +690,7 @@ def task_storage_specs(maps):
             item.get("type"), item.get("bytes_key"), item.get("bytes_value"),
             item.get("max_entries"), item.get("map_flags"),
         )
-        expected = ("task_storage", 4, 544 if item["name"] == "THREAD_OWNER" else 8, 0, 1)
+        expected = ("task_storage", 4, TASK_STORAGE_VALUE_SIZES[item["name"]], 0, 1)
         if actual != expected:
             raise RuntimeError(
                 f"task-storage map id={item['id']} name={item['name']} metadata mismatch: "
@@ -825,11 +874,13 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
     roots = {identity(row) for row in roster.values() if row["root"]}
     if (lane == "external" and roots) or (lane == "owned-root" and not roots):
         raise RuntimeError("stopped roster: root expectations contradict lane")
-    if not isinstance(maps, list) or len(maps) != 3:
+    if not isinstance(maps, list) or len(maps) != len(TASK_STORAGE_NAMES):
         raise RuntimeError("stopped map: invalid task-storage inventory")
     for item in maps:
         snapshot_map_metadata(item)
     ordered = task_storage_specs(maps)
+    if [item["name"] for item in ordered] != list(TASK_STORAGE_NAMES):
+        raise RuntimeError("stopped map: invalid task-storage inventory")
     by_id = {item["id"]: item for item in ordered}
     if any(not snapshot_uint(map_id, 32, positive=True) for map_id in by_id):
         raise RuntimeError("stopped map: invalid task-storage map identity")
@@ -856,6 +907,9 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
                 or record["generation"] != task["generation"]):
             raise RuntimeError(f"{context}: reused identity tid={record['tid']}")
         key = identity(task)
+        if item["name"] == "PROC_EPOCH" and record["pid"] != record["tid"]:
+            # The hooks create the record on the group leader only.
+            raise RuntimeError(f"{context}: record on a non-leader tid={record['tid']}")
         # Idle is a THREAD_OWNER-only state: the same task's leased cookie or
         # affiliation is an independent lease, not a second owner record.
         if key in seen[item["name"]] or (item["name"] == "THREAD_OWNER" and key in idle):
@@ -869,7 +923,11 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
             continue
         seen[item["name"]].add(key)
         bound[item["name"]].append({k: task[k] for k in ("pid", "tid", "generation")})
-    for name, flag in zip(TASK_STORAGE_NAMES, ("cookie", "owner", "root")):
+    # PROC_EPOCH has no required population: a leader holds a record only
+    # once it touched a watched provider mapping (or was marked a CLONE_VM
+    # sharer) after attach, so any subset of roster leaders is honest.
+    for name, flag in (("TASK_COOKIE", "cookie"), ("THREAD_OWNER", "owner"),
+                       ("ROOT_AFFILIATION", "root")):
         required = {identity(row) for row in roster.values() if row[flag]}
         if seen[name] != required or (name == "THREAD_OWNER" and idle & required):
             item = next(item for item in ordered if item["name"] == name)
@@ -922,6 +980,9 @@ def reconcile_task_storage(maps, records, *, expected, before, after, controls,
         elif name == "ROOT_AFFILIATION":
             if struct.unpack("<Q", raw)[0] != 1:
                 raise RuntimeError(f"{context}: invalid affiliation value")
+        elif name == "PROC_EPOCH":
+            if not proc_epoch_value_valid(raw):
+                raise RuntimeError(f"{context}: invalid mutation record value")
         else:
             original, = struct.unpack_from("<Q", raw)
             cookies = struct.unpack_from("<64Q", raw, 8)
@@ -1004,10 +1065,11 @@ def self_test():
         {"name": "TASK_COOKIE", "type": "task_storage"},
         {"name": "THREAD_OWNER", "type": "task_storage"},
         {"name": "ROOT_AFFILIATION", "type": "task_storage"},
+        {"name": "PROC_EPOCH", "type": "task_storage"},
     ]
     assert [map_oracle(item) for item in inventory] == [
         "mmap", "mmap", "dump", "dump", "refused-lookup",
-        "task-storage", "task-storage", "task-storage"
+        "task-storage", "task-storage", "task-storage", "task-storage"
     ], [
         map_oracle(item) for item in inventory
     ]
@@ -1019,6 +1081,25 @@ def self_test():
     else:
         raise AssertionError("EVENTS built as a non-ringbuf was accepted")
     print("EVENTS ringbuf build guard: OK")
+    def epoch(slots=(), epochs=(), flags=0, exec_gen=0):
+        cells = list(slots) + [0] * (PROC_EPOCH_RECORD_SLOTS - len(slots))
+        counts = list(epochs) + [0] * (PROC_EPOCH_RECORD_SLOTS - len(epochs))
+        return PROC_EPOCH_RECORD.pack(*cells, *counts, flags, exec_gen)
+    for value in (epoch(), epoch((3,), (7,)), epoch((1024, 1), (1, 0), PROC_EPOCH_SHARED_MM, 9),
+                  epoch(range(1, 9), (1,) * 8, PROC_EPOCH_OVERFLOW | PROC_EPOCH_LOCAL_FAULT)):
+        assert proc_epoch_value_valid(value)
+    for label, value in (
+        ("file slot beyond the watched table", epoch((1025,), (1,))),
+        ("duplicate file slot", epoch((3, 3), (1, 1))),
+        ("gap before an occupied cell", epoch((0, 3), (0, 1))),
+        ("epoch on an unclaimed cell", epoch((3,), (1, 1))),
+        ("unknown record flag", epoch((3,), (1,), 1 << 5)),
+        ("stamp-only flag", epoch((3,), (1,), 1 << 0)),
+        ("overflow with a free cell", epoch((3,), (1,), PROC_EPOCH_OVERFLOW)),
+        ("truncated record", epoch()[:-8]),
+    ):
+        assert not proc_epoch_value_valid(value), label
+    print("PROC_EPOCH record shape validation: OK")
     with tempfile.TemporaryDirectory() as tmp:
         fresh = os.path.join(tmp, "fresh.json")
         write_receipt(fresh, "{}\n")

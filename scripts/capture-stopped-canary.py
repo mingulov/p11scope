@@ -51,7 +51,8 @@ OWNED_LANES = frozenset(('owned-default-metrics', 'owned-feature-metrics'))
 OWNED_DURATION_SECONDS = 35
 OWNED_CHILD_WAIT_SECONDS = 5
 MAP_TYPES = {1: 'hash', 2: 'array', 3: 'prog_array', 5: 'percpu_hash',
-             6: 'percpu_array', 8: 'cgroup_array', 27: 'ringbuf', 29: 'task_storage'}
+             6: 'percpu_array', 8: 'cgroup_array', 9: 'lru_hash', 27: 'ringbuf',
+             29: 'task_storage'}
 STOP_SECONDS = 30
 READY_SECONDS = 8
 RESUME_SECONDS = 5

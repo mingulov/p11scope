@@ -173,9 +173,9 @@ def burst_rate_per_s(n_calls, go_ns, end_ns):
     return n_calls / ((end_ns - go_ns) / 1e9)
 
 
-# One EVENTS ring-buffer record: 328-byte Event (pinned by
+# One EVENTS ring-buffer record: 368-byte Event (pinned by
 # ebpf-common's size test) + the 8-byte ringbuf header, 8-aligned.
-RING_RECORD_BYTES = 336
+RING_RECORD_BYTES = 376
 
 
 def ring_capacity_records(ring_bytes):

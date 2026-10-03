@@ -19,7 +19,16 @@ struct bpf_map;
 struct bpf_program;
 struct bpf_link;
 
-enum { MAP_COUNT = 3, HEADER_SIZE = 28, LOG_LIMIT = 8192 };
+/* MAP_COUNT is the full owned inventory (TASK_COOKIE, THREAD_OWNER,
+ * ROOT_AFFILIATION, PROC_EPOCH). QUALIFICATION_MAPS is the frozen Task 2 D2
+ * seeded surface: its first three maps, read without PROC_EPOCH. */
+enum { MAP_COUNT = 4, QUALIFICATION_MAPS = 3, HEADER_SIZE = 28, LOG_LIMIT = 8192 };
+static const char *const map_names[MAP_COUNT] = {
+    "TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION", "PROC_EPOCH",
+};
+static const uint32_t map_sizes[MAP_COUNT] = {8, 544, 8, 144};
+static const char qualification_program[] = "dump_task_storage";
+static const char inventory_program[] = "dump_task_storage_epoch";
 static const unsigned char raw_magic[8] = {'P', '1', '1', 'T', 'S', 'R', '1', 0};
 static const unsigned char output_magic[8] = {'P', '1', '1', 'T', 'S', 'V', '1', 0};
 
@@ -53,6 +62,8 @@ struct api {
     int (*object_load)(struct bpf_object *);
     int (*map_fd)(const struct bpf_map *);
     struct bpf_program *(*object_find_program)(const struct bpf_object *, const char *);
+    int (*program_set_autoload)(struct bpf_program *, bool);
+    int (*map_set_autocreate)(struct bpf_map *, bool);
     struct bpf_link *(*program_attach_iter)(const struct bpf_program *, const void *);
     int (*link_fd)(const struct bpf_link *);
     int (*link_destroy)(struct bpf_link *);
@@ -210,6 +221,8 @@ static int load_api(void *library, struct api *api)
     LOAD(api, library, object_load, "bpf_object__load");
     LOAD(api, library, map_fd, "bpf_map__fd");
     LOAD(api, library, object_find_program, "bpf_object__find_program_by_name");
+    LOAD(api, library, program_set_autoload, "bpf_program__set_autoload");
+    LOAD(api, library, map_set_autocreate, "bpf_map__set_autocreate");
     LOAD(api, library, program_attach_iter, "bpf_program__attach_iter");
     LOAD(api, library, link_fd, "bpf_link__fd");
     LOAD(api, library, link_destroy, "bpf_link__destroy");
@@ -241,23 +254,50 @@ static int write_all(int fd, const void *buffer, size_t length)
     return 0;
 }
 
+/* Selects the iterator program for the requested surface before load. The
+ * full inventory loads only the four-map program. The qualification surface
+ * loads only the three-map program and never creates PROC_EPOCH, so the
+ * reader still creates no map of its own on either path. */
+static struct bpf_program *select_surface(const struct api *api, struct bpf_object *object,
+                                          size_t count)
+{
+    struct bpf_program *qualification;
+    struct bpf_program *inventory;
+    struct bpf_map *epoch;
+    if (count != MAP_COUNT && count != QUALIFICATION_MAPS)
+        return NULL;
+    qualification = api->object_find_program(object, qualification_program);
+    inventory = api->object_find_program(object, inventory_program);
+    epoch = api->object_find_map(object, map_names[MAP_COUNT - 1]);
+    if (!qualification || !inventory || !epoch || qualification == inventory)
+        return NULL;
+    if (count == MAP_COUNT)
+        return api->program_set_autoload(qualification, false) ? NULL : inventory;
+    if (api->program_set_autoload(inventory, false) || api->map_set_autocreate(epoch, false))
+        return NULL;
+    return qualification;
+}
+
 static int acquire_reuse_load(const struct api *api, const struct kernel_api *kernel,
-                              struct bpf_object *object, struct map_spec specs[MAP_COUNT])
+                              struct bpf_object *object, struct map_spec specs[MAP_COUNT],
+                              size_t count)
 {
     size_t index;
-    for (index = 0; index < MAP_COUNT; index++) {
+    if (count != MAP_COUNT && count != QUALIFICATION_MAPS)
+        return -1;
+    for (index = 0; index < count; index++) {
         specs[index].fd = kernel->fd_by_id(specs[index].id);
         if (specs[index].fd < 0 || exact_info(kernel, specs[index].fd, &specs[index]))
             return -1;
     }
-    for (index = 0; index < MAP_COUNT; index++) {
+    for (index = 0; index < count; index++) {
         specs[index].map = api->object_find_map(object, specs[index].name);
         if (!specs[index].map || api->map_reuse_fd(specs[index].map, specs[index].fd))
             return -1;
     }
     if (api->object_load(object))
         return -1;
-    for (index = 0; index < MAP_COUNT; index++) {
+    for (index = 0; index < count; index++) {
         int object_fd = api->map_fd(specs[index].map);
         if (object_fd < 0 || exact_info(kernel, object_fd, &specs[index]))
             return -1;
@@ -407,10 +447,96 @@ static void reset_lifecycle(struct map_spec specs[MAP_COUNT])
     }
 }
 
+struct surface_state {
+    int qualification_disabled;
+    int inventory_disabled;
+    int epoch_autocreate_disabled;
+    int missing_epoch;
+    int autoload_failure;
+};
+
+static struct surface_state surface;
+
+static struct bpf_program *fake_find_program(const struct bpf_object *object, const char *name)
+{
+    (void)object;
+    if (!strcmp(name, qualification_program))
+        return (struct bpf_program *)(uintptr_t)1;
+    if (!strcmp(name, inventory_program))
+        return (struct bpf_program *)(uintptr_t)2;
+    return NULL;
+}
+
+static int fake_set_autoload(struct bpf_program *program, bool autoload)
+{
+    if (autoload || surface.autoload_failure)
+        return -1;
+    if (program == (struct bpf_program *)(uintptr_t)1)
+        surface.qualification_disabled++;
+    else if (program == (struct bpf_program *)(uintptr_t)2)
+        surface.inventory_disabled++;
+    else
+        return -1;
+    return 0;
+}
+
+static struct bpf_map *fake_surface_map(const struct bpf_object *object, const char *name)
+{
+    (void)object;
+    if (!surface.missing_epoch && !strcmp(name, map_names[MAP_COUNT - 1]))
+        return (struct bpf_map *)(uintptr_t)MAP_COUNT;
+    return NULL;
+}
+
+static int fake_set_autocreate(struct bpf_map *map, bool autocreate)
+{
+    if (autocreate || map != (struct bpf_map *)(uintptr_t)MAP_COUNT)
+        return -1;
+    surface.epoch_autocreate_disabled++;
+    return 0;
+}
+
+static int surface_self_test(void)
+{
+    struct api api;
+    struct bpf_object *object = (struct bpf_object *)(uintptr_t)1;
+    memset(&api, 0, sizeof(api));
+    api.object_find_program = fake_find_program;
+    api.program_set_autoload = fake_set_autoload;
+    api.object_find_map = fake_surface_map;
+    api.map_set_autocreate = fake_set_autocreate;
+
+    memset(&surface, 0, sizeof(surface));
+    if (select_surface(&api, object, MAP_COUNT) != (struct bpf_program *)(uintptr_t)2 ||
+        surface.qualification_disabled != 1 || surface.inventory_disabled ||
+        surface.epoch_autocreate_disabled)
+        return fail("self-test full inventory did not select only the four-map program");
+    memset(&surface, 0, sizeof(surface));
+    if (select_surface(&api, object, QUALIFICATION_MAPS) != (struct bpf_program *)(uintptr_t)1 ||
+        surface.qualification_disabled || surface.inventory_disabled != 1 ||
+        surface.epoch_autocreate_disabled != 1)
+        return fail("self-test qualification surface would create or read PROC_EPOCH");
+    memset(&surface, 0, sizeof(surface));
+    if (select_surface(&api, object, QUALIFICATION_MAPS - 1) ||
+        select_surface(&api, object, MAP_COUNT + 1))
+        return fail("self-test accepted a partial or oversized map surface");
+    surface.missing_epoch = 1;
+    if (select_surface(&api, object, MAP_COUNT) ||
+        select_surface(&api, object, QUALIFICATION_MAPS))
+        return fail("self-test accepted an object without PROC_EPOCH");
+    memset(&surface, 0, sizeof(surface));
+    surface.autoload_failure = 1;
+    if (select_surface(&api, object, MAP_COUNT) ||
+        select_surface(&api, object, QUALIFICATION_MAPS))
+        return fail("self-test ignored a failed autoload change");
+    puts("dump-task-storage surface selection mutation self-test: OK");
+    return 0;
+}
+
 static int lifecycle_self_test(void)
 {
-    static const char *names[MAP_COUNT] = {"TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION"};
-    static const uint32_t sizes[MAP_COUNT] = {8, 544, 8};
+    const char *const *names = map_names;
+    const uint32_t *sizes = map_sizes;
     struct map_spec specs[MAP_COUNT];
     struct api api;
     struct kernel_api kernel = {
@@ -441,7 +567,7 @@ static int lifecycle_self_test(void)
     object = (struct bpf_object *)(uintptr_t)1;
     link = NULL;
     iterator_fd = -1;
-    if (!acquire_reuse_load(&api, &kernel, object, specs))
+    if (!acquire_reuse_load(&api, &kernel, object, specs, MAP_COUNT))
         return fail("self-test accepted partial map acquisition");
     release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
     if (lifecycle.acquire_calls != 2 || lifecycle.reuse_calls || lifecycle.load_calls ||
@@ -451,17 +577,17 @@ static int lifecycle_self_test(void)
     reset_lifecycle(specs);
     lifecycle.reuse_failure = 1;
     object = (struct bpf_object *)(uintptr_t)1;
-    if (!acquire_reuse_load(&api, &kernel, object, specs))
+    if (!acquire_reuse_load(&api, &kernel, object, specs, MAP_COUNT))
         return fail("self-test accepted failed map reuse");
     release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
-    if (lifecycle.reuse_calls != 2 || lifecycle.load_calls || lifecycle.close_calls != 3 ||
+    if (lifecycle.reuse_calls != 2 || lifecycle.load_calls || lifecycle.close_calls != MAP_COUNT ||
         lifecycle.object_close_calls != 1)
         return fail("self-test reuse failure loaded or leaked resources");
 
     reset_lifecycle(specs);
     lifecycle.substituted_loaded_map = 1;
     object = (struct bpf_object *)(uintptr_t)1;
-    if (!acquire_reuse_load(&api, &kernel, object, specs))
+    if (!acquire_reuse_load(&api, &kernel, object, specs, MAP_COUNT))
         return fail("self-test accepted substituted loaded-map id");
     release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
     if (lifecycle.reuse_calls != MAP_COUNT || lifecycle.load_calls != 1 ||
@@ -472,21 +598,38 @@ static int lifecycle_self_test(void)
     object = (struct bpf_object *)(uintptr_t)1;
     link = (struct bpf_link *)(uintptr_t)1;
     iterator_fd = 300;
-    if (acquire_reuse_load(&api, &kernel, object, specs))
+    if (acquire_reuse_load(&api, &kernel, object, specs, MAP_COUNT))
         return fail("self-test rejected exact reuse lifecycle");
     release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
     if (lifecycle.reuse_calls != MAP_COUNT || lifecycle.load_calls != 1 ||
         lifecycle.close_calls != MAP_COUNT + 1 || lifecycle.destroy_calls != 1 ||
         lifecycle.object_close_calls != 1 || iterator_fd != -1 || link || object)
         return fail("self-test complete resource cleanup mismatch");
+
+    /* The qualification surface reuses exactly its three maps and never
+     * touches PROC_EPOCH's spec. */
+    reset_lifecycle(specs);
+    object = (struct bpf_object *)(uintptr_t)1;
+    if (acquire_reuse_load(&api, &kernel, object, specs, QUALIFICATION_MAPS))
+        return fail("self-test rejected exact qualification reuse lifecycle");
+    if (specs[MAP_COUNT - 1].fd != -1 || specs[MAP_COUNT - 1].map)
+        return fail("self-test qualification surface acquired PROC_EPOCH");
+    release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
+    if (lifecycle.reuse_calls != QUALIFICATION_MAPS || lifecycle.load_calls != 1 ||
+        lifecycle.close_calls != QUALIFICATION_MAPS || lifecycle.object_close_calls != 1)
+        return fail("self-test qualification cleanup mismatch");
+    reset_lifecycle(specs);
+    object = (struct bpf_object *)(uintptr_t)1;
+    if (!acquire_reuse_load(&api, &kernel, object, specs, QUALIFICATION_MAPS - 1) ||
+        lifecycle.acquire_calls || lifecycle.load_calls)
+        return fail("self-test accepted a partial map surface");
+    release_resources(&api, &kernel, &iterator_fd, &link, &object, specs);
     puts("dump-task-storage resource lifecycle mutation self-test: OK");
-    return 0;
+    return surface_self_test();
 }
 
 int main(int argc, char **argv)
 {
-    static const char *names[MAP_COUNT] = {"TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION"};
-    static const uint32_t sizes[MAP_COUNT] = {8, 544, 8};
     struct map_spec specs[MAP_COUNT];
     struct api api;
     struct kernel_api kernel = {
@@ -504,6 +647,7 @@ int main(int argc, char **argv)
     int iterator_fd = -1;
     int status = 1;
     size_t index;
+    size_t count = 0;
 
     memset(&api, 0, sizeof(api));
     memset(specs, 0, sizeof(specs));
@@ -550,13 +694,16 @@ int main(int argc, char **argv)
         puts("dump-task-storage exact-map mutation self-test: OK");
         return lifecycle_self_test();
     }
-    if (argc != 9 || parse_u32(argv[2], &observer_pid) || !observer_pid ||
+    /* Six fixed arguments, then exactly the qualification or full surface. */
+    if (argc == 6 + QUALIFICATION_MAPS || argc == 6 + MAP_COUNT)
+        count = (size_t)argc - 6;
+    if (!count || parse_u32(argv[2], &observer_pid) || !observer_pid ||
         parse_u32(argv[3], &max_records) || !max_records || max_records > 131072 ||
         parse_u32(argv[4], &max_bytes) || !max_bytes || max_bytes > 64U * 1024U * 1024U ||
         parse_u32(argv[5], &timeout_ms) || !timeout_ms || timeout_ms > 60000)
         return fail("invalid arguments");
-    for (index = 0; index < MAP_COUNT; index++) {
-        if (parse_spec(argv[6 + index], &specs[index], names[index], sizes[index]))
+    for (index = 0; index < count; index++) {
+        if (parse_spec(argv[6 + index], &specs[index], map_names[index], map_sizes[index]))
             return fail("invalid map specification");
     }
     if ((size_t)max_records > (SIZE_MAX - max_bytes) / HEADER_SIZE)
@@ -577,13 +724,13 @@ int main(int argc, char **argv)
         fail("cannot open iterator object");
         goto cleanup;
     }
-    if (acquire_reuse_load(&api, &kernel, object, specs)) {
-        fail("cannot acquire, reuse, or validate exact task-storage maps");
+    program = select_surface(&api, object, count);
+    if (!program) {
+        fail("iterator program or surface selection is missing");
         goto cleanup;
     }
-    program = api.object_find_program(object, "dump_task_storage");
-    if (!program) {
-        fail("iterator program is missing");
+    if (acquire_reuse_load(&api, &kernel, object, specs, count)) {
+        fail("cannot acquire, reuse, or validate exact task-storage maps");
         goto cleanup;
     }
     link = api.program_attach_iter(program, NULL);
@@ -634,7 +781,7 @@ int main(int argc, char **argv)
         offset += sizeof(header);
         slot = header.map_id;
         if (memcmp(header.magic, raw_magic, sizeof(raw_magic)) || header.kind != 1 ||
-            slot >= MAP_COUNT || header.value_len != specs[slot].value_size ||
+            slot >= count || header.value_len != specs[slot].value_size ||
             !header.pid || !header.tid || header.value_len > used - offset) {
             fail("iterator produced invalid frame metadata");
             goto cleanup;

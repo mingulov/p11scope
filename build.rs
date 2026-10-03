@@ -85,6 +85,8 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.h");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.lock");
     println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
@@ -183,6 +185,7 @@ fn build_variant(
             "image_identity_fork",
             "task_owner",
             "root_affiliation",
+            "instance_epoch",
         ],
     };
     let mut native_bitcodes = Vec::new();
@@ -232,6 +235,9 @@ fn build_variant(
         }
         if !inventory && wide_detailed && *unit == "task_owner" {
             compile.arg("-DP11SCOPE_OWNER_SLOT_BOUND=2112U");
+        }
+        if !inventory && wide_detailed && *unit == "instance_epoch" {
+            compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=2112U");
         }
         let status = compile
             .status()
@@ -327,6 +333,19 @@ fn build_variant(
             "link-arg=--export=p11_link_emit_fork",
             "-C",
             "link-arg=--export=task_newtask",
+            // Task 3 Stage A continuity witness (native instance_epoch.c).
+            "-C",
+            "link-arg=--export=p11_inst_vma_map",
+            "-C",
+            "link-arg=--export=p11_inst_vma_unmap",
+            "-C",
+            "link-arg=--export=p11_inst_vma_copy",
+            "-C",
+            "link-arg=--export=p11_instance_entry",
+            "-C",
+            "link-arg=--export=p11_instance_return",
+            "-C",
+            "link-arg=--export=p11_instance_exec",
         ] {
             append_flag(flag);
         }

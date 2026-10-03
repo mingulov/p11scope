@@ -149,7 +149,7 @@ class DiscoveryFlow(unittest.TestCase):
             ('thread-bypass', 'p11_link_emit_fork', 'r5 &= 0x10000', 'r5 &= 0x0', 'classification'),
             ('child-zero', 'p11_link_emit_fork', 'if r2 == 0x0 goto -0xc', 'if r2 != 0x0 goto -0xc', 'classification'),
             ('parent-identity', 'p11_link_emit_fork', 'if r9 == 0x0 goto', 'if r9 != 0x0 goto', 'classification'),
-            ('child-identity', 'p11_link_emit_fork', 'if r6 != 0x0 goto', 'if r6 == 0x0 goto', 'classification'),
+            ('child-identity', 'p11_link_emit_fork', 'if r7 != 0x0 goto', 'if r7 == 0x0 goto', 'classification'),
             ('reserve-too-early', 'p11_link_emit_fork', '\tr5 = r2', '\tcall 0x83', 'classification'),
         ]
         self.mutations(cases, 'typed-birth')

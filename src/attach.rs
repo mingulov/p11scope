@@ -47,9 +47,19 @@ pub(crate) use inventory::PreparedInventory;
 pub(crate) use inventory::capture;
 mod stop_gate;
 pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
+// Task 3 Stage A: the readers are consumed by the Task 6 native seam
+// (`stage_native`, DR-T3A-1) and today by the privileged instance gates.
+#[allow(dead_code)]
+mod instance;
+#[allow(unused_imports)]
+pub(crate) use instance::{
+    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, LiveScan, WatchedFile,
+};
 mod cleanup_worker;
 pub use cleanup_worker::CleanupInterrupted;
 pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink, drive_cleanup};
+#[cfg(test)]
+mod instance_tests;
 
 #[cfg(test)]
 mod continuation_guard_tests;
@@ -260,6 +270,11 @@ fn validate_identity_inventory<'a>(maps: impl Iterator<Item = (&'a str, bool)>) 
     let mut storage = BTreeSet::new();
     for (name, unsupported) in maps {
         if unsupported {
+            // Task 3 Stage A's process-epoch task storage is not an identity
+            // map; the instance tracker validates its own metadata.
+            if name == "PROC_EPOCH" {
+                continue;
+            }
             if !matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
                 bail!("unexpected Unsupported map {name}");
             }
@@ -1208,6 +1223,9 @@ pub struct Session {
     /// slot's last link detaches (see [`RetainedStaticTarget`]).
     retained_static: BTreeMap<u32, RetainedStaticTarget>,
     links: Vec<RegisteredLink>,
+    /// Task 3 Stage A continuity witness: hook links, watched files and the
+    /// refusal reason when instance routing is unavailable.
+    instance: InstanceTracking,
     /// Background link cleanup, pre-started during preparation so the
     /// worker thread exists before any submit. `None` once a detach has
     /// driven it to completion; a fresh worker is created if links ever
@@ -2651,7 +2669,10 @@ fn expected_programs(unsafe_enabled: bool) -> BTreeSet<&'static str> {
 }
 
 fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
-    let expected = expected_programs(unsafe_enabled);
+    let mut expected = expected_programs(unsafe_enabled);
+    // The continuity hooks are present in every Detailed object but load
+    // after activation, optionally (`InstanceTracking::start`).
+    expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
     let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
     if actual != expected {
         bail!("eBPF program inventory {actual:?} differs from {expected:?}");
@@ -3190,6 +3211,9 @@ impl Session {
                 )?;
                 Ok((events_domain, discovery_domain, links))
             })?;
+        // After the mandatory lifecycle links and before any endpoint link
+        // (ordering I1). A failure refuses instance routing, not capture.
+        let instance = InstanceTracking::start(&mut ebpf, &btf);
 
         Ok(Self {
             stop_gate: stop_gate.expect("preparation established the stop gate"),
@@ -3217,6 +3241,7 @@ impl Session {
             process_creation_tracking_unavailable: None,
             retained_static: BTreeMap::new(),
             links,
+            instance,
             cleanup_worker: Some(CleanupWorker::pre_start()),
         })
     }
@@ -3535,6 +3560,9 @@ impl Session {
                 Ok((slot.index, (path, abi)))
             })
             .collect::<Result<_>>()?;
+        // Ordering I1: watched-file keys and SLOT_FILE before any link.
+        self.instance
+            .prepare_targets(&mut self.ebpf, targets, objects);
         let scope = self.uprobe_scope;
         let outcome = if self.backend == AttachBackend::Multi {
             self.attach_targets_multi(targets, &attach_targets)?
@@ -4263,6 +4291,24 @@ impl Session {
     /// Detach failures remain available after the terminal best-effort drain.
     pub fn detach_failures(&self) -> &[String] {
         &self.detach_failures
+    }
+
+    /// Task 3 Stage A instance tracking state (hooks, watched files).
+    #[allow(dead_code)] // Task 6 native seam (DR-T3A-1); privileged gates today.
+    pub(crate) fn instance_tracking(&self) -> &InstanceTracking {
+        &self.instance
+    }
+
+    /// Readers over the continuity maps.
+    #[allow(dead_code)] // Task 6 native seam (DR-T3A-1); privileged gates today.
+    pub(crate) fn instance_maps(&self) -> InstanceMaps<'_> {
+        InstanceMaps { ebpf: &self.ebpf }
+    }
+
+    /// The continuity hooks' run/miss statistics.
+    #[allow(dead_code)] // Task 6 native seam (DR-T3A-1); privileged gates today.
+    pub(crate) fn instance_hook_stats(&self) -> Result<Vec<(&'static str, HookStats)>> {
+        self.instance.hook_stats(&self.ebpf)
     }
 
     pub(crate) fn lifecycle_tracking_unavailable(&self) -> Option<&str> {

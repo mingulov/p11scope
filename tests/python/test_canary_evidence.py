@@ -177,7 +177,7 @@ def event_bytes(index, mechanism=None, slot=0, shape=0, p0=0, p1=0, p2=0,
                 attrs=(), attr_count=0, attr_total=0, attr_bools=0,
                 attr_seen=0, capture=0, root_affiliation=0):
     """Independent Event byte constructor; it never calls production encoders."""
-    raw = bytearray(328)
+    raw = bytearray(368)
     struct.pack_into("<Q", raw, 16, 0x555 << 32 | index)
     session, target = (0x101, (1 << 32) - 1)
     if 22 <= index < 25:
@@ -336,7 +336,12 @@ class TaskStorageReaderTests(unittest.TestCase):
         {"name": "ROOT_AFFILIATION", "id": 103, "type": "task_storage",
          "oracle": "task-storage", "bytes_key": 4, "bytes_value": 8,
          "max_entries": 0, "map_flags": 1},
+        {"name": "PROC_EPOCH", "id": 111, "type": "task_storage",
+         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 144,
+         "max_entries": 0, "map_flags": 1},
     ]
+    # The frozen Task 2 D2 seeded surface the qualification canary reads.
+    QUALIFICATION_MAPS = MAPS[:3]
 
     @staticmethod
     def frame(kind, map_id=0, pid=0, tid=0, value=b""):
@@ -456,6 +461,18 @@ class TaskStorageReaderTests(unittest.TestCase):
             unrelated.kill()
             unrelated.wait(timeout=1)
 
+    def test_task_storage_surfaces_are_the_owned_inventory_or_the_frozen_qualification(self):
+        dumper = load_dumper()
+        self.assertEqual([item["name"] for item in dumper.task_storage_specs(list(reversed(self.MAPS)))],
+                         list(dumper.TASK_STORAGE_NAMES))
+        self.assertEqual(dumper.task_storage_specs(self.QUALIFICATION_MAPS), self.QUALIFICATION_MAPS)
+        epoch_only = [self.MAPS[0], self.MAPS[1], self.MAPS[3]]
+        for label, maps in (("partial", self.MAPS[:2]), ("epoch-for-root", epoch_only),
+                            ("duplicate", [*self.MAPS, self.MAPS[3]]),
+                            ("short-epoch", [*self.MAPS[:3], {**self.MAPS[3], "bytes_value": 136}])):
+            with self.subTest(case=label), self.assertRaises(RuntimeError):
+                dumper.task_storage_specs(maps)
+
     def test_native_reader_validates_native_limits_before_spawn(self):
         dumper = load_dumper()
         with tempfile.TemporaryDirectory() as directory:
@@ -513,6 +530,7 @@ class TaskStorageReaderTests(unittest.TestCase):
                         "TASK_COOKIE:101:task_storage:4:8:0:1",
                         "THREAD_OWNER:102:task_storage:4:544:0:1",
                         "ROOT_AFFILIATION:103:task_storage:4:8:0:1",
+                        "PROC_EPOCH:111:task_storage:4:144:0:1",
                     ])
                     parsed = dumper.parse_task_storage_frames(
                         actual, self.MAPS, max_records=maximum_records, max_bytes=maximum_bytes)
@@ -1780,6 +1798,12 @@ class TaskStorageReaderTests(unittest.TestCase):
 class StoppedPopulationTests(unittest.TestCase):
     """Valid EOF and byte counts cannot substitute for exact stopped owners."""
 
+    @staticmethod
+    def epoch_value(slots=(1, 6), epochs=(2, 1), flags=0, exec_gen=3):
+        cells = list(slots) + [0] * (8 - len(slots))
+        counts = list(epochs) + [0] * (8 - len(epochs))
+        return struct.pack("<18Q", *cells, *counts, flags, exec_gen)
+
     def fixture(self, root, *, owned=False, empty=False):
         tasks = [
             {"pid": 7001, "tid": tid, "generation": generation,
@@ -1837,6 +1861,11 @@ class StoppedPopulationTests(unittest.TestCase):
                 records.append({"map_id": map_id, "pid": task["pid"],
                                 "tid": task["tid"], "generation": task["generation"],
                                 "value": bytes(value)})
+        if not empty:
+            # The leader touched watched provider file slots 0 and 5 after
+            # attach; PROC_EPOCH population is optional, never required.
+            records.append({"map_id": 111, "pid": 7001, "tid": 7001, "generation": 900,
+                            "value": self.epoch_value()})
         controls = {
             "COOKIE_CTL": [16384, 7, 0, 0, 0],  # history exceeds live cells
             "OWNER_CTL": [16448, 0 if empty else 2, 0, 0, 0, 0, 0],
@@ -1910,7 +1939,7 @@ class StoppedPopulationTests(unittest.TestCase):
                 # An owned acquisition files a DISCOVERY ring its own observer
                 # already drained: every record consumed, nothing retained.
                 self.publish_fixture(root, *args, drained=5 * stride if owned else 0)
-                self.assertEqual(len(self.check(root, args[0])), 10)
+                self.assertEqual(len(self.check(root, args[0])), 11)
 
     def test_framed_records_bind_generations_for_future_coordinator(self):
         dumper = load_dumper()
@@ -1937,6 +1966,7 @@ class StoppedPopulationTests(unittest.TestCase):
             "THREAD_OWNER": [{"pid": 7001, "tid": 7002, "generation": 901},
                              {"pid": 7001, "tid": 7003, "generation": 902}],
             "ROOT_AFFILIATION": [],
+            "PROC_EPOCH": [{"pid": 7001, "tid": 7001, "generation": 900}],
         })
         for key in ("expected", "before", "after"):
             with self.subTest(bound=key):
@@ -1958,7 +1988,7 @@ class StoppedPopulationTests(unittest.TestCase):
             manifest, receipt, records, controls = self.fixture(root)
             records.append(dict(idle))
             self.publish_fixture(root, manifest, receipt, records, controls)
-            self.assertEqual(len(self.check(root, manifest)), 10)
+            self.assertEqual(len(self.check(root, manifest)), 11)
         for case in ("foreign", "expected-lease", "not-zero", "counted"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -2038,6 +2068,73 @@ class StoppedPopulationTests(unittest.TestCase):
                 self.publish_fixture(root, manifest, receipt, records, controls)
                 with self.assertRaisesRegex(AssertionError, "stopped.*map.*(population|identity)"):
                     self.check(root, manifest)
+
+    def test_proc_epoch_population_is_an_optional_subset_of_roster_leaders(self):
+        # Absent: no leader touched a watched provider mapping after attach.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = self.fixture(root)
+            records[:] = [r for r in records if r["map_id"] != 111]
+            self.publish_fixture(root, manifest, receipt, records, controls)
+            self.assertEqual(len(self.check(root, manifest)), 11)
+        # Every SHARED_MM / OVERFLOW / LOCAL_FAULT shape the hooks can leave.
+        for label, value in (
+            ("shared", self.epoch_value((), (), 1 << 2, 0)),
+            ("overflow", self.epoch_value(range(1, 9), (1,) * 8, (1 << 3) | (1 << 4), 9)),
+            ("last-slot", self.epoch_value((1024,), (7,))),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                next(r for r in records if r["map_id"] == 111)["value"] = value
+                self.publish_fixture(root, manifest, receipt, records, controls)
+                self.assertEqual(len(self.check(root, manifest)), 11)
+
+    def test_proc_epoch_refuses_nonleader_foreign_duplicate_and_malformed_records(self):
+        for case in ("non-leader", "foreign", "reused", "duplicate", "unknown-flag",
+                     "stamp-flag", "slot-beyond-table", "duplicate-slot", "slot-gap",
+                     "orphan-epoch", "overflow-with-free-cell"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, receipt, records, controls = self.fixture(root)
+                row = next(r for r in records if r["map_id"] == 111)
+                if case == "non-leader":
+                    row.update(tid=7002, generation=901)
+                elif case == "foreign":
+                    row.update(pid=8888, tid=8888)
+                elif case == "reused":
+                    row["generation"] = 999
+                elif case == "duplicate":
+                    records.append(dict(row))
+                elif case == "unknown-flag":
+                    row["value"] = self.epoch_value(flags=1 << 5)
+                elif case == "stamp-flag":
+                    row["value"] = self.epoch_value(flags=1 << 0)
+                elif case == "slot-beyond-table":
+                    row["value"] = self.epoch_value((1025,), (1,))
+                elif case == "duplicate-slot":
+                    row["value"] = self.epoch_value((6, 6), (1, 1))
+                elif case == "slot-gap":
+                    row["value"] = self.epoch_value((0, 6), (0, 1))
+                elif case == "orphan-epoch":
+                    row["value"] = self.epoch_value((6,), (1, 1))
+                else:
+                    row["value"] = self.epoch_value((6,), (1,), 1 << 3)
+                # A duplicate frame is refused by the framed parser itself.
+                with self.assertRaisesRegex((AssertionError, RuntimeError),
+                                            "stopped|duplicate task-storage record"):
+                    self.publish_fixture(root, manifest, receipt, records, controls)
+                    self.check(root, manifest)
+
+    def test_stopped_inventory_requires_proc_epoch(self):
+        dumper = load_dumper()
+        manifest, receipt, records, values = self.fixture(Path("/unused"))
+        arguments = {key: receipt[key] for key in ("expected", "before", "after", "lane")}
+        arguments["controls"] = {}
+        with self.assertRaisesRegex(RuntimeError, "invalid task-storage inventory"):
+            dumper.reconcile_task_storage(TaskStorageReaderTests.QUALIFICATION_MAPS,
+                                          [r for r in records if r["map_id"] != 111],
+                                          **arguments)
 
     def test_roster_rejects_missing_changed_reused_and_unstopped_tasks(self):
         for case in ("missing", "changed", "reused", "duplicate", "running", "no-state", "no-after"):
@@ -2146,7 +2243,7 @@ class StoppedPopulationTests(unittest.TestCase):
                     struct.pack_into("<QQII", raw, 520, occupied, domains, starts, 1)
                     row["value"] = bytes(raw)
                 self.publish_fixture(root, manifest, receipt, records, controls)
-                self.assertEqual(len(self.check(root, manifest)), 10)
+                self.assertEqual(len(self.check(root, manifest)), 11)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2291,12 +2388,14 @@ class StoppedPopulationTests(unittest.TestCase):
                     # empty, so the tail between the counters must be empty too.
                     ring["positions"] = [0, load_subject(TARGET_BITS).RING_RECORD_STRIDES["EVENTS"]]
                 elif case != "duplicate-json-field":
-                    path = Path(manifest[3]["file"])
+                    control = next(index for index, item in enumerate(manifest)
+                                   if item["name"] == "COOKIE_CTL")
+                    path = Path(manifest[control]["file"])
                     content = b'[{"key":[0,0,0,0],"value":"PRIVATE_RAW_VALUE"}]'
                     if case == "boolean-control-byte":
                         content = path.read_bytes().replace(b'"key": [0', b'"key": [false', 1)
                     path.write_bytes(content)
-                    receipt["surfaces"][3].update(size=len(content), sha256=hashlib.sha256(content).hexdigest())
+                    receipt["surfaces"][control].update(size=len(content), sha256=hashlib.sha256(content).hexdigest())
                 (root / "snapshot.json").write_text(json.dumps(receipt))
                 if case == "duplicate-json-field":
                     path = root / "snapshot.json"
@@ -2666,15 +2765,15 @@ class RingLayoutTests(unittest.TestCase):
     def test_ring_layout_rejects_busy_and_wrap(self):
         subject = load_subject(TARGET_BITS)
         raw = bytearray(2 * mmap.PAGESIZE)
-        event = bytes(328)
+        event = bytes(368)
         struct.pack_into("<I", raw, 0, len(event))
         raw[8:8 + len(event)] = event
-        self.assertEqual(subject.parse_ring_records(raw, mmap.PAGESIZE, 0, 336), [event])
+        self.assertEqual(subject.parse_ring_records(raw, mmap.PAGESIZE, 0, 376), [event])
         struct.pack_into("<I", raw, 0, len(event) | (1 << 31))
         with self.assertRaises(AssertionError):
-            subject.parse_ring_records(raw, mmap.PAGESIZE, 0, 336)
+            subject.parse_ring_records(raw, mmap.PAGESIZE, 0, 376)
         with self.assertRaises(AssertionError):
-            subject.parse_ring_records(raw, mmap.PAGESIZE, 336, 0)
+            subject.parse_ring_records(raw, mmap.PAGESIZE, 376, 0)
 
     def test_ring_adapter_closes_fd_and_partial_mapping_on_failure(self):
         subject = load_subject(TARGET_BITS)
@@ -2741,8 +2840,8 @@ class RingLayoutTests(unittest.TestCase):
             self.assertFalse(any(mapping.closed for mapping in all_mappings))
             discovery_position = (8 + subject.DISCOVERY_RECORD_SIZE + 7) & ~7
             self.assertEqual([reader.positions() for reader in readers],
-                             [(0, 336), (0, discovery_position)])
-            self.assertEqual(readers[0].read_records((0, 336)), [bytes(328)])
+                             [(0, 376), (0, discovery_position)])
+            self.assertEqual(readers[0].read_records((0, 376)), [bytes(368)])
             self.assertEqual(readers[1].read_records((0, discovery_position)),
                              [bytes(subject.DISCOVERY_RECORD_SIZE)])
             self.assertTrue(all(os.fstat(fd) for fd in libc.fds))
@@ -2971,7 +3070,7 @@ class OwnedMetricsOracleTests(unittest.TestCase):
 
 
 class EventLayoutTests(unittest.TestCase):
-    def test_exact_event328_decodes_unknown_and_positive_root_affiliation(self):
+    def test_exact_event368_decodes_unknown_and_positive_root_affiliation(self):
         subject = load_subject(TARGET_BITS)
         unknown = subject.decode_event(event_bytes(0, root_affiliation=0))
         positive = subject.decode_event(event_bytes(0, root_affiliation=1))

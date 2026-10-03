@@ -225,8 +225,8 @@ def typed_birth(elf, secs):
         if r5 != 0x0 goto @zero
         r9 = *(u64 *)(r3 + 0x0)
         if r9 == 0x0 goto @zero
-        r6 = *(u64 *)(r4 + 0x0)
-        if r6 != 0x0 goto @classify
+        r7 = *(u64 *)(r4 + 0x0)
+        if r7 != 0x0 goto @classify
         zero:
         r0 = 0x0
         exit

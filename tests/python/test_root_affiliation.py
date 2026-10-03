@@ -67,6 +67,9 @@ def hook_contract(main, identity):
         raise AssertionError("fork admission must precede root propagation")
     if not birth.index("p11_root_propagate_thread(") < birth.index("if (clone_flags & CLONE_THREAD)") < birth.index("p11_link_fork_allowed()"):
         raise AssertionError("pre-wake thread propagation must precede semantic filters")
+    if not (birth.index("p11_root_propagate_thread(") < birth.index("p11_instance_fork(")
+            < birth.index("if (clone_flags & CLONE_THREAD)")):
+        raise AssertionError("instance sharer marking must see every admitted birth before filters")
 
 
 class RootAffiliationTests(unittest.TestCase):
@@ -120,6 +123,16 @@ class RootAffiliationTests(unittest.TestCase):
         self.assertNotEqual(gate_removed, identity, "mutation must change the tested source")
         with self.assertRaises((AssertionError, ValueError)):
             hook_contract(main, gate_removed)
+        instance_call = "    (void)p11_instance_fork(child, clone_flags);\n"
+        thread_filter = "    if (clone_flags & CLONE_THREAD)\n        return 0;\n"
+        for instance_mutant in [
+            identity.replace(instance_call, ""),
+            identity.replace(instance_call, "").replace(
+                thread_filter, thread_filter + instance_call, 1),
+        ]:
+            self.assertNotEqual(instance_mutant, identity, "mutation must change the tested source")
+            with self.assertRaises((AssertionError, ValueError)):
+                hook_contract(main, instance_mutant)
 
     def test_native_production_helpers(self):
         with tempfile.TemporaryDirectory(prefix="p11scope-root-affiliation-") as directory:

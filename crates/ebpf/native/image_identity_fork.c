@@ -5,6 +5,8 @@
 
 extern u32 p11_link_fork_allowed(void);
 extern u32 p11_root_propagate_thread(struct task_struct *child, u64 clone_flags);
+/* Task 3 Stage A: marks a CLONE_VM non-thread child as an mm sharer. */
+extern u32 p11_instance_fork(struct task_struct *child, u64 clone_flags);
 extern u32 p11_link_emit_fork(u32 child_tgid, u64 clone_flags,
                               const struct image_identity *parent,
                               const struct image_identity *child);
@@ -38,6 +40,7 @@ static __always_inline int task_newtask_impl(u64 *ctx)
     clone_flags = ctx[1];
     child = (struct task_struct *)(unsigned long)ctx[0];
     (void)p11_root_propagate_thread(child, clone_flags);
+    (void)p11_instance_fork(child, clone_flags);
     if (clone_flags & CLONE_THREAD)
         return 0;
     if (!p11_link_fork_allowed())

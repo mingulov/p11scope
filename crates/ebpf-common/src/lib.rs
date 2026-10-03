@@ -1181,7 +1181,7 @@ pub mod capture {
 }
 
 /// Ring buffer capacity in bytes. Must be a power of two and page-aligned.
-/// 4 MiB holds 12483 current 328-byte events (+8 header bytes each). The
+/// 4 MiB holds 11155 current 368-byte event records (+8 header bytes each). The
 /// 256 KiB default held 780, which an unpaced burst overruns in ~6 ms —
 /// inside routine scheduling jitter under contention (audit F1). The
 /// `small-ring` feature (off by default; the default build is unaffected)
@@ -1315,6 +1315,169 @@ pub struct ImageIdentityControl {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ImageIdentityControl {}
 
+/// Task 3 Stage A: kernel-side load-instance continuity witness.
+///
+/// The hooks read only kernel VMA/file/mm metadata (never syscall arguments,
+/// user addresses or memory contents). Every value here is private transport:
+/// stamps and the entry IP never reach a renderer (proposed allowlist-v3).
+pub mod instance {
+    use super::InstanceStamp;
+
+    /// Watched provider files per capture (`WATCHED_FILES`, `G_EPOCH`).
+    pub const FILE_SLOTS: u32 = 1_024;
+    /// Watched files one process record can localize before `OVERFLOW`.
+    pub const RECORD_SLOTS: usize = 8;
+    /// Bounded compare-exchange attempts for claims and sticky flags.
+    pub const CAS_TRIES: u32 = 8;
+
+    /// The stamp function ran; absence means the call was never stamped.
+    pub const STAMP_VALID: u16 = 1 << 15;
+    /// The endpoint slot has no watched file (not calibrated or refused).
+    pub const STAMP_NO_FILE: u16 = 1 << 0;
+    /// No current task or leader was available.
+    pub const STAMP_NO_TASK: u16 = 1 << 1;
+    /// The caller's process shares its mm without being a thread.
+    pub const STAMP_SHARED_MM: u16 = 1 << 2;
+    /// The caller's record could not localize a watched file.
+    pub const STAMP_OVERFLOW: u16 = 1 << 3;
+    /// A local fault was recorded for the caller's process.
+    pub const STAMP_LOCAL_FAULT: u16 = 1 << 4;
+
+    /// `InstanceRecord::flags` bits; equal to the matching stamp bits.
+    pub const RECORD_SHARED_MM: u64 = 1 << 2;
+    pub const RECORD_OVERFLOW: u64 = 1 << 3;
+    pub const RECORD_LOCAL_FAULT: u64 = 1 << 4;
+
+    /// `INSTANCE_GEN` cells.
+    pub const GEN_FAULT: u32 = 0;
+    pub const GEN_ATTACH: u32 = 1;
+    pub const GEN_STICKY: u32 = 2;
+    pub const GEN_CELLS: u32 = 3;
+    /// `INSTANCE_GEN[GEN_STICKY]`: a CLONE_VM child could not be marked.
+    pub const STICKY_FORK_UNMARKED: u64 = 1;
+
+    const BLOCKING: u16 =
+        STAMP_NO_FILE | STAMP_NO_TASK | STAMP_SHARED_MM | STAMP_OVERFLOW | STAMP_LOCAL_FAULT;
+
+    /// The per-call half of the join rule: both stamps were taken, are equal
+    /// (no straddle), name a watched file, and carry no refusal flag. The
+    /// scan half (a stable observation with this epoch triple) is userspace's.
+    #[inline(always)]
+    pub const fn stamp_joinable(entry: InstanceStamp, ret: InstanceStamp) -> bool {
+        entry.flags & STAMP_VALID != 0
+            && entry.flags & BLOCKING == 0
+            && entry.file_slot_plus1 != 0
+            && entry.epoch == ret.epoch
+            && entry.global == ret.global
+            && entry.fault == ret.fault
+            && entry.file_slot_plus1 == ret.file_slot_plus1
+            && entry.flags == ret.flags
+    }
+}
+
+/// One continuity stamp (16 bytes), shared with `native/instance_epoch.h`.
+/// Low 32 bits of the caller's local epoch for the endpoint's file, of
+/// `G_EPOCH[file]` and of `FAULT_GEN`. No `Debug`: private epoch keys must not
+/// reach logs or output.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub struct InstanceStamp {
+    pub epoch: u32,
+    pub global: u32,
+    pub fault: u32,
+    pub file_slot_plus1: u16,
+    pub flags: u16,
+}
+
+/// `INSTANCE_START` value: what the entry probe's native helper records for
+/// one in-flight call (keyed by the call's `StartKey`). Kept out of
+/// `CallStart` so the entry program's stack does not grow (the 5.15
+/// combined-stack limit is exactly met by the base frame).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct InstanceEntry {
+    /// Private probed runtime address (uprobe `bp_vaddr`, target width).
+    pub entry_ip: u64,
+    pub entry_stamp: InstanceStamp,
+}
+
+/// The private continuity tail of an `EventRecord`, written in place by the
+/// return probe's native helper. An absent entry leaves an all-zero (invalid)
+/// entry stamp, which never joins. No `Debug`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct InstanceContinuity {
+    pub entry_ip: u64,
+    pub entry_stamp: InstanceStamp,
+    pub return_stamp: InstanceStamp,
+}
+
+/// `PROC_EPOCH` task-storage value on the thread-group leader. 64-bit cells
+/// only: the BPF toolchain lowers 64-bit compare-exchange, not 32-bit (F1).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct InstanceRecord {
+    pub slot_plus1: [u64; instance::RECORD_SLOTS],
+    pub epoch: [u64; instance::RECORD_SLOTS],
+    pub flags: u64,
+    pub exec_attach_gen: u64,
+}
+
+/// `WATCHED_FILES` key: the kernel's `vm_file->f_inode` identity
+/// (`i_sb->s_dev`, `i_ino`), learned by calibration, never from `stat()`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub struct InstanceFileKey {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// `INSTANCE_CALIB[0]`: the observer arms `tid`; the `uprobe_mmap` hook
+/// records the first matching mapping's start and kernel file identity.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct InstanceCalib {
+    pub tid: u32,
+    pub _pad: u32,
+    pub vm_start: u64,
+    pub dev: u64,
+    pub ino: u64,
+    pub hits: u64,
+}
+
+/// `INSTANCE_COUNTERS[0]`: saturating-in-practice diagnostic counts.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+pub struct InstanceCounters {
+    pub watched_hits: u64,
+    pub local_bumps: u64,
+    pub global_bumps: u64,
+    pub remote: u64,
+    pub shared: u64,
+    pub storage_null: u64,
+    pub overflow: u64,
+    pub teardown_skips: u64,
+    pub faults: u64,
+    pub calib_hits: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InstanceStamp {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InstanceRecord {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InstanceEntry {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InstanceContinuity {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for EventRecord {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InstanceFileKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InstanceCalib {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for InstanceCounters {}
+
 /// What the entry probe stashes until the matching return. Replaces the
 /// bare timestamp Phase 1b stored.
 #[repr(C)]
@@ -1413,6 +1576,17 @@ pub struct Event {
     pub child_image: ImageIdentity,
     /// Private current physical affiliation: 0 UNKNOWN, 1 positive original root.
     pub root_affiliation: u64,
+}
+
+/// One `EVENTS` ring record (Task 3 Stage A): the unchanged `Event` followed
+/// by its private load-instance continuity. Kernel and userspace exchange
+/// only this shape; every consumer that renders or reduces receives the bare
+/// `Event`, so the continuity cannot reach a renderer by construction.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct EventRecord {
+    pub event: Event,
+    pub continuity: InstanceContinuity,
 }
 
 #[cfg(feature = "user")]
@@ -1774,13 +1948,126 @@ mod tests {
         // tail padding would read as uninitialized on one side.
         assert_eq!(core::mem::size_of::<CallStart>(), 288);
         assert_eq!(core::mem::size_of::<Event>(), 328);
+        assert_eq!(core::mem::size_of::<EventRecord>(), 368);
         assert_eq!(core::mem::align_of::<CallStart>(), 8);
         assert_eq!(core::mem::align_of::<Event>(), 8);
+        assert_eq!(core::mem::align_of::<EventRecord>(), 8);
         let call_start = CallStart::default();
         assert_eq!(
             core::mem::offset_of!(CallStart, image) + core::mem::size_of_val(&call_start.image),
             core::mem::size_of::<CallStart>()
         );
+        let event = Event::default();
+        assert_eq!(
+            core::mem::offset_of!(Event, root_affiliation)
+                + core::mem::size_of_val(&event.root_affiliation),
+            core::mem::size_of::<Event>()
+        );
+        let record = EventRecord::default();
+        assert_eq!(
+            core::mem::offset_of!(EventRecord, continuity)
+                + core::mem::size_of_val(&record.continuity),
+            core::mem::size_of::<EventRecord>()
+        );
+    }
+
+    #[test]
+    fn instance_continuity_wire_layout_is_exact() {
+        use core::mem::{align_of, offset_of, size_of};
+        // Task 3 Stage A private transport: `CallStart` and `Event` are
+        // unchanged; the continuity tail follows the event in the ring record
+        // and the entry half lives in `INSTANCE_START`.
+        assert_eq!(size_of::<CallStart>(), 288);
+        assert_eq!(offset_of!(Event, root_affiliation), 320);
+        assert_eq!(offset_of!(EventRecord, event), 0);
+        assert_eq!(offset_of!(EventRecord, continuity), 328);
+        assert_eq!(size_of::<InstanceContinuity>(), 40);
+        assert_eq!(offset_of!(InstanceContinuity, entry_ip), 0);
+        assert_eq!(offset_of!(InstanceContinuity, entry_stamp), 8);
+        assert_eq!(offset_of!(InstanceContinuity, return_stamp), 24);
+        assert_eq!(size_of::<InstanceEntry>(), 24);
+        assert_eq!(offset_of!(InstanceEntry, entry_ip), 0);
+        assert_eq!(offset_of!(InstanceEntry, entry_stamp), 8);
+        assert_eq!(size_of::<InstanceStamp>(), 16);
+        assert_eq!(align_of::<InstanceStamp>(), 4);
+        assert_eq!(offset_of!(InstanceStamp, epoch), 0);
+        assert_eq!(offset_of!(InstanceStamp, global), 4);
+        assert_eq!(offset_of!(InstanceStamp, fault), 8);
+        assert_eq!(offset_of!(InstanceStamp, file_slot_plus1), 12);
+        assert_eq!(offset_of!(InstanceStamp, flags), 14);
+        assert_eq!(size_of::<InstanceRecord>(), 144);
+        assert_eq!(offset_of!(InstanceRecord, slot_plus1), 0);
+        assert_eq!(offset_of!(InstanceRecord, epoch), 64);
+        assert_eq!(offset_of!(InstanceRecord, flags), 128);
+        assert_eq!(offset_of!(InstanceRecord, exec_attach_gen), 136);
+        assert_eq!(size_of::<InstanceFileKey>(), 16);
+        assert_eq!(size_of::<InstanceCalib>(), 40);
+        assert_eq!(offset_of!(InstanceCalib, vm_start), 8);
+        assert_eq!(offset_of!(InstanceCalib, dev), 16);
+        assert_eq!(offset_of!(InstanceCalib, ino), 24);
+        assert_eq!(offset_of!(InstanceCalib, hits), 32);
+        assert_eq!(size_of::<InstanceCounters>(), 80);
+        assert_eq!(instance::FILE_SLOTS, 1_024);
+        assert_eq!(instance::RECORD_SLOTS, 8);
+        // Flags are disjoint single bits; VALID is distinct from every reason.
+        let reasons = [
+            instance::STAMP_NO_FILE,
+            instance::STAMP_NO_TASK,
+            instance::STAMP_SHARED_MM,
+            instance::STAMP_OVERFLOW,
+            instance::STAMP_LOCAL_FAULT,
+        ];
+        let mut seen = instance::STAMP_VALID;
+        for flag in reasons {
+            assert_eq!(flag.count_ones(), 1);
+            assert_eq!(seen & flag, 0);
+            seen |= flag;
+        }
+        assert_eq!(
+            instance::RECORD_SHARED_MM,
+            u64::from(instance::STAMP_SHARED_MM)
+        );
+        assert_eq!(
+            instance::RECORD_OVERFLOW,
+            u64::from(instance::STAMP_OVERFLOW)
+        );
+        assert_eq!(
+            instance::RECORD_LOCAL_FAULT,
+            u64::from(instance::STAMP_LOCAL_FAULT)
+        );
+    }
+
+    #[test]
+    fn instance_stamp_join_predicate_requires_valid_equal_clean_stamps() {
+        let clean = InstanceStamp {
+            epoch: 3,
+            global: 1,
+            fault: 0,
+            file_slot_plus1: 2,
+            flags: instance::STAMP_VALID,
+        };
+        assert!(instance::stamp_joinable(clean, clean));
+        let mut moved = clean;
+        moved.epoch = 4;
+        assert!(!instance::stamp_joinable(clean, moved), "straddle");
+        assert!(!instance::stamp_joinable(
+            InstanceStamp::default(),
+            InstanceStamp::default()
+        ));
+        for reason in [
+            instance::STAMP_NO_FILE,
+            instance::STAMP_NO_TASK,
+            instance::STAMP_SHARED_MM,
+            instance::STAMP_OVERFLOW,
+            instance::STAMP_LOCAL_FAULT,
+        ] {
+            let mut flagged = clean;
+            flagged.flags |= reason;
+            assert!(!instance::stamp_joinable(flagged, flagged), "{reason:#x}");
+        }
+        let mut other_file = clean;
+        other_file.file_slot_plus1 = 0;
+        assert!(!instance::stamp_joinable(other_file, other_file));
     }
 
     #[test]

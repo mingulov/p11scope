@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Test-only single-task task-storage seed fixture: creates the isolated three
- * map surface the unchanged reader dumps. It loads the existing iterator object
- * with every program's autoload disabled, so no program, link, attachment or
- * bpffs pin is ever created. Seed bytes never reach a diagnostic. */
+ * map surface the reader dumps on its qualification path. It loads the existing
+ * iterator object with every program's autoload disabled, so no program, link,
+ * attachment or bpffs pin is ever created, and with creation disabled for every
+ * map outside the seeded three (the owned-inventory PROC_EPOCH), so the fixture
+ * retains exactly the three maps it publishes. Seed bytes never reach a
+ * diagnostic. */
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <dlfcn.h>
@@ -32,6 +35,7 @@ enum {
     SEED_SIZE = 560,
     READY_LIMIT = 1024,
     PROGRAM_LIMIT = 64,
+    OBJECT_MAP_LIMIT = 64,
     TASK_LIMIT = 64,
     TIMEOUT_LIMIT = 60000,
     PATH_LIMIT = PATH_MAX - 64,
@@ -76,6 +80,9 @@ struct api {
     int (*program_set_autoload)(struct bpf_program *, bool);
     int (*object_load)(struct bpf_object *);
     struct bpf_map *(*object_find_map)(const struct bpf_object *, const char *);
+    struct bpf_map *(*object_next_map)(const struct bpf_object *, const struct bpf_map *);
+    const char *(*map_name)(const struct bpf_map *);
+    int (*map_set_autocreate)(struct bpf_map *, bool);
     int (*map_fd)(const struct bpf_map *);
     void (*object_close)(struct bpf_object *);
     libbpf_print_fn (*set_print)(libbpf_print_fn);
@@ -300,6 +307,9 @@ static int load_api(void *library, struct api *api)
     LOAD(api, library, program_set_autoload, "bpf_program__set_autoload");
     LOAD(api, library, object_load, "bpf_object__load");
     LOAD(api, library, object_find_map, "bpf_object__find_map_by_name");
+    LOAD(api, library, object_next_map, "bpf_object__next_map");
+    LOAD(api, library, map_name, "bpf_map__name");
+    LOAD(api, library, map_set_autocreate, "bpf_map__set_autocreate");
     LOAD(api, library, map_fd, "bpf_map__fd");
     LOAD(api, library, object_close, "bpf_object__close");
     LOAD(api, library, set_print, "libbpf_set_print");
@@ -542,6 +552,38 @@ static int disable_autoload(const struct api *api, struct bpf_object *object)
     return programs ? 0 : -1;
 }
 
+/* Every object map outside the seeded three is never created; each seeded name
+ * must be present exactly once. */
+static int disable_unseeded_maps(const struct api *api, struct bpf_object *object)
+{
+    struct bpf_map *map = NULL;
+    int seen[MAP_COUNT] = {0};
+    int maps = 0;
+    size_t index;
+    while ((map = api->object_next_map(object, map))) {
+        const char *name;
+        bool seeded = false;
+        if (error_pointer(map) || ++maps > OBJECT_MAP_LIMIT)
+            return -1;
+        name = api->map_name(map);
+        if (!name || error_pointer(name) || !*name)
+            return -1;
+        for (index = 0; index < MAP_COUNT; index++) {
+            if (!strcmp(name, map_names[index])) {
+                seen[index]++;
+                seeded = true;
+            }
+        }
+        if (!seeded && api->map_set_autocreate(map, false))
+            return -1;
+    }
+    for (index = 0; index < MAP_COUNT; index++) {
+        if (seen[index] != 1)
+            return -1;
+    }
+    return 0;
+}
+
 static int acquire_maps(const struct api *api, const struct kernel_api *kernel,
                         struct bpf_object *object, struct map_spec specs[MAP_COUNT])
 {
@@ -628,6 +670,9 @@ static int load_seed_publish(const struct api *api, const struct kernel_api *ker
     *stage = "cannot disable autoload for every program in the BPF object";
     if (disable_autoload(api, object))
         return -1;
+    *stage = "cannot disable creation of every unseeded map in the BPF object";
+    if (disable_unseeded_maps(api, object))
+        return -1;
     *stage = "cannot load the BPF object";
     if (api->object_load(object))
         return -1;
@@ -681,7 +726,7 @@ static int wait_for_release(const char *release, uint32_t timeout_ms)
  * Injected self-test surfaces. These fakes never touch the kernel or libbpf.
  * ------------------------------------------------------------------------ */
 
-enum { FAKE_PROGRAMS = 2, FAKE_PIDFD = 500 };
+enum { FAKE_PROGRAMS = 2, FAKE_MAPS = MAP_COUNT + 1, FAKE_PIDFD = 500 };
 
 struct lifecycle_state {
     struct map_spec *specs;
@@ -694,6 +739,10 @@ struct lifecycle_state {
     int autoload_skip;
     int load_calls;
     int load_with_enabled_program;
+    int map_visits;
+    int autocreate_disable_calls;
+    int autocreate_skip;
+    int load_with_unseeded_map;
     int find_calls;
     int map_fd_calls;
     int dup_calls;
@@ -717,6 +766,43 @@ static size_t published_length;
 static const char *const fake_program_names[FAKE_PROGRAMS] = {
     "dump_task_storage", "second_program",
 };
+
+/* The real iterator object: the seeded three, then PROC_EPOCH. */
+static const char *const fake_map_names[FAKE_MAPS] = {
+    "TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION", "PROC_EPOCH",
+};
+
+static struct bpf_map *fake_next_map(const struct bpf_object *object,
+                                     const struct bpf_map *previous)
+{
+    int index = (int)(uintptr_t)previous;
+    (void)object;
+    if (index >= FAKE_MAPS)
+        return NULL;
+    lifecycle.map_visits++;
+    return (struct bpf_map *)(uintptr_t)(index + 1);
+}
+
+static const char *fake_map_name(const struct bpf_map *map)
+{
+    int index = (int)(uintptr_t)map - 1;
+    if (index < 0 || index >= FAKE_MAPS)
+        return NULL;
+    return fake_map_names[index];
+}
+
+static int fake_set_autocreate(struct bpf_map *map, bool autocreate)
+{
+    int index = (int)(uintptr_t)map - 1;
+    if (autocreate || index != FAKE_MAPS - 1) {
+        lifecycle.violations++;
+        return -1;
+    }
+    if (lifecycle.autocreate_skip)
+        return 0;
+    lifecycle.autocreate_disable_calls++;
+    return 0;
+}
 
 static struct bpf_program *fake_next_program(const struct bpf_object *object,
                                              struct bpf_program *previous)
@@ -759,6 +845,10 @@ static int fake_object_load(struct bpf_object *object)
     lifecycle.load_calls++;
     if (lifecycle.disabled_mask != (1 << FAKE_PROGRAMS) - 1) {
         lifecycle.load_with_enabled_program++;
+        return -1;
+    }
+    if (lifecycle.autocreate_disable_calls != FAKE_MAPS - MAP_COUNT) {
+        lifecycle.load_with_unseeded_map++;
         return -1;
     }
     return 0;
@@ -930,6 +1020,9 @@ static void injected_apis(struct api *api, struct kernel_api *kernel)
     api->program_set_autoload = fake_set_autoload;
     api->object_load = fake_object_load;
     api->object_find_map = fake_find_map;
+    api->object_next_map = fake_next_map;
+    api->map_name = fake_map_name;
+    api->map_set_autocreate = fake_set_autocreate;
     api->map_fd = fake_map_fd;
     api->object_close = fake_object_close;
     kernel->info = fake_info;
@@ -1196,7 +1289,8 @@ static int lifecycle_self_test(void)
     if (lifecycle.program_visits != FAKE_PROGRAMS ||
         lifecycle.autoload_disable_calls != FAKE_PROGRAMS || lifecycle.load_calls != 1 ||
         lifecycle.load_with_enabled_program || lifecycle.info_calls != 2 * MAP_COUNT ||
-        stage)
+        lifecycle.map_visits != FAKE_MAPS || lifecycle.autocreate_disable_calls != 1 ||
+        lifecycle.load_with_unseeded_map || stage)
         return fail("self-test injected lifecycle sequence mismatch");
     if (published_length != strlen(published_document) || published_length < 400)
         return fail("self-test injected publication mismatch");
@@ -1223,6 +1317,21 @@ static int lifecycle_self_test(void)
     release_resources(&api, &kernel, &pidfd, &object, specs);
     if (!lifecycle.load_with_enabled_program || lifecycle.find_calls ||
         check_counters("self-test enabled-program cleanup mismatch", 0, 0, 0, 1))
+        return 1;
+
+    /* An unseeded map left creatable must stop the lifecycle before any map is
+     * acquired: the fixture would otherwise retain a fourth, unpublished map. */
+    reset_specs(specs);
+    reset_lifecycle(specs, seed);
+    lifecycle.autocreate_skip = 1;
+    object = (struct bpf_object *)(uintptr_t)1;
+    pidfd = FAKE_PIDFD;
+    if (!load_seed_publish(&api, &kernel, fake_publish, object, specs, seed, pidfd, &identity,
+                           tasks, 1, "/dev/null", &stage))
+        return fail("self-test loaded an object with a creatable unseeded map");
+    release_resources(&api, &kernel, &pidfd, &object, specs);
+    if (!lifecycle.load_with_unseeded_map || lifecycle.find_calls ||
+        check_counters("self-test unseeded-map cleanup mismatch", 0, 0, 0, 1))
         return 1;
 
     /* Partial acquisition: only the acquired duplicate and the pidfd are closed. */

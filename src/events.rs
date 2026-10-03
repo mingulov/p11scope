@@ -8,7 +8,7 @@
 use anyhow::{Context as _, Result};
 use aya::Ebpf;
 use aya::maps::{Map, MapData};
-use p11scope_ebpf_common::{DiscoveryRecord, Event, valid_discovery_record};
+use p11scope_ebpf_common::{DiscoveryRecord, Event, EventRecord, valid_discovery_record};
 use std::mem::size_of;
 use std::ops::{ControlFlow, Deref};
 use std::{
@@ -134,11 +134,19 @@ fn decode_exact<T: aya::Pod>(bytes: &[u8]) -> Option<T> {
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
 }
 
-/// Decodes one ring-buffer record into an `Event`, or `None` if its
-/// length differs from `size_of::<Event>()` or its root affiliation is invalid.
+/// Decodes one ring-buffer record into its `Event`, or `None` if its length
+/// differs from `size_of::<EventRecord>()` or its root affiliation is invalid.
+/// The record's private continuity tail is dropped here: renderers and
+/// reducers only ever receive the bare `Event`.
 pub fn decode(bytes: &[u8]) -> Option<Event> {
-    let event: Event = decode_exact(bytes)?;
-    (event.root_affiliation <= 1).then_some(event)
+    decode_record(bytes).map(|record| record.event)
+}
+
+/// The whole `EVENTS` record, private continuity included (Task 3 Stage A).
+/// Only the load-instance router may consume the continuity.
+pub(crate) fn decode_record(bytes: &[u8]) -> Option<EventRecord> {
+    let record: EventRecord = decode_exact(bytes)?;
+    (record.event.root_affiliation <= 1).then_some(record)
 }
 
 pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
@@ -534,6 +542,37 @@ impl<S: RecordSource> EventDrain<S> {
         }
     }
 
+    /// `poll` delivering whole records, private continuity included, for the
+    /// load-instance router (Task 3 Stage A). Same bound, malformed counting
+    /// and stop semantics as `poll`.
+    #[allow(dead_code)] // Task 6 native seam (DR-T3A-1); privileged gates today.
+    pub(crate) fn poll_records(
+        &mut self,
+        quantum: Option<usize>,
+        mut f: impl FnMut(EventRecord) -> ControlFlow<()>,
+    ) -> bool {
+        let mut left = quantum;
+        loop {
+            if left == Some(0) {
+                return true;
+            }
+            let Some(item) = self.source.next_record() else {
+                return false;
+            };
+            if let Some(left) = left.as_mut() {
+                *left -= 1;
+            }
+            match decode_record(&item) {
+                Some(record) => {
+                    if f(record).is_break() {
+                        return true;
+                    }
+                }
+                None => self.malformed = self.malformed.saturating_add(1),
+            }
+        }
+    }
+
     /// Records rejected by the size or affiliation check so far.
     pub fn malformed(&self) -> u64 {
         self.malformed
@@ -724,12 +763,27 @@ impl BoundedRecordSource for ScriptedRecords {
     }
 }
 
-/// The bytes the kernel side commits for one `Event`: the value read back raw.
+/// The bytes the kernel side commits for one `Event`: its `EventRecord` with
+/// an all-zero (invalid) continuity tail, read back raw.
 #[cfg(test)]
 pub(crate) fn event_bytes(ev: &Event) -> Vec<u8> {
-    // SAFETY: `Event` is a repr(C) Pod value; this reads exactly its bytes.
+    record_bytes(&EventRecord {
+        event: *ev,
+        continuity: Default::default(),
+    })
+}
+
+/// The raw bytes of one whole `EVENTS` record.
+#[cfg(test)]
+pub(crate) fn record_bytes(record: &EventRecord) -> Vec<u8> {
+    // SAFETY: `EventRecord` is a repr(C) Pod value without implicit padding
+    // (pinned in ebpf-common); this reads exactly its bytes.
     unsafe {
-        std::slice::from_raw_parts((ev as *const Event).cast::<u8>(), size_of::<Event>()).to_vec()
+        std::slice::from_raw_parts(
+            (record as *const EventRecord).cast::<u8>(),
+            size_of::<EventRecord>(),
+        )
+        .to_vec()
     }
 }
 
@@ -977,16 +1031,16 @@ mod tests {
     }
 
     #[test]
-    fn domain_boundary_decoder_accepts_only_event328_and_affiliations_zero_one() {
+    fn domain_boundary_decoder_accepts_only_event368_and_affiliations_zero_one() {
         for tag in [0, 1, 2, u64::MAX] {
             let event = Event {
                 root_affiliation: tag,
                 ..sample_event()
             };
             let bytes = event_bytes(&event);
-            assert_eq!(bytes.len(), 328);
+            assert_eq!(bytes.len(), 368);
             assert_eq!(decode(&bytes).is_some(), tag <= 1);
-            assert!(decode(&bytes[..320]).is_none());
+            assert!(decode(&bytes[..360]).is_none());
         }
     }
 

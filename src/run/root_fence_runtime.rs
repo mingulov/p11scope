@@ -429,7 +429,7 @@ fn scenario(
         let boundary = positions.context("stored boundary")?;
         // Kernel ring records have an eight-byte header and eight-byte alignment.
         // Derive payload size from the actual shared wire type; do not parse it here.
-        let stride = (std::mem::size_of::<Event>()
+        let stride = (std::mem::size_of::<p11scope_ebpf_common::EventRecord>()
             + aya_obj::generated::BPF_RINGBUF_HDR_SZ as usize)
             .next_multiple_of(8);
         ensure!(

@@ -230,6 +230,10 @@ class Consumer:
                 output = ("r1", 16)
             elif target == "p11_link_current_identity":
                 output = ("r1", 16)
+            elif target == "p11_instance_return":
+                # Task 3 Stage A: fills the 40-byte private continuity tail
+                # (EventRecord offset 328) through its second argument.
+                output = ("r2", 40)
             if output:
                 pointer = state.get(output[0])
                 if pointer and pointer[0] == "stack":
@@ -339,37 +343,37 @@ DESTINATIONS = {6: (8, 8), 7: (0x10, 8), 10: (0x28, 8),
                 "join": (0x58, 8), "get": (0x30, 8), 16: (0x104, 4)}
 LP64_OFFSETS = (0x70, 0x68, 0x60, 0x58, 0x48, 0x40)
 LP64_READS = {
-    6: ([1184, 1059, 1188, 1152, 1186, 1147], 1165),
-    7: ([1239, 1195, 1243, 1206, 1241, 1201], 1219),
-    10: ([1294, 1251, 1298, 1263, 1296, 1258], 1276),
-    11: ([1355, 1309, 1359, 1324, 1357, 1315], 1337),
-    8: ([1700, 1566, 1378, 1466, 1391, 1471], 1420),
-    9: ([1462, 1474, 1371, 1464, 1385, 1469], 1405),
-    16: ([1560, 1576, 1523, 1562, 1529, 1564], 1542),
-    "join": ([1682, 1587, 1688, 1615, 1685, 1602], 1629),
-    "get": ([1691, 1595, 1697, 1637, 1694, 1609], 1651),
+    6: ([1185, 1060, 1189, 1153, 1187, 1148], 1166),
+    7: ([1240, 1196, 1244, 1207, 1242, 1202], 1220),
+    10: ([1295, 1252, 1299, 1264, 1297, 1259], 1277),
+    11: ([1356, 1310, 1360, 1325, 1358, 1316], 1338),
+    8: ([1701, 1567, 1379, 1467, 1392, 1472], 1421),
+    9: ([1463, 1475, 1372, 1465, 1386, 1470], 1406),
+    16: ([1561, 1577, 1524, 1563, 1530, 1565], 1543),
+    "join": ([1683, 1588, 1689, 1616, 1686, 1603], 1630),
+    "get": ([1692, 1596, 1698, 1638, 1695, 1610], 1652),
 }
-IA32_READS = {6: 1949, 7: 2038, 10: 2060, 11: 2086,
-              8: 2132, 9: 2110, 16: 2201, "join": 2230, "get": 2252}
-LP64_DISPATCH = {6: (1053,), 7: (1190,), 10: (1245,), 11: (1304,),
-                 8: (1362, 1373), 9: (1365, 1366), 16: (1488, 1518),
-                 "join": (1582,), "get": (1590,)}
-IA32_DISPATCH = {6: (1946,), 7: (2035,), 10: (2058,), 11: (2084,),
-                 8: (2106,), 9: (2108,), 16: (2170,), "join": (2227,), "get": (2249,)}
+IA32_READS = {6: 1956, 7: 2045, 10: 2067, 11: 2093,
+              8: 2139, 9: 2117, 16: 2208, "join": 2237, "get": 2259}
+LP64_DISPATCH = {6: (1054,), 7: (1191,), 10: (1246,), 11: (1305,),
+                 8: (1363, 1374), 9: (1366, 1367), 16: (1489, 1519),
+                 "join": (1583,), "get": (1591,)}
+IA32_DISPATCH = {6: (1953,), 7: (2042,), 10: (2065,), 11: (2091,),
+                 8: (2113,), 9: (2115,), 16: (2177,), "join": (2234,), "get": (2256,)}
 SCALAR_CALLS = {
-    "default": {1058: 6, 1071: 7, 1084: 10, 1100: 11, 1186: 8,
-                1219: 9, 1276: 16, 1446: "join", 1460: "get"},
-    "p11_entry_template": {2527: 6, 2540: 7, 2552: 10, 2569: 11,
-                           2585: 9, 2677: 8, 2727: 12, 2738: 13},
-    "p11_entry_template_pair": {3034: 6, 3047: 7, 3059: 10, 3076: 11,
-                                3092: 9, 3184: 8, 3234: 12, 3245: 13},
-    "p11_entry_template_types": {3692: 6, 3705: 7, 3717: 10, 3734: 11,
-                                 3750: 9, 3842: 8, 3892: 12, 3903: 13},
-    "p11_entry_template_second": {3470: 14, 3482: 15},
+    "default": {1064: 6, 1077: 7, 1090: 10, 1106: 11, 1192: 8,
+                1225: 9, 1282: 16, 1452: "join", 1466: "get"},
+    "p11_entry_template": {2543: 6, 2556: 7, 2568: 10, 2585: 11,
+                           2601: 9, 2693: 8, 2743: 12, 2754: 13},
+    "p11_entry_template_pair": {3059: 6, 3072: 7, 3084: 10, 3101: 11,
+                                3117: 9, 3209: 8, 3259: 12, 3270: 13},
+    "p11_entry_template_types": {3726: 6, 3739: 7, 3751: 10, 3768: 11,
+                                 3784: 9, 3876: 8, 3926: 12, 3937: 13},
+    "p11_entry_template_second": {3495: 14, 3507: 15},
 }
-SEMANTIC_INSERT = {"default": 1244, "p11_entry": 1493, "p11_entry_ia32": 2175,
-                   "p11_entry_template": 2770, "p11_entry_template_pair": 3277,
-                   "p11_entry_template_types": 3935}
+SEMANTIC_INSERT = {"default": 1250, "p11_entry": 1494, "p11_entry_ia32": 2182,
+                   "p11_entry_template": 2786, "p11_entry_template_pair": 3302,
+                   "p11_entry_template_types": 3969}
 BYTE_DOMAIN = frozenset(range(256))
 # TAIL_CALLS_NO_PRIVATE_STACK_INDEX: an index no slot of TAIL_CALLS,
 # STACK_GUARD, or PAIR_CALLS has (always falls through).
@@ -995,9 +999,9 @@ def retained_contract(consumer, variant, selectors):
     # Return copies these scalars while START is owned, before removal. They
     # are retained values, never permission to reuse the removed map pointer.
     delta = int(variant == "unsafe")
-    sites = {1447+delta: (0x30, 1, 1), 1668+delta: (0x30, 1, 0),
-             1612+delta: (0x20, None, 1), 1677+delta: (0x20, None, 0),
-             1646+delta: (0x30, 12, 1), 1687+delta: (0x30, 12, 0)}
+    sites = {1447+delta: (0x30, 1, 1), 1673+delta: (0x30, 1, 0),
+             1617+delta: (0x20, None, 1), 1682+delta: (0x20, None, 0),
+             1651+delta: (0x30, 12, 1), 1692+delta: (0x30, 12, 0)}
     for selector in selectors:
         abi = int(selector == 0x23)
         for present in (False, True):

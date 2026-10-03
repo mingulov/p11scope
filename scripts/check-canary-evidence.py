@@ -130,7 +130,9 @@ MECH_NONE = (1 << 64) - 1
 FUNCTION_NONE = (1 << 32) - 1
 ARG_READ_FAILURE = 1 << 4
 CALL_START_SIZE = 288
-EVENT_SIZE = 328
+# One EVENTS ring record: the 328-byte Event plus its private 40-byte
+# continuity tail (ebpf-common EventRecord, Task 3 Stage A).
+EVENT_SIZE = 368
 DISCOVERY_RECORD_SIZE = 920
 # Every owned ringbuf, with the exact record length its mmap oracle accepts.
 # Keyed by name only because a record layout is per-map; which maps are
@@ -1106,7 +1108,7 @@ def assert_stopped_snapshot(manifest, prefix):
             if name == "START":
                 require((item["type"], item["key_size"], item["value_size"],
                          item["max_entries"], item["map_flags"]) == (
-                             "hash", 16, 288, 1 if receipt["small_state"] else 16384, 0),
+                             "hash", 16, CALL_START_SIZE, 1 if receipt["small_state"] else 16384, 0),
                         "START metadata contradicts state-map configuration")
             elif name in ("EVENTS", "DISCOVERY"):
                 require(item["type"] == "ringbuf" and item["oracle"] == "mmap"
@@ -1786,18 +1788,18 @@ def main(argv=None):
         event = bytes(EVENT_SIZE)
         struct.pack_into("<I", raw, 0, EVENT_SIZE)
         raw[8:8 + EVENT_SIZE] = event
-        assert parse_ring_records(raw, mmap.PAGESIZE, 0, 336) == [event]
+        assert parse_ring_records(raw, mmap.PAGESIZE, 0, 376) == [event]
         for label, header, producer in (
-            ("ring busy", EVENT_SIZE | (1 << 31), 336),
-            ("ring discard", EVENT_SIZE | (1 << 30), 336),
-            ("ring short", EVENT_SIZE - 1, 336),
-            ("ring long", EVENT_SIZE + 1, 344),
+            ("ring busy", EVENT_SIZE | (1 << 31), 376),
+            ("ring discard", EVENT_SIZE | (1 << 30), 376),
+            ("ring short", EVENT_SIZE - 1, 376),
+            ("ring long", EVENT_SIZE + 1, 384),
         ):
             mutated = bytearray(raw)
             struct.pack_into("<I", mutated, 0, header)
             reject(label, lambda mutated=mutated, producer=producer:
                    parse_ring_records(mutated, mmap.PAGESIZE, 0, producer))
-        reject("ring producer wrap", lambda: parse_ring_records(raw, mmap.PAGESIZE, 336, 0))
+        reject("ring producer wrap", lambda: parse_ring_records(raw, mmap.PAGESIZE, 376, 0))
 
         def event_bytes(index, mechanism=None, slot=0, shape=0, p0=0, p1=0, p2=0,
                         attrs=(), attr_count=0, attr_total=0, attr_bools=0,
@@ -2101,6 +2103,7 @@ def main(argv=None):
                     map_type, oracle = {
                         RINGBUF: ("ringbuf", "mmap"), 29: ("task_storage", "task-storage"),
                         CGROUP_ARRAY: ("cgroup_array", "refused-lookup"),
+                        9: ("lru_hash", "dump"),
                     }.get(definition["type"], ("hash", "dump"))
                     item = {
                         "name": name, "id": map_id, "max_entries": definition["max_entries"],

@@ -34,6 +34,10 @@
 #     probe), P11SCOPE_ROOT_RUNTIME_STAGE (root fence): each belongs to a
 #     test on the static SKIP list below, which the script cannot provide a
 #     fixture for, so they are never set here.
+#   P11SCOPE_T3A_RELOADS (reload race, default 100), P11SCOPE_T3A_SECONDS
+#     and P11SCOPE_T3A_RATE (SoftHSM continuity experiment, defaults 60 s and
+#     0 unrelated mapping ops/s): optional Task 3 Stage A sizing knobs with
+#     defaults; the runner leaves them unset.
 #   RLIMIT_NOFILE: the Task 4 gates sample soft/hard nofile per phase, the
 #     T7 boundary cell pref lights live FD occupancy against it, and
 #     Session::start may raise soft to hard at attach; wide cells attach
@@ -55,7 +59,7 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (79 ignored tests in the default-feature lib binary): 65 run by
+# Curation (81 ignored tests in the default-feature lib binary): 67 run by
 # default, 4 run only with --include-long, 10 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -68,6 +72,8 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # Default campaign: every ignored test except the long cells and the static
 # skips. Order is the binary's --list order; each runs in its own process.
 DEFAULT_TESTS=(
+attach::instance_tests::privileged_instance_reload_race_has_zero_false_joins
+attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and_mutation
 # DR-CLASSIC-PID0: classic --pid sessions (auto, singles, forced multi)
 # keep a foreign process and a PID reuser out at the kernel boundary (BPF
 # run statistics flat while they call) and in counts and call events; they
@@ -172,6 +178,7 @@ inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
 
 # Long campaign cells: run only with --include-long.
 LONG_TESTS=(
+attach::instance_tests::privileged_instance_continuity_experiment_softhsm
 attach::inventory::activation::privileged_tests::privileged_bench_overhead_detailed_calls
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64

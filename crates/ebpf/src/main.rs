@@ -37,7 +37,8 @@ use p11scope_ebpf_common::{
     lifecycle, normalize_target_word, read_ia32_arg_with, return_allows_mechanism, shape,
     stop_gate_admit_with, target_layout_from_cs, target_stack_arg_address, target_word_end,
     valid_config, valid_loader_cookie, CallStart, DiscoveryRecord, Event, FunctionNameKey,
-    ImageIdentity, LinuxLayout, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState,
+    EventRecord, ImageIdentity, InstanceContinuity, LinuxLayout, PauseKey, RvKey, SlotSemantics,
+    SlotStats, StartKey, StartState,
     StateKey, ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
     DISCOVERY_COUNTER_CELLS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
@@ -1787,6 +1788,11 @@ pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
 fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
     // Mandatory current-physical-task cleanup precedes all capture filters.
     unsafe { p11_owner_cleanup() };
+    // Task 3 Stage A: a new mm ends CLONE_VM sharing for this process.
+    #[cfg(not(feature = "inventory-only"))]
+    unsafe {
+        p11_instance_exec()
+    };
     if let Some(scope) = scope_auth() {
         emit_lifecycle(DISCOVERY_KIND_EXEC, scope, true);
     }
@@ -2545,6 +2551,16 @@ unsafe extern "C" {
     fn p11_root_current_exit();
     #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
     fn p11_link_current_identity(out: *mut ImageIdentity) -> u32;
+    /// Task 3 Stage A continuity halves (native instance_epoch.c): the entry
+    /// half records the private probed address and entry stamp under the
+    /// call's START key; the return half fills an `EventRecord`'s private
+    /// tail in place. Both own their stack frames, so no probe frame grows.
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_instance_entry(key: *const StartKey, ip: u64) -> u32;
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_instance_return(key: *const StartKey, out: *mut InstanceContinuity) -> u32;
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_instance_exec() -> u32;
     fn p11_owner_healthy() -> u32;
     fn p11_owner_cleanup();
     #[cfg(not(feature = "inventory-only"))]
@@ -2627,6 +2643,15 @@ fn record_aggregate_start(key: &StartKey) {
     let _ = store_start(key, start);
 }
 
+/// The probed runtime address: the uprobe `pt_regs` IP is `bp_vaddr`
+/// (kernel `handle_swbp`), normalized to the target width. Private routing
+/// input only (proposed allowlist-v3); never emitted to any renderer.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn entry_ip(ctx: &ProbeContext, layout: LinuxLayout) -> u64 {
+    normalize_target_word(unsafe { (*ctx.regs).rip as u64 }, layout)
+}
+
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContext) -> u32 {
@@ -2686,6 +2711,12 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         return 0;
     }
+    // Task 3 Stage A: the call's private probed address and entry stamp,
+    // recorded natively under its START key (its own frame: this frame does
+    // not grow). A failure leaves no entry, which the return half reports as
+    // an invalid, never-joining stamp. An entry orphaned by a later refusal
+    // is overwritten by the key's next call or reclaimed by the LRU.
+    let _ = unsafe { p11_instance_entry(&key, entry_ip(&ctx, layout)) };
     start.session = SESSION_NONE;
     start.mechanism = MECH_NONE;
     start.user_type = USER_TYPE_NONE;
@@ -3048,9 +3079,16 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         child_image: ImageIdentity::default(),
         root_affiliation: unsafe { p11_root_current_tag() },
     };
-    match EVENTS.reserve::<Event>(0) {
+    match EVENTS.reserve::<EventRecord>(0) {
         Some(mut e) => {
-            e.write(ev);
+            let raw = e.as_mut_ptr();
+            // SAFETY: `raw` is the reserved, exclusively owned record. The
+            // event is written as before; the native return half then fills
+            // every byte of the private continuity tail in place.
+            unsafe {
+                core::ptr::write(core::ptr::addr_of_mut!((*raw).event), ev);
+                let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).continuity));
+            }
             e.submit(0);
         }
         None => {
@@ -3109,9 +3147,14 @@ pub unsafe extern "C" fn p11_link_emit_fork(
         event_type,
         ..Event::default()
     };
-    match EVENTS.reserve::<Event>(0) {
+    // Every EVENTS record is an `EventRecord`; a FORK carries no call, so
+    // its continuity tail is all zero (an invalid stamp).
+    match EVENTS.reserve::<EventRecord>(0) {
         Some(mut event) => {
-            event.write(ev);
+            event.write(EventRecord {
+                event: ev,
+                continuity: InstanceContinuity::default(),
+            });
             event.submit(0);
         }
         None => bump_evidence(EVIDENCE_RING_LOSS),

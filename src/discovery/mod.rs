@@ -7,6 +7,10 @@ pub(crate) mod confirm_shards;
 pub mod engine;
 pub mod hooks;
 pub mod identity;
+// Task 3 Stage A router: consumed by the Task 6 native seam (DR-T3A-1) and
+// today by the privileged instance gates and its unit regressions.
+#[allow(dead_code)]
+pub(crate) mod instances;
 pub(crate) mod inventory_attach_set;
 pub mod inventory_workload;
 pub(crate) mod loader;

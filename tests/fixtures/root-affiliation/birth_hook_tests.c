@@ -89,6 +89,21 @@ static u64 *cookie_storage(void *map, struct task_struct *task, u64 *initial, u6
     return child_storage_absent ? NULL : &child_cookie;
 }
 
+static int instance_fork_calls;
+static u64 instance_fork_flags;
+static int instance_fork_saw;
+
+/* Task 3 Stage A: every admitted birth, thread or process, reaches the
+ * instance sharer marker after root propagation and before any filter. */
+u32 p11_instance_fork(struct task_struct *forked, u64 clone_flags)
+{
+    assert(!forked || forked == &child);
+    instance_fork_saw = allowed_calls + emit_calls + cookie_get_calls;
+    instance_fork_calls++;
+    instance_fork_flags = clone_flags;
+    return 0;
+}
+
 u32 p11_link_fork_allowed(void)
 {
     allowed_calls++;
@@ -109,6 +124,9 @@ u32 p11_link_emit_fork(u32 child_tgid, u64 clone_flags,
 
 static void reset_observation(void)
 {
+    instance_fork_calls = 0;
+    instance_fork_flags = 0;
+    instance_fork_saw = -1;
     allowed_calls = 0;
     cookie_get_calls = 0;
     cookie_create_calls = 0;
@@ -147,6 +165,7 @@ int main(void)
     assert(!task_newtask(ctx));
     assert(child_tag == 1 && root_ctl.affiliation_reserved == 2 && !allowed_calls);
     assert(!emit_calls && !cookie_get_calls);
+    assert(instance_fork_calls == 1 && instance_fork_flags == CLONE_THREAD && !instance_fork_saw);
     child_tag = 0;
     parent_tag = 0;
     assert(!task_newtask(ctx));
@@ -173,6 +192,7 @@ int main(void)
     assert(emitted_parent.exec_id == PARENT_EXEC_ID);
     assert(emitted_child.task_cookie == CHILD_COOKIE);
     assert(emitted_child.exec_id == CHILD_EXEC_ID);
+    assert(instance_fork_calls == 1 && instance_fork_flags == PROCESS_FLAGS && !instance_fork_saw);
     assert(!child_tag && root_ctl.affiliation_reserved == 2);
     assert_cookies_unchanged(PARENT_COOKIE, CHILD_COOKIE, 17);
 
@@ -185,7 +205,7 @@ int main(void)
 
     reset_observation();
     assert(!task_newtask(NULL));
-    assert(!allowed_calls && !emit_calls && !cookie_get_calls);
+    assert(!allowed_calls && !emit_calls && !cookie_get_calls && !instance_fork_calls);
     assert_cookies_unchanged(PARENT_COOKIE, CHILD_COOKIE, 17);
 
     reset_observation();
@@ -235,7 +255,7 @@ int main(void)
     stop_gate_cell = P11_STOP_GATE_STOP;
     assert(!task_newtask(ctx));
     assert(!child_tag && root_ctl.affiliation_reserved == 2 && !allowed_calls);
-    assert(!emit_calls && !cookie_get_calls);
+    assert(!emit_calls && !cookie_get_calls && !instance_fork_calls);
     assert(stop_gate_cell == P11_STOP_GATE_STOP);
     assert_cookies_unchanged(PARENT_COOKIE, CHILD_COOKIE, 17);
 

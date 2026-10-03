@@ -1628,11 +1628,24 @@ fn inject_admission_failures() {
             modules_refused: 0,
             edges_refused: 0,
             endpoints_refused: 0,
-            gaps: Some(3),
+            // The three failures of one pass aggregate into one counted
+            // gap (C1b ruling 4), naming the first.
+            gaps: Some(1),
             gaps_suppressed: 0,
         },
     );
     assert_settled(&document, 0);
+    let gap = &document["gaps"][0];
+    assert_eq!(gap["subject"], "caller admission failed");
+    assert_eq!(gap["pid"], serde_json::Value::Null);
+    assert!(
+        gap["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("3 pids could not be admitted this pass; first: pid 7001: "),
+        "{gap}"
+    );
+    assert_eq!(gap["budget"], serde_json::Value::Null);
 }
 
 #[test]
@@ -2242,4 +2255,318 @@ fn injected_workloads_stay_within_rss_bound() {
         hwm < INJECTION_RSS_BOUND_BYTES,
         "injection battery peak RSS {hwm} bytes stays within {INJECTION_RSS_BOUND_BYTES}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// C1b: callers past the deep-scan cap, through the coordinator.
+// ---------------------------------------------------------------------------
+
+mod c1b {
+    use super::*;
+    use crate::inspect_system::{
+        AdmissionRecord, AdmissionSummary, Catalog, CatalogObject, MemberGeneration, MemberStatus,
+        Observation, ObservationEvidence, ProcessRecord,
+    };
+    use crate::process::ProcessViewId;
+    use p11scope_manifest::maps::{Device, ObjectKey};
+
+    const REP: u32 = 10_000;
+    const CALLERS: u32 = 300;
+    const IDLE: u32 = 148;
+
+    fn start(pid: u32) -> u64 {
+        1_000 + u64::from(pid)
+    }
+
+    fn driver() -> ExeIdentity {
+        ExeIdentity {
+            dev: 1,
+            ino: 100,
+            mtime_secs: 10,
+            mtime_nanos: 0,
+            path: Some("/bin/driver".into()),
+        }
+    }
+
+    fn generation(pid: u32) -> Option<MemberGeneration> {
+        Some(MemberGeneration {
+            start_time: Some(start(pid)),
+            exe: Some(driver()),
+        })
+    }
+
+    fn observation(pid: u32, evidence: ObservationEvidence) -> Observation {
+        Observation {
+            pid,
+            path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+            double_loaded: false,
+            evidence,
+        }
+    }
+
+    /// The catalog `inspect_system::collect` assembles for 448 processes
+    /// over a 256 cap: one deep-scanned SoftHSM2 caller, 299 identical
+    /// callers attributed by maps identity, 148 idle processes. `drop`
+    /// lists callers whose catalog no longer shows the provider.
+    fn catalog(drop: &[u32], generations: &[(u32, Option<MemberGeneration>)]) -> Catalog {
+        let callers: Vec<u32> = (REP..REP + CALLERS)
+            .filter(|pid| !drop.contains(pid))
+            .collect();
+        let object = CatalogObject {
+            path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+            key: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 4_242,
+            },
+            sha256: Some("sha-softhsm2".into()),
+            build_id: None,
+            identity_source: Some("mountinfo"),
+            note: None,
+            mappings: callers
+                .iter()
+                .map(|pid| (*pid, (*pid == REP).then_some(ProcessViewId(0))))
+                .collect(),
+            observations: callers
+                .iter()
+                .map(|pid| {
+                    observation(
+                        *pid,
+                        if *pid == REP {
+                            ObservationEvidence::DeepScan
+                        } else {
+                            ObservationEvidence::MapsMatch
+                        },
+                    )
+                })
+                .collect(),
+            admission: AdmissionRecord::Admitted {
+                class: "heuristic",
+                endpoints: 68,
+            },
+        };
+        let mut processes: Vec<ProcessRecord> = (REP..REP + CALLERS)
+            .map(|pid| ProcessRecord {
+                pid,
+                status: if pid == REP {
+                    MemberStatus::Scanned
+                } else {
+                    MemberStatus::MapsMatched
+                },
+                objects: if drop.contains(&pid) {
+                    Vec::new()
+                } else {
+                    vec![0]
+                },
+                generation: generations
+                    .iter()
+                    .find(|(known, _)| *known == pid)
+                    .map_or_else(|| generation(pid), |(_, scripted)| scripted.clone()),
+            })
+            .collect();
+        processes.extend((20_000..20_000 + IDLE).map(|pid| ProcessRecord {
+            pid,
+            status: MemberStatus::NotSelected { loss: None },
+            objects: Vec::new(),
+            generation: None,
+        }));
+        Catalog {
+            scan_status: "complete",
+            lowering: None,
+            enumerated: (CALLERS + IDLE) as usize,
+            selected: 2,
+            scanned: 2,
+            maps_matched: (CALLERS - 1) as usize,
+            unexamined: 0,
+            unexamined_objects: 0,
+            snapshots_unavailable: 0,
+            attribution_losses: BTreeMap::new(),
+            cap: 256,
+            scan_ms: 0,
+            processes,
+            objects: vec![object],
+            relationships: Vec::new(),
+            admission: AdmissionSummary {
+                uncorroborated_candidates: 0,
+                module_ambiguous: 0,
+                admitted: 1,
+                refused: 0,
+                unresolved: 0,
+            },
+            skipped: Vec::new(),
+            notes: Vec::new(),
+            explanation: None,
+            stage_timings: crate::timing::StageTimings::new(),
+        }
+    }
+
+    fn spawned() -> Harness {
+        let mut harness = harness();
+        for pid in (REP..REP + CALLERS).chain(20_000..20_000 + IDLE) {
+            harness.source().spawn(pid, start(pid));
+        }
+        harness.advance(1);
+        harness
+    }
+
+    fn edge_of(document: &serde_json::Value, pid: u32) -> Option<serde_json::Value> {
+        let caller = document["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|caller| caller["pid"] == pid && caller["retired"] == false)?["id"]
+            .clone();
+        document["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|edge| edge["caller"] == caller)
+            .cloned()
+    }
+
+    #[test]
+    fn every_identical_caller_past_the_cap_registers_with_an_edge() {
+        let mut harness = spawned();
+        let report = harness.apply_catalog(catalog(&[], &[]));
+        assert_eq!(report.scanned, CALLERS as usize);
+        assert_eq!(report.maps_matched, (CALLERS - 1) as usize);
+        let document = harness.render();
+        assert_eq!(
+            document["callers"].as_array().unwrap().len(),
+            CALLERS as usize
+        );
+        assert_eq!(document["modules"].as_array().unwrap().len(), 1);
+        let edges = document["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), CALLERS as usize);
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge["mapping"]["state"] == "mapped")
+        );
+        let evidence = |label: &str| {
+            edges
+                .iter()
+                .filter(|edge| edge["mapping"]["evidence"] == label)
+                .count()
+        };
+        assert_eq!(evidence("deep_scan"), 1);
+        assert_eq!(evidence("maps_match"), (CALLERS - 1) as usize);
+        // The usage coverage shape stays the seven keys.
+        let coverage = edges[0]["entries"]["coverage"].as_object().unwrap();
+        assert_eq!(coverage.len(), 7);
+    }
+
+    #[test]
+    fn a_maps_match_absence_is_uncertain_while_a_deep_scan_absence_ends() {
+        let mut harness = spawned();
+        harness.apply_catalog(catalog(&[], &[]));
+        harness.advance(1);
+        harness.apply_catalog(catalog(&[REP, REP + 5], &[]));
+        let document = harness.render();
+        assert_eq!(
+            edge_of(&document, REP).unwrap()["mapping"]["state"],
+            "ended",
+            "a complete deep scan proves the absence"
+        );
+        assert_eq!(
+            edge_of(&document, REP + 5).unwrap()["mapping"]["state"],
+            "uncertain",
+            "a maps match decoded nothing: its absence is never authoritative"
+        );
+        assert_eq!(
+            edge_of(&document, REP + 6).unwrap()["mapping"]["state"],
+            "mapped"
+        );
+    }
+
+    #[test]
+    fn a_generation_or_image_the_caller_is_not_never_projects() {
+        let mut harness = spawned();
+        let mut exec = driver();
+        exec.ino = 101;
+        let reused = Some(MemberGeneration {
+            start_time: Some(start(REP + 1) + 1),
+            exe: Some(driver()),
+        });
+        let execed = Some(MemberGeneration {
+            start_time: Some(start(REP + 2)),
+            exe: Some(exec),
+        });
+        let blind = Some(MemberGeneration {
+            start_time: Some(start(REP + 3)),
+            exe: None,
+        });
+        let deep_reused = Some(MemberGeneration {
+            start_time: Some(start(REP) + 7),
+            exe: None,
+        });
+        harness.apply_catalog(catalog(
+            &[],
+            &[
+                (REP + 1, reused),
+                (REP + 2, execed),
+                (REP + 3, blind),
+                (REP, deep_reused),
+            ],
+        ));
+        let document = harness.render();
+        for pid in [REP, REP + 1, REP + 2, REP + 3] {
+            assert!(
+                edge_of(&document, pid).is_none(),
+                "pid {pid} must not project"
+            );
+        }
+        assert_eq!(
+            document["edges"].as_array().unwrap().len(),
+            (CALLERS - 4) as usize
+        );
+        let gap = document["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gap| gap["subject"] == "caller generation join refused")
+            .expect("the refused joins are one counted gap");
+        let reason = gap["reason"].as_str().unwrap();
+        assert!(reason.contains("2 generation_changed"), "{reason}");
+        assert!(reason.contains("1 exec_changed"), "{reason}");
+        assert!(reason.contains("1 confirm_unreadable"), "{reason}");
+    }
+
+    #[test]
+    fn budget_refusals_past_the_cap_aggregate_into_one_gap_per_pass() {
+        let limits = RegistryLimits::new(100, 4096, 32768, 1024, 1_048_576, 32768).unwrap();
+        let mut harness = Harness::new(limits).unwrap();
+        for pid in (REP..REP + CALLERS).chain(20_000..20_000 + IDLE) {
+            harness.source().spawn(pid, start(pid));
+        }
+        harness.apply_catalog(catalog(&[], &[]));
+        harness.advance(1);
+        harness.apply_catalog(catalog(&[], &[]));
+        let document = harness.render();
+        assert_eq!(document["callers"].as_array().unwrap().len(), 100);
+        let refusals: Vec<&serde_json::Value> = document["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|gap| gap["subject"] == "caller admission failed")
+            .collect();
+        assert_eq!(
+            refusals.len(),
+            2,
+            "one per pass, not one per pid: {refusals:?}"
+        );
+        for gap in refusals {
+            assert!(
+                gap["reason"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("200 admissions refused this pass"),
+                "{gap}"
+            );
+            assert_eq!(gap["budget"]["resource"], "callers");
+            assert_eq!(gap["budget"]["limit"], 100);
+        }
+    }
 }

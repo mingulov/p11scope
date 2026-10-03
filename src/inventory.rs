@@ -663,9 +663,10 @@ fn progress_lines<Source: ProcessSource>(
     report: &PassReport,
 ) -> Vec<String> {
     let mut lines = vec![format!(
-        "p11scope: pass {}: {} scanned ({} native, {} scan-pinned){}",
+        "p11scope: pass {}: {} scanned ({} maps-matched; {} native, {} scan-pinned){}",
         report.pass,
         report.scanned,
+        report.maps_matched,
         report.native_callers,
         report.scan_callers,
         if report.pending_refresh.is_empty() {
@@ -693,7 +694,34 @@ fn progress_lines<Source: ProcessSource>(
             suppressed,
         ));
     }
+    if crate::inspect_system::stage_timings_requested() {
+        lines.push(format!(
+            "p11scope: pass {}: stage timings: {}",
+            report.pass,
+            report.timings.ops_line()
+        ));
+    }
+    // Admission failures aggregate past one per pass, like their gaps.
+    let failed: Vec<(u32, &str)> = report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            CallerEvent::AdmitFailed { pid, reason, .. } => Some((*pid, reason.as_str())),
+            _ => None,
+        })
+        .collect();
+    if let [(first, reason), _, ..] = failed.as_slice() {
+        lines.push(format!(
+            "p11scope: pass {}: {} caller admissions failed; first: pid {first}: {}",
+            report.pass,
+            failed.len(),
+            crate::render::escape_controls(reason)
+        ));
+    }
     for event in &report.events {
+        if failed.len() > 1 && matches!(event, CallerEvent::AdmitFailed { .. }) {
+            continue;
+        }
         let line = match event {
             CallerEvent::Admitted { id } => {
                 let pid = coordinator
@@ -813,6 +841,7 @@ fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json::Value {
         "module": edge.module.label(),
         "mapping": {
             "state": edge.mapping.label(),
+            "evidence": edge.mapping_evidence.label(),
             "reason": edge.mapping_reason,
             "first_seen_ns": edge.mapping_first_seen_ns,
             "last_seen_ns": edge.mapping_last_seen_ns,
@@ -1205,6 +1234,7 @@ mod tests {
         let report = PassReport {
             pass: 3,
             scanned: 0,
+            maps_matched: 0,
             native_callers: 0,
             scan_callers: 0,
             engine_changed: false,
@@ -1220,6 +1250,7 @@ mod tests {
                     reason: "gone\r\nfake".into(),
                 },
             ],
+            timings: crate::timing::StageTimings::new(),
         };
         let lines = progress_lines(&coordinator, &report);
         for line in &lines {

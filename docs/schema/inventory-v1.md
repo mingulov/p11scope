@@ -34,6 +34,21 @@ never a changed meaning for an existing field.
   the exe identity was unreadable and exec changes were undetectable.
   `lifecycle` is `mapped`, `exited`, `exec_retired`, or `unknown`
   (with `lifecycle_reason` whenever the state is not plainly mapped).
+  Under `--system`, every process with attributable mappings registers
+  as a caller on every pass, whatever `--max-scan-pids` is: a process
+  the deep-scan cap left unselected registers when its `/proc/<pid>/maps`
+  shows, by exact `(device, inode)`, a provider object a deep scan of
+  another process pinned in the same pass (a *maps match*, below). The
+  cap bounds only how many processes are deep-scanned, i.e. the
+  discovery of objects no process seen so far maps. A collected member's
+  mappings project onto a caller only when its generation joins the
+  incarnation reconcile holds for the pid: equal start times (both
+  present), and for a maps match equal exe identities (both present; a
+  deep scan refuses only when both were read and differ). Members that
+  fail the join are not projected (their existing edges read
+  `uncertain`) and are counted in one `caller generation join refused`
+  gap per pass by category (`generation_changed`, `exec_changed`,
+  `confirm_unreadable`).
 - `modules[]`: one record per distinct physical module instance,
   keyed by (device, inode, SHA-256) — never by path. Two callers
   mapping different objects at the same path are distinct records;
@@ -93,7 +108,18 @@ never a changed meaning for an existing field.
 - `edges[]`: one record per (caller incarnation, module instance)
   pair. `mapping` is scan evidence (state `mapped`, `ended`, or
   `uncertain`, with first/last seen and an interruption count of
-  observed mapped→absent→mapped transitions). `entries` is usage
+  observed mapped→absent→mapped transitions). `mapping.evidence` says
+  how the latest mapping observation was established: `deep_scan` (a
+  deep scan of the caller decoded it) or `maps_match` (the caller's
+  maps, re-read under a pidfd/start-time pin with its exe identity
+  unchanged across the read, show the object by exact `(device, inode)`
+  while the object a deep scan pinned this pass is held open — the
+  caller itself was not decoded). Absence is authoritative (`ended`)
+  only after a complete deep scan of the live caller: a module missing
+  from a maps match reads `uncertain`. A maps match never comes from a
+  ` (deleted)` mapping, an overlay-collapsed or aliased key, a rejected
+  key, or a filesystem whose inode numbers are not unique (FUSE,
+  network filesystems). `entries` is usage
   evidence from observed entries only: cumulative `count` plus
   first/last seen, an in-flight flag, and `observation` —
   `observed`, `unknown (not admitted)`, `unknown (usage observation
@@ -229,7 +255,26 @@ never a changed meaning for an existing field.
   exception, counted in `async_evictions`).
 - `gaps[]`: every explicit coverage loss — unadmitted members,
   unreadable pids, deferred scans, unknown identities — with subject
-  and reason. Absence from the document is never evidence of
+  and reason. Past the deep-scan cap, a pass records `discovery capped`
+  only when something stayed unexamined: "`N` processes in scope; `D`
+  deep-scanned by provider rarity (limit `L`); `M` attributed to
+  pinned provider objects by exact maps identity; `U` processes map
+  `K` shared objects no deep scan examined and may use undiscovered
+  providers" (plus how many processes had no maps snapshot). When
+  nothing stayed unexamined and nothing was lost, the same subject
+  reads "attribution complete: …" instead — a note, not a loss.
+  `maps attribution` gaps count attribution losses by category
+  (`generation_changed`, `exec_changed`, `confirm_unreadable`,
+  `deleted_mapping`, `object_changed`, `key_rejected`,
+  `inode_not_unique`, `budget`) and name a matched caller that also
+  maps shared objects no deep scan examined; an object whose sweep
+  matching was refused (non-unique inodes) or dropped (it changed
+  after the confirmation reads) is a gap under its path. Admission
+  failures record one `caller admission failed` gap per pass and kind:
+  a single failure keeps its pid and exact reason; several aggregate
+  with a count (`N admissions refused this pass: caller budget
+  exhausted…` with the budget, or `N pids could not be admitted this
+  pass; first: pid P: …`). Absence from the document is never evidence of
   absence; `gaps_suppressed` counts gaps dropped past the bound.
   A gap that records a budget refusal carries `budget` with the
   `resource`, its `limit`, and the `requested` occupancy; every other

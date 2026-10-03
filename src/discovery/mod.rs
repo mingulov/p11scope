@@ -13,6 +13,7 @@ pub mod noise;
 pub(crate) mod pause;
 pub mod scan;
 pub(crate) mod scheduler;
+pub(crate) mod sweep_attribution;
 
 #[cfg(test)]
 mod test_subject;

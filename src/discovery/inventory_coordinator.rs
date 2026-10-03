@@ -41,6 +41,7 @@ use crate::discovery::inventory_attach_set::{
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
+use crate::discovery::sweep_attribution::AttributionLoss;
 use p11scope_ebpf_common::ImageIdentity;
 use std::path::PathBuf;
 
@@ -56,12 +57,18 @@ pub(crate) enum InventoryScope {
 #[derive(Debug, Clone)]
 pub(crate) struct PassReport {
     pub pass: u64,
+    /// Members observed this pass: deep-scanned plus maps-matched.
     pub scanned: usize,
+    /// Of `scanned`, the members attributed by exact maps identity (C1b).
+    pub maps_matched: usize,
     pub native_callers: usize,
     pub scan_callers: usize,
     pub engine_changed: bool,
     pub pending_refresh: Vec<CallerId>,
     pub events: Vec<CallerEvent>,
+    /// Per-stage wall time of the pass: the catalog collection's stages
+    /// plus reconcile, native scans, and projection.
+    pub timings: crate::timing::StageTimings,
 }
 
 /// What one batch commit published: both revisions, which the ordering
@@ -560,7 +567,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // budget the attach set enforces, never the Detailed slot ceiling
         // `inspect` reports.
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
-        let mut catalog = match scope {
+        let catalog = match scope {
             InventoryScope::Pid(pid) => crate::inspect_system::collect_pid(
                 *pid,
                 &self.engine.module_hints,
@@ -574,16 +581,48 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 policy,
             )?,
         };
+        Ok(self.apply_catalog(catalog, guard, native_image, deadline_ns, now_ns))
+    }
+
+    /// The pass after collection: absorb the lowering into the attach set,
+    /// reconcile caller incarnations over every attributable member
+    /// (deep-scanned or maps-matched), scan native owners, and project the
+    /// catalog. Split from collection so scripted catalogs drive the same
+    /// path (the workload harness).
+    pub(crate) fn apply_catalog(
+        &mut self,
+        mut catalog: crate::inspect_system::Catalog,
+        guard: &mut dyn ImageGuard,
+        native_image: fn(u32) -> Option<ImageIdentity>,
+        deadline_ns: u64,
+        now_ns: u64,
+    ) -> PassReport {
+        let mut timings = std::mem::take(&mut catalog.stage_timings);
         // Absorb at once: the aggregate pins and their fds drop here, never
         // living across reconcile or the native owner scans below.
+        let absorb_start = crate::attach::monotonic_ns();
         let verdicts = self.absorb_lowering(catalog.lowering.take());
+        timings.span(
+            crate::timing::StageKind::Plan,
+            "absorb",
+            absorb_start,
+            crate::attach::monotonic_ns(),
+        );
+        // Maps-matched members register exactly like deep-scanned ones:
+        // same authority resolution (native owners included), same
+        // incarnation pin. Their projection joins the generation below.
         let observed: BTreeSet<u32> = catalog
             .processes
             .iter()
-            .filter(|process| process.status.inventoried())
+            .filter(|process| process.status.attributable())
             .map(|process| process.pid)
             .collect();
         let scanned = observed.len();
+        let maps_matched = catalog
+            .processes
+            .iter()
+            .filter(|process| process.status == crate::inspect_system::MemberStatus::MapsMatched)
+            .count();
         let mut resolver = AuthorityResolver {
             engine: &mut self.engine,
             pending: &mut self.pending_owners,
@@ -592,12 +631,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             native_failures: Vec::new(),
             scan_pinned: 0,
         };
+        let reconcile_start = crate::attach::monotonic_ns();
         let events = self
             .adapter
             .reconcile(&observed, &mut |pid| resolver.resolve(pid), now_ns);
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
         self.record_authority_gaps(native_failures, scan_pinned);
+        timings.span(
+            crate::timing::StageKind::Projection,
+            "reconcile",
+            reconcile_start,
+            crate::attach::monotonic_ns(),
+        );
         // Native scans for live native callers, through the core.
         let mut pending_refresh = Vec::new();
         let mut engine_changed = false;
@@ -635,7 +681,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Scan-lane projection for every inventoried member, including
         // native callers (the catalog carries admission verdicts the
         // registry needs either way).
+        let project_start = crate::attach::monotonic_ns();
         self.project_catalog(&catalog, &verdicts, now_ns);
+        timings.span(
+            crate::timing::StageKind::Projection,
+            "project",
+            project_start,
+            crate::attach::monotonic_ns(),
+        );
         // Owners that never committed a complete receipt cannot back
         // absence claims: absences for their callers stay uncertain, and
         // the gap says so.
@@ -668,15 +721,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let native_callers = native.len();
         let pass = self.passes;
         self.passes += 1;
-        Ok(PassReport {
+        PassReport {
             pass,
             scanned,
+            maps_matched,
             native_callers,
             scan_callers: observed.len().saturating_sub(native_callers),
             engine_changed,
             pending_refresh,
             events,
-        })
+            timings,
+        }
     }
 
     /// One pass with no scan behind it: the collection failed after at
@@ -732,11 +787,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         PassReport {
             pass,
             scanned: 0,
+            maps_matched: 0,
             native_callers,
             scan_callers: live.len().saturating_sub(native_callers),
             engine_changed: false,
             pending_refresh: Vec::new(),
             events,
+            timings: crate::timing::StageTimings::new(),
         }
     }
 
@@ -745,6 +802,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// workload harness reuses this after scripted reconciles so staged
     /// facts follow the same path as scanned ones.
     pub(crate) fn apply_reconcile_events(&mut self, events: &[CallerEvent], now_ns: u64) {
+        let mut failed: Vec<(u32, &str, Option<BudgetRefusal>)> = Vec::new();
         for event in events {
             let id = match event {
                 CallerEvent::Admitted { id }
@@ -775,14 +833,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             budget: None,
                         });
                     }
-                    self.registry.record_gap(RegistryGap {
-                        caller: None,
-                        module: None,
-                        pid: Some(*pid),
-                        subject: "caller admission failed".into(),
-                        reason: reason.clone(),
-                        budget: *budget,
-                    });
+                    failed.push((*pid, reason.as_str(), *budget));
                     continue;
                 }
             };
@@ -794,6 +845,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 && let Some(owner) = self.pending_owners.remove(&pid)
             {
                 self.owners.insert(id, owner);
+            }
+        }
+        self.record_admission_failures(&failed);
+    }
+
+    /// Admission failures, one gap per pass and kind rather than one per
+    /// pid per pass (C1b ruling 4): at system scale a full caller budget
+    /// refuses every new caller every pass. A single failure keeps its
+    /// exact per-pid record; several aggregate with a count — budget
+    /// refusals carry the budget (the highest occupancy requested), pin
+    /// failures name the first.
+    fn record_admission_failures(&mut self, failed: &[(u32, &str, Option<BudgetRefusal>)]) {
+        let (refused, unpinned): (Vec<_>, Vec<_>) =
+            failed.iter().partition(|(_, _, budget)| budget.is_some());
+        for group in [refused, unpinned] {
+            match group.as_slice() {
+                [] => {}
+                [(pid, reason, budget)] => self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: Some(*pid),
+                    subject: "caller admission failed".into(),
+                    reason: (*reason).to_string(),
+                    budget: *budget,
+                }),
+                [(first_pid, first_reason, _), ..] => {
+                    let budget = group
+                        .iter()
+                        .filter_map(|(_, _, budget)| *budget)
+                        .max_by_key(|budget| budget.requested);
+                    let reason = match budget {
+                        Some(budget) => format!(
+                            "{} admissions refused this pass: caller budget exhausted: the \
+                             registry retains at most {} callers; the admissions were refused",
+                            group.len(),
+                            budget.limit
+                        ),
+                        None => format!(
+                            "{} pids could not be admitted this pass; first: pid {first_pid}: \
+                             {first_reason}",
+                            group.len()
+                        ),
+                    };
+                    self.registry.record_gap(RegistryGap {
+                        caller: None,
+                        module: None,
+                        pid: None,
+                        subject: "caller admission failed".into(),
+                        reason,
+                        budget,
+                    });
+                }
             }
         }
     }
@@ -968,11 +1071,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut absent = false;
         for edge in self
             .registry
-            .edges()
-            .filter(|edge| {
-                edge.caller == caller
-                    && matches!(edge.mapping, MappingState::Mapped | MappingState::Uncertain)
-            })
+            .edges_of(caller)
+            .filter(|edge| matches!(edge.mapping, MappingState::Mapped | MappingState::Uncertain))
             .map(|edge| (edge.module, edge.mapping))
             .collect::<Vec<_>>()
         {
@@ -1027,53 +1127,84 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         absorbed.verdicts
     }
 
-    /// Project one catalog pass into the registry: per-member mappings
-    /// carrying the attach set's admission verdicts, per-member absences
-    /// (authoritative only for complete member scans), unscanned-member
-    /// uncertainty, and catalog gaps.
+    /// Project one catalog pass into the registry, per member: its
+    /// mappings (deep-scanned or maps-matched) carrying the attach set's
+    /// admission verdicts, its absences (authoritative only for a complete
+    /// deep scan — never for a maps match), unscanned-member uncertainty,
+    /// and the catalog gaps. A member projects only when the generation it
+    /// was collected under joins the caller incarnation reconcile holds
+    /// for its pid (start time, both present; and the exe identity), so a
+    /// reused pid or a later exec never inherits mappings. Each caller's
+    /// edges come from a per-caller range query, never a scan of all edges.
     fn project_catalog(
         &mut self,
         catalog: &crate::inspect_system::Catalog,
         verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
         now_ns: u64,
     ) {
-        for object in &catalog.objects {
-            let attach_key = object.sha256.as_ref().map(|sha256| AttachModuleKey {
-                object: object.key,
-                sha256: sha256.clone(),
-            });
-            let verdict = attach_key.as_ref().and_then(|key| verdicts.get(key));
+        use crate::inspect_system::{MemberStatus, ObservationEvidence};
+        let mut by_pid: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
+        for (object_index, object) in catalog.objects.iter().enumerate() {
+            for (observation_index, observation) in object.observations.iter().enumerate() {
+                by_pid
+                    .entry(observation.pid)
+                    .or_default()
+                    .push((object_index, observation_index));
+            }
+        }
+        let mut join_losses: BTreeMap<AttributionLoss, usize> = BTreeMap::new();
+        for process in &catalog.processes {
+            let Some(caller) = self.adapter.live_id(process.pid) else {
+                continue;
+            };
+            if !process.status.attributable() {
+                self.registry.note_member_unscanned(caller);
+                continue;
+            }
+            if let Err(loss) = self.generation_join(caller, process) {
+                *join_losses.entry(loss).or_default() += 1;
+                // The collected mappings belong to another generation or
+                // image: they neither confirm nor refute this caller's.
+                self.registry.note_member_unscanned(caller);
+                continue;
+            }
             // One mapping note per observation (not per object path):
             // aliased objects are observed under several paths and the
             // registry accumulates every spelling.
-            for observation in &object.observations {
-                let Some(caller) = self.adapter.live_id(observation.pid) else {
-                    continue;
-                };
+            for &(object_index, observation_index) in by_pid.get(&process.pid).into_iter().flatten()
+            {
+                let object = &catalog.objects[object_index];
+                let observation = &object.observations[observation_index];
+                let attach_key = object.sha256.as_ref().map(|sha256| AttachModuleKey {
+                    object: object.key,
+                    sha256: sha256.clone(),
+                });
+                let verdict = attach_key.as_ref().and_then(|key| verdicts.get(key));
                 let mut info = catalog_module_info(object, verdict);
                 info.path = observation.path.clone();
                 info.double_loaded = observation.double_loaded;
                 let key = info.key.clone();
-                self.registry
-                    .note_mapping(caller, observation.pid, info, now_ns);
+                match observation.evidence {
+                    ObservationEvidence::DeepScan => {
+                        self.registry
+                            .note_mapping(caller, process.pid, info, now_ns);
+                    }
+                    ObservationEvidence::MapsMatch => {
+                        self.registry
+                            .note_maps_match(caller, process.pid, info, now_ns);
+                    }
+                }
                 self.stage_capture_coverage(
                     caller,
-                    observation.pid,
+                    process.pid,
                     &key,
                     attach_key.as_ref(),
                     verdict,
                 );
             }
-        }
-        for process in &catalog.processes {
-            let Some(caller) = self.adapter.live_id(process.pid) else {
-                continue;
-            };
-            if !process.status.inventoried() {
-                self.registry.note_member_unscanned(caller);
-                continue;
-            }
-            let complete = matches!(process.status, crate::inspect_system::MemberStatus::Scanned);
+            // Only a complete deep scan makes absence authoritative: a
+            // maps match decoded nothing, so its absences read uncertain.
+            let complete = matches!(process.status, MemberStatus::Scanned);
             let shown: BTreeSet<ModuleKey> = process
                 .objects
                 .iter()
@@ -1083,10 +1214,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let mut absent = false;
             for (module, mapping) in self
                 .registry
-                .edges()
+                .edges_of(caller)
                 .filter(|edge| {
-                    edge.caller == caller
-                        && matches!(edge.mapping, MappingState::Mapped | MappingState::Uncertain)
+                    matches!(edge.mapping, MappingState::Mapped | MappingState::Uncertain)
                 })
                 .map(|edge| (edge.module, edge.mapping))
                 .collect::<Vec<_>>()
@@ -1105,6 +1235,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.churned_owners.insert(owner);
             }
         }
+        if !join_losses.is_empty() {
+            let parts: Vec<String> = join_losses
+                .iter()
+                .map(|(loss, count)| format!("{count} {}", loss.label()))
+                .collect();
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "caller generation join refused".into(),
+                reason: format!(
+                    "members whose collected generation is not the admitted caller incarnation \
+                     were not projected (their edges read uncertain): {}",
+                    parts.join(", ")
+                ),
+                budget: None,
+            });
+        }
         for gap in catalog.skipped.iter().chain(catalog.notes.iter()) {
             self.registry.record_gap(RegistryGap {
                 caller: gap.pid.and_then(|pid| self.adapter.live_id(pid)),
@@ -1114,6 +1262,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 reason: gap.reason.clone(),
                 budget: None,
             });
+        }
+    }
+
+    /// Whether a member's collected generation is the caller incarnation
+    /// reconcile holds: equal start times, both present (both lanes); for a
+    /// maps match also equal exe identities, both present; for a deep scan
+    /// unequal exe identities refuse when both were read.
+    fn generation_join(
+        &self,
+        caller: CallerId,
+        process: &crate::inspect_system::ProcessRecord,
+    ) -> Result<(), AttributionLoss> {
+        let record = self
+            .adapter
+            .record(caller)
+            .ok_or(AttributionLoss::GenerationChanged)?;
+        let generation = process
+            .generation
+            .as_ref()
+            .ok_or(AttributionLoss::GenerationChanged)?;
+        match (generation.start_time, record.start_time) {
+            (Some(collected), Some(admitted)) if collected == admitted => {}
+            _ => return Err(AttributionLoss::GenerationChanged),
+        }
+        let matched = process.status == crate::inspect_system::MemberStatus::MapsMatched;
+        match (&generation.exe, &record.exe) {
+            (Some(collected), Some(admitted)) if collected != admitted => {
+                Err(AttributionLoss::ExecChanged)
+            }
+            (Some(_), Some(_)) => Ok(()),
+            _ if matched => Err(AttributionLoss::ConfirmUnreadable),
+            _ => Ok(()),
         }
     }
 
@@ -1995,6 +2175,7 @@ mod tests {
         pins: &crate::discovery::identity::PinnedObjects,
         paths: &[&std::path::Path],
         pid: u32,
+        generation: Option<crate::inspect_system::MemberGeneration>,
     ) -> crate::inspect_system::Catalog {
         let objects = paths
             .iter()
@@ -2018,6 +2199,7 @@ mod tests {
                         tables: Vec::new(),
                         interfaces: Vec::new(),
                         double_loaded: false,
+                        evidence: crate::inspect_system::ObservationEvidence::DeepScan,
                     }],
                     admission: crate::inspect_system::AdmissionRecord::Admitted {
                         class: "exact",
@@ -2032,12 +2214,18 @@ mod tests {
             enumerated: 1,
             selected: 1,
             scanned: 1,
+            maps_matched: 0,
+            unexamined: 0,
+            unexamined_objects: 0,
+            snapshots_unavailable: 0,
+            attribution_losses: std::collections::BTreeMap::new(),
             cap: 1,
             scan_ms: 0,
             processes: vec![crate::inspect_system::ProcessRecord {
                 pid,
                 status: crate::inspect_system::MemberStatus::Scanned,
                 objects: (0..objects.len()).collect(),
+                generation,
             }],
             objects,
             relationships: Vec::new(),
@@ -2051,6 +2239,7 @@ mod tests {
             skipped: Vec::new(),
             notes: Vec::new(),
             explanation: None,
+            stage_timings: crate::timing::StageTimings::new(),
         }
     }
 
@@ -2081,7 +2270,12 @@ mod tests {
             .adapter
             .admit(pid, ImageAuthority::ScanPinned, 50)
             .unwrap();
-        let catalog = capture_catalog(&pins, &[&a, &b, &c], pid);
+        // The generation collection reads for this (live) process.
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a, &b, &c], pid, generation);
         let coverage_of = |coordinator: &InventoryCoordinator<_>, path: &std::path::Path| {
             let edge = coordinator
                 .registry
@@ -2315,7 +2509,17 @@ mod tests {
         }
 
         fn project(&mut self, pid: u32, now_ns: u64) {
-            let catalog = capture_catalog(&self.pins, &[&self.path], pid);
+            // Collected under the incarnation reconcile holds for the pid.
+            let generation = self
+                .coordinator
+                .adapter
+                .live_id(pid)
+                .and_then(|caller| self.coordinator.adapter.record(caller))
+                .map(|record| crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                });
+            let catalog = capture_catalog(&self.pins, &[&self.path], pid, generation);
             self.coordinator
                 .project_catalog(&catalog, &self.verdicts, now_ns);
         }

@@ -546,6 +546,13 @@ impl ProcessView {
         self.admitted_ns
     }
 
+    /// The `/proc` start time the view's pin retained (clock ticks since
+    /// boot), `None` when it was unreadable: the generation a projection
+    /// joins against the caller incarnation.
+    pub(crate) fn start_time(&self) -> Option<u64> {
+        self.pin.start_time()
+    }
+
     pub(crate) fn matches_lifecycle_event(&self, pid: u32, hook_ts_ns: u64) -> bool {
         self.pid() == pid && hook_ts_ns >= self.admitted_ns
     }

@@ -153,6 +153,24 @@ pub(crate) trait ProcessSource {
     fn gone(&self, pid: u32) -> bool;
 }
 
+/// The exe identity of `pid` (`/proc/<pid>/exe` metadata plus its link
+/// text), or `None` when unreadable. One reader for the caller adapter and
+/// the C1b confirmation read, so the two compare like for like.
+pub(crate) fn read_exe_identity(pid: u32) -> Option<ExeIdentity> {
+    let path = format!("/proc/{pid}/exe");
+    let metadata = std::fs::metadata(&path).ok()?;
+    let link = std::fs::read_link(&path)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    Some(ExeIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mtime_secs: metadata.mtime(),
+        mtime_nanos: metadata.mtime_nsec(),
+        path: link,
+    })
+}
+
 /// Production source: `PidPin` identity, `/proc` start-time and exe.
 pub(crate) struct OsProcessSource;
 
@@ -172,18 +190,7 @@ impl ProcessSource for OsProcessSource {
     }
 
     fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
-        let path = format!("/proc/{pid}/exe");
-        let metadata = std::fs::metadata(&path).ok()?;
-        let link = std::fs::read_link(&path)
-            .ok()
-            .map(|path| path.to_string_lossy().into_owned());
-        Some(ExeIdentity {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-            mtime_secs: metadata.mtime(),
-            mtime_nanos: metadata.mtime_nsec(),
-            path: link,
-        })
+        read_exe_identity(pid)
     }
 
     fn gone(&self, pid: u32) -> bool {
@@ -639,6 +646,25 @@ pub(crate) struct ModuleInfo {
     pub admission_reasons: Vec<String>,
 }
 
+/// How an edge's latest mapping observation was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MappingEvidence {
+    /// A deep scan of the caller (catalog member or native owner).
+    DeepScan,
+    /// C1b: the caller's confirmed maps show the pinned object by exact
+    /// `(device, inode)`; the caller itself was not decoded.
+    MapsMatch,
+}
+
+impl MappingEvidence {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::DeepScan => "deep_scan",
+            Self::MapsMatch => "maps_match",
+        }
+    }
+}
+
 /// Lifecycle of one module instance across passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModuleLifecycle {
@@ -885,6 +911,8 @@ pub(crate) struct EdgeRecord {
     pub module: ModuleId,
     pub mapping: MappingState,
     pub mapping_reason: Option<String>,
+    /// How the latest mapping note was established (`mapping.evidence`).
+    pub mapping_evidence: MappingEvidence,
     pub mapping_first_seen_ns: u64,
     pub mapping_last_seen_ns: u64,
     /// Transitions from mapped to absent-while-live observed across
@@ -1064,6 +1092,7 @@ enum Mutation {
         caller: CallerId,
         pid: u32,
         info: ModuleInfo,
+        evidence: MappingEvidence,
         at_ns: u64,
     },
     #[allow(dead_code)] // Privileged BPF usage-feed seam.
@@ -1241,6 +1270,15 @@ impl CallerRegistry {
 
     pub(crate) fn edge(&self, caller: CallerId, module: ModuleId) -> Option<&EdgeRecord> {
         self.edges.get(&(caller, module))
+    }
+
+    /// One caller's edges: a range query over the `(caller, module)` key,
+    /// so per-caller projection is O(log E + edges of the caller), never a
+    /// scan of every edge (C1b: callers grow to every provider user).
+    pub(crate) fn edges_of(&self, caller: CallerId) -> impl Iterator<Item = &EdgeRecord> {
+        self.edges
+            .range((caller, ModuleId(0))..=(caller, ModuleId(u32::MAX)))
+            .map(|(_, edge)| edge)
     }
 
     pub(crate) fn gaps(&self) -> &[RegistryGap] {
@@ -1443,6 +1481,26 @@ impl CallerRegistry {
             caller,
             pid,
             info,
+            evidence: MappingEvidence::DeepScan,
+            at_ns,
+        });
+    }
+
+    /// Stage one mapping observed by exact maps identity (C1b): the same
+    /// edge semantics as [`Self::note_mapping`], with the edge's evidence
+    /// marked `maps_match`.
+    pub(crate) fn note_maps_match(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        info: ModuleInfo,
+        at_ns: u64,
+    ) {
+        self.staged.push(Mutation::NoteMapping {
+            caller,
+            pid,
+            info,
+            evidence: MappingEvidence::MapsMatch,
             at_ns,
         });
     }
@@ -1658,8 +1716,9 @@ impl CallerRegistry {
                 caller,
                 pid,
                 info,
+                evidence,
                 at_ns,
-            } => self.apply_mapping(caller, pid, info, at_ns),
+            } => self.apply_mapping(caller, pid, info, evidence, at_ns),
             Mutation::ObserveEntries {
                 caller,
                 module,
@@ -1794,8 +1853,9 @@ impl CallerRegistry {
                 let mut modules = BTreeSet::new();
                 for edge in self
                     .edges
-                    .values_mut()
-                    .filter(|edge| edge.caller == caller && edge.mapping == MappingState::Mapped)
+                    .range_mut((caller, ModuleId(0))..=(caller, ModuleId(u32::MAX)))
+                    .map(|(_, edge)| edge)
+                    .filter(|edge| edge.mapping == MappingState::Mapped)
                 {
                     edge.mapping = MappingState::Uncertain;
                     edge.mapping_reason = Some(
@@ -1818,7 +1878,14 @@ impl CallerRegistry {
         }
     }
 
-    fn apply_mapping(&mut self, caller: CallerId, pid: u32, info: ModuleInfo, at_ns: u64) {
+    fn apply_mapping(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        info: ModuleInfo,
+        evidence: MappingEvidence,
+        at_ns: u64,
+    ) {
         if self.retired.contains_key(&caller) {
             self.push_gap(RegistryGap {
                 caller: Some(caller),
@@ -1959,6 +2026,7 @@ impl CallerRegistry {
                     edge.mapping = MappingState::Mapped;
                     edge.mapping_reason = None;
                 }
+                edge.mapping_evidence = evidence;
                 edge.mapping_last_seen_ns = at_ns;
             }
             None => {
@@ -1989,6 +2057,7 @@ impl CallerRegistry {
                         module,
                         mapping: MappingState::Mapped,
                         mapping_reason: None,
+                        mapping_evidence: evidence,
                         mapping_first_seen_ns: at_ns,
                         mapping_last_seen_ns: at_ns,
                         mapping_interruptions: 0,
@@ -2414,10 +2483,12 @@ impl CallerRegistry {
         let _ = at_ns;
         self.retired.insert(caller, reason.clone());
         let mut modules = BTreeSet::new();
-        for edge in self.edges.values_mut().filter(|edge| {
-            edge.caller == caller
-                && matches!(edge.mapping, MappingState::Mapped | MappingState::Uncertain)
-        }) {
+        for edge in self
+            .edges
+            .range_mut((caller, ModuleId(0))..=(caller, ModuleId(u32::MAX)))
+            .map(|(_, edge)| edge)
+            .filter(|edge| matches!(edge.mapping, MappingState::Mapped | MappingState::Uncertain))
+        {
             edge.mapping = MappingState::Ended;
             edge.mapping_reason = Some(reason.clone());
             // A retired edge keeps its claims (retained evidence) but
@@ -2657,6 +2728,56 @@ pub(crate) mod tests {
             admission_endpoints: Some(3),
             admission_reasons: Vec::new(),
         }
+    }
+
+    #[test]
+    fn edges_of_ranges_one_callers_edges_and_notes_carry_their_evidence() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        for caller in 0..3 {
+            for module in 0..3 {
+                let info = module_info(
+                    &format!("/opt/m{module}.so"),
+                    50 + module,
+                    AdmissionState::Admitted,
+                );
+                if caller == 1 && module == 2 {
+                    registry.note_maps_match(CallerId(caller), 10 + caller, info, 5);
+                } else {
+                    registry.note_mapping(CallerId(caller), 10 + caller, info, 5);
+                }
+            }
+        }
+        registry.publish();
+        let edges: Vec<(u32, u32, &str)> = registry
+            .edges_of(CallerId(1))
+            .map(|edge| (edge.caller.0, edge.module.0, edge.mapping_evidence.label()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![
+                (1, 0, "deep_scan"),
+                (1, 1, "deep_scan"),
+                (1, 2, "maps_match")
+            ]
+        );
+        assert_eq!(registry.edges_of(CallerId(7)).count(), 0);
+        // The latest note's evidence wins.
+        let info = module_info("/opt/m2.so", 52, AdmissionState::Admitted);
+        registry.note_mapping(CallerId(1), 11, info, 6);
+        registry.publish();
+        let module = registry
+            .module_id_for(&ModuleKey::physical(
+                8,
+                1,
+                52,
+                Some("sha0052".into()),
+                "/opt/m2.so",
+            ))
+            .unwrap();
+        assert_eq!(
+            registry.edge(CallerId(1), module).unwrap().mapping_evidence,
+            MappingEvidence::DeepScan
+        );
     }
 
     #[test]

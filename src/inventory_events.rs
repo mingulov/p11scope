@@ -493,6 +493,7 @@ pub(crate) fn pass_payload(
     serde_json::json!({
         "pass": report.pass,
         "scanned": report.scanned,
+        "maps_matched": report.maps_matched,
         "native_callers": report.native_callers,
         "scan_callers": report.scan_callers,
         "totals": {

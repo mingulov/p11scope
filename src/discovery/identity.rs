@@ -128,6 +128,11 @@ struct Entry {
     /// heuristic but does not prove that another overlay instance resolves to the
     /// same underlying kernel inode.
     overlay: bool,
+    /// Sticky: another mapping was folded onto this entry by the overlayfs
+    /// heuristic (same-key alias or cross-key canonicalization). Such an
+    /// entry stands for more than one proven kernel file, so its raw key is
+    /// never a sweep-matching key (`sweep_match_keys`).
+    collapsed: bool,
 }
 
 /// The exact, bounded pin subset retained by private Inventory activation.
@@ -262,6 +267,44 @@ fn on_overlayfs(fd: RawFd) -> Result<bool, String> {
     })
 }
 
+/// Filesystems whose inode numbers do not name one file per device: FUSE
+/// (the daemon chooses them) and network filesystems (server-assigned,
+/// possibly folded). C1b never matches a maps `(device, inode)` key there.
+const NONUNIQUE_INODE_FILESYSTEMS: [(u64, &str); 9] = [
+    (0x6573_5546, "fuse"),
+    (0x6969, "nfs"),
+    (0x517b, "smb"),
+    (0xff53_4d42, "cifs"),
+    (0xfe53_4d42, "smb2"),
+    (0x0102_1997, "9p"),
+    (0x00c3_6400, "ceph"),
+    (0x5346_414f, "afs"),
+    (0x7375_7245, "coda"),
+];
+
+/// The named filesystem kind for an `f_type` with non-unique inodes, or
+/// `None`. Pure so the table is unit-testable without such a mount.
+pub(crate) fn nonunique_inode_kind(f_type: u64) -> Option<&'static str> {
+    NONUNIQUE_INODE_FILESYSTEMS
+        .iter()
+        .find_map(|(magic, name)| (*magic == f_type).then_some(*name))
+}
+
+fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, String> {
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fstatfs` fills `buf` for a valid fd and is only read on success.
+    if unsafe { libc::fstatfs(fd, buf.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "fstatfs failed while classifying inode uniqueness: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful `fstatfs` above initialized `buf`. `f_type` is
+    // signed on some ABIs; the magic numbers are 32-bit values.
+    let f_type = unsafe { buf.assume_init().f_type } as u64 & 0xffff_ffff;
+    Ok(nonunique_inode_kind(f_type))
+}
+
 impl Entry {
     fn new(
         file: std::fs::File,
@@ -273,6 +316,7 @@ impl Entry {
     ) -> Result<Self, String> {
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
+            collapsed: false,
             raw,
             mapping,
             file: Arc::new(file),
@@ -676,6 +720,70 @@ impl PinnedObjects {
         self.rejected_keys.contains(&key)
     }
 
+    /// The raw maps keys that name exactly one opened object, for C1b sweep
+    /// matching: a key qualifies only when it is not rejected, every scan
+    /// alias filed under it resolves to one capture-local ID, that ID carries
+    /// a digest, files no alias under any other key, and was never folded
+    /// onto by the overlayfs heuristic. Overlay-collapsed and cross-key alias
+    /// keys therefore never qualify: they stand for more than one proven
+    /// kernel file. Manifest aliases are ignored (they never come from maps).
+    pub(crate) fn sweep_match_keys(&self) -> BTreeMap<ObjectKey, PinnedObjectId> {
+        let mut ids_by_key: BTreeMap<ObjectKey, BTreeSet<PinnedObjectId>> = BTreeMap::new();
+        let mut keys_by_id: BTreeMap<PinnedObjectId, BTreeSet<ObjectKey>> = BTreeMap::new();
+        for (raw, id) in &self.raw_to_id {
+            if raw.mount_namespace.is_none() {
+                continue;
+            }
+            ids_by_key.entry(raw.key).or_default().insert(*id);
+            keys_by_id.entry(*id).or_default().insert(raw.key);
+        }
+        ids_by_key
+            .into_iter()
+            .filter_map(|(key, ids)| {
+                let mut ids = ids.into_iter();
+                let id = ids.next()?;
+                if ids.next().is_some() || self.rejected_keys.contains(&key) {
+                    return None;
+                }
+                let entry = self.by_id.get(&id)?;
+                let single_key = keys_by_id
+                    .get(&id)
+                    .is_some_and(|keys| keys.len() == 1 && keys.contains(&key));
+                (single_key && !entry.collapsed && !entry.sha256.is_empty() && entry.raw.key == key)
+                    .then_some((key, id))
+            })
+            .collect()
+    }
+
+    /// Per-object `(ino, size, ctime)` recheck for C1b's confirmation step:
+    /// `Ok(true)` while this one object still matches its pin. Unlike
+    /// `check_unchanged` it neither latches nor answers for the whole set,
+    /// so one changed object drops only its own sweep attributions.
+    pub(crate) fn object_unchanged(&self, id: PinnedObjectId) -> Result<bool, String> {
+        let entry = self
+            .by_id
+            .get(&id)
+            .ok_or_else(|| format!("object {id:?} was not pinned"))?;
+        pin_of(&entry.file)
+            .map(|pin| pin == entry.pin)
+            .map_err(|error| format!("{}: {error}", entry.path))
+    }
+
+    /// `Some(filesystem)` when the pinned object lives on a filesystem whose
+    /// inode numbers are not unique per device (FUSE, network filesystems):
+    /// there a maps `(device, inode)` cannot name one file, so C1b refuses
+    /// sweep matching for it. `Err` only when `fstatfs` itself fails.
+    pub(crate) fn nonunique_inode_filesystem(
+        &self,
+        id: PinnedObjectId,
+    ) -> Result<Option<&'static str>, String> {
+        let entry = self
+            .by_id
+            .get(&id)
+            .ok_or_else(|| format!("object {id:?} was not pinned"))?;
+        filesystem_without_unique_inodes(entry.file.as_raw_fd())
+    }
+
     /// Every pinned object, for `discovery[]`.
     pub fn pinned(&self) -> impl Iterator<Item = PinnedSummary<'_>> {
         self.by_id.iter().map(|(id, entry)| PinnedSummary {
@@ -1008,6 +1116,11 @@ impl PinnedObjects {
             .copied()
             .find(|id| ordinary_identity_equal(&self.by_id[id], &entry))
         {
+            if entry.collapsed
+                && let Some(kept) = self.by_id.get_mut(&id)
+            {
+                kept.collapsed = true;
+            }
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
         }
@@ -1018,6 +1131,9 @@ impl PinnedObjects {
         {
             skipped.push(overlay_uncertainty(&entry, &self.by_id[&id]));
             self.overlay_uncertain = true;
+            if let Some(kept) = self.by_id.get_mut(&id) {
+                kept.collapsed = true;
+            }
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
         }
@@ -1982,8 +2098,11 @@ pub fn canonicalize_scanned_overlays(pinned: &mut PinnedObjects) -> (usize, Vec<
     for claims in pinned.ownership.values_mut() {
         claims.remap(&canonical);
     }
-    for id in canonical.keys() {
+    for (id, kept) in &canonical {
         pinned.by_id.remove(id);
+        if let Some(kept) = pinned.by_id.get_mut(kept) {
+            kept.collapsed = true;
+        }
     }
     if !canonical.is_empty() {
         pinned.bump_revision();
@@ -2285,6 +2404,7 @@ pub(crate) mod test_fixture {
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
             overlay: false,
+            collapsed: false,
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -2324,6 +2444,7 @@ pub(crate) mod test_fixture {
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
             overlay,
+            collapsed: false,
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -2385,6 +2506,7 @@ pub(crate) mod test_fixture {
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
             overlay: true,
+            collapsed: false,
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -2415,6 +2537,7 @@ pub(crate) mod test_fixture {
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
             overlay: true,
+            collapsed: false,
         };
         let mut pins = PinnedObjects::empty();
         pins.insert_entry(entry, &mut Vec::new());
@@ -4257,6 +4380,142 @@ mod tests {
 
         pins.remove_view(second_module.view);
         assert_pins_consistent("remove", &pins);
+    }
+
+    /// C1b: only a key naming exactly one proven opened object may match a
+    /// sweep. Collapsed overlay instances, same-key heuristic aliases, and
+    /// rejected keys never do; one file seen through two mounts does.
+    #[test]
+    fn sweep_match_keys_name_exactly_one_proven_object() {
+        let plain = pin_set(&[(overlay(1), SHA, 1)], false);
+        let keys: Vec<ObjectKey> = plain.sweep_match_keys().into_keys().collect();
+        assert_eq!(keys, vec![overlay(1)]);
+
+        // Two overlay instances collapsed by the heuristic: neither key.
+        let mut collapsed = pins(&[
+            (overlay(1), SHA, 1),
+            (overlay(2), SHA, 1),
+            (overlay(3), "cc", 9),
+        ]);
+        let (count, _) = canonicalize_scanned_overlays(&mut collapsed);
+        assert_eq!(count, 1);
+        let keys: Vec<ObjectKey> = collapsed.sweep_match_keys().into_keys().collect();
+        assert_eq!(
+            keys,
+            vec![overlay(3)],
+            "only the uncollapsed instance matches"
+        );
+
+        let key = overlay(1);
+        let view = |id: u32, mount: u64, overlay: bool| {
+            let mut scanned = module(key);
+            scanned.view = ProcessViewId(id);
+            scanned.mount_namespace.inode = u64::from(id) + 100;
+            view_pin(&scanned, mount, SHA, 1, overlay)
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        // One kernel file through two mounts: the same-open-file proof.
+        let shared = backing_file(&dir, "shared.so");
+        let mut first = view(1, 11, false);
+        reback(&mut first, &shared);
+        let mut second = view(2, 12, false);
+        reback(&mut second, &shared);
+        let (merged, skipped) = PinnedObjects::aggregate_views([&first, &second]);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(merged.sweep_match_keys().len(), 1);
+
+        // Two kernel files under one key on overlay: the heuristic alias.
+        let mut left = view(3, 13, true);
+        reback(&mut left, &backing_file(&dir, "left.so"));
+        let mut right = view(4, 14, true);
+        reback(&mut right, &backing_file(&dir, "right.so"));
+        let (aliased, _) = PinnedObjects::aggregate_views([&left, &right]);
+        assert_eq!(aliased.pinned().count(), 1, "the heuristic merged them");
+        assert!(aliased.sweep_match_keys().is_empty());
+
+        // Two kernel files under one key off overlay: rejected.
+        let mut one = view(5, 15, false);
+        reback(&mut one, &backing_file(&dir, "one.so"));
+        let mut two = view(6, 16, false);
+        reback(&mut two, &backing_file(&dir, "two.so"));
+        let (rejected, _) = PinnedObjects::aggregate_views([&one, &two]);
+        assert!(rejected.rejects(key));
+        assert!(rejected.sweep_match_keys().is_empty());
+    }
+
+    /// C1b defense in depth: `reject_key` drops a rejected key's raw
+    /// aliases and insertion never files one key under two objects, so
+    /// these states are unreachable through the public API today. The
+    /// sweep-match filter must still fail closed on each of them by
+    /// itself, never relying on those invariants.
+    #[test]
+    fn sweep_match_keys_fail_closed_on_states_the_invariants_forbid() {
+        let id_of = |pins: &PinnedObjects, key: ObjectKey| {
+            pins.raw_to_id
+                .iter()
+                .find_map(|(raw, id)| (raw.key == key).then_some(*id))
+                .expect("a raw alias under the key")
+        };
+        let alias_raw = |pins: &PinnedObjects, key: ObjectKey| {
+            let (raw, _) = pins.raw_to_id.first_key_value().expect("one scan raw");
+            RawObjectInstance { key, ..raw.clone() }
+        };
+
+        // One key filed under two objects.
+        let mut two_objects = pin_set(&[(overlay(1), SHA, 1), (overlay(2), "bb", 2)], false);
+        assert_eq!(two_objects.sweep_match_keys().len(), 2);
+        let other = id_of(&two_objects, overlay(2));
+        let raw = alias_raw(&two_objects, overlay(1));
+        let raw = RawObjectInstance {
+            path: format!("{}.second", raw.path),
+            ..raw
+        };
+        two_objects.raw_to_id.insert(raw, other);
+        // overlay(2)'s object is now filed under two keys as well.
+        assert!(
+            two_objects.sweep_match_keys().is_empty(),
+            "a key naming two objects never matches"
+        );
+
+        // One object filed under a second key (not collapsed): neither key.
+        let mut aliased = pin_set(&[(overlay(1), SHA, 1)], false);
+        let id = id_of(&aliased, overlay(1));
+        let raw = alias_raw(&aliased, overlay(5));
+        aliased.raw_to_id.insert(raw, id);
+        assert!(
+            aliased.sweep_match_keys().is_empty(),
+            "an object aliased under another key matches under neither"
+        );
+
+        // A rejected key whose raw alias was (wrongly) left behind.
+        let mut rejected = pin_set(&[(overlay(1), SHA, 1)], false);
+        rejected.rejected_keys.insert(overlay(1));
+        assert!(
+            rejected.sweep_match_keys().is_empty(),
+            "a rejected key never matches"
+        );
+    }
+
+    #[test]
+    fn object_checks_are_per_object_and_name_nonunique_inode_filesystems() {
+        assert_eq!(nonunique_inode_kind(0x6573_5546), Some("fuse"));
+        assert_eq!(nonunique_inode_kind(0x6969), Some("nfs"));
+        assert_eq!(nonunique_inode_kind(0xef53), None, "ext4 inodes are unique");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.so");
+        std::fs::write(&path, b"provider bytes").unwrap();
+        let pinned = super::test_fixture::real_scan_pin(&path, None, 1, SHA);
+        let id = pinned.pinned().next().unwrap().id;
+        assert_eq!(pinned.object_unchanged(id), Ok(true));
+        assert_eq!(pinned.nonunique_inode_filesystem(id), Ok(None));
+        std::fs::write(&path, b"replaced provider bytes").unwrap();
+        assert_eq!(pinned.object_unchanged(id), Ok(false));
+        assert!(
+            !pinned.provider_changed(),
+            "the per-object check does not latch the whole set"
+        );
+        assert!(pinned.object_unchanged(PinnedObjectId(999)).is_err());
     }
 
     #[test]

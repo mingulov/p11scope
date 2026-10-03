@@ -265,7 +265,7 @@ impl<'a> MapIndex<'a> {
     }
 }
 
-fn mapped_path(raw: &[u8]) -> MappedPath {
+pub fn mapped_path(raw: &[u8]) -> MappedPath {
     let unusable = if raw.windows(4).any(|window| window == b"\\012") {
         Some("ambiguous \\012 pathname")
     } else if raw.ends_with(b" (deleted)") {

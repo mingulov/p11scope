@@ -749,14 +749,15 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
     let body = std::fs::read_to_string(&file).unwrap();
     let doc: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(doc["schema"], "p11scope/inventory/v1");
-    // The run is genuinely partial: the over-cap diagnostic made the
-    // document.
+    // The run is genuinely partial: the discovery-capped record made the
+    // document (one deep scan cannot examine every process's objects).
     let gaps = doc["gaps"].as_array().unwrap();
     assert!(
-        gaps.iter().any(|gap| gap["reason"]
-            .as_str()
-            .unwrap()
-            .contains("for deep scanning by provider rarity (limit 1)")),
+        gaps.iter().any(|gap| gap["subject"] == "discovery capped"
+            && gap["reason"]
+                .as_str()
+                .unwrap()
+                .contains("deep-scanned by provider rarity (limit 1)")),
         "the truncation gap names the overflowed budget: {}",
         doc["gaps"]
     );

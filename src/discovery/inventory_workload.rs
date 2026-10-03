@@ -999,6 +999,19 @@ impl Harness {
             .note_capture_loss(reason.to_string());
     }
 
+    /// One pass over a scripted catalog through the production
+    /// post-collection path (`apply_catalog`: attach-set absorb,
+    /// reconcile over every attributable member, generation join,
+    /// projection), then the batch commit. No native identity exists.
+    pub(crate) fn apply_catalog(&mut self, catalog: crate::inspect_system::Catalog) -> PassReport {
+        let mut guard = UnavailableImageGuard;
+        let report =
+            self.coordinator
+                .apply_catalog(catalog, &mut guard, |_| None, u64::MAX, self.now_ns);
+        self.commit();
+        report
+    }
+
     /// One pass with no observation behind it (discovery loss): the
     /// production empty-pass path, then the batch commit.
     pub(crate) fn observe_loss(&mut self, reason: &str) -> PassReport {

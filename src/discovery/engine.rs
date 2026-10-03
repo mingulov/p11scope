@@ -4016,7 +4016,7 @@ fn broad_pool_table(
 /// A mapping that can carry a PKCS#11 provider: a mapped file whose path
 /// names a shared object. Pure so phase-1 selection can group pids without
 /// decoding anything.
-fn is_provider_mapping(entry: &MapEntry) -> bool {
+pub(crate) fn is_provider_mapping(entry: &MapEntry) -> bool {
     entry.inode != 0
         && entry
             .raw_path
@@ -4158,8 +4158,10 @@ fn select_rotation_candidates(
 /// provider-rarity order, not a pid prefix, so the message must never say
 /// "first N". Never names pids or paths. Refresh passes only new candidates
 /// (known views excluded); it must not claim successful scans.
-/// The published over-cap record, shared with `inspect --system` so the
-/// bound reads the same everywhere it is hit.
+/// Capture discovery's published over-cap record. `inspect --system` and
+/// `inventory --system` publish their own (C1b): past the cap they
+/// attribute unselected processes by exact maps identity, so their record
+/// says what remained unexamined instead.
 pub(crate) fn scan_cap_reason(total: usize, selected: usize, cap: usize, live: bool) -> String {
     if live {
         let noun = if selected == 1 {
@@ -4187,6 +4189,9 @@ enum MapsSnapshot {
 pub(crate) struct MapsSweep {
     snapshots: Vec<(u32, MapsSnapshot)>,
 }
+
+/// One maps snapshot per swept pid (empty when unavailable).
+pub(crate) type SweepSnapshots = Vec<(u32, Vec<MapEntry>)>;
 
 impl MapsSweep {
     fn record(&mut self, pid: u32, result: Result<Vec<MapEntry>, String>) {
@@ -4225,8 +4230,24 @@ impl MapsSweep {
     /// authority: an admitted deep scan acquires its own retained view.
     /// Return the gap with the hints so both callers publish it even when
     /// none of these candidates can receive a deep-scan slot.
-    pub(crate) fn into_selection(self) -> (Vec<(u32, Vec<MapEntry>)>, Option<Skipped>) {
+    pub(crate) fn into_selection(self) -> (SweepSnapshots, Option<Skipped>) {
+        let (hints, _, skipped) = self.into_selection_with_unavailable();
+        (hints, skipped)
+    }
+
+    /// [`Self::into_selection`] plus the pids whose snapshot was
+    /// unavailable: C1b must not read an unavailable snapshot as a process
+    /// mapping nothing.
+    pub(crate) fn into_selection_with_unavailable(
+        self,
+    ) -> (SweepSnapshots, BTreeSet<u32>, Option<Skipped>) {
         let skipped = self.unavailable_skip();
+        let unavailable: BTreeSet<u32> = self
+            .snapshots
+            .iter()
+            .filter(|(_, snapshot)| matches!(snapshot, MapsSnapshot::Unavailable))
+            .map(|(pid, _)| *pid)
+            .collect();
         let hints = self
             .snapshots
             .into_iter()
@@ -4238,7 +4259,7 @@ impl MapsSweep {
                 (pid, hints)
             })
             .collect();
-        (hints, skipped)
+        (hints, unavailable, skipped)
     }
 }
 

@@ -112,6 +112,9 @@ pub struct StageTimings {
     invocations: [u64; STAGE_COUNT],
     unknown_clock: u64,
     longest: Option<LongestOp>,
+    /// Per-operation totals `(op, total_ns, spans)` in first-recorded
+    /// order. Bounded by the finite set of static op labels.
+    ops: Vec<(&'static str, u64, u64)>,
 }
 
 impl StageTimings {
@@ -154,6 +157,35 @@ impl StageTimings {
                 duration_ns: duration,
             });
         }
+        self.add_op(op, duration, 1);
+    }
+
+    fn add_op(&mut self, op: &'static str, duration_ns: u64, spans: u64) {
+        match self.ops.iter_mut().find(|(known, _, _)| *known == op) {
+            Some((_, total, count)) => {
+                *total = total.saturating_add(duration_ns);
+                *count = count.saturating_add(spans);
+            }
+            None => self.ops.push((op, duration_ns, spans)),
+        }
+    }
+
+    /// Per-operation totals `(op, total_ns, spans)`, in first-recorded
+    /// order: the per-stage cost breakdown one pass prints.
+    pub fn ops(&self) -> &[(&'static str, u64, u64)] {
+        &self.ops
+    }
+
+    /// One human line of per-operation totals in milliseconds, in
+    /// first-recorded order (`sweep 1.234ms, select 0.010ms, …`).
+    pub fn ops_line(&self) -> String {
+        self.ops
+            .iter()
+            .map(|(op, total, _)| {
+                format!("{op} {}.{:03}ms", total / 1_000_000, total / 1_000 % 1_000)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Folds another accumulator in (the run loop merges the engine's stage
@@ -165,6 +197,9 @@ impl StageTimings {
             self.invocations[slot] = self.invocations[slot].saturating_add(other.invocations[slot]);
         }
         self.unknown_clock = self.unknown_clock.saturating_add(other.unknown_clock);
+        for (op, total, spans) in &other.ops {
+            self.add_op(op, *total, *spans);
+        }
         if let Some(candidate) = other.longest
             && self
                 .longest
@@ -590,6 +625,32 @@ mod tests {
                 op: "attach_targets",
                 duration_ns: 200,
             })
+        );
+    }
+
+    #[test]
+    fn per_op_totals_keep_first_recorded_order_and_merge() {
+        let mut timings = StageTimings::new();
+        timings.span(StageKind::Scan, "sweep", Some(0), Some(2_500_000));
+        timings.span(StageKind::Plan, "assemble", Some(0), Some(1_000));
+        timings.span(StageKind::Scan, "sweep", Some(0), Some(500_000));
+        timings.span(StageKind::Scan, "sweep", None, Some(1));
+        assert_eq!(
+            timings.ops(),
+            &[("sweep", 3_000_000, 2), ("assemble", 1_000, 1)]
+        );
+        assert_eq!(timings.ops_line(), "sweep 3.000ms, assemble 0.001ms");
+        let mut other = StageTimings::new();
+        other.span(StageKind::Projection, "project", Some(0), Some(7));
+        other.span(StageKind::Scan, "sweep", Some(0), Some(1));
+        timings.merge(&other);
+        assert_eq!(
+            timings.ops(),
+            &[
+                ("sweep", 3_000_001, 3),
+                ("assemble", 1_000, 1),
+                ("project", 7, 1)
+            ]
         );
     }
 

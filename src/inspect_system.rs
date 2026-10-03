@@ -24,9 +24,11 @@
 //! (verified absence), never as phantom modules.
 
 use crate::attach::Scope;
+use crate::attach::monotonic_ns;
+use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
 use crate::discovery::engine::{
-    MAX_SCAN_PIDS, scan_cap_reason, scope_label, scope_pids, select_deep_scan_candidates,
-    sweep_process_maps, unreadable_member_skip,
+    MAX_SCAN_PIDS, scope_pids, select_deep_scan_candidates, sweep_process_maps,
+    unreadable_member_skip,
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
@@ -38,9 +40,15 @@ use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
     scan_skip_truncates,
 };
+use crate::discovery::sweep_attribution::{
+    AttributionLoss, KnownKeyIndex, MatchedObject, MemberProbe, ObjectChecks, OsMemberProbe,
+    RefusedObject, SweepAttribution, SweptMember, attribute_unselected, retain_unchanged,
+};
 use crate::plan::{self, AdmissionPolicy, AdmissionScope};
 use crate::process::{ProcessView, ProcessViewId, generation_gone};
+use crate::timing::{StageKind, StageTimings};
 use anyhow::Result;
+use p11scope_manifest::maps::MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -80,6 +88,12 @@ fn run_with_writer(
     out: &mut dyn std::io::Write,
 ) -> Result<i32> {
     let catalog = collect(hints, hooks, max_scan_pids, AdmissionPolicy::detailed())?;
+    if stage_timings_requested() {
+        eprintln!(
+            "p11scope: stage timings: {}",
+            catalog.stage_timings.ops_line()
+        );
+    }
     if json {
         let document = serde_json::to_string_pretty(&render_json(&catalog))?;
         writeln!(out, "{document}")?;
@@ -87,6 +101,12 @@ fn run_with_writer(
         write!(out, "{}", render_text(&catalog))?;
     }
     Ok(0)
+}
+
+/// `P11SCOPE_STAGE_TIMINGS=1` prints each pass's per-stage wall time to
+/// stderr (the system-scale cost measurement); stdout never carries it.
+pub(crate) fn stage_timings_requested() -> bool {
+    std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|value| value == "1")
 }
 
 /// One gap record with optional member attribution. Scope-level gaps
@@ -131,14 +151,27 @@ impl PidGap {
     }
 }
 
-/// What one deep-scan attempt over a scope member concluded.
+/// What one deep-scan attempt — or, past the cap, the maps attribution —
+/// concluded about a scope member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MemberStatus {
     Scanned,
-    MemoryUnavailable { reason: &'static str },
-    Unreadable { reason: String },
+    MemoryUnavailable {
+        reason: &'static str,
+    },
+    Unreadable {
+        reason: String,
+    },
     Exited,
-    NotSelected,
+    /// Past the deep-scan cap and attributed to pinned provider objects by
+    /// exact maps identity (C1b): its mappings are confirmed, nothing in it
+    /// was decoded, so its absences are never authoritative.
+    MapsMatched,
+    /// Past the deep-scan cap and not attributed; `loss` names why a
+    /// process mapping a known provider object was not attributed to it.
+    NotSelected {
+        loss: Option<String>,
+    },
 }
 
 impl MemberStatus {
@@ -148,7 +181,8 @@ impl MemberStatus {
             Self::MemoryUnavailable { .. } => "memory_unavailable",
             Self::Unreadable { .. } => "unreadable",
             Self::Exited => "exited",
-            Self::NotSelected => "not_selected",
+            Self::MapsMatched => "maps_matched",
+            Self::NotSelected { .. } => "not_selected",
         }
     }
 
@@ -156,7 +190,8 @@ impl MemberStatus {
         match self {
             Self::MemoryUnavailable { reason } => Some(reason),
             Self::Unreadable { reason } => Some(reason),
-            Self::Scanned | Self::Exited | Self::NotSelected => None,
+            Self::NotSelected { loss } => loss.as_deref(),
+            Self::Scanned | Self::Exited | Self::MapsMatched => None,
         }
     }
 
@@ -165,6 +200,22 @@ impl MemberStatus {
     pub(crate) const fn inventoried(&self) -> bool {
         matches!(self, Self::Scanned | Self::MemoryUnavailable { .. })
     }
+
+    /// The member's mappings are evidence a caller can be registered on:
+    /// a deep scan inventoried it, or C1b attributed it by maps identity.
+    pub(crate) const fn attributable(&self) -> bool {
+        self.inventoried() || matches!(self, Self::MapsMatched)
+    }
+}
+
+/// One member's generation as collection saw it: the pin's start time and
+/// the exe identity. The coordinator joins it against the caller
+/// incarnation reconcile admits (both lanes), so a reused pid or a later
+/// exec never inherits these mappings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemberGeneration {
+    pub start_time: Option<u64>,
+    pub exe: Option<ExeIdentity>,
 }
 
 /// One scope member's deep-scan result: its status, what it mapped, and
@@ -173,6 +224,7 @@ struct MemberResult {
     pid: u32,
     view: ProcessViewId,
     status: MemberStatus,
+    generation: Option<MemberGeneration>,
     modules: Vec<ScannedModule>,
     pins: PinnedObjects,
     gaps: Vec<PidGap>,
@@ -189,13 +241,16 @@ struct Collection {
     members: Vec<MemberResult>,
     scope_gaps: Vec<PidGap>,
     proc_list_failed: bool,
+    /// Phase-1 maps snapshots (over the cap only): the attribution input.
+    sweep: Vec<(u32, Vec<MapEntry>)>,
+    /// Swept pids whose snapshot was unavailable (never "maps nothing").
+    sweep_unavailable: BTreeSet<u32>,
+    /// The pass's work budget, carried from the sweep and the deep scans
+    /// into the confirmation reads.
+    budget: CaptureWorkBudget,
 }
 
 impl Collection {
-    fn member_by_pid(&self, pid: u32) -> Option<&MemberResult> {
-        self.members.iter().find(|member| member.pid == pid)
-    }
-
     fn scanned(&self) -> usize {
         self.members
             .iter()
@@ -225,6 +280,7 @@ fn collect_members(
     hints: &[PathBuf],
     hooks: &HookRegistry,
     max_scan_pids: Option<usize>,
+    timings: &mut StageTimings,
 ) -> Collection {
     eprintln!("p11scope: enumerating processes...");
     let scope = Scope::System;
@@ -239,21 +295,28 @@ fn collect_members(
 
     // Phase 1+2, exactly like capture discovery: the sweep and the
     // rarity selection run only over the cap; under it selection is the
-    // identity (ascending pids).
+    // identity (ascending pids). Past the cap the sweep is kept: C1b
+    // attributes the unselected pids from it after the deep scans, and
+    // the capped-or-complete record is decided then, from its counts.
+    let mut sweep = Vec::new();
+    let mut sweep_unavailable = BTreeSet::new();
     let selected: Vec<u32> = if pids.len() > cap {
         eprintln!(
             "p11scope: sweeping {} process maps (cap {cap})...",
             pids.len()
         );
-        let (sweep, unavailable) = sweep_process_maps(&pids, &mut budget).into_selection();
-        if let Some(skip) = unavailable {
+        let sweep_start = monotonic_ns();
+        let (swept, unavailable, skip) =
+            sweep_process_maps(&pids, &mut budget).into_selection_with_unavailable();
+        timings.span(StageKind::Scan, "sweep", sweep_start, monotonic_ns());
+        if let Some(skip) = skip {
             scope_gaps.push(PidGap::scope(skip));
         }
-        let selected = select_deep_scan_candidates(&sweep, cap);
-        scope_gaps.push(PidGap::scope(Skipped {
-            subject: scope_label(&scope),
-            reason: scan_cap_reason(pids.len(), selected.len(), cap, false),
-        }));
+        let select_start = monotonic_ns();
+        let selected = select_deep_scan_candidates(&swept, cap);
+        timings.span(StageKind::Scan, "select", select_start, monotonic_ns());
+        sweep = swept;
+        sweep_unavailable = unavailable;
         selected
     } else {
         eprintln!(
@@ -267,6 +330,7 @@ fn collect_members(
     let cap_hit = pids.len() > cap;
 
     let mut members = Vec::with_capacity(selected.len());
+    let deep_start = monotonic_ns();
     for (index, pid) in selected.iter().enumerate() {
         eprintln!(
             "p11scope: deep-scanning {}/{} (pid {pid})...",
@@ -287,6 +351,7 @@ fn collect_members(
             &mut noise,
         ));
     }
+    timings.span(StageKind::Scan, "deep_scan", deep_start, monotonic_ns());
     noise.report();
     Collection {
         enumerated: pids,
@@ -296,6 +361,9 @@ fn collect_members(
         members,
         scope_gaps,
         proc_list_failed,
+        sweep,
+        sweep_unavailable,
+        budget,
     }
 }
 
@@ -322,6 +390,13 @@ fn scan_member(
                 gaps,
             );
         }
+    };
+    // The generation this member's mappings belong to: the pin's start
+    // time and the exe identity, read while the pin holds. The
+    // coordinator joins both against the caller incarnation it admits.
+    let generation = MemberGeneration {
+        start_time: view_handle.start_time(),
+        exe: read_exe_identity(pid),
     };
     // One generation from the first check to the last pin read, mirroring
     // pid-inspect: a member that changes mid-scan is re-read as whatever
@@ -399,6 +474,7 @@ fn scan_member(
         pid,
         view,
         status,
+        generation: Some(generation),
         modules,
         pins,
         gaps,
@@ -429,6 +505,7 @@ fn member_not_scanned(
         pid,
         view,
         status,
+        generation: None,
         modules: Vec::new(),
         pins: PinnedObjects::empty(),
         gaps,
@@ -537,6 +614,25 @@ impl AdmissionRecord {
     }
 }
 
+/// How one observation's mapping was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservationEvidence {
+    /// A deep scan decoded the member: exports, tables, interfaces.
+    DeepScan,
+    /// C1b: the member's confirmed maps show the pinned object by exact
+    /// `(device, inode)`; nothing in the member was decoded.
+    MapsMatch,
+}
+
+impl ObservationEvidence {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::DeepScan => "deep_scan",
+            Self::MapsMatch => "maps_match",
+        }
+    }
+}
+
 /// One member's decode of one object: the scan facts from that view, kept
 /// per view because generations remap (addresses) and even file versions
 /// (tables) can differ between two mappings of one object.
@@ -551,6 +647,9 @@ pub(crate) struct Observation {
     /// duplicate executable file-offset coverage (a same-file
     /// double-load in this process).
     pub double_loaded: bool,
+    /// How the mapping was established. A `MapsMatch` observation decodes
+    /// nothing: its exports, tables, and interfaces stay empty.
+    pub evidence: ObservationEvidence,
 }
 
 /// One catalog object: every pinned physical object the machine maps —
@@ -564,7 +663,9 @@ pub(crate) struct CatalogObject {
     pub build_id: Option<String>,
     pub identity_source: Option<&'static str>,
     pub note: Option<String>,
-    pub mappings: Vec<(u32, ProcessViewId)>,
+    /// `(pid, view)`: the deep-scan view that mapped it, or `None` for a
+    /// member attributed by maps identity (no view was opened).
+    pub mappings: Vec<(u32, Option<ProcessViewId>)>,
     pub observations: Vec<Observation>,
     pub admission: AdmissionRecord,
 }
@@ -573,6 +674,9 @@ pub(crate) struct ProcessRecord {
     pub pid: u32,
     pub status: MemberStatus,
     pub objects: Vec<usize>,
+    /// The generation the member's mappings belong to (deep scans and
+    /// maps matches); `None` when no read reached it.
+    pub generation: Option<MemberGeneration>,
 }
 
 /// A discovered relationship between catalog objects: two observations of
@@ -617,7 +721,18 @@ pub(crate) struct Catalog {
     pub lowering: Option<CatalogLowering>,
     pub enumerated: usize,
     pub selected: usize,
+    /// Members a deep scan inventoried.
     pub scanned: usize,
+    /// Members past the cap attributed by exact maps identity (C1b).
+    pub maps_matched: usize,
+    /// Members past the cap mapping a shared object no deep scan examined.
+    pub unexamined: usize,
+    /// Distinct shared objects (maps keys) no deep scan examined.
+    pub unexamined_objects: usize,
+    /// Members past the cap whose phase-1 maps snapshot was unavailable.
+    pub snapshots_unavailable: usize,
+    /// Attribution losses by category (each member once per category).
+    pub attribution_losses: BTreeMap<AttributionLoss, usize>,
     pub cap: usize,
     pub scan_ms: u64,
     pub processes: Vec<ProcessRecord>,
@@ -627,6 +742,11 @@ pub(crate) struct Catalog {
     pub skipped: Vec<PidGap>,
     pub notes: Vec<PidGap>,
     pub explanation: Option<String>,
+    /// Per-stage wall time of this collection (sweep, select, deep scan,
+    /// confirm, assemble): the system-scale cost measurement. Never
+    /// rendered in the catalog document; `P11SCOPE_STAGE_TIMINGS=1` prints
+    /// it to stderr.
+    pub stage_timings: StageTimings,
 }
 
 /// The one scan-only lowering behind a catalog's admission verdicts: the
@@ -648,7 +768,8 @@ pub(crate) fn collect(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
 ) -> Result<Catalog> {
-    let collection = collect_members(hints, hooks, max_scan_pids);
+    let mut timings = StageTimings::new();
+    let mut collection = collect_members(hints, hooks, max_scan_pids, &mut timings);
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
         scanned: collection.scanned(),
@@ -659,7 +780,24 @@ pub(crate) fn collect(
         return Err(unreadable_system_error(&collection));
     }
     eprintln!("p11scope: lowering scan-only admission and rendering...");
-    Ok(assemble(collection, policy))
+    let bind_start = monotonic_ns();
+    let bound = bind_collection(&mut collection);
+    timings.span(StageKind::Bind, "assemble", bind_start, monotonic_ns());
+    // The confirmation reads run here: after the deep scans, while the
+    // aggregate pins (and their fds) are held, before the pure assembly.
+    let confirm_start = monotonic_ns();
+    let attributed = attribute_sweep(
+        &mut collection,
+        &bound,
+        &mut OsMemberProbe,
+        &bound.aggregate,
+    );
+    timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
+    let assemble_start = monotonic_ns();
+    let mut catalog = assemble(collection, bound, attributed, policy);
+    timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
+    catalog.stage_timings = timings;
+    Ok(catalog)
 }
 
 /// Collect one pid through the same member scan and the same assembly:
@@ -690,24 +828,34 @@ pub(crate) fn collect_pid(
         return Err(anyhow::anyhow!("cannot inventory pid {pid}: {detail}{fix}"));
     }
     eprintln!("p11scope: lowering scan-only admission and rendering...");
-    Ok(assemble(
-        Collection {
-            enumerated: vec![pid],
-            selected: vec![pid],
-            cap: 1,
-            cap_hit: false,
-            members: vec![member],
-            scope_gaps: Vec::new(),
-            proc_list_failed: false,
-        },
-        policy,
-    ))
+    let mut collection = Collection {
+        enumerated: vec![pid],
+        selected: vec![pid],
+        cap: 1,
+        cap_hit: false,
+        members: vec![member],
+        scope_gaps: Vec::new(),
+        proc_list_failed: false,
+        sweep: Vec::new(),
+        sweep_unavailable: BTreeSet::new(),
+        budget,
+    };
+    let bound = bind_collection(&mut collection);
+    Ok(assemble(collection, bound, None, policy))
 }
 
-/// Aggregate every view's pins, bind every module, lower one shared-scope
-/// plan over scan evidence only under `policy`, and project the catalog
-/// records.
-fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
+/// The aggregate pin set and every module bound against it: the pure half
+/// of assembly, run before the confirmation reads so they see exactly the
+/// objects (and hold exactly the fds) the catalog will report.
+struct Bound {
+    aggregate: PinnedObjects,
+    reconciled: Vec<(u32, ProcessViewId, ReconciledModule)>,
+    unresolved: Vec<(u32, ProcessViewId, ScannedModule, Vec<String>)>,
+    bind_gaps: Vec<PidGap>,
+}
+
+/// Aggregate every view's pins and bind every module.
+fn bind_collection(collection: &mut Collection) -> Bound {
     // One aggregate pin set first: exact comparable identities merge and
     // equal raw keys with unequal full identity reject the group — the
     // same absorb semantics capture relies on.
@@ -745,6 +893,111 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
             }
         }
     }
+    Bound {
+        aggregate,
+        reconciled,
+        unresolved,
+        bind_gaps,
+    }
+}
+
+/// What C1b concluded for the unselected members, plus the objects whose
+/// sweep matching was refused or dropped (their gaps).
+struct Attributed {
+    attribution: SweepAttribution,
+    refused: Vec<RefusedObject>,
+    changed: Vec<(PinnedObjectId, String)>,
+}
+
+/// C1b over the cap: index this pass's deep-scanned keys, confirm every
+/// unselected phase-1 match through `probe` while `bound`'s pins are held,
+/// then recheck each matched object once. `None` under the cap (no sweep).
+fn attribute_sweep(
+    collection: &mut Collection,
+    bound: &Bound,
+    probe: &mut dyn MemberProbe,
+    checks: &dyn ObjectChecks,
+) -> Option<Attributed> {
+    if !collection.cap_hit {
+        return None;
+    }
+    let modules = bound
+        .reconciled
+        .iter()
+        .map(|(_, _, module)| (module.scanned.key, Some(module.object)))
+        .chain(
+            bound
+                .unresolved
+                .iter()
+                .map(|(_, _, module, _)| (module.key, None)),
+        );
+    let match_keys = bound.aggregate.sweep_match_keys();
+    // A deep scan examined its snapshot's keys only when it completed:
+    // scanned with memory and no truncating loss of its own.
+    let complete: BTreeSet<u32> = collection
+        .members
+        .iter()
+        .filter(|member| {
+            matches!(member.status, MemberStatus::Scanned)
+                && !member
+                    .gaps
+                    .iter()
+                    .any(|gap| scan_skip_truncates(&gap.reason))
+        })
+        .map(|member| member.pid)
+        .collect();
+    let examined = collection
+        .sweep
+        .iter()
+        .filter(|(pid, _)| complete.contains(pid))
+        .flat_map(|(_, entries)| entries);
+    let (index, refused) = KnownKeyIndex::build(modules, &match_keys, examined, checks);
+    let selected: BTreeSet<u32> = collection.selected.iter().copied().collect();
+    eprintln!(
+        "p11scope: attributing {} unselected processes by maps identity...",
+        collection.sweep.len().saturating_sub(selected.len())
+    );
+    let mut attribution = attribute_unselected(
+        &collection.sweep,
+        &collection.sweep_unavailable,
+        &selected,
+        &index,
+        probe,
+        &mut collection.budget,
+    );
+    let changed = retain_unchanged(&mut attribution, checks);
+    Some(Attributed {
+        attribution,
+        refused,
+        changed,
+    })
+}
+
+/// The capped-or-complete record's shared prefix: what was deep-scanned
+/// and what was attributed by maps identity.
+fn coverage_prefix(total: usize, deep: usize, cap: usize, matched: usize) -> String {
+    format!(
+        "{total} processes in scope; {deep} deep-scanned by provider rarity (limit {cap}); \
+         {matched} attributed to pinned provider objects by exact maps identity"
+    )
+}
+
+/// Lower one shared-scope plan over scan evidence only under `policy`,
+/// and project the catalog records — deep-scanned and maps-matched
+/// members alike. Pure: no `/proc` reads.
+fn assemble(
+    mut collection: Collection,
+    bound: Bound,
+    attributed: Option<Attributed>,
+    policy: AdmissionPolicy,
+) -> Catalog {
+    let Bound {
+        aggregate,
+        reconciled,
+        unresolved,
+        bind_gaps,
+    } = bound;
+    let mut bind_gaps = bind_gaps;
 
     // The existing plan-lowering path, scan evidence only: no manifests,
     // no history, no reserved slots, no attach. The lowering is pure over
@@ -780,6 +1033,19 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
         })
         .collect();
 
+    // Maps-matched members by the pinned object they were attributed to.
+    let mut matched: BTreeMap<PinnedObjectId, Vec<(u32, &MatchedObject)>> = BTreeMap::new();
+    if let Some(attributed) = &attributed {
+        for member in &attributed.attribution.members {
+            for object in &member.objects {
+                matched
+                    .entry(object.object)
+                    .or_default()
+                    .push((member.pid, object));
+            }
+        }
+    }
+
     // Group observations by pinned object in first-seen order.
     let mut order: Vec<PinnedObjectId> = Vec::new();
     let mut groups: BTreeMap<PinnedObjectId, Vec<usize>> = BTreeMap::new();
@@ -814,7 +1080,7 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
                     build_id: None,
                     identity_source: None,
                     note: None,
-                    mappings: vec![(pid, view)],
+                    mappings: vec![(pid, Some(view))],
                     observations: vec![observation_of(pid, &inputs[index].scanned)],
                     admission: AdmissionRecord::Unresolved {
                         reasons: vec![
@@ -841,14 +1107,20 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
                 reasons: vec!["object reached no admission verdict".to_string()],
             },
         };
-        let mut mappings: Vec<(u32, ProcessViewId)> =
-            members.iter().map(|&index| owners[index]).collect();
-        mappings.sort();
-        mappings.dedup();
-        let observations: Vec<Observation> = members
+        let mut mappings: Vec<(u32, Option<ProcessViewId>)> = members
+            .iter()
+            .map(|&index| (owners[index].0, Some(owners[index].1)))
+            .collect();
+        let mut observations: Vec<Observation> = members
             .iter()
             .map(|&index| observation_of(owners[index].0, &inputs[index].scanned))
             .collect();
+        for (pid, object) in matched.get(&object).into_iter().flatten() {
+            mappings.push((*pid, None));
+            observations.push(matched_observation(*pid, object));
+        }
+        mappings.sort();
+        mappings.dedup();
         objects.push(CatalogObject {
             path: pin.path.to_string(),
             key: pin.key,
@@ -872,7 +1144,7 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
             build_id: None,
             identity_source: None,
             note: None,
-            mappings: vec![(pid, view)],
+            mappings: vec![(pid, Some(view))],
             observations: vec![observation_of(pid, &scanned)],
             admission: AdmissionRecord::Unresolved { reasons },
         });
@@ -901,21 +1173,58 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
             by_pid.entry(*pid).or_default().insert(index);
         }
     }
+    let members_by_pid: BTreeMap<u32, &MemberResult> = collection
+        .members
+        .iter()
+        .map(|member| (member.pid, member))
+        .collect();
+    let swept_by_pid: BTreeMap<u32, &SweptMember> = attributed
+        .iter()
+        .flat_map(|attributed| &attributed.attribution.members)
+        .map(|member| (member.pid, member))
+        .collect();
+    let objects_of = |pid: &u32| {
+        by_pid
+            .get(pid)
+            .map_or(Vec::new(), |set| set.iter().copied().collect())
+    };
     let mut processes: Vec<ProcessRecord> = Vec::new();
     for pid in &collection.enumerated {
-        let (status, objects) = match collection.member_by_pid(*pid) {
-            Some(member) => (
+        let (status, objects, generation) = if let Some(member) = members_by_pid.get(pid) {
+            (
                 member.status.clone(),
-                by_pid
+                objects_of(pid),
+                member.generation.clone(),
+            )
+        } else if let Some(swept) = swept_by_pid.get(pid) {
+            (
+                MemberStatus::MapsMatched,
+                objects_of(pid),
+                Some(MemberGeneration {
+                    start_time: Some(swept.start_time),
+                    exe: Some(swept.exe.clone()),
+                }),
+            )
+        } else if attributed
+            .as_ref()
+            .is_some_and(|attributed| attributed.attribution.exited.contains(pid))
+        {
+            (MemberStatus::Exited, Vec::new(), None)
+        } else {
+            let loss = attributed.as_ref().and_then(|attributed| {
+                attributed
+                    .attribution
+                    .member_losses
                     .get(pid)
-                    .map_or(Vec::new(), |set| set.iter().copied().collect()),
-            ),
-            None => (MemberStatus::NotSelected, Vec::new()),
+                    .map(|(loss, detail)| format!("{}: {detail}", loss.label()))
+            });
+            (MemberStatus::NotSelected { loss }, Vec::new(), None)
         };
         processes.push(ProcessRecord {
             pid: *pid,
             status,
             objects,
+            generation,
         });
     }
     processes.sort_by_key(|process| process.pid);
@@ -928,8 +1237,115 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
     for member in &collection.members {
         gaps.extend(member.gaps.iter().cloned());
     }
-    gaps.extend(bind_gaps);
-    let (skipped, notes) = split_gaps(gaps);
+    gaps.append(&mut bind_gaps);
+    let deep = collection.scanned();
+    let matched_count = swept_by_pid.len();
+    let (unexamined, unexamined_objects, unavailable, losses) = match &attributed {
+        Some(attributed) => {
+            let attribution = &attributed.attribution;
+            (
+                attribution.unexamined.len(),
+                attribution.unexamined_keys(),
+                attribution.unavailable,
+                attribution.losses.clone(),
+            )
+        }
+        None => (0, 0, 0, BTreeMap::new()),
+    };
+    let lost: usize = losses.values().sum();
+    if let Some(attributed) = &attributed {
+        for object in &attributed.refused {
+            gaps.push(PidGap::scope(Skipped {
+                subject: aggregate.summary(object.object).map_or_else(
+                    || "maps attribution".to_string(),
+                    |pin| pin.path.to_string(),
+                ),
+                reason: format!(
+                    "on a {} filesystem, whose inode numbers are not unique: processes past the \
+                     deep-scan cap are never matched to it by device and inode, so only deep \
+                     scans attribute it",
+                    object.filesystem
+                ),
+            }));
+        }
+        for (object, reason) in &attributed.changed {
+            gaps.push(PidGap::scope(Skipped {
+                subject: aggregate.summary(*object).map_or_else(
+                    || "maps attribution".to_string(),
+                    |pin| pin.path.to_string(),
+                ),
+                reason: format!("{reason}; its maps attributions were dropped"),
+            }));
+        }
+        for member in &attributed.attribution.members {
+            if member.unexamined > 0 {
+                gaps.push(PidGap::member(
+                    member.pid,
+                    Skipped {
+                        subject: "maps attribution".into(),
+                        reason: format!(
+                            "maps {} shared object{} no deep scan examined this pass; {} may be \
+                             an undiscovered provider",
+                            member.unexamined,
+                            if member.unexamined == 1 { "" } else { "s" },
+                            if member.unexamined == 1 { "it" } else { "each" },
+                        ),
+                    },
+                ));
+            }
+        }
+        if lost > 0 {
+            let parts: Vec<String> = losses
+                .iter()
+                .map(|(loss, count)| format!("{count} {}", loss.label()))
+                .collect();
+            gaps.push(PidGap::scope(Skipped {
+                subject: "maps attribution".into(),
+                reason: format!(
+                    "processes mapping pinned provider objects were not attributed to them: {} \
+                     (per-process reasons in the process table)",
+                    parts.join(", ")
+                ),
+            }));
+        }
+    }
+    // Discovery capped is a loss only when something was left unexamined:
+    // a process mapping a shared object no deep scan examined, or a
+    // process with no maps snapshot. Otherwise the cap bounded only how
+    // many processes were deep-scanned, and attribution is complete.
+    let capped = collection.cap_hit && (unexamined > 0 || unavailable > 0);
+    let total = collection.enumerated.len();
+    if capped {
+        let mut reason = format!(
+            "{}; {unexamined} processes map {unexamined_objects} shared objects no deep scan \
+             examined and may use undiscovered providers",
+            coverage_prefix(total, deep, collection.cap, matched_count)
+        );
+        if unavailable > 0 {
+            let _ = write!(
+                reason,
+                "; {unavailable} processes past the cap had no maps snapshot"
+            );
+        }
+        gaps.push(PidGap::scope(Skipped {
+            subject: "discovery capped".into(),
+            reason,
+        }));
+    }
+    let (skipped, mut notes) = split_gaps(gaps);
+    let attribution_complete = collection.cap_hit && !capped && lost == 0;
+    if attribution_complete {
+        notes.push(PidGap {
+            pid: None,
+            subject: "discovery capped".into(),
+            reason: format!(
+                "attribution complete: {}; every other process maps only shared objects a deep \
+                 scan examined",
+                coverage_prefix(total, deep, collection.cap, matched_count)
+            ),
+            generic: false,
+        });
+    }
 
     let relationships = build_relationships(&objects);
     let admission = AdmissionSummary {
@@ -949,15 +1365,17 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
             .count(),
     };
     let scan_ms = collection.members.iter().map(|member| member.scan_ms).sum();
-    let complete = !collection.cap_hit
+    // Complete: nothing lost and nothing unexamined. Over the cap that
+    // needs every unselected process examined (by a deep scan's keys or a
+    // confirmed maps match) and no attribution loss.
+    let complete = (!collection.cap_hit || attribution_complete)
         && skipped.is_empty()
         && collection
             .members
             .iter()
-            .all(|member| matches!(member.status, MemberStatus::Scanned))
-        && collection.selected.len() == collection.enumerated.len();
+            .all(|member| matches!(member.status, MemberStatus::Scanned));
     let explanation = if objects.is_empty() {
-        Some(empty_explanation(&collection, &skipped))
+        Some(empty_explanation(&collection, matched_count, &skipped))
     } else {
         None
     };
@@ -969,7 +1387,12 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
         scan_status: if complete { "complete" } else { "partial" },
         enumerated: collection.enumerated.len(),
         selected: collection.selected.len(),
-        scanned: collection.scanned(),
+        scanned: deep,
+        maps_matched: matched_count,
+        unexamined,
+        unexamined_objects,
+        snapshots_unavailable: unavailable,
+        attribution_losses: losses,
         cap: collection.cap,
         scan_ms,
         processes,
@@ -979,6 +1402,7 @@ fn assemble(mut collection: Collection, policy: AdmissionPolicy) -> Catalog {
         skipped,
         notes,
         explanation,
+        stage_timings: StageTimings::new(),
     }
 }
 
@@ -990,6 +1414,20 @@ fn observation_of(pid: u32, scanned: &ScannedModule) -> Observation {
         tables: scanned.tables.clone(),
         interfaces: scanned.interfaces.clone(),
         double_loaded: scanned.double_loaded,
+        evidence: ObservationEvidence::DeepScan,
+    }
+}
+
+/// A maps-matched member's observation: the confirmed mapping only.
+fn matched_observation(pid: u32, matched: &MatchedObject) -> Observation {
+    Observation {
+        pid,
+        path: matched.path.clone(),
+        exports: Vec::new(),
+        tables: Vec::new(),
+        interfaces: Vec::new(),
+        double_loaded: matched.double_loaded,
+        evidence: ObservationEvidence::MapsMatch,
     }
 }
 
@@ -1123,7 +1561,7 @@ fn build_relationships(objects: &[CatalogObject]) -> Vec<Relationship> {
 
 /// The empty-machine explanation (D2): what was scanned, which caps hit,
 /// and where to look next. Rendered in both text and JSON.
-fn empty_explanation(collection: &Collection, skipped: &[PidGap]) -> String {
+fn empty_explanation(collection: &Collection, matched: usize, skipped: &[PidGap]) -> String {
     let unreadable = collection.unreadable();
     let exited = collection
         .members
@@ -1136,7 +1574,8 @@ fn empty_explanation(collection: &Collection, skipped: &[PidGap]) -> String {
         .saturating_sub(collection.selected.len());
     let mut parts = vec![format!(
         "deep-scanned {} of {} enumerated processes ({unreadable} unreadable, {exited} exited \
-         before scan, {not_selected} past the {} scan cap)",
+         before scan, {not_selected} past the {} scan cap, {matched} of them attributed by maps \
+         identity)",
         collection.scanned(),
         collection.enumerated.len(),
         collection.cap,
@@ -1223,15 +1662,29 @@ fn render_json(catalog: &Catalog) -> serde_json::Value {
             "reason": gap.reason,
         })
     };
+    let losses: serde_json::Map<String, serde_json::Value> = AttributionLoss::ALL
+        .iter()
+        .map(|loss| {
+            (
+                loss.label().to_string(),
+                serde_json::Value::from(catalog.attribution_losses.get(loss).copied().unwrap_or(0)),
+            )
+        })
+        .collect();
     let mut document = serde_json::json!({
         "schema": DOC_ID,
         "scope": "system",
         "scan": {
             "status": catalog.scan_status,
             "enumerated": catalog.enumerated,
+            "limit": catalog.cap,
             "selected": catalog.selected,
-            "scanned": catalog.scanned,
-            "max_scan_pids": catalog.cap,
+            "deep_scanned": catalog.scanned,
+            "maps_matched": catalog.maps_matched,
+            "unexamined": catalog.unexamined,
+            "unexamined_objects": catalog.unexamined_objects,
+            "snapshots_unavailable": catalog.snapshots_unavailable,
+            "attribution_losses": losses,
             "scan_ms": catalog.scan_ms,
         },
         "processes": processes,
@@ -1299,6 +1752,7 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
             serde_json::json!({
                 "pid": observation.pid,
                 "path": observation.path,
+                "evidence": observation.evidence.label(),
                 "exports": observation.exports,
                 "tables": tables,
                 "interfaces": interfaces,
@@ -1339,7 +1793,7 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
         "mappings": object
             .mappings
             .iter()
-            .map(|(pid, view)| serde_json::json!({ "pid": pid, "view": view.0 }))
+            .map(|(pid, view)| serde_json::json!({ "pid": pid, "view": view.map(|view| view.0) }))
             .collect::<Vec<_>>(),
         "observations": observations,
         "admission": admission,
@@ -1358,11 +1812,12 @@ fn render_text(catalog: &Catalog) -> String {
     };
     let _ = writeln!(
         out,
-        "system — {} PKCS#11 {word} in {} processes ({} scanned of {} enumerated, cap {}; \
-         scan {}ms, {})",
+        "system — {} PKCS#11 {word} in {} processes ({} deep-scanned and {} maps-matched of {} \
+         enumerated, cap {}; scan {}ms, {})",
         catalog.objects.len(),
         catalog.processes.len(),
         catalog.scanned,
+        catalog.maps_matched,
         catalog.enumerated,
         catalog.cap,
         catalog.scan_ms,
@@ -1449,7 +1904,10 @@ fn render_object(out: &mut String, index: usize, object: &CatalogObject) {
     let mappings: Vec<String> = object
         .mappings
         .iter()
-        .map(|(pid, view)| format!("pid {pid} (view {})", view.0))
+        .map(|(pid, view)| match view {
+            Some(view) => format!("pid {pid} (view {})", view.0),
+            None => format!("pid {pid} (maps match)"),
+        })
         .collect();
     let _ = writeln!(out, "  mapped by  {}", mappings.join(", "));
     match &object.admission {
@@ -1477,6 +1935,15 @@ fn render_object(out: &mut String, index: usize, object: &CatalogObject) {
         }
     }
     for observation in &object.observations {
+        if observation.evidence == ObservationEvidence::MapsMatch {
+            let _ = writeln!(
+                out,
+                "  observed   pid {}: maps match at {} (not decoded)",
+                observation.pid,
+                crate::render::escape_controls(&observation.path),
+            );
+            continue;
+        }
         let _ = writeln!(
             out,
             "  observed   pid {}: exports {}",
@@ -1624,13 +2091,14 @@ mod tests {
             build_id: None,
             identity_source: sha256.map(|_| "mountinfo"),
             note: None,
-            mappings: vec![(pid, ProcessViewId(0))],
+            mappings: vec![(pid, Some(ProcessViewId(0)))],
             observations: vec![Observation {
                 pid,
                 path: path.into(),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![table((2, 40), 2)],
                 double_loaded: false,
+                evidence: ObservationEvidence::DeepScan,
                 interfaces: vec![ScannedInterface {
                     index: 0,
                     name_class: "exact_standard",
@@ -1660,6 +2128,11 @@ mod tests {
             enumerated: 2,
             selected: 2,
             scanned: 2,
+            maps_matched: 0,
+            unexamined: 0,
+            unexamined_objects: 0,
+            snapshots_unavailable: 0,
+            attribution_losses: BTreeMap::new(),
             cap: MAX_SCAN_PIDS,
             scan_ms: 7,
             processes: vec![
@@ -1667,11 +2140,13 @@ mod tests {
                     pid: 100,
                     status: MemberStatus::Scanned,
                     objects: vec![0],
+                    generation: None,
                 },
                 ProcessRecord {
                     pid: 200,
                     status: MemberStatus::Scanned,
                     objects: if objects.len() > 1 { vec![1] } else { vec![] },
+                    generation: None,
                 },
             ],
             objects,
@@ -1686,6 +2161,364 @@ mod tests {
             skipped: Vec::new(),
             notes: Vec::new(),
             explanation: None,
+            stage_timings: StageTimings::new(),
+        }
+    }
+
+    mod c1b {
+        use super::super::*;
+        use crate::discovery::identity::test_fixture::{PATH, SHA, module, view_pin};
+        use crate::discovery::sweep_attribution::{Confirmation, ConfirmedRead};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        use std::collections::HashMap;
+
+        const PROVIDER: ObjectKey = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 4_242,
+        };
+
+        fn entry(start: u64, perms: &[u8; 4], inode: u64, path: &str) -> MapEntry {
+            MapEntry {
+                start,
+                end: start + 0x1000,
+                file_offset: if perms[2] == b'x' { 0x1000 } else { 0 },
+                permissions: *perms,
+                device: Device { major: 8, minor: 1 },
+                inode,
+                raw_path: Some(path.as_bytes().to_vec()),
+            }
+        }
+
+        fn libc() -> Vec<MapEntry> {
+            vec![
+                entry(0x2000_0000, b"r--p", 11, "/usr/lib/libc.so.6"),
+                entry(0x2000_1000, b"r-xp", 11, "/usr/lib/libc.so.6"),
+            ]
+        }
+
+        fn caller() -> Vec<MapEntry> {
+            let mut entries = vec![
+                entry(0x1000_0000, b"r--p", PROVIDER.inode, PATH),
+                entry(0x1000_1000, b"r-xp", PROVIDER.inode, PATH),
+            ];
+            entries.extend(libc());
+            entries
+        }
+
+        fn exe() -> ExeIdentity {
+            ExeIdentity {
+                dev: 1,
+                ino: 100,
+                mtime_secs: 10,
+                mtime_nanos: 0,
+                path: Some("/usr/bin/caller".into()),
+            }
+        }
+
+        struct Probe(HashMap<u32, Vec<MapEntry>>, HashMap<u32, Confirmation>);
+
+        impl MemberProbe for Probe {
+            fn confirm(&mut self, pid: u32, _: &mut CaptureWorkBudget) -> Confirmation {
+                if let Some(scripted) = self.1.get(&pid) {
+                    return scripted.clone();
+                }
+                Confirmation::Confirmed(ConfirmedRead {
+                    start_time: 9_000 + u64::from(pid),
+                    exe: exe(),
+                    entries: self.0.get(&pid).cloned().unwrap_or_default(),
+                })
+            }
+        }
+
+        /// Scripted object checks: the fixture pins are backed by /dev/null,
+        /// whose real metadata never matches the forged pin.
+        struct Checks {
+            changed: bool,
+        }
+
+        impl ObjectChecks for Checks {
+            fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
+                Ok(None)
+            }
+            fn unchanged(&self, _: PinnedObjectId) -> Result<bool, String> {
+                Ok(!self.changed)
+            }
+        }
+
+        fn scanned(
+            pid: u32,
+            view: u32,
+            modules: Vec<ScannedModule>,
+            pins: PinnedObjects,
+        ) -> MemberResult {
+            MemberResult {
+                pid,
+                view: ProcessViewId(view),
+                status: MemberStatus::Scanned,
+                generation: Some(MemberGeneration {
+                    start_time: Some(1),
+                    exe: Some(exe()),
+                }),
+                modules,
+                pins,
+                gaps: Vec::new(),
+                scan_ms: 1,
+            }
+        }
+
+        /// 448 processes over a 256 cap: 300 identical callers of one
+        /// provider (one deep-scanned) plus 148 idle processes (one
+        /// deep-scanned). `extra` adds per-pid mappings past phase 1.
+        fn over_cap(extra: &[(u32, Vec<MapEntry>)]) -> Collection {
+            let mut sweep: Vec<(u32, Vec<MapEntry>)> =
+                (10_000..10_300).map(|pid| (pid, caller())).collect();
+            sweep.extend((20_000..20_148).map(|pid| (pid, libc())));
+            for (pid, entries) in extra {
+                if let Some((_, known)) = sweep.iter_mut().find(|(known, _)| known == pid) {
+                    known.extend(entries.iter().cloned());
+                }
+            }
+            let mut provider = module(PROVIDER);
+            provider.view = ProcessViewId(0);
+            let pins = view_pin(&provider, 21, SHA, 1, false);
+            Collection {
+                enumerated: sweep.iter().map(|(pid, _)| *pid).collect(),
+                selected: vec![10_000, 20_000],
+                cap: 256,
+                cap_hit: true,
+                members: vec![
+                    scanned(10_000, 0, vec![provider], pins),
+                    scanned(20_000, 1, Vec::new(), PinnedObjects::empty()),
+                ],
+                scope_gaps: Vec::new(),
+                proc_list_failed: false,
+                sweep,
+                sweep_unavailable: BTreeSet::new(),
+                budget: CaptureWorkBudget::default(),
+            }
+        }
+
+        fn catalog_of(
+            mut collection: Collection,
+            overrides: HashMap<u32, Confirmation>,
+            changed: bool,
+        ) -> Catalog {
+            let snapshots: HashMap<u32, Vec<MapEntry>> = collection.sweep.iter().cloned().collect();
+            let bound = bind_collection(&mut collection);
+            let mut probe = Probe(snapshots, overrides);
+            let attributed =
+                attribute_sweep(&mut collection, &bound, &mut probe, &Checks { changed });
+            assemble(collection, bound, attributed, AdmissionPolicy::detailed())
+        }
+
+        fn statuses(catalog: &Catalog) -> BTreeMap<&'static str, usize> {
+            let mut counts = BTreeMap::new();
+            for process in &catalog.processes {
+                *counts.entry(process.status.label()).or_default() += 1;
+            }
+            counts
+        }
+
+        #[test]
+        fn over_the_cap_every_identical_caller_is_mapped_and_attribution_is_complete() {
+            let catalog = catalog_of(over_cap(&[]), HashMap::new(), false);
+            assert_eq!(
+                statuses(&catalog),
+                BTreeMap::from([("maps_matched", 299), ("not_selected", 147), ("scanned", 2)])
+            );
+            assert_eq!(catalog.objects.len(), 1);
+            let object = &catalog.objects[0];
+            let pids: BTreeSet<u32> = object.mappings.iter().map(|(pid, _)| *pid).collect();
+            assert_eq!(pids, (10_000..10_300).collect());
+            assert_eq!(
+                object.observations.len(),
+                300,
+                "one observation per caller, no duplicate"
+            );
+            let matched: Vec<&Observation> = object
+                .observations
+                .iter()
+                .filter(|observation| observation.evidence == ObservationEvidence::MapsMatch)
+                .collect();
+            assert_eq!(matched.len(), 299);
+            assert!(
+                matched
+                    .iter()
+                    .all(|observation| observation.exports.is_empty()
+                        && observation.tables.is_empty()
+                        && observation.interfaces.is_empty())
+            );
+            let process = catalog
+                .processes
+                .iter()
+                .find(|process| process.pid == 10_007)
+                .unwrap();
+            assert_eq!(process.objects, vec![0]);
+            assert_eq!(
+                process.generation,
+                Some(MemberGeneration {
+                    start_time: Some(19_007),
+                    exe: Some(exe()),
+                })
+            );
+            assert_eq!(catalog.scan_status, "complete", "{:?}", catalog.skipped);
+            assert!(catalog.skipped.is_empty(), "{:?}", catalog.skipped);
+            assert!(
+                catalog
+                    .notes
+                    .iter()
+                    .any(|note| note.subject == "discovery capped"
+                        && note.reason.starts_with(
+                            "attribution complete: 448 processes in scope; 2 \
+                     deep-scanned by provider rarity (limit 256); 299 attributed"
+                        )),
+                "{:?}",
+                catalog.notes
+            );
+            let document = render_json(&catalog);
+            assert_eq!(document["scan"]["maps_matched"], 299);
+            assert_eq!(document["scan"]["deep_scanned"], 2);
+            assert_eq!(document["scan"]["limit"], 256);
+            assert_eq!(document["scan"]["unexamined"], 0);
+            assert_eq!(document["scan"]["attribution_losses"]["deleted_mapping"], 0);
+            let observation = document["objects"][0]["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|observation| observation["pid"] == 10_007)
+                .unwrap()
+                .clone();
+            assert_eq!(observation["evidence"], "maps_match");
+            let mapping = document["objects"][0]["mappings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|mapping| mapping["pid"] == 10_007)
+                .unwrap()
+                .clone();
+            assert_eq!(mapping["view"], serde_json::Value::Null);
+            let text = render_text(&catalog);
+            assert!(
+                text.contains("2 deep-scanned and 299 maps-matched of 448"),
+                "{text}"
+            );
+            assert!(text.contains("299 maps_matched"), "{text}");
+        }
+
+        #[test]
+        fn unexamined_shared_objects_make_discovery_capped_never_complete() {
+            let other = vec![
+                entry(0x5000_0000, b"r--p", 77, "/opt/vendor/libunknown.so"),
+                entry(0x5000_1000, b"r-xp", 77, "/opt/vendor/libunknown.so"),
+            ];
+            let catalog = catalog_of(
+                over_cap(&[(10_001, other.clone()), (20_005, other)]),
+                HashMap::new(),
+                false,
+            );
+            assert_eq!(catalog.scan_status, "partial");
+            assert_eq!((catalog.unexamined, catalog.unexamined_objects), (2, 1));
+            let capped: Vec<&PidGap> = catalog
+                .skipped
+                .iter()
+                .filter(|gap| gap.subject == "discovery capped")
+                .collect();
+            assert_eq!(capped.len(), 1, "{:?}", catalog.skipped);
+            assert_eq!(
+                capped[0].reason,
+                "448 processes in scope; 2 deep-scanned by provider rarity (limit 256); 299 \
+                 attributed to pinned provider objects by exact maps identity; 2 processes map 1 \
+                 shared objects no deep scan examined and may use undiscovered providers"
+            );
+            assert!(
+                catalog
+                    .skipped
+                    .iter()
+                    .any(|gap| gap.pid == Some(10_001) && gap.subject == "maps attribution"),
+                "the matched member names its unexamined object: {:?}",
+                catalog.skipped
+            );
+            assert!(
+                !catalog
+                    .notes
+                    .iter()
+                    .any(|note| note.reason.starts_with("attribution complete"))
+            );
+            assert_eq!(statuses(&catalog)["maps_matched"], 299);
+        }
+
+        #[test]
+        fn losses_are_counted_by_category_and_named_per_process() {
+            let overrides = HashMap::from([
+                (
+                    10_003,
+                    Confirmation::Lost(
+                        crate::discovery::sweep_attribution::AttributionLoss::ExecChanged,
+                        "exec".into(),
+                    ),
+                ),
+                (10_004, Confirmation::Exited),
+            ]);
+            let catalog = catalog_of(over_cap(&[]), overrides, false);
+            assert_eq!(catalog.scan_status, "partial");
+            let gap = catalog
+                .skipped
+                .iter()
+                .find(|gap| gap.subject == "maps attribution")
+                .unwrap();
+            assert!(gap.reason.contains("1 exec_changed"), "{gap:?}");
+            let lost = catalog
+                .processes
+                .iter()
+                .find(|process| process.pid == 10_003)
+                .unwrap();
+            assert_eq!(lost.status.label(), "not_selected");
+            assert_eq!(lost.status.reason(), Some("exec_changed: exec"));
+            let gone = catalog
+                .processes
+                .iter()
+                .find(|process| process.pid == 10_004)
+                .unwrap();
+            assert_eq!(gone.status, MemberStatus::Exited);
+            assert!(
+                !catalog
+                    .notes
+                    .iter()
+                    .any(|note| note.reason.starts_with("attribution complete"))
+            );
+            assert_eq!(statuses(&catalog)["maps_matched"], 297);
+        }
+
+        #[test]
+        fn a_changed_object_drops_every_maps_attribution_with_a_gap() {
+            let catalog = catalog_of(over_cap(&[]), HashMap::new(), true);
+            assert_eq!(catalog.maps_matched, 0);
+            assert_eq!(
+                catalog.objects[0].observations.len(),
+                1,
+                "the deep scan stays"
+            );
+            assert!(
+                catalog.skipped.iter().any(|gap| gap.subject == PATH
+                    && gap.reason.contains("maps attributions were dropped")),
+                "{:?}",
+                catalog.skipped
+            );
+            assert_eq!(catalog.scan_status, "partial");
+        }
+
+        #[test]
+        fn under_the_cap_nothing_is_attributed_by_maps() {
+            let mut collection = over_cap(&[]);
+            collection.cap_hit = false;
+            let catalog = catalog_of(collection, HashMap::new(), false);
+            assert_eq!(catalog.maps_matched, 0);
+            assert!(
+                !catalog
+                    .notes
+                    .iter()
+                    .any(|note| note.subject == "discovery capped")
+            );
         }
     }
 
@@ -1754,6 +2587,7 @@ mod tests {
                 MemberResult {
                     pid: 1,
                     view: ProcessViewId(0),
+                    generation: None,
                     status: MemberStatus::Unreadable {
                         reason: "the process generation could not be pinned: Permission denied \
                                  (os error 13)"
@@ -1768,6 +2602,7 @@ mod tests {
                     pid: 2,
                     view: ProcessViewId(1),
                     status: MemberStatus::Exited,
+                    generation: None,
                     modules: Vec::new(),
                     pins: PinnedObjects::empty(),
                     gaps: Vec::new(),
@@ -1776,6 +2611,9 @@ mod tests {
             ],
             scope_gaps: Vec::new(),
             proc_list_failed: false,
+            sweep: Vec::new(),
+            sweep_unavailable: BTreeSet::new(),
+            budget: CaptureWorkBudget::default(),
         };
         let error = format!("{:#}", unreadable_system_error(&collection));
         assert!(error.contains("no process could be read"), "{error}");
@@ -1988,7 +2826,7 @@ mod tests {
                 endpoints: 68,
             },
         );
-        aliased.mappings.push((200, ProcessViewId(1)));
+        aliased.mappings.push((200, Some(ProcessViewId(1))));
         aliased.observations.push(Observation {
             pid: 200,
             path: "/opt/b.so".into(),
@@ -1996,6 +2834,7 @@ mod tests {
             tables: vec![table((2, 40), 2)],
             double_loaded: false,
             interfaces: Vec::new(),
+            evidence: ObservationEvidence::DeepScan,
         });
         let relationships = build_relationships(std::slice::from_ref(&aliased));
         assert_eq!(relationships.len(), 1, "{relationships:?}");

@@ -44,9 +44,12 @@ Every line carries the same envelope plus its `kind`-specific `event`:
 - `gap_recorded`: `{caller, module, pid, subject, reason, budget}` —
   IDENTICAL in shape and meaning to a snapshot `gaps[]` entry. A
   refused capture produces stream gaps identical to snapshot gaps.
-- `pass_committed`: `{pass, scanned, native_callers, scan_callers,
-  totals: {callers, modules, edges}, new_gaps, suppressed_delta,
-  gaps_suppressed}` — what the pass scanned and what it cost.
+- `pass_committed`: `{pass, scanned, maps_matched, native_callers,
+  scan_callers, totals: {callers, modules, edges}, new_gaps,
+  suppressed_delta, gaps_suppressed}` — what the pass scanned and what
+  it cost. `scanned` counts the members observed (deep-scanned plus
+  maps-matched); `maps_matched` counts those past the deep-scan cap
+  attributed by exact maps identity (see `inventory-v1.md`).
 - `caller_observed` / `module_observed` / `edge_observed`: full
   snapshot record shapes (test/sync emission; production emits
   incrementally instead). `edge_observed` adds the three derived
@@ -116,7 +119,7 @@ document pass for pass.
 {"schema": "p11scope/inventory-events/v1", "seq": 1, "at_ns": 110, "kind": "caller_event",
  "event": {"event": "admitted", "caller": "c0"}}
 {"schema": "p11scope/inventory-events/v1", "seq": 2, "at_ns": 110, "kind": "pass_committed",
- "event": {"pass": 0, "scanned": 1, "native_callers": 0, "scan_callers": 1,
+ "event": {"pass": 0, "scanned": 1, "maps_matched": 0, "native_callers": 0, "scan_callers": 1,
            "totals": {"callers": 1, "modules": 1, "edges": 1}, "new_gaps": 1,
            "suppressed_delta": 0, "gaps_suppressed": 0}}
 ```

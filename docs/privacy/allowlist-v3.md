@@ -314,6 +314,57 @@ sorting alone must not settle concurrent handle reuse. Terminal shutdown
 drains known producers before publishing observation-ended status, and marks
 an incomplete drain as loss.
 
+## Stage A continuity witness (Task 3; PROPOSED addendum)
+
+This addendum is additive and PROPOSED like the rest of this document. It
+names the only new state the Task 3 Stage A continuity mechanism keeps. It
+does not enable any semantic field above; it only supplies the private
+load-instance authority that "Instance, session and object lifetime"
+requires. v1 and v2 are unchanged.
+
+Kernel-side state, owned by the exact observer:
+
+- `WATCHED_FILES` (`{s_dev, i_ino}` to a file slot) and `SLOT_FILE`,
+  written by userspace only from the calibrated watched provider files.
+- A per-process task-storage record of at most eight `(file slot, mutation
+  counter)` pairs plus finite flags, a per-file global counter, a fault
+  generation and an attach generation, and finite hook counters. These are
+  counts of file-VMA map/unmap/move events for watched provider files. No
+  address, length, protection, path or content of any VMA is stored.
+- `INSTANCE_CALIB`: one transient cell holding the observer's own
+  calibration mapping (`vm_start`, `s_dev`, `i_ino`), cleared after use.
+- `INSTANCE_START` (LRU, bounded): per in-flight call, keyed by the existing
+  START key, the private **entry IP** (the probed address) and a 16-byte
+  stamp `{epoch, global, fault, file slot, flags}`. Consumed and deleted on
+  return; eviction is a counted unknown, never a join.
+
+Kernel metadata read transiently by the hooks and never stored except as
+the counters above: `vm_file`, `f_inode`, `i_ino`, `i_sb->s_dev`, `vm_mm`,
+`mm_users`, `current->mm`, `group_leader`, `clone_flags`. No syscall
+argument, user address or length, target memory, or kernel pointer is
+captured or emitted.
+
+Wire: each EVENTS record carries a private 40-byte tail `{entry_ip,
+entry_stamp, return_stamp}` after the unchanged 328-byte `Event`.
+Userspace keeps the entry IP inside the instance router (`EntryIp`: no
+`Debug`, `Display` or `Serialize`) and drops the tail before any decoder
+used by renderers. The entry IP, stamps, maps ranges and map_files
+identities never reach JSON, JSONL, trace, profile, dashboard, logs or
+errors; public output may carry only finite continuity, coverage and
+refusal facts and capture-local instance IDs.
+
+Userspace join input: `/proc/PID/maps` ranges of the watched file, each
+confirmed by `stat()` of `/proc/PID/map_files/<range>` against the identity
+recorded at calibration (device and inode numbers of a provider file, used
+for equality only, never emitted). The `(s_dev, i_ino)` maps key alone is
+not unique (btrfs subvolumes, overlay without xino) and is never a join
+authority.
+
+Required evidence before activation adds: an exact-offset canary scanner for
+the entry IP and stamps in the EVENTS tail and `INSTANCE_START`, with
+must-detect positive controls in public outputs; and a sentinel regression
+proving renderers never receive the tail.
+
 ## Bounds, loss and output
 
 Proposed ceilings are eight inspected attributes per template, at most two

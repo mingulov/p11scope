@@ -87,6 +87,32 @@ versioned separately and are opaque, exact dispatch keys.
 - `docs/usage.md` states the symlink policy: inputs follow symbolic links and
   are pinned by identity; outputs never follow one.
 
+### Fixed
+
+- **PID namespaces (DR-K8S-1/2).** An observer outside the initial PID
+  namespace (a kind/k3d node, a container without the host PID namespace)
+  used to publish its own-view PID into the kernel PID filter, which keys on
+  initial-namespace PIDs: `profile --pid` counted nothing while claiming
+  exact observation. p11scope now reads its PID namespace from
+  `/proc/self/ns/pid` and checks that the mounted `/proc` is that
+  namespace's own (`nsenter -m` without `-p` is not). On either mismatch it
+  refuses `--pid`, `run` and `inventory --pid` with
+  `pid-namespace-mismatch`; `--cgroup` and `--system` captures still match
+  and count attached providers correctly but are `PARTIAL` with the
+  observation cause `pid_namespace` or `proc_namespace_mismatch`, and
+  `inventory --system` carries a scope-level gap. Capture evidence and the
+  inventory and `inspect --system` documents carry `pid_namespace`
+  (`observer`, `kernel_pids`, `proc_pids`), naming which namespace numbers
+  which PIDs, and `doctor` has a `PID namespace` row. See `docs/usage.md`,
+  PID namespaces.
+- **`perf_event_paranoid >= 3` (DR-K8S-3).** The uretprobe self-probe and
+  live-discovery probes attach through `perf_event_open`, which paranoid
+  >= 3 refuses without `CAP_SYS_ADMIN` (`CAP_PERFMON` does not lift it).
+  `doctor` no longer says `CAP_BPF+CAP_PERFMON` suffice there, and the
+  refusal names the sysctl and `CAP_SYS_ADMIN` (or a root process without
+  it) instead of a lockdown, LSM or seccomp profile. Capturing at paranoid
+  >= 3 needs `CAP_SYS_ADMIN`.
+
 ## [0.1.0]
 
 First release. p11scope is a passive, non-interposing PKCS#11 observer for

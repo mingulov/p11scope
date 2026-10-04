@@ -84,6 +84,7 @@ jobs:
           UNRUN: scripts/matrix/verify-docker.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-kind-pod.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-knative.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/matrix/verify-pidns.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-proxy-stack.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           EOF
           cat "$RUNNER_TEMP/lanes.txt"

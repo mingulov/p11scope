@@ -39,7 +39,7 @@
         "kernel_control",
         "loader_discovery", "malformed_records", "manifest_object_fallbacks",
         "module_ambiguous", "module_unresolved_slots", "modules_skipped", "operation_state_imports",
-        "orphan_ops", "p11scope_env", "pause", "pause_attempts",
+        "orphan_ops", "p11scope_env", "pause", "pause_attempts", "pid_namespace",
         "pause_confirmed", "pause_partial", "pending_at_end",
         "process_tracking_evictions", "process_tracking_failures",
         "process_tracking_fallbacks", "provider_changed", "rv_update_failures",
@@ -201,6 +201,16 @@
         "process_tracking_evictions": {"type": "integer", "minimum": 0},
         "process_tracking_failures": {"type": "integer", "minimum": 0},
         "process_tracking_fallbacks": {"type": "integer", "minimum": 0},
+        "pid_namespace": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "observer": {"enum": ["initial", "nested", "unknown"]},
+            "kernel_pids": {"const": "initial"},
+            "proc_pids": {"enum": ["observer", "foreign"]}
+          },
+          "required": ["observer", "kernel_pids", "proc_pids"]
+        },
         "provider_changed": {"type": "boolean"},
         "rv_update_failures": {"type": "integer", "minimum": 0},
         "scan_ms": {"type": "integer", "minimum": 0},

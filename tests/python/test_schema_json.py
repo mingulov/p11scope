@@ -86,6 +86,20 @@ class SchemaOracleAgreement(unittest.TestCase):
             CHECKER["MAX_FUNCTION_ORDINALS"],
         )
 
+    def test_pid_namespace_shape_matches_oracle(self):
+        """`evidence.pid_namespace` is the oracle's closed object (DR-K8S-2)."""
+        pidns = evidence_schema()["properties"]["pid_namespace"]
+        self.assertEqual(set(pidns["properties"]), set(CHECKER["PID_NAMESPACE_KEYS"]))
+        self.assertEqual(set(pidns["required"]), set(CHECKER["PID_NAMESPACE_KEYS"]))
+        self.assertEqual(
+            set(pidns["properties"]["observer"]["enum"]),
+            set(CHECKER["PID_NAMESPACE_OBSERVERS"]),
+        )
+        self.assertEqual(
+            set(pidns["properties"]["proc_pids"]["enum"]),
+            set(CHECKER["PID_NAMESPACE_PROC_PIDS"]),
+        )
+
     def test_gap_classes_shape_matches_oracle(self):
         """`evidence.gap_classes` keys match the oracle's closed set."""
         classes = evidence_schema()["properties"]["gap_classes"]

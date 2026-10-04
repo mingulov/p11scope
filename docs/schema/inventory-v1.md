@@ -12,6 +12,21 @@ only — new optional fields and new enum labels, each documented here
 (a label this document does not list must be read as unknown) —
 never a changed meaning for an existing field.
 
+## PID numbering
+
+`pid_namespace` (additive within v1) is the same object capture evidence
+carries: `{"observer": "initial" | "nested" | "unknown", "kernel_pids":
+"initial", "proc_pids": "observer" | "foreign"}`. Every PID in this
+document (`callers[].pid`, `gaps[].pid`) is read through `/proc`, so it is
+in the numbering `proc_pids` names; it equals the kernel's initial-namespace
+PID only when `observer` is `initial` and `proc_pids` is `observer`.
+`inventory --pid` is refused (`pid-namespace-mismatch`) otherwise, and
+`inventory --system` then also carries one scope-level gap (`caller`,
+`module` and `pid` null, `subject` `pid namespace`) from its first pass on,
+so a consumer reading only `gaps[]` still sees the incompleteness: callers
+that load a module after a scan pass can be missed. See `docs/usage.md`,
+PID namespaces.
+
 ## Clock and units
 
 - `clock.basis` is always `CLOCK_MONOTONIC`; `clock.unit` is always `ns`.

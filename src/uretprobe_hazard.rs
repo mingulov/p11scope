@@ -275,22 +275,108 @@ fn classify_probe_error(error: &anyhow::Error) -> KernelVerdict {
     }
 }
 
+/// `CAP_SYS_ADMIN`'s bit in a `CapEff` mask.
+const CAP_SYS_ADMIN_BIT: u32 = 21;
+
+/// The privilege facts a not-permitted refusal is explained from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrivilegeFacts {
+    pub(crate) euid_root: bool,
+    pub(crate) sys_admin: bool,
+    /// `kernel.perf_event_paranoid`, when readable and numeric.
+    pub(crate) perf_event_paranoid: Option<i64>,
+}
+
+impl PrivilegeFacts {
+    pub(crate) fn current() -> Self {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let cap_eff = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| parse_cap_eff(&status));
+        Self::from_parts(
+            euid,
+            cap_eff,
+            std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid"),
+        )
+    }
+
+    fn from_parts(euid: u32, cap_eff: Option<u64>, paranoid: std::io::Result<String>) -> Self {
+        Self {
+            euid_root: euid == 0,
+            sys_admin: cap_eff.is_some_and(|mask| mask & (1u64 << CAP_SYS_ADMIN_BIT) != 0),
+            perf_event_paranoid: paranoid
+                .ok()
+                .and_then(|value| value.trim().parse::<i64>().ok()),
+        }
+    }
+}
+
+fn parse_cap_eff(status: &str) -> Option<u64> {
+    let hex = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))?;
+    u64::from_str_radix(hex.trim(), 16).ok()
+}
+
+/// The `kernel.perf_event_paranoid` level from which Debian- and
+/// Ubuntu-patched kernels refuse every `perf_event_open` to a process
+/// without CAP_SYS_ADMIN (`perf_paranoid_any()`; upstream defines levels only
+/// up to 2). CAP_PERFMON does not lift it: measured 2026-10-03 on
+/// 7.0.0-34-generic at paranoid 4, CAP_BPF+CAP_PERFMON+CAP_SYS_PTRACE+
+/// CAP_DAC_READ_SEARCH as root failed the self-probe with EACCES (DR-K8S-3).
+pub(crate) const PERF_OPEN_RESTRICT_PARANOID: i64 = 3;
+
+/// Whether this process's `perf_event_open` is refused outright: the
+/// self-probe, live-discovery loader/export probes, and every per-probe
+/// (singles) uprobe attach through it. Static uprobe-multi links do not.
+pub(crate) fn perf_open_restricted(facts: PrivilegeFacts) -> bool {
+    !facts.sys_admin
+        && facts
+            .perf_event_paranoid
+            .is_some_and(|level| level >= PERF_OPEN_RESTRICT_PARANOID)
+}
+
 /// The operator-facing refusal for [`Action::NotPermitted`]: what was
 /// refused, what privilege it takes, and how to get it — never the uretprobe
 /// override, which cannot grant privilege.
-pub(crate) fn not_permitted_message(why: &str, running_as_root: bool) -> String {
-    if running_as_root {
-        format!(
+///
+/// The cause is named from facts, not from the uid: a root observer whose
+/// capabilities were dropped (a Kubernetes DaemonSet) is missing a
+/// capability, and a self-probe attach refused under a restrictive
+/// `perf_event_paranoid` is that sysctl — neither is a lockdown, an LSM or
+/// seccomp (DR-K8S-3).
+pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts) -> String {
+    if why.starts_with(SELF_PROBE_ATTACH_CONTEXT)
+        && perf_open_restricted(facts)
+        && let Some(level) = facts.perf_event_paranoid
+    {
+        return format!(
+            "cannot attach p11scope's uretprobe self-probe ({why}): kernel.perf_event_paranoid \
+             is {level}, and at {PERF_OPEN_RESTRICT_PARANOID} or above this kernel refuses \
+             perf_event_open to any process without CAP_SYS_ADMIN — CAP_BPF and CAP_PERFMON do \
+             not lift it. The self-probe and live-discovery probes attach through \
+             perf_event_open, so this capture needs CAP_SYS_ADMIN (root normally has it), or \
+             kernel.perf_event_paranoid at 2 or below. `p11scope doctor` shows this host's row"
+        );
+    }
+    match (facts.euid_root, facts.sys_admin) {
+        (true, true) => format!(
             "cannot load p11scope's BPF programs even as root ({why}): a kernel lockdown, an \
              LSM policy, or a container's seccomp profile is refusing BPF here. Run \
              `p11scope doctor` to see which"
-        )
-    } else {
-        format!(
+        ),
+        (true, false) => format!(
+            "cannot load p11scope's BPF programs: the kernel refused ({why}). This process runs \
+             as root without CAP_SYS_ADMIN (a container that dropped it): capturing requires \
+             CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON. `p11scope doctor` shows what this host \
+             allows"
+        ),
+        (false, _) => format!(
             "cannot load p11scope's BPF programs: the kernel refused ({why}). Capturing requires \
              root, or CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON: run it with sudo. `p11scope \
              doctor` shows what this host allows"
-        )
+        ),
     }
 }
 
@@ -723,12 +809,21 @@ mod tests {
         );
     }
 
+    fn facts(euid_root: bool, sys_admin: bool, paranoid: Option<i64>) -> PrivilegeFacts {
+        PrivilegeFacts {
+            euid_root,
+            sys_admin,
+            perf_event_paranoid: paranoid,
+        }
+    }
+
     #[test]
     fn the_not_permitted_message_names_the_privilege_and_never_the_override() {
         let why = "loading the BPF object: Operation not permitted (os error 1)";
-        let user = not_permitted_message(why, false);
-        let root = not_permitted_message(why, true);
-        for message in [&user, &root] {
+        let user = not_permitted_message(why, facts(false, false, Some(2)));
+        let root = not_permitted_message(why, facts(true, true, Some(2)));
+        let capless_root = not_permitted_message(why, facts(true, false, Some(2)));
+        for message in [&user, &root, &capless_root] {
             assert!(message.contains(why), "{message}");
             assert!(message.contains("p11scope doctor"), "{message}");
             assert!(
@@ -740,6 +835,102 @@ mod tests {
         assert!(user.contains("requires root"), "{user}");
         assert!(user.contains("sudo"), "{user}");
         assert!(root.contains("even as root"), "{root}");
+        // Root without CAP_SYS_ADMIN (a container that dropped it) is a
+        // missing capability, not a lockdown or an LSM.
+        assert!(
+            capless_root.contains("without CAP_SYS_ADMIN"),
+            "{capless_root}"
+        );
+        assert!(!capless_root.contains("lockdown"), "{capless_root}");
+    }
+
+    /// DR-K8S-3: the self-probe attaches through `perf_event_open`, which
+    /// `perf_event_paranoid >= 3` refuses to anything without CAP_SYS_ADMIN
+    /// (CAP_PERFMON does not lift it). That refusal must name the sysctl
+    /// and the capability — for root too — never a lockdown, LSM or seccomp.
+    #[test]
+    fn a_paranoid_refused_self_probe_names_the_sysctl_and_cap_sys_admin() {
+        let why = "attaching the uretprobe self-probe: `perf_event_open` failed: Permission \
+                   denied (os error 13)";
+        for euid_root in [false, true] {
+            for paranoid in [3, 4] {
+                let message = not_permitted_message(why, facts(euid_root, false, Some(paranoid)));
+                assert!(message.contains(why), "{message}");
+                assert!(
+                    message.contains(&format!("kernel.perf_event_paranoid is {paranoid}")),
+                    "{message}"
+                );
+                assert!(message.contains("CAP_SYS_ADMIN"), "{message}");
+                assert!(message.contains("CAP_PERFMON do not lift it"), "{message}");
+                assert!(message.contains("p11scope doctor"), "{message}");
+                assert!(!message.contains("lockdown"), "{message}");
+                assert!(!message.contains("seccomp"), "{message}");
+            }
+        }
+        // Not the sysctl: CAP_SYS_ADMIN held, paranoid permissive or
+        // unreadable, or a refusal that was not the self-probe's attach.
+        for (facts, why) in [
+            (facts(true, true, Some(4)), why),
+            (facts(false, false, Some(2)), why),
+            (facts(false, false, None), why),
+            (
+                facts(false, false, Some(4)),
+                "loading the BPF object: Operation not permitted (os error 1)",
+            ),
+        ] {
+            let message = not_permitted_message(why, facts);
+            assert!(
+                !message.contains("perf_event_paranoid is"),
+                "{facts:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_paranoid_three_or_more_without_cap_sys_admin_restricts_perf_open() {
+        assert!(!perf_open_restricted(facts(false, false, Some(2))));
+        assert!(perf_open_restricted(facts(false, false, Some(3))));
+        assert!(perf_open_restricted(facts(true, false, Some(4))));
+        assert!(!perf_open_restricted(facts(true, true, Some(4))));
+        assert!(!perf_open_restricted(facts(false, false, None)));
+    }
+
+    #[test]
+    fn privilege_facts_parse_cap_sys_admin_and_paranoid() {
+        let status = "Name:\tx\nCapEff:\t0000000000200000\n";
+        assert_eq!(parse_cap_eff(status), Some(1 << 21));
+        assert_eq!(parse_cap_eff("CapEff:\tzz\n"), None);
+        assert_eq!(parse_cap_eff("Name:\tx\n"), None);
+        let facts = PrivilegeFacts::from_parts(0, Some(1 << 21), Ok("4\n".into()));
+        assert_eq!(
+            facts,
+            PrivilegeFacts {
+                euid_root: true,
+                sys_admin: true,
+                perf_event_paranoid: Some(4),
+            }
+        );
+        let facts = PrivilegeFacts::from_parts(
+            1000,
+            Some(!(1u64 << 21)),
+            Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+        );
+        assert_eq!(
+            facts,
+            PrivilegeFacts {
+                euid_root: false,
+                sys_admin: false,
+                perf_event_paranoid: None,
+            }
+        );
+        assert_eq!(
+            PrivilegeFacts::from_parts(0, None, Ok("x".into())),
+            PrivilegeFacts {
+                euid_root: true,
+                sys_admin: false,
+                perf_event_paranoid: None,
+            }
+        );
     }
 
     #[test]

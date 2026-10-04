@@ -649,6 +649,9 @@ mod tests {
             stdout_data_sink: false,
             uretprobe_override: None,
             handoff_child_pid: None,
+            pid_namespace: crate::pidns::PidNamespaceEvidence::of(
+                &crate::pidns::PidNumbering::agreeing(),
+            ),
             p11scope_env: vec![],
             completeness: "COMPLETE",
         }

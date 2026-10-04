@@ -155,6 +155,9 @@ fn run_with_writer(
         OsProcessSource,
         registry_limits(max_gaps),
     )?;
+    // F4 (review): a document with no `exact` flag still says, as a
+    // scope-level gap, that /proc PIDs are not the kernel's here.
+    stage_numbering_gap(&mut coordinator, crate::pidns::numbering());
     // The scan lane stages no usage coverage: every edge reads
     // `unknown (scan only)`. Only native producers (Task 6 C3-C6) stage
     // per-edge coverage notes.
@@ -999,6 +1002,18 @@ pub(crate) fn render_json<Source: ProcessSource>(
     render_json_from_presentation(&presentation)
 }
 
+/// Stages the scope-level `pid namespace` gap when `/proc` PIDs are not
+/// the kernel's (nested observer or foreign `/proc`); it publishes with the
+/// first pass, so the snapshot and the event stream carry it alike.
+fn stage_numbering_gap<S: ProcessSource>(
+    coordinator: &mut InventoryCoordinator<S>,
+    numbering: &crate::pidns::PidNumbering,
+) {
+    if let Some((subject, reason)) = crate::pidns::numbering_gap(numbering) {
+        coordinator.note_scope_gap(subject.to_string(), reason);
+    }
+}
+
 /// The JSON document from an already-captured presentation: the same
 /// bytes `render_json` emits, callable wherever a snapshot is already
 /// in hand (dashboard agreement checks, event emission).
@@ -1047,6 +1062,9 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         "edges": presentation.edges.iter().map(edge_json).collect::<Vec<_>>(),
         "gaps": gaps,
         "gaps_suppressed": presentation.gaps_suppressed,
+        // Additive (v1, DR-K8S-2): caller PIDs are this observer's /proc
+        // numbering; the kernel's are the initial namespace's.
+        "pid_namespace": crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
     })
 }
 
@@ -1151,6 +1169,48 @@ mod tests {
             RegistryLimits::default_limits(),
         )
         .unwrap()
+    }
+
+    /// F4 (review): `inventory --system` outside the agreeing numbering
+    /// carries a scope-level gap in `gaps[]`, not just the field; an
+    /// agreeing numbering stages nothing.
+    #[test]
+    fn a_mismatched_numbering_is_a_scope_level_gap() {
+        use crate::pidns::{ObserverPidNs, PidNumbering, ProcView};
+        let mut quiet = coordinator();
+        stage_numbering_gap(&mut quiet, &PidNumbering::agreeing());
+        quiet.registry_mut().publish();
+        assert!(
+            render_json(&quiet, "system", 1, 2, 1)["gaps"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        for numbering in [
+            PidNumbering {
+                observer: ObserverPidNs::Nested,
+                proc_view: ProcView::Own,
+            },
+            PidNumbering {
+                observer: ObserverPidNs::Initial,
+                proc_view: ProcView::Foreign("/proc/self: gone".into()),
+            },
+        ] {
+            let mut coordinator = coordinator();
+            stage_numbering_gap(&mut coordinator, &numbering);
+            coordinator.registry_mut().publish();
+            let document = render_json(&coordinator, "system", 1, 2, 1);
+            let gaps = document["gaps"].as_array().unwrap();
+            assert_eq!(gaps.len(), 1, "{document}");
+            assert_eq!(gaps[0]["subject"], "pid namespace");
+            assert_eq!(gaps[0]["caller"], serde_json::Value::Null);
+            assert!(
+                gaps[0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pid_namespace")
+            );
+        }
     }
 
     #[test]

@@ -225,7 +225,12 @@ RESIDUAL_EVIDENCE_KEYS = {
     "handoff_child_pid",
     # F-26: active values of every capture-visible P11SCOPE_* switch.
     "p11scope_env",
+    # DR-K8S-1/2: which PID namespace numbers which PIDs.
+    "pid_namespace",
 }
+PID_NAMESPACE_KEYS = {"observer", "kernel_pids", "proc_pids"}
+PID_NAMESPACE_OBSERVERS = {"initial", "nested", "unknown"}
+PID_NAMESPACE_PROC_PIDS = {"observer", "foreign"}
 # Native kernel control state (OWNER_CTL / COOKIE_CTL / ROOT_CTL), read at
 # every snapshot. Finite reason names and counters only; any gap forces PARTIAL.
 KERNEL_CONTROL_KEYS = {
@@ -1162,6 +1167,8 @@ def expected_gap_classes(evidence):
             ("malformed_records", evidence["malformed_records"] > 0),
             ("provider_changed", evidence["provider_changed"] is True),
             ("kernel_control", kernel_control_lossy(evidence)),
+            ("pid_namespace", evidence["pid_namespace"]["observer"] != "initial"),
+            ("proc_namespace_mismatch", evidence["pid_namespace"].get("proc_pids") != "observer"),
             ("unprotected_live_windows", evidence["unprotected_live_windows"] > 0),
             ("discovery_ring_loss", evidence["discovery_ring_loss"] > 0),
             ("discovery_state_failures", evidence["discovery_state_failures"] > 0),
@@ -1354,6 +1361,14 @@ def exact_terminal_verdict(evidence):
             isinstance(override["reason"], str) and override["reason"],
             f"invalid uretprobe_override.reason: {override!r}",
         )
+    pidns = evidence["pid_namespace"]
+    exact_keys(pidns, PID_NAMESPACE_KEYS, "pid_namespace")
+    require(
+        pidns["observer"] in PID_NAMESPACE_OBSERVERS
+        and pidns["kernel_pids"] == "initial"
+        and pidns["proc_pids"] in PID_NAMESPACE_PROC_PIDS,
+        f"invalid pid_namespace: {pidns!r}",
+    )
     pid = evidence["handoff_child_pid"]
     require(
         pid is None or (u64(pid) and 0 < pid <= U32_MAX),
@@ -3053,6 +3068,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         },
         "uretprobe_override": None,
         "handoff_child_pid": None,
+        "pid_namespace": {"observer": "initial", "kernel_pids": "initial", "proc_pids": "observer"},
         "p11scope_env": [],
     }
 
@@ -3183,6 +3199,41 @@ def self_test():
     settle_fixture_verdict(budget_only)
     exact_metrics_schema(budget_only)
     print("kernel control halt/loss is closed, finite and a concrete gap: OK")
+    # DR-K8S-1/2: a nested (or unknown) observer cannot resolve the kernel's
+    # PIDs, so its observation is a concrete gap, and the object is closed.
+    for observer in ("nested", "unknown"):
+        nested = copy.deepcopy(clean)
+        nested["evidence"]["pid_namespace"]["observer"] = observer
+        settle_fixture_verdict(nested)
+        require(nested["evidence"]["gap_classes"]["observation"]["causes"] == ["pid_namespace"]
+                and nested["evidence"]["verdict_detail"] == "concrete_gap",
+                "a nested observer must classify as observation loss")
+        exact_metrics_schema(nested)
+        unflagged = copy.deepcopy(clean)
+        unflagged["evidence"]["pid_namespace"]["observer"] = observer
+        rejected(lambda unflagged=unflagged: exact_metrics_schema(unflagged))
+    # M1: an initial observer reading another namespace's /proc.
+    foreign = copy.deepcopy(clean)
+    foreign["evidence"]["pid_namespace"]["proc_pids"] = "foreign"
+    settle_fixture_verdict(foreign)
+    require(foreign["evidence"]["gap_classes"]["observation"]["causes"] == ["proc_namespace_mismatch"]
+            and foreign["evidence"]["verdict_detail"] == "concrete_gap",
+            "a foreign /proc must classify as observation loss")
+    exact_metrics_schema(foreign)
+    unflagged = copy.deepcopy(clean)
+    unflagged["evidence"]["pid_namespace"]["proc_pids"] = "foreign"
+    rejected(lambda unflagged=unflagged: exact_metrics_schema(unflagged))
+    for mutate in (
+        lambda pidns: pidns.update(observer="host"),
+        lambda pidns: pidns.update(kernel_pids="observer"),
+        lambda pidns: pidns.update(proc_pids="initial"),
+        lambda pidns: pidns.pop("proc_pids"),
+        lambda pidns: pidns.update(inode=4026531836),
+    ):
+        invalid = copy.deepcopy(clean)
+        mutate(invalid["evidence"]["pid_namespace"])
+        rejected(lambda invalid=invalid: exact_metrics_schema(invalid))
+    print("pid_namespace is closed and a nested observer is a concrete gap: OK")
     bad_metrics = copy.deepcopy(clean)
     bad_metrics["evidence"]["secret_selection_payload"] = "CANARY"
     rejected(lambda: validate_clean_metrics(bad_metrics, {"C_Initialize": 1}))

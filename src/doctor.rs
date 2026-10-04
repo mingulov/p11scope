@@ -182,6 +182,7 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
             }),
         ),
         capabilities_check(),
+        pid_namespace_check(crate::pidns::numbering(), pid.is_some()),
     ];
     checks.extend(bpf_checks());
     let attach_preflight = attach_preflight_checks(pid, cgroup);
@@ -266,6 +267,53 @@ fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check
         },
         scope,
     ]
+}
+
+/// Name of the observer's PID namespace row (DR-K8S-1/2).
+const PID_NAMESPACE_ROW: &str = "PID namespace";
+
+/// Whether `/proc` PIDs are the kernel's PIDs (DR-K8S-1/2). Outside the
+/// initial PID namespace every PID-scoped capture is refused
+/// (`pid-namespace-mismatch`) and cgroup/system captures stay `PARTIAL`
+/// (`pid_namespace`), so this row warns, and FAILs when `--pid` was asked.
+fn pid_namespace_check(numbering: &crate::pidns::PidNumbering, pid_requested: bool) -> Check {
+    use crate::pidns::{ObserverPidNs, ProcView};
+    let status = if numbering.agrees() {
+        Status::Ok("initial — /proc PIDs are the kernel's PIDs".to_string())
+    } else {
+        let mut why = Vec::new();
+        if let ObserverPidNs::Unknown(reason) = &numbering.observer {
+            why.push(reason.clone());
+        }
+        if let ProcView::Foreign(reason) = &numbering.proc_view {
+            why.push(format!("/proc numbering foreign: {reason}"));
+        }
+        let why = if why.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", why.join("; "))
+        };
+        let detail = format!(
+            "{}{why} — the kernel numbers tasks in the initial PID namespace: --pid, run and \
+             inventory --pid are refused ({}); --cgroup/--system captures stay PARTIAL \
+             (pid_namespace / proc_namespace_mismatch)",
+            numbering.observer.label(),
+            crate::pidns::MISMATCH_CODE,
+        );
+        if pid_requested {
+            Status::Fail(detail)
+        } else {
+            Status::Warn(detail)
+        }
+    };
+    Check {
+        name: PID_NAMESPACE_ROW.into(),
+        status,
+    }
+}
+
+fn is_pid_namespace_row(name: &str) -> bool {
+    name == PID_NAMESPACE_ROW
 }
 
 fn not_applicable(name: &str, reason: &str) -> Check {
@@ -393,13 +441,15 @@ fn sysctl_status(
     }
 }
 
-/// The `kernel.perf_event_paranoid` row, backend-aware. Uprobe-multi links
-/// (kernels ≥ 6.9, the backend `Auto` picks there) never call
-/// `perf_event_open`, so a restrictive paranoid does not limit them:
-/// `CAP_BPF`+`CAP_PERFMON` suffice (measured 136/136 at paranoid=4,
-/// `scripts/matrix/verify-fork-scope.sh` Part 2). Below 6.9 the product
-/// attaches per-probe `perf_event` uprobes, where the old rule holds: a
-/// restrictive paranoid warns unless this process holds `CAP_SYS_ADMIN`.
+/// The `kernel.perf_event_paranoid` row, backend-aware. Static uprobe-multi
+/// links (kernels ≥ 6.9, the backend `Auto` picks there) never call
+/// `perf_event_open`, so a restrictive paranoid does not limit them
+/// (measured 136/136 at paranoid=4 with `CAP_BPF`+`CAP_PERFMON`,
+/// `scripts/matrix/verify-fork-scope.sh` Part 2). But the uretprobe
+/// self-probe and live-discovery loader/export probes are per-probe
+/// `perf_event` uprobes on every kernel, and at paranoid ≥ 3 those need
+/// `CAP_SYS_ADMIN` (DR-K8S-3), so the row warns there unless it is held.
+/// Below 6.9 every probe is per-probe and the same rule applies.
 /// The multi decision is the same `kernel_supports_multi()` the capture
 /// uses, injected as a bool so both branches are unit-testable.
 fn paranoid_check(held_sysadmin: bool, multi_capable: bool) -> Check {
@@ -415,8 +465,9 @@ fn paranoid_check(held_sysadmin: bool, multi_capable: bool) -> Check {
 }
 
 /// Pure over the sysctl read and the backend decision, mirroring
-/// `sysctl_status` outcomes: on a multi-capable kernel every parsed value
-/// is `Ok` (paranoid gates nothing there); below the multi floor the
+/// `sysctl_status` outcomes: on a multi-capable kernel a value below 3 is
+/// `Ok` and 3 or above warns unless CAP_SYS_ADMIN is held (the per-probe
+/// self-probe and live-discovery probes); below the multi floor the
 /// restrictive range warns exactly as before.
 fn paranoid_status(
     read: std::io::Result<String>,
@@ -442,8 +493,20 @@ fn paranoid_status(
         Ok(content) => {
             let trimmed = content.trim();
             match trimmed.parse::<i64>() {
+                Ok(v) if v >= crate::uretprobe_hazard::PERF_OPEN_RESTRICT_PARANOID => {
+                    let limit = "does not gate static uprobe-multi links, but refuses every \
+                                 perf_event_open without CAP_SYS_ADMIN (CAP_PERFMON does not \
+                                 lift it): the uretprobe self-probe (--cgroup, --system, run, \
+                                 confined --pid targets) and live-discovery loader/export probes";
+                    if held_sysadmin {
+                        Status::Ok(format!("{v} — {limit}; this process has CAP_SYS_ADMIN"))
+                    } else {
+                        Status::Warn(format!("{v} — {limit} need CAP_SYS_ADMIN"))
+                    }
+                }
                 Ok(v) => Status::Ok(format!(
-                    "{v} — does not limit uprobe-multi attach; CAP_BPF+CAP_PERFMON suffice"
+                    "{v} — does not limit uprobe attach for CAP_PERFMON; CAP_BPF+CAP_PERFMON \
+                     suffice"
                 )),
                 Err(_) => Status::Warn(format!("{trimmed}: unparsable value")),
             }
@@ -676,8 +739,15 @@ fn uretprobe_seccomp_check() -> Check {
         crate::uretprobe_hazard::KernelVerdict::Unknown(why) => {
             Status::Warn(format!("could not be determined: {why}"))
         }
+        // DR-K8S-3: the same fact-based cause the capture's refusal names
+        // (a restrictive perf_event_paranoid, a dropped CAP_SYS_ADMIN), never
+        // a blanket "rerun with sudo".
         crate::uretprobe_hazard::KernelVerdict::NotPermitted(why) => Status::Warn(format!(
-            "not assessed: this process may not load BPF ({why}); rerun doctor with sudo"
+            "not assessed: {}",
+            crate::uretprobe_hazard::not_permitted_message(
+                &why,
+                crate::uretprobe_hazard::PrivilegeFacts::current(),
+            )
         )),
     };
     Check {
@@ -1231,7 +1301,12 @@ fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
             && row_ok("host program preflight"),
         target_readable,
         lifecycle: row_ok("lifecycle preflight"),
-        scope: row_ok("scope preflight"),
+        // A requested --pid lane refused for its PID namespace is not a
+        // preflighted scope, whatever the filter publication proved.
+        scope: row_ok("scope preflight")
+            && !checks.iter().any(|check| {
+                is_pid_namespace_row(&check.name) && matches!(check.status, Status::Fail(_))
+            }),
     })
 }
 
@@ -1283,6 +1358,11 @@ fn verdict_line(checks: &[Check]) -> String {
             Status::Fail(detail) => parts.push(format!("cgroup scope unavailable ({detail})")),
             _ => parts.push("cgroup scope available".to_string()),
         }
+    }
+    if let Some(check) = checks.iter().find(|c| is_pid_namespace_row(&c.name))
+        && let Status::Warn(detail) | Status::Fail(detail) = &check.status
+    {
+        parts.push(format!("PID scope unavailable ({detail})"));
     }
     if let Some(check) = checks.iter().find(|c| is_run_capture_row(&c.name)) {
         match &check.status {
@@ -1340,7 +1420,8 @@ pub fn verdict(checks: &[Check]) -> i32 {
             || is_target_row(&c.name)
             || is_scan_row(&c.name)
             || is_cgroup_row(&c.name)
-            || is_run_capture_row(&c.name))
+            || is_run_capture_row(&c.name)
+            || is_pid_namespace_row(&c.name))
             && matches!(c.status, Status::Fail(_))
     });
     if gated { 1 } else { 0 }
@@ -2124,10 +2205,19 @@ mod tests {
     /// this to infer requested lanes without a parameter of its own.
     #[test]
     fn probe_marks_unrequested_lanes_not_applicable_and_never_fails_them() {
+        fn by_name_status<'a>(checks: &'a [Check], name: &str) -> &'a Status {
+            &checks.iter().find(|c| c.name == name).unwrap().status
+        }
         let checks = probe(None, None);
         // 13 host/target rows, eight §10.1 rows, three finite preflight rows,
-        // the cgroup version row, and the uprobe-multi self-link row.
-        assert_eq!(checks.len(), 26, "{checks:?}");
+        // the cgroup version row, the uprobe-multi self-link row, and the
+        // PID namespace row.
+        assert_eq!(checks.len(), 27, "{checks:?}");
+        // Never FAIL without --pid: a nested observer only warns here.
+        assert!(!matches!(
+            by_name_status(&checks, PID_NAMESPACE_ROW),
+            Status::Fail(_)
+        ));
         let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
         assert_eq!(
             by_name("/proc/<pid>/maps").status,
@@ -2487,23 +2577,137 @@ mod tests {
         assert!(matches!(ptrace("3", true), Status::Warn(_)));
     }
 
-    /// F3: on a multi-capable kernel (≥ 6.9) a restrictive paranoid does
-    /// not limit uprobe-multi attach, so the row is `Ok` even without
-    /// `CAP_SYS_ADMIN` — and says what suffices instead of warning.
+    /// F3 + DR-K8S-3: on a multi-capable kernel (≥ 6.9) paranoid does not
+    /// gate static uprobe-multi links, but at 3 or above it refuses every
+    /// `perf_event_open` without CAP_SYS_ADMIN — and the uretprobe
+    /// self-probe and live-discovery probes attach through it. So the row
+    /// warns there unless CAP_SYS_ADMIN is held, and never claims that
+    /// CAP_BPF+CAP_PERFMON suffice.
     #[test]
-    fn paranoid_row_does_not_warn_on_multi_capable_kernels() {
-        let status = paranoid_status(
-            Ok("4\n".into()),
-            "/proc/sys/kernel/perf_event_paranoid",
-            false,
-            true,
-        );
-        let Status::Ok(detail) = status else {
-            panic!("paranoid must not warn on multi kernels: {status:?}");
+    fn paranoid_row_on_multi_kernels_names_what_still_needs_cap_sys_admin() {
+        let row = |value: &str, held| {
+            paranoid_status(
+                Ok(value.into()),
+                "/proc/sys/kernel/perf_event_paranoid",
+                held,
+                true,
+            )
         };
-        assert!(detail.starts_with("4 — "), "{detail}");
-        assert!(detail.contains("uprobe-multi"), "{detail}");
-        assert!(detail.contains("CAP_BPF+CAP_PERFMON suffice"), "{detail}");
+        for value in ["3\n", "4\n"] {
+            let Status::Warn(detail) = row(value, false) else {
+                panic!(
+                    "paranoid {value:?} without CAP_SYS_ADMIN must warn: {:?}",
+                    row(value, false)
+                );
+            };
+            assert!(
+                detail.starts_with(&format!("{} — ", value.trim())),
+                "{detail}"
+            );
+            assert!(detail.contains("uprobe-multi"), "{detail}");
+            assert!(detail.contains("uretprobe self-probe"), "{detail}");
+            assert!(detail.contains("need CAP_SYS_ADMIN"), "{detail}");
+            assert!(!detail.contains("suffice"), "{detail}");
+            let Status::Ok(detail) = row(value, true) else {
+                panic!(
+                    "CAP_SYS_ADMIN lifts paranoid {value:?}: {:?}",
+                    row(value, true)
+                );
+            };
+            assert!(
+                detail.contains("this process has CAP_SYS_ADMIN"),
+                "{detail}"
+            );
+        }
+        for value in ["-1\n", "0\n", "1\n", "2\n"] {
+            let Status::Ok(detail) = row(value, false) else {
+                panic!(
+                    "paranoid {value:?} gates nothing for CAP_PERFMON: {:?}",
+                    row(value, false)
+                );
+            };
+            assert!(detail.contains("CAP_BPF+CAP_PERFMON suffice"), "{detail}");
+        }
+        assert!(matches!(row("x\n", false), Status::Warn(_)));
+    }
+
+    /// DR-K8S-1: the `PID namespace` row. Initial is `ok`; a nested or
+    /// unreadable namespace warns (cgroup/system captures stay PARTIAL)
+    /// and FAILs when `--pid` was requested, because that capture is
+    /// refused. The FAIL gates the exit code, names the refusal on the
+    /// verdict line, and keeps the tier below T4.
+    #[test]
+    fn the_pid_namespace_row_refuses_a_requested_pid_scope_outside_the_initial_namespace() {
+        use crate::pidns::{ObserverPidNs, PidNumbering, ProcView};
+        let with = |observer| PidNumbering {
+            observer,
+            proc_view: ProcView::Own,
+        };
+        let initial = pid_namespace_check(&PidNumbering::agreeing(), true);
+        assert_eq!(initial.name, PID_NAMESPACE_ROW);
+        assert!(
+            matches!(&initial.status, Status::Ok(d) if d.starts_with("initial")),
+            "{initial:?}"
+        );
+        let foreign = PidNumbering {
+            observer: ObserverPidNs::Initial,
+            proc_view: ProcView::Foreign("/proc/self: gone".into()),
+        };
+        for numbering in [
+            with(ObserverPidNs::Nested),
+            with(ObserverPidNs::Unknown("gone".into())),
+            foreign.clone(),
+        ] {
+            let observer = &numbering.observer;
+            let Status::Warn(detail) = pid_namespace_check(&numbering, false).status else {
+                panic!("{observer:?} without --pid must warn");
+            };
+            assert!(detail.starts_with(observer.label()), "{detail}");
+            assert!(detail.contains("pid_namespace"), "{detail}");
+            let Status::Fail(detail) = pid_namespace_check(&numbering, true).status else {
+                panic!("{observer:?} with --pid must fail");
+            };
+            assert!(detail.contains("pid-namespace-mismatch"), "{detail}");
+        }
+        let unknown = pid_namespace_check(&with(ObserverPidNs::Unknown("gone".into())), false);
+        let foreign_row = pid_namespace_check(&foreign, false);
+        assert!(
+            matches!(&foreign_row.status, Status::Warn(d) if d.contains("/proc numbering foreign: /proc/self: gone")),
+            "{foreign_row:?}"
+        );
+        assert!(
+            matches!(&unknown.status, Status::Warn(d) if d.contains("(gone)")),
+            "{unknown:?}"
+        );
+
+        let ok_row = |name: &str| Check {
+            name: name.into(),
+            status: Status::Ok("ok".into()),
+        };
+        let mut checks = vec![
+            ok_row("BPF map create"),
+            ok_row(UPROBE_ATTACH_SELF_ROW),
+            ok_row("host program preflight"),
+            ok_row("target readability"),
+            ok_row("lifecycle preflight"),
+            ok_row("scope preflight"),
+            pid_namespace_check(&PidNumbering::agreeing(), true),
+        ];
+        assert_eq!(verdict(&checks), 0);
+        assert_eq!(capability_tier(&checks).tier, CapabilityTier::T4);
+        assert!(!verdict_line(&checks).contains("PID scope"));
+        checks[6] = pid_namespace_check(&with(ObserverPidNs::Nested), false);
+        assert_eq!(verdict(&checks), 0, "a warning does not gate");
+        assert!(
+            verdict_line(&checks).starts_with("verdict: capture available; "),
+            "{}",
+            verdict_line(&checks)
+        );
+        assert!(verdict_line(&checks).contains("PID scope unavailable"));
+        checks[6] = pid_namespace_check(&with(ObserverPidNs::Nested), true);
+        assert_eq!(verdict(&checks), 1, "a refused --pid lane gates");
+        assert_eq!(capability_tier(&checks).tier, CapabilityTier::T3);
+        assert!(verdict_line(&checks).contains("PID scope unavailable"));
     }
 
     /// F3: below the multi floor the per-probe path still needs the old

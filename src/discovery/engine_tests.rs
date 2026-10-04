@@ -7880,6 +7880,9 @@ fn evidence_verdict(
         stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
+        pid_namespace: crate::pidns::PidNamespaceEvidence::of(
+            &crate::pidns::PidNumbering::agreeing(),
+        ),
         p11scope_env: vec![],
         completeness: "UNKNOWN",
     };
@@ -20868,6 +20871,9 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
+        pid_namespace: crate::pidns::PidNamespaceEvidence::of(
+            &crate::pidns::PidNumbering::agreeing(),
+        ),
         p11scope_env: vec![],
         completeness: "UNKNOWN",
     };

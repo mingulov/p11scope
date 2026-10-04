@@ -48,6 +48,7 @@ pub mod manifest_input;
 pub mod mechanism_names;
 pub mod metrics;
 pub mod output;
+pub mod pidns;
 pub mod plan;
 pub mod process;
 pub mod render;

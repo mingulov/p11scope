@@ -220,6 +220,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.registry
     }
 
+    /// Stages one scope-level gap (no caller, module or PID) that
+    /// publishes with the next pass: the run-wide PID-numbering mismatch
+    /// (`pidns::numbering_gap`, review F4) is the only producer.
+    pub(crate) fn note_scope_gap(&mut self, subject: String, reason: String) {
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject,
+            reason,
+            budget: None,
+        });
+    }
+
     // Test seam: production stages only through `scan_pass` (and, from
     // Task 6 C5, the native staging call).
     #[cfg(test)]

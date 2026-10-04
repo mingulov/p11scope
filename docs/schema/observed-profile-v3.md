@@ -11,8 +11,8 @@ v2, and the historical v2-metrics document is not accepted as a v3
 profile. All profile fields documented by
 [`observed-profile-v2.md`](observed-profile-v2.md) remain unchanged except for
 the profile identifier, the `lane` discriminator, the six original additions
-below, the five residual additions (`drain_proven`, `verdict_detail`,
-`uretprobe_override`, `handoff_child_pid`, `p11scope_env`), the stop-gate
+below, the six residual additions (`drain_proven`, `verdict_detail`,
+`uretprobe_override`, `handoff_child_pid`, `p11scope_env`, `pid_namespace`), the stop-gate
 outcome (`stop_quiescence`), the verdict
 classes (`gap_classes` and its three published inputs), and row identity
 (`functions[].target`, `functions[].ordinals`, table linkage `exports`).
@@ -178,7 +178,7 @@ though the start/readiness/end samples hold RSS. `tail_publishes`/
 `tail_skips` count executed versus provably redundant batch-tail
 publications.
 
-## Residual additions: terminal verdict, override, handoff, environment
+## Residual additions: terminal verdict, override, handoff, environment, PID namespace
 
 These fields are always present in every v3 profile, v3-metrics, and terminal
 trace evidence object. Historical documents predate them (see Migration).
@@ -251,6 +251,25 @@ trace evidence object. Historical documents predate them (see Migration).
 - `p11scope_env` is the active value of every capture-visible `P11SCOPE_*`
   switch: `{name, effect, value}` objects, `value` `null` when unset.
   Absent means the narrow default.
+- `pid_namespace` (DR-K8S-1/2) names which PID namespace numbers which
+  PIDs, as exactly `{observer, kernel_pids, proc_pids}`. `observer` is
+  `initial`, `nested`, or `unknown`: the observer's own PID namespace,
+  read from `/proc/self/ns/pid` (initial means the fixed
+  `PROC_PID_INIT_INO` inode; an unreadable or malformed link is `unknown`,
+  never `initial`). `kernel_pids` is always `initial`: PIDs the kernel
+  reports (trace `pid`/`tid`) are initial-namespace PIDs. `proc_pids` is
+  `observer` when the mounted `/proc` numbers processes in the observer's
+  own namespace (`/proc/self` is `getpid()` and `/proc/<getpid()>/status`
+  `NSpid` is exactly `getpid()`), else `foreign` (for example `nsenter -m`
+  without `-p`, or `unshare --pid` without `--mount-proc`): PIDs read from
+  `/proc` (`--pid`, `run`'s child, `handoff_child_pid`, discovery subjects)
+  are in that numbering. The two agree exactly when `observer` is `initial`
+  and `proc_pids` is `observer`. Any other `observer` is the observation
+  cause `pid_namespace`, and `proc_pids: foreign` the cause
+  `proc_namespace_mismatch` (both `lossy`, `concrete_gap`): live discovery
+  keys on kernel PIDs that cannot be resolved through `/proc`. A PID-scoped
+  capture never reaches a document there: it is refused with
+  `pid-namespace-mismatch` (see `docs/usage.md`, PID namespaces).
 
 ## Row identity and export linkage
 
@@ -331,9 +350,9 @@ v2 profiles remain historical. Metrics consumers must dispatch live output on
 `p11scope/observed-profile/v2-metrics` documents remain readable as a
 separate compatibility shape. That shape predates — and therefore lacks —
 `task_uprobe_link_losses`, `abi_refusals`, `semantic_history_drops`,
-`scheduling`, `active_slots` (U-14), the five residual fields above
+`scheduling`, `active_slots` (U-14), the six residual fields above
 (`drain_proven`, `verdict_detail`, `uretprobe_override`, `handoff_child_pid`,
-`p11scope_env`), and `stop_quiescence`.
+`p11scope_env`, `pid_namespace`), and `stop_quiescence`.
 
 A machine-readable JSON Schema for live v3 documents ships beside this file
 (`observed-profile-v3.schema.json`); it pins the closed evidence key sets

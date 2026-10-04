@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result};
 use p11scope::cli::{self, CliError, Command};
 use p11scope::{
     capture, capture_startup_signal_dispositions, doctor, failure_already_reported,
-    failure_exit_code, inspect, inventory, run_owned,
+    failure_exit_code, inspect, inventory, pidns, run_owned,
 };
 
 fn main() {
@@ -83,6 +83,15 @@ fn run() -> Result<i32> {
                 cli::InspectScope::Pid(pid) => format!("inventory --pid {pid}"),
                 cli::InspectScope::System => "inventory --system".to_string(),
             };
+            // DR-K8S-1: the kernel-side PID filter numbers tasks in the
+            // initial PID namespace; a nested observer's --pid would match
+            // nothing, so it is refused by name before anything runs.
+            let observer = pidns::numbering();
+            if matches!(a.scope, cli::InspectScope::Pid(_)) {
+                pidns::require_numbering_agrees(observer, &scope)?;
+            } else if let Some(warning) = pidns::nested_warning(observer) {
+                let _ = writeln!(std::io::stderr(), "{warning}");
+            }
             inventory::run(
                 a.scope,
                 &a.modules,

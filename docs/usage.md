@@ -25,6 +25,7 @@ implementation limits are code contracts, not measurements.
 - [Quickstart](#quickstart)
 - [PKCS #11 versions and interface names](#pkcs-11-versions-and-interface-names)
 - [Privileges, per environment](#privileges-per-environment)
+- [PID namespaces](#pid-namespaces)
 - [Kernel floor and unsupported environments](#kernel-floor-and-unsupported-environments)
 - [Overhead (measured)](#overhead-measured)
 - [The evidence/completeness model](#the-evidencecompleteness-model)
@@ -319,6 +320,9 @@ unsupported instead of accepting and ignoring operator input; use
 `scripts/attach-pod.sh` resolves a pod/container to its host cgroup and runs the
 manifest-free `profile --cgroup` path. It copies no helper or provider into the
 pod. The operator still needs node access and the privileges described below.
+On a node that itself runs in a nested PID namespace (kind, k3d), `--pid` is
+refused and `--cgroup` captures are `PARTIAL` with the cause `pid_namespace`;
+see [PID namespaces](#pid-namespaces).
 
 The application may already have mapped the provider at an unrelated ASLR
 address. That is expected: discovery converts each live table pointer to an
@@ -523,6 +527,11 @@ not prove the final drain (see `evidence.stop_quiescence`).
 22:25:03.791885 pid 431682 tid 431682 sess#1 C_CloseSession → CKR_OK 3.7µs
 EVIDENCE {"table_entries":68,"slots":68,...,"completeness":"COMPLETE"}
 ```
+
+Trace `pid`/`tid` values are the kernel's, numbered in the initial PID
+namespace; they equal the PIDs `/proc` shows only when p11scope runs in that
+namespace, which `evidence.pid_namespace` states (see
+[PID namespaces](#pid-namespaces)).
 
 Every trace ends with the same machine-readable evidence object used by
 profile output. If the ring buffer drops events, it also emits an explicit
@@ -741,9 +750,13 @@ stay `PARTIAL`; `run` itself works, and the verdict line says so). A
 `kernel.yama.ptrace_scope` restriction is `ok` when doctor holds the
 capability that lifts it (`CAP_SYS_PTRACE` for Yama 1-2), as under `sudo`.
 A `kernel.perf_event_paranoid` restriction is `ok` when doctor holds
-`CAP_SYS_ADMIN` on the per-probe path. On the uprobe-multi path, paranoid does
-not gate multi attach; if multi is unsupported and `auto` falls back to
-per-probe links, the per-probe privilege floor applies.
+`CAP_SYS_ADMIN`. At 3 or above (the Debian/Ubuntu level that refuses every
+`perf_event_open` to a process without `CAP_SYS_ADMIN`; `CAP_PERFMON` does not
+lift it) the row warns without `CAP_SYS_ADMIN` on every kernel: static
+uprobe-multi links are not gated, but the uretprobe self-probe and the
+live-discovery loader/export probes are per-probe `perf_event` uprobes
+everywhere. Below 3, `CAP_BPF`+`CAP_PERFMON` suffice. The `PID namespace` row
+is described under [PID namespaces](#pid-namespaces).
 
 | Tier | Proven prefix | Meaning and loss |
 | --- | --- | --- |
@@ -799,9 +812,25 @@ no new privileged experiment.
 | `CAP_SYS_ADMIN` | memory scan | unavailable: `ptrace` | 0 probes planned/attached |
 | `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE` | memory scan | available | 136/136 probes |
 
-On a multi-capable kernel, `CAP_BPF`+`CAP_PERFMON` suffice for uprobe
-attach; `perf_event_paranoid` does not gate it. On the per-probe path a
-restrictive paranoid needs `CAP_SYS_ADMIN` (2026-08-25:
+The `CAP_BPF` + `CAP_PERFMON` multi row is the static probes of an
+unconfined `--pid` target only. It does not mean `CAP_BPF`+`CAP_PERFMON`
+suffice at `perf_event_paranoid >= 3` (DR-K8S-3, measured 2026-10-03 on
+7.0.0-34-generic at paranoid 4, observer running as root with exactly
+`CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH`, as a Kubernetes
+DaemonSet without `CAP_SYS_ADMIN` would):
+
+| Command | Result |
+| --- | --- |
+| `profile --pid` (unconfined SoftHSM2 target, memory scan) | 136/136 probes via uprobe-multi, exact 6 x 100 counts, but `PARTIAL`: live discovery unavailable (`skipped: discovery unavailable`, `loader_discovery.strategies.unavailable: 1`) |
+| `profile --system` (and `--cgroup`, `run`, a confined `--pid` target) | refused before attach: the uretprobe self-probe's `perf_event_open` gets EACCES, and the refusal names `kernel.perf_event_paranoid` and `CAP_SYS_ADMIN` |
+| `doctor` | paranoid row `warn`; `uprobe attach (self)` FAIL; tier T0 |
+
+So, stated plainly: at `perf_event_paranoid >= 3`, capturing needs
+`CAP_SYS_ADMIN` (root normally has it). The self-probe could in principle
+attach through uprobe-multi instead, but the live-discovery probes and the
+`doctor` self-uprobe would still need `perf_event_open`, so that change would
+not remove the requirement; it is not made. On the per-probe path a
+restrictive paranoid needs `CAP_SYS_ADMIN` too (2026-08-25:
 `CAP_BPF`+`CAP_PERFMON` attached 0/136, every failure `perf_event_open`).
 On every kernel, manifest-free scanning of this same-UID non-descendant
 additionally needs `CAP_SYS_PTRACE`. A target that is a descendant of the
@@ -813,6 +842,76 @@ measurements, not a portable promise; run
 
 There is no `CAP_LEASE`, `fs.suid_dumpable=0`, or root-owned trusted exec dir
 requirement.
+
+## PID namespaces
+
+The kernel side numbers every task by its PID in the **initial** PID
+namespace. Everything p11scope reads from `/proc` — the `--pid` argument,
+`run`'s child, inventory callers, discovery subjects — is numbered in the
+PID namespace of the **mounted `/proc`**, normally the observer's own. On a
+host, in a container started with the host PID namespace
+(`docker run --pid=host`), and in a Kubernetes pod with `hostPID: true` on a
+real node, all of these are the same namespace and every command prints the
+same PIDs.
+
+An observer in a **nested** PID namespace — a kind or k3d node (whose "host"
+PID namespace is itself a child of the real one), sysbox, or a container
+without the host PID namespace — sees different numbers than the kernel.
+The same mismatch arises when the mounted `/proc` belongs to another
+namespace than the observer's: `nsenter -t <pid> -m` without `-p` keeps an
+initial-namespace observer but serves the container's `/proc` (its PIDs
+would never match the kernel's), and `unshare --pid` without
+`--mount-proc` serves the host's `/proc` to a nested observer. p11scope
+detects both halves:
+
+- the observer's own namespace from `/proc/self/ns/pid` (the initial
+  namespace has the fixed inode `4026531836`, `PROC_PID_INIT_INO`; an
+  unreadable or malformed link counts as not initial);
+- the mounted `/proc`: `/proc/self` must resolve to `getpid()` and
+  `/proc/<getpid()>/status` must list exactly `getpid()` as `NSpid`;
+  anything else (`/proc/self` missing, another number, an ancestor's
+  multi-level `NSpid`) is a foreign `/proc`.
+
+Either mismatch is treated alike, fail-closed. The second direction
+(`unshare --pid` without `--mount-proc`) is refused even though the stale
+host `/proc` would in fact name the kernel's PIDs: the refusal costs
+availability, never honesty. Then p11scope:
+
+- **refuses every PID-scoped capture** — `profile`/`trace`/`metrics --pid`,
+  `run`, and `inventory --pid` — before anything is scanned or attached,
+  with an error that starts `pid-namespace-mismatch:`. Without this the
+  kernel-side PID filter would never match and the capture would read zero
+  calls while claiming exact observation;
+- lets **`--cgroup` and `--system`** captures run — their kernel filter does
+  not depend on PID numbering, so it matches correctly, and providers that
+  were attached count correctly — but marks the observation `lossy` with the
+  cause `pid_namespace` (nested observer) and/or `proc_namespace_mismatch`
+  (foreign `/proc`), `verdict_detail: concrete_gap`: live discovery keys on
+  kernel PIDs that cannot be resolved through `/proc`, so a provider loaded
+  mid-capture can be missed and its calls go uncounted. A stderr warning
+  says the same;
+- gives `inventory --system` one scope-level gap (`subject: "pid
+  namespace"`), so its `gaps[]` is never empty there;
+- names both numberings in every document: capture evidence, the inventory
+  document and the `inspect --system` document carry
+  `"pid_namespace": {"observer": "initial" | "nested" | "unknown",
+  "kernel_pids": "initial", "proc_pids": "observer" | "foreign"}`.
+  `kernel_pids` are the PIDs the kernel reports (trace `pid`/`tid` lines);
+  `proc_pids` are the PIDs read through `/proc` (`--pid`, `run`'s child,
+  `handoff_child_pid`, inventory `callers[].pid`, inspect `processes`,
+  discovery subjects), `foreign` when the mounted `/proc` is not the
+  observer's own. They are the same numbers exactly when `observer` is
+  `initial` and `proc_pids` is `observer`;
+- `doctor` shows a `PID namespace` row: `ok` in the initial namespace with
+  its own `/proc`, `warn` otherwise, and `FAIL` (exit 1, tier below T4,
+  `PID scope unavailable` on the verdict line) when `--pid` was requested.
+
+To capture by PID from a nested environment, run p11scope in the real host's
+initial PID namespace with its own `/proc` instead (`nsenter` needs `-p`
+with `-m`, `unshare --pid` needs `--mount-proc`), or capture the target's
+cgroup. `scripts/matrix/verify-pidns.sh` reproduces all of this without kind:
+`unshare --pid --fork --mount-proc` for a nested observer, and
+`unshare --mount` with a foreign `/proc` for the stale-`/proc` case.
 
 ## Kernel floor and unsupported environments
 

@@ -844,6 +844,12 @@ pub struct Evidence {
     /// residual F-15). `Some` exactly when the `run` lane left its owned
     /// child running — the operator's own child, nameable, exit still 0.
     pub handoff_child_pid: Option<u32>,
+    /// Which PID namespace numbers which PIDs (DR-K8S-1/2): the observer's
+    /// own (`initial`, `nested`, `unknown`), kernel-reported PIDs (always
+    /// `initial`), and `/proc`-read PIDs (always the observer's). Anything
+    /// but an `initial` observer is an observation gap (`pid_namespace`):
+    /// live discovery keys on kernel PIDs this observer cannot resolve.
+    pub pid_namespace: crate::pidns::PidNamespaceEvidence,
     /// Active values of every capture-visible `P11SCOPE_*` switch
     /// ([`P11SCOPE_ENV_VARS`]), so the document says which behavior
     /// switches were live (SYSPLAN residual F-26).
@@ -1308,6 +1314,21 @@ impl Evidence {
         // D1: a poisoned owner or refused identity/root accounting halts or
         // thins capture in the kernel; it is loss, never attribution.
         cause(o, "kernel_control", !self.kernel_control.complete());
+        // DR-K8S-1/2: outside the initial PID namespace the kernel's PIDs
+        // cannot be resolved through this observer's /proc, so every live
+        // discovery keyed on them is unproven.
+        cause(
+            o,
+            "pid_namespace",
+            !self.pid_namespace.observer_is_initial(),
+        );
+        // M1: an initial observer reading another namespace's /proc
+        // (`nsenter -m` without `-p`) resolves kernel PIDs no better.
+        cause(
+            o,
+            "proc_namespace_mismatch",
+            !self.pid_namespace.proc_is_own(),
+        );
         // Live discovery (design §5.7, §9.1, §9.2).
         cause(
             o,
@@ -1734,6 +1755,13 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "abi_refusals" => count(ev.abi_refusals, "ABI probe hits refused"),
             "malformed_records" => count(ev.malformed_records, "malformed records"),
             "provider_changed" => "provider changed".to_string(),
+            "proc_namespace_mismatch" => {
+                "/proc numbering foreign: kernel PIDs unresolvable".to_string()
+            }
+            "pid_namespace" => format!(
+                "observer PID namespace {}: kernel PIDs unresolvable",
+                ev.pid_namespace.observer
+            ),
             "unprotected_live_windows" => "unprotected live window".to_string(),
             "discovery_ring_loss" => count(ev.discovery_ring_loss, "discovery records lost"),
             "discovery_state_failures" => {
@@ -2519,6 +2547,9 @@ pub(crate) mod tests {
             stdout_data_sink: false,
             uretprobe_override: None,
             handoff_child_pid: None,
+            pid_namespace: crate::pidns::PidNamespaceEvidence::of(
+                &crate::pidns::PidNumbering::agreeing(),
+            ),
             p11scope_env: vec![],
             completeness: "UNKNOWN",
         }
@@ -3131,6 +3162,76 @@ pub(crate) mod tests {
         ev.verdict();
         assert_eq!(ev.gap_classes.semantics.status, "not_applicable");
         assert_eq!(ev.verdict_detail, VERDICT_ATTRIBUTION_ONLY);
+    }
+
+    /// DR-K8S-1/2: an observer outside the initial PID namespace cannot
+    /// resolve the kernel's PIDs, so its live discovery is unproven and the
+    /// observation is never exact — the cause names it, the line says why,
+    /// and the evidence names both numberings.
+    #[test]
+    fn an_observer_outside_the_initial_pid_namespace_is_never_exact() {
+        use crate::pidns::{ObserverPidNs, PidNamespaceEvidence, PidNumbering, ProcView};
+        let mut clean = evidence();
+        clean.verdict();
+        assert!(clean.gap_classes.observation.causes.is_empty());
+        assert_eq!(
+            serde_json::to_value(&clean).unwrap()["pid_namespace"],
+            serde_json::json!({"observer": "initial", "kernel_pids": "initial", "proc_pids": "observer"})
+        );
+        for observer in [ObserverPidNs::Nested, ObserverPidNs::Unknown("x".into())] {
+            let mut ev = evidence();
+            ev.pid_namespace = PidNamespaceEvidence::of(&PidNumbering {
+                observer: observer.clone(),
+                proc_view: ProcView::Own,
+            });
+            ev.verdict();
+            assert_eq!(ev.gap_classes.observation.status, "lossy", "{observer:?}");
+            assert_eq!(ev.gap_classes.observation.causes, ["pid_namespace"]);
+            assert_eq!(ev.completeness, "PARTIAL");
+            assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+            assert_eq!(
+                serde_json::to_value(&ev).unwrap()["pid_namespace"]["observer"],
+                observer.label()
+            );
+            let reasons = verdict_reasons(&ev);
+            assert!(
+                reasons.contains(&format!(
+                    "observation lossy (observer PID namespace {}",
+                    observer.label()
+                )),
+                "{reasons}"
+            );
+        }
+    }
+
+    /// M1 (review): an initial observer reading another namespace's /proc
+    /// (`nsenter -m` without `-p`) is the cause `proc_namespace_mismatch`;
+    /// a nested observer on a stale host /proc carries both causes.
+    #[test]
+    fn a_foreign_proc_is_never_exact_either() {
+        use crate::pidns::{ObserverPidNs, PidNamespaceEvidence, PidNumbering, ProcView};
+        for (observer, causes) in [
+            (ObserverPidNs::Initial, vec!["proc_namespace_mismatch"]),
+            (
+                ObserverPidNs::Nested,
+                vec!["pid_namespace", "proc_namespace_mismatch"],
+            ),
+        ] {
+            let mut ev = evidence();
+            ev.pid_namespace = PidNamespaceEvidence::of(&PidNumbering {
+                observer,
+                proc_view: ProcView::Foreign("/proc/self: gone".into()),
+            });
+            ev.verdict();
+            assert_eq!(ev.gap_classes.observation.status, "lossy");
+            assert_eq!(ev.gap_classes.observation.causes, causes);
+            assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
+            assert_eq!(
+                serde_json::to_value(&ev).unwrap()["pid_namespace"]["proc_pids"],
+                "foreign"
+            );
+            assert!(verdict_reasons(&ev).contains("/proc numbering foreign"));
+        }
     }
 
     /// A NULL function-table entry cannot be called, so no call is missed

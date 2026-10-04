@@ -8584,6 +8584,9 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         stdout_data_sink: false,
         uretprobe_override: None,
         handoff_child_pid: None,
+        pid_namespace: p11scope::pidns::PidNamespaceEvidence::of(
+            &p11scope::pidns::PidNumbering::agreeing(),
+        ),
         p11scope_env: vec![],
         completeness: "UNKNOWN",
     };

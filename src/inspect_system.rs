@@ -1723,6 +1723,9 @@ fn render_json(catalog: &Catalog) -> serde_json::Value {
         },
         "skipped": catalog.skipped.iter().map(gap_json).collect::<Vec<_>>(),
         "notes": catalog.notes.iter().map(gap_json).collect::<Vec<_>>(),
+        // F3 (review): the same PID-numbering disclosure as capture evidence
+        // and inventory; every PID here is read through /proc.
+        "pid_namespace": crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
     });
     if let Some(explanation) = &catalog.explanation {
         document["explanation"] = serde_json::Value::String(explanation.clone());
@@ -3082,6 +3085,9 @@ mod tests {
         catalog.relationships = build_relationships(&catalog.objects);
         let document = render_json(&catalog);
         assert_eq!(document["schema"], DOC_ID);
+        // F3: the same PID-numbering object as capture evidence and inventory.
+        assert_eq!(document["pid_namespace"]["kernel_pids"], "initial");
+        assert!(document["pid_namespace"]["observer"].is_string());
         let mut stack = vec![&document];
         let mut keys = Vec::new();
         while let Some(value) = stack.pop() {

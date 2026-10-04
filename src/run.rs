@@ -1756,6 +1756,9 @@ fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Du
 pub fn capture(a: &CaptureArgs) -> Result<()> {
     let kind = a.kind;
     let policy = capture_policy(kind, a.metrics, a.unsafe_requested)?;
+    if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
+        eprintln!("{warning}");
+    }
     let (scope, named_view) = match &a.scope {
         ScopeArg::Pid(p) => {
             let view = ProcessView::open(ProcessViewId(0), *p)
@@ -2560,6 +2563,9 @@ fn stop_signal_name(signal: libc::c_int) -> String {
 
 fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOutcome> {
     let policy = capture_policy(args.kind, args.metrics, args.unsafe_requested)?;
+    // DR-K8S-1: `run` is a PID scope over its own child, numbered in this
+    // observer's namespace; refuse before anything is forked.
+    crate::pidns::require_numbering_agrees(crate::pidns::numbering(), "run")?;
     warn_unsafe_policy(policy);
     let mut command = args.command.iter().cloned();
     let program = command
@@ -2805,10 +2811,27 @@ fn preflight_uretprobe_hazard(target: Option<u32>, overridden: bool) -> Result<O
              seccomp` verdict)"
         )),
         // HIGH-1: missing privilege is not a hazard; the override is not offered.
-        uretprobe_hazard::Action::NotPermitted(why) => Err(anyhow!(
-            uretprobe_hazard::not_permitted_message(&why, unsafe { libc::geteuid() } == 0)
-        )),
+        uretprobe_hazard::Action::NotPermitted(why) => {
+            Err(anyhow!(uretprobe_hazard::not_permitted_message(
+                &why,
+                uretprobe_hazard::PrivilegeFacts::current()
+            )))
+        }
     }
+}
+
+/// DR-K8S-1: a PID scope is refused unless `/proc` PIDs are proven to be the
+/// kernel's (`pid-namespace-mismatch`), before anything is discovered or
+/// attached; any other scope proceeds, with the stderr warning that its
+/// evidence (`pid_namespace`, an observation gap) backs.
+fn pid_namespace_preflight(
+    scope: &ScopeArg,
+    numbering: &crate::pidns::PidNumbering,
+) -> Result<Option<String>> {
+    if let ScopeArg::Pid(pid) = scope {
+        crate::pidns::require_numbering_agrees(numbering, &format!("--pid {pid}"))?;
+    }
+    Ok(crate::pidns::nested_warning(numbering))
 }
 
 /// Zero modules is not an error; point the operator at the discovery diagnostics.
@@ -6698,6 +6721,7 @@ fn evidence_for(
         stdout_data_sink: false,
         uretprobe_override,
         handoff_child_pid,
+        pid_namespace: crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
         p11scope_env: render::snapshot_process_env(),
         completeness: "UNKNOWN",
     };
@@ -14155,6 +14179,54 @@ mod tests {
 
         assert_eq!(state.first_signal(), Some(libc::SIGTERM));
         assert_eq!(state.sigint_deliveries(), 2);
+    }
+
+    /// DR-K8S-1: outside the initial PID namespace `--pid` is refused by
+    /// name before discovery; cgroup and system proceed with the warning.
+    /// In the initial namespace every scope proceeds silently.
+    #[test]
+    fn a_pid_scope_outside_the_initial_pid_namespace_is_refused_by_name() {
+        use crate::pidns::{ObserverPidNs, PidNumbering, ProcView};
+        let scopes = [
+            ScopeArg::Pid(42),
+            ScopeArg::Cgroup("/sys/fs/cgroup/x".into()),
+            ScopeArg::System,
+        ];
+        for scope in &scopes {
+            assert_eq!(
+                pid_namespace_preflight(scope, &PidNumbering::agreeing()).unwrap(),
+                None,
+                "{scope:?}"
+            );
+        }
+        let mismatches = [
+            PidNumbering {
+                observer: ObserverPidNs::Nested,
+                proc_view: ProcView::Own,
+            },
+            PidNumbering {
+                observer: ObserverPidNs::Unknown("gone".into()),
+                proc_view: ProcView::Own,
+            },
+            // M1: initial observer, foreign /proc (`nsenter -m` without -p).
+            PidNumbering {
+                observer: ObserverPidNs::Initial,
+                proc_view: ProcView::Foreign("/proc/self: gone".into()),
+            },
+        ];
+        for observer in mismatches {
+            let error = pid_namespace_preflight(&scopes[0], &observer).unwrap_err();
+            assert!(
+                format!("{error:#}").starts_with("pid-namespace-mismatch: refusing --pid 42: "),
+                "{error:#}"
+            );
+            for scope in &scopes[1..] {
+                let warning = pid_namespace_preflight(scope, &observer)
+                    .unwrap()
+                    .expect("a non-PID scope proceeds with a warning");
+                assert!(warning.contains("pid_namespace"), "{warning}");
+            }
+        }
     }
 
     /// Finding nothing is not an error, so the only thing that keeps the operator

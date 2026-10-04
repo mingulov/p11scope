@@ -1,8 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Known limitations (v0.2.0)
+# Known limitations (v0.2.1)
 
-User-facing limits of p11scope v0.2.0, cut 2026-10-04 from merged and green
-`s2s3-semantics`. The following move to v0.3.0: C6 (semantics, churn and
+User-facing limits of p11scope v0.2.1, a point release on v0.2.0 (cut
+2026-10-04 from merged and green `s2s3-semantics`). v0.2.1 changes only the
+proof-stat pool threshold and the `-o` JSON write; every measured number
+below, M1 included, was taken on v0.2.0 and a v0.2.1 re-measure is pending. The following move to v0.3.0: C6 (semantics, churn and
 capacity, 30-minute endurance), C5b (cgroup/pod scope, namespace-aware BPF
 filter), C7 (V1 call counts, 2 MiB inventory ring, kernel-side identity,
 allowlist-v3, BPF nightly bump), the full measurement set M2–M7, the full §7
@@ -137,20 +139,34 @@ static-pie). Ranges below are the min..max of per-sample p95.
 - Planned: the 1 s route is v0.3.0 kernel-side identity (C7). M1 at 10,000
   and the ≤15%-over-scan gate move to v0.3.0 with it.
 
-### Proof-stat pool benefit (C5.6 R4) — no gain on 2 physical cores
+### Proof-stat pool benefit (C5.6 R4) — v0.2.1: serial below 128 ranges
 
-- What the user sees: no gain from the bounded per-collection `map_files`
-  proof pool (at most 3 scoped workers) on this host: scan pass p95 at
-  4,096 processes is ~2.30 s with the candidate (warm median 2,309 ms,
-  range 2,282–2,329 ms) against ~2.02 s with the pre-pool build 570eb7d
-  (warm median 2,035 ms, range 2,031–2,087 ms). This is not a clean A/B:
-  570eb7d predates other slices. Do not read it as the pool helping.
+- What the user sees: since v0.2.1 the bounded per-collection `map_files`
+  proof pool (at most 3 scoped workers) engages only for a batch of 128 or
+  more ranges (`MIN_PARALLEL_BATCH`, was 8). Typical per-process batches
+  are 30–45 ranges, so by default a pass behaves like the serial path.
+  Results are identical by construction; only wall time differs. Why: on
+  the author's host (2 physical cores with SMT, Linux 7.0, btrfs; indicative
+  single-host measurements) the channel round-trip per process (~85 us)
+  cost more than the ~114 us of `fstatat` it parallelized. A same-tree
+  ABBA A/B at 4,096 processes measured serial confirm at ~960 ms against
+  ~1,310 ms pooled at 2 CPUs (about 350 ms per pass lost to the pool) and
+  1,700–2,600 ms at 4 CPUs. The M1 pass time above was measured on v0.2.0;
+  a v0.2.1 re-measure is pending and no v0.2.1 number is claimed here.
+- History (v0.2.0): scan pass p95 at 4,096 processes was ~2.30 s with the
+  v0.2.0 candidate (warm median 2,309 ms, range 2,282–2,329 ms) against
+  ~2.02 s with the pre-pool build 570eb7d (warm median 2,035 ms, range
+  2,031–2,087 ms). That was not a clean A/B (570eb7d predates other
+  slices); the later same-tree A/B above is the cleaner answer: the pool
+  did not help on this shape.
 - Kernels/conditions: `--system` with maps-matched callers past the
   deep-scan cap, scan lane on CPUs 8–11 (2 physical cores with SMT), on
-  kernels where `map_files` proofs run.
+  kernels where `map_files` proofs run. The pool can still engage for a
+  process mapping 128 or more examined ranges; its benefit there is not
+  measured.
 - Disclosure: stage timings (`confirm`), this row.
-- Workaround: none; the pool is always on.
-- Planned: measured in the v0.2.0 short tier. Cross-pass caching stays out
+- Workaround: none needed; small batches are serial.
+- Planned: v0.2.1 re-measures M1. Cross-pass caching stays out
   (R-C56-1: inode reuse makes it unsound); kernel-side identity is
   v0.3.0 (C7).
 

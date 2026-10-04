@@ -5,6 +5,31 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
+## [0.2.1] - 2026-10-05
+
+Performance point release on v0.2.0: two fixes, no schema, flag or report
+change. The measurements below are indicative single-host numbers (2
+physical cores with SMT, Linux 7.0, btrfs), not guarantees. See
+[docs/known-limitations.md](docs/known-limitations.md).
+
+### Fixed
+
+- `inventory -o <out.json>` now buffers the JSON write. A 4,096-process run
+  issued about 557,000 `write` calls for the output file and now issues about
+  2,100; the pause at the end of a run before the process exits dropped from
+  about 3.5 s to about 0.1 s on that host. The document is unchanged.
+
+### Changed
+
+- The proof-stat pool (the bounded `map_files` identity-proof workers) now
+  engages only for a batch of 128 or more ranges, up from 8. Typical
+  per-process batches are 30-45 ranges, so by default a pass behaves like the
+  serial path. On that host the pool's per-process channel round-trips cost
+  about 350 ms per 4,096-process pass at 2 CPUs and more at 4 CPUs, more than
+  the `fstatat` work they parallelized. Results are identical by
+  construction; only wall time changes. The M1 pass time in the known
+  limitations was measured on v0.2.0; a v0.2.1 re-measure is pending.
+
 ## [0.2.0] - 2026-10-04
 
 Module/caller inventory and usage observation, Kubernetes deployment, and

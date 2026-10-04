@@ -988,18 +988,12 @@ pub(crate) fn generation_gone(pid: u32) -> bool {
     gone_from(process_start_time(pid))
 }
 
-/// True when `pid` names a zombie: the generation exited but its parent
-/// has not reaped it, so `/proc/<pid>/stat` still parses while the
-/// process is dead. Any read or parse failure answers false — an
-/// unreadable pid is merely unknown here, and `generation_gone` covers
-/// the reaped case. The inventory adapter treats zombies as exited:
-/// without this, an unreaped target (the observer is often its parent)
-/// re-admits every pass under a fresh caller ID.
 /// The whole `/proc/<pid>/stat` in (almost always) one `read`:
 /// `read_to_string` grows from 32 bytes, so it issues ~5 tiny reads per
 /// stat (~13 us vs ~10 us measured, exp-pass-profile). Same bytes on
 /// success — a stat bigger than the buffer falls back to `read_to_end` —
-/// and the same `InvalidData` on non-UTF-8.
+/// and the same `InvalidData` on non-UTF-8 and `NotFound` for a reaped
+/// pid (exit detection in `gone_from`).
 fn read_proc_stat(pid: u32) -> io::Result<String> {
     use std::io::Read as _;
     const STAT_BUF_BYTES: usize = 4096;
@@ -1007,7 +1001,12 @@ fn read_proc_stat(pid: u32) -> io::Result<String> {
     let mut buf = [0u8; STAT_BUF_BYTES];
     let mut len = 0;
     loop {
-        let n = file.read(&mut buf[len..])?;
+        // `read_to_string` retries an interrupted read; so does this.
+        let n = match file.read(&mut buf[len..]) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if n == 0 {
             break;
         }
@@ -1025,6 +1024,13 @@ fn read_proc_stat(pid: u32) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stat utf8"))
 }
 
+/// True when `pid` names a zombie: the generation exited but its parent
+/// has not reaped it, so `/proc/<pid>/stat` still parses while the
+/// process is dead. Any read or parse failure answers false — an
+/// unreadable pid is merely unknown here, and `generation_gone` covers
+/// the reaped case. The inventory adapter treats zombies as exited:
+/// without this, an unreaped target (the observer is often its parent)
+/// re-admits every pass under a fresh caller ID.
 pub(crate) fn process_is_zombie(pid: u32) -> bool {
     let Ok(stat) = read_proc_stat(pid) else {
         return false;

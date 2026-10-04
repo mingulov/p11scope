@@ -5,7 +5,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [0.2.0] - UNRELEASED
+## [0.2.0] - 2026-10-04
 
 Module/caller inventory and usage observation, Kubernetes deployment, and
 fail-closed PID-namespace and privilege handling. See
@@ -241,11 +241,15 @@ export CARGO_BUILD_JOBS=4 TMPDIR=/var/tmp/p11scope-ws-tmp
 scripts/qualify-release-matrix.sh --rev <RC> --bin-dir /home/user/.cache/p11scope-vng/rc-qualify-bins-<RC>
 ```
 
-Still to land: the short measurement tier (M0, M1 at 4,096 processes, M4
-churn, C5.6 pool — `TBD-MEASURED` in
-[docs/known-limitations.md](docs/known-limitations.md) until they land).
-Explicitly out of scope for v0.2.0: a long soak and a v0.1.0 comparison
-(see [docs/known-limitations.md](docs/known-limitations.md)).
+The short measurement tier landed on release day: M0 PASS (29 of 29 units
+valid); M1 pass p95 ~0.34 s at 448 processes and ~2.20 s at 4,096 in
+both lanes, over the 1 s target at 4,096; M4 lossless at 100 exec/s and
+~100 ring records/min lost at 1,000 exec/s (448 processes, native lane);
+C5.6 pool with no gain on 2 physical cores (not a clean A/B: 012807c
+predates other slices). See
+[docs/known-limitations.md](docs/known-limitations.md) for the numbers
+and method. Explicitly out of scope for v0.2.0: a long soak and a v0.1.0
+comparison (see [docs/known-limitations.md](docs/known-limitations.md)).
 
 ## [0.1.0]
 

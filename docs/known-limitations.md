@@ -9,8 +9,12 @@ allowlist-v3, BPF nightly bump), the full measurement set M2–M7, the full §7
 deferred closure, and the §8 Fable audit.
 
 A short measurement tier (M0, M1 at 4,096 processes, M4 churn, and the C5.6
-pool) runs later on release day. Where those numbers go, this document reads
-`TBD-MEASURED` until they land.
+pool) ran on release day; its numbers are in the M0, M1, M4 and R4 rows
+below. Method for every row: Linux 7.0 x86-64, observer pinned to CPUs
+10,11 (R4: 8–11), 3 cold + 6 warm samples per cell (M4: 3 + 3), each a
+30 s run (M4: 60 s), in a quiet window (load gate 4.0), on the v0.2.0
+candidate c837a19 (glibc release build; the shipped observer is musl
+static-pie). Ranges below are the min..max of per-sample p95.
 
 ## Kernels and backends
 
@@ -111,41 +115,57 @@ pool) runs later on release day. Where those numbers go, this document reads
 
 ## System scale and performance
 
-### Pass time at 4,096 processes (M1) — `TBD-MEASURED`
+### Pass time at 4,096 processes (M1) — 2.20 s p95, over the 1 s target
 
-- What the user sees: `TBD-MEASURED`: native pass p95 at 4,096 processes
-  (300/1,000 callers), scan-vs-native delta, longest indivisible operation,
-  newcomer admission age, RSS and FDs.
+- What the user sees: a 4,096-process / 1,000-caller `--system` pass takes
+  about 2.20 s in both lanes (pass p95, warm-cell medians: native
+  2,202 ms, range 2,184–2,248 ms; scan 2,204 ms, range 2,198–2,708 ms,
+  including one slow sample at 2,708 ms). Native adds no measurable cost
+  over scan. At 448 processes / 300 callers the pass p95 is about 0.34 s
+  in both lanes (native 337 ms, range 335–558 ms, including one sample at
+  558 ms beside elevated host load; scan 335 ms, range 332–340 ms). At
+  4,096 the longest stage is confirm (identity proofs) at ~1.59 s, then
+  sweep at ~0.56 s. RSS peaks at ~69 MiB (native) / ~59 MiB (scan) at
+  4,096 and ~40 MiB / ~18 MiB at 448; FDs peak at 1,051 / 1,012 and
+  350 / 312. Newcomer admission age was not measured in this tier. The
+  < 1 s target at 4,096 is not met.
 - Kernels/conditions: `--system --capture scan` and `native` at 448 / 4,096
-  processes, churn 0, interleaved cold/warm pairs.
+  processes, churn 0, 3 cold + 6 warm 30 s samples per cell.
 - Disclosure: `P11SCOPE_STAGE_TIMINGS=1` per-pass stage timings, the
-  `observation` block, and this document once measured.
-- Workaround: narrow scope (`--pid`, `--module`) until the numbers land.
-- Planned: v0.2.0 short tier (M1 at 4,096). M1 at 10,000 and the
-  ≤15%-over-scan gate move to v0.3.0 with kernel-side identity (C7).
+  `observation` block, and this row.
+- Workaround: narrow scope (`--pid`, `--module`).
+- Planned: the 1 s route is v0.3.0 kernel-side identity (C7). M1 at 10,000
+  and the ≤15%-over-scan gate move to v0.3.0 with it.
 
-### Proof-stat pool benefit (C5.6 R4) — `TBD-MEASURED`
+### Proof-stat pool benefit (C5.6 R4) — no gain on 2 physical cores
 
-- What the user sees: `TBD-MEASURED`: the bounded per-collection `map_files`
-  proof pool (at most 3 scoped workers) against the unpooled baseline at
-  4,096 processes. Pre-pool, a 4,096-process pass took about 1.7 s on
-  2 cores (over the 1 s cadence) from ~40k `map_files` proofs.
+- What the user sees: no gain from the bounded per-collection `map_files`
+  proof pool (at most 3 scoped workers) on this host: scan pass p95 at
+  4,096 processes is ~2.30 s with the candidate (warm median 2,309 ms,
+  range 2,282–2,329 ms) against ~2.02 s with the pre-pool build 012807c
+  (warm median 2,035 ms, range 2,031–2,087 ms). This is not a clean A/B:
+  012807c predates other slices. Do not read it as the pool helping.
 - Kernels/conditions: `--system` with maps-matched callers past the
-  deep-scan cap, on kernels where `map_files` proofs run.
-- Disclosure: stage timings (`confirm`), this document once measured.
+  deep-scan cap, scan lane on CPUs 8–11 (2 physical cores with SMT), on
+  kernels where `map_files` proofs run.
+- Disclosure: stage timings (`confirm`), this row.
 - Workaround: none; the pool is always on.
-- Planned: v0.2.0 short tier. Cross-pass caching stays out (R-C56-1:
-  inode reuse makes it unsound); kernel-side identity is v0.3.0 (C7).
+- Planned: measured in the v0.2.0 short tier. Cross-pass caching stays out
+  (R-C56-1: inode reuse makes it unsound); kernel-side identity is
+  v0.3.0 (C7).
 
-### Harness validity (M0) — `TBD-MEASURED`
+### Harness validity (M0) — PASS
 
-- What the user sees: `TBD-MEASURED`: the harness must distinguish correct
-  capture, loss/refusal, and missing samples on a ledgered SoftHSM2
-  `--pid` cell, an induced-loss cell, and a killed-sampler cell.
-- Kernels/conditions: release binary, quiet host.
+- What the user sees: PASS: all 5 legs classified as expected (29 of 29
+  tier-1 units valid): a correct ledgered SoftHSM2 `--pid` capture, an
+  induced-loss cell (3,000 exec/s) read as lossy, a killed-sampler cell
+  read as missing, a dead-pid refusal read as refused, and a correct
+  no-observer control.
+- Kernels/conditions: candidate binary, quiet host, one 30 s sample per
+  leg (64-process cells; loss and control in the host namespace).
 - Disclosure: campaign receipt; invalid runs are kept with reasons.
 - Workaround: none.
-- Planned: v0.2.0 short tier.
+- Planned: landed in the v0.2.0 short tier.
 
 ### 10,000-process cadence
 
@@ -212,23 +232,27 @@ pool) runs later on release day. Where those numbers go, this document reads
 
 ## Capture loss and coverage
 
-### Lifecycle ring loss under exec churn (M4) — `TBD-MEASURED`
+### Lifecycle ring loss under exec churn (M4) — clean at 100 exec/s, ~100/min lost at 1,000
 
-- What the user sees: `TBD-MEASURED`: `COUNTERS[0]` rise/min, share of
-  passes with `health_unproven`, and watch demotions/min at 0/100/1,000
-  exec/s on 448 and 4,096 processes. Pre-tier evidence: 1,000 exec/s loses
-  47–171 records/run; the 64 KiB ring holds about 70 920-byte records, and
-  the lane does not drain while a pass applies its scan, attaches entries,
-  or reads usage.
+- What the user sees: at 448 processes, native lane: 100 exec/s loses
+  nothing (0 lifecycle and 0 ring loss in all 6 samples); 1,000 exec/s
+  loses about 100 ring records per minute (84–117 across 6 samples),
+  demotes 55 edges per minute-long capture with sticky unproven share
+  1.0, and runs 1 recovery rescan per capture. The loss stays disclosed
+  (`health_unproven`, demoted edges, the gap). The 64 KiB ring holds
+  about 70 920-byte records, and the lane does not drain while a pass
+  applies its scan, attaches entries, or reads usage. Churn 0 and
+  4,096-process churn cells were not measured in this tier.
 - Kernels/conditions: `--system --capture native` under unrelated exec
-  churn.
+  churn, 3 cold + 3 warm 60 s samples per cell.
 - Disclosure: `observation.lifecycle` (`records`, `ring_loss`, `malformed`,
   `failed_quanta`, `recovery_rescans`), the `native capture lifecycle
   evidence lost` gap, sticky demotion of `watched_no_use`, and an immediate
   bounded recovery rescan (never two in a row).
 - Workaround: quiet host, narrower scope.
-- Planned: v0.2.0 short tier for the numbers; the lossless fix (2 MiB
-  inventory-only ring) is v0.3.0 (C7 batched verifier/vng campaign).
+- Planned: numbers landed in the v0.2.0 short tier; the lossless fix
+  (2 MiB inventory-only ring) is v0.3.0 (C7 batched verifier/vng
+  campaign).
 
 ### Settlement always `unsettled`
 

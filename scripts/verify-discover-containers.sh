@@ -3,7 +3,7 @@
 # Gate G1: p11scope-discover runs against SoftHSM2 and the deterministic
 # 68/92/104 table fixture in ubuntu (glibc) and alpine (musl). Both helper
 # builds are DYNAMIC (a static helper cannot dlopen providers sanely).
-# The glibc binary is built in rust:1.88.0-bookworm
+# The glibc binary is built in rust:1.98.1-bookworm
 # (glibc 2.36) so it runs on ubuntu 24.04 (2.39) — the host glibc may be
 # newer than the container's, so a host build is not portable.
 #
@@ -16,17 +16,18 @@ cd "$(dirname "$0")/.."
 
 ORACLE=scripts/fixtures/discover-manifest.jq
 SOFTHSM_FUNCTION_RECORDS=68
-# Official registry index digests acquired on 2026-09-08. Each PLATFORM_IMAGE is
-# the single linux/amd64 entry of the index above it, read back from
-# registry-1.docker.io on 2026-09-12 and compared digest-for-digest -- not
-# inferred. Retain Rust 1.88 and Ubuntu 24.04; changing a tag, index or selected
-# platform must not silently change the qualification inputs.
-DISCOVER_GLIBC_BUILD_IMAGE=rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
-DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0
+# Official registry index digests: the Ubuntu pins were acquired on 2026-09-08
+# and the Rust pins on 2026-10-04. Each PLATFORM_IMAGE is the single
+# linux/amd64 entry of the index above it, read back from registry-1.docker.io
+# (Ubuntu on 2026-09-12, Rust on 2026-10-04) and compared digest-for-digest --
+# not inferred. Retain Rust 1.98 and Ubuntu 24.04; changing a tag, index or
+# selected platform must not silently change the qualification inputs.
+DISCOVER_GLIBC_BUILD_IMAGE=rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
 DISCOVER_GLIBC_RUN_IMAGE=ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 DISCOVER_GLIBC_RUN_PLATFORM_IMAGE=ubuntu:noble-20260810@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
-DISCOVER_MUSL_IMAGE=rust:1.88.0-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d
-DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.88.0-alpine@sha256:64eba3726734dcfe89e0a62a0485007a3ab7c7372ce5b38c621d8812f70215f0
+DISCOVER_MUSL_IMAGE=rust:1.98.1-alpine3.22@sha256:a1796ca6fa216d6727b5f61c69e4c665b120b1a4dcb969639e2f25f1ed309456
+DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.98.1-alpine3.22@sha256:df2234c615138222413254f45937ae45d284aad971644fe564e4250609abe452
 # Ubuntu 24.04's signed snapshot service freezes the complete apt dependency
 # closure. Alpine has no equivalent archive snapshot, so every requested v3.22
 # package is exact-versioned and restricted to the official main repository.
@@ -56,12 +57,12 @@ work, oracle, records = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 script_path, matrix_path = Path(sys.argv[4]), Path(sys.argv[5])
 
 EXPECTED_PINS = (
-    "DISCOVER_GLIBC_BUILD_IMAGE=rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0",
-    "DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.88.0-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0",
+    "DISCOVER_GLIBC_BUILD_IMAGE=rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e",
+    "DISCOVER_GLIBC_BUILD_PLATFORM_IMAGE=rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec",
     "DISCOVER_GLIBC_RUN_IMAGE=ubuntu:noble-20260810@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
     "DISCOVER_GLIBC_RUN_PLATFORM_IMAGE=ubuntu:noble-20260810@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316",
-    "DISCOVER_MUSL_IMAGE=rust:1.88.0-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d",
-    "DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.88.0-alpine@sha256:64eba3726734dcfe89e0a62a0485007a3ab7c7372ce5b38c621d8812f70215f0",
+    "DISCOVER_MUSL_IMAGE=rust:1.98.1-alpine3.22@sha256:a1796ca6fa216d6727b5f61c69e4c665b120b1a4dcb969639e2f25f1ed309456",
+    "DISCOVER_MUSL_PLATFORM_IMAGE=rust:1.98.1-alpine3.22@sha256:df2234c615138222413254f45937ae45d284aad971644fe564e4250609abe452",
     "UBUNTU_APT_SNAPSHOT=20260810T000000Z",
     "ALPINE_MAIN_REPOSITORY=https://dl-cdn.alpinelinux.org/alpine/v3.22/main",
 )
@@ -94,6 +95,54 @@ EXPECTED_APK_PACKAGES = (
     "sqlite-libs=3.49.2-r1",
     "zlib=1.3.2-r0",
     "zstd-libs=1.5.7-r0",
+)
+# Exact `apk info -v | sort` closure left by the musl lane on the pinned
+# alpine3.22 base: base image (30) plus the 12 requested packages absent
+# from it. Any solver-pulled extra dependency changes this set and must
+# fail the lane. Names are `name-version` as apk info prints them.
+EXPECTED_MUSL_APK_INFO = (
+    "alpine-baselayout-3.7.0-r0",
+    "alpine-baselayout-data-3.7.0-r0",
+    "alpine-keys-2.5-r0",
+    "alpine-release-3.22.6-r0",
+    "apk-tools-2.14.12-r0",
+    "binutils-2.44-r3",
+    "busybox-1.37.0-r20",
+    "busybox-binsh-1.37.0-r20",
+    "ca-certificates-20260909-r0",
+    "ca-certificates-bundle-20260909-r0",
+    "file-5.46-r2",
+    "gcc-14.2.0-r6",
+    "gmp-6.3.0-r3",
+    "isl26-0.26-r1",
+    "jansson-2.14.1-r0",
+    "jq-1.8.2-r0",
+    "libapk2-2.14.12-r0",
+    "libatomic-14.2.0-r6",
+    "libcap-ng-0.8.5-r0",
+    "libcrypto3-3.5.8-r0",
+    "libgcc-14.2.0-r6",
+    "libgomp-14.2.0-r6",
+    "libmagic-5.46-r2",
+    "libncursesw-6.5_p20250503-r0",
+    "libssl3-3.5.8-r0",
+    "libstdc++-14.2.0-r6",
+    "mpc1-1.3.1-r1",
+    "mpfr4-4.2.1_p1-r0",
+    "musl-1.2.5-r12",
+    "musl-dev-1.2.5-r12",
+    "musl-utils-1.2.5-r12",
+    "ncurses-terminfo-base-6.5_p20250503-r0",
+    "oniguruma-6.9.10-r0",
+    "readline-8.2.13-r1",
+    "scanelf-1.3.8-r1",
+    "setpriv-2.41.6-r1",
+    "softhsm-2.6.1-r6",
+    "sqlite-3.49.2-r1",
+    "sqlite-libs-3.49.2-r1",
+    "ssl_client-1.37.0-r20",
+    "zlib-1.3.2-r0",
+    "zstd-libs-1.5.7-r0",
 )
 PRODUCTION_CA_BOOTSTRAP = (
     "apt-get update -q >/dev/null",
@@ -154,18 +203,24 @@ def check_container_pins(script, matrix):
                 f"{label} live apt operation lacks an intervening snapshot selector"
             )
     if not re.search(
-        r'--no-deps\s+--repositories-file\s+/dev/null\s+'
+        r'--repositories-file\s+/dev/null\s+'
         r'--repository\s+"\$ALPINE_MAIN_REPOSITORY"\s+add\b',
         production,
     ):
-        raise ValueError("Alpine package origin or dependency closure is not exclusive")
+        raise ValueError("Alpine package origin is not exclusive")
     apk_lines = [
         line.strip() for line in production.splitlines()
         if line.lstrip().startswith("apk ")
     ]
-    if len(apk_lines) != 1:
+    apk_add_lines = [line for line in apk_lines if " add " in f" {line} "]
+    apk_info_lines = [line for line in apk_lines if "info -v" in line]
+    if len(apk_add_lines) != 1:
         raise ValueError("expected exactly one Alpine package install")
-    apk_words = shlex.split(apk_lines[0])
+    if len(apk_info_lines) != 1:
+        raise ValueError("expected exactly one Alpine installed-set recording")
+    if len(apk_lines) != 2:
+        raise ValueError("unexpected Alpine package operation")
+    apk_words = shlex.split(apk_add_lines[0])
     try:
         add_index = apk_words.index("add")
     except ValueError as error:
@@ -179,6 +234,20 @@ def check_container_pins(script, matrix):
             raise ValueError(f"Alpine package is not exact-versioned: {package}")
     if apk_packages != EXPECTED_APK_PACKAGES:
         raise ValueError("Alpine package set differs from the approved closure")
+    if production.count("apk info -v 2>/dev/null | sort > /receipt/musl-apk-info.txt") != 1:
+        raise ValueError("Alpine installed set is not recorded to the receipt mount")
+    production_lines = [line.strip() for line in production.splitlines()]
+    for installed in EXPECTED_MUSL_APK_INFO:
+        if production_lines.count(installed) != 1:
+            raise ValueError(f"missing or duplicated recorded Alpine install: {installed}")
+    required_apk_checks = (
+        'diff -u "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
+        '"$DISCOVER_WORK/musl-apk-info.txt" "$LANE14_ARTIFACTS/discover.musl-apk-info.txt"',
+        "musl_apk_info_sha256",
+    )
+    for check in required_apk_checks:
+        if check not in production:
+            raise ValueError(f"missing Alpine installed-set receipt check: {check}")
     if re.search(r"\bdocker\s+manifest\b", production):
         raise ValueError("driver path performs a runtime docker manifest operation")
     compact_production = re.sub(r"\s+", " ", production)
@@ -246,8 +315,31 @@ pin_mutations = (
         matrix_source,
     ),
     (
-        "implicit Alpine dependency resolution",
-        mutate_production(script_source, "--no-deps ", ""),
+        "non-exclusive Alpine package origin",
+        mutate_production(script_source, "--repositories-file /dev/null ", ""),
+        matrix_source,
+    ),
+    (
+        "unrecorded Alpine installed set",
+        mutate_production(
+            script_source,
+            "apk info -v 2>/dev/null | sort > /receipt/musl-apk-info.txt",
+            "apk info -v 2>/dev/null | sort",
+        ),
+        matrix_source,
+    ),
+    (
+        "unchecked Alpine installed set",
+        mutate_production(
+            script_source,
+            'diff -u "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
+            'diff -u "$DISCOVER_WORK/musl-apk-info.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
+        ),
+        matrix_source,
+    ),
+    (
+        "incomplete Alpine installed-set closure",
+        mutate_production(script_source, "softhsm-2.6.1-r6", "softhsm-removed"),
         matrix_source,
     ),
     (
@@ -276,7 +368,7 @@ pin_mutations = (
     (
         "wrong linux platform manifest",
         script_source.replace(
-            "64eba3726734dcfe89e0a62a0485007a3ab7c7372ce5b38c621d8812f70215f0",
+            "df2234c615138222413254f45937ae45d284aad971644fe564e4250609abe452",
             "4cd7a3f9ccccbdf1825d14a015a30ac19bf8b959ec3d18aa5da8e6a17ce7ec70",
             1,
         ),
@@ -674,7 +766,12 @@ MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
     --platform linux/amd64 -e ALPINE_MAIN_REPOSITORY="$ALPINE_MAIN_REPOSITORY" \
     -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src \
     "$DISCOVER_MUSL_PLATFORM_IMAGE" sh -ec '
-  apk --no-cache --no-deps --repositories-file /dev/null \
+  # Base is Alpine 3.22 (apk v2), matching the pinned v3.22 repository.
+  # No --no-deps: apk v2 has no such option. Exclusivity comes from the
+  # exact-versioned closure below plus the single pinned repository, and
+  # the host verifies the recorded installed set equals the approved
+  # 42-package closure, so no solver-pulled extra can slip in.
+  apk --no-cache --repositories-file /dev/null \
       --repository "$ALPINE_MAIN_REPOSITORY" add -q \
       binutils=2.44-r3 file=5.46-r2 gcc=14.2.0-r6 \
       gmp=6.3.0-r3 isl26=0.26-r1 jansson=2.14.1-r0 \
@@ -686,6 +783,9 @@ MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
       readline=8.2.13-r1 setpriv=2.41.6-r1 softhsm=2.6.1-r6 \
       sqlite=3.49.2-r1 sqlite-libs=3.49.2-r1 zlib=1.3.2-r0 \
       zstd-libs=1.5.7-r0
+  apk info -v 2>/dev/null | sort > /receipt/musl-apk-info.txt
+  cat /receipt/musl-apk-info.txt
+  chown "$(stat -c %u:%g /receipt)" /receipt/musl-apk-info.txt
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
   export RUSTFLAGS="-C target-feature=-crt-static"
@@ -714,6 +814,62 @@ MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
   echo "alpine musl-dynamic: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"')
 printf 'container_musl_build\t%s\n' "$MUSL_BUILD_ID" >> "$LANE14_FACTS"
 timeout --signal=TERM --kill-after=5s 600s docker start -a "$MUSL_BUILD_ID"
+
+# The Alpine solver must leave exactly the approved closure: any unlisted
+# dependency pulled from the live v3.22 repository fails here. The recorded
+# set is bound into the receipt alongside the lane facts.
+[ -f "$DISCOVER_WORK/musl-apk-info.txt" ] || { echo "musl apk info missing" >&2; exit 1; }
+cat > "$DISCOVER_WORK/musl-apk-expected.txt" <<'EOF'
+alpine-baselayout-3.7.0-r0
+alpine-baselayout-data-3.7.0-r0
+alpine-keys-2.5-r0
+alpine-release-3.22.6-r0
+apk-tools-2.14.12-r0
+binutils-2.44-r3
+busybox-1.37.0-r20
+busybox-binsh-1.37.0-r20
+ca-certificates-20260909-r0
+ca-certificates-bundle-20260909-r0
+file-5.46-r2
+gcc-14.2.0-r6
+gmp-6.3.0-r3
+isl26-0.26-r1
+jansson-2.14.1-r0
+jq-1.8.2-r0
+libapk2-2.14.12-r0
+libatomic-14.2.0-r6
+libcap-ng-0.8.5-r0
+libcrypto3-3.5.8-r0
+libgcc-14.2.0-r6
+libgomp-14.2.0-r6
+libmagic-5.46-r2
+libncursesw-6.5_p20250503-r0
+libssl3-3.5.8-r0
+libstdc++-14.2.0-r6
+mpc1-1.3.1-r1
+mpfr4-4.2.1_p1-r0
+musl-1.2.5-r12
+musl-dev-1.2.5-r12
+musl-utils-1.2.5-r12
+ncurses-terminfo-base-6.5_p20250503-r0
+oniguruma-6.9.10-r0
+readline-8.2.13-r1
+scanelf-1.3.8-r1
+setpriv-2.41.6-r1
+softhsm-2.6.1-r6
+sqlite-3.49.2-r1
+sqlite-libs-3.49.2-r1
+ssl_client-1.37.0-r20
+zlib-1.3.2-r0
+zstd-libs-1.5.7-r0
+EOF
+diff -u "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt" \
+    || { echo "unexpected Alpine installed set" >&2; exit 1; }
+cp "$DISCOVER_WORK/musl-apk-info.txt" "$LANE14_ARTIFACTS/discover.musl-apk-info.txt"
+chmod 600 "$LANE14_ARTIFACTS/discover.musl-apk-info.txt"
+musl_apk_hash=$(sha256sum < "$LANE14_ARTIFACTS/discover.musl-apk-info.txt") || exit 1
+facts_identity_valid || exit 1
+printf 'musl_apk_info_sha256\t%s\n' "${musl_apk_hash%% *}" >> "$LANE14_FACTS"
 
 echo "=== container verification: ALL OK ==="
 printf 'oracle\tsofthsm-68-and-fixture-68-92-104\n' >> "$LANE14_FACTS"

@@ -6,7 +6,7 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.1.0.** This guide describes the v0.1.0 release: `doctor`,
+> **Status: v0.2.0.** This guide describes the v0.1.0 release: `doctor`,
 > `inspect`, `profile` (including `--mode metrics`), `trace`, and `run`, with
 > memory-scan discovery, `C_GetInterface`, multi-module capture, owned-child
 > live discovery, and schema v3. Its

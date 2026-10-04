@@ -173,3 +173,53 @@ fn release_docs_name_the_version_file() {
         );
     }
 }
+
+#[test]
+fn licence_recipe_toolchain_tracks_the_release_compiler() {
+    let recipe: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string("third-party/licenses/sources.json").expect("read licence recipe"),
+    )
+    .expect("parse licence recipe");
+    let name = recipe["toolchains"][0]["name"]
+        .as_str()
+        .expect("first toolchain has a name");
+    assert_eq!(
+        name,
+        release_rust(),
+        "licence recipe toolchain must equal .release-rust-version"
+    );
+}
+
+#[test]
+fn licence_rust_patches_match_their_payload_hashes() {
+    use sha2::{Digest, Sha256};
+    let recipe: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string("third-party/licenses/sources.json").expect("read licence recipe"),
+    )
+    .expect("parse licence recipe");
+    let patches = recipe["musl"][0]["rust_patches"]
+        .as_array()
+        .expect("musl recipe has rust_patches");
+    assert!(!patches.is_empty(), "rust_patches must not be empty");
+    for entry in patches {
+        let file = entry["file"].as_str().expect("patch has a file");
+        let want = entry["sha256"].as_str().expect("patch has a sha256");
+        let recorded = recipe["files"][file]["sha256"]
+            .as_str()
+            .unwrap_or_else(|| panic!("rust_patches entry {file} has no files record"));
+        assert_eq!(
+            recorded, want,
+            "rust_patches {file} drifted from its files record"
+        );
+        let bytes = fs::read(format!("third-party/licenses/{file}"))
+            .unwrap_or_else(|_| panic!("read patch payload {file}"));
+        let got: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            got, want,
+            "rust_patches {file} bytes do not match its recorded sha256"
+        );
+    }
+}

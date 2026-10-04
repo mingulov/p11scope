@@ -51,7 +51,7 @@ class PackageReleaseTests(unittest.TestCase):
             "toolchains": [{
                 "name": name, "rustc_verbose_version": f"fixture {name}",
                 "files": [{"payload": f"licenses/rust-{name}/COPYRIGHT-library.html", "sha256": digest(b"Rust notice")}],
-            } for name in ("1.88", "nightly-2026-05-20")],
+            } for name in ("1.98.1", "nightly-2026-05-20")],
         }
         self.inputs["third-party/licenses/sources.json"] = json.dumps(self.recipe).encode()
         self.inputs[".release-rust-version"] = (RELEASE_RUST + "\n").encode()
@@ -239,7 +239,7 @@ class PackageReleaseTests(unittest.TestCase):
         self.refused("notice.*(graph|recipe|complete)")
 
     def test_missing_required_runtime_notice_refuses(self):
-        name = "licenses/rust-1.88/COPYRIGHT-library.html"
+        name = "licenses/rust-1.98.1/COPYRIGHT-library.html"
         del self.notice_manifest["files"][name]
         (self.notices / name).unlink()
         self.write_notice_manifest()

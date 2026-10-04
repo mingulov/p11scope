@@ -376,9 +376,6 @@ jobs:
           tar -xzf "$tools/cargo-about.tar.gz" -C "$tools" \
             cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about
           install -m 0755 "$tools/cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about" "$tools/cargo-about"
-          curl -fsSL --retry 3 -o "$tools/musl-1.2.3.tar.gz" \
-            https://musl.libc.org/releases/musl-1.2.3.tar.gz
-          echo "7d5b0b6062521e4627e099e4c9dc8248d32a30285e959b7eecaa780cf8cfd4a4  $tools/musl-1.2.3.tar.gz" | sha256sum --check
           curl -fsSL --retry 3 -o "$tools/musl-1.2.5.tar.gz" \
             https://musl.libc.org/releases/musl-1.2.5.tar.gz
           echo "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  $tools/musl-1.2.5.tar.gz" | sha256sum --check
@@ -573,16 +570,15 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I scripts/export-source.py \
-            --output "$RUNNER_TEMP/release-evidence/p11scope-0.1.0-source.tar.gz"
+            --output "$RUNNER_TEMP/release-evidence/p11scope-0.2.0-source.tar.gz"
           python3 -I scripts/release-notices.py \
             --cargo-about "$RUNNER_TEMP/release-tools/cargo-about" \
-            --musl-archive "$RUNNER_TEMP/release-tools/musl-1.2.3.tar.gz" \
             --musl-archive "$RUNNER_TEMP/release-tools/musl-1.2.5.tar.gz" \
             --output "$RUNNER_TEMP/release-evidence/notices"
           python3 -I scripts/package-release.py \
             --receipt "$RUNNER_TEMP/release-evidence/receipt" \
             --notices "$RUNNER_TEMP/release-evidence/notices" \
-            --source "$RUNNER_TEMP/release-evidence/p11scope-0.1.0-source.tar.gz" \
+            --source "$RUNNER_TEMP/release-evidence/p11scope-0.2.0-source.tar.gz" \
             --output "$RUNNER_TEMP/release-evidence/public"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

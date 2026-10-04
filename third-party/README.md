@@ -12,7 +12,7 @@ the source fragments retained in the patch files below.
 `scripts/release-notices.py` inventories both locked Cargo workspaces and
 preserves original licensing files independently of the selected SPDX
 alternative. It adds pinned Rust library reports, native runtime notices and
-musl 1.2.3/1.2.5 source archives, including their per-file notices. The
+the musl 1.2.5 source archive plus Rust's musl CVE patches, including their per-file notices. The
 inventory includes build, development and non-Linux dependencies and does not
 claim that every listed package is linked into each release binary. Generated
 bundles remain outside this source tree. See [the release runbook](../RELEASING.md).

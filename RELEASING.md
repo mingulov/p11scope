@@ -1,14 +1,15 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Releasing p11scope
 
-The owner's runbook for tagging a release, written for v0.1.0. The release
+The owner's runbook for tagging a release, written for v0.1.0 and updated for
+v0.2.0. The release
 build uses network access and pins its source dependencies (lockfiles, the
 `pkcs11-components` Git revision and hash-pinned patched crates), Rust
 toolchains and discover build images. The builder records the effective host
 tools and source tree in its receipt. Binary byte reproducibility has not been
 established by independent builds. A full offline source export is an optional
 capability, described in [docs/build-offline.md](docs/build-offline.md); the
-attached v0.1.0 source export uses network access for remaining dependencies.
+attached source export uses network access for remaining dependencies.
 
 Run the steps in order. The release receipt binds the tree of `HEAD`. Finish
 every tracked file before the final hosted CI run, qualification and artifact
@@ -26,9 +27,10 @@ requires the affected gates to run again on that new revision.
   The tree must be clean, including untracked files:
   `git status --porcelain=v1 --untracked-files=all` prints nothing.
 - Confirm the versions: `Cargo.toml` and `crates/discover/Cargo.toml` both
-  say the release version (`0.1.0`). The other crates are internal and stay
+  say the release version (`0.2.0`). The other crates are internal and stay
   `0.0.0`.
-- Keep the version heading in `CHANGELOG.md` (`## [0.1.0]`). Put the actual
+- Set the version heading in `CHANGELOG.md` to `## [0.2.0]` (drop
+  ` - UNRELEASED`). Put the actual
   publication date in the GitHub release. Every tracked text change must land
   before final CI and artifact builds.
 - Resolve release placeholders, then check that none remain:
@@ -132,7 +134,7 @@ The driver checks the host tool selection before building:
   `RUSTUP_TOOLCHAIN`, which the release preflight rejects. If these select
   only the standard homes and the pinned toolchain, remove those inherited
   variables when launching the driver, for example
-  `mise exec -- env -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN scripts/build-release.sh /var/tmp/p11scope-release/v0.1.0`.
+  `mise exec -- env -u CARGO_HOME -u RUSTUP_HOME -u RUSTUP_TOOLCHAIN scripts/build-release.sh /var/tmp/p11scope-release/v0.2.0`.
   A custom Cargo or rustup home requires a separate build environment.
 
 The discover helper lane creates one dedicated Docker bridge with automatic
@@ -149,8 +151,8 @@ The single argument is an absent evidence root whose parent is a private
 directory outside the checkout:
 
 ```sh
-mkdir -m 700 /var/tmp/p11scope-release
-scripts/build-release.sh /var/tmp/p11scope-release/v0.1.0
+mkdir -p -m 700 /var/tmp/p11scope-release && chmod 700 /var/tmp/p11scope-release
+scripts/build-release.sh /var/tmp/p11scope-release/v0.2.0
 ```
 
 The body prints `=== build-release: ALL OK ===` before the finalizer runs.
@@ -166,7 +168,7 @@ the explicitly named glibc and musl outputs.
 Record the build facts for the release notes:
 
 ```sh
-cd /var/tmp/p11scope-release/v0.1.0/work/dist
+cd /var/tmp/p11scope-release/v0.2.0/work/dist
 rustc +1.98.1 -V; rustc +nightly-2026-05-20 -V; bpf-linker --version; clang-18 --version
 if strings -a p11scope | grep -Fq -- "$HOME"; then
   echo 'release binary embeds build-home path' >&2
@@ -187,9 +189,9 @@ that ran in the final release notes.
 
 `scripts/package-release.py` makes three versioned tarballs from the official
 binaries:
-`p11scope-0.1.0-x86_64-linux-musl.tar.gz`,
-`p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz`, and
-`p11scope-discover-0.1.0-x86_64-linux-musl.tar.gz`. Each archive has one
+`p11scope-0.2.0-x86_64-linux-musl.tar.gz`,
+`p11scope-discover-0.2.0-x86_64-linux-gnu.tar.gz`, and
+`p11scope-discover-0.2.0-x86_64-linux-musl.tar.gz`. Each archive has one
 same-named top-level directory containing an executable named `p11scope` or
 `p11scope-discover` (mode `0755`), project GPL license texts, `notices/`, and
 `RELEASE.json` with curated build provenance. The glibc and musl helpers
@@ -200,37 +202,32 @@ libc. Retain license texts in the bundle even though the source export also
 contains them. The package directory also contains top-level `RELEASE.json`
 and `SHA256SUMS`; those metadata files accompany the four archives on GitHub.
 
-Use `cargo-about` 0.9.2 and the official musl 1.2.3 and 1.2.5 source archives
-for the observer and helper runtime notices. Verify each archive's SHA-256
+Use `cargo-about` 0.9.2 and the official musl 1.2.5 source archive (the Rust 1.98.1 static target
+builds patched musl 1.2.5; the Alpine helper links musl 1.2.5-r12). The
+notice generator refuses any other archive. Verify its SHA-256
 before running the notice generator. The
 example paths below are absolute; `/var/tmp/p11scope-release` was created with
 mode `0700` in step 5, each output is absent, and their parent remains private:
 
 ```sh
-cargo +1.98.1 install cargo-about --version 0.9.2 --locked
-mkdir -m 700 /var/tmp/p11scope-release/package-inputs
-curl -fL https://musl.libc.org/releases/musl-1.2.3.tar.gz \
-  -o /var/tmp/p11scope-release/package-inputs/musl-1.2.3.tar.gz
-printf '%s  %s\n' \
-  7d5b0b6062521e4627e099e4c9dc8248d32a30285e959b7eecaa780cf8cfd4a4 \
-  /var/tmp/p11scope-release/package-inputs/musl-1.2.3.tar.gz | sha256sum --check
+cargo +1.98.1 install cargo-about --version 0.9.2 --locked --features cli
+mkdir -m 700 /var/tmp/p11scope-release/v0.2.0-package-inputs
 curl -fL https://musl.libc.org/releases/musl-1.2.5.tar.gz \
-  -o /var/tmp/p11scope-release/package-inputs/musl-1.2.5.tar.gz
+  -o /var/tmp/p11scope-release/v0.2.0-package-inputs/musl-1.2.5.tar.gz
 printf '%s  %s\n' \
   a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4 \
-  /var/tmp/p11scope-release/package-inputs/musl-1.2.5.tar.gz | sha256sum --check
+  /var/tmp/p11scope-release/v0.2.0-package-inputs/musl-1.2.5.tar.gz | sha256sum --check
 python3 -I scripts/release-notices.py \
   --cargo-about "$(command -v cargo-about)" \
-  --musl-archive /var/tmp/p11scope-release/package-inputs/musl-1.2.3.tar.gz \
-  --musl-archive /var/tmp/p11scope-release/package-inputs/musl-1.2.5.tar.gz \
-  --output /var/tmp/p11scope-release/notices
+  --musl-archive /var/tmp/p11scope-release/v0.2.0-package-inputs/musl-1.2.5.tar.gz \
+  --output /var/tmp/p11scope-release/v0.2.0-notices
 python3 -I scripts/export-source.py \
-  --output /var/tmp/p11scope-release/p11scope-0.1.0-source.tar.gz
+  --output /var/tmp/p11scope-release/p11scope-0.2.0-source.tar.gz
 python3 -I scripts/package-release.py \
-  --receipt /var/tmp/p11scope-release/v0.1.0 \
-  --notices /var/tmp/p11scope-release/notices \
-  --source /var/tmp/p11scope-release/p11scope-0.1.0-source.tar.gz \
-  --output /var/tmp/p11scope-release/public-assets
+  --receipt /var/tmp/p11scope-release/v0.2.0 \
+  --notices /var/tmp/p11scope-release/v0.2.0-notices \
+  --source /var/tmp/p11scope-release/p11scope-0.2.0-source.tar.gz \
+  --output /var/tmp/p11scope-release/v0.2.0-public-assets
 ```
 
 The attached schema-v1 source export contains the committed source and the two
@@ -244,7 +241,7 @@ Verify `SHA256SUMS` against the four versioned `.tar.gz` assets and top-level
 `RELEASE.json`:
 
 ```sh
-(cd /var/tmp/p11scope-release/public-assets && sha256sum --check SHA256SUMS)
+(cd /var/tmp/p11scope-release/v0.2.0-public-assets && sha256sum --check SHA256SUMS)
 ```
 
 Extract each archive into a fresh private
@@ -258,7 +255,7 @@ reconstruct without downloading them. For example, from the repository root:
 ```sh
 source_recipient=$(mktemp -d /var/tmp/p11scope-source-recipient.XXXXXX)
 tar --same-permissions --no-same-owner -xzf \
-  /var/tmp/p11scope-release/p11scope-0.1.0-source.tar.gz \
+  /var/tmp/p11scope-release/p11scope-0.2.0-source.tar.gz \
   -C "$source_recipient"
 (
   cd "$source_recipient/p11scope-source"
@@ -283,8 +280,8 @@ On the commit that steps 3–6 ran on:
 2. Create an annotated (optionally signed) tag and push `main` and the tag:
 
    ```sh
-   git tag -a v0.1.0 -m 'p11scope v0.1.0'    # or -s to sign
-   git push origin main v0.1.0
+   git tag -a v0.2.0 -m 'p11scope v0.2.0'    # or -s to sign
+   git push origin main v0.2.0
    ```
 
 3. Create the GitHub release with the four versioned `.tar.gz` assets,

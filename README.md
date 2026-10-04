@@ -11,7 +11,7 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: v0.1.0**, the first release of the existing commands: `doctor`,
+> **Status: v0.2.0**, the first release of the existing commands: `doctor`,
 > `inspect`, `profile` (including `--mode metrics`), `trace`, and `run`, with
 > memory-scan discovery, multi-module capture, and schema v3. Read the
 > [known limitations](CHANGELOG.md#known-limitations) before relying on a

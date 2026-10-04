@@ -7,272 +7,225 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [0.2.0] - UNRELEASED
 
-### Inventory
+Module/caller inventory and usage observation, Kubernetes deployment, and
+fail-closed PID-namespace and privilege handling. See
+[docs/known-limitations.md](docs/known-limitations.md) for the v0.2.0 limits.
 
-- `inventory --event-log` streams `edge_observed` records in production
-  (previously only test builds emitted them): a record when an edge is new
-  or its entries, coverage, presence, capture or activity class changes,
-  at most 4,096 per pass with the rest counted in the pass marker's
-  `edge_events_deferred` and carried to the next pass, plus one exact sweep
-  before `ended`, so the last record per edge equals the snapshot's
-  `edges[]` entry. An edge whose record retention deleted is re-sent
-  while the edges' records fit the retention, and `ended.edges_unretained`
-  counts edges left without a retained record when they cannot (the
-  schema states the sizing condition). `pass_committed.edge_events`,
-  `edge_events_deferred`, `ended.edge_events` and `ended.edges_unretained`
-  are additive within `p11scope/inventory-events/v1`.
-- `profile` and `trace` under `--pid` no longer put breakpoints into every
-  process that maps the provider. Classic uprobe-multi links named pid 0 and
-  relied on the in-BPF PID guard alone, which cost about 3.7 µs per call in
-  every other process (measured on a debug fixture) and left the guard as
-  the only barrier against a process that reuses the PID. Now `--pid` takes
-  uprobe-multi only where a functional probe proves the kernel pid filter
-  (every thread of the target, no other process), and the links name the
-  target. Elsewhere it uses per-offset links bound to the target. The
-  classic `--attach-backend auto` decides by functional probes, not the
-  6.9 version floor. The new `evidence.attach_backend` in profile reports
-  (and the trace terminal record) discloses the selection, any fallback
-  reason and the `--pid` scope filter; a fallback is also printed on
-  stderr before the readiness line.
-- The native lane of `inventory` attaches provider entries as uprobe-multi
-  links wherever a functional probe shows the kernel supports them (6.6+,
-  including distribution backports; never decided by version), one
-  immutable link per provider object per extend instead of one per entry
-  (8 to 96 entries per link, sized so one attach call stays near 200 ms:
-  whole function tables for providers few processes map, smaller links
-  for one mapped by hundreds; under `--pid`, which cannot count the
-  processes mapping a provider, the first link takes 16 and the measured
-  cost grows the next ones).
-  Stopping a system-scale capture no longer waits on several kernel grace
-  periods per entry: hundreds of entries detach in well under a second on
-  6.12 and 7.x, so `observation.retirement` reads `closed` where it used to
-  read `unsettled`. `--pid` uses uprobe-multi only where the kernel pid
-  filter is proven to cover every thread of the target (Linux 6.6 to
-  6.9.11 shipped a thread-exact one), and keeps per-offset links bound to
-  the target otherwise. New `inventory --attach-backend auto|multi|singles`;
-  `observation.attach` (additive within `p11scope/inventory/v1`) discloses
-  the selection, mechanism, any fallback reason and the PID scope filter.
-  The stop budget now counts kernel links per backend.
-- The native lane of `inventory` keeps servicing the kernel's lifecycle
-  ring while a pass collects `/proc`: the collection runs on a worker
-  thread and the ring is drained every 10 ms, so a busy host's exec churn
-  no longer overflows it behind a one-second `--system` pass. A found loss
-  starts the next pass at once (a bounded recovery rescan) and stays
-  reported. The native document's `observation.lifecycle` (additive within
-  `p11scope/inventory/v1`) counts the records drained, the kernel's ring
-  loss, malformed records, failed drains and recovery rescans.
-- `inventory` publishes each distinct gap once per run. An identical gap
-  recorded again (for example the overlay-collapse gap on every pass) no
-  longer adds an entry or consumes `--max-gaps` budget; `gaps[].repeats`
-  (integer >= 1, additive within `p11scope/inventory/v1`) counts the
-  recordings. The event stream emits `gap_recorded` (identity only) on
-  the first occurrence (now with an ordinal `index`) and
-  `gap_repeated{index, repeats}` only when a gap's count crosses a power of
-  two, plus one exact flush before `ended`, so a replayed stream equals the
-  snapshot while a steady recurring gap lets the stream go quiet.
-  A suppressed gap that recurs is counted once in `gaps_suppressed` while
-  the registry remembers it (up to 4096 distinct suppressed gaps; past
-  that a recurrence of an unremembered one counts again, so the counter
-  can over-count; it under-counts only on a 64-bit fingerprint
-  collision, about 2^-40 likely).
-- `inventory --system` and `inspect --system` read each past-the-cap
-  `/proc/<pid>/map_files` proof as one stat relative to that process's
-  `map_files` directory, opened once per confirmation, rather than a
-  walk of the full `/proc` path. A range that is no longer one mapping
-  when its proof is read is the new `mapping_changed` attribution loss
-  (inside a confirmation), or makes an unmatched process confirm afresh
-  (after the sweep), instead of `map_files_unavailable` or an
-  unexamined object.
+### Added
 
-### Kubernetes deployment
-
-- `deploy/k8s` is now a least-privilege node DaemonSet: capabilities
-  `drop: [ALL]` plus `SYS_ADMIN`, `SYS_PTRACE` and `DAC_READ_SEARCH` (each
-  shown necessary on kind; `BPF`/`PERFMON` are redundant while `SYS_ADMIN` is
-  held), hostPID, a read-only cgroupfs hostPath, a size-capped `/tmp`
-  emptyDir, read-only root, seccomp `RuntimeDefault`, no ServiceAccount token
-  and no RBAC. The pod is still root on its node: restrict `pods/exec`,
-  `pods/attach` and ephemeral containers in its namespace to node
-  administrators (`deploy/k8s/README.md`). Manifests are numbered
-  (`00-namespace.yaml`, `10-serviceaccount.yaml`, `20-daemonset.yaml`) so
-  `kubectl apply -f deploy/k8s/` works on a fresh cluster.
-- `k8s-profile-entry` targets a pod by `--pod-uid` (or `--cid`), resolved from
-  the node's cgroup tree; it refuses ambiguous or non-`kubepods` matches and
-  names a missing hostPID or unreadable target memory instead of producing an
-  empty capture. **Removed:** its API mode (`--pod NAME`, `--namespace`,
-  `--container`) and the curl/jq it needed; `deploy/k8s/rbac.yaml` (the
-  observer Role) and `deploy/k8s/holder.yaml`.
-- `scripts/kind-e2e.sh` replaces `scripts/verify-k8s-attach.sh`: a committed
-  kind end-to-end test with ledgered SoftHSM2 workloads, concurrent per-pod
-  captures, positive and negative controls.
-
-### Inventory and system catalog
-
-- `inventory --capture auto|scan|native` (default `auto`) runs the native
-  usage lane on the classic path: the Inventory BPF object attaches every
-  admitted provider entry, and each positive use binds to the exact caller
-  image (`witnessed`) or is reported as module-level use by an unidentified
-  caller; an edge whose entries were all attached under proven health reads
-  `watched_no_use` over that interval. A native document states
-  `observation.lane` (`native`), `observation.settlement` (always
-  `unsettled`: Inventory has no quiescence protocol) and
-  `observation.retirement` (`closed`, or `unsettled` plus a gap when the
-  probes did not detach within the stop budget). `native` that cannot start
-  is an error naming why; `auto` falls back to the scan lane with the gap
-  `native usage feed unavailable`; `scan` is unchanged. In a foreign PID
-  namespace native `--system` binds witnesses but never claims a watch.
-- `inventory --dashboard` services the native lane through the same loop
-  as the classic path, and draws only inside its service ticks with a
-  non-blocking frame writer: a terminal that stops reading never delays
-  the capture. Frames the terminal does not take within 10 ms are shed
-  and counted (`p11scope: dashboard terminal: … shed …; longest gap … ms
-  (… ms across a pass)` on stderr at exit, and a log-tail note once frames are drawn again);
-  entering and restoring the screen wait at most 1 s (a shed restore is
-  retried for up to 5 s once the report is written). When stderr is the
-  terminal, its diagnostics go to the log tail while the dashboard owns
-  the screen and are replayed after it with the pass warnings and caller
-  events; a stderr file or pipe (`2>run.log`) is left alone and gets the
-  log lines as they come. Key polling no longer waits 100 ms per tick.
-- The classic `inventory` loop now ends cleanly on SIGINT, SIGTERM or SIGHUP:
-  the stream's `ended`, the `-o` document and stdout are still written. A
-  native stop's final commit reaches the event stream under one
-  `pass_committed` with the additive `final: true`.
-- Privacy: inventory publishes caller `pid`, `start_time` and `exe` (owner
-  ruling FB-PRIV); documented in the inventory schema and as a proposed
-  allowlist-v3 row. Nothing new is captured.
-
-- `inventory --system` and `inspect --system` no longer drop callers past
-  `--max-scan-pids` (DR-C8-1). The cap still bounds how many processes are
-  deep-scanned, one per provider group; every other process whose
-  `/proc/<pid>/maps` shows, by exact `(device, inode)`, a provider object a
-  deep scan pinned in the same pass is attributed to it after a confirmation
-  read (pidfd and start-time pin, maps re-read, exe identity unchanged) taken
-  while the pinned object is held open, and only when every mapped range is
-  proven through `/proc/<pid>/map_files` to be the same kernel file as a
-  self-mapping of the held object (a maps key alone is not one file on
-  btrfs). That proof needs `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`;
-  without it nothing is attributed by maps and the losses say so. Only the
-  deep-scan cap's discovery of objects no other process maps remains
-  bounded.
-- `inspect --system`: processes past the cap read `maps_matched` (attributed)
-  or `not_selected` (with the loss reason when a known provider object could
-  not be attributed); observations carry `evidence` (`deep_scan` or
-  `maps_match`; a maps match decodes nothing, so its exports, tables, and
-  interfaces are empty) and maps-matched mappings have a `null` view. The
-  `scan` block is now `{status, enumerated, limit, selected, deep_scanned,
-  maps_matched, unexamined, unexamined_objects, snapshots_unavailable,
-  attribution_losses, scan_ms}`: `limit` replaces `max_scan_pids` and
-  `deep_scanned` replaces `scanned`.
-- The flat scan-cap gap is replaced by `discovery capped` (a loss, only when
-  some process maps a shared object no deep scan examined or had no maps
-  snapshot) or an `attribution complete` note. Attribution losses are counted
-  by category in a `maps attribution` gap. `scan.status` reads `complete` past
-  the cap when nothing was left unexamined and nothing was lost.
-- `inventory`: `edges[].mapping.evidence` (`deep_scan` or `maps_match`); a
-  module missing from a maps-matched caller reads `uncertain`, never `ended`.
-  Both lanes join the collected generation (start time; exe identity) to the
-  caller incarnation before projecting. Caller admission failures aggregate
-  into one gap per pass and kind with a count. The event stream's
-  `pass_committed` gains `maps_matched`.
-- Deep scans, when `map_files` can be followed, also refuse an opened object
-  whose path resolved to another file than the mapped one under the same
-  maps key (btrfs subvolume inode collisions).
-- `P11SCOPE_STAGE_TIMINGS=1` prints per-pass stage timings (sweep, select,
-  deep scan, confirm, assemble, absorb, reconcile, project) to stderr.
-- Native caller binding (Task 6 C4; wired into the command by C5): a
-  native `CALLER_USE` witness binds to a caller incarnation only through a
-  task-cookie query on the incarnation's held pidfd that answers the row's
-  own ticket in its own capture domain, recorded after the admission, with
-  no exec or lifecycle loss since and no competing image; otherwise it is
-  module-level use with a reason. New JSON: `modules[].unbound_use`
-  (`{first_ns, rows, reasons}` or `null`) and
-  `observation.native_witnesses` (`{rows, bound, unbound, pending,
-  integrity, unbound_reasons}`; the unbound-witness ratio), plus the gaps
-  `used by an unidentified caller image`, `native witness without mapping
-  evidence`, `native witness rows failed validation`, and `native witness
-  without a module`. A natively proven exec retires the caller
-  (`exec_retired`) and admits its successor. A caller admitted before a
-  capture's exec coverage began binds only after a later scan pass
-  revalidates it (reason `exec_coverage_gap` otherwise); a same-binary
-  re-exec before coverage stays one incarnation (named boundary). An
-  endpoint several admitted modules share witnesses a caller edge only
-  when exactly one sharer has an edge to the caller (otherwise an
-  `ambiguous shared endpoint` gap); `observation.native_witnesses.placement`
-  (`{edge, module, ambiguous, unresolved}`) accounts for every decided
-  row, and witness gaps carry no tgid.
+- `p11scope inventory [--pid <n> | --system]`: answers "which module is used
+  by whom" over one snapshot pass or a `--duration` window. Reports callers
+  (per process incarnation), modules (per physical object), and caller/module
+  edges with usage coverage, lifecycle, and explicit gaps. `--json` prints
+  the `p11scope/inventory/v1` document
+  ([docs/schema/inventory-v1.md](docs/schema/inventory-v1.md)); `-o <out.json>`
+  writes it atomically; `--dashboard` runs the live read-only dashboard
+  (scrollable edge table, coverage header, bounded log tail; degrades honestly
+  to snapshots on a pipe, never ANSI); `--event-log <f.jsonl>` appends the
+  versioned JSONL observation-event stream
+  ([docs/schema/inventory-events-v1.md](docs/schema/inventory-events-v1.md))
+  with size rotation and retention accounting.
+- `inventory --capture auto|scan|native` (default `auto`): the scan lane reads
+  `/proc` only (every edge's usage coverage reads `unknown`, never a zero as
+  fact); the native lane loads the Inventory BPF object, attaches every
+  admitted provider entry, and binds each positive use to the exact caller
+  image (`witnessed`) or reports module-level use by an unidentified caller.
+  An edge whose entries were all attached under proven health reads
+  `watched_no_use`. `native` that cannot start is an error naming why; `auto`
+  falls back to scan with a named gap. Witness-only in this release: no
+  per-call counts (see Known limitations).
+- Native caller binding: each `CALLER_USE` witness binds through a task-cookie
+  query on the incarnation's held pidfd, recorded after admission, with no
+  exec or lifecycle loss since and no competing image. New JSON:
+  `modules[].unbound_use`, `observation.native_witnesses` (rows/bound/unbound
+  census with per-reason codes and per-row placement), exec retirement
+  (`exec_retired`), exec-coverage gating, and the `ambiguous shared endpoint`
+  rule. Zero false joins is the hard bar.
+- The native lane attaches through uprobe-multi groups where a functional
+  probe (never a version check) shows support: one immutable link per provider
+  object per extend (8–96 entries per link, sized near 200 ms per attach), so
+  hundreds of entries detach in well under a second on 6.12/7.x and
+  `observation.retirement` reads `closed`. New
+  `inventory --attach-backend auto|multi|singles`; `observation.attach`
+  discloses selection, mechanism, fallback reason and PID-scope filter.
+  `--pid` uses Multi only where the kernel pid filter is proven to cover every
+  thread, else per-offset links bound to the target.
+- The native lane drains the kernel lifecycle ring every 10 ms, including
+  while a pass collects `/proc` on a worker thread; a found loss starts a
+  bounded recovery rescan at once and stays reported.
+  `observation.lifecycle` counts records, ring loss, malformed records, failed
+  drains and recovery rescans.
+- The event stream emits `edge_observed` in production (both lanes): a record
+  when an edge is new or its class changes, at most 4,096 per pass with the
+  rest counted and carried, plus one exact sweep before `ended`, so a replayed
+  stream equals the snapshot. Each distinct gap is published once per run
+  (`gaps[].repeats`, `gap_recorded`/`gap_repeated`, `ended.edges_unretained`).
+- `inventory --system` and `inspect --system` attribute callers past
+  `--max-scan-pids`: the cap bounds deep scans only; every other process
+  whose maps show a pinned provider object is attributed after a like-for-like
+  `map_files` proof (pidfd and start-time pin, maps re-read, exe identity
+  unchanged). New `maps_matched` / `not_selected` states, `mapping.evidence`
+  (`deep_scan`/`maps_match`), the reshaped `scan` block, and per-category
+  `maps attribution` losses. The proof needs `CAP_SYS_ADMIN` or
+  `CAP_CHECKPOINT_RESTORE` to follow `map_files`; without it nothing is
+  attributed by maps and the `maps attribution` losses say so.
+- Per-edge semantic summaries (S1): `edges[].semantics` labels plus per-edge
+  `mechanisms` and `operations` aggregates where an authorized feed observed
+  them; scan-only edges stay `unknown (semantic capture withheld)`.
+  Same-file double-load detection latches affected edges to unknown with a
+  named gap.
+- `inventory --max-gaps <n>` (1–65,536; default 1,024): retained gap history
+  bound; gaps past it count in `gaps_suppressed`, never silently.
+- `P11SCOPE_STAGE_TIMINGS=1` prints per-pass inventory stage timings to
+  stderr. `profile`/`trace` discovery gains per-stage timing, queue-age and
+  resource evidence (`evidence.scheduling`).
+- Kubernetes: `deploy/k8s` is a least-privilege node DaemonSet (drop ALL plus
+  `SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`, hostPID, read-only cgroupfs,
+  capped `/tmp`, read-only root, seccomp `RuntimeDefault`, no token, no RBAC)
+  with numbered manifests and a privilege rationale; `k8s-profile-entry`
+  targets a pod by `--pod-uid` (or `--cid`) and refuses ambiguous matches;
+  `scripts/kind-e2e.sh` is the committed kind end-to-end test with ledgered
+  workloads and concurrent per-pod captures.
+- `p11scope inventory` publishes caller `pid`, `start_time` and `image.exe`
+  (owner ruling FB-PRIV): `/proc`-derived caller identity, documented in the
+  inventory schema and in the allowlist-v3 "Inventory caller identity"
+  section, which is implemented in this release (the rest of v3 stays
+  proposed; allowlist v1/v2 remain the implemented capture contracts). Nothing
+  new is captured: every field comes from `/proc` reads the scan lane
+  already makes.
 
 ### Changed
 
-- A written capture can now be `COMPLETE`. On stop, a Detailed capture's
-  stop gate refuses new BPF callbacks and waits for admitted ones to finish;
-  when that quiescence is proven, both terminal drains reach the ring
-  positions read at that point with no record past them, and the build is
-  x86_64, `evidence.drain_proven` is true and a clean run reports `COMPLETE`
-  (`verdict_detail: "clean_proven"`). Every other terminal document stays
-  `PARTIAL` as before (owner ruling B, 2026-09-25). New
-  `evidence.stop_quiescence` (`state`: `proven` / `unproven` / `not_reached`,
-  plus `post_q_events` / `post_q_discovery`) publishes the stop-gate outcome
-  that used to reach stderr only. The trace terminal `EVIDENCE` record now
-  carries the sealed verdict, and its `final_drain` equals `drain_proven`.
-  A trace stopped by its event cap (`--max-events` or the default cap) stays
-  `PARTIAL` even behind a proven drain, with the observation cause
-  `trace_truncated`.
+- Classic `profile`/`trace` `--attach-backend auto` is decided by functional
+  probes, not the 6.9 version floor: multi only where the probe links one
+  (and, under `--pid`, only where it also proves the kernel pid filter).
+  New `evidence.attach_backend` in profile reports and the trace terminal
+  record discloses the selection, any fallback reason and the `--pid` scope
+  filter; a fallback is also printed on stderr before the readiness line.
+- A written capture can now be `COMPLETE`. The Detailed stop gate refuses new
+  BPF callbacks and waits for admitted ones to finish; when quiescence is
+  proven, both terminal drains reach their quiescence positions with no record
+  past them, and the build is x86_64, `evidence.drain_proven` is true and a
+  clean run reports `COMPLETE` (`verdict_detail: "clean_proven"`). New
+  `evidence.stop_quiescence`; the trace terminal `EVIDENCE` carries the sealed
+  verdict with `final_drain` equal to `drain_proven`. Every other terminal
+  document stays `PARTIAL` (owner ruling B).
+- A trace stopped by its event cap (`--max-events` or the 10,000,000 default)
+  stays `PARTIAL` with cause `trace_truncated`, even behind a proven drain.
+- The classic `inventory` loop ends cleanly on SIGINT/SIGTERM/SIGHUP: the
+  stream's `ended`, the `-o` document and stdout are still written. The native
+  stop writes the report first (at most 10 s of retirement wait), then finishes
+  the detach after the report; a second signal once the report is written exits
+  at once and the kernel releases the remaining links.
+- The dashboard services the native lane through the same loop as the classic
+  path and draws only inside service ticks with a non-blocking frame writer: a
+  stalled terminal never delays capture. Shed frames are counted and reported;
+  stderr diagnostics go to the log tail while the dashboard owns the screen.
 - Every profile `mechanisms[]` row whose `params` is `null` now says why in
-  `params_omitted`: `policy` (the default `allowlisted` policy), `no_shape` or
-  `decode_failed`, so a policy omission no longer reads like "no parameters".
+  `params_omitted` (`policy`, `no_shape`, `decode_failed`).
+- The flat scan-cap gap is replaced by `discovery capped` (only when something
+  stayed unexamined) or an `attribution complete` note; `scan.status` reads
+  `complete` past the cap when nothing was left unexamined and nothing was lost.
+- `docs/usage.md` documents the symlink policy (inputs follow and pin;
+  outputs never follow), the cleanup progress lines, `cleanup incomplete` and
+  exit 130, and the PID-namespace and paranoid ≥ 3 behavior.
 
 ### Fixed
 
-- A second Ctrl-C while probe links are closing now returns through the stop
-  path instead of exiting from inside the capture session: the exit status is
-  still 130 and the published report stays intact, but post-cleanup reporting
-  and destructors run. A capture that fails also still prints its live
-  discovery-noise summary. `docs/usage.md` documents the cleanup progress
-  lines, `cleanup incomplete` and exit 130.
-- `p11scope-discover -o` no longer writes through a symbolic link or with the
-  umask's mode: the manifest is published private (0600) and atomically
-  (temporary file, fsync, rename), and a name that is a symbolic link, FIFO,
-  socket, device or directory is refused, as is a world-writable directory
-  without the sticky bit. `p11scope-discover --help` prints on stdout.
+- PID namespaces: an observer outside the initial PID namespace no longer
+  publishes a silent zero claiming exact observation. p11scope reads its PID
+  namespace and checks the mounted `/proc` is that namespace's own; on either
+  mismatch it refuses `--pid`/`run`/`inventory --pid` with
+  `pid-namespace-mismatch`, marks `--cgroup`/`--system` `PARTIAL` with cause
+  `pid_namespace`/`proc_namespace_mismatch`, and carries `pid_namespace`
+  (`observer`, `kernel_pids`, `proc_pids`) in every document plus a `doctor`
+  row. A `/proc` with no entry for the observer refuses every capture
+  except `inventory --system`, which warns and carries the `pid namespace`
+  gap.
+- `perf_event_paranoid >= 3`: `doctor` and the refusal now name the sysctl and
+  `CAP_SYS_ADMIN` (the uretprobe self-probe and live-discovery probes attach
+  through `perf_event_open`, which paranoid ≥ 3 refuses without it) instead of
+  a lockdown/LSM/seccomp hint. Capabilities are judged where the kernel checks
+  them (child user namespaces told plainly; unreadable `CapEff` no longer
+  reported as dropped `CAP_SYS_ADMIN`).
+- A second Ctrl-C while probe links close returns through the stop path:
+  exit 130, the published report intact, post-cleanup reporting and
+  destructors run. A failed capture still prints its live discovery-noise
+  summary.
 - A trace `-o` file that does not exist yet is created unnamed (`O_TMPFILE`)
-  and linked at its name only once the capture has attached, so a failed
-  start no longer creates and then removes a file at the name; filesystems
-  without `O_TMPFILE` keep the previous create-then-remove behaviour.
-- A `--manifest` file that changes size while it is read is refused instead
-  of a truncated read being parsed.
-- `docs/usage.md` states the symlink policy: inputs follow symbolic links and
-  are pinned by identity; outputs never follow one.
-- **PID namespaces (DR-K8S-1/2).** An observer outside the initial PID
-  namespace (a kind/k3d node, a container without the host PID namespace)
-  used to publish its own-view PID into the kernel PID filter, which keys on
-  initial-namespace PIDs: `profile --pid` counted nothing while claiming
-  exact observation. p11scope now reads its PID namespace from
-  `/proc/self/ns/pid` and checks that the mounted `/proc` is that
-  namespace's own (`nsenter -m` without `-p` is not). On either mismatch it
-  refuses `--pid`, `run` and `inventory --pid` with
-  `pid-namespace-mismatch`; `--cgroup` and `--system` captures still match
-  and count attached providers correctly but are `PARTIAL` with the
-  observation cause `pid_namespace` or `proc_namespace_mismatch`, and
-  `inventory --system` carries a scope-level gap. A mounted `/proc` with no
-  entry for the observer at all (`nsenter -m` without `-p`) refuses every
-  capture by name, since the observer cannot read its own `/proc/self`;
-  before, a `--cgroup`/`--system` capture there failed at the uretprobe
-  self-probe and suggested the uretprobe override. Capture evidence and the
-  inventory and `inspect --system` documents carry `pid_namespace`
-  (`observer`, `kernel_pids`, `proc_pids`), naming which namespace numbers
-  which PIDs, and `doctor` has a `PID namespace` row. See `docs/usage.md`,
-  PID namespaces.
-- **`perf_event_paranoid >= 3` (DR-K8S-3).** The uretprobe self-probe and
-  live-discovery probes attach through `perf_event_open`, which paranoid
-  >= 3 refuses without `CAP_SYS_ADMIN` (`CAP_PERFMON` does not lift it).
-  `doctor` no longer says `CAP_BPF+CAP_PERFMON` suffice there, and the
-  refusal names the sysctl and `CAP_SYS_ADMIN` (or a root process without
-  it) instead of a lockdown, LSM or seccomp profile. Capturing at paranoid
-  >= 3 needs `CAP_SYS_ADMIN`. Capabilities are judged where the kernel checks them: a
-  process in a child user namespace (a rootless or userns-remapped
-  container), even uid 0 with a full `CapEff`, is told its capabilities do
-  not count there, and an unreadable `CapEff` is no longer reported as a
-  dropped `CAP_SYS_ADMIN`.
+  and linked at its name only once attached; filesystems without `O_TMPFILE`
+  keep create-then-remove. An existing trace file is truncated only after
+  attach; a failed start leaves a previous file as it was.
+- Frozen watches render as `watch ended` / `capture ended`, never `Armed`;
+  retiring/retired reads re-poll custody; pre-stop custody loss freezes
+  watches at the last clean read; system-scope lifecycle loss demotes watches
+  stickily; watches are withheld once the caller-use pair set saturates.
+- The k8s pod-cgroup resolution is anchored at the kubelet hierarchy root and
+  rejects decoy paths; the DaemonSet docs require `CAP_CHECKPOINT_RESTORE`
+  when dropping `SYS_ADMIN` (past-cap `map_files` proofs need one of the two).
+
+### Security
+
+- Under `--pid`, classic `profile`/`trace` no longer links pid 0: uprobe-multi
+  links name the target where the kernel pid filter is proven, else per-offset
+  links bound to the target. This closes the PID-reuse exposure and stops the
+  ~3.6 µs/call cost in unrelated processes mapping the provider (two probes
+  per call on a `-O0` fixture, measured on host 7.0).
+- Fail-closed PID-namespace handling above (silent-zero → refusal/lossy
+  `PARTIAL`); no new PIDs are trusted across namespace boundaries.
+- `(dev, ino)` object keys are not trusted alone on filesystems where they
+  are not unique: maps-match attribution proves every range through
+  `/proc/<pid>/map_files` like-for-like against a self-mapping of the held
+  object (btrfs subvolumes, overlay with xino=off), and deep scans refuse a
+  path-swapped object under the same maps key. The range-proof skip applies
+  only on ext2/3/4, XFS, squashfs and EROFS; tmpfs was removed from that
+  allowlist (32-bit wrapping inodes).
+- `p11scope-discover -o` publishes private (0600) and atomically, and refuses
+  symlink/FIFO/socket/device/directory names and non-sticky world-writable
+  directories. A `--manifest` that changes size while read is refused.
+- Spawned children close inherited descriptors (`close_range`, with a fallback
+  that enumerates only after refusal), so a sibling test's child can no longer
+  hold another child's exec pipe open past its deadline.
+- The k8s entry script requires pod-cgroup depth/shape to match a kubelet QoS
+  layout and rejects candidate paths with control characters.
+- The static observer now links musl 1.2.5 with Rust's CVE-2026-6042 and
+  CVE-2026-40200 patches (was musl 1.2.3).
+
+### Removed
+
+- The Rust 1.88 MSRV: the release compiler (`.release-rust-version`,
+  currently 1.98.1) is the only supported toolchain. The 1.88 CI job and
+  floor assertions are gone; the digest-pinned helper build containers and
+  the release licence notices move to `rust:1.98.1` (f737b13).
+  `rust-version` fields name the release major.minor (`crates/ebpf-common`
+  stays at 1.97 with the pinned BPF nightly until the C7 bump).
+- `k8s-profile-entry` API mode (`--pod NAME`, `--namespace`, `--container`)
+  and its curl/jq dependency, `deploy/k8s/rbac.yaml` (observer Role) and
+  `deploy/k8s/holder.yaml`. Pod targeting is by `--pod-uid`/`--cid` from the
+  node's cgroup tree; the observer has no API token and no RBAC.
+- `scripts/verify-k8s-attach.sh`, replaced by `scripts/kind-e2e.sh`.
+
+### Known limitations
+
+See [docs/known-limitations.md](docs/known-limitations.md) for the v0.2.0
+user-facing limits (kernel tiers, scale, loss and coverage, scopes, counting,
+platform, packaging). The v0.1.0 limits below stay for that release.
+
+### Qualification of this release
+
+`TBD-QUALIFIED`: the v0.2.0 qualification record is not written yet (lane:
+`release-v020-qualification.md`). Until it lands, no kernel-tier claim here
+is this release's evidence; the v0.1.0 record stays with that release.
+
+Planned qualification kernels: 5.15, Ubuntu 6.8, 6.12, 7.2.
+
+What will be recorded here: the merged gates on the release compiler
+(1.98.1); the kind end-to-end result; the vng per-kernel matrix; the
+privileged library runner; the short measurement tier (M0, M1 at 4,096
+processes, M4 churn, C5.6 pool — `TBD-MEASURED` in
+[docs/known-limitations.md](docs/known-limitations.md) until they land).
+Explicitly out of scope for v0.2.0: a long soak and a v0.1.0 comparison
+(see [docs/known-limitations.md](docs/known-limitations.md)).
 
 ## [0.1.0]
 

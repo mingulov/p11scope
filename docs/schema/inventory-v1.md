@@ -269,7 +269,9 @@ caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
   usage columns can claim, per edge — never a run-wide flag. Always
   the seven keys `{state, since_ns, until_ns, first_ns, lossy, reason, detail}`
   (`null` where a key does not apply: `lossy` is a boolean only for
-  `counted`). `state` is:
+  `counted`). In v0.2.0 the producer emits `witnessed`, `watched_no_use`
+  and `unknown` only; `counted` is a contract state reserved for a future
+  counting feed (C7) and never appears in v0.2.0 output. `state` is:
   - `counted`: a counting feed (actual call observations) covers the
     edge since `since_ns`; `count` and `last_seen_ns` are meaningful.
     `lossy: true` means records were lost: a positive count is a lower

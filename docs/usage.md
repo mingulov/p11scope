@@ -6,12 +6,13 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.2.0.** This guide describes the v0.1.0 release: `doctor`,
-> `inspect`, `profile` (including `--mode metrics`), `trace`, and `run`, with
-> memory-scan discovery, `C_GetInterface`, multi-module capture, owned-child
-> live discovery, and schema v3. Its
+> **Status: v0.2.0.** This guide describes the v0.2.0 release: `doctor`,
+> `inspect` (now `--system`), `profile` (including `--mode metrics`),
+> `trace`, `run` and `inventory`, with memory-scan discovery,
+> `C_GetInterface`, multi-module capture, owned-child live discovery, and
+> schema v3. Its
 > [known limitations](../CHANGELOG.md#known-limitations) apply throughout;
-> `--system` is a preview. The [v0.1.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)
+> `--system` is a preview. The [v0.2.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.2.0)
 > record final tagged-artifact qualification and hosted CI;
 > [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) preserves
 > revision-specific pre-release evidence. To install the binaries or build
@@ -360,7 +361,7 @@ included, is refused with `not a cgroup v2 directory` before discovery, by
 whole-machine capture with no cgroup path: the BPF scope gate admits
 all tasks subject to the owner-health and config checks, and userspace
 discovery sweeps `/proc` under the same `--max-scan-pids` cap (default 256,
-rarest providers first). `--system` is a preview in v0.1.0 (see the
+rarest providers first). `--system` is a preview (see the
 [known limitations](../CHANGELOG.md#known-limitations)): scope admission does
 not promise that every process or call is captured, and the whole-machine
 scope shares the 512 attach slots with every ambient provider. Without
@@ -694,8 +695,10 @@ Limits that matter in pods:
   whom": one snapshot pass, or a `--duration` observation window of
   rescanning passes, reporting callers (per process incarnation), modules
   (per physical object, with scan-only admission verdicts), and the
-  caller/module edges between them with cumulative entry counts, recency,
-  and lifecycle. `--json` prints the `p11scope/inventory/v1` document
+  caller/module edges between them with usage coverage, lifecycle, and
+  explicit gaps (witness-only in this release: no per-call counts; see
+  `entries.coverage` below). `--json` prints the `p11scope/inventory/v1`
+  document
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
   report requires a file). `--dashboard` runs the live read-only
@@ -1079,12 +1082,14 @@ availability, never honesty. Then p11scope:
   with an error that starts `pid-namespace-mismatch:`. Without this the
   kernel-side PID filter would never match and the capture would read zero
   calls while claiming exact observation;
-- **refuses every capture** — any scope — when the mounted `/proc` has no
-  entry for the observer at all (`/proc/self` does not resolve, as under
-  `nsenter -m` without `-p`), with the same `pid-namespace-mismatch:` prefix:
-  p11scope reads its own `/proc/self` (the uretprobe self-probe, the trace
-  `-o` link) and resolves every discovered process through `/proc`, so no
-  scope can run honestly there. `doctor`'s `PID namespace` row FAILs;
+- **refuses every capture** — any scope except `inventory --system` (every
+  `--capture` lane), which warns and records the `pid namespace` gap
+  instead of refusing — when the mounted `/proc` has no entry for the
+  observer at all (`/proc/self` does not resolve, as under `nsenter -m`
+  without `-p`), with the same `pid-namespace-mismatch:` prefix: p11scope
+  reads its own `/proc/self` (the uretprobe self-probe, the trace `-o`
+  link) and resolves every discovered process through `/proc`, so no other
+  scope runs there. `doctor`'s `PID namespace` row FAILs;
 - otherwise lets **`--cgroup` and `--system`** captures run — their kernel filter does
   not depend on PID numbering, so it matches correctly, and providers that
   were attached count correctly — but marks the observation `lossy` with the

@@ -11,11 +11,13 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: v0.2.0**, the first release of the existing commands: `doctor`,
-> `inspect`, `profile` (including `--mode metrics`), `trace`, and `run`, with
-> memory-scan discovery, multi-module capture, and schema v3. Read the
-> [known limitations](CHANGELOG.md#known-limitations) before relying on a
-> capture; `--system` is a preview. The [v0.1.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)
+> **Status: v0.2.0** adds `inventory` (which module is used by whom:
+> scan and native lanes, JSON/JSONL/dashboard) and Kubernetes DaemonSet
+> manifests to `doctor`, `inspect` (now `--system`), `profile`
+> (including `--mode metrics`), `trace` and `run`. Read the
+> [known limitations](CHANGELOG.md#known-limitations) and
+> [docs/known-limitations.md](docs/known-limitations.md) before relying on
+> a capture; `--system` is a preview. The [v0.2.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.2.0)
 > identify tagged-artifact qualification and hosted CI;
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) preserves
 > revision-specific pre-release evidence.
@@ -32,11 +34,13 @@ and leaves deceptive/vendor tables undecoded. The explicit offline helper
 performs ten fixed `C_GetInterface` queries before any provider initialization;
 live observation remains passive.
 
-See [CHANGELOG.md](CHANGELOG.md) for what v0.1.0 contains and its known
-limitations, [Install](#install) to build and install it, and
+See [CHANGELOG.md](CHANGELOG.md) for what each release contains and its
+known limitations, [Install](#install) to build and install it, and
 [docs/usage.md](docs/usage.md) for the full operator's guide (privileges,
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
+The v0.2.0 user-facing limits live in
+[docs/known-limitations.md](docs/known-limitations.md).
 
 ## Building from source
 
@@ -86,8 +90,8 @@ assets and local release-mode builds.
 
 ## Install
 
-p11scope v0.1.0 is distributed through the
-[GitHub release](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)
+p11scope v0.2.0 is distributed through the
+[GitHub release](https://github.com/mingulov/p11scope/releases/tag/v0.2.0)
 as a static x86-64 Linux observer bundle, optional glibc and musl discovery
 helper bundles, and a source export. Download `SHA256SUMS` with the bundle you
 choose. The release also provides `RELEASE.json` with curated provenance;
@@ -95,9 +99,9 @@ each bundle contains its license notices and a copy of that record.
 
 | Bundle | Use |
 | --- | --- |
-| `p11scope-0.1.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
-| `p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
-| `p11scope-discover-0.1.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
+| `p11scope-0.2.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
+| `p11scope-discover-0.2.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
+| `p11scope-discover-0.2.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
 
 For example, download the observer and `SHA256SUMS` into a private directory,
 then verify the archive before extraction:
@@ -105,11 +109,11 @@ then verify the archive before extraction:
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.1.0/p11scope-0.1.0-x86_64-linux-musl.tar.gz
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.1.0/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.2.0/p11scope-0.2.0-x86_64-linux-musl.tar.gz
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.2.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf p11scope-0.1.0-x86_64-linux-musl.tar.gz
-sudo install -m 0755 p11scope-0.1.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
+tar -xzf p11scope-0.2.0-x86_64-linux-musl.tar.gz
+sudo install -m 0755 p11scope-0.2.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
 p11scope --version
 sudo p11scope doctor
 ```
@@ -125,7 +129,7 @@ The observer needs Linux x86-64 and the kernel and privilege requirements
 below. The helper needs the matching provider ABI and libc; a 32-bit provider
 requires a separately built 32-bit helper.
 
-The release also includes `p11scope-0.1.0-source.tar.gz`. It contains the
+The release also includes `p11scope-0.2.0-source.tar.gz`. It contains the
 committed source and the two pinned Aya archives needed to reconstruct the
 local patches. Building it still needs network access for the remaining
 locked Cargo dependencies, plus the Rust/BPF and host build tools described
@@ -178,12 +182,14 @@ loading provider code. Never give it capabilities or a set-id bit.
 
 **Kernel and privileges.** Linux 5.15 or newer with BTF
 (`/sys/kernel/btf/vmlinux`). Captures need root (`sudo p11scope ...`) or file
-capabilities on the observer. The attach floor is backend-dependent: on
-kernels ≥ 6.9 the default first attempts uprobe-multi links and falls back
-to per-probe links if multi is unsupported. With multi active,
-`CAP_BPF`+`CAP_PERFMON` suffice (measured 136/136 at
-`perf_event_paranoid=4`); on the per-probe `perf_event` path a restrictive
-paranoid needs `CAP_SYS_ADMIN`
+capabilities on the observer. The attach backend is probe-decided: the
+default first attempts uprobe-multi links where a functional probe shows
+support and falls back to per-probe links elsewhere. With multi active,
+`CAP_BPF`+`CAP_PERFMON` suffice for the static probes of an unconfined
+`--pid` target (measured 136/136 at `perf_event_paranoid=4`); full capture
+at paranoid ≥ 3 (live discovery, uretprobe self-probe) needs `CAP_SYS_ADMIN`,
+and on the per-probe `perf_event` path a restrictive paranoid needs
+`CAP_SYS_ADMIN` too
 ([measured matrix](docs/usage.md#privileges-per-environment)). The full set is:
 
 ```sh
@@ -234,7 +240,7 @@ If you installed the optional helper, also run
   sudo p11scope profile --pid 12345 --duration 60 -o diagnostic-profile.json
   ```
 
-  Whole-machine capture (a preview in v0.1.0) needs no PID or cgroup path;
+  Whole-machine capture (a preview) needs no PID or cgroup path;
   `--module` aims it at one provider:
 
   ```bash
@@ -309,11 +315,14 @@ report format.
   (`scripts/bench-overhead.sh`, `docs/notes/phase5-overhead.md`; full numbers
   and the event-loss finding at high call rates: [docs/usage.md](docs/usage.md#overhead-measured)).
 - Requires elevated privileges, kernel-version-dependent, x86-64 first. The
-  default attempts uprobe-multi on kernels ≥ 6.9, with per-probe fallback if
-  the kernel refuses multi. With multi active, `CAP_BPF`+`CAP_PERFMON`
-  suffice to attach at `kernel.perf_event_paranoid=4` (measured 136/136);
-  on the per-probe `perf_event` path a restrictive paranoid needs
-  `CAP_SYS_ADMIN`. Manifest-free scanning of a same-UID non-descendant
+  default attempts uprobe-multi where a functional probe shows support,
+  with per-probe fallback if the kernel refuses multi. With multi active,
+  `CAP_BPF`+`CAP_PERFMON`
+  suffice for the static probes of an unconfined `--pid` target at
+  `kernel.perf_event_paranoid=4` (measured 136/136); full capture at
+  paranoid ≥ 3 needs `CAP_SYS_ADMIN`, and on the per-probe `perf_event`
+  path a restrictive paranoid needs `CAP_SYS_ADMIN` too. Manifest-free
+  scanning of a same-UID non-descendant
   additionally needs `CAP_SYS_PTRACE` under Yama `ptrace_scope=1`, or
   equivalently a descendant target / `--manifest`. Root works everywhere.
   No `CAP_LEASE`, no `fs.suid_dumpable=0`, no root-owned trusted exec dir
@@ -409,8 +418,10 @@ Docker container, two containers sharing one image layer, a Kubernetes pod
 (kind), and a Knative service's scale-from-zero cold start
 (`docs/notes/phase4-matrix.md`). On the v0.1.0 release candidate the Docker,
 shared-layer, kind-pod, fork-scope and Knative lanes all passed with exact
-counts (host kernel 7.0; see
-[CHANGELOG.md](CHANGELOG.md#qualification-of-this-release)).
+counts (host kernel 7.0; see the
+[v0.1.0 notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)).
+This release's qualification is
+[CHANGELOG.md](CHANGELOG.md#qualification-of-this-release).
 `deploy/k8s` is a least-privilege node DaemonSet built from this tree (not a
 published image or an operator), with a committed kind end-to-end test
 (`scripts/kind-e2e.sh`); see [deploy/k8s/README.md](deploy/k8s/README.md) for
@@ -458,7 +469,7 @@ For now, the sudo path clears supplementary groups, so workloads needing an
 HSM/device group should use an already-running target until explicit run-as
 group selection is implemented.
 
-The [v0.1.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)
+The [v0.2.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.2.0)
 identify final tagged-artifact qualification and hosted CI. The
 [changelog](CHANGELOG.md#qualification-of-this-release) and earlier campaign
 records in `docs/` retain revision-specific historical evidence.

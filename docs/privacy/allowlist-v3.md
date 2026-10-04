@@ -1,10 +1,13 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Privacy allowlist v3 — PROPOSED object and attribute extension
 
-**Status: PROPOSED; pending independent privacy and implementation review.**
-This document does not enable capture, describe implemented fields, or qualify
-a release. The implemented contracts remain [v1](allowlist-v1.md) and
-[v2](allowlist-v2.md), whose bytes and existing exclusions are unchanged.
+**Status: PROPOSED; pending independent privacy and implementation review,
+except [Inventory caller identity](#inventory-caller-identity-owner-ruling-fb-priv),
+which is IMPLEMENTED in v0.2.0 by owner ruling FB-PRIV (2026-10-03).**
+Apart from that one section, this document does not enable capture, describe
+implemented fields, or qualify a release. The implemented contracts remain
+[v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
+exclusions are unchanged.
 Implementation, schema changes, decoder review and the evidence below must
 precede activation. This proposal extends the default `allowlisted` policy;
 it never enables `unsafe-unvalidated-metadata`. Metrics remains aggregate-only

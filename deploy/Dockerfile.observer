@@ -1,20 +1,22 @@
 # p11scope node-observer image: musl-static binary on Alpine + the
-# in-cluster attach entry script. Built from the repository root context:
+# in-cluster entry script. Built from the repository root context:
 #   docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:1 p11scope
 # Requires the static binary (pure-Rust deps + aya make this work):
 #   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-#     cargo +1.98.1 build --locked --release \
-#     --target x86_64-unknown-linux-musl --bin p11scope
+#     cargo +"$(cat .release-rust-version)" build --locked --release \
+#     --no-default-features --target x86_64-unknown-linux-musl --bin p11scope
 # (musl-tools provides the linker; the target-scoped env var keeps the
 # nested bpfel-unknown-none build inside build.rs on its own linker.)
+# scripts/kind-e2e.sh does all of this from a staged minimal context.
 # Base rationale (see deploy/k8s/README.md): static-pie needs no libc, so
-# Alpine's musl is fine; sh entrypoint keeps distroless out (no shell).
-FROM alpine:3.24
-# hadolint ignore=DL3018 # Test image tracks the pinned Alpine 3.24 repository; package versions vary by architecture.
-RUN apk add --no-cache ca-certificates curl jq
+# Alpine's musl is fine; the sh entrypoint keeps distroless out (no shell).
+# No curl/jq: the observer never talks to the Kubernetes API.
+# The base is pinned by digest (multi-arch index of alpine:3.24 as published
+# 2026-10-03); bump tag and digest together.
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 COPY target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/p11scope
 COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
-RUN chmod +x /usr/local/bin/k8s-profile-entry \
+RUN chmod 0755 /usr/local/bin/k8s-profile-entry \
     && /usr/local/bin/p11scope --help >/dev/null \
     && /usr/local/bin/k8s-profile-entry --self-test
 ENTRYPOINT ["/usr/local/bin/k8s-profile-entry"]

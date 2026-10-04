@@ -1,0 +1,148 @@
+# p11scope node observer: one agent pod per node. It idles (`sleep infinity`)
+# and runs one-shot captures on operator request through `kubectl exec`
+# (scripts/k8s-profile-entry.sh), so every capture keeps an explicit human
+# trigger, a bounded --duration and its own output file. See README.md here
+# for the full flow, the limits and troubleshooting.
+#
+# Privileges: each one below was removed in turn on kind (kernel 7.0,
+# kernel.perf_event_paranoid=4) and the capture failed or degraded without
+# it; the evidence table is in README.md ("Privileges and why").
+# - hostPID: the observer must see the target's processes to scan their
+#   memory, open the provider through /proc/<pid>/root and attach to it.
+#   Without it the pod cgroup resolves but holds no visible process (the
+#   entry script refuses with a named error; p11scope itself would read it
+#   as "no PKCS#11 modules discovered", 0 probes).
+# - CAP_SYS_ADMIN: BPF map/program load and perf-event attach. The
+#   uretprobe self-probe attaches through perf_event_open(), which
+#   kernel.perf_event_paranoid >= 3 (the Debian/Ubuntu default) refuses
+#   without CAP_SYS_ADMIN even on uprobe-multi kernels; CAP_BPF+CAP_PERFMON
+#   alone fail there. While SYS_ADMIN is held the kernel accepts it for
+#   every CAP_BPF/CAP_PERFMON check, so those two add nothing and are not
+#   listed (measured: the capture is exact without either). It also opens
+#   /proc/<pid>/map_files (else CAP_CHECKPOINT_RESTORE is needed), which
+#   inventory's caller attribution past the scan cap reads.
+# - CAP_SYS_PTRACE: ptrace-mode access to other processes' /proc/<pid>/mem
+#   (Yama ptrace_scope=1, other UIDs). Without it the memory scan fails and
+#   no provider is attached.
+# - CAP_DAC_READ_SEARCH: the memory scan of /proc/<pid>/mem without
+#   CAP_DAC_OVERRIDE, and providers in directories only their application
+#   user can traverse (a 0700 vendor directory). Without it a root workload
+#   degrades to a concrete-gap capture and a non-root one with a private
+#   provider is not captured at all.
+# Mounts: the node cgroup v2 hierarchy read-only (the pod's own cgroup
+# namespace hides every other pod, so the target cgroup is named from the
+# node view), and an emptyDir at /tmp, the only writable path. No bpffs,
+# tracefs, debugfs or BTF mount is needed (none is mounted here and every
+# cell passes): nothing is pinned, the programs are raw/BTF tracepoints and
+# uprobes, and the container's sysfs already shows /sys/kernel/btf/vmlinux.
+#
+# Gated variant: on hosts with kernel.perf_event_paranoid <= 2 the
+# perf_event_open() refusal above does not apply, but SYS_ADMIN also covers
+# a second need: inventory's caller attribution past the scan cap reads
+# /proc/<pid>/map_files, which requires CAP_SYS_ADMIN or
+# CAP_CHECKPOINT_RESTORE (without either those callers read
+# `map_files_unavailable`). So there, never just drop SYS_ADMIN: replace it
+# by BPF + PERFMON + CHECKPOINT_RESTORE. That variant is NOT measured by this
+# repository (the sysctl is host-global and was left alone). Prove a node
+# first: `kubectl exec ... -- k8s-profile-entry --pod-uid <uid> --command
+# doctor` must read `uprobe attach (self) ... ok` and `verdict: capture
+# available`.
+#
+# BLAST RADIUS — read before deploying. This pod is root on its node, and
+# the hardening below narrows the surface, not the power:
+# - uid 0 with hostPID + CAP_SYS_PTRACE + CAP_DAC_READ_SEARCH reads the
+#   whole host filesystem through /proc/1/root (and every container's
+#   through /proc/<pid>/root), whatever is or is not mounted;
+# - CAP_SYS_ADMIN allows setns()/mount(): `nsenter -t 1 -m -u -n -i` enters
+#   the host's namespaces, and the read-only cgroup mount can be remounted;
+# - allowPrivilegeEscalation: false is accepted only because the capability
+#   is spelled SYS_ADMIN (the API rejects the combination for CAP_SYS_ADMIN);
+#   no_new_privs is set, but it is not a boundary for a process that already
+#   holds CAP_SYS_ADMIN;
+# - with `tolerations: [operator: Exists]` there is one such pod on every
+#   node, so anyone who may create pods/exec, pods/attach or
+#   pods/ephemeralcontainers in this namespace, or edit this DaemonSet, is
+#   root on every node. Restrict those verbs in the p11scope namespace to
+#   node administrators (README.md "Who may exec into the observer").
+# What is genuinely absent: privileged mode, hostNetwork, host IPC,
+# hostPath mounts other than the read-only cgroup tree, a ServiceAccount
+# token, any RBAC for the observer itself. Seccomp RuntimeDefault (the
+# containerd default profile allows bpf() and perf_event_open() for these
+# capabilities; measured: Unconfined does not lift the CAP_SYS_ADMIN
+# requirement). Read-only root filesystem.
+# Kubelet creates the /tmp emptyDir 0777 without the sticky bit, which the
+# observer's output trust check refuses: the entry script restores 1777
+# before every exec. Copy results out with `kubectl cp` before the pod is
+# replaced: the emptyDir does not survive a rollout.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: p11scope-observer
+  namespace: p11scope
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: observer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: p11scope
+      app.kubernetes.io/component: observer
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: p11scope
+        app.kubernetes.io/component: observer
+    spec:
+      serviceAccountName: p11scope-observer
+      automountServiceAccountToken: false
+      hostPID: true
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      containers:
+        - name: observer
+          image: p11scope-observer:1
+          imagePullPolicy: Never
+          command: ["sleep", "infinity"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - SYS_ADMIN
+                - SYS_PTRACE
+                - DAC_READ_SEARCH
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: cgroupfs
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: scratch
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: cgroupfs
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: scratch
+          emptyDir:
+            sizeLimit: 256Mi
+      tolerations:
+        # Observe every node, including tainted and control-plane nodes.
+        - operator: Exists

@@ -1,0 +1,156 @@
+# Test-only workloads for scripts/kind-e2e.sh. NOT for production.
+# A separate namespace from the observer on purpose: the observer has no API
+# access and needs none to capture a pod in any namespace on its node.
+#   ledger-a  ledgered SoftHSM2 client, 400 iterations  (positive control)
+#   ledger-b  ledgered SoftHSM2 client, 250 iterations  (same node, a different
+#             cgroup: must never leak into a capture of ledger-a)
+#   ledger-p  ledgered client, 300 iterations, as uid 1000 with the provider
+#             copied into a private 0700 directory (needs CAP_DAC_READ_SEARCH
+#             in the observer; a vendor-library shape)
+#   ledger-t  ledgered client, 200 iterations, captured with `trace`
+#   ledger-n  ledgered client, 100 iterations, an inventory caller and the pid the `--pid` refusal names
+#             that records PID-namespace behaviour (DR-30)
+#   idle      same image, maps no provider               (negative control)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: p11scope-e2e
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: e2e-workload
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ledger-a
+  namespace: p11scope-e2e
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: e2e-workload
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: workload
+      image: p11scope-holder:1
+      imagePullPolicy: Never
+      args: ["ledger", "400"]
+      resources:
+        limits:
+          cpu: 500m
+          memory: 128Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ledger-b
+  namespace: p11scope-e2e
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: e2e-workload
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: workload
+      image: p11scope-holder:1
+      imagePullPolicy: Never
+      args: ["ledger", "250"]
+      resources:
+        limits:
+          cpu: 500m
+          memory: 128Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ledger-p
+  namespace: p11scope-e2e
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: e2e-workload
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    runAsNonRoot: true
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: workload
+      image: p11scope-holder:1
+      imagePullPolicy: Never
+      args: ["ledger-private", "300"]
+      resources:
+        limits:
+          cpu: 500m
+          memory: 128Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ledger-n
+  namespace: p11scope-e2e
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: e2e-workload
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: workload
+      image: p11scope-holder:1
+      imagePullPolicy: Never
+      args: ["ledger", "100"]
+      resources:
+        limits:
+          cpu: 500m
+          memory: 128Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ledger-t
+  namespace: p11scope-e2e
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: e2e-workload
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: workload
+      image: p11scope-holder:1
+      imagePullPolicy: Never
+      args: ["ledger", "200"]
+      resources:
+        limits:
+          cpu: 500m
+          memory: 128Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: idle
+  namespace: p11scope-e2e
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: e2e-workload
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: workload
+      image: p11scope-holder:1
+      imagePullPolicy: Never
+      args: ["idle"]
+      resources:
+        limits:
+          cpu: 100m
+          memory: 32Mi

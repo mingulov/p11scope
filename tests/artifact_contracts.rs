@@ -7160,12 +7160,13 @@ fn documented_scan_operation_cap_matches_the_code() {
 #[test]
 fn daemonset_posture_is_hardened_and_documented() {
     // MED (DaemonSet privilege posture): node-root-capable by design, so
-    // the manifest ships the cheap hardening (read-only root + scratch
-    // emptyDir) and documents the gated variant + seccomp backlog.
-    let daemonset = read("deploy/k8s/daemonset.yaml");
+    // the manifest ships the cheap hardening (read-only root + a size-capped
+    // scratch emptyDir) and documents the gated variant + seccomp backlog.
+    let daemonset = read("deploy/k8s/20-daemonset.yaml");
     for marker in [
         "readOnlyRootFilesystem: true",
-        "emptyDir: {}",
+        "emptyDir:",
+        "sizeLimit:",
         "mountPath: /tmp",
         "Gated variant",
         "allowPrivilegeEscalation: false",
@@ -7174,7 +7175,7 @@ fn daemonset_posture_is_hardened_and_documented() {
     ] {
         assert!(
             daemonset.contains(marker),
-            "deploy/k8s/daemonset.yaml is missing: {marker}"
+            "deploy/k8s/20-daemonset.yaml is missing: {marker}"
         );
     }
     assert!(
@@ -7199,7 +7200,7 @@ fn k8s_entry_hardens_the_scratch_mount() {
         entry.contains("chmod 1777 /tmp"),
         "k8s-profile-entry.sh must harden /tmp before exec"
     );
-    let daemonset = read("deploy/k8s/daemonset.yaml");
+    let daemonset = read("deploy/k8s/20-daemonset.yaml");
     assert!(
         daemonset.contains("mountPath: /tmp"),
         "the hardened path must stay the manifest's scratch mount"

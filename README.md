@@ -409,8 +409,10 @@ Docker container, two containers sharing one image layer, a Kubernetes pod
 shared-layer, kind-pod, fork-scope and Knative lanes all passed with exact
 counts (host kernel 7.0; see
 [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release)).
-`deploy/k8s` is an example, not a published image; cluster-wide packaging
-(DaemonSet/operator) comes later.
+`deploy/k8s` is a least-privilege node DaemonSet built from this tree (not a
+published image or an operator), with a committed kind end-to-end test
+(`scripts/kind-e2e.sh`); see [deploy/k8s/README.md](deploy/k8s/README.md) for
+the privileges it needs and why.
 
 Manifest-free discovery collapses matching overlay mappings in that common
 shared-layer case so the kernel point is attached once. Overlayfs classification,

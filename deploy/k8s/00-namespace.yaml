@@ -1,0 +1,14 @@
+# The observer's namespace. Pod Security Admission must allow the
+# `privileged` level here: hostPID and the added capabilities are outside the
+# `baseline` profile. Keep target workloads in their own namespaces; nothing
+# else belongs in this one.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: p11scope
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: observer
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+    pod-security.kubernetes.io/audit: privileged

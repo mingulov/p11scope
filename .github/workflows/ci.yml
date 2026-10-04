@@ -71,7 +71,7 @@ jobs:
           UNRUN: scripts/verify-capability-tier.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-discover-containers.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-induced-gaps.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
-          UNRUN: scripts/verify-k8s-attach.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/kind-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-live-discovery-preflight.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane16.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -185,7 +185,7 @@ jobs:
       - run: scripts/bench-overhead.sh --self-test
       - run: scripts/bench-discovery.sh --self-test
       - run: scripts/k8s-profile-entry.sh --self-test
-      - run: scripts/verify-k8s-attach.sh --self-test
+      - run: scripts/kind-e2e.sh --self-test
       - run: scripts/tsprobe.sh --self-test
       - run: scripts/qualify-inventory-native.sh --self-test
         timeout-minutes: 10
@@ -201,7 +201,7 @@ jobs:
       - run: python3 -I scripts/dump-owned-bpf-maps.py --self-test
       - run: python3 -I scripts/check-live-discovery-evidence.py --self-test
       - run: python3 -I scripts/lane-attach-e2e-oracle.py --self-test
-      - run: python3 -I scripts/lane-k8s-attach-oracle.py --self-test
+      - run: python3 -I scripts/kind-e2e-oracle.py --self-test
       - run: python3 -I scripts/lane-inspect-doctor-oracle.py --self-test
       - run: python3 -I scripts/lane-induced-gaps-oracle-1.py --self-test
       - run: python3 -I scripts/lane-induced-gaps-oracle-2.py --self-test

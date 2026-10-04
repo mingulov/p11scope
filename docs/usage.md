@@ -318,8 +318,10 @@ unsupported instead of accepting and ignoring operator input; use
 ### Attaching to an existing Kubernetes pod
 
 `scripts/attach-pod.sh` resolves a pod/container to its host cgroup and runs the
-manifest-free `profile --cgroup` path. It copies no helper or provider into the
-pod. The operator still needs node access and the privileges described below.
+manifest-free `profile --cgroup` path from a node shell; the in-cluster
+equivalent is the [DaemonSet](#kubernetes-daemonset). Neither copies a helper
+or provider into the pod. The operator still needs node access and the
+privileges described below.
 On a node that itself runs in a nested PID namespace (kind, k3d), `--pid` is
 refused and `--cgroup` captures are `PARTIAL` with the cause `pid_namespace`;
 see [PID namespaces](#pid-namespaces).
@@ -573,6 +575,76 @@ predates `active_slots` and shows only `slots`). The same script's
 `observed-scan` lane (manifest-free, memory scan only) exits the identical
 kind of workload without a manifest and ends `68`/`0` instead.
 
+### Kubernetes DaemonSet
+
+`deploy/k8s` runs the observer as a node DaemonSet: one idle pod per node
+that captures a target pod on request. The operator resolves the pod UID with
+their own credentials; the observer resolves it to the pod cgroup from the
+node's cgroup tree and runs the same manifest-free `--cgroup` capture as
+`attach-pod.sh`. The observer has no API token and no RBAC.
+
+```bash
+UID_=$(kubectl -n my-app get pod my-app-0 -o jsonpath='{.metadata.uid}')
+# OBS: the p11scope-observer pod on the target's node (spec.nodeName)
+kubectl -n p11scope exec "$OBS" -- k8s-profile-entry --pod-uid "$UID_" --command doctor
+kubectl -n p11scope exec "$OBS" -- k8s-profile-entry --pod-uid "$UID_" -- \
+  --duration 60 -o /tmp/capture.json
+kubectl -n p11scope cp "$OBS:/tmp/capture.json" capture.json
+```
+
+Privileges, each removed in turn on kind and shown to break or degrade the
+capture (kernel 7.0, `perf_event_paranoid=4`; table and reasons in
+[deploy/k8s/README.md](../deploy/k8s/README.md#privileges-and-why)):
+`hostPID`, `CAP_SYS_ADMIN` (the uretprobe self-probe always uses
+`perf_event_open()`, which paranoid >= 3 refuses without it, uprobe-multi
+or not; with it held, `CAP_BPF`/`CAP_PERFMON` add nothing),
+`CAP_SYS_PTRACE` (target `/proc/<pid>/mem`), `CAP_DAC_READ_SEARCH` (the
+memory scan, and providers in directories only their application can read),
+and a read-only hostPath of `/sys/fs/cgroup`. No bpffs, tracefs, debugfs or
+BTF mount, no `privileged: true`, no hostNetwork; read-only root, seccomp
+`RuntimeDefault`. On `perf_event_paranoid <= 2` nodes `CAP_BPF` +
+`CAP_PERFMON` + `CAP_CHECKPOINT_RESTORE` instead of `CAP_SYS_ADMIN` is
+expected to suffice but is not measured here; check with `--command doctor`.
+Do not drop `CAP_SYS_ADMIN` without adding `CAP_CHECKPOINT_RESTORE`:
+`inventory` attributes callers past the scan cap through
+`/proc/<pid>/map_files`, which needs one of the two, and otherwise reports
+them as `map_files_unavailable`.
+
+The hardening narrows the surface, not the power: the observer pod is root on
+its node. With hostPID, CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH it reads and
+writes the host root through `/proc/1/root`; CAP_SYS_ADMIN allows `setns()`
+into host namespaces and remounting the cgroup mount read-write (all measured
+in kind). Because the DaemonSet runs on every node, anyone allowed `pods/exec`,
+`pods/attach`, ephemeral containers, or pod/DaemonSet writes in the `p11scope`
+namespace is root on every node: grant those to node administrators only
+([deploy/k8s/README.md](../deploy/k8s/README.md#who-may-exec-into-the-observer)
+has an example Role). The entry script refuses a missing hostPID or
+unreadable target memory with a named error instead of an empty capture.
+
+`scripts/kind-e2e.sh` is the committed end-to-end test: it builds everything
+from the tree, creates and deletes its own kind cluster, applies
+`deploy/k8s/` as documented, and checks exact ledgered counts in two
+concurrent per-pod captures of pods sharing one provider, a non-root pod with
+a private provider, `trace`, an idle negative control whose process is proven
+visible, and `inventory --system` callers.
+
+Limits that matter in pods:
+
+- **PID namespaces (DR-30).** p11scope has no `NSpid` translation: BPF sees
+  initial-namespace PIDs, `/proc` shows the observer's own view. With
+  `hostPID` on an ordinary node these are the same. When the node itself runs
+  in a PID namespace (kind, k3d, sysbox) they differ, and p11scope says so:
+  `profile --pid` is refused with `pid-namespace-mismatch:`, every report
+  carries `pid_namespace` with the `pid_namespace` observation cause (lossy,
+  `concrete_gap`), and `doctor` reports `PID scope unavailable`. Use
+  `--cgroup` (the entry script's `--pod-uid`), whose counts stay exact there;
+  see [PID namespaces](#pid-namespaces).
+- `inventory` is scan-only in this release: callers and mappings, no usage
+  counts.
+- Results live in the pod's `/tmp` emptyDir: copy them out before a rollout.
+  Nothing else persists between observer pods, and a capture running during
+  a rollout is lost.
+
 ### More capture options
 
 - `-o <file>` — write the profile report (published atomically: a private
@@ -697,9 +769,19 @@ arguments instead of environment wherever a script is invoked by hand.
   `P11SCOPE_PREPARED_PYTHON`, `P11SCOPE_PREPARED_RUSTUP` — pinned tool paths
   selected by `scripts/prepared-dependency-tools.sh` for prepared builds and
   dependency verification. Build-only.
-- `P11SCOPE_K8S_NAMESPACE`, `P11SCOPE_K8S_WORK`, `P11SCOPE_K8S_ALLOW_CONTEXT` —
-  Kubernetes lane inputs: the namespace and work directory under test, and the
-  explicit context allowlist a lane may touch. Lane-only.
+- `P11SCOPE_K8S_CLUSTER`, `P11SCOPE_K8S_OBSERVER_BIN`, `P11SCOPE_K8S_TOOLCHAIN`,
+  `P11SCOPE_K8S_WORK`, `P11SCOPE_K8S_LOCK`, `P11SCOPE_K8S_NODE_IMAGE` —
+  `scripts/kind-e2e.sh` inputs: the kind cluster name (refused if it already
+  exists; default a unique `p11scope-e2e-<time>-<pid>`), a prebuilt static
+  observer to package instead of building one, the cargo toolchain for that
+  build (default `.release-rust-version`; it needs the
+  `x86_64-unknown-linux-musl` target), the evidence directory (must not
+  exist), a lock file that serializes each docker/kind/capture step with
+  other privileged work on the host, and the kind node image. Lane-only.
+- `P11SCOPE_OBSERVER`, `P11SCOPE_CGROUP_ROOT` — `scripts/k8s-profile-entry.sh`
+  (and `P11SCOPE_OBSERVER` also `scripts/attach-pod.sh`): the observer binary
+  to exec (default `/usr/local/bin/p11scope` in the image) and the node cgroup
+  v2 mount the pod cgroup is resolved under (default `/sys/fs/cgroup`).
 - `P11SCOPE_PKCS11_MODULE` — provider under test for lanes that take one as
   input (notably the capability-tier lane). Lane-only.
 - `P11SCOPE_MEASURE_SEED`, `P11SCOPE_CANARY_TARGET_BITS`,

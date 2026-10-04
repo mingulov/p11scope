@@ -7,6 +7,28 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [Unreleased]
 
+### Kubernetes deployment
+
+- `deploy/k8s` is now a least-privilege node DaemonSet: capabilities
+  `drop: [ALL]` plus `SYS_ADMIN`, `SYS_PTRACE` and `DAC_READ_SEARCH` (each
+  shown necessary on kind; `BPF`/`PERFMON` are redundant while `SYS_ADMIN` is
+  held), hostPID, a read-only cgroupfs hostPath, a size-capped `/tmp`
+  emptyDir, read-only root, seccomp `RuntimeDefault`, no ServiceAccount token
+  and no RBAC. The pod is still root on its node: restrict `pods/exec`,
+  `pods/attach` and ephemeral containers in its namespace to node
+  administrators (`deploy/k8s/README.md`). Manifests are numbered
+  (`00-namespace.yaml`, `10-serviceaccount.yaml`, `20-daemonset.yaml`) so
+  `kubectl apply -f deploy/k8s/` works on a fresh cluster.
+- `k8s-profile-entry` targets a pod by `--pod-uid` (or `--cid`), resolved from
+  the node's cgroup tree; it refuses ambiguous or non-`kubepods` matches and
+  names a missing hostPID or unreadable target memory instead of producing an
+  empty capture. **Removed:** its API mode (`--pod NAME`, `--namespace`,
+  `--container`) and the curl/jq it needed; `deploy/k8s/rbac.yaml` (the
+  observer Role) and `deploy/k8s/holder.yaml`.
+- `scripts/kind-e2e.sh` replaces `scripts/verify-k8s-attach.sh`: a committed
+  kind end-to-end test with ledgered SoftHSM2 workloads, concurrent per-pod
+  captures, positive and negative controls.
+
 ### Inventory and system catalog
 
 - `inventory --system` and `inspect --system` no longer drop callers past

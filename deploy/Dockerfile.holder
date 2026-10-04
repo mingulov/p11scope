@@ -1,11 +1,28 @@
-# Test holder image: SoftHSM library present so LD_PRELOAD maps a provider
-# into the sleeping pid. No token traffic needed for discovery.
+# Test-only workload image for the Kubernetes e2e (scripts/kind-e2e.sh):
+# SoftHSM2 plus the ledgered `gated` client from tests/fixtures/public-cli,
+# so a pod makes an exactly known number of PKCS#11 calls on request.
 #   docker build -f p11scope/deploy/Dockerfile.holder -t p11scope-holder:1 p11scope
-# ubuntu:26.04 for the longer support window (test-only image; the observer
-# itself is musl-static on Alpine and has no distro dependency).
-FROM ubuntu:26.04
+# The image's default command maps nothing (the negative-control shape);
+# `holder-entry ledger N` runs the ledgered client. ubuntu:26.04 for the
+# longer support window (test-only image; the observer itself is musl-static
+# on Alpine and has no distro dependency). Both stages pin ubuntu:26.04 by
+# digest (index as published 2026-10-03); apt packages still float with the
+# archive, so the holder is repeatable, not bit-reproducible.
+FROM ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7937c94ca3f7a804e AS build
+# hadolint ignore=DL3008 # Test holder tracks the pinned Ubuntu 26.04 repository; package versions vary by architecture.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY tests/fixtures/public-cli/gated.c /src/gated.c
+RUN gcc -O1 -o /src/gated /src/gated.c -ldl
+
+FROM ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7937c94ca3f7a804e
 # hadolint ignore=DL3008 # Test holder tracks the pinned Ubuntu 26.04 repository; package versions vary by architecture.
 RUN apt-get update && apt-get install -y --no-install-recommends softhsm2 \
     && rm -rf /var/lib/apt/lists/* \
     && test -f /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
-CMD ["sleep", "infinity"]
+COPY --from=build /src/gated /usr/local/bin/p11scope-ledger-gated
+COPY deploy/holder-entry.sh /usr/local/bin/holder-entry
+RUN chmod 0755 /usr/local/bin/holder-entry /usr/local/bin/p11scope-ledger-gated \
+    && /usr/local/bin/holder-entry --self-test
+ENTRYPOINT ["/usr/local/bin/holder-entry"]
+CMD ["idle"]

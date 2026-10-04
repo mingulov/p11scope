@@ -621,10 +621,10 @@ fn j6_k8s_doc_pins() {
     for referenced in [
         "deploy/Dockerfile.observer",
         "deploy/Dockerfile.holder",
-        "deploy/k8s/daemonset.yaml",
-        "deploy/k8s/namespace.yaml",
+        "deploy/k8s/20-daemonset.yaml",
+        "deploy/k8s/00-namespace.yaml",
         "scripts/k8s-profile-entry.sh",
-        "scripts/verify-k8s-attach.sh",
+        "scripts/kind-e2e.sh",
         "scripts/attach-pod.sh",
     ] {
         let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join(referenced);

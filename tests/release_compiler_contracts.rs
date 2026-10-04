@@ -60,7 +60,7 @@ fn live_shell_selectors_read_the_version_file() {
         "scripts/bench-overhead.sh",
         "scripts/system-scope-measure.sh",
         "scripts/attach-pod.sh",
-        "scripts/verify-k8s-attach.sh",
+        "scripts/kind-e2e.sh",
         "scripts/run-flake-quarantine.sh",
     ] {
         let text = fs::read_to_string(path).expect("read a live selector");

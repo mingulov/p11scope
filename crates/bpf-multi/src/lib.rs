@@ -335,6 +335,32 @@ impl std::error::Error for GroupHalt {
     }
 }
 
+/// A group attach that halted mid-bisect, with the leaf links it had
+/// already created. Those leaves are closed (dropped, synchronously:
+/// one grace period each) before this is returned and never handed to
+/// the caller, so a caller must not claim that no link existed: it can
+/// only report how many were closed.
+#[derive(Debug)]
+pub struct BisectHalt {
+    pub halt: GroupHalt,
+    /// Leaf links created and then closed by the halt.
+    pub closed_leaves: usize,
+}
+
+impl std::fmt::Display for BisectHalt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.halt)?;
+        if self.closed_leaves > 0 {
+            write!(
+                f,
+                " ({} already-attached leaf link(s) closed)",
+                self.closed_leaves
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// One site the kernel refused, with the error that refused it: the
 /// singleton slice's own error, or the fail-fast error shared by its
 /// slice (OS errors round-trip exactly; anything else keeps its text).
@@ -373,7 +399,27 @@ pub fn bisect_attach<T>(
     attach: &mut TryAttach<'_, T>,
     sites: &[(u64, u64)],
 ) -> Result<(Vec<T>, Vec<RefusedSite>), GroupHalt> {
+    bisect_attach_counted(attach, sites).map_err(|halted| halted.halt)
+}
+
+/// [`bisect_attach`], with a halt that counts the leaf links it closed
+/// (a halt can come after earlier leaves linked: a poison offset split
+/// the group, the left leaf linked, the right one met EMFILE).
+pub fn bisect_attach_counted<T>(
+    attach: &mut TryAttach<'_, T>,
+    sites: &[(u64, u64)],
+) -> Result<(Vec<T>, Vec<RefusedSite>), BisectHalt> {
     let mut links = Vec::new();
+    // Dropping the leaves closes them; done explicitly so the count is
+    // exact and the close is visible here.
+    let halt = |links: Vec<T>, halt: GroupHalt| {
+        let closed_leaves = links.len();
+        drop(links);
+        BisectHalt {
+            halt,
+            closed_leaves,
+        }
+    };
     let mut bad = Vec::new();
     let mut stack: Vec<Vec<usize>> = vec![(0..sites.len()).collect()];
     while let Some(idxs) = stack.pop() {
@@ -388,10 +434,10 @@ pub fn bisect_attach<T>(
                     .raw_os_error()
                     .is_some_and(is_unsupported_kernel_errno) =>
             {
-                return Err(GroupHalt::Unsupported(error));
+                return Err(halt(links, GroupHalt::Unsupported(error)));
             }
             Err(error) if is_exhaustion_err(&error) => {
-                return Err(GroupHalt::Exhausted(error));
+                return Err(halt(links, GroupHalt::Exhausted(error)));
             }
             Err(error) => {
                 if idxs.len() > 1 && !is_permission_err(&error) {
@@ -799,6 +845,42 @@ mod tests {
         assert!(matches!(halted, GroupHalt::Unsupported(_)), "{halted:?}");
         // Halts stop the walk: exactly one attempt each, nothing refused.
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_halt_after_a_linked_leaf_closes_and_counts_that_leaf() {
+        // Site 0 is poison (EINVAL), site 3 meets EMFILE: [0..4] bisects
+        // to [0,1] -> [0] refused, [1] linked; then [2,3] halts.
+        #[derive(Debug)]
+        struct Leaf<'a>(&'a Cell<usize>);
+        impl Drop for Leaf<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        let live = Cell::new(0usize);
+        let sites: Vec<(u64, u64)> = (0..4).map(|i| (i, i)).collect();
+        let halted = bisect_attach_counted(
+            &mut |slice| {
+                if slice.iter().any(|(offset, _)| *offset == 0) {
+                    return Err(os_error(libc::EINVAL));
+                }
+                if slice.iter().any(|(offset, _)| *offset == 3) {
+                    return Err(os_error(libc::EMFILE));
+                }
+                live.set(live.get() + 1);
+                Ok(Leaf(&live))
+            },
+            &sites,
+        )
+        .unwrap_err();
+        assert!(matches!(halted.halt, GroupHalt::Exhausted(_)), "{halted:?}");
+        assert_eq!(halted.closed_leaves, 1);
+        assert_eq!(live.get(), 0, "the linked leaf was closed by the halt");
+        assert_eq!(
+            halted.to_string(),
+            "fd table exhausted: Too many open files (os error 24) (1 already-attached leaf link(s) closed)"
+        );
     }
 
     #[test]

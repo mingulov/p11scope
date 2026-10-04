@@ -44,7 +44,7 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (67 ignored tests in the default-feature lib binary): 57 run by
+# Curation (69 ignored tests in the default-feature lib binary): 59 run by
 # default, 4 run only with --include-long, 6 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -132,6 +132,11 @@ inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64
 inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64
 inventory::privileged_tests::privileged_native_lane_system_exec_churn_lp64
 inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
+# Task 6 C5.11: --system over 544 endpoints (8 mapped copies of SoftHSM2)
+# retires closed under uprobe-multi (per-offset links may read unsettled);
+# under auto on a kernel whose functional probe links uprobe-multi it must
+# take it. Prints C511_SCALE (about 10-30 s).
+inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64
 # Task 6 C5.3: the native lane under the interactive dashboard on a pty never
 # read for 20 s (same workload needs; about 30 s).
 inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64

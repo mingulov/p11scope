@@ -284,15 +284,20 @@ pub(super) trait InventoryLinkIo {
         None
     }
     /// One uprobe-multi group (Multi backend only). `Unsupported` and
-    /// `Exhausted` halt the group with no link acquired; every other
-    /// refusal is isolated per site. An IO without multi support refuses.
+    /// `Exhausted` halt the group: no link reaches custody, and the leaf
+    /// links a bisect had already created are closed and counted
+    /// (`closed_leaves`). Every other refusal is isolated per site. An IO
+    /// without multi support refuses.
     fn attach_entry_group(
         &mut self,
         _request: InventoryGroupRequest<'_>,
-    ) -> std::result::Result<InventoryGroupAttach<Self::Link>, p11scope_bpf_multi::GroupHalt> {
-        Err(p11scope_bpf_multi::GroupHalt::Unsupported(
-            std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
-        ))
+    ) -> std::result::Result<InventoryGroupAttach<Self::Link>, p11scope_bpf_multi::BisectHalt> {
+        Err(p11scope_bpf_multi::BisectHalt {
+            halt: p11scope_bpf_multi::GroupHalt::Unsupported(std::io::Error::from_raw_os_error(
+                libc::EOPNOTSUPP,
+            )),
+            closed_leaves: 0,
+        })
     }
 }
 
@@ -711,7 +716,7 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
     fn attach_entry_group(
         &mut self,
         request: InventoryGroupRequest<'_>,
-    ) -> std::result::Result<InventoryGroupAttach<Self::Link>, p11scope_bpf_multi::GroupHalt> {
+    ) -> std::result::Result<InventoryGroupAttach<Self::Link>, p11scope_bpf_multi::BisectHalt> {
         use std::os::fd::{AsFd as _, AsRawFd as _};
         let InventoryGroupRequest {
             program,
@@ -755,7 +760,7 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
             // Never widen to pid 0 for a scope that names one process.
             UProbeScope::CallingProcess => std::process::id(),
         };
-        let (links, refused) = p11scope_bpf_multi::bisect_attach(
+        let (links, refused) = p11scope_bpf_multi::bisect_attach_counted(
             &mut |slice| {
                 let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
                 p11scope_bpf_multi::attach_group(prog_fd, pid, path, &offsets, &cookies, false)

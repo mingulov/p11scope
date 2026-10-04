@@ -113,6 +113,9 @@ struct FakeIo {
     emfile: BTreeSet<u32>,
     /// attach_entry_group() halts as an unsupported kernel would.
     unsupported: bool,
+    /// Leaf links an EMFILE halt creates (as a bisect would, after a
+    /// poison split) before halting; the halt closes them.
+    leaves_before_halt: usize,
 }
 
 fn entry_id(cookie: u64) -> u32 {
@@ -175,7 +178,7 @@ impl InventoryLinkIo for FakeIo {
         request: InventoryGroupRequest<'_>,
     ) -> std::result::Result<
         super::super::activation::InventoryGroupAttach<Self::Link>,
-        p11scope_bpf_multi::GroupHalt,
+        p11scope_bpf_multi::BisectHalt,
     > {
         let ids: Vec<u32> = request
             .sites
@@ -183,14 +186,33 @@ impl InventoryLinkIo for FakeIo {
             .map(|(_, cookie)| entry_id(*cookie))
             .collect();
         if self.unsupported {
-            return Err(p11scope_bpf_multi::GroupHalt::Unsupported(
-                std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
-            ));
+            return Err(p11scope_bpf_multi::BisectHalt {
+                halt: p11scope_bpf_multi::GroupHalt::Unsupported(
+                    std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+                ),
+                closed_leaves: 0,
+            });
         }
         if ids.iter().any(|id| self.emfile.contains(id)) {
-            return Err(p11scope_bpf_multi::GroupHalt::Exhausted(
-                std::io::Error::from_raw_os_error(libc::EMFILE),
-            ));
+            // Leaves linked before the halt live briefly, then close.
+            let leaves: Vec<FakeLink> = (0..self.leaves_before_halt)
+                .map(|_| {
+                    let mut log = self.log.lock().unwrap();
+                    log.ops.push(Op::Group(request.program, ids.clone()));
+                    log.live += 1;
+                    FakeLink {
+                        log: self.log.clone(),
+                    }
+                })
+                .collect();
+            let closed_leaves = leaves.len();
+            drop(leaves);
+            return Err(p11scope_bpf_multi::BisectHalt {
+                halt: p11scope_bpf_multi::GroupHalt::Exhausted(std::io::Error::from_raw_os_error(
+                    libc::EMFILE,
+                )),
+                closed_leaves,
+            });
         }
         let refused: Vec<(usize, std::io::Error)> = ids
             .iter()
@@ -2163,6 +2185,33 @@ fn fd_exhaustion_defers_the_group_and_the_rest_published_for_an_attach_only_retr
     harness.assert_group_invariants();
 }
 
+/// Review L1: an EMFILE halt after a bisect leaf already linked closes that
+/// leaf and counts it; nothing reaches custody and the members defer.
+#[test]
+fn a_halt_after_a_linked_leaf_counts_the_closed_leaf_and_defers_the_group() {
+    let mut fixture = SetFixture::new(64);
+    let delta = fixture.pass("a.so", 4);
+    let mut harness = Harness::multi(64, None);
+    harness.io.refuse.insert(0);
+    harness.io.emfile.insert(3);
+    harness.io.leaves_before_halt = 1;
+    let receipt = harness.extend(delta, &fixture.set);
+    assert!(receipt.fd_exhausted);
+    assert_eq!(receipt.halt_closed_links, 1);
+    assert!(receipt.attached.is_empty() && receipt.failed.is_empty());
+    let mut deferred = delta_ids(&receipt.deferred);
+    deferred.sort_unstable();
+    assert_eq!(deferred, [0, 1, 2, 3]);
+    assert!(harness.links.is_empty(), "no halted leaf reached custody");
+    assert_eq!(
+        harness.io.log.lock().unwrap().live,
+        0,
+        "the leaf was closed"
+    );
+    assert!(harness.book.groups.is_empty());
+    harness.assert_group_invariants();
+}
+
 #[test]
 fn a_kernel_refusing_multi_after_preparation_fails_the_group_without_fallback() {
     let mut fixture = SetFixture::new(64);
@@ -2227,6 +2276,15 @@ fn a_multi_extend_honours_the_window_and_defers_the_rest_unpublished() {
             ("p11_usage_entry_lp64", vec![3, 4])
         ]
     );
+    // The same object's later entries form a second group: the first
+    // group's record is neither grown nor reused (groups are immutable).
+    let groups: Vec<(u32, Vec<u32>)> = harness
+        .book
+        .groups
+        .iter()
+        .map(|group| (group.serial, group.members.iter().map(|id| id.0).collect()))
+        .collect();
+    assert_eq!(groups, [(0, vec![0, 1, 2]), (1, vec![3, 4])]);
     harness.assert_group_invariants();
 }
 

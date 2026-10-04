@@ -12,11 +12,12 @@ use crate::attach::capture::{
 };
 use crate::discovery::caller_registry::UseCoverage;
 use crate::discovery::inventory_attach_set::TargetDelta;
-use crate::inventory_capture::{CaptureLane, Retirement, Stopped};
+use crate::inventory_capture::{CaptureLane, Retirement, RetirementLoad, Stopped};
 use anyhow::{bail, ensure};
 use p11scope_ebpf_common::ImageIdentity;
 use std::cell::{Cell, RefCell};
 use std::process::{Child, Command, Stdio};
+use std::rc::Rc;
 
 const SOFTHSM: &str = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so";
 
@@ -192,6 +193,12 @@ struct Probe<L> {
     stop_began: Option<Instant>,
     /// Begin-stop to retired: the measured kernel detach time.
     retired_after: Option<Duration>,
+    /// Endpoints attached so far, shared with the pass callback.
+    attached: Rc<Cell<usize>>,
+    /// Summed attach wall time over every extend.
+    attach_ns: u64,
+    /// The kernel links the capture held when the stop began.
+    links_at_stop: Option<usize>,
 }
 
 impl<L> Probe<L> {
@@ -205,6 +212,9 @@ impl<L> Probe<L> {
             row_tgids: Vec::new(),
             stop_began: None,
             retired_after: None,
+            attached: Rc::default(),
+            attach_ns: 0,
+            links_at_stop: None,
         }
     }
 }
@@ -228,6 +238,10 @@ impl<L: CaptureLane<PidPin>> CaptureLane<PidPin> for Probe<L> {
         self.inner.backend()
     }
 
+    fn live_links(&self) -> Option<usize> {
+        self.inner.live_links()
+    }
+
     fn incarnation(&self) -> Option<ScopeIncarnation> {
         self.inner.incarnation()
     }
@@ -248,6 +262,9 @@ impl<L: CaptureLane<PidPin>> CaptureLane<PidPin> for Probe<L> {
             }
         }
         let receipt = self.inner.extend(delta, targets, window);
+        self.attached
+            .set(self.attached.get() + receipt.attached.len());
+        self.attach_ns += receipt.attach_ns_total;
         if let Some(coverage) = receipt.exec_coverage {
             self.exec_coverage_ns = Some(coverage.start_ns());
         }
@@ -275,6 +292,7 @@ impl<L: CaptureLane<PidPin>> CaptureLane<PidPin> for Probe<L> {
     }
 
     fn begin_stop(&mut self) {
+        self.links_at_stop = self.inner.live_links();
         self.stop_began = Some(Instant::now());
         self.inner.begin_stop();
     }
@@ -1331,5 +1349,140 @@ fn privileged_native_lane_system_exec_churn_lp64() -> Result<()> {
         ensure_lossless(&outcome)?;
         eprintln!("C57_CHURN_BRANCH rate=1000 branch=lossless");
     }
+    Ok(())
+}
+
+/// C5.11: a `--system` run over at least 400 endpoints retires inside its
+/// budget and reads `retirement: closed` under uprobe-multi (per-offset
+/// links may read unsettled: one close per endpoint). Copies of SoftHSM2 (each its own
+/// inode, so its own object of 68 endpoints) are mapped by `map` ledgers;
+/// the lane absorbs them over several passes.
+/// Under `auto` on a kernel whose functional probe links uprobe-multi the
+/// run must take it. Prints `C511_SCALE` with begin-stop to retired, for
+/// the retirement-time-against-endpoints measurement.
+///
+/// Knobs (measurement only): `P11SCOPE_CELL_COPIES` (default 8 copies,
+/// 544 endpoints) and `P11SCOPE_CELL_BACKEND` (auto|multi|singles,
+/// default auto).
+#[test]
+#[ignore = "root-owned live BPF lane; native --system over 400+ endpoints retires closed"]
+fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
+    let copies: usize = std::env::var("P11SCOPE_CELL_COPIES")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(8);
+    let selection = crate::attach::BackendSelection::from_cli(
+        &std::env::var("P11SCOPE_CELL_BACKEND").unwrap_or_else(|_| "auto".into()),
+    )?;
+    let workload = Workload::build()?;
+    let mut providers = Vec::with_capacity(copies);
+    for copy in 0..copies {
+        let out = workload.path(&format!("softhsm-{copy}.so"));
+        std::fs::copy(SOFTHSM, &out)?;
+        providers.push(out);
+    }
+    let gate = workload.path("gate");
+    let gate_arg = gate.to_str().context("gate path")?.to_string();
+    let mut mappers = Vec::new();
+    for (index, chunk) in providers.chunks(4).enumerate() {
+        let mut args = vec!["map".to_string(), "--cell".into(), format!("S{index}")];
+        for provider in chunk {
+            args.push("--module".into());
+            args.push(provider.to_str().context("provider path")?.into());
+        }
+        args.extend(["--gate".into(), gate_arg.clone(), "--hold".into()]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        mappers.push(workload.spawn(&format!("map{index}"), &args)?);
+    }
+    let mut coordinator = InventoryCoordinator::new(
+        Scope::System,
+        HookRegistry::builtin(),
+        providers.clone(),
+        OsProcessSource,
+        RegistryLimits::default_limits(),
+    )?;
+    let probe = Probe::new(FacadeLane::prepare(
+        crate::attach::capture::CaptureScope::System,
+        coordinator.attach_set().budget(),
+        selection,
+    )?);
+    let attached = Rc::clone(&probe.attached);
+    let lane = NativeLane::start(probe, &mut coordinator, LaneWindows::PROVISIONAL, None)
+        .map_err(|(_, reason)| anyhow::anyhow!("{reason}"))?;
+    let expected = copies * 68;
+    let attached_at = Cell::new(None::<u64>);
+    let stopped = drive(
+        &mut coordinator,
+        InspectScope::System,
+        lane,
+        &mut |passes| {
+            if attached_at.get().is_none() && attached.get() >= expected {
+                attached_at.set(Some(passes));
+            }
+            Ok(attached_at.get().is_some_and(|at| passes >= at + 2) || passes >= 40)
+        },
+    )?;
+    let _ = std::fs::write(&gate, b"");
+    let summary = &stopped.summary;
+    let backend = &summary.backend;
+    let load = RetirementLoad {
+        backend: backend.backend,
+        links: stopped.capture.links_at_stop.unwrap_or(summary.attached),
+        endpoints: summary.attached,
+    };
+    let budget = LaneWindows::PROVISIONAL.retirement_budget(load);
+    let cleanup = stopped.capture.cleanup();
+    eprintln!(
+        "C511_SCALE selection={} mechanism={} fallback={:?} copies={copies} expected={expected} \
+         attached={} failed={} passes={} links={} attach_ms={} budget_ms={} retired_ms={:?} \
+         retirement={} cleanup={cleanup:?}",
+        backend.selection_label(),
+        backend.mechanism(),
+        backend.fallback,
+        summary.attached,
+        summary.failed,
+        summary.passes,
+        load.links,
+        stopped.capture.attach_ns / 1_000_000,
+        budget.as_millis(),
+        stopped.capture.retired_after.map(|after| after.as_millis()),
+        summary.retirement.label(),
+    );
+    let summary = summary.clone();
+    let backend = summary.backend.clone();
+    // An unsettled retirement finishes in the drop (after the report in
+    // production): its time completes the measurement.
+    let dropping = Instant::now();
+    drop(stopped);
+    eprintln!(
+        "C511_SCALE_DROP retirement={} drop_ms={}",
+        summary.retirement.label(),
+        dropping.elapsed().as_millis()
+    );
+    ensure!(
+        summary.attached >= 400 && summary.attached >= expected && summary.failed == 0,
+        "{summary:?}"
+    );
+    // uprobe-multi closes hundreds of endpoints in a few links well inside
+    // the budget: it must read closed. Per-offset links on a kernel without
+    // it (5.15) close one link per endpoint and may honestly outlast the
+    // 10 s pre-report wait (R-C51-4): closed or unsettled, never a failure.
+    let closed = matches!(summary.retirement, Retirement::Closed(ref cleanup) if cleanup.failures.is_empty());
+    ensure!(
+        closed
+            || (backend.backend == crate::attach::AttachBackend::Singles
+                && matches!(summary.retirement, Retirement::Unsettled(_))),
+        "{summary:?}"
+    );
+    if selection == crate::attach::BackendSelection::Auto
+        && crate::inventory_capture::multi_functional_probe().is_ok()
+    {
+        ensure!(
+            backend.mechanism() == "uprobe-multi" && backend.fallback.is_none(),
+            "auto did not take uprobe-multi on a capable kernel: {backend:?}"
+        );
+    }
+    drop(mappers);
     Ok(())
 }

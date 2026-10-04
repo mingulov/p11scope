@@ -428,6 +428,12 @@ pub(crate) struct ExtendReceipt {
     /// An attach hit EMFILE: the window stopped there and the rest was
     /// deferred, nothing failed.
     pub fd_exhausted: bool,
+    /// Multi: leaf links a halted group attach (EMFILE, or a kernel
+    /// refusing uprobe-multi) had already created and then closed before
+    /// they reached custody. Their members are deferred or failed with
+    /// the rest of the group; while live, those leaves could only fire
+    /// for published, in-scope entries.
+    pub halt_closed_links: usize,
     /// Why nothing was attempted, when the whole extend refused.
     pub refused: Option<String>,
     pub custody: Option<ScopeCustody>,
@@ -1457,14 +1463,24 @@ fn extend_groups_with<I: InventoryLinkIo>(
         receipt.attach_ns_max = receipt.attach_ns_max.max(spent);
         let attach = match attached {
             Ok(attach) => attach,
-            Err(p11scope_bpf_multi::GroupHalt::Exhausted(_)) => {
-                // No link was acquired: the members stay published-
-                // unattached and they and every later group defer.
+            Err(p11scope_bpf_multi::BisectHalt {
+                halt: p11scope_bpf_multi::GroupHalt::Exhausted(_),
+                closed_leaves,
+            }) => {
+                // No link reached custody: leaves a bisect had already
+                // linked were closed by the halt and are counted, never
+                // claimed absent. The members stay published-unattached
+                // and they and every later group defer.
+                receipt.halt_closed_links += closed_leaves;
                 receipt.fd_exhausted = true;
                 defer_members(receipt, &members, &pending);
                 return;
             }
-            Err(p11scope_bpf_multi::GroupHalt::Unsupported(error)) => {
+            Err(p11scope_bpf_multi::BisectHalt {
+                halt: p11scope_bpf_multi::GroupHalt::Unsupported(error),
+                closed_leaves,
+            }) => {
+                receipt.halt_closed_links += closed_leaves;
                 // The backend was chosen before any producer existed; a
                 // kernel refusing it now fails the group, never silently
                 // falls back (no fresh object after observations).

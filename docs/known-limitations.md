@@ -142,8 +142,9 @@ the min..max of per-sample p95.
   2,198–2,708 ms, including one slow sample at 2,708 ms); 448 was about
   0.34 s (native 337 ms, range 335–558 ms; scan 335 ms, range
   332–340 ms). Absolute pass times shift with host state between
-  campaigns (the same v0.2.0 binary measured 1.80 s at 2 CPUs in the
-  v0.2.1 window against 2.20 s in its own), so the cross-campaign drop
+  campaigns (the v0.2.0 product code measured 1.80 s scan at 2 CPUs in
+  the v0.2.1 window, build 6abd2b7, against 2.20 s in its own window,
+  build b16c858), so the cross-campaign drop
   overstates the code effect; the interleaved R4 A/B below is the clean
   measure of it.
 - Kernels/conditions: `--system --capture scan` and `native` at 448 / 4,096

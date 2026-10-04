@@ -111,11 +111,13 @@ pub(crate) const PIN_RECHECK_PER_READ: usize = 64;
 /// own files).
 pub(crate) const FD_RESERVE: u64 = 64;
 
-/// Multi's link bound for the descriptor preflight: one link per attach
-/// group, and a group per (object, entry program) of one extend, so a
-/// capture holds about one link per provider object per extend that grew
-/// it, far below N. Only a kernel-isolated refused site splits a group
-/// into more links (bisect leaves). A capture that outgrows this bound
+/// Multi's link bound for the descriptor preflight. Each (object, entry
+/// program) group of one extend attaches in links of
+/// [`MULTI_LINK_MIN_SITES`]..=[`MULTI_LINK_MAX_SITES`] sites (sized by
+/// `multi_link_sites`), so a capture holds at most about N/8 full links
+/// plus one partial remainder per group per extend, plus a leaf per
+/// kernel-isolated refused site (bisect); usually far fewer (96-site links
+/// for providers few processes map). A capture that outgrows this bound
 /// meets EMFILE, which defers the rest explicitly (`fd_exhausted`), as for
 /// Singles.
 pub(crate) const MULTI_LINK_BOUND: u64 = 1024;
@@ -143,19 +145,52 @@ pub(crate) const MULTI_LINK_MAX_SITES: usize = 96;
 pub(crate) const MULTI_LINK_SITE_BASE_NS: u64 = 150_000;
 pub(crate) const MULTI_LINK_SITE_PER_MAPPER_NS: u64 = 20_000;
 
+/// The first link of an object whose mapper count discovery cannot know
+/// (a scope-limited view, review R4): 16 sites stay near the target even
+/// at 500 mappers (<= 10 ms per site there), and the measured cost grows
+/// the next links up to the max.
+pub(crate) const MULTI_LINK_SCOPE_LIMITED_SITES: usize = 16;
+
+/// What discovery knows of the processes mapping one object: the first
+/// estimate of a uprobe-multi link's cost (review M1, R4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapperEstimate {
+    /// A whole-system pass saw this many processes mapping it (deep-scanned
+    /// or attributed by maps identity).
+    System(usize),
+    /// Discovery saw a limited scope (`--pid`): the kernel's registration
+    /// still walks every process mapping the object, which this view does
+    /// not count, so the first link starts at
+    /// [`MULTI_LINK_SCOPE_LIMITED_SITES`].
+    ScopeLimited,
+    /// No pass has reported (tests and pre-pass callers): as one mapper.
+    Unknown,
+}
+
 /// The sites of the next link of one object: from the per-site cost the
-/// previous link of that object measured when there is one, else from the
-/// cost model and the object's mapper count as discovery knows it
-/// (unknown counts as one). Always within the min and max.
-pub(crate) fn multi_link_sites(mappers: Option<usize>, measured_ns_per_site: Option<u64>) -> usize {
-    let per_site = measured_ns_per_site.unwrap_or_else(|| {
-        let mappers = u64::try_from(mappers.unwrap_or(1)).unwrap_or(u64::MAX);
-        MULTI_LINK_SITE_BASE_NS
-            .saturating_add(MULTI_LINK_SITE_PER_MAPPER_NS.saturating_mul(mappers))
-    });
+/// previous link of that object measured when there is one, else from
+/// what discovery knows of its mappers (the cost model over a system
+/// count, unknown counting as one; a conservative fixed start for a
+/// scope-limited view). Always within the min and max.
+pub(crate) fn multi_link_sites(
+    mappers: MapperEstimate,
+    measured_ns_per_site: Option<u64>,
+) -> usize {
+    let per_site = match (measured_ns_per_site, mappers) {
+        (Some(measured), _) => measured,
+        (None, MapperEstimate::ScopeLimited) => return MULTI_LINK_SCOPE_LIMITED_SITES,
+        (None, MapperEstimate::System(count)) => link_site_estimate(count),
+        (None, MapperEstimate::Unknown) => link_site_estimate(1),
+    };
     let target = u64::try_from(MULTI_LINK_TARGET.as_nanos()).unwrap_or(u64::MAX);
     let sites = usize::try_from(target / per_site.max(1)).unwrap_or(usize::MAX);
     sites.clamp(MULTI_LINK_MIN_SITES, MULTI_LINK_MAX_SITES)
+}
+
+/// The cost model's per-site estimate for `mappers` mapping processes.
+fn link_site_estimate(mappers: usize) -> u64 {
+    let mappers = u64::try_from(mappers).unwrap_or(u64::MAX);
+    MULTI_LINK_SITE_BASE_NS.saturating_add(MULTI_LINK_SITE_PER_MAPPER_NS.saturating_mul(mappers))
 }
 
 /// The named resource of a descriptor refusal (`CapacityLimited("fds")`).
@@ -353,11 +388,10 @@ pub(crate) struct ScopeIncarnation {
 /// set in production. The facade takes shared clones; it never borrows.
 pub(crate) trait CaptureTargets {
     fn target(&self, object: AttachObjectId) -> Option<&RetainedInventoryTarget>;
-    /// How many processes discovery last saw mapping `object` (deep-scanned
-    /// or attributed by maps identity), when known: the first estimate of
-    /// a uprobe-multi link's cost (`multi_link_sites`).
-    fn mappers(&self, _object: AttachObjectId) -> Option<usize> {
-        None
+    /// What discovery last knew of the processes mapping `object`: the
+    /// first estimate of a uprobe-multi link's cost (`multi_link_sites`).
+    fn mappers(&self, _object: AttachObjectId) -> MapperEstimate {
+        MapperEstimate::Unknown
     }
 }
 
@@ -366,7 +400,7 @@ impl CaptureTargets for InventoryAttachSet {
         InventoryAttachSet::target(self, object)
     }
 
-    fn mappers(&self, object: AttachObjectId) -> Option<usize> {
+    fn mappers(&self, object: AttachObjectId) -> MapperEstimate {
         InventoryAttachSet::mappers(self, object)
     }
 }

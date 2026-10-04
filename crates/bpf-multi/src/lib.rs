@@ -691,30 +691,50 @@ fn probe_pid_filter_with(link_pid: u32) -> io::Result<PidFilterHits> {
         .map_err(|_| io::Error::other("the probe's sibling thread panicked"))?;
     let own_threads = read_hits()?;
     // The negative leg: another process with the same breakpointed text.
-    // SAFETY: the child only calls a pure function and `_exit`s, both
-    // async-signal-safe, so forking a multithreaded process is sound.
+    // A pipe handshake proves the child called the target (review R2):
+    // with SIGCHLD ignored the kernel reaps the child itself and `waitpid`
+    // answers ECHILD, which then means "ended", not a failed probe.
+    let (handshake, report) = cloexec_pipe()?;
+    // SAFETY: the child only calls a pure function, `write`s one byte and
+    // `_exit`s, all async-signal-safe, so forking a multithreaded process
+    // is sound.
     let child = unsafe { libc::fork() };
     if child < 0 {
         return Err(io::Error::last_os_error());
     }
     if child == 0 {
         call(3);
-        // SAFETY: leave the forked child without running any destructor.
-        unsafe { libc::_exit(0) };
+        let called = 1u8;
+        // SAFETY: one byte from a live local into the inherited pipe; the
+        // child leaves without running any destructor.
+        unsafe {
+            libc::write(report.as_raw_fd(), std::ptr::addr_of!(called).cast(), 1);
+            libc::_exit(0)
+        };
     }
+    drop(report);
+    let called = read_handshake(&handshake)?;
     let mut status = 0;
-    loop {
+    let reaped = loop {
         // SAFETY: waiting for our own child.
         let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
         if reaped == child {
-            break;
+            break true;
         }
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINTR) {
-            return Err(error);
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            // Reaped by the kernel (SIGCHLD ignored or SA_NOCLDWAIT).
+            Some(libc::ECHILD) => break false,
+            _ => return Err(error),
         }
+    };
+    if !called {
+        return Err(io::Error::other(
+            "the probe's child process ended before it called the probe target",
+        ));
     }
-    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+    if reaped && (!libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0) {
         return Err(io::Error::other(format!(
             "the probe's child process ended abnormally (status {status:#x})"
         )));
@@ -725,6 +745,37 @@ fn probe_pid_filter_with(link_pid: u32) -> io::Result<PidFilterHits> {
         own_threads,
         other_process: total.saturating_sub(own_threads),
     })
+}
+
+/// A close-on-exec pipe: (read end, write end).
+fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a two-int array for pipe2 to fill.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two fresh owned fds.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Whether the probe child wrote its byte before every write end closed.
+fn read_handshake(pipe: &OwnedFd) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: reading one byte into a live local.
+        let read = unsafe { libc::read(pipe.as_raw_fd(), std::ptr::addr_of_mut!(byte).cast(), 1) };
+        match read {
+            1 => return Ok(byte == 1),
+            0 => return Ok(false),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(error);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1006,8 +1057,104 @@ mod tests {
                 );
                 assert!(hits.own_threads <= 2 && hits.other_process <= 1, "{hits:?}");
             }
-            Err(error) => assert!(error.raw_os_error().is_some(), "{error}"),
+            Err(error) => assert_kernel_refusal(&error),
         }
+    }
+
+    /// The kernel's own answer to a probe it refuses (review R2): EPERM or
+    /// EACCES without privilege; as root, EPERM (no CAP_BPF/CAP_PERFMON in
+    /// a container), or EINVAL/EOPNOTSUPP where the kernel has no
+    /// uprobe-multi. Never a process-management error such as ECHILD.
+    fn assert_kernel_refusal(error: &io::Error) {
+        let root = unsafe { libc::geteuid() } == 0;
+        let expected: &[i32] = if root {
+            &[libc::EPERM, libc::EINVAL, libc::EOPNOTSUPP]
+        } else {
+            &[libc::EPERM, libc::EACCES]
+        };
+        assert!(
+            error
+                .raw_os_error()
+                .is_some_and(|errno| expected.contains(&errno)),
+            "root={root}: {error} ({:?})",
+            error.raw_os_error()
+        );
+    }
+
+    const SIGCHLD_IGNORED_ENV: &str = "P11SCOPE_PIDFLT_SIGCHLD_IGNORED";
+
+    fn outcome_line(outcome: &io::Result<PidFilterHits>) -> String {
+        match outcome {
+            Ok(hits) => format!("ok own={} other={}", hits.own_threads, hits.other_process),
+            Err(error) => format!("err errno={:?} {error}", error.raw_os_error()),
+        }
+    }
+
+    /// The inner half of `an_ignored_sigchld_changes_no_probe_outcome`:
+    /// a no-op unless that test spawned it with SIGCHLD ignored.
+    #[test]
+    fn pid_filter_probe_under_ignored_sigchld_inner() {
+        if std::env::var_os(SIGCHLD_IGNORED_ENV).is_none() {
+            return;
+        }
+        // The premise: the inherited disposition really is SIG_IGN.
+        // SAFETY: reading the current disposition into a zeroed struct.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) },
+            0
+        );
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "SIGCHLD is not ignored"
+        );
+        println!(
+            "PIDFLT_SIGCHLD_IGNORED {}",
+            outcome_line(&probe_pid_filter_hits())
+        );
+    }
+
+    /// Review R2: a process started with SIGCHLD ignored (inherited across
+    /// exec) has its probe child reaped by the kernel, so `waitpid`
+    /// answers ECHILD; the probe's outcome must still be exactly the one a
+    /// default disposition gives (here: the outer test's own), never an
+    /// error that would silently demote `auto` to per-offset links.
+    #[test]
+    fn an_ignored_sigchld_changes_no_probe_outcome() {
+        use std::os::unix::process::CommandExt as _;
+        let baseline = outcome_line(&probe_pid_filter_hits());
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tests::pid_filter_probe_under_ignored_sigchld_inner",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SIGCHLD_IGNORED_ENV, "1");
+        // SAFETY: `signal` is async-signal-safe; SIG_IGN survives exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ignored = stdout
+            .lines()
+            .find_map(|line| Some(line.split_once("PIDFLT_SIGCHLD_IGNORED ")?.1))
+            .unwrap_or_else(|| panic!("the inner probe did not run: {stdout}"));
+        eprintln!("PIDFLT_SIGCHLD baseline=[{baseline}] ignored=[{ignored}]");
+        assert_eq!(ignored, baseline);
     }
 
     /// Review L3: a link that ignores the pid (modelled by pid 0, which
@@ -1025,7 +1172,7 @@ mod tests {
                 assert_eq!(hits.other_process, 1, "{hits:?}");
                 assert!(!hits.proves_pid_scope(), "{hits:?}");
             }
-            Err(error) => assert!(error.raw_os_error().is_some(), "{error}"),
+            Err(error) => assert_kernel_refusal(&error),
         }
     }
 

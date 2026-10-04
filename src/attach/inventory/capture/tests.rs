@@ -118,8 +118,10 @@ struct FakeIo {
     leaves_before_halt: usize,
     /// attach_entry_group() takes this long (a slow registration walk).
     group_delay: Duration,
-    /// ... plus this long per site.
+    /// ... plus this long per site (per `slow` site when that is set).
     site_delay: Duration,
+    /// Only these endpoint IDs cost `site_delay` (empty: every site).
+    slow: BTreeSet<u32>,
 }
 
 fn entry_id(cookie: u64) -> u32 {
@@ -189,29 +191,36 @@ impl InventoryLinkIo for FakeIo {
             .iter()
             .map(|(_, cookie)| entry_id(*cookie))
             .collect();
-        std::thread::sleep(self.group_delay + self.site_delay * ids.len() as u32);
+        let costly = ids
+            .iter()
+            .filter(|id| self.slow.is_empty() || self.slow.contains(id))
+            .count();
+        std::thread::sleep(self.group_delay + self.site_delay * costly as u32);
+        // Leaves linked before a halt live briefly, then close.
+        let halt_leaves = |io: &Self| {
+            let leaves: Vec<FakeLink> = (0..io.leaves_before_halt)
+                .map(|_| {
+                    let mut log = io.log.lock().unwrap();
+                    log.ops.push(Op::Group(request.program, ids.clone()));
+                    log.live += 1;
+                    FakeLink {
+                        log: io.log.clone(),
+                    }
+                })
+                .collect();
+            leaves.len()
+        };
         if self.unsupported {
+            let closed_leaves = halt_leaves(self);
             return Err(p11scope_bpf_multi::BisectHalt {
                 halt: p11scope_bpf_multi::GroupHalt::Unsupported(
                     std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
                 ),
-                closed_leaves: 0,
+                closed_leaves,
             });
         }
         if ids.iter().any(|id| self.emfile.contains(id)) {
-            // Leaves linked before the halt live briefly, then close.
-            let leaves: Vec<FakeLink> = (0..self.leaves_before_halt)
-                .map(|_| {
-                    let mut log = self.log.lock().unwrap();
-                    log.ops.push(Op::Group(request.program, ids.clone()));
-                    log.live += 1;
-                    FakeLink {
-                        log: self.log.clone(),
-                    }
-                })
-                .collect();
-            let closed_leaves = leaves.len();
-            drop(leaves);
+            let closed_leaves = halt_leaves(self);
             return Err(p11scope_bpf_multi::BisectHalt {
                 halt: p11scope_bpf_multi::GroupHalt::Exhausted(std::io::Error::from_raw_os_error(
                     libc::EMFILE,
@@ -2194,7 +2203,7 @@ fn fd_exhaustion_defers_the_group_and_the_rest_published_for_an_attach_only_retr
 /// discovery would report for a provider mapped by `mappers` processes.
 struct Mapped<'a> {
     set: &'a InventoryAttachSet,
-    mappers: usize,
+    mappers: MapperEstimate,
 }
 
 impl CaptureTargets for Mapped<'_> {
@@ -2202,8 +2211,8 @@ impl CaptureTargets for Mapped<'_> {
         self.set.target(object)
     }
 
-    fn mappers(&self, _object: AttachObjectId) -> Option<usize> {
-        Some(self.mappers)
+    fn mappers(&self, _object: AttachObjectId) -> MapperEstimate {
+        self.mappers
     }
 }
 
@@ -2225,11 +2234,20 @@ fn group_sizes(harness: &Harness) -> Vec<usize> {
 fn the_link_size_keeps_whole_tables_for_few_mappers_and_fits_the_target_for_many() {
     let target = MULTI_LINK_TARGET.as_nanos() as u64;
     // Few or unknown mappers: a whole v2.40 / v3.0 table in one link.
-    assert_eq!(multi_link_sites(None, None), MULTI_LINK_MAX_SITES);
-    assert_eq!(multi_link_sites(Some(1), None), MULTI_LINK_MAX_SITES);
-    assert_eq!(multi_link_sites(Some(50), None), MULTI_LINK_MAX_SITES);
+    assert_eq!(
+        multi_link_sites(MapperEstimate::Unknown, None),
+        MULTI_LINK_MAX_SITES
+    );
+    assert_eq!(
+        multi_link_sites(MapperEstimate::System(1), None),
+        MULTI_LINK_MAX_SITES
+    );
+    assert_eq!(
+        multi_link_sites(MapperEstimate::System(50), None),
+        MULTI_LINK_MAX_SITES
+    );
     // 500 mappers: the estimate fits the 200 ms target.
-    let sites = multi_link_sites(Some(500), None);
+    let sites = multi_link_sites(MapperEstimate::System(500), None);
     let per_site = MULTI_LINK_SITE_BASE_NS + 500 * MULTI_LINK_SITE_PER_MAPPER_NS;
     assert!(
         sites < MULTI_LINK_MAX_SITES && sites as u64 * per_site <= target,
@@ -2241,17 +2259,36 @@ fn the_link_size_keeps_whole_tables_for_few_mappers_and_fits_the_target_for_many
     );
     // Clamps at both ends.
     assert_eq!(
-        multi_link_sites(Some(1_000_000), None),
+        multi_link_sites(MapperEstimate::System(1_000_000), None),
         MULTI_LINK_MIN_SITES
     );
-    assert_eq!(multi_link_sites(None, Some(u64::MAX)), MULTI_LINK_MIN_SITES);
-    assert_eq!(multi_link_sites(None, Some(0)), MULTI_LINK_MAX_SITES);
-    // The measured cost overrides the estimate both ways.
     assert_eq!(
-        multi_link_sites(Some(500), Some(1_000)),
+        multi_link_sites(MapperEstimate::Unknown, Some(u64::MAX)),
+        MULTI_LINK_MIN_SITES
+    );
+    assert_eq!(
+        multi_link_sites(MapperEstimate::Unknown, Some(0)),
         MULTI_LINK_MAX_SITES
     );
-    assert_eq!(multi_link_sites(Some(1), Some(10_000_000)), 20);
+    // The measured cost overrides the estimate both ways.
+    assert_eq!(
+        multi_link_sites(MapperEstimate::System(500), Some(1_000)),
+        MULTI_LINK_MAX_SITES
+    );
+    assert_eq!(
+        multi_link_sites(MapperEstimate::System(1), Some(10_000_000)),
+        20
+    );
+    // Review R4: a scope-limited view starts conservatively, whatever a
+    // count would say, and only a measurement grows it.
+    assert_eq!(
+        multi_link_sites(MapperEstimate::ScopeLimited, None),
+        MULTI_LINK_SCOPE_LIMITED_SITES
+    );
+    assert_eq!(
+        multi_link_sites(MapperEstimate::ScopeLimited, Some(1_000)),
+        MULTI_LINK_MAX_SITES
+    );
 }
 
 /// Review M1: with few mappers an (object, program) group attaches in
@@ -2264,7 +2301,7 @@ fn a_large_object_with_few_mappers_attaches_in_maximum_size_links() {
     let mut harness = Harness::multi(n, None);
     let source = Mapped {
         set: &fixture.set,
-        mappers: 1,
+        mappers: MapperEstimate::System(1),
     };
     let receipt = harness.extend_with_custody(delta, &source, long_window(n), &mut || Ok(()));
     assert_eq!(receipt.attached.len(), n as usize);
@@ -2284,11 +2321,11 @@ fn a_cheap_measured_link_grows_the_next_links_of_that_object() {
     let mut harness = Harness::multi(n, None);
     let source = Mapped {
         set: &fixture.set,
-        mappers: 500,
+        mappers: MapperEstimate::System(500),
     };
     let receipt = harness.extend_with_custody(delta, &source, long_window(n), &mut || Ok(()));
     assert_eq!(receipt.attached.len(), n as usize);
-    let first = multi_link_sites(Some(500), None);
+    let first = multi_link_sites(MapperEstimate::System(500), None);
     assert_eq!(
         group_sizes(&harness),
         [
@@ -2297,6 +2334,54 @@ fn a_cheap_measured_link_grows_the_next_links_of_that_object() {
             n as usize - first - MULTI_LINK_MAX_SITES
         ]
     );
+    harness.assert_group_invariants();
+}
+
+/// Review R4: under a scope-limited discovery view (`--pid`) the first
+/// link of an object starts at the conservative size and the measured cost
+/// grows the next ones to the maximum.
+#[test]
+fn a_scope_limited_view_starts_small_and_grows_from_what_it_measured() {
+    let n = 150u64;
+    let mut fixture = SetFixture::new(n);
+    let delta = fixture.pass("a.so", n);
+    let mut harness = Harness::multi(n, None);
+    let source = Mapped {
+        set: &fixture.set,
+        mappers: MapperEstimate::ScopeLimited,
+    };
+    let receipt = harness.extend_with_custody(delta, &source, long_window(n), &mut || Ok(()));
+    assert_eq!(receipt.attached.len(), n as usize);
+    assert_eq!(
+        group_sizes(&harness),
+        [
+            MULTI_LINK_SCOPE_LIMITED_SITES,
+            MULTI_LINK_MAX_SITES,
+            n as usize - MULTI_LINK_SCOPE_LIMITED_SITES - MULTI_LINK_MAX_SITES
+        ]
+    );
+    harness.assert_group_invariants();
+}
+
+/// Review R3: the attach set's own mapper counts reach the link size (the
+/// production `CaptureTargets`, not a test double).
+#[test]
+fn the_attach_sets_noted_mappers_size_the_first_link() {
+    let n = 150u64;
+    let mut fixture = SetFixture::new(n);
+    let delta = fixture.pass("a.so", n);
+    let key = fixture
+        .set
+        .target(delta.endpoints[0].object)
+        .unwrap()
+        .object_key();
+    fixture.set.note_mappers(true, [(&key, 500)]);
+    let mut harness = Harness::multi(n, None);
+    let receipt = harness.extend_with_custody(delta, &fixture.set, long_window(n), &mut || Ok(()));
+    assert_eq!(receipt.attached.len(), n as usize);
+    let first = multi_link_sites(MapperEstimate::System(500), None);
+    assert!(first < MULTI_LINK_MAX_SITES, "{first}");
+    assert_eq!(group_sizes(&harness)[0], first);
     harness.assert_group_invariants();
 }
 
@@ -2310,7 +2395,7 @@ fn an_expensive_measured_link_shrinks_the_next_link_of_that_object() {
     harness.io.site_delay = Duration::from_millis(3);
     let source = Mapped {
         set: &fixture.set,
-        mappers: 1,
+        mappers: MapperEstimate::System(1),
     };
     let receipt = harness.extend_with_custody(delta, &source, long_window(n), &mut || Ok(()));
     assert_eq!(receipt.attached.len(), n as usize);
@@ -2395,6 +2480,62 @@ fn a_halt_after_a_linked_leaf_counts_the_closed_leaf_and_defers_the_group() {
         "the leaf was closed"
     );
     assert!(harness.book.groups.is_empty());
+    assert!(
+        harness.book.link_ns_per_site.is_empty(),
+        "a halted attach measures no per-site cost"
+    );
+    harness.assert_group_invariants();
+}
+
+/// Review R3: an unsupported-kernel halt after a bisect leaf already
+/// linked counts the closed leaf too, fails the members, and records no
+/// per-site cost.
+#[test]
+fn an_unsupported_halt_after_a_linked_leaf_counts_the_closed_leaf() {
+    let mut fixture = SetFixture::new(64);
+    let delta = fixture.pass("a.so", 3);
+    let mut harness = Harness::multi(64, None);
+    harness.io.unsupported = true;
+    harness.io.leaves_before_halt = 2;
+    let receipt = harness.extend(delta, &fixture.set);
+    assert_eq!(receipt.halt_closed_links, 2);
+    assert_eq!(receipt.failed.len(), 3);
+    assert!(receipt.attached.is_empty() && !receipt.fd_exhausted);
+    assert!(harness.links.is_empty(), "no halted leaf reached custody");
+    assert_eq!(harness.io.log.lock().unwrap().live, 0, "the leaves closed");
+    assert!(harness.book.link_ns_per_site.is_empty());
+}
+
+/// Review R3: the measured per-site cost sizes only the object that
+/// measured it: an expensive first object never shrinks the first link of
+/// a cheap one.
+#[test]
+fn an_expensive_object_does_not_shrink_another_objects_links() {
+    let n = MULTI_LINK_MAX_SITES as u64;
+    let mut fixture = SetFixture::new(4 * n);
+    let mut harness = Harness::multi(4 * n, None);
+    // a.so's sites cost 3 ms each: alone, 200 ms would fit 66 per link.
+    harness.io.site_delay = Duration::from_millis(3);
+    harness.io.slow = (0..n as u32).collect();
+    let a = fixture.pass("a.so", n);
+    let receipt = harness.extend(a, &fixture.set);
+    assert_eq!(receipt.attached.len(), n as usize);
+    assert_eq!(group_sizes(&harness), [MULTI_LINK_MAX_SITES]);
+    // b.so arrives in a later pass, a whole table of cheap sites.
+    let b = fixture.pass("b.so", n);
+    assert_eq!(b.endpoints.len(), n as usize);
+    let receipt = harness.extend(b, &fixture.set);
+    assert_eq!(receipt.attached.len(), n as usize);
+    assert_eq!(
+        group_sizes(&harness),
+        [MULTI_LINK_MAX_SITES, MULTI_LINK_MAX_SITES],
+        "b.so keeps whole-table links"
+    );
+    assert_eq!(
+        harness.book.link_ns_per_site.len(),
+        2,
+        "one cost per object"
+    );
     harness.assert_group_invariants();
 }
 

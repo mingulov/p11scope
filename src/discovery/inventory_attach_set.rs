@@ -40,6 +40,7 @@
 //! bounded by the endpoint budget: at most that many endpoints, retained
 //! objects, alias keys, module records and refusal-gap memo entries.
 
+use crate::attach::capture::MapperEstimate;
 use crate::capacity::InventoryBudget;
 use crate::discovery::identity::{
     PinnedContentKey, PinnedObjectId, PinnedObjects, RetainedInventoryTarget,
@@ -211,6 +212,10 @@ pub(crate) struct InventoryAttachSet {
     /// The processes discovery last saw mapping each retained object
     /// (replaced every pass; bounded by the retained objects).
     mappers: BTreeMap<AttachObjectId, usize>,
+    /// What the last pass's view was: `None` before any pass, `Some(true)`
+    /// for a whole-system view whose counts estimate a link's cost, and
+    /// `Some(false)` for a scope-limited one whose counts never do.
+    mappers_system_view: Option<bool>,
 }
 
 impl InventoryAttachSet {
@@ -231,17 +236,26 @@ impl InventoryAttachSet {
             endpoint_refusals: 0,
             module_record_refusals: 0,
             mappers: BTreeMap::new(),
+            mappers_system_view: None,
         }
     }
 
     /// Record one pass's mapper counts by raw object key (a catalog's
     /// objects with their mappings); keys that name no retained object
     /// are ignored, and an object seen under several keys sums them.
+    /// `system_view` says whether the pass saw the whole system: only then
+    /// do the counts estimate how many processes the kernel walks (review
+    /// R4); a scope-limited view keeps none.
     pub(crate) fn note_mappers<'a>(
         &mut self,
+        system_view: bool,
         counts: impl IntoIterator<Item = (&'a ObjectKey, usize)>,
     ) {
         self.mappers.clear();
+        self.mappers_system_view = Some(system_view);
+        if !system_view {
+            return;
+        }
         for (key, count) in counts {
             if let Some(&object) = self.by_raw.get(key) {
                 *self.mappers.entry(object).or_default() += count;
@@ -249,9 +263,14 @@ impl InventoryAttachSet {
         }
     }
 
-    /// The processes discovery last saw mapping `object`, when known.
-    pub(crate) fn mappers(&self, object: AttachObjectId) -> Option<usize> {
-        self.mappers.get(&object).copied()
+    /// What the last pass knew of the processes mapping `object`. A system
+    /// pass that did not see it counts none.
+    pub(crate) fn mappers(&self, object: AttachObjectId) -> MapperEstimate {
+        match self.mappers_system_view {
+            None => MapperEstimate::Unknown,
+            Some(false) => MapperEstimate::ScopeLimited,
+            Some(true) => MapperEstimate::System(self.mappers.get(&object).copied().unwrap_or(0)),
+        }
     }
 
     pub(crate) const fn budget(&self) -> InventoryBudget {
@@ -1178,6 +1197,66 @@ pub(crate) mod tests {
         let outcome = set.absorb(&lower(&modules, &pins, policy), &pins);
         assert!(outcome.delta.is_empty(), "{:?}", outcome.delta);
         assert_eq!(set.len(), 3);
+    }
+
+    /// Review R3/R4: mapper counts key by raw object key and sum an
+    /// object's aliases, ignore keys of no retained object, are replaced
+    /// every pass, and count only from a whole-system view.
+    #[test]
+    fn mapper_counts_sum_aliases_replace_per_pass_and_need_a_system_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = provider(&dir, "a.so", "provider-a");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let pins = pass_pins(&[(&a, "sha-a")]);
+        let modules = [module(&pins, &a, &offsets(3))];
+        let delta = set.absorb(&lower(&modules, &pins, policy), &pins).delta;
+        let object = delta.endpoints[0].object;
+        let key = module_key(&a, "sha-a").object;
+        // The same file through another mount view: an alias raw key.
+        let view_key = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 4242,
+            },
+            inode: key.inode,
+        };
+        let mut pins = PinnedObjects::empty();
+        assert!(
+            pins.absorb(real_scan_pin(&a, Some(view_key), 2, "sha-a"))
+                .is_empty()
+        );
+        let modules = [module(&pins, &a, &offsets(3))];
+        assert!(
+            set.absorb(&lower(&modules, &pins, policy), &pins)
+                .delta
+                .is_empty()
+        );
+        let stranger = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 4343,
+            },
+            inode: key.inode + 1,
+        };
+
+        assert_eq!(
+            set.mappers(object),
+            MapperEstimate::Unknown,
+            "before a pass"
+        );
+        set.note_mappers(true, [(&key, 3), (&view_key, 2), (&stranger, 7)]);
+        assert_eq!(set.mappers(object), MapperEstimate::System(5));
+        // The next pass replaces the counts; one that did not see it, none.
+        set.note_mappers(true, [(&view_key, 4)]);
+        assert_eq!(set.mappers(object), MapperEstimate::System(4));
+        set.note_mappers(true, []);
+        assert_eq!(set.mappers(object), MapperEstimate::System(0));
+        // A scope-limited view never estimates, whatever it counted.
+        set.note_mappers(false, [(&key, 1)]);
+        assert_eq!(set.mappers(object), MapperEstimate::ScopeLimited);
+        set.note_mappers(true, [(&key, 9)]);
+        assert_eq!(set.mappers(object), MapperEstimate::System(9));
     }
 
     #[test]

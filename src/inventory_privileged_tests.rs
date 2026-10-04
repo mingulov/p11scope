@@ -778,20 +778,39 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
     Ok(())
 }
 
-/// `P11SCOPE_TEST_TIME_SCALE` (default 1, at least 1): how much slower than
-/// nominal a loaded host declares itself, the same variable the Python
-/// harnesses and `tests/artifact_contracts.rs` read. Cells that scale a
-/// bound by it say which; with the default every bound is literal.
+/// `P11SCOPE_TEST_TIME_SCALE` (default 1, from 1 to 4 here): how much
+/// slower than nominal a loaded host declares itself, the same variable
+/// the Python harnesses and `tests/artifact_contracts.rs` read. Cells that
+/// scale a bound by it say which; with the default every bound is literal.
 fn test_time_scale() -> Result<f64> {
-    let scale = match std::env::var("P11SCOPE_TEST_TIME_SCALE") {
-        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse::<f64>().unwrap_or(f64::NAN),
+    parse_time_scale(std::env::var("P11SCOPE_TEST_TIME_SCALE").ok().as_deref())
+}
+
+fn parse_time_scale(raw: Option<&str>) -> Result<f64> {
+    let scale = match raw.map(str::trim) {
+        Some(raw) if !raw.is_empty() => raw.parse::<f64>().unwrap_or(f64::NAN),
         _ => 1.0,
     };
+    // A cap keeps the knob a load allowance, never a way to pass a
+    // regressed dashboard (4 x 100 ms ticks, a quarter of the passes).
     ensure!(
-        scale.is_finite() && scale >= 1.0,
-        "P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1"
+        scale.is_finite() && (1.0..=4.0).contains(&scale),
+        "P11SCOPE_TEST_TIME_SCALE must be a number from 1 to 4"
     );
     Ok(scale)
+}
+
+/// Review (runner opt-ins): the time scale defaults to 1 and is refused
+/// outside 1..=4 rather than clamped.
+#[test]
+fn the_test_time_scale_is_refused_outside_one_to_four() {
+    assert_eq!(parse_time_scale(None).unwrap(), 1.0);
+    assert_eq!(parse_time_scale(Some(" ")).unwrap(), 1.0);
+    assert_eq!(parse_time_scale(Some("2.5")).unwrap(), 2.5);
+    assert_eq!(parse_time_scale(Some("4")).unwrap(), 4.0);
+    for refused in ["4.01", "0.5", "abc", "inf", "NaN"] {
+        assert!(parse_time_scale(Some(refused)).is_err(), "{refused}");
+    }
 }
 
 /// One production run through `run_with_writer` with `--json` and an event
@@ -1460,34 +1479,51 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
             mappers.push(workload.spawn(&format!("map{index}-{round}"), &args)?);
         }
     }
+    // Review R4: `P11SCOPE_CELL_SCOPE=pid` captures the first mapper only
+    // (its providers, each still mapped by every round), as `--pid` would.
+    let pid_scope = match std::env::var("P11SCOPE_CELL_SCOPE").as_deref() {
+        Ok("pid") => Some(mappers[0].pid()),
+        Ok("system") | Err(_) => None,
+        Ok(other) => bail!("P11SCOPE_CELL_SCOPE={other}: expected system or pid"),
+    };
+    let (engine_scope, capture_scope, inspect_scope, expected) = match pid_scope {
+        Some(pid) => (
+            Scope::Pid(pid),
+            crate::attach::capture::CaptureScope::Pid(
+                PidPin::open(pid).map_err(anyhow::Error::msg)?,
+            ),
+            InspectScope::Pid(pid),
+            copies.min(4) * 68,
+        ),
+        None => (
+            Scope::System,
+            crate::attach::capture::CaptureScope::System,
+            InspectScope::System,
+            copies * 68,
+        ),
+    };
     let mut coordinator = InventoryCoordinator::new(
-        Scope::System,
+        engine_scope,
         HookRegistry::builtin(),
         providers.clone(),
         OsProcessSource,
         RegistryLimits::default_limits(),
     )?;
     let probe = Probe::new(FacadeLane::prepare(
-        crate::attach::capture::CaptureScope::System,
+        capture_scope,
         coordinator.attach_set().budget(),
         selection,
     )?);
     let attached = Rc::clone(&probe.attached);
     let lane = NativeLane::start(probe, &mut coordinator, LaneWindows::PROVISIONAL, None)
         .map_err(|(_, reason)| anyhow::anyhow!("{reason}"))?;
-    let expected = copies * 68;
     let attached_at = Cell::new(None::<u64>);
-    let stopped = drive(
-        &mut coordinator,
-        InspectScope::System,
-        lane,
-        &mut |passes| {
-            if attached_at.get().is_none() && attached.get() >= expected {
-                attached_at.set(Some(passes));
-            }
-            Ok(attached_at.get().is_some_and(|at| passes >= at + 2) || passes >= 40)
-        },
-    )?;
+    let stopped = drive(&mut coordinator, inspect_scope, lane, &mut |passes| {
+        if attached_at.get().is_none() && attached.get() >= expected {
+            attached_at.set(Some(passes));
+        }
+        Ok(attached_at.get().is_some_and(|at| passes >= at + 2) || passes >= 40)
+    })?;
     let _ = std::fs::write(&gate, b"");
     let summary = &stopped.summary;
     let backend = &summary.backend;
@@ -1499,10 +1535,11 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
     let budget = LaneWindows::PROVISIONAL.retirement_budget(load);
     let cleanup = stopped.capture.cleanup();
     eprintln!(
-        "C511_SCALE selection={} mechanism={} fallback={:?} copies={copies} expected={expected} \
+        "C511_SCALE scope={} selection={} mechanism={} fallback={:?} copies={copies} expected={expected} \
          mappers={} attached={} failed={} passes={} links={} attach_ms={} \
          attach_link_max_ms={:.1} extend_attach_max_ms={:.1} budget_ms={} retired_ms={:?} \
          retirement={} cleanup={cleanup:?}",
+        if pid_scope.is_some() { "pid" } else { "system" },
         backend.selection_label(),
         backend.mechanism(),
         backend.fallback,
@@ -1530,7 +1567,9 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
         dropping.elapsed().as_millis()
     );
     ensure!(
-        summary.attached >= 400 && summary.attached >= expected && summary.failed == 0,
+        (pid_scope.is_some() || summary.attached >= 400)
+            && summary.attached >= expected
+            && summary.failed == 0,
         "{summary:?}"
     );
     // uprobe-multi closes hundreds of endpoints in a few links well inside
@@ -1546,6 +1585,7 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
     );
     if selection == crate::attach::BackendSelection::Auto
         && crate::inventory_capture::multi_functional_probe().is_ok()
+        && (pid_scope.is_none() || crate::attach::kernel_multi_pid_filter().is_ok())
     {
         ensure!(
             backend.mechanism() == "uprobe-multi" && backend.fallback.is_none(),

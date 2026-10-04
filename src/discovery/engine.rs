@@ -7860,6 +7860,12 @@ impl Engine {
         self.multi_rebuild_gaps
     }
 
+    /// Whether the scope is the whole machine: only then does a pass see
+    /// every process mapping an object.
+    pub(crate) fn sees_whole_system(&self) -> bool {
+        matches!(self.scope, Scope::System)
+    }
+
     /// Scopes that admit process generations over time: cgroup membership and
     /// the whole machine both track an admission ledger and count descendant
     /// gaps. PID scope names one exact generation and never admits another.

@@ -52,7 +52,8 @@
 # counters zero) and the capture's production consumer, fed that read,
 # marks lifecycle loss; a missing owned lifecycle record is accepted on any
 # reported ring loss. Each such read prints LIFECYCLE_LOSS_REPORTED. Never
-# set it for a guest or qualification run.
+# set it for a guest or qualification run. A set opt-in is recorded as an
+# `# opt-in:` line in results.txt and echoed to stderr.
 #
 # Curation (72 ignored tests in the default-feature lib binary): 61 run by
 # default, 4 run only with --include-long, 7 are statically skipped with a
@@ -153,8 +154,9 @@ inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
 inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64
 # Task 6 C5.3: the native lane under the interactive dashboard on a pty never
 # read for 20 s (same workload needs; about 30 s). A loaded host may declare
-# P11SCOPE_TEST_TIME_SCALE (default 1, pass it through sudo env): it scales
-# only this cell's 100 ms tick-gap bound and its pass floor.
+# P11SCOPE_TEST_TIME_SCALE (default 1, at most 4, pass it through sudo
+# env): it scales only this cell's 100 ms tick-gap bound and its pass
+# floor. The runner refuses a value outside 1..4 and records a set one.
 inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
 )
 
@@ -440,12 +442,26 @@ main() {
         rm -rf "$probe_img" "$probe_mnt"
     fi
 
+    # Opt-in tolerances are declared in the results, never applied silently.
+    if [ -n "${P11SCOPE_TEST_TIME_SCALE:-}" ] \
+        && ! awk -v s="$P11SCOPE_TEST_TIME_SCALE" \
+            'BEGIN { exit !(s ~ /^[0-9]+([.][0-9]+)?$/ && s >= 1 && s <= 4) }'; then
+        echo "$PROG: P11SCOPE_TEST_TIME_SCALE=$P11SCOPE_TEST_TIME_SCALE: must be a number from 1 to 4" >&2
+        return 2
+    fi
     {
         echo "# $PROG run: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "# binary: $bin"
         echo "# include_long: $include_long"
         echo "# selectors: ${SELECTORS[*]:-<none>}"
+        if [ -n "${P11SCOPE_PRIV_LIFECYCLE_LOSS:-}" ]; then
+            echo "# opt-in: P11SCOPE_PRIV_LIFECYCLE_LOSS=$P11SCOPE_PRIV_LIFECYCLE_LOSS"
+        fi
+        if [ -n "${P11SCOPE_TEST_TIME_SCALE:-}" ]; then
+            echo "# opt-in: P11SCOPE_TEST_TIME_SCALE=$P11SCOPE_TEST_TIME_SCALE"
+        fi
     } >"$results"
+    grep '^# opt-in: ' "$results" >&2 || true
 
     cd "$REPO_ROOT" || return 1
 

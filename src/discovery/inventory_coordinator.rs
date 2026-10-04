@@ -728,8 +728,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // living across reconcile or the native owner scans below.
         let absorb_start = crate::attach::monotonic_ns();
         let verdicts = self.absorb_lowering(catalog.lowering.take());
-        // Mapper counts size uprobe-multi links (C5.11 review M1).
+        // Mapper counts size uprobe-multi links (C5.11 review M1), from a
+        // whole-system view only (review R4).
         self.attach_set.note_mappers(
+            self.engine.sees_whole_system(),
             catalog
                 .objects
                 .iter()
@@ -2921,6 +2923,50 @@ mod tests {
             notes: Vec::new(),
             explanation: None,
             stage_timings: crate::timing::StageTimings::new(),
+        }
+    }
+
+    /// Review R3/R4: a pass notes the catalog's mapper counts into the
+    /// attach set (which sizes uprobe-multi links), from a whole-system
+    /// view only; a PID-scoped pass marks the counts scope-limited.
+    #[test]
+    fn a_pass_notes_mapper_counts_from_a_system_view_only() {
+        use crate::attach::capture::MapperEstimate;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let pid = std::process::id();
+        for (scope, expected) in [
+            (Scope::System, MapperEstimate::System(3)),
+            (Scope::Pid(pid), MapperEstimate::ScopeLimited),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = fx::provider(&dir, "a.so", "provider-a");
+            let pins = fx::pass_pins(&[(&a, "sha-a")]);
+            let modules = [fx::module(&pins, &a, &fx::offsets(3))];
+            let mut coordinator = InventoryCoordinator::new(
+                scope,
+                HookRegistry::builtin(),
+                Vec::new(),
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+            )
+            .unwrap();
+            let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+            let plan = fx::lower_named(&modules, &pins, policy);
+            let object = coordinator.attach_set.absorb(&plan, &pins).delta.endpoints[0].object;
+            assert_eq!(
+                coordinator.attach_set.mappers(object),
+                MapperEstimate::Unknown
+            );
+            let mut catalog = capture_catalog(&pins, &[&a], pid, None);
+            catalog.objects[0].mappings = vec![(pid, None), (pid + 1, None), (pid + 2, None)];
+            coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut ScanOnlyIdentity,
+                u64::MAX,
+                100,
+            );
+            assert_eq!(coordinator.attach_set.mappers(object), expected);
         }
     }
 

@@ -241,7 +241,7 @@ def check_container_pins(script, matrix):
         if production_lines.count(installed) != 1:
             raise ValueError(f"missing or duplicated recorded Alpine install: {installed}")
     required_apk_checks = (
-        'diff -u "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
+        'cmp -s "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
         '"$DISCOVER_WORK/musl-apk-info.txt" "$LANE14_ARTIFACTS/discover.musl-apk-info.txt"',
         "musl_apk_info_sha256",
     )
@@ -332,8 +332,8 @@ pin_mutations = (
         "unchecked Alpine installed set",
         mutate_production(
             script_source,
-            'diff -u "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
-            'diff -u "$DISCOVER_WORK/musl-apk-info.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
+            'cmp -s "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
+            'cmp -s "$DISCOVER_WORK/musl-apk-info.txt" "$DISCOVER_WORK/musl-apk-info.txt"',
         ),
         matrix_source,
     ),
@@ -863,7 +863,7 @@ ssl_client-1.37.0-r20
 zlib-1.3.2-r0
 zstd-libs-1.5.7-r0
 EOF
-diff -u "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt" \
+cmp -s "$DISCOVER_WORK/musl-apk-expected.txt" "$DISCOVER_WORK/musl-apk-info.txt" \
     || { echo "unexpected Alpine installed set" >&2; exit 1; }
 cp "$DISCOVER_WORK/musl-apk-info.txt" "$LANE14_ARTIFACTS/discover.musl-apk-info.txt"
 chmod 600 "$LANE14_ARTIFACTS/discover.musl-apk-info.txt"

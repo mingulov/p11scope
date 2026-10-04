@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 
 type Pin = (u32, u64);
 type Log = Rc<RefCell<Vec<String>>>;
@@ -25,6 +26,12 @@ type Log = Rc<RefCell<Vec<String>>>;
 const PID: u32 = 7;
 const START: u64 = 500;
 const TICKET: u64 = 41;
+/// A failure bound only: a gated collection that is never serviced fails
+/// after this instead of hanging.
+const GATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// No collection tick fires in the exact-order tests: their collections
+/// return at once.
+const NO_COLLECTION_TICK: Duration = Duration::from_secs(3600);
 
 /// Strictly increasing CLOCK_MONOTONIC stamps: each facade batch follows
 /// the one before it, and every stamp follows the real clock.
@@ -80,6 +87,21 @@ struct ScriptedLane {
     /// The start of the last complete lifecycle drain (the facade's
     /// `lifecycle_proven_ns`).
     drained_ns: u64,
+    /// Signalled on every discovery service (the collection gate's tap).
+    serviced: Option<mpsc::Sender<()>>,
+    /// Every serviced quantum's start stamp, in drain order.
+    service_stamps: Rc<RefCell<Vec<u64>>>,
+    /// Records each discovery quantum returns (non-exec, binder-neutral).
+    records_per_service: usize,
+    /// The DISCOVERY ring-loss counter each read reports, in read order
+    /// (the last one repeats; empty: 0).
+    ring_loss: VecDeque<u64>,
+    /// The malformed-record count each read reports, as `ring_loss`.
+    malformed: VecDeque<u64>,
+    /// Discovery services (1-based) whose quantum fails on an undecodable
+    /// record.
+    failed_services: HashSet<usize>,
+    services: usize,
 }
 
 impl Drop for ScriptedLane {
@@ -112,6 +134,13 @@ impl ScriptedLane {
             read_delay: Duration::ZERO,
             undrained_after_reads: None,
             drained_ns: 0,
+            serviced: None,
+            service_stamps: Rc::default(),
+            records_per_service: 0,
+            ring_loss: VecDeque::new(),
+            malformed: VecDeque::new(),
+            failed_services: HashSet::new(),
+            services: 0,
         }
     }
 
@@ -187,9 +216,24 @@ impl CaptureLane<Pin> for ScriptedLane {
         receipt
     }
 
-    fn service_discovery(&mut self, _: ReadWindow) -> DiscoveryBatch {
+    fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
         self.note("service");
-        let mut batch = DiscoveryBatch::scripted(self.domain, Vec::new(), self.stamps.next());
+        self.services += 1;
+        // SAFETY: `DiscoveryRecord` is a plain `repr(C)` integer record; all
+        // zeroes is a valid value (kind 0: no exec, the binder ignores it).
+        let records = (0..self.records_per_service.min(window.max_rows()))
+            .map(|_| unsafe { std::mem::zeroed::<p11scope_ebpf_common::DiscoveryRecord>() })
+            .collect();
+        let mut batch = DiscoveryBatch::scripted(self.domain, records, self.stamps.next());
+        // A quantum that fills its window stops at its record bound.
+        batch.record_bound_reached = self.records_per_service >= window.max_rows();
+        if self.failed_services.contains(&self.services) {
+            batch.failure = Some("scripted undecodable record".into());
+        }
+        self.service_stamps.borrow_mut().push(batch.started_ns);
+        if let Some(serviced) = &self.serviced {
+            let _ = serviced.send(());
+        }
         if let Some((after, left)) = self.undrained_after_reads.as_mut()
             && self.read_stamps.len() >= *after
             && *left > 0
@@ -229,6 +273,13 @@ impl CaptureLane<Pin> for ScriptedLane {
         let rows_read_ns = self.stamps.next();
         let health_unproven = (self.read_stamps.len() <= self.unproven_reads)
             .then(|| "scripted unreadable health".to_string());
+        let scripted = |counts: &mut VecDeque<u64>| match counts.len() {
+            0 => 0,
+            1 => counts[0],
+            _ => counts.pop_front().unwrap(),
+        };
+        let ring_loss = scripted(&mut self.ring_loss);
+        let malformed = scripted(&mut self.malformed);
         WitnessBatch {
             domain: self.domain,
             phase: if self.stopping {
@@ -252,7 +303,8 @@ impl CaptureLane<Pin> for ScriptedLane {
             lifecycle_loss: None,
             lifecycle_proven_ns: self.drained_ns,
             health: CaptureHealth {
-                discovery_counters: Some([0; 5]),
+                discovery_counters: Some([ring_loss, 0, 0, 0, 0]),
+                malformed_discovery: malformed,
                 ..CaptureHealth::default()
             },
             health_regression: None,
@@ -304,6 +356,12 @@ struct Scene {
     /// (1-based) on.
     joiner: Option<(u32, u64, usize)>,
     scans: usize,
+    /// The first collection waits for this many discovery services (C5.7
+    /// threading boundary): it cannot finish unless the loop services the
+    /// ring while it runs.
+    collect_gate: Option<(mpsc::Receiver<()>, usize)>,
+    /// Every staged lifecycle quantum's start stamp, in staging order.
+    staged_lifecycle: Vec<u64>,
 }
 
 impl Scene {
@@ -328,6 +386,8 @@ impl Scene {
             log: Rc::clone(log),
             joiner: None,
             scans: 0,
+            collect_gate: None,
+            staged_lifecycle: Vec::new(),
         }
     }
 
@@ -504,6 +564,9 @@ impl LaneHost<Pin> for Scene {
             NativeBatch::Lifecycle(_) => "stage:lifecycle",
             NativeBatch::Finish { .. } => "stage:finish",
         });
+        if let NativeBatch::Lifecycle(lifecycle) = &batch {
+            self.staged_lifecycle.push(lifecycle.started_ns);
+        }
         self.coordinator.stage_native(batch, identity, now_ns)
     }
 
@@ -530,12 +593,32 @@ impl PassDriver<Pin> for Scene {
         self
     }
 
-    fn scan(&mut self, identity: &mut dyn NativeIdentity<Pin>, now_ns: u64) -> Result<PassReport> {
-        self.note("scan");
+    fn collector(&mut self) -> CollectJob {
+        self.note("collect");
         self.scans += 1;
         let catalog = self.catalog();
+        let gate = self.collect_gate.take();
+        Box::new(move || {
+            if let Some((serviced, wanted)) = gate {
+                for _ in 0..wanted {
+                    serviced
+                        .recv_timeout(GATE_TIMEOUT)
+                        .map_err(|_| anyhow!("the ring was not serviced during the collection"))?;
+                }
+            }
+            Ok(catalog)
+        })
+    }
+
+    fn apply(
+        &mut self,
+        collected: Result<crate::inspect_system::Catalog>,
+        identity: &mut dyn NativeIdentity<Pin>,
+        now_ns: u64,
+    ) -> Result<PassReport> {
+        self.note("scan");
         Ok(self.coordinator.apply_catalog(
-            catalog,
+            collected?,
             &mut UnavailableImageGuard,
             identity,
             u64::MAX,
@@ -563,6 +646,16 @@ fn run(
     lane: ScriptedLane,
     passes: usize,
 ) -> (Stopped<ScriptedLane>, Vec<CallerEvent>) {
+    run_ticking(scene, lane, passes, NO_COLLECTION_TICK)
+}
+
+/// `run` with a collection tick.
+fn run_ticking(
+    scene: &mut Scene,
+    lane: ScriptedLane,
+    passes: usize,
+    collection_tick: Duration,
+) -> (Stopped<ScriptedLane>, Vec<CallerEvent>) {
     let log = Rc::clone(&scene.log);
     let started = NativeLane::start(lane, scene, windows(), None)
         .map_err(|(_, reason)| reason)
@@ -574,6 +667,7 @@ fn run(
         stop: &stop,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
+        collection_tick,
     };
     let mut published = Vec::new();
     let stopped = run_classic(
@@ -618,6 +712,7 @@ const STARTUP: [&str; 4] = [
 
 fn pass(extend: &str) -> Vec<String> {
     [
+        "collect",
         "scan",
         "take_target_delta",
         extend,
@@ -794,6 +889,7 @@ fn a_stop_requested_during_startup_still_runs_one_full_pass() {
         stop: &|| true,
         interval: Duration::from_secs(600),
         tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
     };
     let stopped = run_classic(&mut scene, Some(started), &clock, &mut |_, _| Ok(()))
         .unwrap()
@@ -1091,6 +1187,7 @@ fn a_refused_activation_hands_back_the_capture_and_forgets_coverage() {
         stop: &|| false,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
     };
     let none: Option<NativeLane<ScriptedLane>> = None;
     run_classic(&mut scene, none, &clock, &mut |_, _| Ok(())).unwrap();
@@ -1110,6 +1207,7 @@ fn the_scan_lane_makes_no_native_call() {
         stop: &|| false,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
     };
     let none: Option<NativeLane<ScriptedLane>> = None;
     let stopped = run_classic(&mut scene, none, &clock, &mut |scene: &mut Scene, _| {
@@ -1118,7 +1216,7 @@ fn the_scan_lane_makes_no_native_call() {
     })
     .unwrap();
     assert!(stopped.is_none());
-    assert_eq!(entries(&log), ["scan", "commit", "publish"]);
+    assert_eq!(entries(&log), ["collect", "scan", "commit", "publish"]);
 }
 
 /// Invariant 3: between passes each tick drains one discovery quantum and
@@ -1141,6 +1239,7 @@ fn ticks_between_passes_stage_each_discovery_quantum() {
         stop: &stop,
         interval: Duration::from_millis(40),
         tick: Duration::from_millis(5),
+        collection_tick: NO_COLLECTION_TICK,
     };
     run_classic(
         &mut scene,
@@ -1157,7 +1256,7 @@ fn ticks_between_passes_stage_each_discovery_quantum() {
         .iter()
         .position(|entry| entry == "publish:pass")
         .unwrap();
-    let second = log.iter().rposition(|entry| entry == "scan").unwrap();
+    let second = log.iter().rposition(|entry| entry == "collect").unwrap();
     let between = &log[first + 1..second];
     assert!(between.len() >= 4, "{between:?}");
     for pair in between.chunks(2) {
@@ -1191,6 +1290,7 @@ fn a_lossy_start_never_claims_a_watch() {
         stop: &stop,
         interval: Duration::ZERO,
         tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
     };
     run_classic(&mut scene, Some(started), &clock, &mut |_, _| Ok(())).unwrap();
     assert!(
@@ -1220,5 +1320,338 @@ fn an_edge_no_coverage_note_reached_reads_not_attached_in_the_native_lane() {
     assert_eq!(
         scene.coverage_of(8),
         UseCoverage::Unknown(UnknownReason::NotAttached)
+    );
+}
+
+/// C5.7 (ruling D8), the threading boundary: the pass's collection runs on
+/// a worker while the loop services the lifecycle ring. The gated
+/// collection cannot finish until the ring was serviced three times while
+/// it ran (servicing only between passes fails it). Nothing is staged
+/// while it runs; the held quanta stage after the scan applied and the
+/// extend receipt, ahead of the pass's own quantum, and every quantum ever
+/// drained stages exactly once, in drain order.
+#[test]
+fn the_ring_is_serviced_while_a_pass_collects_and_staged_after_its_scan() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    let (serviced, gate) = mpsc::channel();
+    lane.serviced = Some(serviced);
+    scene.collect_gate = Some((gate, 3));
+    let drained = Rc::clone(&lane.service_stamps);
+    run_ticking(&mut scene, lane, 1, Duration::from_millis(1));
+    let log = entries(&log);
+    let collect = log.iter().position(|entry| entry == "collect").unwrap();
+    let scan = log.iter().position(|entry| entry == "scan").unwrap();
+    let during = &log[collect + 1..scan];
+    assert!(during.len() >= 3, "{log:?}");
+    assert!(during.iter().all(|entry| entry == "service"), "{log:?}");
+    let after_scan = &log[scan..];
+    let mut expected: Vec<String> = [
+        "scan",
+        "take_target_delta",
+        "extend[0,1]",
+        "note_extend_receipt",
+    ]
+    .map(String::from)
+    .to_vec();
+    expected.extend(std::iter::repeat_n(
+        "stage:lifecycle".to_string(),
+        during.len(),
+    ));
+    expected.extend(["service", "stage:lifecycle", "read"].map(String::from));
+    assert_eq!(
+        &after_scan[..expected.len()],
+        expected.as_slice(),
+        "{log:?}"
+    );
+    assert_eq!(scene.staged_lifecycle, *drained.borrow());
+}
+
+/// C5.7: collection ticks hold at most `held_records` drained records, a
+/// strict bound: each quantum is capped at the room left, and past the
+/// bound they drain nothing (the ring keeps the rest, and the kernel counts
+/// what it cannot hold). The held quanta stage with the pass, which frees
+/// the bound.
+#[test]
+fn collection_ticks_hold_at_most_the_record_bound() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.records_per_service = 2;
+    let windows = LaneWindows {
+        held_records: 3,
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut scene, windows, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    for _ in 0..5 {
+        started.collecting_tick();
+        assert!(started.held_records <= 3, "{}", started.held_records);
+    }
+    let services = |log: &Log| {
+        log.borrow()
+            .iter()
+            .filter(|entry| *entry == "service")
+            .count()
+    };
+    // Two records, then the one record of room left, then nothing.
+    assert_eq!(services(&log), 2);
+    assert_eq!(started.held_records, 3);
+    assert!(!entries(&log).contains(&"stage:lifecycle".to_string()));
+    started.after_pass(&mut scene);
+    assert_eq!(scene.staged_lifecycle.len(), 3, "two held, one serviced");
+    // Staging frees the bound.
+    started.collecting_tick();
+    assert_eq!(services(&log), 4);
+}
+
+/// C5.7: one collection tick drains quantum after quantum while each stops
+/// at its record bound (the ring still holds more), until the held bound
+/// stops it; the last quantum takes only the room left.
+#[test]
+fn a_collection_tick_drains_full_quanta_until_the_held_bound() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.records_per_service = 1000;
+    let windows = LaneWindows {
+        held_records: 600,
+        ..windows()
+    };
+    let mut started = NativeLane::start(lane, &mut scene, windows, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.collecting_tick();
+    // 256 + 256 + the 88 records of room left.
+    let services = entries(&log)
+        .iter()
+        .filter(|entry| *entry == "service")
+        .count();
+    assert_eq!(services, 3);
+    assert_eq!((started.held_records, started.tally.records), (600, 600));
+}
+
+/// C5.7 (review M-1): collection-time drains are counted like any other:
+/// their records, a failed quantum (which also grants a recovery rescan),
+/// and they stage with the pass. `observation.lifecycle` is public, so
+/// each field is pinned.
+#[test]
+fn collection_time_drains_are_counted_and_a_failed_one_grants_a_rescan() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.records_per_service = 3;
+    lane.failed_services = HashSet::from([2]);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    // Service 1 drains 3 records; service 2 fails (its 3 records still
+    // count as dequeued) and ends the tick; service 3 drains 3 more.
+    started.collecting_tick();
+    started.collecting_tick();
+    started.collecting_tick();
+    assert_eq!(
+        started.tally,
+        LifecycleTally {
+            records: 9,
+            failed_quanta: 1,
+            ..LifecycleTally::default()
+        }
+    );
+    assert!(started.take_recovery_rescan(), "a failed quantum is a loss");
+    started.after_pass(&mut scene);
+    assert_eq!(scene.staged_lifecycle.len(), 4, "three held, one serviced");
+}
+
+/// FB-R5 (review M-1): a malformed-record rise is a loss: counted, and it
+/// grants a recovery rescan; an unchanged count grants nothing.
+#[test]
+fn a_malformed_record_rise_is_counted_and_grants_a_rescan() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.malformed = VecDeque::from([0, 2, 2]);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.after_pass(&mut scene);
+    assert!(!started.take_recovery_rescan());
+    started.after_pass(&mut scene);
+    assert_eq!(started.tally.malformed, 2);
+    assert!(started.take_recovery_rescan());
+    started.after_pass(&mut scene);
+    assert!(
+        !started.take_recovery_rescan(),
+        "no rescan follows a rescan"
+    );
+    started.after_pass(&mut scene);
+    assert!(!started.take_recovery_rescan(), "no new loss, no new grant");
+    assert_eq!(started.tally.malformed, 2);
+}
+
+/// Runs the scripted lane under `clock`; the stop is `stop_after` scans.
+fn run_clocked(
+    scene: &mut Scene,
+    lane: ScriptedLane,
+    stop_after: usize,
+    interval: Duration,
+    deadline: Duration,
+) -> Stopped<ScriptedLane> {
+    let started = NativeLane::start(lane, scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let scans = {
+        let log = Rc::clone(&scene.log);
+        move || log.borrow().iter().filter(|entry| *entry == "scan").count()
+    };
+    let stop = move || scans() >= stop_after;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + deadline),
+        stop: &stop,
+        interval,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    run_classic(scene, Some(started), &clock, &mut |_, _| Ok(()))
+        .unwrap()
+        .unwrap()
+}
+
+/// FB-R5: a lifecycle loss starts the next pass at once (a recovery
+/// rescan) instead of waiting out the interval; the tally counts the loss
+/// and the rescan. Without the rescan the hour-long interval holds the
+/// second pass past the deadline.
+#[test]
+fn a_lifecycle_loss_starts_the_next_pass_at_once() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.ring_loss = VecDeque::from([4]);
+    let stopped = run_clocked(
+        &mut scene,
+        lane,
+        2,
+        Duration::from_secs(3600),
+        Duration::from_secs(3),
+    );
+    assert_eq!(stopped.summary.passes, 2);
+    let tally = stopped.summary.lifecycle;
+    assert_eq!(
+        (tally.ring_loss, tally.recovery_rescans),
+        (4, 1),
+        "{tally:?}"
+    );
+    // Every quantum the lane drained is counted (none carried records).
+    assert_eq!(tally.records, 0);
+}
+
+/// FB-R5 (review M-1 N1): one loss grants one rescan for the whole run; a
+/// steady loss count never re-arms it, so later passes keep the interval.
+#[test]
+fn one_loss_grants_one_recovery_rescan_for_the_run() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.ring_loss = VecDeque::from([4]);
+    let stopped = run_clocked(
+        &mut scene,
+        lane,
+        5,
+        Duration::ZERO,
+        Duration::from_secs(600),
+    );
+    assert_eq!(stopped.summary.passes, 5);
+    let tally = stopped.summary.lifecycle;
+    assert_eq!(
+        (tally.ring_loss, tally.recovery_rescans),
+        (4, 1),
+        "{tally:?}"
+    );
+}
+
+/// Review L-2: `recovery_rescans` counts passes that started; a rescan
+/// granted just before the stop never ran and is not counted.
+#[test]
+fn a_rescan_granted_before_the_stop_is_not_counted() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.ring_loss = VecDeque::from([4]);
+    let stopped = run_clocked(
+        &mut scene,
+        lane,
+        1,
+        Duration::from_secs(3600),
+        Duration::from_secs(600),
+    );
+    assert_eq!(stopped.summary.passes, 1);
+    let tally = stopped.summary.lifecycle;
+    assert_eq!(
+        (tally.ring_loss, tally.recovery_rescans),
+        (4, 0),
+        "{tally:?}"
+    );
+}
+
+/// FB-R5, the bound: a recovery rescan is never followed by another, so a
+/// host that loses records on every pass rescans early at most every
+/// second pass; a later loss after a normal pass is granted again.
+#[test]
+fn recovery_rescans_never_follow_each_other() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.ring_loss = VecDeque::from([1, 2, 3, 4, 5]);
+    lane.records_per_service = 2;
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let mut granted = Vec::new();
+    for _ in 0..5 {
+        started.after_pass(&mut scene);
+        let grant = started.take_recovery_rescan();
+        if grant {
+            started.begin_recovery_rescan();
+        }
+        granted.push(grant);
+    }
+    assert_eq!(granted, [true, false, true, false, true]);
+    let stopped = started.stop(&mut scene);
+    let tally = stopped.summary.lifecycle;
+    assert_eq!(
+        (tally.ring_loss, tally.recovery_rescans),
+        (5, 3),
+        "{tally:?}"
+    );
+    let services = entries(&log)
+        .iter()
+        .filter(|entry| *entry == "service")
+        .count() as u64;
+    assert_eq!(tally.records, 2 * services);
+    assert_eq!((tally.malformed, tally.failed_quanta), (0, 0));
+}
+
+/// C5.7: a worker that panics resumes its panic on the loop's thread
+/// (never a silent empty pass), and its value otherwise crosses back.
+#[test]
+fn the_collection_worker_hands_back_its_value_or_its_panic() {
+    let mut ticks = 0;
+    assert_eq!(
+        collect_off_thread(|| 7, Duration::from_millis(1), &mut || ticks += 1),
+        7
+    );
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        collect_off_thread(
+            || -> u32 { panic!("scripted collection panic") },
+            Duration::from_millis(1),
+            &mut || {},
+        )
+    }))
+    .unwrap_err();
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("scripted collection panic")
     );
 }

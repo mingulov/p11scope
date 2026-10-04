@@ -733,6 +733,17 @@ Limits that matter in pods:
   probes …` and `p11scope: native probes detached`, and a second
   SIGINT, SIGTERM or SIGHUP once the report is written exits at once
   (status 128 + signal; the kernel releases the remaining probes).
+  Every exec and process exit in scope sends a 920-byte record through
+  the native lane's 64 KiB lifecycle ring (about 70 records). The lane
+  drains it every 10 ms, also while a pass collects `/proc` on a worker
+  thread, holding at most 8,192 drained records (about 7.2 MiB) until the
+  pass applies; the ring is not drained while a pass applies its scan,
+  attaches new provider entries, or reads usage. A record the full ring
+  could not take is a loss: it is counted in `observation.lifecycle`
+  (`records`, `ring_loss`, `malformed`, `failed_quanta`), recorded as the
+  gap `native capture lifecycle evidence lost`, demotes every
+  `watched_no_use` interval it may affect, and starts the next pass at
+  once (`recovery_rescans`; never two in a row).
   `native`
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can

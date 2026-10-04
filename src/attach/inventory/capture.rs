@@ -196,6 +196,12 @@ impl ReadWindow {
         }
         Ok(Self { max_rows, deadline })
     }
+
+    /// The row bound (scripted facades honour it).
+    #[cfg(test)]
+    pub(crate) fn max_rows(&self) -> usize {
+        self.max_rows
+    }
 }
 
 /// One loaded object's identity domain. Cookies are tickets inside one

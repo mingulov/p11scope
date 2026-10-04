@@ -667,7 +667,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Every staged fact publishes at the next `commit_batch`, never
     /// before. `identity` supplies the owner lane's exact image per pid, or
     /// none (the scan lane: `ScanOnlyIdentity`). Hints and hooks are the
-    /// engine's, fixed for the run.
+    /// engine's, fixed for the run. Production collects through
+    /// `collector` (C5.7) and applies with `apply_catalog`.
+    #[cfg(test)]
     pub(crate) fn scan_pass(
         &mut self,
         scope: &InventoryScope,
@@ -677,25 +679,35 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         deadline_ns: u64,
         now_ns: u64,
     ) -> Result<PassReport> {
+        let catalog = self.collector(*scope, max_scan_pids)()?;
+        Ok(self.apply_catalog(catalog, guard, identity, deadline_ns, now_ns))
+    }
+
+    /// The pass's collection as an owned job (Task 6 C5.7): it reads
+    /// `/proc` only, over its own copies of the run's fixed hints and hooks,
+    /// and hands back its catalog. It borrows nothing of the coordinator, so
+    /// it can run on a worker thread while the caller keeps servicing the
+    /// native capture; every registry and binder mutation stays with
+    /// `apply_catalog` on the caller's thread.
+    pub(crate) fn collector(
+        &self,
+        scope: InventoryScope,
+        max_scan_pids: Option<usize>,
+    ) -> impl FnOnce() -> Result<crate::inspect_system::Catalog> + Send + 'static {
         // The catalog lowers its admission under the Inventory policy and
         // budget the attach set enforces, never the Detailed slot ceiling
         // `inspect` reports.
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
-        let catalog = match scope {
-            InventoryScope::Pid(pid) => crate::inspect_system::collect_pid(
-                *pid,
-                &self.engine.module_hints,
-                &self.engine.hooks,
-                policy,
-            )?,
-            InventoryScope::System => crate::inspect_system::collect(
-                &self.engine.module_hints,
-                &self.engine.hooks,
-                max_scan_pids,
-                policy,
-            )?,
-        };
-        Ok(self.apply_catalog(catalog, guard, identity, deadline_ns, now_ns))
+        let hints = self.engine.module_hints.clone();
+        let hooks = self.engine.hooks.clone();
+        move || match scope {
+            InventoryScope::Pid(pid) => {
+                crate::inspect_system::collect_pid(pid, &hints, &hooks, policy)
+            }
+            InventoryScope::System => {
+                crate::inspect_system::collect(&hints, &hooks, max_scan_pids, policy)
+            }
+        }
     }
 
     /// The pass after collection: absorb the lowering into the attach set,

@@ -52,6 +52,20 @@ A native document adds to `observation`:
   10 s), `"unsettled"` when the budget passed first; then `gaps[]` also
   holds `subject` `native capture retirement unsettled`, and the probes
   are reclaimed (blocking) after the document is written.
+- `lifecycle`: the lifecycle feed's own account. The native lane drains
+  the kernel's lifecycle (exec and exit) ring every 10 ms, including while
+  a pass collects `/proc` on a worker thread; it stages what it drained
+  after that pass's scan, in drain order.
+  - `records`: lifecycle records drained;
+  - `ring_loss`: records the kernel could not queue because the ring was
+    full, as counted at the last readable health read;
+  - `malformed`: malformed records;
+  - `failed_quanta`: drains stopped by an undecodable record;
+  - `recovery_rescans`: passes started at once, without the interval,
+    because a loss was found. A recovery rescan is never followed by
+    another. It admits what the lost records would have announced; the
+    loss itself stays: the `native capture lifecycle evidence lost` gap
+    and its demotion apply for the rest of the capture.
 
 In the native lane an admitted edge no coverage note reached reads
 `not_attached`, never `scan_only`. When the observer's `/proc` numbering is

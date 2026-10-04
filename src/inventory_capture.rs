@@ -43,6 +43,7 @@ use crate::discovery::engine::inventory_coordinator::{
 };
 use crate::discovery::inventory_attach_set::TargetDelta;
 use crate::discovery::native_binding::{NativeIdentity, ScanOnlyIdentity};
+use crate::inspect_system::Catalog;
 use crate::process::PidPin;
 use anyhow::{Result, anyhow};
 use p11scope_ebpf_common::ImageIdentity;
@@ -78,6 +79,12 @@ pub(crate) struct LaneWindows {
     pub terminal_sweep_budget: Duration,
     pub retirement_per_endpoint: Duration,
     pub retirement_cap: Duration,
+    /// Lifecycle records the lane may hold, drained but not yet staged,
+    /// while a pass's collection runs (C5.7). A strict bound: each quantum
+    /// is capped at the room left, and at the bound the collection ticks
+    /// stop draining; the ring keeps the rest, and what it cannot hold is
+    /// counted lost by the kernel, never dropped here.
+    pub held_records: usize,
 }
 
 /// The longest stop waits for the probes to detach before it writes the
@@ -99,6 +106,10 @@ impl LaneWindows {
         terminal_sweep_budget: Duration::from_millis(500),
         retirement_per_endpoint: Duration::from_millis(250),
         retirement_cap: PRE_OUTPUT_RETIREMENT_WAIT,
+        // 8,192 records of 920 B: at most about 7.2 MiB of user memory
+        // (strict), over 4 s of a 1,000 execs/s host (two records per
+        // short-lived exec) behind one collection.
+        held_records: 8192,
     };
 
     /// The stop's retirement budget for `attached` endpoints.
@@ -123,16 +134,22 @@ impl LaneWindows {
     }
 
     fn discovery(&self) -> ReadWindow {
+        self.discovery_at_most(self.discovery_records)
+    }
+
+    /// A discovery window of at most `records` (at least one) records.
+    fn discovery_at_most(&self, records: usize) -> ReadWindow {
         ReadWindow::new(
-            self.discovery_records,
+            self.discovery_records.min(records).max(1),
             Instant::now() + self.discovery_budget,
         )
         .expect("the provisional discovery window is positive")
     }
 }
 
-/// The service tick between passes (plan §1 C5.1 invariant 3).
-pub(crate) const SERVICE_TICK: Duration = Duration::from_millis(20);
+/// The service tick between passes (plan §1 C5.1 invariant 3) and while
+/// a pass's collection runs on its worker thread (C5.7, ruling D8).
+pub(crate) const SERVICE_TICK: Duration = Duration::from_millis(10);
 
 /// The facade operations the lane drives: the real capture in production,
 /// a scripted lane in the call-order tests. Every method is the facade's
@@ -257,6 +274,52 @@ pub(crate) struct LaneSummary {
     pub passes: u64,
     pub attached: usize,
     pub failed: usize,
+    pub lifecycle: LifecycleTally,
+}
+
+/// The lifecycle feed's own account (C5.7): what the lane drained, what the
+/// kernel counted lost, and the recovery rescans losses scheduled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LifecycleTally {
+    /// Lifecycle records drained from the ring.
+    pub records: u64,
+    /// The DISCOVERY ring-loss counter (`COUNTERS[0]`, records the kernel
+    /// could not reserve) at the last readable health read.
+    pub ring_loss: u64,
+    /// Malformed lifecycle records at the last health read.
+    pub malformed: u64,
+    /// Discovery quanta that failed on an undecodable record.
+    pub failed_quanta: u64,
+    /// Passes started early because a loss was found.
+    pub recovery_rescans: u64,
+}
+
+impl LifecycleTally {
+    /// Absorbs one drained quantum; true when it shows a loss.
+    fn note_quantum(&mut self, batch: &DiscoveryBatch) -> bool {
+        self.records += batch.records.len() as u64;
+        if batch.failure.is_some() {
+            self.failed_quanta += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Absorbs one witness read's health; true when a loss counter rose.
+    fn note_health(&mut self, batch: &WitnessBatch) -> bool {
+        let mut rose = false;
+        if let Some(counters) = batch.health.discovery_counters
+            && counters[0] > self.ring_loss
+        {
+            self.ring_loss = counters[0];
+            rose = true;
+        }
+        if batch.health.malformed_discovery > self.malformed {
+            self.malformed = batch.health.malformed_discovery;
+            rose = true;
+        }
+        rose
+    }
 }
 
 /// A stopped lane: the events and summary its stop staged, and the capture
@@ -282,6 +345,15 @@ pub(crate) struct NativeLane<L> {
     attached: usize,
     failed: usize,
     refusal_reported: bool,
+    /// Quanta drained while the pass's collection ran, in drain order, not
+    /// yet staged (C5.7); and the records they hold.
+    held: Vec<DiscoveryBatch>,
+    held_records: usize,
+    tally: LifecycleTally,
+    /// A loss was found since the last recovery rescan was granted.
+    loss_seen: bool,
+    /// The pass that just ran was itself a recovery rescan.
+    rescanning: bool,
 }
 
 impl<L> NativeLane<L> {
@@ -333,6 +405,11 @@ impl<L> NativeLane<L> {
             attached: receipt.attached.len(),
             failed: receipt.failed.len(),
             refusal_reported: false,
+            held: Vec::new(),
+            held_records: 0,
+            tally: LifecycleTally::default(),
+            loss_seen: false,
+            rescanning: false,
         })
     }
 
@@ -374,8 +451,12 @@ impl<L> NativeLane<L> {
         }
         self.backlog = receipt.deferred;
         let mut events = std::mem::take(&mut self.pending_events);
+        // What the collection ticks drained stages here, where the ring's
+        // own records of that window always staged: after the scan applied
+        // and the extend receipt, before any later quantum and the read.
+        events.extend(self.stage_held(host));
         events.extend(self.service(host, self.windows.pass_quanta));
-        let batch = self.capture.read_witnesses(self.windows.witness());
+        let batch = self.read();
         events.extend(
             host.stage_native(
                 NativeBatch::Witness(Box::new(batch)),
@@ -397,6 +478,96 @@ impl<L> NativeLane<L> {
         self.pending_events.extend(events);
     }
 
+    /// One service tick while the pass's collection runs on its worker
+    /// (C5.7): drain up to `pass_quanta` quanta and hold them, in drain
+    /// order, for `after_pass`. Nothing reaches the host while the catalog
+    /// is collected, so the coordinator sees every call in the order it
+    /// saw when the ring was serviced only between passes; only the ring
+    /// empties sooner. At `held_records` the tick drains nothing more.
+    pub(crate) fn collecting_tick<Pin>(&mut self)
+    where
+        L: CaptureLane<Pin>,
+    {
+        for _ in 0..self.windows.pass_quanta {
+            let room = self.windows.held_records.saturating_sub(self.held_records);
+            if room == 0 {
+                return;
+            }
+            let batch = self.drain_within(self.windows.discovery_at_most(room));
+            let more = batch.record_bound_reached || batch.deadline_reached;
+            self.held_records += batch.records.len();
+            self.held.push(batch);
+            if !more {
+                return;
+            }
+        }
+    }
+
+    /// Stages the held quanta in drain order, never rebuilt.
+    fn stage_held<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        let mut events = Vec::new();
+        self.held_records = 0;
+        for batch in std::mem::take(&mut self.held) {
+            events.extend(
+                host.stage_native(NativeBatch::Lifecycle(batch), &mut self.capture, now_ns())
+                    .events,
+            );
+        }
+        events
+    }
+
+    /// One discovery quantum, counted.
+    fn drain_one<Pin>(&mut self) -> DiscoveryBatch
+    where
+        L: CaptureLane<Pin>,
+    {
+        self.drain_within(self.windows.discovery())
+    }
+
+    /// One discovery quantum within `window`, counted.
+    fn drain_within<Pin>(&mut self, window: ReadWindow) -> DiscoveryBatch
+    where
+        L: CaptureLane<Pin>,
+    {
+        let batch = self.capture.service_discovery(window);
+        self.loss_seen |= self.tally.note_quantum(&batch);
+        batch
+    }
+
+    /// One witness read, its loss counters counted.
+    fn read<Pin>(&mut self) -> WitnessBatch
+    where
+        L: CaptureLane<Pin>,
+    {
+        let batch = self.capture.read_witnesses(self.windows.witness());
+        self.loss_seen |= self.tally.note_health(&batch);
+        batch
+    }
+
+    /// Whether the next pass starts at once (FB-R5): a lifecycle loss was
+    /// found, so a catalog re-walk admits what the lost records would have
+    /// announced without waiting out the interval. Bounded: a recovery
+    /// rescan is never followed by another, so at most every second pass is
+    /// early. The loss itself stays sticky (ruling D4). The rescan is
+    /// counted only when its pass starts (`begin_recovery_rescan`).
+    pub(crate) fn take_recovery_rescan(&mut self) -> bool {
+        if std::mem::take(&mut self.rescanning) || !self.loss_seen {
+            return false;
+        }
+        self.loss_seen = false;
+        self.rescanning = true;
+        true
+    }
+
+    /// A granted recovery rescan's pass starts now.
+    pub(crate) fn begin_recovery_rescan(&mut self) {
+        self.tally.recovery_rescans += 1;
+    }
+
     /// Up to `quanta` discovery quanta, each staged as drained, in order.
     fn service<Pin, H>(&mut self, host: &mut H, quanta: usize) -> Vec<CallerEvent>
     where
@@ -405,7 +576,7 @@ impl<L> NativeLane<L> {
     {
         let mut events = Vec::new();
         for _ in 0..quanta {
-            let batch = self.capture.service_discovery(self.windows.discovery());
+            let batch = self.drain_one();
             let more = batch.record_bound_reached || batch.deadline_reached;
             events.extend(
                 host.stage_native(NativeBatch::Lifecycle(batch), &mut self.capture, now_ns())
@@ -427,6 +598,8 @@ impl<L> NativeLane<L> {
     {
         debug_assert!(self.passes > 0, "stop before any pass after activation");
         let mut events = std::mem::take(&mut self.pending_events);
+        // Nothing is held after a pass; staged first all the same.
+        events.extend(self.stage_held(host));
         // Drain the lifecycle ring completely (bounded) right before the
         // terminal read, each quantum staged before the coverage ends: a
         // loss still in the ring then reaches the watch before it freezes
@@ -434,7 +607,7 @@ impl<L> NativeLane<L> {
         // dates; retrying it would not drain more.
         let drain_deadline = Instant::now() + self.windows.terminal_sweep_budget;
         loop {
-            let batch = self.capture.service_discovery(self.windows.discovery());
+            let batch = self.drain_one();
             let done = batch.drained() || batch.failure.is_some();
             let head_pending = batch.head_pending;
             events.extend(
@@ -453,7 +626,7 @@ impl<L> NativeLane<L> {
         // one completes.
         let sweep_deadline = Instant::now() + self.windows.terminal_sweep_budget;
         loop {
-            let terminal = self.capture.read_witnesses(self.windows.witness());
+            let terminal = self.read();
             let swept = terminal.sweep_completed;
             events.extend(
                 host.stage_native(
@@ -480,7 +653,7 @@ impl<L> NativeLane<L> {
                     Err(error) => poll_error = Some(format!("{error:#}")),
                 }
             }
-            let batch = self.capture.service_discovery(self.windows.discovery());
+            let batch = self.drain_one();
             let drained = batch.drained();
             events.extend(
                 host.stage_native(NativeBatch::Lifecycle(batch), &mut self.capture, now_ns())
@@ -495,7 +668,7 @@ impl<L> NativeLane<L> {
             }
         }
         // The health horizon for rows the terminal read reported.
-        let last = self.capture.read_witnesses(self.windows.witness());
+        let last = self.read();
         events.extend(
             host.stage_native(
                 NativeBatch::Witness(Box::new(last)),
@@ -534,6 +707,7 @@ impl<L> NativeLane<L> {
                 passes: self.passes,
                 attached: self.attached,
                 failed: self.failed,
+                lifecycle: self.tally,
             },
             capture: self.capture,
         }
@@ -564,6 +738,8 @@ pub(crate) struct LoopClock<'a> {
     /// From one pass's end to the next pass's start.
     pub interval: Duration,
     pub tick: Duration,
+    /// The service tick while a pass's collection runs on its worker.
+    pub collection_tick: Duration,
 }
 
 impl LoopClock<'_> {
@@ -572,12 +748,80 @@ impl LoopClock<'_> {
     }
 }
 
-/// The classic loop's pass side: one scan at `now` and the batch commit.
+/// One pass's collection, owned (C5.7): it reads the scope through its own
+/// inputs and hands back its catalog. It runs on a worker thread, so it
+/// shares nothing with the host or the capture; the catalog is the only
+/// thing that crosses back.
+pub(crate) type CollectJob = Box<dyn FnOnce() -> Result<Catalog> + Send>;
+
+/// The classic loop's pass side: one pass's collection, its application at
+/// `now`, and the batch commit.
 pub(crate) trait PassDriver<Pin> {
     type Host: LaneHost<Pin> + ?Sized;
     fn host(&mut self) -> &mut Self::Host;
-    fn scan(&mut self, identity: &mut dyn NativeIdentity<Pin>, now_ns: u64) -> Result<PassReport>;
+    /// The pass's collection job, built on the loop's thread.
+    fn collector(&mut self) -> CollectJob;
+    /// Applies what the collection returned (an error goes through the
+    /// pass failure policy), with `identity` as the native identity.
+    fn apply(
+        &mut self,
+        collected: Result<Catalog>,
+        identity: &mut dyn NativeIdentity<Pin>,
+        now_ns: u64,
+    ) -> Result<PassReport>;
     fn commit(&mut self, engine_changed: bool) -> Result<()>;
+}
+
+/// Runs `job` on a scoped worker thread and calls `service` every `tick`
+/// until its result arrives (C5.7, ruling D8): the lifecycle ring is
+/// serviced while the scope is collected, not only between passes. The
+/// result crosses back over a channel; the worker owns everything it reads.
+/// A worker that cannot be spawned runs `job` here instead (the ring then
+/// waits for the pass, as before); a worker panic resumes here.
+pub(crate) fn collect_off_thread<T: Send>(
+    job: impl FnOnce() -> T + Send,
+    tick: Duration,
+    service: &mut dyn FnMut(),
+) -> T {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    let slot = std::sync::Mutex::new(Some(job));
+    let take = |slot: &std::sync::Mutex<Option<_>>| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    };
+    std::thread::scope(|scope| {
+        let (sender, results) = mpsc::sync_channel(1);
+        let slot = &slot;
+        let spawned = std::thread::Builder::new()
+            .name("p11scope-collect".into())
+            .spawn_scoped(scope, move || {
+                if let Some(job) = take(slot) {
+                    let _ = sender.send(job());
+                }
+            });
+        let worker = match spawned {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!(
+                    "p11scope: collecting this pass on the main thread (no worker thread: \
+                     {error}); the lifecycle ring waits for it"
+                );
+                let job = take(slot).expect("an unspawned worker never took the job");
+                return job();
+            }
+        };
+        loop {
+            match results.recv_timeout(tick) {
+                Ok(value) => return value,
+                Err(RecvTimeoutError::Timeout) => service(),
+                Err(RecvTimeoutError::Disconnected) => match worker.join() {
+                    Err(panic) => std::panic::resume_unwind(panic),
+                    Ok(()) => unreachable!("the worker sends its result before it ends"),
+                },
+            }
+        }
+    })
 }
 
 /// What the loop hands its publisher after each commit.
@@ -609,16 +853,29 @@ where
     L: CaptureLane<Pin>,
 {
     let mut passes: u64 = 0;
+    let mut rescan = false;
     loop {
         // At least one full pass after activation: a stop that arrived
         // during startup (activation included) still gets one.
         if passes > 0 && clock.ending() {
             break;
         }
+        // A granted recovery rescan counts once its pass really starts.
+        if std::mem::take(&mut rescan)
+            && let Some(lane) = lane.as_mut()
+        {
+            lane.begin_recovery_rescan();
+        }
         let now = now_ns();
+        let job = driver.collector();
+        let collected = collect_off_thread(job, clock.collection_tick, &mut || {
+            if let Some(lane) = lane.as_mut() {
+                lane.collecting_tick();
+            }
+        });
         let mut report = match lane.as_mut() {
-            Some(lane) => driver.scan(lane.identity(), now)?,
-            None => driver.scan(&mut ScanOnlyIdentity, now)?,
+            Some(lane) => driver.apply(collected, lane.identity(), now)?,
+            None => driver.apply(collected, &mut ScanOnlyIdentity, now)?,
         };
         if let Some(lane) = lane.as_mut() {
             report.events.extend(lane.after_pass(driver.host()));
@@ -632,7 +889,12 @@ where
                 now_ns: now,
             },
         )?;
-        let next = Instant::now() + clock.interval;
+        rescan = lane.as_mut().is_some_and(NativeLane::take_recovery_rescan);
+        let next = if rescan {
+            Instant::now()
+        } else {
+            Instant::now() + clock.interval
+        };
         loop {
             let now = Instant::now();
             if clock.ending() || now >= next {

@@ -44,7 +44,7 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (64 ignored tests in the default-feature lib binary): 54 run by
+# Curation (66 ignored tests in the default-feature lib binary): 56 run by
 # default, 4 run only with --include-long, 6 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -119,10 +119,15 @@ events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict
 # inventory-ledger workloads; need gcc, softhsm2-util and SoftHSM2 at
 # /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so; about 5-20 s each): --pid
 # stamps + witnessed edge + no foreign caller, --system late dlopen, stop with
-# a held call, SIGINT during activation.
+# a held call, SIGINT during activation, --system under 100 and 1,000 execs/s
+# exec churn (C5.7; about 1-2 min). The churn cell is load-sensitive: its
+# zero-loss check at 100 execs/s retries once, and is skipped with a printed
+# reason only when both attempts started at load1 above 4 and lost at most 1%
+# of the lifecycle records.
 inventory::privileged_tests::privileged_native_lane_pid_lp64
 inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64
 inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64
+inventory::privileged_tests::privileged_native_lane_system_exec_churn_lp64
 inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
 )
 

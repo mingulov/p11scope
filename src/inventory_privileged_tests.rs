@@ -358,6 +358,7 @@ fn drive<L: CaptureLane<PidPin>>(
         stop: &stop_now,
         interval: Duration::from_millis(300),
         tick: SERVICE_TICK,
+        collection_tick: SERVICE_TICK,
     };
     let stopped = run_classic(
         &mut driver,
@@ -620,8 +621,10 @@ fn privileged_native_lane_system_late_dlopen_lp64() -> Result<()> {
     let witnesses = &document["observation"]["native_witnesses"];
     ensure!(edges.len() == 1, "late dlopen edges: {edges:?}");
     let state = &edges[0]["entries"]["coverage"]["state"];
-    // Host exec churn can overflow the DISCOVERY ring while a system pass
-    // scans (no servicing then): the late caller's row is then honestly
+    // Host exec churn can still overflow the DISCOVERY ring in a window the
+    // lane does not service (C5.7 services it while a pass collects, not
+    // while the scan applies or the extend attaches): the late caller's row
+    // is then honestly
     // `lifecycle_loss`, and its watch must not claim absence (the C5.2
     // demotion, gap `native capture lifecycle evidence lost`).
     let lifecycle_lost = witnesses["unbound_reasons"].get("lifecycle_loss").is_some()
@@ -781,6 +784,7 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         stop: &stop,
         interval: POLL_INTERVAL,
         tick: SERVICE_TICK,
+        collection_tick: SERVICE_TICK,
     };
     let began = Instant::now();
     let stopped = run_classic(&mut driver, Some(lane), &clock, &mut |_, _| Ok(()))?
@@ -805,5 +809,291 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         target.pid(),
         elapsed.as_millis()
     );
+    Ok(())
+}
+
+/// One `exec_churn` run's SUMMARY fields.
+fn churn_summary(ledger: &Path) -> Result<BTreeMap<String, f64>> {
+    let text = std::fs::read_to_string(ledger)?;
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("SUMMARY "))
+        .context("exec_churn wrote no SUMMARY")?;
+    Ok(line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|field| field.split_once('='))
+        .filter_map(|(key, value)| Some((key.to_string(), value.parse().ok()?)))
+        .collect())
+}
+
+/// One churn phase: a production `--system` native run while `exec_churn`
+/// forks `rate` /bin/true execs per second (unrelated to any provider) for
+/// `seconds`, beside an idle process that maps SoftHSM2 and never calls it
+/// (a watch to demote). Returns the document and the churn's SUMMARY.
+fn churn_phase(
+    workload: &Workload,
+    churn: &Path,
+    rate: u32,
+    seconds: u32,
+) -> Result<(serde_json::Value, BTreeMap<String, f64>, u32)> {
+    let mut mapper = Command::new("sleep")
+        .arg("600")
+        .env("LD_PRELOAD", SOFTHSM)
+        .env("SOFTHSM2_CONF", &workload.conf)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("spawning the idle mapper")?;
+    let mapper_pid = mapper.id();
+    let ledger = workload.path(&format!("churn-{rate}.ledger"));
+    let child = RefCell::new(None::<Child>);
+    let ended = Cell::new(None::<Instant>);
+    let started = Instant::now();
+    let stop = || {
+        // Churn from the first service tick on (the capture is active).
+        if child.borrow().is_none() && ended.get().is_none() {
+            match Command::new(churn)
+                .args([rate.to_string(), seconds.to_string(), "0".into()])
+                .arg(&ledger)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+            {
+                Ok(spawned) => *child.borrow_mut() = Some(spawned),
+                Err(_) => ended.set(Some(Instant::now())),
+            }
+        }
+        if ended.get().is_none()
+            && let Some(running) = child.borrow_mut().as_mut()
+            && !matches!(running.try_wait(), Ok(None))
+        {
+            ended.set(Some(Instant::now()));
+        }
+        // Two more seconds of passes after the churn, then stop.
+        ended
+            .get()
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(2))
+            || started.elapsed() > Duration::from_secs(u64::from(seconds) + 60)
+    };
+    let events = workload.path(&format!("churn-{rate}.jsonl"));
+    let result = run_product(InspectScope::System, Path::new(SOFTHSM), &events, &stop);
+    if let Some(mut running) = child.borrow_mut().take() {
+        let _ = running.kill();
+        let _ = running.wait();
+    }
+    let _ = mapper.kill();
+    let _ = mapper.wait();
+    let (document, stream) = result?;
+    ensure!(stream_ended(&stream), "the stream did not end");
+    Ok((document, churn_summary(&ledger)?, mapper_pid))
+}
+
+/// The host's 1-minute load average.
+fn load1() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse().ok())
+        .unwrap_or(f64::INFINITY)
+}
+
+/// What one churn phase showed: its loss (ring loss, malformed records and
+/// failed quanta together), whether the loss gap was recorded, and the
+/// idle mapper's edges as `state/reason`.
+struct ChurnOutcome {
+    achieved: f64,
+    loss: u64,
+    records: u64,
+    lost_gap: bool,
+    mapper: Vec<(String, String)>,
+    load1: f64,
+    line: String,
+}
+
+fn churn_outcome(
+    workload: &Workload,
+    churn: &Path,
+    rate: u32,
+    seconds: u32,
+) -> Result<ChurnOutcome> {
+    let load1 = load1();
+    let began = Instant::now();
+    let (document, summary, mapper_pid) = churn_phase(workload, churn, rate, seconds)?;
+    let minutes = began.elapsed().as_secs_f64() / 60.0;
+    let observation = &document["observation"];
+    ensure!(observation["lane"] == "native", "{observation}");
+    let lifecycle = &observation["lifecycle"];
+    let count = |key: &str| lifecycle[key].as_u64().context(format!("lifecycle {key}"));
+    let ring_loss = count("ring_loss")?;
+    let loss = ring_loss + count("malformed")? + count("failed_quanta")?;
+    let records = count("records")?;
+    let execs = summary.get("execs").copied().unwrap_or(0.0);
+    let achieved = summary.get("achieved_rate").copied().unwrap_or(0.0);
+    // Every churn exec is an exec record plus a leader-exit record.
+    ensure!(
+        loss > 0 || records as f64 >= 2.0 * execs * 0.95,
+        "{records} lifecycle records for {execs} execs and no loss: {lifecycle}"
+    );
+    let lost_gap = document["gaps"].as_array().is_some_and(|gaps| {
+        gaps.iter()
+            .any(|gap| gap["subject"] == "native capture lifecycle evidence lost")
+    });
+    let mapper: Vec<(String, String)> = doc_edges(&document, mapper_pid)
+        .iter()
+        .map(|edge| {
+            let coverage = &edge["entries"]["coverage"];
+            (
+                coverage["state"].as_str().unwrap_or("?").to_string(),
+                coverage["reason"].as_str().unwrap_or("-").to_string(),
+            )
+        })
+        .collect();
+    // The positive control: the idle mapper was admitted and its provider
+    // edge exists in every phase, or nothing below proves anything.
+    ensure!(
+        !mapper.is_empty(),
+        "the idle mapper (pid {mapper_pid}) has no edge: the cell would pass vacuously"
+    );
+    let line = format!(
+        "rate={rate} achieved={achieved} execs={execs} load1={load1:.2} passes={} \
+         records={records} ring_loss={ring_loss} loss={loss} loss_per_min={:.0} \
+         recovery_rescans={} lost_gap={lost_gap} mapper_edges={mapper:?}",
+        observation["passes"],
+        loss as f64 / minutes,
+        lifecycle["recovery_rescans"],
+    );
+    Ok(ChurnOutcome {
+        achieved,
+        loss,
+        records,
+        lost_gap,
+        mapper,
+        load1,
+        line,
+    })
+}
+
+/// No loss: no loss gap, and the idle mapper's every edge is a real watch.
+fn ensure_lossless(outcome: &ChurnOutcome) -> Result<()> {
+    ensure!(
+        !outcome.lost_gap,
+        "a lifecycle-loss gap without a counted loss: {}",
+        outcome.line
+    );
+    ensure!(
+        outcome
+            .mapper
+            .iter()
+            .all(|(state, _)| state == "watched_no_use"),
+        "with no loss the idle mapper must read watched_no_use: {}",
+        outcome.line
+    );
+    Ok(())
+}
+
+/// A loss: its gap is recorded and the idle mapper's every edge is demoted
+/// to unknown/loss, never a watch over the loss.
+fn ensure_honest_loss(outcome: &ChurnOutcome) -> Result<()> {
+    ensure!(outcome.lost_gap, "a loss without its gap: {}", outcome.line);
+    ensure!(
+        outcome
+            .mapper
+            .iter()
+            .all(|(state, reason)| state == "unknown" && reason == "loss"),
+        "under a lifecycle loss the idle mapper must read unknown/loss: {}",
+        outcome.line
+    );
+    Ok(())
+}
+
+/// C5.7 (DR-C3-1, M4): exec-only host churn against the native `--system`
+/// lane, beside an idle SoftHSM2 mapper whose edge must exist in every
+/// phase (review L-3).
+///
+/// - 100 execs/s: no loss, no loss gap, and the mapper reads
+///   `watched_no_use`. Servicing the ring only between passes loses about
+///   half the records here. An attempt whose churn reached under 90
+///   execs/s proves nothing and counts as a failed attempt (re-check R-1).
+///   Unrelated host churn can still overflow the ring in the windows the
+///   lane does not service, so a lossy or starved attempt is retried once
+///   (review L-4); if both lose, each started at load1 above 4 and the
+///   loss stays within 1% of the records, the zero-loss check is skipped
+///   with its reason (the honesty checks still apply). Anything else
+///   fails, a starved attempt included.
+/// - 1,000 execs/s: either a loss with its gap and the mapper demoted to
+///   unknown/loss, or no loss with the 100/s checks. The branch taken is
+///   printed (`C57_CHURN_BRANCH`).
+#[test]
+#[ignore = "root-owned live BPF lane; native --system under 100 and 1,000 execs/s exec churn"]
+fn privileged_native_lane_system_exec_churn_lp64() -> Result<()> {
+    let workload = Workload::build()?;
+    let churn = workload.path("exec_churn");
+    let status = Command::new("gcc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&churn)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/exec_churn.c"))
+        .status()
+        .context("running gcc")?;
+    ensure!(status.success(), "gcc exec_churn failed");
+    let seconds = 20;
+    let mut lossy = Vec::new();
+    let mut starved = Vec::new();
+    let mut passed = false;
+    for attempt in 1..=2 {
+        let outcome = churn_outcome(&workload, &churn, 100, seconds)?;
+        eprintln!("C57_CHURN attempt={attempt} {}", outcome.line);
+        if outcome.loss > 0 {
+            ensure_honest_loss(&outcome)?;
+        }
+        if outcome.achieved < 90.0 {
+            // The churn never reached the rate: nothing is proven.
+            eprintln!(
+                "C57_CHURN_BRANCH rate=100 branch=starved attempt={attempt} achieved={}",
+                outcome.achieved
+            );
+            starved.push(outcome.line);
+            continue;
+        }
+        if outcome.loss == 0 {
+            ensure_lossless(&outcome)?;
+            eprintln!("C57_CHURN_BRANCH rate=100 branch=lossless attempt={attempt}");
+            passed = true;
+            break;
+        }
+        lossy.push(outcome);
+    }
+    if !passed {
+        ensure!(
+            starved.is_empty(),
+            "the 100 execs/s churn was starved (under 90 execs/s) and no attempt passed: {}",
+            starved.join(" | ")
+        );
+        let loaded = lossy.iter().all(|outcome| outcome.load1 > 4.0);
+        let small = lossy
+            .iter()
+            .all(|outcome| outcome.loss * 100 <= outcome.records + outcome.loss);
+        ensure!(
+            loaded && small,
+            "100 execs/s lost lifecycle records twice: {}",
+            lossy
+                .iter()
+                .map(|outcome| outcome.line.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        eprintln!(
+            "C57_CHURN_BRANCH rate=100 branch=skipped reason=\"both attempts lost at most 1% \
+             at load1 above 4; zero-loss not judged (indicative)\""
+        );
+    }
+    let outcome = churn_outcome(&workload, &churn, 1000, seconds)?;
+    eprintln!("C57_CHURN {}", outcome.line);
+    if outcome.loss > 0 {
+        ensure_honest_loss(&outcome)?;
+        eprintln!("C57_CHURN_BRANCH rate=1000 branch=loss");
+    } else {
+        ensure_lossless(&outcome)?;
+        eprintln!("C57_CHURN_BRANCH rate=1000 branch=lossless");
+    }
     Ok(())
 }

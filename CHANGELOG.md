@@ -9,6 +9,14 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Inventory
 
+- The native lane of `inventory` keeps servicing the kernel's lifecycle
+  ring while a pass collects `/proc`: the collection runs on a worker
+  thread and the ring is drained every 10 ms, so a busy host's exec churn
+  no longer overflows it behind a one-second `--system` pass. A found loss
+  starts the next pass at once (a bounded recovery rescan) and stays
+  reported. The native document's `observation.lifecycle` (additive within
+  `p11scope/inventory/v1`) counts the records drained, the kernel's ring
+  loss, malformed records, failed drains and recovery rescans.
 - `inventory` publishes each distinct gap once per run. An identical gap
   recorded again (for example the overlay-collapse gap on every pass) no
   longer adds an entry or consumes `--max-gaps` budget; `gaps[].repeats`

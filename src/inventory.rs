@@ -249,6 +249,7 @@ fn run_with_writer(
         stop,
         interval: POLL_INTERVAL,
         tick: SERVICE_TICK,
+        collection_tick: SERVICE_TICK,
     };
     let stopped = run_classic(
         &mut driver,
@@ -362,16 +363,23 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         self.coordinator
     }
 
-    fn scan(
+    fn collector(&mut self) -> crate::inventory_capture::CollectJob {
+        Box::new(
+            self.coordinator
+                .collector(*self.inventory_scope, self.max_scan_pids),
+        )
+    }
+
+    fn apply(
         &mut self,
+        collected: Result<crate::inspect_system::Catalog>,
         identity: &mut dyn NativeIdentity<PidPin>,
         now_ns: u64,
     ) -> Result<PassReport> {
-        let (report, warning) = scan_one_pass(
+        let (report, warning) = apply_one_pass(
             self.coordinator,
-            self.inventory_scope,
+            collected,
             self.scope,
-            self.max_scan_pids,
             &mut self.guard,
             self.deadline,
             identity,
@@ -552,10 +560,36 @@ fn scan_one_pass(
     identity: &mut dyn NativeIdentity<PidPin>,
     now: u64,
 ) -> Result<(PassReport, Option<String>)> {
+    let collected = coordinator.collector(*inventory_scope, max_scan_pids)();
+    apply_one_pass(
+        coordinator,
+        collected,
+        scope,
+        guard,
+        deadline,
+        identity,
+        now,
+    )
+}
+
+/// `scan_one_pass` after its collection: the collection may have run on a
+/// worker thread (C5.7); its catalog, or its error, is applied here under
+/// the same failure policy.
+fn apply_one_pass(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    collected: Result<crate::inspect_system::Catalog>,
+    scope: InspectScope,
+    guard: &mut UnavailableImageGuard,
+    deadline: Option<Instant>,
+    identity: &mut dyn NativeIdentity<PidPin>,
+    now: u64,
+) -> Result<(PassReport, Option<String>)> {
+    // The run's deadline on the pass clock, read after the collection (it
+    // may have taken a while on its worker): it bounds the owner scans.
     let pass_deadline = match deadline {
         Some(end) => {
             let remaining = end.saturating_duration_since(Instant::now());
-            now.saturating_add(remaining.as_nanos().min(u128::from(u64::MAX)) as u64)
+            now_ns().saturating_add(remaining.as_nanos().min(u128::from(u64::MAX)) as u64)
         }
         None => u64::MAX,
     };
@@ -563,14 +597,9 @@ fn scan_one_pass(
         InspectScope::Pid(pid) => format!("inventory --pid {pid}"),
         InspectScope::System => "inventory --system".to_string(),
     };
-    match coordinator.scan_pass(
-        inventory_scope,
-        max_scan_pids,
-        guard,
-        &mut *identity,
-        pass_deadline,
-        now,
-    ) {
+    match collected.map(|catalog| {
+        coordinator.apply_catalog(catalog, guard, &mut *identity, pass_deadline, now)
+    }) {
         Ok(report) => Ok((report, None)),
         Err(error) if coordinator.passes() == 0 => Err(error).with_context(|| scope_context),
         Err(error) => {
@@ -734,13 +763,22 @@ fn emit_stop_events(
 }
 
 /// A native run's observation statement: the lane, its settlement (always
-/// `unsettled`, ruling D3) and how its retirement ended. Absent in the
-/// scan lane, whose document is unchanged.
+/// `unsettled`, ruling D3), how its retirement ended, and the lifecycle
+/// feed's own account (C5.7). Absent in the scan lane, whose document is
+/// unchanged.
 fn note_native_observation(document: &mut serde_json::Value, summary: &LaneSummary) {
     let observation = &mut document["observation"];
     observation["lane"] = "native".into();
     observation["settlement"] = crate::inventory_capture::SETTLEMENT.into();
     observation["retirement"] = summary.retirement.label().into();
+    let lifecycle = &summary.lifecycle;
+    observation["lifecycle"] = serde_json::json!({
+        "records": lifecycle.records,
+        "ring_loss": lifecycle.ring_loss,
+        "malformed": lifecycle.malformed,
+        "failed_quanta": lifecycle.failed_quanta,
+        "recovery_rescans": lifecycle.recovery_rescans,
+    });
 }
 
 /// The interactive dashboard loop: rescan at 1 Hz, offer immutable
@@ -1810,6 +1848,13 @@ mod tests {
             passes: 2,
             attached: 4,
             failed: 0,
+            lifecycle: crate::inventory_capture::LifecycleTally {
+                records: 40,
+                ring_loss: 3,
+                malformed: 0,
+                failed_quanta: 0,
+                recovery_rescans: 1,
+            },
         }
     }
 
@@ -1859,6 +1904,16 @@ mod tests {
             assert_eq!(observation["lane"], "native");
             assert_eq!(observation["settlement"], "unsettled");
             assert_eq!(observation["retirement"], retirement);
+            assert_eq!(
+                observation["lifecycle"],
+                serde_json::json!({
+                    "records": 40,
+                    "ring_loss": 3,
+                    "malformed": 0,
+                    "failed_quanta": 0,
+                    "recovery_rescans": 1,
+                })
+            );
         }
         let mut stdout = Vec::new();
         finish_output(
@@ -1873,7 +1928,7 @@ mod tests {
         )
         .unwrap();
         let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-        for key in ["lane", "settlement", "retirement"] {
+        for key in ["lane", "settlement", "retirement", "lifecycle"] {
             assert!(document["observation"].get(key).is_none(), "{key}");
         }
     }

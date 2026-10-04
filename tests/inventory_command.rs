@@ -427,6 +427,155 @@ fn e2_unload_reload_observed_with_history() {
     drop(dance.guard.take());
 }
 
+/// DR-C5-EDGE through the real `run_with_writer` stream: one multi-pass
+/// reload run read by three consumers — the `-o` JSON document, the
+/// `--event-log` JSONL stream and the stdout text snapshot. The last
+/// `edge_observed` per edge equals the document's edge, every edge has
+/// one, the derived states equal the text snapshot's, the mid-run
+/// unload/reload streamed its own records, and the records are accounted
+/// by the pass markers plus `ended`.
+#[test]
+fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-edge-stream");
+    let ready = dir.join("edges.ready");
+    let driver = gcc(
+        &dir,
+        "edges-reload-driver",
+        &fixture_source("inventory-reload-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let prov = gcc(
+        &dir,
+        "ic-edges.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let private = private_dir();
+    let document_path = private.path().join("edges.json");
+    let stream_path = dir.join("edges.jsonl");
+    let text_path = dir.join("edges.txt");
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-pid.sh"))
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", "reload")
+        .env("INV_PROV", &prov)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &text_path)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .args(["--duration", "14s", "-o"])
+        .arg(&document_path)
+        .arg("--event-log")
+        .arg(&stream_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let _fixture = FixtureGuard { pids: vec![pid] };
+    assert!(
+        output.status.success(),
+        "observe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&document_path).unwrap()).unwrap();
+    let text = std::fs::read_to_string(&text_path).unwrap();
+    let lines: Vec<Value> = std::fs::read_to_string(&stream_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.last().unwrap()["kind"], "ended");
+    assert!(doc["observation"]["passes"].as_u64().unwrap() >= 5);
+    let records: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["kind"] == "edge_observed")
+        .map(|line| &line["event"])
+        .collect();
+    let mut last: BTreeMap<(String, String), &Value> = BTreeMap::new();
+    let mut per_edge: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for record in &records {
+        let key = (
+            record["caller"].as_str().unwrap().to_string(),
+            record["module"].as_str().unwrap().to_string(),
+        );
+        *per_edge.entry(key.clone()).or_default() += 1;
+        last.insert(key, record);
+    }
+    let edges = doc["edges"].as_array().unwrap();
+    assert!(!edges.is_empty());
+    assert_eq!(last.len(), edges.len(), "one replayed record per edge");
+    for edge in edges {
+        let key = (
+            edge["caller"].as_str().unwrap().to_string(),
+            edge["module"].as_str().unwrap().to_string(),
+        );
+        let record = last[&key];
+        let mut replayed = record.clone();
+        for state in ["presence", "capture", "activity"] {
+            replayed.as_object_mut().unwrap().remove(state);
+        }
+        assert_eq!(&replayed, edge, "JSONL replay == JSON for {key:?}");
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&format!("edge {} -> {} ", key.0, key.1)))
+            .unwrap_or_else(|| panic!("no text line for {key:?}: {text}"));
+        let states = format!(
+            "presence {} capture {} activity {} ",
+            record["presence"].as_str().unwrap(),
+            record["capture"].as_str().unwrap(),
+            record["activity"].as_str().unwrap()
+        );
+        assert!(line.contains(&states), "text {line:?} vs JSONL {states:?}");
+    }
+    // The reloaded edge streamed mapped, unloaded and mapped again mid-run.
+    let module = module_for(&doc, "ic-edges.so");
+    let caller = &caller_for(&doc, u64::from(pid))[0];
+    let key = (
+        caller["id"].as_str().unwrap().to_string(),
+        module["id"].as_str().unwrap().to_string(),
+    );
+    assert_eq!(last[&key]["mapping"]["interruptions"], 1);
+    assert!(
+        per_edge[&key] >= 3,
+        "records for the reloaded edge: {per_edge:?}"
+    );
+    let presences: Vec<&str> = records
+        .iter()
+        .filter(|record| record["caller"] == key.0.as_str() && record["module"] == key.1.as_str())
+        .map(|record| record["presence"].as_str().unwrap())
+        .collect();
+    assert!(presences.contains(&"unloaded"), "{presences:?}");
+    // Accounting: pass markers plus the final sweep cover every record.
+    let passes: u64 = lines
+        .iter()
+        .filter(|line| line["kind"] == "pass_committed")
+        .map(|line| line["event"]["edge_events"].as_u64().unwrap())
+        .sum();
+    let swept = lines.last().unwrap()["event"]["edge_events"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(passes + swept, records.len() as u64);
+    // ...commit by commit, and nothing was left unretained.
+    let mut since = 0u64;
+    for line in &lines {
+        match line["kind"].as_str().unwrap() {
+            "edge_observed" => since += 1,
+            "pass_committed" | "ended" => {
+                assert_eq!(line["event"]["edge_events"], since, "{line}");
+                since = 0;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(lines.last().unwrap()["event"]["edges_unretained"], 0);
+}
+
 #[test]
 fn b3_sigkill_freezes_evidence_with_exit_state() {
     let _guard = serial_guard();

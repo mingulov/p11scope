@@ -80,12 +80,78 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `before_admission`). It never names a pid. At most 256 entries are
   listed; the rows of the rest are summed in `unbound_rows_truncated`
   (0 when nothing was cut). A scan-lane run always reads `[]` and 0.
-- `caller_observed` / `module_observed` / `edge_observed`: full
-  snapshot record shapes (test/sync emission; production emits
-  incrementally instead). `edge_observed` adds the three derived
-  presentation states `presence`, `capture`, `activity` — computed
-  from the same model the dashboard renders, never new capture. Its
-  `entries` object is the snapshot's verbatim, including the additive
+  Every `pass_committed` also carries `edge_events` (the `edge_observed`
+  records the commit wrote just before it) and `edge_events_deferred`
+  (changed edges still waiting past the per-pass cap; see
+  `edge_observed`).
+- `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
+  plus the three derived presentation states `presence`, `capture`,
+  `activity` — computed from the same model the dashboard renders,
+  never new capture. Production streams emit it (both lanes, classic
+  and `--dashboard` paths) change-driven:
+  - During the run a commit writes a record for an edge that is new or
+    whose class changed since the record the stream last carried for
+    it. The class is the edge's entries (the count's power-of-two
+    bucket — 0, 1, 2–3, 4–7, … — plus `saturated`, `in_flight` and
+    `observation`), its full `entries.coverage`, and `presence`,
+    `capture` and `activity` (as of the whole-run activity window).
+    Other fields (mapping instants and interruptions, semantics) do not
+    trigger a record by themselves.
+  - Each record is exact as of its write (`at_ns`), but mid-run values
+    lag between records: until the edge's next record or the final
+    sweep, `entries.count` may have grown within its power-of-two bucket
+    (so a mid-run count is a lower bound), and the mapping instants,
+    `entries.last_seen_ns` and the semantics may be stale. Only the
+    sweep's records are exact for the run's end.
+  - At most 4,096 records per commit. Further changed edges wait in
+    arrival order (first in, first out), are counted in that commit's
+    `edge_events_deferred`, and are written by the next commits with
+    their state at that time; with the 32,768-edge limit an edge waits
+    at most 8 commits.
+  - Mid-run, an edge whose last record was deleted by retention is
+    re-sent by the next commits (within the same cap), but only while
+    one copy of every edge's record fits the retention (the condition
+    below); otherwise re-sending would only evict other edges' records
+    on every pass, and the final sweep accounts for it instead.
+  - Just before `ended`, on every clean termination, one exact sweep
+    writes every edge whose full payload differs from its last record,
+    whose last record was deleted by retention, or that has none,
+    uncapped (at most the edge limit, 32,768 by default). Live mapped
+    edges are always included (their mapping instants move every pass),
+    so the sweep is close to a dump of the live edges. If the sweep's
+    own lines made retention delete a record it still needs, it writes
+    one more contiguous copy of every edge when the condition below
+    holds. `ended.edge_events` counts the sweep's records and
+    `ended.edges_unretained` the edges left with no retained record.
+  - Replay guarantee: when `ended.edges_unretained` is 0, the last
+    retained `edge_observed` per (`caller`, `module`) equals the
+    snapshot's `edges[]` entry (plus the three states) and every
+    snapshot edge has one. That always holds for a stream with no
+    `retention_evicted`, where also
+    `sum(pass_committed.edge_events) + ended.edge_events` equals the
+    `edge_observed` lines. Under retention it holds whenever one copy of
+    every edge's record fits, that is when (sum of the edges' record
+    line bytes + 32 B per edge + 8 KiB) ≤ (`--event-max-files` − 1) ×
+    (`--event-rotate-bytes` − largest record line − 32 B − 2 KiB).
+    Otherwise `edges_unretained` counts the edges whose record retention
+    deleted (the loss is also accounted in `retention_evicted`); read
+    the snapshot, or raise the retention. A stream without `ended` was
+    cut short; its last records may lag the run's end.
+  - Volume: a record is typically 0.7–0.8 KiB, more with semantic
+    mechanisms and operations. A commit writes at most 4,096 records
+    (about 3 MB), which happens only while that many edges change class
+    every pass (for example repeated health regressions demoting and
+    restarting every watch). The sweep writes up to one record per edge
+    (32,768 at the limit, about 24 MB), twice in the fallback above.
+    Size `--event-rotate-bytes` × (`--event-max-files` − 1) to at least
+    the live edges × the record size, plus that margin, for the replay
+    guarantee to hold under retention; the defaults (1 MiB × 5 files)
+    cover about 5,000 edges.
+  - The producer keeps one digest per edge, bounded by the edge limit.
+  - Order: a commit writes its `caller_event` lines, its gap lines, its
+    `edge_observed` records, then its `pass_committed`; at the end the
+    exact gap flush precedes the edge sweep, which precedes `ended`.
+  Its `entries` object is the snapshot's verbatim, including the additive
   `entries.coverage` (see `inventory-v1.md`). `capture` is `armed`
   (usage actually covered: counted, witnessed, or watched), `scan
   only` (a live mapping no usage producer instruments), `refused`,
@@ -100,6 +166,9 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   (nothing covers the edge's usage), or `unknown` (no live mapping, or
   a watch that ended: its interval stays in `entries.coverage`). The
   dashboard shows a watch that ended as `entries ?`.
+- `caller_observed` / `module_observed`: full snapshot record shapes
+  (test/sync emission only; production streams caller turnover as
+  `caller_event` instead).
 - `snapshot`: `{scope, passes, budgets, gaps_suppressed}` (test/sync
   emission marker).
 - `rotated`: `{prior_file, prior_events, prior_bytes, rotation_seq}` —
@@ -114,8 +183,12 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   chain stays exact however deep it runs: retained lines plus
   accounted (direct + covered) always equal emitted.
 - `ended`: `{ended_ns, passes, budgets, gaps_suppressed, stream:
-  {rotations, evicted_events, evicted_bytes}}` — terminal marker with
-  final budgets plus stream accounting.
+  {rotations, evicted_events, evicted_bytes}, edge_events,
+  edges_unretained}` — terminal marker with final budgets plus stream
+  accounting; `edge_events` counts the final edge sweep's records and
+  `edges_unretained` the edges whose last record retention deleted (0
+  unless the retention cannot hold one record per edge; see
+  `edge_observed`).
 
 ## Transport and rotation
 

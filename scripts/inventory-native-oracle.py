@@ -159,6 +159,8 @@ CAPTURE = {
     "armed": "armed", "scan_only": "scan only", "refused": "refused",
     "retired": "retired", "lost": "coverage lost", "ended": "watch ended",
 }
+PRESENCE = {"mapped": "mapped", "unloaded": "unloaded", "exited": "process exited", "unknown": "unknown"}
+EDGE_STATES = ("presence", "capture", "activity")
 # inventory_present.rs DASHBOARD_ACTIVITY_WINDOW_NS: recency is judged against
 # the frame's now; a counted edge seen within this of the run end may read recent.
 DASHBOARD_RECENT_WINDOW_NS = 5_000_000_000
@@ -585,6 +587,21 @@ def expected_capture(caller, module, edge):
     return CAPTURE["lost"]
 
 
+def expected_presence(caller, module, edge):
+    """inventory-events-v1 `presence`, re-derived from the snapshot record
+    (inventory_present.rs Presence::for_edge): an exited caller, then an
+    unloaded module, then a live mapping on two live endpoints; anything
+    else (exec_retired, uncertain mapping, unknown lifecycles) is unknown."""
+    if caller.get("lifecycle") == "exited":
+        return PRESENCE["exited"]
+    if module.get("lifecycle") == "unloaded":
+        return PRESENCE["unloaded"]
+    if caller.get("lifecycle") == "mapped" and module.get("lifecycle") == "mapped" \
+            and edge.get("mapping", {}).get("state") == MAPPING_LIVE:
+        return PRESENCE["mapped"]
+    return PRESENCE["unknown"]
+
+
 def expected_activity(edge, end_ns):
     """inventory-events-v1 `activity` from the snapshot; recency (counted only)
     may additionally read recent when last_seen is within the dashboard window."""
@@ -756,32 +773,67 @@ def check_streams(view, res):
     want = {"callers": len(view.callers), "modules": len(view.modules), "edges": len(view.edges)}
     totals = passes[-1].get("totals") if passes else None
     res.ok(run, "*", "AGREE-TOTALS", totals == want, f"last pass totals {totals} != snapshot {want}")
+    # DR-C5-EDGE: production streams carry edge_observed (change-driven, capped
+    # per pass, plus one exact sweep before `ended`). The LAST record per edge,
+    # minus the three derived states, must equal the snapshot edge verbatim;
+    # every snapshot edge needs one; the derived states must match the oracle's
+    # own derivation; pass markers plus `ended` account every record.
     edge_events = view.kind("edge")
-    if edge_events:
-        last = {}
-        for e in edge_events:
-            last[(e["event"].get("caller"), e["event"].get("module"))] = e["event"]
-        bad = []
-        for key, ev in last.items():
-            edge = view.edges.get(key)
-            if edge is None:
-                bad.append((key, "not in snapshot"))
-                continue
-            caller, module = view.callers[key[0]], view.modules[key[1]]
-            if ev.get("entries") != edge.get("entries"):
-                bad.append((key, "entries"))
-            if ev.get("capture") != expected_capture(caller, module, edge):
-                bad.append((key, f"capture {ev.get('capture')!r}"))
-            if ev.get("activity") not in expected_activity(edge, view.window[1]):
-                bad.append((key, f"activity {ev.get('activity')!r}"))
-        res.ok(run, "*", "AGREE-EDGE-EVENTS", not bad, f"edge_observed disagrees with the snapshot: {bad[:4]}",
-               f"{len(last)} edge_observed records agree")
-    else:
-        # Production emits edge_observed only under #[cfg(test)] today, so a real
-        # stream cannot prove edge-level JSONL agreement: never a pass.
-        res.add(run, "*", "AGREE-EDGE-EVENTS", "nonqualifying",
-                "the stream carries no edge_observed records, so edge-level JSON/JSONL agreement is unproven "
-                "(the product emits them only in test builds; follow-up for C5 public wiring)")
+    if not edge_events and view.edges:
+        res.add(run, "*", "AGREE-EDGE-EVENTS", "fail",
+                f"the stream carries no edge_observed records for {len(view.edges)} snapshot edges")
+        return
+    last = {}
+    for e in edge_events:
+        ev = e.get("event") if isinstance(e.get("event"), dict) else {}
+        last[(ev.get("caller"), ev.get("module"))] = ev
+    bad = []
+    for key, ev in last.items():
+        edge = view.edges.get(key)
+        if edge is None:
+            bad.append((key, "not in snapshot"))
+            continue
+        caller, module = view.callers.get(key[0], {}), view.modules.get(key[1], {})
+        replayed = {k: v for k, v in ev.items() if k not in EDGE_STATES}
+        if replayed != edge:
+            fields = sorted(k for k in set(replayed) | set(edge) if replayed.get(k) != edge.get(k))
+            bad.append((key, f"fields {fields}"))
+        if ev.get("presence") != expected_presence(caller, module, edge):
+            bad.append((key, f"presence {ev.get('presence')!r} != {expected_presence(caller, module, edge)!r}"))
+        if ev.get("capture") != expected_capture(caller, module, edge):
+            bad.append((key, f"capture {ev.get('capture')!r}"))
+        if ev.get("activity") not in expected_activity(edge, view.window[1]):
+            bad.append((key, f"activity {ev.get('activity')!r}"))
+    missing = sorted(set(view.edges) - set(last))
+    if missing:
+        bad.append((missing[:4], f"{len(missing)} snapshot edges have no edge_observed"))
+    # Accounting per commit: each pass marker's edge_events counts exactly the
+    # edge_observed lines since the previous marker, ended.edge_events the
+    # lines after the last one (the sweep); deferred is a count of waiting
+    # edges, so a non-negative int no larger than the snapshot's edges. (A
+    # deferred tail need not force a sweep record: a change that reverted
+    # while it waited is already carried.)
+    since, split = 0, []
+    for e in events:
+        if e.get("kind") == EVENT_KINDS["edge"]:
+            since += 1
+        elif e.get("kind") in (EVENT_KINDS["pass"], EVENT_KINDS["ended"]):
+            ev = e.get("event") if isinstance(e.get("event"), dict) else {}
+            stated = ev.get("edge_events")
+            if type(stated) is not int or stated != since:
+                split.append(f"{e.get('kind')} seq {e.get('seq')} edge_events {stated!r} != {since} lines")
+            if e.get("kind") == EVENT_KINDS["pass"]:
+                deferred = ev.get("edge_events_deferred")
+                if type(deferred) is not int or not 0 <= deferred <= len(view.edges):
+                    split.append(f"pass seq {e.get('seq')} edge_events_deferred {deferred!r} "
+                                 f"not an int in 0..{len(view.edges)}")
+            since = 0
+    if split:
+        bad.append(("*", f"edge accounting: {split[:3]}"))
+    if ended.get("edges_unretained") != 0 or type(ended.get("edges_unretained")) is not int:
+        bad.append(("*", f"ended.edges_unretained {ended.get('edges_unretained')!r} != 0"))
+    res.ok(run, "*", "AGREE-EDGE-EVENTS", not bad, f"edge_observed disagrees with the snapshot: {bad[:4]}",
+           f"{len(last)} edge_observed replays agree ({len(edge_events)} records)")
 
 
 def resolve_providers(view, res, needed):
@@ -1739,27 +1791,32 @@ class Synth:
             doc["observation"]["retirement"] = verdict
         return doc
 
-    def events(self, doc, edge_events=False, extra=None):
+    def events(self, doc, edge_events=True, extra=None):
         rows = [("started", {"scope": doc["scope"]})]
         rows += [("caller_event", {"event": "admitted", "caller": c["id"]}) for c in doc["callers"]]
         rows += [("gap_recorded", dict({k: v for k, v in g.items() if k != "repeats"}, index=i))
                  for i, g in enumerate(doc["gaps"])]
         rows += [("gap_repeated", {"index": i, "repeats": g["repeats"]})
                  for i, g in enumerate(doc["gaps"]) if g.get("repeats", 1) > 1]
+        edge_rows = 0
         if edge_events:
             callers = {c["id"]: c for c in doc["callers"]}
             modules = {m["id"]: m for m in doc["modules"]}
             for e in doc["edges"]:
-                ev = dict(_deep(e), capture=expected_capture(callers[e["caller"]], modules[e["module"]], e),
+                ev = dict(_deep(e), presence=expected_presence(callers[e["caller"]], modules[e["module"]], e),
+                          capture=expected_capture(callers[e["caller"]], modules[e["module"]], e),
                           activity=sorted(expected_activity(e, doc["observation"]["ended_ns"]))[0])
                 rows.append(("edge_observed", ev))
+                edge_rows += 1
         rows += extra or []
         rows.append(("pass_committed", {"pass": doc["observation"]["passes"] - 1, "new_gaps": len(doc["gaps"]),
                                         "suppressed_delta": doc["gaps_suppressed"],
+                                        "edge_events": edge_rows, "edge_events_deferred": 0,
                                         "totals": {"callers": len(doc["callers"]), "modules": len(doc["modules"]),
                                                    "edges": len(doc["edges"])}}))
         rows.append(("ended", {"ended_ns": doc["observation"]["ended_ns"], "passes": doc["observation"]["passes"],
-                               "budgets": doc["budgets"], "gaps_suppressed": doc["gaps_suppressed"]}))
+                               "budgets": doc["budgets"], "gaps_suppressed": doc["gaps_suppressed"],
+                               "edge_events": 0, "edges_unretained": 0}))
         return [{"schema": SCHEMAS["events"], "seq": i, "at_ns": T0 + i, "kind": k, "event": e}
                 for i, (k, e) in enumerate(rows)]
 
@@ -2269,6 +2326,102 @@ def self_test():
             return {"events": ev}
         case("jsonl-edge-event-mismatch", "AGREE-EDGE-EVENTS", edge_event)
 
+        def _edge_rows(ev):
+            return [i for i, e in enumerate(ev) if e["kind"] == "edge_observed"]
+
+        def _account(ev, extra):
+            next(e for e in ev if e["kind"] == "pass_committed")["event"]["edge_events"] += extra
+            return _renumber(ev)
+
+        def edge_missing(s, d, dash):
+            ev = s.events(d, True)
+            ev.pop(_edge_rows(ev)[-1])
+            return {"events": _account(ev, -1)}
+        case("jsonl-edge-event-missing", "AGREE-EDGE-EVENTS", edge_missing)
+
+        def edge_stale_then_exact(s, d, dash):
+            ev = s.events(d, True)
+            at = _edge_rows(ev)[0]
+            stale = _deep(ev[at])
+            stale["event"]["mapping"]["last_seen_ns"] -= 1
+            stale["event"]["capture"] = CAPTURE["lost"]
+            ev.insert(at, stale)
+            return {"events": _account(ev, 1)}
+        case("jsonl-edge-event-replay-positive", None, edge_stale_then_exact)
+
+        def edge_stale_last(s, d, dash):
+            ev = s.events(d, True)
+            ev[_edge_rows(ev)[0]]["event"]["mapping"]["last_seen_ns"] -= 1
+            return {"events": ev}
+        case("jsonl-edge-event-stale-instant", "AGREE-EDGE-EVENTS", edge_stale_last)
+
+        def edge_unaccounted(s, d, dash):
+            ev = s.events(d, True)
+            ev[-1]["event"]["edge_events"] = 1
+            return {"events": ev}
+        case("jsonl-edge-event-accounting", "AGREE-EDGE-EVENTS", edge_unaccounted)
+
+        def edge_presence(s, d, dash):
+            ev = s.events(d, True)
+            ev[_edge_rows(ev)[0]]["event"]["presence"] = "attached"
+            return {"events": ev}
+        case("jsonl-edge-event-presence", "AGREE-EDGE-EVENTS", edge_presence)
+
+        # Presence derivation, every branch and its precedence (Presence::for_edge).
+        live = {"mapping": {"state": MAPPING_LIVE}}
+        for caller_lc, module_lc, edge, want in (
+                ("mapped", "mapped", live, "mapped"),
+                ("exited", "unloaded", live, "process exited"),
+                ("exec_retired", "unloaded", live, "unloaded"),
+                ("mapped", "unloaded", live, "unloaded"),
+                ("mapped", "mapped", {"mapping": {"state": "uncertain"}}, "unknown"),
+                ("exec_retired", "mapped", live, "unknown"),
+                ("mapped", "unknown", live, "unknown")):
+            got = expected_presence({"lifecycle": caller_lc}, {"lifecycle": module_lc}, edge)
+            if got != want:
+                failures.append(f"presence-{caller_lc}-{module_lc}-{edge['mapping']['state']}")
+
+        def edge_presence_wrong_label(s, d, dash):
+            ev = s.events(d, True)
+            row = ev[_edge_rows(ev)[0]]["event"]
+            row["presence"] = PRESENCE["unloaded"] if row["presence"] == PRESENCE["mapped"] else PRESENCE["mapped"]
+            return {"events": ev}
+        case("jsonl-edge-event-presence-wrong-label", "AGREE-EDGE-EVENTS", edge_presence_wrong_label)
+
+        def split_markers(at_rows, first_count, last_count):
+            """Insert an earlier pass marker after `at_rows` edge records,
+            stating `first_count`; the real marker then states `last_count`."""
+            def mutate(s, d, dash):
+                ev = s.events(d, True)
+                rows = _edge_rows(ev)
+                real = next(e for e in ev if e["kind"] == "pass_committed")
+                early = _deep(real)
+                early["event"].update({"pass": real["event"]["pass"] - 1, "new_gaps": 0, "suppressed_delta": 0,
+                                       "edge_events": first_count, "edge_events_deferred": 0})
+                real["event"]["edge_events"] = last_count
+                ev.insert(rows[at_rows - 1] + 1, early)
+                return {"events": _renumber(ev)}
+            return mutate
+        n_edges = len(Synth("native", None).doc["edges"])
+        case("jsonl-edge-event-split-positive", None, split_markers(2, 2, n_edges - 2))
+        case("jsonl-edge-event-split-swapped", "AGREE-EDGE-EVENTS", split_markers(2, n_edges - 2, 2))
+
+        def deferred(value):
+            def mutate(s, d, dash):
+                ev = s.events(d, True)
+                next(e for e in ev if e["kind"] == "pass_committed")["event"]["edge_events_deferred"] = value
+                return {"events": ev}
+            return mutate
+        case("jsonl-edge-event-deferred-too-large", "AGREE-EDGE-EVENTS", deferred(12345))
+        case("jsonl-edge-event-deferred-negative", "AGREE-EDGE-EVENTS", deferred(-1))
+        case("jsonl-edge-event-deferred-missing", "AGREE-EDGE-EVENTS", deferred(None))
+
+        def unretained(s, d, dash):
+            ev = s.events(d, True)
+            ev[-1]["event"]["edges_unretained"] = 3
+            return {"events": ev}
+        case("jsonl-edge-event-unretained", "AGREE-EDGE-EVENTS", unretained)
+
         def rotation(s, d, dash):
             ev = s.events(d, True, extra=[("rotated", {"prior_file": "x.jsonl.1", "prior_events": 3,
                                                        "prior_bytes": 9, "rotation_seq": 1})])
@@ -2302,11 +2455,8 @@ def self_test():
         case("held-stop-object-settled", "STOP-SETTLEMENT", settlement_object({"state": "settled"}))
         case("held-stop-object-unknown-shape", "STOP-SETTLEMENT", settlement_object({"foo": 1}))
         case("held-stop-list-shape", "STOP-SETTLEMENT", settlement_object(["unsettled"]))
-        # A real-shaped stream (production: no edge_observed) can never qualify.
-        res = case("real-stream-without-edge-events", EXIT["nonqualifying"],
-                   lambda s, d, dash: {"edge_events": False})
-        if not any(r["check"] == "AGREE-EDGE-EVENTS" and r["status"] == "nonqualifying" for r in res.rows):
-            failures.append("real-stream-edge-events-row")
+        # DR-C5-EDGE: a stream without edge_observed records now fails.
+        case("stream-without-edge-events", "AGREE-EDGE-EVENTS", lambda s, d, dash: {"edge_events": False})
 
         def released_early(s, d, dash):
             s.stop_sent = s.held_t + 3000 * MS

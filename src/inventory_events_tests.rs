@@ -532,3 +532,44 @@ fn snapshot_events_and_dashboard_agree_on_a_repeated_gap() {
         assert_eq!(**stream, identity);
     }
 }
+
+/// Review R-1 (margins): the dump fit bound holds exactly at its
+/// boundary. With the records an emitter carries, the smallest rotate
+/// size whose contiguous capacity covers carried bytes + per-edge slack +
+/// the tail reserve fits; one byte less does not. Loosening any margin
+/// (the tail reserve, the largest line, the rotation overhead, the slack)
+/// moves the boundary and fails here.
+#[test]
+fn the_dump_fit_bound_is_exact_at_its_boundary() {
+    let mut harness = limited(8);
+    harness.stage_scale(&ScaleSpec {
+        name: "fit-boundary",
+        callers: 3,
+        modules: 2,
+        edges_per_caller: 2,
+        endpoints_per_module: 4,
+        first_pid: 70_000,
+    });
+    harness.commit();
+    let (presentation, _) = presentation_for(&harness);
+    assert_eq!(presentation.edges.len(), 6);
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = EventWriter::create(&dir.path().join("big.jsonl"), 1 << 20, 2).unwrap();
+    let mut emitter = EdgeEmitter::new();
+    emitter
+        .emit(&mut writer, &presentation.edges, 64, 1)
+        .unwrap();
+    let edges = presentation.edges.len() as u64;
+    let need = emitter.carried_bytes + DUMP_LINE_SLACK * edges + DUMP_TAIL_RESERVE;
+    let per_line = emitter.largest_line + DUMP_LINE_SLACK + ROTATION_OVERHEAD;
+    for files in [2u64, 3, 5] {
+        let per_file = need.div_ceil(files - 1);
+        let boundary = per_file + per_line;
+        let probe = dir.path().join(format!("probe-{files}.jsonl"));
+        let fits = |max_bytes: u64| {
+            emitter.fits(&EventWriter::create(&probe, max_bytes, files as usize).unwrap())
+        };
+        assert!(fits(boundary), "{files} files at {boundary}");
+        assert!(!fits(boundary - 1), "{files} files at {}", boundary - 1);
+    }
+}

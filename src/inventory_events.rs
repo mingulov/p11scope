@@ -13,15 +13,17 @@
 //! events carry the same caller/module/edge/gap shapes the snapshot
 //! document carries (plus derived presentation states, never new
 //! capture), and every dropped/rotated/evicted event is accounted in
-//! a retained event.
+//! a retained event. Edge records are change-driven and capped per
+//! pass ([`EdgeEmitter`]); deferred ones are counted, never dropped.
 
-use crate::discovery::caller_registry::CallerEvent;
+use crate::discovery::caller_registry::{CallerEvent, CallerId, ModuleId, UseCoverage};
 use crate::discovery::engine::inventory_coordinator::PassReport;
-use crate::inventory::render_json_from_presentation;
+use crate::inventory::{edge_json, render_json_from_presentation};
 use crate::inventory_present::GapView;
-use crate::inventory_present::Presentation;
-use std::collections::VecDeque;
+use crate::inventory_present::{Activity, Capture, EdgeView, Presence, Presentation};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
+use std::hash::BuildHasher as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +36,11 @@ pub(crate) const EVENT_SCHEMA: &str = "p11scope/inventory-events/v1";
 pub(crate) const DEFAULT_ROTATE_BYTES: u64 = 1_048_576;
 /// Default retention: the live file plus this many rotated files.
 pub(crate) const DEFAULT_MAX_FILES: usize = 5;
+
+/// Upper bound on the non-payload lines one rotation adds to a file: its
+/// `rotated` marker and at most one `retention_evicted` record (file names
+/// are at most 255 bytes, the rest is fixed text).
+const ROTATION_OVERHEAD: u64 = 2048;
 
 /// One retained rotated file: its rotation sequence, the event and
 /// byte counts it carries, plus the transitively covered loss — the
@@ -115,6 +122,17 @@ impl EventWriter {
         payload: serde_json::Value,
         at_ns: u64,
     ) -> Result<(), String> {
+        self.append_sized(kind, payload, at_ns).map(|_| ())
+    }
+
+    /// [`EventWriter::append`], returning the line's length in bytes. The
+    /// line lands in the live file, generation [`EventWriter::generation`].
+    pub(crate) fn append_sized(
+        &mut self,
+        kind: &str,
+        payload: serde_json::Value,
+        at_ns: u64,
+    ) -> Result<u64, String> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         let line = serde_json::json!({
@@ -136,7 +154,52 @@ impl EventWriter {
             .map_err(|error| format!("flushing {kind} event failed: {error}"))?;
         self.current_bytes = self.current_bytes.saturating_add(bytes.len() as u64);
         self.events_in_file = self.events_in_file.saturating_add(1);
-        Ok(())
+        Ok(bytes.len() as u64)
+    }
+
+    /// The live file's generation: how many times this run's stream
+    /// rotated. A line appended now belongs to this generation.
+    pub(crate) fn generation(&self) -> u64 {
+        self.rotations
+    }
+
+    /// The oldest generation still retained on disk: a line of an older
+    /// generation was evicted (and accounted in `retention_evicted`).
+    pub(crate) fn oldest_generation(&self) -> u64 {
+        self.rotations.saturating_sub(self.retained.len() as u64)
+    }
+
+    /// Rotate now if a tail of `bytes` would not fit the live file, so
+    /// that tail (`ended`) can no longer rotate (unless `bytes` exceeds
+    /// what a fresh file holds); see [`EventWriter::oldest_generation_after`].
+    pub(crate) fn reserve(&mut self, bytes: u64) -> Result<(), String> {
+        self.rotate_if_needed(bytes)
+    }
+
+    /// The oldest generation still retained once a line of `incoming` bytes
+    /// is appended: one generation later when that line would rotate a full
+    /// retained set.
+    pub(crate) fn oldest_generation_after(&self, incoming: u64) -> u64 {
+        if self.events_in_file > 0 && self.current_bytes.saturating_add(incoming) > self.max_bytes {
+            let retained = (self.retained.len() + 1).min(self.max_files - 1) as u64;
+            self.rotations.saturating_add(1).saturating_sub(retained)
+        } else {
+            self.oldest_generation()
+        }
+    }
+
+    /// Bytes of one contiguous run of lines that retention is guaranteed
+    /// to keep, whatever the live file holds when the run starts: the
+    /// `max_files - 1` files the run can fill after its first one, each
+    /// holding at least `max_bytes - largest_line - ROTATION_OVERHEAD`
+    /// bytes of it (a file rotates only when the next line does not fit;
+    /// its rotation marker and eviction record take the rest). Zero when
+    /// only the live file is kept.
+    pub(crate) fn contiguous_capacity(&self, largest_line: u64) -> u64 {
+        let per_file = self
+            .max_bytes
+            .saturating_sub(largest_line.saturating_add(ROTATION_OVERHEAD));
+        (self.max_files as u64 - 1).saturating_mul(per_file)
     }
 
     /// Write the terminal `ended` event, flush, and sync the live file.
@@ -161,6 +224,12 @@ impl EventWriter {
 
     pub(crate) fn evicted_bytes(&self) -> u64 {
         self.evicted_bytes
+    }
+
+    /// Bytes in the live file (tests fill it to a boundary).
+    #[cfg(test)]
+    pub(crate) fn live_bytes(&self) -> u64 {
+        self.current_bytes
     }
 
     /// Events in the live file (tests assert rotation boundaries).
@@ -428,7 +497,8 @@ pub(crate) fn caller_event_payload(event: &CallerEvent) -> serde_json::Value {
 /// budget the snapshot gaps carry — a refused capture produces stream
 /// gaps identical in meaning to snapshot gaps. Test-gated: production
 /// emits incrementally per pass; tests replay whole snapshots through
-/// here for equivalence and rotation accounting.
+/// here for equivalence and rotation accounting. Edges and gaps go
+/// through the production emitters ([`EdgeEmitter`], [`GapEmitter`]).
 #[cfg(test)]
 pub(crate) fn emit_snapshot_as_events(
     writer: &mut EventWriter,
@@ -442,14 +512,13 @@ pub(crate) fn emit_snapshot_as_events(
     for module in document["modules"].as_array().expect("modules array") {
         writer.append("module_observed", module.clone(), at_ns)?;
     }
-    let edges = document["edges"].as_array().expect("edges array");
-    for (edge_json, edge_view) in edges.iter().zip(presentation.edges.iter()) {
-        let mut enriched = edge_json.clone();
-        enriched["presence"] = serde_json::Value::from(edge_view.presence.label());
-        enriched["capture"] = serde_json::Value::from(edge_view.capture.label());
-        enriched["activity"] = serde_json::Value::from(edge_view.activity.label());
-        writer.append("edge_observed", enriched, at_ns)?;
-    }
+    EdgeEmitter::new().sweep(
+        writer,
+        &presentation.edges,
+        presentation.budgets.edges_limit,
+        at_ns,
+        0,
+    )?;
     GapEmitter::new().emit(writer, &presentation.gaps, true, at_ns)?;
     writer.append(
         "snapshot",
@@ -461,6 +530,357 @@ pub(crate) fn emit_snapshot_as_events(
         }),
         at_ns,
     )
+}
+
+/// One edge as an `edge_observed` payload: the snapshot `edges[]` entry
+/// verbatim plus ONLY the three derived presentation states the
+/// dashboard renders from the same view (`presence`, `capture`,
+/// `activity`) — never new capture.
+pub(crate) fn edge_payload(edge: &EdgeView) -> serde_json::Value {
+    let mut payload = edge_json(edge);
+    payload["presence"] = serde_json::Value::from(edge.presence.label());
+    payload["capture"] = serde_json::Value::from(edge.capture.label());
+    payload["activity"] = serde_json::Value::from(edge.activity.label());
+    payload
+}
+
+/// The most `edge_observed` records one pass (or the native stop's
+/// commit) writes; the rest wait, counted in `edge_events_deferred`.
+pub(crate) const EDGE_EVENTS_PER_PASS: usize = 4096;
+
+/// Bytes the mid-run refresh condition reserves for the lines that end a
+/// stream after a contiguous copy of every edge (the sweep itself uses the
+/// measured `ended` size).
+pub(crate) const DUMP_TAIL_RESERVE: u64 = 8192;
+
+/// Slack added to the `ended` line's measured size when reserving its
+/// room: its envelope plus digits that may still grow (counts, `seq`).
+pub(crate) const ENDED_TAIL_SLACK: u64 = 256;
+
+/// Per-edge slack on a dump's size estimate: a record's `seq` and `at_ns`
+/// digits may grow between its last write and the dump.
+const DUMP_LINE_SLACK: u64 = 32;
+
+type EdgeKey = (CallerId, ModuleId);
+
+/// The classes whose change makes an edge due mid-run: its entries
+/// (count by power-of-two bucket, so a busy counter costs O(log calls)
+/// records, plus saturation, in-flight and the observation label), its
+/// full usage coverage, and the presence, capture and activity states.
+/// Activity is read from the presentation the stream is given, which must
+/// be the classic whole-run-window one (the dashboard display's trailing
+/// window is for frames only). Anything else (mapping instants,
+/// semantics) reaches the stream with the next record or the exact sweep
+/// before `ended`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EdgeClass {
+    entries_bucket: u32,
+    entries_saturated: bool,
+    entries_in_flight: bool,
+    entries_observation: &'static str,
+    coverage: UseCoverage,
+    presence: Presence,
+    capture: Capture,
+    activity: Activity,
+}
+
+impl EdgeClass {
+    fn of(edge: &EdgeView) -> Self {
+        Self {
+            entries_bucket: edge.entry_count.checked_ilog2().map_or(0, |log| log + 1),
+            entries_saturated: edge.entry_saturated,
+            entries_in_flight: edge.entry_in_flight,
+            entries_observation: edge.entry_observation,
+            coverage: edge.coverage.clone(),
+            presence: edge.presence,
+            capture: edge.capture,
+            activity: edge.activity,
+        }
+    }
+}
+
+/// What the stream last carried for one edge: its class, a 128-bit keyed
+/// digest of the exact payload (the sweep's comparison), and where and
+/// how large that record is (the retention checks).
+#[derive(Debug)]
+struct EdgeDigest {
+    class: EdgeClass,
+    exact: (u64, u64),
+    generation: u64,
+    bytes: u64,
+}
+
+/// One pass's edge output: records written and records still waiting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EdgeEmission {
+    pub emitted: usize,
+    pub deferred: usize,
+}
+
+/// The final sweep's output: records written, and edges whose last record
+/// is no longer retained on disk (0 unless retention could not hold them).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EdgeSweep {
+    pub emitted: usize,
+    pub unretained: usize,
+}
+
+/// The single place `edge_observed` records are written (DR-C5-EDGE).
+/// **Every emitter that appends edge records (the per-pass emitter, the
+/// stop-time emitter, the final sweep before `ended`, the snapshot sync
+/// emitter) must call [`EdgeEmitter`]; never append `edge_observed`
+/// directly**, or the replayed stream diverges from the snapshot.
+///
+/// Per pass ([`EdgeEmitter::emit`]) an edge is due when it is new, when
+/// its [`EdgeClass`] differs from the one the stream last carried, or when
+/// retention evicted its last record while the edges' records fit the
+/// retention ([`EdgeEmitter::fits`]). Due edges queue in arrival order;
+/// at most `EDGE_EVENTS_PER_PASS` records go out per pass, each with the
+/// edge's current payload, and the rest stay queued (FIFO, so a deferred
+/// edge is never starved) and are counted as deferred.
+///
+/// The sweep ([`EdgeEmitter::sweep`]), made once before `ended` on every
+/// clean termination, writes every edge whose exact payload differs from
+/// its last record, or whose last record was evicted, uncapped (bounded by
+/// the edge limit). If its own lines rotated a needed record out, it
+/// writes one contiguous dump of every edge when that provably fits the
+/// retention, and reports any edge still without a retained record. So the
+/// last retained record per (caller, module) equals the snapshot's
+/// `edges[]` entry plus its three derived states whenever the sweep reports
+/// none unretained. A stream that was cut short has no `ended`; its last
+/// records may lag the run's end.
+///
+/// Memory: one digest per edge, bounded by the registry's edge limit
+/// (32,768 by default). An edge past that bound (unreachable while the
+/// registry enforces the same limit) keeps no digest and is treated as
+/// always changed: it over-emits, never under-emits.
+#[derive(Debug)]
+pub(crate) struct EdgeEmitter {
+    digests: HashMap<EdgeKey, EdgeDigest>,
+    queue: VecDeque<EdgeKey>,
+    queued: HashSet<EdgeKey>,
+    per_pass: usize,
+    /// Sum of `bytes` over `digests`: the size of one copy of every
+    /// tracked edge's last record.
+    carried_bytes: u64,
+    /// The largest edge record line written so far.
+    largest_line: u64,
+    keys: (std::hash::RandomState, std::hash::RandomState),
+}
+
+impl Default for EdgeEmitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EdgeEmitter {
+    pub(crate) fn new() -> Self {
+        Self::with_cap(EDGE_EVENTS_PER_PASS)
+    }
+
+    /// An emitter with its own per-pass record cap (tests).
+    pub(crate) fn with_cap(per_pass: usize) -> Self {
+        Self {
+            digests: HashMap::new(),
+            queue: VecDeque::new(),
+            queued: HashSet::new(),
+            per_pass,
+            carried_bytes: 0,
+            largest_line: 0,
+            keys: (std::hash::RandomState::new(), std::hash::RandomState::new()),
+        }
+    }
+
+    /// Edges holding a digest (at most the edge limit).
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.digests.len()
+    }
+
+    fn digest(&self, payload: &serde_json::Value) -> (u64, u64) {
+        let bytes = payload.to_string();
+        (
+            self.keys.0.hash_one(bytes.as_bytes()),
+            self.keys.1.hash_one(bytes.as_bytes()),
+        )
+    }
+
+    /// Whether one contiguous copy of every tracked edge's record, plus
+    /// a tail of at most [`DUMP_TAIL_RESERVE`] bytes, is guaranteed to
+    /// survive retention (the mid-run refresh condition).
+    fn fits(&self, writer: &EventWriter) -> bool {
+        self.fits_with_tail(writer, DUMP_TAIL_RESERVE)
+    }
+
+    /// [`EdgeEmitter::fits`] for a known tail of `tail` bytes (the sweep's
+    /// dump, followed by `reserve(tail)` and then only that tail).
+    fn fits_with_tail(&self, writer: &EventWriter, tail: u64) -> bool {
+        let slack = DUMP_LINE_SLACK.saturating_mul(self.digests.len() as u64);
+        let dump = self
+            .carried_bytes
+            .saturating_add(slack)
+            .saturating_add(tail);
+        dump <= writer.contiguous_capacity(self.largest_line.saturating_add(DUMP_LINE_SLACK))
+    }
+
+    /// Whether `key`'s last record is gone from disk.
+    fn evicted(&self, key: &EdgeKey, writer: &EventWriter) -> bool {
+        self.evicted_before(key, writer.oldest_generation())
+    }
+
+    /// Whether `key`'s last record is older than generation `oldest`.
+    fn evicted_before(&self, key: &EdgeKey, oldest: u64) -> bool {
+        self.digests
+            .get(key)
+            .is_some_and(|digest| digest.generation < oldest)
+    }
+
+    /// Write one record and remember it, within `limit`.
+    fn write(
+        &mut self,
+        writer: &mut EventWriter,
+        edge: &EdgeView,
+        payload: serde_json::Value,
+        limit: usize,
+        at_ns: u64,
+    ) -> Result<(), String> {
+        let exact = self.digest(&payload);
+        let bytes = writer.append_sized("edge_observed", payload, at_ns)?;
+        self.largest_line = self.largest_line.max(bytes);
+        let key = (edge.caller, edge.module);
+        if !self.digests.contains_key(&key) && self.digests.len() >= limit {
+            return Ok(());
+        }
+        let digest = EdgeDigest {
+            class: EdgeClass::of(edge),
+            exact,
+            generation: writer.generation(),
+            bytes,
+        };
+        self.carried_bytes = self.carried_bytes.saturating_add(bytes);
+        if let Some(old) = self.digests.insert(key, digest) {
+            self.carried_bytes = self.carried_bytes.saturating_sub(old.bytes);
+        }
+        Ok(())
+    }
+
+    /// One pass: queue every new, class-changed or (while the records fit
+    /// the retention) evicted edge, then write up to the per-pass cap from
+    /// the queue's head. `edges` is the presentation's (sorted by (caller,
+    /// module)); `limit` its edge limit.
+    pub(crate) fn emit(
+        &mut self,
+        writer: &mut EventWriter,
+        edges: &[EdgeView],
+        limit: usize,
+        at_ns: u64,
+    ) -> Result<EdgeEmission, String> {
+        let refresh = self.fits(writer);
+        for edge in edges {
+            let key = (edge.caller, edge.module);
+            if self.queued.contains(&key) {
+                continue;
+            }
+            let due = match self.digests.get(&key) {
+                None => true,
+                Some(digest) => {
+                    digest.class != EdgeClass::of(edge)
+                        || (refresh && digest.generation < writer.oldest_generation())
+                }
+            };
+            if due {
+                self.queue.push_back(key);
+                self.queued.insert(key);
+            }
+        }
+        let mut emitted = 0;
+        while emitted < self.per_pass {
+            let Some(key) = self.queue.pop_front() else {
+                break;
+            };
+            self.queued.remove(&key);
+            let Ok(position) = edges.binary_search_by_key(&key, |edge| (edge.caller, edge.module))
+            else {
+                continue;
+            };
+            let edge = &edges[position];
+            // A change that reverted while it waited is already carried,
+            // unless its record has since been evicted.
+            if self
+                .digests
+                .get(&key)
+                .is_some_and(|digest| digest.class == EdgeClass::of(edge))
+                && !self.evicted(&key, writer)
+            {
+                continue;
+            }
+            self.write(writer, edge, edge_payload(edge), limit, at_ns)?;
+            emitted += 1;
+        }
+        Ok(EdgeEmission {
+            emitted,
+            deferred: self.queue.len(),
+        })
+    }
+
+    /// The exact sweep before `ended`: every edge whose payload differs
+    /// from its last record, or whose last record was evicted (or that was
+    /// never carried), in `edges` order, uncapped. Room for the `tail`
+    /// bytes still to come (the `ended` line) is then reserved, so a
+    /// rotation that tail would cause happens here, before the count. If a
+    /// needed record was rotated out, one contiguous dump of every edge
+    /// follows when it, plus the tail, provably fits the retention. The
+    /// returned
+    /// `unretained` is final for a tail of at most `tail` bytes: it counts
+    /// the edges whose last record will not be retained once that tail is
+    /// written. Clears the deferred queue.
+    pub(crate) fn sweep(
+        &mut self,
+        writer: &mut EventWriter,
+        edges: &[EdgeView],
+        limit: usize,
+        at_ns: u64,
+        tail: u64,
+    ) -> Result<EdgeSweep, String> {
+        self.queue.clear();
+        self.queued.clear();
+        let mut emitted = 0;
+        for edge in edges {
+            let key = (edge.caller, edge.module);
+            let payload = edge_payload(edge);
+            let carried = self.digests.get(&key).is_some_and(|digest| {
+                digest.exact == self.digest(&payload)
+                    && digest.generation >= writer.oldest_generation()
+            });
+            if carried {
+                continue;
+            }
+            self.write(writer, edge, payload, limit, at_ns)?;
+            emitted += 1;
+        }
+        let lost = |emitter: &Self, writer: &EventWriter| {
+            let oldest = writer.oldest_generation_after(tail);
+            edges
+                .iter()
+                .filter(|edge| emitter.evicted_before(&(edge.caller, edge.module), oldest))
+                .count()
+        };
+        writer.reserve(tail)?;
+        if lost(self, writer) > 0 && self.fits_with_tail(writer, tail) {
+            for edge in edges {
+                self.write(writer, edge, edge_payload(edge), limit, at_ns)?;
+                emitted += 1;
+            }
+            // No second reserve: the fit bound already holds the tail, and
+            // the count below is taken against the generation that remains
+            // after it.
+        }
+        Ok(EdgeSweep {
+            emitted,
+            unretained: lost(self, writer),
+        })
+    }
 }
 
 /// One gap as a `gap_recorded` payload: the IDENTICAL caller/module/

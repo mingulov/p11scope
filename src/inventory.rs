@@ -22,17 +22,18 @@ use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, InventoryScope, PassReport,
 };
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::native_binding::NativeIdentity;
+use crate::discovery::native_binding::{NativeIdentity, ScanOnlyIdentity};
 use crate::inventory_capture::{
     FacadeLane, LaneSummary, LaneWindows, LoopClock, NativeLane, PassDriver, Publish, SERVICE_TICK,
     run_classic,
 };
 use crate::inventory_dashboard::{
-    DashboardIo, Display, DisplayAccount, RESCAN_INTERVAL, RESTORE_RETRY_BUDGET, StderrRoute,
-    StopFlag,
+    DashboardState, DetailPage, DisplayHandoff, Key, LogTail, REDRAW_INTERVAL, RESCAN_INTERVAL,
+    RawModeGuard, StopFlag, TerminalGuard, Viewport, poll_key, render_frame, stdout_terminal,
 };
 use crate::inventory_events::{
-    EventWriter, GapEmitter, caller_event_payload, ended_payload, pass_payload, started_payload,
+    EdgeEmitter, EventWriter, GapEmitter, caller_event_payload, ended_payload, pass_payload,
+    started_payload,
 };
 use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, render_snapshot};
 use crate::output::AtomicFile;
@@ -40,7 +41,9 @@ use crate::process::PidPin;
 use anyhow::{Context as _, Result};
 use std::collections::BTreeMap;
 use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DOC_ID: &str = "p11scope/inventory/v1";
@@ -82,11 +85,10 @@ pub fn run(
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
     capture: CaptureMode,
-    attach_backend: crate::attach::BackendSelection,
 ) -> Result<i32> {
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
-    // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
-    // its stop path (the final sinks are still written).
+    // SIGINT/SIGTERM/SIGHUP end the classic loop through its stop path
+    // (the final sinks are still written); the dashboard installs its own.
     let stop = StopFlag::install();
     run_with_writer(
         scope,
@@ -102,7 +104,6 @@ pub fn run(
         event_rotate_bytes,
         event_max_files,
         capture,
-        attach_backend,
         &|| stop.stopped(),
         &|| stop.exit_on_next_signal(),
         stdout_tty,
@@ -125,59 +126,10 @@ fn run_with_writer(
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
     capture: CaptureMode,
-    attach_backend: crate::attach::BackendSelection,
     stop: &dyn Fn() -> bool,
     report_written: &dyn Fn(),
     stdout_tty: bool,
     stdout: &mut dyn std::io::Write,
-) -> Result<i32> {
-    run_with_terminal(
-        scope,
-        modules,
-        hooks,
-        json,
-        max_scan_pids,
-        max_gaps,
-        duration,
-        out,
-        dashboard,
-        event_log,
-        event_rotate_bytes,
-        event_max_files,
-        capture,
-        attach_backend,
-        stop,
-        report_written,
-        stdout_tty,
-        stdout,
-        &DashboardIo::stdio(),
-    )
-}
-
-/// `run_with_writer` with the interactive dashboard's terminal named
-/// (production: stdout and stdin; the privileged slow-terminal cell: a
-/// pty).
-#[allow(clippy::too_many_arguments)]
-fn run_with_terminal(
-    scope: InspectScope,
-    modules: &[PathBuf],
-    hooks: &HookRegistry,
-    json: bool,
-    max_scan_pids: Option<usize>,
-    max_gaps: Option<usize>,
-    duration: Option<Duration>,
-    out: Option<&Path>,
-    dashboard: bool,
-    event_log: Option<&Path>,
-    event_rotate_bytes: Option<u64>,
-    event_max_files: Option<usize>,
-    capture: CaptureMode,
-    attach_backend: crate::attach::BackendSelection,
-    stop: &dyn Fn() -> bool,
-    report_written: &dyn Fn(),
-    stdout_tty: bool,
-    stdout: &mut dyn std::io::Write,
-    terminal: &DashboardIo,
 ) -> Result<i32> {
     // DR-K8S-1: the kernel-side PID filter numbers tasks in the initial PID
     // namespace; a mismatched observer's --pid would match nothing, so it
@@ -237,47 +189,27 @@ fn run_with_terminal(
     // The scan lane stages no usage coverage: every edge reads
     // `unknown (scan only)`. The native lane stages per-edge coverage
     // notes and witnesses; `auto` falls back to scan with a named gap.
-    let lane = open_native_lane(capture, attach_backend, scope, &mut coordinator)?;
+    let lane = open_native_lane(capture, scope, &mut coordinator, dashboard && stdout_tty)?;
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
-    let mut degraded = dashboard.then(|| "needs a terminal on stdout".to_string());
     if dashboard && stdout_tty {
-        match Display::open(terminal, &scope_label) {
-            Ok(display) => {
-                return run_dashboard(
-                    DashboardRun {
-                        scope,
-                        inventory_scope,
-                        scope_label,
-                        started_ns,
-                        max_scan_pids,
-                        duration,
-                        json,
-                    },
-                    coordinator,
-                    lane,
-                    display,
-                    sink,
-                    stream,
-                    stop,
-                    report_written,
-                    stdout,
-                    terminal,
-                );
-            }
-            // A terminal the run cannot open privately (another user's
-            // tty) or put in raw mode: the classic path, honestly.
-            Err(error) => {
-                degraded = Some(format!(
-                    "cannot take over the terminal ({})",
-                    crate::render::escape_controls(&format!("{error}"))
-                ));
-            }
-        }
+        return run_dashboard_loop(
+            scope,
+            inventory_scope,
+            scope_label,
+            started_ns,
+            coordinator,
+            max_scan_pids,
+            duration.map(|window| Instant::now() + window),
+            sink,
+            stream,
+            json,
+            stdout,
+        );
     }
-    if let Some(why) = degraded {
+    if dashboard {
         eprintln!(
-            "p11scope: --dashboard {why}; degraded to {} (no ANSI emitted)",
+            "p11scope: --dashboard needs a terminal on stdout; degraded to {} (no ANSI emitted)",
             if json {
                 "the JSON document"
             } else {
@@ -312,7 +244,6 @@ fn run_with_terminal(
         max_scan_pids,
         guard: UnavailableImageGuard,
         deadline,
-        display: None,
     };
     let clock = LoopClock {
         deadline,
@@ -333,25 +264,37 @@ fn run_with_terminal(
                         eprintln!("{line}");
                     }
                     if let Some(writer) = stream.as_mut() {
-                        let presentation =
-                            stream_presentation(coordinator, &scope_label, started_ns, now_ns);
+                        let window_ns = now_ns.saturating_sub(started_ns);
+                        let presentation = Presentation::capture(
+                            coordinator,
+                            &scope_label,
+                            started_ns,
+                            now_ns,
+                            coordinator.passes(),
+                            now_ns,
+                            window_ns,
+                        );
                         emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
                             .map_err(|error| anyhow::anyhow!("{error}"))?;
                     }
                 }
-                Publish::Retiring {
-                    attached,
-                    links,
-                    budget,
-                } => eprintln!(
+                Publish::Retiring { attached, budget } => eprintln!(
                     "p11scope: stopping: detaching the native probes of {attached} endpoints \
-                     in {links} links (up to {} s)",
+                     (up to {} s)",
                     budget.as_secs()
                 ),
                 Publish::Stop { events, now_ns } => {
                     if let Some(writer) = stream.as_mut() {
-                        let presentation =
-                            stream_presentation(coordinator, &scope_label, started_ns, now_ns);
+                        let window_ns = now_ns.saturating_sub(started_ns);
+                        let presentation = Presentation::capture(
+                            coordinator,
+                            &scope_label,
+                            started_ns,
+                            now_ns,
+                            coordinator.passes(),
+                            now_ns,
+                            window_ns,
+                        );
                         emit_stop_events(
                             writer,
                             &mut stream_state,
@@ -412,21 +355,6 @@ struct ClassicDriver<'a> {
     max_scan_pids: Option<usize>,
     guard: UnavailableImageGuard,
     deadline: Option<Instant>,
-    /// The interactive dashboard's display (C5.3): it draws on the loop's
-    /// service ticks and takes the pass warnings into its log tail.
-    display: Option<Display>,
-}
-
-impl ClassicDriver<'_> {
-    /// A pass warning: stderr on the classic path; under the dashboard
-    /// (which must never scribble beside its screen) the log tail, kept
-    /// for stderr past the screen.
-    fn warn(&mut self, warning: &str) {
-        match self.display.as_mut() {
-            Some(display) => display.warn(warning),
-            None => eprintln!("{warning}"),
-        }
-    }
 }
 
 impl PassDriver<PidPin> for ClassicDriver<'_> {
@@ -459,7 +387,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             now_ns,
         )?;
         if let Some(warning) = warning {
-            self.warn(&warning);
+            eprintln!("{warning}");
         }
         Ok(report)
     }
@@ -467,26 +395,20 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     fn commit(&mut self, engine_changed: bool) -> Result<()> {
         self.coordinator.commit_batch(engine_changed).map(|_| ())
     }
-
-    fn on_tick(&mut self) {
-        if let Some(display) = self.display.as_mut() {
-            display.tick();
-        }
-    }
 }
 
 /// Opens the native usage lane `mode` asks for. `native` that cannot start
 /// is an error naming why; `auto` falls back to the scan lane with the gap
 /// `native usage feed unavailable` (plan ruling D1). The interactive
-/// dashboard services the lane through the same loop as the classic path
-/// (C5.3). In a foreign PID namespace `--system` runs native (cookies bind
-/// callers, never PID numbers) but no watch is ever claimed (ruling D1:
-/// the run stays lossy).
+/// dashboard does not service a native capture yet, so there `native` is
+/// refused and `auto` falls back. In a foreign PID namespace `--system`
+/// runs native (cookies bind callers, never PID numbers) but no watch is
+/// ever claimed (ruling D1: the run stays lossy).
 fn open_native_lane(
     mode: CaptureMode,
-    attach_backend: crate::attach::BackendSelection,
     scope: InspectScope,
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    interactive_dashboard: bool,
 ) -> Result<Option<NativeLane<FacadeLane>>> {
     let unavailable =
         |coordinator: &mut InventoryCoordinator<OsProcessSource>, reason: String| match mode {
@@ -505,6 +427,12 @@ fn open_native_lane(
     if mode == CaptureMode::Scan {
         return Ok(None);
     }
+    if interactive_dashboard {
+        return unavailable(
+            coordinator,
+            "the interactive --dashboard does not service the native lane yet".into(),
+        );
+    }
     let capture_scope = match scope {
         InspectScope::Pid(pid) => match PidPin::open(pid) {
             Ok(pin) => crate::attach::capture::CaptureScope::Pid(pin),
@@ -512,15 +440,10 @@ fn open_native_lane(
         },
         InspectScope::System => crate::attach::capture::CaptureScope::System,
     };
-    let capture = match FacadeLane::prepare(
-        capture_scope,
-        coordinator.attach_set().budget(),
-        attach_backend,
-    ) {
+    let capture = match FacadeLane::prepare(capture_scope, coordinator.attach_set().budget()) {
         Ok(capture) => capture,
         Err(error) => return unavailable(coordinator, format!("{error:#}")),
     };
-    let backend = crate::inventory_capture::CaptureLane::<PidPin>::backend(&capture);
     let numbering = crate::pidns::numbering();
     let lossy = (!numbering.agrees()).then(|| {
         format!(
@@ -533,7 +456,7 @@ fn open_native_lane(
     });
     match NativeLane::start(capture, coordinator, LaneWindows::PROVISIONAL, lossy) {
         Ok(lane) => {
-            eprintln!("{}", lane_active_line(&backend));
+            eprintln!("p11scope: native usage lane active (Inventory capture activated)");
             Ok(Some(lane))
         }
         Err((mut capture, reason)) => {
@@ -542,23 +465,6 @@ fn open_native_lane(
             unavailable(coordinator, reason)
         }
     }
-}
-
-/// The stderr line a native lane starts with: its attach mechanism and,
-/// under `auto`, why it fell back to per-offset links.
-fn lane_active_line(backend: &crate::inventory_capture::LaneBackend) -> String {
-    let fallback = backend.fallback.as_deref().map_or(String::new(), |reason| {
-        format!(
-            "; uprobe-multi fallback: {}",
-            crate::render::escape_controls(reason)
-        )
-    });
-    format!(
-        "p11scope: native usage lane active (Inventory capture activated, {} links, \
-         --attach-backend {}{fallback})",
-        backend.mechanism(),
-        backend.selection_label()
-    )
 }
 
 /// The stderr line a native run ends with: what it attached, how its
@@ -581,12 +487,11 @@ fn stop_line(summary: &LaneSummary) -> String {
         ),
     };
     format!(
-        "p11scope: native capture stopped after {} pass{}: {} endpoints attached ({} links), \
-         {} failed; {retirement}; settlement {}",
+        "p11scope: native capture stopped after {} pass{}: {} endpoints attached, {} failed; \
+         {retirement}; settlement {}",
         summary.passes,
         if summary.passes == 1 { "" } else { "es" },
         summary.attached,
-        summary.backend.mechanism(),
         summary.failed,
         crate::inventory_capture::SETTLEMENT,
     )
@@ -612,13 +517,31 @@ fn finish_output(
         note_native_observation(&mut document, summary);
     }
     if let Some(writer) = stream {
-        // Exact repeat counts before `ended`, on every termination path:
-        // the last `gap_repeated` per index then equals the snapshot.
+        // The exact repeat counts and the final edge sweep before `ended`,
+        // on every termination path, in the per-pass order (gaps, then
+        // edges): the last `gap_repeated` per index and the last
+        // `edge_observed` per edge then equal the snapshot. The sweep goes
+        // last so nothing but `ended` follows it (its retention bound).
         stream_state
             .gaps
             .emit(writer, &presentation.gaps, true, presentation.ended_ns)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let payload = ended_payload(presentation, presentation.ended_ns, writer);
+        // The sweep reserves room for `ended` before it counts, so the
+        // `edges_unretained` it reports is final (review R-1).
+        let tail = ended_tail(presentation, writer);
+        let swept = stream_state
+            .edges
+            .sweep(
+                writer,
+                &presentation.edges,
+                presentation.budgets.edges_limit,
+                presentation.ended_ns,
+                tail,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut payload = ended_payload(presentation, presentation.ended_ns, writer);
+        payload["edge_events"] = swept.emitted.into();
+        payload["edges_unretained"] = swept.unretained.into();
         writer
             .finish(payload, presentation.ended_ns)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -640,9 +563,46 @@ fn finish_output(
     Ok(0)
 }
 
-/// One pass's application after its collection, with the shared failure
-/// policy: the collection may have run on a worker thread (C5.7); its
-/// catalog, or its error, is applied here.
+/// Bytes the `ended` line may take: its payload as measured now plus
+/// [`ENDED_TAIL_SLACK`] (the envelope and counters that may still grow).
+fn ended_tail(presentation: &Presentation, writer: &EventWriter) -> u64 {
+    let mut payload = ended_payload(presentation, presentation.ended_ns, writer);
+    payload["edge_events"] = u64::MAX.into();
+    payload["edges_unretained"] = u64::MAX.into();
+    (payload.to_string().len() as u64).saturating_add(crate::inventory_events::ENDED_TAIL_SLACK)
+}
+
+/// One scan pass with the shared failure policy: a failed FIRST pass
+/// is a hard error (nothing was ever observed); a later failure is an
+/// empty pass plus a warning line the caller routes (stderr on the
+/// classic path, the log tail on the dashboard) — lifecycle still
+/// reconciles, and the observation survives its target's death.
+#[allow(clippy::too_many_arguments)]
+fn scan_one_pass(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    inventory_scope: &InventoryScope,
+    scope: InspectScope,
+    max_scan_pids: Option<usize>,
+    guard: &mut UnavailableImageGuard,
+    deadline: Option<Instant>,
+    identity: &mut dyn NativeIdentity<PidPin>,
+    now: u64,
+) -> Result<(PassReport, Option<String>)> {
+    let collected = coordinator.collector(*inventory_scope, max_scan_pids)();
+    apply_one_pass(
+        coordinator,
+        collected,
+        scope,
+        guard,
+        deadline,
+        identity,
+        now,
+    )
+}
+
+/// `scan_one_pass` after its collection: the collection may have run on a
+/// worker thread (C5.7); its catalog, or its error, is applied here under
+/// the same failure policy.
 fn apply_one_pass(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     collected: Result<crate::inspect_system::Catalog>,
@@ -686,9 +646,11 @@ fn apply_one_pass(
 
 /// Incremental stream position: gaps are push-only until the bound,
 /// so an index plus the suppressed counter replays exactly the new
-/// loss on every pass.
+/// loss on every pass; edges keep one digest each (bounded by the edge
+/// limit) so only changes are streamed (DR-C5-EDGE).
 struct StreamState {
     gaps: GapEmitter,
+    edges: EdgeEmitter,
     emitted_suppressed: u64,
     /// Unbound witness rows per (module, reason) already counted on a
     /// pass marker.
@@ -699,6 +661,7 @@ impl StreamState {
     fn new() -> Self {
         Self {
             gaps: GapEmitter::new(),
+            edges: EdgeEmitter::new(),
             emitted_suppressed: 0,
             emitted_unbound: BTreeMap::new(),
         }
@@ -778,8 +741,10 @@ fn emit_pass_events(
 
 /// The one commit emitter (C5.9's single gap emitter): caller events, the
 /// fresh gaps through `state.gaps` (unflushed: the classic path's
-/// `finish_output` flushes), then the pass marker with its loss accounting
-/// and unbound row counts; `final` marks the native stop's commit.
+/// `finish_output` flushes), the changed edges through `state.edges`
+/// (capped per pass; `finish_output` sweeps the rest), then the pass
+/// marker with its loss accounting, edge record counts and unbound row
+/// counts; `final` marks the native stop's commit.
 fn emit_commit(
     writer: &mut EventWriter,
     state: &mut StreamState,
@@ -792,11 +757,19 @@ fn emit_commit(
         writer.append("caller_event", caller_event_payload(event), now_ns)?;
     }
     let fresh = state.gaps.emit(writer, &presentation.gaps, false, now_ns)?;
+    let edges = state.edges.emit(
+        writer,
+        &presentation.edges,
+        presentation.budgets.edges_limit,
+        now_ns,
+    )?;
     let suppressed_delta = presentation
         .gaps_suppressed
         .saturating_sub(state.emitted_suppressed);
     state.emitted_suppressed = presentation.gaps_suppressed;
     let mut payload = pass_payload(report, presentation, fresh, suppressed_delta);
+    payload["edge_events"] = edges.emitted.into();
+    payload["edge_events_deferred"] = edges.deferred.into();
     add_unbound_rows(&mut payload, state, presentation);
     if stop {
         payload["final"] = serde_json::Value::Bool(true);
@@ -839,14 +812,6 @@ fn note_native_observation(document: &mut serde_json::Value, summary: &LaneSumma
     observation["lane"] = "native".into();
     observation["settlement"] = crate::inventory_capture::SETTLEMENT.into();
     observation["retirement"] = summary.retirement.label().into();
-    // C5.11: the attach mechanism, as the classic `attach_mechanisms`
-    // spells it, the operator's selection, and any `auto` fallback reason.
-    observation["attach"] = serde_json::json!({
-        "selection": summary.backend.selection_label(),
-        "mechanism": summary.backend.mechanism(),
-        "fallback": summary.backend.fallback,
-        "scope_filter": summary.backend.scope_filter.label(),
-    });
     let lifecycle = &summary.lifecycle;
     observation["lifecycle"] = serde_json::json!({
         "records": lifecycle.records,
@@ -857,100 +822,40 @@ fn note_native_observation(document: &mut serde_json::Value, summary: &LaneSumma
     });
 }
 
-/// What the interactive dashboard run is over.
-struct DashboardRun {
+/// The interactive dashboard loop: rescan at 1 Hz, offer immutable
+/// snapshots through the bounded handoff, redraw coalesced at ~3 Hz.
+/// Keys scroll (stdin TTY only — a pipe never blocks the loop);
+/// `--duration`, `q`/Ctrl-C/ESC, or SIGINT/SIGTERM/SIGHUP ends it.
+/// Every exit path drops the guards first (terminal restored) and
+/// only then touches the final sinks.
+#[allow(clippy::too_many_arguments)]
+fn run_dashboard_loop(
     scope: InspectScope,
     inventory_scope: InventoryScope,
     scope_label: String,
     started_ns: u64,
-    max_scan_pids: Option<usize>,
-    duration: Option<Duration>,
-    json: bool,
-}
-
-/// The event stream's view of a pass: the classic cumulative window, on
-/// both front ends. The stream must not depend on whether `--dashboard` was
-/// given (C5.3 review M2): activity is window-dependent, and C5.4's
-/// `edge_observed` records carry it.
-fn stream_presentation<S: ProcessSource>(
-    coordinator: &InventoryCoordinator<S>,
-    scope_label: &str,
-    started_ns: u64,
-    now_ns: u64,
-) -> Presentation {
-    Presentation::capture(
-        coordinator,
-        scope_label,
-        started_ns,
-        now_ns,
-        coordinator.passes(),
-        now_ns,
-        now_ns.saturating_sub(started_ns),
-    )
-}
-
-/// The dashboard's two views of a pass: the stream's
-/// ([`stream_presentation`]) and the display's, whose activity reads
-/// through the trailing [`DASHBOARD_ACTIVITY_WINDOW_NS`] (a growing window
-/// would pin every historical entry as "recent" forever on screen).
-fn dashboard_pass_views<S: ProcessSource>(
-    coordinator: &InventoryCoordinator<S>,
-    scope_label: &str,
-    started_ns: u64,
-    now_ns: u64,
-) -> (Presentation, Presentation) {
-    let display = Presentation::capture(
-        coordinator,
-        scope_label,
-        started_ns,
-        now_ns,
-        coordinator.passes(),
-        now_ns,
-        DASHBOARD_ACTIVITY_WINDOW_NS,
-    );
-    (
-        stream_presentation(coordinator, scope_label, started_ns, now_ns),
-        display,
-    )
-}
-
-/// With no `--duration` the dashboard runs until a key or a signal: its
-/// loop clock gets a deadline it never reaches.
-const DASHBOARD_UNBOUNDED: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
-
-/// The interactive dashboard (C5.3), over the `display` the caller opened:
-/// the classic loop (`run_classic`) with the display on its service ticks. Passes, the native lane's
-/// service ticks, witness reads and the stop run exactly as on the
-/// classic path; the display only draws inside a tick, with a frame
-/// writer that sheds what a stalled terminal does not take within its
-/// budget, so a terminal that stops reading never delays a service tick.
-/// Keys (stdin TTY only), `--duration`, or SIGINT/SIGTERM/SIGHUP end it.
-/// The terminal is given back (bounded) before the native stop, so the
-/// stop's notices are readable; the report follows R-C51-4 like the
-/// classic path's.
-#[allow(clippy::too_many_arguments)]
-fn run_dashboard(
-    run: DashboardRun,
     mut coordinator: InventoryCoordinator<OsProcessSource>,
-    lane: Option<NativeLane<FacadeLane>>,
-    display: Display,
+    max_scan_pids: Option<usize>,
+    deadline: Option<Instant>,
     sink: Option<AtomicFile>,
     mut stream: Option<EventWriter>,
-    stop: &dyn Fn() -> bool,
-    report_written: &dyn Fn(),
+    json: bool,
     stdout: &mut dyn std::io::Write,
-    terminal: &DashboardIo,
 ) -> Result<i32> {
-    let DashboardRun {
-        scope,
-        inventory_scope,
-        scope_label,
-        started_ns,
-        max_scan_pids,
-        duration,
-        json,
-    } = run;
-    let quit = display.quit_flag();
+    let mut term = stdout_terminal().with_context(|| "opening the dashboard terminal")?;
+    let _term_guard =
+        TerminalGuard::enter(&term).with_context(|| "entering the dashboard screen")?;
+    let raw_guard = RawModeGuard::enter_stdin().with_context(|| "entering dashboard input mode")?;
+    let keys_live = raw_guard.is_some();
+    let stop = StopFlag::install();
+    let handoff = DisplayHandoff::new();
+    let mut tail = LogTail::bounded();
+    let mut state = DashboardState::new();
+    let mut last_viewport = Viewport {
+        width: 80,
+        height: 24,
+    };
+    let mut last_frame: Option<crate::inventory_dashboard::DisplayFrame> = None;
     let mut stream_state = StreamState::new();
     if let Some(writer) = stream.as_mut() {
         let prologue = Presentation::capture(
@@ -970,102 +875,194 @@ fn run_dashboard(
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
-    let deadline = duration.map(|window| Instant::now() + window);
-    let mut driver = ClassicDriver {
-        coordinator: &mut coordinator,
-        inventory_scope: &inventory_scope,
-        scope,
-        max_scan_pids,
-        guard: UnavailableImageGuard,
-        deadline,
-        display: Some(display),
-    };
-    let ending = || stop() || quit.get();
-    let clock = LoopClock {
-        deadline: Some(deadline.unwrap_or_else(|| Instant::now() + DASHBOARD_UNBOUNDED)),
-        stop: &ending,
-        interval: RESCAN_INTERVAL,
-        tick: SERVICE_TICK,
-        collection_tick: SERVICE_TICK,
-    };
-    let stopped = run_classic(
-        &mut driver,
-        lane,
-        &clock,
-        &mut |driver: &mut ClassicDriver<'_>, point| {
-            match point {
-                Publish::Pass { report, now_ns } => {
-                    let coordinator = &*driver.coordinator;
-                    let (stream_view, display_view) =
-                        dashboard_pass_views(coordinator, &scope_label, started_ns, now_ns);
-                    if let Some(writer) = stream.as_mut() {
-                        emit_pass_events(writer, &mut stream_state, report, &stream_view, now_ns)
-                            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    tail.push(&format!(
+        "p11scope inventory {scope_label}: dashboard started (rescan 1 Hz, redraw ~3 Hz{})",
+        if keys_live {
+            ""
+        } else {
+            "; stdin is not a terminal, keys unavailable"
+        }
+    ));
+    let mut guard = UnavailableImageGuard;
+    let mut next_rescan = Instant::now();
+    let mut next_redraw = Instant::now();
+    loop {
+        if keys_live {
+            while let Some(key) = poll_key() {
+                match key {
+                    Key::Quit => {
+                        tail.push("p11scope: quit requested");
+                        return finish_dashboard(
+                            scope_label.clone(),
+                            started_ns,
+                            coordinator,
+                            &handoff,
+                            sink,
+                            stream,
+                            stream_state,
+                            json,
+                            stdout,
+                            _term_guard,
+                            raw_guard,
+                        );
                     }
-                    if let Some(display) = driver.display.as_mut() {
-                        // The pass line is progress; its events and gaps
-                        // must outlive the screen.
-                        for (index, line) in progress_lines(coordinator, report).iter().enumerate()
-                        {
-                            if index == 0 {
-                                display.log(line);
-                            } else {
-                                display.warn(line);
-                            }
+                    Key::Up => {
+                        if state.detail == DetailPage::Gaps {
+                            state.scroll_gaps_up();
+                        } else {
+                            state.scroll_up();
                         }
-                        display.offer(display_view);
+                    }
+                    Key::Down => {
+                        if state.detail == DetailPage::Gaps {
+                            // Within-record paging (F6d) wraps at the
+                            // live viewport width, exactly like the
+                            // renderer — tall records page line by
+                            // line before records advance.
+                            if let Some(frame) = last_frame.as_ref() {
+                                state.scroll_gaps_down(&frame.presentation, last_viewport.width);
+                            }
+                        } else {
+                            let total = last_frame
+                                .as_ref()
+                                .map(|frame| state.items_total(&frame.presentation))
+                                .unwrap_or(0);
+                            state.scroll_down(total);
+                        }
+                    }
+                    Key::Detail => {
+                        state.next_detail();
+                        if let Some(frame) = last_frame.as_ref() {
+                            state.clamp_to_presentation(&frame.presentation);
+                        }
                     }
                 }
-                Publish::Retiring {
-                    attached,
-                    links,
-                    budget,
-                } => {
-                    // The terminal back first: the stop's notices (and a
-                    // detach past the report) are then readable.
-                    if let Some(display) = driver.display.as_mut() {
-                        display.restore();
-                        display.notice(&format!(
-                            "p11scope: stopping: detaching the native probes of {attached} \
-                             endpoints in {links} links (up to {} s)",
-                            budget.as_secs()
-                        ));
-                    }
-                }
-                Publish::Stop { events, now_ns } => {
-                    if let Some(writer) = stream.as_mut() {
-                        let coordinator = &*driver.coordinator;
-                        let presentation =
-                            stream_presentation(coordinator, &scope_label, started_ns, now_ns);
-                        emit_stop_events(
-                            writer,
-                            &mut stream_state,
-                            events,
-                            coordinator.passes(),
-                            &presentation,
-                            now_ns,
-                        )
-                        .map_err(|error| anyhow::anyhow!("{error}"))?;
-                    }
-                }
+                // Keys redraw immediately (scrolling stays responsive
+                // inside the coalesced cadence).
+                next_redraw = Instant::now();
             }
-            Ok(())
-        },
-    )?;
-    let mut display = driver
-        .display
-        .take()
-        .expect("the dashboard driver keeps its display");
-    display.restore();
-    let failure = display.take_failure();
-    if let Some(stopped) = &stopped {
-        display.notice(&stop_line(&stopped.summary));
+        }
+        if stop.stopped() {
+            tail.push("p11scope: stop signal received");
+            return finish_dashboard(
+                scope_label.clone(),
+                started_ns,
+                coordinator,
+                &handoff,
+                sink,
+                stream,
+                stream_state,
+                json,
+                stdout,
+                _term_guard,
+                raw_guard,
+            );
+        }
+        if let Some(end) = deadline
+            && Instant::now() >= end
+        {
+            return finish_dashboard(
+                scope_label.clone(),
+                started_ns,
+                coordinator,
+                &handoff,
+                sink,
+                stream,
+                stream_state,
+                json,
+                stdout,
+                _term_guard,
+                raw_guard,
+            );
+        }
+        let tick = Instant::now();
+        if tick >= next_rescan {
+            next_rescan = tick + RESCAN_INTERVAL;
+            let now = now_ns();
+            let (report, warning) = scan_one_pass(
+                &mut coordinator,
+                &inventory_scope,
+                scope,
+                max_scan_pids,
+                &mut guard,
+                deadline,
+                &mut ScanOnlyIdentity,
+                now,
+            )?;
+            coordinator.commit_batch(report.engine_changed)?;
+            if let Some(warning) = warning {
+                tail.push(&warning);
+            }
+            for line in progress_lines(&coordinator, &report) {
+                tail.push(&line);
+            }
+            // Dashboard frames read activity through the trailing
+            // window (a growing observation window would pin every
+            // historical entry as "recent" forever). Activity is in the
+            // event stream's change check, so the stream is meant to read
+            // the classic whole-run-window presentation and only these
+            // frames the trailing window (C5.3 gives the stream its own
+            // full-window capture); its final sweep already does.
+            let presentation = Presentation::capture(
+                &coordinator,
+                &scope_label,
+                started_ns,
+                now,
+                coordinator.passes(),
+                now,
+                DASHBOARD_ACTIVITY_WINDOW_NS,
+            );
+            if let Some(writer) = stream.as_mut() {
+                emit_pass_events(writer, &mut stream_state, &report, &presentation, now)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+            }
+            handoff.offer(Arc::new(presentation), tail.snapshot());
+        }
+        if tick >= next_redraw {
+            next_redraw = tick + REDRAW_INTERVAL;
+            if let Some(frame) = handoff.take() {
+                last_frame = Some(frame);
+            }
+            if let Some(frame) = last_frame.as_ref() {
+                state.clamp_to_presentation(&frame.presentation);
+                let viewport = Viewport::from_fd(term.as_raw_fd()).unwrap_or(Viewport {
+                    width: 80,
+                    height: 24,
+                });
+                last_viewport = viewport;
+                let bytes = render_frame(frame, viewport, &state);
+                term.write_all(&bytes)
+                    .with_context(|| "writing the dashboard frame")?;
+                term.flush()
+                    .with_context(|| "flushing the dashboard frame")?;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    let passes = coordinator.passes();
-    for line in dashboard_account_lines(passes, &display.account()) {
-        display.notice(&line);
-    }
+}
+
+/// Dashboard exit: drop the terminal guards FIRST (restoring cursor,
+/// screen, and input mode on every path), then write the final sinks
+/// exactly like the classic path — silent text, since the live view
+/// already showed it.
+#[allow(clippy::too_many_arguments)]
+fn finish_dashboard(
+    scope_label: String,
+    started_ns: u64,
+    coordinator: InventoryCoordinator<OsProcessSource>,
+    handoff: &DisplayHandoff,
+    sink: Option<AtomicFile>,
+    mut stream: Option<EventWriter>,
+    mut stream_state: StreamState,
+    json: bool,
+    stdout: &mut dyn std::io::Write,
+    _term_guard: TerminalGuard,
+    _raw_guard: Option<RawModeGuard>,
+) -> Result<i32> {
+    drop(_raw_guard);
+    drop(_term_guard);
     let ended_ns = now_ns();
+    let passes = coordinator.passes();
     let window_ns = ended_ns.saturating_sub(started_ns);
     let presentation = Presentation::capture(
         &coordinator,
@@ -1076,104 +1073,25 @@ fn run_dashboard(
         ended_ns,
         window_ns,
     );
-    // The report first (R-C51-4), silent text: the live view showed it.
-    let code = crate::inventory_capture::finish_native(
-        stopped,
-        |summary| {
-            finish_output(
-                sink,
-                stream.as_mut(),
-                &mut stream_state,
-                &presentation,
-                json,
-                true,
-                stdout,
-                summary,
-            )
-        },
-        report_written,
-        &mut |line| display.notice(&line),
-    )?;
-    // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
-    // the alternate screen: with the report written, it can wait longer.
-    display.retry_restore(RESTORE_RETRY_BUDGET);
-    if let Some(slot) = &terminal.account {
-        slot.set(Some(display.account()));
-    }
-    if let Some(error) = failure {
-        return Err(anyhow::anyhow!(error)).context("writing the dashboard terminal");
-    }
-    Ok(code)
-}
-
-/// The stderr account a dashboard run ends with: its passes, the frame
-/// handoff, what the terminal writer shed, and the longest gaps between
-/// two service ticks, without and across a pass (C5.3: a stalled
-/// terminal sheds frames, never ticks).
-fn dashboard_account_lines(passes: u64, account: &DisplayAccount) -> Vec<String> {
-    let terminal = &account.terminal;
-    vec![
-        format!(
-            "p11scope: dashboard exited after {passes} pass{}",
-            if passes == 1 { "" } else { "es" }
-        ),
-        format!(
-            "p11scope: dashboard frames: {} offered, {} consumed, {} shed (shed frames are \
-             obsolete display work; capture is unaffected)",
-            account.offered, account.consumed, account.superseded,
-        ),
-        format!(
-            "p11scope: dashboard terminal: {} frames written, {} shed by a terminal that did \
-             not keep up ({} cut short, {} bytes, {} ms waited); screen {}; service ticks {}, \
-             longest gap {} ms ({} ms across a pass)",
-            terminal.frames_written,
-            terminal.frames_shed,
-            terminal.frames_cut,
-            terminal.bytes_shed,
-            terminal.stall_ms,
-            if terminal.restored {
-                "restored"
-            } else {
-                "restore shed"
-            },
-            account.ticks,
-            account.longest_gap.as_millis(),
-            account.longest_pass_gap.as_millis(),
-        ),
-        dashboard_stderr_line(account),
-    ]
-}
-
-/// What became of the run's stderr lines (C5.3, review M1): replayed
-/// after the screen, mirrored beside it, or left alone; and what was
-/// dropped or shed on the way.
-fn dashboard_stderr_line(account: &DisplayAccount) -> String {
-    let stderr = &account.stderr;
-    let route = match stderr.route {
-        StderrRoute::Capture => format!(
-            "captured from the terminal, {} lines replayed, {} dropped{}{}",
-            stderr.replayed,
-            stderr.dropped,
-            if stderr.undrained {
-                ", a helper still held the capture (its later lines are unread)"
-            } else {
-                ""
-            },
-            if stderr.restore_failed {
-                ", stderr not put back"
-            } else {
-                ""
-            },
-        ),
-        StderrRoute::Mirror => format!(
-            "left alone, {} log lines mirrored to it, {} shed",
-            stderr.mirrored, stderr.mirror_shed
-        ),
-        StderrRoute::Leave => "left alone".to_string(),
-    };
-    format!(
-        "p11scope: dashboard stderr: {route}; {} closing lines shed so far",
-        account.notices_shed
+    eprintln!(
+        "p11scope: dashboard exited after {passes} pass{}",
+        if passes == 1 { "" } else { "es" }
+    );
+    eprintln!(
+        "p11scope: dashboard frames: {} offered, {} consumed, {} shed (shed frames are obsolete display work; capture is unaffected)",
+        handoff.offered(),
+        handoff.consumed(),
+        handoff.dropped_frames(),
+    );
+    finish_output(
+        sink,
+        stream.as_mut(),
+        &mut stream_state,
+        &presentation,
+        json,
+        true,
+        stdout,
+        None,
     )
 }
 
@@ -1365,7 +1283,7 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
     })
 }
 
-fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json::Value {
+pub(crate) fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json::Value {
     serde_json::json!({
         "caller": edge.caller.label(),
         "module": edge.module.label(),
@@ -1804,7 +1722,6 @@ mod tests {
                 None,
                 None,
                 crate::cli::CaptureMode::Scan,
-                crate::attach::BackendSelection::Auto,
                 &|| false,
                 &|| {},
                 false,
@@ -1961,8 +1878,8 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "p11scope: native capture stopped after 2 passes: 4 endpoints attached \
-                 (per-offset links), 0 failed; retirement unsettled: budget passed; settlement {}",
+                "p11scope: native capture stopped after 2 passes: 4 endpoints attached, 0 \
+                 failed; retirement unsettled: budget passed; settlement {}",
                 crate::inventory_capture::SETTLEMENT
             )
         );
@@ -1971,7 +1888,6 @@ mod tests {
 
     fn lane_summary(retirement: crate::inventory_capture::Retirement) -> LaneSummary {
         LaneSummary {
-            backend: crate::inventory_capture::LaneBackend::singles(),
             retirement,
             passes: 2,
             attached: 4,
@@ -1983,66 +1899,6 @@ mod tests {
                 failed_quanta: 0,
                 recovery_rescans: 1,
             },
-        }
-    }
-
-    /// C5.11: a native document discloses the attach mechanism, the
-    /// operator's selection and any `auto` fallback reason; the start and
-    /// stop lines name the mechanism too.
-    #[test]
-    fn a_native_document_discloses_its_attach_backend_and_fallback() {
-        use crate::attach::{AttachBackend, BackendSelection};
-        use crate::inventory_capture::{LaneBackend, Retirement};
-        let mut coordinator = coordinator();
-        coordinator.commit_batch(false).unwrap();
-        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1, 2, 1);
-        let multi = LaneBackend {
-            selection: BackendSelection::Auto,
-            backend: AttachBackend::Multi,
-            fallback: None,
-            scope_filter: crate::inventory_capture::ScopeFilter::None,
-        };
-        let fell_back = LaneBackend {
-            selection: BackendSelection::Auto,
-            backend: AttachBackend::Singles,
-            fallback: Some("the uprobe-multi functional probe failed: EOPNOTSUPP".into()),
-            scope_filter: crate::inventory_capture::ScopeFilter::None,
-        };
-        for (backend, mechanism, fallback) in [
-            (multi.clone(), "uprobe-multi", serde_json::Value::Null),
-            (
-                fell_back.clone(),
-                "per-offset",
-                serde_json::json!("the uprobe-multi functional probe failed: EOPNOTSUPP"),
-            ),
-        ] {
-            let mut summary = lane_summary(Retirement::Closed(Default::default()));
-            summary.backend = backend.clone();
-            let mut stdout = Vec::new();
-            finish_output(
-                None,
-                None,
-                &mut StreamState::new(),
-                &presentation,
-                true,
-                false,
-                &mut stdout,
-                Some(&summary),
-            )
-            .unwrap();
-            let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-            let attach = &document["observation"]["attach"];
-            assert_eq!(attach["selection"], "auto");
-            assert_eq!(attach["mechanism"], mechanism);
-            assert_eq!(attach["fallback"], fallback);
-            assert!(stop_line(&summary).contains(&format!("({mechanism} links)")));
-            let active = lane_active_line(&backend);
-            assert!(active.contains(mechanism) && active.contains("--attach-backend auto"));
-            assert_eq!(
-                active.contains("fallback"),
-                backend.fallback.is_some(),
-                "{active}"
-            );
         }
     }
 
@@ -2453,141 +2309,12 @@ mod tests {
         assert_eq!(per_pass[69], 1, "pass 70 is only pass_committed");
         assert_eq!(per_pass[98], 1, "pass 99 is only pass_committed");
     }
-
-    /// C5.3: a terminal the dashboard cannot take over (here: an fd that
-    /// cannot be reopened) degrades to the classic path with its report,
-    /// never to an error or a half-entered screen.
-    #[test]
-    fn a_terminal_the_dashboard_cannot_take_over_degrades_to_the_classic_path() {
-        let mut stdout = Vec::new();
-        let terminal = DashboardIo {
-            output: -1,
-            input: None,
-            account: None,
-            stderr_fd: 2,
-            stderr: StderrRoute::Leave,
-        };
-        let code = run_with_terminal(
-            InspectScope::Pid(std::process::id()),
-            &[],
-            &HookRegistry::builtin(),
-            true,
-            None,
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            CaptureMode::Scan,
-            crate::attach::BackendSelection::Auto,
-            &|| false,
-            &|| {},
-            true,
-            &mut stdout,
-            &terminal,
-        )
-        .unwrap();
-        assert_eq!(code, 0);
-        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-        assert_eq!(document["schema"], DOC_ID);
-        assert!(!stdout.contains(&0x1b), "no ANSI on the degraded path");
-    }
-
-    /// C5.3 review M2: for the same input a dashboard run streams exactly
-    /// what a classic run streams. The dashboard's display reads activity
-    /// through its trailing 5 s window, the stream through the classic
-    /// cumulative one: here a counted edge last used 10 s ago is recent for
-    /// the stream and not for the display, and the stream records still
-    /// match the classic ones byte for byte.
-    #[test]
-    fn a_dashboard_run_streams_what_a_classic_run_streams() {
-        use crate::discovery::caller_registry::CoverageNote;
-        use crate::discovery::inventory_workload::{Harness, ScaleSpec};
-        let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
-        harness.stage_scale(&ScaleSpec {
-            name: "m2-stream",
-            callers: 1,
-            modules: 1,
-            edges_per_caller: 1,
-            endpoints_per_module: 2,
-            first_pid: 83_000,
-        });
-        harness.commit();
-        let started = harness.now_ns();
-        let caller = harness.coordinator().adapter().live_id(83_000).unwrap();
-        let key = ModuleKey::physical(8, 1, 100_000, Some("sha000000".into()), "/scale/m0.so");
-        harness.advance(1_000);
-        let at = harness.now_ns();
-        {
-            let registry = harness.coordinator_mut().registry_mut();
-            registry.note_coverage(caller, &key, CoverageNote::Counted { since_ns: at });
-            registry.observe_entries(caller, &key, 3, at);
-        }
-        harness.commit();
-        harness.advance(10_000_000_000);
-        let now = harness.now_ns();
-        let coordinator = harness.coordinator();
-        let classic = stream_presentation(coordinator, "pid:83000", started, now);
-        let (stream_view, display_view) =
-            dashboard_pass_views(coordinator, "pid:83000", started, now);
-        let activity = |view: &Presentation| {
-            view.edges
-                .iter()
-                .map(|edge| format!("{:?}", edge.activity))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(activity(&classic).len(), 1);
-        assert_eq!(activity(&stream_view), activity(&classic));
-        assert_ne!(
-            activity(&display_view),
-            activity(&classic),
-            "the scenario must make the windows disagree"
-        );
-        let report = PassReport {
-            pass: 1,
-            scanned: 1,
-            maps_matched: 1,
-            native_callers: 0,
-            scan_callers: 1,
-            engine_changed: false,
-            pending_refresh: Vec::new(),
-            events: Vec::new(),
-            timings: crate::timing::StageTimings::new(),
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let stream = |name: &str, view: &Presentation| {
-            let path = dir.path().join(name);
-            let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
-            let mut state = StreamState::new();
-            emit_pass_events(&mut writer, &mut state, &report, view, now).unwrap();
-            let mut sink = Vec::new();
-            finish_output(
-                None,
-                Some(&mut writer),
-                &mut state,
-                view,
-                false,
-                true,
-                &mut sink,
-                None,
-            )
-            .unwrap();
-            drop(writer);
-            std::fs::read(&path).unwrap()
-        };
-        assert_eq!(
-            stream("dashboard.jsonl", &stream_view),
-            stream("classic.jsonl", &classic)
-        );
-        assert_eq!(
-            render_json_from_presentation(&stream_view),
-            render_json_from_presentation(&classic)
-        );
-    }
 }
 
 #[cfg(test)]
 #[path = "inventory_privileged_tests.rs"]
 mod privileged_tests;
+
+#[cfg(test)]
+#[path = "inventory_edge_stream_tests.rs"]
+mod edge_stream_tests;

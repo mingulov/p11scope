@@ -9,20 +9,18 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Inventory
 
-- The native lane of `inventory` attaches provider entries as uprobe-multi
-  links wherever a functional probe shows the kernel supports them (6.6+,
-  including distribution backports; never decided by version), one
-  immutable link per provider object per extend instead of one per entry.
-  Stopping a system-scale capture no longer waits on several kernel grace
-  periods per entry: hundreds of entries detach in well under a second on
-  6.12 and 7.x, so `observation.retirement` reads `closed` where it used to
-  read `unsettled`. `--pid` uses uprobe-multi only where the kernel pid
-  filter is proven to cover every thread of the target (Linux 6.6 to
-  6.9.11 shipped a thread-exact one), and keeps per-offset links bound to
-  the target otherwise. New `inventory --attach-backend auto|multi|singles`;
-  `observation.attach` (additive within `p11scope/inventory/v1`) discloses
-  the selection, mechanism, any fallback reason and the PID scope filter.
-  The stop budget now counts kernel links per backend.
+- `inventory --event-log` streams `edge_observed` records in production
+  (previously only test builds emitted them): a record when an edge is new
+  or its entries, coverage, presence, capture or activity class changes,
+  at most 4,096 per pass with the rest counted in the pass marker's
+  `edge_events_deferred` and carried to the next pass, plus one exact sweep
+  before `ended`, so the last record per edge equals the snapshot's
+  `edges[]` entry. An edge whose record retention deleted is re-sent
+  while the edges' records fit the retention, and `ended.edges_unretained`
+  counts edges left without a retained record when they cannot (the
+  schema states the sizing condition). `pass_committed.edge_events`,
+  `edge_events_deferred`, `ended.edge_events` and `ended.edges_unretained`
+  are additive within `p11scope/inventory-events/v1`.
 - The native lane of `inventory` keeps servicing the kernel's lifecycle
   ring while a pass collects `/proc`: the collection runs on a worker
   thread and the ring is drained every 10 ms, so a busy host's exec churn
@@ -45,14 +43,6 @@ versioned separately and are opaque, exact dispatch keys.
   that a recurrence of an unremembered one counts again, so the counter
   can over-count; it under-counts only on a 64-bit fingerprint
   collision, about 2^-40 likely).
-- `inventory --system` and `inspect --system` read each past-the-cap
-  `/proc/<pid>/map_files` proof as one stat relative to that process's
-  `map_files` directory, opened once per confirmation, rather than a
-  walk of the full `/proc` path. A range that is no longer one mapping
-  when its proof is read is the new `mapping_changed` attribution loss
-  (inside a confirmation), or makes an unmatched process confirm afresh
-  (after the sweep), instead of `map_files_unavailable` or an
-  unexamined object.
 
 ### Kubernetes deployment
 
@@ -89,20 +79,10 @@ versioned separately and are opaque, exact dispatch keys.
   `observation.retirement` (`closed`, or `unsettled` plus a gap when the
   probes did not detach within the stop budget). `native` that cannot start
   is an error naming why; `auto` falls back to the scan lane with the gap
-  `native usage feed unavailable`; `scan` is unchanged. In a foreign PID
-  namespace native `--system` binds witnesses but never claims a watch.
-- `inventory --dashboard` services the native lane through the same loop
-  as the classic path, and draws only inside its service ticks with a
-  non-blocking frame writer: a terminal that stops reading never delays
-  the capture. Frames the terminal does not take within 10 ms are shed
-  and counted (`p11scope: dashboard terminal: … shed …; longest gap … ms
-  (… ms across a pass)` on stderr at exit, and a log-tail note once frames are drawn again);
-  entering and restoring the screen wait at most 1 s (a shed restore is
-  retried for up to 5 s once the report is written). When stderr is the
-  terminal, its diagnostics go to the log tail while the dashboard owns
-  the screen and are replayed after it with the pass warnings and caller
-  events; a stderr file or pipe (`2>run.log`) is left alone and gets the
-  log lines as they come. Key polling no longer waits 100 ms per tick.
+  `native usage feed unavailable`; `scan` is unchanged. The interactive
+  `--dashboard` does not service the native lane yet (`native` is refused
+  there, `auto` falls back). In a foreign PID namespace native `--system`
+  binds witnesses but never claims a watch.
 - The classic `inventory` loop now ends cleanly on SIGINT, SIGTERM or SIGHUP:
   the stream's `ended`, the `-o` document and stdout are still written. A
   native stop's final commit reaches the event stream under one

@@ -1058,7 +1058,7 @@ mod tests;
 /// One scripted module: distinct physical identity per index, admitted
 /// with its endpoint count.
 #[cfg(test)]
-fn scale_module_info(index: usize, endpoints: usize) -> ModuleInfo {
+pub(crate) fn scale_module_info(index: usize, endpoints: usize) -> ModuleInfo {
     let path = format!("/scale/m{index}.so");
     ModuleInfo {
         path: path.clone(),

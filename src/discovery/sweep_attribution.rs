@@ -42,7 +42,9 @@
 
 use crate::discovery::caller_registry::ExeIdentity;
 use crate::discovery::engine::is_provider_mapping;
-use crate::discovery::identity::{ExaminedObject, FileIdentity, MappedFile, PinnedObjectId};
+use crate::discovery::identity::{
+    ExaminedObject, FileIdentity, MapFilesDir, MappedFile, PinnedObjectId,
+};
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, MAPS_CEILING_REASON, MAPS_ENTRY_CEILING_REASON,
     SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON, duplicate_exec_coverage,
@@ -81,12 +83,16 @@ pub(crate) enum AttributionLoss {
     /// key collision: btrfs subvolumes, overlayfs).
     IdentityMismatch,
     /// The key needs the `map_files` proof and it could not be read (no
-    /// `CAP_SYS_ADMIN`/`CAP_CHECKPOINT_RESTORE`, or the range vanished).
+    /// `CAP_SYS_ADMIN`/`CAP_CHECKPOINT_RESTORE`).
     MapFilesUnavailable,
+    /// A range confirmed inside the pin was no longer one mapping when its
+    /// `map_files` entry was read (unmapped or remapped during the
+    /// confirmation): the proof is impossible this pass, not unprivileged.
+    MappingChanged,
 }
 
 impl AttributionLoss {
-    pub(crate) const ALL: [AttributionLoss; 10] = [
+    pub(crate) const ALL: [AttributionLoss; 11] = [
         Self::GenerationChanged,
         Self::ExecChanged,
         Self::ConfirmUnreadable,
@@ -97,6 +103,7 @@ impl AttributionLoss {
         Self::Budget,
         Self::IdentityMismatch,
         Self::MapFilesUnavailable,
+        Self::MappingChanged,
     ];
 
     /// Stable category label (`scan.attribution_losses` keys).
@@ -112,6 +119,7 @@ impl AttributionLoss {
             Self::Budget => "budget",
             Self::IdentityMismatch => "identity_mismatch",
             Self::MapFilesUnavailable => "map_files_unavailable",
+            Self::MappingChanged => "mapping_changed",
         }
     }
 }
@@ -447,8 +455,15 @@ impl Classified<'_> {
 
     /// Settle the pending examined keys against `mapped`: a key whose
     /// every range stats to an identity a deep scan examined is examined;
-    /// any other becomes unexamined.
-    fn settle_examined(&mut self, index: &KnownKeyIndex, mapped: &MappedIdentities) {
+    /// a key with a range that is no longer one mapping
+    /// ([`RANGE_NOT_MAPPED`]) is returned (its mapping changed since the
+    /// maps read: not a coverage gap); any other becomes unexamined.
+    fn settle_examined(
+        &mut self,
+        index: &KnownKeyIndex,
+        mapped: &MappedIdentities,
+    ) -> BTreeSet<ObjectKey> {
+        let mut changed = BTreeSet::new();
         for (key, group) in std::mem::take(&mut self.examined_pending) {
             let proven = index.key_is_identity(key)
                 || index.examined_identities(key).is_some_and(|files| {
@@ -459,10 +474,33 @@ impl Classified<'_> {
                         )
                     })
                 });
-            if !proven {
+            if proven {
+                continue;
+            }
+            if group.iter().any(|entry| {
+                matches!(
+                    mapped.get(&(entry.start, entry.end)),
+                    Some(Err(error)) if error == RANGE_NOT_MAPPED
+                )
+            }) {
+                changed.insert(key);
+            } else {
                 self.unexamined.insert(key);
             }
         }
+        changed
+    }
+
+    /// Whether any pending examined range read [`RANGE_NOT_MAPPED`].
+    fn pending_changed(&self, mapped: &MappedIdentities) -> bool {
+        self.examined_pending.iter().any(|(_, group)| {
+            group.iter().any(|entry| {
+                matches!(
+                    mapped.get(&(entry.start, entry.end)),
+                    Some(Err(error)) if error == RANGE_NOT_MAPPED
+                )
+            })
+        })
     }
 }
 
@@ -502,6 +540,16 @@ fn prove_match(
                         identity.ino,
                         expected.dev,
                         expected.ino
+                    ),
+                ));
+            }
+            Some(Err(error)) if error == RANGE_NOT_MAPPED => {
+                return Err((
+                    AttributionLoss::MappingChanged,
+                    format!(
+                        "the range {:x}-{:x} was no longer one mapping when its map_files \
+                         entry was read",
+                        entry.start, entry.end
                     ),
                 ));
             }
@@ -588,7 +636,19 @@ pub(crate) fn attribute_unselected(
             .iter()
             .filter_map(|(key, _, group)| usable_path(group).err().map(|loss| (*key, loss)))
             .collect();
+        // No pin is needed to prove examined keys: a range that does not
+        // stat to an examined identity only counts as unexamined. But a
+        // range that is no longer one mapping means the snapshot is stale
+        // (an unload, a remap or an exit since the sweep): only a re-read
+        // can say which, so such a pid is confirmed like a match.
+        let mut mapped = MappedIdentities::new();
         if unusable.len() == first.matches.len() {
+            let ranges = first.pending_ranges(index);
+            if !ranges.is_empty() {
+                mapped = probe.stat_ranges(pid, &ranges, budget);
+            }
+        }
+        if unusable.len() == first.matches.len() && !first.pending_changed(&mapped) {
             for (key, loss) in &unusable {
                 out.note_loss(
                     pid,
@@ -602,14 +662,6 @@ pub(crate) fn attribute_unselected(
                 );
             }
             note_ineligible(&mut out, &mut seen, &first.ineligible);
-            // No pin is needed to prove examined keys: a range that does
-            // not stat to an examined identity only counts as unexamined.
-            let ranges = first.pending_ranges(index);
-            let mapped = if ranges.is_empty() {
-                MappedIdentities::new()
-            } else {
-                probe.stat_ranges(pid, &ranges, budget)
-            };
             first.settle_examined(index, &mapped);
             out.note_unexamined(pid, &first.unexamined);
             continue;
@@ -630,7 +682,18 @@ pub(crate) fn attribute_unselected(
             }
         };
         let mut confirmed = classify_snapshot(index, &read.entries);
-        confirmed.settle_examined(index, &read.mapped);
+        for key in confirmed.settle_examined(index, &read.mapped) {
+            out.note_loss(
+                pid,
+                AttributionLoss::MappingChanged,
+                format!(
+                    "a confirmed range of {} was no longer one mapping when its map_files \
+                     entry was read",
+                    key_detail(key)
+                ),
+                &mut seen,
+            );
+        }
         note_ineligible(&mut out, &mut seen, &confirmed.ineligible);
         let mut objects = Vec::new();
         for (key, object, group) in &confirmed.matches {
@@ -795,8 +858,9 @@ pub(crate) fn budget_refusal(reason: &str) -> bool {
 /// decision order is unit-testable.
 pub(crate) trait ConfirmIo {
     type Pin;
-    /// The `map_files` identity of `[start, end)` in `pid`.
-    fn mapped_file(&self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String>;
+    /// The `map_files` identity of `[start, end)` in `pid`; `Err` equal to
+    /// [`RANGE_NOT_MAPPED`] when no mapping (or no process) is there now.
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String>;
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String>;
     fn start_time(&self, pin: &Self::Pin) -> Option<u64>;
     fn still_the_same(&self, pin: &Self::Pin) -> bool;
@@ -892,15 +956,43 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
     })
 }
 
+/// The `map_files` error that means "no mapping is at this range now":
+/// `ENOENT` from the entry (unmapped, or split or merged by a remap since
+/// the maps read) or from the directory (the process is gone). Never a
+/// missing privilege, which is `EPERM`/`EACCES`.
+pub(crate) const RANGE_NOT_MAPPED: &str = "no mapping is at this range now (ENOENT: unmapped or remapped since the maps read, or the \
+     process exited)";
+
+fn map_files_error(error: std::io::Error) -> String {
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        RANGE_NOT_MAPPED.to_string()
+    } else {
+        error.to_string()
+    }
+}
+
 /// Production confirmation: `PidPin` (pidfd plus start time), the exe
-/// metadata the caller adapter reads, and a budget-charged maps re-read.
-pub(crate) struct OsConfirmIo;
+/// metadata the caller adapter reads, a budget-charged maps re-read, and
+/// `map_files` stats relative to one `/proc/<pid>/map_files` directory
+/// (DR-C1b-3), opened at the first range and dropped with this value, so
+/// it is never held past the confirmation or stat batch that opened it.
+#[derive(Default)]
+pub(crate) struct OsConfirmIo {
+    map_files: Option<(u32, Result<MapFilesDir, String>)>,
+}
 
 impl ConfirmIo for OsConfirmIo {
     type Pin = crate::process::PidPin;
 
-    fn mapped_file(&self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
-        crate::discovery::identity::map_files_identity(pid, start, end).map_err(|e| e.to_string())
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        if self.map_files.as_ref().is_none_or(|(held, _)| *held != pid) {
+            self.map_files = Some((pid, MapFilesDir::open(pid).map_err(map_files_error)));
+        }
+        match self.map_files.as_ref().map(|(_, dir)| dir) {
+            Some(Ok(dir)) => dir.identity(start, end).map_err(map_files_error),
+            Some(Err(error)) => Err(error.clone()),
+            None => Err("the map_files directory was not opened".into()),
+        }
     }
 
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
@@ -939,7 +1031,7 @@ impl MemberProbe for OsMemberProbe {
         prove: &BTreeSet<ObjectKey>,
         budget: &mut CaptureWorkBudget,
     ) -> Confirmation {
-        confirm_with(&mut OsConfirmIo, pid, prove, budget)
+        confirm_with(&mut OsConfirmIo::default(), pid, prove, budget)
     }
 
     fn stat_ranges(
@@ -948,6 +1040,7 @@ impl MemberProbe for OsMemberProbe {
         ranges: &[(u64, u64)],
         budget: &mut CaptureWorkBudget,
     ) -> MappedIdentities {
+        let mut io = OsConfirmIo::default();
         let mut mapped = MappedIdentities::new();
         for &(start, end) in ranges {
             if mapped.contains_key(&(start, end)) {
@@ -957,7 +1050,7 @@ impl MemberProbe for OsMemberProbe {
             if budget.spend(1).is_err() {
                 break;
             }
-            mapped.insert((start, end), OsConfirmIo.mapped_file(pid, start, end));
+            mapped.insert((start, end), io.mapped_file(pid, start, end));
         }
         mapped
     }

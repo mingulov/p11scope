@@ -697,7 +697,7 @@ impl Io {
 impl ConfirmIo for Io {
     type Pin = u64;
 
-    fn mapped_file(&self, _: u32, start: u64, _: u64) -> Result<FileIdentity, String> {
+    fn mapped_file(&mut self, _: u32, start: u64, _: u64) -> Result<FileIdentity, String> {
         self.mapped
             .get(&start)
             .cloned()
@@ -1194,4 +1194,499 @@ fn an_examined_identity_key_needs_no_stat() {
     let attribution = run(&sweep, &BTreeSet::new(), &build(false), &mut probe);
     assert_eq!(attribution.unexamined, BTreeMap::from([(20_001, 1)]));
     assert_eq!(probe.stat_calls, vec![20_001]);
+}
+
+// ---- C5.6 (DR-C1b-3) and its review fixes (R-C56-1) ----
+
+/// Two fresh btrfs subvolumes under `parent` (`BTRFS_IOC_SUBVOL_CREATE`).
+fn create_subvolume(parent: &std::path::Path, name: &str) {
+    use std::os::fd::AsRawFd as _;
+    #[repr(C)]
+    struct VolArgs {
+        fd: i64,
+        name: [u8; 4088],
+    }
+    const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000_940e;
+    let dir = std::fs::File::open(parent).unwrap();
+    let mut args = VolArgs {
+        fd: 0,
+        name: [0; 4088],
+    };
+    args.name[..name.len()].copy_from_slice(name.as_bytes());
+    // SAFETY: a valid directory fd and a NUL-terminated name in a
+    // correctly sized btrfs_ioctl_vol_args.
+    let rc = unsafe { libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_SUBVOL_CREATE, &args) };
+    assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+}
+
+/// A forked, quiescent target: it maps `path` (one page) and reports the
+/// address; on `s` it unmaps that page and maps `path` again at the same
+/// address (whatever file the path names now), then acknowledges.
+struct SwapChild {
+    pid: libc::pid_t,
+    command: std::os::fd::OwnedFd,
+    reply: std::os::fd::OwnedFd,
+    address: u64,
+}
+
+impl SwapChild {
+    fn spawn(path: &std::path::Path) -> Self {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let (mut down, mut up) = ([0; 2], [0; 2]);
+        // SAFETY: two valid two-element arrays for pipe2.
+        assert_eq!(
+            unsafe { libc::pipe2(down.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        assert_eq!(unsafe { libc::pipe2(up.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the child only makes raw syscalls on preallocated
+        // buffers and leaves through `_exit`.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // SAFETY: raw syscalls on valid fds and the preallocated path.
+            unsafe {
+                let map = |at: *mut libc::c_void, flags| {
+                    let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY);
+                    let base =
+                        libc::mmap(at, 4096, libc::PROT_READ, libc::MAP_PRIVATE | flags, fd, 0);
+                    libc::close(fd);
+                    base
+                };
+                let base = map(std::ptr::null_mut(), 0);
+                let address = (base as u64).to_ne_bytes();
+                libc::write(up[1], address.as_ptr().cast(), 8);
+                let mut byte = 0u8;
+                while libc::read(down[0], (&raw mut byte).cast(), 1) == 1 && byte == b's' {
+                    libc::munmap(base, 4096);
+                    let again = map(base, libc::MAP_FIXED_NOREPLACE);
+                    let ok = [u8::from(again == base)];
+                    libc::write(up[1], ok.as_ptr().cast(), 1);
+                }
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: the parent owns its pipe ends; the child's are closed.
+        let (command, reply) = unsafe {
+            libc::close(down[0]);
+            libc::close(up[1]);
+            (OwnedFd::from_raw_fd(down[1]), OwnedFd::from_raw_fd(up[0]))
+        };
+        let mut address = [0u8; 8];
+        // SAFETY: reading 8 bytes into a valid buffer.
+        assert_eq!(
+            unsafe { libc::read(reply.as_raw_fd(), address.as_mut_ptr().cast(), 8) },
+            8
+        );
+        let address = u64::from_ne_bytes(address);
+        assert_ne!(address, libc::MAP_FAILED as u64);
+        Self {
+            pid,
+            command,
+            reply,
+            address,
+        }
+    }
+
+    fn remap(&self) {
+        use std::os::fd::AsRawFd as _;
+        let mut ok = 0u8;
+        // SAFETY: one-byte writes and reads on owned pipe ends.
+        unsafe {
+            assert_eq!(
+                libc::write(self.command.as_raw_fd(), b"s".as_ptr().cast(), 1),
+                1
+            );
+            assert_eq!(
+                libc::read(self.reply.as_raw_fd(), (&raw mut ok).cast(), 1),
+                1
+            );
+        }
+        assert_eq!(ok, 1, "the child mapped the page again at the same address");
+    }
+
+    fn maps(&self) -> Vec<MapEntry> {
+        let file = std::fs::File::open(format!("/proc/{}/maps", self.pid)).unwrap();
+        crate::discovery::scan::read_maps_or_refuse(
+            file,
+            &mut CaptureWorkBudget::default(),
+            crate::attach::monotonic_ns,
+        )
+        .unwrap()
+    }
+}
+
+impl Drop for SwapChild {
+    fn drop(&mut self) {
+        // SAFETY: our own child; reaped here.
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// A synthetic index binding the child's mapping key `key` to `OBJECT`,
+/// as a deep scan that pinned a file under that key would: `identity` is
+/// the pinned file's self-mapped identity; `magic` its filesystem.
+fn index_binding(key: ObjectKey, identity: FileIdentity, magic: Option<u64>) -> KnownKeyIndex {
+    let checks = Checks {
+        identities: BTreeMap::from([(OBJECT, Ok(identity))]),
+        fs_magic: magic
+            .map(|magic| BTreeMap::from([(OBJECT, magic)]))
+            .unwrap_or_default(),
+        ..Checks::default()
+    };
+    KnownKeyIndex::build(
+        [(key, Some(OBJECT))],
+        &BTreeMap::from([(key, OBJECT)]),
+        [],
+        &checks,
+    )
+    .0
+}
+
+fn attribute_child(
+    child: &SwapChild,
+    snapshot: Vec<MapEntry>,
+    index: &KnownKeyIndex,
+) -> SweepAttribution {
+    attribute_unselected(
+        &[(child.pid as u32, snapshot)],
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        index,
+        &mut OsMemberProbe,
+        &mut CaptureWorkBudget::default(),
+    )
+}
+
+/// Root on a btrfs TMPDIR, through the production probe: a process's
+/// page is swapped (munmap, then mmap at the same address) for another
+/// subvolume's file reached through the same path. Its maps render byte
+/// for byte the same, so only a fresh `map_files` proof can tell: the
+/// edge it had before the swap becomes an identity mismatch after it.
+/// Guards against any proof ever being reused across an identical line.
+#[test]
+#[ignore = "root (map_files) on a btrfs TMPDIR: creates two subvolumes there"]
+fn privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs.
+    let magic = (unsafe { stat.assume_init().f_type }) as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "TMPDIR must be on btrfs");
+    create_subvolume(parent, "s");
+    create_subvolume(parent, "t");
+    let path = parent.join("s/libswap.so");
+    std::fs::write(&path, vec![0xa5u8; 8192]).unwrap();
+    std::fs::write(parent.join("t/libswap.so"), vec![0x5au8; 8192]).unwrap();
+    let (a, b) = (
+        std::fs::metadata(&path).unwrap(),
+        std::fs::metadata(parent.join("t/libswap.so")).unwrap(),
+    );
+    assert_eq!(a.ino(), b.ino(), "fresh subvolumes repeat inode numbers");
+    assert_ne!(a.dev(), b.dev());
+    let held_a =
+        crate::discovery::identity::self_mapped_identity(&std::fs::File::open(&path).unwrap())
+            .expect("map_files is readable as root");
+
+    let child = SwapChild::spawn(&path);
+    let range = (child.address, child.address + 4096);
+    let before = child.maps();
+    let line = before
+        .iter()
+        .find(|entry| (entry.start, entry.end) == range)
+        .expect("the child's mapping")
+        .clone();
+    let index = index_binding(ObjectKey::of(&line), held_a, None);
+    let first = attribute_child(&child, before.clone(), &index);
+    let pids: Vec<u32> = first.members.iter().map(|member| member.pid).collect();
+    assert_eq!(pids, vec![child.pid as u32], "{:?}", first.member_losses);
+
+    std::fs::rename(parent.join("s"), parent.join("s.old")).unwrap();
+    std::fs::rename(parent.join("t"), parent.join("s")).unwrap();
+    child.remap();
+    let after = child.maps();
+    assert_eq!(after, before, "the swapped mapping renders the same maps");
+    let second = attribute_child(&child, after, &index);
+    assert!(second.members.is_empty(), "{:?}", second.members);
+    assert_eq!(
+        second.losses.get(&AttributionLoss::IdentityMismatch),
+        Some(&1),
+        "{:?}",
+        second.member_losses
+    );
+    drop(child);
+    std::fs::remove_file(parent.join("s/libswap.so")).unwrap();
+    std::fs::remove_file(parent.join("s.old/libswap.so")).unwrap();
+    std::fs::remove_dir(parent.join("s")).unwrap();
+    std::fs::remove_dir(parent.join("s.old")).unwrap();
+}
+
+/// A private ext4 filesystem on a loop device under a temporary directory,
+/// unmounted (lazily if busy) and deleted on drop.
+struct Ext4Loop {
+    _dir: tempfile::TempDir,
+    mount: std::path::PathBuf,
+}
+
+impl Ext4Loop {
+    fn new() -> Self {
+        let run = |program: &str, args: &[&std::ffi::OsStr]| {
+            let status = std::process::Command::new(program)
+                .args(args)
+                .status()
+                .unwrap_or_else(|error| panic!("{program} is required: {error}"));
+            assert!(status.success(), "{program} {args:?}: {status}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("ext4.img");
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let mount = dir.path().join("mnt");
+        std::fs::create_dir(&mount).unwrap();
+        run(
+            "mkfs.ext4",
+            &["-q".as_ref(), "-F".as_ref(), image.as_os_str()],
+        );
+        run(
+            "mount",
+            &[
+                "-o".as_ref(),
+                "loop".as_ref(),
+                image.as_os_str(),
+                mount.as_os_str(),
+            ],
+        );
+        Self { _dir: dir, mount }
+    }
+}
+
+impl Drop for Ext4Loop {
+    fn drop(&mut self) {
+        let unmounted = std::process::Command::new("umount")
+            .arg(&self.mount)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !unmounted {
+            let _ = std::process::Command::new("umount")
+                .arg("-l")
+                .arg(&self.mount)
+                .status();
+        }
+    }
+}
+
+/// R-C56-1 (review H1), root with a loop-mounted ext4: a caller maps a
+/// file whose maps key is its identity (ext4); after the sweep read it
+/// unmaps the file, the file is freed, and ext4 gives its inode number to
+/// another file at once — the key the stale sweep line carries now names
+/// a file the caller never mapped. With an index binding that key (as a
+/// deep scan pinning the new file would), the confirmation re-reads maps
+/// inside the pin and attributes nothing. A cross-pass cache that let the
+/// sweep line stand in for that re-read attributed the caller.
+#[test]
+#[ignore = "root: mounts a loop ext4 image (mkfs.ext4, mount, umount)"]
+fn privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4() {
+    use std::os::unix::fs::MetadataExt as _;
+    let ext4 = Ext4Loop::new();
+    let path = ext4.mount.join("libprobe.so");
+    std::fs::write(&path, vec![0xa5u8; 8192]).unwrap();
+    let f1 = std::fs::metadata(&path).unwrap();
+    let child = SwapChild::spawn(&path);
+    let range = (child.address, child.address + 4096);
+    let sweep = child.maps();
+    let line = sweep
+        .iter()
+        .find(|entry| (entry.start, entry.end) == range)
+        .expect("the child's mapping")
+        .clone();
+    assert_eq!(line.inode, f1.ino());
+    let key_k = ObjectKey::of(&line);
+    let index = index_binding(
+        key_k,
+        FileIdentity {
+            dev: libc::makedev(key_k.device.major as u32, key_k.device.minor as u32),
+            ino: key_k.inode,
+        },
+        Some(0xef53),
+    );
+    assert!(
+        !index.map_files_keys().contains(&key_k),
+        "an identity key: no per-range proof"
+    );
+
+    // After the sweep read: the path is replaced (F2), the child maps it
+    // again (freeing F1), and a new file F3 takes F1's inode number.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, vec![0x5au8; 8192]).unwrap();
+    child.remap();
+    let f3_path = ext4.mount.join("libother.so");
+    std::fs::write(&f3_path, vec![0x33u8; 8192]).unwrap();
+    assert_eq!(
+        std::fs::metadata(&f3_path).unwrap().ino(),
+        f1.ino(),
+        "ext4 reused the freed inode number"
+    );
+    assert!(
+        !child
+            .maps()
+            .iter()
+            .any(|entry| ObjectKey::of(entry) == key_k),
+        "the child no longer maps key K"
+    );
+
+    let attribution = attribute_child(&child, sweep, &index);
+    assert_eq!(attribution.probed, 1, "the stale match was confirmed");
+    assert!(
+        attribution.members.is_empty(),
+        "attributed to a file it never mapped: {:?}",
+        attribution.members
+    );
+    drop(child);
+}
+
+/// A held `map_files` directory is the given process's, never the
+/// observer's own (unprivileged: the directory's procfs inode; as root
+/// also the followed identity of the child's mapping).
+#[test]
+fn a_held_map_files_directory_is_the_given_processes() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("libchild.so");
+    std::fs::write(&path, vec![0x11u8; 8192]).unwrap();
+    let child = SwapChild::spawn(&path);
+    let held = MapFilesDir::open(child.pid as u32).expect("the child's map_files opens");
+    let ino = held.directory_metadata().unwrap().ino();
+    let by_path = std::fs::metadata(format!("/proc/{}/map_files", child.pid)).unwrap();
+    let own = std::fs::metadata("/proc/self/map_files").unwrap();
+    assert_eq!(ino, by_path.ino(), "the child's directory");
+    assert_ne!(ino, own.ino(), "never the observer's own");
+    let range = (child.address, child.address + 4096);
+    match (
+        held.identity(range.0, range.1),
+        crate::discovery::identity::map_files_identity(child.pid as u32, range.0, range.1),
+    ) {
+        (Ok(by_dir), Ok(by_path)) => {
+            assert_eq!(by_dir, by_path);
+            assert_eq!(by_dir.ino, std::fs::metadata(&path).unwrap().ino());
+        }
+        (Err(by_dir), Err(by_path)) => assert_eq!(by_dir.raw_os_error(), by_path.raw_os_error()),
+        (by_dir, by_path) => panic!("the two reads disagree: {by_dir:?} vs {by_path:?}"),
+    }
+}
+
+/// `ENOENT` (no mapping, or no process, at the range now) is
+/// [`RANGE_NOT_MAPPED`]; a missing privilege never is.
+#[test]
+fn only_enoent_reads_as_a_range_no_longer_mapped() {
+    assert_eq!(
+        map_files_error(std::io::Error::from_raw_os_error(libc::ENOENT)),
+        RANGE_NOT_MAPPED
+    );
+    for errno in [libc::EPERM, libc::EACCES, libc::ESRCH] {
+        assert_ne!(
+            map_files_error(std::io::Error::from_raw_os_error(errno)),
+            RANGE_NOT_MAPPED
+        );
+    }
+    // The production probe on a process that has exited.
+    let mut io = OsConfirmIo::default();
+    let gone = {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+    assert_eq!(
+        io.mapped_file(gone, 0x1000, 0x2000),
+        Err(RANGE_NOT_MAPPED.to_string())
+    );
+}
+
+/// Review L4: an examined range that is no longer one mapping when an
+/// unmatched process's ranges are statted (unloaded, remapped or exited
+/// since the sweep) is never counted unexamined: the pid is confirmed,
+/// and its re-read decides — an unloaded key is simply gone.
+#[test]
+fn a_range_unmapped_after_the_sweep_is_confirmed_never_counted_unexamined() {
+    let checks = Checks::default();
+    let index = provider_index(&checks);
+    let sweep = vec![(10_000, provider_caller()), (20_001, idle(None))];
+    let libc_range = (0x2000_0000, 0x2000_1000);
+
+    // Unloaded since the sweep: the re-read no longer maps libc.
+    let mut probe = Probe::over(&sweep);
+    probe.mapped.insert(
+        20_001,
+        MappedIdentities::from([(libc_range, Err(RANGE_NOT_MAPPED.into()))]),
+    );
+    probe.snapshots.insert(20_001, Vec::new());
+    let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
+    assert_eq!(probe.calls, vec![20_001], "escalated to a confirmation");
+    assert!(
+        attribution.unexamined.is_empty(),
+        "{:?}",
+        attribution.unexamined
+    );
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+
+    // Exited since the sweep: an exit, never a loss or a coverage gap.
+    let mut probe = Probe::over(&sweep);
+    probe.mapped.insert(
+        20_001,
+        MappedIdentities::from([(libc_range, Err(RANGE_NOT_MAPPED.into()))]),
+    );
+    probe.overrides.insert(20_001, Confirmation::Exited);
+    let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
+    assert_eq!(attribution.exited, BTreeSet::from([20_001]));
+    assert!(
+        attribution.unexamined.is_empty(),
+        "{:?}",
+        attribution.unexamined
+    );
+
+    // A privilege refusal is not a stale range: no confirmation, and the
+    // unproven key stays unexamined, as before.
+    let mut probe = Probe::over(&sweep);
+    probe.denied.insert(20_001);
+    let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
+    assert!(probe.calls.is_empty());
+    assert_eq!(attribution.unexamined, BTreeMap::from([(20_001, 1)]));
+}
+
+/// Review L4, inside the pin: a confirmed range (matched or examined) that
+/// is no longer one mapping when its `map_files` entry is read is a
+/// `mapping_changed` loss, never `map_files_unavailable` (which says the
+/// privilege is missing) and never an unexamined key.
+#[test]
+fn a_range_gone_inside_the_pin_is_a_mapping_changed_loss() {
+    let checks = Checks::default();
+    let index = provider_index(&checks);
+    let sweep = vec![(10_000, provider_caller()), (10_001, provider_caller())];
+    for range in [(0x1000_0000, 0x1000_1000), (0x2000_0000, 0x2000_1000)] {
+        let mut probe = Probe::over(&sweep);
+        probe.mapped.insert(
+            10_001,
+            MappedIdentities::from([(range, Err(RANGE_NOT_MAPPED.into()))]),
+        );
+        let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
+        assert_eq!(
+            attribution.losses,
+            BTreeMap::from([(AttributionLoss::MappingChanged, 1)]),
+            "{range:x?}"
+        );
+        assert!(attribution.unexamined.is_empty(), "{range:x?}");
+    }
 }

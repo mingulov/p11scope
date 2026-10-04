@@ -439,6 +439,53 @@ pub(crate) fn map_files_identity(pid: u32, start: u64, end: u64) -> std::io::Res
     map_files_entry_identity(&format!("/proc/{pid}/map_files/{start:x}-{end:x}"))
 }
 
+/// One process's `/proc/<pid>/map_files` directory, held open so each
+/// range is one `fstatat` relative to it instead of a full `/proc` path
+/// walk (DR-C1b-3). The same entry, followed the same way, as
+/// [`map_files_identity`]: like for like. The directory names the process
+/// it was opened for; after an exit its lookups fail and never reach a
+/// process that reuses the pid.
+pub(crate) struct MapFilesDir {
+    dir: std::fs::File,
+}
+
+impl MapFilesDir {
+    pub(crate) fn open(pid: u32) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(format!("/proc/{pid}/map_files"))
+            .map(|dir| Self { dir })
+    }
+
+    /// The held directory's own metadata: which process's directory it is.
+    #[cfg(test)]
+    pub(crate) fn directory_metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.dir.metadata()
+    }
+
+    /// The `vm_file` identity of `[start, end)`: [`map_files_identity`]
+    /// relative to the held directory (the entry is followed, as `stat`
+    /// follows it).
+    pub(crate) fn identity(&self, start: u64, end: u64) -> std::io::Result<FileIdentity> {
+        let name =
+            std::ffi::CString::new(format!("{start:x}-{end:x}")).map_err(std::io::Error::other)?;
+        let mut buf = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: a valid directory fd, a NUL-terminated relative name and
+        // a writable stat buffer, read only on success.
+        if unsafe { libc::fstatat(self.dir.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: initialized by the successful `fstatat`.
+        let stat = unsafe { buf.assume_init() };
+        Ok(FileIdentity {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        })
+    }
+}
+
 fn map_files_entry_identity(entry: &str) -> std::io::Result<FileIdentity> {
     let metadata = std::fs::metadata(entry)?;
     Ok(FileIdentity {
@@ -4902,6 +4949,49 @@ mod tests {
         // No scanned identity (map_files unreadable at scan time): key only.
         let (count, skipped) = pin(module(None), Ok(FileIdentity { dev: 47, ino: 9 }));
         assert_eq!((count, skipped.len()), (1, 0), "{skipped:?}");
+    }
+
+    /// DR-C1b-3: a stat relative to the held `map_files` directory reads
+    /// exactly what the full-path stat reads — the followed `vm_file`'s
+    /// identity as root, the same `EPERM` unprivileged — and a range that
+    /// is not one mapping is not found either way.
+    #[test]
+    fn a_held_map_files_directory_reads_what_the_path_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libdirfd.so");
+        std::fs::write(&path, vec![0x5au8; 8192]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: a private read-only page of a valid fd, unmapped below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let _guard = SelfMapping { base, len: 4096 };
+        let start = base as u64;
+        let pid = std::process::id();
+        let held = MapFilesDir::open(pid).expect("the own map_files directory opens");
+        for (low, high) in [(start, start + 4096), (start, start + 8192)] {
+            let by_path = map_files_identity(pid, low, high);
+            let by_dir = held.identity(low, high);
+            match (&by_path, &by_dir) {
+                (Ok(path_identity), Ok(dir_identity)) => {
+                    assert_eq!(path_identity, dir_identity);
+                    assert_eq!(dir_identity.ino, file.metadata().unwrap().ino());
+                }
+                (Err(path_error), Err(dir_error)) => {
+                    assert_eq!(path_error.raw_os_error(), dir_error.raw_os_error());
+                    assert_ne!(dir_error.raw_os_error(), Some(libc::ENOSYS));
+                }
+                _ => panic!("the two reads disagree: {by_path:?} vs {by_dir:?}"),
+            }
+        }
     }
 
     #[test]

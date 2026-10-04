@@ -45,6 +45,14 @@ versioned separately and are opaque, exact dispatch keys.
   that a recurrence of an unremembered one counts again, so the counter
   can over-count; it under-counts only on a 64-bit fingerprint
   collision, about 2^-40 likely).
+- `inventory --system` and `inspect --system` read each past-the-cap
+  `/proc/<pid>/map_files` proof as one stat relative to that process's
+  `map_files` directory, opened once per confirmation, rather than a
+  walk of the full `/proc` path. A range that is no longer one mapping
+  when its proof is read is the new `mapping_changed` attribution loss
+  (inside a confirmation), or makes an unmatched process confirm afresh
+  (after the sweep), instead of `map_files_unavailable` or an
+  unexamined object.
 
 ### Kubernetes deployment
 

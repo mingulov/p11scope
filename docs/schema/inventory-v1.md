@@ -240,6 +240,16 @@ caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
   wrapping inode numbers without `inode64`), btrfs, overlayfs (as
   rendered from 6.8 on), bcachefs, FUSE and network filesystems always
   prove every range.
+  Nothing about a confirmation or a proof is carried from one pass to
+  the next: every pass re-reads a matched caller's maps inside its pin
+  and re-reads every range that needs the proof. An identical maps line
+  is not the same file across a pass (btrfs: another subvolume's file
+  at the same address and path; ext4 and other identity filesystems: an
+  unmapped file's inode number reused at once by a new file). An
+  unmatched process whose examined range is no longer one mapping when
+  it is read (unloaded, remapped or exited since the sweep) is confirmed
+  the same way, so its fresh read decides rather than an unexamined
+  count.
   Absence is authoritative (`ended`)
   only after a complete deep scan of the live caller: a module missing
   from a maps match reads `uncertain`. A maps match never comes from a
@@ -502,7 +512,9 @@ caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
   `deleted_mapping`, `object_changed`, `key_rejected`,
   `inode_not_unique`, `budget`, `identity_mismatch` — a range at the
   key is another file —, `map_files_unavailable` — the proof could not
-  be read) and name a matched caller that also
+  be read for lack of privilege —, `mapping_changed` — a range read
+  inside the confirmation's pin was no longer one mapping when its
+  `map_files` entry was read, an unmap or remap during the read) and name a matched caller that also
   maps shared objects no deep scan examined. A shared object counts as
   examined only where a complete deep scan's own maps read opened it
   and found no provider, and the other process's ranges are proven,

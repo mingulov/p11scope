@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Native lifecycle checks for scripts/matrix/verify-oracle.sh."""
 
+import math
 import os
 from pathlib import Path
 import signal
@@ -17,6 +18,38 @@ DRIVER = ROOT / "scripts/matrix/verify-oracle.sh"
 WORKLOAD = ROOT / "scripts/matrix/oracle-workload.sh"
 CLEANUP = ROOT / "scripts/matrix/oracle-cgroup-cleanup.py"
 FIXTURE = ROOT / "tests/fixtures/oracle-lifecycle/scenarios.sh"
+# SLACK bounds (waits whose expiry can only mean failure) scale with
+# P11SCOPE_TEST_TIME_SCALE, as in test_lane13_evidence.py. SEMANTIC bounds
+# a case asserts (the owned-child wait deadline, the hung-descendant and
+# wait-query elapsed budgets, the cleanup helper's kill deadline, and the
+# negative no-EOF probes) stay literal.
+DEFAULT_TIME_SCALE = 5.0
+
+
+def _time_scale():
+    raw = os.environ.get("P11SCOPE_TEST_TIME_SCALE", "").strip()
+    if not raw:
+        return DEFAULT_TIME_SCALE
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 1:
+        raise SystemExit("P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1")
+    return value
+
+
+TIME_SCALE = _time_scale()
+
+
+def slack(seconds):
+    """Scale a wait-until bound whose expiry can only mean failure."""
+    return seconds * TIME_SCALE
+
+
+def scaled_whole_seconds(seconds):
+    """Scale a process lifetime that must outlast SLACK waits; whole seconds."""
+    return str(math.ceil(seconds * TIME_SCALE))
 
 
 def process_starttime(pid):
@@ -51,7 +84,7 @@ def read_process_identity(path):
 
 
 def wait_process_identity(testcase, path, process, timeout=1.0):
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + slack(timeout)
     while time.monotonic() < deadline:
         identity = read_process_identity(path)
         if identity is not None:
@@ -63,7 +96,7 @@ def wait_process_identity(testcase, path, process, timeout=1.0):
 
 
 def wait_process_state(testcase, pid, expected, timeout=1.0):
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + slack(timeout)
     while time.monotonic() < deadline:
         try:
             state = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1][:1]
@@ -90,7 +123,7 @@ def terminate_process_generation(pid, starttime, timeout=2.0):
         signal.pidfd_send_signal(pidfd, signal.SIGKILL)
     finally:
         os.close(pidfd)
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + slack(timeout)
     while time.monotonic() < deadline:
         try:
             if process_starttime(pid) != starttime:
@@ -108,7 +141,7 @@ def quiesce_after_kill(kill_path, events_path, timeout=2.0):
     errors = []
 
     def watch():
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + slack(timeout)
         try:
             while not stop.is_set():
                 if kill_path.read_bytes().startswith(b"1"):
@@ -138,18 +171,25 @@ def quiesce_after_kill(kill_path, events_path, timeout=2.0):
         yield assert_observed
     finally:
         stop.set()
-        watcher.join(timeout)
+        watcher.join(slack(timeout))
 
 
 class OracleLifecycleTests(unittest.TestCase):
+    def fixture_env(self, env):
+        merged = {**os.environ, **(env or {})}
+        merged.setdefault(
+            "ORACLE_TEST_HOLD_SECONDS", scaled_whole_seconds(30)
+        )
+        return merged
+
     def run_fixture(self, scenario, *args, timeout=5, env=None):
         return subprocess.run(
             ["/bin/sh", str(FIXTURE), str(DRIVER), scenario, *map(str, args)],
             cwd=ROOT,
             text=True,
             capture_output=True,
-            timeout=timeout,
-            env={**os.environ, **(env or {})},
+            timeout=slack(timeout),
+            env=self.fixture_env(env),
         )
 
     def start_hung_fixture(self, identity, env=None):
@@ -159,7 +199,7 @@ class OracleLifecycleTests(unittest.TestCase):
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, **(env or {})},
+            env=self.fixture_env(env),
         )
 
     def cleanup_hung_fixture(self, process, identity):
@@ -167,7 +207,7 @@ class OracleLifecycleTests(unittest.TestCase):
         try:
             if process.poll() is None:
                 process.kill()
-            process.wait(timeout=1)
+            process.wait(timeout=slack(1))
         except Exception as error:
             errors.append(error)
         published = read_process_identity(identity)
@@ -182,7 +222,7 @@ class OracleLifecycleTests(unittest.TestCase):
             for stream in (process.stdout, process.stderr)
         ):
             try:
-                output = process.communicate(timeout=2)
+                output = process.communicate(timeout=slack(2))
             except Exception as error:
                 errors.append(error)
                 for stream in (process.stdout, process.stderr):
@@ -227,16 +267,16 @@ class OracleLifecycleTests(unittest.TestCase):
                 env={**os.environ, "ARGV_CAPTURE": str(capture)},
             )
             self.addCleanup(lambda: process.poll() is None and process.kill())
-            deadline = time.monotonic() + 2
-            while not record.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertTrue(record.exists(), "workload did not publish identity")
-            pid, starttime = map(int, record.read_text().split())
+            # Wait for a complete identity, not mere existence: the
+            # workload's redirect creates the file before printf writes
+            # the "pid starttime" pair, and under load this reader can
+            # slip between the two and parse an empty file.
+            pid, starttime = wait_process_identity(self, record, process, timeout=2)
             self.assertEqual(pid, process.pid)
             self.assertEqual(starttime, process_starttime(pid))
             with fifo.open("wb", buffering=0) as stream:
                 stream.write(b"x")
-            self.assertEqual(process.wait(timeout=2), 0)
+            self.assertEqual(process.wait(timeout=slack(2)), 0)
             self.assertEqual(
                 capture.read_text().splitlines(),
                 [
@@ -281,7 +321,7 @@ class OracleLifecycleTests(unittest.TestCase):
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
-                timeout=2,
+                timeout=slack(2),
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue((base / "pid").exists(), result.stderr)
@@ -308,7 +348,7 @@ class OracleLifecycleTests(unittest.TestCase):
             cwd=ROOT,
             text=True,
             capture_output=True,
-            timeout=2,
+            timeout=slack(2),
         )
 
     def test_cleanup_helper_probes_and_kills_through_receipt_fd(self):
@@ -361,7 +401,7 @@ class OracleLifecycleTests(unittest.TestCase):
                     cwd=ROOT,
                     text=True,
                     capture_output=True,
-                    timeout=2,
+                    timeout=slack(2),
                 )
             self.assertEqual(result.returncode, 0, result.stderr)
             assert_kill_observed()
@@ -465,7 +505,7 @@ class OracleLifecycleTests(unittest.TestCase):
             process = self.start_hung_fixture(identity)
             try:
                 pid, starttime = wait_process_identity(self, identity, process)
-                stdout, stderr = process.communicate(timeout=3)
+                stdout, stderr = process.communicate(timeout=slack(3))
                 elapsed = time.monotonic() - started
                 self.assertEqual(process.returncode, 0, stderr)
                 self.assertEqual(stdout.strip(), "hung=124 observer=1")
@@ -486,7 +526,7 @@ class OracleLifecycleTests(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     process.communicate(timeout=0.05)
                 process.kill()
-                process.wait(timeout=1)
+                process.wait(timeout=slack(1))
                 self.assertEqual(process_starttime(pid), starttime)
                 with self.assertRaises(subprocess.TimeoutExpired):
                     process.communicate(timeout=0.05)
@@ -498,7 +538,7 @@ class OracleLifecycleTests(unittest.TestCase):
                 self.cleanup_hung_fixture(process, identity)
 
     def test_parent_cleanup_ignores_unauthenticated_identity_receipts(self):
-        decoy = subprocess.Popen(["sleep", "30"])
+        decoy = subprocess.Popen(["sleep", scaled_whole_seconds(30)])
         try:
             decoy_start = process_starttime(decoy.pid)
             receipts = (
@@ -530,13 +570,13 @@ class OracleLifecycleTests(unittest.TestCase):
                         finally:
                             if process.poll() is None:
                                 process.kill()
-                            process.wait(timeout=1)
+                            process.wait(timeout=slack(1))
                             for stream in (process.stdout, process.stderr):
                                 stream.close()
         finally:
             if decoy.poll() is None:
                 decoy.kill()
-            decoy.wait(timeout=1)
+            decoy.wait(timeout=slack(1))
 
     def test_authentication_pins_actual_membership_and_rejects_mismatch(self):
         membership = next(
@@ -558,7 +598,7 @@ class OracleLifecycleTests(unittest.TestCase):
         self.assertNotEqual(changed.returncode, 0)
 
     def test_identity_query_error_never_enters_bare_wait_or_touches_foreign_process(self):
-        foreign = subprocess.Popen(["sleep", "30"])
+        foreign = subprocess.Popen(["sleep", scaled_whole_seconds(30)])
         try:
             started = time.monotonic()
             result = self.run_fixture("wait-query-error", foreign.pid, timeout=2)
@@ -569,7 +609,7 @@ class OracleLifecycleTests(unittest.TestCase):
         finally:
             if foreign.poll() is None:
                 foreign.kill()
-            foreign.wait(timeout=1)
+            foreign.wait(timeout=slack(1))
 
     def test_repeated_signals_cannot_interrupt_bounded_finalization(self):
         with tempfile.TemporaryDirectory() as raw:

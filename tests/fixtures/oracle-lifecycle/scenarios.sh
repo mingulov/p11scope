@@ -10,6 +10,9 @@ export P11SCOPE_ORACLE_SOURCE_ONLY
 . "$driver"
 
 mark() { printf '%s\n' "$1" >> "$events"; }
+# Held-child lifetime: must outlast the harness's scaled SLACK waits. The
+# harness passes ORACLE_TEST_HOLD_SECONDS; the default keeps standalone runs.
+hold=${ORACLE_TEST_HOLD_SECONDS:-30}
 
 case $scenario in
 body)
@@ -82,7 +85,7 @@ cleanup)
     if oracle_cleanup; then exit 0; else exit $?; fi
     ;;
 wait-deadline)
-    sleep 30 & child=$!
+    sleep "$hold" & child=$!
     start=$(process_starttime "$child")
     if oracle_wait_child "$child" "$start" 2; then rc=0; else rc=$?; fi
     kill "$child" 2>/dev/null || :
@@ -141,7 +144,7 @@ hung-clients)
     }
     trap 'fixture_cleanup_owned' EXIT
 
-    sleep 30 & owned_hung_pid=$!
+    sleep "$hold" & owned_hung_pid=$!
     owned_hung_start=$(process_starttime "$owned_hung_pid")
     printf '%s %s\n' "$owned_hung_pid" "$owned_hung_start" > "$identity"
     [ "${STOP_AFTER_IDENTITY-0}" = 0 ] || kill -STOP $$

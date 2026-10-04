@@ -694,9 +694,15 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
         account.terminal.frames_shed > 0,
         "the stall never bit: {account:?}"
     );
+    // A loaded host declares its slowness through P11SCOPE_TEST_TIME_SCALE
+    // (default 1: the literal bounds); it scales the tick-gap bound and
+    // the pass floor below, nothing else.
+    let scale = test_time_scale()?;
+    let tick_bound = Duration::from_millis(100).mul_f64(scale);
     ensure!(
-        account.longest_gap < Duration::from_millis(100),
-        "a service tick waited on the terminal: {account:?}"
+        account.longest_gap < tick_bound,
+        "a service tick waited on the terminal (bound {tick_bound:?}, time scale {scale}): \
+         {account:?}"
     );
     // Across a pass the gap also carries the pass's own work (the first
     // pass attaches every endpoint, within its 250 ms extend window).
@@ -718,7 +724,7 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
     // of the active seconds, at least 12 (15 for the nominal 20 s).
     let anchor = anchor.get().context("the lane never committed a pass")?;
     let active_secs = stop_at.saturating_duration_since(anchor).as_secs_f64();
-    let required = 12u64.max((0.75 * active_secs).floor() as u64);
+    let required = ((12.0 / scale).floor() as u64).max((0.75 * active_secs / scale).floor() as u64);
     let passes = document["observation"]["passes"].as_u64().unwrap_or(0);
     ensure!(
         passes >= required,
@@ -752,6 +758,7 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
     ensure!(stream_ended(&stream), "the stream did not end");
     eprintln!(
         "C53_SLOW_PTY pid={} passes={passes} required={required} active_s={active_secs:.1} \
+         time_scale={scale} \
          startup_ms={} ticks={} longest_gap_ms={} written={} shed={} \
          cut={} shed_bytes={} stall_ms={} restored={} stop_to_report_ms={} \
          longest_pass_gap_ms={} witnesses={witnesses}",
@@ -769,6 +776,22 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
         account.longest_pass_gap.as_millis(),
     );
     Ok(())
+}
+
+/// `P11SCOPE_TEST_TIME_SCALE` (default 1, at least 1): how much slower than
+/// nominal a loaded host declares itself, the same variable the Python
+/// harnesses and `tests/artifact_contracts.rs` read. Cells that scale a
+/// bound by it say which; with the default every bound is literal.
+fn test_time_scale() -> Result<f64> {
+    let scale = match std::env::var("P11SCOPE_TEST_TIME_SCALE") {
+        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse::<f64>().unwrap_or(f64::NAN),
+        _ => 1.0,
+    };
+    ensure!(
+        scale.is_finite() && scale >= 1.0,
+        "P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1"
+    );
+    Ok(scale)
 }
 
 /// One production run through `run_with_writer` with `--json` and an event

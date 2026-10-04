@@ -150,7 +150,9 @@ inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
 # take it. Prints C511_SCALE (about 10-30 s).
 inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64
 # Task 6 C5.3: the native lane under the interactive dashboard on a pty never
-# read for 20 s (same workload needs; about 30 s).
+# read for 20 s (same workload needs; about 30 s). A loaded host may declare
+# P11SCOPE_TEST_TIME_SCALE (default 1, pass it through sudo env): it scales
+# only this cell's 100 ms tick-gap bound and its pass floor.
 inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
 )
 

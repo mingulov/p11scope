@@ -16,17 +16,6 @@ use crate::discovery::hooks::HookRegistry;
 use p11scope_ebpf_common::ImageIdentity;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
-
-/// Serialize this module's owned-pidfd workloads. Global FD measurements run
-/// in exact private workers; this mutex cannot constrain unrelated lib tests.
-fn serial_guard() -> MutexGuard<'static, ()> {
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
 
 fn harness() -> Harness {
     Harness::new(RegistryLimits::default_limits()).unwrap()
@@ -176,6 +165,15 @@ fn workload_fd_worker() {
         "churn" => run_churn_storm(),
         "shutdown" => interrupt_shutdown(),
         "rss" => workload_rss_worker(),
+        // Owned-pidfd accounting runs here, in a private process: the
+        // census observes /proc/self/fd, which a concurrent lib test
+        // can pollute with its own pidfds for our sleepers (a census
+        // read 2 with zero held here; a unit read 36 after one owner).
+        // A pidfd for one of our pids in this worker is ours by
+        // construction, so the exact counts keep their meaning.
+        "owner-growth-257" => grow_native_owners_to_257(),
+        "owner-growth-failure" => inject_native_owner_growth_failure(),
+        "pidfd-census" => owned_pidfd_census_classifier(),
         "oracle-clean" => {
             let owned_directory = std::fs::File::open("/proc/self/fd").unwrap();
             let scope = FdScope::open("isolated clean baseline");
@@ -840,12 +838,13 @@ fn inventory_projection_at_t7_cardinality_8192() {
 
 #[test]
 fn native_owner_growth_to_257_over_owned_sleepers() {
-    let _serial = serial_guard();
-    grow_native_owners_to_257();
+    // The owned-pidfd census observes /proc/self/fd: it runs in a
+    // private worker, never beside concurrent lib tests.
+    isolated_workload("owner-growth-257");
 }
 
-/// 257 native owners through the real growth path, callable from the
-/// test above with its owned-pidfd accounting.
+/// 257 native owners through the real growth path, run in the
+/// `owner-growth-257` worker with its owned-pidfd accounting.
 fn grow_native_owners_to_257() {
     // 257 owned sleepers: the pids behind 257 native owners through the
     // real `open_inventory_owner` growth path.
@@ -875,13 +874,14 @@ fn grow_native_owners_to_257() {
     let owned: BTreeSet<u32> = pids.iter().copied().collect();
     let mut harness = harness();
     let mut guard = AcceptAllImages;
-    // Owned-FD accounting, measured never assumed: the census counts
-    // only pidfds for these 257 sleepers, so parallel tests'
-    // pipes/sockets/eventfds — and their pidfds for other pids —
-    // cannot move the needle. The first owner establishes the unit
-    // cost (one pin fd where the kernel offers pidfds, zero where it
-    // falls back), and the remaining 256 must cost exactly 256× that
-    // unit — retained by design, never leaked beyond it.
+    // Owned-FD accounting, measured never assumed: this private
+    // worker owns its fd table, and the census counts only pidfds for
+    // these 257 sleepers, so foreign pipes/sockets/eventfds — and
+    // pidfds for other pids — cannot move the needle. The first owner
+    // establishes the unit cost (one pin fd where the kernel offers
+    // pidfds, zero where it falls back), and the remaining 256 must
+    // cost exactly 256× that unit — retained by design, never leaked
+    // beyond it.
     let now = harness.now_ns();
     let before = count_owned_pidfds_floor(&owned);
     harness.source().spawn(pids[0], 5000);
@@ -958,10 +958,17 @@ fn pidfd_open_test(pid: u32) -> Option<std::os::fd::OwnedFd> {
 
 #[test]
 fn owned_pidfd_census_counts_only_owned_pidfds() {
+    // The owned-pidfd census observes /proc/self/fd: it runs in a
+    // private worker, never beside concurrent lib tests.
+    isolated_workload("pidfd-census");
+}
+
+/// The owned-pidfd classifier, run in the `pidfd-census` worker.
+/// Two owned sleepers behind the census; nothing else in this private
+/// process pins them, so the owned count is exactly what this workload
+/// opens itself.
+fn owned_pidfd_census_classifier() {
     use std::os::fd::{FromRawFd as _, OwnedFd};
-    // Two owned sleepers behind the census; nothing else in this
-    // process pins them, so the owned count is exactly what this test
-    // opens itself — no serial guard needed.
     let mut reapers = Vec::new();
     for _ in 0..2 {
         reapers.push(ChildReaper(
@@ -1650,12 +1657,13 @@ fn inject_admission_failures() {
 
 #[test]
 fn native_owner_growth_failure_accounts_loss_exactly() {
-    let _serial = serial_guard();
-    inject_native_owner_growth_failure();
+    // The owned-pidfd census observes /proc/self/fd: it runs in a
+    // private worker, never beside concurrent lib tests.
+    isolated_workload("owner-growth-failure");
 }
 
-/// Native-owner growth-path failure injection, callable from the test
-/// above with its owned-pidfd accounting.
+/// Native-owner growth-path failure injection, run in the
+/// `owner-growth-failure` worker with its owned-pidfd accounting.
 fn inject_native_owner_growth_failure() {
     fn some_image(pid: u32) -> Option<ImageIdentity> {
         Some(owner_image(pid))

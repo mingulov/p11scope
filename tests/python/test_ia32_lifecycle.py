@@ -3,6 +3,7 @@
 
 import ctypes
 import hashlib
+import math
 import os
 from pathlib import Path
 import select
@@ -23,6 +24,39 @@ DRIVER = FIXTURES / "driver.sh"
 TARGET = FIXTURES / "target.sh"
 GUARD_SOURCE = ROOT / "scripts/matrix/ia32-compat-trace-exec.c"
 EXPECTED_DEFAULT_TESTS = 28
+# SLACK bounds (waits whose expiry can only mean failure: driver guards,
+# custody waits, file markers, teardown reaps) scale with
+# P11SCOPE_TEST_TIME_SCALE, as in test_lane13_evidence.py. SEMANTIC bounds
+# inside the driver (completion deadlines, guard-timeout escalation,
+# stop/ack state machines) and the mocked poll timeouts, which wait for
+# nothing, stay literal.
+DEFAULT_TIME_SCALE = 5.0
+
+
+def _time_scale():
+    raw = os.environ.get("P11SCOPE_TEST_TIME_SCALE", "").strip()
+    if not raw:
+        return DEFAULT_TIME_SCALE
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 1:
+        raise SystemExit("P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1")
+    return value
+
+
+TIME_SCALE = _time_scale()
+
+
+def slack(seconds):
+    """Scale a wait-until bound whose expiry can only mean failure."""
+    return seconds * TIME_SCALE
+
+
+def scaled_whole_seconds(seconds):
+    """Scale a process lifetime that must outlast SLACK waits; whole seconds."""
+    return str(math.ceil(seconds * TIME_SCALE))
 
 
 def starttime(pid):
@@ -52,8 +86,9 @@ class Ia32LifecycleTests(unittest.TestCase):
         self.work = Path(self.temp.name)
         self.env = os.environ.copy()
         self.env["CASE_DIR"] = str(self.work)
-        self.env["IA32_TEST_HOLD_SECONDS"] = "12"
-        self.env["IA32_GUARD_TEST_SECONDS"] = "12"
+        self.env["IA32_TEST_HOLD_SECONDS"] = scaled_whole_seconds(12)
+        self.env["IA32_GUARD_TEST_SECONDS"] = scaled_whole_seconds(12)
+        self.env["IA32_GUARD_TIMEOUT_SECONDS"] = scaled_whole_seconds(30)
         self.bin = self.work / "bin"
         self.bin.mkdir(mode=0o700)
         self.mock_sudo = self.bin / "sudo"
@@ -137,19 +172,19 @@ class Ia32LifecycleTests(unittest.TestCase):
             else:
                 # Popen still owns this unreaped direct child, so PID reuse is impossible.
                 proc.terminate()
-            owned["terminal"] = proc.wait(timeout=2)
+            owned["terminal"] = proc.wait(timeout=slack(2))
         except subprocess.TimeoutExpired:
             try:
                 if owned["fd"] is not None:
                     signal.pidfd_send_signal(owned["fd"], signal.SIGKILL)
                 else:
                     proc.kill()
-                owned["terminal"] = proc.wait(timeout=2)
+                owned["terminal"] = proc.wait(timeout=slack(2))
             except (ProcessLookupError, subprocess.TimeoutExpired) as error:
                 return [f"direct child {owned['pid']} exit unproved: {error}"]
         except ProcessLookupError:
             try:
-                owned["terminal"] = proc.wait(timeout=2)
+                owned["terminal"] = proc.wait(timeout=slack(2))
             except subprocess.TimeoutExpired as error:
                 return [f"direct child {owned['pid']} reap unproved: {error}"]
         self.close_owned(owned)
@@ -188,7 +223,7 @@ class Ia32LifecycleTests(unittest.TestCase):
             except OSError as error:
                 failures.append(f"verified child {owned['pid']} signal failed: {error}")
             try:
-                self.wait_pidfd(owned, timeout=2)
+                self.wait_pidfd(owned, timeout=slack(2))
             except (ChildProcessError, TimeoutError, ValueError) as error:
                 failures.append(f"verified child {owned['pid']} exit/reap unproved: {error}")
         return failures
@@ -235,7 +270,7 @@ class Ia32LifecycleTests(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs,
         )
         try:
-            stdout, stderr = proc.communicate(input=input, timeout=timeout)
+            stdout, stderr = proc.communicate(input=input, timeout=slack(timeout))
         except subprocess.TimeoutExpired:
             failures = self.retire_direct(owned)
             if failures:
@@ -480,7 +515,7 @@ class Ia32LifecycleTests(unittest.TestCase):
     def test_killed_foreground_timeout_status_does_not_prove_command_ended(self):
         record = self.work / "orphan"
         wrapper, wrapper_owned = self.popen_owned(
-            ["timeout", "--foreground", "30", TARGET, record, "ignore", "0"],
+            ["timeout", "--foreground", scaled_whole_seconds(30), TARGET, record, "ignore", "0"],
             stdin=subprocess.DEVNULL,
         )
         self.wait_file(Path(str(record) + ".ready"))
@@ -488,10 +523,10 @@ class Ia32LifecycleTests(unittest.TestCase):
         command_owned = self.own_pid(command_pid, generation)
         command_owned["owner_entry"] = wrapper_owned
         self.signal_owned(wrapper_owned, signal.SIGKILL)
-        self.assertEqual(self.wait_popen(wrapper_owned, 2), -signal.SIGKILL)
+        self.assertEqual(self.wait_popen(wrapper_owned, slack(2)), -signal.SIGKILL)
         self.assertEqual(starttime(command_pid), generation)
         self.signal_owned(command_owned, signal.SIGKILL)
-        self.wait_pidfd(command_owned, 2)
+        self.wait_pidfd(command_owned, slack(2))
 
     def test_self_test_retains_all_fifteen_vectors(self):
         result = self.run_owned(
@@ -509,7 +544,7 @@ class Ia32LifecycleTests(unittest.TestCase):
                     env["P11SCOPE_IA32_RUNNER_PROBE"] = mode
                 result = subprocess.run(
                     [sys.executable, str(Path(__file__)), *args], cwd=ROOT, env=env,
-                    capture_output=True, timeout=5,
+                    capture_output=True, timeout=slack(5),
                 )
                 self.assertNotEqual(result.returncode, 0)
 
@@ -676,13 +711,13 @@ class Ia32LifecycleTests(unittest.TestCase):
 
     def finish_guard_parent(self, proc, timeout=3):
         parent_owned = next(item for item in self.owned if item["proc"] is proc)
-        parent_status = self.wait_popen(parent_owned, timeout)
+        parent_status = self.wait_popen(parent_owned, slack(timeout))
         child_owned = self.guard_children[id(proc)]
-        child_status = self.wait_pidfd(child_owned, timeout)
+        child_status = self.wait_pidfd(child_owned, slack(timeout))
         return parent_status, child_status, child_owned
 
     def wait_file(self, path, timeout=3):
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + slack(timeout)
         while time.monotonic() < deadline:
             if path.exists():
                 return
@@ -802,7 +837,7 @@ class Ia32LifecycleTests(unittest.TestCase):
         self.assertFalse((self.work / "guard-target.ready").exists())
 
     def test_parent_death_kills_execed_guard_but_foreign_sentinel_survives(self):
-        sentinel, sentinel_owned = self.popen_owned(["sleep", "30"])
+        sentinel, sentinel_owned = self.popen_owned(["sleep", scaled_whole_seconds(30)])
         try:
             proc, _, self_record, _, _ = self.launch_guard_parent()
             self.wait_file(self.work / "guard-target.ready")
@@ -818,7 +853,7 @@ class Ia32LifecycleTests(unittest.TestCase):
         finally:
             if sentinel.poll() is None:
                 self.signal_owned(sentinel_owned, signal.SIGTERM)
-            self.wait_popen(sentinel_owned, 2)
+            self.wait_popen(sentinel_owned, slack(2))
 
     def test_timeout_stop_cont_and_kill_ends_guard_command_with_status137(self):
         guard, target = self.build_guard()
@@ -826,7 +861,7 @@ class Ia32LifecycleTests(unittest.TestCase):
         program = self.work / "program.bt"
         program.write_text("BEGIN { exit(); }\n")
         self.env["IA32_GUARD_TEST_RECORD"] = str(self.work / "guard-target")
-        sentinel, sentinel_owned = self.popen_owned(["sleep", "30"])
+        sentinel, sentinel_owned = self.popen_owned(["sleep", scaled_whole_seconds(30)])
         driver, driver_owned = self.popen_owned(
             ["sh", str(DRIVER), "guard-timeout", guard, self_record, target, program],
             cwd=ROOT, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -842,7 +877,7 @@ class Ia32LifecycleTests(unittest.TestCase):
             guard_owned["owner_entry"] = timeout_owned
             Path(str(self.work / "guard-target") + ".acquired").touch()
             self.signal_owned(timeout_owned, signal.SIGSTOP)
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + slack(2)
             while time.monotonic() < deadline and state(timeout_pid) not in ("T", "t"):
                 time.sleep(0.01)
             self.assertIn(state(timeout_pid), ("T", "t"))
@@ -851,21 +886,21 @@ class Ia32LifecycleTests(unittest.TestCase):
             self.signal_owned(timeout_owned, signal.SIGCONT)
             self.signal_owned(timeout_owned, signal.SIGKILL)
             (self.work / "release").touch()
-            out, err = driver.communicate(timeout=5)
+            out, err = driver.communicate(timeout=slack(5))
             self.assertEqual(driver.returncode, 0, err.decode())
             driver_owned["terminal"] = driver.returncode
             self.close_owned(driver_owned)
             self.assertEqual((self.work / "wait").read_text().splitlines()[1], "137")
-            self.wait_pidfd(timeout_owned, 2)
-            self.wait_pidfd(guard_owned, 2)
+            self.wait_pidfd(timeout_owned, slack(2))
+            self.wait_pidfd(guard_owned, slack(2))
             self.assertIsNone(sentinel.poll())
         finally:
             if driver.poll() is None:
                 self.signal_owned(driver_owned, signal.SIGKILL)
-                self.wait_popen(driver_owned, 2)
+                self.wait_popen(driver_owned, slack(2))
             if sentinel.poll() is None:
                 self.signal_owned(sentinel_owned, signal.SIGTERM)
-            self.wait_popen(sentinel_owned, 2)
+            self.wait_popen(sentinel_owned, slack(2))
 
     def test_guard_adopted_before_arming_refuses_exec(self):
         proc, parent_record, self_record, guard, target = self.launch_guard_parent("adopt")

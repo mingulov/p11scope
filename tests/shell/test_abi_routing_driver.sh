@@ -6,6 +6,23 @@ ABI_ROUTING_DRIVER_LIBRARY_ONLY=1 . scripts/matrix/verify-abi-routing.sh
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Mirror the Python harnesses (test_lane13_evidence.py): SLACK lifetimes
+# scale with P11SCOPE_TEST_TIME_SCALE, default 5x. No case asserts the
+# runtime duration, so scaling it only adds margin under load.
+abi_scaled_seconds() {
+    python3 -I - "$1" <<'PY' || return 1
+import math, os, sys
+raw = os.environ.get("P11SCOPE_TEST_TIME_SCALE", "").strip() or "5.0"
+try:
+    value = float(raw)
+except ValueError:
+    value = math.nan
+if not math.isfinite(value) or value < 1:
+    raise SystemExit("P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1")
+print(math.ceil(float(sys.argv[1]) * value))
+PY
+}
+
 # These subprocess modes make $$ the actual interrupted driver, allowing the
 # production committed-transfer and pending-ACK trap boundaries to be tested.
 if [ "${1:-}" = --interrupt ]; then
@@ -91,10 +108,16 @@ chmod 700 "$target"
 old_path=$PATH
 PATH=$shim_dir:$PATH
 export PATH
-ABI_RUNTIME_DURATION=3
+ABI_RUNTIME_DURATION=$(abi_scaled_seconds 3) || fail bad-time-scale
 
 ABI_ROUTING_SUDO_POST_WAIT=0.5
 export ABI_ROUTING_SUDO_POST_WAIT
+# The wrapper stays alive until this file exists, so the intermediate
+# custody state below (root process cleared, wrapper still owned) is
+# observable no matter how slow one ownership poll is under load.
+ABI_ROUTING_SUDO_RELEASE_FILE=$test_parent/sudo-release-natural
+export ABI_ROUTING_SUDO_RELEASE_FILE
+rm -f -- "$ABI_ROUTING_SUDO_RELEASE_FILE"
 abi_launch_variant_runtime natural "$target" "$EVIDENCE/nonzero" "$EVIDENCE/natural.log" a b c d || fail natural-launch
 [ "$ABI_RUNTIME_LAUNCH_PID" -ne "$ABI_RUNTIME_PROCESS_PID" ] || fail roles-not-distinct
 attempt=0
@@ -105,10 +128,11 @@ while [ "$ABI_RUNTIME_PROCESS_OWNED" -eq 1 ] && [ "$attempt" -lt 100 ]; do
 done
 [ "$ABI_RUNTIME_PROCESS_OWNED" -eq 0 ] || fail root-completion-not-observed
 [ "$ABI_RUNTIME_LAUNCH_OWNED" -eq 1 ] || fail wrapper-cleared-with-root
+: > "$ABI_ROUTING_SUDO_RELEASE_FILE" || fail natural-release
 abi_wait_runtime || fail natural-wait
 [ "$ABI_RUNTIME_STATUS" -eq 7 ] || fail natural-status
 [ "$ABI_RUNTIME_OWNED" -eq 0 ] || fail natural-custody
-unset ABI_ROUTING_SUDO_POST_WAIT
+unset ABI_ROUTING_SUDO_POST_WAIT ABI_ROUTING_SUDO_RELEASE_FILE
 
 abi_launch_variant_runtime success "$target" "$EVIDENCE/success" "$EVIDENCE/success.log" a b c d || fail sequential-success-launch
 abi_wait_runtime || fail sequential-success-wait

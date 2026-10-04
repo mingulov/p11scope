@@ -193,8 +193,11 @@ EOF
     guard-timeout)
         guard=$2 self_record=$3 target=$4 program=$5
         prepare_actual_cleanup
+        # Hang backstop for the guard chain: must outlast the harness's
+        # scaled waits. The harness passes IA32_GUARD_TIMEOUT_SECONDS;
+        # the default keeps standalone runs.
         ia32_launch_fixture "$CASE_DIR/timeout.pid" "$CASE_DIR/timeout.log" \
-            timeout 30 "$guard" "$CASE_DIR/timeout.pid" "$self_record" "$target" "$program" \
+            timeout "${IA32_GUARD_TIMEOUT_SECONDS:-30}" "$guard" "$CASE_DIR/timeout.pid" "$self_record" "$target" "$program" \
             || exit 1
         timeout_pid=$fixture_pid timeout_start=$fixture_starttime
         timeout_launch=$fixture_launch_pid timeout_launch_start=$fixture_launch_starttime

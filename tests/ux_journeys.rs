@@ -1121,3 +1121,46 @@ fn se04_zero_duration_is_a_usage_error_exit_2() {
         assert!(usage.stderr.contains("usage:"), "{argv:?}");
     }
 }
+
+/// B2: a huge `--duration` is a usage error, never a panic. A bare
+/// `u64::MAX` used to parse and then panic `inventory` in
+/// `Instant::now() + window` (exit 101, no report); both huge spellings
+/// now exit 2 with the invalid-value message on every surface.
+#[test]
+fn b2_huge_duration_is_a_usage_error_not_a_panic() {
+    let target = SleepTarget::spawn();
+    let pid = target.pid();
+    let cases: Vec<Vec<String>> = [
+        vec!["profile", "--pid", &pid, "--duration", "18446744073709551615"],
+        vec!["profile", "--pid", &pid, "--duration", "99999999999999999h"],
+        vec!["trace", "--pid", &pid, "--duration", "18446744073709551615"],
+        vec!["run", "--duration", "99999999999999999h", "--", "/bin/true"],
+        vec![
+            "inventory",
+            "--pid",
+            &pid,
+            "--duration",
+            "18446744073709551615",
+        ],
+        vec!["inventory", "--system", "--duration", "99999999999999999h"],
+    ]
+    .into_iter()
+    .map(|args| args.into_iter().map(str::to_string).collect())
+    .collect();
+    for argv in &cases {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let usage = run(&refs);
+        assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
+        assert!(
+            usage.stderr.contains("--duration: invalid value"),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert!(
+            !usage.stderr.contains("panicked"),
+            "{argv:?}: {}",
+            usage.stderr
+        );
+        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+    }
+}

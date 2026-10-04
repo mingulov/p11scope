@@ -1235,8 +1235,17 @@ fn resolve_dash_out(
     }
 }
 
+/// The longest `--duration` any capture accepts: 366 days (one leap
+/// year), far past any real observation window yet small enough that
+/// `Instant::now() + d` can never overflow on a supported host.
+pub const MAX_DURATION_SECS: u64 = 366 * 24 * 3600;
+
 /// Parses a duration given as bare seconds or with a single trailing
-/// `s`/`m`/`h` suffix — `"30"`, `"30s"`, `"5m"`, `"1h"`.
+/// `s`/`m`/`h` suffix — `"30"`, `"30s"`, `"5m"`, `"1h"` — up to
+/// [`MAX_DURATION_SECS`]. The suffix multiplication is checked, and a
+/// value past the bound is refused, so no accepted duration can
+/// overflow the clock arithmetic a capture builds on it (B2: a bare
+/// `u64::MAX` used to panic `inventory` in `Instant::now() + window`).
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     if s.is_empty() {
         return Err("empty duration".to_string());
@@ -1256,6 +1265,11 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let secs = secs
         .checked_mul(mult)
         .ok_or_else(|| format!("duration {s:?} overflows"))?;
+    if secs > MAX_DURATION_SECS {
+        return Err(format!(
+            "duration {s:?} exceeds the maximum {MAX_DURATION_SECS} seconds (366 days)"
+        ));
+    }
     Ok(Duration::from_secs(secs))
 }
 
@@ -2034,6 +2048,47 @@ mod tests {
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
         for bad in ["", "5x", "-1", "s", "1.5m"] {
             assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// B2: absurd durations are usage errors, never clock overflows. A
+    /// bare `u64::MAX` used to parse and then panic `inventory` in
+    /// `Instant::now() + window`; a suffixed value whose seconds
+    /// overflow `u64` is refused by the checked multiplication.
+    #[test]
+    fn huge_durations_are_refused_at_the_cli_boundary() {
+        for bad in ["18446744073709551615", "99999999999999999h"] {
+            let error = parse_duration(bad).expect_err("a huge duration must be refused");
+            assert!(
+                error.contains("exceeds the maximum") || error.contains("overflows"),
+                "{bad}: {error}"
+            );
+        }
+        // The bound itself is exact: the maximum parses, one past it
+        // does not, in bare and suffixed spellings alike.
+        assert_eq!(
+            parse_duration(&MAX_DURATION_SECS.to_string()).unwrap(),
+            Duration::from_secs(MAX_DURATION_SECS)
+        );
+        assert_eq!(
+            parse_duration("8784h").unwrap(),
+            Duration::from_secs(MAX_DURATION_SECS)
+        );
+        assert!(parse_duration(&(MAX_DURATION_SECS + 1).to_string()).is_err());
+        assert!(parse_duration("8785h").is_err());
+        // Huge values stay usage errors (exit 2 surfaces) on every
+        // capture, not panics or late runtime failures.
+        for argv in [
+            vec!["profile", "--pid", "42", "--duration", "18446744073709551615"],
+            vec!["trace", "--pid", "42", "--duration", "99999999999999999h"],
+            vec!["run", "--duration", "18446744073709551615", "--", "/bin/true"],
+            vec!["inventory", "--pid", "7", "--duration", "18446744073709551615"],
+            vec!["inventory", "--system", "--duration", "99999999999999999h"],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("--duration: invalid value")),
+                "{argv:?}"
+            );
         }
     }
 

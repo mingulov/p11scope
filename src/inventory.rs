@@ -305,7 +305,7 @@ fn run_with_terminal(
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     let mut stream_state = StreamState::new();
-    let deadline = duration.map(|window| Instant::now() + window);
+    let deadline = deadline_for_duration(duration);
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
         inventory_scope: &inventory_scope,
@@ -993,6 +993,26 @@ fn dashboard_stream_pass<S: ProcessSource>(
 /// loop clock gets a deadline it never reaches.
 const DASHBOARD_UNBOUNDED: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 
+/// The observation deadline for a `--duration` window. `checked_add`
+/// like the classic wait (`run.rs`): a window that overflows the clock
+/// degrades to no deadline instead of panicking. Unreachable via the
+/// CLI (`parse_duration` bounds every duration); the classic path reads
+/// no deadline as a single snapshot, the dashboard as its unbounded
+/// sentinel below.
+fn deadline_for_duration(duration: Option<Duration>) -> Option<Instant> {
+    duration.and_then(|window| Instant::now().checked_add(window))
+}
+
+/// The dashboard's unbounded deadline: a century out, `checked_add`
+/// like every other clock addition here (the fallback mirrors the
+/// classic settlement deadline and is unreachable on a supported
+/// host — a century never overflows the clock).
+fn unbounded_dashboard_deadline() -> Instant {
+    Instant::now()
+        .checked_add(DASHBOARD_UNBOUNDED)
+        .unwrap_or_else(Instant::now)
+}
+
 /// The interactive dashboard (C5.3), over the `display` the caller opened:
 /// the classic loop (`run_classic`) with the display on its service ticks. Passes, the native lane's
 /// service ticks, witness reads and the stop run exactly as on the
@@ -1045,7 +1065,7 @@ fn run_dashboard(
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
-    let deadline = duration.map(|window| Instant::now() + window);
+    let deadline = deadline_for_duration(duration);
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
         inventory_scope: &inventory_scope,
@@ -1057,7 +1077,7 @@ fn run_dashboard(
     };
     let ending = || stop() || quit.get();
     let clock = LoopClock {
-        deadline: Some(deadline.unwrap_or_else(|| Instant::now() + DASHBOARD_UNBOUNDED)),
+        deadline: Some(deadline.unwrap_or_else(unbounded_dashboard_deadline)),
         stop: &ending,
         interval: RESCAN_INTERVAL,
         tick: SERVICE_TICK,
@@ -1815,6 +1835,24 @@ mod tests {
             RegistryLimits::default_limits(),
         )
         .unwrap()
+    }
+
+    /// B2: the observation deadline never panics. A window that
+    /// overflows the clock degrades to no deadline (the classic wait's
+    /// `checked_add` shape in `run.rs`); a plain `Instant::now() +
+    /// window` would panic on `u64::MAX` here.
+    #[test]
+    fn an_overflowing_duration_degrades_to_no_deadline_without_panicking() {
+        assert_eq!(deadline_for_duration(None), None);
+        let end = deadline_for_duration(Some(Duration::from_secs(60)))
+            .expect("a bounded window has a deadline");
+        assert!(end > Instant::now());
+        assert_eq!(
+            deadline_for_duration(Some(Duration::from_secs(u64::MAX))),
+            None,
+            "an overflowing window degrades instead of panicking"
+        );
+        assert!(unbounded_dashboard_deadline() > Instant::now());
     }
 
     /// F4 (review): `inventory --system` outside the agreeing numbering

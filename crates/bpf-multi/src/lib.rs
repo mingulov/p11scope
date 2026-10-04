@@ -574,16 +574,51 @@ fn own_function_offset(address: usize) -> io::Result<(std::path::PathBuf, u64)> 
     ))
 }
 
+/// What the pid-filter probe counted: hits from this process's own two
+/// threads, and hits from a forked child process (another tgid and mm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidFilterHits {
+    pub own_threads: u64,
+    pub other_process: u64,
+}
+
+impl PidFilterHits {
+    /// The filter covers every thread of the named process and nothing
+    /// else: the property PID-scoped uprobe-multi relies on.
+    pub fn proves_pid_scope(&self) -> bool {
+        self.own_threads == 2 && self.other_process == 0
+    }
+}
+
 /// Functional check of the kernel's uprobe_multi pid filter. One counting
 /// link with `pid` = this process on a local function, which the calling
-/// thread and then a freshly spawned sibling thread call once each.
-/// Returns the hits: 2 when the filter covers every thread of the process
-/// (fixed kernels compare the mm or the thread group), 1 when it covers
-/// only the named task (the 6.9 thread bug: `current != link->task`, fixed
-/// by "bpf: fix multi-uprobe PID filtering logic" in 6.10, backported to
-/// 6.9.12 and 6.6.y), 0 when the probe never fired. The link, program and
-/// map are dropped before return.
-pub fn probe_pid_filter_hits() -> io::Result<u64> {
+/// thread and then a freshly spawned sibling thread call once each, then
+/// a forked child process calls once (it inherits the breakpointed text,
+/// so only the filter can keep it out).
+///
+/// - Own threads: 2 when the filter covers every thread of the process
+///   (fixed kernels compare the mm or the thread group), 1 when it covers
+///   only the named task (the 6.9 thread bug: `current != link->task`,
+///   fixed by "bpf: fix multi-uprobe PID filtering logic" in 6.10,
+///   backported to 6.9.12 and 6.6.y), 0 when the probe never fired.
+/// - Other process: 0 when the filter excludes another process; anything
+///   else means the kernel ignored the pid (and would also fire for a
+///   process that later reuses it).
+///
+/// The link, program and map are dropped before return.
+pub fn probe_pid_filter_hits() -> io::Result<PidFilterHits> {
+    probe_pid_filter_with(std::process::id())
+}
+
+/// The probe with the link naming `link_pid` (tests pass 0 to model a
+/// kernel that ignores the pid).
+fn probe_pid_filter_with(link_pid: u32) -> io::Result<PidFilterHits> {
+    // One probe at a time: concurrent probes in one process would count
+    // each other's calls of the shared target.
+    static PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut map_attr: MapCreateAttr = zeroed();
     map_attr.map_type = BPF_MAP_TYPE_ARRAY;
     map_attr.key_size = 4;
@@ -615,14 +650,24 @@ pub fn probe_pid_filter_hits() -> io::Result<u64> {
     let prog = unsafe { OwnedFd::from_raw_fd(prog) };
     let target = p11scope_multi_pid_filter_probe_target as extern "C" fn(u64) -> u64;
     let (path, offset) = own_function_offset(target as usize)?;
-    let link = attach_group(
-        prog.as_raw_fd(),
-        std::process::id(),
-        &path,
-        &[offset],
-        &[1],
-        false,
-    )?;
+    let link = attach_group(prog.as_raw_fd(), link_pid, &path, &[offset], &[1], false)?;
+    let read_hits = || -> io::Result<u64> {
+        let key = 0u32;
+        let mut hits = 0u64;
+        let mut elem = MapElemAttr {
+            map_fd: map.as_raw_fd() as u32,
+            _pad: 0,
+            key: std::ptr::addr_of!(key) as u64,
+            value: std::ptr::addr_of_mut!(hits) as u64,
+            flags: 0,
+        };
+        bpf(
+            BPF_MAP_LOOKUP_ELEM,
+            std::ptr::addr_of_mut!(elem).cast(),
+            size_of::<MapElemAttr>(),
+        )?;
+        Ok(hits)
+    };
     let call = std::hint::black_box(target);
     call(1);
     std::thread::Builder::new()
@@ -630,22 +675,42 @@ pub fn probe_pid_filter_hits() -> io::Result<u64> {
         .spawn(move || call(2))?
         .join()
         .map_err(|_| io::Error::other("the probe's sibling thread panicked"))?;
+    let own_threads = read_hits()?;
+    // The negative leg: another process with the same breakpointed text.
+    // SAFETY: the child only calls a pure function and `_exit`s, both
+    // async-signal-safe, so forking a multithreaded process is sound.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if child == 0 {
+        call(3);
+        // SAFETY: leave the forked child without running any destructor.
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    loop {
+        // SAFETY: waiting for our own child.
+        let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
+        if reaped == child {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(io::Error::other(format!(
+            "the probe's child process ended abnormally (status {status:#x})"
+        )));
+    }
+    let total = read_hits()?;
     drop(link);
-    let key = 0u32;
-    let mut hits = 0u64;
-    let mut elem = MapElemAttr {
-        map_fd: map.as_raw_fd() as u32,
-        _pad: 0,
-        key: std::ptr::addr_of!(key) as u64,
-        value: std::ptr::addr_of_mut!(hits) as u64,
-        flags: 0,
-    };
-    bpf(
-        BPF_MAP_LOOKUP_ELEM,
-        std::ptr::addr_of_mut!(elem).cast(),
-        size_of::<MapElemAttr>(),
-    )?;
-    Ok(hits)
+    Ok(PidFilterHits {
+        own_threads,
+        other_process: total.saturating_sub(own_threads),
+    })
 }
 
 #[cfg(test)]
@@ -908,10 +973,49 @@ mod tests {
         // Privileged lanes count hits; elsewhere the kernel answers.
         match probe_pid_filter_hits() {
             Ok(hits) => {
-                eprintln!("PIDFLT_PROBE hits={hits}");
-                assert!(hits <= 2, "{hits}");
+                eprintln!(
+                    "PIDFLT_PROBE own={} other={} proves={}",
+                    hits.own_threads,
+                    hits.other_process,
+                    hits.proves_pid_scope()
+                );
+                assert!(hits.own_threads <= 2 && hits.other_process <= 1, "{hits:?}");
             }
             Err(error) => assert!(error.raw_os_error().is_some(), "{error}"),
         }
+    }
+
+    /// Review L3: a link that ignores the pid (modelled by pid 0, which
+    /// every kernel treats as "every process") fires for the forked child
+    /// too, so the probe must not prove PID scope. On a kernel without
+    /// uprobe-multi or without privilege the kernel answers instead.
+    #[test]
+    fn a_pid_ignoring_filter_fails_the_negative_leg() {
+        match probe_pid_filter_with(0) {
+            Ok(hits) => {
+                eprintln!(
+                    "PIDFLT_PROBE_PID0 own={} other={}",
+                    hits.own_threads, hits.other_process
+                );
+                assert_eq!(hits.other_process, 1, "{hits:?}");
+                assert!(!hits.proves_pid_scope(), "{hits:?}");
+            }
+            Err(error) => assert!(error.raw_os_error().is_some(), "{error}"),
+        }
+    }
+
+    #[test]
+    fn only_both_own_threads_and_no_other_process_prove_pid_scope() {
+        let hits = |own_threads, other_process| PidFilterHits {
+            own_threads,
+            other_process,
+        };
+        assert!(hits(2, 0).proves_pid_scope());
+        assert!(
+            !hits(1, 0).proves_pid_scope(),
+            "the 6.9 thread-exact filter"
+        );
+        assert!(!hits(2, 1).proves_pid_scope(), "a pid-ignoring filter");
+        assert!(!hits(0, 0).proves_pid_scope(), "a probe that never fired");
     }
 }

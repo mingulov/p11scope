@@ -892,7 +892,8 @@ pub(crate) fn kernel_supports_multi() -> bool {
 /// Whether the running kernel's uprobe_multi pid filter covers every
 /// thread of the named process, proven once per run by a functional probe
 /// (`p11scope_bpf_multi::probe_pid_filter_hits`: a counting link with
-/// `pid` = self, called from this thread and a fresh sibling). A version
+/// `pid` = self, called from this thread and a fresh sibling, which must
+/// both fire, and from a forked child process, which must not). A version
 /// check would be wrong both ways: 6.6-6.9 shipped a thread-exact filter
 /// (`current != link->task`), fixed by "bpf: fix multi-uprobe PID
 /// filtering logic" in 6.10 and backported to 6.9.12 and 6.6.y, and
@@ -905,10 +906,16 @@ pub(crate) fn kernel_multi_pid_filter() -> std::result::Result<(), String> {
         std::sync::OnceLock::new();
     VERDICT
         .get_or_init(|| match p11scope_bpf_multi::probe_pid_filter_hits() {
-            Ok(2) => Ok(()),
+            Ok(hits) if hits.proves_pid_scope() => Ok(()),
+            Ok(hits) if hits.other_process > 0 => Err(format!(
+                "the kernel uprobe-multi pid filter also fired for another process \
+                 ({} hit(s)): it does not exclude other processes",
+                hits.other_process
+            )),
             Ok(hits) => Err(format!(
-                "the kernel uprobe-multi pid filter fired for {hits} of 2 threads of the \
-                 named process"
+                "the kernel uprobe-multi pid filter fired for {} of 2 threads of the \
+                 named process",
+                hits.own_threads
             )),
             Err(error) => Err(format!("the uprobe-multi pid filter probe failed: {error}")),
         })

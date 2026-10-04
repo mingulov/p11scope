@@ -91,7 +91,8 @@ attach::inventory::activation::privileged_tests::privileged_task4_inventory_phys
 # query across a nonleader exec, stop with a held call, and the leader-exit
 # probe (leader pthread_exit while a worker keeps calling). C5.11: the
 # foreign/reused-PID cell again with a PID-named uprobe-multi group (kernel
-# pid filter plus the in-BPF guard; needs the pid-filter probe to pass).
+# pid filter plus the in-BPF guard); where the pid-filter probe fails (5.15)
+# it asserts the PID-scoped Multi refusal instead.
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64

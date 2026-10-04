@@ -296,11 +296,30 @@ fn privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64()
 /// filter) plus the in-BPF PID_FILTER guard. A foreign process calling the
 /// same provider meanwhile, and a later process that reuses the target's
 /// PID, leave no row, no integrity row and no cookie.
+///
+/// On a kernel whose pid filter the probe does not prove (no uprobe-multi
+/// at all on 5.15, or a filter that misses threads or other processes),
+/// the property is the refusal instead: a PID-scoped Multi preparation
+/// fails naming the kernel pid filter, so `auto` lands on Singles.
 #[test]
 #[ignore = "root-owned live BPF lane; PID-scoped uprobe-multi excludes a foreign caller and a reused-PID process"]
 fn privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64() -> Result<()>
 {
-    crate::attach::kernel_multi_pid_filter().map_err(anyhow::Error::msg)?;
+    if let Err(reason) = crate::attach::kernel_multi_pid_filter() {
+        let a = OwnedFixture::build_n(false, 1)?;
+        let target = a.spawn()?;
+        let pin = PidPin::open(target.child.id()).map_err(anyhow::Error::msg)?;
+        let refused = match prepare_on(CaptureScope::Pid(pin), AttachBackend::Multi) {
+            Ok(_) => bail!("PID-scoped Multi prepared without a proven pid filter ({reason})"),
+            Err(error) => format!("{error:#}"),
+        };
+        ensure!(
+            refused.contains("kernel pid filter") && refused.contains(&reason),
+            "{refused}"
+        );
+        eprintln!("C3_PID_SCOPE backend=Multi refused={refused:?}");
+        return Ok(());
+    }
     pid_scope_excludes_foreign_and_reused_pid(AttachBackend::Multi)
 }
 

@@ -89,9 +89,12 @@ attach::inventory::activation::privileged_tests::privileged_task4_inventory_phys
 # late-provider extend, PID scope vs foreign and reused-PID callers (writes
 # /proc/sys/kernel/ns_last_pid to reuse the target's PID), pidfd cookie
 # query across a nonleader exec, stop with a held call, and the leader-exit
-# probe (leader pthread_exit while a worker keeps calling).
+# probe (leader pthread_exit while a worker keeps calling). C5.11: the
+# foreign/reused-PID cell again with a PID-named uprobe-multi group (kernel
+# pid filter plus the in-BPF guard; needs the pid-filter probe to pass).
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_leader_exit_probe_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_with_held_call_reports_unsettled_lp64

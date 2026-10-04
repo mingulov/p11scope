@@ -933,7 +933,7 @@ fn lifecycle_bytes(pid: u32) -> Vec<u8> {
 #[test]
 fn inventory_retirement_actual_fd_payload_is_send_without_sharing_target_cells() {
     fn assert_send<T: Send>() {}
-    assert_send::<RetirementWork<Vec<FdLink>>>();
+    assert_send::<RetirementWork<Vec<InventoryFd>>>();
     assert_send::<Arc<std::fs::File>>();
 }
 

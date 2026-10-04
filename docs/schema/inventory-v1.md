@@ -48,10 +48,24 @@ A native document adds to `observation`:
   `watched_no_use` intervals, which end at the last clean read before
   stop (`until_ns`), never through the stop itself.
 - `retirement`: `"closed"` when every probe link had its close attempt
-  within the stop budget (5 s plus 250 ms per attached endpoint, at most
-  10 s), `"unsettled"` when the budget passed first; then `gaps[]` also
-  holds `subject` `native capture retirement unsettled`, and the probes
-  are reclaimed (blocking) after the document is written.
+  within the stop budget (5 s plus 150 ms per per-offset link, or plus
+  100 ms per uprobe-multi link and 10 ms per entry in it; at most 10 s),
+  `"unsettled"` when the budget passed first; then `gaps[]` also holds
+  `subject` `native capture retirement unsettled`, and the probes are
+  reclaimed (blocking) after the document is written.
+- `attach` (additive): how the native lane attached the provider entries.
+  - `selection`: the operator's `--attach-backend`, `"auto"`, `"multi"`
+    or `"singles"`;
+  - `mechanism`: `"uprobe-multi"` (one immutable link per provider object
+    per extend, chosen by a functional probe) or `"per-offset"` (one link
+    per entry), spelled as the classic `evidence.attach_mechanisms`;
+  - `fallback`: why `auto` runs `"per-offset"` (the probe or the
+    uprobe-multi preparation failed), else `null`;
+  - `scope_filter`: under `--pid`, what keeps other processes out besides
+    the in-BPF PID guard: `"kernel-pid+bpf"` (the uprobe-multi links name
+    the target; the kernel pid filter was proven to cover every thread)
+    or `"perf-task+bpf"` (each per-offset link is bound to the target's
+    task); `null` under `--system`.
 - `lifecycle`: the lifecycle feed's own account. The native lane drains
   the kernel's lifecycle (exec and exit) ring every 10 ms, including while
   a pass collects `/proc` on a worker thread; it stages what it drained

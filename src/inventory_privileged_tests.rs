@@ -224,6 +224,10 @@ impl<L: CaptureLane<PidPin>> CaptureLane<PidPin> for Probe<L> {
         self.inner.domain()
     }
 
+    fn backend(&self) -> crate::inventory_capture::LaneBackend {
+        self.inner.backend()
+    }
+
     fn incarnation(&self) -> Option<ScopeIncarnation> {
         self.inner.incarnation()
     }
@@ -306,6 +310,7 @@ fn pid_probe(
     Ok(Probe::new(FacadeLane::prepare(
         crate::attach::capture::CaptureScope::Pid(pin),
         coordinator.attach_set().budget(),
+        crate::attach::BackendSelection::Auto,
     )?))
 }
 
@@ -469,6 +474,30 @@ fn privileged_native_lane_pid_lp64() -> Result<()> {
         "{:?}",
         stopped.summary
     );
+    // C5.11: `auto` takes uprobe-multi under PID scope exactly where the
+    // pid-filter probe proves the kernel filter, and discloses the filter.
+    let backend = &stopped.summary.backend;
+    let expected = if crate::attach::kernel_multi_pid_filter().is_ok() {
+        (
+            crate::attach::AttachBackend::Multi,
+            crate::inventory_capture::ScopeFilter::KernelPidAndBpf,
+        )
+    } else {
+        (
+            crate::attach::AttachBackend::Singles,
+            crate::inventory_capture::ScopeFilter::PerfTaskAndBpf,
+        )
+    };
+    ensure!(
+        (backend.backend, backend.scope_filter) == expected,
+        "{backend:?}"
+    );
+    eprintln!(
+        "C51_PID mechanism={} scope_filter={:?} fallback={:?}",
+        backend.mechanism(),
+        backend.scope_filter.label(),
+        backend.fallback
+    );
     eprintln!(
         "C51_PID target={} foreign={} passes={} reads={} rows={} bound={} unbound={} \
          coverage_after_activation_ns={} attached={} retired_ms={:?}",
@@ -599,6 +628,7 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
         Some(1 << 30),
         None,
         CaptureMode::Native,
+        crate::attach::BackendSelection::Auto,
         &stop,
         &|| reported.set(Some(Instant::now())),
         true,
@@ -713,6 +743,7 @@ fn run_product(
         Some(1 << 30),
         None,
         CaptureMode::Native,
+        crate::attach::BackendSelection::Auto,
         stop,
         &|| reported.set(Some(Instant::now())),
         false,

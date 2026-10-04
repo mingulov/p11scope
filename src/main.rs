@@ -99,6 +99,7 @@ fn run() -> Result<i32> {
                 a.event_rotate_bytes,
                 a.event_max_files,
                 a.capture,
+                a.attach_backend,
             )
             .map_err(|error| {
                 if error.is::<pidns::NumberingMismatch>() {

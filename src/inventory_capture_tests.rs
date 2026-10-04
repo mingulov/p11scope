@@ -644,7 +644,7 @@ impl PassDriver<Pin> for Scene {
 fn windows() -> LaneWindows {
     LaneWindows {
         retirement_base: Duration::from_millis(200),
-        retirement_per_endpoint: Duration::from_millis(50),
+        retirement_per_link: Duration::from_millis(50),
         ..LaneWindows::PROVISIONAL
     }
 }
@@ -689,7 +689,9 @@ fn run_ticking(
                     scene.note("publish:pass");
                     published.extend(report.events.iter().cloned());
                 }
-                Publish::Retiring { attached, budget } => {
+                Publish::Retiring {
+                    attached, budget, ..
+                } => {
                     scene.note(format!(
                         "publish:retiring {attached} {}",
                         budget.as_millis()
@@ -1061,12 +1063,59 @@ fn a_terminal_sweep_that_never_completes_is_bounded() {
 #[test]
 fn the_retirement_budget_grows_with_the_attached_endpoints_up_to_its_cap() {
     let windows = LaneWindows::PROVISIONAL;
+    let singles = |links| RetirementLoad {
+        backend: AttachBackend::Singles,
+        links,
+        endpoints: links,
+    };
     assert_eq!(PRE_OUTPUT_RETIREMENT_WAIT, Duration::from_secs(10));
-    assert_eq!(windows.retirement_budget(0), Duration::from_secs(5));
-    assert_eq!(windows.retirement_budget(8), Duration::from_millis(7_000));
-    assert_eq!(windows.retirement_budget(68), PRE_OUTPUT_RETIREMENT_WAIT);
     assert_eq!(
-        windows.retirement_budget(usize::MAX),
+        windows.retirement_budget(singles(0)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        windows.retirement_budget(singles(8)),
+        Duration::from_millis(6_200)
+    );
+    assert_eq!(
+        windows.retirement_budget(singles(68)),
+        PRE_OUTPUT_RETIREMENT_WAIT
+    );
+    assert_eq!(
+        windows.retirement_budget(singles(usize::MAX)),
+        PRE_OUTPUT_RETIREMENT_WAIT
+    );
+}
+
+/// C5.11: Multi's share is per group link plus each member's walk, so a
+/// system scope of hundreds of endpoints in a few groups budgets seconds,
+/// not the cap; the same endpoints as Singles links reach the cap.
+#[test]
+fn the_multi_retirement_budget_counts_group_links_and_member_walks() {
+    let windows = LaneWindows::PROVISIONAL;
+    let multi = RetirementLoad {
+        backend: AttachBackend::Multi,
+        links: 12,
+        endpoints: 400,
+    };
+    // 5 s + 12 x 100 ms + 400 x 10 ms = 10.2 s, capped.
+    assert_eq!(windows.retirement_budget(multi), PRE_OUTPUT_RETIREMENT_WAIT);
+    let small = RetirementLoad {
+        backend: AttachBackend::Multi,
+        links: 3,
+        endpoints: 68,
+    };
+    assert_eq!(
+        windows.retirement_budget(small),
+        Duration::from_millis(5_000 + 300 + 680)
+    );
+    let as_singles = RetirementLoad {
+        backend: AttachBackend::Singles,
+        links: 70,
+        endpoints: 68,
+    };
+    assert_eq!(
+        windows.retirement_budget(as_singles),
         PRE_OUTPUT_RETIREMENT_WAIT
     );
 }
@@ -1305,7 +1354,9 @@ fn the_display_ticks_after_each_lane_service_without_reordering_it() {
         &mut |scene: &mut Scene, point| {
             match point {
                 Publish::Pass { .. } => scene.note("publish:pass"),
-                Publish::Retiring { attached, budget } => scene.note(format!(
+                Publish::Retiring {
+                    attached, budget, ..
+                } => scene.note(format!(
                     "publish:retiring {attached} {}",
                     budget.as_millis()
                 )),
@@ -1854,4 +1905,156 @@ fn the_collection_worker_hands_back_its_value_or_its_panic() {
         panic.downcast_ref::<&str>().copied(),
         Some("scripted collection panic")
     );
+}
+
+// ---- C5.11: backend selection and disclosure --------------------------------
+
+mod backend_selection {
+    use crate::attach::{AttachBackend, BackendSelection};
+    use crate::inventory_capture::{LaneBackend, prepare_on_backend};
+    use anyhow::anyhow;
+    use std::cell::RefCell;
+
+    /// Runs the resolution with a scripted probe and preparation, and
+    /// returns the outcome plus every backend a preparation was tried on.
+    fn resolve(
+        selection: BackendSelection,
+        probe: Result<(), &str>,
+        multi_prepares: bool,
+    ) -> (anyhow::Result<LaneBackend>, Vec<AttachBackend>, bool) {
+        let tried = RefCell::new(Vec::new());
+        let probed = RefCell::new(false);
+        let outcome = prepare_on_backend(
+            selection,
+            || {
+                *probed.borrow_mut() = true;
+                probe.map_err(String::from)
+            },
+            |backend| {
+                tried.borrow_mut().push(backend);
+                if backend == AttachBackend::Multi && !multi_prepares {
+                    return Err(anyhow!("multi load refused"));
+                }
+                Ok(backend)
+            },
+        )
+        .map(|(prepared, chosen)| {
+            assert_eq!(
+                prepared, chosen.backend,
+                "the prepared backend is disclosed"
+            );
+            chosen
+        });
+        (outcome, tried.into_inner(), probed.into_inner())
+    }
+
+    #[test]
+    fn auto_on_a_multi_kernel_attaches_multi_after_a_linking_probe() {
+        let (chosen, tried, probed) = resolve(BackendSelection::Auto, Ok(()), true);
+        let chosen = chosen.unwrap();
+        assert_eq!(chosen.backend, AttachBackend::Multi);
+        assert_eq!(chosen.mechanism(), "uprobe-multi");
+        assert_eq!(chosen.selection_label(), "auto");
+        assert_eq!(chosen.fallback, None);
+        assert!(probed);
+        assert_eq!(
+            tried,
+            [AttachBackend::Multi],
+            "no Singles object was loaded"
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_to_singles_for_the_whole_capture_when_the_probe_fails() {
+        let (chosen, tried, _) = resolve(BackendSelection::Auto, Err("EOPNOTSUPP"), true);
+        let chosen = chosen.unwrap();
+        assert_eq!(chosen.backend, AttachBackend::Singles);
+        assert_eq!(chosen.mechanism(), "per-offset");
+        assert!(
+            chosen
+                .fallback
+                .as_deref()
+                .is_some_and(|reason| reason.contains("functional probe failed: EOPNOTSUPP")),
+            "{chosen:?}"
+        );
+        assert_eq!(tried, [AttachBackend::Singles], "Multi was never loaded");
+    }
+
+    #[test]
+    fn auto_retries_a_failed_multi_preparation_once_on_singles() {
+        let (chosen, tried, _) = resolve(BackendSelection::Auto, Ok(()), false);
+        let chosen = chosen.unwrap();
+        assert_eq!(chosen.backend, AttachBackend::Singles);
+        assert!(
+            chosen
+                .fallback
+                .as_deref()
+                .is_some_and(|reason| reason.contains("multi load refused"))
+        );
+        assert_eq!(tried, [AttachBackend::Multi, AttachBackend::Singles]);
+    }
+
+    /// The owner directive: a capability probe, never the kernel version,
+    /// decides; `auto` always asks the probe.
+    #[test]
+    fn auto_always_asks_the_probe_whatever_the_kernel_version() {
+        let (_, _, probed) = resolve(BackendSelection::Auto, Ok(()), true);
+        assert!(probed);
+        let (chosen, tried, probed) = resolve(BackendSelection::Auto, Err("EINVAL"), true);
+        assert!(probed);
+        assert_eq!(chosen.unwrap().backend, AttachBackend::Singles);
+        assert_eq!(tried, [AttachBackend::Singles]);
+    }
+
+    #[test]
+    fn forced_multi_surfaces_the_refusal_and_never_falls_back() {
+        let (chosen, tried, _) = resolve(BackendSelection::Multi, Err("ENOSYS"), true);
+        let error = chosen.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--attach-backend multi") && tried.is_empty(),
+            "{error:#} {tried:?}"
+        );
+        let (chosen, tried, _) = resolve(BackendSelection::Multi, Ok(()), false);
+        assert!(chosen.is_err());
+        assert_eq!(
+            tried,
+            [AttachBackend::Multi],
+            "forced Multi never tries Singles"
+        );
+        let (chosen, _, _) = resolve(BackendSelection::Multi, Ok(()), true);
+        assert_eq!(chosen.unwrap().backend, AttachBackend::Multi);
+    }
+
+    #[test]
+    fn forced_singles_never_probes() {
+        let (chosen, tried, probed) = resolve(BackendSelection::Singles, Ok(()), true);
+        assert_eq!(chosen.unwrap().backend, AttachBackend::Singles);
+        assert!(!probed);
+        assert_eq!(tried, [AttachBackend::Singles]);
+    }
+
+    /// The security review's rule at the facade: a PID-scoped Multi
+    /// capture needs the proven kernel pid filter. Unprivileged, the probe
+    /// cannot run, so the refusal names the filter before anything loads.
+    #[test]
+    fn a_pid_scoped_multi_capture_needs_the_proven_kernel_pid_filter() {
+        use crate::attach::capture::{CaptureScope, InventoryCapture, caller_budget};
+        if crate::attach::kernel_multi_pid_filter().is_ok() {
+            return; // privileged on a fixed kernel: the privileged cells cover it
+        }
+        let budget = crate::capacity::InventoryBudget::new(4, 32).unwrap();
+        let pin = crate::process::PidPin::open(std::process::id()).unwrap();
+        let error = InventoryCapture::prepare(
+            CaptureScope::Pid(pin),
+            budget,
+            caller_budget(budget, 2).unwrap(),
+            AttachBackend::Multi,
+        )
+        .err()
+        .expect("a PID-scoped Multi capture was prepared without the pid filter");
+        assert!(
+            format!("{error:#}").contains("kernel pid filter"),
+            "{error:#}"
+        );
+    }
 }

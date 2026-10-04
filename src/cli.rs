@@ -159,6 +159,9 @@ pub struct InventoryArgs {
     pub event_max_files: Option<usize>,
     /// `--capture`: which usage lane runs; `auto` by default.
     pub capture: CaptureMode,
+    /// `--attach-backend`: how the native lane attaches its usage entries
+    /// (C5.11); `auto` by default. The scan lane attaches nothing.
+    pub attach_backend: BackendSelection,
 }
 
 /// `inventory --capture`: the usage lane (Task 6 C5.1, plan §10 ruling D1).
@@ -255,8 +258,8 @@ pub const USAGE: &str = "usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
@@ -270,7 +273,8 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --attach-backend selects the static probe backend: auto (default) uses one
 multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
 multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links.
+export probes always use per-offset links. inventory --attach-backend auto picks multi
+wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -305,7 +309,8 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --attach-backend selects the static probe backend: auto (default) uses one
 multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
 multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links.
+export probes always use per-offset links. inventory --attach-backend auto picks multi
+wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -336,7 +341,8 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --attach-backend selects the static probe backend: auto (default) uses one
 multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
 multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links.
+export probes always use per-offset links. inventory --attach-backend auto picks multi
+wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -368,7 +374,8 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --attach-backend selects the static probe backend: auto (default) uses one
 multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
 multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links.
+export probes always use per-offset links. inventory --attach-backend auto picks multi
+wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -398,7 +405,8 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --attach-backend selects the static probe backend: auto (default) uses one
 multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
 multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links.
+export probes always use per-offset links. inventory --attach-backend auto picks multi
+wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -427,7 +435,8 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --attach-backend selects the static probe backend: auto (default) uses one
 multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
 multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links.
+export probes always use per-offset links. inventory --attach-backend auto picks multi
+wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -444,8 +453,8 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// shared notes footer. Every line is verbatim from [`USAGE`]; update
 /// both together when the CLI changes.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -457,7 +466,8 @@ nothing, auto only when the child would otherwise load unobserved, always on eve
 --attach-backend selects the static probe backend: auto (default) uses one
 multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
 multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links.
+export probes always use per-offset links. inventory --attach-backend auto picks multi
+wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -823,6 +833,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut event_rotate_bytes: Option<u64> = None;
     let mut event_max_files: Option<usize> = None;
     let mut capture: Option<CaptureMode> = None;
+    let mut attach_backend: Option<BackendSelection> = None;
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inventory)),
@@ -841,6 +852,14 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                         )));
                     }
                 });
+            }
+            "--attach-backend" => {
+                if attach_backend.is_some() {
+                    return Err(usage_err("--attach-backend given twice"));
+                }
+                let v = require_value(&mut args, "--attach-backend")?;
+                attach_backend =
+                    Some(BackendSelection::from_cli(&v).map_err(|e| usage_err(format!("{e:#}")))?);
             }
             "--pid" => {
                 if pid.is_some() {
@@ -968,6 +987,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         event_rotate_bytes,
         event_max_files,
         capture: capture.unwrap_or(CaptureMode::Auto),
+        attach_backend: attach_backend.unwrap_or_default(),
     })
 }
 
@@ -1683,6 +1703,52 @@ mod tests {
             for line in lines {
                 assert!(line.contains("[--capture auto|scan|native]"), "{line}");
             }
+        }
+    }
+
+    /// C5.11: `inventory --attach-backend` selects the native lane's attach
+    /// backend; `auto` by default, each value parsed, repeats refused, and
+    /// both usage lines carry it.
+    #[test]
+    fn inventory_attach_backend_defaults_to_auto_and_parses_each_value() {
+        use crate::attach::BackendSelection;
+        let Command::Inventory(plain) = parse(args(&["inventory", "--system"])).unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(plain.attach_backend, BackendSelection::Auto);
+        for (word, expected) in [
+            ("auto", BackendSelection::Auto),
+            ("multi", BackendSelection::Multi),
+            ("singles", BackendSelection::Singles),
+        ] {
+            let Command::Inventory(i) =
+                parse(args(&["inventory", "--system", "--attach-backend", word])).unwrap()
+            else {
+                panic!("expected inventory")
+            };
+            assert_eq!(i.attach_backend, expected);
+        }
+        assert!(matches!(
+            parse(args(&["inventory", "--system", "--attach-backend", "both"])),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--system", "--attach-backend", "multi", "--attach-backend", "singles"
+            ])),
+            Err(CliError::Usage(m)) if m.contains("given twice")
+        ));
+        for help in [USAGE, INVENTORY_HELP] {
+            let lines: Vec<&str> = help
+                .lines()
+                .filter(|line| line.contains("p11scope inventory"))
+                .collect();
+            assert_eq!(lines.len(), 2);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| line.contains("[--attach-backend auto|multi|singles]"))
+            );
         }
     }
 
@@ -2434,8 +2500,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 4130);
-        assert_eq!(hash, 0x95db75fe_fe9c7c59);
+        assert_eq!(USAGE.len(), 4357);
+        assert_eq!(hash, 0x34b4b83f_6e1799bd);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

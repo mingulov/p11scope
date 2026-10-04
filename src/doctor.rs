@@ -992,7 +992,7 @@ fn libc_path_in_maps(bytes: &[u8]) -> Option<PathBuf> {
 /// at `getpid`, else the observer's own entry point (static builds, which
 /// map no libc). Either site only proves attach works — the probe is dropped
 /// immediately without ever firing.
-fn self_probe_anchor() -> Result<(PathBuf, u64), String> {
+pub(crate) fn self_probe_anchor() -> Result<(PathBuf, u64), String> {
     if let Ok(libc) = own_libc_path() {
         let file =
             std::fs::File::open(&libc).map_err(|e| format!("open {}: {e}", libc.display()))?;

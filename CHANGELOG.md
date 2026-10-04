@@ -9,6 +9,20 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Inventory
 
+- The native lane of `inventory` attaches provider entries as uprobe-multi
+  links wherever a functional probe shows the kernel supports them (6.6+,
+  including distribution backports; never decided by version), one
+  immutable link per provider object per extend instead of one per entry.
+  Stopping a system-scale capture no longer waits on several kernel grace
+  periods per entry: hundreds of entries detach in well under a second on
+  6.12 and 7.x, so `observation.retirement` reads `closed` where it used to
+  read `unsettled`. `--pid` uses uprobe-multi only where the kernel pid
+  filter is proven to cover every thread of the target (Linux 6.6 to
+  6.9.11 shipped a thread-exact one), and keeps per-offset links bound to
+  the target otherwise. New `inventory --attach-backend auto|multi|singles`;
+  `observation.attach` (additive within `p11scope/inventory/v1`) discloses
+  the selection, mechanism, any fallback reason and the PID scope filter.
+  The stop budget now counts kernel links per backend.
 - The native lane of `inventory` keeps servicing the kernel's lifecycle
   ring while a pass collects `/proc`: the collection runs on a worker
   thread and the ring is drained every 10 ms, so a busy host's exec churn

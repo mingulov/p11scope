@@ -18,12 +18,11 @@ fn budget(n: u64) -> InventoryBudget {
 const N: u64 = 128;
 
 fn prepare(scope: CaptureScope) -> Result<InventoryCapture> {
-    InventoryCapture::prepare(
-        scope,
-        budget(N),
-        caller_budget(budget(N), 64)?,
-        AttachBackend::Singles,
-    )
+    prepare_on(scope, AttachBackend::Singles)
+}
+
+fn prepare_on(scope: CaptureScope, backend: AttachBackend) -> Result<InventoryCapture> {
+    InventoryCapture::prepare(scope, budget(N), caller_budget(budget(N), 64)?, backend)
 }
 
 fn read_window() -> ReadWindow {
@@ -289,6 +288,23 @@ fn spawn_with_pid(fixture: &OwnedFixture, pid: u32) -> Result<OwnedCaller> {
 #[test]
 #[ignore = "root-owned live BPF lane; PID scope excludes a foreign caller and a reused-PID process"]
 fn privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64() -> Result<()> {
+    pid_scope_excludes_foreign_and_reused_pid(AttachBackend::Singles)
+}
+
+/// C5.11 security review: the same cell with the entries in one
+/// uprobe-multi group named by the target's PID (the proven kernel pid
+/// filter) plus the in-BPF PID_FILTER guard. A foreign process calling the
+/// same provider meanwhile, and a later process that reuses the target's
+/// PID, leave no row, no integrity row and no cookie.
+#[test]
+#[ignore = "root-owned live BPF lane; PID-scoped uprobe-multi excludes a foreign caller and a reused-PID process"]
+fn privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64() -> Result<()>
+{
+    crate::attach::kernel_multi_pid_filter().map_err(anyhow::Error::msg)?;
+    pid_scope_excludes_foreign_and_reused_pid(AttachBackend::Multi)
+}
+
+fn pid_scope_excludes_foreign_and_reused_pid(backend: AttachBackend) -> Result<()> {
     let a = OwnedFixture::build_n(false, 4)?;
     let mut set = InventoryAttachSet::new(budget(N));
     let delta = absorb(&mut set, &[&a]);
@@ -296,7 +312,8 @@ fn privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64()
     let mut foreign = a.spawn()?;
     let pid = target.child.id();
     let pin = PidPin::open(pid).map_err(anyhow::Error::msg)?;
-    let mut capture = prepare(CaptureScope::Pid(pin))?;
+    let mut capture = prepare_on(CaptureScope::Pid(pin), backend)?;
+    ensure!(capture.backend() == backend);
     let fds_before = fd_count();
     let receipt = capture.extend(delta, &set, extend_window());
     report_cost("pid-4", &receipt, fds_before, fd_count());
@@ -304,6 +321,13 @@ fn privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64()
         receipt.attached.len() == 4 && receipt.custody == Some(ScopeCustody::PidHeld),
         "{receipt:?}"
     );
+    ensure!(
+        (backend == AttachBackend::Multi) == (receipt.groups.len() == 1),
+        "{:?}",
+        receipt.groups
+    );
+    // Interleaved: both processes stay live with the probes attached.
+    foreign.calls(0, 2)?;
     target.calls(0, 2)?;
     foreign.calls(1, 2)?;
     foreign.calls(0, 2)?;
@@ -328,8 +352,13 @@ fn privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64()
         capture.query_cookie(foreign.pin.as_ref().context("foreign pin")?) == CookieQuery::NoCookie,
         "the foreign caller entered an instrumented endpoint"
     );
+    ensure!(
+        batch.integrity_total == 0,
+        "integrity rows: {:?}",
+        batch.integrity
+    );
     eprintln!(
-        "C3_PID_SCOPE target={pid} foreign={} rows=1",
+        "C3_PID_SCOPE backend={backend:?} target={pid} foreign={} rows=1",
         foreign.child.id()
     );
 
@@ -357,7 +386,7 @@ fn privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64()
     );
     ensure!(matches!(capture.custody(), ScopeCustody::PidLost { .. }));
     ensure!(capture.failure().is_some() && capture.phase() == CapturePhase::Retiring);
-    eprintln!("C3_PID_REUSE_EXCLUDED pid={pid} rows=0 custody=lost");
+    eprintln!("C3_PID_REUSE_EXCLUDED backend={backend:?} pid={pid} rows=0 custody=lost");
     reused.finish()?;
     foreign.finish()?;
     let retired = stop(capture)?;

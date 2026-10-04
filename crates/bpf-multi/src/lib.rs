@@ -418,6 +418,190 @@ pub fn bisect_attach<T>(
     Ok((links, bad))
 }
 
+/// `BPF_MAP_CREATE` / `BPF_MAP_LOOKUP_ELEM` command numbers and the array
+/// map type (`linux/bpf.h`).
+const BPF_MAP_CREATE: u32 = 0;
+const BPF_MAP_LOOKUP_ELEM: u32 = 1;
+const BPF_MAP_TYPE_ARRAY: u32 = 2;
+
+/// `BPF_MAP_CREATE` attr head (map_type .. map_flags); the kernel
+/// zero-fills the rest of a shorter attr.
+#[repr(C)]
+struct MapCreateAttr {
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    map_flags: u32,
+}
+
+/// `BPF_MAP_*_ELEM` attr (`map_fd`, `key`, `value`, `flags`).
+#[repr(C)]
+struct MapElemAttr {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
+const _: () = assert!(size_of::<MapCreateAttr>() == 20);
+const _: () = assert!(size_of::<MapElemAttr>() == 32);
+
+/// One eBPF instruction (`struct bpf_insn`).
+const fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
+    let off = off.to_le_bytes();
+    let imm = imm.to_le_bytes();
+    [
+        code,
+        (src << 4) | dst,
+        off[0],
+        off[1],
+        imm[0],
+        imm[1],
+        imm[2],
+        imm[3],
+    ]
+}
+
+/// The counting probe program: `ARRAY[0] += 1` (atomic) on every hit.
+/// `map_fd` is patched into the `ld_imm64` pseudo-map-fd pair.
+fn counting_insns(map_fd: i32) -> Vec<u8> {
+    [
+        insn(0x62, 10, 0, -4, 0),    // *(u32 *)(r10 - 4) = 0
+        insn(0xbf, 2, 10, 0, 0),     // r2 = r10
+        insn(0x07, 2, 0, 0, -4),     // r2 += -4
+        insn(0x18, 1, 1, 0, map_fd), // r1 = map (BPF_PSEUDO_MAP_FD)
+        insn(0x00, 0, 0, 0, 0),      //   (ld_imm64 high half)
+        insn(0x85, 0, 0, 0, 1),      // call bpf_map_lookup_elem
+        insn(0x15, 0, 0, 2, 0),      // if r0 == 0 goto +2
+        insn(0xb7, 1, 0, 0, 1),      // r1 = 1
+        insn(0xdb, 0, 1, 0, 0),      // lock *(u64 *)(r0 + 0) += r1
+        insn(0xb7, 0, 0, 0, 0),      // r0 = 0
+        insn(0x95, 0, 0, 0, 0),      // exit
+    ]
+    .concat()
+}
+
+/// The probe's own target: a local function the probe links, then calls.
+#[inline(never)]
+#[unsafe(no_mangle)]
+pub extern "C" fn p11scope_multi_pid_filter_probe_target(value: u64) -> u64 {
+    std::hint::black_box(value) ^ 0x5a
+}
+
+/// The file offset and attach path of a function of this executable,
+/// resolved through `/proc/self/maps` (PIE or not). The path is the
+/// `/proc/self/exe` magic link, which names the mapped file even when its
+/// pathname was replaced.
+fn own_function_offset(address: usize) -> io::Result<(std::path::PathBuf, u64)> {
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    let exe = std::fs::read_link("/proc/self/exe")?;
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(perms), Some(offset)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let path = fields.nth(2).unwrap_or("");
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let parse = |hex: &str| usize::from_str_radix(hex, 16).ok();
+        let (Some(start), Some(end), Some(offset)) = (parse(start), parse(end), parse(offset))
+        else {
+            continue;
+        };
+        if (start..end).contains(&address) && perms.contains('x') {
+            if Path::new(path) != exe {
+                return Err(io::Error::other(format!(
+                    "the probe target is mapped from {path}, not the executable {}",
+                    exe.display()
+                )));
+            }
+            return Ok(("/proc/self/exe".into(), (address - start + offset) as u64));
+        }
+    }
+    Err(io::Error::other(
+        "the probe target is in no executable mapping",
+    ))
+}
+
+/// Functional check of the kernel's uprobe_multi pid filter. One counting
+/// link with `pid` = this process on a local function, which the calling
+/// thread and then a freshly spawned sibling thread call once each.
+/// Returns the hits: 2 when the filter covers every thread of the process
+/// (fixed kernels compare the mm or the thread group), 1 when it covers
+/// only the named task (the 6.9 thread bug: `current != link->task`, fixed
+/// by "bpf: fix multi-uprobe PID filtering logic" in 6.10, backported to
+/// 6.9.12 and 6.6.y), 0 when the probe never fired. The link, program and
+/// map are dropped before return.
+pub fn probe_pid_filter_hits() -> io::Result<u64> {
+    let mut map_attr: MapCreateAttr = zeroed();
+    map_attr.map_type = BPF_MAP_TYPE_ARRAY;
+    map_attr.key_size = 4;
+    map_attr.value_size = 8;
+    map_attr.max_entries = 1;
+    let map = bpf(
+        BPF_MAP_CREATE,
+        std::ptr::addr_of_mut!(map_attr).cast(),
+        size_of::<MapCreateAttr>(),
+    )?;
+    // SAFETY: bpf() returned a fresh owned fd.
+    let map = unsafe { OwnedFd::from_raw_fd(map) };
+    use std::os::fd::AsRawFd as _;
+    let insns = counting_insns(map.as_raw_fd());
+    let mut attr: ProgAttr = zeroed();
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    attr.insn_cnt = (insns.len() / 8) as u32;
+    attr.insns = insns.as_ptr() as u64;
+    attr.license = c"GPL".as_ptr() as u64;
+    let name = b"p11scope_pidflt";
+    attr.prog_name[..name.len()].copy_from_slice(name);
+    attr.expected_attach_type = BPF_TRACE_UPROBE_MULTI;
+    let prog = bpf(
+        BPF_PROG_LOAD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<ProgAttr>(),
+    )?;
+    // SAFETY: bpf() returned a fresh owned fd.
+    let prog = unsafe { OwnedFd::from_raw_fd(prog) };
+    let target = p11scope_multi_pid_filter_probe_target as extern "C" fn(u64) -> u64;
+    let (path, offset) = own_function_offset(target as usize)?;
+    let link = attach_group(
+        prog.as_raw_fd(),
+        std::process::id(),
+        &path,
+        &[offset],
+        &[1],
+        false,
+    )?;
+    let call = std::hint::black_box(target);
+    call(1);
+    std::thread::Builder::new()
+        .name("p11scope-pidflt".into())
+        .spawn(move || call(2))?
+        .join()
+        .map_err(|_| io::Error::other("the probe's sibling thread panicked"))?;
+    drop(link);
+    let key = 0u32;
+    let mut hits = 0u64;
+    let mut elem = MapElemAttr {
+        map_fd: map.as_raw_fd() as u32,
+        _pad: 0,
+        key: std::ptr::addr_of!(key) as u64,
+        value: std::ptr::addr_of_mut!(hits) as u64,
+        flags: 0,
+    };
+    bpf(
+        BPF_MAP_LOOKUP_ELEM,
+        std::ptr::addr_of_mut!(elem).cast(),
+        size_of::<MapElemAttr>(),
+    )?;
+    Ok(hits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +799,37 @@ mod tests {
         assert!(matches!(halted, GroupHalt::Unsupported(_)), "{halted:?}");
         // Halts stop the walk: exactly one attempt each, nothing refused.
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn the_counting_probe_program_is_eleven_insns_with_a_patched_map_fd() {
+        let insns = counting_insns(7);
+        assert_eq!(insns.len(), 11 * 8);
+        // ld_imm64 with src = BPF_PSEUDO_MAP_FD and the fd in imm.
+        assert_eq!(&insns[24..32], &[0x18, 0x11, 0, 0, 7, 0, 0, 0]);
+        // The branch skips exactly the two increment insns.
+        assert_eq!(&insns[48..56], &[0x15, 0x00, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(insns[80], 0x95, "ends with exit");
+    }
+
+    #[test]
+    fn the_probe_target_resolves_to_an_executable_file_offset() {
+        let target = p11scope_multi_pid_filter_probe_target as extern "C" fn(u64) -> u64;
+        let (path, offset) = own_function_offset(target as usize).unwrap();
+        assert_eq!(path, std::path::Path::new("/proc/self/exe"));
+        assert!(offset > 0);
+        assert_eq!(target(1), 1 ^ 0x5a);
+    }
+
+    #[test]
+    fn the_pid_filter_probe_reaches_the_kernel() {
+        // Privileged lanes count hits; elsewhere the kernel answers.
+        match probe_pid_filter_hits() {
+            Ok(hits) => {
+                eprintln!("PIDFLT_PROBE hits={hits}");
+                assert!(hits <= 2, "{hits}");
+            }
+            Err(error) => assert!(error.raw_os_error().is_some(), "{error}"),
+        }
     }
 }

@@ -33,14 +33,39 @@
 //!   record, a failed discovery quantum) make custody `PidUnproven`.
 //!   System scope has no custody: the earliest lifecycle loss rides every
 //!   later witness batch as a sticky `lifecycle_loss` instead.
-//! - (f) Singles only; Multi stays refused.
+//! - (f) Backends (C5.11): Singles attaches one perf link per entry. Multi
+//!   attaches each extend's entries as uprobe-multi attach groups, one per
+//!   (object, entry program): every member is published before the group's
+//!   link exists, the pin is checked before and after the group, custody
+//!   after it. A group is an immutable offset set: a later extend adds new
+//!   groups and never touches an existing one, no endpoint is ever a member
+//!   of two live groups, and nothing detaches a group (or any member of
+//!   one) before stop, which closes every group whole. Should a member
+//!   ever need retirement or replacement before stop, the explicit group
+//!   rebuild rule applies (system-scale plan Task 2.3: retire the whole
+//!   group, publish the gap, then rebuild or demote it whole); there is no
+//!   such path today, because endpoints only grow, a failed endpoint is
+//!   never retried, and a changed pin demotes coverage, not links. The
+//!   kernel isolates refused sites (bisect), so they fail one by one; a
+//!   post-attach failure fails every member, its links kept in custody.
+//!   Scope filtering (C5.11 security review): System scope links use
+//!   pid 0 (every process is in scope). PID scope links name the target
+//!   (the kernel pid filter, which holds the target's task: a process
+//!   that later reuses the PID never fires them) and keep the in-BPF
+//!   PID_FILTER tgid guard as defence in depth. `prepare` admits a
+//!   PID-scoped Multi capture only when the functional probe
+//!   ([`crate::attach::kernel_multi_pid_filter`]) proved the kernel filter
+//!   covers every thread; a pid-0 group under PID scope would rest on the
+//!   tgid *number* alone, which a reused PID passes.
 //! - (g) Health: a counter rise is a `health_regression` (once per rise);
 //!   unreadable health or a poisoned OWNER_CTL is a non-sticky
 //!   `health_unproven` that only withholds that pass's watches.
 //!
-//! Costs: one perf link and one FD per attached endpoint (plus two roots
-//! and the DISCOVERY ring); `prepare` raises RLIMIT_NOFILE and refuses
-//! with [`CaptureCapacityLimited`] (`fds`) unless N + 3 + a reserve fit.
+//! Costs: Singles holds one perf link and one FD per attached endpoint;
+//! Multi one FD per attach group (plus one per kernel-isolated refused
+//! site's split), both plus two roots and the DISCOVERY ring. `prepare`
+//! raises RLIMIT_NOFILE and refuses with [`CaptureCapacityLimited`]
+//! (`fds`) unless the backend's link bound + 3 + a reserve fit.
 //! Retained objects are shared clones of the attach set's open files (no
 //! new FDs). A witness read costs two syscalls per visited row, keeps a
 //! seen set bounded by the pair limit P, and rechecks at most
@@ -49,10 +74,10 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::activation::{
-    ActiveInventory, InventoryEndpoint, InventoryHealthSnapshot, InventoryLinkIo, InventoryLinked,
-    InventoryState, InventoryTargets, RetiredInventory, RetiringInventory,
-    attach_published_entry_with, require_live_pid_custody, service_inventory_discovery_with,
-    validate_entry,
+    ActiveInventory, InventoryEndpoint, InventoryGroupRequest, InventoryHealthSnapshot,
+    InventoryLinkIdentity, InventoryLinkIo, InventoryLinked, InventoryState, InventoryTargets,
+    RetiredInventory, RetiringInventory, attach_published_entry_with, require_live_pid_custody,
+    service_inventory_discovery_with, validate_entry,
 };
 use super::callers::{CallerRowFault, CallerUseCursor};
 use super::{AttachBackend, PreparedInventory, Scope};
@@ -82,8 +107,18 @@ const HEALTH_READ_BUDGET: Duration = Duration::from_millis(50);
 /// Held object pins rechecked per witness read (round-robin).
 pub(crate) const PIN_RECHECK_PER_READ: usize = 64;
 
-/// Descriptors kept free beyond N + 3 (pidfds, the caller's own files).
+/// Descriptors kept free beyond the link bound + 3 (pidfds, the caller's
+/// own files).
 pub(crate) const FD_RESERVE: u64 = 64;
+
+/// Multi's link bound for the descriptor preflight: one link per attach
+/// group, and a group per (object, entry program) of one extend, so a
+/// capture holds about one link per provider object per extend that grew
+/// it, far below N. Only a kernel-isolated refused site splits a group
+/// into more links (bisect leaves). A capture that outgrows this bound
+/// meets EMFILE, which defers the rest explicitly (`fd_exhausted`), as for
+/// Singles.
+pub(crate) const MULTI_LINK_BOUND: u64 = 1024;
 
 /// The named resource of a descriptor refusal (`CapacityLimited("fds")`).
 pub(crate) const FD_RESOURCE: &str = "fds";
@@ -103,20 +138,40 @@ impl fmt::Display for CaptureCapacityLimited {
 
 impl std::error::Error for CaptureCapacityLimited {}
 
-/// The descriptor preflight: N entry links + 2 roots + the DISCOVERY ring
-/// + `FD_RESERVE` must fit what the soft limit leaves free.
+/// The entry links a capture may hold: one per endpoint under Singles, at
+/// most [`MULTI_LINK_BOUND`] (and never more than N) under Multi.
+pub(crate) fn entry_link_bound(backend: AttachBackend, endpoint_limit: u64) -> u64 {
+    match backend {
+        AttachBackend::Singles => endpoint_limit,
+        AttachBackend::Multi => endpoint_limit.min(MULTI_LINK_BOUND),
+    }
+}
+
+/// The descriptor preflight: the backend's entry-link bound + 2 roots +
+/// the DISCOVERY ring + `FD_RESERVE` must fit what the soft limit leaves
+/// free.
 fn fd_preflight(
+    backend: AttachBackend,
     endpoint_limit: u64,
     soft_limit: u64,
     in_use: u64,
 ) -> std::result::Result<(), CaptureCapacityLimited> {
-    let needed = endpoint_limit.saturating_add(3).saturating_add(FD_RESERVE);
+    let links = entry_link_bound(backend, endpoint_limit);
+    let needed = links.saturating_add(3).saturating_add(FD_RESERVE);
     let free = soft_limit.saturating_sub(in_use);
     if needed > free {
+        let what = match backend {
+            AttachBackend::Singles => format!(
+                "N={endpoint_limit} entries need {needed} descriptors (N + 3 + {FD_RESERVE} reserve)"
+            ),
+            AttachBackend::Multi => format!(
+                "N={endpoint_limit} entries in up to {links} attach-group links need {needed} descriptors ({links} + 3 + {FD_RESERVE} reserve)"
+            ),
+        };
         return Err(CaptureCapacityLimited {
             resource: FD_RESOURCE,
             detail: format!(
-                "N={endpoint_limit} entries need {needed} descriptors (N + 3 + {FD_RESERVE} reserve) but RLIMIT_NOFILE {soft_limit} leaves {free} free ({in_use} in use)"
+                "{what} but RLIMIT_NOFILE {soft_limit} leaves {free} free ({in_use} in use)"
             ),
         });
     }
@@ -339,6 +394,21 @@ impl ExecCoverage {
     }
 }
 
+/// One attach group the capture created (Multi): its kernel links and its
+/// members never change; it is closed whole, at stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttachGroup {
+    /// The group's serial in this capture (its links' identity).
+    pub serial: u32,
+    pub object: AttachObjectId,
+    pub program: &'static str,
+    /// Members whose sites the kernel holds, in delta order.
+    pub members: Vec<EndpointId>,
+    /// Kernel links the group holds (one, unless the kernel refused a site
+    /// and the group was split around it).
+    pub links: usize,
+}
+
 /// What one `extend` did. Every endpoint of the delta lands in exactly one
 /// of `attached`, `failed`, `known`, or `deferred`.
 #[derive(Debug, Default)]
@@ -361,9 +431,12 @@ pub(crate) struct ExtendReceipt {
     /// Why nothing was attempted, when the whole extend refused.
     pub refused: Option<String>,
     pub custody: Option<ScopeCustody>,
-    /// Attach cost: total and worst single-entry wall time.
+    /// Attach cost: total and worst single-attach wall time (one entry
+    /// under Singles, one group under Multi).
     pub attach_ns_total: u64,
     pub attach_ns_max: u64,
+    /// The attach groups this extend created (Multi; empty under Singles).
+    pub groups: Vec<AttachGroup>,
 }
 
 /// A positive physical-use witness that passed validation.
@@ -693,6 +766,11 @@ pub(crate) struct CleanupSummary {
 struct CaptureBook {
     domain: NativeDomainId,
     budget: InventoryBudget,
+    /// The backend this capture attaches entries with (fixed at prepare).
+    backend: AttachBackend,
+    /// Every attach group created so far (Multi), in creation order. Each
+    /// endpoint is a member of at most one; bounded by N members.
+    groups: Vec<AttachGroup>,
     pair_limit: usize,
     scope: Option<ScopeIncarnation>,
     /// Endpoint → object for every ENDPOINT_OBJECT binding this capture
@@ -745,6 +823,8 @@ impl CaptureBook {
         Self {
             domain: NativeDomainId::mint(),
             budget,
+            backend: AttachBackend::Singles,
+            groups: Vec::new(),
             pair_limit,
             scope,
             published: BTreeMap::new(),
@@ -769,6 +849,11 @@ impl CaptureBook {
             recheck_after: None,
             stopping: false,
         }
+    }
+
+    fn with_backend(mut self, backend: AttachBackend) -> Self {
+        self.backend = backend;
+        self
     }
 
     fn scope_pid(&self) -> Option<u32> {
@@ -1054,9 +1139,123 @@ fn monotonic_ns() -> u64 {
 }
 
 /// The incremental entry transaction over any link IO (the fake one in
-/// unit tests). `custody` is the PID-scope check; `now` stamps attaches.
+/// unit tests), under the book's backend. `custody` is the PID-scope
+/// check; `now` stamps attaches.
 #[allow(clippy::too_many_arguments)]
 fn extend_entries_with<I: InventoryLinkIo>(
+    io: &mut I,
+    targets: &mut InventoryTargets,
+    links: &mut Vec<InventoryLinked<I::Link>>,
+    book: &mut CaptureBook,
+    delta: TargetDelta,
+    source: &dyn CaptureTargets,
+    window: ExtendWindow,
+    custody: &mut dyn FnMut() -> std::result::Result<(), String>,
+    now: &mut dyn FnMut() -> u64,
+    receipt: &mut ExtendReceipt,
+) {
+    match book.backend {
+        AttachBackend::Singles => extend_singles_with(
+            io, targets, links, book, delta, source, window, custody, now, receipt,
+        ),
+        AttachBackend::Multi => extend_groups_with(
+            io, targets, links, book, delta, source, window, custody, now, receipt,
+        ),
+    }
+}
+
+/// The endpoints of `delta[from..]` this capture has not handled, deferred.
+fn defer_unknown(book: &CaptureBook, receipt: &mut ExtendReceipt, rest: &[AttachEndpoint]) {
+    let rest: Vec<AttachEndpoint> = rest
+        .iter()
+        .filter(|endpoint| !book.knows(endpoint.id.0))
+        .copied()
+        .collect();
+    defer(receipt, &rest);
+}
+
+/// One endpoint's pre-attach transaction, shared by both backends: the
+/// object's retained pin (a shared clone of the attach set's), the entry
+/// record and its validation, and the ENDPOINT_OBJECT binding published
+/// (or, for a published-but-unattached entry, the standing binding
+/// checked). `None`: the endpoint failed and is recorded as failed.
+fn admit_entry<I: InventoryLinkIo>(
+    io: &mut I,
+    targets: &mut InventoryTargets,
+    book: &mut CaptureBook,
+    endpoint: &AttachEndpoint,
+    source: &dyn CaptureTargets,
+    receipt: &mut ExtendReceipt,
+) -> Option<InventoryEndpoint> {
+    let local = PinnedObjectId(endpoint.object.index());
+    let entry = InventoryEndpoint {
+        id: endpoint.id.0,
+        object: local,
+        file_offset: endpoint.file_offset,
+        abi: endpoint.abi,
+    };
+    // Published but unattached (an earlier attach hit EMFILE): the
+    // binding and the entry record stand; only the attach is retried.
+    let republish = !book.published.contains_key(&entry.id);
+    if republish && !targets.holds_object(local) {
+        match source.target(endpoint.object) {
+            Some(target) => targets.retain_object(local, target.share()),
+            None => {
+                book.fail(
+                    receipt,
+                    endpoint,
+                    format!(
+                        "the attach set holds no retained target for object {}",
+                        endpoint.object.index()
+                    ),
+                    false,
+                );
+                return None;
+            }
+        }
+    }
+    if republish {
+        let checked = targets
+            .record_entry(entry)
+            .and_then(|()| validate_entry(targets, &entry))
+            .and_then(|()| {
+                targets
+                    .check_object(local)
+                    .with_context(|| format!("before publishing Inventory endpoint {}", entry.id))
+            });
+        if let Err(error) = checked {
+            book.fail(receipt, endpoint, format!("{error:#}"), false);
+            return None;
+        }
+        if let Err(error) = io
+            .publish_endpoint(entry.id, entry.object)
+            .with_context(|| format!("publishing Inventory endpoint {}", entry.id))
+        {
+            // The cell's content is unknown: no binding is recorded, so
+            // a row naming this endpoint is integrity evidence.
+            book.fail(receipt, endpoint, format!("{error:#}"), false);
+            return None;
+        }
+        book.published.insert(entry.id, endpoint.object);
+    } else if book.published.get(&entry.id) != Some(&endpoint.object) {
+        book.fail(
+            receipt,
+            endpoint,
+            format!(
+                "Inventory endpoint {} was published for another object",
+                entry.id
+            ),
+            false,
+        );
+        return None;
+    }
+    Some(entry)
+}
+
+/// Singles: one perf link per entry, each published, attached and checked
+/// before the next.
+#[allow(clippy::too_many_arguments)]
+fn extend_singles_with<I: InventoryLinkIo>(
     io: &mut I,
     targets: &mut InventoryTargets,
     links: &mut Vec<InventoryLinked<I::Link>>,
@@ -1075,12 +1274,7 @@ fn extend_entries_with<I: InventoryLinkIo>(
             continue;
         }
         if attempted >= window.max_entries || Instant::now() >= window.deadline {
-            let rest: Vec<AttachEndpoint> = delta.endpoints[index..]
-                .iter()
-                .filter(|endpoint| !book.knows(endpoint.id.0))
-                .copied()
-                .collect();
-            defer(receipt, &rest);
+            defer_unknown(book, receipt, &delta.endpoints[index..]);
             receipt.known.extend(
                 delta.endpoints[index..]
                     .iter()
@@ -1090,68 +1284,9 @@ fn extend_entries_with<I: InventoryLinkIo>(
             return;
         }
         attempted += 1;
-        let local = PinnedObjectId(endpoint.object.index());
-        let entry = InventoryEndpoint {
-            id: endpoint.id.0,
-            object: local,
-            file_offset: endpoint.file_offset,
-            abi: endpoint.abi,
-        };
-        // Published but unattached (an earlier attach hit EMFILE): the
-        // binding and the entry record stand; only the attach is retried.
-        let republish = !book.published.contains_key(&entry.id);
-        if republish && !targets.holds_object(local) {
-            match source.target(endpoint.object) {
-                Some(target) => targets.retain_object(local, target.share()),
-                None => {
-                    book.fail(
-                        receipt,
-                        endpoint,
-                        format!(
-                            "the attach set holds no retained target for object {}",
-                            endpoint.object.index()
-                        ),
-                        false,
-                    );
-                    continue;
-                }
-            }
-        }
-        if republish {
-            let checked = targets
-                .record_entry(entry)
-                .and_then(|()| validate_entry(targets, &entry))
-                .and_then(|()| {
-                    targets.check_object(local).with_context(|| {
-                        format!("before publishing Inventory endpoint {}", entry.id)
-                    })
-                });
-            if let Err(error) = checked {
-                book.fail(receipt, endpoint, format!("{error:#}"), false);
-                continue;
-            }
-            if let Err(error) = io
-                .publish_endpoint(entry.id, entry.object)
-                .with_context(|| format!("publishing Inventory endpoint {}", entry.id))
-            {
-                // The cell's content is unknown: no binding is recorded, so
-                // a row naming this endpoint is integrity evidence.
-                book.fail(receipt, endpoint, format!("{error:#}"), false);
-                continue;
-            }
-            book.published.insert(entry.id, endpoint.object);
-        } else if book.published.get(&entry.id) != Some(&endpoint.object) {
-            book.fail(
-                receipt,
-                endpoint,
-                format!(
-                    "Inventory endpoint {} was published for another object",
-                    entry.id
-                ),
-                false,
-            );
+        let Some(entry) = admit_entry(io, targets, book, endpoint, source, receipt) else {
             continue;
-        }
+        };
         let before = links.len();
         let started = Instant::now();
         let attached = attach_published_entry_with(io, targets, &entry, links);
@@ -1164,12 +1299,7 @@ fn extend_entries_with<I: InventoryLinkIo>(
                 // Descriptors ran out: nothing about this entry is wrong.
                 // It stays published-unattached; it and the rest defer.
                 receipt.fd_exhausted = true;
-                let rest: Vec<AttachEndpoint> = delta.endpoints[index..]
-                    .iter()
-                    .filter(|endpoint| !book.knows(endpoint.id.0))
-                    .copied()
-                    .collect();
-                defer(receipt, &rest);
+                defer_unknown(book, receipt, &delta.endpoints[index..]);
                 return;
             }
             Err(error) => {
@@ -1185,12 +1315,7 @@ fn extend_entries_with<I: InventoryLinkIo>(
             );
             book.mark_lost(reason.clone());
             book.fail(receipt, endpoint, reason, retained);
-            let rest: Vec<AttachEndpoint> = delta.endpoints[index + 1..]
-                .iter()
-                .filter(|endpoint| !book.knows(endpoint.id.0))
-                .copied()
-                .collect();
-            defer(receipt, &rest);
+            defer_unknown(book, receipt, &delta.endpoints[index + 1..]);
             return;
         }
         book.attached.insert(entry.id);
@@ -1199,6 +1324,233 @@ fn extend_entries_with<I: InventoryLinkIo>(
             object: endpoint.object,
             at_ns: now(),
         });
+    }
+}
+
+/// The entry program of `abi`, the same choice for both backends.
+fn entry_program(abi: p11scope_manifest::elf::ElfAbi) -> &'static str {
+    match abi {
+        p11scope_manifest::elf::ElfAbi::Lp64 => "p11_usage_entry_lp64",
+        p11scope_manifest::elf::ElfAbi::Ilp32 => "p11_usage_entry_ia32",
+    }
+}
+
+/// A group's key: the local object id and the entry program.
+type GroupKey = (u32, &'static str);
+/// One admitted group member: its endpoint and published entry.
+type GroupMember = (AttachEndpoint, InventoryEndpoint);
+
+/// Multi: the window's new entries are admitted (published) first, then
+/// attached as one immutable uprobe-multi group per (object, entry
+/// program), in object order. Nothing here detaches, replaces, or extends
+/// an existing group: a later extend's entries form new groups.
+#[allow(clippy::too_many_arguments)]
+fn extend_groups_with<I: InventoryLinkIo>(
+    io: &mut I,
+    targets: &mut InventoryTargets,
+    links: &mut Vec<InventoryLinked<I::Link>>,
+    book: &mut CaptureBook,
+    delta: TargetDelta,
+    source: &dyn CaptureTargets,
+    window: ExtendWindow,
+    custody: &mut dyn FnMut() -> std::result::Result<(), String>,
+    now: &mut dyn FnMut() -> u64,
+    receipt: &mut ExtendReceipt,
+) {
+    // Admission: the same per-entry transaction and window as Singles.
+    let mut attempted = 0usize;
+    let mut admitted: Vec<(AttachEndpoint, InventoryEndpoint)> = Vec::new();
+    for (index, endpoint) in delta.endpoints.iter().enumerate() {
+        // An endpoint submitted twice in one delta is admitted once (the
+        // Singles path finds it attached by then).
+        if book.knows(endpoint.id.0) || admitted.iter().any(|(seen, _)| seen.id == endpoint.id) {
+            receipt.known.push(endpoint.id);
+            continue;
+        }
+        if attempted >= window.max_entries || Instant::now() >= window.deadline {
+            defer_unknown(book, receipt, &delta.endpoints[index..]);
+            receipt.known.extend(
+                delta.endpoints[index..]
+                    .iter()
+                    .filter(|endpoint| book.knows(endpoint.id.0))
+                    .map(|endpoint| endpoint.id),
+            );
+            break;
+        }
+        attempted += 1;
+        if let Some(entry) = admit_entry(io, targets, book, endpoint, source, receipt) {
+            admitted.push((*endpoint, entry));
+        }
+    }
+    // Grouping: one group per (object, entry program), members in delta
+    // order. Every member's binding is already published.
+    let mut groups: BTreeMap<GroupKey, Vec<GroupMember>> = BTreeMap::new();
+    for (endpoint, entry) in admitted {
+        groups
+            .entry((entry.object.0, entry_program(entry.abi)))
+            .or_default()
+            .push((endpoint, entry));
+    }
+    let mut pending: Vec<_> = groups.into_iter().collect();
+    pending.reverse();
+    while let Some(((object, program), members)) = pending.pop() {
+        let defer_members = |receipt: &mut ExtendReceipt,
+                             members: &[GroupMember],
+                             rest: &[(GroupKey, Vec<GroupMember>)]| {
+            let deferred: Vec<AttachEndpoint> = members
+                .iter()
+                .chain(rest.iter().flat_map(|(_, members)| members))
+                .map(|(endpoint, _)| *endpoint)
+                .collect();
+            defer(receipt, &deferred);
+        };
+        // A published-but-unattached group retries its attach only.
+        if Instant::now() >= window.deadline {
+            defer_members(receipt, &members, &pending);
+            return;
+        }
+        let local = PinnedObjectId(object);
+        let fail_all = |book: &mut CaptureBook,
+                        receipt: &mut ExtendReceipt,
+                        members: &[(AttachEndpoint, InventoryEndpoint)],
+                        reason: &str,
+                        retained: bool| {
+            for (endpoint, _) in members {
+                book.fail(receipt, endpoint, reason.to_string(), retained);
+            }
+        };
+        if let Err(error) = targets
+            .check_object(local)
+            .with_context(|| format!("before Inventory group of object {object}"))
+        {
+            fail_all(book, receipt, &members, &format!("{error:#}"), false);
+            continue;
+        }
+        let Some(path) = targets.attach_path(local) else {
+            fail_all(
+                book,
+                receipt,
+                &members,
+                "missing Inventory target pin",
+                false,
+            );
+            continue;
+        };
+        let sites: Vec<(u64, u64)> = members
+            .iter()
+            .map(|(_, entry)| {
+                (
+                    entry.file_offset,
+                    (u64::from(p11scope_ebpf_common::INVENTORY_COOKIE_TAG) << 32)
+                        | u64::from(entry.id),
+                )
+            })
+            .collect();
+        let started = Instant::now();
+        let attached = io.attach_entry_group(InventoryGroupRequest {
+            program,
+            path: &path,
+            sites: &sites,
+        });
+        let spent = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        receipt.attach_ns_total = receipt.attach_ns_total.saturating_add(spent);
+        receipt.attach_ns_max = receipt.attach_ns_max.max(spent);
+        let attach = match attached {
+            Ok(attach) => attach,
+            Err(p11scope_bpf_multi::GroupHalt::Exhausted(_)) => {
+                // No link was acquired: the members stay published-
+                // unattached and they and every later group defer.
+                receipt.fd_exhausted = true;
+                defer_members(receipt, &members, &pending);
+                return;
+            }
+            Err(p11scope_bpf_multi::GroupHalt::Unsupported(error)) => {
+                // The backend was chosen before any producer existed; a
+                // kernel refusing it now fails the group, never silently
+                // falls back (no fresh object after observations).
+                fail_all(
+                    book,
+                    receipt,
+                    &members,
+                    &format!("uprobe-multi refused by the running kernel: {error}"),
+                    false,
+                );
+                continue;
+            }
+        };
+        let serial = u32::try_from(book.groups.len()).unwrap_or(u32::MAX);
+        let before = links.len();
+        // Custody first, before any post-acquisition check can fail.
+        for handle in attach.links {
+            links.push(InventoryLinked {
+                target: InventoryLinkIdentity::EntryGroup(serial),
+                handle,
+            });
+        }
+        let retained = links.len() > before;
+        let refused: BTreeMap<usize, std::io::Error> = attach.refused.into_iter().collect();
+        let mut accepted = Vec::with_capacity(members.len());
+        for (index, (endpoint, entry)) in members.iter().enumerate() {
+            match refused.get(&index) {
+                Some(error) => book.fail(
+                    receipt,
+                    endpoint,
+                    format!(
+                        "attaching Inventory entry {} in group {serial}: {error}",
+                        entry.id
+                    ),
+                    false,
+                ),
+                None => accepted.push((*endpoint, *entry)),
+            }
+        }
+        let post = links[before..]
+            .iter()
+            .find_map(|link| io.attachment_error(&link.handle))
+            .map(|error| anyhow::anyhow!(error))
+            .map_or_else(
+                || {
+                    targets
+                        .check_object(local)
+                        .with_context(|| format!("during Inventory group {serial} attachment"))
+                },
+                Err,
+            );
+        if retained {
+            book.groups.push(AttachGroup {
+                serial,
+                object: members[0].0.object,
+                program,
+                members: accepted.iter().map(|(endpoint, _)| endpoint.id).collect(),
+                links: links.len() - before,
+            });
+            receipt.groups.push(book.groups.last().unwrap().clone());
+        }
+        if let Err(error) = post {
+            // Every accepted member fails; the group's links stay owned
+            // until stop closes them whole.
+            fail_all(book, receipt, &accepted, &format!("{error:#}"), retained);
+            continue;
+        }
+        if accepted.is_empty() {
+            continue;
+        }
+        if let Err(reason) = custody() {
+            let reason = format!("PID custody lost after attaching group {serial}: {reason}");
+            book.mark_lost(reason.clone());
+            fail_all(book, receipt, &accepted, &reason, retained);
+            defer_members(receipt, &[], &pending);
+            return;
+        }
+        let at_ns = now();
+        for (endpoint, entry) in accepted {
+            book.attached.insert(entry.id);
+            receipt.attached.push(AttachedEndpoint {
+                id: endpoint.id,
+                object: endpoint.object,
+                at_ns,
+            });
+        }
     }
 }
 
@@ -1230,8 +1582,13 @@ impl InventoryCapture {
         callers: CallerBudget,
         backend: AttachBackend,
     ) -> Result<Self> {
-        if backend != AttachBackend::Singles {
-            bail!("Inventory capture supports Singles only");
+        if backend == AttachBackend::Multi && matches!(scope, CaptureScope::Pid(_)) {
+            crate::attach::kernel_multi_pid_filter().map_err(|reason| {
+                anyhow::anyhow!(
+                    "Inventory PID capture refuses uprobe-multi: its groups must carry the \
+                     kernel pid filter, and {reason}"
+                )
+            })?;
         }
         let (scope, pin) = match scope {
             CaptureScope::System => (Scope::System, None),
@@ -1245,21 +1602,51 @@ impl InventoryCapture {
             start_time: pin.start_time(),
         });
         // Every entry link costs a descriptor (the `Session::start`
-        // precedent): raise first, then prove N + 3 + reserve fit.
+        // precedent): raise first, then prove the backend's link bound + 3
+        // + reserve fit.
         let soft_limit = crate::process::raise_nofile().context("reading RLIMIT_NOFILE")?;
-        fd_preflight(endpoints.endpoint_limit(), soft_limit as u64, fds_in_use()?)?;
+        fd_preflight(
+            backend,
+            endpoints.endpoint_limit(),
+            soft_limit as u64,
+            fds_in_use()?,
+        )?;
         // The seen set's bound IS the CALLER_USE capacity (pair precondition).
         let pair_limit = super::callers::seen_limit(callers)?;
         let prepared =
             PreparedInventory::prepare_callers_pinned(scope, pin, endpoints, callers, backend)?;
         Ok(Self {
             state: CaptureState::Prepared(Box::new(prepared)),
-            book: CaptureBook::new(endpoints, pair_limit, incarnation, monotonic_ns()),
+            book: CaptureBook::new(endpoints, pair_limit, incarnation, monotonic_ns())
+                .with_backend(backend),
         })
     }
 
     pub(crate) fn domain(&self) -> NativeDomainId {
         self.book.domain
+    }
+
+    /// The backend this capture attaches entries with.
+    pub(crate) fn backend(&self) -> AttachBackend {
+        self.book.backend
+    }
+
+    /// The attach groups created so far (Multi; empty under Singles).
+    pub(crate) fn groups(&self) -> &[AttachGroup] {
+        &self.book.groups
+    }
+
+    /// The kernel links this capture holds now: the lifecycle roots plus
+    /// every entry link (one per endpoint under Singles, one per group
+    /// leaf under Multi). Zero before activation.
+    pub(crate) fn live_links(&self) -> usize {
+        match &self.state {
+            CaptureState::Active(active) => active.state().live_links(),
+            CaptureState::Failed { retiring, .. } => {
+                retiring.state().map_or(0, InventoryState::live_links)
+            }
+            CaptureState::Prepared(_) | CaptureState::Moving => 0,
+        }
     }
 
     /// The PID incarnation this capture covers (`None` for the machine).

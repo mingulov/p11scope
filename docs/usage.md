@@ -774,6 +774,27 @@ Limits that matter in pods:
   gap `native capture lifecycle evidence lost`, demotes every
   `watched_no_use` interval it may affect, and starts the next pass at
   once (`recovery_rescans`; never two in a row).
+  `--attach-backend auto|multi|singles` (default `auto`) selects how the
+  native lane attaches the provider entries. `auto` decides by a
+  functional probe once per run, never by the kernel version: where the
+  kernel links a uprobe-multi probe, each extend's new entries attach as
+  one immutable uprobe-multi link per provider object (one file
+  descriptor instead of one per entry, and a stop that closes hundreds
+  of entries in well under a second on 6.12 and 7.x, against 35-95 ms
+  per entry for per-offset links); otherwise (5.15) every entry gets its
+  own per-offset link. Under `--pid` the probe must also prove that the
+  kernel's uprobe-multi pid filter covers every thread of the named
+  process: the links then name the target, so no other process — not one
+  that later reuses the PID — traps or runs the probe, and the in-BPF PID
+  guard stays as a second check; where the filter is not proven (Linux
+  6.6 to 6.9.11 shipped a thread-exact filter) `auto` keeps per-offset
+  links bound to the target. `multi` forces uprobe-multi and fails
+  naming why where it is unavailable; `singles` forces per-offset links.
+  The document discloses the choice in `observation.attach`
+  (`selection`, `mechanism` `uprobe-multi` or `per-offset`, `fallback`,
+  `scope_filter`), and the start and stop lines name the mechanism. The
+  stop's wait budget is 5 s plus 150 ms per per-offset link, or 100 ms
+  per uprobe-multi link plus 10 ms per entry in it, at most 10 s.
   `native`
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can

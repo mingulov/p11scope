@@ -82,6 +82,8 @@ impl SetFixture {
 enum Op {
     Publish(u32, u32),
     Attach(u32),
+    /// One uprobe-multi link over these endpoint IDs (Multi).
+    Group(&'static str, Vec<u32>),
 }
 
 #[derive(Default)]
@@ -109,6 +111,8 @@ struct FakeIo {
     poison: BTreeSet<u32>,
     /// attach() fails with EMFILE (no link) for these endpoint IDs.
     emfile: BTreeSet<u32>,
+    /// attach_entry_group() halts as an unsupported kernel would.
+    unsupported: bool,
 }
 
 fn entry_id(cookie: u64) -> u32 {
@@ -161,6 +165,58 @@ impl InventoryLinkIo for FakeIo {
             .contains(&link.1)
             .then(|| format!("post-acquisition failure on {}", link.1))
     }
+
+    /// One link per group, the kernel's bisect modelled exactly: refused
+    /// sites fail alone and the accepted ones share one link; EMFILE or an
+    /// unsupported kernel halt with no link. The link carries the group's
+    /// first accepted ID (so `poison` can target a group).
+    fn attach_entry_group(
+        &mut self,
+        request: InventoryGroupRequest<'_>,
+    ) -> std::result::Result<
+        super::super::activation::InventoryGroupAttach<Self::Link>,
+        p11scope_bpf_multi::GroupHalt,
+    > {
+        let ids: Vec<u32> = request
+            .sites
+            .iter()
+            .map(|(_, cookie)| entry_id(*cookie))
+            .collect();
+        if self.unsupported {
+            return Err(p11scope_bpf_multi::GroupHalt::Unsupported(
+                std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+            ));
+        }
+        if ids.iter().any(|id| self.emfile.contains(id)) {
+            return Err(p11scope_bpf_multi::GroupHalt::Exhausted(
+                std::io::Error::from_raw_os_error(libc::EMFILE),
+            ));
+        }
+        let refused: Vec<(usize, std::io::Error)> = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| self.refuse.contains(id))
+            .map(|(index, _)| (index, std::io::Error::from_raw_os_error(libc::EINVAL)))
+            .collect();
+        let accepted: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.refuse.contains(id))
+            .collect();
+        let mut links = Vec::new();
+        if let Some(first) = accepted.first().copied() {
+            let mut log = self.log.lock().unwrap();
+            log.ops.push(Op::Group(request.program, accepted));
+            log.live += 1;
+            links.push((
+                FakeLink {
+                    log: self.log.clone(),
+                },
+                first,
+            ));
+        }
+        Ok(super::super::activation::InventoryGroupAttach { links, refused })
+    }
 }
 
 struct Harness {
@@ -180,6 +236,62 @@ impl Harness {
             book: test_book(n, 16, scope_pid),
             clock: 1_000,
         }
+    }
+
+    /// A Multi capture's harness: entries attach as groups.
+    fn multi(n: u64, scope_pid: Option<u32>) -> Self {
+        let mut harness = Self::new(n, scope_pid);
+        harness.book.backend = AttachBackend::Multi;
+        harness
+    }
+
+    /// The groups the IO created, in order: (program, member IDs).
+    fn group_ops(&self) -> Vec<(&'static str, Vec<u32>)> {
+        self.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Group(program, ids) => Some((program, ids)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The capture-wide group invariants: every endpoint is a member of at
+    /// most one group, every member is attached, every group's links are
+    /// still in custody under that group's identity, and no Singles link
+    /// exists beside groups.
+    fn assert_group_invariants(&self) {
+        let mut seen = BTreeSet::new();
+        for group in &self.book.groups {
+            for member in &group.members {
+                assert!(
+                    seen.insert(member.0),
+                    "endpoint {} is a member of two groups: {:?}",
+                    member.0,
+                    self.book.groups
+                );
+            }
+            let held = self
+                .links
+                .iter()
+                .filter(|link| {
+                    link.target
+                        == super::super::activation::InventoryLinkIdentity::EntryGroup(group.serial)
+                })
+                .count();
+            assert_eq!(held, group.links, "group {} link custody", group.serial);
+        }
+        assert!(
+            self.links.iter().all(|link| !matches!(
+                link.target,
+                super::super::activation::InventoryLinkIdentity::Entry(_)
+            )),
+            "a Singles link beside groups"
+        );
+        assert!(
+            self.book.attached.iter().all(|id| seen.contains(id)),
+            "an attached endpoint outside every group"
+        );
     }
 
     fn extend_with_custody(
@@ -223,7 +335,7 @@ impl Harness {
             .into_iter()
             .filter_map(|op| match op {
                 Op::Attach(id) => Some(id),
-                Op::Publish(..) => None,
+                Op::Publish(..) | Op::Group(..) => None,
             })
             .collect()
     }
@@ -481,15 +593,16 @@ fn pid_scope_without_a_live_original_pidfd_refuses_before_anything_loads() {
     .expect("an exited PID target was accepted");
     assert!(format!("{error:#}").contains("exited"), "{error:#}");
 
-    let error = InventoryCapture::prepare(
+    // C5.11: the facade admits Multi; an unprivileged run fails only at
+    // the object load, never at a backend refusal.
+    if let Err(error) = InventoryCapture::prepare(
         CaptureScope::System,
         budget(4),
         caller_budget(budget(4), 2).unwrap(),
         AttachBackend::Multi,
-    )
-    .err()
-    .expect("Multi was accepted");
-    assert!(format!("{error:#}").contains("Singles"), "{error:#}");
+    ) {
+        assert!(!format!("{error:#}").contains("Singles"), "{error:#}");
+    }
 }
 
 #[test]
@@ -523,15 +636,15 @@ fn capture_activation_admits_pid_only_with_matching_live_custody() {
         .unwrap_err();
         assert!(format!("{error:#}").contains(expected), "{error:#}");
     }
-    let error = super::super::activation::validate_capture_activation(
+    // C5.11: the capture path admits Multi (its entries attach as groups).
+    super::super::activation::validate_capture_activation(
         &Scope::System,
         None,
         AttachBackend::Multi,
         budget(4),
         &targets,
     )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("Singles"));
+    .unwrap();
 }
 
 #[test]
@@ -1100,8 +1213,8 @@ fn an_emfile_attach_stops_the_window_defers_and_retries_without_republishing() {
 fn the_fd_preflight_refuses_a_named_fds_capacity() {
     // N + 2 roots + DISCOVERY + reserve must fit the free soft limit.
     let need = 128 + 3 + FD_RESERVE;
-    assert!(fd_preflight(128, need + 10, 10).is_ok());
-    let refused = fd_preflight(128, need + 10, 11).unwrap_err();
+    assert!(fd_preflight(AttachBackend::Singles, 128, need + 10, 10).is_ok());
+    let refused = fd_preflight(AttachBackend::Singles, 128, need + 10, 11).unwrap_err();
     assert_eq!(refused.resource, FD_RESOURCE);
     assert!(
         refused.to_string().starts_with("capacity limited (fds)"),
@@ -1113,7 +1226,7 @@ fn the_fd_preflight_refuses_a_named_fds_capacity() {
         Some(&refused)
     );
     assert!(
-        fd_preflight(u64::MAX, 1 << 20, 0).is_err(),
+        fd_preflight(AttachBackend::Singles, u64::MAX, 1 << 20, 0).is_err(),
         "N saturates, never wraps"
     );
     assert!(fds_in_use().unwrap() > 2);
@@ -1857,4 +1970,277 @@ fn a_clock_failure_never_becomes_the_undatable_floor() {
     );
     failed_service(&mut book, 220);
     assert_eq!(loss_at(&book), 0, "an unstamped creation proves no drain");
+}
+
+// ---- C5.11: uprobe-multi attach groups -----------------------------------
+
+#[test]
+fn a_multi_extend_attaches_one_group_per_object_after_publishing_every_member() {
+    let mut fixture = SetFixture::new(64);
+    let _ = fixture.pass("a.so", 3);
+    let _ = fixture.pass("b.so", 2);
+    let mut both = TargetDelta {
+        endpoints: fixture.set.endpoints().copied().collect(),
+        objects: vec![],
+    };
+    assert_eq!(delta_ids(&both), [0, 1, 2, 3, 4]);
+    let mut harness = Harness::multi(64, None);
+    let receipt = harness.extend(std::mem::take(&mut both), &fixture.set);
+    assert_eq!(ids(&receipt.attached), [0, 1, 2, 3, 4]);
+    assert!(receipt.failed.is_empty() && receipt.deferred.endpoints.is_empty());
+    assert_eq!(
+        harness.group_ops(),
+        [
+            ("p11_usage_entry_lp64", vec![0, 1, 2]),
+            ("p11_usage_entry_lp64", vec![3, 4])
+        ],
+        "one link per (object, program)"
+    );
+    assert!(harness.attached_ops().is_empty(), "no Singles attach");
+    // Every member's binding is published before its group's link exists.
+    let ops = harness.ops();
+    for (position, op) in ops.iter().enumerate() {
+        if let Op::Group(_, members) = op {
+            for id in members {
+                let publish = ops
+                    .iter()
+                    .position(|op| matches!(op, Op::Publish(endpoint, _) if endpoint == id))
+                    .unwrap();
+                assert!(publish < position, "member {id} published after its group");
+            }
+        }
+    }
+    assert_eq!(harness.links.len(), 2);
+    assert_eq!(receipt.groups.len(), 2);
+    assert_eq!(receipt.groups[0].members.len(), 3);
+    assert_eq!(receipt.groups[1].links, 1);
+    // A group's members share one attach instant, stamped after its checks.
+    assert_eq!(receipt.attached[0].at_ns, receipt.attached[2].at_ns);
+    assert!(receipt.attached[2].at_ns < receipt.attached[3].at_ns);
+    harness.assert_group_invariants();
+}
+
+#[test]
+fn a_later_multi_extend_adds_a_new_group_and_never_touches_an_existing_one() {
+    let mut fixture = SetFixture::new(64);
+    let first = fixture.pass("a.so", 3);
+    let mut harness = Harness::multi(64, None);
+    let receipt = harness.extend(first.clone(), &fixture.set);
+    assert_eq!(ids(&receipt.attached), [0, 1, 2]);
+    let live_before = harness.io.log.lock().unwrap().live;
+    let ops_before = harness.ops().len();
+
+    // The next pass re-presents A and adds B: only B forms a group.
+    let second = fixture.pass("b.so", 2);
+    let mut both = first;
+    both.append(second);
+    let receipt = harness.extend(both, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [3, 4]);
+    assert_eq!(
+        receipt.known.iter().map(|id| id.0).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    // The old group's link was neither closed nor recreated: one more link
+    // only, and the IO saw exactly one new group (B's), nothing for A.
+    assert_eq!(harness.io.log.lock().unwrap().live, live_before + 1);
+    assert_eq!(
+        harness.ops()[ops_before..]
+            .iter()
+            .filter(|op| matches!(op, Op::Group(..)))
+            .cloned()
+            .collect::<Vec<_>>(),
+        [Op::Group("p11_usage_entry_lp64", vec![3, 4])]
+    );
+    assert_eq!(harness.book.groups.len(), 2);
+    assert_eq!(
+        harness.book.groups[0]
+            .members
+            .iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>(),
+        [0, 1, 2],
+        "the first group's members are unchanged"
+    );
+    harness.assert_group_invariants();
+
+    // A resubmission of everything forms no group at all.
+    let all = TargetDelta {
+        endpoints: fixture.set.endpoints().copied().collect(),
+        objects: vec![],
+    };
+    let receipt = harness.extend(all, &fixture.set);
+    assert!(receipt.attached.is_empty() && receipt.groups.is_empty());
+    assert_eq!(harness.group_ops().len(), 2);
+    harness.assert_group_invariants();
+}
+
+#[test]
+fn a_kernel_refused_site_fails_alone_and_its_siblings_stay_in_one_group() {
+    let mut fixture = SetFixture::new(64);
+    let delta = fixture.pass("a.so", 5);
+    let mut harness = Harness::multi(64, None);
+    harness.io.refuse.insert(1);
+    let receipt = harness.extend(delta.clone(), &fixture.set);
+    assert_eq!(ids(&receipt.attached), [0, 2, 3, 4]);
+    let failed: Vec<(u32, bool)> = receipt
+        .failed
+        .iter()
+        .map(|failure| (failure.id.0, failure.link_retained))
+        .collect();
+    assert_eq!(failed, [(1, false)]);
+    assert!(receipt.failed[0].reason.contains("in group 0"));
+    assert_eq!(
+        harness.book.groups[0]
+            .members
+            .iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>(),
+        [0, 2, 3, 4]
+    );
+    // The refused endpoint is never retried.
+    harness.io.refuse.clear();
+    let again = harness.extend(delta, &fixture.set);
+    assert!(again.attached.is_empty() && again.groups.is_empty());
+    harness.assert_group_invariants();
+}
+
+#[test]
+fn a_post_attach_failure_fails_every_member_and_keeps_the_group_link() {
+    let mut fixture = SetFixture::new(64);
+    let first = fixture.pass("a.so", 3);
+    let second = fixture.pass("b.so", 2);
+    let mut harness = Harness::multi(64, None);
+    // The group link of A carries its first member, 0.
+    harness.io.poison.insert(0);
+    let mut both = first;
+    both.append(second);
+    let receipt = harness.extend(both, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [3, 4], "B's group is unaffected");
+    let failed: Vec<(u32, bool)> = receipt
+        .failed
+        .iter()
+        .map(|failure| (failure.id.0, failure.link_retained))
+        .collect();
+    assert_eq!(failed, [(0, true), (1, true), (2, true)]);
+    // The link stays in custody under its group (closed whole at stop).
+    assert_eq!(harness.links.len(), 2);
+    assert_eq!(harness.io.log.lock().unwrap().live, 2);
+    assert!(harness.book.attached.iter().all(|id| *id >= 3));
+}
+
+#[test]
+fn fd_exhaustion_defers_the_group_and_the_rest_published_for_an_attach_only_retry() {
+    let mut fixture = SetFixture::new(64);
+    let first = fixture.pass("a.so", 2);
+    let second = fixture.pass("b.so", 2);
+    let mut harness = Harness::multi(64, None);
+    harness.io.emfile.insert(0);
+    let mut both = first;
+    both.append(second);
+    let receipt = harness.extend(both, &fixture.set);
+    assert!(receipt.fd_exhausted);
+    assert!(receipt.attached.is_empty() && receipt.failed.is_empty());
+    let mut deferred = delta_ids(&receipt.deferred);
+    deferred.sort_unstable();
+    assert_eq!(deferred, [0, 1, 2, 3]);
+    assert!(harness.links.is_empty());
+    let publishes = harness
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, Op::Publish(..)))
+        .count();
+    assert_eq!(publishes, 4);
+    // The retry attaches without republishing.
+    harness.io.emfile.clear();
+    let receipt = harness.extend(receipt.deferred, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [0, 1, 2, 3]);
+    let republished = harness
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, Op::Publish(..)))
+        .count();
+    assert_eq!(republished, 4, "a published entry retries its attach only");
+    harness.assert_group_invariants();
+}
+
+#[test]
+fn a_kernel_refusing_multi_after_preparation_fails_the_group_without_fallback() {
+    let mut fixture = SetFixture::new(64);
+    let delta = fixture.pass("a.so", 2);
+    let mut harness = Harness::multi(64, None);
+    harness.io.unsupported = true;
+    let receipt = harness.extend(delta, &fixture.set);
+    assert!(receipt.attached.is_empty());
+    assert_eq!(receipt.failed.len(), 2);
+    assert!(
+        receipt.failed[0]
+            .reason
+            .contains("uprobe-multi refused by the running kernel"),
+        "{:?}",
+        receipt.failed
+    );
+    assert!(harness.attached_ops().is_empty(), "never a Singles attach");
+    assert!(harness.links.is_empty());
+}
+
+#[test]
+fn pid_custody_lost_after_a_group_fails_its_members_and_defers_later_groups() {
+    let mut fixture = SetFixture::new(64);
+    let first = fixture.pass("a.so", 2);
+    let second = fixture.pass("b.so", 2);
+    let mut harness = Harness::multi(64, Some(42));
+    let mut both = first;
+    both.append(second);
+    let mut checks = 0;
+    let receipt = harness.extend_with_custody(both, &fixture.set, wide(), &mut || {
+        checks += 1;
+        Err("the PID target exited".into())
+    });
+    assert_eq!(checks, 1, "custody is checked after the first group");
+    assert!(receipt.attached.is_empty());
+    let failed: Vec<(u32, bool)> = receipt
+        .failed
+        .iter()
+        .map(|failure| (failure.id.0, failure.link_retained))
+        .collect();
+    assert_eq!(failed, [(0, true), (1, true)]);
+    assert_eq!(delta_ids(&receipt.deferred), [2, 3]);
+    assert!(harness.book.custody_lost.is_some());
+    assert_eq!(harness.group_ops().len(), 1);
+}
+
+#[test]
+fn a_multi_extend_honours_the_window_and_defers_the_rest_unpublished() {
+    let mut fixture = SetFixture::new(64);
+    let delta = fixture.pass("a.so", 5);
+    let mut harness = Harness::multi(64, None);
+    let window = ExtendWindow::new(3, Instant::now() + Duration::from_secs(30)).unwrap();
+    let receipt = harness.extend_with_custody(delta, &fixture.set, window, &mut || Ok(()));
+    assert_eq!(ids(&receipt.attached), [0, 1, 2]);
+    assert_eq!(delta_ids(&receipt.deferred), [3, 4]);
+    let receipt = harness.extend(receipt.deferred, &fixture.set);
+    assert_eq!(ids(&receipt.attached), [3, 4]);
+    assert_eq!(
+        harness.group_ops(),
+        [
+            ("p11_usage_entry_lp64", vec![0, 1, 2]),
+            ("p11_usage_entry_lp64", vec![3, 4])
+        ]
+    );
+    harness.assert_group_invariants();
+}
+
+#[test]
+fn the_multi_fd_preflight_needs_the_group_bound_not_n() {
+    let n = 4096;
+    let singles = n + 3 + FD_RESERVE;
+    let multi = MULTI_LINK_BOUND + 3 + FD_RESERVE;
+    assert!(fd_preflight(AttachBackend::Singles, n, singles - 1, 0).is_err());
+    assert!(fd_preflight(AttachBackend::Multi, n, singles - 1, 0).is_ok());
+    assert!(fd_preflight(AttachBackend::Multi, n, multi, 0).is_ok());
+    let refused = fd_preflight(AttachBackend::Multi, n, multi - 1, 0).unwrap_err();
+    assert!(refused.detail.contains("attach-group links"), "{refused}");
+    // A small N bounds Multi too.
+    assert_eq!(entry_link_bound(AttachBackend::Multi, 16), 16);
+    assert_eq!(entry_link_bound(AttachBackend::Singles, n), n);
 }

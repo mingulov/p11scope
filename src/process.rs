@@ -700,6 +700,27 @@ pub struct PidPin {
     start_time: Option<u64>,
 }
 
+impl PidPin {
+    /// A second custody handle on the same pinned generation: the pidfd is
+    /// duplicated (`F_DUPFD_CLOEXEC`), never reopened by PID, so it names
+    /// exactly the process the original names.
+    pub(crate) fn try_clone(&self) -> Result<Self, String> {
+        let pidfd = match &self.pidfd {
+            Some(pidfd) => Some(
+                pidfd
+                    .try_clone()
+                    .map_err(|error| format!("duplicating the pidfd of {}: {error}", self.pid))?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            pid: self.pid,
+            pidfd,
+            start_time: self.start_time,
+        })
+    }
+}
+
 /// The kernel's current pid ceiling: a pid above it never named a process.
 /// `None` when the sysctl is unreadable — the failure text then falls back
 /// to the in-range wording, which stays true either way.

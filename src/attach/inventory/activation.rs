@@ -1,6 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Private static Inventory activation: entry-only Singles with retained pins,
 //! discovery transport and monotonic positive evidence. No caller/count claim.
+//! The capture facade additionally attaches entries as immutable uprobe-multi
+//! groups (Task 6 C5.11): one link per attach group, closed whole.
 
 use super::{AttachBackend, InventoryBudget, InventoryFlavor, PreparedInventory, Scope, callers};
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, RetainedInventoryTarget};
@@ -18,6 +20,7 @@ use p11scope_manifest::elf::ElfAbi;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::time::Instant;
 
@@ -106,6 +109,14 @@ impl InventoryTargets {
         self.pins.contains_key(&object)
     }
 
+    /// The retained pin's attach path (`/proc/self/fd/<n>` of the held
+    /// file): never a reopened pathname.
+    pub(super) fn attach_path(&self, object: PinnedObjectId) -> Option<std::path::PathBuf> {
+        self.pins
+            .get(&object)
+            .map(RetainedInventoryTarget::attach_path)
+    }
+
     pub(super) fn object_abi(&self, object: PinnedObjectId) -> Option<ElfAbi> {
         self.pins.get(&object).map(RetainedInventoryTarget::abi)
     }
@@ -176,10 +187,15 @@ fn validate_activation(
         !matches!(scope, Scope::Pid(_)),
         "Inventory PID activation requires generation-safe I2c scope"
     );
-    validate_activation_common(backend, budget, targets)
+    ensure!(
+        backend == AttachBackend::Singles,
+        "Inventory I3a activation supports Singles only"
+    );
+    validate_activation_common(budget, targets)
 }
 
-/// The capture facade's activation: the one path that admits PID scope.
+/// The capture facade's activation: the one path that admits PID scope
+/// and the Multi backend (entries attach as immutable groups).
 /// Its entries attach with `UProbeScope::OneProcess` and the retained
 /// original pidfd must be live, so a reused PID can never be selected.
 pub(super) fn validate_capture_activation(
@@ -202,7 +218,10 @@ pub(super) fn validate_capture_activation(
         Scope::System => {}
         Scope::Cgroup { .. } => bail!("Inventory capture does not offer cgroup scope yet"),
     }
-    validate_activation_common(backend, budget, targets)
+    // Both backends: Multi loads the entries for uprobe-multi and attaches
+    // them only through `attach_entry_group`.
+    let _ = backend;
+    validate_activation_common(budget, targets)
 }
 
 /// PID custody the capture facade accepts: the original pidfd (never the
@@ -218,15 +237,7 @@ pub(super) fn require_live_pid_custody(pin: &PidPin) -> Result<()> {
     Ok(())
 }
 
-fn validate_activation_common(
-    backend: AttachBackend,
-    budget: InventoryBudget,
-    targets: &InventoryTargets,
-) -> Result<()> {
-    ensure!(
-        backend == AttachBackend::Singles,
-        "Inventory I3a activation supports Singles only"
-    );
+fn validate_activation_common(budget: InventoryBudget, targets: &InventoryTargets) -> Result<()> {
     ensure!(
         budget == targets.budget,
         "Inventory plan and prepared object budget differ"
@@ -247,6 +258,23 @@ pub(super) enum InventoryAttachRequest<'a> {
     },
 }
 
+/// One attach group's request: every site of one (object, entry program)
+/// selection of one extend, as `(file offset, cookie)` pairs. The kernel
+/// link is an immutable offset set: it is created once and closed whole.
+pub(super) struct InventoryGroupRequest<'a> {
+    pub(super) program: &'static str,
+    pub(super) path: &'a Path,
+    pub(super) sites: &'a [(u64, u64)],
+}
+
+/// What one group attach produced: the live links (one per bisect leaf;
+/// one in the ordinary case) and the sites the kernel refused, by index
+/// into the request's `sites`, each with its own error.
+pub(super) struct InventoryGroupAttach<L> {
+    pub(super) links: Vec<L>,
+    pub(super) refused: Vec<(usize, std::io::Error)>,
+}
+
 pub(super) trait InventoryLinkIo {
     type Link;
     fn publish_endpoint(&mut self, endpoint: u32, object: PinnedObjectId) -> Result<()>;
@@ -254,6 +282,17 @@ pub(super) trait InventoryLinkIo {
     fn detach(&mut self, link: &mut Self::Link) -> Result<()>;
     fn attachment_error(&self, _link: &Self::Link) -> Option<String> {
         None
+    }
+    /// One uprobe-multi group (Multi backend only). `Unsupported` and
+    /// `Exhausted` halt the group with no link acquired; every other
+    /// refusal is isolated per site. An IO without multi support refuses.
+    fn attach_entry_group(
+        &mut self,
+        _request: InventoryGroupRequest<'_>,
+    ) -> std::result::Result<InventoryGroupAttach<Self::Link>, p11scope_bpf_multi::GroupHalt> {
+        Err(p11scope_bpf_multi::GroupHalt::Unsupported(
+            std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+        ))
     }
 }
 
@@ -275,6 +314,8 @@ pub(super) struct InventoryDetachFailure {
 pub(super) enum InventoryLinkIdentity {
     Lifecycle(&'static str),
     Entry(u32),
+    /// One link of the capture's attach group with this serial (Multi).
+    EntryGroup(u32),
 }
 
 pub(super) struct InventoryLinked<L> {
@@ -530,10 +571,28 @@ struct InventoryUsageRead {
     deadline_reached: bool,
 }
 
+/// One owned kernel link descriptor: an Aya fd link (a Singles entry or a
+/// lifecycle root) or a raw uprobe-multi link (one attach group's leaf).
+/// Closing either is dropping it.
+pub(super) enum InventoryFd {
+    Aya(FdLink),
+    Multi(OwnedFd),
+}
+
+impl InventoryFd {
+    /// The Aya link, for link-info inspection (Singles and roots).
+    pub(super) fn as_aya(&self) -> Option<&FdLink> {
+        match self {
+            InventoryFd::Aya(link) => Some(link),
+            InventoryFd::Multi(_) => None,
+        }
+    }
+}
+
 /// Ordinary cookies require Aya's fd-backed perf link path. Keep an unexpected
 /// representation or registry-transfer error owned and explicitly quarantined.
 pub(super) enum KernelInventoryLink {
-    Fds(Vec<FdLink>),
+    Fds(Vec<InventoryFd>),
     UnexpectedUProbe(UProbeLink),
     RegistryUncertain {
         program: &'static str,
@@ -582,7 +641,7 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
                     .try_into()?;
                 let id = probe.attach(tracepoint)?;
                 Ok(match probe.take_link(id) {
-                    Ok(link) => KernelInventoryLink::Fds(vec![link.into()]),
+                    Ok(link) => KernelInventoryLink::Fds(vec![InventoryFd::Aya(link.into())]),
                     Err(error) => KernelInventoryLink::RegistryUncertain {
                         program,
                         error: error.to_string(),
@@ -607,7 +666,9 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
                 let id = probe.attach([point], path, self.entry_scope)?;
                 Ok(match probe.take_link(id) {
                     Ok(link) => match link.into_fd_links() {
-                        Ok(links) => KernelInventoryLink::Fds(links),
+                        Ok(links) => KernelInventoryLink::Fds(
+                            links.into_iter().map(InventoryFd::Aya).collect(),
+                        ),
                         Err(link) => KernelInventoryLink::UnexpectedUProbe(link),
                     },
                     Err(error) => KernelInventoryLink::RegistryUncertain {
@@ -646,9 +707,75 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
             )),
         }
     }
+
+    fn attach_entry_group(
+        &mut self,
+        request: InventoryGroupRequest<'_>,
+    ) -> std::result::Result<InventoryGroupAttach<Self::Link>, p11scope_bpf_multi::GroupHalt> {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let InventoryGroupRequest {
+            program,
+            path,
+            sites,
+        } = request;
+        // The program was loaded for uprobe-multi (`load_multi`); a missing
+        // or unloaded program refuses every site, never the backend.
+        let prog_fd = (|| -> Result<std::os::fd::RawFd> {
+            let probe: &mut UProbe = self
+                .ebpf
+                .program_mut(program)
+                .context(program)?
+                .try_into()?;
+            Ok(probe.fd()?.as_fd().as_raw_fd())
+        })();
+        let prog_fd = match prog_fd {
+            Ok(fd) => fd,
+            Err(error) => {
+                return Ok(InventoryGroupAttach {
+                    links: Vec::new(),
+                    refused: (0..sites.len())
+                        .map(|index| {
+                            (
+                                index,
+                                std::io::Error::other(format!("Inventory {program}: {error:#}")),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        };
+        // System scope: pid 0, every process. PID scope: the target, so the
+        // kernel filter (proven to cover every thread before `prepare`
+        // admitted Multi) keeps the breakpoint and the program out of
+        // every other process, including one that reuses the PID; the
+        // in-BPF PID_FILTER guard in `scope_auth` stays as a second check.
+        let pid = match self.entry_scope {
+            UProbeScope::AllProcesses => crate::attach::multi_link_pid(),
+            UProbeScope::OneProcess(pid) => pid.get(),
+            // Never widen to pid 0 for a scope that names one process.
+            UProbeScope::CallingProcess => std::process::id(),
+        };
+        let (links, refused) = p11scope_bpf_multi::bisect_attach(
+            &mut |slice| {
+                let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                p11scope_bpf_multi::attach_group(prog_fd, pid, path, &offsets, &cookies, false)
+            },
+            sites,
+        )?;
+        Ok(InventoryGroupAttach {
+            links: links
+                .into_iter()
+                .map(|fd| KernelInventoryLink::Fds(vec![InventoryFd::Multi(fd)]))
+                .collect(),
+            refused: refused
+                .into_iter()
+                .map(|site| (site.index, site.error))
+                .collect(),
+        })
+    }
 }
 
-fn close_inventory_fds(links: &mut Vec<FdLink>) -> Result<()> {
+fn close_inventory_fds(links: &mut Vec<InventoryFd>) -> Result<()> {
     // Aya FdLink::detach has exactly this close-on-drop behavior. This leaf
     // needs neither Ebpf nor the reader; its blocking work belongs off-main.
     links.clear();
@@ -669,7 +796,7 @@ pub(super) struct InventoryState {
 }
 
 impl InventoryState {
-    fn take_retirement_work(&mut self) -> RetirementWork<Vec<FdLink>> {
+    fn take_retirement_work(&mut self) -> RetirementWork<Vec<InventoryFd>> {
         let leases = self
             .targets
             .pins
@@ -709,7 +836,7 @@ impl InventoryState {
 
     fn collect_retirement_work(
         &mut self,
-        mut work: RetirementWork<Vec<FdLink>>,
+        mut work: RetirementWork<Vec<InventoryFd>>,
     ) -> InventoryCleanupReceipt {
         let (receipt, links) = work.take_result();
         for link in links {
@@ -724,6 +851,7 @@ impl InventoryState {
             InventoryLinkIdentity::Lifecycle("sched_process_exec") => (0, 0),
             InventoryLinkIdentity::Lifecycle(_) => (0, 1),
             InventoryLinkIdentity::Entry(id) => (1, id),
+            InventoryLinkIdentity::EntryGroup(serial) => (2, serial),
         });
         receipt
     }
@@ -747,7 +875,7 @@ impl InventoryState {
         }
     }
 
-    fn reclaim_unstarted_work(&mut self, mut work: RetirementWork<Vec<FdLink>>) {
+    fn reclaim_unstarted_work(&mut self, mut work: RetirementWork<Vec<InventoryFd>>) {
         self.fallback.begin_abandonment();
         // Thread creation/transfer has already failed. Last-resort reclamation
         // can service only between closes; it makes no responsiveness or loss
@@ -759,7 +887,7 @@ impl InventoryState {
         let _receipt = self.collect_retirement_work(work);
     }
 
-    fn reclaim_job(&mut self, job: RetirementJob<Vec<FdLink>>) {
+    fn reclaim_job(&mut self, job: RetirementJob<Vec<InventoryFd>>) {
         let evidence = self.fallback.clone();
         let result = abandon_and_reclaim_with(job, &evidence, || {
             self.discovery
@@ -950,9 +1078,9 @@ pub(super) struct RetiredInventory {
 #[must_use]
 pub(super) struct RetiringInventory {
     state: Option<InventoryState>,
-    job: Option<RetirementJob<Vec<FdLink>>>,
-    unstarted: Option<RetirementWork<Vec<FdLink>>>,
-    empty_worker: Option<std::thread::JoinHandle<Option<RetirementWork<Vec<FdLink>>>>>,
+    job: Option<RetirementJob<Vec<InventoryFd>>>,
+    unstarted: Option<RetirementWork<Vec<InventoryFd>>>,
+    empty_worker: Option<std::thread::JoinHandle<Option<RetirementWork<Vec<InventoryFd>>>>>,
     cleanup: Option<InventoryCleanupReceipt>,
     control_error: Option<String>,
 }
@@ -964,7 +1092,7 @@ impl RetiringInventory {
 
     fn begin_with_close(
         mut state: InventoryState,
-        close: impl FnMut(&mut Vec<FdLink>) -> Result<()> + Send + 'static,
+        close: impl FnMut(&mut Vec<InventoryFd>) -> Result<()> + Send + 'static,
     ) -> Self {
         let work = state.take_retirement_work();
         let mut retiring = Self {

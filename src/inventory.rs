@@ -82,6 +82,7 @@ pub fn run(
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
     capture: CaptureMode,
+    attach_backend: crate::attach::BackendSelection,
 ) -> Result<i32> {
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
     // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
@@ -101,6 +102,7 @@ pub fn run(
         event_rotate_bytes,
         event_max_files,
         capture,
+        attach_backend,
         &|| stop.stopped(),
         &|| stop.exit_on_next_signal(),
         stdout_tty,
@@ -123,6 +125,7 @@ fn run_with_writer(
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
     capture: CaptureMode,
+    attach_backend: crate::attach::BackendSelection,
     stop: &dyn Fn() -> bool,
     report_written: &dyn Fn(),
     stdout_tty: bool,
@@ -142,6 +145,7 @@ fn run_with_writer(
         event_rotate_bytes,
         event_max_files,
         capture,
+        attach_backend,
         stop,
         report_written,
         stdout_tty,
@@ -168,6 +172,7 @@ fn run_with_terminal(
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
     capture: CaptureMode,
+    attach_backend: crate::attach::BackendSelection,
     stop: &dyn Fn() -> bool,
     report_written: &dyn Fn(),
     stdout_tty: bool,
@@ -232,7 +237,7 @@ fn run_with_terminal(
     // The scan lane stages no usage coverage: every edge reads
     // `unknown (scan only)`. The native lane stages per-edge coverage
     // notes and witnesses; `auto` falls back to scan with a named gap.
-    let lane = open_native_lane(capture, scope, &mut coordinator)?;
+    let lane = open_native_lane(capture, attach_backend, scope, &mut coordinator)?;
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
     let mut degraded = dashboard.then(|| "needs a terminal on stdout".to_string());
@@ -334,9 +339,13 @@ fn run_with_terminal(
                             .map_err(|error| anyhow::anyhow!("{error}"))?;
                     }
                 }
-                Publish::Retiring { attached, budget } => eprintln!(
+                Publish::Retiring {
+                    attached,
+                    links,
+                    budget,
+                } => eprintln!(
                     "p11scope: stopping: detaching the native probes of {attached} endpoints \
-                     (up to {} s)",
+                     in {links} links (up to {} s)",
                     budget.as_secs()
                 ),
                 Publish::Stop { events, now_ns } => {
@@ -475,6 +484,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 /// the run stays lossy).
 fn open_native_lane(
     mode: CaptureMode,
+    attach_backend: crate::attach::BackendSelection,
     scope: InspectScope,
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
 ) -> Result<Option<NativeLane<FacadeLane>>> {
@@ -502,10 +512,15 @@ fn open_native_lane(
         },
         InspectScope::System => crate::attach::capture::CaptureScope::System,
     };
-    let capture = match FacadeLane::prepare(capture_scope, coordinator.attach_set().budget()) {
+    let capture = match FacadeLane::prepare(
+        capture_scope,
+        coordinator.attach_set().budget(),
+        attach_backend,
+    ) {
         Ok(capture) => capture,
         Err(error) => return unavailable(coordinator, format!("{error:#}")),
     };
+    let backend = crate::inventory_capture::CaptureLane::<PidPin>::backend(&capture);
     let numbering = crate::pidns::numbering();
     let lossy = (!numbering.agrees()).then(|| {
         format!(
@@ -518,7 +533,7 @@ fn open_native_lane(
     });
     match NativeLane::start(capture, coordinator, LaneWindows::PROVISIONAL, lossy) {
         Ok(lane) => {
-            eprintln!("p11scope: native usage lane active (Inventory capture activated)");
+            eprintln!("{}", lane_active_line(&backend));
             Ok(Some(lane))
         }
         Err((mut capture, reason)) => {
@@ -527,6 +542,23 @@ fn open_native_lane(
             unavailable(coordinator, reason)
         }
     }
+}
+
+/// The stderr line a native lane starts with: its attach mechanism and,
+/// under `auto`, why it fell back to per-offset links.
+fn lane_active_line(backend: &crate::inventory_capture::LaneBackend) -> String {
+    let fallback = backend.fallback.as_deref().map_or(String::new(), |reason| {
+        format!(
+            "; uprobe-multi fallback: {}",
+            crate::render::escape_controls(reason)
+        )
+    });
+    format!(
+        "p11scope: native usage lane active (Inventory capture activated, {} links, \
+         --attach-backend {}{fallback})",
+        backend.mechanism(),
+        backend.selection_label()
+    )
 }
 
 /// The stderr line a native run ends with: what it attached, how its
@@ -549,11 +581,12 @@ fn stop_line(summary: &LaneSummary) -> String {
         ),
     };
     format!(
-        "p11scope: native capture stopped after {} pass{}: {} endpoints attached, {} failed; \
-         {retirement}; settlement {}",
+        "p11scope: native capture stopped after {} pass{}: {} endpoints attached ({} links), \
+         {} failed; {retirement}; settlement {}",
         summary.passes,
         if summary.passes == 1 { "" } else { "es" },
         summary.attached,
+        summary.backend.mechanism(),
         summary.failed,
         crate::inventory_capture::SETTLEMENT,
     )
@@ -806,6 +839,14 @@ fn note_native_observation(document: &mut serde_json::Value, summary: &LaneSumma
     observation["lane"] = "native".into();
     observation["settlement"] = crate::inventory_capture::SETTLEMENT.into();
     observation["retirement"] = summary.retirement.label().into();
+    // C5.11: the attach mechanism, as the classic `attach_mechanisms`
+    // spells it, the operator's selection, and any `auto` fallback reason.
+    observation["attach"] = serde_json::json!({
+        "selection": summary.backend.selection_label(),
+        "mechanism": summary.backend.mechanism(),
+        "fallback": summary.backend.fallback,
+        "scope_filter": summary.backend.scope_filter.label(),
+    });
     let lifecycle = &summary.lifecycle;
     observation["lifecycle"] = serde_json::json!({
         "records": lifecycle.records,
@@ -975,14 +1016,18 @@ fn run_dashboard(
                         display.offer(display_view);
                     }
                 }
-                Publish::Retiring { attached, budget } => {
+                Publish::Retiring {
+                    attached,
+                    links,
+                    budget,
+                } => {
                     // The terminal back first: the stop's notices (and a
                     // detach past the report) are then readable.
                     if let Some(display) = driver.display.as_mut() {
                         display.restore();
                         display.notice(&format!(
                             "p11scope: stopping: detaching the native probes of {attached} \
-                             endpoints (up to {} s)",
+                             endpoints in {links} links (up to {} s)",
                             budget.as_secs()
                         ));
                     }
@@ -1759,6 +1804,7 @@ mod tests {
                 None,
                 None,
                 crate::cli::CaptureMode::Scan,
+                crate::attach::BackendSelection::Auto,
                 &|| false,
                 &|| {},
                 false,
@@ -1915,8 +1961,8 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "p11scope: native capture stopped after 2 passes: 4 endpoints attached, 0 \
-                 failed; retirement unsettled: budget passed; settlement {}",
+                "p11scope: native capture stopped after 2 passes: 4 endpoints attached \
+                 (per-offset links), 0 failed; retirement unsettled: budget passed; settlement {}",
                 crate::inventory_capture::SETTLEMENT
             )
         );
@@ -1925,6 +1971,7 @@ mod tests {
 
     fn lane_summary(retirement: crate::inventory_capture::Retirement) -> LaneSummary {
         LaneSummary {
+            backend: crate::inventory_capture::LaneBackend::singles(),
             retirement,
             passes: 2,
             attached: 4,
@@ -1936,6 +1983,66 @@ mod tests {
                 failed_quanta: 0,
                 recovery_rescans: 1,
             },
+        }
+    }
+
+    /// C5.11: a native document discloses the attach mechanism, the
+    /// operator's selection and any `auto` fallback reason; the start and
+    /// stop lines name the mechanism too.
+    #[test]
+    fn a_native_document_discloses_its_attach_backend_and_fallback() {
+        use crate::attach::{AttachBackend, BackendSelection};
+        use crate::inventory_capture::{LaneBackend, Retirement};
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1, 2, 1);
+        let multi = LaneBackend {
+            selection: BackendSelection::Auto,
+            backend: AttachBackend::Multi,
+            fallback: None,
+            scope_filter: crate::inventory_capture::ScopeFilter::None,
+        };
+        let fell_back = LaneBackend {
+            selection: BackendSelection::Auto,
+            backend: AttachBackend::Singles,
+            fallback: Some("the uprobe-multi functional probe failed: EOPNOTSUPP".into()),
+            scope_filter: crate::inventory_capture::ScopeFilter::None,
+        };
+        for (backend, mechanism, fallback) in [
+            (multi.clone(), "uprobe-multi", serde_json::Value::Null),
+            (
+                fell_back.clone(),
+                "per-offset",
+                serde_json::json!("the uprobe-multi functional probe failed: EOPNOTSUPP"),
+            ),
+        ] {
+            let mut summary = lane_summary(Retirement::Closed(Default::default()));
+            summary.backend = backend.clone();
+            let mut stdout = Vec::new();
+            finish_output(
+                None,
+                None,
+                &mut StreamState::new(),
+                &presentation,
+                true,
+                false,
+                &mut stdout,
+                Some(&summary),
+            )
+            .unwrap();
+            let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            let attach = &document["observation"]["attach"];
+            assert_eq!(attach["selection"], "auto");
+            assert_eq!(attach["mechanism"], mechanism);
+            assert_eq!(attach["fallback"], fallback);
+            assert!(stop_line(&summary).contains(&format!("({mechanism} links)")));
+            let active = lane_active_line(&backend);
+            assert!(active.contains(mechanism) && active.contains("--attach-backend auto"));
+            assert_eq!(
+                active.contains("fallback"),
+                backend.fallback.is_some(),
+                "{active}"
+            );
         }
     }
 
@@ -2374,6 +2481,7 @@ mod tests {
             None,
             None,
             CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
             &|| false,
             &|| {},
             true,

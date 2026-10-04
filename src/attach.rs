@@ -889,6 +889,32 @@ pub(crate) fn kernel_supports_multi() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the running kernel's uprobe_multi pid filter covers every
+/// thread of the named process, proven once per run by a functional probe
+/// (`p11scope_bpf_multi::probe_pid_filter_hits`: a counting link with
+/// `pid` = self, called from this thread and a fresh sibling). A version
+/// check would be wrong both ways: 6.6-6.9 shipped a thread-exact filter
+/// (`current != link->task`), fixed by "bpf: fix multi-uprobe PID
+/// filtering logic" in 6.10 and backported to 6.9.12 and 6.6.y, and
+/// distribution kernels carry their own backports. Fixed kernels bind the
+/// link to the target's task (`get_pid_task(..., PIDTYPE_TGID)`, then
+/// `current->mm != link->task->mm`, `same_thread_group` from 6.12), so a
+/// later process reusing the PID never fires it.
+pub(crate) fn kernel_multi_pid_filter() -> std::result::Result<(), String> {
+    static VERDICT: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    VERDICT
+        .get_or_init(|| match p11scope_bpf_multi::probe_pid_filter_hits() {
+            Ok(2) => Ok(()),
+            Ok(hits) => Err(format!(
+                "the kernel uprobe-multi pid filter fired for {hits} of 2 threads of the \
+                 named process"
+            )),
+            Err(error) => Err(format!("the uprobe-multi pid filter probe failed: {error}")),
+        })
+        .clone()
+}
+
 /// First backend attempted for a session. `Auto` follows the kernel
 /// policy (multi on 6.9+, singles below); `Multi`/`Singles` force one.
 /// An auto multi attempt that the kernel refuses is rebuilt on singles

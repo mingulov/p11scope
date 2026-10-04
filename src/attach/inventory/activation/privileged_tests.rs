@@ -1308,7 +1308,10 @@ impl OwnedIds {
                 bail!("quarantined live link");
             };
             ensure!(fds.len() == 1);
-            let info = fds[0].info()?;
+            let info = fds[0]
+                .as_aya()
+                .context("a Singles link is an Aya link")?
+                .info()?;
             ensure!(id_exists(bpf_cmd::BPF_LINK_GET_NEXT_ID, info.id())?);
             self.links.insert(info.id());
             let observed = raw_infos
@@ -1333,6 +1336,9 @@ impl OwnedIds {
                             }
                         }),
                     )
+                }
+                InventoryLinkIdentity::EntryGroup(serial) => {
+                    bail!("the private activation never attaches group {serial}")
                 }
                 InventoryLinkIdentity::Entry(id) => {
                     let entry = &state.targets.entries[id as usize];
@@ -9838,7 +9844,7 @@ fn privileged_inventory_retirement_controlled_churn() -> Result<()> {
     // close is entry575; both roots remain in the work while the barrier waits.
     ensure!(active.state.links.last().unwrap().target == InventoryLinkIdentity::Entry(575));
     let mut first = true;
-    let mut close = move |fds: &mut Vec<FdLink>| {
+    let mut close = move |fds: &mut Vec<InventoryFd>| {
         close_inventory_fds(fds)?;
         if first {
             first = false;

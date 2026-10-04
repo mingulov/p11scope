@@ -30,13 +30,26 @@
 //! Settlement (ruling D3): Inventory has no stop gate, so a native run's
 //! settlement is always `unsettled` — a call in flight at stop may leave no
 //! row. Witnesses are positive facts and survive stop.
+//!
+//! Backend (C5.11, owner directive "kernel tiers"): `--attach-backend
+//! auto` attaches the usage entries as uprobe-multi groups wherever a
+//! functional probe proves the kernel links one — a capability probe, never
+//! the kernel version, so distribution backports take the fast path; under
+//! `--pid` the probe must also prove the kernel pid filter covers every
+//! thread (the groups name the target, plus the in-BPF guard). Otherwise
+//! (5.15, or a kernel whose pid filter is thread-exact), or when the
+//! Multi preparation fails, the whole capture runs Singles. The choice is
+//! made before anything loads, so no observation precedes it and no fresh
+//! object is ever presented as a fallback. `multi` and `singles` force
+//! one (forced Multi surfaces the refusal). Every native document
+//! discloses the mechanism and any fallback reason.
 
-use crate::attach::AttachBackend;
 use crate::attach::capture::{
     CaptureScope, CaptureTargets, CleanupSummary, CookieQuery, DiscoveryBatch, ExtendReceipt,
     ExtendWindow, InventoryCapture, NativeDomainId, ReadWindow, RetiredCapture, RetiringCapture,
     ScopeCustody, ScopeIncarnation, WitnessBatch, default_caller_budget,
 };
+use crate::attach::{AttachBackend, BackendSelection};
 use crate::discovery::caller_registry::{CallerEvent, ProcessSource, UnknownReason, now_ns};
 use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, NativeBatch, NativeReceipt, PassReport,
@@ -45,7 +58,7 @@ use crate::discovery::inventory_attach_set::TargetDelta;
 use crate::discovery::native_binding::{NativeIdentity, ScanOnlyIdentity};
 use crate::inspect_system::Catalog;
 use crate::process::PidPin;
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use p11scope_ebpf_common::ImageIdentity;
 use std::time::{Duration, Instant};
 
@@ -66,9 +79,12 @@ pub(crate) struct LaneWindows {
     /// between passes take the rest).
     pub pass_quanta: usize,
     /// How long stop waits for the probes to detach before it reads
-    /// `retirement: unsettled`: the base, plus a share for each attached
-    /// endpoint (every Singles link pays its own kernel detach), up to the
-    /// cap.
+    /// `retirement: unsettled`: the base, plus the backend's share for
+    /// every kernel link it must close ([`RetirementLoad`]), up to the cap.
+    /// The shares are upper bounds of a measured close, keyed by the
+    /// backend the capability probe chose (never by kernel version): a
+    /// close that finishes early ends the wait at once, so only an
+    /// under-estimate costs (a false `unsettled`).
     /// The pre-output wait is at most `retirement_cap` (R-C51-4: about
     /// 10 s, so a supervisor's grace — k8s 30 s, systemd 90 s — always
     /// sees the report); the rest of the detach runs after it.
@@ -77,7 +93,16 @@ pub(crate) struct LaneWindows {
     /// read, and then keeps reading for a terminal CALLER_USE sweep to
     /// complete (a read that stops mid-sweep proves no clean instant).
     pub terminal_sweep_budget: Duration,
-    pub retirement_per_endpoint: Duration,
+    /// Singles: one close per link, each waiting on its own kernel grace
+    /// periods (C5.11 measurements: 18 ms on 5.15, 32-35 ms idle on 6.12
+    /// and 7.x, 50-95 ms on a loaded 7.0 host).
+    pub retirement_per_link: Duration,
+    /// Multi: one close per group link, one grace period each (5-57 ms
+    /// measured for a 64-offset group) ...
+    pub retirement_per_group_link: Duration,
+    /// ... plus each member's per-mm unregister walk (0.5-6 ms measured
+    /// per offset with up to 500 processes mapping the provider).
+    pub retirement_per_group_endpoint: Duration,
     pub retirement_cap: Duration,
     /// Lifecycle records the lane may hold, drained but not yet staged,
     /// while a pass's collection runs (C5.7). A strict bound: each quantum
@@ -101,10 +126,11 @@ impl LaneWindows {
         discovery_records: 256,
         discovery_budget: Duration::from_millis(10),
         pass_quanta: 64,
-        // Host 7.0 detached 68 links in 4.9 s (about 73 ms each).
         retirement_base: Duration::from_secs(5),
         terminal_sweep_budget: Duration::from_millis(500),
-        retirement_per_endpoint: Duration::from_millis(250),
+        retirement_per_link: Duration::from_millis(150),
+        retirement_per_group_link: Duration::from_millis(100),
+        retirement_per_group_endpoint: Duration::from_millis(10),
         retirement_cap: PRE_OUTPUT_RETIREMENT_WAIT,
         // 8,192 records of 920 B: at most about 7.2 MiB of user memory
         // (strict), over 4 s of a 1,000 execs/s host (two records per
@@ -112,12 +138,19 @@ impl LaneWindows {
         held_records: 8192,
     };
 
-    /// The stop's retirement budget for `attached` endpoints.
-    pub(crate) fn retirement_budget(&self, attached: usize) -> Duration {
-        let share = u32::try_from(attached)
-            .ok()
-            .and_then(|count| self.retirement_per_endpoint.checked_mul(count))
-            .unwrap_or(self.retirement_cap);
+    /// The stop's retirement budget for `load`.
+    pub(crate) fn retirement_budget(&self, load: RetirementLoad) -> Duration {
+        let times = |share: Duration, count: usize| {
+            u32::try_from(count)
+                .ok()
+                .and_then(|count| share.checked_mul(count))
+                .unwrap_or(self.retirement_cap)
+        };
+        let share = match load.backend {
+            AttachBackend::Singles => times(self.retirement_per_link, load.links),
+            AttachBackend::Multi => times(self.retirement_per_group_link, load.links)
+                .saturating_add(times(self.retirement_per_group_endpoint, load.endpoints)),
+        };
         self.retirement_base
             .saturating_add(share)
             .min(self.retirement_cap)
@@ -147,15 +180,168 @@ impl LaneWindows {
     }
 }
 
+/// What a stop must close: every kernel link the capture holds (lifecycle
+/// roots included) on its backend, and the endpoints in them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetirementLoad {
+    pub backend: AttachBackend,
+    pub links: usize,
+    pub endpoints: usize,
+}
+
 /// The service tick between passes (plan §1 C5.1 invariant 3) and while
 /// a pass's collection runs on its worker thread (C5.7, ruling D8).
 pub(crate) const SERVICE_TICK: Duration = Duration::from_millis(10);
+
+/// The native lane's attach backend and how it was chosen (disclosed in
+/// every native document, like the classic `evidence.attach_mechanisms`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaneBackend {
+    pub selection: BackendSelection,
+    pub backend: AttachBackend,
+    /// Why `auto` runs Singles: the functional probe (or, under PID
+    /// scope, the pid-filter probe) or the Multi preparation failed.
+    pub fallback: Option<String>,
+    /// How the kernel keeps other processes out of a PID-scoped capture.
+    pub scope_filter: ScopeFilter,
+}
+
+/// What restricts the entry probes to the scope, besides `scope_auth`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeFilter {
+    /// System scope: every process is in scope.
+    None,
+    /// PID scope, Singles: each perf event is bound to the target's task
+    /// (`OneProcess`), plus the in-BPF PID_FILTER guard.
+    PerfTaskAndBpf,
+    /// PID scope, Multi: each group names the target (the proven kernel
+    /// uprobe-multi pid filter), plus the in-BPF PID_FILTER guard.
+    KernelPidAndBpf,
+}
+
+impl ScopeFilter {
+    pub(crate) fn label(self) -> Option<&'static str> {
+        match self {
+            ScopeFilter::None => None,
+            ScopeFilter::PerfTaskAndBpf => Some("perf-task+bpf"),
+            ScopeFilter::KernelPidAndBpf => Some("kernel-pid+bpf"),
+        }
+    }
+}
+
+impl LaneBackend {
+    /// The mechanism label, as the classic `attach_mechanisms` spells it.
+    pub(crate) fn mechanism(&self) -> &'static str {
+        match self.backend {
+            AttachBackend::Multi => "uprobe-multi",
+            AttachBackend::Singles => "per-offset",
+        }
+    }
+
+    pub(crate) fn selection_label(&self) -> &'static str {
+        match self.selection {
+            BackendSelection::Auto => "auto",
+            BackendSelection::Multi => "multi",
+            BackendSelection::Singles => "singles",
+        }
+    }
+
+    /// A forced Singles capture (the scripted lanes' default).
+    pub(crate) fn singles() -> Self {
+        Self {
+            selection: BackendSelection::Singles,
+            backend: AttachBackend::Singles,
+            fallback: None,
+            scope_filter: ScopeFilter::None,
+        }
+    }
+}
+
+/// Picks the capture's backend and prepares it, before anything loads
+/// (session granularity, the classic rule). `probe` links a uprobe-multi
+/// probe once (the capability check: no kernel-version policy); `prepare`
+/// builds the capture on one backend.
+///
+/// - `singles`: Singles, never probed.
+/// - `multi`: Multi, or the probe's refusal as an error (never a fallback).
+/// - `auto`: Multi when the probe links, else Singles with the probe's
+///   reason; a failed Multi preparation is retried once on Singles with
+///   its reason.
+pub(crate) fn prepare_on_backend<T>(
+    selection: BackendSelection,
+    probe: impl FnOnce() -> std::result::Result<(), String>,
+    mut prepare: impl FnMut(AttachBackend) -> Result<T>,
+) -> Result<(T, LaneBackend)> {
+    let chosen = |backend, fallback| LaneBackend {
+        selection,
+        backend,
+        fallback,
+        scope_filter: ScopeFilter::None,
+    };
+    match selection {
+        BackendSelection::Singles => Ok((
+            prepare(AttachBackend::Singles)?,
+            chosen(AttachBackend::Singles, None),
+        )),
+        BackendSelection::Multi => {
+            probe().map_err(|reason| {
+                anyhow!("--attach-backend multi: uprobe-multi is unavailable: {reason}")
+            })?;
+            Ok((
+                prepare(AttachBackend::Multi)?,
+                chosen(AttachBackend::Multi, None),
+            ))
+        }
+        BackendSelection::Auto => {
+            let reason = match probe() {
+                Err(reason) => format!("the uprobe-multi functional probe failed: {reason}"),
+                Ok(()) => match prepare(AttachBackend::Multi) {
+                    Ok(capture) => return Ok((capture, chosen(AttachBackend::Multi, None))),
+                    Err(error) => format!("the uprobe-multi preparation failed: {error:#}"),
+                },
+            };
+            let capture = prepare(AttachBackend::Singles)
+                .map_err(|error| error.context(format!("after Multi fallback ({reason})")))?;
+            Ok((capture, chosen(AttachBackend::Singles, Some(reason))))
+        }
+    }
+}
+
+/// The production functional probe: a mapless no-op program linked as a
+/// one-offset uprobe-multi probe at the observer's own anchor (the doctor
+/// row's self-link), dropped at once. It never fires a capture program.
+pub(crate) fn multi_functional_probe() -> std::result::Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    let (path, offset) = crate::doctor::self_probe_anchor()
+        .map_err(|error| format!("self-probe anchor unavailable: {error}"))?;
+    let program = p11scope_bpf_multi::prog_load_scratch_multi()
+        .map_err(|error| format!("loading the scratch uprobe-multi program: {error}"))?;
+    p11scope_bpf_multi::attach_group(
+        program.as_raw_fd(),
+        std::process::id(),
+        &path,
+        &[offset],
+        &[1],
+        false,
+    )
+    .map(drop)
+    .map_err(|error| format!("linking the scratch uprobe-multi probe: {error}"))
+}
 
 /// The facade operations the lane drives: the real capture in production,
 /// a scripted lane in the call-order tests. Every method is the facade's
 /// own; `begin_stop` and `poll_retirement` hide the typestate moves.
 pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
     fn domain(&self) -> NativeDomainId;
+    /// The attach backend and how it was chosen.
+    fn backend(&self) -> LaneBackend {
+        LaneBackend::singles()
+    }
+    /// The kernel links the capture holds now (roots included), when the
+    /// lane can count them; else the stop budgets one per endpoint.
+    fn live_links(&self) -> Option<usize> {
+        None
+    }
     fn incarnation(&self) -> Option<ScopeIncarnation>;
     fn extend(
         &mut self,
@@ -271,6 +457,7 @@ pub(crate) const SETTLEMENT: &str = "unsettled";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LaneSummary {
     pub retirement: Retirement,
+    pub backend: LaneBackend,
     pub passes: u64,
     pub attached: usize,
     pub failed: usize,
@@ -589,6 +776,18 @@ impl<L> NativeLane<L> {
         events
     }
 
+    /// What the stop will close (before `begin_stop`).
+    pub(crate) fn retirement_load<Pin>(&self) -> RetirementLoad
+    where
+        L: CaptureLane<Pin>,
+    {
+        RetirementLoad {
+            backend: self.capture.backend().backend,
+            links: self.capture.live_links().unwrap_or(self.attached),
+            endpoints: self.attached,
+        }
+    }
+
     /// The bounded stop (invariant 4). Needs one full pass after
     /// activation: the loop guarantees it before calling.
     pub(crate) fn stop<Pin, H>(mut self, host: &mut H) -> Stopped<L>
@@ -642,7 +841,7 @@ impl<L> NativeLane<L> {
         }
         host.end_capture_coverage(now_ns());
         self.capture.begin_stop();
-        let budget = self.windows.retirement_budget(self.attached);
+        let budget = self.windows.retirement_budget(self.retirement_load());
         let deadline = Instant::now() + budget;
         let mut retired = false;
         let mut poll_error: Option<String> = None;
@@ -704,6 +903,7 @@ impl<L> NativeLane<L> {
             events,
             summary: LaneSummary {
                 retirement,
+                backend: self.capture.backend(),
                 passes: self.passes,
                 attached: self.attached,
                 failed: self.failed,
@@ -869,9 +1069,14 @@ impl TickSchedule {
 pub(crate) enum Publish<'a> {
     /// A committed pass; its events include the native events.
     Pass { report: &'a PassReport, now_ns: u64 },
-    /// The native stop begins: `attached` endpoints get up to `budget` to
-    /// detach before the document reads unsettled.
-    Retiring { attached: usize, budget: Duration },
+    /// The native stop begins: `attached` endpoints in `links` kernel
+    /// links get up to `budget` to detach before the document reads
+    /// unsettled.
+    Retiring {
+        attached: usize,
+        links: usize,
+        budget: Duration,
+    },
     /// The native stop's commit: the events it staged.
     Stop {
         events: &'a [CallerEvent],
@@ -962,7 +1167,8 @@ where
         driver,
         Publish::Retiring {
             attached: lane.attached,
-            budget: lane.windows.retirement_budget(lane.attached),
+            links: lane.retirement_load().links,
+            budget: lane.windows.retirement_budget(lane.retirement_load()),
         },
     )?;
     let stopped = lane.stop(driver.host());
@@ -981,6 +1187,7 @@ where
 pub(crate) struct FacadeLane {
     domain: NativeDomainId,
     incarnation: Option<ScopeIncarnation>,
+    backend: LaneBackend,
     state: FacadeState,
 }
 
@@ -994,16 +1201,52 @@ enum FacadeState {
 
 impl FacadeLane {
     /// Loads and prepares the Inventory object for `scope` with the attach
-    /// set's endpoint budget and the default caller-pair limit.
+    /// set's endpoint budget and the default caller-pair limit, on the
+    /// backend `selection` resolves to ([`prepare_on_backend`]).
     pub(crate) fn prepare(
         scope: CaptureScope,
         endpoints: crate::capacity::InventoryBudget,
+        selection: BackendSelection,
     ) -> Result<Self> {
         let callers = default_caller_budget(endpoints)?;
-        let capture = InventoryCapture::prepare(scope, endpoints, callers, AttachBackend::Singles)?;
+        // A PID scope's custody is one pidfd: a retried preparation needs
+        // its own clone of the same pin, never a reopened PID.
+        let mut scope = Some(scope);
+        // PID scope's probe is the pid-filter probe: it links a counting
+        // uprobe-multi probe named by PID, so it proves both that the
+        // kernel links one and that its filter covers every thread.
+        let system = matches!(scope, Some(CaptureScope::System));
+        let (capture, mut backend) = prepare_on_backend(
+            selection,
+            || {
+                if system {
+                    multi_functional_probe()
+                } else {
+                    crate::attach::kernel_multi_pid_filter()
+                }
+            },
+            |backend| {
+                let attempt = match scope.as_ref().context("the capture scope was consumed")? {
+                    CaptureScope::System => CaptureScope::System,
+                    CaptureScope::Pid(pin) => CaptureScope::Pid(
+                        pin.try_clone()
+                            .map_err(anyhow::Error::msg)
+                            .context("cloning the PID custody for a preparation")?,
+                    ),
+                };
+                InventoryCapture::prepare(attempt, endpoints, callers, backend)
+            },
+        )?;
+        scope.take();
+        backend.scope_filter = match (system, backend.backend) {
+            (true, _) => ScopeFilter::None,
+            (false, AttachBackend::Multi) => ScopeFilter::KernelPidAndBpf,
+            (false, AttachBackend::Singles) => ScopeFilter::PerfTaskAndBpf,
+        };
         Ok(Self {
             domain: capture.domain(),
             incarnation: capture.incarnation(),
+            backend,
             state: FacadeState::Active(Box::new(capture)),
         })
     }
@@ -1033,6 +1276,17 @@ impl NativeIdentity<PidPin> for FacadeLane {
 impl CaptureLane<PidPin> for FacadeLane {
     fn domain(&self) -> NativeDomainId {
         self.domain
+    }
+
+    fn backend(&self) -> LaneBackend {
+        self.backend.clone()
+    }
+
+    fn live_links(&self) -> Option<usize> {
+        match &self.state {
+            FacadeState::Active(capture) => Some(capture.live_links()),
+            _ => None,
+        }
     }
 
     fn incarnation(&self) -> Option<ScopeIncarnation> {

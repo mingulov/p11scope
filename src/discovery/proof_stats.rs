@@ -49,11 +49,26 @@ pub(crate) trait RangeStat: Send + Sync {
 /// How many threads a collection's proof stats may use here: the
 /// observer's usable CPUs (its affinity), at most
 /// [`MAX_PROOF_STAT_THREADS`].
+///
+/// Experiment override: `P11SCOPE_PROOF_STAT_THREADS` pins the count
+/// (`0`/`1` force the serial path, `N` caps at `N`); unset or
+/// unparsable keeps the default below.
 pub(crate) fn proof_stat_threads() -> usize {
-    std::thread::available_parallelism()
+    let default = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1)
-        .min(MAX_PROOF_STAT_THREADS)
+        .min(MAX_PROOF_STAT_THREADS);
+    proof_stat_threads_override(std::env::var("P11SCOPE_PROOF_STAT_THREADS").ok(), default)
+}
+
+/// [`proof_stat_threads`] without the environment read, so the override
+/// is unit-testable without process-global env mutation.
+fn proof_stat_threads_override(env: Option<String>, default: usize) -> usize {
+    match env.as_deref().map(str::trim).map(str::parse::<usize>) {
+        Some(Ok(0)) | Some(Ok(1)) => 1,
+        Some(Ok(n)) => n.min(MAX_PROOF_STAT_THREADS),
+        _ => default,
+    }
 }
 
 type Chunk = (usize, Vec<StatResult>);
@@ -268,6 +283,24 @@ mod tests {
             stat_batch(pool, fake.clone(), &ranges(192));
             assert!(fake.threads.lock().unwrap().len() > 1);
         });
+    }
+
+    /// The experiment override pins the pool size (`0`/`1` force the
+    /// serial path, `N` caps at the maximum); unset or unparsable keeps
+    /// the default.
+    #[test]
+    fn the_thread_override_pins_or_keeps_the_default() {
+        assert_eq!(proof_stat_threads_override(None, 4), 4);
+        assert_eq!(proof_stat_threads_override(Some(String::new()), 4), 4);
+        assert_eq!(proof_stat_threads_override(Some("bogus".into()), 4), 4);
+        assert_eq!(proof_stat_threads_override(Some("0".into()), 4), 1);
+        assert_eq!(proof_stat_threads_override(Some("1".into()), 4), 1);
+        assert_eq!(proof_stat_threads_override(Some("2".into()), 4), 2);
+        assert_eq!(
+            proof_stat_threads_override(Some("99".into()), 4),
+            MAX_PROOF_STAT_THREADS
+        );
+        assert_eq!(proof_stat_threads_override(Some(" 3 ".into()), 4), 3);
     }
 
     /// A worker that panics (or whose result never returns) does not lose

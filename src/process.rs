@@ -995,9 +995,15 @@ pub(crate) fn generation_gone(pid: u32) -> bool {
 /// and the same `InvalidData` on non-UTF-8 and `NotFound` for a reaped
 /// pid (exit detection in `gone_from`).
 fn read_proc_stat(pid: u32) -> io::Result<String> {
+    let file = std::fs::File::open(format!("/proc/{pid}/stat"))?;
+    read_stat_bytes(file)
+}
+
+/// The read loop behind [`read_proc_stat`], over any reader so the
+/// interrupted-read retry is unit-testable without `/proc`.
+fn read_stat_bytes<R: io::Read>(mut file: R) -> io::Result<String> {
     use std::io::Read as _;
     const STAT_BUF_BYTES: usize = 4096;
-    let mut file = std::fs::File::open(format!("/proc/{pid}/stat"))?;
     let mut buf = [0u8; STAT_BUF_BYTES];
     let mut len = 0;
     loop {
@@ -1440,6 +1446,47 @@ mod tests {
         assert!(process_start_time(me).is_ok());
         let missing = read_proc_stat(u32::MAX).unwrap_err();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Like `read_to_string`, the stat read loop retries an interrupted
+    /// read instead of failing the stat (which `process_start_time`
+    /// would report as "not gone"). Any other error still surfaces.
+    #[test]
+    fn stat_read_retries_interrupted_reads() {
+        struct InterruptThenData {
+            interrupts_left: usize,
+            data: &'static [u8],
+        }
+        impl io::Read for InterruptThenData {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.interrupts_left > 0 {
+                    self.interrupts_left -= 1;
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "test intr"));
+                }
+                if self.data.is_empty() {
+                    return Ok(0);
+                }
+                let n = self.data.len().min(out.len());
+                out[..n].copy_from_slice(&self.data[..n]);
+                self.data = &self.data[n..];
+                Ok(n)
+            }
+        }
+        let stat = read_stat_bytes(InterruptThenData {
+            interrupts_left: 2,
+            data: b"1 (x) R 0 0",
+        })
+        .unwrap();
+        assert_eq!(stat, "1 (x) R 0 0");
+
+        struct FailAfterInterrupt;
+        impl io::Read for FailAfterInterrupt {
+            fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "test deny"))
+            }
+        }
+        let denied = read_stat_bytes(FailAfterInterrupt).unwrap_err();
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

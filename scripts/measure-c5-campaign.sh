@@ -13,13 +13,13 @@
 #   measure-c5-campaign.sh --self-test    (no privilege: plan shapes, resume and gate logic)
 #
 # The plan is .superpowers/sdd/2026-09-30-module-caller-inventory/task6-c5-plan.md §2
-# (M0–M7) plus the C5.6 R4 pool timing (task6-c5-6-report.md: base 012807c vs
+# (M0–M7) plus the C5.6 R4 pool timing (task6-c5-6-report.md: base 570eb7d vs
 # head on cores 10,11 and on the 4-core set 8,9,10,11). Binaries:
 #   --candidate       the release build of the s2s3 tip under test
 #   --baseline        the fresh v0.1.0 tag build (M1-match, M2, M6, M7)
-#   --r4-base         a release build of 012807c (R4; the C5.6 base before the pool)
+#   --r4-base         a release build of 570eb7d (R4; the C5.6 base before the pool)
 #   --loss-candidate  optional: the candidate built with P11SCOPE_SMALL_DISCOVERY_RING=1
-#                     (a 4 KiB DISCOVERY ring) for M0's induced loss. At 60f2f38 the
+#                     (a 4 KiB DISCOVERY ring) for M0's induced loss. In v0.2.0 the
 #                     native Inventory loader refuses that build (its exact-map
 #                     validator pins DISCOVERY at 65,536 bytes, src/attach/inventory.rs),
 #                     so by default M0 induces the loss on the stock candidate with
@@ -258,7 +258,7 @@ duration, samples, latency = opt("duration", 60), opt("samples", 2), opt("latenc
 build = 15 + 0.06 * callers + 0.003 * (total - callers)
 per_sample = duration + latency + 5 + 0.002 * total + (0 if total < 1000 else 20)
 # A host-namespace native observer retires its attachments one by one on
-# stop (~30 s per sample at 60f2f38, measured in the smoke; C5.11's grouped
+# stop (~30 s per sample before C5.11, measured in the smoke; C5.11's grouped
 # detach should shrink it, so this stays an upper bound).
 if "--observer-ns host" in args:
     per_sample += 30

@@ -13,7 +13,7 @@ pool) ran on release day; its numbers are in the M0, M1, M4 and R4 rows
 below. Method for every row: Linux 7.0 x86-64, observer pinned to CPUs
 10,11 (R4: 8–11), 3 cold + 6 warm samples per cell (M4: 3 + 3), each a
 30 s run (M4: 60 s), in a quiet window (load gate 4.0), on the v0.2.0
-candidate c837a19 (glibc release build; the shipped observer is musl
+candidate b16c858 (glibc release build; the shipped observer is musl
 static-pie). Ranges below are the min..max of per-sample p95.
 
 ## Kernels and backends
@@ -142,9 +142,9 @@ static-pie). Ranges below are the min..max of per-sample p95.
 - What the user sees: no gain from the bounded per-collection `map_files`
   proof pool (at most 3 scoped workers) on this host: scan pass p95 at
   4,096 processes is ~2.30 s with the candidate (warm median 2,309 ms,
-  range 2,282–2,329 ms) against ~2.02 s with the pre-pool build 012807c
+  range 2,282–2,329 ms) against ~2.02 s with the pre-pool build 570eb7d
   (warm median 2,035 ms, range 2,031–2,087 ms). This is not a clean A/B:
-  012807c predates other slices. Do not read it as the pool helping.
+  570eb7d predates other slices. Do not read it as the pool helping.
 - Kernels/conditions: `--system` with maps-matched callers past the
   deep-scan cap, scan lane on CPUs 8–11 (2 physical cores with SMT), on
   kernels where `map_files` proofs run.

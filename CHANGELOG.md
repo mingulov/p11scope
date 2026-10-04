@@ -196,7 +196,7 @@ fail-closed PID-namespace and privilege handling. See
 - The Rust 1.88 MSRV: the release compiler (`.release-rust-version`,
   currently 1.98.1) is the only supported toolchain. The 1.88 CI job and
   floor assertions are gone; the digest-pinned helper build containers and
-  the release licence notices move to `rust:1.98.1` (f737b13).
+  the release licence notices move to `rust:1.98.1`.
   `rust-version` fields name the release major.minor (`crates/ebpf-common`
   stays at 1.97 with the pinned BPF nightly until the C7 bump).
 - `k8s-profile-entry` API mode (`--pod NAME`, `--namespace`, `--container`)
@@ -215,7 +215,7 @@ platform, packaging). The v0.1.0 limits below stay for that release.
 
 Kernels: 5.15.221, Ubuntu 6.8.0-142, 6.12.111, 7.2.6, via
 `scripts/qualify-release-matrix.sh` (vng guests, release binaries, Rust
-1.98.1). The qualified binaries were built from `24f233c`; the release
+1.98.1). The qualified binaries were built from `f824046`; the release
 candidate differs from that tree only in the classic `--pid` attach path,
 `--event-log` hardening, the `--duration` bound, a doctor refusal-string
 wording correction, and the 0.2.0 version bump. The classic `--pid` path
@@ -245,7 +245,7 @@ The short measurement tier landed on release day: M0 PASS (29 of 29 units
 valid); M1 pass p95 ~0.34 s at 448 processes and ~2.20 s at 4,096 in
 both lanes, over the 1 s target at 4,096; M4 lossless at 100 exec/s and
 ~100 ring records/min lost at 1,000 exec/s (448 processes, native lane);
-C5.6 pool with no gain on 2 physical cores (not a clean A/B: 012807c
+C5.6 pool with no gain on 2 physical cores (not a clean A/B: 570eb7d
 predates other slices). See
 [docs/known-limitations.md](docs/known-limitations.md) for the numbers
 and method. Explicitly out of scope for v0.2.0: a long soak and a v0.1.0

@@ -110,6 +110,14 @@ SCAN_LANE_REASONS = frozenset({SCAN_ONLY_REASON, "not_admitted", None})
 # Preference order (UnboundPool.claim): before_admission rows serve only
 # pre-admission images.
 COUNTED_PREADMISSION_REASONS = ("before_admission", "no_live_caller")
+# An exec-chain image's row may stay unbound by the binder's documented exec
+# rules (inventory-v1 `unbound_reasons`: Rule 4 `exec_after_admission`, and
+# `exec_transition`, `exec_coverage_gap`, `cookie_mismatch` for a nonleader
+# exec) - never a loss, never a pid. Exec-only reasons come first so the
+# shared reasons' rows stay for short-lived and leader-exit images (L-4).
+COUNTED_EXEC_REASONS = ("exec_after_admission", "exec_transition", "exec_coverage_gap", "cookie_mismatch")
+COUNTED_EXEC_CHAIN_REASONS = COUNTED_EXEC_REASONS + ("before_admission", "no_live_caller")
+COUNTED_EXEC_PREADMISSION_REASONS = ("before_admission",) + COUNTED_EXEC_REASONS + ("no_live_caller",)
 # The --system deep-scan selection bound (inventory --max-scan-pids).
 SCAN_LIMIT_GAP = re.compile(r"selected \d+ for deep scanning", re.I)
 # Retirement settlement after a stop (plan C5: "retirement: unsettled";
@@ -1127,7 +1135,10 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
         if gap is None and state.pool is not None:
             first_ns = first_call_ns(image, prov["path"])
             early = preadmission_edge(view, edges, exe_ids, first_ns)
-            pidless = pidless_unbound_gap(view, mid, COUNTED_SHORT_LIVED_REASONS)
+            exec_chain = spec["mode"] == "exec-chain"
+            short_reasons = COUNTED_EXEC_CHAIN_REASONS if exec_chain else COUNTED_SHORT_LIVED_REASONS
+            early_reasons = COUNTED_EXEC_PREADMISSION_REASONS if exec_chain else COUNTED_PREADMISSION_REASONS
+            pidless = pidless_unbound_gap(view, mid, short_reasons)
             # R-C51-2 covers never-admitted images only: one whose caller was
             # admitted at or before its first call must bind (review M-1).
             # The image began at its exec (after the predecessor's last
@@ -1138,12 +1149,12 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
                 (c.get("first_seen_ns") is not None and began <= c["first_seen_ns"] <= first_ns)
                 for c in candidates(view, image) if c["id"] in exe_ids)
             if early is not None:
-                row = state.pool.claim(mid, COUNTED_PREADMISSION_REASONS, first_ns)
+                row = state.pool.claim(mid, early_reasons, first_ns)
                 if row is not None:
                     counted = (f"{ctag} (reached by {how}): used before its caller {early['caller']} was admitted; "
                                f"edge reads unknown/{USE_BEFORE_ADMISSION}, row counted {row[2]} in the pass at {row[0]}")
             elif pidless is not None and first_ns is not None and not admitted:
-                row = state.pool.claim(mid, COUNTED_SHORT_LIVED_REASONS, first_ns)
+                row = state.pool.claim(mid, short_reasons, first_ns)
                 if row is not None:
                     counted = (f"{ctag} (reached by {how}): pid-less {pidless.get('subject')!r} covered by an "
                                f"unbound_rows {row[2]} count in the pass at {row[0]}")
@@ -1355,6 +1366,16 @@ def check_dashboard(view, images_by_cell, res):
     passes, ncallers, nmodules, nedges = (int(head.group(i)) for i in (2, 3, 4, 5))
     pass_events = [e["event"] for e in view.kind("pass")]
     at = next((p for p in pass_events if p.get("pass") == passes - 1), None)
+    # Each edge's coverage as of the frame's pass: its last `edge_observed`
+    # record before that pass's (non-final) marker. The stop's final commit,
+    # which freezes every ongoing watch, comes later and no frame shows it.
+    as_of = {}
+    for ev in view.events or []:
+        if ev.get("kind") == EVENT_KINDS["pass"] and ev["event"].get("pass") == passes - 1 \
+                and not ev["event"].get("final"):
+            break
+        if ev.get("kind") == "edge_observed":
+            as_of[(ev["event"].get("caller"), ev["event"].get("module"))] = coverage(ev["event"])
     gaps_line = next((FRAME["coverage"].match(line) for line in last if FRAME["coverage"].match(line)), None)
     if at is None:
         res.add(run, "*", "DASH-TOTALS", "fail", f"final frame claims {passes} passes; the stream has no such pass")
@@ -1381,6 +1402,16 @@ def check_dashboard(view, images_by_cell, res):
                 "entries": {expected_entries_display(edge)},
                 "semantics": {edge.get("semantics")},
                 "activity": expected_activity(edge, view.window[1])}
+        then = as_of.get(key) or {}
+        if frozen_watch(edge) and then.get("state") == WATCH_STATE and then.get("until_ns") is None \
+                and then.get("since_ns") == coverage(edge).get("since_ns"):
+            # The frame's pass predates the stop that froze this watch: it
+            # rendered the then-ongoing watch (armed, quiet, the zero a fact).
+            # A frame whose pass already carried the frozen record must read
+            # `watch ended`.
+            want["capture"].add(CAPTURE["armed"])
+            want["entries"].add(str(edge["entries"].get("count", 0)))
+            want["activity"].add(ACTIVITY["quiet"])
         wrong = {k: (items.get(k), sorted(v)) for k, v in want.items() if items.get(k) not in v}
         if (caller.get("pid"), caller.get("start_time")) in mine:
             compared += 1
@@ -2061,6 +2092,26 @@ def self_test():
         case("exec-images-count-covered", None, p5_counted(2))
         case("exec-images-count-short", "EXEC-SPLIT", p5_counted(1))
 
+        # Rule 4 (native_binding.rs): an exec-chain image's row may stay
+        # unbound as exec_after_admission; the oracle counts it. Without the
+        # exec-reason rule this case fails EXEC-SPLIT like count-short.
+        def p5_exec_reason(s, d, dash):
+            drop(s, d, "P5", gens=(1, 2))
+            pidless(s, d)
+            return counted(s, d, [{"module": s.mid["A"], "reason": "exec_after_admission", "rows": 2}])
+        res = case("exec-chain-count-exec-reason", None, p5_exec_reason)
+        if not any(r["cell"] == "P5" and r["status"] == "unbound" and "exec_after_admission" in r["detail"]
+                   for r in res.rows):
+            failures.append("exec-chain-count-exec-reason-exercised")
+
+        # Exec reasons are exec-chain-only: a short-lived image cannot claim
+        # them, so its no_live_caller rows are not stolen (L-4).
+        def p4_exec_reason(s, d, dash):
+            drop(s, d, "P4")
+            pidless(s, d)
+            return counted(s, d, [{"module": s.mid["A"], "reason": "exec_after_admission", "rows": 2}])
+        case("short-lived-count-exec-reason-rejected", "RETAINED", p4_exec_reason)
+
         def p1_preadmission(n, admitted_early=False):
             def mutate(s, d, dash):
                 e = _edge(d, cid(s, "P1"), s.mid["A"])
@@ -2244,6 +2295,25 @@ def self_test():
             return mutate
         case("frozen-watch-frame-quiet", "DASH-EDGE-LABELS", frozen_frame_claims(("activity", ACTIVITY["quiet"])))
         case("frozen-watch-frame-zero", "DASH-EDGE-LABELS", frozen_frame_claims(("entries", "0")))
+
+        # A frame rendered before the stop that froze the watches: the
+        # snapshot is frozen, the frame shows the then-ongoing watches as
+        # armed/quiet/0, and the stream carries the ongoing records before
+        # the frame's pass marker plus the frozen sweep after it. The frame
+        # is compared with the edge state at its own pass, so this passes;
+        # without the as-of rule it fails DASH-EDGE-LABELS on every edge.
+        def dash_frame_before_freeze(s, d, dash):
+            live = _deep(dash)
+            for e in dash["edges"]:
+                cov = e["entries"]["coverage"]
+                cov["until_ns"] = cov["since_ns"] + 10 * MS
+            ev = s.events(live)
+            frozen = [r for r in s.events(dash) if r["kind"] == "edge_observed"]
+            at = next(i for i, r in enumerate(ev) if r["kind"] == "ended")
+            out = [dict(r, seq=i) for i, r in enumerate(ev[:at] + frozen + ev[at:])]
+            next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(frozen)
+            return {"frames": s.frames(live), "dash_events": out}
+        case("dashboard-frame-before-freeze", None, dash_frame_before_freeze)
 
         def frozen_quiet_event(s, d, dash):
             freeze(d, cid(s, "P3"), s.mid["C"])

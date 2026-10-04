@@ -54,6 +54,32 @@ pool) runs later on release day. Where those numbers go, this document reads
   Otherwise stays a documented correct-but-slow fallback per the
   kernel-tier directive.
 
+### 5.15: physical-identity controls and non-leader exec unqualified
+
+- What the user sees: on 5.15 only, four privileged regression cells fail
+  that pass on 6.8+. `privileged_task4_detailed_physical_identity_controls`
+  and `privileged_task4_inventory_physical_identity_controls` pin two
+  byte-identical provider files at distinct inodes, spawn an owned caller
+  per file, and prove each caller executes its own physical object; the
+  proof fails (`owned caller executes a different physical object`).
+  `privileged_detailed_failed_nonleader_exec_preserves_start_and_image`
+  and
+  `privileged_detailed_nonleader_exec_cleans_old_tid_before_same_session_rebind`
+  exec a worker thread (non-leader exec, failing and succeeding) and
+  require the provider's executable mapping at the pinned file offset to
+  still be present afterwards; it is absent (`actual provider executable
+  mapping contains the probed file offset`). Per-copy module attribution
+  and exec-handoff accounting are therefore unqualified on 5.15: treat
+  same-bytes/distinct-inode provider copies as undistinguished there, and
+  calls held across a non-leader exec as unaccounted.
+- Kernels/conditions: 5.15 only. Ubuntu 6.8, 6.12 and 7.2 pass all 61
+  privileged library cells (57/61 on 5.15).
+- Disclosure: the four failing cells; no product gap marks this at
+  runtime — this entry is the disclosure.
+- Workaround: qualify 5.15 captures without per-copy or exec-handoff
+  claims, or capture on 6.8+.
+- Planned: v0.3.0 (diagnose the 5.15-only failures; qualify or bound).
+
 ### 6.6 to 6.9.11 thread-exact pid filter
 
 - What the user sees: under `inventory --pid`, `auto` keeps per-offset
@@ -237,7 +263,10 @@ pool) runs later on release day. Where those numbers go, this document reads
 
 - What the user sees: sub-second CLI callers (100 ms at 10/s) may stay
   "used by an unidentified caller image": their `CALLER_USE` rows are
-  module-level `unbound_use`, never a caller edge.
+  module-level `unbound_use`, never a caller edge. An exec-chain image
+  that was never admitted (a thread exec inside one pass) likewise binds
+  nothing: the retired caller's edge reads `unknown`/`use_before_admission`
+  and the use is disclosed only via `unbound_use` (see the next entry).
 - Kernels/conditions: P4/P5-style exec chains and short-lived callers.
 - Disclosure: `modules[].unbound_use`, `observation.native_witnesses`
   (rows/bound/unbound/pending, `unbound_reasons`), and the `used by an
@@ -248,6 +277,27 @@ pool) runs later on release day. Where those numbers go, this document reads
 - Planned: v0.3.0 (measure unbound ratio per cell after C5; I2c exact-image
   iterator or a documented boundary; D6 rule-3 relaxation only if
   `before_admission` ≥20% with zero false joins on P5).
+
+### Leader-exit and exec-chain callers under `--system` stay unattributed (DR-05)
+
+- What the user sees: a process whose thread-group leader has exited while
+  other threads keep running (a zombie leader) is never admitted as a
+  caller: it has no `callers[]` record and no edge, and its provider use
+  appears only as module-level `modules[].unbound_use` with the
+  `used by an unidentified caller image` gap. An exec chain whose images
+  exec within one pass likewise binds no image: its rows are unbound as
+  `exec_after_admission`, `no_live_caller` or `before_admission`, and the
+  retired callers' edges read `unknown`/`use_before_admission`.
+- Kernels/conditions: all; `--system` scope (for `--pid`
+  see DR-C3-2).
+- Disclosure: the pid-less `process view` gap ("a process in scope could
+  not be retained or scanned before it changed"), `modules[].unbound_use`
+  (`rows`, `reasons`), `observation.native_witnesses.unbound_reasons`, and
+  the per-pass `unbound_rows` of the event stream. No pid is named and no
+  watch or positive claim is made for these processes.
+- Workaround: none for attribution; the module-level use is exact.
+- Planned: v0.3.0 (exact image identity, I2c; a zombie-leader admission
+  path that pins a live thread).
 
 ### Pre-admission use voids the watch (R-C51-1)
 
@@ -266,6 +316,24 @@ pool) runs later on release day. Where those numbers go, this document reads
 - Workaround: none; relaxing the admission rule is not allowed.
 - Planned: v0.3.0 (DR-C51-PREADMIT: upgrade to `Witnessed` when proven
   same-incarnation by cookie/start_time).
+
+### Live `quiet` lags a first use by up to one pass (decision horizon)
+
+- What the user sees: on the dashboard and in mid-run `edge_observed`
+  records, an edge whose caller has just used the module for the first
+  time can still read `capture armed | activity quiet | entries 0` for
+  up to one pass (~2 s by default) before it turns `witnessed` (or
+  `unknown`). A witness row binds only after a lifecycle drain and a
+  health read that both started after the row was read, i.e. at the next
+  pass.
+- Kernels/conditions: every native run; first use of each (image,
+  module) pair.
+- Disclosure: `observation.native_witnesses.pending`; the `-o` snapshot
+  and the stream's final sweep are exact (no pending row survives stop).
+- Workaround: read the `-o` report, or wait one pass before treating a
+  live `quiet` as final.
+- Planned: v0.3.0 (present an edge with a pending row of its caller as
+  `unknown` until decided).
 
 ### Gap retention is first-1024-wins (DR-41)
 

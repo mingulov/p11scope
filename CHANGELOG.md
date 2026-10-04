@@ -213,16 +213,36 @@ platform, packaging). The v0.1.0 limits below stay for that release.
 
 ### Qualification of this release
 
-`TBD-QUALIFIED`: the v0.2.0 qualification record is not written yet (lane:
-`release-v020-qualification.md`). Until it lands, no kernel-tier claim here
-is this release's evidence; the v0.1.0 record stays with that release.
+Kernels: 5.15.221, Ubuntu 6.8.0-142, 6.12.111, 7.2.6, via
+`scripts/qualify-release-matrix.sh` (vng guests, release binaries, Rust
+1.98.1). The qualified binaries were built from `24f233c`; the release
+candidate differs from that tree only in the classic `--pid` attach path,
+`--event-log` hardening, the `--duration` bound, a doctor refusal-string
+wording correction, and the 0.2.0 version bump. The classic `--pid` path
+was separately vng-qualified 9/9 on all 4 kernels.
 
-Planned qualification kernels: 5.15, Ubuntu 6.8, 6.12, 7.2.
+Checks, per kernel: `--version`, `doctor` capability tier T1
+(`capture available`), the public CLI matrix 13/0, the inventory scan
+lane, native backend selection (per-offset with the disclosed probe
+reason on 5.15, uprobe-multi on 6.8+), and the pid filter. The
+privileged library runner passes 61/61 cells on 6.8+ and 57/61 on 5.15
+(see [docs/known-limitations.md](docs/known-limitations.md): physical-identity
+controls and non-leader exec handling are unqualified on 5.15). The
+native C8 oracle, after the oracle fix on this branch (exec-chain rows
+counted, dashboard frames compared at their own pass), leaves only the 3
+C6 attested-delivery cells unmet on each kernel — `inventory` has no
+`--manifest` flag, so attested delivery cannot be exercised.
 
-What will be recorded here: the merged gates on the release compiler
-(1.98.1); the kind end-to-end result; the vng per-kernel matrix; the
-privileged library runner; the short measurement tier (M0, M1 at 4,096
-processes, M4 churn, C5.6 pool — `TBD-MEASURED` in
+Re-run from the repo root (release binaries for `<RC>` staged as
+`p11scope`, `p11scope-lib`, `p11scope-bpfmulti` in the bin dir):
+
+```sh
+export CARGO_BUILD_JOBS=4 TMPDIR=/var/tmp/p11scope-ws-tmp
+scripts/qualify-release-matrix.sh --rev <RC> --bin-dir /home/user/.cache/p11scope-vng/rc-qualify-bins-<RC>
+```
+
+Still to land: the short measurement tier (M0, M1 at 4,096 processes, M4
+churn, C5.6 pool — `TBD-MEASURED` in
 [docs/known-limitations.md](docs/known-limitations.md) until they land).
 Explicitly out of scope for v0.2.0: a long soak and a v0.1.0 comparison
 (see [docs/known-limitations.md](docs/known-limitations.md)).

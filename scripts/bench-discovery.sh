@@ -31,14 +31,14 @@
 #
 # Usage:
 #   scripts/bench-discovery.sh [--self-test] [--full]
-# Environment: RUNS (default 5), TOOLCHAIN (default +1.88),
+# Environment: RUNS (default 5), TOOLCHAIN (default +<.release-rust-version>),
 # TMPDIR (test temp I/O; repo rule: /var/tmp/p11scope-ws-tmp, never /tmp),
 # CARGO_BUILD_JOBS (default 2).
 set -eu
 cd "$(dirname "$0")/.."
 
 RUNS=${RUNS:-5}
-TOOLCHAIN=${TOOLCHAIN:-+1.88}
+TOOLCHAIN=${TOOLCHAIN:-+$(cat .release-rust-version)}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 WORK=${TMPDIR:-/var/tmp/p11scope-ws-tmp}/bench-discovery-$$
 HARNESS=cold_and_warm_discovery_agree_on_catalog_attach_sets_and_call_counts

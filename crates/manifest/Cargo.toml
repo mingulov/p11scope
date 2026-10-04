@@ -2,7 +2,7 @@
 name = "p11scope-manifest"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.98"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/mingulov/p11scope"
 description = "Probe-manifest schema shared by p11scope-discover and p11scope"

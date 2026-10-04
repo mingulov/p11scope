@@ -49,7 +49,9 @@ repository navigation and working rules for coding agents. The versioned
 [privacy allowlist](docs/privacy/allowlist-v1.md), including its
 [v2 extension](docs/privacy/allowlist-v2.md), define the public contracts.
 Keep changes scoped, preserve unrelated work, and never broaden capture
-implicitly. Retain Rust 1.88, edition 2024, and Linux x86-64 host support,
+implicitly. Use the release compiler (`.release-rust-version`) as the only supported
+toolchain, bumped as new stable releases ship. Retain edition 2024 and Linux
+x86-64 host support,
 including the documented ia32 target compatibility.
 
 Commit source, public documentation and reproducible test inputs. Generated

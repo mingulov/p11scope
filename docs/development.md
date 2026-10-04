@@ -36,8 +36,10 @@ mise exec -- cargo +1.98.1 install bpf-linker --version 0.10.4 --locked
 
 The release Rust version is single-sourced from `.release-rust-version`
 (currently 1.98.1): `mise.toml`, CI, and the shell/Python selectors all read
-that file, so a future bump starts there. Crate `rust-version` fields stay at
-1.88, the minimum supported compiler.
+that file, so a future bump starts there. The release compiler is the only
+supported toolchain; there is no older MSRV floor. When a new stable Rust
+ships, adopt it: update `.release-rust-version`, `mise.toml`, and the crate
+`rust-version` fields (the release compiler's major.minor).
 
 Keep `~/.cargo/bin` on `PATH` so Cargo-installed tools such as `bpf-linker`
 are directly discoverable. The later container lanes also require a working

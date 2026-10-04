@@ -856,7 +856,7 @@
         "system-product"
       ],
       "expected_behavior": "regression",
-      "limitation": "source-fixed: no coverage measurement. Existing check: `cargo +1.88 llvm-cov --locked --offline --workspace --all-targets --fail-under-lines \"$(cat .coverage-floor)\"` (floor 83). Final execution not recorded.",
+      "limitation": "source-fixed: no coverage measurement. Existing check: `cargo +\"$(cat .release-rust-version)\" llvm-cov --locked --offline --workspace --all-targets --fail-under-lines \"$(cat .coverage-floor)\"` (floor 83). Final execution not recorded.",
       "test_ids": [],
       "command": [],
       "artifact_hashes": {},

@@ -2,9 +2,10 @@
 //! The release compiler is single-sourced from `.release-rust-version`.
 //!
 //! Every live toolchain selector (shell, Python, CI) reads that file instead
-//! of pinning a literal, while the crate `rust-version` fields stay at the
-//! 1.88 minimum. These tests pin the mechanism so a future bump touches the
-//! version file first and cannot silently reintroduce a literal selector.
+//! of pinning a literal, and the crate `rust-version` fields equal that
+//! compiler's major.minor (latest only, no older supported floor). These tests
+//! pin the mechanism so a future bump touches the version file first and cannot
+//! silently reintroduce a literal selector or a stale-toolchain job.
 
 use std::fs;
 
@@ -75,32 +76,6 @@ fn live_shell_selectors_read_the_version_file() {
     }
 }
 
-/// Byte span of the `msrv` job block: from its `  msrv:` line to the next
-/// exactly-2-space-indented line (the next job or a trailing comment) or EOF.
-/// The `msrv` block is the one CI span allowed to pin literal 1.88.
-fn ci_msrv_span(ci: &str) -> (usize, usize) {
-    let start = ci.find("\n  msrv:\n").expect("CI must define an msrv job") + 1;
-    let mut end = ci.len();
-    let mut offset = start + "  msrv:\n".len();
-    while offset < ci.len() {
-        let next = ci[offset..].find('\n');
-        let line_start = match next {
-            Some(index) => offset + index + 1,
-            None => break,
-        };
-        if line_start >= ci.len() {
-            break;
-        }
-        let line = &ci[line_start..];
-        if line.starts_with("  ") && !line.starts_with("   ") {
-            end = line_start;
-            break;
-        }
-        offset = line_start;
-    }
-    (start, end)
-}
-
 #[test]
 fn ci_selectors_read_the_version_file() {
     let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
@@ -108,55 +83,79 @@ fn ci_selectors_read_the_version_file() {
         ci.contains("$(cat .release-rust-version)"),
         "CI must read the release Rust version file"
     );
-    let (start, end) = ci_msrv_span(&ci);
-    let without = format!("{}{}", &ci[..start], &ci[end..]);
     // Full-comment lines cannot pin a selector; executable steps can.
-    let executable: String = without
+    let executable: String = ci
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
         !executable.contains("1.88"),
-        "CI must not pin a literal 1.88 selector outside the msrv job"
+        "CI must not pin a literal 1.88 selector"
     );
 }
 
 #[test]
-fn ci_msrv_exemption_is_scoped() {
+fn ci_has_no_stale_toolchain_job() {
     let ci = fs::read_to_string(".github/workflows/ci.yml").expect("read ci.yml");
-    // The msrv job exists, pins 1.88, runs the four gates, and never reads
-    // the release version file (the lanes stay split).
-    let (start, end) = ci_msrv_span(&ci);
-    let block = &ci[start..end];
     assert!(
-        block.contains("cargo +1.88 fmt")
-            && block.contains("cargo +1.88 check")
-            && block.contains("cargo +1.88 test")
-            && block.contains("cargo +1.88 clippy"),
-        "the msrv job must run the four canonical gates on 1.88"
+        !ci.contains("\n  msrv:\n"),
+        "CI must not define an msrv job: the release compiler is the only supported toolchain"
     );
-    assert!(
-        !block.contains(".release-rust-version"),
-        "the msrv job must not read the release version file"
-    );
+    // Every `cargo +X` / `rustup toolchain install X` selector in executable
+    // steps must be the release version file or the pinned BPF nightly.
+    for line in ci
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        for marker in ["cargo +", "toolchain install "] {
+            let mut rest = line;
+            while let Some(index) = rest.find(marker) {
+                rest = &rest[index + marker.len()..];
+                let selector = rest.trim_start_matches('"');
+                assert!(
+                    selector.starts_with("$(cat .release-rust-version)")
+                        || selector.starts_with("nightly-2026-05-20"),
+                    "CI toolchain selector must be the release compiler or the BPF nightly: {line}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn msrv_declarations_stay_at_1_88() {
+fn rust_version_declarations_track_the_release_compiler() {
+    let release = release_rust();
+    let mut parts = release.split('.');
+    let expected = format!(
+        "{}.{}",
+        parts.next().expect("major"),
+        parts.next().expect("minor")
+    );
     for manifest in [
         "Cargo.toml",
         "crates/discover/Cargo.toml",
-        "crates/ebpf-common/Cargo.toml",
         "crates/manifest/Cargo.toml",
         "crates/bpf-multi/Cargo.toml",
     ] {
         let text = fs::read_to_string(manifest).expect("read a workspace manifest");
         assert!(
-            text.contains("rust-version = \"1.88\""),
-            "{manifest} must keep the 1.88 MSRV floor"
+            text.contains(&format!("rust-version = \"{expected}\"")),
+            "{manifest} rust-version must equal the release compiler's major.minor {expected}"
         );
     }
+}
+
+/// `p11scope-ebpf-common` is also compiled by the pinned BPF nightly
+/// (`nightly-2026-05-20`, rustc 1.97), which rejects a higher `rust-version`.
+/// It tracks that nightly's major.minor instead of the release compiler's.
+#[test]
+fn ebpf_common_rust_version_matches_the_bpf_nightly() {
+    let text = fs::read_to_string("crates/ebpf-common/Cargo.toml").expect("read ebpf-common");
+    assert!(
+        text.contains("rust-version = \"1.97\""),
+        "ebpf-common rust-version must match the pinned BPF nightly (1.97)"
+    );
 }
 
 #[test]

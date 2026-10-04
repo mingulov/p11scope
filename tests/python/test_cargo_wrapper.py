@@ -15,6 +15,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 PREPARER_TESTS = runpy.run_path(str(ROOT / "tests/python/test_prepare_dependencies.py"))
 FIXTURES = ROOT / "tests/fixtures/cargo-wrapper"
+TOOLCHAIN = "+" + (ROOT / ".release-rust-version").read_text(encoding="utf-8").strip()
 
 
 class CargoWrapperTests(unittest.TestCase):
@@ -79,7 +80,7 @@ class CargoWrapperTests(unittest.TestCase):
             (self.base / name).unlink(missing_ok=True)
 
     def test_preparation_precedes_cargo_and_preserves_arguments_and_environment(self):
-        arguments = ("+1.88", "build", "--locked", "--manifest-path", "folder with spaces/Cargo.toml",
+        arguments = (TOOLCHAIN, "build", "--locked", "--manifest-path", "folder with spaces/Cargo.toml",
                      "--", "argument with spaces", "", "*", "--offline", "--frozen")
         result = self.invoke(*arguments)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -92,7 +93,7 @@ class CargoWrapperTests(unittest.TestCase):
 
     def test_preparation_refusal_stops_before_cargo(self):
         (self.archives / "demo-1.0.0.crate").write_bytes(b"corrupt pinned archive")
-        result = self.invoke("+1.88", "build", "--locked")
+        result = self.invoke(TOOLCHAIN, "build", "--locked")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("archive digest mismatch", result.stderr)
         self.assertFalse((self.base / "cargo-executed").exists())
@@ -100,8 +101,8 @@ class CargoWrapperTests(unittest.TestCase):
     def test_offline_and_frozen_missing_archives_never_reach_downloader(self):
         self.guard_downloads()
         shutil.rmtree(self.archives)
-        for arguments in (("--offline", "build"), ("+1.88", "build", "--frozen"),
-                          ("+1.88", "--frozen", "--offline", "build")):
+        for arguments in (("--offline", "build"), (TOOLCHAIN, "build", "--frozen"),
+                          (TOOLCHAIN, "--frozen", "--offline", "build")):
             with self.subTest(arguments=arguments):
                 self.clear_markers()
                 result = self.invoke(*arguments)
@@ -113,7 +114,7 @@ class CargoWrapperTests(unittest.TestCase):
 
     def test_literal_delimiter_preserves_application_flags(self):
         self.guard_downloads()
-        arguments = ("+1.88", "run", "--", "--offline", "--frozen", "two words")
+        arguments = (TOOLCHAIN, "run", "--", "--offline", "--frozen", "two words")
         result = self.invoke(*arguments)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.preparation_record()["argv"], [])
@@ -133,7 +134,7 @@ class CargoWrapperTests(unittest.TestCase):
     def test_cargo_exit_status_and_streams_are_preserved(self):
         self.config.update(status=37, stdout="fake Cargo stdout\n", stderr="fake Cargo stderr\n")
         self.write_config()
-        result = self.invoke("+1.88", "check", "--locked")
+        result = self.invoke(TOOLCHAIN, "check", "--locked")
         self.assertEqual(result.returncode, 37)
         self.assertEqual(result.stdout, self.config["stdout"])
         self.assertEqual(result.stderr, self.config["stderr"])

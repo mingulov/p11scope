@@ -92,7 +92,7 @@ jobs:
           { echo '## UNRUN lanes'; echo '```'; cat "$RUNNER_TEMP/lanes.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
       # UNRUN lanes end
       # The stable toolchain is single-sourced from .release-rust-version,
-      # read inline like .coverage-floor; crate rust-version (MSRV) is unchanged.
+      # read inline like .coverage-floor; crate rust-version tracks its major.minor.
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
@@ -244,28 +244,6 @@ jobs:
             shellcheck -S error "$dir"/*.sh
           done
       - run: ruff check scripts/ tests/python/
-  # MSRV floor: 1.88 stays the minimum supported compiler while the release
-  # compiler moves on. The literal 1.88 pins below are intentional — the one
-  # exemption to the .release-rust-version single-source rule, scoped by
-  # release_compiler_contracts::ci_msrv_exemption_is_scoped.
-  msrv:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
-      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib libseccomp-dev llvm python3
-      - name: Reconstruct pinned dependency sources
-        run: python3 -I scripts/prepare-dependencies.py
-      - run: cargo +1.88 fetch --locked --manifest-path Cargo.toml
-      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - run: cargo +1.88 fmt --all -- --check
-      - run: cargo +1.88 check --locked --offline --workspace --all-targets
-      - run: cargo +1.88 test --locked --offline --workspace --all-targets
-      - run: cargo +1.88 clippy --locked --offline --workspace --all-targets -- -D warnings
   # A step cannot read its own job's log, so a second job fetches the finished
   # log through the Actions API and keeps it as a run artifact (90 days requested;
   # repo and org settings can cap that). Its

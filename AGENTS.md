@@ -18,7 +18,8 @@ or internal planning files exist.
 - `crates/discover/` is the optional helper that executes provider code in
   its own process. Keep provider loading out of the observer process.
   `crates/manifest/` contains the shared manifest contract.
-- Keep Rust 1.88, edition 2024, Linux x86-64 host support and the documented
+- Keep the release compiler (`.release-rust-version`) as the only supported
+  toolchain, edition 2024, Linux x86-64 host support and the documented
   ia32 target compatibility. Do not assume the development host's libc,
   kernel, provider paths or system utilities are universal.
 - Use `mise exec -- ./scripts/cargo.sh` for host Rust commands. The wrapper

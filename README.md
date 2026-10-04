@@ -51,7 +51,9 @@ mise exec -- ./scripts/cargo.sh +1.98.1 build --locked
 ```
 
 The stable toolchain version is single-sourced from `.release-rust-version`
-(currently 1.98.1), which `mise.toml`, CI, and the build scripts all read.
+(currently 1.98.1), which `mise.toml`, CI, and the build scripts all read. It is the only
+supported toolchain (no older MSRV); it is bumped as new stable Rust releases
+ship.
 
 Preparation downloads only the recipe-pinned crates.io archives and verifies
 their hashes, ordered patches, final tree hashes, and receipts. For an offline

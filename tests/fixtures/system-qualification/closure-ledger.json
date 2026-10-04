@@ -286,7 +286,7 @@
       "title": "no coverage measurement",
       "disposition": "source-fixed",
       "owner_task": "T13",
-      "check": "`cargo +1.88 llvm-cov --locked --offline --workspace --all-targets --fail-under-lines \"$(cat .coverage-floor)\"` (floor 83)"
+      "check": "`cargo +\"$(cat .release-rust-version)\" llvm-cov --locked --offline --workspace --all-targets --fail-under-lines \"$(cat .coverage-floor)\"` (floor 83)"
     },
     {
       "id": "F-41",

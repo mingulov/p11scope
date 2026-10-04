@@ -2191,6 +2191,39 @@ def exact_capture_modules(document):
         )
 
 
+# Owner decision G-03 (081cec8): an already-attached module whose growth does
+# not fit keeps its attached endpoints and stays in `modules_skipped` with a
+# reason starting `admitted module needs`, forcing PARTIAL. A whole-module
+# refusal (`module needs` without `admitted`) is never that record.
+ADMITTED_GROWTH_PREFIX = "admitted module needs "
+
+
+def exact_admitted_growth_skips(evidence, growth_path=None):
+    """`modules_skipped` holds only G-03 growth records for `growth_path`.
+
+    With `growth_path` None no record is allowed. A record makes the
+    document PARTIAL. Returns how many records there were (0 or 1).
+    """
+    skips = evidence["modules_skipped"]
+    require(isinstance(skips, list), f"invalid modules_skipped: {skips!r}")
+    for skip in skips:
+        require(
+            growth_path is not None
+            and isinstance(skip, dict)
+            and skip.get("name") == growth_path
+            and isinstance(skip.get("reason"), str)
+            and skip["reason"].startswith(ADMITTED_GROWTH_PREFIX),
+            f"modules_skipped allows only an admitted-growth record for {growth_path!r}: {skip!r}",
+        )
+    require(len(skips) <= 1, f"more than one admitted-growth record: {skips!r}")
+    if skips:
+        require(
+            evidence["completeness"] == "PARTIAL",
+            f"an admitted-growth record forces PARTIAL: {evidence['completeness']!r}",
+        )
+    return len(skips)
+
+
 def validate_proxy_capacity_fallback(document, module_path=None):
     """The exact p11-kit-bounded/SoftHSM2-attached live shape.
 
@@ -2235,7 +2268,6 @@ def validate_proxy_capacity_fallback(document, module_path=None):
         f"manifest-free proxy lane attested slot semantics: "
         f"{evidence['semantic_unverified_slots']} of {evidence['slots']} unverified",
     )
-    require(evidence["modules_skipped"] == [], evidence["modules_skipped"])
     require(evidence["skipped"] == [], evidence["skipped"])
 
     modules = document["capture"]["modules"]
@@ -2254,6 +2286,8 @@ def validate_proxy_capacity_fallback(document, module_path=None):
     )
     soft_id = {key: soft[key] for key in ("dev", "ino", "sha256")}
     proxy_id = {key: proxy[key] for key in ("dev", "ino", "sha256")}
+    # G-03: the capped proxy may carry its admitted-growth record, nothing else.
+    exact_admitted_growth_skips(evidence, growth_path=proxy["path"])
 
     discovery = evidence["discovery"]
     require(len(discovery) == 2, [module["path"] for module in discovery])
@@ -3847,6 +3881,36 @@ def self_test():
         if bad["evidence"]["completeness"] != "COMPLETE":
             settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad, module_path=soft_path))
+    # DR-RETRO-PROXY-1 (G-03): the live lane records the capped proxy's
+    # admitted growth in modules_skipped. That record, for the proxy path
+    # only, is accepted and forces PARTIAL; a whole-module refusal, a record
+    # for SoftHSM2, or COMPLETE beside the record is refused.
+    growth_reason = (
+        "admitted module needs 6120 more; only 512 attach slots are available; 478 are in use "
+        "(478 active, 0 retired) — 6120 endpoints not attached; kept its 410 attached endpoints"
+    )
+    proxy_path = PROXY_MODULE_FIXTURE["path"]
+    grown = copy.deepcopy(proven_proxy)
+    grown["evidence"]["modules_skipped"] = [{"name": proxy_path, "reason": growth_reason}]
+    settle_fixture_verdict(grown)
+    require(grown["evidence"]["verdict_detail"] == "concrete_gap", grown["evidence"]["verdict_detail"])
+    validate_proxy_capacity_fallback(grown, module_path=soft_path)
+    for skip in (
+        {"name": proxy_path, "reason": growth_reason.removeprefix("admitted ")},
+        {"name": soft_path, "reason": growth_reason},
+        {"name": proxy_path, "reason": "stale shape"},
+    ):
+        bad = copy.deepcopy(grown)
+        bad["evidence"]["modules_skipped"] = [skip]
+        rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad, module_path=soft_path))
+    twice = copy.deepcopy(grown)
+    twice["evidence"]["modules_skipped"] *= 2
+    rejected(lambda: validate_proxy_capacity_fallback(twice, module_path=soft_path))
+    claimed = copy.deepcopy(grown)
+    claimed["evidence"]["completeness"] = "COMPLETE"
+    rejected(lambda: exact_admitted_growth_skips(claimed["evidence"], proxy_path))
+    rejected(lambda: exact_admitted_growth_skips(grown["evidence"], None))
+    print("proxy lane accepts only its admitted-growth record, always PARTIAL: OK")
     # The lane pins its own module by exact path, so a capture that attached
     # some other SoftHSM2 build is not this lane's evidence.
     rejected(

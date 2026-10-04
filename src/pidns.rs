@@ -21,7 +21,7 @@
 
 use std::sync::OnceLock;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde::Serialize;
 
 /// `PROC_PID_INIT_INO`: the nsfs inode of the initial PID namespace.
@@ -112,8 +112,14 @@ pub enum ProcView {
     /// `/proc/self` is `getpid()` and `/proc/<getpid()>` is this process,
     /// numbered by this namespace alone (`NSpid` is exactly `getpid()`).
     Own,
-    /// Anything else, with the evidence. Never treated as `Own`.
+    /// `/proc` serves this process under other numbers, with the evidence.
+    /// Never treated as `Own`.
     Foreign(String),
+    /// `/proc` has no entry for this process at all (`/proc/self` does not
+    /// resolve: `nsenter -m` without `-p`), with the evidence. Published as
+    /// `foreign` too; unlike `Foreign`, no capture can run here, because the
+    /// observer cannot read its own `/proc/self` (DR-RETRO-PIDNS-2).
+    Unserved(String),
 }
 
 impl ProcView {
@@ -121,7 +127,7 @@ impl ProcView {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Own => "observer",
-            Self::Foreign(_) => "foreign",
+            Self::Foreign(_) | Self::Unserved(_) => "foreign",
         }
     }
 }
@@ -139,7 +145,7 @@ pub fn classify_proc_view(
 ) -> ProcView {
     let own = own_pid.to_string();
     match self_link {
-        Err(error) => return ProcView::Foreign(format!("/proc/self: {error}")),
+        Err(error) => return ProcView::Unserved(format!("/proc/self: {error}")),
         Ok(link) if link != own => {
             return ProcView::Foreign(format!(
                 "/proc/self names pid {:?}, this process is {own}",
@@ -165,12 +171,13 @@ pub fn classify_proc_view(
     ProcView::Own
 }
 
-fn read_proc_view() -> ProcView {
+/// The view of the procfs mounted at `proc_root` (normally `/proc`).
+fn read_proc_view_at(proc_root: &std::path::Path) -> ProcView {
     let own_pid = std::process::id();
     classify_proc_view(
         own_pid,
-        std::fs::read_link("/proc/self").map(|link| link.to_string_lossy().into_owned()),
-        std::fs::read_to_string(format!("/proc/{own_pid}/status")),
+        std::fs::read_link(proc_root.join("self")).map(|link| link.to_string_lossy().into_owned()),
+        std::fs::read_to_string(proc_root.join(own_pid.to_string()).join("status")),
     )
 }
 
@@ -200,11 +207,60 @@ impl PidNumbering {
 /// This process's numbering, read once: neither half changes under a
 /// running process (a remount of `/proc` mid-run is out of scope).
 pub fn numbering() -> &'static PidNumbering {
+    #[cfg(test)]
+    if let Some(injected) = test_seam::injected() {
+        return injected;
+    }
     static NUMBERING: OnceLock<PidNumbering> = OnceLock::new();
-    NUMBERING.get_or_init(|| PidNumbering {
-        observer: observer().clone(),
-        proc_view: read_proc_view(),
-    })
+    NUMBERING.get_or_init(|| numbering_from(observer().clone(), std::path::Path::new("/proc")))
+}
+
+/// Both halves composed: `observer`, and the view of the procfs mounted at
+/// `proc_root`. Neither half alone decides agreement.
+fn numbering_from(observer: ObserverPidNs, proc_root: &std::path::Path) -> PidNumbering {
+    PidNumbering {
+        observer,
+        proc_view: read_proc_view_at(proc_root),
+    }
+}
+
+/// DR-RETRO-PIDNS-1: unprivileged tests drive every [`numbering`] call
+/// site with a mismatched numbering. The injection is per thread, so a
+/// test sees it on its own thread only and no other test is affected.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use super::PidNumbering;
+    use std::cell::Cell;
+
+    thread_local! {
+        static INJECTED: Cell<Option<&'static PidNumbering>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn injected() -> Option<&'static PidNumbering> {
+        INJECTED.with(Cell::get)
+    }
+
+    /// Runs `body` with [`super::numbering`] answering `numbering` on this
+    /// thread, restoring the real answer afterwards (also on a panic).
+    pub(crate) fn with_numbering<R>(numbering: PidNumbering, body: impl FnOnce() -> R) -> R {
+        struct Restore(Option<&'static PidNumbering>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                INJECTED.with(|cell| cell.set(self.0));
+            }
+        }
+        let leaked: &'static PidNumbering = Box::leak(Box::new(numbering));
+        let _restore = Restore(INJECTED.with(|cell| cell.replace(Some(leaked))));
+        body()
+    }
+
+    /// An observer in a nested PID namespace with its own `/proc`.
+    pub(crate) fn nested() -> PidNumbering {
+        PidNumbering {
+            observer: super::ObserverPidNs::Nested,
+            proc_view: super::ProcView::Own,
+        }
+    }
 }
 
 /// Refuses a PID-scoped capture unless `/proc` PIDs are proven to be the
@@ -217,7 +273,10 @@ pub fn require_numbering_agrees(numbering: &PidNumbering, what: &str) -> Result<
         // A foreign /proc also hides `/proc/self/ns/pid` (an initial
         // observer is invisible in any other namespace's procfs), so it is
         // the root cause whenever the observer is not known to be nested.
-        (ObserverPidNs::Initial | ObserverPidNs::Unknown(_), ProcView::Foreign(why)) => format!(
+        (
+            ObserverPidNs::Initial | ObserverPidNs::Unknown(_),
+            ProcView::Foreign(why) | ProcView::Unserved(why),
+        ) => format!(
             "the mounted /proc does not number processes in this observer's PID namespace \
              ({why}; for example `nsenter -m` without `-p`)"
         ),
@@ -228,14 +287,45 @@ pub fn require_numbering_agrees(numbering: &PidNumbering, what: &str) -> Result<
             format!("this observer could not prove it runs in the initial PID namespace ({why})")
         }
     };
-    Err(anyhow!(
+    Err(anyhow::Error::new(NumberingMismatch(format!(
         "{MISMATCH_CODE}: refusing {what}: {situation}, but the kernel-side PID filter matches \
          initial-namespace PIDs, so this PID-scoped capture would count nothing. Run p11scope \
          in the host's initial PID namespace with its own /proc (Kubernetes: hostPID on a real \
          node; docker: --pid=host; nsenter: -p with -m), or use --cgroup, whose filter does \
          not depend on PID numbering"
-    ))
+    ))))
 }
+
+/// Refuses every capture when the mounted `/proc` has no entry for this
+/// process ([`ProcView::Unserved`]). `what` names the request. The observer
+/// reads its own `/proc/self` (the uretprobe self-probe, a trace `-o` link)
+/// and resolves every discovered process through `/proc`, so no scope can
+/// run honestly there, and a later failure would blame something else.
+pub fn require_self_served(numbering: &PidNumbering, what: &str) -> Result<()> {
+    let ProcView::Unserved(why) = &numbering.proc_view else {
+        return Ok(());
+    };
+    Err(anyhow::Error::new(NumberingMismatch(format!(
+        "{MISMATCH_CODE}: refusing {what}: the mounted /proc has no entry for this observer \
+         ({why}; for example `nsenter -m` without `-p`), so p11scope cannot read its own \
+         /proc/self (the uretprobe self-probe, trace -o) or resolve the processes it \
+         discovers. Mount a procfs of this observer's PID namespace (nsenter: -p with -m), or \
+         run p11scope in the host's initial PID namespace with its own /proc"
+    ))))
+}
+
+/// A `pid-namespace-mismatch` refusal. Typed so a caller that adds its own
+/// context to other failures can leave this already-complete line alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumberingMismatch(String);
+
+impl std::fmt::Display for NumberingMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NumberingMismatch {}
 
 /// `pid_namespace` in capture evidence and the inventory and inspect
 /// documents: which namespace numbers which PIDs, so a reader never has to
@@ -289,8 +379,11 @@ pub fn nested_warning(numbering: &PidNumbering) -> Option<String> {
         format!(
             "p11scope: WARNING: this observer's PID namespace is {} and its /proc numbers \
              processes as {}: the kernel reports initial-namespace PIDs (trace pid/tid), not \
-             the PIDs this /proc shows, and live discovery cannot resolve them; the output names \
-             both numberings (pid_namespace) and a capture's observation is never exact here",
+             the PIDs this /proc shows, and live discovery cannot resolve them; processes \
+             outside the PID namespace this /proc shows (the host's, for a nested observer) are \
+             invisible to its scan, so a provider only they map is never discovered. The output \
+             names both numberings (pid_namespace): a capture is never exact here, and an \
+             inventory carries a pid namespace gap",
             numbering.observer.label(),
             numbering.proc_view.label()
         )
@@ -304,9 +397,11 @@ pub fn numbering_gap(numbering: &PidNumbering) -> Option<(&'static str, String)>
         (
             "pid namespace",
             format!(
-                "observer PID namespace {}, /proc numbering {}: kernel-reported PIDs cannot be \
-                 resolved through /proc, so callers that load a module after a scan pass can be \
-                 missed (pid_namespace)",
+                "observer PID namespace {}, /proc numbering {}: processes outside the PID \
+                 namespace this /proc shows (the host's, for a nested observer) are invisible to \
+                 the /proc scan, so a module only they map is never discovered, and \
+                 kernel-reported PIDs cannot be resolved through /proc, so callers that load a \
+                 module after a scan pass can be missed (pid_namespace)",
                 numbering.observer.label(),
                 numbering.proc_view.label()
             ),
@@ -452,6 +547,20 @@ mod tests {
         assert!(warning.contains("PID namespace is nested"), "{warning}");
         assert!(warning.contains("pid_namespace"), "{warning}");
         assert!(nested_warning(&with(ObserverPidNs::Unknown("x".into()))).is_some());
+        // DR-RETRO-PIDNS-2 (review 4): the blind spot is stated whole, and
+        // the warning does not promise inventory an `exact` it never has.
+        assert!(
+            warning.contains("host's, for a nested observer) are invisible"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("an inventory carries a pid namespace gap"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("a capture's observation is never exact"),
+            "{warning}"
+        );
         assert!(
             nested_warning(&foreign_proc())
                 .unwrap()
@@ -496,7 +605,8 @@ mod tests {
             Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
             status("\t42"),
         );
-        assert!(matches!(&missing, ProcView::Foreign(text) if text.starts_with("/proc/self:")));
+        assert!(matches!(&missing, ProcView::Unserved(text) if text.starts_with("/proc/self:")));
+        assert_eq!(missing.label(), "foreign");
         let gone = classify_proc_view(
             42,
             Ok("42".into()),
@@ -550,7 +660,114 @@ mod tests {
         let (subject, reason) = numbering_gap(&numbering).unwrap();
         assert_eq!(subject, "pid namespace");
         assert!(reason.contains("/proc numbering foreign"), "{reason}");
-        assert!(numbering_gap(&with(ObserverPidNs::Nested)).is_some());
+        let (_, nested_reason) = numbering_gap(&with(ObserverPidNs::Nested)).unwrap();
+        assert!(
+            nested_reason
+                .contains("(the host's, for a nested observer) are invisible to the /proc scan"),
+            "{nested_reason}"
+        );
+        assert!(
+            nested_reason.contains("never discovered"),
+            "{nested_reason}"
+        );
+    }
+
+    /// DR-RETRO-PIDNS-2: a `/proc` with no entry for this observer refuses
+    /// every scope by name; a foreign but serving `/proc` refuses none here.
+    #[test]
+    fn an_unserved_proc_refuses_every_capture_by_name() {
+        let unserved = PidNumbering {
+            observer: ObserverPidNs::Unknown("/proc/self/ns/pid: ENOENT".into()),
+            proc_view: ProcView::Unserved("/proc/self: ENOENT".into()),
+        };
+        let error = require_self_served(&unserved, "a --system capture").unwrap_err();
+        assert!(error.is::<NumberingMismatch>());
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with(
+                "pid-namespace-mismatch: refusing a --system capture: the mounted /proc has no \
+                 entry for this observer (/proc/self: ENOENT;"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("uretprobe self-probe"), "{text}");
+        assert!(!text.contains("--allow-uretprobe"), "{text}");
+        assert!(!unserved.agrees());
+        assert!(require_self_served(&foreign_proc(), "a --system capture").is_ok());
+        assert!(require_self_served(&PidNumbering::agreeing(), "a --system capture").is_ok());
+        assert!(require_self_served(&with(ObserverPidNs::Nested), "a --system capture").is_ok());
+        // A PID scope names the /proc mismatch either way.
+        let text = format!(
+            "{:#}",
+            require_numbering_agrees(&unserved, "--pid 7").unwrap_err()
+        );
+        assert!(
+            text.contains("refusing --pid 7: the mounted /proc"),
+            "{text}"
+        );
+    }
+
+    /// DR-RETRO-PIDNS-1 (review P5): the composed numbering reads the
+    /// mounted procfs; a `/proc` that numbers this process elsewhere makes
+    /// it foreign even under an initial observer.
+    #[test]
+    fn the_numbering_composes_the_mounted_procs_view() {
+        let own = std::process::id().to_string();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&own, root.path().join("self")).unwrap();
+        std::fs::create_dir(root.path().join(&own)).unwrap();
+        std::fs::write(
+            root.path().join(&own).join("status"),
+            format!("Name:\tp11scope\nNSpid:\t{own}\n"),
+        )
+        .unwrap();
+        assert!(numbering_from(ObserverPidNs::Initial, root.path()).agrees());
+        // The host's /proc under `unshare --pid` without `--mount-proc`.
+        std::fs::write(
+            root.path().join(&own).join("status"),
+            format!("Name:\tp11scope\nNSpid:\t3026492\t{own}\n"),
+        )
+        .unwrap();
+        let foreign = numbering_from(ObserverPidNs::Initial, root.path());
+        assert!(matches!(&foreign.proc_view, ProcView::Foreign(why) if why.contains("NSpid")));
+        assert!(!foreign.agrees());
+        // A procfs with no entry for this process.
+        let empty = tempfile::tempdir().unwrap();
+        let unserved = numbering_from(ObserverPidNs::Initial, empty.path());
+        assert!(matches!(&unserved.proc_view, ProcView::Unserved(_)));
+        // `numbering()` is that composition over the real mount.
+        let source = include_str!("pidns.rs");
+        let body = source
+            .split_once("pub fn numbering() -> &'static PidNumbering {")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            body.contains(
+                "NUMBERING.get_or_init(|| numbering_from(observer().clone(), std::path::Path::new(\"/proc\")))"
+            ),
+            "{body}"
+        );
+        assert_eq!(
+            numbering(),
+            &numbering_from(observer().clone(), std::path::Path::new("/proc"))
+        );
+    }
+
+    /// The seam is per thread and restores the real answer.
+    #[test]
+    fn the_test_seam_injects_on_this_thread_only() {
+        let real = numbering().clone();
+        test_seam::with_numbering(test_seam::nested(), || {
+            assert_eq!(numbering(), &test_seam::nested());
+            let other = real.clone();
+            std::thread::spawn(move || assert_eq!(numbering(), &other))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(numbering(), &real);
     }
 
     /// The live read: the test runner's own link is a PID namespace link,
@@ -561,7 +778,10 @@ mod tests {
         assert!(parse_pid_ns_link(&ours).is_some(), "{ours}");
         assert_eq!(observer(), &classify(Ok(ours.clone())));
         // The test runner reads its own /proc (no nsenter -m, no stale mount).
-        assert_eq!(read_proc_view(), ProcView::Own);
+        assert_eq!(
+            read_proc_view_at(std::path::Path::new("/proc")),
+            ProcView::Own
+        );
         // Unprivileged, the denied magic link reads back as an empty string
         // on 7.0 (measured), which is exactly why only a parsed link counts.
         if let Ok(init) = std::fs::read_link("/proc/1/ns/pid")

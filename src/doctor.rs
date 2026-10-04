@@ -285,22 +285,37 @@ fn pid_namespace_check(numbering: &crate::pidns::PidNumbering, pid_requested: bo
         if let ObserverPidNs::Unknown(reason) = &numbering.observer {
             why.push(reason.clone());
         }
-        if let ProcView::Foreign(reason) = &numbering.proc_view {
-            why.push(format!("/proc numbering foreign: {reason}"));
+        match &numbering.proc_view {
+            ProcView::Foreign(reason) => why.push(format!("/proc numbering foreign: {reason}")),
+            ProcView::Unserved(reason) => why.push(format!(
+                "/proc numbering foreign, no entry for this process: {reason}"
+            )),
+            ProcView::Own => {}
         }
         let why = if why.is_empty() {
             String::new()
         } else {
             format!(" ({})", why.join("; "))
         };
-        let detail = format!(
-            "{}{why} — the kernel numbers tasks in the initial PID namespace: --pid, run and \
-             inventory --pid are refused ({}); --cgroup/--system captures stay PARTIAL \
-             (pid_namespace / proc_namespace_mismatch)",
-            numbering.observer.label(),
-            crate::pidns::MISMATCH_CODE,
-        );
-        if pid_requested {
+        let detail = if matches!(numbering.proc_view, ProcView::Unserved(_)) {
+            format!(
+                "{}{why} — this observer cannot read its own /proc/self, so every capture is \
+                 refused ({})",
+                numbering.observer.label(),
+                crate::pidns::MISMATCH_CODE,
+            )
+        } else {
+            format!(
+                "{}{why} — the kernel numbers tasks in the initial PID namespace: --pid, run and \
+                 inventory --pid are refused ({}); --cgroup/--system captures stay PARTIAL \
+                 (pid_namespace / proc_namespace_mismatch)",
+                numbering.observer.label(),
+                crate::pidns::MISMATCH_CODE,
+            )
+        };
+        // An unserved /proc refuses every capture, so the row fails for
+        // every scope, not only a --pid one.
+        if pid_requested || matches!(numbering.proc_view, ProcView::Unserved(_)) {
             Status::Fail(detail)
         } else {
             Status::Warn(detail)
@@ -2668,6 +2683,24 @@ mod tests {
                 panic!("{observer:?} with --pid must fail");
             };
             assert!(detail.contains("pid-namespace-mismatch"), "{detail}");
+        }
+        // DR-RETRO-PIDNS-2: a /proc with no entry for this observer fails
+        // the row for every scope, saying every capture is refused.
+        let unserved = PidNumbering {
+            observer: ObserverPidNs::Unknown("gone".into()),
+            proc_view: ProcView::Unserved("/proc/self: ENOENT".into()),
+        };
+        for pid_requested in [false, true] {
+            let Status::Fail(detail) = pid_namespace_check(&unserved, pid_requested).status else {
+                panic!("an unserved /proc must fail the row");
+            };
+            assert!(detail.contains("every capture is refused"), "{detail}");
+            assert!(
+                detail.contains(
+                    "/proc numbering foreign, no entry for this process: /proc/self: ENOENT"
+                ),
+                "{detail}"
+            );
         }
         let unknown = pid_namespace_check(&with(ObserverPidNs::Unknown("gone".into())), false);
         let foreign_row = pid_namespace_check(&foreign, false);

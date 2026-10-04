@@ -995,7 +995,13 @@ availability, never honesty. Then p11scope:
   with an error that starts `pid-namespace-mismatch:`. Without this the
   kernel-side PID filter would never match and the capture would read zero
   calls while claiming exact observation;
-- lets **`--cgroup` and `--system`** captures run — their kernel filter does
+- **refuses every capture** — any scope — when the mounted `/proc` has no
+  entry for the observer at all (`/proc/self` does not resolve, as under
+  `nsenter -m` without `-p`), with the same `pid-namespace-mismatch:` prefix:
+  p11scope reads its own `/proc/self` (the uretprobe self-probe, the trace
+  `-o` link) and resolves every discovered process through `/proc`, so no
+  scope can run honestly there. `doctor`'s `PID namespace` row FAILs;
+- otherwise lets **`--cgroup` and `--system`** captures run — their kernel filter does
   not depend on PID numbering, so it matches correctly, and providers that
   were attached count correctly — but marks the observation `lossy` with the
   cause `pid_namespace` (nested observer) and/or `proc_namespace_mismatch`
@@ -1004,7 +1010,10 @@ availability, never honesty. Then p11scope:
   mid-capture can be missed and its calls go uncounted. A stderr warning
   says the same;
 - gives `inventory --system` one scope-level gap (`subject: "pid
-  namespace"`), so its `gaps[]` is never empty there;
+  namespace"`), so its `gaps[]` is never empty there. Its `/proc` scan sees
+  only the processes the mounted `/proc` shows: in a nested namespace the
+  host's processes are invisible, so a provider only they map is never
+  discovered at all, by inventory or by a `--system` capture's scan;
 - names both numberings in every document: capture evidence, the inventory
   document and the `inspect --system` document carry
   `"pid_namespace": {"observer": "initial" | "nested" | "unknown",

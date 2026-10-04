@@ -83,15 +83,8 @@ fn run() -> Result<i32> {
                 cli::InspectScope::Pid(pid) => format!("inventory --pid {pid}"),
                 cli::InspectScope::System => "inventory --system".to_string(),
             };
-            // DR-K8S-1: the kernel-side PID filter numbers tasks in the
-            // initial PID namespace; a nested observer's --pid would match
-            // nothing, so it is refused by name before anything runs.
-            let observer = pidns::numbering();
-            if matches!(a.scope, cli::InspectScope::Pid(_)) {
-                pidns::require_numbering_agrees(observer, &scope)?;
-            } else if let Some(warning) = pidns::nested_warning(observer) {
-                let _ = writeln!(std::io::stderr(), "{warning}");
-            }
+            // DR-K8S-1: `inventory::run` refuses a mismatched --pid by
+            // name before anything runs; that line is already complete.
             inventory::run(
                 a.scope,
                 &a.modules,
@@ -107,7 +100,13 @@ fn run() -> Result<i32> {
                 a.event_max_files,
                 a.capture,
             )
-            .with_context(|| scope)
+            .map_err(|error| {
+                if error.is::<pidns::NumberingMismatch>() {
+                    error
+                } else {
+                    error.context(scope)
+                }
+            })
         }
         // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
         Err(CliError::Help(topic)) => print_stdout(format_args!("{}\n", topic.text())),

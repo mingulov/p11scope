@@ -3165,8 +3165,16 @@ fn pid_namespace_preflight(
     scope: &ScopeArg,
     numbering: &crate::pidns::PidNumbering,
 ) -> Result<Option<String>> {
-    if let ScopeArg::Pid(pid) = scope {
-        crate::pidns::require_numbering_agrees(numbering, &format!("--pid {pid}"))?;
+    let what = match scope {
+        ScopeArg::Pid(pid) => format!("--pid {pid}"),
+        ScopeArg::Cgroup(_) => "a --cgroup capture".to_string(),
+        ScopeArg::System => "a --system capture".to_string(),
+    };
+    // DR-RETRO-PIDNS-2: a /proc with no entry for this observer refuses
+    // every scope by name, before the self-probe could fail misleadingly.
+    crate::pidns::require_self_served(numbering, &what)?;
+    if let ScopeArg::Pid(_) = scope {
+        crate::pidns::require_numbering_agrees(numbering, &what)?;
     }
     Ok(crate::pidns::nested_warning(numbering))
 }
@@ -10821,6 +10829,111 @@ mod tests {
             kill_on_timeout: false,
             command: command.iter().map(OsString::from).collect(),
         }
+    }
+
+    // DR-RETRO-PIDNS-1: every product call site of `pidns::numbering()`,
+    // driven unprivileged through the per-thread seam with a nested
+    // observer. Each refusal fires before anything is forked or attached.
+    fn nested<R>(body: impl FnOnce() -> R) -> R {
+        crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), body)
+    }
+
+    /// Review P1: `run` refuses by name before resolving or forking its
+    /// command (the command here could not even run).
+    #[test]
+    fn a_nested_observer_refuses_run_before_anything_is_forked() {
+        let error = nested(|| {
+            run_owned(&run_args(
+                cli::PausePolicy::Never,
+                &["/definitely/missing/p11scope-pidns"],
+            ))
+            .expect_err("a nested observer must refuse run")
+        });
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("pid-namespace-mismatch: refusing run:"),
+            "{text}"
+        );
+    }
+
+    fn capture_args(scope: ScopeArg) -> CaptureArgs {
+        CaptureArgs {
+            kind: Kind::Profile,
+            modules: Vec::new(),
+            manifests: Vec::new(),
+            hooks: crate::discovery::hooks::HookRegistry::builtin(),
+            scope,
+            metrics: false,
+            duration: None,
+            out: None,
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        }
+    }
+
+    /// Review P2: a PID-scoped capture refuses by name before its target is
+    /// even opened (this PID cannot exist).
+    #[test]
+    fn a_nested_observer_refuses_a_pid_capture_before_opening_its_target() {
+        let error = nested(|| {
+            capture(&capture_args(ScopeArg::Pid(i32::MAX as u32)))
+                .expect_err("a nested observer must refuse --pid")
+        });
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with(&format!(
+                "pid-namespace-mismatch: refusing --pid {}:",
+                i32::MAX
+            )),
+            "{text}"
+        );
+    }
+
+    /// DR-RETRO-PIDNS-2: a `/proc` with no entry for this observer refuses
+    /// a --system capture by name before discovery or the uretprobe
+    /// self-probe, which would otherwise fail and point at the override.
+    #[test]
+    fn an_unserved_proc_refuses_a_system_capture_by_name() {
+        let unserved = crate::pidns::PidNumbering {
+            observer: crate::pidns::ObserverPidNs::Unknown("/proc/self/ns/pid: ENOENT".into()),
+            proc_view: crate::pidns::ProcView::Unserved("/proc/self: ENOENT".into()),
+        };
+        let error = crate::pidns::test_seam::with_numbering(unserved, || {
+            capture(&capture_args(ScopeArg::System)).expect_err("an unserved /proc must refuse")
+        });
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with(
+                "pid-namespace-mismatch: refusing a --system capture: the mounted /proc"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("--allow-uretprobe"), "{text}");
+    }
+
+    /// Review P3: the published evidence reads the observer's numbering,
+    /// so a nested capture can never seal `exact`/COMPLETE.
+    #[test]
+    fn a_nested_observers_evidence_names_its_numbering_as_a_gap() {
+        let evidence = nested(|| terminal_evidence_for(render::SchedulingEvidence::default()));
+        assert_eq!(evidence.pid_namespace.observer, "nested");
+        assert!(
+            evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"pid_namespace"),
+            "{:?}",
+            evidence.gap_classes
+        );
+        assert_eq!(evidence.completeness, "PARTIAL");
+        let agreeing = terminal_evidence_for(render::SchedulingEvidence::default());
+        assert_eq!(agreeing.pid_namespace.observer, "initial");
     }
 
     /// Design §10.3: exec, kill/reap, cancellation, pause, and environment

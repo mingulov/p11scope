@@ -172,9 +172,6 @@ versioned separately and are opaque, exact dispatch keys.
   of a truncated read being parsed.
 - `docs/usage.md` states the symlink policy: inputs follow symbolic links and
   are pinned by identity; outputs never follow one.
-
-### Fixed
-
 - **PID namespaces (DR-K8S-1/2).** An observer outside the initial PID
   namespace (a kind/k3d node, a container without the host PID namespace)
   used to publish its own-view PID into the kernel PID filter, which keys on
@@ -186,7 +183,11 @@ versioned separately and are opaque, exact dispatch keys.
   `pid-namespace-mismatch`; `--cgroup` and `--system` captures still match
   and count attached providers correctly but are `PARTIAL` with the
   observation cause `pid_namespace` or `proc_namespace_mismatch`, and
-  `inventory --system` carries a scope-level gap. Capture evidence and the
+  `inventory --system` carries a scope-level gap. A mounted `/proc` with no
+  entry for the observer at all (`nsenter -m` without `-p`) refuses every
+  capture by name, since the observer cannot read its own `/proc/self`;
+  before, a `--cgroup`/`--system` capture there failed at the uretprobe
+  self-probe and suggested the uretprobe override. Capture evidence and the
   inventory and `inspect --system` documents carry `pid_namespace`
   (`observer`, `kernel_pids`, `proc_pids`), naming which namespace numbers
   which PIDs, and `doctor` has a `PID namespace` row. See `docs/usage.md`,
@@ -197,7 +198,11 @@ versioned separately and are opaque, exact dispatch keys.
   `doctor` no longer says `CAP_BPF+CAP_PERFMON` suffice there, and the
   refusal names the sysctl and `CAP_SYS_ADMIN` (or a root process without
   it) instead of a lockdown, LSM or seccomp profile. Capturing at paranoid
-  >= 3 needs `CAP_SYS_ADMIN`.
+  >= 3 needs `CAP_SYS_ADMIN`. Capabilities are judged where the kernel checks them: a
+  process in a child user namespace (a rootless or userns-remapped
+  container), even uid 0 with a full `CapEff`, is told its capabilities do
+  not count there, and an unreadable `CapEff` is no longer reported as a
+  dropped `CAP_SYS_ADMIN`.
 
 ## [0.1.0]
 

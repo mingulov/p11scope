@@ -200,7 +200,10 @@ def validate(doc):
     oracle.exact_counters(ev)
     assert ev["slots"] == 4 and ev["attached_probes"] == 8
     assert ev["table_entries"] == 136 and ev["completeness"] == "PARTIAL"
-    assert ev["attach_failures"] == ev["modules_skipped"] == ev["skipped"] == []
+    assert ev["attach_failures"] == ev["skipped"] == []
+    # G-03: no provider here is the p11-kit proxy, so no admitted-growth
+    # record is allowed either.
+    oracle.exact_admitted_growth_skips(ev, growth_path=None)
     assert ev["in_flight_at_end"] == 0 and ev["provider_changed"] is False
     assert {module["path"] for module in doc["capture"]["modules"]} == paths
     assert len(ev["discovery"]) == 2
@@ -213,7 +216,13 @@ def validate(doc):
             "source": "scan",
             "version": [2, 40],
         }
-        assert tables[0]["linkage"] == "heuristic"
+        # GT-2 (ed858d5): each provider's table holds the standard name it
+        # exports itself, C_GetFunctionList, at its own ordinal (3); the other
+        # 67 entries are the unexported static `spare`, which is neutral
+        # (export-nesting-harness.c). So the table is export-linked with
+        # exactly one agreeing ordinal; heuristic here would be a regression.
+        assert tables[0]["linkage"] == "exports", tables[0]
+        assert tables[0]["exports_agreeing"] == 1, tables[0]
         assert isinstance(tables[0]["file_offset"], int) and tables[0]["file_offset"] >= 0
         assert len(module["objects"]) == 1
         target = module["objects"][0]

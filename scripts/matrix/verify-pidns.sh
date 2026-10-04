@@ -19,11 +19,17 @@
 #   nested-inventory-pid  `inventory --pid`: the same refusal
 #   nested-doctor-pid     `doctor --pid`: the `PID namespace` row FAILs, exit 1
 #   nested-cgroup  `profile --cgroup` inside the namespace: exact counts, but the
-#                  observation is `lossy` with cause `pid_namespace`, never exact
+#                  observation is `lossy` with cause `pid_namespace`, never exact,
+#                  and `completeness` stays PARTIAL even behind a proven drain
 #   foreign-proc   an initial-namespace observer with a child namespace's /proc
 #                  (`nsenter -m` without -p), `profile --pid <pid that /proc
 #                  shows>`: the same named refusal (before the review fix: a
 #                  silent zero), and doctor's PID namespace row names `foreign`
+#   foreign-proc-system  the same observer, `profile --system`: that /proc has
+#                  no entry for the observer, so it cannot read its own
+#                  /proc/self; refused by name before discovery or the
+#                  uretprobe self-probe, never pointed at the uretprobe
+#                  override (DR-RETRO-PIDNS-2)
 #   nested-trace   `trace --cgroup` inside the namespace: every call line, the
 #                  printed PIDs are initial-namespace PIDs and the EVIDENCE line
 #                  names the observer's namespace as `nested`
@@ -52,7 +58,8 @@ except Exception as e: print(json.dumps({"error":str(e)})); sys.exit()
 e=d.get("evidence",{}); o=e.get("gap_classes",{}).get("observation",{})
 print(json.dumps({"calls":sorted(f["calls"] for f in d.get("functions",[]) if f.get("calls")),
  "observation":o.get("status"),"causes":o.get("causes"),"verdict_detail":e.get("verdict_detail"),
- "pid_namespace":e.get("pid_namespace")}))
+ "pid_namespace":e.get("pid_namespace"),"completeness":e.get("completeness"),
+ "drain_proven":e.get("drain_proven")}))
 PY
 }
 
@@ -121,7 +128,7 @@ PY
   # nested-cgroup
   gated nested-cgroup profile --cgroup @CG@ --duration 10 -o "$OUT/nested-cgroup.json"
   s=$(summ "$OUT/nested-cgroup.json")
-  result nested-cgroup $(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); n=int(sys.argv[2]); print(1 if s.get("calls")==[n]*6 and s.get("observation")=="lossy" and "pid_namespace" in (s.get("causes") or []) and (s.get("pid_namespace") or {}).get("observer")=="nested" else 0)' "$s" $ITERS) "$(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); s["rc"]=int(open(sys.argv[2]).read()); print(json.dumps(s))' "$s" "$OUT/nested-cgroup.rc")"
+  result nested-cgroup $(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); n=int(sys.argv[2]); print(1 if s.get("calls")==[n]*6 and s.get("observation")=="lossy" and "pid_namespace" in (s.get("causes") or []) and (s.get("pid_namespace") or {}).get("observer")=="nested" and s.get("completeness")=="PARTIAL" else 0)' "$s" $ITERS) "$(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); s["rc"]=int(open(sys.argv[2]).read()); print(json.dumps(s))' "$s" "$OUT/nested-cgroup.rc")"
   # nested-trace
   gated nested-trace trace --cgroup @CG@ --duration 10 -o "$OUT/nested-trace.txt"
   d=$(python3 - "$OUT" "$ITERS" <<'PY'
@@ -178,11 +185,14 @@ done
 sleep 0.5; touch "$OUT/foreign.gate"; waitfor "$OUT/foreign.wl" LEDGER 60 || true
 wait $pp; echo $? > "$OUT/foreign-proc.rc"
 nsenter -t "$inner" -m "$P" doctor > "$OUT/foreign-doctor.out" 2>&1; frc=$?
+nsenter -t "$inner" -m "$P" profile --system --duration 3 -o "$OUT/foreign-proc-system.json" > "$OUT/foreign-proc-system.stdout" 2> "$OUT/foreign-proc-system.stderr"; echo $? > "$OUT/foreign-proc-system.rc"
 pkill -TERM -P "$inner" 2>/dev/null; wait $ns_wrap 2>/dev/null
 d=$(refusal_detail foreign-proc "$OUT")
 if [ -s "$OUT/foreign-proc.json" ]; then d=$(python3 -c 'import json,sys; a=json.loads(sys.argv[1]); a["report"]=json.loads(sys.argv[2]); print(json.dumps(a))' "$d" "$(summ "$OUT/foreign-proc.json")"); fi
 d=$(python3 -c 'import json,sys; a=json.loads(sys.argv[1]); a["nested_target_pid"]=int(sys.argv[2]); a["doctor_rc"]=int(sys.argv[3]); a["doctor_row"]=[l for l in open(sys.argv[4]) if l.startswith("PID namespace ")]; print(json.dumps(a))' "$d" "$NPID" "$frc" "$OUT/foreign-doctor.out")
 result foreign-proc $(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(1 if d["rc"]!=0 and d["named"] and not d["report_written"] and d["doctor_row"] and "foreign" in d["doctor_row"][0] else 0)' "$d") "$d"
+d=$(refusal_detail foreign-proc-system "$OUT")
+result foreign-proc-system $(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t=" ".join(d["stderr_tail"]); print(1 if d["rc"]!=0 and d["named"] and not d["report_written"] and "no entry for this observer" in t and "allow-uretprobe" not in t else 0)' "$d") "$d"
 
 unshare --pid --fork --mount-proc "$SELF" --inside "$P" "$OUT"
 python3 -c 'import json; r=[json.loads(l) for l in open("results.jsonl")]; print("SUMMARY pass=%d fail=%d failed=%s" % (sum(x["pass"] for x in r), sum(not x["pass"] for x in r), [x["cell"] for x in r if not x["pass"]]))' | tee summary.txt

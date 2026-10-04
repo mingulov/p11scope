@@ -278,11 +278,24 @@ fn classify_probe_error(error: &anyhow::Error) -> KernelVerdict {
 /// `CAP_SYS_ADMIN`'s bit in a `CapEff` mask.
 const CAP_SYS_ADMIN_BIT: u32 = 21;
 
+/// `PROC_USER_INIT_INO`: the nsfs inode of the initial user namespace
+/// (`include/linux/proc_ns.h`), as `PROC_PID_INIT_INO` is for PIDs.
+const INIT_USER_NS_INODE: u64 = 0xEFFF_FFFD;
+
 /// The privilege facts a not-permitted refusal is explained from.
+///
+/// `CapEff` lists capabilities in the task's **own** user namespace, while
+/// BPF and perf check them in the initial one, so a uid 0 with a full
+/// `CapEff` inside a child user namespace (a rootless or userns-remapped
+/// container) holds none of them for this purpose (DR-RETRO-PIDNS-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PrivilegeFacts {
     pub(crate) euid_root: bool,
-    pub(crate) sys_admin: bool,
+    /// `CAP_SYS_ADMIN` in `CapEff`; `None` when `CapEff` was unreadable.
+    pub(crate) sys_admin: Option<bool>,
+    /// Whether this task runs in the initial user namespace; `None` when
+    /// `/proc/self/ns/user` was unreadable or not a user namespace link.
+    pub(crate) init_user_ns: Option<bool>,
     /// `kernel.perf_event_paranoid`, when readable and numeric.
     pub(crate) perf_event_paranoid: Option<i64>,
 }
@@ -297,19 +310,45 @@ impl PrivilegeFacts {
         Self::from_parts(
             euid,
             cap_eff,
+            std::fs::read_link("/proc/self/ns/user")
+                .map(|link| link.to_string_lossy().into_owned()),
             std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid"),
         )
     }
 
-    fn from_parts(euid: u32, cap_eff: Option<u64>, paranoid: std::io::Result<String>) -> Self {
+    fn from_parts(
+        euid: u32,
+        cap_eff: Option<u64>,
+        user_ns: std::io::Result<String>,
+        paranoid: std::io::Result<String>,
+    ) -> Self {
         Self {
             euid_root: euid == 0,
-            sys_admin: cap_eff.is_some_and(|mask| mask & (1u64 << CAP_SYS_ADMIN_BIT) != 0),
+            sys_admin: cap_eff.map(|mask| mask & (1u64 << CAP_SYS_ADMIN_BIT) != 0),
+            init_user_ns: user_ns
+                .ok()
+                .and_then(|link| parse_user_ns_link(&link))
+                .map(|inode| inode == INIT_USER_NS_INODE),
             perf_event_paranoid: paranoid
                 .ok()
                 .and_then(|value| value.trim().parse::<i64>().ok()),
         }
     }
+
+    /// Whether `CAP_SYS_ADMIN` is known held, and not merely inside a child
+    /// user namespace where the kernel's BPF and perf checks ignore it.
+    fn sys_admin_counts(&self) -> bool {
+        self.sys_admin == Some(true) && self.init_user_ns != Some(false)
+    }
+}
+
+/// `user:[4026531837]` → `4026531837`; any other shape → `None`.
+fn parse_user_ns_link(link: &str) -> Option<u64> {
+    let digits = link.strip_prefix("user:[")?.strip_suffix(']')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn parse_cap_eff(status: &str) -> Option<u64> {
@@ -331,7 +370,7 @@ pub(crate) const PERF_OPEN_RESTRICT_PARANOID: i64 = 3;
 /// self-probe, live-discovery loader/export probes, and every per-probe
 /// (singles) uprobe attach through it. Static uprobe-multi links do not.
 pub(crate) fn perf_open_restricted(facts: PrivilegeFacts) -> bool {
-    !facts.sys_admin
+    !facts.sys_admin_counts()
         && facts
             .perf_event_paranoid
             .is_some_and(|level| level >= PERF_OPEN_RESTRICT_PARANOID)
@@ -347,6 +386,18 @@ pub(crate) fn perf_open_restricted(facts: PrivilegeFacts) -> bool {
 /// `perf_event_paranoid` is that sysctl — neither is a lockdown, an LSM or
 /// seccomp (DR-K8S-3).
 pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts) -> String {
+    // Checked first: in a child user namespace no capability this process
+    // holds counts, so neither the sysctl nor a lockdown is the story.
+    if facts.init_user_ns == Some(false) {
+        return format!(
+            "cannot load p11scope's BPF programs: the kernel refused ({why}). This process \
+             runs in a child user namespace (a rootless or userns-remapped container), and \
+             capabilities held there, even as uid 0, do not count for BPF or perf_event_open: \
+             capturing requires CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON in the host's initial \
+             user namespace (for example a container without user-namespace remapping). \
+             `p11scope doctor` shows what this host allows"
+        );
+    }
     if why.starts_with(SELF_PROBE_ATTACH_CONTEXT)
         && perf_open_restricted(facts)
         && let Some(level) = facts.perf_event_paranoid
@@ -361,16 +412,23 @@ pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts) -> String 
         );
     }
     match (facts.euid_root, facts.sys_admin) {
-        (true, true) => format!(
+        (true, Some(true)) => format!(
             "cannot load p11scope's BPF programs even as root ({why}): a kernel lockdown, an \
              LSM policy, or a container's seccomp profile is refusing BPF here. Run \
              `p11scope doctor` to see which"
         ),
-        (true, false) => format!(
+        (true, Some(false)) => format!(
             "cannot load p11scope's BPF programs: the kernel refused ({why}). This process runs \
              as root without CAP_SYS_ADMIN (a container that dropped it): capturing requires \
              CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON. `p11scope doctor` shows what this host \
              allows"
+        ),
+        // An unreadable CapEff is not evidence of a dropped capability.
+        (true, None) => format!(
+            "cannot load p11scope's BPF programs: the kernel refused ({why}). This process runs \
+             as root, but its effective capabilities could not be read (/proc/self/status \
+             CapEff): capturing requires CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON. `p11scope \
+             doctor` shows what this host allows"
         ),
         (false, _) => format!(
             "cannot load p11scope's BPF programs: the kernel refused ({why}). Capturing requires \
@@ -812,9 +870,63 @@ mod tests {
     fn facts(euid_root: bool, sys_admin: bool, paranoid: Option<i64>) -> PrivilegeFacts {
         PrivilegeFacts {
             euid_root,
-            sys_admin,
+            sys_admin: Some(sys_admin),
+            init_user_ns: Some(true),
             perf_event_paranoid: paranoid,
         }
+    }
+
+    /// DR-RETRO-PIDNS-2 (review 3): capabilities are user-namespace
+    /// relative. A uid 0 with full `CapEff` in a child user namespace is
+    /// told so, never blamed on a lockdown, LSM, seccomp or the sysctl; an
+    /// unreadable `CapEff` is never stated as a dropped capability.
+    #[test]
+    fn capability_facts_are_judged_in_the_initial_user_namespace() {
+        let why = "loading the BPF object: Operation not permitted (os error 1)";
+        let remapped = PrivilegeFacts {
+            init_user_ns: Some(false),
+            ..facts(true, true, Some(4))
+        };
+        for why in [
+            why,
+            "attaching the uretprobe self-probe: `perf_event_open` failed: Permission denied",
+        ] {
+            let message = not_permitted_message(why, remapped);
+            assert!(message.contains("child user namespace"), "{message}");
+            assert!(message.contains("initial"), "{message}");
+            for blamed in [
+                "lockdown",
+                "seccomp",
+                "perf_event_paranoid is",
+                "without CAP_SYS_ADMIN",
+            ] {
+                assert!(!message.contains(blamed), "{blamed}: {message}");
+            }
+        }
+        assert!(perf_open_restricted(remapped));
+        // An unreadable user-namespace link does not invent a remap.
+        let unknown_ns = PrivilegeFacts {
+            init_user_ns: None,
+            ..facts(true, true, Some(4))
+        };
+        assert!(not_permitted_message(why, unknown_ns).contains("even as root"));
+        assert!(!perf_open_restricted(unknown_ns));
+        // An unreadable CapEff.
+        let unread = PrivilegeFacts {
+            sys_admin: None,
+            ..facts(true, false, Some(2))
+        };
+        let message = not_permitted_message(why, unread);
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(!message.contains("without CAP_SYS_ADMIN"), "{message}");
+        assert!(!message.contains("lockdown"), "{message}");
+        assert_eq!(
+            parse_user_ns_link("user:[4026531837]"),
+            Some(INIT_USER_NS_INODE)
+        );
+        assert_eq!(parse_user_ns_link("user:[4026532001]"), Some(4_026_532_001));
+        assert_eq!(parse_user_ns_link("pid:[4026531837]"), None);
+        assert_eq!(parse_user_ns_link(""), None);
     }
 
     #[test]
@@ -901,33 +1013,47 @@ mod tests {
         assert_eq!(parse_cap_eff(status), Some(1 << 21));
         assert_eq!(parse_cap_eff("CapEff:\tzz\n"), None);
         assert_eq!(parse_cap_eff("Name:\tx\n"), None);
-        let facts = PrivilegeFacts::from_parts(0, Some(1 << 21), Ok("4\n".into()));
+        let facts = PrivilegeFacts::from_parts(
+            0,
+            Some(1 << 21),
+            Ok("user:[4026531837]".into()),
+            Ok("4\n".into()),
+        );
         assert_eq!(
             facts,
             PrivilegeFacts {
                 euid_root: true,
-                sys_admin: true,
+                sys_admin: Some(true),
+                init_user_ns: Some(true),
                 perf_event_paranoid: Some(4),
             }
         );
         let facts = PrivilegeFacts::from_parts(
             1000,
             Some(!(1u64 << 21)),
+            Ok("user:[4026532001]".into()),
             Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
         );
         assert_eq!(
             facts,
             PrivilegeFacts {
                 euid_root: false,
-                sys_admin: false,
+                sys_admin: Some(false),
+                init_user_ns: Some(false),
                 perf_event_paranoid: None,
             }
         );
         assert_eq!(
-            PrivilegeFacts::from_parts(0, None, Ok("x".into())),
+            PrivilegeFacts::from_parts(
+                0,
+                None,
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+                Ok("x".into())
+            ),
             PrivilegeFacts {
                 euid_root: true,
-                sys_admin: false,
+                sys_admin: None,
+                init_user_ns: None,
                 perf_event_paranoid: None,
             }
         );

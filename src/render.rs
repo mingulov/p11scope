@@ -854,9 +854,11 @@ pub struct Evidence {
     pub handoff_child_pid: Option<u32>,
     /// Which PID namespace numbers which PIDs (DR-K8S-1/2): the observer's
     /// own (`initial`, `nested`, `unknown`), kernel-reported PIDs (always
-    /// `initial`), and `/proc`-read PIDs (always the observer's). Anything
-    /// but an `initial` observer is an observation gap (`pid_namespace`):
-    /// live discovery keys on kernel PIDs this observer cannot resolve.
+    /// `initial`), and `/proc`-read PIDs (`observer` when the mounted `/proc`
+    /// is the observer's own, `foreign` otherwise). Anything but an
+    /// `initial` observer is the observation gap `pid_namespace`, and a
+    /// `foreign` `/proc` is `proc_namespace_mismatch`: live discovery keys
+    /// on kernel PIDs this observer cannot resolve through `/proc`.
     pub pid_namespace: crate::pidns::PidNamespaceEvidence,
     /// Active values of every capture-visible `P11SCOPE_*` switch
     /// ([`P11SCOPE_ENV_VARS`]), so the document says which behavior

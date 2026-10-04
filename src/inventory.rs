@@ -130,6 +130,20 @@ fn run_with_writer(
     stdout_tty: bool,
     stdout: &mut dyn std::io::Write,
 ) -> Result<i32> {
+    // DR-K8S-1: the kernel-side PID filter numbers tasks in the initial PID
+    // namespace; a mismatched observer's --pid would match nothing, so it
+    // is refused by name before anything is opened or scanned.
+    let numbering = crate::pidns::numbering();
+    match scope {
+        InspectScope::Pid(pid) => {
+            crate::pidns::require_numbering_agrees(numbering, &format!("inventory --pid {pid}"))?;
+        }
+        InspectScope::System => {
+            if let Some(warning) = crate::pidns::nested_warning(numbering) {
+                let _ = writeln!(std::io::stderr(), "{warning}");
+            }
+        }
+    }
     // Fail fast before scanning: an unwritable `-o` or event stream
     // must not cost a pass.
     let sink = match out {
@@ -170,7 +184,7 @@ fn run_with_writer(
     )?;
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
-    stage_numbering_gap(&mut coordinator, crate::pidns::numbering());
+    stage_numbering_gap(&mut coordinator, numbering);
     // The scan lane stages no usage coverage: every edge reads
     // `unknown (scan only)`. The native lane stages per-edge coverage
     // notes and witnesses; `auto` falls back to scan with a named gap.
@@ -1601,6 +1615,78 @@ mod tests {
                     .contains("pid_namespace")
             );
         }
+    }
+
+    /// DR-RETRO-PIDNS-1 (review P4) and PIDNS-2 (review 5): the library
+    /// itself refuses a mismatched `inventory --pid` before anything is
+    /// scanned, and `inventory --system` publishes the numbering gap from
+    /// the observer's real `numbering()`, not a fixture.
+    #[test]
+    fn a_nested_observer_refuses_inventory_pid_and_gaps_inventory_system() {
+        use crate::pidns::test_seam::{nested, with_numbering};
+        let hooks = HookRegistry::builtin();
+        let run = |scope: InspectScope, out: &mut Vec<u8>| {
+            run_with_writer(
+                scope,
+                &[],
+                &hooks,
+                true,
+                Some(1),
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                crate::cli::CaptureMode::Scan,
+                &|| false,
+                &|| {},
+                false,
+                out,
+            )
+        };
+        let mut out = Vec::new();
+        let pid = std::process::id();
+        let error = with_numbering(nested(), || run(InspectScope::Pid(pid), &mut out)).unwrap_err();
+        assert!(error.is::<crate::pidns::NumberingMismatch>(), "{error:#}");
+        assert!(
+            format!("{error:#}").starts_with(&format!(
+                "pid-namespace-mismatch: refusing inventory --pid {pid}:"
+            )),
+            "{error:#}"
+        );
+        assert!(out.is_empty(), "a refused inventory printed a document");
+
+        let gap_subjects = |out: &[u8]| -> Vec<String> {
+            let document: serde_json::Value = serde_json::from_slice(out).unwrap();
+            document["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|gap| gap["subject"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let mut out = Vec::new();
+        with_numbering(nested(), || run(InspectScope::System, &mut out)).unwrap();
+        assert!(
+            gap_subjects(&out)
+                .iter()
+                .any(|subject| subject == "pid namespace"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+        let mut out = Vec::new();
+        with_numbering(crate::pidns::PidNumbering::agreeing(), || {
+            run(InspectScope::System, &mut out)
+        })
+        .unwrap();
+        assert!(
+            !gap_subjects(&out)
+                .iter()
+                .any(|subject| subject == "pid namespace"),
+            "an agreeing observer staged a numbering gap"
+        );
     }
 
     #[test]

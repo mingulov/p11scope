@@ -23,9 +23,11 @@ PID only when `observer` is `initial` and `proc_pids` is `observer`.
 `inventory --pid` is refused (`pid-namespace-mismatch`) otherwise, and
 `inventory --system` then also carries one scope-level gap (`caller`,
 `module` and `pid` null, `subject` `pid namespace`) from its first pass on,
-so a consumer reading only `gaps[]` still sees the incompleteness: callers
-that load a module after a scan pass can be missed. See `docs/usage.md`,
-PID namespaces.
+so a consumer reading only `gaps[]` still sees the incompleteness: the scan
+sees only the processes the mounted `/proc` shows (in a nested namespace the
+host's processes are invisible, so a module only they map is never
+discovered), and callers that load a module after a scan pass can be
+missed. See `docs/usage.md`, PID namespaces.
 
 ## Usage lane, settlement and retirement
 

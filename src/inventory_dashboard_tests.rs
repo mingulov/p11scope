@@ -845,18 +845,22 @@ fn pty_frame_roundtrip_resize_and_layout() {
     let bytes = render_frame(&frame, small, &DashboardState::new());
     pty.slave.write_all(&bytes).unwrap();
     pty.slave.flush().unwrap();
-    let seen = pty.read_until(b"minimal", Duration::from_secs(5));
+    // The whole minimal frame (its footer is its last row): its header
+    // alone can arrive in a read before its coverage line does.
+    let seen = pty.read_until(b"enlarge the terminal", Duration::from_secs(5));
     let text = String::from_utf8_lossy(&seen).replace("\r\n", "\n");
+    assert!(text.contains("minimal"), "{text}");
     assert!(text.contains("coverage:"), "{text}");
 }
 
 #[test]
-fn pty_terminal_guard_restores_on_clean_and_error_paths() {
+fn pty_terminal_writer_restores_on_clean_and_error_paths() {
     // Clean path: enter, frame, drop — exit sequences follow content.
     let mut pty = Pty::open();
     pty.set_winsize(80, 24);
     {
-        let _guard = TerminalGuard::enter(&pty.slave).unwrap();
+        let mut writer = TerminalWriter::open(pty.slave.as_raw_fd()).unwrap();
+        writer.enter().unwrap();
         let presentation = varied_presentation();
         let frame = frame_for(&presentation);
         let bytes = render_frame(
@@ -867,8 +871,8 @@ fn pty_terminal_guard_restores_on_clean_and_error_paths() {
             },
             &DashboardState::new(),
         );
-        pty.slave.write_all(&bytes).unwrap();
-        pty.slave.flush().unwrap();
+        writer.frame(&bytes).unwrap();
+        assert_eq!(writer.account().frames_written, 1);
     }
     let seen = pty.read_until(b"\x1b[?1049l", Duration::from_secs(5));
     let text = String::from_utf8_lossy(&seen);
@@ -878,17 +882,578 @@ fn pty_terminal_guard_restores_on_clean_and_error_paths() {
     assert!(enter < frame_at && frame_at < exit, "enter < frame < exit");
     assert!(text.contains("\x1b[?25l"), "cursor hidden");
     assert!(text.contains("\x1b[?25h"), "cursor restored");
-    // Error path: a fallible scope returns Err through the guard —
+    // Error path: a fallible scope returns Err through the writer —
     // restoration still lands (Drop runs on `?`).
     let mut pty = Pty::open();
     let outcome: std::io::Result<()> = (|| {
-        let _guard = TerminalGuard::enter(&pty.slave)?;
-        pty.slave.write_all(b"partial")?;
+        let mut writer = TerminalWriter::open(pty.slave.as_raw_fd())?;
+        writer.enter()?;
+        writer.frame(b"partial")?;
         Err(std::io::Error::other("injected dashboard failure"))
     })();
     assert!(outcome.is_err());
     let seen = pty.read_until(b"\x1b[?1049l", Duration::from_secs(5));
     assert!(seen.windows(b"\x1b[?25h".len()).any(|w| w == b"\x1b[?25h"));
+}
+
+/// Fills the pty until its slave refuses more (nobody reads the master).
+/// The kernel moves buffered output on asynchronously, which can reopen a
+/// little room after a refusal: refill until a pass after a pause takes
+/// nothing.
+fn fill(pty: &Pty) {
+    use std::io::Write as _;
+    let mut filler = pty.slave.try_clone().unwrap();
+    let flags = unsafe { libc::fcntl(filler.as_raw_fd(), libc::F_GETFL) };
+    unsafe {
+        libc::fcntl(filler.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    loop {
+        let mut took = 0;
+        while let Ok(wrote) = filler.write(&[b'.'; 1024]) {
+            if wrote == 0 {
+                break;
+            }
+            took += wrote;
+        }
+        if took == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe {
+        libc::fcntl(filler.as_raw_fd(), libc::F_SETFL, flags);
+    }
+}
+
+/// Reads whatever the master holds now, until it stays empty for `quiet`.
+fn drain(pty: &mut Pty, quiet: Duration) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut collected = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut idle_since = Instant::now();
+    while idle_since.elapsed() < quiet {
+        match pty.master.read(&mut chunk) {
+            Ok(n) if n > 0 => {
+                collected.extend_from_slice(&chunk[..n]);
+                idle_since = Instant::now();
+            }
+            _ => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    collected
+}
+
+/// C5.3: a terminal that stops reading costs each frame at most the write
+/// budget; its frames shed with counters, and the screen is still restored
+/// once it reads again.
+#[test]
+fn pty_a_stalled_terminal_sheds_frames_within_the_write_budget() {
+    let mut pty = Pty::open();
+    let mut writer = TerminalWriter::open(pty.slave.as_raw_fd()).unwrap();
+    writer.enter().unwrap();
+    fill(&pty);
+    let frame = vec![b'F'; 4096];
+    for _ in 0..20 {
+        let began = Instant::now();
+        writer.frame(&frame).unwrap();
+        let took = began.elapsed();
+        assert!(
+            took < FRAME_WRITE_BUDGET + Duration::from_millis(40),
+            "a stalled frame write took {took:?}"
+        );
+    }
+    let account = writer.account();
+    assert_eq!(account.frames_written, 0, "{account:?}");
+    assert_eq!(account.frames_shed, 20, "{account:?}");
+    assert_eq!(account.bytes_shed, 20 * 4096, "{account:?}");
+    // The reader comes back: the restore reaches it whole.
+    let reader = std::thread::spawn(move || {
+        let seen = pty.read_until(b"\x1b[?1049l", Duration::from_secs(5));
+        (pty, seen)
+    });
+    assert!(writer.restore(), "{:?}", writer.account());
+    let (_pty, seen) = reader.join().unwrap();
+    assert!(
+        seen.windows(4).any(|w| w == b"\x18\x1b[?"),
+        "CAN before the restore"
+    );
+    assert!(
+        !seen.contains(&b'F'),
+        "no shed frame byte reached the terminal"
+    );
+}
+
+/// C5.3: a frame the terminal took only in part is counted cut, and the
+/// next frame starts with CAN (aborting the cut escape sequence) before
+/// its full repaint.
+#[test]
+fn pty_a_frame_cut_short_is_repaired_by_the_next() {
+    let mut pty = Pty::open();
+    let mut writer = TerminalWriter::open(pty.slave.as_raw_fd()).unwrap();
+    fill(&pty);
+    // Free a little room, less than the frame.
+    let mut freed = 0;
+    let mut chunk = [0u8; 512];
+    while freed < 1024 {
+        use std::io::Read as _;
+        match pty.master.read(&mut chunk) {
+            Ok(n) => freed += n,
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    writer.frame(&[b'A'; 32 * 1024]).unwrap();
+    let account = writer.account();
+    assert_eq!(
+        (account.frames_shed, account.frames_cut),
+        (1, 1),
+        "{account:?}"
+    );
+    assert!(account.bytes_shed > 0 && account.bytes_shed < 32 * 1024);
+    drain(&mut pty, Duration::from_millis(100));
+    writer.frame(b"BBBB").unwrap();
+    let seen = drain(&mut pty, Duration::from_millis(100));
+    assert!(
+        seen.ends_with(b"\x18BBBB"),
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_eq!(writer.account().frames_written, 1);
+    // Repaired: the frame after it carries no prefix.
+    writer.frame(b"CCCC").unwrap();
+    let seen = drain(&mut pty, Duration::from_millis(100));
+    assert_eq!(seen, b"CCCC");
+}
+
+/// Review N1: a sustained stall cuts a frame, then sheds the next ones
+/// whole; the repair is still owed, so the first frame written after the
+/// stall starts with CAN.
+#[test]
+fn pty_a_repair_survives_frames_shed_whole_after_a_cut() {
+    let mut pty = Pty::open();
+    let mut writer = TerminalWriter::open(pty.slave.as_raw_fd()).unwrap();
+    fill(&pty);
+    let mut freed = 0;
+    let mut chunk = [0u8; 512];
+    while freed < 1024 {
+        use std::io::Read as _;
+        match pty.master.read(&mut chunk) {
+            Ok(n) => freed += n,
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    writer.frame(&[b'A'; 32 * 1024]).unwrap();
+    fill(&pty);
+    writer.frame(&[b'X'; 4096]).unwrap();
+    writer.frame(&[b'X'; 4096]).unwrap();
+    let account = writer.account();
+    assert_eq!(
+        (
+            account.frames_shed,
+            account.frames_cut,
+            account.frames_written
+        ),
+        (3, 1, 0),
+        "{account:?}"
+    );
+    drain(&mut pty, Duration::from_millis(100));
+    writer.frame(b"BBBB").unwrap();
+    let seen = drain(&mut pty, Duration::from_millis(100));
+    assert!(
+        seen.ends_with(b"\x18BBBB"),
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+/// C5.3, the display under its loop: with a terminal that never reads,
+/// every service tick still returns within the frame budget (keys never
+/// wait either), frames shed with counters, and the display restores the
+/// screen once the terminal reads again. The ticks run on their own
+/// thread: a blocking write would hang it, and the watchdog fails the
+/// test instead of the suite.
+#[test]
+fn pty_display_ticks_never_wait_on_a_stalled_terminal() {
+    let mut pty = Pty::open();
+    pty.set_winsize(200, 60);
+    let output = pty.slave.as_raw_fd();
+    let input = pty.slave.try_clone().unwrap();
+    let input_fd = input.as_raw_fd();
+    fill(&pty);
+    let (done, finished) = std::sync::mpsc::channel();
+    let ticker = std::thread::spawn(move || {
+        let io = DashboardIo {
+            output,
+            input: Some(input_fd),
+            account: None,
+            stderr_fd: 2,
+            stderr: StderrRoute::Leave,
+        };
+        let mut display = Display::open(&io, "pid:1").unwrap();
+        let presentation = varied_presentation();
+        let mut slowest = Duration::ZERO;
+        let began = Instant::now();
+        let mut ticks = 0;
+        while began.elapsed() < Duration::from_millis(1500) {
+            // A pass about every 10 ticks, as the 1 s cadence over 20 ms
+            // ticks would offer (scaled down).
+            if ticks % 10 == 0 {
+                display.offer(presentation.clone());
+            }
+            ticks += 1;
+            let tick = Instant::now();
+            display.tick();
+            slowest = slowest.max(tick.elapsed());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let account = display.account();
+        done.send((slowest, account)).unwrap();
+        // Restore once the reader is back (the main thread drains).
+        display.restore();
+        let restored = display.account().terminal.restored;
+        drop(input);
+        restored
+    });
+    let (slowest, account) = finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a display tick blocked on the stalled terminal");
+    assert!(
+        slowest < FRAME_WRITE_BUDGET + Duration::from_millis(40),
+        "slowest tick {slowest:?}"
+    );
+    assert!(account.ticks >= 50, "{account:?}");
+    assert!(
+        account.longest_gap < Duration::from_millis(100),
+        "{account:?}"
+    );
+    assert!(
+        account.longest_pass_gap < Duration::from_millis(100),
+        "{account:?}"
+    );
+    assert!(account.terminal.frames_shed >= 3, "{account:?}");
+    assert_eq!(account.terminal.frames_written, 0, "{account:?}");
+    let seen = pty.read_until(b"\x1b[?1049l", Duration::from_secs(5));
+    assert!(ticker.join().unwrap(), "restore reached the terminal");
+    assert!(
+        seen.windows(6).any(|w| w == b"\x1b[?25h"),
+        "cursor restored"
+    );
+}
+
+/// C5.3: restoring the screen on a terminal that never reads again waits
+/// at most the restore budget, then sheds the sequence and says so.
+#[test]
+fn pty_a_restore_on_a_terminal_that_never_reads_is_bounded() {
+    let pty = Pty::open();
+    let fd = pty.slave.as_raw_fd();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut writer = TerminalWriter::open(fd).unwrap();
+        writer.enter().unwrap();
+        fill(&pty);
+        let began = Instant::now();
+        let restored = writer.restore();
+        done.send((restored, began.elapsed())).unwrap();
+        drop(pty);
+    });
+    // Fixed bounds (not derived from the budget): the documented 1 s.
+    let (restored, took) = finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the restore blocked on a terminal that never reads");
+    assert!(!restored, "nothing could reach the terminal");
+    assert!(took < Duration::from_millis(1250), "{took:?}");
+}
+
+/// Review L1: a restore the terminal shed is tried once more (after the
+/// report): a terminal that reads again gets the whole sequence, CAN
+/// first; a restore that went through is never repeated.
+#[test]
+fn pty_a_shed_restore_is_retried_once() {
+    let pty = Pty::open();
+    let mut writer = TerminalWriter::open(pty.slave.as_raw_fd()).unwrap();
+    writer.enter().unwrap();
+    fill(&pty);
+    assert!(!writer.restore(), "nothing could reach the terminal");
+    let reader = std::thread::spawn(move || {
+        let mut pty = pty;
+        let seen = pty.read_until(b"\x1b[?1049l", Duration::from_secs(5));
+        (pty, seen)
+    });
+    assert!(
+        writer.retry_restore(Duration::from_secs(5)),
+        "{:?}",
+        writer.account()
+    );
+    let (mut pty, seen) = reader.join().unwrap();
+    assert!(
+        seen.ends_with(RESTORE_SCREEN),
+        "the whole sequence, CAN first"
+    );
+    let account = writer.account();
+    assert!(account.restored && account.restore_retried, "{account:?}");
+    assert!(writer.retry_restore(Duration::from_secs(5)));
+    assert!(drain(&mut pty, Duration::from_millis(100)).is_empty());
+    // A restore that went through first time is not retried.
+    let mut pty = Pty::open();
+    let mut writer = TerminalWriter::open(pty.slave.as_raw_fd()).unwrap();
+    writer.enter().unwrap();
+    assert!(writer.restore());
+    drain(&mut pty, Duration::from_millis(100));
+    assert!(writer.retry_restore(Duration::from_secs(5)));
+    assert!(!writer.account().restore_retried);
+    assert!(drain(&mut pty, Duration::from_millis(100)).is_empty());
+}
+
+/// C5.3: the stop's closing lines share one budget on a stderr that does
+/// not read: past it each line is shed after the floor wait, counted.
+#[test]
+fn notices_on_a_stalled_stderr_share_one_budget() {
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (reader, writer) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    let mut sink =
+        crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer.try_clone().unwrap()))
+            .unwrap();
+    // Fill the pipe through the sink's own nonblocking description.
+    {
+        use std::io::Write as _;
+        let mut filler = writer;
+        while filler.write(&[b'.'; 4096]).is_ok() {}
+    }
+    sink.take_drops();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut notices = Notices::over(sink, Duration::from_millis(200));
+        let began = Instant::now();
+        for line in 0..5 {
+            notices.line(&format!("notice {line}"));
+        }
+        done.send((notices.shed(), began.elapsed())).unwrap();
+    });
+    let (shed, took) = finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a notice blocked on the stalled stderr");
+    assert_eq!(shed, 5);
+    assert!(took < Duration::from_millis(500), "{took:?}");
+    drop(reader);
+}
+
+/// Review N2: once the shared budget is spent on a stalled stderr, a
+/// later line still gets its floor wait, so a stderr that reads again
+/// takes it.
+#[test]
+fn notices_reach_a_stderr_that_reads_again_after_the_budget_is_spent() {
+    use std::io::Read as _;
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (mut reader, writer) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    let sink =
+        crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer.try_clone().unwrap()))
+            .unwrap();
+    {
+        use std::io::Write as _;
+        let mut filler = writer;
+        while filler.write(&[b'.'; 4096]).is_ok() {}
+    }
+    let mut notices = Notices::over(sink, Duration::from_millis(20));
+    notices.line("shed while stalled");
+    assert_eq!(notices.shed(), 1);
+    // The reader drains everything it was sent.
+    let mut chunk = [0u8; 65536];
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    unsafe {
+        libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    while reader.read(&mut chunk).is_ok_and(|read| read > 0) {}
+    notices.line("delivered once it reads");
+    assert_eq!((notices.written(), notices.shed()), (1, 1));
+    let read = reader.read(&mut chunk).unwrap();
+    assert_eq!(&chunk[..read], b"delivered once it reads\n");
+}
+
+/// C5.3: the loop's last stretch, from its last tick to the stop, counts
+/// as a service gap (a pass that held the loop until the stop is not
+/// hidden by the missing next tick).
+#[test]
+fn pty_the_stretch_before_the_stop_counts_as_a_gap() {
+    let pty = Pty::open();
+    let io = DashboardIo {
+        output: pty.slave.as_raw_fd(),
+        input: None,
+        account: None,
+        stderr_fd: 2,
+        stderr: StderrRoute::Leave,
+    };
+    let mut display = Display::open(&io, "pid:1").unwrap();
+    display.tick();
+    std::thread::sleep(Duration::from_millis(150));
+    display.restore();
+    let account = display.account();
+    assert!(
+        account.longest_gap >= Duration::from_millis(150),
+        "{account:?}"
+    );
+}
+
+/// A stand-in for the process's stderr (review M1): a file only this
+/// test writes, behind an fd of its own (the test process's fd 2 is
+/// never touched).
+struct FakeStderr {
+    file: File,
+    fd: std::os::fd::OwnedFd,
+}
+
+impl FakeStderr {
+    fn open() -> Self {
+        let file = tempfile::tempfile().unwrap();
+        let fd = file.try_clone().unwrap().into();
+        Self { file, fd }
+    }
+
+    fn raw(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    /// A writer of the process's stderr (a scan diagnostic, a panic).
+    fn write(&self, line: &str) {
+        let bytes = format!("{line}\n");
+        let wrote = unsafe { libc::write(self.raw(), bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(wrote, bytes.len() as isize);
+    }
+
+    fn text(&self) -> String {
+        use std::io::{Read as _, Seek as _};
+        let mut file = &self.file;
+        file.rewind().unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        text
+    }
+}
+
+fn display_over(pty: &Pty, stderr: &FakeStderr, route: StderrRoute) -> Display {
+    let io = DashboardIo {
+        output: pty.slave.as_raw_fd(),
+        input: None,
+        account: None,
+        stderr_fd: stderr.raw(),
+        stderr: route,
+    };
+    Display::open(&io, "pid:1").unwrap()
+}
+
+/// Review M1: a stderr that is the terminal is captured while the screen
+/// is up, and at the restore everything it held (also what arrived after
+/// the last pass) and every pass warning is replayed on the real stderr,
+/// which is then back in place. Progress lines are not replayed.
+#[test]
+fn pty_a_captured_stderr_is_replayed_on_the_real_stderr_at_the_restore() {
+    let pty = Pty::open();
+    let stderr = FakeStderr::open();
+    let mut display = display_over(&pty, &stderr, StderrRoute::Capture);
+    stderr.write("discovery: a stray diagnostic");
+    display.warn("p11scope: pass failed, continuing without its scan");
+    display.log("p11scope: pass 1: 1 scanned");
+    display.offer(varied_presentation());
+    stderr.write("discovery: after the last pass");
+    assert_eq!(stderr.text(), "", "nothing reached the real stderr yet");
+    display.restore();
+    let text = stderr.text();
+    assert!(
+        text.starts_with("p11scope: stderr while the dashboard ran (3 lines):\n"),
+        "{text}"
+    );
+    for kept in [
+        "discovery: a stray diagnostic\n",
+        "p11scope: pass failed, continuing without its scan\n",
+        "discovery: after the last pass\n",
+    ] {
+        assert!(text.contains(kept), "{kept:?} in {text}");
+    }
+    assert!(!text.contains("pass 1:"), "{text}");
+    let account = display.account().stderr;
+    assert_eq!(
+        (
+            account.route,
+            account.replayed,
+            account.dropped,
+            account.undrained
+        ),
+        (StderrRoute::Capture, 3, 0, false),
+        "{account:?}"
+    );
+    // The stderr fd is back on the real stderr.
+    stderr.write("after the restore");
+    assert!(stderr.text().ends_with("after the restore\n"));
+}
+
+/// Review M1 (F8): a panic under the dashboard writes its message into the
+/// capture; the unwind restores the screen and replays it.
+#[test]
+fn pty_a_panic_message_survives_the_dashboard() {
+    let pty = Pty::open();
+    let stderr = FakeStderr::open();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _display = display_over(&pty, &stderr, StderrRoute::Capture);
+        // What the panic hook writes to the process's stderr.
+        stderr.write("thread 'main' panicked at src/inventory.rs:1:1:");
+        stderr.write("an injected invariant failure");
+        panic!("an injected invariant failure");
+    }));
+    assert!(unwound.is_err());
+    let text = stderr.text();
+    assert!(
+        text.contains(
+            "thread 'main' panicked at src/inventory.rs:1:1:\nan injected invariant failure\n"
+        ),
+        "{text}"
+    );
+}
+
+/// Review M1: a stderr that is not the terminal (`2>file`) is left alone,
+/// and the log lines (progress and warnings) are mirrored to it as they
+/// come, like the classic path's.
+#[test]
+fn pty_a_stderr_file_gets_the_log_lines_as_they_come() {
+    let pty = Pty::open();
+    let stderr = FakeStderr::open();
+    let mut display = display_over(&pty, &stderr, StderrRoute::Mirror);
+    stderr.write("discovery: a direct diagnostic");
+    display.log("p11scope: pass 1: 1 scanned");
+    display.warn("p11scope: pass 3: caller c0 exited");
+    display.offer(varied_presentation());
+    assert_eq!(
+        stderr.text(),
+        "discovery: a direct diagnostic\np11scope: pass 1: 1 scanned\n\
+         p11scope: pass 3: caller c0 exited\n"
+    );
+    display.restore();
+    assert_eq!(stderr.text().lines().count(), 3, "nothing replayed twice");
+    let account = display.account().stderr;
+    assert_eq!(
+        (account.mirrored, account.mirror_shed),
+        (2, 0),
+        "{account:?}"
+    );
+}
+
+/// Review M1 (L3): a stderr pipe nobody reads (its reopen fails with
+/// ENXIO, a write would be EPIPE) sheds the closing lines with counts and
+/// never panics or blocks.
+#[test]
+fn notices_on_a_readerless_stderr_shed_without_panicking() {
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (reader, writer) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    // Opened while the reader is there; the reader then goes away.
+    let mut late = Notices::on_fd(writer.as_raw_fd(), Duration::from_millis(100));
+    drop(reader);
+    let mut early = Notices::on_fd(writer.as_raw_fd(), Duration::from_millis(100));
+    for line in 0..3 {
+        late.line(&format!("closing line {line}"));
+        early.line(&format!("closing line {line}"));
+    }
+    assert_eq!((late.written(), late.shed()), (0, 3));
+    assert_eq!((early.written(), early.shed()), (0, 3));
 }
 
 #[test]

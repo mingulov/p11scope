@@ -1452,50 +1452,194 @@ fn visible_item_range(shown: usize, total: usize, scroll: usize) -> (usize, usiz
     (scroll + 1, scroll + shown)
 }
 
-/// Alternate-screen + cursor guard: entering takes over the terminal;
-/// dropping (all paths: return, error, `?`) restores cursor, screen,
-/// and mode. Best-effort writes — restoration must never panic.
-pub(crate) struct TerminalGuard {
-    restore_to: File,
+/// How long one redraw may wait for the terminal to take its frame
+/// (C5.3). The wait comes out of a service tick, so it is small: past
+/// it the rest of the frame is shed and counted, never blocked on.
+pub(crate) const FRAME_WRITE_BUDGET: Duration = Duration::from_millis(10);
+/// How long entering or restoring the screen may wait for a terminal
+/// that does not read (C5.3): past it the sequence is shed and counted,
+/// so a stalled terminal never holds the stop or the report.
+pub(crate) const RESTORE_BUDGET: Duration = Duration::from_secs(1);
+
+/// Enter the alternate screen, hide the cursor, home.
+const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[H";
+/// Show the cursor and leave the alternate screen, after a CAN that
+/// aborts any escape sequence a shed frame cut short.
+const RESTORE_SCREEN: &[u8] = b"\x18\x1b[?25h\x1b[?1049l";
+/// Prefix of the first frame after one was cut short: CAN aborts the
+/// cut escape sequence; the full repaint that follows rewrites every
+/// row.
+const REPAIR_FRAME: &[u8] = b"\x18";
+
+/// What the terminal writer shed (C5.3): every frame is either written
+/// whole or counted here. A frame is shed when the terminal did not take
+/// it within [`FRAME_WRITE_BUDGET`]; `frames_cut` counts those whose
+/// head already reached the terminal (the next frame repairs the
+/// screen).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TerminalAccount {
+    pub frames_written: u64,
+    pub frames_shed: u64,
+    pub frames_cut: u64,
+    pub bytes_shed: u64,
+    /// Total time frame writes waited for the terminal.
+    pub stall_ms: u64,
+    /// The restore sequence reached the terminal whole.
+    pub restored: bool,
+    /// The first restore was shed and tried once more after the report
+    /// ([`TerminalWriter::retry_restore`]).
+    pub restore_retried: bool,
 }
 
-impl TerminalGuard {
-    /// Enter the dashboard screen on `term` (the live terminal file).
-    pub(crate) fn enter(term: &File) -> std::io::Result<Self> {
-        let mut out = term.try_clone()?;
-        out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[H")?;
-        out.flush()?;
+/// The dashboard's terminal output (C5.3): a private nonblocking
+/// description of the terminal behind the reused bounded sink
+/// ([`SinkWriter`](crate::sink::SinkWriter)), so a terminal that stops
+/// reading costs a redraw at most [`FRAME_WRITE_BUDGET`] and its frames
+/// shed with counters. Entering takes over the screen; [`restore`]
+/// (also on drop, every path) shows the cursor and leaves the alternate
+/// screen within [`RESTORE_BUDGET`]. The shared description of the
+/// terminal (the shell's) keeps its flags.
+///
+/// [`restore`]: TerminalWriter::restore
+pub(crate) struct TerminalWriter {
+    sink: crate::sink::SinkWriter<File>,
+    fd: std::os::fd::RawFd,
+    entered: bool,
+    /// The last frame was cut short: the next one starts with a repair.
+    torn: bool,
+    /// The last frame reached the terminal whole.
+    last_written: bool,
+    /// The restore was shed: one retry is left.
+    restore_shed: bool,
+    account: TerminalAccount,
+}
+
+impl TerminalWriter {
+    /// Opens the terminal on `fd` as a private description (through
+    /// `/proc/self/fd`, `O_NONBLOCK | O_NOCTTY`): `dup` would alias the
+    /// shell's description, and nonblocking writes there would leak to
+    /// it.
+    pub(crate) fn open(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(format!("/proc/self/fd/{fd}"))?;
+        let own_fd = std::os::fd::AsRawFd::as_raw_fd(&file);
         Ok(Self {
-            restore_to: term.try_clone()?,
+            sink: crate::sink::SinkWriter::new(file)?,
+            fd: own_fd,
+            entered: false,
+            torn: false,
+            last_written: false,
+            restore_shed: false,
+            account: TerminalAccount::default(),
         })
+    }
+
+    /// The terminal's fd (for the window size), owned by the sink.
+    pub(crate) fn fd(&self) -> std::os::fd::RawFd {
+        self.fd
+    }
+
+    /// Takes over the screen (bounded). A terminal that does not take the
+    /// sequence still gets the restore at the end.
+    pub(crate) fn enter(&mut self) -> std::io::Result<()> {
+        self.entered = true;
+        self.write_bounded(ENTER_SCREEN, RESTORE_BUDGET).map(|_| ())
+    }
+
+    /// Writes one frame within [`FRAME_WRITE_BUDGET`]; what the terminal
+    /// did not take is shed and counted. Only a transport error (a hung-up
+    /// terminal) is an error.
+    pub(crate) fn frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        let repair = if self.torn { REPAIR_FRAME } else { b"" };
+        let mut bytes = Vec::with_capacity(repair.len() + frame.len());
+        bytes.extend_from_slice(repair);
+        bytes.extend_from_slice(frame);
+        let shed = self.write_bounded(&bytes, FRAME_WRITE_BUDGET)?;
+        self.last_written = shed == 0;
+        if shed == 0 {
+            self.account.frames_written += 1;
+            self.torn = false;
+        } else {
+            self.account.frames_shed += 1;
+            self.account.bytes_shed = self.account.bytes_shed.saturating_add(shed);
+            if shed < bytes.len() as u64 {
+                self.account.frames_cut += 1;
+                self.torn = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Shows the cursor and leaves the alternate screen (bounded by
+    /// [`RESTORE_BUDGET`]); true when the sequence reached the terminal
+    /// whole. Only the first call writes.
+    pub(crate) fn restore(&mut self) -> bool {
+        if !self.entered {
+            return self.account.restored;
+        }
+        self.entered = false;
+        self.account.restored = matches!(self.write_bounded(RESTORE_SCREEN, RESTORE_BUDGET), Ok(0));
+        self.restore_shed = !self.account.restored;
+        self.account.restored
+    }
+
+    /// One more attempt after a shed restore, bounded by `budget` (call it
+    /// only once nothing it could hold remains: after the report). The
+    /// sequence starts with CAN, which aborts whatever head of the shed one
+    /// reached the terminal. True when the terminal is restored.
+    pub(crate) fn retry_restore(&mut self, budget: Duration) -> bool {
+        if std::mem::take(&mut self.restore_shed) {
+            self.account.restore_retried = true;
+            self.account.restored = matches!(self.write_bounded(RESTORE_SCREEN, budget), Ok(0));
+        }
+        self.account.restored
+    }
+
+    pub(crate) fn account(&self) -> TerminalAccount {
+        self.account
+    }
+
+    /// The last frame reached the terminal whole.
+    pub(crate) fn last_frame_written(&self) -> bool {
+        self.last_written
+    }
+
+    /// One bounded write: the bytes shed (0 when all were written).
+    fn write_bounded(&mut self, bytes: &[u8], budget: Duration) -> std::io::Result<u64> {
+        self.sink.begin_tick(budget);
+        self.sink.write_all(bytes)?;
+        self.sink.flush()?;
+        let drops = self.sink.take_drops();
+        self.account.stall_ms = self.account.stall_ms.saturating_add(drops.stall_ms);
+        Ok(drops.dropped_bytes)
     }
 }
 
-impl Drop for TerminalGuard {
+impl Drop for TerminalWriter {
     fn drop(&mut self) {
-        let _ = self.restore_to.write_all(b"\x1b[?25h\x1b[?1049l");
-        let _ = self.restore_to.flush();
+        self.restore();
     }
 }
 
 /// Minimal raw-mode guard for dashboard key input: disables
 /// canonical mode, echo, and signal-chars on stdin, keeping output
-/// processing (so `\n` still renders). Dropping restores the saved
-/// termios on every path. `None` when stdin is not a terminal (the
-/// dashboard then runs without keys until `--duration`/signal).
+/// processing (so `\n` still renders). Reads never wait (`VMIN` 0,
+/// `VTIME` 0): a key poll must not hold a service tick (C5.3).
+/// Dropping restores the saved termios on every path. `None` when
+/// stdin is not a terminal (the dashboard then runs without keys until
+/// `--duration`/signal).
 pub(crate) struct RawModeGuard {
     fd: std::os::fd::RawFd,
     saved: libc::termios,
 }
 
 impl RawModeGuard {
-    pub(crate) fn enter_stdin() -> std::io::Result<Option<Self>> {
-        Self::enter_fd(0)
-    }
-
-    /// Raw mode on any terminal fd (production passes stdin; tests pass
-    /// a pty slave so the real termios round-trips without touching the
-    /// test runner's stdin).
+    /// Raw mode on any terminal fd (production passes stdin through
+    /// [`DashboardIo`]; tests pass a pty slave so the real termios
+    /// round-trips without touching the test runner's stdin).
     pub(crate) fn enter_fd(fd: std::os::fd::RawFd) -> std::io::Result<Option<Self>> {
         if unsafe { libc::isatty(fd) } != 1 {
             return Ok(None);
@@ -1507,11 +1651,16 @@ impl RawModeGuard {
         let mut raw = saved;
         raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
         raw.c_cc[libc::VMIN] = 0;
-        raw.c_cc[libc::VTIME] = 1;
+        raw.c_cc[libc::VTIME] = 0;
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(Some(Self { fd, saved }))
+    }
+
+    /// The terminal input fd keys are read from.
+    pub(crate) fn fd(&self) -> std::os::fd::RawFd {
+        self.fd
     }
 }
 
@@ -1533,11 +1682,25 @@ pub(crate) enum Key {
     Quit,
 }
 
-/// Non-blocking key poll on stdin (100 ms VTIME slices when raw;
-/// immediate EOF/absence otherwise). Arrow escape sequences parse as
-/// scrolling; Tab pages the detail views; `q`/`Q`/Ctrl-C/ESC quit.
-pub(crate) fn poll_key() -> Option<Key> {
-    poll_key_from(&mut read_stdin_byte)
+/// How long an escape sequence's continuation bytes may take to arrive
+/// after its ESC (only then does a key poll wait at all).
+const ESCAPE_CONTINUATION_WAIT: Duration = Duration::from_millis(30);
+
+/// Key poll on the terminal input `fd` that never waits for a first byte
+/// (C5.3: it runs inside a service tick). Arrow escape sequences parse
+/// as scrolling (their continuation waits at most
+/// [`ESCAPE_CONTINUATION_WAIT`]); Tab pages the detail views;
+/// `q`/`Q`/Ctrl-C/ESC quit.
+pub(crate) fn poll_key_fd(fd: std::os::fd::RawFd) -> Option<Key> {
+    let mut first = true;
+    poll_key_from(&mut |into: &mut [u8]| {
+        let wait = if std::mem::take(&mut first) {
+            Duration::ZERO
+        } else {
+            ESCAPE_CONTINUATION_WAIT
+        };
+        read_key_byte(fd, into, wait)
+    })
 }
 
 /// Key parsing over an injected byte reader (production reads stdin;
@@ -1574,13 +1737,25 @@ fn poll_key_from(read: &mut dyn FnMut(&mut [u8]) -> bool) -> Option<Key> {
     }
 }
 
-fn read_stdin_byte(into: &mut [u8]) -> bool {
+/// Reads `into` from `fd` once it is readable within `wait`.
+fn read_key_byte(fd: std::os::fd::RawFd, into: &mut [u8], wait: Duration) -> bool {
     if into.is_empty() {
         return false;
     }
+    let mut ready = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = wait.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one valid stack `pollfd`; `poll` writes only its `revents`.
+    if unsafe { libc::poll(&mut ready, 1, timeout_ms) } != 1 {
+        return false;
+    }
+    // SAFETY: `into` is a valid writable buffer of `into.len()` bytes.
     let outcome = unsafe {
         libc::read(
-            0,
+            fd,
             into.as_mut_ptr().cast::<libc::c_void>(),
             into.len() as libc::size_t,
         )
@@ -1588,10 +1763,11 @@ fn read_stdin_byte(into: &mut [u8]) -> bool {
     outcome == into.len() as isize
 }
 
-/// Cooperative stop flag for the dashboard loop: SIGINT/SIGTERM/
-/// SIGHUP set it (signal-safe atomics only, like the capture loops);
-/// the loop polls it every tick and exits through the guards, so the
-/// terminal restores on operator stops and supervisor kills alike.
+/// Cooperative stop flag for the inventory loop (classic or dashboard):
+/// SIGINT/SIGTERM/SIGHUP set it (signal-safe atomics only, like the
+/// capture loops); the loop polls it every tick and exits through its
+/// stop path, so the terminal restores on operator stops and supervisor
+/// kills alike.
 /// SIGKILL cannot be caught — its terminal needs `reset(1)`.
 pub(crate) struct StopFlag {
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -1651,19 +1827,804 @@ pub(crate) fn fd_is_tty(fd: std::os::fd::RawFd) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
-/// Open stdout (fd 1) as a terminal file for frame writes + guard
-/// restoration. The fd is never closed here (`try_clone` owns a
-/// duplicate; the original stays the process's stdout).
-pub(crate) fn stdout_terminal() -> std::io::Result<File> {
-    use std::os::fd::FromRawFd as _;
-    // Check BEFORE wrapping: from_raw_fd(-1) on dup failure would
-    // violate the ownership contract (Drop would close an fd we
-    // never owned).
-    let duped = unsafe { libc::dup(1) };
-    if duped < 0 {
-        return Err(std::io::Error::last_os_error());
+/// Where the interactive dashboard draws and reads keys (C5.3).
+/// Production: the terminal on stdout, the keys on stdin and the
+/// process's stderr on fd 2; tests pass a pty and their own stderr.
+pub(crate) struct DashboardIo {
+    /// The terminal frames go to (opened as a private nonblocking
+    /// description; the fd itself is never changed or closed).
+    pub output: std::os::fd::RawFd,
+    /// The key input; keys are live only when it is a terminal.
+    pub input: Option<std::os::fd::RawFd>,
+    /// Receives the display's account when the dashboard ends (tests).
+    pub account: Option<std::rc::Rc<std::cell::Cell<Option<DisplayAccount>>>>,
+    /// The process's stderr (production fd 2): where the closing lines
+    /// go, and what [`StderrRoute::Capture`] redirects.
+    pub stderr_fd: std::os::fd::RawFd,
+    /// What the dashboard does with that stderr while it owns the screen.
+    pub stderr: StderrRoute,
+}
+
+impl DashboardIo {
+    pub(crate) fn stdio() -> Self {
+        Self {
+            output: 1,
+            input: Some(0),
+            account: None,
+            stderr_fd: 2,
+            stderr: StderrRoute::for_fd(2),
+        }
     }
-    Ok(unsafe { File::from_raw_fd(duped) })
+}
+
+/// What the dashboard does with the process's stderr while it owns the
+/// screen (C5.3, review M1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum StderrRoute {
+    /// Stderr is a terminal (normally the dashboard's own): every writer
+    /// would scribble beside the screen and, on a terminal that stopped
+    /// reading, block in a blocking write. It is captured
+    /// ([`StderrCapture`]) into the log tail, and what it held, with the
+    /// pass warnings, is replayed on the real stderr at the restore.
+    Capture,
+    /// Stderr is a file or a pipe: left alone, so it keeps every line it
+    /// kept on the classic path; the log tail's lines are mirrored to it
+    /// (bounded, shed and counted when it stops reading).
+    Mirror,
+    /// Left alone and nothing mirrored (unit tests running beside others).
+    #[default]
+    Leave,
+}
+
+impl StderrRoute {
+    /// Capture only a terminal: a file or a pipe neither scribbles on the
+    /// screen nor loses what it is given.
+    pub(crate) fn for_fd(fd: std::os::fd::RawFd) -> Self {
+        if fd_is_tty(fd) {
+            Self::Capture
+        } else {
+            Self::Mirror
+        }
+    }
+}
+
+/// Captured stderr lines kept for the log tail, at most this many between
+/// two ticks (older ones are counted, not kept).
+const CAPTURED_LINES_MAX: usize = 256;
+
+/// What the capture's reader thread holds for the next tick.
+#[derive(Default)]
+struct CapturedLines {
+    lines: VecDeque<String>,
+    dropped: u64,
+}
+
+/// The process's stderr while the dashboard owns the terminal (C5.3): the
+/// stderr fd points at a pipe whose reader thread keeps the lines
+/// (bounded) for the log tail. Every stderr writer of a pass (warnings
+/// deep in a scan, a helper process) would otherwise scribble beside the
+/// screen and, on a terminal that stopped reading, block the loop in a
+/// blocking write. The reader drains continuously, so a writer never
+/// waits on the terminal. [`finish`](Self::finish) puts the saved stderr
+/// back and hands over what the reader still held; a drop only puts it
+/// back.
+pub(crate) struct StderrCapture {
+    fd: std::os::fd::RawFd,
+    saved: Option<std::os::fd::OwnedFd>,
+    captured: Arc<Mutex<CapturedLines>>,
+    /// Signalled by the reader once it reached the pipe's end.
+    drained: Option<std::sync::mpsc::Receiver<()>>,
+    progress_was: bool,
+}
+
+/// How long the restore waits for the capture's reader to drain the pipe
+/// once the stderr is back. The pipe ends when its last write end closes:
+/// at once, unless a helper process that inherited it still runs; past
+/// the wait the lines read so far are replayed and the rest stay unread.
+const CAPTURE_DRAIN_WAIT: Duration = Duration::from_millis(250);
+
+/// What a [`StderrCapture`] held when it finished.
+pub(crate) struct CaptureEnd {
+    pub lines: Vec<String>,
+    /// Lines the reader dropped before anyone took them.
+    pub dropped: u64,
+    /// Putting the saved stderr back failed: the stderr fd still names
+    /// the pipe (the closing lines use their own description of the real
+    /// stderr, opened before the capture).
+    pub restore_error: Option<std::io::Error>,
+    /// The reader reached the pipe's end within [`CAPTURE_DRAIN_WAIT`].
+    pub drained: bool,
+}
+
+impl StderrCapture {
+    /// Captures the stderr on `fd` (production: 2).
+    pub(crate) fn begin(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh owned fd, or -1.
+        let saved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if saved < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor this capture owns.
+        let saved = unsafe { OwnedFd::from_raw_fd(saved) };
+        let mut ends = [0; 2];
+        // SAFETY: `pipe2` writes two fresh fds into `ends`.
+        if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: both ends are fresh descriptors owned here.
+        let (read, write) = unsafe { (File::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        // Room for a burst while the reader is descheduled (best effort).
+        // SAFETY: a size request on our own pipe.
+        unsafe {
+            libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20);
+        }
+        let captured = Arc::new(Mutex::new(CapturedLines::default()));
+        let sink = Arc::clone(&captured);
+        let (done, drained) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("p11scope-stderr".into())
+            .spawn(move || {
+                read_captured(read, &sink);
+                let _ = done.send(());
+            })?;
+        // SAFETY: `dup2` onto the stderr fd; the pipe's write end stays
+        // owned by `write` until it drops below (the reader then ends).
+        if unsafe { libc::dup2(write.as_raw_fd(), fd) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        drop(write);
+        Ok(Self {
+            fd,
+            saved: Some(saved),
+            captured,
+            drained: Some(drained),
+            progress_was: crate::inspect_system::set_progress_lines(false),
+        })
+    }
+
+    /// The lines captured since the last call, and how many were dropped.
+    pub(crate) fn take(&self) -> (Vec<String>, u64) {
+        let mut captured = self
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dropped = std::mem::take(&mut captured.dropped);
+        (captured.lines.drain(..).collect(), dropped)
+    }
+
+    /// Puts the saved stderr back, waits (bounded) for the reader to
+    /// drain the pipe, and hands over every line it still held: nothing
+    /// written to stderr while the dashboard ran is lost unannounced.
+    pub(crate) fn finish(mut self, wait: Duration) -> CaptureEnd {
+        let restore_error = self.end().err();
+        // With the stderr still on the pipe its end never comes: no wait.
+        let drained = restore_error.is_none()
+            && self
+                .drained
+                .take()
+                .is_some_and(|drained| drained.recv_timeout(wait).is_ok());
+        let (lines, dropped) = self.take();
+        CaptureEnd {
+            lines,
+            dropped,
+            restore_error,
+            drained,
+        }
+    }
+
+    /// Puts the saved stderr back (once).
+    fn end(&mut self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let Some(saved) = self.saved.take() else {
+            return Ok(());
+        };
+        crate::inspect_system::set_progress_lines(self.progress_was);
+        loop {
+            // SAFETY: `dup2` of our own saved descriptor onto the stderr
+            // fd.
+            if unsafe { libc::dup2(saved.as_raw_fd(), self.fd) } >= 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        let _ = self.end();
+    }
+}
+
+/// The capture's reader: lines, each capped at [`LOG_LINE_MAX_CHARS`]
+/// bytes (the tail truncates further), at most [`CAPTURED_LINES_MAX`]
+/// held.
+fn read_captured(mut pipe: File, captured: &Mutex<CapturedLines>) {
+    use std::io::Read as _;
+    let mut partial: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let keep = |line: &[u8]| {
+        let text = String::from_utf8_lossy(line).into_owned();
+        let mut captured = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        captured.lines.push_back(text);
+        while captured.lines.len() > CAPTURED_LINES_MAX {
+            captured.lines.pop_front();
+            captured.dropped = captured.dropped.saturating_add(1);
+        }
+    };
+    loop {
+        let read = match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        for &byte in &chunk[..read] {
+            if byte == b'\n' {
+                keep(&partial);
+                partial.clear();
+            } else if partial.len() < LOG_LINE_MAX_CHARS {
+                partial.push(byte);
+            }
+        }
+    }
+    if !partial.is_empty() {
+        keep(&partial);
+    }
+}
+
+/// Keys handled in one service tick, at most (a paste cannot hold a tick).
+const KEYS_PER_TICK: usize = 64;
+
+/// What the dashboard's display did over a run (C5.3): the frame
+/// handoff, the terminal writer's account, and the service ticks the
+/// loop gave it. `longest_gap` is the longest time between two
+/// consecutive ticks with no pass between them (what the display and the
+/// ticks themselves cost); `longest_pass_gap` the longest stretch across
+/// a pass (from the takeover to the first tick, between the ticks around
+/// a pass, or from the last tick to the stop), which also carries the
+/// pass's own work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DisplayAccount {
+    pub offered: u64,
+    pub consumed: u64,
+    pub superseded: u64,
+    pub terminal: TerminalAccount,
+    pub ticks: u64,
+    pub longest_gap: Duration,
+    pub longest_pass_gap: Duration,
+    pub stderr: StderrAccount,
+    /// Closing stderr lines the real stderr did not take within their
+    /// budget (or that had no stderr to go to).
+    pub notices_shed: u64,
+}
+
+/// What became of the stderr lines of a dashboard run (C5.3, review M1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StderrAccount {
+    pub route: StderrRoute,
+    /// Captured lines and pass warnings replayed at the restore.
+    pub replayed: u64,
+    /// Captured lines and pass warnings dropped before the replay (the
+    /// capture's reader and the replay keep the newest lines only).
+    pub dropped: u64,
+    /// The capture's reader had not drained the pipe within its wait.
+    pub undrained: bool,
+    /// Putting the saved stderr back failed.
+    pub restore_failed: bool,
+    /// Log lines mirrored to a stderr that is not the terminal.
+    pub mirrored: u64,
+    /// Log lines the mirror shed: that stderr did not take them in time.
+    pub mirror_shed: u64,
+}
+
+/// Captured lines and pass warnings the replay keeps, at most (the newest;
+/// older ones are counted).
+const REPLAY_LINES_MAX: usize = 256;
+
+/// What mirroring the log lines may wait on a stderr that stopped reading,
+/// per pass; past it the pass's further lines are shed (counted).
+const MIRROR_PASS_BUDGET: Duration = Duration::from_millis(5);
+
+/// How long the restore retried after the report may wait for a terminal
+/// that shed the first one ([`Display::retry_restore`]); a second signal
+/// exits sooner.
+pub(crate) const RESTORE_RETRY_BUDGET: Duration = Duration::from_secs(5);
+
+/// The closing stderr lines' shared budget ([`Notices`]).
+pub(crate) const NOTICE_BUDGET: Duration = Duration::from_secs(1);
+
+/// The interactive dashboard's display side (C5.3), driven by the
+/// inventory loop's service ticks: it never owns the loop. Each tick
+/// reads keys without waiting and, at the ~3 Hz cadence (or after a
+/// key), renders the newest presentation and hands it to the
+/// [`TerminalWriter`], which sheds what the terminal does not take
+/// within its budget. A stalled terminal therefore never delays a tick:
+/// the capture keeps its cadence and the frames are counted as shed.
+pub(crate) struct Display {
+    writer: TerminalWriter,
+    keys: Option<RawModeGuard>,
+    stderr: Option<StderrCapture>,
+    /// The closing lines, on the real stderr (opened before the capture).
+    notices: Notices,
+    /// The log lines' mirror ([`StderrRoute::Mirror`]).
+    mirror: Option<Notices>,
+    /// What the restore replays ([`StderrRoute::Capture`]).
+    replay: VecDeque<String>,
+    stderr_account: StderrAccount,
+    handoff: DisplayHandoff,
+    tail: LogTail,
+    state: DashboardState,
+    last_frame: Option<DisplayFrame>,
+    last_viewport: Viewport,
+    next_redraw: std::time::Instant,
+    quit: std::rc::Rc<std::cell::Cell<bool>>,
+    failure: Option<std::io::Error>,
+    restored: bool,
+    ticks: u64,
+    last_tick: Option<std::time::Instant>,
+    /// A pass was offered since the last tick.
+    pass_since_tick: bool,
+    longest_gap: Duration,
+    longest_pass_gap: Duration,
+    /// Frames shed already announced in the log tail.
+    shed_announced: u64,
+}
+
+impl Display {
+    /// Takes over the terminal of `io`: the alternate screen (bounded),
+    /// and raw key input when its input is a terminal.
+    pub(crate) fn open(io: &DashboardIo, scope_label: &str) -> std::io::Result<Self> {
+        // Before the capture: the closing lines go to the real stderr.
+        let notices = Notices::on_fd(io.stderr_fd, NOTICE_BUDGET);
+        let mirror = (io.stderr == StderrRoute::Mirror)
+            .then(|| Notices::mirror_on_fd(io.stderr_fd, MIRROR_PASS_BUDGET));
+        let mut writer = TerminalWriter::open(io.output)?;
+        writer.enter()?;
+        let keys = match io.input {
+            Some(fd) => RawModeGuard::enter_fd(fd)?,
+            None => None,
+        };
+        let stderr = if io.stderr == StderrRoute::Capture {
+            Some(StderrCapture::begin(io.stderr_fd)?)
+        } else {
+            None
+        };
+        let mut tail = LogTail::bounded();
+        tail.push(&format!(
+            "p11scope inventory {scope_label}: dashboard started (rescan 1 Hz, redraw ~3 Hz{})",
+            if keys.is_some() {
+                ""
+            } else {
+                "; stdin is not a terminal, keys unavailable"
+            }
+        ));
+        Ok(Self {
+            writer,
+            keys,
+            stderr,
+            notices,
+            mirror,
+            replay: VecDeque::new(),
+            stderr_account: StderrAccount {
+                route: io.stderr,
+                ..StderrAccount::default()
+            },
+            handoff: DisplayHandoff::new(),
+            tail,
+            state: DashboardState::new(),
+            last_frame: None,
+            last_viewport: Viewport {
+                width: 80,
+                height: 24,
+            },
+            next_redraw: std::time::Instant::now(),
+            quit: std::rc::Rc::new(std::cell::Cell::new(false)),
+            failure: None,
+            restored: false,
+            ticks: 0,
+            // The first gap runs from the takeover (the first pass in it).
+            last_tick: Some(std::time::Instant::now()),
+            pass_since_tick: true,
+            longest_gap: Duration::ZERO,
+            longest_pass_gap: Duration::ZERO,
+            shed_announced: 0,
+        })
+    }
+
+    /// Set by `q`/ESC/Ctrl-C, or by a terminal transport error: the loop
+    /// polls it with its stop signals.
+    pub(crate) fn quit_flag(&self) -> std::rc::Rc<std::cell::Cell<bool>> {
+        std::rc::Rc::clone(&self.quit)
+    }
+
+    /// One line for the log tail (sanitized there), mirrored to a stderr
+    /// that is not the terminal: a progress line.
+    pub(crate) fn log(&mut self, line: &str) {
+        self.tail.push(line);
+        if let Some(mirror) = self.mirror.as_mut() {
+            mirror.line(&crate::render::escape_controls(line));
+        }
+    }
+
+    /// A line that must outlive the screen (a pass warning, a caller
+    /// event): logged, and kept for the replay when stderr is captured.
+    /// After the restore it goes straight to the closing lines.
+    pub(crate) fn warn(&mut self, line: &str) {
+        if self.restored {
+            self.notice(line);
+            return;
+        }
+        self.log(line);
+        if self.stderr.is_some() {
+            self.keep(line.to_string());
+        }
+    }
+
+    /// One closing line on the real stderr, within the shared notice
+    /// budget (shed and counted past it).
+    pub(crate) fn notice(&mut self, line: &str) {
+        self.notices.line(line);
+    }
+
+    fn keep(&mut self, line: String) {
+        self.replay.push_back(line);
+        while self.replay.len() > REPLAY_LINES_MAX {
+            self.replay.pop_front();
+            self.stderr_account.dropped += 1;
+        }
+    }
+
+    /// Offers the pass's presentation (latest wins, never blocks), with
+    /// the log tail including what stderr captured since the last pass.
+    pub(crate) fn offer(&mut self, presentation: Presentation) {
+        self.pass_since_tick = true;
+        self.take_stderr();
+        if let Some(mirror) = self.mirror.as_mut() {
+            mirror.refill(MIRROR_PASS_BUDGET);
+        }
+        self.handoff
+            .offer(Arc::new(presentation), self.tail.snapshot());
+    }
+
+    /// Moves the captured stderr lines into the log tail (sanitized there)
+    /// and the replay.
+    fn take_stderr(&mut self) {
+        let Some(capture) = self.stderr.as_ref() else {
+            return;
+        };
+        let (lines, dropped) = capture.take();
+        self.captured(lines, dropped);
+    }
+
+    fn captured(&mut self, lines: Vec<String>, dropped: u64) {
+        if dropped > 0 {
+            self.stderr_account.dropped += dropped;
+            self.tail.push(&format!(
+                "p11scope: {dropped} stderr lines dropped before the log tail took them"
+            ));
+        }
+        for line in lines {
+            self.tail.push(&line);
+            self.keep(line);
+        }
+    }
+
+    /// One service tick: keys, then the frame when one is due. Never
+    /// waits on the terminal past [`FRAME_WRITE_BUDGET`].
+    pub(crate) fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        self.note_gap(now);
+        self.ticks += 1;
+        if self.restored || self.quit.get() {
+            return;
+        }
+        let mut redraw = now >= self.next_redraw;
+        if let Some(fd) = self.keys.as_ref().map(RawModeGuard::fd) {
+            for _ in 0..KEYS_PER_TICK {
+                let Some(key) = poll_key_fd(fd) else {
+                    break;
+                };
+                // Keys redraw at once (scrolling stays responsive inside
+                // the coalesced cadence).
+                redraw = true;
+                match key {
+                    Key::Quit => {
+                        self.tail.push("p11scope: quit requested");
+                        self.quit.set(true);
+                        return;
+                    }
+                    Key::Up => {
+                        if self.state.detail == DetailPage::Gaps {
+                            self.state.scroll_gaps_up();
+                        } else {
+                            self.state.scroll_up();
+                        }
+                    }
+                    Key::Down => {
+                        if let Some(frame) = self.last_frame.as_ref() {
+                            if self.state.detail == DetailPage::Gaps {
+                                // Within-record paging (F6d) wraps at the
+                                // live viewport width, exactly like the
+                                // renderer.
+                                self.state.scroll_gaps_down(
+                                    &frame.presentation,
+                                    self.last_viewport.width,
+                                );
+                            } else {
+                                let total = self.state.items_total(&frame.presentation);
+                                self.state.scroll_down(total);
+                            }
+                        } else if self.state.detail != DetailPage::Gaps {
+                            self.state.scroll_down(0);
+                        }
+                    }
+                    Key::Detail => {
+                        self.state.next_detail();
+                        if let Some(frame) = self.last_frame.as_ref() {
+                            self.state.clamp_to_presentation(&frame.presentation);
+                        }
+                    }
+                }
+            }
+        }
+        if redraw {
+            self.next_redraw = now + REDRAW_INTERVAL;
+            self.draw();
+        }
+    }
+
+    fn draw(&mut self) {
+        if let Some(frame) = self.handoff.take() {
+            self.last_frame = Some(frame);
+        }
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        self.state.clamp_to_presentation(&frame.presentation);
+        let viewport = Viewport::from_fd(self.writer.fd()).unwrap_or(Viewport {
+            width: 80,
+            height: 24,
+        });
+        self.last_viewport = viewport;
+        let bytes = render_frame(frame, viewport, &self.state);
+        if let Err(error) = self.writer.frame(&bytes) {
+            // A transport error (a hung-up terminal): stop drawing and end
+            // the run through its stop path, so the report is written.
+            self.failure = Some(error);
+            self.quit.set(true);
+            return;
+        }
+        let account = self.writer.account();
+        if account.frames_shed > self.shed_announced && self.writer.last_frame_written() {
+            self.tail.push(&format!(
+                "p11scope: the terminal did not keep up: {} frames shed so far ({} bytes); \
+                 the capture was not delayed",
+                account.frames_shed, account.bytes_shed
+            ));
+            self.shed_announced = account.frames_shed;
+        }
+    }
+
+    fn note_gap(&mut self, now: std::time::Instant) {
+        if let Some(last) = self.last_tick.replace(now) {
+            let gap = now.saturating_duration_since(last);
+            if std::mem::take(&mut self.pass_since_tick) {
+                self.longest_pass_gap = self.longest_pass_gap.max(gap);
+            } else {
+                self.longest_gap = self.longest_gap.max(gap);
+            }
+        }
+    }
+
+    /// Gives the terminal back: raw input off, cursor shown, alternate
+    /// screen left (bounded by [`RESTORE_BUDGET`]), stderr restored, then
+    /// what stderr captured and the pass warnings replayed on it (within
+    /// the notice budget), so nothing the screen alone showed is lost
+    /// with it. Idempotent; ticks after it draw nothing. The loop's last
+    /// stretch (from its last tick to the stop) counts as a gap.
+    pub(crate) fn restore(&mut self) {
+        if std::mem::replace(&mut self.restored, true) {
+            return;
+        }
+        self.note_gap(std::time::Instant::now());
+        self.last_tick = None;
+        drop(self.keys.take());
+        self.writer.restore();
+        let Some(capture) = self.stderr.take() else {
+            return;
+        };
+        let end = capture.finish(CAPTURE_DRAIN_WAIT);
+        self.captured(end.lines, end.dropped);
+        self.stderr_account.undrained = !end.drained;
+        if let Some(error) = end.restore_error {
+            self.stderr_account.restore_failed = true;
+            self.notice(&format!(
+                "p11scope: could not put stderr back after the dashboard ({error}); \
+                 later stderr lines are lost"
+            ));
+        }
+        self.replay_kept();
+    }
+
+    /// Replays the kept lines on the real stderr, oldest first.
+    fn replay_kept(&mut self) {
+        let dropped = self.stderr_account.dropped;
+        if self.replay.is_empty() && dropped == 0 {
+            return;
+        }
+        self.notice(&format!(
+            "p11scope: stderr while the dashboard ran ({} lines{}):",
+            self.replay.len(),
+            if dropped > 0 {
+                format!(", {dropped} older dropped")
+            } else {
+                String::new()
+            }
+        ));
+        while let Some(line) = self.replay.pop_front() {
+            self.notices.line(&crate::render::escape_controls(&line));
+            self.stderr_account.replayed += 1;
+        }
+    }
+
+    /// After a restore the terminal did not take whole (one still stalled
+    /// at the stop, e.g. Ctrl-S then `q`): one more attempt, bounded by
+    /// `budget`, once the report is written. Says how it went (on the
+    /// closing lines) when it was needed; true when the terminal is
+    /// restored.
+    pub(crate) fn retry_restore(&mut self, budget: Duration) -> bool {
+        let before = self.writer.account();
+        let restored = self.writer.retry_restore(budget);
+        if !before.restored && self.writer.account().restore_retried {
+            self.notice(if restored {
+                "p11scope: dashboard screen restored after the report (the terminal read again)"
+            } else {
+                "p11scope: dashboard screen restore shed: the terminal did not read; run `reset`"
+            });
+        }
+        restored
+    }
+
+    /// A terminal transport error that ended the run, once.
+    pub(crate) fn take_failure(&mut self) -> Option<std::io::Error> {
+        self.failure.take()
+    }
+
+    pub(crate) fn account(&self) -> DisplayAccount {
+        DisplayAccount {
+            offered: self.handoff.offered(),
+            consumed: self.handoff.consumed(),
+            superseded: self.handoff.dropped_frames(),
+            terminal: self.writer.account(),
+            ticks: self.ticks,
+            longest_gap: self.longest_gap,
+            longest_pass_gap: self.longest_pass_gap,
+            stderr: StderrAccount {
+                mirrored: self.mirror.as_ref().map_or(0, Notices::written),
+                mirror_shed: self.mirror.as_ref().map_or(0, Notices::shed),
+                ..self.stderr_account
+            },
+            notices_shed: self.notices.shed(),
+        }
+    }
+}
+
+impl Drop for Display {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// Bounded stderr lines (C5.3): the closing lines a dashboard run ends
+/// with, and the mirror of its log lines. Their stderr may be the stalled
+/// terminal or a pipe nobody reads, so every line waits only within one
+/// shared budget and is shed past it (counted), never holding a pass, the
+/// stop or the report. A stderr that cannot be opened sheds every line:
+/// nothing here ever falls back to a blocking (or panicking) write.
+pub(crate) struct Notices {
+    sink: Option<crate::sink::SinkWriter<crate::sink::StdoutInner>>,
+    left: Duration,
+    /// The least wait a line gets once the budget is spent.
+    floor: Duration,
+    /// After a shed the further lines shed at once (until a refill).
+    pause_after_shed: bool,
+    stalled: bool,
+    written: u64,
+    shed: u64,
+}
+
+/// The least wait a closing line gets once the shared budget is spent: a
+/// terminal that recovered still takes it.
+const NOTICE_FLOOR: Duration = Duration::from_millis(5);
+
+/// The least wait a mirrored line gets: a regular file or a pipe with
+/// room takes it at once.
+const MIRROR_FLOOR: Duration = Duration::from_millis(1);
+
+impl Notices {
+    /// The closing lines, on the stderr `fd` names now: open them before
+    /// a [`StderrCapture`] begins, so they reach the real stderr.
+    pub(crate) fn on_fd(fd: std::os::fd::RawFd, budget: Duration) -> Self {
+        Self::over_sink(crate::sink::sink_on_fd(fd).ok(), budget)
+    }
+
+    /// The mirror of the log lines on `fd`, with `budget` per pass
+    /// ([`refill`](Self::refill)).
+    fn mirror_on_fd(fd: std::os::fd::RawFd, budget: Duration) -> Self {
+        Self {
+            floor: MIRROR_FLOOR,
+            pause_after_shed: true,
+            ..Self::over_sink(crate::sink::sink_on_fd(fd).ok(), budget)
+        }
+    }
+
+    fn over_sink(
+        sink: Option<crate::sink::SinkWriter<crate::sink::StdoutInner>>,
+        budget: Duration,
+    ) -> Self {
+        Self {
+            sink,
+            left: budget,
+            floor: NOTICE_FLOOR,
+            pause_after_shed: false,
+            stalled: false,
+            written: 0,
+            shed: 0,
+        }
+    }
+
+    pub(crate) fn line(&mut self, line: &str) {
+        let Some(sink) = self
+            .sink
+            .as_mut()
+            .filter(|_| !(self.pause_after_shed && self.stalled))
+        else {
+            self.shed += 1;
+            return;
+        };
+        let started = std::time::Instant::now();
+        sink.begin_tick(self.left.max(self.floor));
+        let written = writeln!(sink, "{line}").and_then(|()| sink.flush());
+        self.left = self.left.saturating_sub(started.elapsed());
+        if written.is_err() || sink.take_drops().dropped_bytes > 0 {
+            self.shed += 1;
+            self.stalled = true;
+        } else {
+            self.written += 1;
+        }
+    }
+
+    /// A fresh budget (the mirror's, per pass).
+    fn refill(&mut self, budget: Duration) {
+        self.left = budget;
+        self.stalled = false;
+    }
+
+    /// Notices over an explicit sink (tests).
+    #[cfg(test)]
+    pub(crate) fn over(
+        sink: crate::sink::SinkWriter<crate::sink::StdoutInner>,
+        budget: Duration,
+    ) -> Self {
+        Self::over_sink(Some(sink), budget)
+    }
+
+    /// Lines written whole so far.
+    pub(crate) fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Lines shed so far.
+    pub(crate) fn shed(&self) -> u64 {
+        self.shed
+    }
 }
 
 #[cfg(test)]

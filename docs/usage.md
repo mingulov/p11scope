@@ -702,7 +702,37 @@ Limits that matter in pods:
   dashboard on stdout when it is a terminal (scrollable edge table with
   presence/capture/activity states, coverage header, bounded log tail;
   `q` quits, `--duration` bounds the run); on a pipe it degrades
-  honestly to snapshots (or JSON under `--json`), never ANSI.
+  honestly to snapshots (or JSON under `--json`), never ANSI. The
+  dashboard runs the same loop as the classic path (passes, native
+  service ticks, witness reads, stop) and only draws inside its service
+  ticks: a terminal that stops reading (a frozen SSH session, a
+  suspended terminal) never delays the capture. Each frame may wait at
+  most 10 ms for the terminal; what it does not take is shed and
+  counted, and the next frame repaints the whole screen. When stderr
+  is the terminal, its diagnostics go to the log tail while the
+  dashboard owns the screen (the per-process scan progress lines are
+  off) and are replayed on stderr after it, with the pass warnings and
+  caller events (`p11scope: stderr while the dashboard ran (N lines,
+  D older dropped):`, the newest 256 kept). When stderr is a file or a
+  pipe (`2>run.log`) it is left alone and also gets the log lines as
+  they come, like the classic path (shed, counted, if it stops
+  reading). The log tail notes `the terminal did not keep up: N frames
+  shed so far` once frames are drawn again. On exit the screen is
+  restored (waiting at most 1 s for the terminal; a restore the
+  terminal did not take, e.g. after Ctrl-S then `q`, is tried once
+  more for up to 5 s after the report is written, and a second signal
+  ends that wait), and stderr ends with
+  `p11scope: dashboard terminal: W frames written, S shed by a terminal
+  that did not keep up (C cut short, B bytes, T ms waited); screen
+  restored; service ticks N, longest gap G ms (P ms across a pass)` and
+  `p11scope: dashboard stderr: …` (what was replayed, mirrored,
+  dropped or shed). Every closing line shares one 1 s budget (at least
+  5 ms each) and is shed, counted, past it. Shed frames are display work
+  only; capture facts live in the report and the event stream. `G` is
+  the longest time between two consecutive service ticks with no pass
+  between them (what drawing costs the loop); `P` is the longest
+  stretch across a pass, which also carries the pass's own scan and
+  attach work.
   `--event-log <f.jsonl>` appends the versioned JSONL
   observation-event stream (see
   `docs/schema/inventory-events-v1.md`), rotating past
@@ -748,10 +778,11 @@ Limits that matter in pods:
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can
   start and otherwise falls back to `scan` with the gap `native usage
-  feed unavailable`. The native lane does not run under the interactive
-  `--dashboard` yet: there `native` is refused and `auto` falls back.
-  Ctrl-C, SIGTERM or SIGHUP end a classic run cleanly: the stream's
-  `ended`, the `-o` document and stdout are still written. Admission
+  feed unavailable`. Under the interactive `--dashboard` the native lane
+  runs exactly as on the classic path; the dashboard gives the terminal
+  back before the native stop, so its stderr notices are readable.
+  Ctrl-C, SIGTERM or SIGHUP end a classic or dashboard run cleanly: the
+  stream's `ended`, the `-o` document and stdout are still written. Admission
   verdicts come only from the run's attach set; an object it did not
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in

@@ -153,6 +153,13 @@ pub(crate) fn stdout_sink() -> io::Result<SinkWriter<StdoutInner>> {
     stdout_sink_from(std::io::stdout().as_raw_fd())
 }
 
+/// The same sink over any writer fd (the dashboard passes its stderr):
+/// bounded diagnostic lines next to an interactive view, whose terminal
+/// may be the stalled one (C5.3).
+pub(crate) fn sink_on_fd(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
+    stdout_sink_from(fd)
+}
+
 /// Best-effort diagnostics: use existing descriptor-safe transports and
 /// immediate nonblocking writes. A full pipe/socket must not delay cleanup.
 /// Callers must not treat a missing diagnostic as a successful measurement.

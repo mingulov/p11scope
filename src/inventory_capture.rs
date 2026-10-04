@@ -770,6 +770,10 @@ pub(crate) trait PassDriver<Pin> {
         now_ns: u64,
     ) -> Result<PassReport>;
     fn commit(&mut self, engine_changed: bool) -> Result<()>;
+    /// Once per service tick, after the lane's own service (C5.3: the
+    /// interactive dashboard draws here). It must return within a small
+    /// bound: it shares the tick.
+    fn on_tick(&mut self) {}
 }
 
 /// Runs `job` on a scoped worker thread and calls `service` every `tick`
@@ -811,10 +815,14 @@ pub(crate) fn collect_off_thread<T: Send>(
                 return job();
             }
         };
+        let mut schedule = TickSchedule::starting(Instant::now(), tick);
         loop {
-            match results.recv_timeout(tick) {
+            match results.recv_timeout(schedule.wait(Instant::now())) {
                 Ok(value) => return value,
-                Err(RecvTimeoutError::Timeout) => service(),
+                Err(RecvTimeoutError::Timeout) => {
+                    service();
+                    schedule.advance(Instant::now());
+                }
                 Err(RecvTimeoutError::Disconnected) => match worker.join() {
                     Err(panic) => std::panic::resume_unwind(panic),
                     Ok(()) => unreachable!("the worker sends its result before it ends"),
@@ -822,6 +830,39 @@ pub(crate) fn collect_off_thread<T: Send>(
             }
         }
     })
+}
+
+/// A fixed-rate tick schedule (C5.3): each tick falls due one period after
+/// the previous one fell due, not one period after its work ended. Work a
+/// tick does after the lifecycle ring's service (the dashboard's draw)
+/// therefore never pushes the next ring service later; a tick whose work
+/// overran a whole period makes the next one due at once (never a burst).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TickSchedule {
+    due: Instant,
+    period: Duration,
+}
+
+impl TickSchedule {
+    pub(crate) fn starting(now: Instant, period: Duration) -> Self {
+        Self {
+            due: now + period,
+            period,
+        }
+    }
+
+    /// How long until the next tick is due (zero once it is).
+    pub(crate) fn wait(&self, now: Instant) -> Duration {
+        self.due.saturating_duration_since(now)
+    }
+
+    /// The tick that was due has run (its work ended at `now`).
+    pub(crate) fn advance(&mut self, now: Instant) {
+        self.due += self.period;
+        if self.due < now {
+            self.due = now;
+        }
+    }
 }
 
 /// What the loop hands its publisher after each commit.
@@ -868,10 +909,13 @@ where
         }
         let now = now_ns();
         let job = driver.collector();
+        // The ring first, then the display (C5.3): on a fixed-rate schedule,
+        // so the draw never delays the next ring service.
         let collected = collect_off_thread(job, clock.collection_tick, &mut || {
             if let Some(lane) = lane.as_mut() {
                 lane.collecting_tick();
             }
+            driver.on_tick();
         });
         let mut report = match lane.as_mut() {
             Some(lane) => driver.apply(collected, lane.identity(), now)?,
@@ -895,15 +939,20 @@ where
         } else {
             Instant::now() + clock.interval
         };
+        let mut schedule = TickSchedule::starting(Instant::now(), clock.tick);
         loop {
             let now = Instant::now();
             if clock.ending() || now >= next {
                 break;
             }
-            std::thread::sleep(clock.tick.min(next - now));
+            std::thread::sleep(schedule.wait(now).min(next - now));
+            // The ring first, then the display; the schedule is fixed-rate,
+            // so the draw never delays the next ring service.
             if let Some(lane) = lane.as_mut() {
                 lane.tick(driver.host());
             }
+            driver.on_tick();
+            schedule.advance(Instant::now());
         }
     }
     let Some(lane) = lane else {

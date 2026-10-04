@@ -103,6 +103,27 @@ fn run_with_writer(
     Ok(0)
 }
 
+/// The scan stages' progress lines on stderr ("enumerating…",
+/// "deep-scanning…"): on by default. The interactive inventory dashboard
+/// turns them off while it owns the terminal (C5.3): its own pass lines
+/// say the same, and one line per scanned process would flood its bounded
+/// log tail.
+static PROGRESS_LINES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turns the scan progress lines on or off; returns the previous setting.
+pub(crate) fn set_progress_lines(on: bool) -> bool {
+    PROGRESS_LINES.swap(on, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `eprintln!` for a scan progress line (see [`set_progress_lines`]).
+macro_rules! progress {
+    ($($arg:tt)*) => {
+        if PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// `P11SCOPE_STAGE_TIMINGS=1` prints each pass's per-stage wall time to
 /// stderr (the system-scale cost measurement); stdout never carries it.
 pub(crate) fn stage_timings_requested() -> bool {
@@ -285,7 +306,7 @@ fn collect_members(
     max_scan_pids: Option<usize>,
     timings: &mut StageTimings,
 ) -> Collection {
-    eprintln!("p11scope: enumerating processes...");
+    progress!("p11scope: enumerating processes...");
     let scope = Scope::System;
     let (pids, unlisted) = scope_pids(&scope);
     let proc_list_failed = unlisted
@@ -304,7 +325,7 @@ fn collect_members(
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();
     let selected: Vec<u32> = if pids.len() > cap {
-        eprintln!(
+        progress!(
             "p11scope: sweeping {} process maps (cap {cap})...",
             pids.len()
         );
@@ -322,7 +343,7 @@ fn collect_members(
         sweep_unavailable = unavailable;
         selected
     } else {
-        eprintln!(
+        progress!(
             "p11scope: sweep skipped ({} processes fit the {cap} cap)",
             pids.len()
         );
@@ -335,7 +356,7 @@ fn collect_members(
     let mut members = Vec::with_capacity(selected.len());
     let deep_start = monotonic_ns();
     for (index, pid) in selected.iter().enumerate() {
-        eprintln!(
+        progress!(
             "p11scope: deep-scanning {}/{} (pid {pid})...",
             index + 1,
             selected.len()
@@ -787,7 +808,7 @@ pub(crate) fn collect(
     if decide_system_outcome(stats) == SystemOutcome::HardError {
         return Err(unreadable_system_error(&collection));
     }
-    eprintln!("p11scope: lowering scan-only admission and rendering...");
+    progress!("p11scope: lowering scan-only admission and rendering...");
     let bind_start = monotonic_ns();
     let bound = bind_collection(&mut collection);
     timings.span(StageKind::Bind, "assemble", bind_start, monotonic_ns());
@@ -817,7 +838,7 @@ pub(crate) fn collect_pid(
     hooks: &HookRegistry,
     policy: AdmissionPolicy,
 ) -> Result<Catalog> {
-    eprintln!("p11scope: deep-scanning pid {pid}...");
+    progress!("p11scope: deep-scanning pid {pid}...");
     let mut budget = CaptureWorkBudget::default();
     let mut noise = DiscoveryNoiseAggregator::default();
     let member = scan_member(pid, ProcessViewId(0), hints, hooks, &mut budget, &mut noise);
@@ -835,7 +856,7 @@ pub(crate) fn collect_pid(
         };
         return Err(anyhow::anyhow!("cannot inventory pid {pid}: {detail}{fix}"));
     }
-    eprintln!("p11scope: lowering scan-only admission and rendering...");
+    progress!("p11scope: lowering scan-only admission and rendering...");
     let mut collection = Collection {
         enumerated: vec![pid],
         selected: vec![pid],
@@ -973,7 +994,7 @@ fn attribute_sweep(
         .map(ObjectKey::of)
         .collect();
     refused.retain(|object| unselected_keys.contains(&object.key));
-    eprintln!(
+    progress!(
         "p11scope: attributing {} unselected processes by maps identity...",
         collection.sweep.len().saturating_sub(selected.len())
     );

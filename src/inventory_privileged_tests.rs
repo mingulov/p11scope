@@ -350,6 +350,7 @@ fn drive<L: CaptureLane<PidPin>>(
         max_scan_pids: None,
         guard: UnavailableImageGuard,
         deadline,
+        display: None,
     };
     let stop = Cell::new(false);
     let stop_now = || stop.get();
@@ -481,6 +482,209 @@ fn privileged_native_lane_pid_lp64() -> Result<()> {
         coverage_ns - began,
         stopped.summary.attached,
         probe.retired_after.map(|after| after.as_millis()),
+    );
+    Ok(())
+}
+
+/// A pty pair for the slow-terminal cell: the master is the terminal the
+/// cell never reads during the stall.
+fn open_pty(cols: u16, rows: u16) -> Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd as _;
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `openpty` writes two fresh fds; the other pointers may be null.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &size,
+        )
+    };
+    ensure!(opened == 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: fresh descriptors owned from here on.
+    Ok(unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    })
+}
+
+/// C5.3 cell: the native lane under the interactive dashboard on a
+/// terminal that is never read for 20 s. The ledger calls the provider
+/// during the stall. The capture must not notice the terminal: the longest
+/// gap between service ticks stays under 100 ms, passes keep their 1 s
+/// cadence, the calls are witnessed, no lifecycle record is lost (idle
+/// host), and the frames the terminal did not take are shed and counted.
+/// After the stop the terminal reads again: the screen is restored and the
+/// report is written before any detach (R-C51-4).
+#[test]
+#[ignore = "root-owned live BPF lane; native lane under the dashboard on a stalled pty"]
+fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    let workload = Workload::build()?;
+    let gate = workload.path("gate");
+    let gate_arg = gate.to_str().context("gate path")?.to_string();
+    let target = workload.spawn(
+        "target",
+        &[
+            "mech", "--cell", "D", "--module", SOFTHSM, "--iters", "4", "--gate", &gate_arg,
+            "--hold",
+        ],
+    )?;
+    let (master, slave) = open_pty(200, 60)?;
+    let stall = Duration::from_secs(20);
+    let started = Instant::now();
+    let stop_at = RefCell::new(None::<Instant>);
+    let drainer = RefCell::new(None::<std::thread::JoinHandle<Vec<u8>>>);
+    let master = RefCell::new(Some(master));
+    let stop = || {
+        // The ledger calls in the middle of the stall.
+        if started.elapsed() > Duration::from_secs(8) && !gate.exists() {
+            let _ = std::fs::write(&gate, b"");
+        }
+        if started.elapsed() < stall {
+            return false;
+        }
+        if stop_at.borrow().is_none() {
+            *stop_at.borrow_mut() = Some(Instant::now());
+            // The terminal reads again from the stop on.
+            if let Some(mut master) = master.borrow_mut().take() {
+                *drainer.borrow_mut() = Some(std::thread::spawn(move || {
+                    let mut seen = Vec::new();
+                    let mut chunk = [0u8; 65536];
+                    while let Ok(read) = master.read(&mut chunk) {
+                        if read == 0 {
+                            break;
+                        }
+                        seen.extend_from_slice(&chunk[..read]);
+                    }
+                    seen
+                }));
+            }
+        }
+        true
+    };
+    let account = std::rc::Rc::new(Cell::new(None::<DisplayAccount>));
+    let terminal = DashboardIo {
+        output: slave.as_raw_fd(),
+        input: None,
+        account: Some(std::rc::Rc::clone(&account)),
+        stderr_fd: 2,
+        stderr: StderrRoute::Capture,
+    };
+    let events = workload.path("dashboard.jsonl");
+    let reported = Cell::new(None::<Instant>);
+    let mut stdout = Vec::new();
+    let code = run_with_terminal(
+        InspectScope::Pid(target.pid()),
+        &[PathBuf::from(SOFTHSM)],
+        &HookRegistry::builtin(),
+        true,
+        None,
+        None,
+        Some(Duration::from_secs(120)),
+        None,
+        true,
+        Some(&events),
+        Some(1 << 30),
+        None,
+        CaptureMode::Native,
+        &stop,
+        &|| reported.set(Some(Instant::now())),
+        true,
+        &mut stdout,
+        &terminal,
+    )?;
+    drop(slave);
+    let seen = drainer
+        .borrow_mut()
+        .take()
+        .context("the stop never started the drainer")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the drainer panicked"))?;
+    ensure!(code == 0, "exit code {code}");
+    let stop_at = stop_at.borrow().context("never stopped")?;
+    let to_report = reported.get().context("no report")? - stop_at;
+    let account = account.get().context("no display account")?;
+    let document: serde_json::Value = serde_json::from_slice(&stdout)?;
+    let stream = std::fs::read_to_string(&events)?;
+    ensure!(target.has("DONE "), "the ledger never finished");
+    ensure!(
+        account.terminal.frames_shed > 0,
+        "the stall never bit: {account:?}"
+    );
+    ensure!(
+        account.longest_gap < Duration::from_millis(100),
+        "a service tick waited on the terminal: {account:?}"
+    );
+    // Across a pass the gap also carries the pass's own work (the first
+    // pass attaches every endpoint, within its 250 ms extend window).
+    ensure!(
+        account.longest_pass_gap < Duration::from_secs(1),
+        "a pass lost its cadence: {account:?}"
+    );
+    ensure!(
+        account.terminal.restored,
+        "screen not restored: {account:?}"
+    );
+    let restore = b"\x1b[?25h\x1b[?1049l";
+    ensure!(
+        seen.windows(restore.len()).any(|window| window == restore),
+        "the restore never reached the terminal"
+    );
+    let passes = document["observation"]["passes"].as_u64().unwrap_or(0);
+    ensure!(passes >= 15, "passes kept no cadence: {passes}");
+    ensure!(document["observation"]["lane"] == "native");
+    ensure!(
+        document["observation"]["retirement"] == "closed",
+        "{}",
+        document["observation"]
+    );
+    // R-C51-4: the report within the 10 s pre-output bound of the stop.
+    ensure!(
+        to_report < Duration::from_secs(12),
+        "stop to report took {to_report:?}"
+    );
+    let edges = doc_edges(&document, target.pid());
+    ensure!(
+        edges.len() == 1 && edges[0]["entries"]["coverage"]["state"] == "witnessed",
+        "the calls during the stall were not witnessed: {edges:?}"
+    );
+    let witnesses = &document["observation"]["native_witnesses"];
+    ensure!(
+        witnesses["unbound_reasons"].get("lifecycle_loss").is_none()
+            && !document["gaps"].as_array().is_some_and(|gaps| {
+                gaps.iter()
+                    .any(|gap| gap["subject"] == "native capture lifecycle evidence lost")
+            }),
+        "lifecycle evidence lost on an idle host: {witnesses}"
+    );
+    ensure!(stream_ended(&stream), "the stream did not end");
+    eprintln!(
+        "C53_SLOW_PTY pid={} passes={passes} ticks={} longest_gap_ms={} written={} shed={} \
+         cut={} shed_bytes={} stall_ms={} restored={} stop_to_report_ms={} \
+         longest_pass_gap_ms={} witnesses={witnesses}",
+        target.pid(),
+        account.ticks,
+        account.longest_gap.as_millis(),
+        account.terminal.frames_written,
+        account.terminal.frames_shed,
+        account.terminal.frames_cut,
+        account.terminal.bytes_shed,
+        account.terminal.stall_ms,
+        account.terminal.restored,
+        to_report.as_millis(),
+        account.longest_pass_gap.as_millis(),
     );
     Ok(())
 }
@@ -777,6 +981,7 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         max_scan_pids: None,
         guard: UnavailableImageGuard,
         deadline,
+        display: None,
     };
     let stop = || flag.stopped();
     let clock = LoopClock {

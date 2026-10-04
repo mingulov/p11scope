@@ -67,10 +67,20 @@ versioned separately and are opaque, exact dispatch keys.
   `observation.retirement` (`closed`, or `unsettled` plus a gap when the
   probes did not detach within the stop budget). `native` that cannot start
   is an error naming why; `auto` falls back to the scan lane with the gap
-  `native usage feed unavailable`; `scan` is unchanged. The interactive
-  `--dashboard` does not service the native lane yet (`native` is refused
-  there, `auto` falls back). In a foreign PID namespace native `--system`
-  binds witnesses but never claims a watch.
+  `native usage feed unavailable`; `scan` is unchanged. In a foreign PID
+  namespace native `--system` binds witnesses but never claims a watch.
+- `inventory --dashboard` services the native lane through the same loop
+  as the classic path, and draws only inside its service ticks with a
+  non-blocking frame writer: a terminal that stops reading never delays
+  the capture. Frames the terminal does not take within 10 ms are shed
+  and counted (`p11scope: dashboard terminal: … shed …; longest gap … ms
+  (… ms across a pass)` on stderr at exit, and a log-tail note once frames are drawn again);
+  entering and restoring the screen wait at most 1 s (a shed restore is
+  retried for up to 5 s once the report is written). When stderr is the
+  terminal, its diagnostics go to the log tail while the dashboard owns
+  the screen and are replayed after it with the pass warnings and caller
+  events; a stderr file or pipe (`2>run.log`) is left alone and gets the
+  log lines as they come. Key polling no longer waits 100 ms per tick.
 - The classic `inventory` loop now ends cleanly on SIGINT, SIGTERM or SIGHUP:
   the stream's `ended`, the `-o` document and stdout are still written. A
   native stop's final commit reaches the event stream under one

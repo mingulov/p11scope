@@ -352,6 +352,8 @@ struct Scene {
     source: ScriptedSource,
     coordinator: InventoryCoordinator<ScriptedSource>,
     log: Log,
+    /// The loop's per-tick hook notes `display` (C5.3: the dashboard).
+    display_ticks: bool,
     /// A second caller (pid, start) that maps the provider from this scan
     /// (1-based) on.
     joiner: Option<(u32, u64, usize)>,
@@ -384,6 +386,7 @@ impl Scene {
             source,
             coordinator,
             log: Rc::clone(log),
+            display_ticks: false,
             joiner: None,
             scans: 0,
             collect_gate: None,
@@ -629,6 +632,12 @@ impl PassDriver<Pin> for Scene {
     fn commit(&mut self, engine_changed: bool) -> Result<()> {
         self.note("commit");
         self.coordinator.commit_batch(engine_changed).map(|_| ())
+    }
+
+    fn on_tick(&mut self) {
+        if self.display_ticks {
+            self.note("display");
+        }
     }
 }
 
@@ -1262,6 +1271,197 @@ fn ticks_between_passes_stage_each_discovery_quantum() {
     for pair in between.chunks(2) {
         assert_eq!(pair, ["service", "stage:lifecycle"], "{between:?}");
     }
+}
+
+/// C5.3: the dashboard draws on the loop's own service ticks, each after
+/// the lane's quantum is staged, so the native lane runs under the
+/// dashboard exactly as on the classic path: the passes and the stop keep
+/// the contract order, and every tick still services the ring first.
+#[test]
+fn the_display_ticks_after_each_lane_service_without_reordering_it() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    scene.display_ticks = true;
+    let lane = ScriptedLane::new(&log);
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let scans = {
+        let log = Rc::clone(&log);
+        move || log.borrow().iter().filter(|entry| *entry == "scan").count()
+    };
+    let stop = move || scans() >= 2;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(600)),
+        stop: &stop,
+        interval: Duration::from_millis(40),
+        tick: Duration::from_millis(5),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    run_classic(
+        &mut scene,
+        Some(started),
+        &clock,
+        &mut |scene: &mut Scene, point| {
+            match point {
+                Publish::Pass { .. } => scene.note("publish:pass"),
+                Publish::Retiring { attached, budget } => scene.note(format!(
+                    "publish:retiring {attached} {}",
+                    budget.as_millis()
+                )),
+                Publish::Stop { .. } => scene.note("publish:stop"),
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let log = entries(&log);
+    let first = log
+        .iter()
+        .position(|entry| entry == "publish:pass")
+        .unwrap();
+    let second = log.iter().rposition(|entry| entry == "scan").unwrap();
+    // A pass's collection entry (C5.7) belongs to the pass, not the ticks.
+    let between: Vec<&str> = log[first + 1..second]
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry != "collect")
+        .collect();
+    assert!(between.len() >= 6, "{between:?}");
+    for tick in between.chunks(3) {
+        assert_eq!(
+            tick,
+            ["service", "stage:lifecycle", "display"],
+            "{between:?}"
+        );
+    }
+    // Without the display's entries the run is the classic contract order.
+    let classic: Vec<String> = log
+        .iter()
+        .filter(|entry| !matches!(entry.as_str(), "display" | "service" | "stage:lifecycle"))
+        .cloned()
+        .collect();
+    let mut expected: Vec<String> = STARTUP.map(String::from).to_vec();
+    for extend in ["extend[0,1]", "extend[]"] {
+        expected.extend(pass(extend));
+    }
+    expected.extend(STOP.map(String::from));
+    expected.push("drop".into());
+    expected.retain(|entry| !matches!(entry.as_str(), "service" | "stage:lifecycle"));
+    assert_eq!(classic, expected);
+    // The stop never draws: the display is given back before it.
+    let retiring = log
+        .iter()
+        .position(|entry| entry.starts_with("publish:retiring"))
+        .unwrap();
+    assert!(!log[retiring..].iter().any(|entry| entry == "display"));
+}
+
+/// The scan lane's dashboard still draws on every tick.
+#[test]
+fn the_display_ticks_in_the_scan_lane_too() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    scene.display_ticks = true;
+    let scans = {
+        let log = Rc::clone(&log);
+        move || log.borrow().iter().filter(|entry| *entry == "scan").count()
+    };
+    let stop = move || scans() >= 2;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(600)),
+        stop: &stop,
+        interval: Duration::from_millis(30),
+        tick: Duration::from_millis(5),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let none: Option<NativeLane<ScriptedLane>> = None;
+    run_classic(&mut scene, none, &clock, &mut |scene: &mut Scene, _| {
+        scene.note("publish");
+        Ok(())
+    })
+    .unwrap();
+    let log = entries(&log);
+    let first = log.iter().position(|entry| entry == "publish").unwrap();
+    let second = log.iter().rposition(|entry| entry == "scan").unwrap();
+    // A pass's collection entry (C5.7) belongs to the pass, not the ticks.
+    let between: Vec<&str> = log[first + 1..second]
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry != "collect")
+        .collect();
+    assert!(between.len() >= 2, "{log:?}");
+    assert!(between.iter().all(|entry| *entry == "display"), "{log:?}");
+}
+
+/// C5.3 with C5.7: while a pass collects, each collection tick services the
+/// lifecycle ring first and only then lets the dashboard draw.
+#[test]
+fn the_ring_is_serviced_before_the_display_while_a_pass_collects() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    scene.display_ticks = true;
+    let mut lane = ScriptedLane::new(&log);
+    let (serviced, gate) = mpsc::channel();
+    lane.serviced = Some(serviced);
+    scene.collect_gate = Some((gate, 3));
+    run_ticking(&mut scene, lane, 1, Duration::from_millis(1));
+    let log = entries(&log);
+    let collect = log.iter().position(|entry| entry == "collect").unwrap();
+    let scan = log.iter().position(|entry| entry == "scan").unwrap();
+    let during = &log[collect + 1..scan];
+    assert!(during.len() >= 6, "{log:?}");
+    for tick in during.chunks(2) {
+        assert_eq!(tick, ["service", "display"], "{log:?}");
+    }
+}
+
+/// C5.3: the tick schedule is fixed-rate: a tick's own work (the draw after
+/// the ring's service) does not move the next tick later, and a tick that
+/// overran a whole period makes the next one due at once.
+#[test]
+fn a_tick_schedule_keeps_its_rate_through_the_work_of_a_tick() {
+    let start = Instant::now();
+    let period = Duration::from_millis(10);
+    let mut schedule = TickSchedule::starting(start, period);
+    assert_eq!(schedule.wait(start), period);
+    // The tick due at 10 ms ran until 13 ms: the next is due at 20 ms.
+    schedule.advance(start + Duration::from_millis(13));
+    assert_eq!(
+        schedule.wait(start + Duration::from_millis(13)),
+        Duration::from_millis(7)
+    );
+    // The tick due at 20 ms ran until 45 ms: the next is due at once.
+    schedule.advance(start + Duration::from_millis(45));
+    assert_eq!(
+        schedule.wait(start + Duration::from_millis(45)),
+        Duration::ZERO
+    );
+    // And the one after keeps the period from there.
+    schedule.advance(start + Duration::from_millis(46));
+    assert_eq!(
+        schedule.wait(start + Duration::from_millis(46)),
+        Duration::from_millis(9)
+    );
+}
+
+/// C5.3: a slow draw inside each collection tick (15 ms of a 20 ms tick)
+/// does not slow the ring's service cadence: over a 400 ms collection the
+/// ring is serviced about every 20 ms (about 19 times), not every 35 ms
+/// (about 11 times) as a schedule restarted after each tick's work would.
+#[test]
+fn a_slow_draw_never_delays_the_ring_service_while_a_pass_collects() {
+    let mut services = 0;
+    collect_off_thread(
+        || std::thread::sleep(Duration::from_millis(400)),
+        Duration::from_millis(20),
+        &mut || {
+            services += 1;
+            // The draw that follows the ring's service.
+            std::thread::sleep(Duration::from_millis(15));
+        },
+    );
+    assert!(services >= 15, "the ring was serviced {services} times");
 }
 
 /// Ruling D1: a run whose watches cannot be proven (a foreign PID

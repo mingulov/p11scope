@@ -388,3 +388,109 @@ fn dashboard_interactive_over_pty_exits_clean() {
     );
     assert!(stdout.contains("PASS"), "{stdout}");
 }
+
+/// C5.3: a terminal that stops reading never delays a service tick. The
+/// pty is never read for 30 s after the first frame (its buffer fills
+/// within seconds), then SIGINT: the run exits within 5 s, the stall shed
+/// frames (counted on stderr) while the longest gap between service ticks
+/// stayed under 100 ms, the screen is restored once the terminal reads
+/// again, and the `-o` report is written.
+#[test]
+fn dashboard_over_a_stalled_pty_keeps_its_service_ticks() {
+    let dir = tmp("inventory-dashboard-stall");
+    let _driver = Driver::spawn(&dir, "stall", &["st-p1.so", "st-p2.so"]);
+    // `-o` refuses untrusted ancestors: the report goes under TMPDIR.
+    let private = tempfile::tempdir().unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let report = private.path().join("report.json");
+    let output = Command::new("python3")
+        .arg(fixture_source("dashboard-pty-drive.py"))
+        .arg(env!("CARGO_BIN_EXE_p11scope"))
+        .arg(_driver.pid.to_string())
+        .arg("100")
+        .arg("60")
+        .arg("stall")
+        .arg("30")
+        .arg(&report)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The measurement line (shed frames, longest service gap, exit time).
+    eprintln!("{}", stdout.lines().next().unwrap_or_default());
+    assert!(
+        output.status.success(),
+        "stalled pty drive passed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("PASS"), "{stdout}");
+}
+
+/// C5.3 review M1: the dashboard keeps the lines a classic run leaves on
+/// stderr. Its target exits mid-run, so passes fail and the caller exits:
+/// with `2>file` both lines reach the file (stderr left alone, the log
+/// lines mirrored); with stderr on the terminal they are replayed after
+/// the screen is restored.
+#[test]
+fn dashboard_keeps_its_stderr_lines_in_a_file_and_on_the_terminal() {
+    let private = tempfile::tempdir().unwrap();
+    let file = private.path().join("stderr.log");
+    for route in ["file", "tty"] {
+        let mut command = Command::new("python3");
+        command
+            .arg(fixture_source("dashboard-pty-drive.py"))
+            .arg(env!("CARGO_BIN_EXE_p11scope"))
+            .arg("-")
+            .arg("7")
+            .arg("60")
+            .arg("stderr")
+            .arg(route);
+        if route == "file" {
+            command.arg(&file);
+        }
+        let output = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("PASS"),
+            "{route}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// C5.3 review L1: Ctrl-S (raw mode keeps IXON) then `q` sheds the
+/// restore; once the report is written the restore is tried again, so
+/// after Ctrl-Q the shell is not left in the alternate screen.
+#[test]
+fn dashboard_retries_a_shed_restore_after_the_report() {
+    let dir = tmp("inventory-dashboard-xoff");
+    let driver = Driver::spawn(&dir, "xoff", &["xo-p1.so", "xo-p2.so"]);
+    let output = Command::new("python3")
+        .arg(fixture_source("dashboard-pty-drive.py"))
+        .arg(env!("CARGO_BIN_EXE_p11scope"))
+        .arg(driver.pid.to_string())
+        .arg("60")
+        .arg("45")
+        .arg("xoff")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("PASS"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}

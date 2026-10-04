@@ -1502,17 +1502,33 @@ fn a_tick_schedule_keeps_its_rate_through_the_work_of_a_tick() {
 /// (about 11 times) as a schedule restarted after each tick's work would.
 #[test]
 fn a_slow_draw_never_delays_the_ring_service_while_a_pass_collects() {
-    let mut services = 0;
+    let mut starts = Vec::new();
     collect_off_thread(
         || std::thread::sleep(Duration::from_millis(400)),
         Duration::from_millis(20),
         &mut || {
-            services += 1;
+            starts.push(Instant::now());
             // The draw that follows the ring's service.
             std::thread::sleep(Duration::from_millis(15));
         },
     );
-    assert!(services >= 15, "the ring was serviced {services} times");
+    // Judge the typical spacing between services, not the count: a loaded
+    // host can oversleep any single tick, but only a schedule restarted
+    // after each tick's work spaces services by the period plus the draw
+    // (about 35 ms) as a rule. The fixed-rate schedule keeps about 20 ms.
+    assert!(
+        starts.len() >= 5,
+        "the ring was serviced {} times",
+        starts.len()
+    );
+    let mut gaps: Vec<Duration> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort();
+    let median = gaps[gaps.len() / 2];
+    assert!(
+        median < Duration::from_millis(30),
+        "median service spacing {median:?} over {} services",
+        starts.len()
+    );
 }
 
 /// Ruling D1: a run whose watches cannot be proven (a foreign PID

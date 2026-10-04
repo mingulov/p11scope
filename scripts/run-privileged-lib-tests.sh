@@ -44,7 +44,15 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (62 ignored tests in the default-feature lib binary): 51 run by
+# DISCOVERY loss: cells that assert health under system scope require zero
+# lifecycle-ring loss by default, a quiet-host property (vng guests, idle
+# hosts). On a loaded host, P11SCOPE_PRIV_LIFECYCLE_LOSS=report (pass it
+# through sudo, e.g. `sudo env P11SCOPE_PRIV_LIFECYCLE_LOSS=report ...`)
+# tolerates ring loss only where it is reported in the health read and the
+# capture's demotion rule fires on it; each such read prints
+# LIFECYCLE_LOSS_REPORTED. Never set it for a guest or qualification run.
+#
+# Curation (72 ignored tests in the default-feature lib binary): 61 run by
 # default, 4 run only with --include-long, 7 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -89,9 +97,15 @@ attach::inventory::activation::privileged_tests::privileged_task4_inventory_phys
 # late-provider extend, PID scope vs foreign and reused-PID callers (writes
 # /proc/sys/kernel/ns_last_pid to reuse the target's PID), pidfd cookie
 # query across a nonleader exec, stop with a held call, and the leader-exit
-# probe (leader pthread_exit while a worker keeps calling).
+# probe (leader pthread_exit while a worker keeps calling). C5.11: the
+# foreign/reused-PID cell again with a PID-named uprobe-multi group (kernel
+# pid filter plus the in-BPF guard); where the pid-filter probe fails (5.15)
+# it asserts the PID-scoped Multi refusal instead; the leader-exit probe
+# again under uprobe-multi (or the same refusal).
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_leader_exit_probe_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_leader_exit_probe_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_with_held_call_reports_unsettled_lp64
@@ -116,6 +130,28 @@ discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains
 events::runtime_tests::real_retained_discovery_consumer_owns_one_exact_map
 events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict
+# Task 6 C5.1 native inventory lane cells (production classic loop over owned
+# inventory-ledger workloads; need gcc, softhsm2-util and SoftHSM2 at
+# /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so; about 5-20 s each): --pid
+# stamps + witnessed edge + no foreign caller, --system late dlopen, stop with
+# a held call, SIGINT during activation, --system under 100 and 1,000 execs/s
+# exec churn (C5.7; about 1-2 min). The churn cell is load-sensitive: its
+# zero-loss check at 100 execs/s retries once, and is skipped with a printed
+# reason only when both attempts started at load1 above 4 and lost at most 1%
+# of the lifecycle records.
+inventory::privileged_tests::privileged_native_lane_pid_lp64
+inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64
+inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64
+inventory::privileged_tests::privileged_native_lane_system_exec_churn_lp64
+inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
+# Task 6 C5.11: --system over 544 endpoints (8 mapped copies of SoftHSM2)
+# retires closed under uprobe-multi (per-offset links may read unsettled);
+# under auto on a kernel whose functional probe links uprobe-multi it must
+# take it. Prints C511_SCALE (about 10-30 s).
+inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64
+# Task 6 C5.3: the native lane under the interactive dashboard on a pty never
+# read for 20 s (same workload needs; about 30 s).
+inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64
 )
 
 # Long campaign cells: run only with --include-long.

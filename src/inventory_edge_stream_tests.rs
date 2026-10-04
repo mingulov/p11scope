@@ -527,7 +527,8 @@ fn a_sweep_that_rotates_out_a_needed_record_dumps_every_edge_when_it_fits() {
         sweep,
         crate::inventory_events::EdgeSweep {
             emitted: 9 + 10,
-            unretained: 0
+            unretained: 0,
+            dumped: true,
         }
     );
     drop(writer);
@@ -593,27 +594,47 @@ fn presence_capture_and_activity_each_trigger_a_record_alone() {
     assert_eq!(last["event"]["activity"], "unknown");
 }
 
-/// One R-1 scenario: `edges` emitted mid-run, the retained set filled
-/// (`rotations` rotations) and the live file padded until less than
-/// `room` bytes are left, then the edges in `changed` change; the sweep
-/// runs with the real `ended` line's tail, `ended` is written, and the
-/// retained files must hold exactly the edges the sweep did not report
-/// unretained, each equal to its payload.
+/// One R-1 scenario: `edges` emitted mid-run over `passes` passes (from
+/// pass 2 on, one edge changes and a few unrelated lines go out per
+/// pass), the stream rotated `rotations` times and the live file padded
+/// until less than `room` bytes are left, then the edges in `changed`
+/// change. The sweep runs with the padded `ended` reservation, the count
+/// is settled for the real `ended` line exactly as `finish_output` does,
+/// `ended` is written, and the retained files must hold exactly the edges
+/// not reported unretained, each equal to its payload.
+#[derive(Debug)]
 struct Shape {
     max_bytes: u64,
     files: usize,
+    passes: u64,
     rotations: u64,
     room: u64,
     ended_pad: usize,
 }
 
-fn run_shape(shape: &Shape, mut edges: Vec<EdgeView>, changed: &[usize]) -> EdgeSweep {
+/// The sweep's own result (its count is the padded upper bound) and the
+/// settled count `ended` carries.
+#[derive(Debug)]
+struct Outcome {
+    sweep: EdgeSweep,
+    settled: usize,
+}
+
+fn run_shape(shape: &Shape, mut edges: Vec<EdgeView>, changed: &[usize]) -> Outcome {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, shape.max_bytes, shape.files).unwrap();
     let mut emitter = EdgeEmitter::new();
-    emitter.emit(&mut writer, &edges, 64, 1).unwrap();
     let pad = serde_json::json!({"pad": "p".repeat(40)});
+    emitter.emit(&mut writer, &edges, 64, 1).unwrap();
+    for pass in 2..=shape.passes {
+        let index = pass as usize % edges.len();
+        edges[index].entry_count += 1;
+        for _ in 0..3 {
+            writer.append("probe", pad.clone(), pass).unwrap();
+        }
+        emitter.emit(&mut writer, &edges, 64, pass).unwrap();
+    }
     while writer.rotations() < shape.rotations {
         writer.append("probe", pad.clone(), 2).unwrap();
     }
@@ -624,15 +645,22 @@ fn run_shape(shape: &Shape, mut edges: Vec<EdgeView>, changed: &[usize]) -> Edge
     for &index in changed {
         edges[index].entry_count += 1;
     }
-    let ended = serde_json::json!({"pad": "e".repeat(shape.ended_pad)});
-    let tail = ended.to_string().len() as u64 + crate::inventory_events::ENDED_TAIL_SLACK;
+    let ended = |unretained: usize| serde_json::json!({"pad": "e".repeat(shape.ended_pad), "edges_unretained": unretained});
+    let tail =
+        ended(usize::MAX).to_string().len() as u64 + crate::inventory_events::ENDED_TAIL_SLACK;
     let sweep = emitter.sweep(&mut writer, &edges, 64, 3, tail).unwrap();
-    writer.finish(ended, 4).unwrap();
+    let (settled, payload) = emitter.settle_ended(&writer, &edges, sweep.unretained, 4, ended);
+    assert!(
+        settled <= sweep.unretained,
+        "the reservation bounds the count"
+    );
+    writer.finish(payload, 4).unwrap();
     drop(writer);
     // `rotated`/`retention_evicted` lines take seqs after the line that
     // triggered them, so the live file's own last line is checked.
     let live = lines(&path);
     assert_eq!(live.last().unwrap()["kind"], "ended");
+    assert_eq!(live.last().unwrap()["event"]["edges_unretained"], settled);
     let retained = retained_edges(&path);
     for edge in &edges {
         if let Some(record) = retained.get(&edge.caller.label()) {
@@ -641,10 +669,10 @@ fn run_shape(shape: &Shape, mut edges: Vec<EdgeView>, changed: &[usize]) -> Edge
     }
     assert_eq!(
         edges.len() - retained.len(),
-        sweep.unretained,
-        "edges_unretained is final after `ended`"
+        settled,
+        "edges_unretained is exact after `ended`"
     );
-    sweep
+    Outcome { sweep, settled }
 }
 
 use crate::inventory_events::EdgeSweep;
@@ -660,18 +688,13 @@ fn ended_cannot_evict_records_after_the_sweep_counted_4k_x2() {
     let shape = Shape {
         max_bytes: 4096,
         files: 2,
+        passes: 1,
         rotations: 1,
         room: 600,
         ended_pad: 1000,
     };
-    let sweep = run_shape(&shape, synthetic_edges(2), &[]);
-    assert_eq!(
-        sweep,
-        EdgeSweep {
-            emitted: 0,
-            unretained: 2
-        }
-    );
+    let outcome = run_shape(&shape, synthetic_edges(2), &[]);
+    assert_eq!((outcome.sweep.emitted, outcome.settled), (0, 2));
 }
 
 /// Review R-1, the 16 KiB x 4 shape where one copy of every edge fits:
@@ -684,20 +707,16 @@ fn ended_cannot_evict_records_after_the_sweep_counted_16k_x4() {
     let shape = Shape {
         max_bytes: 16 * 1024,
         files: 4,
+        passes: 1,
         rotations: 3,
         room: 600,
         ended_pad: 1000,
     };
-    let sweep = run_shape(&shape, synthetic_edges(10), &[]);
-    assert_eq!(
-        sweep,
-        EdgeSweep {
-            emitted: 10,
-            unretained: 0
-        }
-    );
-    let sweep = run_shape(&shape, synthetic_edges(10), &[3]);
-    assert_eq!(sweep.unretained, 0, "{sweep:?}");
+    let outcome = run_shape(&shape, synthetic_edges(10), &[]);
+    assert!(outcome.sweep.dumped);
+    assert_eq!((outcome.sweep.emitted, outcome.settled), (10, 0));
+    let outcome = run_shape(&shape, synthetic_edges(10), &[3]);
+    assert_eq!(outcome.settled, 0, "{outcome:?}");
 }
 
 /// A file too small for even a fresh file to take `ended` after its
@@ -709,26 +728,84 @@ fn a_tail_larger_than_a_fresh_file_is_counted_before_it_rotates() {
     let shape = Shape {
         max_bytes: 1024,
         files: 3,
+        passes: 1,
         rotations: 1,
         room: 200,
         ended_pad: 1200,
     };
-    let sweep = run_shape(&shape, synthetic_edges(1), &[]);
-    assert_eq!(
-        sweep,
-        EdgeSweep {
-            emitted: 0,
-            unretained: 1
-        }
-    );
+    let outcome = run_shape(&shape, synthetic_edges(1), &[]);
+    assert_eq!((outcome.sweep.emitted, outcome.settled), (0, 1));
 }
 
-/// Review R-1, randomized: sizes, file counts, edge counts and record
-/// sizes, padding, changed subsets and `ended` lengths vary; after
-/// `ended` the retained files always hold exactly the edges the sweep did
-/// not report unretained.
+/// Review R2-1: a 1918-byte rotate size. After the reserve rotates, the
+/// fresh file (its `rotated` and `retention_evicted` lines in it) cannot
+/// take the 256-byte-padded reservation but can take the real `ended`
+/// line, so the sweep's bound predicts a rotation that never happens and
+/// over-counts one edge whose record is still retained. Settling for the
+/// real line reports the exact 0.
+#[test]
+fn edges_unretained_is_recounted_for_the_real_ended_line() {
+    let shape = Shape {
+        max_bytes: 1918,
+        files: 3,
+        passes: 1,
+        rotations: 3,
+        room: 164,
+        ended_pad: 1170,
+    };
+    let mut edges = synthetic_edges(2);
+    edges[0].mapping_reason = Some("r".repeat(115));
+    edges[1].mapping_reason = Some("r".repeat(67));
+    let outcome = run_shape(&shape, edges, &[]);
+    assert_eq!(outcome.sweep.unretained, 1, "the padded bound: {outcome:?}");
+    assert_eq!(outcome.settled, 0, "exact for the real line");
+}
+
+/// One randomized shape from `next` (a deterministic xorshift draw).
+fn random_shape(next: &mut impl FnMut(u64) -> u64, template: &EdgeView) -> Outcome {
+    // A third of the shapes use rotate sizes under 2 KiB (review R2-1's
+    // window: a fresh file can take the real `ended` but not the padded
+    // reservation), the rest up to 32 KiB; 1 to 6 files.
+    let max_bytes = if next(3) == 0 {
+        1024 + next(1024)
+    } else {
+        2048 + next(30 * 1024)
+    };
+    let files = 1 + next(6) as usize;
+    let shape = Shape {
+        max_bytes,
+        files,
+        passes: 1 + next(6),
+        rotations: next(files as u64 + 1),
+        room: 50 + next(2000),
+        ended_pad: 100 + next(1400) as usize,
+    };
+    let count = 2 + next(40) as u32;
+    let edges: Vec<EdgeView> = (0..count)
+        .map(|index| {
+            let mut edge = template.clone();
+            edge.caller = CallerId(index);
+            edge.mapping_reason = Some("r".repeat(next(600) as usize));
+            edge
+        })
+        .collect();
+    let changed: Vec<usize> = (0..count as usize).filter(|_| next(3) == 0).collect();
+    run_shape(&shape, edges, &changed)
+}
+
+/// Review R-1 / R2-2, randomized: rotate sizes (including under 2 KiB),
+/// 1 to 6 files, records over several passes, padding, changed subsets
+/// and `ended` lengths vary; after `ended` the retained files always hold
+/// exactly the edges `ended` does not report unretained. 120 shapes by
+/// default; set `P11SCOPE_EDGE_SHAPES=<n>` (for example 2000) for a long
+/// run. Each outcome (none lost, some lost, a full copy written, and an
+/// over-reserved count that settling lowered) must occur at least once.
 #[test]
 fn edges_unretained_is_final_after_ended_over_random_shapes() {
+    let shapes: usize = std::env::var("P11SCOPE_EDGE_SHAPES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120);
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = |bound: u64| {
         state ^= state << 13;
@@ -737,35 +814,102 @@ fn edges_unretained_is_final_after_ended_over_random_shapes() {
         state % bound
     };
     let template = synthetic_edges(1).remove(0);
-    let (mut lossy, mut clean) = (0, 0);
-    for _ in 0..600 {
-        let files = 2 + next(5) as usize;
-        let shape = Shape {
-            max_bytes: 2048 + next(30 * 1024),
-            files,
-            rotations: next(files as u64 + 1),
-            room: 50 + next(2000),
-            ended_pad: 100 + next(1400) as usize,
-        };
-        let count = 2 + next(40) as u32;
-        let edges: Vec<EdgeView> = (0..count)
-            .map(|index| {
-                let mut edge = template.clone();
-                edge.caller = CallerId(index);
-                edge.mapping_reason = Some("r".repeat(next(600) as usize));
-                edge
-            })
-            .collect();
-        let changed: Vec<usize> = (0..count as usize).filter(|_| next(3) == 0).collect();
-        let sweep = run_shape(&shape, edges, &changed);
-        if sweep.unretained > 0 {
+    let (mut lossy, mut clean, mut dumped, mut settled) = (0, 0, 0, 0);
+    for _ in 0..shapes {
+        let outcome = random_shape(&mut next, &template);
+        if outcome.settled > 0 {
             lossy += 1;
         } else {
             clean += 1;
         }
+        dumped += usize::from(outcome.sweep.dumped);
+        settled += usize::from(outcome.settled < outcome.sweep.unretained);
     }
     assert!(
-        lossy > 0 && clean > 0,
-        "both outcomes exercised: {lossy} {clean}"
+        lossy > 0 && clean > 0 && dumped > 0 && settled > 0,
+        "every outcome exercised: lossy {lossy} clean {clean} dumped {dumped} settled {settled}"
+    );
+}
+
+/// C5.3 re-check R2: a dashboard pass streams the classic view, not the
+/// display's 5 s window. A counted edge is recent on pass 1 in both
+/// windows; by pass 2 its last use is 10 s old, so the display reads it
+/// `quiet` while the classic view still reads `recently observed`. The
+/// dashboard's stream, through `dashboard_stream_pass`, must equal a
+/// classic run's stream byte for byte (streaming the display view would
+/// add a mid-run activity record on pass 2).
+#[test]
+fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
+    let mut harness = harness(1, 1);
+    let started = harness.now_ns();
+    let c0 = caller(&harness, 0);
+    harness.advance(1_000);
+    let at = harness.now_ns();
+    {
+        let registry = harness.coordinator_mut().registry_mut();
+        registry.note_coverage(c0, &key(0), CoverageNote::Counted { since_ns: at });
+        registry.observe_entries(c0, &key(0), 3, at);
+    }
+    harness.commit();
+    let dir = tempfile::tempdir().unwrap();
+    let dashboard_path = dir.path().join("dashboard.jsonl");
+    let classic_path = dir.path().join("classic.jsonl");
+    let mut dashboard = EventWriter::create(&dashboard_path, 1 << 20, 2).unwrap();
+    let mut classic = EventWriter::create(&classic_path, 1 << 20, 2).unwrap();
+    let mut dashboard_state = StreamState::new();
+    let mut classic_state = StreamState::new();
+    let mut display_activity = Vec::new();
+    for (pass, age) in [(1u64, 1_000_000_000u64), (2, 10_000_000_000)] {
+        let now = at + age;
+        let coordinator = harness.coordinator();
+        let display = dashboard_stream_pass(
+            Some(&mut dashboard),
+            &mut dashboard_state,
+            &report(pass),
+            coordinator,
+            "pid",
+            started,
+            now,
+        )
+        .unwrap();
+        display_activity.push(display.edges[0].activity.label());
+        let view = stream_presentation(coordinator, "pid", started, now);
+        emit_pass_events(&mut classic, &mut classic_state, &report(pass), &view, now).unwrap();
+    }
+    assert_eq!(
+        display_activity,
+        ["recently observed", "quiet"],
+        "the display window expires mid-run"
+    );
+    let end = at + 11_000_000_000;
+    let last = stream_presentation(harness.coordinator(), "pid", started, end);
+    for (writer, state) in [
+        (&mut dashboard, &mut dashboard_state),
+        (&mut classic, &mut classic_state),
+    ] {
+        let mut sink = Vec::new();
+        finish_output(
+            None,
+            Some(writer),
+            state,
+            &last,
+            false,
+            true,
+            &mut sink,
+            None,
+        )
+        .unwrap();
+    }
+    drop((dashboard, classic));
+    let dashboard_lines = lines(&dashboard_path);
+    assert!(
+        dashboard_lines
+            .iter()
+            .filter(|line| line["kind"] == "edge_observed")
+            .all(|line| line["event"]["activity"] == "recently observed")
+    );
+    assert_eq!(
+        std::fs::read(&dashboard_path).unwrap(),
+        std::fs::read(&classic_path).unwrap()
     );
 }

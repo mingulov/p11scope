@@ -118,11 +118,17 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     whose last record was deleted by retention, or that has none,
     uncapped (at most the edge limit, 32,768 by default). Live mapped
     edges are always included (their mapping instants move every pass),
-    so the sweep is close to a dump of the live edges. If the sweep's
-    own lines made retention delete a record it still needs, it writes
-    one more contiguous copy of every edge when the condition below
-    holds. `ended.edge_events` counts the sweep's records and
-    `ended.edges_unretained` the edges left with no retained record.
+    so the sweep is close to a dump of the live edges. It then makes room
+    for the `ended` line first (rotating now if `ended` would not fit the
+    live file), so any deletion `ended` would cause happens before the
+    count. If a record it still needs was deleted, it writes one more
+    contiguous copy of every edge when the condition below holds.
+    `ended.edge_events` counts the sweep's records and
+    `ended.edges_unretained` the edges whose last record is not retained
+    once that `ended` line is written. The count is exact: it is taken
+    for the `ended` line's own length, so it includes a rotation that
+    line causes (when `--event-rotate-bytes` is too small for even a
+    fresh file to take it) and only that.
   - Replay guarantee: when `ended.edges_unretained` is 0, the last
     retained `edge_observed` per (`caller`, `module`) equals the
     snapshot's `edges[]` entry (plus the three states) and every
@@ -130,9 +136,11 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     `retention_evicted`, where also
     `sum(pass_committed.edge_events) + ended.edge_events` equals the
     `edge_observed` lines. Under retention it holds whenever one copy of
-    every edge's record fits, that is when (sum of the edges' record
-    line bytes + 32 B per edge + 8 KiB) ≤ (`--event-max-files` − 1) ×
-    (`--event-rotate-bytes` − largest record line − 32 B − 2 KiB).
+    every edge's record fits beside `ended`, that is when (sum of the
+    edges' record line bytes + 32 B per edge + the `ended` line + 256 B)
+    ≤ (`--event-max-files` − 1) × (`--event-rotate-bytes` − largest
+    record line − 32 B − 2 KiB). The mid-run refresh uses the same
+    condition with 8 KiB in place of the `ended` line.
     Otherwise `edges_unretained` counts the edges whose record retention
     deleted (the loss is also accounted in `retention_evicted`); read
     the snapshot, or raise the retention. A stream without `ended` was

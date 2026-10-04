@@ -157,6 +157,19 @@ impl EventWriter {
         Ok(bytes.len() as u64)
     }
 
+    /// The exact length of the line [`EventWriter::append`] would write
+    /// next for this event (seq, envelope and trailing newline included).
+    pub(crate) fn line_len(&self, kind: &str, payload: &serde_json::Value, at_ns: u64) -> u64 {
+        let line = serde_json::json!({
+            "schema": EVENT_SCHEMA,
+            "seq": self.next_seq,
+            "at_ns": at_ns,
+            "kind": kind,
+            "event": payload,
+        });
+        line.to_string().len() as u64 + 1
+    }
+
     /// The live file's generation: how many times this run's stream
     /// rotated. A line appended now belongs to this generation.
     pub(crate) fn generation(&self) -> u64 {
@@ -622,7 +635,11 @@ pub(crate) struct EdgeEmission {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct EdgeSweep {
     pub emitted: usize,
+    /// An upper bound, taken for a tail of the reserved size; the exact
+    /// count for the real `ended` line is [`EdgeEmitter::settle_ended`]'s.
     pub unretained: usize,
+    /// Whether the sweep wrote a contiguous copy of every edge.
+    pub dumped: bool,
 }
 
 /// The single place `edge_observed` records are written (DR-C5-EDGE).
@@ -859,27 +876,64 @@ impl EdgeEmitter {
             self.write(writer, edge, payload, limit, at_ns)?;
             emitted += 1;
         }
-        let lost = |emitter: &Self, writer: &EventWriter| {
-            let oldest = writer.oldest_generation_after(tail);
-            edges
-                .iter()
-                .filter(|edge| emitter.evicted_before(&(edge.caller, edge.module), oldest))
-                .count()
-        };
         writer.reserve(tail)?;
-        if lost(self, writer) > 0 && self.fits_with_tail(writer, tail) {
+        let dumped =
+            self.unretained_after(writer, edges, tail) > 0 && self.fits_with_tail(writer, tail);
+        if dumped {
             for edge in edges {
                 self.write(writer, edge, edge_payload(edge), limit, at_ns)?;
                 emitted += 1;
             }
-            // No second reserve: the fit bound already holds the tail, and
-            // the count below is taken against the generation that remains
-            // after it.
+            // No second reserve: the fit bound already holds the tail.
         }
         Ok(EdgeSweep {
             emitted,
-            unretained: lost(self, writer),
+            unretained: self.unretained_after(writer, edges, tail),
+            dumped,
         })
+    }
+
+    /// Edges whose last record will not be retained once one more line of
+    /// `incoming` bytes is appended.
+    pub(crate) fn unretained_after(
+        &self,
+        writer: &EventWriter,
+        edges: &[EdgeView],
+        incoming: u64,
+    ) -> usize {
+        let oldest = writer.oldest_generation_after(incoming);
+        edges
+            .iter()
+            .filter(|edge| self.evicted_before(&(edge.caller, edge.module), oldest))
+            .count()
+    }
+
+    /// The exact `ended` payload and its `edges_unretained` (review R2-1).
+    /// `ended(count)` builds the payload carrying `count`; the count is
+    /// recomputed for that payload's exact line length until it is stable.
+    /// Starting from the sweep's `estimate` (taken for the reserved tail,
+    /// at least as long as any real `ended` line) the count can only fall,
+    /// and a longer count never shortens the line, so this converges to a
+    /// count that is exact for the line actually written.
+    pub(crate) fn settle_ended(
+        &self,
+        writer: &EventWriter,
+        edges: &[EdgeView],
+        estimate: usize,
+        at_ns: u64,
+        ended: impl Fn(usize) -> serde_json::Value,
+    ) -> (usize, serde_json::Value) {
+        let mut count = estimate;
+        for _ in 0..=edges.len() + 1 {
+            let payload = ended(count);
+            let exact =
+                self.unretained_after(writer, edges, writer.line_len("ended", &payload, at_ns));
+            if exact == count {
+                return (count, payload);
+            }
+            count = exact;
+        }
+        unreachable!("the unretained count converges within edges + 1 steps")
     }
 }
 

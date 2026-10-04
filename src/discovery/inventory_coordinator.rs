@@ -42,7 +42,7 @@ use crate::discovery::inventory_attach_set::{
     InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::native_binding::{
-    BinderLimits, Binding, Decision, ExecTransition, NativeBinder, NativeIdentity,
+    BinderLimits, Binding, Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
 };
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
@@ -286,8 +286,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             health_unproven: None,
             pairs_unproven: None,
             last_clean_ns: None,
+            sweep_began_ns: None,
+            preadmission: PreadmissionStash::new(PREADMISSION_STASH_LIMIT),
             stopped: false,
         });
+    }
+
+    /// Forgets a capture coverage whose capture never activated (the
+    /// `--capture auto` fallback): the run is the scan lane again.
+    pub(crate) fn abandon_capture_coverage(&mut self) {
+        self.capture = None;
+    }
+
+    /// The reason an edge no coverage note reached reads (`scan_only` by
+    /// default; the native lane sets `not_attached`).
+    pub(crate) fn set_uncovered_reason(&mut self, reason: UnknownReason) {
+        self.registry.set_uncovered_reason(reason);
     }
 
     /// Absorbs one extend receipt: attached endpoints with their instants,
@@ -359,13 +373,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// the detecting read on; an unproven health withholds watches until a
     /// batch proves it again; changed objects make their modules unknown
     /// from now on. The pair precondition (`pair_precondition_failure`,
-    /// sticky) withholds every watch without demoting one. A batch with
-    /// proven health, the pair precondition intact, no rise, and held
-    /// custody is the latest proven-clean instant: its `health_read_ns`, but never
-    /// past its custody proof (`custody_proven_ns`, the last held poll) or
-    /// its lifecycle drain horizon (`lifecycle_proven_ns`: any lifecycle
-    /// loss found later dates at or after it, so it never falls inside an
-    /// interval — what makes "nothing after stop" sound).
+    /// sticky) withholds every watch without demoting one. A batch that
+    /// completes a gap-free CALLER_USE sweep with proven health, the pair
+    /// precondition intact, no rise, and held custody is the latest
+    /// proven-clean instant: the `health_read_ns` of the batch that sweep
+    /// began in, but never past its custody proof (`custody_proven_ns`, the
+    /// last held poll) or its lifecycle drain horizon (`lifecycle_proven_ns`:
+    /// any lifecycle loss found later dates at or after it, so it never
+    /// falls inside an interval — what makes "nothing after stop" sound).
     /// A system-scope lifecycle loss is a sticky demotion (C5.2 D4): see
     /// `note_lifecycle_loss`; a batch carrying one is never clean.
     /// After stop it stages nothing: forward the terminal read before
@@ -383,15 +398,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .changed_objects
             .extend(batch.changed_objects.iter().copied());
         let custody_held = matches!(batch.custody, ScopeCustody::System | ScopeCustody::PidHeld);
-        if batch.health_unproven.is_none()
+        // Only a completed, gap-free CALLER_USE sweep has visited every row
+        // present when it began, so it proves that sweep's first health
+        // read; a bounded read that stopped mid-sweep proves nothing.
+        let sweep_began_ns = *capture.sweep_began_ns.get_or_insert(batch.health_read_ns);
+        if batch.sweep_completed {
+            capture.sweep_began_ns = None;
+        }
+        if batch.sweep_completed
+            && !batch.sweep_gaps
+            && batch.health_unproven.is_none()
             && capture.pairs_unproven.is_none()
             && batch.health_regression.is_none()
             && custody_held
             && batch.lifecycle_loss.is_none()
             && capture.unproven.is_none()
         {
-            let clean_ns = batch
-                .health_read_ns
+            let clean_ns = sweep_began_ns
                 .min(batch.custody_proven_ns.unwrap_or(u64::MAX))
                 .min(batch.lifecycle_proven_ns);
             capture.last_clean_ns = Some(
@@ -590,6 +613,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         let scope = self.capture_scope_verdict(caller, pid);
+        if let Some(loss) = self.preadmission_holds(caller, pid, key) {
+            self.downgrade(caller, Some(key.clone()), loss);
+            return;
+        }
         if let Some(note) = self.capture_coverage_note(scope, attach_key, verdict) {
             self.registry.note_coverage(caller, key, note);
         }
@@ -640,7 +667,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Every staged fact publishes at the next `commit_batch`, never
     /// before. `identity` supplies the owner lane's exact image per pid, or
     /// none (the scan lane: `ScanOnlyIdentity`). Hints and hooks are the
-    /// engine's, fixed for the run.
+    /// engine's, fixed for the run. Production collects through
+    /// `collector` (C5.7) and applies with `apply_catalog`.
+    #[cfg(test)]
     pub(crate) fn scan_pass(
         &mut self,
         scope: &InventoryScope,
@@ -650,25 +679,35 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         deadline_ns: u64,
         now_ns: u64,
     ) -> Result<PassReport> {
+        let catalog = self.collector(*scope, max_scan_pids)()?;
+        Ok(self.apply_catalog(catalog, guard, identity, deadline_ns, now_ns))
+    }
+
+    /// The pass's collection as an owned job (Task 6 C5.7): it reads
+    /// `/proc` only, over its own copies of the run's fixed hints and hooks,
+    /// and hands back its catalog. It borrows nothing of the coordinator, so
+    /// it can run on a worker thread while the caller keeps servicing the
+    /// native capture; every registry and binder mutation stays with
+    /// `apply_catalog` on the caller's thread.
+    pub(crate) fn collector(
+        &self,
+        scope: InventoryScope,
+        max_scan_pids: Option<usize>,
+    ) -> impl FnOnce() -> Result<crate::inspect_system::Catalog> + Send + 'static {
         // The catalog lowers its admission under the Inventory policy and
         // budget the attach set enforces, never the Detailed slot ceiling
         // `inspect` reports.
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
-        let catalog = match scope {
-            InventoryScope::Pid(pid) => crate::inspect_system::collect_pid(
-                *pid,
-                &self.engine.module_hints,
-                &self.engine.hooks,
-                policy,
-            )?,
-            InventoryScope::System => crate::inspect_system::collect(
-                &self.engine.module_hints,
-                &self.engine.hooks,
-                max_scan_pids,
-                policy,
-            )?,
-        };
-        Ok(self.apply_catalog(catalog, guard, identity, deadline_ns, now_ns))
+        let hints = self.engine.module_hints.clone();
+        let hooks = self.engine.hooks.clone();
+        move || match scope {
+            InventoryScope::Pid(pid) => {
+                crate::inspect_system::collect_pid(pid, &hints, &hooks, policy)
+            }
+            InventoryScope::System => {
+                crate::inspect_system::collect(&hints, &hooks, max_scan_pids, policy)
+            }
+        }
     }
 
     /// The pass after collection: absorb the lowering into the attach set,
@@ -1506,18 +1545,164 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// module.
     fn stage_witness(&mut self, decision: Decision) -> Result<(), String> {
         let Decision { row, binding } = decision;
-        let modules = self.witness_modules(&row)?;
+        let modules = match self.witness_modules(&row) {
+            Ok(modules) => modules,
+            Err(reason) => {
+                if let Binding::Unbound(unbound) = binding {
+                    self.note_preadmission(row.host_tgid, &[None], unbound);
+                }
+                return Err(reason);
+            }
+        };
         match binding {
             Binding::Bound(caller) => {
                 self.registry
                     .note_bound_witness(caller, modules, row.recorded_at_ns)
             }
             Binding::Unbound(reason) => {
+                let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
+                self.note_preadmission(row.host_tgid, &keys, reason);
                 self.registry
                     .note_unbound_witness(modules, row.recorded_at_ns, reason)
             }
         }
         Ok(())
+    }
+
+    /// R-C51-1 (fail-safe): an unbound CALLER_USE row of `pid` — refused
+    /// as `before_admission` or unmatched for any other reason — is the
+    /// pair's only row ever (BPF inserts it `NOEXIST` and never deletes
+    /// it), so a later use of that module by `pid` leaves no row and no
+    /// watch of it can be a fact. Every caller record of `pid` (live or
+    /// retired: a reused pid also downgrades, failing safe) reads
+    /// `use_before_admission` on those modules, and so does any caller
+    /// admitted with `pid` later (`stage_capture_coverage`) unless both
+    /// start times are known and differ. Entries of exited or reused pids
+    /// are pruned (R-C51-5) before the stash may overflow. Past the
+    /// stash bound every caller of the scope reads it, with a gap. A row
+    /// left unbound by lifecycle loss downgrades the same way but reads
+    /// `loss` (R-C51-3): the loss, not an early use, is what it shows.
+    fn note_preadmission(
+        &mut self,
+        pid: u32,
+        modules: &[Option<ModuleKey>],
+        unbound: UnboundReason,
+    ) {
+        let loss = unbound == UnboundReason::LifecycleLoss;
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        let stash = &mut capture.preadmission;
+        if stash.overflowed {
+            stash.refused += modules.len() as u64;
+            return;
+        }
+        let source = self.adapter.source();
+        // An entry of an earlier holder of this pid no longer applies.
+        stash.prune_pid(pid, source);
+        let mut fresh: Vec<Option<ModuleKey>> = Vec::new();
+        for module in modules {
+            let held = stash.entries.get(&pid).is_some_and(|entry| {
+                entry.modules.contains_key(module) || entry.modules.contains_key(&None)
+            });
+            if held {
+                continue;
+            }
+            if stash.len >= stash.limit {
+                stash.prune(source);
+            }
+            if stash.len >= stash.limit {
+                stash.overflowed = true;
+                stash.refused += 1;
+                self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "native pre-admission rows past their bound".into(),
+                    reason: format!(
+                        "more than {} (pid, module) pairs of unbound CALLER_USE rows: a caller's \
+                         use before its admission can no longer be told apart, so every watch \
+                         of this capture reads unknown use_before_admission",
+                        stash.limit
+                    ),
+                    budget: None,
+                });
+                let callers: Vec<CallerId> =
+                    self.adapter.records().map(|record| record.id).collect();
+                for caller in callers {
+                    self.registry.note_use_before_admission(caller, None);
+                }
+                return;
+            }
+            let entry = stash
+                .entries
+                .entry(pid)
+                .or_insert_with(|| PreadmissionEntry {
+                    start_time: source.start_time(pid),
+                    modules: BTreeMap::new(),
+                });
+            entry.modules.insert(module.clone(), loss);
+            stash.len += 1;
+            fresh.push(module.clone());
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let callers: Vec<CallerId> = self
+            .adapter
+            .records()
+            .filter(|record| record.pid == pid)
+            .map(|record| record.id)
+            .collect();
+        for caller in callers {
+            for module in &fresh {
+                self.downgrade(caller, module.clone(), loss);
+            }
+        }
+    }
+
+    fn downgrade(&mut self, caller: CallerId, module: Option<ModuleKey>, loss: bool) {
+        if loss {
+            self.registry
+                .note_unbound_row_loss(caller, module, UNBOUND_ROW_LOSS);
+        } else {
+            self.registry.note_use_before_admission(caller, module);
+        }
+    }
+
+    /// Whether R-C51-1 downgrades `caller`'s edge on `key`: `Some(loss)`.
+    /// An entry stashed under another process's start time does not apply
+    /// (R-C51-5); liveness is not consulted here — a caller that exits
+    /// right after its maps were read still owes its downgrade.
+    fn preadmission_holds(&self, caller: CallerId, pid: u32, key: &ModuleKey) -> Option<bool> {
+        let stash = &self.capture.as_ref()?.preadmission;
+        if stash.overflowed {
+            return Some(false);
+        }
+        let entry = stash.entries.get(&pid)?;
+        let caller_start = self
+            .adapter
+            .record(caller)
+            .and_then(|record| record.start_time);
+        if matches!(
+            (entry.start_time, caller_start),
+            (Some(stashed), Some(own)) if stashed != own
+        ) {
+            return None;
+        }
+        entry
+            .modules
+            .get(&None)
+            .or_else(|| entry.modules.get(&Some(key.clone())))
+            .copied()
+    }
+
+    /// The pre-admission stash's counters (R-C51-5), `None` without a
+    /// native capture.
+    pub(crate) fn preadmission_counters(&self) -> Option<PreadmissionCounters> {
+        self.capture
+            .as_ref()
+            .map(|capture| capture.preadmission.counters())
     }
 
     /// The registry modules a row witnesses: every admitted module whose
@@ -1685,7 +1870,112 @@ struct CaptureCoverage {
     /// The latest witness read with proven health, no rise, and held
     /// custody: where a watch ends at stop.
     last_clean_ns: Option<u64>,
+    /// The health read of the batch the open CALLER_USE sweep began in
+    /// (`None`: the next batch begins one).
+    sweep_began_ns: Option<u64>,
+    /// Pids of unbound CALLER_USE rows (R-C51-1): their callers' watches
+    /// on the rows' modules read `use_before_admission`, whichever is
+    /// staged first, the row or the caller's admission.
+    preadmission: PreadmissionStash,
     stopped: bool,
+}
+
+/// The loss detail of an edge whose caller's use row lifecycle loss left
+/// unbound (R-C51-3).
+const UNBOUND_ROW_LOSS: &str =
+    "lifecycle evidence was lost before this caller's use row could bind";
+
+/// (pid, module) pairs the stash holds before it overflows.
+const PREADMISSION_STASH_LIMIT: usize = 4096;
+
+/// The (pid, module) pairs of every unbound CALLER_USE row, bounded. A
+/// `None` module is a row whose endpoint resolved to no module: every
+/// module of that pid. Past the bound the whole scope reads
+/// `use_before_admission` (sticky).
+#[derive(Debug)]
+struct PreadmissionStash {
+    entries: BTreeMap<u32, PreadmissionEntry>,
+    len: usize,
+    limit: usize,
+    overflowed: bool,
+    /// (pid, module) pairs dropped because their process exited or the
+    /// pid now names another process (R-C51-5).
+    pruned: u64,
+    /// (pid, module) notes refused once the stash overflowed.
+    refused: u64,
+}
+
+/// The unbound rows of one pid: the process's start time when the first
+/// row was stashed (`None`: unreadable then — kept until the pid is gone,
+/// failing safe), and module -> whether lifecycle loss left the row
+/// unbound.
+#[derive(Debug, Default)]
+struct PreadmissionEntry {
+    start_time: Option<u64>,
+    modules: BTreeMap<Option<ModuleKey>, bool>,
+}
+
+/// The stash's counters (R-C51-5), published under
+/// `observation.native_witnesses.preadmission`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PreadmissionCounters {
+    pub held: usize,
+    pub limit: usize,
+    pub pruned: u64,
+    pub refused: u64,
+}
+
+impl PreadmissionStash {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            len: 0,
+            limit,
+            overflowed: false,
+            pruned: 0,
+            refused: 0,
+        }
+    }
+
+    /// The entry can no longer matter (R-C51-5): its process is gone (a
+    /// dead pid is never admitted again), or the pid now names a process
+    /// with another start time. Each fork or exec writes rows under its
+    /// own image key, so a later holder's use leaves rows of its own.
+    fn stale<S: ProcessSource>(entry: &PreadmissionEntry, pid: u32, source: &S) -> bool {
+        source.gone(pid)
+            || matches!(
+                (entry.start_time, source.start_time(pid)),
+                (Some(stashed), Some(now)) if stashed != now
+            )
+    }
+
+    fn prune_pid<S: ProcessSource>(&mut self, pid: u32, source: &S) {
+        if self
+            .entries
+            .get(&pid)
+            .is_some_and(|entry| Self::stale(entry, pid, source))
+        {
+            let entry = self.entries.remove(&pid).expect("checked above");
+            self.len -= entry.modules.len();
+            self.pruned += entry.modules.len() as u64;
+        }
+    }
+
+    fn prune<S: ProcessSource>(&mut self, source: &S) {
+        let pids: Vec<u32> = self.entries.keys().copied().collect();
+        for pid in pids {
+            self.prune_pid(pid, source);
+        }
+    }
+
+    fn counters(&self) -> PreadmissionCounters {
+        PreadmissionCounters {
+            held: self.len,
+            limit: self.limit,
+            pruned: self.pruned,
+            refused: self.refused,
+        }
+    }
 }
 
 /// The WatchedNoUse pair precondition (C3 open item, C5.2): the userspace
@@ -3631,7 +3921,6 @@ mod tests {
 
     use crate::attach::capture::{CookieQuery, DomainCookie, ExecCoverage};
     use crate::discovery::caller_registry::{UnboundUse, UseCoverage};
-    use crate::discovery::native_binding::UnboundReason;
 
     /// Facade stamps for scripted native batches: strictly increasing, so
     /// each batch follows the one staged before it.
@@ -3761,6 +4050,10 @@ mod tests {
                 .modules()
                 .next()
                 .and_then(|module| module.unbound_use.clone())
+        }
+
+        fn preadmission(&self) -> PreadmissionCounters {
+            self.scene.coordinator.preadmission_counters().unwrap()
         }
 
         fn gap_subjects(&self) -> Vec<String> {
@@ -4270,5 +4563,459 @@ mod tests {
             native.scene.coverage(caller),
             UseCoverage::Witnessed { first_ns: 210 }
         );
+    }
+
+    /// C5.1 carry (C5.2 review): a read proves a clean instant only when it
+    /// completes a gap-free CALLER_USE sweep, and that instant is the health
+    /// read of the batch the sweep began in — a bounded read that stopped
+    /// mid-sweep may have left a use dated before its stamp unvisited.
+    #[test]
+    fn only_a_completed_gap_free_sweep_proves_a_clean_read() {
+        let (mut scene, caller) = watched_scene(7, 500);
+        assert_eq!(last_clean(&scene), Some(200));
+        // A sweep begins at 250 and stops at its row bound.
+        let mut partial = witness_batch();
+        partial.health_read_ns = 250;
+        partial.sweep_completed = false;
+        partial.row_bound_reached = true;
+        scene.coordinator.note_witness_batch(&partial);
+        assert_eq!(last_clean(&scene), Some(200));
+        // It completes at 280: every row present at 250 was visited.
+        let mut rest = witness_batch();
+        rest.health_read_ns = 280;
+        scene.coordinator.note_witness_batch(&rest);
+        assert_eq!(last_clean(&scene), Some(250));
+        // A sweep that completes with skipped rows proves nothing.
+        let mut gaps = witness_batch();
+        gaps.health_read_ns = 290;
+        gaps.sweep_gaps = true;
+        scene.coordinator.note_witness_batch(&gaps);
+        assert_eq!(last_clean(&scene), Some(250));
+        // A terminal read that stopped mid-sweep never extends the interval.
+        let mut terminal = witness_batch();
+        terminal.health_read_ns = 295;
+        terminal.sweep_completed = false;
+        terminal.deadline_reached = true;
+        scene.coordinator.note_witness_batch(&terminal);
+        scene.coordinator.end_capture_coverage(300);
+        scene.coordinator.registry.publish();
+        assert_eq!(
+            scene.coverage(caller),
+            crate::discovery::caller_registry::UseCoverage::WatchedNoUse {
+                since_ns: 100,
+                until_ns: Some(250),
+            }
+        );
+    }
+
+    // ---- R-C51-1: an unbound row of a watched caller's pid ----
+
+    /// A system-scope native lane with pid 7 (start 500) admitted at 50,
+    /// every endpoint attached at 100, and its edge watched since 120.
+    fn watched_native() -> (NativeScene, CallerId) {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.coordinator.begin_capture_coverage(None);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::System);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(watched(&native.scene.coverage(caller)));
+        (native, caller)
+    }
+
+    fn use_before_admission(coverage: &UseCoverage) -> bool {
+        matches!(
+            coverage,
+            UseCoverage::Unknown(UnknownReason::UseBeforeAdmission)
+        )
+    }
+
+    #[test]
+    fn a_row_from_before_admission_downgrades_the_watch_for_good() {
+        // Read after the admission: the row predates it (t0 40 < 50).
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 40, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            census.unbound.get(&UnboundReason::BeforeAdmission),
+            Some(&1)
+        );
+        assert!(
+            use_before_admission(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        // Sticky: later passes and the stop never restore a watch.
+        native.scene.project(7, 2_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.end_capture_coverage(3_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(use_before_admission(&native.scene.coverage(caller)));
+    }
+
+    #[test]
+    fn a_row_read_before_its_callers_admission_downgrades_the_later_watch() {
+        // Read before the admission: pid 9 holds no caller yet.
+        let (mut native, _) = watched_native();
+        let row = native.row(77, 1, 9, 1_000, 1);
+        native.witness(vec![row]);
+        native.scene.source.spawn(9, 900);
+        let later = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 1_500)
+            .unwrap();
+        native.scene.project(9, 1_600);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            use_before_admission(&native.scene.coverage(later)),
+            "{:?}",
+            native.scene.coverage(later)
+        );
+    }
+
+    #[test]
+    fn a_full_preadmission_stash_degrades_the_scope_with_a_gap() {
+        let (mut native, caller) = watched_native();
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .unwrap()
+            .preadmission
+            .limit = 1;
+        // Live writers: pruning cannot make room (R-C51-5).
+        native.scene.source.spawn(9, 90);
+        native.scene.source.spawn(11, 110);
+        let rows = vec![
+            native.row(77, 1, 9, 1_000, 0),
+            native.row(78, 1, 11, 1_000, 0),
+        ];
+        native.witness(rows);
+        assert_eq!(
+            native.preadmission(),
+            PreadmissionCounters {
+                held: 1,
+                limit: 1,
+                pruned: 0,
+                refused: 1,
+            }
+        );
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"native pre-admission rows past their bound".to_string()),
+            "{:?}",
+            native.gap_subjects()
+        );
+        // pid 7 had no unbound row, yet its watch degrades with the scope.
+        assert!(
+            use_before_admission(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        native.scene.project(7, 2_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(use_before_admission(&native.scene.coverage(caller)));
+        // A caller admitted after the overflow, with no row of its own.
+        native.scene.source.spawn(13, 1_300);
+        let later = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(13, ImageAuthority::ScanPinned, 2_100)
+            .unwrap();
+        native.scene.project(13, 2_200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            use_before_admission(&native.scene.coverage(later)),
+            "{:?}",
+            native.scene.coverage(later)
+        );
+    }
+
+    fn stash_limit(native: &mut NativeScene, limit: usize) {
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .unwrap()
+            .preadmission
+            .limit = limit;
+    }
+
+    #[test]
+    fn an_exited_writer_is_pruned_before_the_stash_overflows() {
+        let (mut native, caller) = watched_native();
+        stash_limit(&mut native, 1);
+        native.scene.source.spawn(9, 90);
+        native.scene.source.spawn(11, 110);
+        let row = native.row(77, 1, 9, 1_000, 0);
+        native.witness(vec![row]);
+        // pid 9 exits unadmitted: its entry can never apply again.
+        native.scene.source.kill(9);
+        let row = native.row(78, 1, 11, 1_010, 0);
+        native.witness(vec![row]);
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"native pre-admission rows past their bound".to_string()),
+            "{:?}",
+            native.gap_subjects()
+        );
+        assert_eq!(
+            native.preadmission(),
+            PreadmissionCounters {
+                held: 1,
+                limit: 1,
+                pruned: 1,
+                refused: 0,
+            }
+        );
+        let document =
+            crate::inventory::render_json(&native.scene.coordinator, "system", 0, 1_020, 1);
+        assert_eq!(
+            document["budgets"]["native_preadmission"],
+            serde_json::json!({"limit": 1, "occupied": 1, "refused": 0, "pruned": 1})
+        );
+        assert!(!use_before_admission(&native.scene.coverage(caller)));
+        // pid 11's entry stays and still downgrades its later admission.
+        let later = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(11, ImageAuthority::ScanPinned, 1_500)
+            .unwrap();
+        native.scene.project(11, 1_600);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(use_before_admission(&native.scene.coverage(later)));
+    }
+
+    #[test]
+    fn a_reused_pid_drops_the_earlier_holders_entry() {
+        let (mut native, _) = watched_native();
+        stash_limit(&mut native, 1);
+        native.scene.source.spawn(9, 90);
+        let row = native.row(77, 1, 9, 1_000, 0);
+        native.witness(vec![row]);
+        // pid 9 now names another process, admitted with no row of its own.
+        native.scene.source.kill(9);
+        native.scene.source.spawn(9, 950);
+        let reused = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 1_500)
+            .unwrap();
+        native.scene.project(9, 1_600);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !use_before_admission(&native.scene.coverage(reused)),
+            "{:?}",
+            native.scene.coverage(reused)
+        );
+        // A full stash prunes the stale entry instead of overflowing.
+        native.scene.source.spawn(11, 110);
+        let row = native.row(78, 1, 11, 1_700, 0);
+        native.witness(vec![row]);
+        assert_eq!(
+            native.preadmission(),
+            PreadmissionCounters {
+                held: 1,
+                limit: 1,
+                pruned: 1,
+                refused: 0,
+            }
+        );
+        assert!(!use_before_admission(&native.scene.coverage(reused)));
+    }
+
+    #[test]
+    fn an_entry_with_an_unreadable_start_is_held_while_its_pid_lives() {
+        // Fail safe: with no start time to compare, only exit releases it.
+        let (mut native, _) = watched_native();
+        stash_limit(&mut native, 1);
+        native.scene.source.spawn(9, 90);
+        native.scene.source.blind(9);
+        native.scene.source.spawn(11, 110);
+        let row = native.row(77, 1, 9, 1_000, 0);
+        native.witness(vec![row]);
+        let row = native.row(78, 1, 11, 1_010, 0);
+        native.witness(vec![row]);
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"native pre-admission rows past their bound".to_string())
+        );
+        assert_eq!(native.preadmission().pruned, 0);
+    }
+
+    /// A row whose endpoint resolves to no module still names its pid:
+    /// every module of that pid's callers downgrades (the `None` entry).
+    #[test]
+    fn an_unresolved_row_downgrades_every_module_of_its_pid() {
+        let (mut native, caller) = watched_native();
+        let mut row = native.row(77, 1, 7, 1_000, 0);
+        row.endpoint = EndpointId(9_999);
+        native.witness(vec![row]);
+        assert!(
+            use_before_admission(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn an_unresolved_row_downgrades_a_later_admission_of_its_pid() {
+        let (mut native, _) = watched_native();
+        native.scene.source.spawn(9, 900);
+        let mut row = native.row(77, 1, 9, 1_000, 0);
+        row.endpoint = EndpointId(9_999);
+        native.witness(vec![row]);
+        let later = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 1_500)
+            .unwrap();
+        native.scene.project(9, 1_600);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            use_before_admission(&native.scene.coverage(later)),
+            "{:?}",
+            native.scene.coverage(later)
+        );
+    }
+
+    /// The overflow reaches retained retired callers too: a frozen
+    /// `watched_no_use` is no more a fact than a live one.
+    #[test]
+    fn an_overflow_downgrades_a_retired_callers_frozen_watch() {
+        let (mut native, caller) = watched_native();
+        native.read(Vec::new());
+        native.scene.source.kill(7);
+        let events = native.scene.coordinator.adapter.reconcile(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            1_050,
+        );
+        assert_eq!(events.len(), 1, "{events:?}");
+        native
+            .scene
+            .coordinator
+            .registry
+            .retire_caller(caller, "exited".into(), 1_050);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired,
+            "the record is retained, retired"
+        );
+        assert!(
+            watched(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        stash_limit(&mut native, 1);
+        native.scene.source.spawn(9, 90);
+        native.scene.source.spawn(11, 110);
+        let rows = vec![
+            native.row(77, 1, 9, 1_100, 0),
+            native.row(78, 1, 11, 1_100, 0),
+        ];
+        native.witness(rows);
+        assert!(
+            use_before_admission(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_bound_row_of_the_same_pid_keeps_the_caller_witnessed() {
+        // Positives stay positives: the rule only replaces a watch.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        native.witness(vec![row]);
+        assert!(native.scene.coverage(caller).is_witnessed());
+        assert!(
+            native
+                .scene
+                .coordinator
+                .capture
+                .as_ref()
+                .unwrap()
+                .preadmission
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_row_decided_after_stop_still_downgrades_a_frozen_watch() {
+        let (mut native, caller) = watched_native();
+        // A clean read at 1_010, then the stop freezes the watch there.
+        native.read(Vec::new());
+        native.scene.coordinator.end_capture_coverage(1_100);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(watched(&native.scene.coverage(caller)));
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 40, 0);
+        native.witness(vec![row]);
+        assert!(
+            use_before_admission(&native.scene.coverage(caller)),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    /// R-C51-3: a row lifecycle loss left unbound downgrades the same way,
+    /// sticky, but the edge reads unknown `loss` — never watched, and not
+    /// `use_before_admission`.
+    #[test]
+    fn a_row_lifecycle_loss_left_unbound_reads_loss() {
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        let mut batch = native.stamps.read(native.domain, vec![row]);
+        let NativeBatch::Witness(read) = &mut batch else {
+            unreachable!()
+        };
+        // The ring lost a record before this read: the binder dates a loss.
+        read.health.discovery_counters = Some([1, 0, 0, 0, 0]);
+        native.stage(batch);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.unbound.get(&UnboundReason::LifecycleLoss), Some(&1));
+        assert!(
+            lost_with(&native.scene.coverage(caller), "use row could bind"),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        native.scene.project(7, 2_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(lost_with(
+            &native.scene.coverage(caller),
+            "use row could bind"
+        ));
     }
 }

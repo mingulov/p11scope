@@ -6992,8 +6992,10 @@ fn same_cpu_preemption_lane(selection: crate::attach::BackendSelection, label: &
         selection,
     )
     .with_context(|| format!("same-CPU {label} Detailed session"))?;
+    // DR-CLASSIC-PID0: a PID-scoped auto session takes uprobe-multi only
+    // where the pid-filter probe proves the kernel filter.
     let multi_expected = selection == crate::attach::BackendSelection::Auto
-        && crate::attach::kernel_supports_multi();
+        && crate::attach::kernel_multi_pid_filter().is_ok();
     ensure!(
         session.attach_failures().is_empty() && session.attached_probes() == 2,
         "same-CPU {label} Detailed did not retain its paired static probe"
@@ -10552,4 +10554,253 @@ fn privileged_stop_gate_keeps_calls_in_flight_as_residual() -> Result<()> {
     detached?;
     ensure!(clean_detach, "stop-gate detach retained failures");
     Ok(())
+}
+
+/// A process holding `pid`: the kernel's next PID is set through
+/// `ns_last_pid` (the CRIU technique) and the spawn retried, since other
+/// host processes may take the number first.
+pub(in crate::attach::inventory) fn spawn_with_pid(
+    fixture: &OwnedFixture,
+    pid: u32,
+) -> Result<OwnedCaller> {
+    for attempt in 0..64 {
+        std::fs::write("/proc/sys/kernel/ns_last_pid", format!("{}", pid - 1))
+            .context("writing ns_last_pid (needs CONFIG_CHECKPOINT_RESTORE and root)")?;
+        let caller = fixture.spawn()?;
+        if caller.child.id() == pid {
+            eprintln!("C3_PID_REUSE pid={pid} attempt={attempt}");
+            return Ok(caller);
+        }
+        drop(caller);
+    }
+    bail!("could not reuse pid {pid} in 64 attempts")
+}
+
+/// Kernel-side runs of the session's uprobe programs (static endpoint
+/// twins and any live-discovery uprobes), from the BPF run statistics.
+/// Counts only while a `BPF_ENABLE_STATS` descriptor is held.
+fn uprobe_runs(session: &crate::attach::Session) -> Result<u64> {
+    let mut runs = 0u64;
+    for (_, program) in session.ebpf.programs() {
+        if let aya::programs::Program::UProbe(probe) = program {
+            runs = runs.saturating_add(probe.info()?.run_count());
+        }
+    }
+    Ok(runs)
+}
+
+/// Calls the session's slot reports count, summed.
+fn classic_calls(session: &crate::attach::Session, plan: &AttachPlan) -> Result<u64> {
+    Ok(crate::metrics::read(session, plan)?
+        .iter()
+        .map(|report| report.calls)
+        .sum())
+}
+
+/// Times `calls` calls of endpoint 0 in `caller`, in ns per call
+/// (including one command round trip, amortized).
+fn ns_per_call(caller: &mut OwnedCaller, calls: u32) -> Result<f64> {
+    let started = Instant::now();
+    caller.calls(0, calls)?;
+    Ok(started.elapsed().as_nanos() as f64 / f64::from(calls))
+}
+
+/// DR-CLASSIC-PID0: the classic profile/trace session under `--pid`. The
+/// static probes must never reach another process mapping the provider:
+/// not a foreign process calling it meanwhile, and not a later process
+/// that reuses the target's PID. Proven at the kernel boundary (the BPF
+/// run statistics of every uprobe program stay flat while they call, so no
+/// breakpoint traps there) and in the published counts and call events
+/// (only the target's calls). Where the kernel pid filter is proven, `auto`
+/// and forced `multi` attach uprobe-multi links naming the target
+/// (`kernel-pid+bpf`); elsewhere `auto` runs per-offset links bound to the
+/// target (`perf-task+bpf`) with the probe's reason, and forced `multi` is
+/// refused naming the pid filter. A link naming pid 0 (the old classic
+/// behaviour) traps in both and fails here.
+fn classic_pid_scope_lane(selection: crate::attach::BackendSelection, label: &str) -> Result<()> {
+    use crate::attach::{BackendSelection, CapturePolicy, Session};
+    const CALLS: u32 = 1_000;
+    const TIMED: u32 = 200_000;
+    let proven = crate::attach::kernel_multi_pid_filter();
+    let fixture = OwnedFixture::build_n(false, 1)?;
+    let plan =
+        AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
+            .map_err(anyhow::Error::msg)?;
+    let mut target = fixture.spawn()?;
+    let mut foreign = fixture.spawn()?;
+    let pid = target.child.id();
+    let baseline_ns = ns_per_call(&mut foreign, TIMED)?;
+    let _stats =
+        aya::sys::enable_stats(aya::sys::Stats::RunTime).context("enabling BPF run statistics")?;
+    let started = Session::start(
+        &plan,
+        &Scope::Pid(pid),
+        &fixture.pins,
+        CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        selection,
+    );
+    if selection == BackendSelection::Multi
+        && let Err(reason) = &proven
+    {
+        let refused = match started {
+            Ok(_) => bail!("forced multi under --pid started without a proven pid filter"),
+            Err(error) => format!("{error:#}"),
+        };
+        ensure!(
+            refused.contains("pid filter") && refused.contains(reason.as_str()),
+            "{refused}"
+        );
+        eprintln!("CLASSIC_PID_SCOPE selection={label} refused={refused:?}");
+        target.finish()?;
+        foreign.finish()?;
+        return Ok(());
+    }
+    let mut session = started.with_context(|| format!("classic {label} PID session"))?;
+    ensure!(
+        session.attach_failures().is_empty() && session.attached_probes() == 2,
+        "classic {label} PID session did not attach its paired static probe"
+    );
+    let evidence = session.attach_backend_evidence();
+    let multi = session.static_multi_attached();
+    match (selection, &proven) {
+        (BackendSelection::Singles, _) => {
+            ensure!(!multi && evidence.fallback.is_none(), "{evidence:?}");
+            ensure!(
+                evidence.scope_filter == Some("perf-task+bpf"),
+                "{evidence:?}"
+            );
+        }
+        (_, Ok(())) => {
+            ensure!(multi && evidence.fallback.is_none(), "{evidence:?}");
+            ensure!(
+                evidence.scope_filter == Some("kernel-pid+bpf"),
+                "{evidence:?}"
+            );
+        }
+        (_, Err(reason)) => {
+            ensure!(!multi, "{evidence:?}");
+            ensure!(
+                evidence.scope_filter == Some("perf-task+bpf"),
+                "{evidence:?}"
+            );
+            ensure!(
+                evidence
+                    .fallback
+                    .as_deref()
+                    .is_some_and(|fallback| fallback.contains("pid filter")
+                        && fallback.contains(reason.as_str())),
+                "{evidence:?}"
+            );
+        }
+    }
+
+    // The target: counted, and its probes run in the kernel.
+    let runs = uprobe_runs(&session)?;
+    target.calls(0, CALLS)?;
+    let target_runs = uprobe_runs(&session)? - runs;
+    ensure!(
+        classic_calls(&session, &plan)? == u64::from(CALLS),
+        "the target's calls were not all counted"
+    );
+    ensure!(
+        target_runs >= u64::from(CALLS),
+        "the target's calls did not run the probes: {target_runs}"
+    );
+
+    // A foreign process mapping the same provider: no trap, no count.
+    let runs = uprobe_runs(&session)?;
+    let session_ns = ns_per_call(&mut foreign, TIMED)?;
+    foreign.calls(0, CALLS)?;
+    let foreign_runs = uprobe_runs(&session)? - runs;
+    // Printed before the verdict so a failing run still reports its cost.
+    eprintln!(
+        "CLASSIC_PID_FOREIGN selection={label} multi={multi} foreign_runs={foreign_runs} \
+         foreign_ns_per_call_before={baseline_ns:.1} foreign_ns_per_call_during={session_ns:.1}"
+    );
+    ensure!(
+        classic_calls(&session, &plan)? == u64::from(CALLS),
+        "PID scope counted a foreign caller"
+    );
+    ensure!(
+        foreign_runs == 0,
+        "a foreign process ran the PID-scoped probes {foreign_runs} times"
+    );
+
+    // Every call event is the target's.
+    let mut events = Vec::new();
+    let drain = session.event_drain()?;
+    let more = drain.poll(Some(4 * CALLS as usize), |event| {
+        events.push(event);
+        ControlFlow::Continue(())
+    });
+    ensure!(
+        !more && drain.malformed() == 0,
+        "event backlog or malformed records"
+    );
+    let calls: Vec<&Event> = events
+        .iter()
+        .filter(|event| event.event_type == event_type::CALL)
+        .collect();
+    ensure!(
+        calls.len() == CALLS as usize
+            && calls
+                .iter()
+                .all(|event| (event.pid_tgid >> 32) as u32 == pid),
+        "call events: {} (want {CALLS}, all from {pid})",
+        calls.len()
+    );
+
+    // A later process reusing the target's PID: no trap, no count.
+    target.finish()?;
+    let mut reused = spawn_with_pid(&fixture, pid)?;
+    let runs = uprobe_runs(&session)?;
+    reused.calls(0, CALLS)?;
+    let reused_runs = uprobe_runs(&session)? - runs;
+    ensure!(
+        classic_calls(&session, &plan)? == u64::from(CALLS),
+        "PID scope counted a process reusing the target's PID"
+    );
+    ensure!(
+        reused_runs == 0,
+        "a process reusing the target's PID ran the probes {reused_runs} times"
+    );
+    eprintln!(
+        "CLASSIC_PID_SCOPE selection={label} multi={multi} scope_filter={:?} fallback={:?} \
+         target={pid} target_runs={target_runs} foreign_runs={foreign_runs} \
+         reused_runs={reused_runs} foreign_ns_per_call_before={baseline_ns:.1} \
+         foreign_ns_per_call_during={session_ns:.1}",
+        evidence.scope_filter, evidence.fallback
+    );
+    reused.finish()?;
+    foreign.finish()?;
+    let detached = session.detach_producers();
+    let clean = session.detach_failures().is_empty();
+    drop(session);
+    detached?;
+    ensure!(
+        clean,
+        "classic {label} PID session detach retained failures"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; classic --pid auto keeps foreign and reused-PID processes out at the kernel"]
+fn privileged_classic_pid_scope_auto_excludes_foreign_and_reused_pid_lp64() -> Result<()> {
+    classic_pid_scope_lane(crate::attach::BackendSelection::Auto, "auto")
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; classic --pid singles keeps foreign and reused-PID processes out at the kernel"]
+fn privileged_classic_pid_scope_singles_excludes_foreign_and_reused_pid_lp64() -> Result<()> {
+    classic_pid_scope_lane(crate::attach::BackendSelection::Singles, "singles")
+}
+
+#[test]
+#[ignore = "root-owned BPF lane; classic --pid forced multi names the target or is refused"]
+fn privileged_classic_pid_scope_forced_multi_names_the_target_or_refuses_lp64() -> Result<()> {
+    classic_pid_scope_lane(crate::attach::BackendSelection::Multi, "multi")
 }

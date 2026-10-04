@@ -4,7 +4,7 @@
 //! an owned fixture process with an independent stdout ledger; every
 //! endpoint comes through the real attach set (`absorb`) and the facade.
 
-use super::super::activation::privileged_tests::{OwnedCaller, OwnedFixture};
+use super::super::activation::privileged_tests::{OwnedFixture, spawn_with_pid};
 use super::*;
 use crate::discovery::inventory_attach_set::tests as fx;
 use crate::plan::AdmissionPolicy;
@@ -266,23 +266,6 @@ fn privileged_inventory_capture_extend_late_provider_lp64() -> Result<()> {
         retired.cleanup()
     );
     Ok(())
-}
-
-/// A process holding `pid`: the kernel's next PID is set through
-/// `ns_last_pid` (the CRIU technique) and the spawn retried, since other
-/// host processes may take the number first.
-fn spawn_with_pid(fixture: &OwnedFixture, pid: u32) -> Result<OwnedCaller> {
-    for attempt in 0..64 {
-        std::fs::write("/proc/sys/kernel/ns_last_pid", format!("{}", pid - 1))
-            .context("writing ns_last_pid (needs CONFIG_CHECKPOINT_RESTORE and root)")?;
-        let caller = fixture.spawn()?;
-        if caller.child.id() == pid {
-            eprintln!("C3_PID_REUSE pid={pid} attempt={attempt}");
-            return Ok(caller);
-        }
-        drop(caller);
-    }
-    bail!("could not reuse pid {pid} in 64 attempts")
 }
 
 #[test]

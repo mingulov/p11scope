@@ -831,13 +831,29 @@ Limits that matter in pods:
   Takes no scope or subcommand; anything after it is a usage error.
   `p11scope-discover --version` prints the helper's version
   (`p11scope-discover <semver>`, the same release version) the same way.
-- `--attach-backend auto|multi|singles` — the static probe backend. `auto`
-  (default) attempts one multi-uprobe link per attach group on kernels 6.9+
-  and falls back to per-offset links if multi is unsupported; it uses
-  per-offset links below 6.9. `multi` forces multi (needs 6.6+); `singles`
-  forces per-offset links everywhere. Dynamic loader and export probes use
-  per-offset links. The backend that owned each link is disclosed per report
-  (`evidence.attach_mechanisms`).
+- `--attach-backend auto|multi|singles` — the static probe backend. The
+  decision comes from a functional probe, never from the kernel version.
+  - `auto` (the default) uses one multi-uprobe link per attach group wherever
+    the probe links one, and per-offset links elsewhere. It also falls back to
+    per-offset links if the kernel then refuses multi.
+  - Under `--pid`, `auto` uses multi only where the probe also proves that the
+    kernel's uprobe-multi pid filter covers every thread of the named process
+    and no other process. The links then name the target, so no other process
+    that maps the provider (including a later one that reuses the PID) gets a
+    breakpoint. The in-BPF PID guard stays as a second check. Where the filter
+    is not proven, `--pid` uses per-offset links bound to the target and never
+    a process-wide link.
+  - `multi` forces multi. It needs 6.6+, and under `--pid` it also needs a
+    proven pid filter; without one it is refused.
+  - `singles` forces per-offset links everywhere.
+
+  Dynamic loader and export probes always use per-offset links. Each profile
+  report discloses the backend that owned each link
+  (`evidence.attach_mechanisms`). It also discloses the selection, why `auto`
+  fell back, and under `--pid` the kernel-side scope filter
+  (`evidence.attach_backend`). A fallback is also printed on stderr, as
+  `p11scope: attach backend: per-offset links (<reason>)`, before the
+  `p11scope: capturing:` line.
 - Trace event cap — `trace` (including `run --trace`) without `--max-events`
   still stops at 10,000,000 events: the cap is a default, not unbounded
   streaming, and the no-duration notice says so. The `TRUNCATED` line cites

@@ -21,6 +21,19 @@ versioned separately and are opaque, exact dispatch keys.
   schema states the sizing condition). `pass_committed.edge_events`,
   `edge_events_deferred`, `ended.edge_events` and `ended.edges_unretained`
   are additive within `p11scope/inventory-events/v1`.
+- `profile` and `trace` under `--pid` no longer put breakpoints into every
+  process that maps the provider. Classic uprobe-multi links named pid 0 and
+  relied on the in-BPF PID guard alone, which cost about 3.7 µs per call in
+  every other process (measured on a debug fixture) and left the guard as
+  the only barrier against a process that reuses the PID. Now `--pid` takes
+  uprobe-multi only where a functional probe proves the kernel pid filter
+  (every thread of the target, no other process), and the links name the
+  target. Elsewhere it uses per-offset links bound to the target. The
+  classic `--attach-backend auto` decides by functional probes, not the
+  6.9 version floor. The new `evidence.attach_backend` in profile reports
+  (and the trace terminal record) discloses the selection, any fallback
+  reason and the `--pid` scope filter; a fallback is also printed on
+  stderr before the readiness line.
 - The native lane of `inventory` attaches provider entries as uprobe-multi
   links wherever a functional probe shows the kernel supports them (6.6+,
   including distribution backports; never decided by version), one

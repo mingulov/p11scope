@@ -816,8 +816,9 @@ pub enum AttachBackend {
     Singles,
 }
 
-/// Operator's `--attach-backend` request: `auto` follows the backend
-/// policy (multi on 6.9+, singles below), `multi`/`singles` force one.
+/// Operator's `--attach-backend` request: `auto` follows a functional
+/// probe (never the kernel version; see [`select_session_backend`]),
+/// `multi`/`singles` force one.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum BackendSelection {
     #[default]
@@ -867,22 +868,22 @@ impl std::error::Error for BackendFallbackRequired {
     }
 }
 
-/// Kernel floor for the multi backend: `uprobe_multi` landed in 6.6,
-/// but the session only attempts multi on 6.9+, where the link UAPI the
-/// backport targets is settled. Below the floor `Auto` is singles; an
-/// `ENOTSUP`/`EOPNOTSUPP` link error still falls back at runtime.
+/// Release floor the doctor's diagnostics still quote: `uprobe_multi`
+/// landed in 6.6 and the session once attempted it only on 6.9+. The
+/// capture no longer reads it: [`select_session_backend`] decides by
+/// functional probes (owner directive "kernel tiers", DR-CLASSIC-PID0).
 pub(crate) const MULTI_KERNEL_FLOOR: (u32, u32) = (6, 9);
 
-/// Pure policy predicate over a `/proc/sys/kernel/osrelease` release
-/// string: multi is attempted at or above [`MULTI_KERNEL_FLOOR`], and
-/// an unparseable release conservatively resolves to singles.
+/// Pure predicate over a `/proc/sys/kernel/osrelease` release string: at
+/// or above [`MULTI_KERNEL_FLOOR`]; an unparseable release is below it.
+/// Doctor diagnostics only.
 pub(crate) fn multi_allowed_on(release: &str) -> bool {
     crate::doctor::parse_major_minor(release).is_some_and(|version| version >= MULTI_KERNEL_FLOOR)
 }
 
-/// Live policy probe: multi is attempted when the running kernel is at
-/// or above [`MULTI_KERNEL_FLOOR`]. An unreadable release resolves to
-/// singles; forced multi still attempts regardless (see `start`).
+/// The running release against [`MULTI_KERNEL_FLOOR`], for the doctor's
+/// `perf_event_paranoid` row hint only (it may run unprivileged, where no
+/// functional probe can answer). The capture never consults it.
 pub(crate) fn kernel_supports_multi() -> bool {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|release| multi_allowed_on(release.trim()))
@@ -922,16 +923,95 @@ pub(crate) fn kernel_multi_pid_filter() -> std::result::Result<(), String> {
         .clone()
 }
 
-/// First backend attempted for a session. `Auto` follows the kernel
-/// policy (multi on 6.9+, singles below); `Multi`/`Singles` force one.
-/// An auto multi attempt that the kernel refuses is rebuilt on singles
-/// at session granularity; forced multi surfaces the refusal instead.
-pub(crate) fn resolve_initial_backend(selection: BackendSelection) -> AttachBackend {
-    match selection {
-        BackendSelection::Auto if kernel_supports_multi() => AttachBackend::Multi,
-        BackendSelection::Auto | BackendSelection::Singles => AttachBackend::Singles,
-        BackendSelection::Multi => AttachBackend::Multi,
-    }
+/// The classic session's static attach backend, as selected before any
+/// object loads (DR-CLASSIC-PID0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionBackend {
+    pub backend: AttachBackend,
+    /// Why `auto` runs per-offset links (a failed probe), else `None`.
+    pub fallback: Option<String>,
+}
+
+/// The production functional probe: a mapless no-op program linked as a
+/// one-offset uprobe-multi probe at the observer's own anchor (the doctor
+/// row's self-link), dropped at once. It never fires a capture program.
+pub(crate) fn multi_functional_probe() -> std::result::Result<(), String> {
+    // The anchor error names local paths (libc, the observer's own
+    // executable); the published reason stays pathless (the doctor's row
+    // keeps the detail).
+    let (path, offset) = crate::doctor::self_probe_anchor()
+        .map_err(|_| "the self-probe anchor is unavailable".to_string())?;
+    let program = p11scope_bpf_multi::prog_load_scratch_multi()
+        .map_err(|error| format!("loading the scratch uprobe-multi program: {error}"))?;
+    p11scope_bpf_multi::attach_group(
+        program.as_raw_fd(),
+        std::process::id(),
+        &path,
+        &[offset],
+        &[1],
+        false,
+    )
+    .map(drop)
+    .map_err(|error| format!("linking the scratch uprobe-multi probe: {error}"))
+}
+
+/// First backend attempted for a classic session, decided by functional
+/// probes, never by the kernel version (owner directive "kernel tiers").
+///
+/// - `singles`: per-offset links, never probed.
+/// - PID scope (`pid_scope`): uprobe-multi only where `pid_probe` proves
+///   the kernel pid filter covers every thread of the named process and
+///   no other process (`kernel_multi_pid_filter`); the links then name the
+///   target, so no other process mapping the provider carries a
+///   breakpoint, and the in-BPF PID guard stays as a second check. Where
+///   it is not proven, `auto` runs per-offset links bound to the target
+///   with the probe's reason, and forced `multi` is refused: a PID-scoped
+///   uprobe-multi link never names pid 0.
+/// - Cgroup and system scope: links name pid 0 and the in-BPF scope gate
+///   decides. `auto` takes uprobe-multi where `multi_probe` links one,
+///   else per-offset links with its reason; forced `multi` attempts
+///   regardless.
+///
+/// An auto uprobe-multi session that the kernel still refuses is rebuilt
+/// on per-offset links at session granularity (see [`Session::start`]).
+pub(crate) fn select_session_backend(
+    selection: BackendSelection,
+    pid_scope: bool,
+    multi_probe: impl FnOnce() -> std::result::Result<(), String>,
+    pid_probe: impl FnOnce() -> std::result::Result<(), String>,
+) -> Result<SessionBackend> {
+    let chosen = |backend, fallback| SessionBackend { backend, fallback };
+    Ok(match (selection, pid_scope) {
+        (BackendSelection::Singles, _) => chosen(AttachBackend::Singles, None),
+        (BackendSelection::Multi, false) => chosen(AttachBackend::Multi, None),
+        (BackendSelection::Multi, true) => {
+            pid_probe().map_err(|reason| {
+                anyhow!(
+                    "--attach-backend multi under --pid needs a proven kernel uprobe-multi pid \
+                     filter (links never name pid 0): {reason}"
+                )
+            })?;
+            chosen(AttachBackend::Multi, None)
+        }
+        (BackendSelection::Auto, true) => match pid_probe() {
+            Ok(()) => chosen(AttachBackend::Multi, None),
+            Err(reason) => chosen(
+                AttachBackend::Singles,
+                Some(format!(
+                    "uprobe-multi under --pid needs a proven kernel pid filter: {reason}"
+                )),
+            ),
+        },
+        (BackendSelection::Auto, false) => match multi_probe() {
+            Ok(()) => chosen(AttachBackend::Multi, None),
+            Err(reason) => chosen(
+                AttachBackend::Singles,
+                Some(format!(
+                    "the uprobe-multi functional probe failed: {reason}"
+                )),
+            ),
+        },
+    })
 }
 
 /// The static endpoint twins (every program `static_probe_side` routes)
@@ -1113,6 +1193,10 @@ pub struct Session {
     /// Load-time backend: static endpoint twins load with attach type 48
     /// under multi, so the attach path must match the load decision.
     backend: AttachBackend,
+    /// The operator's `--attach-backend` and why an `auto` session runs
+    /// per-offset links (DR-CLASSIC-PID0).
+    selection: BackendSelection,
+    backend_fallback: Option<String>,
     uprobe_scope: UProbeScope,
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pause_key: Option<PauseKey>,
@@ -2098,15 +2182,21 @@ fn multi_prog_fd(ebpf: &mut Ebpf, program: &'static str) -> Result<RawFd> {
     Ok(fd.as_fd().as_raw_fd())
 }
 
-/// PID filter for the multi `link_create`: always 0 (all processes).
-/// The 6.9.x kernel pid filter misses threads (osslscope-proven), so
-/// `Scope::Pid` under multi relies on the existing in-BPF `PID_FILTER`
-/// tgid guard, which every static probe already consults via
-/// `scope_auth`; Cgroup/System scopes are BPF-enforced under singles
-/// too. Out-of-scope tasks run the probe prologue and return 0, so
-/// captured events are identical to kernel-filtered singles.
-fn multi_link_pid() -> u32 {
-    0
+/// PID filter for a uprobe-multi `link_create` (DR-CLASSIC-PID0): the
+/// target under PID scope, which [`select_session_backend`] allows only
+/// where the functional probe proved the kernel filter covers every thread
+/// of the named process and excludes every other process (and so a later
+/// process reusing the PID); 0 (all processes) under cgroup and system
+/// scope, which the in-BPF scope gate enforces. The in-BPF PID_FILTER tgid
+/// guard every static probe consults via `scope_auth` stays under PID
+/// scope as defence in depth.
+pub(crate) fn multi_link_pid(scope: UProbeScope) -> u32 {
+    match scope {
+        UProbeScope::OneProcess(pid) => pid.get(),
+        // Never widen to pid 0 for a scope that names one process.
+        UProbeScope::CallingProcess => std::process::id(),
+        UProbeScope::AllProcesses => 0,
+    }
 }
 
 pub(crate) fn monotonic_ns() -> Option<u64> {
@@ -2793,8 +2883,13 @@ impl Session {
         // exists yet at attach time. A 1024 soft limit dies near slot 256.
         let _ = crate::process::raise_nofile();
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
-        let backend = resolve_initial_backend(selection);
-        match Self::start_on_backend(
+        let SessionBackend { backend, fallback } = select_session_backend(
+            selection,
+            matches!(scope, Scope::Pid(_)),
+            multi_functional_probe,
+            kernel_multi_pid_filter,
+        )?;
+        let started = match Self::start_on_backend(
             plan,
             scope,
             objects,
@@ -2804,7 +2899,7 @@ impl Session {
             owned_child,
             backend,
         ) {
-            Ok(session) => Ok(session),
+            Ok(session) => Ok((session, fallback)),
             Err(error)
                 if selection == BackendSelection::Auto
                     && backend == AttachBackend::Multi
@@ -2814,6 +2909,13 @@ impl Session {
                 // attempt the kernel refuses is rebuilt on singles at
                 // session granularity; the dropped session detaches every
                 // probe it created. Forced multi surfaces the refusal.
+                // Only the kernel's refusal, never the context chain (which
+                // names the provider path).
+                let refusal = error
+                    .downcast_ref::<BackendFallbackRequired>()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let reason = format!("the uprobe-multi attach failed: {refusal}");
                 Self::start_on_backend(
                     plan,
                     scope,
@@ -2824,9 +2926,14 @@ impl Session {
                     owned_child,
                     AttachBackend::Singles,
                 )
+                .map(|session| (session, Some(reason)))
             }
             Err(error) => Err(error),
-        }
+        };
+        let (mut session, fallback) = started?;
+        session.selection = selection;
+        session.backend_fallback = fallback;
+        Ok(session)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3101,6 +3208,8 @@ impl Session {
             dynamic_attach_evidence: DynamicAttachEvidence::default(),
             policy,
             backend,
+            selection: BackendSelection::Auto,
+            backend_fallback: None,
             uprobe_scope,
             pause_key,
             lifecycle_tracking_unavailable: None,
@@ -3513,7 +3622,7 @@ impl Session {
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
-        let pid = multi_link_pid();
+        let pid = multi_link_pid(self.uprobe_scope);
         let (bundles, outcome) = attach_target_groups_with(
             &groups,
             |_| monotonic_ns(),
@@ -3658,7 +3767,7 @@ impl Session {
             _ => link.slots().iter().any(|slot| requested.contains(slot)),
         })?;
         prune_linkless_retained(&mut self.retained_static, &self.links);
-        let pid = multi_link_pid();
+        let pid = multi_link_pid(self.uprobe_scope);
         let (bundles, outcome) = reattach_rebuilt_groups_with(
             &groups,
             |_| monotonic_ns(),
@@ -4174,6 +4283,36 @@ impl Session {
         self.backend == AttachBackend::Multi && !self.successful_static.is_empty()
     }
 
+    /// The profile lane's `evidence.attach_backend` (DR-CLASSIC-PID0).
+    pub(crate) fn attach_backend_evidence(&self) -> crate::render::AttachBackendEvidence {
+        crate::render::AttachBackendEvidence {
+            selection: match self.selection {
+                BackendSelection::Auto => "auto",
+                BackendSelection::Multi => "multi",
+                BackendSelection::Singles => "singles",
+            },
+            fallback: self.backend_fallback.clone(),
+            scope_filter: self.scope_filter(),
+        }
+    }
+
+    /// Why an `auto` session runs per-offset links, else `None`.
+    pub(crate) fn backend_fallback(&self) -> Option<&str> {
+        self.backend_fallback.as_deref()
+    }
+
+    /// Under PID scope, what keeps other processes out of the static
+    /// probes besides the in-BPF PID guard: `kernel-pid+bpf` (uprobe-multi
+    /// links name the target) or `perf-task+bpf` (each per-offset link is
+    /// bound to the target's task); `None` under cgroup and system scope.
+    pub(crate) fn scope_filter(&self) -> Option<&'static str> {
+        match (self.uprobe_scope, self.backend) {
+            (UProbeScope::OneProcess(_), AttachBackend::Multi) => Some("kernel-pid+bpf"),
+            (UProbeScope::OneProcess(_), AttachBackend::Singles) => Some("perf-task+bpf"),
+            (UProbeScope::AllProcesses | UProbeScope::CallingProcess, _) => None,
+        }
+    }
+
     pub(crate) fn dynamic_per_offset_attached(&self) -> bool {
         self.dynamic_attach_evidence.successful()
     }
@@ -4521,11 +4660,14 @@ mod tests {
     }
 
     #[test]
-    fn multi_links_attach_pid_wide_and_filter_in_bpf() {
-        // Pin the sketch step-6 decision: the kernel pid filter is never
-        // used for multi links (6.9.x misses threads); Scope::Pid rides
-        // on the in-BPF PID_FILTER tgid guard every static probe checks.
-        assert_eq!(super::multi_link_pid(), 0);
+    fn multi_links_name_the_pid_target_and_pid_zero_only_scope_wide() {
+        // DR-CLASSIC-PID0: a PID-scoped uprobe-multi link names the target
+        // (never pid 0); cgroup and system scope stay pid-wide behind the
+        // in-BPF scope gate.
+        use aya::programs::uprobe::UProbeScope;
+        let target = std::num::NonZeroU32::new(4242).unwrap();
+        assert_eq!(super::multi_link_pid(UProbeScope::OneProcess(target)), 4242);
+        assert_eq!(super::multi_link_pid(UProbeScope::AllProcesses), 0);
     }
 
     #[test]
@@ -4585,26 +4727,74 @@ mod tests {
         assert_eq!(static_probe_side("p11_entry_template_second"), None);
     }
 
+    /// DR-CLASSIC-PID0: the classic backend follows functional probes:
+    /// PID scope takes uprobe-multi only where the pid-filter probe proves
+    /// the kernel filter, else per-offset links with its reason (auto) or a
+    /// refusal (forced multi); other scopes follow the multi probe; forced
+    /// singles probes nothing.
     #[test]
-    fn backend_resolution_forces_directly_and_auto_follows_the_kernel() {
-        use super::AttachBackend;
-        use super::BackendSelection;
-        use super::kernel_supports_multi;
-        use super::resolve_initial_backend;
-        assert_eq!(
-            resolve_initial_backend(BackendSelection::Multi),
-            AttachBackend::Multi
-        );
-        assert_eq!(
-            resolve_initial_backend(BackendSelection::Singles),
-            AttachBackend::Singles
-        );
-        let expected = if kernel_supports_multi() {
-            AttachBackend::Multi
-        } else {
-            AttachBackend::Singles
+    fn backend_selection_follows_the_probes_never_the_kernel_version() {
+        use super::{AttachBackend, BackendSelection, SessionBackend, select_session_backend};
+        let ok = || Ok(());
+        let refused = |reason: &'static str| move || Err(reason.to_string());
+        let never = || -> std::result::Result<(), String> { panic!("probed") };
+        let pick = |backend, fallback: Option<&str>| SessionBackend {
+            backend,
+            fallback: fallback.map(str::to_string),
         };
-        assert_eq!(resolve_initial_backend(BackendSelection::Auto), expected);
+        // Singles: no probe at all.
+        for pid_scope in [false, true] {
+            assert_eq!(
+                select_session_backend(BackendSelection::Singles, pid_scope, never, never).unwrap(),
+                pick(AttachBackend::Singles, None)
+            );
+        }
+        // PID scope: the pid-filter probe alone decides.
+        assert_eq!(
+            select_session_backend(BackendSelection::Auto, true, never, ok).unwrap(),
+            pick(AttachBackend::Multi, None)
+        );
+        let fallback =
+            select_session_backend(BackendSelection::Auto, true, never, refused("own=1")).unwrap();
+        assert_eq!(fallback.backend, AttachBackend::Singles);
+        assert!(
+            fallback
+                .fallback
+                .as_deref()
+                .is_some_and(|reason| reason.contains("pid filter") && reason.contains("own=1")),
+            "{fallback:?}"
+        );
+        assert_eq!(
+            select_session_backend(BackendSelection::Multi, true, never, ok).unwrap(),
+            pick(AttachBackend::Multi, None)
+        );
+        let forced =
+            select_session_backend(BackendSelection::Multi, true, never, refused("EINVAL"))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            forced.contains("pid filter") && forced.contains("EINVAL"),
+            "{forced}"
+        );
+        // Other scopes: the multi probe decides auto; forced multi attempts.
+        assert_eq!(
+            select_session_backend(BackendSelection::Auto, false, ok, never).unwrap(),
+            pick(AttachBackend::Multi, None)
+        );
+        let fallback =
+            select_session_backend(BackendSelection::Auto, false, refused("EINVAL"), never)
+                .unwrap();
+        assert_eq!(fallback.backend, AttachBackend::Singles);
+        assert!(
+            fallback.fallback.as_deref().is_some_and(
+                |reason| reason.contains("functional probe") && reason.contains("EINVAL")
+            ),
+            "{fallback:?}"
+        );
+        assert_eq!(
+            select_session_backend(BackendSelection::Multi, false, never, never).unwrap(),
+            pick(AttachBackend::Multi, None)
+        );
     }
 
     #[test]

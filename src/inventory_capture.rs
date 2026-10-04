@@ -307,26 +307,9 @@ pub(crate) fn prepare_on_backend<T>(
     }
 }
 
-/// The production functional probe: a mapless no-op program linked as a
-/// one-offset uprobe-multi probe at the observer's own anchor (the doctor
-/// row's self-link), dropped at once. It never fires a capture program.
-pub(crate) fn multi_functional_probe() -> std::result::Result<(), String> {
-    use std::os::fd::AsRawFd as _;
-    let (path, offset) = crate::doctor::self_probe_anchor()
-        .map_err(|error| format!("self-probe anchor unavailable: {error}"))?;
-    let program = p11scope_bpf_multi::prog_load_scratch_multi()
-        .map_err(|error| format!("loading the scratch uprobe-multi program: {error}"))?;
-    p11scope_bpf_multi::attach_group(
-        program.as_raw_fd(),
-        std::process::id(),
-        &path,
-        &[offset],
-        &[1],
-        false,
-    )
-    .map(drop)
-    .map_err(|error| format!("linking the scratch uprobe-multi probe: {error}"))
-}
+/// The production functional probe ([`crate::attach::multi_functional_probe`],
+/// shared with the classic session's backend selection).
+pub(crate) use crate::attach::multi_functional_probe;
 
 /// The facade operations the lane drives: the real capture in production,
 /// a scripted lane in the call-order tests. Every method is the facade's

@@ -3983,6 +3983,13 @@ pub(crate) fn capture_ready_line(attached_probes: usize) -> String {
     format!("p11scope: capturing: {attached_probes} probe(s) attached; stop with Ctrl-C")
 }
 
+/// The disclosure line, printed on stderr before the readiness line, when
+/// an `auto` session runs per-offset links instead of uprobe-multi
+/// (DR-CLASSIC-PID0): the reason is also `evidence.attach_backend.fallback`.
+pub(crate) fn attach_fallback_line(fallback: Option<&str>) -> Option<String> {
+    fallback.map(|reason| format!("p11scope: attach backend: per-offset links ({reason})"))
+}
+
 fn target_exit_marker(ticks: u64) -> String {
     format!("p11scope: capture ended: target exited after {ticks} ticks")
 }
@@ -4434,6 +4441,9 @@ fn capture_profile(
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
     scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
+    if let Some(line) = attach_fallback_line(session.backend_fallback()) {
+        eprintln!("{line}");
+    }
     eprintln!("{}", capture_ready_line(session.attached_probes()));
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
@@ -4575,6 +4585,7 @@ fn capture_profile(
                 session.attached_probes(),
                 session.dynamic_per_offset_attached(),
                 session.static_multi_attached(),
+                session.attach_backend_evidence(),
                 session.attach_failures(),
                 &reports,
                 kernel_evidence,
@@ -4930,6 +4941,7 @@ fn capture_profile(
                         context.1.attached_probes(),
                         context.1.dynamic_per_offset_attached(),
                         context.1.static_multi_attached(),
+                        context.1.attach_backend_evidence(),
                         context.1.attach_failures(),
                         &reports,
                         kernel_evidence,
@@ -5126,6 +5138,9 @@ fn capture_trace(
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
     scheduling.sample_resource(crate::timing::ResourcePoint::Readiness);
+    if let Some(line) = attach_fallback_line(session.backend_fallback()) {
+        eprintln!("{line}");
+    }
     eprintln!("{}", capture_ready_line(session.attached_probes()));
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
@@ -5610,6 +5625,7 @@ fn capture_trace(
                         context.1.attached_probes(),
                         context.1.dynamic_per_offset_attached(),
                         context.1.static_multi_attached(),
+                        context.1.attach_backend_evidence(),
                         context.1.attach_failures(),
                         &reports,
                         terminal_kernel,
@@ -6903,6 +6919,7 @@ fn evidence_for(
     attached_probes: usize,
     dynamic_per_offset_attached: bool,
     static_multi_attached: bool,
+    attach_backend: render::AttachBackendEvidence,
     attach_failures: &[(u32, String)],
     reports: &[metrics::SlotReport],
     kernel_evidence: metrics::KernelEvidence,
@@ -7042,6 +7059,7 @@ fn evidence_for(
         } else {
             Vec::new()
         },
+        attach_backend,
         pid_descendant_gaps,
         multi_rebuild_gaps: engine.multi_rebuild_gaps(),
         // Design §5.7: a live-learned attach key is protected only inside a
@@ -7851,6 +7869,7 @@ mod tests {
             0,
             false,
             false,
+            Default::default(),
             &failures,
             &[],
             metrics::KernelEvidence::default(),
@@ -13100,6 +13119,7 @@ mod tests {
             0,
             false,
             false,
+            Default::default(),
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -14981,6 +15001,21 @@ mod tests {
         assert_eq!(resolve_ring_bytes(Some(1 << 20)), 1 << 20);
     }
 
+    /// DR-CLASSIC-PID0: an `auto` fallback is disclosed on stderr before the
+    /// readiness line (which stays byte-identical); none without one.
+    #[test]
+    fn an_attach_fallback_is_disclosed_before_the_readiness_line() {
+        assert_eq!(attach_fallback_line(None), None);
+        assert_eq!(
+            attach_fallback_line(Some("the uprobe-multi functional probe failed: EINVAL")),
+            Some(
+                "p11scope: attach backend: per-offset links (the uprobe-multi functional \
+                 probe failed: EINVAL)"
+                    .to_string()
+            )
+        );
+    }
+
     #[test]
     fn task_8d_attach_mechanism_requires_a_successfully_owned_link() {
         assert!(attach_mechanisms(0, false, false).is_empty());
@@ -15010,6 +15045,7 @@ mod tests {
                 0,
                 false,
                 false,
+                Default::default(),
                 &[],
                 &[],
                 metrics::KernelEvidence::default(),
@@ -15106,6 +15142,7 @@ mod tests {
                     0,
                     false,
                     false,
+                    Default::default(),
                     &[],
                     &[],
                     metrics::KernelEvidence::default(),
@@ -15177,6 +15214,7 @@ mod tests {
             0,
             false,
             false,
+            Default::default(),
             &[],
             &[],
             metrics::KernelEvidence::default(),
@@ -15229,6 +15267,7 @@ mod tests {
             0,
             false,
             false,
+            Default::default(),
             &[],
             &[],
             metrics::KernelEvidence::default(),

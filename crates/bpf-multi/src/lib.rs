@@ -574,11 +574,11 @@ fn own_function_offset(address: usize) -> io::Result<(std::path::PathBuf, u64)> 
             continue;
         };
         if (start..end).contains(&address) && perms.contains('x') {
+            // Pathless: the reason reaches published evidence.
             if Path::new(path) != exe {
-                return Err(io::Error::other(format!(
-                    "the probe target is mapped from {path}, not the executable {}",
-                    exe.display()
-                )));
+                return Err(io::Error::other(
+                    "the probe target is not mapped from the running executable",
+                ));
             }
             return Ok(("/proc/self/exe".into(), (address - start + offset) as u64));
         }

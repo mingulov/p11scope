@@ -541,6 +541,16 @@
           "uniqueItems": true,
           "items": {"enum": ["per-offset", "uprobe-multi"]}
         },
+        "attach_backend": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["selection", "fallback", "scope_filter"],
+          "properties": {
+            "selection": {"enum": ["auto", "multi", "singles"]},
+            "fallback": {"type": ["string", "null"], "minLength": 1},
+            "scope_filter": {"enum": ["kernel-pid+bpf", "perf-task+bpf", null]}
+          }
+        },
         "pid_descendant_gaps": {"type": "integer", "minimum": 0},
         "multi_rebuild_gaps": {"type": "integer", "minimum": 0}
       }
@@ -593,7 +603,7 @@
         "properties": {
           "schema": {"const": "p11scope/observed-profile/v3"},
           "evidence": {
-            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps"]
+            "required": ["interface_selection", "attach_mechanisms", "attach_backend", "pid_descendant_gaps", "multi_rebuild_gaps"]
           }
         },
         "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]
@@ -609,6 +619,7 @@
               "anyOf": [
                 {"required": ["interface_selection"]},
                 {"required": ["attach_mechanisms"]},
+                {"required": ["attach_backend"]},
                 {"required": ["pid_descendant_gaps"]},
                 {"required": ["multi_rebuild_gaps"]}
               ]

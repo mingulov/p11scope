@@ -55,7 +55,7 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (72 ignored tests in the default-feature lib binary): 61 run by
+# Curation (75 ignored tests in the default-feature lib binary): 64 run by
 # default, 4 run only with --include-long, 7 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -68,6 +68,14 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # Default campaign: every ignored test except the long cells and the static
 # skips. Order is the binary's --list order; each runs in its own process.
 DEFAULT_TESTS=(
+# DR-CLASSIC-PID0: classic --pid sessions (auto, singles, forced multi)
+# keep a foreign process and a PID reuser out at the kernel boundary (BPF
+# run statistics flat while they call) and in counts and call events; they
+# print CLASSIC_PID_SCOPE with the non-target ns per call before and during
+# the session. Needs ns_last_pid (CONFIG_CHECKPOINT_RESTORE).
+attach::inventory::activation::privileged_tests::privileged_classic_pid_scope_auto_excludes_foreign_and_reused_pid_lp64
+attach::inventory::activation::privileged_tests::privileged_classic_pid_scope_forced_multi_names_the_target_or_refuses_lp64
+attach::inventory::activation::privileged_tests::privileged_classic_pid_scope_singles_excludes_foreign_and_reused_pid_lp64
 attach::inventory::activation::privileged_tests::privileged_detailed_auto_backend_same_cpu_preemption_keeps_frames
 attach::inventory::activation::privileged_tests::privileged_detailed_multithread_owner_accounting_exact
 attach::inventory::activation::privileged_tests::privileged_detailed_multithread_same_slot_allowlisted_exact

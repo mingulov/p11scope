@@ -465,8 +465,9 @@ fn sysctl_status(
 /// `perf_event` uprobes on every kernel, and at paranoid ≥ 3 those need
 /// `CAP_SYS_ADMIN` (DR-K8S-3), so the row warns there unless it is held.
 /// Below 6.9 every probe is per-probe and the same rule applies.
-/// The multi decision is the same `kernel_supports_multi()` the capture
-/// uses, injected as a bool so both branches are unit-testable.
+/// The multi hint is the release floor (`kernel_supports_multi()`), not the
+/// capture's functional-probe decision (which needs privilege the doctor
+/// may lack), injected as a bool so both branches are unit-testable.
 fn paranoid_check(held_sysadmin: bool, multi_capable: bool) -> Check {
     Check {
         name: "kernel.perf_event_paranoid".to_string(),

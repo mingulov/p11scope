@@ -8823,6 +8823,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         },
         interface_selection: InterfaceSelection::default(),
         attach_mechanisms: vec!["per-offset"],
+        attach_backend: Default::default(),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
         unprotected_live_windows: 1,

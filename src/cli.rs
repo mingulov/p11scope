@@ -271,8 +271,10 @@ selects what run may do to its own child while it observes loading: never (defau
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
-multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+multi-uprobe link per attach group wherever a functional probe links one (under
+--pid, only where the kernel pid filter covers every thread; the links then name
+the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
+--pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
@@ -307,8 +309,10 @@ selects what run may do to its own child while it observes loading: never (defau
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
-multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+multi-uprobe link per attach group wherever a functional probe links one (under
+--pid, only where the kernel pid filter covers every thread; the links then name
+the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
+--pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
@@ -339,8 +343,10 @@ selects what run may do to its own child while it observes loading: never (defau
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
-multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+multi-uprobe link per attach group wherever a functional probe links one (under
+--pid, only where the kernel pid filter covers every thread; the links then name
+the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
+--pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
@@ -372,8 +378,10 @@ selects what run may do to its own child while it observes loading: never (defau
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
-multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+multi-uprobe link per attach group wherever a functional probe links one (under
+--pid, only where the kernel pid filter covers every thread; the links then name
+the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
+--pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
@@ -403,8 +411,10 @@ selects what run may do to its own child while it observes loading: never (defau
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
-multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+multi-uprobe link per attach group wherever a functional probe links one (under
+--pid, only where the kernel pid filter covers every thread; the links then name
+the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
+--pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
@@ -433,8 +443,10 @@ selects what run may do to its own child while it observes loading: never (defau
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
-multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+multi-uprobe link per attach group wherever a functional probe links one (under
+--pid, only where the kernel pid filter covers every thread; the links then name
+the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
+--pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
@@ -464,8 +476,10 @@ selects what run may do to its own child while it observes loading: never (defau
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group on kernels 6.9+ and per-offset links below,
-multi forces multi (needs 6.6+), singles forces per-offset. Dynamic loader and
+multi-uprobe link per attach group wherever a functional probe links one (under
+--pid, only where the kernel pid filter covers every thread; the links then name
+the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
+--pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
@@ -2500,8 +2514,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 4357);
-        assert_eq!(hash, 0x34b4b83f_6e1799bd);
+        assert_eq!(USAGE.len(), 4521);
+        assert_eq!(hash, 0xff1ef03b_58fc47b9);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

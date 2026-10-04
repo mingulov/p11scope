@@ -41,12 +41,13 @@ capture, and a consumer must dispatch on the top-level `lane` field
 
 - The **profile** lane (`render::profile_json`, verdict
   `verdict_with_selection(true)`) embeds `versioned_evidence`: the full base
-  set plus the four profile-only fields `interface_selection`,
-  `attach_mechanisms`, `pid_descendant_gaps`, and `multi_rebuild_gaps`. Its
+  set plus the five profile-only fields `interface_selection`,
+  `attach_mechanisms`, `attach_backend`, `pid_descendant_gaps`, and
+  `multi_rebuild_gaps`. Its
   verdict is selection-aware: a descendant gap, a rebuild gap, or any
   selection loss forces `PARTIAL`.
 - The **metrics** lane (`render::json`, verdict
-  `verdict_with_selection(false)`) embeds `Evidence` directly, so the four
+  `verdict_with_selection(false)`) embeds `Evidence` directly, so the five
   `#[serde(skip)]` profile-only fields above are absent. Its verdict is
   selection-blind by construction: the same capture that reads `PARTIAL` as
   profile over a descendant gap reads `COMPLETE`-eligible as metrics, with no
@@ -114,6 +115,26 @@ result (a null table output) is handled uniformly with nonzero `rv`: null
 `attach_mechanisms` is a sorted, duplicate-free subset of `per-offset` and
 `uprobe-multi`, derived only from successfully owned links. Before the
 uprobe-multi attachment slice, a nonempty array can contain only `per-offset`.
+
+`attach_backend` says how the session chose its static attach backend, as
+the inventory document's `observation.attach` does. The backend is chosen by
+functional probes, never by the kernel version:
+- `selection`: the operator's `--attach-backend` (`auto`, `multi` or
+  `singles`).
+- `fallback`: why `auto` runs per-offset links instead of uprobe-multi, else
+  `null`. The reason is built from fixed text and the kernel's error. It
+  never names a provider path or a process. Three cases produce one: the
+  uprobe-multi functional probe failed; under `--pid`, the kernel pid filter
+  was not proven; or the kernel refused the uprobe-multi attach.
+- `scope_filter`: under `--pid`, what keeps other processes out of the static
+  probes besides the in-BPF PID guard. It is `kernel-pid+bpf` when the
+  uprobe-multi links name the target, which the probe allows only after it
+  proves that the kernel pid filter covers every thread of the named process
+  and no other process. It is `perf-task+bpf` when each per-offset link is
+  bound to the target's task. It is `null` under `--cgroup` and `--system`,
+  where links are process-wide and the in-BPF scope gate decides.
+
+A PID-scoped uprobe-multi link never names pid 0.
 
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation

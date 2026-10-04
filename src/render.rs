@@ -381,6 +381,34 @@ impl CaptureFacts {
     }
 }
 
+/// How the classic session attached its static probes (DR-CLASSIC-PID0),
+/// as the native inventory lane's `observation.attach` spells it.
+/// Profile lane only (`evidence.attach_backend`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AttachBackendEvidence {
+    /// The operator's `--attach-backend`: `auto`, `multi` or `singles`.
+    pub selection: &'static str,
+    /// Why `auto` runs per-offset links (a failed functional probe, or a
+    /// uprobe-multi attach the kernel refused), else `None`.
+    pub fallback: Option<String>,
+    /// Under `--pid`, what keeps other processes out of the static probes
+    /// besides the in-BPF PID guard: `kernel-pid+bpf` (uprobe-multi links
+    /// name the target; the kernel pid filter was proven) or
+    /// `perf-task+bpf` (per-offset links bound to the target's task);
+    /// `None` under cgroup and system scope.
+    pub scope_filter: Option<&'static str>,
+}
+
+impl Default for AttachBackendEvidence {
+    fn default() -> Self {
+        Self {
+            selection: "auto",
+            fallback: None,
+            scope_filter: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct InterfaceSelection {
     pub providers: Vec<SelectionProvider>,
@@ -798,6 +826,8 @@ pub struct Evidence {
     pub interface_selection: InterfaceSelection,
     #[serde(skip)]
     pub attach_mechanisms: Vec<&'static str>,
+    #[serde(skip)]
+    pub attach_backend: AttachBackendEvidence,
     #[serde(skip)]
     pub pid_descendant_gaps: u64,
     #[serde(skip)]
@@ -2033,6 +2063,10 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
         "attach_mechanisms".into(),
         serde_json::json!(ev.attach_mechanisms),
     );
+    object.insert(
+        "attach_backend".into(),
+        serde_json::to_value(&ev.attach_backend).expect("attach backend evidence serializes"),
+    );
     object.insert("pid_descendant_gaps".into(), ev.pid_descendant_gaps.into());
     object.insert("multi_rebuild_gaps".into(), ev.multi_rebuild_gaps.into());
     evidence
@@ -2542,6 +2576,7 @@ pub(crate) mod tests {
             loader_discovery: LoaderDiscovery::default(),
             interface_selection: InterfaceSelection::default(),
             attach_mechanisms: vec![],
+            attach_backend: Default::default(),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             unprotected_live_windows: 0,
@@ -2611,6 +2646,10 @@ pub(crate) mod tests {
             profile["evidence"]["attach_mechanisms"],
             serde_json::json!([])
         );
+        assert_eq!(
+            profile["evidence"]["attach_backend"],
+            serde_json::json!({"selection": "auto", "fallback": null, "scope_filter": null})
+        );
         assert_eq!(profile["evidence"]["pid_descendant_gaps"], 0);
         assert_eq!(profile["evidence"]["multi_rebuild_gaps"], 0);
 
@@ -2619,6 +2658,7 @@ pub(crate) mod tests {
         for field in [
             "interface_selection",
             "attach_mechanisms",
+            "attach_backend",
             "pid_descendant_gaps",
             "multi_rebuild_gaps",
         ] {

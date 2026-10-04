@@ -754,12 +754,8 @@ impl InventoryLinkIo for AyaInventoryLinkIo<'_> {
         // admitted Multi) keeps the breakpoint and the program out of
         // every other process, including one that reuses the PID; the
         // in-BPF PID_FILTER guard in `scope_auth` stays as a second check.
-        let pid = match self.entry_scope {
-            UProbeScope::AllProcesses => crate::attach::multi_link_pid(),
-            UProbeScope::OneProcess(pid) => pid.get(),
-            // Never widen to pid 0 for a scope that names one process.
-            UProbeScope::CallingProcess => std::process::id(),
-        };
+        // One rule with the classic session (`multi_link_pid`).
+        let pid = crate::attach::multi_link_pid(self.entry_scope);
         let (links, refused) = p11scope_bpf_multi::bisect_attach_counted(
             &mut |slice| {
                 let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();

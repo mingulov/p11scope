@@ -209,9 +209,12 @@ STANDARD_EXPORT_STATUS = {
 }
 ATTACH_MECHANISMS = {"per-offset", "uprobe-multi"}
 PROFILE_V3_FIELDS = {
-    "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
-    "multi_rebuild_gaps",
+    "interface_selection", "attach_mechanisms", "attach_backend",
+    "pid_descendant_gaps", "multi_rebuild_gaps",
 }
+ATTACH_BACKEND_KEYS = {"selection", "fallback", "scope_filter"}
+ATTACH_SELECTIONS = {"auto", "multi", "singles"}
+SCOPE_FILTERS = {None, "kernel-pid+bpf", "perf-task+bpf"}
 RESIDUAL_EVIDENCE_KEYS = {
     # F-02: settlement latch + terminal verdict detail.
     "drain_proven", "verdict_detail",
@@ -558,6 +561,30 @@ def exact_kernel_control(evidence):
                 "kernel control loss must be a concrete PARTIAL gap")
 
 
+def exact_attach_backend(backend, mechanisms, document, *, terminal=False):
+    """DR-CLASSIC-PID0: the closed backend-selection disclosure."""
+    exact_keys(backend, ATTACH_BACKEND_KEYS, "attach_backend")
+    require(backend["selection"] in ATTACH_SELECTIONS, f"invalid attach selection: {backend!r}")
+    fallback = backend["fallback"]
+    require(
+        fallback is None or (isinstance(fallback, str) and fallback and len(fallback) <= 1024
+                             and "/" not in fallback),
+        f"invalid attach fallback: {fallback!r}",
+    )
+    require(fallback is None or backend["selection"] == "auto",
+            f"only auto falls back: {backend!r}")
+    require(fallback is None or "uprobe-multi" not in mechanisms,
+            f"a fallback session attached uprobe-multi: {backend!r} {mechanisms!r}")
+    scope_filter = backend["scope_filter"]
+    require(scope_filter in SCOPE_FILTERS, f"invalid scope filter: {backend!r}")
+    require(scope_filter != "kernel-pid+bpf" or fallback is None,
+            f"a kernel pid filter with a fallback: {backend!r}")
+    if not terminal:
+        pid_scope = document["capture"]["scope"] == "pid"
+        require((scope_filter is not None) == pid_scope,
+                f"scope filter disagrees with the capture scope: {backend!r}")
+
+
 def exact_profile_v3_selection(document, *, terminal=False, run=False):
     """Validate the closed, bounded profile-v3 selection/privacy extension."""
     if not terminal:
@@ -574,10 +601,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     exact_kernel_control(evidence)
     exact_task_uprobe_link_losses(evidence)
     exact_terminal_verdict(evidence)
-    missing = {
-        "interface_selection", "attach_mechanisms", "pid_descendant_gaps",
-        "multi_rebuild_gaps",
-    } - set(evidence)
+    missing = PROFILE_V3_FIELDS - set(evidence)
     require(not missing, f"missing profile-v3 evidence: {sorted(missing)}")
     selection = evidence["interface_selection"]
     exact_keys(selection, SELECTION_KEYS, "interface_selection")
@@ -693,6 +717,7 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
         (not mechanisms) == (evidence["attached_probes"] == 0),
         f"attach mechanisms disagree with attached probes: {mechanisms!r}",
     )
+    exact_attach_backend(evidence["attach_backend"], mechanisms, document, terminal=terminal)
     for field in ("pid_descendant_gaps", "multi_rebuild_gaps"):
         uint(evidence[field], U64_MAX, field)
     loss = (
@@ -3138,6 +3163,10 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             "tuples": [], "selection_truncated": False,
         })
         evidence.setdefault("attach_mechanisms", [] if evidence["attached_probes"] == 0 else ["per-offset"])
+        # The fixture's capture scope is `pid` (below), behind per-offset links.
+        evidence.setdefault("attach_backend", {
+            "selection": "auto", "fallback": None, "scope_filter": "perf-task+bpf",
+        })
         evidence.setdefault("pid_descendant_gaps", 0)
         evidence.setdefault("multi_rebuild_gaps", 0)
     elif schema in (METRICS_SCHEMA, HISTORICAL_METRICS_SCHEMA):
@@ -4140,6 +4169,10 @@ def self_test():
         for scope in ("pid", "cgroup", "system"):
             candidate = copy.deepcopy(live_document)
             candidate["capture"]["scope"] = scope
+            if "attach_backend" in candidate["evidence"]:
+                candidate["evidence"]["attach_backend"]["scope_filter"] = (
+                    "perf-task+bpf" if scope == "pid" else None
+                )
             validator(candidate)
         for invalid in (
             None, False, 4242, ["pid"], {"scope": "pid"}, "",
@@ -4324,6 +4357,47 @@ def self_test():
         candidate = copy.deepcopy(selection_doc)
         candidate["evidence"]["attach_mechanisms"] = mechanisms
         rejected(lambda candidate=candidate: exact_profile_v3_selection(candidate))
+    # DR-CLASSIC-PID0: the attach-backend disclosure is closed and consistent.
+    for backend, mechanisms in (
+        ({"selection": "auto", "fallback": None, "scope_filter": "kernel-pid+bpf"},
+         ["uprobe-multi"]),
+        ({"selection": "auto", "fallback": "uprobe-multi under --pid needs a proven kernel "
+          "pid filter: the kernel uprobe-multi pid filter fired for 1 of 2 threads",
+          "scope_filter": "perf-task+bpf"}, ["per-offset"]),
+        ({"selection": "singles", "fallback": None, "scope_filter": "perf-task+bpf"},
+         ["per-offset"]),
+        ({"selection": "multi", "fallback": None, "scope_filter": "kernel-pid+bpf"},
+         ["per-offset", "uprobe-multi"]),
+    ):
+        candidate = copy.deepcopy(selection_doc)
+        candidate["evidence"]["attach_backend"] = backend
+        candidate["evidence"]["attach_mechanisms"] = mechanisms
+        exact_profile_v3_selection(candidate)
+    for backend, mechanisms in (
+        ({"selection": "auto", "fallback": None}, ["per-offset"]),
+        ({"selection": "auto", "fallback": None, "scope_filter": None, "pid": 1},
+         ["per-offset"]),
+        ({"selection": "always", "fallback": None, "scope_filter": "perf-task+bpf"},
+         ["per-offset"]),
+        ({"selection": "auto", "fallback": "", "scope_filter": "perf-task+bpf"},
+         ["per-offset"]),
+        ({"selection": "auto", "fallback": "attach /usr/lib/provider.so refused",
+          "scope_filter": "perf-task+bpf"}, ["per-offset"]),
+        ({"selection": "singles", "fallback": "probe failed", "scope_filter": "perf-task+bpf"},
+         ["per-offset"]),
+        ({"selection": "auto", "fallback": "probe failed", "scope_filter": "perf-task+bpf"},
+         ["uprobe-multi"]),
+        ({"selection": "auto", "fallback": "probe failed", "scope_filter": "kernel-pid+bpf"},
+         ["per-offset"]),
+        ({"selection": "auto", "fallback": None, "scope_filter": "kernel-pid"},
+         ["per-offset"]),
+        ({"selection": "auto", "fallback": None, "scope_filter": None}, ["per-offset"]),
+    ):
+        candidate = copy.deepcopy(selection_doc)
+        candidate["evidence"]["attach_backend"] = backend
+        candidate["evidence"]["attach_mechanisms"] = mechanisms
+        rejected(lambda candidate=candidate: exact_profile_v3_selection(candidate))
+    print("profile-v3 attach backend disclosure is closed and consistent: OK")
     two_modules = copy.deepcopy(selection_doc)
     two_modules["evidence"]["discovery"].append(copy.deepcopy(two_modules["evidence"]["discovery"][0]))
     two_modules["evidence"]["interface_selection"]["inventory_surfaces"][1]["module"] = 1

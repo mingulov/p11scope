@@ -642,6 +642,7 @@ mod tests {
             loader_discovery: render::LoaderDiscovery::default(),
             interface_selection: render::InterfaceSelection::default(),
             attach_mechanisms: vec![],
+            attach_backend: Default::default(),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             unprotected_live_windows: 0,

@@ -120,6 +120,11 @@ elif operation == "create":
     identity = f'{current["count"]:064d}'
     current["ids"][identity] = name
     current["names"][name] = identity
+    mounts = [arguments[i + 1] for i, value in enumerate(arguments[:-1]) if value == "-v"]
+    for mount in mounts:
+        parts = mount.split(":")
+        if len(parts) >= 2 and parts[1] in ("/src", "/receipt"):
+            current.setdefault("mounts", {}).setdefault(identity, {})[parts[1]] = parts[0]
     if "--network" in arguments:
         network = arguments[arguments.index("--network") + 1]
         if network not in current["networks"]:
@@ -139,6 +144,17 @@ elif operation == "inspect":
 elif operation == "start":
     if len(arguments) != 3 or arguments[1] != "-a" or resolve(arguments[-1]) is None:
         refuse("unsupported start or absent container")
+    # A build container that mounts /receipt leaves the approved Alpine
+    # closure there, as the pinned image does: the fixture reads it from
+    # the production script's own heredoc, so the driver's cmp still runs.
+    mounted = current.get("mounts", {}).get(resolve(arguments[-1]), {})
+    if "/src" in mounted and "/receipt" in mounted:
+        script = Path(mounted["/src"]) / "scripts/verify-discover-containers.sh"
+        text = script.read_text()
+        marker = 'cat > "$DISCOVER_WORK/musl-apk-expected.txt" <<\'EOF\'\n'
+        if marker in text:
+            closure = text.split(marker, 1)[1].split("\nEOF\n", 1)[0] + "\n"
+            (Path(mounted["/receipt"]) / "musl-apk-info.txt").write_text(closure)
     if not current["mutated"] and CONFIG.get("mutation"):
         if CONFIG["mutation"] == "tree":
             with Path(CONFIG["prepared_source"]).open("a") as stream:

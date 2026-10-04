@@ -1916,7 +1916,10 @@ impl ConfirmIo for PoolIo<'_> {
     }
 }
 
-const WIDE_LIBS: u64 = 6;
+/// Enough wide libs that both `wide(true)` (132 entries) and
+/// `wide(false)` (130) reach the pool: the pooled-equivalence tests below
+/// are vacuous unless the pool engages.
+const WIDE_LIBS: u64 = 64;
 
 /// A caller (or, without the provider, an idle process) mapping enough
 /// candidate ranges for its proof batch to reach the pool.
@@ -2002,9 +2005,10 @@ fn the_pool_confirms_and_stats_exactly_like_one_thread() {
         );
         (confirmed, unpinned)
     };
-    for ceiling in [0, 1, 5, 9, 15, 16, 1_000] {
+    let full = entries.len() as u64;
+    for ceiling in [0, 1, 5, 9, 15, full - 1, full, 1_000] {
         let serial = run(None, ceiling);
-        if ceiling >= 16 {
+        if ceiling >= full {
             assert!(matches!(serial.0, Confirmation::Confirmed(_)));
         } else {
             assert!(matches!(
@@ -2012,7 +2016,7 @@ fn the_pool_confirms_and_stats_exactly_like_one_thread() {
                 Confirmation::Lost(AttributionLoss::Budget, _)
             ));
         }
-        assert_eq!(serial.1.len() as u64, ceiling.min(16));
+        assert_eq!(serial.1.len() as u64, ceiling.min(full));
         for threads in 1..=MAX_PROOF_STAT_THREADS {
             ProofStatPool::scoped(threads, |pool| {
                 assert_eq!(

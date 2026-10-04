@@ -28,8 +28,11 @@ use std::sync::{Arc, mpsc};
 pub(crate) const MAX_PROOF_STAT_THREADS: usize = 4;
 
 /// Batches smaller than this stay on the caller: dispatching costs more
-/// than it saves.
-pub(crate) const MIN_PARALLEL_BATCH: usize = 8;
+/// than it saves. Measured (exp-pass-profile, 4,096 processes): one
+/// `fstatat` is ~3.4 us while one pid's channel round-trip costs ~85 us
+/// at 2 threads and more at 4, so batches under ~51 ranges lose; 128
+/// keeps the pool for monster mappings with clear margin.
+pub(crate) const MIN_PARALLEL_BATCH: usize = 128;
 
 /// Each worker's stack: the stat path is shallow.
 const WORKER_STACK_BYTES: usize = 256 << 10;
@@ -232,12 +235,14 @@ mod tests {
                 for n in [
                     0,
                     1,
-                    MIN_PARALLEL_BATCH as u64 - 1,
-                    MIN_PARALLEL_BATCH as u64,
                     9,
                     30,
                     31,
                     97,
+                    MIN_PARALLEL_BATCH as u64 - 1,
+                    MIN_PARALLEL_BATCH as u64,
+                    MIN_PARALLEL_BATCH as u64 + 1,
+                    192,
                 ] {
                     let input = ranges(n);
                     let fake = Fake::new();
@@ -260,7 +265,7 @@ mod tests {
     fn a_large_batch_uses_the_workers() {
         ProofStatPool::scoped(MAX_PROOF_STAT_THREADS, |pool| {
             let fake = Fake::new();
-            stat_batch(pool, fake.clone(), &ranges(64));
+            stat_batch(pool, fake.clone(), &ranges(192));
             assert!(fake.threads.lock().unwrap().len() > 1);
         });
     }
@@ -283,7 +288,7 @@ mod tests {
             }
         }
         ProofStatPool::scoped(MAX_PROOF_STAT_THREADS, |pool| {
-            let input = ranges(40);
+            let input = ranges(192);
             let flaky = Arc::new(Flaky {
                 inner: Fake::new(),
                 caller: std::thread::current().id(),

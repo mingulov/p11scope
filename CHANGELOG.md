@@ -24,11 +24,13 @@ physical cores with SMT, Linux 7.0, btrfs), not guarantees. See
 - The proof-stat pool (the bounded `map_files` identity-proof workers) now
   engages only for a batch of 128 or more ranges, up from 8. Typical
   per-process batches are 30-45 ranges, so by default a pass behaves like the
-  serial path. On that host the pool's per-process channel round-trips cost
-  about 350 ms per 4,096-process pass at 2 CPUs and more at 4 CPUs, more than
-  the `fstatat` work they parallelized. Results are identical by
-  construction; only wall time changes. The M1 pass time in the known
-  limitations was measured on v0.2.0; a v0.2.1 re-measure is pending.
+  serial path. A quiet-window A/B of v0.2.0 against v0.2.1 at 4,096
+  processes saved about 230 ms per pass at 2 CPUs (1,797 ms vs 1,568 ms
+  pass p95) and about 625 ms at 4 CPUs (2,220 ms vs 1,595 ms), nearly
+  all of it in the confirm stage; the 2-CPU gain is smaller than the
+  indicative experiment's ~350 ms. Results are identical by
+  construction; only wall time changes. See the M1 and R4 rows in the
+  known limitations for the full ranges.
 
 ## [0.2.0] - 2026-10-04
 

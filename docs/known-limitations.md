@@ -3,20 +3,25 @@
 
 User-facing limits of p11scope v0.2.1, a point release on v0.2.0 (cut
 2026-10-04 from merged and green `s2s3-semantics`). v0.2.1 changes only the
-proof-stat pool threshold and the `-o` JSON write; every measured number
-below, M1 included, was taken on v0.2.0 and a v0.2.1 re-measure is pending. The following move to v0.3.0: C6 (semantics, churn and
+proof-stat pool threshold and the `-o` JSON write. The M1 and R4 rows below
+were re-measured on v0.2.1 in a quiet window on 2026-10-05; every other
+measured number is still the v0.2.0 value. The following move to v0.3.0: C6 (semantics, churn and
 capacity, 30-minute endurance), C5b (cgroup/pod scope, namespace-aware BPF
 filter), C7 (V1 call counts, 2 MiB inventory ring, kernel-side identity,
 allowlist-v3, BPF nightly bump), the full measurement set M2–M7, the full §7
 deferred closure, and the §8 Fable audit.
 
 A short measurement tier (M0, M1 at 4,096 processes, M4 churn, and the C5.6
-pool) ran on release day; its numbers are in the M0, M1, M4 and R4 rows
-below. Method for every row: Linux 7.0 x86-64, observer pinned to CPUs
-10,11 (R4: 8–11), 3 cold + 6 warm samples per cell (M4: 3 + 3), each a
-30 s run (M4: 60 s), in a quiet window (load gate 4.0), on the v0.2.0
-candidate b16c858 (glibc release build; the shipped observer is musl
-static-pie). Ranges below are the min..max of per-sample p95.
+pool) ran on v0.2.0 release day; its numbers are in the M0, M1, M4 and R4
+rows below, with M1 and R4 since re-measured on v0.2.1 as noted in those
+rows. Method for every row: Linux 7.0 x86-64, observer pinned to CPUs
+10,11 (R4: 8–11, plus a v0.2.1 cell on 10,11), 3 cold + 6 warm samples
+per cell (M4: 3 + 3; v0.2.1 R4 at 2 CPUs: 5 + 5), each a 30 s run
+(M4: 60 s), in a quiet window (load gate 4.0), on glibc release builds
+(the shipped observer is musl static-pie): the v0.2.0 candidate b16c858
+for the v0.2.0 rows, the v0.2.1 candidate aa62b87 for the re-measured M1
+and R4 rows, the v0.2.0 build 6abd2b7 as the R4 base. Ranges below are
+the min..max of per-sample p95.
 
 ## Kernels and backends
 
@@ -117,20 +122,30 @@ static-pie). Ranges below are the min..max of per-sample p95.
 
 ## System scale and performance
 
-### Pass time at 4,096 processes (M1) — 2.20 s p95, over the 1 s target
+### Pass time at 4,096 processes (M1) — 1.61–1.70 s p95, over the 1 s target
 
 - What the user sees: a 4,096-process / 1,000-caller `--system` pass takes
-  about 2.20 s in both lanes (pass p95, warm-cell medians: native
-  2,202 ms, range 2,184–2,248 ms; scan 2,204 ms, range 2,198–2,708 ms,
-  including one slow sample at 2,708 ms). Native adds no measurable cost
-  over scan. At 448 processes / 300 callers the pass p95 is about 0.34 s
-  in both lanes (native 337 ms, range 335–558 ms, including one sample at
-  558 ms beside elevated host load; scan 335 ms, range 332–340 ms). At
-  4,096 the longest stage is confirm (identity proofs) at ~1.59 s, then
-  sweep at ~0.56 s. RSS peaks at ~69 MiB (native) / ~59 MiB (scan) at
-  4,096 and ~40 MiB / ~18 MiB at 448; FDs peak at 1,051 / 1,012 and
-  350 / 312. Newcomer admission age was not measured in this tier. The
-  < 1 s target at 4,096 is not met.
+  about 1.61 s native and 1.70 s scan on v0.2.1 (pass p95, warm-cell
+  medians: native 1,613 ms, range 1,567–2,418 ms, including one slow
+  sample at 2,418 ms; scan 1,702 ms, range 1,574–1,916 ms). Native adds
+  no measurable cost over scan. At 448 processes / 300 callers the pass
+  p95 is about 0.30 s in both lanes (native 297 ms, range 291–409 ms,
+  including two slow samples at 373 and 409 ms in one unit; scan
+  296 ms, range 290–297 ms). At 4,096 the longest stage is confirm
+  (identity proofs) at ~1.06–1.10 s, then sweep at ~0.52 s. RSS peaks at
+  ~69 MiB (native) / ~59 MiB (scan) at 4,096 and ~40 MiB / ~15 MiB at
+  448; FDs peak at 1,051 / 1,012 and 350 / 312. Newcomer admission age
+  was not measured in this tier. The < 1 s target at 4,096 is not met:
+  the pass is still about 0.6–0.7 s over it.
+- History (v0.2.0): the 4,096 pass p95 was about 2.20 s in both lanes
+  (native 2,202 ms, range 2,184–2,248 ms; scan 2,204 ms, range
+  2,198–2,708 ms, including one slow sample at 2,708 ms); 448 was about
+  0.34 s (native 337 ms, range 335–558 ms; scan 335 ms, range
+  332–340 ms). Absolute pass times shift with host state between
+  campaigns (the same v0.2.0 binary measured 1.80 s at 2 CPUs in the
+  v0.2.1 window against 2.20 s in its own), so the cross-campaign drop
+  overstates the code effect; the interleaved R4 A/B below is the clean
+  measure of it.
 - Kernels/conditions: `--system --capture scan` and `native` at 448 / 4,096
   processes, churn 0, 3 cold + 6 warm 30 s samples per cell.
 - Disclosure: `P11SCOPE_STAGE_TIMINGS=1` per-pass stage timings, the
@@ -139,36 +154,43 @@ static-pie). Ranges below are the min..max of per-sample p95.
 - Planned: the 1 s route is v0.3.0 kernel-side identity (C7). M1 at 10,000
   and the ≤15%-over-scan gate move to v0.3.0 with it.
 
-### Proof-stat pool benefit (C5.6 R4) — v0.2.1: serial below 128 ranges
+### Proof-stat pool benefit (C5.6 R4) — v0.2.1 serial below 128 ranges: −230 ms at 2 CPUs, −625 ms at 4 CPUs
 
 - What the user sees: since v0.2.1 the bounded per-collection `map_files`
   proof pool (at most 3 scoped workers) engages only for a batch of 128 or
   more ranges (`MIN_PARALLEL_BATCH`, was 8). Typical per-process batches
   are 30–45 ranges, so by default a pass behaves like the serial path.
   Results are identical by construction; only wall time differs. Why: on
-  the author's host (2 physical cores with SMT, Linux 7.0, btrfs; indicative
-  single-host measurements) the channel round-trip per process (~85 us)
-  cost more than the ~114 us of `fstatat` it parallelized. A same-tree
-  ABBA A/B at 4,096 processes measured serial confirm at ~960 ms against
-  ~1,310 ms pooled at 2 CPUs (about 350 ms per pass lost to the pool) and
-  1,700–2,600 ms at 4 CPUs. The M1 pass time above was measured on v0.2.0;
-  a v0.2.1 re-measure is pending and no v0.2.1 number is claimed here.
+  the author's host (2 physical cores with SMT, Linux 7.0, btrfs) the
+  channel round-trip per process (~85 us) cost more than the ~114 us of
+  `fstatat` it parallelized. A clean same-history A/B (v0.2.1 aa62b87
+  against v0.2.0 6abd2b7, interleaved, scan lane, 4,096 processes)
+  measured, as pass p95 warm-cell medians: at 2 CPUs (10,11) 1,797 ms
+  pooled vs 1,568 ms serial (ranges 1,761–1,818 ms and 1,536–1,925 ms,
+  the serial range including one slow sample at 1,925 ms), a gain of
+  about 230 ms per pass, nearly all of it in confirm (1,249 ms vs
+  1,041 ms); at 4 CPUs (8–11) 2,220 ms pooled vs 1,595 ms serial (ranges
+  2,178–2,240 ms and 1,559–1,839 ms, including one slow serial sample at
+  1,839 ms), a gain of about 625 ms per pass, nearly all of it in
+  confirm (1,672 ms vs 1,058 ms). Sweep is unchanged within noise.
+  The 2-CPU gain is
+  smaller than the indicative experiment's ~350 ms on a hotter host; the
+  4-CPU gain matches its "more at 4 CPUs".
 - History (v0.2.0): scan pass p95 at 4,096 processes was ~2.30 s with the
   v0.2.0 candidate (warm median 2,309 ms, range 2,282–2,329 ms) against
   ~2.02 s with the pre-pool build 570eb7d (warm median 2,035 ms, range
   2,031–2,087 ms). That was not a clean A/B (570eb7d predates other
-  slices); the later same-tree A/B above is the cleaner answer: the pool
-  did not help on this shape.
+  slices); the same-history campaign A/B above is the clean answer: the
+  pool did not help on this shape.
 - Kernels/conditions: `--system` with maps-matched callers past the
-  deep-scan cap, scan lane on CPUs 8–11 (2 physical cores with SMT), on
-  kernels where `map_files` proofs run. The pool can still engage for a
-  process mapping 128 or more examined ranges; its benefit there is not
-  measured.
+  deep-scan cap, scan lane on CPUs 8–11 (2 physical cores with SMT) and
+  on CPUs 10,11 for the v0.2.1 2-CPU cell, on kernels where `map_files`
+  proofs run. The pool can still engage for a process mapping 128 or more
+  examined ranges; its benefit there is not measured.
 - Disclosure: stage timings (`confirm`), this row.
 - Workaround: none needed; small batches are serial.
-- Planned: v0.2.1 re-measures M1. Cross-pass caching stays out
-  (R-C56-1: inode reuse makes it unsound); kernel-side identity is
-  v0.3.0 (C7).
+- Planned: Cross-pass caching stays out (R-C56-1: inode reuse makes it
+  unsound); kernel-side identity is v0.3.0 (C7).
 
 ### Harness validity (M0) — PASS
 
@@ -176,7 +198,8 @@ static-pie). Ranges below are the min..max of per-sample p95.
   tier-1 units valid): a correct ledgered SoftHSM2 `--pid` capture, an
   induced-loss cell (3,000 exec/s) read as lossy, a killed-sampler cell
   read as missing, a dead-pid refusal read as refused, and a correct
-  no-observer control.
+  no-observer control. The v0.2.1 M1/R4 campaign re-ran the same gate:
+  PASS, 43 of 43 units valid on the first attempt.
 - Kernels/conditions: candidate binary, quiet host, one 30 s sample per
   leg (64-process cells; loss and control in the host namespace).
 - Disclosure: campaign receipt; invalid runs are kept with reasons.

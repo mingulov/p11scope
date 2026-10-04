@@ -1002,7 +1002,6 @@ fn read_proc_stat(pid: u32) -> io::Result<String> {
 /// The read loop behind [`read_proc_stat`], over any reader so the
 /// interrupted-read retry is unit-testable without `/proc`.
 fn read_stat_bytes<R: io::Read>(mut file: R) -> io::Result<String> {
-    use std::io::Read as _;
     const STAT_BUF_BYTES: usize = 4096;
     let mut buf = [0u8; STAT_BUF_BYTES];
     let mut len = 0;

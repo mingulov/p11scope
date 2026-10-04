@@ -654,11 +654,18 @@ fn finish_output(
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     if let Some(mut sink) = sink {
-        serde_json::to_writer_pretty(sink.file(), &document)?;
-        // Same bytes stdout carries: the pretty document plus its
-        // trailing newline, so the two sinks agree byte for byte.
-        sink.file().write_all(b"\n")?;
-        sink.file().flush()?;
+        // Buffered: serde_json writes a few bytes at a time (a 1.6 MB
+        // inventory was ~557k write syscalls unbuffered). Same bytes;
+        // the buffer is flushed to the temp file before commit.
+        {
+            let mut buffered =
+                std::io::BufWriter::with_capacity(crate::sink::SINK_BUFFER_BYTES, sink.file());
+            serde_json::to_writer_pretty(&mut buffered, &document)?;
+            // Same bytes stdout carries: the pretty document plus its
+            // trailing newline, so the two sinks agree byte for byte.
+            buffered.write_all(b"\n")?;
+            buffered.flush()?;
+        }
         sink.commit().map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     if json {

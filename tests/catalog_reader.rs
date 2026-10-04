@@ -653,13 +653,37 @@ fn catalog_reader_finds_every_fixture_object() {
             .contains("manifest"),
         "scan-only note must disclaim the manifest"
     );
+    // The summary totals count every catalog object, ambient ones
+    // included, so they are pinned to the per-object records rather than
+    // to a machine-dependent number.
+    let objects = doc["objects"].as_array().unwrap();
+    let in_state = |state: &str| {
+        objects
+            .iter()
+            .filter(|object| object["admission"]["state"] == state)
+            .count() as u64
+    };
+    assert_eq!(doc["admission"]["admitted"], in_state("admitted"));
+    assert_eq!(doc["admission"]["refused"], in_state("refused"));
     assert!(doc["admission"]["refused"].as_u64().unwrap() >= 2);
-    // N/C are refused on every machine (their endpoints exceed the whole
-    // 512-slot budget alone); T/H are admitted on every machine (zero
-    // endpoints always fit). B/M admission is ambient-sensitive, hence
-    // the strict gate.
-    assert!(doc["admission"]["admitted"].as_u64().unwrap() >= if strict { 6 } else { 2 });
-    for object in doc["objects"].as_array().unwrap() {
+    // Fixture-owned admissions only: an ambient same-uid process keeps its
+    // maps readable under ptrace_scope=1, so a desktop's libp11-kit is
+    // cataloged and admitted at 0 endpoints, while a hosted runner maps
+    // none. N/C are refused on every machine (their endpoints exceed the
+    // whole 512-slot budget alone); T/H are admitted on every machine
+    // (zero endpoints always fit). B/M admission is ambient-sensitive,
+    // hence the strict gate.
+    assert_eq!(h["admission"]["state"], "admitted");
+    let fixture_admitted = [b, m, t, h]
+        .iter()
+        .filter(|object| object["admission"]["state"] == "admitted")
+        .count();
+    if strict {
+        assert_eq!(fixture_admitted, 4, "B, M, T and H must all be admitted");
+    } else {
+        assert!(fixture_admitted >= 2, "T and H must be admitted");
+    }
+    for object in objects {
         assert_eq!(object["admission"]["scan_only"], true);
         assert!(object["admission"]["state"].is_string());
         assert!(object["admission"]["class"].is_string());

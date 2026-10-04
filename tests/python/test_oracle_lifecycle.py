@@ -4,6 +4,8 @@
 import math
 import os
 from pathlib import Path
+import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -20,9 +22,11 @@ CLEANUP = ROOT / "scripts/matrix/oracle-cgroup-cleanup.py"
 FIXTURE = ROOT / "tests/fixtures/oracle-lifecycle/scenarios.sh"
 # SLACK bounds (waits whose expiry can only mean failure) scale with
 # P11SCOPE_TEST_TIME_SCALE, as in test_lane13_evidence.py. SEMANTIC bounds
-# a case asserts (the owned-child wait deadline, the hung-descendant and
-# wait-query elapsed budgets, the cleanup helper's kill deadline, and the
-# negative no-EOF probes) stay literal.
+# a case asserts (the owned-child wait deadline, the wait-query elapsed
+# budget, the cleanup helper's kill deadline, and the negative no-EOF
+# probes) stay literal. Hung-descendant promptness is not timed at all: the
+# case asserts the exact poll/sleep sequence of the product loops, which no
+# host load can change.
 DEFAULT_TIME_SCALE = 5.0
 
 
@@ -81,6 +85,12 @@ def read_process_identity(path):
     if pid <= 0 or starttime <= 0:
         return None
     return pid, starttime
+
+
+# The product poll loops sleep 0.05 s between live polls; the hung-clients
+# scenario gives its hung child oracle_wait_child's limit of 2 attempts.
+POLL_SLEEP = "sleep 0.05"
+HUNG_WAIT_ATTEMPTS = 2
 
 
 def wait_process_identity(testcase, path, process, timeout=1.0):
@@ -496,23 +506,102 @@ class OracleLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertLess(time.monotonic() - started, 2)
 
-    def test_hung_descendant_is_terminated_reaped_and_closes_capture_pipe(self):
+    def run_hung_descendant_case(self):
+        """Run hung-clients with every product poll and sleep logged.
+
+        Returns the hung child's pid, its hold argument, and the event log:
+        `poll PID LABEL` per liveness poll (poll-log.py interposes the
+        recorded-process helper) and `sleep ARGS` per sleep (a PATH shim
+        that execs the real sleep, so the hold keeps its pid and
+        starttime).
+        """
         with tempfile.TemporaryDirectory() as raw:
-            identity = Path(raw) / "hung.identity"
-            started = time.monotonic()
+            directory = Path(raw)
+            identity = directory / "hung.identity"
+            events = directory / "events.log"
+            shim_dir = directory / "bin"
+            shim_dir.mkdir()
+            real_sleep = shutil.which("sleep")
+            self.assertIsNotNone(real_sleep, "sleep is required")
+            shim = shim_dir / "sleep"
+            shim.write_text(
+                "#!/bin/sh\n"
+                "printf 'sleep %s\\n' \"$*\" >> \"$ORACLE_TEST_EVENT_LOG\"\n"
+                f"exec {shlex.quote(real_sleep)} \"$@\"\n"
+            )
+            shim.chmod(0o700)
+            env = {
+                "ORACLE_TEST_EVENT_LOG": str(events),
+                "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+            }
+            hold = self.fixture_env(env)["ORACLE_TEST_HOLD_SECONDS"]
             # Capturing the fixture's real stdout makes communicate wait for EOF
             # from every inheriting descendant; a leaked sleep cannot be hidden.
-            process = self.start_hung_fixture(identity)
+            process = self.start_hung_fixture(identity, env=env)
             try:
                 pid, starttime = wait_process_identity(self, identity, process)
                 stdout, stderr = process.communicate(timeout=slack(3))
-                elapsed = time.monotonic() - started
                 self.assertEqual(process.returncode, 0, stderr)
                 self.assertEqual(stdout.strip(), "hung=124 observer=1")
-                self.assertLess(elapsed, 2)
                 assert_process_generation_absent(self, pid, starttime)
+                return pid, hold, events.read_text().splitlines()
             finally:
                 self.cleanup_hung_fixture(process, identity)
+
+    def assert_hung_poll_rounds(self, events, hung_pid, hold):
+        """Assert the exact round structure of the hung-clients scenario.
+
+        - hold: exactly one `sleep HOLD` (the hung child).
+        - wait: exactly HUNG_WAIT_ATTEMPTS live polls of the hung child,
+          each followed by exactly one 0.05 s poll sleep, then 124.
+        - terminate: exactly one live check, then KILL (not logged).
+        - reap, then observer wait: each loop ends at its first terminal
+          poll (gone/zombie); any live poll before it, which only the
+          kernel's exit latency can produce, costs exactly one 0.05 s
+          sleep.
+        Nothing else may appear: an added round, an extra or longer sleep,
+        or a poll after the terminal one fails, whatever the host load.
+        """
+        remaining = list(events)
+
+        def take(expected):
+            self.assertTrue(remaining, f"event log ended before {expected}: {events}")
+            return remaining.pop(0)
+
+        def settle(pid, phase):
+            while True:
+                fields = take(f"{phase} poll").split()
+                self.assertEqual(len(fields), 3, f"{phase}: {events}")
+                self.assertEqual(fields[:2], ["poll", pid], f"{phase}: {events}")
+                if fields[2] in ("gone", "zombie"):
+                    return
+                self.assertEqual(fields[2], "live", f"{phase}: {events}")
+                self.assertEqual(take(f"{phase} sleep"), POLL_SLEEP, f"{phase}: {events}")
+
+        hung = str(hung_pid)
+        self.assertEqual(take("hold"), f"sleep {hold}", events)
+        for attempt in range(HUNG_WAIT_ATTEMPTS):
+            self.assertEqual(take(f"wait poll {attempt}"), f"poll {hung} live", events)
+            self.assertEqual(take(f"wait sleep {attempt}"), POLL_SLEEP, events)
+        self.assertEqual(take("terminate check"), f"poll {hung} live", events)
+        settle(hung, "reap")
+        self.assertTrue(remaining, f"observer never polled: {events}")
+        observer = remaining[0].split()[1:2]
+        self.assertNotEqual(observer, [hung], f"hung child polled after reap: {events}")
+        settle(observer[0] if observer else "", "observer")
+        self.assertEqual(remaining, [], f"unexpected trailing events: {events}")
+
+    def test_hung_descendant_is_terminated_reaped_and_closes_capture_pipe(self):
+        # Promptness is structural, not timed: the hung-path wait makes
+        # exactly its 2 attempts, the reap and observer loops stop at the
+        # first terminal poll, and every sleep is one accounted 0.05 s poll
+        # sleep. That catches a hung or round-adding finalization on any
+        # host, where a wall-clock or relative bound could not (a planted
+        # 2 s reap stall slipped past an 8x-of-control bound under load).
+        # A truly hung wait still trips the communicate guard. Every run
+        # proves termination, reaping, and capture-pipe closure.
+        hung_pid, hold, events = self.run_hung_descendant_case()
+        self.assert_hung_poll_rounds(events, hung_pid, hold)
 
     def test_outer_timeout_cleans_published_descendant_and_capture_pipe(self):
         with tempfile.TemporaryDirectory() as raw:

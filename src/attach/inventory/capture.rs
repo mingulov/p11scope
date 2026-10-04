@@ -568,6 +568,18 @@ pub(crate) struct CaptureHealth {
 
 impl CaptureHealth {
     fn from_snapshot(snapshot: InventoryHealthSnapshot, state: &InventoryState) -> Self {
+        Self::from_parts(
+            snapshot,
+            state.malformed_discovery(),
+            state.pin_check_failures(),
+        )
+    }
+
+    fn from_parts(
+        snapshot: InventoryHealthSnapshot,
+        malformed_discovery: u64,
+        pin_check_failures: u64,
+    ) -> Self {
         Self {
             caller_evidence: snapshot.caller_evidence,
             caller_control: snapshot.caller_control,
@@ -576,8 +588,8 @@ impl CaptureHealth {
             discovery_counters: snapshot.discovery_counters,
             owner: snapshot.owner,
             failures: snapshot.failures,
-            malformed_discovery: state.malformed_discovery(),
-            pin_check_failures: state.pin_check_failures(),
+            malformed_discovery,
+            pin_check_failures,
         }
     }
 
@@ -871,17 +883,24 @@ struct CaptureBook {
     stopping: bool,
 }
 
-/// The lifecycle-loss demotion a health read's DISCOVERY counters cause:
-/// ring loss above what was already seen marks lifecycle evidence lost
-/// (custody or watch coverage demoted). Returns the new loss count and
-/// the demotion reason, or `None` when nothing new was lost.
-pub(in crate::attach::inventory) fn ring_loss_demotion(
+/// The one lifecycle-ring loss rule every consumer applies (the capture
+/// book, the native binder, the lane's tally): a health read's DISCOVERY
+/// ring-loss counter above what the consumer already saw is new loss.
+/// Returns the new count, or `None` when nothing new was lost (or the
+/// counters were not read).
+pub(crate) fn ring_loss_rose(seen: u64, counters: Option<[u64; 5]>) -> Option<u64> {
+    let ring_loss = counters?[0];
+    (ring_loss > seen).then_some(ring_loss)
+}
+
+/// The capture book's demotion for [`ring_loss_rose`]: the new count and
+/// the lifecycle-loss reason (custody or watch coverage demoted).
+fn ring_loss_demotion(
     seen: u64,
     counters: Option<[u64; 5]>,
     hidden: &str,
 ) -> Option<(u64, String)> {
-    let ring_loss = counters?[0];
-    (ring_loss > seen).then(|| {
+    ring_loss_rose(seen, counters).map(|ring_loss| {
         (
             ring_loss,
             format!(
@@ -889,6 +908,27 @@ pub(in crate::attach::inventory) fn ring_loss_demotion(
             ),
         )
     })
+}
+
+/// Test seam for the I3a privileged cells' loaded-host mode: one real
+/// health read (`health`, with the usage read's own malformed and pin
+/// counts) through the production consumer of a fresh system-scope
+/// capture book (`CaptureHealth::from_parts`, then `observe_lifecycle`).
+/// Returns the lifecycle-loss mark the book now carries, if any.
+#[cfg(test)]
+pub(in crate::attach::inventory) fn system_book_lifecycle_loss(
+    health: InventoryHealthSnapshot,
+    malformed_discovery: u64,
+    pin_check_failures: u64,
+) -> Option<String> {
+    let budget = InventoryBudget::new(1, 8).expect("a valid one-endpoint budget");
+    let mut book = CaptureBook::new(budget, 1, None, monotonic_ns());
+    book.observe_lifecycle(&CaptureHealth::from_parts(
+        health,
+        malformed_discovery,
+        pin_check_failures,
+    ));
+    book.lifecycle_loss().map(|loss| loss.reason)
 }
 
 impl CaptureBook {

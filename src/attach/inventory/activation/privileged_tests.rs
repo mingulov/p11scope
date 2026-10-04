@@ -8871,11 +8871,16 @@ const LIFECYCLE_LOSS_ENV: &str = "P11SCOPE_PRIV_LIFECYCLE_LOSS";
 /// quiet-host property: under `Scope::System` the ring sees every exec on
 /// the machine, so unrelated host churn can overflow it. Strict by
 /// default (vng guests, quiet hosts). With `P11SCOPE_PRIV_LIFECYCLE_LOSS=
-/// report` (a loaded host) ring loss may occur, but then it must be
-/// reported (the health read carries it in `discovery_counters[0]`, every
-/// other counter still zero) and the production consumer must demote on
-/// exactly this read ([`ring_loss_demotion`]); each tolerated loss prints
-/// `LIFECYCLE_LOSS_REPORTED`, never silently.
+/// report` (a loaded host) ring loss is tolerated only when all of:
+/// - this health read reports it in `discovery_counters[0]`, every other
+///   counter zero;
+/// - the production consumer, fed this very read, demotes: a fresh
+///   system-scope capture book given it through `CaptureHealth::from_parts`
+///   and `observe_lifecycle` carries a lifecycle-loss mark naming that
+///   count ([`super::super::capture::system_book_lifecycle_loss`]).
+///
+/// It does not prove that the run's own records were among those lost.
+/// Each tolerated read prints `LIFECYCLE_LOSS_REPORTED`, never silently.
 fn assert_health(snapshot: &InventoryUsageSnapshot) -> Result<()> {
     assert_non_loss_health(snapshot)?;
     let counters = snapshot
@@ -8893,14 +8898,25 @@ fn assert_health(snapshot: &InventoryUsageSnapshot) -> Result<()> {
          loaded host): {snapshot:?}",
         counters[0]
     );
-    let (lost, reason) = super::super::capture::ring_loss_demotion(
-        0,
-        Some(counters),
-        "an exec or exit of a watched caller",
+    let demoted = super::super::capture::system_book_lifecycle_loss(
+        snapshot.health.clone(),
+        snapshot.malformed_discovery,
+        snapshot.pin_check_failures,
     )
-    .with_context(|| format!("ring loss {} caused no demotion", counters[0]))?;
-    ensure!(lost == counters[0], "{lost} != {}", counters[0]);
-    eprintln!("LIFECYCLE_LOSS_REPORTED ring_loss={lost} demotion={reason:?} mode=report");
+    .with_context(|| {
+        format!(
+            "ring loss {} reported, but the capture consumer did not demote on it",
+            counters[0]
+        )
+    })?;
+    ensure!(
+        demoted.contains(&format!("0 -> {}", counters[0])),
+        "the consumer demoted for another count: {demoted}"
+    );
+    eprintln!(
+        "LIFECYCLE_LOSS_REPORTED ring_loss={} consumer_demotion={demoted:?} mode=report",
+        counters[0]
+    );
     Ok(())
 }
 
@@ -9015,8 +9031,9 @@ fn assert_caller_health(snapshot: &InventoryUsageSnapshot, evidence: [u64; 4]) -
 
 /// Waits for the owned process's lifecycle record. Under
 /// `P11SCOPE_PRIV_LIFECYCLE_LOSS=report` (see [`assert_health`]) a record
-/// that never arrives is accepted only when the health read reports
-/// DISCOVERY ring loss, the honest reason it can be missing.
+/// that never arrives is accepted when the health read reports any
+/// DISCOVERY ring loss: the honest reason it can be missing, though the
+/// loss is not shown to include this record.
 fn await_lifecycle(active: &mut ActiveInventory, pid: u32, kind: u8) -> Result<()> {
     let Err(error) = await_lifecycle_record(active, pid, kind) else {
         return Ok(());

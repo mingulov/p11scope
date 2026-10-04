@@ -48,9 +48,11 @@
 # lifecycle-ring loss by default, a quiet-host property (vng guests, idle
 # hosts). On a loaded host, P11SCOPE_PRIV_LIFECYCLE_LOSS=report (pass it
 # through sudo, e.g. `sudo env P11SCOPE_PRIV_LIFECYCLE_LOSS=report ...`)
-# tolerates ring loss only where it is reported in the health read and the
-# capture's demotion rule fires on it; each such read prints
-# LIFECYCLE_LOSS_REPORTED. Never set it for a guest or qualification run.
+# tolerates ring loss only where the health read reports it (all other
+# counters zero) and the capture's production consumer, fed that read,
+# marks lifecycle loss; a missing owned lifecycle record is accepted on any
+# reported ring loss. Each such read prints LIFECYCLE_LOSS_REPORTED. Never
+# set it for a guest or qualification run.
 #
 # Curation (72 ignored tests in the default-feature lib binary): 61 run by
 # default, 4 run only with --include-long, 7 are statically skipped with a

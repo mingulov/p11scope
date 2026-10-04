@@ -174,6 +174,7 @@ fn workload_fd_worker() {
         "owner-growth-257" => grow_native_owners_to_257(),
         "owner-growth-failure" => inject_native_owner_growth_failure(),
         "pidfd-census" => owned_pidfd_census_classifier(),
+        "system-sweep-release" => system_sweep_releases_its_pins(),
         "oracle-clean" => {
             let owned_directory = std::fs::File::open("/proc/self/fd").unwrap();
             let scope = FdScope::open("isolated clean baseline");
@@ -954,6 +955,83 @@ fn pidfd_open_test(pid: u32) -> Option<std::os::fd::OwnedFd> {
     }
     // SAFETY: the syscall returned a live fd this test owns.
     Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[test]
+fn system_sweep_releases_its_pidfd_pins_on_drop() {
+    // The owned-pidfd census runs in private workers because concurrent
+    // system sweeps transiently pin every live process, ours included.
+    // This is the release side of that premise: a real system-scope
+    // discovery pins the fresh sleepers while its engine lives, and
+    // dropping the engine returns the census to zero. Private worker: no
+    // other sweep can pin these sleepers here.
+    isolated_workload("system-sweep-release");
+}
+
+/// The system-sweep release workload, run in the `system-sweep-release`
+/// worker.
+fn system_sweep_releases_its_pins() {
+    let mut reapers = Vec::new();
+    for _ in 0..2 {
+        reapers.push(ChildReaper(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
+    }
+    let owned: BTreeSet<u32> = reapers.iter().map(|reaper| reaper.0.id()).collect();
+    assert_eq!(
+        count_owned_pidfds_floor(&owned),
+        0,
+        "nothing pins the fresh sleepers yet"
+    );
+    let live = std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .count();
+    let args = crate::cli::CaptureArgs {
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::System,
+        metrics: false,
+        duration: None,
+        out: None,
+        max_events: None,
+        // Under-cap: the sweep admits every live process, both sleepers
+        // included, with headroom for processes born meanwhile.
+        max_scan_pids: Some(live + 256),
+        ring_bytes: None,
+        drain_interval: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: crate::attach::BackendSelection::default(),
+    };
+    let engine =
+        crate::discovery::engine::Engine::discover(&args, &crate::attach::Scope::System, None)
+            .expect("system-scope discovery");
+    let held = count_owned_pidfds_floor(&owned);
+    assert!(
+        held >= owned.len(),
+        "the live system engine pins every fresh sleeper (non-vacuous premise), held {held}"
+    );
+    drop(engine);
+    assert_eq!(
+        count_owned_pidfds_floor(&owned),
+        0,
+        "a dropped system engine releases every pin it took"
+    );
 }
 
 #[test]

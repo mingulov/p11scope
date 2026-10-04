@@ -51,6 +51,12 @@ const DEFAULT_TEST_TIME_SCALE: f64 = 5.0;
 /// approaches it. SEMANTIC bounds (a deadline a case asserts) and
 /// forced-cleanup grace periods stay literal.
 fn slack_timeout(seconds: u64) -> String {
+    format!("{}s", slack_duration(seconds).as_secs())
+}
+
+/// The same SLACK scaling as [`slack_timeout`], as a whole-second
+/// [`std::time::Duration`] for in-process waits.
+fn slack_duration(seconds: u64) -> std::time::Duration {
     let scale = match std::env::var("P11SCOPE_TEST_TIME_SCALE") {
         Ok(raw) if !raw.trim().is_empty() => raw.trim().parse::<f64>().unwrap_or(f64::NAN),
         _ => DEFAULT_TEST_TIME_SCALE,
@@ -61,7 +67,161 @@ fn slack_timeout(seconds: u64) -> String {
     );
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let scaled = (seconds as f64 * scale).ceil() as u64;
-    format!("{scaled}s")
+    std::time::Duration::from_secs(scaled)
+}
+
+/// SLACK hang guard for one runner subprocess (a whole native Python suite
+/// or a helper script): its expiry can only mean a hang.
+const RUNNER_DEADLINE_SECONDS: u64 = 120;
+
+/// A runner child that leads its own process group. While the leader is
+/// unreaped it pins the group id, so `kill(-pgid, SIGKILL)` reaches only
+/// its own tree; dropping an unreaped guard (a panic or an expired
+/// deadline) ends the whole group, stopped members included, then reaps.
+struct GroupChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // SAFETY: process_group(0) made this unreaped child its group's
+            // leader, so the group id cannot have been reused.
+            unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Live (non-zombie) members of process group `pgid` other than `leader`.
+fn group_survivors(pgid: u32, leader: u32) -> Vec<String> {
+    let mut survivors = Vec::new();
+    for entry in fs::read_dir("/proc").expect("/proc is readable").flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == leader {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((head, tail)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let fields: Vec<&str> = tail.split_whitespace().collect();
+        if fields.len() > 2 && fields[2] == pgid.to_string() && !matches!(fields[0], "Z" | "X") {
+            let comm = head.split_once(" (").map_or("", |(_, comm)| comm);
+            survivors.push(format!("pid {pid} state {} ({comm})", fields[0]));
+        }
+    }
+    survivors
+}
+
+/// Run `program args` as its own process-group leader, with a null stdin
+/// (as `Command::output` gives) and a scaled deadline. On every exit path
+/// the whole group is SIGKILLed before the leader is reaped, so no
+/// descendant, stopped or not, outlives the test; members still alive once
+/// the leader has exited are a leak and fail the run.
+fn run_group(program: &str, args: &[&str]) -> std::process::Output {
+    run_group_within(program, args, slack_duration(RUNNER_DEADLINE_SECONDS))
+}
+
+/// [`run_group`] with an explicit deadline.
+fn run_group_within(
+    program: &str,
+    args: &[&str],
+    limit: std::time::Duration,
+) -> std::process::Output {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
+
+    let directory = tempfile::tempdir().expect("runner output directory");
+    let stdout_path = directory.path().join("stdout");
+    let stderr_path = directory.path().join("stderr");
+    let child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&stdout_path).expect("runner stdout file"))
+        .stderr(fs::File::create(&stderr_path).expect("runner stderr file"))
+        .process_group(0)
+        .spawn()
+        .unwrap_or_else(|error| panic!("running {program}: {error}"));
+    let pid = child.id();
+    let mut owned = GroupChild {
+        child,
+        reaped: false,
+    };
+    let deadline = std::time::Instant::now() + limit;
+    let expired = loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: valid output for our own unreaped child; WNOWAIT keeps it
+        // unreaped so the group id stays pinned for the group kill below.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "waiting for {program}: {error}"
+            );
+        } else {
+            // SAFETY: zero-initialized output, filled by successful waitid.
+            if unsafe { info.assume_init().si_pid() } == pid as i32 {
+                break false;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut survivors = Vec::new();
+    if !expired {
+        // A member that is merely finishing gets a short grace to exit.
+        let grace = std::time::Instant::now() + slack_duration(1);
+        loop {
+            survivors = group_survivors(pid, pid);
+            if survivors.is_empty() || std::time::Instant::now() >= grace {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    // SAFETY: the leader is still unreaped, so the group id is still ours.
+    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    let status = owned.child.wait().expect("reap runner leader");
+    owned.reaped = true;
+    let stdout = fs::read(&stdout_path).expect("read runner stdout");
+    let stderr = fs::read(&stderr_path).expect("read runner stderr");
+    assert!(
+        !expired,
+        "{program} {args:?} exceeded its {}s deadline\nstdout:\n{}\nstderr:\n{}",
+        limit.as_secs(),
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        survivors.is_empty(),
+        "{program} {args:?} left live process-group members (now killed): {survivors:?}"
+    );
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 fn read(path: &str) -> String {
@@ -1291,11 +1451,80 @@ fn canary_literals(source: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// Pids of live processes whose argv contains `marker`.
+fn live_with_marker(marker: &str) -> Vec<u32> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc").expect("/proc is readable").flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let state = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let zombie = state
+            .rsplit_once(") ")
+            .is_some_and(|(_, tail)| tail.starts_with('Z') || tail.starts_with('X'));
+        if !zombie && String::from_utf8_lossy(&cmdline).contains(marker) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+#[test]
+fn group_runner_ends_and_reports_leaked_members_and_expired_runs() {
+    // A runner that exits 0 but leaves a live child in its group fails, and
+    // the child is ended. The child stops itself and ignores SIGHUP (as a
+    // nohup'd tree does), so the kernel's orphaned-group SIGHUP+SIGCONT
+    // only resumes it and it survives the leader.
+    let marker = format!("p11scope-group-runner-{}", std::process::id());
+    let leak = format!(
+        "sh -c 'trap \"\" HUP; kill -STOP \"$$\"; sleep 30; : {marker}' \
+         </dev/null >/dev/null 2>&1 & c=$!; i=0; \
+         until grep -q '^State:[[:space:]]*T' /proc/$c/status 2>/dev/null; do \
+         i=$((i + 1)); [ \"$i\" -lt 1000 ] || exit 9; sleep 0.01; done"
+    );
+    let panic = std::panic::catch_unwind(|| run_group("sh", &["-c", &leak]))
+        .expect_err("a leaked member must fail the run");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.contains("left live process-group members"),
+        "{message}"
+    );
+    let settled = std::time::Instant::now() + slack_duration(2);
+    while !live_with_marker(&marker).is_empty() && std::time::Instant::now() < settled {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(live_with_marker(&marker), Vec::<u32>::new());
+
+    // An expired deadline fails the run and ends the whole group.
+    let hang = format!("sh -c 'sleep 30; : {marker}' & sleep 31; : {marker}");
+    let panic = std::panic::catch_unwind(|| {
+        run_group_within("sh", &["-c", &hang], std::time::Duration::from_secs(1))
+    })
+    .expect_err("an expired runner must fail");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or_default();
+    assert!(message.contains("exceeded its 1s deadline"), "{message}");
+    let settled = std::time::Instant::now() + slack_duration(2);
+    while !live_with_marker(&marker).is_empty() && std::time::Instant::now() < settled {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(live_with_marker(&marker), Vec::<u32>::new());
+}
+
 fn run_ok(program: &str, args: &[&str]) -> String {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .unwrap_or_else(|error| panic!("running {program}: {error}"));
+    let output = run_group(program, args);
     assert!(
         output.status.success(),
         "{program} {args:?} exited {}\nstdout:\n{}\nstderr:\n{}",
@@ -10019,10 +10248,7 @@ fn run_native_python_suite(script: &str, class: &str) {
     let _native_suite_guard = NATIVE_SUITE_GATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let output = Command::new("python3")
-        .args(["-I", script, class])
-        .output()
-        .expect("run the complete native Python suite");
+    let output = run_group("python3", &["-I", script, class]);
     let report = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

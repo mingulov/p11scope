@@ -495,10 +495,10 @@ impl LifecycleTally {
     /// Absorbs one witness read's health; true when a loss counter rose.
     fn note_health(&mut self, batch: &WitnessBatch) -> bool {
         let mut rose = false;
-        if let Some(counters) = batch.health.discovery_counters
-            && counters[0] > self.ring_loss
+        if let Some(ring_loss) =
+            crate::attach::capture::ring_loss_rose(self.ring_loss, batch.health.discovery_counters)
         {
-            self.ring_loss = counters[0];
+            self.ring_loss = ring_loss;
             rose = true;
         }
         if batch.health.malformed_discovery > self.malformed {

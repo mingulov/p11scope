@@ -601,7 +601,9 @@ impl NativeBinder {
         let limits = self.limits;
         let state = &mut self.domains[index];
         if let Some(counters) = batch.health.discovery_counters {
-            if counters[0] > state.ring_loss || batch.health.malformed_discovery > state.malformed {
+            if crate::attach::capture::ring_loss_rose(state.ring_loss, Some(counters)).is_some()
+                || batch.health.malformed_discovery > state.malformed
+            {
                 state.note_loss(batch.health_read_ns);
             }
             state.ring_loss = state.ring_loss.max(counters[0]);

@@ -46,16 +46,19 @@ if Path(sys.argv[0]).name == "sudo":
         # Deterministic wrapper custody: stay alive until the test
         # publishes the release file, so the intermediate state (root
         # process cleared, wrapper still owned) is observable no matter
-        # how slow one ownership poll is. A removed release directory
-        # means the test gave up (a failed launch removes its tree),
-        # so exit promptly instead of orphaning the full bound. The
-        # bound only backstops a live test that never releases;
+        # how slow one ownership poll is. A missing release directory
+        # means the test gave up (its EXIT trap removes the tree), so
+        # exit promptly instead of orphaning the full bound. Check it on
+        # every pass, including the first: a test that fails while this
+        # shim is still in subprocess.run or the post-wait removes the
+        # tree before the gate is reached, and remembering whether the
+        # directory was ever seen would then wait out the whole bound.
+        # The bound only backstops a live test that never releases;
         # expiring it must fail loudly with a status no target produces.
         parent = os.path.dirname(os.path.abspath(release))
-        parent_existed = os.path.isdir(parent)
         deadline = time.monotonic() + _slack(30)
         while not os.path.exists(release):
-            if parent_existed and not os.path.isdir(parent):
+            if not os.path.isdir(parent):
                 break
             if time.monotonic() >= deadline:
                 print("sudo shim: release file never published", file=sys.stderr)

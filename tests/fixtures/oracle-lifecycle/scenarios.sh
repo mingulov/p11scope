@@ -143,6 +143,15 @@ hung-clients)
         exit "$fco_status"
     }
     trap 'fixture_cleanup_owned' EXIT
+    # Structural round accounting: with ORACLE_TEST_EVENT_LOG set, every
+    # liveness poll the product loops make goes through poll-log.py, which
+    # logs it (the harness logs sleeps through a PATH shim). The harness
+    # then asserts the exact poll/sleep sequence, independent of load.
+    if [ -n "${ORACLE_TEST_EVENT_LOG-}" ]; then
+        ORACLE_TEST_REAL_HELPER=$RECORDED_PROCESS_EXEC
+        export ORACLE_TEST_REAL_HELPER ORACLE_TEST_EVENT_LOG
+        RECORDED_PROCESS_EXEC=${0%/*}/poll-log.py
+    fi
 
     sleep "$hold" & owned_hung_pid=$!
     owned_hung_start=$(process_starttime "$owned_hung_pid")

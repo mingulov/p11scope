@@ -23,7 +23,7 @@ ROOT_FIXTURES = ROOT / "tests/fixtures/root-recorded-launcher"
 DRIVER = FIXTURES / "driver.sh"
 TARGET = FIXTURES / "target.sh"
 GUARD_SOURCE = ROOT / "scripts/matrix/ia32-compat-trace-exec.c"
-EXPECTED_DEFAULT_TESTS = 28
+EXPECTED_DEFAULT_TESTS = 29
 # SLACK bounds (waits whose expiry can only mean failure: driver guards,
 # custody waits, file markers, teardown reaps) scale with
 # P11SCOPE_TEST_TIME_SCALE, as in test_lane13_evidence.py. SEMANTIC bounds
@@ -67,6 +67,44 @@ def state(pid):
     return Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()[0].decode()
 
 
+def proc_entries():
+    """Yield (pid, state, ppid, pgrp, starttime, comm) for every live /proc entry."""
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = Path(f"/proc/{entry.name}/stat").read_bytes()
+        except OSError:
+            continue
+        head, _, tail = raw.rpartition(b") ")
+        fields = tail.split()
+        comm = head.partition(b" (")[2].decode(errors="replace")
+        yield (int(entry.name), fields[0].decode(), int(fields[1]), int(fields[2]),
+               int(fields[19]), comm)
+
+
+def kill_verified(pid, generation, pgid=None):
+    """SIGKILL pid only if a pidfd pins the same generation (and group)."""
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        return False
+    try:
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()
+        except OSError:
+            return False
+        if int(fields[19]) != generation or (pgid is not None and int(fields[2]) != pgid):
+            return False
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
 class Ia32LifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -99,6 +137,7 @@ class Ia32LifecycleTests(unittest.TestCase):
 
     def tearDown(self):
         failures = self.cleanup_entries(self.owned)
+        failures.extend(self.sweep_adopted())
         if failures:
             self.temp._finalizer.detach()
             self.fail("cleanup ownership unresolved; evidence retained at "
@@ -125,7 +164,10 @@ class Ia32LifecycleTests(unittest.TestCase):
         return owned
 
     def popen_owned(self, *args, **kwargs):
-        proc = subprocess.Popen(*args, **kwargs)
+        # Every owned direct child leads its own process group, so cleanup
+        # can end the whole tree (stopped members included) with one group
+        # SIGKILL while the unreaped leader still pins the group id.
+        proc = subprocess.Popen(*args, process_group=0, **kwargs)
         owned = {"pid": proc.pid, "generation": None, "fd": None,
                  "proc": proc, "closed": False, "verified": False,
                  "owner_entry": None, "parent_status": None, "terminal": None}
@@ -158,10 +200,119 @@ class Ia32LifecycleTests(unittest.TestCase):
             raise AssertionError(f"pid {owned['pid']} has no verified pidfd signal authority")
         signal.pidfd_send_signal(owned["fd"], sig)
 
+    def leader_exited(self, owned, timeout):
+        """Wait up to timeout for a direct child to exit WITHOUT reaping it.
+
+        True/False: exited or not; None: the pid is not a waitable child of
+        this process (already reaped, or a test double), so there is no
+        group custody to exercise.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if getattr(owned["proc"], "returncode", None) is not None:
+                return None
+            try:
+                info = os.waitid(os.P_PID, owned["pid"],
+                                 os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
+                return None
+            if info is not None:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
     def retire_direct(self, owned):
         proc = owned["proc"]
         if proc is None:
             return [f"pid {owned['pid']} is not a direct Popen child"]
+        exited = self.leader_exited(owned, 0)
+        if exited is None:
+            return self.retire_direct_only(owned)
+        if not exited:
+            try:
+                if owned["fd"] is not None:
+                    signal.pidfd_send_signal(owned["fd"], signal.SIGTERM)
+                else:
+                    # Popen still owns this unreaped direct child, so PID reuse is impossible.
+                    proc.terminate()
+            except ProcessLookupError:
+                pass
+            self.leader_exited(owned, slack(2))
+        # Kill the whole group before reaping the leader: the unreaped
+        # leader pins the group id against reuse, and SIGKILL also ends
+        # stopped members, which SIGTERM never reaches. Without this a
+        # driver killed mid-cleanup left its stopped fixture alive forever
+        # (DR-LEAKED-STOPPED-HOLD).
+        try:
+            os.killpg(owned["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            owned["terminal"] = proc.wait(timeout=slack(2))
+        except subprocess.TimeoutExpired as error:
+            return [f"direct child {owned['pid']} exit unproved: {error}"]
+        self.close_owned(owned)
+        return []
+
+    def group_leftovers(self, pgid):
+        """Live members of a reaped leader's group. Any member keeps the group
+        id allocated, so a match is a real survivor, never a reused id."""
+        return [entry for entry in proc_entries()
+                if entry[3] == pgid and entry[1] not in ("Z", "X")]
+
+    def assert_group_empty(self, owned):
+        """After a successful run the driver's group must be empty: a
+        survivor is a cleanup leak, killed here and reported, never hidden."""
+        leftovers = self.group_leftovers(owned["pid"])
+        for pid, _, _, pgid, generation, _ in leftovers:
+            kill_verified(pid, generation, pgid)
+        deadline = time.monotonic() + slack(2)
+        while self.group_leftovers(owned["pid"]) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if leftovers:
+            raise AssertionError(
+                f"driver group {owned['pid']} leaked live members: "
+                + "; ".join(f"pid {pid} state {st} ppid {ppid} ({comm})"
+                            for pid, st, ppid, _, _, comm in leftovers)
+            )
+
+    def sweep_adopted(self):
+        """Reap or kill descendants this subreaper adopted from dead owners.
+
+        Owned entries are retired first, so any live child left here is a
+        leaked descendant: it is killed, reaped, and reported. Exited
+        adoptees are only reaped.
+        """
+        failures = []
+        reported = set()
+        tracked = {owned["pid"] for owned in self.owned
+                   if owned["proc"] is not None
+                   and getattr(owned["proc"], "returncode", None) is None}
+        deadline = time.monotonic() + slack(2)
+        while True:
+            adopted = [entry for entry in proc_entries()
+                       if entry[2] == os.getpid() and entry[0] not in tracked]
+            if not adopted:
+                return failures
+            for pid, st, _, _, generation, comm in adopted:
+                if st not in ("Z", "X"):
+                    if pid not in reported:
+                        reported.add(pid)
+                        failures.append(f"leaked descendant pid {pid} state {st} ({comm})")
+                    kill_verified(pid, generation)
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+            if time.monotonic() >= deadline:
+                failures.append(f"adopted descendants not reaped: {[e[0] for e in adopted]}")
+                return failures
+            time.sleep(0.01)
+
+    def retire_direct_only(self, owned):
+        """Direct-child retirement for a pid without group custody."""
+        proc = owned["proc"]
         if proc.poll() is not None:
             owned["terminal"] = proc.wait()
             self.close_owned(owned)
@@ -278,6 +429,7 @@ class Ia32LifecycleTests(unittest.TestCase):
             raise
         owned["terminal"] = proc.returncode
         self.close_owned(owned)
+        self.assert_group_empty(owned)
         return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
     def run_driver(self, *args, input=b"", timeout=8, env=None):
@@ -440,6 +592,27 @@ class Ia32LifecycleTests(unittest.TestCase):
         status = dict(line.split("=", 1) for line in (self.work / "evidence/status").read_text().splitlines())
         self.assertNotIn(status["fixture_status"], ("STARTED", "UNKNOWN"))
 
+    def test_owned_runs_end_and_report_leaked_group_members_and_adoptees(self):
+        # A driver that exits 0 while leaving a stopped child in its own
+        # group must fail loudly, and the child must be ended, not left
+        # stopped forever (DR-LEAKED-STOPPED-HOLD's shape).
+        stop_child = (
+            'sh -c \'kill -STOP "$$"\' </dev/null >/dev/null 2>&1 & c=$!; i=0; '
+            'until grep -q "^State:[[:space:]]*T" /proc/$c/status 2>/dev/null; do '
+            'i=$((i + 1)); [ "$i" -lt 1000 ] || exit 9; sleep 0.01; done'
+        )
+        with self.assertRaisesRegex(AssertionError, "leaked live members"):
+            self.run_owned(["sh", "-c", stop_child])
+        self.assertEqual(self.sweep_adopted(), [])
+        # A descendant that leaves the group (setsid) is adopted by this
+        # subreaper when its parent exits; the sweep ends and reports it.
+        result = self.run_owned(["sh", "-c", stop_child.replace("sh -c", "setsid sh -c", 1)])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        failures = self.sweep_adopted()
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("leaked descendant", failures[0])
+        self.assertEqual(self.sweep_adopted(), [])
+
     def test_setarch_style_exec_keeps_authenticated_target_identity(self):
         if subprocess.run(["sh", "-c", "command -v setarch"], capture_output=True).returncode != 0:
             self.fail("required test prerequisite setarch is unavailable")
@@ -469,9 +642,16 @@ class Ia32LifecycleTests(unittest.TestCase):
         cases = (
             ("exit9", 9, ["timeout", "2"], ["exit", 9]),
             ("timeout124", 124, ["timeout", "-s", "TERM", "0.2"], ["hold", 0]),
+            # Stimulus deadlines, not asserted properties: INT must land
+            # after the target arms its traps (now first in target.sh, but
+            # loaded shell startup still needs margin), or the target dies
+            # by INT (124) instead of surviving to KILL (137). The 1 s
+            # values keep the escalation shape with 10x the old margin;
+            # fixed because shell startup stays far below 1 s in any
+            # plausible gate load.
             (
                 "escalation137", 137,
-                ["timeout", "--kill-after=0.1", "-s", "INT", "0.1"], ["ignore", 0],
+                ["timeout", "--kill-after=1", "-s", "INT", "1"], ["ignore", 0],
             ),
         )
         for name, expected, wrapper, target_args in cases:
@@ -862,9 +1042,14 @@ class Ia32LifecycleTests(unittest.TestCase):
         program.write_text("BEGIN { exit(); }\n")
         self.env["IA32_GUARD_TEST_RECORD"] = str(self.work / "guard-target")
         sentinel, sentinel_owned = self.popen_owned(["sleep", scaled_whole_seconds(30)])
+        # The guard target reads stdin to EOF before it publishes .ready:
+        # give the driver a closed stdin, never the runner's own (an open
+        # socket or pipe there would block the chain past the driver's
+        # release window).
         driver, driver_owned = self.popen_owned(
             ["sh", str(DRIVER), "guard-timeout", guard, self_record, target, program],
-            cwd=ROOT, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         try:
             self.wait_file(self.work / "fields")

@@ -2523,3 +2523,28 @@ fn the_multi_fd_preflight_needs_the_group_bound_not_n() {
     assert_eq!(entry_link_bound(AttachBackend::Multi, 16), 16);
     assert_eq!(entry_link_bound(AttachBackend::Singles, n), n);
 }
+
+/// Review R1: the loaded-host mode of the I3a cells asserts through this
+/// seam, so it must reflect the consumer: reported ring loss marks
+/// lifecycle loss naming the count; no loss marks nothing.
+#[test]
+fn the_system_book_seam_demotes_exactly_on_reported_ring_loss() {
+    let health = |ring_loss| super::super::activation::InventoryHealthSnapshot {
+        discovery_counters: Some([ring_loss, 0, 0, 0, 0]),
+        ..Default::default()
+    };
+    let demoted = system_book_lifecycle_loss(health(7), 0, 0).expect("ring loss demotes");
+    assert!(demoted.contains("0 -> 7"), "{demoted}");
+    assert_eq!(system_book_lifecycle_loss(health(0), 0, 0), None);
+    let unread = super::super::activation::InventoryHealthSnapshot::default();
+    assert_eq!(system_book_lifecycle_loss(unread, 0, 0), None);
+}
+
+/// Review R1: every consumer applies one ring-loss rule.
+#[test]
+fn ring_loss_rises_only_above_what_was_seen() {
+    assert_eq!(ring_loss_rose(0, Some([3, 0, 0, 0, 0])), Some(3));
+    assert_eq!(ring_loss_rose(3, Some([3, 9, 9, 9, 9])), None);
+    assert_eq!(ring_loss_rose(3, Some([4, 0, 0, 0, 0])), Some(4));
+    assert_eq!(ring_loss_rose(0, None), None);
+}

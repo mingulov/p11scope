@@ -1541,7 +1541,7 @@ impl RetiredInventory {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct InventoryHealthSnapshot {
     pub(super) discovery_counters: Option<[u64; 5]>,
     pub(super) evidence: Option<[u64; 9]>,

@@ -6,13 +6,13 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.2.0.** This guide describes the v0.2.0 release: `doctor`,
+> **Status: v0.2.1.** This guide describes the v0.2.1 release: `doctor`,
 > `inspect` (now `--system`), `profile` (including `--mode metrics`),
 > `trace`, `run` and `inventory`, with memory-scan discovery,
 > `C_GetInterface`, multi-module capture, owned-child live discovery, and
 > schema v3. Its
 > [known limitations](../CHANGELOG.md#known-limitations) apply throughout;
-> `--system` is a preview. The [v0.2.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.2.0)
+> `--system` is a preview. The [v0.2.1 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.2.1)
 > record final tagged-artifact qualification and hosted CI;
 > [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) preserves
 > revision-specific pre-release evidence. To install the binaries or build

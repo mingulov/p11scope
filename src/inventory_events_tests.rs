@@ -554,7 +554,10 @@ fn event_log_refuses_a_symlink_and_leaves_its_target_untouched() {
     );
     assert_eq!(std::fs::read(&victim).unwrap(), b"do not truncate");
     assert!(
-        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "the planted link is left as it was"
     );
 }
@@ -594,8 +597,7 @@ fn event_log_refuses_a_fifo_without_blocking() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let fifo = dir.path().join("events.jsonl");
-    let c_path =
-        std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL in temp path");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL in temp path");
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
     let Err(error) = EventWriter::create(&fifo, 1 << 20, 5) else {
         panic!("a FIFO at the event-log path must be refused");
@@ -678,7 +680,10 @@ fn event_log_rotation_refuses_a_planted_symlink_target() {
     assert!(error.contains("refusing to replace"), "{error}");
     assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
     assert!(
-        std::fs::symlink_metadata(&rotated).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&rotated)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "the planted rotation link is left as it was"
     );
     assert_eq!(std::fs::read(&live).unwrap(), b"live");
@@ -705,7 +710,10 @@ fn event_log_append_rotation_does_not_follow_a_planted_symlink() {
     assert!(error.contains("refusing to replace"), "{error}");
     assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
     assert!(
-        std::fs::symlink_metadata(&planted).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "the planted rotation link is left as it was"
     );
 }
@@ -725,7 +733,10 @@ fn event_log_eviction_refuses_a_symlink_victim() {
     assert!(error.contains("refusing to remove"), "{error}");
     assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
     assert!(
-        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "the planted victim link is left as it was"
     );
     // A missing victim is already evicted.

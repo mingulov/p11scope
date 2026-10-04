@@ -381,7 +381,8 @@ as cgroup scope (overflow latches one lower-bound increment and `PARTIAL`).
 `p11scope doctor` needs no scope flags for a system capture: its host
 program preflight already covers the whole-machine lane.
 `--duration` (bare
-seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Final
+seconds or `30s`/`5m`/`1h`, up to 366 days) requests shutdown after the
+given interval; a larger value is a usage error. Final
 reporting and probe teardown follow, in that order: the report is published
 at the stop gate's quiescence point, before any probe link is closed. Closing
 the links then runs in the background with a progress line on stderr about
@@ -479,8 +480,8 @@ the end, pinned by descriptor and identified by device, inode and SHA-256 as
 above. A manifest is read whole from that descriptor, and a read whose length
 differs from the file's size (the file changed while it was read) is refused.
 Outputs never follow a symbolic link at the final name: `-o` (see
-[More capture options](#more-capture-options)) and `p11scope-discover -o`
-refuse one and leave it as it was.
+[More capture options](#more-capture-options)), `--event-log` (live file and
+rotations), and `p11scope-discover -o` refuse one and leave it as it was.
 
 The capture retains each selected process generation through its last target
 access and through attach, checking it immediately before and after session
@@ -740,7 +741,11 @@ Limits that matter in pods:
   observation-event stream (see
   `docs/schema/inventory-events-v1.md`), rotating past
   `--event-rotate-bytes` (default 1M) and retaining `--event-max-files`
-  (default 5) with explicit loss accounting. Entry columns read unknown
+  (default 5) with explicit loss accounting. The live file opens with
+  `-o`'s hardening (a new file is 0600, a symlink or other non-regular
+  target is refused and left as it was, the parent directory must be
+  trusted) and is truncated when the stream opens; a rotation rename
+  never replaces an entry planted at its target. Entry columns read unknown
   unless a usage feed observed them, mappings are never reported as
   observed calls, and every coverage loss is an explicit gap.
   `--capture auto|scan|native` selects the usage lane. `scan` reads

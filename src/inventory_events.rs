@@ -431,8 +431,8 @@ fn next_rotation_seq(live: &Path) -> u64 {
 /// [`EventWriter::create`] for the policy and its one documented
 /// difference (immediate truncate).
 fn open_event_live_file(path: &Path) -> Result<File, String> {
-    let stream = crate::output::create_private_stream(path)
-        .map_err(|error| open_failed(path, error))?;
+    let stream =
+        crate::output::create_private_stream(path).map_err(|error| open_failed(path, error))?;
     stream.begin().map_err(|error| open_failed(path, error))
 }
 
@@ -545,16 +545,10 @@ fn rename_live_to_rotated(live: &Path, rotated: &Path) -> Result<(), String> {
 fn rename_noreplace(old: &Path, new: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let old = std::ffi::CString::new(old.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path contains a NUL byte",
-        )
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
     })?;
     let new = std::ffi::CString::new(new.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path contains a NUL byte",
-        )
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
     })?;
     // SAFETY: both names are NUL-terminated C strings that outlive the call.
     let result = unsafe {

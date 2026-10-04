@@ -97,6 +97,10 @@ The native lane adds none: its witness rows bind through a pidfd cookie
 query, and no witness gap carries the kernel tgid. No command line,
 environment, `comm` or argument is read or published. See the inventory
 caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
+`callers[].image.task_cookie` and `.exec_id` are always null in v0.2.0
+(`owner_image` returns `None` everywhere in production); only a future
+lane returning exact owner images would fill them, and publishing
+non-null values needs a new allowlist row.
 
 ## Clock and units
 

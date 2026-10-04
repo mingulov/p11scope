@@ -20,6 +20,16 @@ fn tmp(name: &str) -> PathBuf {
     dir
 }
 
+/// A 0700 scratch dir for `--event-log` streams: B1 gives the stream
+/// `-o`'s trusted-parent check, and `tmp()` inherits the checkout's
+/// ancestors, which may be group-writable.
+fn private_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 fn fixture_source(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -244,7 +254,8 @@ fn dashboard_multi_caller_system_subset_over_owned_fixtures() {
 fn event_stream_command_level_with_rotation_and_conservation() {
     let dir = tmp("inventory-dashboard-events");
     let _driver = Driver::spawn(&dir, "events", &["ev-p1.so"]);
-    let stream = dir.join("events.jsonl");
+    let private = private_dir();
+    let stream = private.path().join("events.jsonl");
     // First: no rotation (wide threshold) — stream gaps equal the
     // document gaps exactly.
     let output = observer(
@@ -304,7 +315,7 @@ fn event_stream_command_level_with_rotation_and_conservation() {
     }
     // Second: a tiny threshold forces rotation + eviction; exact
     // conservation (retained + accounted == emitted) holds.
-    let stream2 = dir.join("events2.jsonl");
+    let stream2 = private.path().join("events2.jsonl");
     let output = observer(
         _driver.pid,
         &[
@@ -319,7 +330,7 @@ fn event_stream_command_level_with_rotation_and_conservation() {
     );
     assert!(output.status.success(), "rotating run exits 0: {stderr}");
     let mut all: Vec<Value> = Vec::new();
-    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+    for entry in std::fs::read_dir(private.path()).unwrap().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == "events2.jsonl" || name.starts_with("events2.jsonl.") {
             for line in std::fs::read_to_string(entry.path()).unwrap().lines() {

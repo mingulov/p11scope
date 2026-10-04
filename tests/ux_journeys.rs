@@ -1131,7 +1131,13 @@ fn b2_huge_duration_is_a_usage_error_not_a_panic() {
     let target = SleepTarget::spawn();
     let pid = target.pid();
     let cases: Vec<Vec<String>> = [
-        vec!["profile", "--pid", &pid, "--duration", "18446744073709551615"],
+        vec![
+            "profile",
+            "--pid",
+            &pid,
+            "--duration",
+            "18446744073709551615",
+        ],
         vec!["profile", "--pid", &pid, "--duration", "99999999999999999h"],
         vec!["trace", "--pid", &pid, "--duration", "18446744073709551615"],
         vec!["run", "--duration", "99999999999999999h", "--", "/bin/true"],

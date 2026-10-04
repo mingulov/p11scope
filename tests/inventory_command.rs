@@ -455,7 +455,10 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
     );
     let private = private_dir();
     let document_path = private.path().join("edges.json");
-    let stream_path = dir.join("edges.jsonl");
+    // B1: the stream needs a trusted parent like `-o`, so it lives in
+    // the private dir too — `target/tmp` inherits the checkout's
+    // ancestors, which may be group-writable.
+    let stream_path = private.path().join("edges.jsonl");
     let text_path = dir.join("edges.txt");
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
@@ -1243,7 +1246,8 @@ fn a_classic_run_interrupted_by_sigint_commits_its_report_and_stream() {
     let driver = LiveDriver::spawn(&dir, "si", &["si-p1.so"]);
     let private = private_dir();
     let out = private.path().join("report.json");
-    let stream = dir.join("events.jsonl");
+    // B1: the stream needs a trusted parent like `-o` (see above).
+    let stream = private.path().join("events.jsonl");
     let mut observer = Command::new(env!("CARGO_BIN_EXE_p11scope"))
         .args(["inventory", "--pid", &driver.pid.to_string()])
         .args(["--capture", "scan", "--duration", "120s", "-o"])

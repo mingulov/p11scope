@@ -37,6 +37,7 @@ requires the affected gates to run again on that new revision.
 
   ```sh
   git grep -n 'TODO[(]release)'   # must print nothing
+  git grep -n 'TBD-MEASURED\|TBD-QUALIFIED' -- docs CHANGELOG.md   # must print nothing
   ```
 
   Keep earlier candidate measurements revision-specific in `CHANGELOG.md`.

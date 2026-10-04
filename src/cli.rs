@@ -2079,10 +2079,28 @@ mod tests {
         // Huge values stay usage errors (exit 2 surfaces) on every
         // capture, not panics or late runtime failures.
         for argv in [
-            vec!["profile", "--pid", "42", "--duration", "18446744073709551615"],
+            vec![
+                "profile",
+                "--pid",
+                "42",
+                "--duration",
+                "18446744073709551615",
+            ],
             vec!["trace", "--pid", "42", "--duration", "99999999999999999h"],
-            vec!["run", "--duration", "18446744073709551615", "--", "/bin/true"],
-            vec!["inventory", "--pid", "7", "--duration", "18446744073709551615"],
+            vec![
+                "run",
+                "--duration",
+                "18446744073709551615",
+                "--",
+                "/bin/true",
+            ],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--duration",
+                "18446744073709551615",
+            ],
             vec!["inventory", "--system", "--duration", "99999999999999999h"],
         ] {
             assert!(

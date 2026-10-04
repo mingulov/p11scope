@@ -299,8 +299,9 @@ fn pid_namespace_check(numbering: &crate::pidns::PidNumbering, pid_requested: bo
         };
         let detail = if matches!(numbering.proc_view, ProcView::Unserved(_)) {
             format!(
-                "{}{why} — this observer cannot read its own /proc/self, so every capture is \
-                 refused ({})",
+                "{}{why} — this observer cannot read its own /proc/self, so every capture \
+                 except inventory --system is refused ({}; inventory --system warns \
+                 and carries the pid namespace gap)",
                 numbering.observer.label(),
                 crate::pidns::MISMATCH_CODE,
             )
@@ -313,8 +314,9 @@ fn pid_namespace_check(numbering: &crate::pidns::PidNumbering, pid_requested: bo
                 crate::pidns::MISMATCH_CODE,
             )
         };
-        // An unserved /proc refuses every capture, so the row fails for
-        // every scope, not only a --pid one.
+        // An unserved /proc refuses every capture except inventory
+        // --system, so the row fails for every scope, not only a --pid
+        // one: doctor cannot know which capture the operator will run.
         if pid_requested || matches!(numbering.proc_view, ProcView::Unserved(_)) {
             Status::Fail(detail)
         } else {
@@ -2686,7 +2688,10 @@ mod tests {
             assert!(detail.contains("pid-namespace-mismatch"), "{detail}");
         }
         // DR-RETRO-PIDNS-2: a /proc with no entry for this observer fails
-        // the row for every scope, saying every capture is refused.
+        // the row for every scope, saying every capture except inventory
+        // --system is refused (inventory --system warns and carries the
+        // pid namespace gap instead: inventory.rs lets that scope
+        // through, run.rs refuses every classic scope by name).
         let unserved = PidNumbering {
             observer: ObserverPidNs::Unknown("gone".into()),
             proc_view: ProcView::Unserved("/proc/self: ENOENT".into()),
@@ -2695,7 +2700,14 @@ mod tests {
             let Status::Fail(detail) = pid_namespace_check(&unserved, pid_requested).status else {
                 panic!("an unserved /proc must fail the row");
             };
-            assert!(detail.contains("every capture is refused"), "{detail}");
+            assert!(
+                detail.contains("every capture except inventory --system is refused"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("inventory --system warns and carries the pid namespace gap"),
+                "{detail}"
+            );
             assert!(
                 detail.contains(
                     "/proc numbering foreign, no entry for this process: /proc/self: ENOENT"

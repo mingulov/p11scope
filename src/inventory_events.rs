@@ -22,7 +22,7 @@ use crate::inventory::{edge_json, render_json_from_presentation};
 use crate::inventory_present::GapView;
 use crate::inventory_present::{Activity, Capture, EdgeView, Presence, Presentation};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::hash::BuildHasher as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -85,18 +85,27 @@ impl EventWriter {
     /// inventoried so this run's sequence never collides with a prior
     /// run's; prior files are never deleted here — only this run's
     /// retention enforcement evicts, and every eviction is an event.
+    ///
+    /// Hardening (B1): the live file opens with the `-o` policy
+    /// ([`crate::output::create_private_stream`] + `begin`): the parent
+    /// is retained without following a symlink, the final component is
+    /// opened `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, a new file is `0600`, an
+    /// existing target must be a regular file owned by the caller and is
+    /// truncated and made `0600`. A symlink, FIFO, device, socket or
+    /// directory at the name is refused with a clear error and left
+    /// untouched. Difference from `-o` trace: the truncate happens here,
+    /// at stream creation, because the event stream writes synchronously
+    /// from the first `started` event (there is no attach-then-begin
+    /// split); a stream that is created and never appended to still
+    /// truncates. Rotation reopen uses the same helper; rotation renames
+    /// and retention removals use the no-follow/no-clobber helpers below.
     pub(crate) fn create(path: &Path, max_bytes: u64, max_files: usize) -> Result<Self, String> {
         if max_bytes == 0 {
             return Err("event rotation threshold must be greater than zero".into());
         }
         let max_files = max_files.max(1);
         let rotation_seq = next_rotation_seq(path);
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .map_err(|error| format!("opening event stream {} failed: {error}", path.display()))?;
+        let file = open_event_live_file(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -270,13 +279,7 @@ impl EventWriter {
         let seq = self.rotation_seq;
         self.rotation_seq = self.rotation_seq.saturating_add(1);
         let rotated_name = rotated_path(&self.path, seq);
-        std::fs::rename(&self.path, &rotated_name).map_err(|error| {
-            format!(
-                "rotating event stream {} to {} failed: {error}",
-                self.path.display(),
-                rotated_name.display()
-            )
-        })?;
+        rename_live_to_rotated(&self.path, &rotated_name)?;
         self.retained.push_back(RetainedFile {
             seq,
             events: self.events_in_file,
@@ -287,17 +290,12 @@ impl EventWriter {
         self.live_covered_events = 0;
         self.live_covered_bytes = 0;
         self.rotations = self.rotations.saturating_add(1);
-        self.file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)
-            .map_err(|error| {
-                format!(
-                    "opening rotated event stream {} failed: {error}",
-                    self.path.display()
-                )
-            })?;
+        self.file = open_event_live_file(&self.path).map_err(|error| {
+            format!(
+                "opening rotated event stream {} failed: {error}",
+                self.path.display()
+            )
+        })?;
         self.current_bytes = 0;
         self.events_in_file = 0;
         // The rotation marker is the new file's first line: the
@@ -347,16 +345,7 @@ impl EventWriter {
                 break;
             };
             let victim = rotated_path(&self.path, oldest.seq);
-            match std::fs::remove_file(&victim) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "evicting retained event file {} failed: {error}",
-                        victim.display()
-                    ));
-                }
-            }
+            remove_retained_file(&victim)?;
             let total_events = oldest.events.saturating_add(oldest.covered_events);
             let total_bytes = oldest.bytes.saturating_add(oldest.covered_bytes);
             self.evicted_events = self.evicted_events.saturating_add(total_events);
@@ -436,6 +425,195 @@ fn next_rotation_seq(live: &Path) -> u64 {
         }
     }
     max.map_or(1, |best| best.saturating_add(1))
+}
+
+/// Open (or truncate) the live event file with the `-o` hardening. See
+/// [`EventWriter::create`] for the policy and its one documented
+/// difference (immediate truncate).
+fn open_event_live_file(path: &Path) -> Result<File, String> {
+    let stream = crate::output::create_private_stream(path)
+        .map_err(|error| open_failed(path, error))?;
+    stream.begin().map_err(|error| open_failed(path, error))
+}
+
+/// The refusal for a failed event-stream open. When the name holds a
+/// target the stream must never touch, the kind is named explicitly —
+/// a symlink, FIFO, socket, device or directory — instead of surfacing
+/// the bare errno (`ELOOP`, `ENXIO`) the hardened open failed with.
+/// Advisory only: the open itself is the enforcement, so a name that
+/// raced past this check is still refused by `O_NOFOLLOW`/ownership.
+fn open_failed(path: &Path, error: String) -> String {
+    if let Some(kind) = existing_target_kind(path) {
+        format!(
+            "refusing to open event stream {}: it is {kind}; leaving it as it was ({error})",
+            path.display()
+        )
+    } else {
+        format!("opening event stream {} failed: {error}", path.display())
+    }
+}
+
+/// What the failed open found at the name, when it found a target the
+/// stream must never touch. Kind names match `-o`
+/// (`output::check_final_name`).
+fn existing_target_kind(path: &Path) -> Option<&'static str> {
+    use std::os::unix::fs::FileTypeExt as _;
+    let kind = std::fs::symlink_metadata(path).ok()?.file_type();
+    if kind.is_symlink() {
+        Some("a symbolic link")
+    } else if kind.is_fifo() {
+        Some("a FIFO")
+    } else if kind.is_socket() {
+        Some("a socket")
+    } else if kind.is_char_device() {
+        Some("a character device")
+    } else if kind.is_block_device() {
+        Some("a block device")
+    } else if kind.is_dir() {
+        Some("a directory")
+    } else {
+        None
+    }
+}
+
+/// Rename the live file to its rotated name without following or
+/// clobbering a planted entry. The sequence is fresh
+/// ([`next_rotation_seq`] skips prior files), so anything at the target
+/// is a race or an attack: refuse it. The rename itself uses
+/// `RENAME_NOREPLACE` so a name that appears between the check and the
+/// rename is not replaced either.
+fn rename_live_to_rotated(live: &Path, rotated: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(rotated) {
+        Ok(_) => {
+            return Err(format!(
+                "rotating event stream {} to {} failed: target exists; refusing to replace it",
+                live.display(),
+                rotated.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "checking rotation target {} failed: {error}",
+                rotated.display()
+            ));
+        }
+    }
+    match rename_noreplace(live, rotated) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => Err(format!(
+            "rotating event stream {} to {} failed: target appeared during rotation; refusing to replace it",
+            live.display(),
+            rotated.display()
+        )),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            // Filesystem without RENAME_NOREPLACE: re-check, then plain
+            // rename. The remaining check-then-rename window needs write
+            // access to a parent the live-file open already trusted.
+            match std::fs::symlink_metadata(rotated) {
+                Ok(_) => Err(format!(
+                    "rotating event stream {} to {} failed: target exists; refusing to replace it",
+                    live.display(),
+                    rotated.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::rename(live, rotated).map_err(|error| {
+                        format!(
+                            "rotating event stream {} to {} failed: {error}",
+                            live.display(),
+                            rotated.display()
+                        )
+                    })
+                }
+                Err(error) => Err(format!(
+                    "checking rotation target {} failed: {error}",
+                    rotated.display()
+                )),
+            }
+        }
+        Err(error) => Err(format!(
+            "rotating event stream {} to {} failed: {error}",
+            live.display(),
+            rotated.display()
+        )),
+    }
+}
+
+/// `renameat2(..., RENAME_NOREPLACE)` on paths, so a libc without the
+/// wrapper still links. EEXIST when the new name exists; EINVAL when the
+/// filesystem does not support the flag.
+fn rename_noreplace(old: &Path, new: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let old = std::ffi::CString::new(old.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains a NUL byte",
+        )
+    })?;
+    let new = std::ffi::CString::new(new.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains a NUL byte",
+        )
+    })?;
+    // SAFETY: both names are NUL-terminated C strings that outlive the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Remove one retention victim without following a symlink. The victim
+/// must be a regular file owned by the caller — anything this run
+/// rotated there was — otherwise it is refused and left as it was. A
+/// missing file is already evicted.
+fn remove_retained_file(victim: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(victim) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "evicting retained event file {} failed: {error}",
+                victim.display()
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        return Err(format!(
+            "refusing to evict retained event file {}: not a regular file; refusing to remove it",
+            victim.display()
+        ));
+    }
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = metadata.uid();
+        let current = unsafe { libc::geteuid() } as u32;
+        if owner != current {
+            return Err(format!(
+                "refusing to evict retained event file {}: owned by uid {owner}; refusing to remove it",
+                victim.display()
+            ));
+        }
+    }
+    match std::fs::remove_file(victim) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "evicting retained event file {} failed: {error}",
+            victim.display()
+        )),
+    }
 }
 
 /// The `started` payload: scope, clock, and enforced limits.

@@ -533,6 +533,205 @@ fn snapshot_events_and_dashboard_agree_on_a_repeated_gap() {
     }
 }
 
+/// B1: the live event file opens with the `-o` hardening. A symlink
+/// at the name is refused and its target is left byte-for-byte untouched
+/// (a plain `OpenOptions` open would truncate through it).
+#[test]
+fn event_log_refuses_a_symlink_and_leaves_its_target_untouched() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not truncate").unwrap();
+    let link = dir.path().join("events.jsonl");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let Err(error) = EventWriter::create(&link, 1 << 20, 5) else {
+        panic!("a symlink at the event-log path must be refused");
+    };
+    assert!(
+        error.contains("it is a symbolic link"),
+        "clear symlink refusal: {error}"
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not truncate");
+    assert!(
+        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        "the planted link is left as it was"
+    );
+}
+
+/// B1: a new event file is private from creation.
+#[test]
+fn event_log_creates_private_0600_and_truncates_an_existing_file_to_0600() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("events.jsonl");
+    drop(EventWriter::create(&path, 1 << 20, 5).unwrap());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "a new file is 0600, not the default umask mode"
+    );
+    // A pre-existing world-readable file is truncated and made private,
+    // like `-o`: same policy, documented difference is only that the
+    // truncate happens at creation rather than at a later begin.
+    std::fs::write(&path, b"previous run\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(EventWriter::create(&path, 1 << 20, 5).unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), b"");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+/// B1: a FIFO at the name is refused without blocking. No reader exists:
+/// a plain blocking open would hang here.
+#[test]
+fn event_log_refuses_a_fifo_without_blocking() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let fifo = dir.path().join("events.jsonl");
+    let c_path =
+        std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL in temp path");
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let Err(error) = EventWriter::create(&fifo, 1 << 20, 5) else {
+        panic!("a FIFO at the event-log path must be refused");
+    };
+    assert!(
+        error.contains("it is a FIFO"),
+        "clear non-regular refusal: {error}"
+    );
+}
+
+/// B1: a directory at the name is refused (non-regular final component).
+#[test]
+fn event_log_refuses_a_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let subdir = dir.path().join("events.jsonl");
+    std::fs::create_dir(&subdir).unwrap();
+    let Err(error) = EventWriter::create(&subdir, 1 << 20, 5) else {
+        panic!("a directory at the event-log path must be refused");
+    };
+    assert!(
+        error.contains("it is a directory"),
+        "clear non-regular refusal: {error}"
+    );
+}
+
+/// B1: a device at the name is refused without opening it for the
+/// stream. `/dev/null` opens fine with plain flags, so only the
+/// regular-file check refuses it — the same check that now refuses
+/// `/dev/full` up front (see `a_full_event_log_disk_is_an_error`).
+#[test]
+fn event_log_refuses_a_device() {
+    let Err(error) = EventWriter::create(std::path::Path::new("/dev/null"), 1 << 20, 5) else {
+        panic!("a device at the event-log path must be refused");
+    };
+    assert!(
+        error.contains("it is a character device"),
+        "clear non-regular refusal: {error}"
+    );
+}
+
+/// B1: the live file inherits `-o`'s trusted-parent check. A directory
+/// writable by others without the sticky bit is refused by name, like
+/// `-o`, before anything is created in it.
+#[test]
+fn event_log_refuses_an_untrusted_parent_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let loose = dir.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let path = loose.join("events.jsonl");
+    let Err(error) = EventWriter::create(&path, 1 << 20, 5) else {
+        panic!("an untrusted parent directory must be refused");
+    };
+    assert!(error.contains("untrusted"), "names the parent: {error}");
+    assert!(
+        std::fs::symlink_metadata(&path).is_err(),
+        "nothing was created in the refused directory"
+    );
+}
+
+/// B1: the rotation rename never follows or clobbers a planted
+/// `<path>.1` symlink: it fails closed and leaves both the link and its
+/// target untouched.
+#[test]
+fn event_log_rotation_refuses_a_planted_symlink_target() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let live = dir.path().join("events.jsonl");
+    std::fs::write(&live, b"live").unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    let rotated = dir.path().join("events.jsonl.1");
+    std::os::unix::fs::symlink(&victim, &rotated).unwrap();
+    let error = rename_live_to_rotated(&live, &rotated).unwrap_err();
+    assert!(error.contains("refusing to replace"), "{error}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    assert!(
+        std::fs::symlink_metadata(&rotated).unwrap().file_type().is_symlink(),
+        "the planted rotation link is left as it was"
+    );
+    assert_eq!(std::fs::read(&live).unwrap(), b"live");
+}
+
+/// B1: a full rotation through `append` fails closed on a planted
+/// rotation symlink instead of writing through it.
+#[test]
+fn event_log_append_rotation_does_not_follow_a_planted_symlink() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 512, 5).unwrap();
+    writer.append("first", serde_json::json!({}), 1).unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    // The next rotation sequence is 1: no prior files existed at creation.
+    let planted = dir.path().join("events.jsonl.1");
+    std::os::unix::fs::symlink(&victim, &planted).unwrap();
+    // A payload large enough to force the rotation.
+    let big = serde_json::json!({"pad": "x".repeat(1024)});
+    let error = writer.append("second", big, 2).unwrap_err();
+    assert!(error.contains("refusing to replace"), "{error}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    assert!(
+        std::fs::symlink_metadata(&planted).unwrap().file_type().is_symlink(),
+        "the planted rotation link is left as it was"
+    );
+}
+
+/// B1: retention eviction never follows a symlink victim: it refuses and
+/// leaves both the link and its target untouched.
+#[test]
+fn event_log_eviction_refuses_a_symlink_victim() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    let link = dir.path().join("events.jsonl.1");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let error = remove_retained_file(&link).unwrap_err();
+    assert!(error.contains("refusing to remove"), "{error}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    assert!(
+        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        "the planted victim link is left as it was"
+    );
+    // A missing victim is already evicted.
+    remove_retained_file(&dir.path().join("events.jsonl.9")).unwrap();
+}
+
 /// Review R-1 (margins): the dump fit bound holds exactly at its
 /// boundary. With the records an emitter carries, the smallest rotate
 /// size whose contiguous capacity covers carried bytes + per-edge slack +

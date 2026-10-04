@@ -1322,10 +1322,13 @@ fn a_closed_stdout_pipe_is_an_error_after_the_report_commits() {
     assert_eq!(doc["schema"], "p11scope/inventory/v1");
 }
 
-/// An event stream that cannot be written (a full disk) is an error, never
-/// silent loss.
+/// A device as `--event-log` is refused up front, never written through:
+/// B1 gives the stream `-o`'s regular-file check, so `/dev/full` (once the
+/// full-disk probe, failing at write with ENOSPC) now fails at open with
+/// the non-regular refusal. Either way an unusable stream is an error,
+/// never silent loss, and no success document is printed.
 #[test]
-fn a_full_event_log_disk_is_an_error() {
+fn a_device_event_log_is_refused_up_front() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-full-stream");
     let driver = LiveDriver::spawn(&dir, "fs", &["fs-p1.so"]);
@@ -1335,6 +1338,6 @@ fn a_full_event_log_disk_is_an_error() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("No space left on device"), "{stderr}");
+    assert!(stderr.contains("it is a character device"), "{stderr}");
     assert!(output.stdout.is_empty(), "no success document: {stderr}");
 }

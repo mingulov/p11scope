@@ -1595,6 +1595,10 @@ fn read_stdin_byte(into: &mut [u8]) -> bool {
 /// SIGKILL cannot be caught — its terminal needs `reset(1)`.
 pub(crate) struct StopFlag {
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Armed once the report is written (R-C51-4): a further stop signal
+    /// then ends the process at once (`_exit(128 + signal)`); the kernel
+    /// releases whatever the drop was still detaching.
+    exit_on_next: Arc<std::sync::atomic::AtomicBool>,
     _hooks: Vec<signal_hook::SigId>,
 }
 
@@ -1603,13 +1607,19 @@ pub(crate) struct StopFlag {
 impl StopFlag {
     pub(crate) fn install() -> Self {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_on_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut hooks = Vec::new();
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             let flag = Arc::clone(&stop);
-            // The callback is the signal-safe minimum: one atomic
-            // store, no allocation, no I/O, no locks.
+            let armed = Arc::clone(&exit_on_next);
+            // The callback is the signal-safe minimum: atomic loads and a
+            // store, or `_exit` (async-signal-safe); no allocation, no
+            // I/O, no locks.
             let hook = unsafe {
                 signal_hook::low_level::register(signal, move || {
+                    if armed.load(Ordering::SeqCst) {
+                        libc::_exit(128 + signal);
+                    }
                     flag.store(true, Ordering::SeqCst);
                 })
             };
@@ -1619,12 +1629,19 @@ impl StopFlag {
         }
         Self {
             stop,
+            exit_on_next,
             _hooks: hooks,
         }
     }
 
     pub(crate) fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+
+    /// From now on a stop signal exits the process at once (R-C51-4: the
+    /// report is written; only the blocking probe detach may remain).
+    pub(crate) fn exit_on_next_signal(&self) {
+        self.exit_on_next.store(true, Ordering::SeqCst);
     }
 }
 

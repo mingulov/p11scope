@@ -285,6 +285,11 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.callers.get(&id).map(|tracked| &tracked.record)
     }
 
+    /// The process source (liveness and start-time reads).
+    pub(crate) fn source(&self) -> &Source {
+        &self.source
+    }
+
     pub(crate) fn records(&self) -> impl Iterator<Item = &CallerRecord> {
         self.callers.values().map(|tracked| &tracked.record)
     }
@@ -3161,7 +3166,7 @@ pub(crate) mod tests {
             );
         }
 
-        fn blind(&self, pid: u32) {
+        pub(crate) fn blind(&self, pid: u32) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.readable = false;
             }
@@ -4416,6 +4421,52 @@ pub(crate) mod tests {
             registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
             UseCoverage::Unknown(UnknownReason::Loss(_))
         ));
+    }
+
+    /// F2 (use first, then loss): the reason names what first voided the
+    /// watch. A loss demotion acts on watch intervals reaching into its
+    /// window; a `use_before_admission` edge holds none, so a later loss
+    /// neither renames it nor counts it as a demoted watch. Either order
+    /// reads unknown with no restart (the loss-first order above keeps
+    /// `loss`).
+    #[test]
+    fn a_later_loss_keeps_use_before_admission() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 120 },
+        );
+        registry.publish();
+        registry.note_use_before_admission(CallerId(0), Some(keys[0].clone()));
+        registry.publish();
+        registry.note_watch_demotion("lifecycle lost", "ring loss", 150);
+        registry.note_health_regression("counter rose", 150, 160);
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 900 },
+        );
+        registry.publish();
+        assert_eq!(
+            registry.coverage(edge_of(&registry, CallerId(0), &keys[0])),
+            UseCoverage::Unknown(UnknownReason::UseBeforeAdmission)
+        );
+        let demoted: Vec<&str> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "lifecycle lost")
+            .map(|gap| gap.reason.as_str())
+            .collect();
+        assert!(
+            matches!(demoted.as_slice(), [reason] if reason.contains("0 watched no-use edges were demoted")),
+            "{demoted:?}"
+        );
     }
 
     /// R-C51-1: the downgrade replaces an ongoing or frozen watch, blocks

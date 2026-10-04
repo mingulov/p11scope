@@ -1936,7 +1936,7 @@ def self_test():
             d["edges"] = [e for e in d["edges"] if e["caller"] not in gone]
 
         def pidless(s, d):
-            d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
+            d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None, "repeats": 1,
                               "subject": "used by an unidentified caller image", "reason": "x", "budget": None})
 
         def p4_counted(n, at=None):

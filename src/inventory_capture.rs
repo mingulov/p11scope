@@ -68,6 +68,9 @@ pub(crate) struct LaneWindows {
     /// `retirement: unsettled`: the base, plus a share for each attached
     /// endpoint (every Singles link pays its own kernel detach), up to the
     /// cap.
+    /// The pre-output wait is at most `retirement_cap` (R-C51-4: about
+    /// 10 s, so a supervisor's grace — k8s 30 s, systemd 90 s — always
+    /// sees the report); the rest of the detach runs after it.
     pub retirement_base: Duration,
     /// How long stop keeps draining the lifecycle ring before its terminal
     /// read, and then keeps reading for a terminal CALLER_USE sweep to
@@ -76,6 +79,11 @@ pub(crate) struct LaneWindows {
     pub retirement_per_endpoint: Duration,
     pub retirement_cap: Duration,
 }
+
+/// The longest stop waits for the probes to detach before it writes the
+/// report (R-C51-4). Past it the report reads `retirement: unsettled` and
+/// the detach finishes after the report, interruptible by a second signal.
+pub(crate) const PRE_OUTPUT_RETIREMENT_WAIT: Duration = Duration::from_secs(10);
 
 impl LaneWindows {
     pub(crate) const PROVISIONAL: Self = Self {
@@ -90,7 +98,7 @@ impl LaneWindows {
         retirement_base: Duration::from_secs(5),
         terminal_sweep_budget: Duration::from_millis(500),
         retirement_per_endpoint: Duration::from_millis(250),
-        retirement_cap: Duration::from_secs(120),
+        retirement_cap: PRE_OUTPUT_RETIREMENT_WAIT,
     };
 
     /// The stop's retirement budget for `attached` endpoints.
@@ -799,6 +807,32 @@ impl CaptureLane<PidPin> for FacadeLane {
             _ => None,
         }
     }
+}
+
+/// The run's end after the stop (R-C51-4): `write` writes the report
+/// (stream end, `-o`, stdout) first; then `report_written` arms the
+/// immediate exit on a second signal; only then does an unsettled
+/// retirement finish its blocking detach, between two progress lines.
+pub(crate) fn finish_native<L, T>(
+    stopped: Option<Stopped<L>>,
+    write: impl FnOnce(Option<&LaneSummary>) -> T,
+    report_written: &dyn Fn(),
+    progress: &mut dyn FnMut(String),
+) -> T {
+    let result = write(stopped.as_ref().map(|stopped| &stopped.summary));
+    report_written();
+    if let Some(stopped) = stopped
+        && let Retirement::Unsettled(_) = stopped.summary.retirement
+    {
+        progress(format!(
+            "p11scope: report written; detaching the remaining native probes of {} \
+             endpoints (a second SIGINT/SIGTERM exits at once)",
+            stopped.summary.attached
+        ));
+        drop(stopped);
+        progress("p11scope: native probes detached".into());
+    }
+    result
 }
 
 #[cfg(test)]

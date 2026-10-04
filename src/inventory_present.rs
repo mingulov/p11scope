@@ -388,6 +388,10 @@ pub(crate) struct BudgetView {
     pub retained_limit: usize,
     pub retained: usize,
     pub retained_suppressed: u64,
+    /// The native lane's pre-admission stash (R-C51-5): unbound use rows
+    /// held per (pid, module) until their caller's admission; `None` in
+    /// the scan lane.
+    pub preadmission: Option<crate::discovery::engine::inventory_coordinator::PreadmissionCounters>,
 }
 
 impl BudgetView {
@@ -626,6 +630,7 @@ impl Presentation {
                 retained_limit: limits.max_gaps,
                 retained: registry.gaps().len(),
                 retained_suppressed: registry.gaps_suppressed(),
+                preadmission: coordinator.preadmission_counters(),
             },
         }
     }

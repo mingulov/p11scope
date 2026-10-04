@@ -723,7 +723,15 @@ Limits that matter in pods:
   `observation.settlement: "unsettled"` (Inventory has no quiescence
   protocol, so a call in flight at stop may still be unrecorded), and
   `observation.retirement` (`closed`, or `unsettled` when the probes did
-  not detach within the stop budget — that also records a gap). `native`
+  not detach within the stop budget — that also records a gap). The stop
+  waits at most 10 s for the probes before it writes the report (so a
+  supervisor's grace, such as Kubernetes' 30 s, always sees it); a
+  detach still running then finishes after the report, between the
+  stderr lines `p11scope: report written; detaching the remaining native
+  probes …` and `p11scope: native probes detached`, and a second
+  SIGINT, SIGTERM or SIGHUP once the report is written exits at once
+  (status 128 + signal; the kernel releases the remaining probes).
+  `native`
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can
   start and otherwise falls back to `scan` with the gap `native usage

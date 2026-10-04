@@ -493,6 +493,7 @@ fn run_product(
     stop: &dyn Fn() -> bool,
 ) -> Result<(serde_json::Value, String)> {
     let mut stdout = Vec::new();
+    let reported = std::cell::Cell::new(None::<Instant>);
     let code = run_with_writer(
         scope,
         &[module.to_path_buf()],
@@ -508,9 +509,17 @@ fn run_product(
         None,
         CaptureMode::Native,
         stop,
+        &|| reported.set(Some(Instant::now())),
         false,
         &mut stdout,
     )?;
+    // Evidence for DR-C51-DETACH: the blocking detach after the report.
+    if let Some(at) = reported.get() {
+        eprintln!(
+            "p11scope-cell: blocking detach after the report took {} ms",
+            at.elapsed().as_millis()
+        );
+    }
     ensure!(code == 0, "exit code {code}");
     let document: serde_json::Value = serde_json::from_slice(&stdout)?;
     Ok((document, std::fs::read_to_string(events)?))
@@ -593,7 +602,20 @@ fn privileged_native_lane_system_late_dlopen_lp64() -> Result<()> {
         document["observation"]
     );
     ensure!(document["observation"]["settlement"] == "unsettled");
-    ensure!(document["observation"]["retirement"] == "closed");
+    // R-C51-4 bounds the pre-report detach wait to 10 s; a system scope's
+    // detach (136 endpoints here) can outlast it on a loaded host. Then
+    // the report must say so: retirement unsettled with its gap.
+    let retirement = &document["observation"]["retirement"];
+    ensure!(
+        retirement == "closed"
+            || (retirement == "unsettled"
+                && document["gaps"].as_array().is_some_and(|gaps| {
+                    gaps.iter()
+                        .any(|gap| gap["subject"] == "native capture retirement unsettled")
+                })),
+        "{}",
+        document["observation"]
+    );
     let edges = doc_edges(&document, late.pid());
     let witnesses = &document["observation"]["native_witnesses"];
     ensure!(edges.len() == 1, "late dlopen edges: {edges:?}");
@@ -608,9 +630,13 @@ fn privileged_native_lane_system_late_dlopen_lp64() -> Result<()> {
                 .any(|gap| gap["subject"] == "native capture lifecycle evidence lost")
         });
     if lifecycle_lost {
+        // R-C51-3: witnessed, or unknown with reason `loss` — never a
+        // watch, never another unknown reason (review F6).
+        let reason = &edges[0]["entries"]["coverage"]["reason"];
         ensure!(
-            *state != "watched_no_use",
-            "a watch claims no use across lost lifecycle evidence: {edges:?}; witnesses {witnesses}"
+            *state == "witnessed" || (*state == "unknown" && *reason == "loss"),
+            "under lost lifecycle evidence the edge must read witnessed or unknown/loss: \
+             {edges:?}; witnesses {witnesses}"
         );
         eprintln!("C51_LATE_LIFECYCLE_LOSS state={state} witnesses={witnesses}");
     } else {

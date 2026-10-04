@@ -82,6 +82,12 @@ struct ScriptedLane {
     drained_ns: u64,
 }
 
+impl Drop for ScriptedLane {
+    fn drop(&mut self) {
+        self.note("drop");
+    }
+}
+
 impl ScriptedLane {
     fn new(log: &Log) -> Self {
         let mut cookies = HashMap::new();
@@ -944,21 +950,117 @@ fn a_terminal_sweep_that_never_completes_is_bounded() {
 }
 
 /// Each Singles link pays its own kernel detach (about 73 ms on host 7.0,
-/// 68 links in 4.9 s), so the budget grows with the attached endpoints up
-/// to a cap.
+/// 68 links in 4.9 s), so the budget grows with the attached endpoints —
+/// but the report never waits more than `PRE_OUTPUT_RETIREMENT_WAIT`
+/// (R-C51-4); the rest of the detach runs after the report.
 #[test]
 fn the_retirement_budget_grows_with_the_attached_endpoints_up_to_its_cap() {
     let windows = LaneWindows::PROVISIONAL;
+    assert_eq!(PRE_OUTPUT_RETIREMENT_WAIT, Duration::from_secs(10));
     assert_eq!(windows.retirement_budget(0), Duration::from_secs(5));
-    assert_eq!(
-        windows.retirement_budget(68),
-        Duration::from_millis(5_000 + 68 * 250)
-    );
-    assert!(windows.retirement_budget(68) > Duration::from_millis(68 * 73 * 3));
-    assert_eq!(windows.retirement_budget(100_000), Duration::from_secs(120));
+    assert_eq!(windows.retirement_budget(8), Duration::from_millis(7_000));
+    assert_eq!(windows.retirement_budget(68), PRE_OUTPUT_RETIREMENT_WAIT);
     assert_eq!(
         windows.retirement_budget(usize::MAX),
-        Duration::from_secs(120)
+        PRE_OUTPUT_RETIREMENT_WAIT
+    );
+}
+
+/// R-C51-4: the report is written first, the immediate exit on a second
+/// signal is armed next, and only then does an unsettled retirement's
+/// blocking detach run, between two progress lines.
+#[test]
+fn the_report_is_written_before_the_blocking_detach() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert_eq!(stopped.summary.retirement.label(), "unsettled");
+    log.borrow_mut().clear();
+    let note = |entry: &str| log.borrow_mut().push(entry.to_string());
+    let code = finish_native(
+        Some(stopped),
+        |summary| {
+            assert_eq!(summary.unwrap().retirement.label(), "unsettled");
+            note("report");
+            7
+        },
+        &|| note("armed"),
+        &mut |line| {
+            note(if line.contains("detached") {
+                "progress:done"
+            } else {
+                "progress:start"
+            })
+        },
+    );
+    assert_eq!(code, 7);
+    assert_eq!(
+        entries(&log),
+        ["report", "armed", "progress:start", "drop", "progress:done"]
+    );
+}
+
+/// A closed retirement has nothing left to detach: no progress lines.
+#[test]
+fn a_closed_retirement_reports_without_a_detach_phase() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = ScriptedLane::new(&log);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    log.borrow_mut().clear();
+    let note = |entry: &str| log.borrow_mut().push(entry.to_string());
+    finish_native(
+        Some(stopped),
+        |_| note("report"),
+        &|| note("armed"),
+        &mut |_| note("progress"),
+    );
+    assert_eq!(entries(&log), ["report", "armed", "drop"]);
+}
+
+/// The child half of the second-signal test: inert unless its parent sets
+/// the environment.
+#[test]
+fn stop_flag_child_exits_on_the_armed_signal() {
+    if std::env::var_os("P11SCOPE_STOPFLAG_CHILD").is_none() {
+        return;
+    }
+    let flag = crate::inventory_dashboard::StopFlag::install();
+    // SAFETY: raising a signal whose handler is installed.
+    unsafe { libc::raise(libc::SIGINT) };
+    // Positive control: before arming, a signal only requests the stop.
+    assert!(flag.stopped());
+    println!("FIRST_SIGNAL_STOPPED");
+    flag.exit_on_next_signal();
+    // SAFETY: as above.
+    unsafe { libc::raise(libc::SIGTERM) };
+    println!("SURVIVED_SECOND_SIGNAL");
+    std::process::exit(0);
+}
+
+/// R-C51-4: once the report is written, a second SIGINT/SIGTERM ends the
+/// process at once (128 + signal), whatever the drop is still doing.
+#[test]
+fn after_the_report_a_second_signal_exits_at_once() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "inventory_capture::tests::stop_flag_child_exits_on_the_armed_signal",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("P11SCOPE_STOPFLAG_CHILD", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FIRST_SIGNAL_STOPPED"), "{stdout}");
+    assert!(!stdout.contains("SURVIVED_SECOND_SIGNAL"), "{stdout}");
+    assert_eq!(
+        output.status.code(),
+        Some(128 + libc::SIGTERM),
+        "{output:?}"
     );
 }
 

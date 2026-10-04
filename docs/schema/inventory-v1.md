@@ -46,9 +46,10 @@ A native document adds to `observation`:
   `watched_no_use` intervals, which end at the last clean read before
   stop (`until_ns`), never through the stop itself.
 - `retirement`: `"closed"` when every probe link had its close attempt
-  within the stop budget, `"unsettled"` when the budget passed first; then
-  `gaps[]` also holds `subject` `native capture retirement unsettled`, and
-  the probes are reclaimed (blocking) after the document is written.
+  within the stop budget (5 s plus 250 ms per attached endpoint, at most
+  10 s), `"unsettled"` when the budget passed first; then `gaps[]` also
+  holds `subject` `native capture retirement unsettled`, and the probes
+  are reclaimed (blocking) after the document is written.
 
 In the native lane an admitted edge no coverage note reached reads
 `not_attached`, never `scan_only`. When the observer's `/proc` numbering is
@@ -288,11 +289,17 @@ caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
     good: an ongoing or frozen watch is replaced, none starts again,
     and it holds whichever is read first, the row or the admission.
     Fail-safe by pid: a row of an earlier process that held the same
-    pid also downgrades the watch. Past a bound of 4096 (pid, module)
-    pairs every watch of the capture reads `use_before_admission`, with
-    a `native pre-admission rows past their bound` gap. Positive
-    history (`counted`, `witnessed`) is never downgraded, and a watch a
-    loss already demoted keeps `loss` (no watch starts again either way).
+    pid also downgrades the callers of that pid admitted when the row is
+    read; a caller admitted later is spared only when both start times
+    are known and differ. Rows of exited pids, or of pids now naming
+    another process, are pruned (`budgets.native_preadmission.pruned`).
+    Past a bound of 4096 held (pid, module) pairs every watch of the
+    capture reads `use_before_admission`, with a `native pre-admission
+    rows past their bound` gap. Positive history (`counted`,
+    `witnessed`) is never downgraded. The reason names what first voided
+    the watch: a watch a loss already demoted keeps `loss`, and a later
+    loss leaves `use_before_admission` in place (a loss demotes watch
+    intervals only); no watch starts again either way.
     A row that lifecycle loss left unbound (`lifecycle_loss`) downgrades
     the same way but reads `loss` (`detail`: the lost lifecycle
     evidence), since the loss, not an early use, is what it shows.
@@ -532,7 +539,15 @@ caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
   budget gap) plus per-edge keys past the S1 bounds),
   and `retained_history` (`limit`, `retained`, `suppressed` — the gap
   retention cap and its eviction marker; `limit` is the `--max-gaps`
-  bound, 1024 unless the operator overrode it). Refusal never erases
+  bound, 1024 unless the operator overrode it), and
+  `native_preadmission` (additive within v1; `null` in the scan lane:
+  `{limit, occupied, refused, pruned}` — the native lane's unbound use
+  rows held per (pid, module) until their caller's admission;
+  `pruned` counts pairs dropped because their process exited or the pid
+  now names a process with another start time, and `refused` counts
+  the (pid, module) notes refused once pruning could not make room, which also records the gap
+  `native pre-admission rows past their bound` and degrades every
+  watched caller's scope). Refusal never erases
   retained evidence: over-budget members are dropped with a named
   gap while catalog entries and previously observed use stay.
 

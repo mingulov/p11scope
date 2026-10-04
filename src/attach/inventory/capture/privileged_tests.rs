@@ -305,22 +305,34 @@ fn privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64()
 #[ignore = "root-owned live BPF lane; PID-scoped uprobe-multi excludes a foreign caller and a reused-PID process"]
 fn privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64() -> Result<()>
 {
-    if let Err(reason) = crate::attach::kernel_multi_pid_filter() {
-        let a = OwnedFixture::build_n(false, 1)?;
-        let target = a.spawn()?;
-        let pin = PidPin::open(target.child.id()).map_err(anyhow::Error::msg)?;
-        let refused = match prepare_on(CaptureScope::Pid(pin), AttachBackend::Multi) {
-            Ok(_) => bail!("PID-scoped Multi prepared without a proven pid filter ({reason})"),
-            Err(error) => format!("{error:#}"),
-        };
-        ensure!(
-            refused.contains("kernel pid filter") && refused.contains(&reason),
-            "{refused}"
-        );
-        eprintln!("C3_PID_SCOPE backend=Multi refused={refused:?}");
+    if multi_pid_refused_where_unproven("C3_PID_SCOPE")? {
         return Ok(());
     }
     pid_scope_excludes_foreign_and_reused_pid(AttachBackend::Multi)
+}
+
+/// Where the kernel pid filter is not proven, asserts that a PID-scoped
+/// Multi preparation is refused naming it, prints `<tag> backend=Multi
+/// refused=…` and returns true; returns false where it is proven.
+fn multi_pid_refused_where_unproven(tag: &str) -> Result<bool> {
+    let Err(reason) = crate::attach::kernel_multi_pid_filter() else {
+        return Ok(false);
+    };
+    let mut target = std::process::Command::new("sleep").arg("30").spawn()?;
+    let pin = PidPin::open(target.id()).map_err(anyhow::Error::msg);
+    let refused = pin.map(|pin| prepare_on(CaptureScope::Pid(pin), AttachBackend::Multi));
+    let _ = target.kill();
+    let _ = target.wait();
+    let refused = match refused? {
+        Ok(_) => bail!("PID-scoped Multi prepared without a proven pid filter ({reason})"),
+        Err(error) => format!("{error:#}"),
+    };
+    ensure!(
+        refused.contains("kernel pid filter") && refused.contains(&reason),
+        "{refused}"
+    );
+    eprintln!("{tag} backend=Multi refused={refused:?}");
+    Ok(true)
 }
 
 fn pid_scope_excludes_foreign_and_reused_pid(backend: AttachBackend) -> Result<()> {
@@ -729,6 +741,25 @@ fn usage_bit(capture: &InventoryCapture, endpoint: EndpointId) -> Result<u64> {
 #[test]
 #[ignore = "root-owned live BPF lane; probe: do OneProcess entries keep firing after the PID target's leader thread exits"]
 fn privileged_inventory_capture_pid_scope_leader_exit_probe_lp64() -> Result<()> {
+    leader_exit_probe(AttachBackend::Singles)
+}
+
+/// Review L5: the same probe with the entries in one PID-named uprobe-multi
+/// group. The kernel's consumer filter compares `link->task->mm`, which a
+/// leader exit clears, while 6.12+ handlers compare the thread group: so
+/// whether entries keep firing differs by kernel and is only printed. The
+/// guarantee is the custody rule, not the backend: custody after a leader
+/// exit is unproven. Where the pid filter is unproven, the refusal.
+#[test]
+#[ignore = "root-owned live BPF lane; probe: do PID-named uprobe-multi entries keep firing after the leader exits"]
+fn privileged_inventory_capture_multi_pid_scope_leader_exit_probe_lp64() -> Result<()> {
+    if multi_pid_refused_where_unproven("C3_LEADER_EXIT_PROBE")? {
+        return Ok(());
+    }
+    leader_exit_probe(AttachBackend::Multi)
+}
+
+fn leader_exit_probe(backend: AttachBackend) -> Result<()> {
     let fixture = LeaderExitFixture::build()?;
     let mut set = InventoryAttachSet::new(budget(N));
     let delta = fixture.absorb(&mut set);
@@ -736,7 +767,8 @@ fn privileged_inventory_capture_pid_scope_leader_exit_probe_lp64() -> Result<()>
     let mut target = LineChild::spawn(&fixture.path)?;
     let pid = target.child.id();
     let pin = PidPin::open(pid).map_err(anyhow::Error::msg)?;
-    let mut capture = prepare(CaptureScope::Pid(pin))?;
+    let mut capture = prepare_on(CaptureScope::Pid(pin), backend)?;
+    ensure!(capture.backend() == backend);
     let receipt = capture.extend(delta.clone(), &set, extend_window());
     ensure!(receipt.attached.len() == 4, "{receipt:?}");
     // Control: the leader's own call fires.
@@ -773,7 +805,7 @@ fn privileged_inventory_capture_pid_scope_leader_exit_probe_lp64() -> Result<()>
         Instant::now() + Duration::from_secs(5),
     )?);
     eprintln!(
-        "C3_LEADER_EXIT_PROBE pid={pid} before_exit_usage1={before_exit} leader_state=Z \
+        "C3_LEADER_EXIT_PROBE backend={backend:?} pid={pid} before_exit_usage1={before_exit} leader_state=Z \
          pidfd_alive={pidfd_alive} after_exit_usage2_3={after:?} fired_after_exit={} custody={custody:?}",
         after.contains(&1)
     );

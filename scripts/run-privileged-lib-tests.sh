@@ -44,7 +44,15 @@
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
 #
-# Curation (69 ignored tests in the default-feature lib binary): 59 run by
+# DISCOVERY loss: cells that assert health under system scope require zero
+# lifecycle-ring loss by default, a quiet-host property (vng guests, idle
+# hosts). On a loaded host, P11SCOPE_PRIV_LIFECYCLE_LOSS=report (pass it
+# through sudo, e.g. `sudo env P11SCOPE_PRIV_LIFECYCLE_LOSS=report ...`)
+# tolerates ring loss only where it is reported in the health read and the
+# capture's demotion rule fires on it; each such read prints
+# LIFECYCLE_LOSS_REPORTED. Never set it for a guest or qualification run.
+#
+# Curation (70 ignored tests in the default-feature lib binary): 60 run by
 # default, 4 run only with --include-long, 6 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -92,10 +100,12 @@ attach::inventory::activation::privileged_tests::privileged_task4_inventory_phys
 # probe (leader pthread_exit while a worker keeps calling). C5.11: the
 # foreign/reused-PID cell again with a PID-named uprobe-multi group (kernel
 # pid filter plus the in-BPF guard); where the pid-filter probe fails (5.15)
-# it asserts the PID-scoped Multi refusal instead.
+# it asserts the PID-scoped Multi refusal instead; the leader-exit probe
+# again under uprobe-multi (or the same refusal).
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_excludes_foreign_and_reused_pid_lp64
+attach::inventory::capture::privileged_tests::privileged_inventory_capture_multi_pid_scope_leader_exit_probe_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_excludes_foreign_and_reused_pid_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_pid_scope_leader_exit_probe_lp64
 attach::inventory::capture::privileged_tests::privileged_inventory_capture_stop_with_held_call_reports_unsettled_lp64

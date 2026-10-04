@@ -787,9 +787,14 @@ Limits that matter in pods:
   process: the links then name the target, so no other process — not one
   that later reuses the PID — traps or runs the probe, and the in-BPF PID
   guard stays as a second check; where the filter is not proven (Linux
-  6.6 to 6.9.11 shipped a thread-exact filter) `auto` keeps per-offset
-  links bound to the target. `multi` forces uprobe-multi and fails
-  naming why where it is unavailable; `singles` forces per-offset links.
+  6.6 to 6.9.11 shipped a thread-exact filter; the probe also requires
+  that a forked child process does not fire) `auto` keeps per-offset
+  links bound to the target. `multi` forces uprobe-multi: where it is
+  unavailable the native lane does not start, naming why — under
+  `--capture native` that is an error, and under `--capture auto` (the
+  default) the run continues on the scan lane with the gap `native usage
+  feed unavailable: --attach-backend multi: …`. `singles` forces
+  per-offset links. Under `--capture scan` the option has no effect.
   The document discloses the choice in `observation.attach`
   (`selection`, `mechanism` `uprobe-multi` or `per-offset`, `fallback`,
   `scope_filter`), and the start and stop lines name the mechanism. The

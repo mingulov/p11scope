@@ -197,6 +197,10 @@ struct Probe<L> {
     attached: Rc<Cell<usize>>,
     /// Summed attach wall time over every extend.
     attach_ns: u64,
+    /// The longest single attach (one link: an entry or a group).
+    attach_ns_max: u64,
+    /// The longest one extend spent attaching.
+    extend_attach_ns_max: u64,
     /// The kernel links the capture held when the stop began.
     links_at_stop: Option<usize>,
 }
@@ -214,6 +218,8 @@ impl<L> Probe<L> {
             retired_after: None,
             attached: Rc::default(),
             attach_ns: 0,
+            attach_ns_max: 0,
+            extend_attach_ns_max: 0,
             links_at_stop: None,
         }
     }
@@ -265,6 +271,8 @@ impl<L: CaptureLane<PidPin>> CaptureLane<PidPin> for Probe<L> {
         self.attached
             .set(self.attached.get() + receipt.attached.len());
         self.attach_ns += receipt.attach_ns_total;
+        self.attach_ns_max = self.attach_ns_max.max(receipt.attach_ns_max);
+        self.extend_attach_ns_max = self.extend_attach_ns_max.max(receipt.attach_ns_total);
         if let Some(coverage) = receipt.exec_coverage {
             self.exec_coverage_ns = Some(coverage.start_ns());
         }
@@ -594,12 +602,28 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
     let stop_at = RefCell::new(None::<Instant>);
     let drainer = RefCell::new(None::<std::thread::JoinHandle<Vec<u8>>>);
     let master = RefCell::new(Some(master));
+    let events = workload.path("dashboard.jsonl");
+    // The window is anchored at the lane's first committed pass (review
+    // point 6), not at the test start: scan, prepare and activation (about
+    // 7.5 s in a vng guest) are not the lane's cadence. The terminal is
+    // never read until the stop either way.
+    let anchor = Cell::new(None::<Instant>);
     let stop = || {
+        if anchor.get().is_none() {
+            if std::fs::read_to_string(&events)
+                .is_ok_and(|text| text.contains("\"kind\":\"pass_committed\""))
+            {
+                anchor.set(Some(Instant::now()));
+            } else if started.elapsed() < Duration::from_secs(90) {
+                return false;
+            }
+        }
+        let active = anchor.get().map_or(stall, |at| at.elapsed());
         // The ledger calls in the middle of the stall.
-        if started.elapsed() > Duration::from_secs(8) && !gate.exists() {
+        if active > Duration::from_secs(8) && !gate.exists() {
             let _ = std::fs::write(&gate, b"");
         }
-        if started.elapsed() < stall {
+        if active < stall {
             return false;
         }
         if stop_at.borrow().is_none() {
@@ -629,7 +653,6 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
         stderr_fd: 2,
         stderr: StderrRoute::Capture,
     };
-    let events = workload.path("dashboard.jsonl");
     let reported = Cell::new(None::<Instant>);
     let mut stdout = Vec::new();
     let code = run_with_terminal(
@@ -690,8 +713,17 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
         seen.windows(restore.len()).any(|window| window == restore),
         "the restore never reached the terminal"
     );
+    // The cadence proper is the pass-gap (< 1 s) and tick-gap (< 100 ms)
+    // checks above; the count only catches a stalled loop: three quarters
+    // of the active seconds, at least 12 (15 for the nominal 20 s).
+    let anchor = anchor.get().context("the lane never committed a pass")?;
+    let active_secs = stop_at.saturating_duration_since(anchor).as_secs_f64();
+    let required = 12u64.max((0.75 * active_secs).floor() as u64);
     let passes = document["observation"]["passes"].as_u64().unwrap_or(0);
-    ensure!(passes >= 15, "passes kept no cadence: {passes}");
+    ensure!(
+        passes >= required,
+        "passes kept no cadence: {passes} in {active_secs:.1} s active (need {required})"
+    );
     ensure!(document["observation"]["lane"] == "native");
     ensure!(
         document["observation"]["retirement"] == "closed",
@@ -719,10 +751,12 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
     );
     ensure!(stream_ended(&stream), "the stream did not end");
     eprintln!(
-        "C53_SLOW_PTY pid={} passes={passes} ticks={} longest_gap_ms={} written={} shed={} \
+        "C53_SLOW_PTY pid={} passes={passes} required={required} active_s={active_secs:.1} \
+         startup_ms={} ticks={} longest_gap_ms={} written={} shed={} \
          cut={} shed_bytes={} stall_ms={} restored={} stop_to_report_ms={} \
          longest_pass_gap_ms={} witnesses={witnesses}",
         target.pid(),
+        anchor.saturating_duration_since(started).as_millis(),
         account.ticks,
         account.longest_gap.as_millis(),
         account.terminal.frames_written,
@@ -1362,8 +1396,9 @@ fn privileged_native_lane_system_exec_churn_lp64() -> Result<()> {
 /// the retirement-time-against-endpoints measurement.
 ///
 /// Knobs (measurement only): `P11SCOPE_CELL_COPIES` (default 8 copies,
-/// 544 endpoints) and `P11SCOPE_CELL_BACKEND` (auto|multi|singles,
-/// default auto).
+/// 544 endpoints), `P11SCOPE_CELL_BACKEND` (auto|multi|singles, default
+/// auto) and `P11SCOPE_CELL_MAPPERS` (mapper processes per copy, default 1:
+/// the registration walk grows with them, review M1).
 #[test]
 #[ignore = "root-owned live BPF lane; native --system over 400+ endpoints retires closed"]
 fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
@@ -1375,6 +1410,11 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
     let selection = crate::attach::BackendSelection::from_cli(
         &std::env::var("P11SCOPE_CELL_BACKEND").unwrap_or_else(|_| "auto".into()),
     )?;
+    let rounds: usize = std::env::var("P11SCOPE_CELL_MAPPERS")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(1);
     let workload = Workload::build()?;
     let mut providers = Vec::with_capacity(copies);
     for copy in 0..copies {
@@ -1385,15 +1425,17 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
     let gate = workload.path("gate");
     let gate_arg = gate.to_str().context("gate path")?.to_string();
     let mut mappers = Vec::new();
-    for (index, chunk) in providers.chunks(4).enumerate() {
-        let mut args = vec!["map".to_string(), "--cell".into(), format!("S{index}")];
-        for provider in chunk {
-            args.push("--module".into());
-            args.push(provider.to_str().context("provider path")?.into());
+    for round in 0..rounds {
+        for (index, chunk) in providers.chunks(4).enumerate() {
+            let mut args = vec!["map".to_string(), "--cell".into(), format!("S{index}")];
+            for provider in chunk {
+                args.push("--module".into());
+                args.push(provider.to_str().context("provider path")?.into());
+            }
+            args.extend(["--gate".into(), gate_arg.clone(), "--hold".into()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            mappers.push(workload.spawn(&format!("map{index}-{round}"), &args)?);
         }
-        args.extend(["--gate".into(), gate_arg.clone(), "--hold".into()]);
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        mappers.push(workload.spawn(&format!("map{index}"), &args)?);
     }
     let mut coordinator = InventoryCoordinator::new(
         Scope::System,
@@ -1435,16 +1477,20 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
     let cleanup = stopped.capture.cleanup();
     eprintln!(
         "C511_SCALE selection={} mechanism={} fallback={:?} copies={copies} expected={expected} \
-         attached={} failed={} passes={} links={} attach_ms={} budget_ms={} retired_ms={:?} \
+         mappers={} attached={} failed={} passes={} links={} attach_ms={} \
+         attach_link_max_ms={:.1} extend_attach_max_ms={:.1} budget_ms={} retired_ms={:?} \
          retirement={} cleanup={cleanup:?}",
         backend.selection_label(),
         backend.mechanism(),
         backend.fallback,
+        mappers.len(),
         summary.attached,
         summary.failed,
         summary.passes,
         load.links,
         stopped.capture.attach_ns / 1_000_000,
+        stopped.capture.attach_ns_max as f64 / 1e6,
+        stopped.capture.extend_attach_ns_max as f64 / 1e6,
         budget.as_millis(),
         stopped.capture.retired_after.map(|after| after.as_millis()),
         summary.retirement.label(),

@@ -8863,12 +8863,44 @@ fn owned_link_inspection_borrows_descriptors_and_refuses_changed_identity() -> R
     Ok(())
 }
 
+/// The environment variable that selects the loaded-host variant of the
+/// DISCOVERY loss check (documented in scripts/run-privileged-lib-tests.sh).
+const LIFECYCLE_LOSS_ENV: &str = "P11SCOPE_PRIV_LIFECYCLE_LOSS";
+
+/// Health with no loss of any kind. Zero DISCOVERY ring loss is a
+/// quiet-host property: under `Scope::System` the ring sees every exec on
+/// the machine, so unrelated host churn can overflow it. Strict by
+/// default (vng guests, quiet hosts). With `P11SCOPE_PRIV_LIFECYCLE_LOSS=
+/// report` (a loaded host) ring loss may occur, but then it must be
+/// reported (the health read carries it in `discovery_counters[0]`, every
+/// other counter still zero) and the production consumer must demote on
+/// exactly this read ([`ring_loss_demotion`]); each tolerated loss prints
+/// `LIFECYCLE_LOSS_REPORTED`, never silently.
 fn assert_health(snapshot: &InventoryUsageSnapshot) -> Result<()> {
     assert_non_loss_health(snapshot)?;
+    let counters = snapshot
+        .health
+        .discovery_counters
+        .with_context(|| format!("DISCOVERY counters unread: {snapshot:?}"))?;
+    ensure!(counters[1..] == [0; 4], "{snapshot:?}");
+    if counters[0] == 0 {
+        return Ok(());
+    }
+    let mode = std::env::var(LIFECYCLE_LOSS_ENV).ok();
     ensure!(
-        snapshot.health.discovery_counters == Some([0; 5]),
-        "{snapshot:?}"
+        mode.as_deref() == Some("report"),
+        "DISCOVERY ring loss {} on a strict run (set {LIFECYCLE_LOSS_ENV}=report only on a \
+         loaded host): {snapshot:?}",
+        counters[0]
     );
+    let (lost, reason) = super::super::capture::ring_loss_demotion(
+        0,
+        Some(counters),
+        "an exec or exit of a watched caller",
+    )
+    .with_context(|| format!("ring loss {} caused no demotion", counters[0]))?;
+    ensure!(lost == counters[0], "{lost} != {}", counters[0]);
+    eprintln!("LIFECYCLE_LOSS_REPORTED ring_loss={lost} demotion={reason:?} mode=report");
     Ok(())
 }
 
@@ -8981,7 +9013,27 @@ fn assert_caller_health(snapshot: &InventoryUsageSnapshot, evidence: [u64; 4]) -
     Ok(())
 }
 
+/// Waits for the owned process's lifecycle record. Under
+/// `P11SCOPE_PRIV_LIFECYCLE_LOSS=report` (see [`assert_health`]) a record
+/// that never arrives is accepted only when the health read reports
+/// DISCOVERY ring loss, the honest reason it can be missing.
 fn await_lifecycle(active: &mut ActiveInventory, pid: u32, kind: u8) -> Result<()> {
+    let Err(error) = await_lifecycle_record(active, pid, kind) else {
+        return Ok(());
+    };
+    if std::env::var(LIFECYCLE_LOSS_ENV).ok().as_deref() != Some("report") {
+        return Err(error);
+    }
+    let health = active.state.health(Instant::now() + Duration::from_secs(1));
+    let ring_loss = health.discovery_counters.map_or(0, |counters| counters[0]);
+    ensure!(ring_loss > 0, "{error:#} with no ring loss reported");
+    eprintln!(
+        "LIFECYCLE_LOSS_REPORTED ring_loss={ring_loss} missing=kind{kind}/pid{pid} ({error:#}) mode=report"
+    );
+    Ok(())
+}
+
+fn await_lifecycle_record(active: &mut ActiveInventory, pid: u32, kind: u8) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     for _ in 0..4096 {
         ensure!(

@@ -120,6 +120,15 @@ pub(crate) const FD_RESERVE: u64 = 64;
 /// Singles.
 pub(crate) const MULTI_LINK_BOUND: u64 = 1024;
 
+/// Multi: the most sites one group link carries (review M1). A group
+/// attach is one `BPF_LINK_CREATE`, uninterruptible, whose cost is about
+/// sites x processes mapping the object (each registration walks every
+/// mm), and the extend deadline is checked only between links; capping a
+/// link's sites bounds the overshoot past the extend window, so the
+/// lifecycle ring keeps its service cadence. An (object, program) group
+/// larger than this attaches as several immutable groups.
+pub(crate) const MULTI_SITES_PER_LINK: usize = 64;
+
 /// The named resource of a descriptor refusal (`CapacityLimited("fds")`).
 pub(crate) const FD_RESOURCE: &str = "fds";
 
@@ -819,6 +828,26 @@ struct CaptureBook {
     stopping: bool,
 }
 
+/// The lifecycle-loss demotion a health read's DISCOVERY counters cause:
+/// ring loss above what was already seen marks lifecycle evidence lost
+/// (custody or watch coverage demoted). Returns the new loss count and
+/// the demotion reason, or `None` when nothing new was lost.
+pub(in crate::attach::inventory) fn ring_loss_demotion(
+    seen: u64,
+    counters: Option<[u64; 5]>,
+    hidden: &str,
+) -> Option<(u64, String)> {
+    let ring_loss = counters?[0];
+    (ring_loss > seen).then(|| {
+        (
+            ring_loss,
+            format!(
+                "the lifecycle ring lost records (DISCOVERY ring loss {seen} -> {ring_loss}): {hidden} may be among them"
+            ),
+        )
+    })
+}
+
 impl CaptureBook {
     fn new(
         budget: InventoryBudget,
@@ -966,14 +995,9 @@ impl CaptureBook {
         } else {
             "an exec or exit of a watched caller"
         };
-        let ring_loss = health.discovery_counters.map(|counters| counters[0]);
-        if let Some(ring_loss) = ring_loss
-            && ring_loss > self.ring_loss
+        if let Some((ring_loss, reason)) =
+            ring_loss_demotion(self.ring_loss, health.discovery_counters, hidden)
         {
-            let reason = format!(
-                "the lifecycle ring lost records (DISCOVERY ring loss {} -> {ring_loss}): {hidden} may be among them",
-                self.ring_loss
-            );
             self.mark_lifecycle_loss(self.health_ns, reason);
             self.ring_loss = ring_loss;
         }
@@ -1388,8 +1412,9 @@ fn extend_groups_with<I: InventoryLinkIo>(
             admitted.push((*endpoint, entry));
         }
     }
-    // Grouping: one group per (object, entry program), members in delta
-    // order. Every member's binding is already published.
+    // Grouping: one group per (object, entry program) and at most
+    // MULTI_SITES_PER_LINK members, in delta order. Every member's binding
+    // is already published.
     let mut groups: BTreeMap<GroupKey, Vec<GroupMember>> = BTreeMap::new();
     for (endpoint, entry) in admitted {
         groups
@@ -1397,7 +1422,15 @@ fn extend_groups_with<I: InventoryLinkIo>(
             .or_default()
             .push((endpoint, entry));
     }
-    let mut pending: Vec<_> = groups.into_iter().collect();
+    let mut pending: Vec<(GroupKey, Vec<GroupMember>)> = groups
+        .into_iter()
+        .flat_map(|(key, members)| {
+            members
+                .chunks(MULTI_SITES_PER_LINK)
+                .map(|chunk| (key, chunk.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     pending.reverse();
     while let Some(((object, program), members)) = pending.pop() {
         let defer_members = |receipt: &mut ExtendReceipt,

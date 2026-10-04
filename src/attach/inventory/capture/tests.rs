@@ -116,6 +116,8 @@ struct FakeIo {
     /// Leaf links an EMFILE halt creates (as a bisect would, after a
     /// poison split) before halting; the halt closes them.
     leaves_before_halt: usize,
+    /// attach_entry_group() takes this long (a slow registration walk).
+    group_delay: Duration,
 }
 
 fn entry_id(cookie: u64) -> u32 {
@@ -185,6 +187,7 @@ impl InventoryLinkIo for FakeIo {
             .iter()
             .map(|(_, cookie)| entry_id(*cookie))
             .collect();
+        std::thread::sleep(self.group_delay);
         if self.unsupported {
             return Err(p11scope_bpf_multi::BisectHalt {
                 halt: p11scope_bpf_multi::GroupHalt::Unsupported(
@@ -2182,6 +2185,58 @@ fn fd_exhaustion_defers_the_group_and_the_rest_published_for_an_attach_only_retr
         .filter(|op| matches!(op, Op::Publish(..)))
         .count();
     assert_eq!(republished, 4, "a published entry retries its attach only");
+    harness.assert_group_invariants();
+}
+
+/// Review M1: an (object, program) group larger than MULTI_SITES_PER_LINK
+/// attaches as several immutable groups of at most that many sites.
+#[test]
+fn a_large_object_attaches_in_groups_of_at_most_the_site_cap() {
+    let n = (2 * MULTI_SITES_PER_LINK + 22) as u64;
+    let mut fixture = SetFixture::new(n);
+    let delta = fixture.pass("a.so", n);
+    let mut harness = Harness::multi(n, None);
+    let window = ExtendWindow::new(n as usize, Instant::now() + Duration::from_secs(30)).unwrap();
+    let receipt = harness.extend_with_custody(delta, &fixture.set, window, &mut || Ok(()));
+    assert_eq!(receipt.attached.len(), n as usize);
+    let sizes: Vec<usize> = harness
+        .group_ops()
+        .iter()
+        .map(|(_, members)| members.len())
+        .collect();
+    assert_eq!(sizes, [MULTI_SITES_PER_LINK, MULTI_SITES_PER_LINK, 22]);
+    assert_eq!(receipt.groups.len(), 3);
+    harness.assert_group_invariants();
+}
+
+/// Review M1: the extend deadline is checked between site-capped links, so
+/// a slow registration overshoots the window by one link at most; the rest
+/// stays published-unattached and retries its attach only.
+#[test]
+fn the_extend_deadline_stops_between_site_capped_links() {
+    let n = (3 * MULTI_SITES_PER_LINK) as u64;
+    let mut fixture = SetFixture::new(n);
+    let delta = fixture.pass("a.so", n);
+    let mut harness = Harness::multi(n, None);
+    harness.io.group_delay = Duration::from_millis(80);
+    let window = ExtendWindow::new(n as usize, Instant::now() + Duration::from_millis(50)).unwrap();
+    let receipt = harness.extend_with_custody(delta, &fixture.set, window, &mut || Ok(()));
+    assert_eq!(receipt.attached.len(), MULTI_SITES_PER_LINK);
+    assert_eq!(receipt.deferred.endpoints.len(), 2 * MULTI_SITES_PER_LINK);
+    harness.io.group_delay = Duration::ZERO;
+    let publishes_before = harness
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, Op::Publish(..)))
+        .count();
+    let receipt = harness.extend(receipt.deferred, &fixture.set);
+    assert_eq!(receipt.attached.len(), 2 * MULTI_SITES_PER_LINK);
+    let publishes_after = harness
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, Op::Publish(..)))
+        .count();
+    assert_eq!(publishes_before, publishes_after, "a retry attaches only");
     harness.assert_group_invariants();
 }
 

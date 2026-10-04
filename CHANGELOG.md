@@ -24,8 +24,10 @@ versioned separately and are opaque, exact dispatch keys.
 - The native lane of `inventory` attaches provider entries as uprobe-multi
   links wherever a functional probe shows the kernel supports them (6.6+,
   including distribution backports; never decided by version), one
-  immutable link per provider object per extend (at most 64 entries per
-  link, so one attach call stays short) instead of one per entry.
+  immutable link per provider object per extend instead of one per entry
+  (8 to 96 entries per link, sized so one attach call stays near 200 ms:
+  whole function tables for providers few processes map, smaller links
+  for one mapped by hundreds).
   Stopping a system-scale capture no longer waits on several kernel grace
   periods per entry: hundreds of entries detach in well under a second on
   6.12 and 7.x, so `observation.retirement` reads `closed` where it used to

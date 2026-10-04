@@ -728,6 +728,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // living across reconcile or the native owner scans below.
         let absorb_start = crate::attach::monotonic_ns();
         let verdicts = self.absorb_lowering(catalog.lowering.take());
+        // Mapper counts size uprobe-multi links (C5.11 review M1).
+        self.attach_set.note_mappers(
+            catalog
+                .objects
+                .iter()
+                .map(|object| (&object.key, object.mappings.len())),
+        );
         timings.span(
             crate::timing::StageKind::Plan,
             "absorb",

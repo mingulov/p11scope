@@ -208,6 +208,9 @@ pub(crate) struct InventoryAttachSet {
     reported_overflow: bool,
     endpoint_refusals: u64,
     module_record_refusals: u64,
+    /// The processes discovery last saw mapping each retained object
+    /// (replaced every pass; bounded by the retained objects).
+    mappers: BTreeMap<AttachObjectId, usize>,
 }
 
 impl InventoryAttachSet {
@@ -227,7 +230,28 @@ impl InventoryAttachSet {
             reported_overflow: false,
             endpoint_refusals: 0,
             module_record_refusals: 0,
+            mappers: BTreeMap::new(),
         }
+    }
+
+    /// Record one pass's mapper counts by raw object key (a catalog's
+    /// objects with their mappings); keys that name no retained object
+    /// are ignored, and an object seen under several keys sums them.
+    pub(crate) fn note_mappers<'a>(
+        &mut self,
+        counts: impl IntoIterator<Item = (&'a ObjectKey, usize)>,
+    ) {
+        self.mappers.clear();
+        for (key, count) in counts {
+            if let Some(&object) = self.by_raw.get(key) {
+                *self.mappers.entry(object).or_default() += count;
+            }
+        }
+    }
+
+    /// The processes discovery last saw mapping `object`, when known.
+    pub(crate) fn mappers(&self, object: AttachObjectId) -> Option<usize> {
+        self.mappers.get(&object).copied()
     }
 
     pub(crate) const fn budget(&self) -> InventoryBudget {

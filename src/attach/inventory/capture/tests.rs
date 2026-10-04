@@ -118,6 +118,8 @@ struct FakeIo {
     leaves_before_halt: usize,
     /// attach_entry_group() takes this long (a slow registration walk).
     group_delay: Duration,
+    /// ... plus this long per site.
+    site_delay: Duration,
 }
 
 fn entry_id(cookie: u64) -> u32 {
@@ -187,7 +189,7 @@ impl InventoryLinkIo for FakeIo {
             .iter()
             .map(|(_, cookie)| entry_id(*cookie))
             .collect();
-        std::thread::sleep(self.group_delay);
+        std::thread::sleep(self.group_delay + self.site_delay * ids.len() as u32);
         if self.unsupported {
             return Err(p11scope_bpf_multi::BisectHalt {
                 halt: p11scope_bpf_multi::GroupHalt::Unsupported(
@@ -2188,41 +2190,151 @@ fn fd_exhaustion_defers_the_group_and_the_rest_published_for_an_attach_only_retr
     harness.assert_group_invariants();
 }
 
-/// Review M1: an (object, program) group larger than MULTI_SITES_PER_LINK
-/// attaches as several immutable groups of at most that many sites.
-#[test]
-fn a_large_object_attaches_in_groups_of_at_most_the_site_cap() {
-    let n = (2 * MULTI_SITES_PER_LINK + 22) as u64;
-    let mut fixture = SetFixture::new(n);
-    let delta = fixture.pass("a.so", n);
-    let mut harness = Harness::multi(n, None);
-    let window = ExtendWindow::new(n as usize, Instant::now() + Duration::from_secs(30)).unwrap();
-    let receipt = harness.extend_with_custody(delta, &fixture.set, window, &mut || Ok(()));
-    assert_eq!(receipt.attached.len(), n as usize);
-    let sizes: Vec<usize> = harness
+/// The attach set with a fixed mapper count for every object: what
+/// discovery would report for a provider mapped by `mappers` processes.
+struct Mapped<'a> {
+    set: &'a InventoryAttachSet,
+    mappers: usize,
+}
+
+impl CaptureTargets for Mapped<'_> {
+    fn target(&self, object: AttachObjectId) -> Option<&RetainedInventoryTarget> {
+        self.set.target(object)
+    }
+
+    fn mappers(&self, _object: AttachObjectId) -> Option<usize> {
+        Some(self.mappers)
+    }
+}
+
+fn long_window(n: u64) -> ExtendWindow {
+    ExtendWindow::new(n as usize, Instant::now() + Duration::from_secs(30)).unwrap()
+}
+
+fn group_sizes(harness: &Harness) -> Vec<usize> {
+    harness
         .group_ops()
         .iter()
         .map(|(_, members)| members.len())
-        .collect();
-    assert_eq!(sizes, [MULTI_SITES_PER_LINK, MULTI_SITES_PER_LINK, 22]);
-    assert_eq!(receipt.groups.len(), 3);
+        .collect()
+}
+
+/// Review M1 (controller ruling): link sizes come from the cost model and
+/// the mapper count first, then from the measured per-site cost.
+#[test]
+fn the_link_size_keeps_whole_tables_for_few_mappers_and_fits_the_target_for_many() {
+    let target = MULTI_LINK_TARGET.as_nanos() as u64;
+    // Few or unknown mappers: a whole v2.40 / v3.0 table in one link.
+    assert_eq!(multi_link_sites(None, None), MULTI_LINK_MAX_SITES);
+    assert_eq!(multi_link_sites(Some(1), None), MULTI_LINK_MAX_SITES);
+    assert_eq!(multi_link_sites(Some(50), None), MULTI_LINK_MAX_SITES);
+    // 500 mappers: the estimate fits the 200 ms target.
+    let sites = multi_link_sites(Some(500), None);
+    let per_site = MULTI_LINK_SITE_BASE_NS + 500 * MULTI_LINK_SITE_PER_MAPPER_NS;
+    assert!(
+        sites < MULTI_LINK_MAX_SITES && sites as u64 * per_site <= target,
+        "{sites}"
+    );
+    assert!(
+        (sites as u64 + 1) * per_site > target,
+        "the largest that fits: {sites}"
+    );
+    // Clamps at both ends.
+    assert_eq!(
+        multi_link_sites(Some(1_000_000), None),
+        MULTI_LINK_MIN_SITES
+    );
+    assert_eq!(multi_link_sites(None, Some(u64::MAX)), MULTI_LINK_MIN_SITES);
+    assert_eq!(multi_link_sites(None, Some(0)), MULTI_LINK_MAX_SITES);
+    // The measured cost overrides the estimate both ways.
+    assert_eq!(
+        multi_link_sites(Some(500), Some(1_000)),
+        MULTI_LINK_MAX_SITES
+    );
+    assert_eq!(multi_link_sites(Some(1), Some(10_000_000)), 20);
+}
+
+/// Review M1: with few mappers an (object, program) group attaches in
+/// links of the maximum size, the remainder in a last one.
+#[test]
+fn a_large_object_with_few_mappers_attaches_in_maximum_size_links() {
+    let n = (MULTI_LINK_MAX_SITES + 54) as u64;
+    let mut fixture = SetFixture::new(n);
+    let delta = fixture.pass("a.so", n);
+    let mut harness = Harness::multi(n, None);
+    let source = Mapped {
+        set: &fixture.set,
+        mappers: 1,
+    };
+    let receipt = harness.extend_with_custody(delta, &source, long_window(n), &mut || Ok(()));
+    assert_eq!(receipt.attached.len(), n as usize);
+    assert_eq!(group_sizes(&harness), [MULTI_LINK_MAX_SITES, 54]);
+    assert_eq!(receipt.groups.len(), 2);
     harness.assert_group_invariants();
 }
 
-/// Review M1: the extend deadline is checked between site-capped links, so
-/// a slow registration overshoots the window by one link at most; the rest
+/// Review M1: the first link of a provider mapped by 500 processes is
+/// sized from the estimate; the next ones from what the first measured
+/// (here cheap, so they grow to the maximum).
+#[test]
+fn a_cheap_measured_link_grows_the_next_links_of_that_object() {
+    let n = 150u64;
+    let mut fixture = SetFixture::new(n);
+    let delta = fixture.pass("a.so", n);
+    let mut harness = Harness::multi(n, None);
+    let source = Mapped {
+        set: &fixture.set,
+        mappers: 500,
+    };
+    let receipt = harness.extend_with_custody(delta, &source, long_window(n), &mut || Ok(()));
+    assert_eq!(receipt.attached.len(), n as usize);
+    let first = multi_link_sites(Some(500), None);
+    assert_eq!(
+        group_sizes(&harness),
+        [
+            first,
+            MULTI_LINK_MAX_SITES,
+            n as usize - first - MULTI_LINK_MAX_SITES
+        ]
+    );
+    harness.assert_group_invariants();
+}
+
+/// Review M1: an expensive measured link shrinks the next one.
+#[test]
+fn an_expensive_measured_link_shrinks_the_next_link_of_that_object() {
+    let n = 200u64;
+    let mut fixture = SetFixture::new(n);
+    let delta = fixture.pass("a.so", n);
+    let mut harness = Harness::multi(n, None);
+    harness.io.site_delay = Duration::from_millis(3);
+    let source = Mapped {
+        set: &fixture.set,
+        mappers: 1,
+    };
+    let receipt = harness.extend_with_custody(delta, &source, long_window(n), &mut || Ok(()));
+    assert_eq!(receipt.attached.len(), n as usize);
+    let sizes = group_sizes(&harness);
+    assert_eq!(sizes[0], MULTI_LINK_MAX_SITES);
+    // About 3 ms per site measured: 200 ms fits at most 66.
+    assert!((40..=66).contains(&sizes[1]), "{sizes:?}");
+    harness.assert_group_invariants();
+}
+
+/// Review M1: the extend deadline is checked between links, so a slow
+/// registration overshoots the window by one link at most; the rest
 /// stays published-unattached and retries its attach only.
 #[test]
-fn the_extend_deadline_stops_between_site_capped_links() {
-    let n = (3 * MULTI_SITES_PER_LINK) as u64;
+fn the_extend_deadline_stops_between_links() {
+    let n = (3 * MULTI_LINK_MAX_SITES) as u64;
     let mut fixture = SetFixture::new(n);
     let delta = fixture.pass("a.so", n);
     let mut harness = Harness::multi(n, None);
     harness.io.group_delay = Duration::from_millis(80);
     let window = ExtendWindow::new(n as usize, Instant::now() + Duration::from_millis(50)).unwrap();
     let receipt = harness.extend_with_custody(delta, &fixture.set, window, &mut || Ok(()));
-    assert_eq!(receipt.attached.len(), MULTI_SITES_PER_LINK);
-    assert_eq!(receipt.deferred.endpoints.len(), 2 * MULTI_SITES_PER_LINK);
+    assert_eq!(receipt.attached.len(), MULTI_LINK_MAX_SITES);
+    assert_eq!(receipt.deferred.endpoints.len(), 2 * MULTI_LINK_MAX_SITES);
     harness.io.group_delay = Duration::ZERO;
     let publishes_before = harness
         .ops()
@@ -2230,13 +2342,32 @@ fn the_extend_deadline_stops_between_site_capped_links() {
         .filter(|op| matches!(op, Op::Publish(..)))
         .count();
     let receipt = harness.extend(receipt.deferred, &fixture.set);
-    assert_eq!(receipt.attached.len(), 2 * MULTI_SITES_PER_LINK);
+    assert_eq!(receipt.attached.len(), 2 * MULTI_LINK_MAX_SITES);
     let publishes_after = harness
         .ops()
         .iter()
         .filter(|op| matches!(op, Op::Publish(..)))
         .count();
     assert_eq!(publishes_before, publishes_after, "a retry attaches only");
+    harness.assert_group_invariants();
+}
+
+/// Review I1: an entry submitted twice in one delta, its first copy
+/// admitted and its second past the window break, is attached once and
+/// never also deferred.
+#[test]
+fn a_duplicate_past_the_window_break_is_known_not_deferred() {
+    let mut fixture = SetFixture::new(64);
+    let mut delta = fixture.pass("a.so", 4);
+    let first = delta.endpoints[0];
+    delta.endpoints.push(first);
+    let mut harness = Harness::multi(64, None);
+    // The window breaks at entry 3; the rest is [3, 0].
+    let window = ExtendWindow::new(3, Instant::now() + Duration::from_secs(30)).unwrap();
+    let receipt = harness.extend_with_custody(delta, &fixture.set, window, &mut || Ok(()));
+    assert_eq!(ids(&receipt.attached), [0, 1, 2]);
+    assert_eq!(delta_ids(&receipt.deferred), [3]);
+    assert_eq!(receipt.known.iter().map(|id| id.0).collect::<Vec<_>>(), [0]);
     harness.assert_group_invariants();
 }
 
@@ -2311,6 +2442,41 @@ fn pid_custody_lost_after_a_group_fails_its_members_and_defers_later_groups() {
     assert_eq!(delta_ids(&receipt.deferred), [2, 3]);
     assert!(harness.book.custody_lost.is_some());
     assert_eq!(harness.group_ops().len(), 1);
+}
+
+/// Review I2: a group whose every site the kernel refused (a target that
+/// died since the extend's custody check refuses with ESRCH) re-checks
+/// custody and names its loss, then defers the later groups.
+#[test]
+fn an_all_refused_group_names_lost_custody_and_defers_later_groups() {
+    let mut fixture = SetFixture::new(64);
+    let first = fixture.pass("a.so", 2);
+    let second = fixture.pass("b.so", 2);
+    let mut harness = Harness::multi(64, Some(42));
+    harness.io.refuse.extend([0, 1]);
+    let mut both = first;
+    both.append(second);
+    let receipt = harness.extend_with_custody(both, &fixture.set, wide(), &mut || {
+        Err("the PID target exited".into())
+    });
+    assert!(receipt.attached.is_empty());
+    let failed: Vec<(u32, bool)> = receipt
+        .failed
+        .iter()
+        .map(|failure| (failure.id.0, failure.link_retained))
+        .collect();
+    assert_eq!(failed, [(0, false), (1, false)]);
+    assert!(
+        receipt
+            .failed
+            .iter()
+            .all(|failure| failure.reason.contains("PID custody lost before group")),
+        "{:?}",
+        receipt.failed
+    );
+    assert_eq!(delta_ids(&receipt.deferred), [2, 3]);
+    assert!(harness.book.custody_lost.is_some());
+    harness.assert_group_invariants();
 }
 
 #[test]

@@ -536,6 +536,24 @@ pub extern "C" fn p11scope_multi_pid_filter_probe_target(value: u64) -> u64 {
     std::hint::black_box(value) ^ 0x5a
 }
 
+/// One `/proc/<pid>/maps` line: its five leading fields and the pathname,
+/// which is everything after them (it may contain spaces, and a replaced
+/// file ends in " (deleted)", exactly as `/proc/self/exe` reads then).
+fn split_maps_line(line: &str) -> Option<([&str; 5], &str)> {
+    let mut rest = line;
+    let mut fields = [""; 5];
+    for field in &mut fields {
+        let trimmed = rest.trim_start();
+        let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        if end == 0 {
+            return None;
+        }
+        *field = &trimmed[..end];
+        rest = &trimmed[end..];
+    }
+    Some((fields, rest.trim_start()))
+}
+
 /// The file offset and attach path of a function of this executable,
 /// resolved through `/proc/self/maps` (PIE or not). The path is the
 /// `/proc/self/exe` magic link, which names the mapped file even when its
@@ -544,13 +562,9 @@ fn own_function_offset(address: usize) -> io::Result<(std::path::PathBuf, u64)> 
     let maps = std::fs::read_to_string("/proc/self/maps")?;
     let exe = std::fs::read_link("/proc/self/exe")?;
     for line in maps.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(range), Some(perms), Some(offset)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
+        let Some(([range, perms, offset, _dev, _inode], path)) = split_maps_line(line) else {
             continue;
         };
-        let path = fields.nth(2).unwrap_or("");
         let Some((start, end)) = range.split_once('-') else {
             continue;
         };
@@ -957,6 +971,17 @@ mod tests {
         // The branch skips exactly the two increment insns.
         assert_eq!(&insns[48..56], &[0x15, 0x00, 2, 0, 0, 0, 0, 0]);
         assert_eq!(insns[80], 0x95, "ends with exit");
+    }
+
+    #[test]
+    fn a_maps_line_keeps_a_pathname_with_spaces_and_a_deleted_suffix() {
+        let line = "5600-5700 r-xp 00001000 fd:01 1234     /opt/my tools/p11scope (deleted)";
+        let (fields, path) = split_maps_line(line).unwrap();
+        assert_eq!(fields, ["5600-5700", "r-xp", "00001000", "fd:01", "1234"]);
+        assert_eq!(path, "/opt/my tools/p11scope (deleted)");
+        let (_, anonymous) = split_maps_line("7f00-7f01 rw-p 00000000 00:00 0").unwrap();
+        assert_eq!(anonymous, "");
+        assert!(split_maps_line("7f00-7f01 rw-p").is_none());
     }
 
     #[test]

@@ -120,14 +120,43 @@ pub(crate) const FD_RESERVE: u64 = 64;
 /// Singles.
 pub(crate) const MULTI_LINK_BOUND: u64 = 1024;
 
-/// Multi: the most sites one group link carries (review M1). A group
-/// attach is one `BPF_LINK_CREATE`, uninterruptible, whose cost is about
+/// Multi link sizing (review M1, controller ruling: adaptive). A group
+/// attach is one uninterruptible `BPF_LINK_CREATE` whose cost is about
 /// sites x processes mapping the object (each registration walks every
-/// mm), and the extend deadline is checked only between links; capping a
-/// link's sites bounds the overshoot past the extend window, so the
-/// lifecycle ring keeps its service cadence. An (object, program) group
-/// larger than this attaches as several immutable groups.
-pub(crate) const MULTI_SITES_PER_LINK: usize = 64;
+/// mm), and the extend deadline is checked only between links. Each link's
+/// site count is chosen so one attach stays near [`MULTI_LINK_TARGET`]:
+/// cheap objects keep whole function tables in one link (96 covers a
+/// v2.40 or v3.0 table), and an object mapped by hundreds of processes
+/// attaches in small links the deadline can stop between. An (object,
+/// program) group larger than one link attaches as several immutable
+/// groups.
+pub(crate) const MULTI_LINK_TARGET: Duration = Duration::from_millis(200);
+/// The fewest sites a link carries (a floor on link count and fds).
+pub(crate) const MULTI_LINK_MIN_SITES: usize = 8;
+/// The most sites a link carries.
+pub(crate) const MULTI_LINK_MAX_SITES: usize = 96;
+/// Cost model for a link's first estimate, per site: a base plus a share
+/// per mapping process. Derived conservatively from host 7.0 (C5.11 M1):
+/// 3,264 sites with one mapper each cost <= 0.16 ms/site (10.4 ms for a
+/// 68-site link); 64-68 sites with 500 mappers cost 5.2-9.9 ms/site, i.e.
+/// 10-20 us per site per mapper; the upper end is used.
+pub(crate) const MULTI_LINK_SITE_BASE_NS: u64 = 150_000;
+pub(crate) const MULTI_LINK_SITE_PER_MAPPER_NS: u64 = 20_000;
+
+/// The sites of the next link of one object: from the per-site cost the
+/// previous link of that object measured when there is one, else from the
+/// cost model and the object's mapper count as discovery knows it
+/// (unknown counts as one). Always within the min and max.
+pub(crate) fn multi_link_sites(mappers: Option<usize>, measured_ns_per_site: Option<u64>) -> usize {
+    let per_site = measured_ns_per_site.unwrap_or_else(|| {
+        let mappers = u64::try_from(mappers.unwrap_or(1)).unwrap_or(u64::MAX);
+        MULTI_LINK_SITE_BASE_NS
+            .saturating_add(MULTI_LINK_SITE_PER_MAPPER_NS.saturating_mul(mappers))
+    });
+    let target = u64::try_from(MULTI_LINK_TARGET.as_nanos()).unwrap_or(u64::MAX);
+    let sites = usize::try_from(target / per_site.max(1)).unwrap_or(usize::MAX);
+    sites.clamp(MULTI_LINK_MIN_SITES, MULTI_LINK_MAX_SITES)
+}
 
 /// The named resource of a descriptor refusal (`CapacityLimited("fds")`).
 pub(crate) const FD_RESOURCE: &str = "fds";
@@ -324,11 +353,21 @@ pub(crate) struct ScopeIncarnation {
 /// set in production. The facade takes shared clones; it never borrows.
 pub(crate) trait CaptureTargets {
     fn target(&self, object: AttachObjectId) -> Option<&RetainedInventoryTarget>;
+    /// How many processes discovery last saw mapping `object` (deep-scanned
+    /// or attributed by maps identity), when known: the first estimate of
+    /// a uprobe-multi link's cost (`multi_link_sites`).
+    fn mappers(&self, _object: AttachObjectId) -> Option<usize> {
+        None
+    }
 }
 
 impl CaptureTargets for InventoryAttachSet {
     fn target(&self, object: AttachObjectId) -> Option<&RetainedInventoryTarget> {
         InventoryAttachSet::target(self, object)
+    }
+
+    fn mappers(&self, object: AttachObjectId) -> Option<usize> {
+        InventoryAttachSet::mappers(self, object)
     }
 }
 
@@ -786,6 +825,10 @@ struct CaptureBook {
     /// Every attach group created so far (Multi), in creation order. Each
     /// endpoint is a member of at most one; bounded by N members.
     groups: Vec<AttachGroup>,
+    /// Multi: the per-site attach cost (ns) the last link of each local
+    /// object measured, which sizes that object's next link. Bounded by
+    /// the retained objects.
+    link_ns_per_site: BTreeMap<u32, u64>,
     pair_limit: usize,
     scope: Option<ScopeIncarnation>,
     /// Endpoint → object for every ENDPOINT_OBJECT binding this capture
@@ -860,6 +903,7 @@ impl CaptureBook {
             budget,
             backend: AttachBackend::Singles,
             groups: Vec::new(),
+            link_ns_per_site: BTreeMap::new(),
             pair_limit,
             scope,
             published: BTreeMap::new(),
@@ -1398,13 +1442,22 @@ fn extend_groups_with<I: InventoryLinkIo>(
             continue;
         }
         if attempted >= window.max_entries || Instant::now() >= window.deadline {
-            defer_unknown(book, receipt, &delta.endpoints[index..]);
-            receipt.known.extend(
-                delta.endpoints[index..]
-                    .iter()
-                    .filter(|endpoint| book.knows(endpoint.id.0))
-                    .map(|endpoint| endpoint.id),
-            );
+            // A later copy of an entry this extend already admitted is
+            // handled here (review I1): known, never also deferred, so
+            // the receipt keeps exactly one bucket per entry.
+            let in_extend = |endpoint: &&AttachEndpoint| {
+                book.knows(endpoint.id.0) || admitted.iter().any(|(seen, _)| seen.id == endpoint.id)
+            };
+            let rest = &delta.endpoints[index..];
+            let unknown: Vec<AttachEndpoint> = rest
+                .iter()
+                .filter(|endpoint| !in_extend(endpoint))
+                .copied()
+                .collect();
+            defer(receipt, &unknown);
+            receipt
+                .known
+                .extend(rest.iter().filter(in_extend).map(|endpoint| endpoint.id));
             break;
         }
         attempted += 1;
@@ -1412,9 +1465,9 @@ fn extend_groups_with<I: InventoryLinkIo>(
             admitted.push((*endpoint, entry));
         }
     }
-    // Grouping: one group per (object, entry program) and at most
-    // MULTI_SITES_PER_LINK members, in delta order. Every member's binding
-    // is already published.
+    // Grouping: one group per (object, entry program), in delta order,
+    // attached in links sized by `multi_link_sites` as they go. Every
+    // member's binding is already published.
     let mut groups: BTreeMap<GroupKey, Vec<GroupMember>> = BTreeMap::new();
     for (endpoint, entry) in admitted {
         groups
@@ -1422,17 +1475,19 @@ fn extend_groups_with<I: InventoryLinkIo>(
             .or_default()
             .push((endpoint, entry));
     }
-    let mut pending: Vec<(GroupKey, Vec<GroupMember>)> = groups
-        .into_iter()
-        .flat_map(|(key, members)| {
-            members
-                .chunks(MULTI_SITES_PER_LINK)
-                .map(|chunk| (key, chunk.to_vec()))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let mut pending: Vec<(GroupKey, Vec<GroupMember>)> = groups.into_iter().collect();
     pending.reverse();
-    while let Some(((object, program), members)) = pending.pop() {
+    while let Some(((object, program), mut members)) = pending.pop() {
+        // One link's worth; the rest of the group goes back first in line,
+        // sized after this link measured its cost.
+        let sites = multi_link_sites(
+            source.mappers(members[0].0.object),
+            book.link_ns_per_site.get(&object).copied(),
+        );
+        if members.len() > sites {
+            let rest = members.split_off(sites);
+            pending.push(((object, program), rest));
+        }
         let defer_members = |receipt: &mut ExtendReceipt,
                              members: &[GroupMember],
                              rest: &[(GroupKey, Vec<GroupMember>)]| {
@@ -1494,6 +1549,12 @@ fn extend_groups_with<I: InventoryLinkIo>(
         let spent = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         receipt.attach_ns_total = receipt.attach_ns_total.saturating_add(spent);
         receipt.attach_ns_max = receipt.attach_ns_max.max(spent);
+        // The measured per-site cost sizes this object's next link (a
+        // halted attach measured nothing comparable).
+        if attached.is_ok() {
+            let per_site = spent / u64::try_from(sites.len()).unwrap_or(u64::MAX).max(1);
+            book.link_ns_per_site.insert(object, per_site);
+        }
         let attach = match attached {
             Ok(attach) => attach,
             Err(p11scope_bpf_multi::BisectHalt {
@@ -1538,6 +1599,19 @@ fn extend_groups_with<I: InventoryLinkIo>(
         }
         let retained = links.len() > before;
         let refused: BTreeMap<usize, std::io::Error> = attach.refused.into_iter().collect();
+        // Every site refused and no link: a target that died since the
+        // extend's custody check refuses every site (ESRCH). Name that,
+        // not the per-site errno (review I2).
+        if !retained
+            && !refused.is_empty()
+            && let Err(reason) = custody()
+        {
+            let reason = format!("PID custody lost before group {serial} could attach: {reason}");
+            book.mark_lost(reason.clone());
+            fail_all(book, receipt, &members, &reason, false);
+            defer_members(receipt, &[], &pending);
+            return;
+        }
         let mut accepted = Vec::with_capacity(members.len());
         for (index, (endpoint, entry)) in members.iter().enumerate() {
             match refused.get(&index) {

@@ -220,6 +220,8 @@ list_mode() {
             *_ia32) echo "$name :: preflight: host cc must compile -m32" ;;
             *broad_p11kit_admission_arithmetic)
                 echo "$name :: preflight: host python3 must load libp11-kit.so.0" ;;
+            *_never_attributed_on_ext4)
+                echo "$name :: preflight: host must mkfs.ext4 and loop-mount an ext4 image" ;;
             *) echo "$name" ;;
         esac
     done
@@ -258,6 +260,7 @@ main() {
     local arg name i pass=0 fail=0 skipped=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
     local result_line verdict m32_ok=0 p11kit_ok=0 need_m32=0 need_p11kit=0
+    local need_ext4loop=0 ext4loop_skip=
 
     if [ $# -eq 0 ]; then
         usage >&2
@@ -355,12 +358,13 @@ main() {
         return 1
     fi
 
-    # Runtime preflights for the two external driver dependencies. A failed
+    # Runtime preflights for external driver and host dependencies. A failed
     # probe records SKIP with a reason instead of a false FAIL.
     for name in ${selected_runnable[@]+"${selected_runnable[@]}"}; do
         case $name in
             *_ia32) need_m32=1 ;;
             *broad_p11kit_admission_arithmetic) need_p11kit=1 ;;
+            *_never_attributed_on_ext4) need_ext4loop=1 ;;
         esac
     done
     if [ "$need_m32" -eq 1 ]; then
@@ -374,6 +378,26 @@ main() {
             && python3 -c "import ctypes; ctypes.CDLL('libp11-kit.so.0')" 2>/dev/null; then
             p11kit_ok=1
         fi
+    fi
+
+    # The ext4 inode-reuse cell needs mkfs.ext4 and a loop-mounted ext4.
+    # Probe exactly that (make, loop-mount and unmount a small image); the
+    # reason names the missing piece. A host that can do it runs the test,
+    # which then fails only on a real regression.
+    if [ "$need_ext4loop" -eq 1 ]; then
+        local probe_img=$tmpdir/ext4-probe.img probe_mnt=$tmpdir/ext4-probe.mnt
+        if ! command -v mkfs.ext4 >/dev/null 2>&1; then
+            ext4loop_skip="mkfs.ext4 not found (install e2fsprogs)"
+        elif ! truncate -s 8M "$probe_img" 2>/dev/null \
+            || ! mkfs.ext4 -q -F "$probe_img" >/dev/null 2>&1; then
+            ext4loop_skip="mkfs.ext4 could not make a probe image"
+        elif ! mkdir -p "$probe_mnt" \
+            || ! mount -o loop "$probe_img" "$probe_mnt" >/dev/null 2>&1; then
+            ext4loop_skip="cannot loop-mount ext4 (no loop device or no ext4 in this kernel)"
+        else
+            umount "$probe_mnt" 2>/dev/null || umount -l "$probe_mnt" 2>/dev/null
+        fi
+        rm -rf "$probe_img" "$probe_mnt"
     fi
 
     {
@@ -403,6 +427,13 @@ main() {
             *broad_p11kit_admission_arithmetic)
                 if [ "$p11kit_ok" -eq 0 ]; then
                     echo "SKIP $name :: host python3 cannot load libp11-kit.so.0" | tee -a "$results"
+                    skipped=$((skipped + 1))
+                    continue
+                fi
+                ;;
+            *_never_attributed_on_ext4)
+                if [ -n "$ext4loop_skip" ]; then
+                    echo "SKIP $name :: $ext4loop_skip" | tee -a "$results"
                     skipped=$((skipped + 1))
                     continue
                 fi

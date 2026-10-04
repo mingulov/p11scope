@@ -45,12 +45,14 @@ use crate::discovery::engine::is_provider_mapping;
 use crate::discovery::identity::{
     ExaminedObject, FileIdentity, MapFilesDir, MappedFile, PinnedObjectId,
 };
+use crate::discovery::proof_stats::{ProofStatPool, RangeStat, stat_batch};
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, MAPS_CEILING_REASON, MAPS_ENTRY_CEILING_REASON,
     SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON, duplicate_exec_coverage,
 };
 use p11scope_manifest::maps::{MapEntry, MappedPath, ObjectKey, mapped_path};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Why one unselected process mapping a known provider object was not
 /// attributed to it. Counted per category at scope level; the per-pid
@@ -861,12 +863,58 @@ pub(crate) trait ConfirmIo {
     /// The `map_files` identity of `[start, end)` in `pid`; `Err` equal to
     /// [`RANGE_NOT_MAPPED`] when no mapping (or no process) is there now.
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String>;
+    /// [`Self::mapped_file`] of every range, in order (one result per
+    /// range). Production reads them on the proof-stat pool.
+    fn mapped_files(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+    ) -> Vec<Result<FileIdentity, String>> {
+        ranges
+            .iter()
+            .map(|&(start, end)| self.mapped_file(pid, start, end))
+            .collect()
+    }
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String>;
     fn start_time(&self, pin: &Self::Pin) -> Option<u64>;
     fn still_the_same(&self, pin: &Self::Pin) -> bool;
     fn exe(&self, pid: u32) -> Option<ExeIdentity>;
     fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String>;
     fn gone(&self, pid: u32) -> bool;
+}
+
+/// The proof reads of `ranges` keyed by range. A range whose result is
+/// missing (never expected) is left out, which every consumer reads as
+/// unproven: fail closed.
+fn read_ranges<Io: ConfirmIo>(io: &mut Io, pid: u32, ranges: &[(u64, u64)]) -> MappedIdentities {
+    ranges
+        .iter()
+        .copied()
+        .zip(io.mapped_files(pid, ranges))
+        .collect()
+}
+
+/// The unpinned proof reads of `ranges` (each once): charged in order
+/// first; out of budget, the rest stay unproven (unexamined), exactly as
+/// reading one at a time would leave them.
+pub(crate) fn stat_unpinned<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    ranges: &[(u64, u64)],
+    budget: &mut CaptureWorkBudget,
+) -> MappedIdentities {
+    let mut charged = Vec::new();
+    let mut seen = BTreeSet::new();
+    for &range in ranges {
+        if !seen.insert(range) {
+            continue;
+        }
+        if budget.spend(1).is_err() {
+            break;
+        }
+        charged.push(range);
+    }
+    read_ranges(io, pid, &charged)
 }
 
 /// One confirmation: pin, exe, maps re-read, exe again, then the pin must
@@ -904,20 +952,26 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
     };
     // The map_files proof is read while the pin holds; `still_the_same`
     // below proves it was this generation's mapping.
-    let mut mapped = MappedIdentities::new();
+    // Every range is charged first, in order, exactly as one read at a
+    // time would charge it; only then are the charged ranges read (on the
+    // proof-stat pool when there is one), so a ceiling stops at the same
+    // range and never yields a partial proof.
+    let mut ranges = Vec::new();
+    let mut seen = BTreeSet::new();
     for entry in entries
         .iter()
         .filter(|entry| is_provider_mapping(entry) && prove.contains(&ObjectKey::of(entry)))
     {
         let range = (entry.start, entry.end);
-        if mapped.contains_key(&range) {
+        if !seen.insert(range) {
             continue;
         }
         if let Err(reason) = budget.spend(1) {
             return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
         }
-        mapped.insert(range, io.mapped_file(pid, entry.start, entry.end));
+        ranges.push(range);
     }
+    let mapped = read_ranges(io, pid, &ranges);
     let after = io.exe(pid);
     if !io.still_the_same(&pin) {
         return lost(
@@ -977,21 +1031,53 @@ fn map_files_error(error: std::io::Error) -> String {
 /// (DR-C1b-3), opened at the first range and dropped with this value, so
 /// it is never held past the confirmation or stat batch that opened it.
 #[derive(Default)]
-pub(crate) struct OsConfirmIo {
-    map_files: Option<(u32, Result<MapFilesDir, String>)>,
+pub(crate) struct OsConfirmIo<'p> {
+    map_files: Option<(u32, Result<Arc<HeldMapFiles>, String>)>,
+    /// The collection's proof-stat pool (`None`: read on this thread).
+    pool: Option<&'p ProofStatPool>,
 }
 
-impl ConfirmIo for OsConfirmIo {
+/// A held `map_files` directory as a pool-shareable proof source, with
+/// `ENOENT` read as [`RANGE_NOT_MAPPED`].
+struct HeldMapFiles(MapFilesDir);
+
+impl RangeStat for HeldMapFiles {
+    fn stat(&self, start: u64, end: u64) -> Result<FileIdentity, String> {
+        self.0.identity(start, end).map_err(map_files_error)
+    }
+}
+
+impl OsConfirmIo<'_> {
+    /// The directory of `pid`, opened at its first range.
+    fn held(&mut self, pid: u32) -> Result<Arc<HeldMapFiles>, String> {
+        if self.map_files.as_ref().is_none_or(|(held, _)| *held != pid) {
+            let dir = MapFilesDir::open(pid)
+                .map(|dir| Arc::new(HeldMapFiles(dir)))
+                .map_err(map_files_error);
+            self.map_files = Some((pid, dir));
+        }
+        match self.map_files.as_ref().map(|(_, dir)| dir) {
+            Some(dir) => dir.clone(),
+            None => Err("the map_files directory was not opened".into()),
+        }
+    }
+}
+
+impl ConfirmIo for OsConfirmIo<'_> {
     type Pin = crate::process::PidPin;
 
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
-        if self.map_files.as_ref().is_none_or(|(held, _)| *held != pid) {
-            self.map_files = Some((pid, MapFilesDir::open(pid).map_err(map_files_error)));
-        }
-        match self.map_files.as_ref().map(|(_, dir)| dir) {
-            Some(Ok(dir)) => dir.identity(start, end).map_err(map_files_error),
-            Some(Err(error)) => Err(error.clone()),
-            None => Err("the map_files directory was not opened".into()),
+        self.held(pid)?.stat(start, end)
+    }
+
+    fn mapped_files(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+    ) -> Vec<Result<FileIdentity, String>> {
+        match self.held(pid) {
+            Ok(dir) => stat_batch(self.pool, dir, ranges),
+            Err(error) => vec![Err(error); ranges.len()],
         }
     }
 
@@ -1021,17 +1107,24 @@ impl ConfirmIo for OsConfirmIo {
     }
 }
 
-/// The production probe.
-pub(crate) struct OsMemberProbe;
+/// The production probe: proof stats on the collection's pool, if any.
+#[derive(Default)]
+pub(crate) struct OsMemberProbe<'p> {
+    pub pool: Option<&'p ProofStatPool>,
+}
 
-impl MemberProbe for OsMemberProbe {
+impl MemberProbe for OsMemberProbe<'_> {
     fn confirm(
         &mut self,
         pid: u32,
         prove: &BTreeSet<ObjectKey>,
         budget: &mut CaptureWorkBudget,
     ) -> Confirmation {
-        confirm_with(&mut OsConfirmIo::default(), pid, prove, budget)
+        let mut io = OsConfirmIo {
+            map_files: None,
+            pool: self.pool,
+        };
+        confirm_with(&mut io, pid, prove, budget)
     }
 
     fn stat_ranges(
@@ -1040,19 +1133,11 @@ impl MemberProbe for OsMemberProbe {
         ranges: &[(u64, u64)],
         budget: &mut CaptureWorkBudget,
     ) -> MappedIdentities {
-        let mut io = OsConfirmIo::default();
-        let mut mapped = MappedIdentities::new();
-        for &(start, end) in ranges {
-            if mapped.contains_key(&(start, end)) {
-                continue;
-            }
-            // Out of budget: the rest stay unproven (unexamined).
-            if budget.spend(1).is_err() {
-                break;
-            }
-            mapped.insert((start, end), io.mapped_file(pid, start, end));
-        }
-        mapped
+        let mut io = OsConfirmIo {
+            map_files: None,
+            pool: self.pool,
+        };
+        stat_unpinned(&mut io, pid, ranges, budget)
     }
 }
 

@@ -36,6 +36,7 @@ use crate::discovery::identity::{
     canonicalize_scanned_overlays, pin_scanned_view_objects,
 };
 use crate::discovery::noise::DiscoveryNoiseAggregator;
+use crate::discovery::proof_stats::{ProofStatPool, proof_stat_threads};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped,
     scan_process_view_examined, scan_skip_truncates,
@@ -815,12 +816,16 @@ pub(crate) fn collect(
     // The confirmation reads run here: after the deep scans, while the
     // aggregate pins (and their fds) are held, before the pure assembly.
     let confirm_start = monotonic_ns();
-    let attributed = attribute_sweep(
-        &mut collection,
-        &bound,
-        &mut OsMemberProbe,
-        &bound.aggregate,
-    );
+    // The proof stats run on a bounded pool that lives for this
+    // confirmation stage only (DR-C1b-3).
+    let attributed = ProofStatPool::scoped(proof_stat_threads(), |pool| {
+        attribute_sweep(
+            &mut collection,
+            &bound,
+            &mut OsMemberProbe { pool },
+            &bound.aggregate,
+        )
+    });
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(collection, bound, attributed, policy);

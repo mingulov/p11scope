@@ -12,6 +12,7 @@ pub(crate) mod loader;
 pub(crate) mod native_binding;
 pub mod noise;
 pub(crate) mod pause;
+pub(crate) mod proof_stats;
 pub mod scan;
 pub(crate) mod scheduler;
 pub(crate) mod sweep_attribution;

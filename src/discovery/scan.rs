@@ -862,6 +862,16 @@ impl CaptureWorkBudget {
         }
     }
 
+    /// A default budget whose work ceiling is `units` (tests of where a
+    /// ceiling stops).
+    #[cfg(test)]
+    pub(crate) fn with_work_ceiling(units: u64) -> Self {
+        Self {
+            work_ceiling: units,
+            ..Self::default()
+        }
+    }
+
     pub fn for_inventory(limits: InventoryDiscoveryLimits) -> Self {
         let mut budget = Self::new(ScanLimits {
             per_object_bytes: limits.per_operation_bytes,

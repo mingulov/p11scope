@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::discovery::engine::select_deep_scan_candidates;
+use crate::discovery::proof_stats::{MAX_PROOF_STAT_THREADS, MIN_PARALLEL_BATCH};
 use p11scope_manifest::maps::Device;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1065,6 +1066,125 @@ fn the_confirmation_reads_map_files_for_requested_keys_inside_the_pin() {
     ));
 }
 
+/// [`Io`] that records the order of the confirmation's OS calls and can
+/// kill the pin while the proof reads run (`still_the_same` is false once
+/// any `map_files` read has happened).
+struct OrderedIo {
+    io: Io,
+    calls: RefCell<Vec<&'static str>>,
+    pin_dies_during_reads: bool,
+}
+
+impl OrderedIo {
+    fn new(pin_dies_during_reads: bool) -> Self {
+        let mut io = Io::healthy();
+        for entry in provider_caller()
+            .iter()
+            .filter(|entry| entry.inode == PROVIDER)
+        {
+            io.mapped.insert(entry.start, Ok(vm_file(PROVIDER)));
+        }
+        Self {
+            io,
+            calls: RefCell::new(Vec::new()),
+            pin_dies_during_reads,
+        }
+    }
+
+    fn record(&self, call: &'static str) {
+        self.calls.borrow_mut().push(call);
+    }
+
+    fn read(&self) -> bool {
+        self.calls.borrow().contains(&"mapped_files")
+    }
+}
+
+impl ConfirmIo for OrderedIo {
+    type Pin = u64;
+
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        self.io.mapped_file(pid, start, end)
+    }
+
+    fn mapped_files(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+    ) -> Vec<Result<FileIdentity, String>> {
+        self.record("mapped_files");
+        self.io.mapped_files(pid, ranges)
+    }
+
+    fn open(&mut self, pid: u32) -> Result<u64, String> {
+        self.record("open");
+        self.io.open(pid)
+    }
+
+    fn start_time(&self, pin: &u64) -> Option<u64> {
+        self.io.start_time(pin)
+    }
+
+    fn still_the_same(&self, pin: &u64) -> bool {
+        self.record("still_the_same");
+        self.io.still_the_same(pin) && !(self.pin_dies_during_reads && self.read())
+    }
+
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        self.record("exe");
+        self.io.exe(pid)
+    }
+
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        self.record("maps");
+        self.io.maps(pid, budget)
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        self.io.gone(pid)
+    }
+}
+
+/// R1 (C5.6 re-check): the `map_files` proof reads happen inside the pin
+/// bracket — after the pidfd opens and the maps are read, before the exe
+/// re-read and the one `still_the_same` check that closes the bracket.
+/// Reading them after that check would prove a mapping of a generation
+/// the pin no longer vouches for.
+#[test]
+fn the_proof_reads_happen_before_the_pin_is_checked() {
+    let prove = BTreeSet::from([key(PROVIDER)]);
+    let mut io = OrderedIo::new(false);
+    assert!(matches!(
+        confirm_with(&mut io, 10_001, &prove, &mut CaptureWorkBudget::default()),
+        Confirmation::Confirmed(_)
+    ));
+    assert_eq!(
+        *io.calls.borrow(),
+        [
+            "open",
+            "exe",
+            "maps",
+            "mapped_files",
+            "exe",
+            "still_the_same"
+        ]
+    );
+}
+
+/// R1: a pin that dies while the proofs are read loses the confirmation
+/// (the reads may be of the next generation's mappings); it is never
+/// confirmed.
+#[test]
+fn a_pin_that_dies_during_the_proof_reads_loses_the_confirmation() {
+    let prove = BTreeSet::from([key(PROVIDER)]);
+    let mut io = OrderedIo::new(true);
+    assert!(matches!(
+        confirm_with(&mut io, 10_001, &prove, &mut CaptureWorkBudget::default()),
+        Confirmation::Lost(AttributionLoss::GenerationChanged, _)
+    ));
+    assert!(io.read(), "the proofs were read");
+}
+
 /// A deep-scanned representative maps the provider at its path; another
 /// process maps a different file at that same path. Only `(device,
 /// inode)` and the `vm_file` proof decide: the copy stays unexamined.
@@ -1357,7 +1477,7 @@ fn attribute_child(
         &BTreeSet::new(),
         &BTreeSet::new(),
         index,
-        &mut OsMemberProbe,
+        &mut OsMemberProbe::default(),
         &mut CaptureWorkBudget::default(),
     )
 }
@@ -1585,6 +1705,26 @@ fn a_held_map_files_directory_is_the_given_processes() {
         (Err(by_dir), Err(by_path)) => assert_eq!(by_dir.raw_os_error(), by_path.raw_os_error()),
         (by_dir, by_path) => panic!("the two reads disagree: {by_dir:?} vs {by_path:?}"),
     }
+    // Every range of the child (plus one that is not a mapping), read on
+    // the proof-stat pool and on one thread through the production
+    // source: the same results in the same order (EPERM unprivileged).
+    let mut ranges: Vec<(u64, u64)> = child
+        .maps()
+        .iter()
+        .map(|entry| (entry.start, entry.end))
+        .collect();
+    ranges.push((range.0, range.1 + 4096));
+    let source = Arc::new(HeldMapFiles(held));
+    let serial: Vec<_> = ranges.iter().map(|&(s, e)| source.stat(s, e)).collect();
+    for threads in 1..=MAX_PROOF_STAT_THREADS {
+        ProofStatPool::scoped(threads, |pool| {
+            assert_eq!(
+                crate::discovery::proof_stats::stat_batch(pool, source.clone(), &ranges),
+                serial,
+                "threads {threads}"
+            );
+        });
+    }
 }
 
 /// `ENOENT` (no mapping, or no process, at the range now) is
@@ -1688,5 +1828,303 @@ fn a_range_gone_inside_the_pin_is_a_mapping_changed_loss() {
             "{range:x?}"
         );
         assert!(attribution.unexamined.is_empty(), "{range:x?}");
+    }
+}
+
+// ---- C5.6 owner ruling: proof stats on a bounded pool ----
+
+/// A deterministic stat seam for one process: each range reads its
+/// entry's `vm_file`, unless scripted as a fault (a stale range, a
+/// refusal, or another file).
+struct SeamStat {
+    files: BTreeMap<(u64, u64), FileIdentity>,
+    faults: BTreeMap<(u64, u64), Result<FileIdentity, String>>,
+}
+
+impl SeamStat {
+    fn over(
+        entries: &[MapEntry],
+        faults: BTreeMap<(u64, u64), Result<FileIdentity, String>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            files: entries
+                .iter()
+                .map(|entry| ((entry.start, entry.end), vm_file(entry.inode)))
+                .collect(),
+            faults,
+        })
+    }
+}
+
+impl RangeStat for SeamStat {
+    fn stat(&self, start: u64, end: u64) -> Result<FileIdentity, String> {
+        // Jitter, so workers finish out of order.
+        if (start >> 12).is_multiple_of(3) {
+            std::thread::yield_now();
+        }
+        if let Some(fault) = self.faults.get(&(start, end)) {
+            return fault.clone();
+        }
+        self.files
+            .get(&(start, end))
+            .copied()
+            .ok_or_else(|| RANGE_NOT_MAPPED.to_string())
+    }
+}
+
+/// Scripted confirmation reads whose proof reads go through the pool (or
+/// one thread) over a [`SeamStat`].
+struct PoolIo<'p> {
+    base: Io,
+    pool: Option<&'p ProofStatPool>,
+    source: Arc<SeamStat>,
+}
+
+impl ConfirmIo for PoolIo<'_> {
+    type Pin = u64;
+
+    fn mapped_file(&mut self, _: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        self.source.stat(start, end)
+    }
+
+    fn mapped_files(&mut self, _: u32, ranges: &[(u64, u64)]) -> Vec<Result<FileIdentity, String>> {
+        crate::discovery::proof_stats::stat_batch(self.pool, self.source.clone(), ranges)
+    }
+
+    fn open(&mut self, pid: u32) -> Result<u64, String> {
+        self.base.open(pid)
+    }
+
+    fn start_time(&self, pin: &u64) -> Option<u64> {
+        self.base.start_time(pin)
+    }
+
+    fn still_the_same(&self, pin: &u64) -> bool {
+        self.base.still_the_same(pin)
+    }
+
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        self.base.exe(pid)
+    }
+
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        self.base.maps(pid, budget)
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        self.base.gone(pid)
+    }
+}
+
+const WIDE_LIBS: u64 = 6;
+
+/// A caller (or, without the provider, an idle process) mapping enough
+/// candidate ranges for its proof batch to reach the pool.
+fn wide(provider: bool) -> Vec<MapEntry> {
+    let mut entries = if provider {
+        provider_caller()
+    } else {
+        idle(None)
+    };
+    for lib in 0..WIDE_LIBS {
+        entries.extend(object(
+            0x3000_0000 + lib * 0x10_0000,
+            8_000 + lib,
+            &format!("/usr/lib/libw{lib}.so"),
+        ));
+    }
+    assert!(entries.len() >= MIN_PARALLEL_BATCH);
+    entries
+}
+
+/// Faults by range for one pid, a deterministic function of the pid: a
+/// stale provider range, a refused provider range, a refused libc range,
+/// another file at a wide
+/// lib's range (an examined key that is then unexamined), another file
+/// at a provider range (an identity mismatch).
+fn faults_of(pid: u32) -> BTreeMap<(u64, u64), Result<FileIdentity, String>> {
+    let mut faults = BTreeMap::new();
+    if pid.is_multiple_of(7) {
+        faults.insert(
+            (0x1000_1000, 0x1000_2000),
+            Err(RANGE_NOT_MAPPED.to_string()),
+        );
+    }
+    let refused = || Err("Operation not permitted (os error 1)".to_string());
+    if pid.is_multiple_of(11) {
+        faults.insert((0x1000_1000, 0x1000_2000), refused());
+    }
+    if pid.is_multiple_of(19) {
+        faults.insert((0x2000_0000, 0x2000_1000), refused());
+    }
+    if pid.is_multiple_of(13) {
+        faults.insert((0x1000_0000, 0x1000_1000), Ok(vm_file(9_999)));
+    }
+    if pid.is_multiple_of(17) {
+        faults.insert((0x3010_1000, 0x3010_2000), Ok(vm_file(9_998)));
+    }
+    faults
+}
+
+/// One confirmation and one unpinned batch through the production
+/// `confirm_with` and `stat_unpinned`, on any pool: the same results, the
+/// same losses with the same causes, and a work ceiling that stops at the
+/// same range — for every pool size, 1 (no workers) included.
+#[test]
+fn the_pool_confirms_and_stats_exactly_like_one_thread() {
+    let entries = wide(true);
+    let prove: BTreeSet<ObjectKey> = entries.iter().map(ObjectKey::of).collect();
+    let ranges: Vec<(u64, u64)> = entries
+        .iter()
+        .map(|entry| (entry.start, entry.end))
+        .collect();
+    let run = |pool: Option<&ProofStatPool>, ceiling: u64| {
+        let source = SeamStat::over(&entries, faults_of(7 * 11 * 13));
+        let mut io = PoolIo {
+            base: Io {
+                maps: Ok(entries.clone()),
+                ..Io::healthy()
+            },
+            pool,
+            source,
+        };
+        let confirmed = confirm_with(
+            &mut io,
+            10_001,
+            &prove,
+            &mut CaptureWorkBudget::with_work_ceiling(ceiling),
+        );
+        let unpinned = stat_unpinned(
+            &mut io,
+            10_001,
+            &ranges,
+            &mut CaptureWorkBudget::with_work_ceiling(ceiling),
+        );
+        (confirmed, unpinned)
+    };
+    for ceiling in [0, 1, 5, 9, 15, 16, 1_000] {
+        let serial = run(None, ceiling);
+        if ceiling >= 16 {
+            assert!(matches!(serial.0, Confirmation::Confirmed(_)));
+        } else {
+            assert!(matches!(
+                serial.0,
+                Confirmation::Lost(AttributionLoss::Budget, _)
+            ));
+        }
+        assert_eq!(serial.1.len() as u64, ceiling.min(16));
+        for threads in 1..=MAX_PROOF_STAT_THREADS {
+            ProofStatPool::scoped(threads, |pool| {
+                assert_eq!(
+                    run(pool, ceiling),
+                    serial,
+                    "threads {threads} ceiling {ceiling}"
+                );
+            });
+        }
+    }
+}
+
+/// The production probe's shape over the seam: confirmations through
+/// `confirm_with`, unpinned batches through `stat_unpinned`.
+struct PooledProbe<'p> {
+    pool: Option<&'p ProofStatPool>,
+    snapshots: HashMap<u32, Vec<MapEntry>>,
+}
+
+impl PooledProbe<'_> {
+    fn io(&self, pid: u32) -> PoolIo<'_> {
+        let entries = self.snapshots.get(&pid).cloned().unwrap_or_default();
+        PoolIo {
+            source: SeamStat::over(&entries, faults_of(pid)),
+            base: Io {
+                maps: Ok(entries),
+                ..Io::healthy()
+            },
+            pool: self.pool,
+        }
+    }
+}
+
+impl MemberProbe for PooledProbe<'_> {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        confirm_with(&mut self.io(pid), pid, prove, budget)
+    }
+
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        stat_unpinned(&mut self.io(pid), pid, ranges, budget)
+    }
+}
+
+/// Over the 448 shape with faults spread across pids (stale ranges that
+/// escalate or become `mapping_changed`, refusals, identity mismatches),
+/// and a shared work ceiling that runs out part-way: every pool size
+/// attributes exactly what one thread does.
+#[test]
+fn a_pooled_pass_attributes_exactly_like_a_serial_one() {
+    let mut sweep: Vec<(u32, Vec<MapEntry>)> = (0..300)
+        .map(|offset| (10_000 + offset, wide(true)))
+        .collect();
+    sweep.extend((0..148).map(|offset| (20_000 + offset, wide(false))));
+    let selected = BTreeSet::from([10_000, 20_000]);
+    let checks = Checks::default();
+    let rep = wide(true);
+    let index = KnownKeyIndex::build(
+        [(key(PROVIDER), Some(OBJECT))],
+        &BTreeMap::from([(key(PROVIDER), OBJECT)]),
+        examined_of(&rep),
+        &checks,
+    )
+    .0;
+    let pass = |pool: Option<&ProofStatPool>, ceiling: u64| {
+        let mut probe = PooledProbe {
+            pool,
+            snapshots: sweep.iter().cloned().collect(),
+        };
+        attribute_unselected(
+            &sweep,
+            &BTreeSet::new(),
+            &selected,
+            &index,
+            &mut probe,
+            &mut CaptureWorkBudget::with_work_ceiling(ceiling),
+        )
+    };
+    for ceiling in [3_000, u64::MAX] {
+        let serial = pass(None, ceiling);
+        assert!(!serial.unexamined.is_empty());
+        assert!(serial.losses.contains_key(&AttributionLoss::MappingChanged));
+        assert!(
+            serial
+                .losses
+                .contains_key(&AttributionLoss::IdentityMismatch)
+        );
+        assert!(
+            serial
+                .losses
+                .contains_key(&AttributionLoss::MapFilesUnavailable)
+        );
+        if ceiling != u64::MAX {
+            assert!(serial.losses.contains_key(&AttributionLoss::Budget));
+        }
+        for threads in 1..=MAX_PROOF_STAT_THREADS {
+            ProofStatPool::scoped(threads, |pool| {
+                assert_eq!(
+                    pass(pool, ceiling),
+                    serial,
+                    "threads {threads} ceiling {ceiling}"
+                );
+            });
+        }
     }
 }

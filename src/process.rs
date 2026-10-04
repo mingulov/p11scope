@@ -995,8 +995,38 @@ pub(crate) fn generation_gone(pid: u32) -> bool {
 /// the reaped case. The inventory adapter treats zombies as exited:
 /// without this, an unreaped target (the observer is often its parent)
 /// re-admits every pass under a fresh caller ID.
+/// The whole `/proc/<pid>/stat` in (almost always) one `read`:
+/// `read_to_string` grows from 32 bytes, so it issues ~5 tiny reads per
+/// stat (~13 us vs ~10 us measured, exp-pass-profile). Same bytes on
+/// success — a stat bigger than the buffer falls back to `read_to_end` —
+/// and the same `InvalidData` on non-UTF-8.
+fn read_proc_stat(pid: u32) -> io::Result<String> {
+    use std::io::Read as _;
+    const STAT_BUF_BYTES: usize = 4096;
+    let mut file = std::fs::File::open(format!("/proc/{pid}/stat"))?;
+    let mut buf = [0u8; STAT_BUF_BYTES];
+    let mut len = 0;
+    loop {
+        let n = file.read(&mut buf[len..])?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+        if len == buf.len() {
+            // Absurdly large (never observed; comm caps the size):
+            // finish with `read_to_string` semantics.
+            let mut all = buf.to_vec();
+            file.read_to_end(&mut all)?;
+            return String::from_utf8(all)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stat utf8"));
+        }
+    }
+    String::from_utf8(buf[..len].to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stat utf8"))
+}
+
 pub(crate) fn process_is_zombie(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    let Ok(stat) = read_proc_stat(pid) else {
         return false;
     };
     let Some(end) = stat.rfind(')') else {
@@ -1013,7 +1043,7 @@ fn gone_from(start_time: io::Result<u64>) -> bool {
 }
 
 pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let stat = read_proc_stat(pid)?;
     let end = stat
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat comm"))?;
@@ -1378,6 +1408,32 @@ mod tests {
             !generation_gone(std::process::id()),
             "this process is alive"
         );
+    }
+
+    /// The single-read stat helper returns the same content
+    /// `read_to_string` would: same comm, same state, same starttime
+    /// (compared field-wise — fault and rss counters move between any
+    /// two live reads). A missing pid stays `NotFound` so exit
+    /// detection keeps working.
+    #[test]
+    fn single_read_stat_matches_read_to_string() {
+        fn stable(stat: &str) -> (String, String, String) {
+            let comm_end = stat.rfind(')').unwrap();
+            let mut tail = stat[comm_end + 1..].split_whitespace();
+            (
+                stat[..=comm_end].to_string(),
+                tail.next().unwrap().to_string(),
+                tail.nth(18).unwrap().to_string(),
+            )
+        }
+        let me = std::process::id();
+        let via_helper = read_proc_stat(me).unwrap();
+        let via_std = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
+        assert_eq!(stable(&via_helper), stable(&via_std));
+        assert!(!process_is_zombie(me));
+        assert!(process_start_time(me).is_ok());
+        let missing = read_proc_stat(u32::MAX).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

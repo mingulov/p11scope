@@ -235,6 +235,14 @@ impl AtomicFile {
 }
 
 impl Drop for AtomicFile {
+    /// Unlinks the temp name only while it is still this run's private
+    /// file: Drop must not unlink a file it did not create. The check and
+    /// the `unlinkat` are two steps (J-02sp#7), and that window is the
+    /// trusted-directory boundary, accepted: only a writer the directory
+    /// check already admits (its owner, root, or in a sticky directory the
+    /// entry's own owner) can swap `.p11scope.<pid>.<seq>.tmp` in between,
+    /// and then only loses an entry it could remove itself — `unlinkat`
+    /// never follows a symlink and touches nothing but that name.
     fn drop(&mut self) {
         if self.cleanup
             && metadata_at(&self.directory, &self.temp_name).is_ok_and(|metadata| {
@@ -253,9 +261,16 @@ impl Drop for AtomicFile {
 /// capture (M-2). Opening it proves the path is usable before discovery and
 /// attach, but a capture can still fail after that, so nothing a previous
 /// run left at the name is changed until [`PrivateStream::begin`]: the
-/// capture has attached and is about to write its first line. A stream that
-/// is dropped without beginning removes the file only if this open created
-/// it (and it is still that file), and otherwise leaves it byte-for-byte and
+/// capture has attached and is about to write its first line.
+///
+/// A name that does not exist yet is not created at preflight: the stream
+/// holds an unnamed private `O_TMPFILE` file and links it at the name in
+/// `begin` (J-02sp#7), so a stream dropped before it began has no name to
+/// unlink and a crash leaves nothing behind. Only on a filesystem without
+/// `O_TMPFILE` is the file created at preflight; dropping such a stream
+/// unbegun removes it only while it is still that file (the remaining
+/// check-then-unlink window needs a writer the trusted-directory check
+/// already admits). A file that existed is left byte-for-byte and
 /// mode-for-mode as it was.
 #[must_use = "a PrivateStream that never begins leaves the previous file untouched; call begin() once the capture starts"]
 pub struct PrivateStream {
@@ -264,7 +279,18 @@ pub struct PrivateStream {
     final_name: CString,
     final_path: PathBuf,
     identity: FileIdentity,
-    created: bool,
+    origin: StreamOrigin,
+}
+
+/// How a trace sink's file reaches its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOrigin {
+    /// A regular file the caller owned was already at the name.
+    Existing,
+    /// An unnamed `O_TMPFILE` file, linked at the name by `begin`.
+    Unnamed,
+    /// Created at the name at preflight (no `O_TMPFILE` support).
+    Created,
 }
 
 impl PrivateStream {
@@ -272,6 +298,9 @@ impl PrivateStream {
     /// hand it to the writer.
     pub fn begin(mut self) -> Result<std::fs::File, String> {
         use std::os::unix::fs::PermissionsExt as _;
+        if self.origin == StreamOrigin::Unnamed {
+            self.link_unnamed()?;
+        }
         let file = self
             .file
             .as_ref()
@@ -294,6 +323,40 @@ impl PrivateStream {
             .take()
             .expect("an unbegun PrivateStream holds its file"))
     }
+
+    /// Gives the unnamed file its name. A name that appeared since the
+    /// preflight is opened instead, under the same checks as a file that
+    /// existed then, and truncated by `begin` like one.
+    fn link_unnamed(&mut self) -> Result<(), String> {
+        let file = self
+            .file
+            .as_ref()
+            .expect("an unbegun PrivateStream holds its file");
+        match linkat_unnamed(file, &self.directory, &self.final_name) {
+            Ok(()) => {
+                self.origin = StreamOrigin::Created;
+                Ok(())
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                let (file, origin) = openat_stream(&self.directory, &self.final_name, false)
+                    .map_err(|error| {
+                        format!(
+                            "opening output {} failed: {error}",
+                            self.final_path.display()
+                        )
+                    })?;
+                let identity = check_stream_file(&file, &self.final_path)?;
+                self.file = Some(file);
+                self.identity = identity;
+                self.origin = origin;
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "creating output {} failed: {error}",
+                self.final_path.display()
+            )),
+        }
+    }
 }
 
 impl std::fmt::Debug for PrivateStream {
@@ -301,7 +364,7 @@ impl std::fmt::Debug for PrivateStream {
         formatter
             .debug_struct("PrivateStream")
             .field("final_path", &self.final_path)
-            .field("created", &self.created)
+            .field("origin", &self.origin)
             .field("begun", &self.file.is_none())
             .finish_non_exhaustive()
     }
@@ -310,7 +373,7 @@ impl std::fmt::Debug for PrivateStream {
 impl Drop for PrivateStream {
     fn drop(&mut self) {
         if self.file.is_some()
-            && self.created
+            && self.origin == StreamOrigin::Created
             && metadata_at(&self.directory, &self.final_name).is_ok_and(|metadata| {
                 metadata.is_file()
                     && metadata.identity == self.identity
@@ -330,6 +393,12 @@ impl Drop for PrivateStream {
 /// An existing target must be a regular file owned by the caller; it is only
 /// truncated and made private by [`PrivateStream::begin`].
 pub fn create_private_stream(path: &Path) -> Result<PrivateStream, String> {
+    create_private_stream_with(path, true)
+}
+
+/// [`create_private_stream`], with `O_TMPFILE` use selectable so tests
+/// cover the fallback a filesystem without it takes.
+fn create_private_stream_with(path: &Path, unnamed: bool) -> Result<PrivateStream, String> {
     if path.as_os_str().as_bytes().last() == Some(&b'/') {
         return Err(format!("output {} has no file name", path.display()));
     }
@@ -343,8 +412,21 @@ pub fn create_private_stream(path: &Path) -> Result<PrivateStream, String> {
         .file_name()
         .ok_or_else(|| format!("output {} has no file name", final_path.display()))?;
     let final_name = c_name(final_name, "output file name")?;
-    let (file, created) = openat_stream(&directory, &final_name)
+    let (file, origin) = openat_stream(&directory, &final_name, unnamed)
         .map_err(|error| format!("opening output {} failed: {error}", final_path.display()))?;
+    let identity = check_stream_file(&file, &final_path)?;
+    Ok(PrivateStream {
+        directory,
+        identity,
+        file: Some(file),
+        final_name,
+        final_path,
+        origin,
+    })
+}
+
+/// A trace sink must be a regular file the caller owns.
+fn check_stream_file(file: &std::fs::File, final_path: &Path) -> Result<FileIdentity, String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("checking output {} failed: {error}", final_path.display()))?;
@@ -361,14 +443,7 @@ pub fn create_private_stream(path: &Path) -> Result<PrivateStream, String> {
             metadata.uid()
         ));
     }
-    Ok(PrivateStream {
-        directory,
-        identity: FileIdentity::from_metadata(&metadata),
-        file: Some(file),
-        final_name,
-        final_path,
-        created,
-    })
+    Ok(FileIdentity::from_metadata(&metadata))
 }
 
 fn normalize_output_path(path: PathBuf) -> Result<PathBuf, String> {
@@ -592,16 +667,42 @@ fn uid_has_account(uid: u32) -> bool {
     status == 0 && !result.is_null()
 }
 
-/// Opens the trace target without truncating it, and says whether this call
-/// created it: `O_EXCL` first, then the existing file, retried a few times
-/// if the name comes and goes between the two.
+/// Opens the trace target without truncating it, and says how its file
+/// reaches the name: the existing file first; for an absent name an
+/// unnamed `O_TMPFILE` file in the directory when `unnamed` and the
+/// filesystem supports it, otherwise `O_EXCL` creation at the name —
+/// retried a few times if the name comes and goes in between.
 fn openat_stream(
     directory: &std::fs::File,
     name: &CString,
-) -> std::io::Result<(std::fs::File, bool)> {
+    unnamed: bool,
+) -> std::io::Result<(std::fs::File, StreamOrigin)> {
     let flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
     let mut last = std::io::Error::from_raw_os_error(libc::ENOENT);
     for _ in 0..8 {
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd != -1 {
+            return Ok((
+                unsafe { std::fs::File::from_raw_fd(fd) },
+                StreamOrigin::Existing,
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error);
+        }
+        if unnamed {
+            match openat_tmpfile(directory) {
+                Ok(file) => return Ok((file, StreamOrigin::Unnamed)),
+                // No O_TMPFILE here: an old kernel reads it as O_DIRECTORY
+                // (EISDIR), a filesystem may not support it.
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(code)
+                        if code == libc::EOPNOTSUPP || code == libc::EISDIR || code == libc::EINVAL) =>
+                    {}
+                Err(error) => return Err(error),
+            }
+        }
         let fd = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -611,22 +712,61 @@ fn openat_stream(
             )
         };
         if fd != -1 {
-            return Ok((unsafe { std::fs::File::from_raw_fd(fd) }, true));
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EEXIST) {
-            return Err(error);
-        }
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd != -1 {
-            return Ok((unsafe { std::fs::File::from_raw_fd(fd) }, false));
+            return Ok((
+                unsafe { std::fs::File::from_raw_fd(fd) },
+                StreamOrigin::Created,
+            ));
         }
         last = std::io::Error::last_os_error();
-        if last.raw_os_error() != Some(libc::ENOENT) {
+        if last.raw_os_error() != Some(libc::EEXIST) {
             return Err(last);
         }
     }
     Err(last)
+}
+
+/// An unnamed private (0600) regular file in `directory`.
+fn openat_tmpfile(directory: &std::fs::File) -> std::io::Result<std::fs::File> {
+    let here = CString::new(".").expect("no NUL");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            here.as_ptr(),
+            libc::O_TMPFILE | libc::O_WRONLY | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+/// Links an unnamed `O_TMPFILE` file at `name` in `directory`; EEXIST when
+/// the name exists. Through `/proc/self/fd`, which needs no
+/// `CAP_DAC_READ_SEARCH` (unlike `AT_EMPTY_PATH`).
+fn linkat_unnamed(
+    file: &std::fs::File,
+    directory: &std::fs::File,
+    name: &CString,
+) -> std::io::Result<()> {
+    let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .expect("a descriptor path has no NUL");
+    if unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    } == -1
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn openat_profile(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
@@ -848,14 +988,20 @@ mod tests {
     fn private_stream_file_is_private_from_creation_before_begin() {
         let dir = private_tempdir();
         let path = dir.path().join("trace.log");
-        // A newly created stream target must already be 0600 here, from
-        // the O_CREAT mode — never created permissive and chmod'ed after.
+        // A newly created stream target is 0600 the moment its name
+        // appears, from the creation mode — never created permissive and
+        // chmod'ed after. With O_TMPFILE the name appears at begin; on a
+        // filesystem without it, at preflight.
         let stream = create_private_stream(&path).unwrap();
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        let file = stream.begin().unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        drop(stream.begin().unwrap());
+        drop(file);
     }
 
     #[test]
@@ -880,6 +1026,75 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// J-02sp#7: a trace sink that would create its file holds no
+    /// directory entry until the capture begins, so a stream dropped before
+    /// it began has no name to unlink — a file written at that name in the
+    /// meantime is left exactly as it is.
+    #[test]
+    fn an_unbegun_private_stream_holds_no_name_and_its_drop_unlinks_nothing() {
+        let dir = private_tempdir();
+        let path = dir.path().join("trace.log");
+        let stream = create_private_stream(&path).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the name exists before the capture began"
+        );
+        std::fs::write(&path, b"written meanwhile").unwrap();
+        drop(stream);
+        assert_eq!(std::fs::read(&path).unwrap(), b"written meanwhile");
+    }
+
+    /// The fallback for a filesystem without `O_TMPFILE`: the file is
+    /// created private at preflight, removed by an unbegun drop while it is
+    /// still that file, and kept once something else stands at the name.
+    #[test]
+    fn a_stream_without_o_tmpfile_creates_at_preflight_and_removes_only_its_own_file() {
+        let dir = private_tempdir();
+        let path = dir.path().join("trace.log");
+        let stream = create_private_stream_with(&path, false).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(stream);
+        assert!(std::fs::symlink_metadata(&path).is_err());
+
+        let stream = create_private_stream_with(&path, false).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"someone else's").unwrap();
+        drop(stream);
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
+
+        std::fs::remove_file(&path).unwrap();
+        let mut file = create_private_stream_with(&path, false)
+            .unwrap()
+            .begin()
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"line").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"line");
+    }
+
+    /// A name that appeared during startup is opened like a file that
+    /// existed at preflight: same checks, truncated and made private at
+    /// begin.
+    #[test]
+    fn a_stream_name_that_appeared_during_startup_is_reused_at_begin() {
+        let dir = private_tempdir();
+        let path = dir.path().join("trace.log");
+        let stream = create_private_stream(&path).unwrap();
+        std::fs::write(&path, b"appeared").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut file = stream.begin().unwrap();
+        std::io::Write::write_all(&mut file, b"line\n").unwrap();
+        drop(file);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.ino(), inode);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"line\n");
     }
 
     #[test]

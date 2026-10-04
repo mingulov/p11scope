@@ -435,6 +435,7 @@ statement, and it forces `PARTIAL` so the count is never read as attributed.
 | `calls`, `errors` | Event-derived semantic calls and non-success final results. |
 | `latency_ns` | Same shape as function latency; async semantic latency spans pending entry to completion. |
 | `params` | Always `null` under the default `allowlisted` policy. A separately enabled unsafe diagnostic capture may contain distinct decoded parameter combinations with counts. |
+| `params_omitted` | v3 only, present exactly when `params` is `null`: `policy` (the `allowlisted` policy disables parameter decoding), `no_shape` (no diagnostic shape is published for this id; decoding was not attempted) or `decode_failed` (a shape exists but every decode attempt failed). A `null` never means "no parameters were passed". |
 | `note` | Whether decoding was unavailable, failed totally, or succeeded. |
 
 The following parameter objects describe the unsafe diagnostic representation;

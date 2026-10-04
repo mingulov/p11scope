@@ -303,11 +303,15 @@ fn probe_kernel_inner() -> Result<KernelVerdict> {
 
 #[cfg(target_arch = "x86_64")]
 fn probe_kernel_inner() -> Result<KernelVerdict> {
-    // The production object uses task storage without an Aya typed wrapper.
-    let mut ebpf = aya::EbpfLoader::new()
-        .allow_unsupported_maps()
-        .load(crate::EBPF_OBJECT)
-        .context("loading the BPF object")?;
+    // Loaded exactly as a capture loads it (J-DOSSIER#28), at the default
+    // ring sizes of a `--pid` capture.
+    let btf = aya::Btf::from_sys_fs().context("loading required vmlinux BTF")?;
+    let mut ebpf = crate::attach::load_capture_object(
+        &btf,
+        crate::run::resolve_ring_bytes(None),
+        p11scope_ebpf_common::DISCOVERY_BYTES,
+    )
+    .context("loading the BPF object")?;
     {
         let program: &mut UProbe = ebpf
             .program_mut("p11_return")
@@ -626,6 +630,51 @@ mod tests {
         anyhow::Error::new(std::io::Error::from_raw_os_error(errno))
             .context("map error: failed to create map `STATS`")
             .context(context.to_string())
+    }
+
+    /// J-DOSSIER#28: the self-probe loads the capture object exactly as a
+    /// capture does — one shared loader (vmlinux BTF, EVENTS and DISCOVERY
+    /// ring sizes) — so its verdict is about the same load, not a bare one.
+    #[test]
+    fn the_self_probe_and_the_capture_share_one_object_loader() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            source
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} not found"))
+                .1
+                .split_once("\n}\n")
+                .unwrap()
+                .0
+        }
+        let loader = "crate::attach::load_capture_object(";
+        let probe = body(
+            include_str!("uretprobe_hazard.rs"),
+            "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
+        );
+        assert!(probe.contains(loader), "the self-probe loads bare");
+        assert!(probe.contains("Btf::from_sys_fs()"));
+        assert!(probe.contains("resolve_ring_bytes(None)"));
+        assert!(
+            !probe.contains("EbpfLoader"),
+            "a second loader configuration"
+        );
+        let attach = include_str!("attach.rs");
+        let capture = body(attach, "    fn start_inner(");
+        assert!(capture.contains("load_capture_object("));
+        assert!(
+            !capture.contains("EbpfLoader"),
+            "a second loader configuration"
+        );
+        let shared = body(attach, "pub(crate) fn load_capture_object(");
+        for setting in [
+            ".btf(Some(btf))",
+            ".allow_unsupported_maps()",
+            ".map_max_entries(\"EVENTS\", events_bytes)",
+            ".map_max_entries(\"DISCOVERY\", discovery_bytes)",
+            ".load(crate::EBPF_OBJECT)",
+        ] {
+            assert!(shared.contains(setting), "{setting}");
+        }
     }
 
     /// HIGH-1: EPERM from loading the probe's BPF, or EACCES from its uprobe

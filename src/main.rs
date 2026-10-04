@@ -10,7 +10,8 @@ use std::io::Write as _;
 use anyhow::{Context as _, Result};
 use p11scope::cli::{self, CliError, Command};
 use p11scope::{
-    capture, capture_startup_signal_dispositions, doctor, inspect, inventory, run_owned,
+    capture, capture_startup_signal_dispositions, doctor, failure_already_reported,
+    failure_exit_code, inspect, inventory, run_owned,
 };
 
 fn main() {
@@ -21,9 +22,14 @@ fn main() {
             // Every failure the observer can name arrives here as one line: an
             // unreadable target, a stale manifest, an environment without BPF.
             // Never `eprintln!`: a closed stderr would turn exit 1 into a
-            // panic (HIGH-4), so a failed diagnostic write is dropped.
-            let _ = writeln!(std::io::stderr(), "p11scope: {e:#}");
-            std::process::exit(1);
+            // panic (HIGH-4), so a failed diagnostic write is dropped. A link
+            // cleanup abandoned by a second SIGINT already printed its
+            // progress and "cleanup incomplete", and exits 130 like any
+            // shell-interrupted command (SG-I7).
+            if !failure_already_reported(&e) {
+                let _ = writeln!(std::io::stderr(), "p11scope: {e:#}");
+            }
+            std::process::exit(failure_exit_code(&e));
         }
     }
 }

@@ -255,7 +255,8 @@ as semantic acceptance. A manifest does not recover calls before attachment.
 
 With accepted semantics, the default `allowlisted` profile can report admitted
 mechanism IDs and lifecycle evidence. **Every emitted mechanism has
-`params: null`, and `templates.operations` is always empty under this policy.**
+`params: null` (marked `params_omitted: "policy"`), and `templates.operations`
+is always empty under this policy.**
 Those omissions are deliberate policy limits, not evidence that the application
 used no parameters or templates. Candidate-provider testing and observed
 application coverage remain separate evidence; neither certifies migration
@@ -292,7 +293,15 @@ offline path. It executes provider code in its own unprivileged process; the
 normal manifest-free path does not execute provider code. `--module` is also
 optional and only narrows the memory scan to named providers.
 `p11scope-discover --module` must be an absolute path — a relative path is
-refused rather than resolved against a surprising directory.
+refused rather than resolved against a surprising directory. Its `-o` file is
+published the way a profile report is: a private (0600) temporary file beside
+it, fsync, rename. An existing name that is not a regular file — a symbolic
+link (even a dangling one), FIFO, socket, device or directory — is refused
+and left as it was, and so is a world-writable directory without the sticky
+bit. Unlike the observer's `-o`, the helper runs as the unprivileged operator,
+so it resolves symbolic links on the way to the directory and accepts a
+group-writable one: the directory is the operator's choice. `p11scope-discover --help` prints its usage on stdout and
+exits 0.
 
 Provider entry points are hooked through five built-ins
 (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,
@@ -365,9 +374,18 @@ as cgroup scope (overflow latches one lower-bound increment and `PARTIAL`).
 `p11scope doctor` needs no scope flags for a system capture: its host
 program preflight already covers the whole-machine lane.
 `--duration` (bare
-seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Probe
-teardown and final reporting follow; with many attached functions, this can
-add seconds, and calls may still be observed while probes are being detached.
+seconds or `30s`/`5m`/`1h`) requests shutdown after the given interval. Final
+reporting and probe teardown follow, in that order: the report is published
+at the stop gate's quiescence point, before any probe link is closed. Closing
+the links then runs in the background with a progress line on stderr about
+once a second (`p11scope: cleanup 1200/4227 links released, 38 s`) and a final
+`p11scope: cleanup completed, …` line (`cleanup incomplete, … uncertain` when
+a close failed); with many attached functions this can take seconds. A second
+Ctrl-C while the links are closing stops waiting: p11scope prints the
+progress and `p11scope: cleanup incomplete`, exits with status 130, and the
+kernel finishes the remaining closes as the process exits — the report is
+already written and stays intact. Only a second SIGINT does this; a second
+SIGTERM does not escalate.
 Ctrl-C, SIGTERM, or SIGHUP ends a capture cleanly (final frame printed, `-o`
 file written) instead of aborting it. A stop that arrives during `profile` or
 `trace` startup, before anything is attached (discovery can take seconds),
@@ -390,9 +408,10 @@ frame and no `-o` file, and a child the pause holds stopped stays stopped —
 its own session leaves its process group already orphaned, so the kernel
 sends no hangup when the observer dies; resume or kill the orphan by hand.
 The owned command starts with the signal dispositions p11scope itself
-inherited: a SIGINT, SIGTERM, or SIGHUP ignored on entry (under `nohup`, or
-a background job in a non-interactive shell) stays ignored across the fork,
-so the observed program behaves as if started directly. The exception is
+inherited: a SIGINT, SIGTERM, or SIGHUP ignored on entry stays ignored
+across the fork (`nohup` ignores SIGHUP; a background job of a
+non-interactive shell starts with SIGINT and SIGQUIT ignored), so the
+observed program behaves as if started directly. The exception is
 SIGPIPE, which the observer's runtime ignores before `main`: the child
 resets it to the default, matching `std::process::Command`, so a command
 that writes to a closed pipe dies by SIGPIPE instead of seeing EPIPE errors.
@@ -444,6 +463,17 @@ after attach and during capture. Attach is refused if that identity changes; a
 change during capture sets `evidence.provider_changed`, forces `PARTIAL`, and
 shows " · provider changed" on the live line. Renaming over or unlinking the
 pinned inode is reported by the same conservative check.
+
+Inputs and outputs follow opposite symlink rules. Inputs the operator names
+or the scan selects — `--manifest`, provider objects, `p11scope-discover
+--module` — follow symbolic links, because real providers are routinely
+reached through versioned `.so` links; what is trusted is the regular file at
+the end, pinned by descriptor and identified by device, inode and SHA-256 as
+above. A manifest is read whole from that descriptor, and a read whose length
+differs from the file's size (the file changed while it was read) is refused.
+Outputs never follow a symbolic link at the final name: `-o` (see
+[More capture options](#more-capture-options)) and `p11scope-discover -o`
+refuse one and leave it as it was.
 
 The capture retains each selected process generation through its last target
 access and through attach, checking it immediately before and after session
@@ -544,7 +574,10 @@ kind of workload without a manifest and ends `68`/`0` instead.
   never replaced; the profile report re-checks the name before publishing.
   An existing trace file is truncated only once the capture has attached: a
   capture that fails before that leaves it as it was, and removes a file it
-  had only just created. To keep no report file, leave out `-o`.
+  had only just created; where the filesystem supports `O_TMPFILE`, a new
+  trace file has no name at all until the capture has attached, so a
+  failed start never leaves or removes anything at the name. To keep no
+  report file, leave out `-o`.
   `-o -` means stdout for trace (including `run --trace`), whose lines
   already stream to stdout when `-o` is omitted; profile (including `run`
   without `--trace`) refuses `-o -` because its report requires a file —
@@ -976,10 +1009,13 @@ field and the explicitly informational exceptions.
 perf link stops new probe invocations but does not wait for BPF callbacks
 already running on another CPU, so the terminal snapshot is taken behind the
 stop gate instead: on stop, p11scope refuses new callbacks, waits up to 5 s
-for every admitted one to finish (quiescence), then drains both rings to the
-positions read at that point and publishes before it detaches. When
-quiescence is proven, neither ring holds a record past those positions, and
-the build is x86_64, `evidence.drain_proven` is true and a clean run is
+for every admitted one to finish (quiescence), then drains its rings to the
+positions read at that point and publishes before it detaches. A profile or
+trace capture drains both the EVENTS and the DISCOVERY ring; a
+`--mode metrics` capture reads its counts from maps finalized behind
+quiescence, does not consume the EVENTS ring, and drains only DISCOVERY.
+When quiescence is proven, no drained ring holds a record past those
+positions, and the build is x86_64, `evidence.drain_proven` is true and a clean run is
 `COMPLETE` (`verdict_detail: "clean_proven"`). Otherwise the final document is
 downgraded to `PARTIAL` on the way out: `evidence.stop_quiescence` says
 whether quiescence was `proven`, `unproven` (stderr also prints

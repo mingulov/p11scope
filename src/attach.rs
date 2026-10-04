@@ -47,9 +47,8 @@ pub(crate) use inventory::capture;
 mod stop_gate;
 pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
 mod cleanup_worker;
-pub(crate) use cleanup_worker::{
-    CleanupExit, CleanupWorker, DetachOrder, OwnedLink, drive_cleanup,
-};
+pub use cleanup_worker::CleanupInterrupted;
+pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink, drive_cleanup};
 
 #[cfg(test)]
 mod continuation_guard_tests;
@@ -2015,6 +2014,10 @@ fn reattach_rebuilt_groups_with<T>(
                         && !outcome.successful.contains(&(*slot, ProbeSide::Entry))
                 })
                 .collect();
+            // A member refused this round (its return, or its entry beside
+            // a partial) already carries its failure: it is not re-rounded,
+            // so the refusal is recorded once (F-45).
+            let refused: BTreeSet<u32> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
             failures.extend(outcome.failures);
             if partials.is_empty() {
                 successful.extend(outcome.successful);
@@ -2028,7 +2031,10 @@ fn reattach_rebuilt_groups_with<T>(
                 remaining = round
                     .members
                     .into_iter()
-                    .filter(|member| !partials.contains(&member.slot.index))
+                    .filter(|member| {
+                        !partials.contains(&member.slot.index)
+                            && !refused.contains(&member.slot.index)
+                    })
                     .collect();
             }
         }
@@ -2421,6 +2427,23 @@ fn validate_runtime_map(
 pub(crate) const SHARED_SCOPE_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
 
 /// The DISCOVERY ring size this scope loads with.
+/// The one loader configuration of the capture object, shared by capture
+/// sessions and the uretprobe-hazard self-probe (J-DOSSIER#28): vmlinux BTF
+/// for the typed task storage, unsupported map types allowed, and the EVENTS
+/// and DISCOVERY rings sized at load.
+pub(crate) fn load_capture_object(
+    btf: &Btf,
+    events_bytes: u32,
+    discovery_bytes: u32,
+) -> std::result::Result<Ebpf, aya::EbpfError> {
+    EbpfLoader::new()
+        .btf(Some(btf))
+        .allow_unsupported_maps()
+        .map_max_entries("EVENTS", events_bytes)
+        .map_max_entries("DISCOVERY", discovery_bytes)
+        .load(crate::EBPF_OBJECT)
+}
+
 pub(crate) fn discovery_ring_bytes(scope: &Scope) -> u32 {
     match scope {
         Scope::Pid(_) => p11scope_ebpf_common::DISCOVERY_BYTES,
@@ -2851,13 +2874,12 @@ impl Session {
         // baked-in default, which is a no-op override of the ELF value.
         let btf =
             Btf::from_sys_fs().context("loading required vmlinux BTF for typed task_newtask")?;
-        let mut ebpf = EbpfLoader::new()
-            .btf(Some(&btf))
-            .allow_unsupported_maps()
-            .map_max_entries("EVENTS", crate::run::resolve_ring_bytes(ring_bytes))
-            .map_max_entries("DISCOVERY", discovery_ring_bytes(scope))
-            .load(crate::EBPF_OBJECT)
-            .context("loading BPF object with required task storage")?;
+        let mut ebpf = load_capture_object(
+            &btf,
+            crate::run::resolve_ring_bytes(ring_bytes),
+            discovery_ring_bytes(scope),
+        )
+        .context("loading BPF object with required task storage")?;
         let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
         let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
         let generation_token = pause_key.map(|key| key.generation_token);
@@ -3663,8 +3685,9 @@ impl Session {
     /// Move every producer link out of Aya into the background cleanup
     /// worker, print progress to `out` about once a second until it joins,
     /// then report. `second_signal` interrupts the wait: the progress and
-    /// "cleanup incomplete" are printed and the process exits — the kernel
-    /// finishes the remaining closes at exit.
+    /// "cleanup incomplete" are printed and this returns
+    /// [`CleanupInterrupted`] for the caller to propagate (exit 130) — the
+    /// kernel finishes the remaining closes at exit.
     pub(crate) fn detach_producers_driven(
         &mut self,
         second_signal: impl Fn() -> bool,
@@ -3693,23 +3716,20 @@ impl Session {
             let worker = self.take_cleanup_worker();
             worker.note_transfer_failed(transfer_failed);
             worker.submit(owned, DetachOrder);
-            match drive_cleanup(
+            // A second SIGINT abandons the wait: the worker keeps closing
+            // in the background and the kernel finishes at exit. The typed
+            // outcome travels up the stop path to `main` (exit 130).
+            let failures = cleanup_worker::settle_cleanup_exit(drive_cleanup(
                 worker,
                 second_signal,
                 out,
                 std::time::Duration::from_secs(1),
-            ) {
-                CleanupExit::Completed(receipt) => {
-                    for failure in receipt.failures {
-                        if first_error.is_none() {
-                            first_error = Some(anyhow!(failure.clone()));
-                        }
-                        self.detach_failures.push(failure);
-                    }
+            ))?;
+            for failure in failures {
+                if first_error.is_none() {
+                    first_error = Some(anyhow!(failure.clone()));
                 }
-                CleanupExit::Interrupted(_) => {
-                    std::process::exit(128 + libc::SIGINT);
-                }
+                self.detach_failures.push(failure);
             }
         } else {
             let _ = (second_signal, out);
@@ -6520,6 +6540,49 @@ mod tests {
             returns, 3,
             "group A retries its return once, group B attaches once"
         );
+    }
+
+    /// F-45: a member whose return was refused in a dirty round (another
+    /// member was entry-partial) is not re-rounded, so its refusal is
+    /// recorded once — not again with every retry of the remainder.
+    #[test]
+    fn reattach_records_a_return_refusal_once_beside_an_entry_partial() {
+        let (slots, targets) = two_groups();
+        let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+        let return_poison = grouped_offset(&groups, 0);
+        let entry_poison = grouped_offset(&groups, 1);
+        let mock = MockGroup {
+            calls: std::cell::RefCell::new(Vec::new()),
+            fail: Box::new(move |_, sites, is_return| {
+                let poison = if is_return {
+                    return_poison
+                } else {
+                    entry_poison
+                };
+                sites
+                    .iter()
+                    .any(|(offset, _)| *offset == poison)
+                    .then(|| io::Error::from_raw_os_error(libc::EINVAL))
+            }),
+        };
+        let (_drops, record) = rebuild_drops();
+        let (bundles, outcome) =
+            reattach_rebuilt_groups_with(&groups, |_| Some(9), mock.leaf(), record);
+        let failed: Vec<u32> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(
+            failed,
+            vec![0, 1],
+            "one failure per refused member: {:?}",
+            outcome.failures
+        );
+        let completed: BTreeSet<u32> = outcome.completed.iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(completed, BTreeSet::from([2, 3]));
+        for bundle in &bundles {
+            assert!(
+                !bundle.slots.contains(&0) && !bundle.slots.contains(&1),
+                "no refused member keeps a link: {bundle:?}"
+            );
+        }
     }
 
     #[test]

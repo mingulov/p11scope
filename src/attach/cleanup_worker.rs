@@ -292,6 +292,34 @@ pub(crate) enum CleanupExit {
     Interrupted(CleanupProgress),
 }
 
+/// A link cleanup abandoned by a second SIGINT (SG-I7): the report is
+/// already published and the kernel finishes the remaining closes at
+/// process exit. Returned up the stop path so destructors and
+/// post-cleanup reporting still run; `main` maps it to exit 130.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupInterrupted;
+
+impl std::fmt::Display for CleanupInterrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "link cleanup interrupted by a second SIGINT; the kernel finishes the \
+             remaining closes at exit",
+        )
+    }
+}
+
+impl std::error::Error for CleanupInterrupted {}
+
+/// What a session does with a driven cleanup's exit: the completed
+/// receipt's close failures, or the second-signal abandon as a typed
+/// outcome for the caller to propagate.
+pub(crate) fn settle_cleanup_exit(exit: CleanupExit) -> Result<Vec<String>, CleanupInterrupted> {
+    match exit {
+        CleanupExit::Completed(receipt) => Ok(receipt.failures),
+        CleanupExit::Interrupted(_) => Err(CleanupInterrupted),
+    }
+}
+
 fn write_progress_line(out: &mut dyn Write, progress: &CleanupProgress) {
     let _ = writeln!(
         out,
@@ -520,6 +548,49 @@ mod tests {
             text.contains("links released"),
             "stderr must show the progress, got: {text}"
         );
+    }
+
+    /// SG-I7/M11: the second-signal abandon is a typed outcome the stop
+    /// path returns, never a `process::exit` deep inside the session that
+    /// skips destructors, post-cleanup reporting and the caller's status.
+    #[test]
+    fn a_second_signal_abandons_cleanup_as_a_typed_outcome_not_a_process_exit() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |_link, _| {
+                let _ = gate_rx.recv();
+                Ok(())
+            }),
+            scripted_clock(Arc::new(Mutex::new(Duration::from_secs(3)))),
+        );
+        worker.submit(
+            vec![multi(ProducerProgram::UProbe("p11_entry"))],
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || true, &mut out, Duration::from_millis(0));
+        let settled = settle_cleanup_exit(exit);
+        let _ = gate_tx.send(());
+        assert_eq!(settled, Err(CleanupInterrupted));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("cleanup incomplete"), "{text}");
+    }
+
+    #[test]
+    fn a_completed_cleanup_settles_to_its_close_failures() {
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(|_link, _| Err("close p11_entry: bad fd".to_string())),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![multi(ProducerProgram::UProbe("p11_entry"))],
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup(worker, || false, &mut out, Duration::from_millis(1));
+        let failures = settle_cleanup_exit(exit).expect("no second signal");
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("p11_entry"), "{failures:?}");
     }
 
     /// M1: completion counts settled closes, not started ones. The last

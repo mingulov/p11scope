@@ -28,14 +28,26 @@ pub fn read_manifest(path: &Path) -> Result<String, String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("metadata failed: {error}"))?;
-    if metadata.len() > MAX_MANIFEST_BYTES {
+    let bytes = read_bounded(file, metadata.len())?;
+    String::from_utf8(bytes).map_err(|error| format!("manifest is not UTF-8: {error}"))
+}
+
+/// Reads a manifest whose `fstat` size was `expected_len`, bounded by
+/// [`MAX_MANIFEST_BYTES`]. A read that returns any other length means the
+/// file was truncated or extended between the `fstat` and the read: it is
+/// refused, so a truncation that happens to be valid JSON is never parsed
+/// as a shorter manifest (J-manifest_input#1). A same-length rewrite is not
+/// detected: the manifest is trusted operator input, and the provider
+/// identities it names are still checked against the pinned objects.
+fn read_bounded(reader: impl std::io::Read, expected_len: u64) -> Result<Vec<u8>, String> {
+    if expected_len > MAX_MANIFEST_BYTES {
         return Err(format!(
-            "manifest is {} bytes; limit is {MAX_MANIFEST_BYTES}",
-            metadata.len()
+            "manifest is {expected_len} bytes; limit is {MAX_MANIFEST_BYTES}"
         ));
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_MANIFEST_BYTES + 1)
+    let mut bytes = Vec::with_capacity(expected_len as usize);
+    reader
+        .take(MAX_MANIFEST_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read failed: {error}"))?;
     if bytes.len() as u64 > MAX_MANIFEST_BYTES {
@@ -43,7 +55,13 @@ pub fn read_manifest(path: &Path) -> Result<String, String> {
             "manifest grew beyond the {MAX_MANIFEST_BYTES}-byte limit"
         ));
     }
-    String::from_utf8(bytes).map_err(|error| format!("manifest is not UTF-8: {error}"))
+    if bytes.len() as u64 != expected_len {
+        return Err(format!(
+            "manifest changed while reading: read {} bytes, its size was {expected_len}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
 }
 
 fn bounded(label: &str, value: &str, limit: usize, problems: &mut Vec<String>) {
@@ -1021,4 +1039,34 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
         &mut problems,
     );
     problems
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// J-manifest_input#1: a manifest truncated (or extended) between the
+    /// `fstat` and the read is refused, never parsed as a shorter document.
+    #[test]
+    fn a_manifest_that_changed_size_while_reading_is_refused() {
+        let document = br#"{"schema":"p11scope-manifest/5"}"#;
+        assert_eq!(
+            read_bounded(&document[..], document.len() as u64).unwrap(),
+            document
+        );
+        for (name, reader, expected) in [
+            ("shrunk", &document[..10], document.len() as u64),
+            ("grown", &document[..], 10),
+        ] {
+            let error = read_bounded(reader, expected)
+                .expect_err(&format!("a {name} manifest must be refused"));
+            assert!(error.contains("changed while reading"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_over_the_limit_is_refused_before_reading() {
+        let error = read_bounded(std::io::empty(), MAX_MANIFEST_BYTES + 1).unwrap_err();
+        assert!(error.contains("limit is"), "{error}");
+    }
 }

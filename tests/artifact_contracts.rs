@@ -8363,10 +8363,17 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "context.0.settle_terminal_drain();",
             "let mut ev = evidence_for(",
         ),
+        // SG-T7B: the stop-gate outcome is applied, then the terminal
+        // verdict sealed from it, before anything is rendered.
         (
-            "ev.mark_terminal_drain_unproven();",
-            "let frame = render::live(",
+            "let mut ev = evidence_for(",
+            "ev.apply_stop_quiescence(consumers.stop_quiescence);",
         ),
+        (
+            "ev.apply_stop_quiescence(consumers.stop_quiescence);",
+            "ev.settle_terminal(profile);",
+        ),
+        ("ev.settle_terminal(profile);", "let frame = render::live("),
         ("let frame = render::live(", "write_stdout("),
     ] {
         require_before(
@@ -8400,14 +8407,21 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
     assert!(checks[1] < settle && settle < late_kernel);
     require_before(
         trace_terminal,
-        "evidence.mark_terminal_drain_unproven();",
+        "evidence.apply_stop_quiescence(consumers.stop_quiescence);",
+        "evidence.settle_terminal(true);",
+        "trace terminal seal from the stop-gate outcome",
+    )
+    .unwrap();
+    require_before(
+        trace_terminal,
+        "evidence.settle_terminal(true);",
         "emit_trace_line(",
         "trace truncation output honesty",
     )
     .unwrap();
     require_before(
         trace_terminal,
-        "evidence.mark_terminal_drain_unproven();",
+        "evidence.settle_terminal(true);",
         "emit_trace_terminal(",
         "trace terminal output honesty",
     )

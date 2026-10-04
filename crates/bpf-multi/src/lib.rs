@@ -80,6 +80,11 @@ struct LinkAttr {
     pid: u32,
 }
 
+// UAPI layout, checked at compile time in every profile (F-46): a drift
+// must fail the release build that loads BPF, not only a debug run.
+const _: () = assert!(size_of::<LinkAttr>() == 64);
+const _: () = assert!(std::mem::offset_of!(LinkAttr, flags) == 52);
+
 fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
     // SAFETY: raw bpf() with a caller-sized attr; exactly what libbpf does.
     let ret = unsafe { libc::syscall(libc::SYS_bpf, cmd as libc::c_long, attr, size) };
@@ -150,18 +155,21 @@ static SCRATCH_INSNS: [u8; 16] = [
 /// test below pins that charset.
 const SCRATCH_PROG_NAME: &str = "p11scope_multi";
 
+// `bpf_attr` head and scratch-program shape, checked at compile time in
+// every profile (F-46).
+const _: () = assert!(size_of::<ProgAttr>() == 152);
+const _: () = assert!(std::mem::offset_of!(ProgAttr, prog_name) == 48);
+const _: () = assert!(std::mem::offset_of!(ProgAttr, expected_attach_type) == 68);
+const _: () = assert!(std::mem::offset_of!(ProgAttr, prog_btf_fd) == 72);
+const _: () = assert!(SCRATCH_INSNS.len().is_multiple_of(8));
+const _: () = assert!(SCRATCH_PROG_NAME.len() < 16);
+
 /// Load the mapless no-op scratch program typed for multi attach
 /// (`BPF_PROG_TYPE_KPROBE` + `expected_attach_type=48`). Doctor
 /// functional probe ONLY: production programs load through Aya.
 /// No verifier log: two instructions cannot fail verification, so the
 /// load errno alone diagnoses the failure (EPERM, ENOSYS, ...).
 pub fn prog_load_scratch_multi() -> io::Result<OwnedFd> {
-    debug_assert_eq!(size_of::<ProgAttr>(), 152);
-    debug_assert_eq!(std::mem::offset_of!(ProgAttr, prog_name), 48);
-    debug_assert_eq!(std::mem::offset_of!(ProgAttr, expected_attach_type), 68);
-    debug_assert_eq!(std::mem::offset_of!(ProgAttr, prog_btf_fd), 72);
-    debug_assert_eq!(SCRATCH_INSNS.len() % 8, 0);
-    debug_assert!(SCRATCH_PROG_NAME.len() < 16);
     let mut attr: ProgAttr = zeroed();
     attr.prog_type = BPF_PROG_TYPE_KPROBE;
     attr.insn_cnt = (SCRATCH_INSNS.len() / 8) as u32;
@@ -235,8 +243,6 @@ fn link_create_multi(
             ),
         ));
     }
-    debug_assert_eq!(size_of::<LinkAttr>(), 64);
-    debug_assert_eq!(std::mem::offset_of!(LinkAttr, flags), 52);
     let mut attr: LinkAttr = zeroed();
     attr.prog_fd = prog_fd as u32;
     attr.attach_type = BPF_TRACE_UPROBE_MULTI;

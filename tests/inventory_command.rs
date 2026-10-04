@@ -733,7 +733,7 @@ impl LiveDriver {
         }
         let ready = dir.join(format!("{name}.ready"));
         let _ = std::fs::remove_file(&ready);
-        let mut child = Command::new(&driver)
+        let child = Command::new(&driver)
             .arg("--ready")
             .arg(&ready)
             .arg("--sleep")
@@ -744,9 +744,21 @@ impl LiveDriver {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        Self::adopt(child, &ready, name, Duration::from_secs(30))
+    }
+
+    /// Owns `child` before anything can panic, then waits for its
+    /// `READY <pid>` line in `ready`: a fixture that never becomes ready, or
+    /// a ready line that does not parse, is killed and reaped by `Drop`
+    /// (DR-55).
+    fn adopt(child: std::process::Child, ready: &Path, name: &str, timeout: Duration) -> Self {
+        let mut driver = Self {
+            child: Some(child),
+            pid: 0,
+        };
+        let deadline = Instant::now() + timeout;
         let pid = loop {
-            if let Ok(text) = std::fs::read_to_string(&ready)
+            if let Ok(text) = std::fs::read_to_string(ready)
                 && let Some(pid) = text.split_whitespace().nth(1)
             {
                 break pid.parse::<u32>().unwrap();
@@ -757,12 +769,11 @@ impl LiveDriver {
             );
             std::thread::sleep(Duration::from_millis(50));
         };
+        let child = driver.child.as_mut().expect("the driver owns its child");
         assert_eq!(pid, child.id(), "ready pid is the spawned driver");
         let _ = child.try_wait().unwrap();
-        Self {
-            child: Some(child),
-            pid,
-        }
+        driver.pid = pid;
+        driver
     }
 }
 
@@ -773,6 +784,36 @@ impl Drop for LiveDriver {
             let _ = child.wait();
         }
     }
+}
+
+/// DR-55: a fixture that never becomes ready makes the readiness assert
+/// panic; the driver must already own the child then, so its `Drop` kills
+/// and reaps it instead of leaking a 120 s sleeper.
+#[test]
+fn a_driver_that_never_becomes_ready_is_reaped_after_the_panic() {
+    let dir = tmp("inventory-command-never-ready");
+    let child = Command::new("sleep")
+        .arg("120")
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    let ready = dir.join("never.ready");
+    let adopted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        LiveDriver::adopt(child, &ready, "never", Duration::from_millis(200))
+    }));
+    assert!(adopted.is_err(), "the readiness assert must fire");
+    // Reaped: our child is gone, not running and not a zombie.
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    let error = std::io::Error::last_os_error();
+    if waited == 0 {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        panic!("the never-ready driver {pid} was leaked still running");
+    }
+    assert_eq!(waited, -1, "the never-ready driver {pid} was left unreaped");
+    assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
 }
 
 fn observe(pid: u32, args: &[&str]) -> std::process::Output {

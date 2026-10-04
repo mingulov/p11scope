@@ -96,7 +96,7 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
     let mut rv_by_slot: BTreeMap<u32, BTreeMap<u64, u64>> = BTreeMap::new();
     for entry in rvs.iter() {
         let (k, per_cpu) = entry?;
-        let total: u64 = per_cpu.iter().copied().sum();
+        let total = saturating_total(per_cpu.iter().copied());
         if total > 0 {
             let slot_rv = rv_by_slot
                 .entry(k.slot)
@@ -320,7 +320,8 @@ fn notice_kernel_control(control: &KernelControl) {
 pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
     let evidence: PerCpuArray<_, u64> =
         PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
-    let read = |index| -> Result<u64> { Ok(evidence.get(&index, 0)?.iter().copied().sum()) };
+    let read =
+        |index| -> Result<u64> { Ok(saturating_total(evidence.get(&index, 0)?.iter().copied())) };
     let control = KernelControl::from_cells(
         control_cell::<ThreadOwnerControl>(session, "OWNER_CTL")?,
         control_cell::<ImageIdentityControl>(session, "COOKIE_CTL")?,
@@ -341,17 +342,23 @@ pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
     })
 }
 
+/// Sum of counter cells (per-CPU values, histogram buckets), saturating at
+/// `u64::MAX` like every other aggregate here instead of wrapping (F-58-T7).
+fn saturating_total(values: impl IntoIterator<Item = u64>) -> u64 {
+    values.into_iter().fold(0, u64::saturating_add)
+}
+
 /// Approximate quantile from log2 buckets: the lower bound of the bucket
 /// containing the q-th observation. `q` is in (0.0, 1.0].
 pub fn percentile_ns(buckets: &[u64; LATENCY_BUCKETS], q: f64) -> Option<u64> {
-    let total: u64 = buckets.iter().sum();
+    let total = saturating_total(buckets.iter().copied());
     if total == 0 {
         return None;
     }
     let target = ((total as f64) * q).ceil() as u64;
     let mut seen = 0u64;
     for (i, count) in buckets.iter().enumerate() {
-        seen += count;
+        seen = seen.saturating_add(*count);
         if seen >= target {
             // Bucket i holds [2^(i-1), 2^i); bucket 0 holds exactly 0.
             return Some(if i == 0 { 0 } else { 1u64 << (i - 1) });
@@ -431,6 +438,56 @@ mod tests {
             "1_000_000ns falls in the [524288,1048576) bucket"
         );
         assert!(p99 > p50);
+    }
+
+    /// F-58-T7: per-CPU and per-bucket totals saturate at `u64::MAX`
+    /// instead of wrapping (release) or panicking (debug).
+    #[test]
+    fn counter_totals_saturate_instead_of_wrapping() {
+        assert_eq!(saturating_total([u64::MAX, 2]), u64::MAX);
+        assert_eq!(saturating_total([1, u64::MAX, u64::MAX]), u64::MAX);
+        assert_eq!(saturating_total([2, 3]), 5);
+        // A wrapped total (0) would report no percentile; a wrapped running
+        // sum would never reach the target.
+        let mut b = [0u64; LATENCY_BUCKETS];
+        b[bucket_of(1_000) as usize] = 1;
+        b[bucket_of(1_000_000) as usize] = u64::MAX;
+        assert_eq!(percentile_ns(&b, 0.50), Some(524_288));
+        assert_eq!(percentile_ns(&b, 1.0), Some(524_288));
+        // Every production total in this module goes through a saturating
+        // add: outside comments there is no addition operator, sum,
+        // wrapping/overflowing/checked add, and no fold except
+        // `saturating_add` and the bitmask OR of the control names.
+        let production: String = include_str!("metrics.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for wrapping in [
+            "+=",
+            " + ",
+            ".sum(",
+            ".sum::<",
+            "wrapping_add",
+            "overflowing_add",
+            "checked_add",
+            "unchecked_add",
+        ] {
+            assert!(
+                !production.contains(wrapping),
+                "an unsaturated total: {wrapping}"
+            );
+        }
+        for (at, _) in production.match_indices(".fold(") {
+            let call = production[at..].lines().next().unwrap();
+            assert!(
+                call.contains("u64::saturating_add") || call.contains("mask | bit"),
+                "an unsaturated fold: {call}"
+            );
+        }
     }
 
     fn halted_owner() -> KernelControl {

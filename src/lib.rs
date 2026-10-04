@@ -65,7 +65,10 @@ pub(crate) mod uretprobe_hazard;
 /// The whole public production surface of the capture loops. `run` stays a
 /// crate-private module: the owned child, the pause coordinator, its clocks,
 /// maps, drains, guards and injected actions are unreachable from outside.
-pub use run::{OwnedRunOutcome, capture, capture_startup_signal_dispositions, run_owned};
+pub use run::{
+    OwnedRunOutcome, capture, capture_startup_signal_dispositions, failure_already_reported,
+    failure_exit_code, run_owned,
+};
 
 /// The BPF object, built by build.rs. Alignment matters: aya parses it
 /// as ELF in place.

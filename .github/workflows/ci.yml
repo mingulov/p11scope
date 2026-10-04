@@ -42,7 +42,7 @@ jobs:
           TREE=$(git rev-parse 'HEAD^{tree}')
           cat >"$RUNNER_TEMP/lanes.txt" <<EOF
           commit $GITHUB_SHA tree $TREE
-          scope: printed before any step runs, so it is scope, never a result — each step's own status is the evidence. This job attempts the cargo fmt/check/test/clippy gates, the diagnostic-object inventory test, every --self-test, and these lanes in full: scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh
+          scope: printed before any step runs, so it is scope, never a result — each step's own status is the evidence. This job attempts the cargo fmt/check/test/clippy gates, the diagnostic-object inventory test, every --self-test, and these lanes in full: scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh, scripts/run-python-suites.py
           UNRUN: scripts/attach-pod.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -168,8 +168,6 @@ jobs:
       # runner is one); qualify-inventory-native.sh compiles the ledgered
       # inventory workload and runs every mode against the softhsm2 package
       # installed above. The two container-less live lanes follow the block.
-      - run: python3 -I tests/python/test_system_test_manifest.py -v
-      - run: python3 -I tests/python/test_t7_campaign.py -v
       - run: scripts/verify-inspect-doctor.sh --self-test
       - run: scripts/verify-attach-e2e.sh --self-test
       - run: scripts/verify-induced-gaps.sh --self-test
@@ -214,24 +212,19 @@ jobs:
       - run: python3 -I scripts/task-1.6-lane-a.py --self-test
       - run: python3 -I scripts/task-1.6-lane-b-sparse-model.py --self-test
       - run: python3 -I scripts/inventory-native-oracle.py --self-test
-      - run: python3 -I tests/python/test_canary_evidence.py --target-bits 32 -v
-      - run: python3 -I tests/python/test_canary_evidence.py --target-bits 64 -v
-      - run: python3 -I tests/python/test_system_scope_measure_launch.py -v
-      - run: python3 -I tests/python/test_measure_e03.py -v
-      - run: python3 -I tests/python/test_system_first_use_fixture.py -v
-      - run: python3 -I tests/python/test_system_first_use_receipt.py -v
-      - run: python3 -I tests/python/test_system_scope_sample.py -v
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh
       # SYSPLAN residual gates. None names a lane body: the lint step
       # addresses directories through a shell variable, never a scripts/
       # path (the pipeline derivation test forbids lane paths here).
-      - name: help-drift (flags/parser/usage agreement)
-        run: python3 -I tests/python/test_help_usage_drift.py -v
-      - run: python3 -I tests/python/test_schema_json.py -v
-      - run: python3 -I tests/python/test_release_notices.py -v
-      - run: python3 -I tests/python/test_package_release.py -v
-      - run: python3 -I tests/python/test_residual_gates.py -v
+      # Every tests/python suite (F-62): the runner checks that each file is
+      # registered exactly once (run here, driven by a named cargo test or
+      # self-test, or excluded with a reason), fails on any unregistered or
+      # vanished suite, and runs the standalone ones, including help-drift
+      # (test_help_usage_drift.py), schema, release-notice, packaging and
+      # residual-gate suites. `--list` prints the registry.
+      - name: tests/python suites (help-drift, schema, residual gates, every standalone suite)
+        run: python3 -I scripts/run-python-suites.py
       - run: cargo +"$(cat .release-rust-version)" install cargo-audit --version 0.22.2 --locked
       - run: cargo +"$(cat .release-rust-version)" install cargo-deny --version 0.20.2 --locked
       - run: cargo +"$(cat .release-rust-version)" audit

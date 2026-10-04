@@ -7,6 +7,47 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [Unreleased]
 
+### Inventory and system catalog
+
+- `inventory --system` and `inspect --system` no longer drop callers past
+  `--max-scan-pids` (DR-C8-1). The cap still bounds how many processes are
+  deep-scanned, one per provider group; every other process whose
+  `/proc/<pid>/maps` shows, by exact `(device, inode)`, a provider object a
+  deep scan pinned in the same pass is attributed to it after a confirmation
+  read (pidfd and start-time pin, maps re-read, exe identity unchanged) taken
+  while the pinned object is held open, and only when every mapped range is
+  proven through `/proc/<pid>/map_files` to be the same kernel file as a
+  self-mapping of the held object (a maps key alone is not one file on
+  btrfs). That proof needs `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`;
+  without it nothing is attributed by maps and the losses say so. Only the
+  deep-scan cap's discovery of objects no other process maps remains
+  bounded.
+- `inspect --system`: processes past the cap read `maps_matched` (attributed)
+  or `not_selected` (with the loss reason when a known provider object could
+  not be attributed); observations carry `evidence` (`deep_scan` or
+  `maps_match`; a maps match decodes nothing, so its exports, tables, and
+  interfaces are empty) and maps-matched mappings have a `null` view. The
+  `scan` block is now `{status, enumerated, limit, selected, deep_scanned,
+  maps_matched, unexamined, unexamined_objects, snapshots_unavailable,
+  attribution_losses, scan_ms}`: `limit` replaces `max_scan_pids` and
+  `deep_scanned` replaces `scanned`.
+- The flat scan-cap gap is replaced by `discovery capped` (a loss, only when
+  some process maps a shared object no deep scan examined or had no maps
+  snapshot) or an `attribution complete` note. Attribution losses are counted
+  by category in a `maps attribution` gap. `scan.status` reads `complete` past
+  the cap when nothing was left unexamined and nothing was lost.
+- `inventory`: `edges[].mapping.evidence` (`deep_scan` or `maps_match`); a
+  module missing from a maps-matched caller reads `uncertain`, never `ended`.
+  Both lanes join the collected generation (start time; exe identity) to the
+  caller incarnation before projecting. Caller admission failures aggregate
+  into one gap per pass and kind with a count. The event stream's
+  `pass_committed` gains `maps_matched`.
+- Deep scans, when `map_files` can be followed, also refuse an opened object
+  whose path resolved to another file than the mapped one under the same
+  maps key (btrfs subvolume inode collisions).
+- `P11SCOPE_STAGE_TIMINGS=1` prints per-pass stage timings (sweep, select,
+  deep scan, confirm, assemble, absorb, reconcile, project) to stderr.
+
 ### Changed
 
 - A written capture can now be `COMPLETE`. On stop, a Detailed capture's
@@ -20,6 +61,31 @@ versioned separately and are opaque, exact dispatch keys.
   plus `post_q_events` / `post_q_discovery`) publishes the stop-gate outcome
   that used to reach stderr only. The trace terminal `EVIDENCE` record now
   carries the sealed verdict, and its `final_drain` equals `drain_proven`.
+- Every profile `mechanisms[]` row whose `params` is `null` now says why in
+  `params_omitted`: `policy` (the default `allowlisted` policy), `no_shape` or
+  `decode_failed`, so a policy omission no longer reads like "no parameters".
+
+### Fixed
+
+- A second Ctrl-C while probe links are closing now returns through the stop
+  path instead of exiting from inside the capture session: the exit status is
+  still 130 and the published report stays intact, but post-cleanup reporting
+  and destructors run. A capture that fails also still prints its live
+  discovery-noise summary. `docs/usage.md` documents the cleanup progress
+  lines, `cleanup incomplete` and exit 130.
+- `p11scope-discover -o` no longer writes through a symbolic link or with the
+  umask's mode: the manifest is published private (0600) and atomically
+  (temporary file, fsync, rename), and a name that is a symbolic link, FIFO,
+  socket, device or directory is refused, as is a world-writable directory
+  without the sticky bit. `p11scope-discover --help` prints on stdout.
+- A trace `-o` file that does not exist yet is created unnamed (`O_TMPFILE`)
+  and linked at its name only once the capture has attached, so a failed
+  start no longer creates and then removes a file at the name; filesystems
+  without `O_TMPFILE` keep the previous create-then-remove behaviour.
+- A `--manifest` file that changes size while it is read is refused instead
+  of a truncated read being parsed.
+- `docs/usage.md` states the symlink policy: inputs follow symbolic links and
+  are pinned by identity; outputs never follow one.
 
 ## [0.1.0]
 

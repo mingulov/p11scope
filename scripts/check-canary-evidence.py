@@ -386,7 +386,9 @@ def assert_safe_profile(doc):
     mechanisms = mechanism_map(doc)
     assert REGISTERED in mechanisms, "registered standard mechanism was not useful"
     assert UNKNOWN not in mechanisms and MAXIMUM not in mechanisms, mechanisms.keys()
-    assert all(item["params"] is None for item in mechanisms.values()), mechanisms
+    # F-21: the policy null names its cause.
+    assert all(item["params"] is None and item.get("params_omitted") == "policy"
+               for item in mechanisms.values()), mechanisms
     assert doc["templates"]["operations"] == [], doc["templates"]
     ev = doc["evidence"]
     assert ev["unregistered_mechanisms"] == 2, ev
@@ -1414,10 +1416,15 @@ def main(argv=None):
             "evidence": {**full_fixture, **selection_fixture,
                          "completeness": "PARTIAL", "unregistered_mechanisms": 2,
                          "semantic_capture_failures": 3, "async_target_failures": 2},
-            "mechanisms": [{"mechanism": REGISTERED, "params": None}],
+            "mechanisms": [{"mechanism": REGISTERED, "params": None,
+                            "params_omitted": "policy"}],
             "templates": {"operations": []},
         }
         assert_safe_profile(safe)
+        unmarked = json.loads(json.dumps(safe))
+        del unmarked["mechanisms"][0]["params_omitted"]
+        reject("safe profile params null without its policy marker",
+               lambda: assert_safe_profile(unmarked))
         v3 = json.loads(json.dumps(safe))
         v3["evidence"].update(
             interface_selection={
@@ -1458,7 +1465,8 @@ def main(argv=None):
         extra_evidence["evidence"]["secret_selection_payload"] = "CANARY"
         reject("v3 extra evidence field", lambda: assert_safe_profile(extra_evidence))
         reject("safe profile unknown-id", lambda: assert_safe_profile({
-            **safe, "mechanisms": safe["mechanisms"] + [{"mechanism": UNKNOWN, "params": None}]
+            **safe, "mechanisms": safe["mechanisms"] + [
+                {"mechanism": UNKNOWN, "params": None, "params_omitted": "policy"}]
         }))
         bad_safe = json.loads(json.dumps(safe))
         bad_safe["evidence"]["semantic_capture_failures"] = 4

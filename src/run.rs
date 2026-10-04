@@ -1965,7 +1965,7 @@ fn run_loop(
                 ring_bytes,
                 uretprobe_override,
                 resource_start,
-            )?
+            )
         }
         Kind::Trace => {
             let out = match out {
@@ -1985,11 +1985,13 @@ fn run_loop(
                 drain,
                 uretprobe_override,
                 resource_start,
-            )?
+            )
         }
     };
+    // U-19: flush the live discovery-noise summary on every exit, a failed
+    // or second-signal-abandoned capture included, before its error returns.
     engine.report_discovery_noise();
-    Ok(evidence)
+    evidence
 }
 
 /// What `run` reports back to its caller. `evidence` is the exact finalized
@@ -2339,8 +2341,44 @@ fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
         .map_err(|error| anyhow!("run: aborting pending handoff: {error}"))
 }
 
+/// The exit status `main` reports for a failed command: 130 when a second
+/// SIGINT abandoned link cleanup anywhere on the stop path (SG-I7), like a
+/// shell-interrupted command; 1 otherwise.
+pub fn failure_exit_code(error: &anyhow::Error) -> i32 {
+    if cleanup_interrupted(error) {
+        128 + libc::SIGINT
+    } else {
+        1
+    }
+}
+
+/// Whether the second-signal abandon is the whole failure: the stop path
+/// already printed the progress and "cleanup incomplete", so `main` adds
+/// no error line. A primary failure behind it still gets its line.
+pub fn failure_already_reported(error: &anyhow::Error) -> bool {
+    error.root_cause().is::<crate::attach::CleanupInterrupted>()
+}
+
+fn cleanup_interrupted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::attach::CleanupInterrupted>()
+        .is_some()
+}
+
+/// Keeps a second-signal abandon typed when it is the secondary failure:
+/// the combined error carries it as an outer context so `main` still exits
+/// 130, while the primary failure keeps its message.
+fn keep_cleanup_interruption(combined: anyhow::Error, secondary: &anyhow::Error) -> anyhow::Error {
+    if cleanup_interrupted(secondary) && !cleanup_interrupted(&combined) {
+        combined.context(crate::attach::CleanupInterrupted)
+    } else {
+        combined
+    }
+}
+
 fn also_failed(primary: anyhow::Error, secondary: anyhow::Error, what: &str) -> anyhow::Error {
-    primary.context(format!("{what} also failed: {secondary:#}"))
+    let combined = primary.context(format!("{what} also failed: {secondary:#}"));
+    keep_cleanup_interruption(combined, &secondary)
 }
 
 fn combine_handoff_failure(primary: anyhow::Error, abort: Result<()>) -> anyhow::Error {
@@ -2395,6 +2433,9 @@ fn combine_capture_failure(
 fn combine_detach<T>(terminal: Result<T>, detach: Result<()>) -> Result<T> {
     match (terminal, detach) {
         (result, Ok(())) => result,
+        (Ok(_), Err(detach)) if cleanup_interrupted(&detach) => {
+            Err(detach.context("run: detaching capture producers"))
+        }
         (Ok(_), Err(detach)) => Err(anyhow!("run: detaching capture producers: {detach:#}")),
         (Err(terminal), Err(detach)) => {
             Err(also_failed(terminal, detach, "detaching capture producers"))
@@ -7122,11 +7163,12 @@ mod tests {
     }
 
     /// F-T4-1 hardening: the observer's stop handlers stay the observer's.
-    /// The fork child resets SIGINT and SIGTERM to their default actions
-    /// before it becomes a session leader, so a stop signal ends a pre-exec
-    /// child instead of being swallowed by an inherited handler. exec resets
-    /// caught signals anyway, so the command starts with the same
-    /// dispositions either way.
+    /// The fork child restores SIGINT and SIGTERM to the observer's startup
+    /// dispositions (the default unless ignored at startup, which stays
+    /// ignored) before it becomes a session leader, so a stop signal ends a
+    /// pre-exec child instead of being swallowed by an inherited handler.
+    /// exec resets caught signals anyway, so the command starts with the
+    /// same dispositions either way.
     #[test]
     fn the_pre_exec_child_does_not_inherit_the_observer_stop_handlers() {
         let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
@@ -9351,6 +9393,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// U-19: the live discovery-noise summary is flushed on every
+    /// `run_loop` exit, including a failed or second-signal-abandoned
+    /// capture: no `?` may return between the capture call and the flush.
+    /// `run_loop` needs a live session, so the order is pinned statically.
+    #[test]
+    fn run_loop_reports_discovery_noise_before_returning_a_capture_error() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("\nfn run_loop(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let flush = body
+            .find("engine.report_discovery_noise();")
+            .expect("run_loop flushes the discovery noise");
+        let captures = &body[body.find("let evidence = match kind {").unwrap()..flush];
+        assert!(captures.contains("capture_profile("));
+        assert!(captures.contains("capture_trace("));
+        assert!(
+            !captures.contains(")?"),
+            "a capture error must not return before the noise flush"
+        );
+        assert!(
+            body[flush..]
+                .trim_start_matches("engine.report_discovery_noise();")
+                .contains("evidence"),
+            "run_loop returns the capture result after the flush"
+        );
+    }
+
+    /// SG-I7/M11: a second-SIGINT cleanup abandon reaches `main` through
+    /// every stop-path combinator as the typed outcome (exit 130), and the
+    /// error line is suppressed only when the abandon is the whole story.
+    #[test]
+    fn a_second_signal_abandon_survives_every_stop_path_combinator() {
+        let interrupted = || anyhow::Error::new(crate::attach::CleanupInterrupted);
+        let alone = combine_detach::<()>(Ok(()), Err(interrupted())).unwrap_err();
+        assert_eq!(failure_exit_code(&alone), 130, "{alone:#}");
+        assert!(failure_already_reported(&alone), "{alone:#}");
+        let quiesce = finish_quiesce_error(
+            anyhow!("terminal quiescence failed"),
+            Ok(CaptureEnd::Signal),
+            &mut (),
+            |_, _| Ok(()),
+            |_| Err(interrupted()),
+        );
+        let preflight = combine_preflight_failure_with(
+            anyhow!("pause preflight"),
+            || Err(interrupted()),
+            || Err(anyhow!("settling the child")),
+        );
+        for (name, error) in [
+            (
+                "terminal + detach",
+                combine_detach::<()>(Err(anyhow!("publish failed")), Err(interrupted()))
+                    .unwrap_err(),
+            ),
+            (
+                "capture failure",
+                combine_capture_failure(anyhow!("loop failed"), Ok(()), Err(interrupted())),
+            ),
+            (
+                "capture + settle failure",
+                combine_capture_failure(
+                    anyhow!("loop failed"),
+                    Err(anyhow!("settle failed")),
+                    Err(interrupted()),
+                ),
+            ),
+            ("quiesce failure", quiesce),
+            ("preflight failure", preflight),
+            (
+                "run --pause always",
+                always_wrap(
+                    &SignalState::new(),
+                    combine_capture_failure(anyhow!("loop failed"), Ok(()), Err(interrupted())),
+                ),
+            ),
+        ] {
+            assert_eq!(failure_exit_code(&error), 130, "{name}: {error:#}");
+            assert!(
+                !failure_already_reported(&error),
+                "{name}: the primary failure still needs its line: {error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains("second SIGINT"),
+                "{name}: {error:#}"
+            );
+        }
+        let ordinary = combine_detach::<()>(Ok(()), Err(anyhow!("detach failed"))).unwrap_err();
+        assert_eq!(failure_exit_code(&ordinary), 1);
+        assert!(!failure_already_reported(&ordinary));
     }
 
     #[test]
@@ -12497,23 +12635,75 @@ mod tests {
     }
 
     /// Restores a saved disposition when the scope ends, even on failure,
-    /// so one signal test cannot poison the next. Best effort: a restore
-    /// failure must not panic from `Drop`.
+    /// so one signal test cannot poison the next. The whole `sigaction` is
+    /// saved — handler, mask and flags — so the restore is exact
+    /// (PD-T7-M5). Best effort: a restore failure must not panic from
+    /// `Drop`.
     struct RestoreDisposition {
         signal: libc::c_int,
-        previous: libc::sighandler_t,
+        previous: libc::sigaction,
+    }
+
+    impl RestoreDisposition {
+        fn save(signal: libc::c_int) -> Self {
+            Self {
+                signal,
+                previous: full_sigaction(signal),
+            }
+        }
     }
 
     impl Drop for RestoreDisposition {
         fn drop(&mut self) {
-            // SAFETY: as in `set_disposition`; the saved value came from a
-            // live `sigaction` read of the same signal.
-            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = self.previous;
+            // SAFETY: the saved action came from a live `sigaction` read of
+            // the same signal.
             unsafe {
-                libc::sigaction(self.signal, &action, std::ptr::null_mut());
+                libc::sigaction(self.signal, &self.previous, std::ptr::null_mut());
             }
         }
+    }
+
+    fn full_sigaction(signal: libc::c_int) -> libc::sigaction {
+        // SAFETY: as in `signal_disposition`: a read-only query.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        let read = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) };
+        assert_eq!(read, 0, "reading the disposition of signal {signal}");
+        current
+    }
+
+    /// PD-T7-M5: the guard restores the whole saved `sigaction` — handler,
+    /// mask and flags — not the handler alone with a zeroed mask/flags.
+    #[test]
+    fn restore_disposition_restores_the_whole_saved_sigaction() {
+        let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
+        // SIGUSR2: no p11scope path installs or reads it.
+        let signal = libc::SIGUSR2;
+        let original = full_sigaction(signal);
+        // SAFETY: a valid ignore action with one mask bit and SA_RESTART.
+        let mut custom: libc::sigaction = unsafe { std::mem::zeroed() };
+        custom.sa_sigaction = libc::SIG_IGN;
+        custom.sa_flags = libc::SA_RESTART;
+        unsafe {
+            libc::sigemptyset(&mut custom.sa_mask);
+            libc::sigaddset(&mut custom.sa_mask, libc::SIGUSR1);
+            assert_eq!(libc::sigaction(signal, &custom, std::ptr::null_mut()), 0);
+        }
+        {
+            let _restore = RestoreDisposition::save(signal);
+            set_disposition(signal, libc::SIG_DFL);
+        }
+        let restored = full_sigaction(signal);
+        // SAFETY: put the test process back exactly as it was.
+        unsafe {
+            libc::sigaction(signal, &original, std::ptr::null_mut());
+        }
+        assert_eq!(restored.sa_sigaction, libc::SIG_IGN);
+        assert_ne!(restored.sa_flags & libc::SA_RESTART, 0, "flags dropped");
+        assert_eq!(
+            unsafe { libc::sigismember(&restored.sa_mask, libc::SIGUSR1) },
+            1,
+            "mask dropped"
+        );
     }
 
     /// One full `/proc/<pid>/status` signal mask (`SigCgt`, `SigIgn`).
@@ -12601,10 +12791,7 @@ mod tests {
     #[test]
     fn inherited_sighup_ignore_survives_stop_flag_install() {
         let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
-        let _restore = RestoreDisposition {
-            signal: libc::SIGHUP,
-            previous: signal_disposition(libc::SIGHUP),
-        };
+        let _restore = RestoreDisposition::save(libc::SIGHUP);
         set_disposition(libc::SIGHUP, libc::SIG_IGN);
         let _stop = install_stop_flag().unwrap();
         assert_eq!(
@@ -12658,14 +12845,8 @@ mod tests {
     #[test]
     fn owned_command_inherits_ignored_stop_dispositions() {
         let _signal_guard = ACTUAL_SIGNAL_TEST.lock().unwrap();
-        let _restore_int = RestoreDisposition {
-            signal: libc::SIGINT,
-            previous: signal_disposition(libc::SIGINT),
-        };
-        let _restore_hup = RestoreDisposition {
-            signal: libc::SIGHUP,
-            previous: signal_disposition(libc::SIGHUP),
-        };
+        let _restore_int = RestoreDisposition::save(libc::SIGINT);
+        let _restore_hup = RestoreDisposition::save(libc::SIGHUP);
         let _clear_store = ClearStartupDispositions;
         let fixture_dir = tempfile::tempdir().unwrap();
         let sleeper = build_sleeper(fixture_dir.path());

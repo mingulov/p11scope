@@ -242,3 +242,110 @@ fn constructor_sees_no_planted_fd_or_loader_env() {
         "provider loaded before forged marker refusal: {forged_stderr}"
     );
 }
+
+/// A fresh private directory under the cargo test scratch root.
+fn scratch(name: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("discover-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
+fn discover_to(out: &Path) -> std::process::Output {
+    Command::new(BIN)
+        .args(["--module", SOFTHSM, "-o"])
+        .arg(out)
+        .output()
+        .unwrap()
+}
+
+fn litter(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with('.'))
+        .collect()
+}
+
+/// F-56: `-o` never follows a symlink at the output name — dangling or
+/// not — and leaves it and its target exactly as they were.
+#[test]
+fn o_refuses_a_symlink_at_the_output_name() {
+    if !Path::new(SOFTHSM).exists() {
+        eprintln!("SKIP: {SOFTHSM} not present");
+        return;
+    }
+    let dir = scratch("symlink");
+    let target = dir.join("target.json");
+    let dangling = dir.join("dangling.json");
+    std::os::unix::fs::symlink(&target, &dangling).unwrap();
+    let out = discover_to(&dangling);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!target.exists(), "the write followed the dangling symlink");
+
+    std::fs::write(&target, b"keep").unwrap();
+    let pointing = dir.join("pointing.json");
+    std::os::unix::fs::symlink(&target, &pointing).unwrap();
+    let out = discover_to(&pointing);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("symbolic link"));
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    assert_eq!(litter(&dir), Vec::<String>::new());
+}
+
+/// F-56: the manifest is published private (0600) whatever the umask, and
+/// atomically: an existing regular file is replaced whole, nothing is left
+/// behind beside it.
+#[test]
+fn o_publishes_a_private_file_atomically() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !Path::new(SOFTHSM).exists() {
+        eprintln!("SKIP: {SOFTHSM} not present");
+        return;
+    }
+    let dir = scratch("private");
+    let fresh = dir.join("fresh.json");
+    let out = discover_to(&fresh);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let stale = dir.join("stale.json");
+    std::fs::write(&stale, b"stale").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = discover_to(&stale);
+    assert!(out.status.success(), "{out:?}");
+    let m: p11scope_discover::manifest::Manifest =
+        serde_json::from_slice(&std::fs::read(&stale).unwrap()).unwrap();
+    assert_eq!(m.schema, "p11scope-manifest/5");
+    assert_eq!(
+        std::fs::metadata(&stale).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(litter(&dir), Vec::<String>::new());
+}
+
+/// F-56: `--help` is an exit-0 answer, so it goes to stdout like
+/// `--version` and like `p11scope --help`.
+#[test]
+fn help_prints_usage_on_stdout_and_exits_zero() {
+    for flag in ["--help", "-h"] {
+        let out = Command::new(BIN).arg(flag).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("usage: p11scope-discover"),
+            "{flag}: {out:?}"
+        );
+        assert!(out.stderr.is_empty(), "{flag}: {out:?}");
+    }
+}

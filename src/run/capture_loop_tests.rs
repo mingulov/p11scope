@@ -1765,6 +1765,7 @@ fn quiesced_profile_drain_reduces_pre_q_events_and_excludes_post_q_writes() {
 /// terminal document PARTIAL; the same drain without the write proves
 /// the drain and the document is COMPLETE.
 #[test]
+#[cfg(target_arch = "x86_64")] // the drain proof applies on x86_64 only
 fn an_injected_post_q_write_keeps_the_terminal_document_partial() {
     use crate::events::{BoundedRecordSource as _, DiscoveryDrain};
     use std::ops::ControlFlow;

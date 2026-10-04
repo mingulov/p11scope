@@ -691,6 +691,7 @@ mod tests {
     // verdict. A proven stop-gate drain is COMPLETE with `final_drain:
     // true`; anything less stays PARTIAL with `final_drain: false`.
     #[test]
+    #[cfg(target_arch = "x86_64")] // the drain proof applies on x86_64 only
     fn final_evidence_line_carries_a_proven_drain_and_its_sealed_verdict() {
         use crate::render::{QuiescenceState, StopQuiescence};
         let line_for = |stop: StopQuiescence| {

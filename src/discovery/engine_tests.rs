@@ -2378,6 +2378,41 @@ fn a_later_whole_refusal_replaces_a_published_growth_omission() {
     assert!(!plan::is_growth_omission(&refusal.reason), "{refusal:?}");
 }
 
+/// PD-T6-1: whole refusals are a high-water mark too. A module refused whole
+/// that later needs more publishes the larger need, and a later smaller need
+/// keeps it: what the capture could not attach is history.
+#[test]
+fn a_larger_whole_refusal_replaces_the_published_whole_refusal() {
+    let admitted = p11scope_ebpf_common::MAX_SLOTS - 1;
+    let (mut engine, raw) = engine_admitting_overlay(66, admitted);
+    let mut changed = raw.clone();
+    let mut refuse_needing = |engine: &mut Engine, needed: u32| {
+        changed.tables[0].entries = overlay_entries(
+            &raw,
+            first_offsets(admitted + needed).skip(admitted as usize),
+        );
+        commit_live_rebuild(engine, &changed);
+        assert_eq!(
+            engine.discovery.modules_skipped.len(),
+            1,
+            "{:?}",
+            engine.discovery.modules_skipped
+        );
+        engine.discovery.modules_skipped[0].reason.clone()
+    };
+
+    let first = refuse_needing(&mut engine, 2);
+    assert!(first.starts_with("module needs 2 more;"), "{first}");
+    let larger = refuse_needing(&mut engine, 5);
+    assert!(larger.starts_with("module needs 5 more;"), "{larger}");
+    let smaller = refuse_needing(&mut engine, 3);
+    assert!(
+        smaller.starts_with("module needs 5 more;"),
+        "a smaller later need keeps the larger one: {smaller}"
+    );
+    assert_eq!(engine.plan.active_slot_count(), 0);
+}
+
 #[test]
 fn start_attempt_stages_initial_facts_before_active_cleanup() {
     let (mut engine, _, _, _) = engine_with_overlay(56);
@@ -7358,6 +7393,7 @@ fn apply_outcome_keeps_static_timing_and_generation_loss_ownership() {
         newly_rejected_keys: BTreeSet::new(),
         selection_authorized: false,
         unpublished_views: BTreeSet::new(),
+        detach_failed: false,
     };
 
     engine.record_apply_timing(&outcome);
@@ -17480,6 +17516,42 @@ fn a_conservative_replay_closes_the_tick_only_on_ownership_uncertainty() {
     }
 }
 
+/// PD-T3-1. A replay's detach can fail before any link mutation (a group
+/// rebuild whose program fd cannot be resolved): nothing joins the session's
+/// detach failures, but the apply still blocked additions and says so. The
+/// replay reads that from the apply's own outcome, so the tick closes
+/// exactly as its PARTIAL reason says.
+#[test]
+fn a_conservative_replay_whose_detach_fails_before_mutation_closes_the_tick() {
+    let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+    engine.pending_retirements.insert(engine.views[0].id());
+    let mut session = ScriptedSession::default();
+    session.fail_slot_detaches_before_mutation([true]);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+
+    let outcome = engine.replay_pending_conservative(&mut session, &mut additions, &mut pending);
+
+    assert!(!outcome.refused(), "the replay applied");
+    assert!(
+        session.detach_failures().is_empty(),
+        "the scripted failure recorded no detach failure"
+    );
+    let blocked = Skipped {
+        subject: "live discovery detach".into(),
+        reason: "a one-shot detach failed; additions and replacements were blocked for this cycle"
+            .into(),
+    };
+    assert!(
+        engine.counters.object_skips.contains(&blocked),
+        "{:?}",
+        engine.counters.object_skips
+    );
+    assert!(!additions, "the failed detach closes the tick");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 /// U-07. A tick whose additions are already closed (by its caller or by an
 /// earlier failure in the batch) cannot attach a newcomer, so it must not
 /// publish one: no view, module, pin claim or active slot of the newcomer is
@@ -25665,6 +25737,12 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
     // Discovery scans but never arms: arming needs the session/refresh path.
     assert_eq!(engine.deep_scans, 2, "both initial views were deep-scanned");
     assert_eq!(engine.loader_arms, 0, "discovery alone arms nothing");
+    // The oracle counts scans, arms and maps reads, not wall time: lift the
+    // wall-clock deep-scan and reconcile quanta, which under parallel-test
+    // load deferred scans to the next tick and shifted the exact counts.
+    // The quanta keep their own tests (a zero tick quantum defers, above).
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
 
     let child = system_scope_spawn_loaded(&driver, &provider);
     let newcomer = child.pid();

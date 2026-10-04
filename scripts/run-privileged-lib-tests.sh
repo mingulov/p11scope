@@ -183,15 +183,18 @@ check_curation() {
     missing_cur=$(comm -23 "$bin_list" "$cur_list" || true)
     rm -rf "$workdir"
     if [ -n "$missing_bin" ] || [ -n "$missing_cur" ]; then
+        local -a names
         {
             echo "$PROG: curation drift against $bin"
             [ -n "$missing_bin" ] && {
                 echo "curated but absent from the binary (renamed/removed?):"
-                printf '  %s\n' $missing_bin
+                mapfile -t names <<<"$missing_bin"
+                printf '  %s\n' "${names[@]}"
             }
             [ -n "$missing_cur" ] && {
                 echo "ignored in the binary but not curated (new test?):"
-                printf '  %s\n' $missing_cur
+                mapfile -t names <<<"$missing_cur"
+                printf '  %s\n' "${names[@]}"
             }
         } >&2
         return 1
@@ -280,9 +283,9 @@ main() {
     [ -x "$bin" ] || { echo "$PROG: not an executable test binary: $bin" >&2; return 1; }
 
     # Resolve before cd-ing to the repo root so relative paths keep working.
-    bin=$(CDPATH= cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
+    bin=$(CDPATH='' cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
     mkdir -p "$outdir" || return 1
-    outdir=$(CDPATH= cd "$outdir" && pwd) || return 1
+    outdir=$(CDPATH='' cd "$outdir" && pwd) || return 1
 
     # Fail fast when the curation no longer covers the binary exactly.
     check_curation "$bin" || return 1

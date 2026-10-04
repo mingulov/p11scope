@@ -243,6 +243,17 @@ pub(crate) fn growth_omitted_count(reason: &str) -> Option<usize> {
         .ok()
 }
 
+/// The count a whole capacity refusal states — the `N` of
+/// `module needs N more;` — or `None` for any other reason (PD-T6-1).
+pub(crate) fn whole_refusal_needed_count(reason: &str) -> Option<usize> {
+    reason
+        .strip_prefix("module needs ")?
+        .split_once(" more;")?
+        .0
+        .parse()
+        .ok()
+}
+
 /// The omitted endpoints are not called new: an endpoint deactivated earlier
 /// in the capture and listed again needs a fresh slot just the same.
 fn growth_omission_reason(
@@ -4795,6 +4806,11 @@ mod tests {
             );
         }
         assert_eq!(growth_omitted_count(whole), None);
+        assert_eq!(whole_refusal_needed_count(whole), Some(2));
+        assert_eq!(
+            whole_refusal_needed_count(&growth_omission_reason(2, 512, 511, 3, 7)),
+            None
+        );
         assert_eq!(
             growth_omitted_count("admitted module needs many more;"),
             None

@@ -1954,6 +1954,8 @@ impl CaptureFacts {
             // largest omitted count the capture saw is kept, so a growth that
             // later shrinks never under-reports what was missed. That count
             // is a lower bound on the endpoints omitted over the capture.
+            // Whole capacity refusals rank by what they needed the same way
+            // (PD-T6-1); any other whole refusal stays first-wins.
             let rank = |reason: &str| {
                 (
                     !plan::is_growth_omission(reason),
@@ -1964,8 +1966,16 @@ impl CaptureFacts {
                 .refusals
                 .entry(id)
                 .or_insert_with(|| refused.clone());
-            if plan::is_growth_omission(&known.reason)
-                && rank(&refused.reason) >= rank(&known.reason)
+            let larger_whole = matches!(
+                (
+                    plan::whole_refusal_needed_count(&known.reason),
+                    plan::whole_refusal_needed_count(&refused.reason),
+                ),
+                (Some(known), Some(refused)) if refused > known
+            );
+            if larger_whole
+                || (plan::is_growth_omission(&known.reason)
+                    && rank(&refused.reason) >= rank(&known.reason))
             {
                 known.clone_from(refused);
             }
@@ -2538,6 +2548,10 @@ struct ApplyOutcome {
     /// Inventory newcomers (`extra_views`) this apply left unpublished: none
     /// of their pins, modules or links were committed (U-07).
     unpublished_views: BTreeSet<ProcessViewId>,
+    /// The one-shot detach of the retired and replaced targets failed —
+    /// before or after any link mutation — and the apply blocked additions
+    /// for the cycle (PD-T3-1).
+    detach_failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9681,6 +9695,7 @@ impl Engine {
         };
         if detach_failed {
             *additions_allowed = false;
+            outcome.detach_failed = true;
             outcome
                 .static_failures
                 .extend(target_modules.iter().cloned());
@@ -14074,7 +14089,6 @@ impl Engine {
                 return ApplyOutcome::default();
             }
         };
-        let detach_failures = session.detach_failures().len();
         let mut no_additions = false;
         let outcome = match self.apply_candidate(session, candidate, &mut no_additions, false, &[])
         {
@@ -14088,7 +14102,10 @@ impl Engine {
                 return ApplyOutcome::default();
             }
         };
-        if !outcome.accepted() || session.detach_failures().len() > detach_failures {
+        // The apply's own detach flag, not growth of the session's detach
+        // failures: a detach that fails before any link mutation records no
+        // failure there but still blocked additions (PD-T3-1).
+        if !outcome.accepted() || outcome.detach_failed {
             *additions_allowed = false;
         }
         self.record_apply_timing(&outcome);
@@ -16956,6 +16973,10 @@ pub(crate) mod session_fixture {
         pub(crate) detached_slot_indices: Vec<Vec<u32>>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
         detach_slot_script: VecDeque<bool>,
+        /// One entry per upcoming `detach_slots` call; `true` fails it
+        /// before any link mutation, recording no detach failure (a program
+        /// fd that cannot be resolved for a group rebuild).
+        detach_slot_premutation_script: VecDeque<bool>,
         /// One rebuild report per upcoming `detach_slots` call; later calls
         /// report no rebuild.
         detach_rebuild_script: VecDeque<DetachOutcome>,
@@ -17086,6 +17107,15 @@ pub(crate) mod session_fixture {
         /// fails that call. Later calls succeed.
         pub(crate) fn fail_slot_detaches(&mut self, script: impl IntoIterator<Item = bool>) {
             self.detach_slot_script = script.into_iter().collect();
+        }
+
+        /// Schedules `detach_slots` errors raised before any link mutation:
+        /// `true` fails that call without recording a detach failure.
+        pub(crate) fn fail_slot_detaches_before_mutation(
+            &mut self,
+            script: impl IntoIterator<Item = bool>,
+        ) {
+            self.detach_slot_premutation_script = script.into_iter().collect();
         }
 
         /// Schedules generation losses inside the next `detach_slots` calls:
@@ -17241,6 +17271,13 @@ pub(crate) mod session_fixture {
                 .push(slots.iter().map(|slot| slot.index).collect());
             if let Some(Some(pid)) = self.detach_losses.pop_front() {
                 kill_and_reap(pid);
+            }
+            if self
+                .detach_slot_premutation_script
+                .pop_front()
+                .unwrap_or(false)
+            {
+                bail!("scripted program fd resolution failed before any link mutation");
             }
             if self.detach_slot_script.pop_front().unwrap_or(false) {
                 self.detach_failures

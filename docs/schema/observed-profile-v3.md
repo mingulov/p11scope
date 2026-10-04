@@ -18,7 +18,10 @@ classes (`gap_classes` and its three published inputs), and row identity
 (`functions[].target`, `functions[].ordinals`, table linkage `exports`).
 
 Under the default `allowlisted` policy, every emitted mechanism has
-`params: null` and `templates.operations` is always empty. The diagnostic
+`params: null` with `params_omitted: "policy"` beside it, and
+`templates.operations` is always empty. Every `params: null` carries a
+`params_omitted` cause (`policy`, `no_shape` or `decode_failed`); the field is
+absent when `params` is an array. The diagnostic
 parameter/template representations in the inherited schema are not default
 capture promises. Missing metadata is not evidence that the application used
 none. Scan-only function slots remain semantics-unverified/count-only; an
@@ -182,8 +185,10 @@ trace evidence object. Historical documents predate them (see Migration).
 
 - `drain_proven` (boolean) is the terminal-drain settlement latch. It is
   true only when the Detailed stop gate proved quiescence (no admitted BPF
-  callback still running), both terminal drains read to the ring positions
-  observed at that point, neither drain saw a record past them, and the
+  callback still running), the terminal drains read to the ring positions
+  observed at that point (EVENTS and DISCOVERY for profile and trace;
+  DISCOVERY only for v3-metrics, whose counts come from maps finalized
+  behind quiescence), no drain saw a record past them, and the
   build is x86_64 (owner ruling B, 2026-09-25); other architectures keep it
   false. The producer's terminal seal forces `PARTIAL` while it is false, and
   the oracle refuses any `COMPLETE` without it.
@@ -194,7 +199,8 @@ trace evidence object. Historical documents predate them (see Migration).
   stop gate ran). `post_q_events` / `post_q_discovery` are true when the
   EVENTS / DISCOVERY ring held a record past its quiescence position — an
   ungated writer, also named on stderr; either keeps `drain_proven` false
-  and only occurs with `state: proven`.
+  and only occurs with `state: proven`. A v3-metrics capture does not drain
+  EVENTS, so its `post_q_events` is always false.
 - `verdict_detail` is exactly `clean_proven` (no gap, latch set),
   `clean_but_unproven` (no gap, latch unset — the terminal `PARTIAL` with
   nothing concrete behind it), `attribution_only` (counts are exact; only a

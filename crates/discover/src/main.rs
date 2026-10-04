@@ -395,6 +395,162 @@ fn drop_privileges_and_open_self_memory(target: DropTarget) -> Result<File, Stri
     Ok(self_memory)
 }
 
+/// Publishes `bytes` at `path` (F-56): a private (0600) temp file created
+/// beside it with `O_CREAT|O_EXCL|O_NOFOLLOW`, fsynced, then renamed over
+/// the name. A name that exists and is not a regular file — a symbolic
+/// link (dangling or not), FIFO, socket, device or directory — is refused
+/// and left as it was, never followed or replaced. The parent directory is
+/// the operator's choice and is resolved normally; this process already
+/// runs as the dropped, unprivileged identity.
+fn write_private_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    write_private_atomically_with(path, bytes, || {})
+}
+
+/// `write_private_atomically` with a hook run once the temp file is
+/// written, before the name is re-checked and replaced (test seam).
+fn write_private_atomically_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce(),
+) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let name = path
+        .file_name()
+        .ok_or_else(|| "the output names no file".to_string())?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let c = |value: &std::ffi::OsStr| {
+        CString::new(value.as_bytes())
+            .map_err(|_| "the output path contains a NUL byte".to_string())
+    };
+    let directory_path = c(parent.as_os_str())?;
+    let final_name = c(name)?;
+    let fd = unsafe {
+        libc::open(
+            directory_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let directory = unsafe { File::from_raw_fd(fd) };
+    // The directory that holds the file must not be world-writable unless
+    // sticky, so no other user can rename or replace the published manifest
+    // (review M2). Checked on the opened descriptor every later operation is
+    // relative to. Unlike the observer, which runs privileged and also
+    // refuses group-writable and symlinked parents, this helper runs as the
+    // unprivileged operator: the parent path is theirs to choose, and a
+    // group-writable directory (a user-private group under a 002 umask) is
+    // accepted.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = directory
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .permissions()
+            .mode();
+        if mode & 0o002 != 0 && mode & 0o1000 == 0 {
+            return Err(format!(
+                "directory {} is world-writable without the sticky bit (mode {:o}); \
+                 choose a private directory or chmod o-w it",
+                parent.display(),
+                mode & 0o7777
+            ));
+        }
+    }
+    let check_final = || -> Result<(), String> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                final_name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == -1
+        {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error.to_string())
+            };
+        }
+        let kind = match unsafe { stat.assume_init() }.st_mode & libc::S_IFMT {
+            libc::S_IFREG => return Ok(()),
+            libc::S_IFLNK => "a symbolic link",
+            libc::S_IFDIR => "a directory",
+            libc::S_IFIFO => "a FIFO",
+            libc::S_IFSOCK => "a socket",
+            libc::S_IFCHR | libc::S_IFBLK => "a device",
+            _ => "not a regular file",
+        };
+        Err(format!("it exists and is {kind}; refusing to replace it"))
+    };
+    check_final()?;
+    let (temp_name, mut temp) = (0..128u32)
+        .find_map(|sequence| {
+            let temp_name = CString::new(format!(
+                ".p11scope-discover.{}.{sequence}.tmp",
+                std::process::id()
+            ))
+            .expect("a generated name has no NUL");
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    temp_name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd == -1 {
+                let error = io::Error::last_os_error();
+                return (error.raw_os_error() != Some(libc::EEXIST)).then_some(Err(error));
+            }
+            Some(Ok((temp_name, unsafe { File::from_raw_fd(fd) })))
+        })
+        .ok_or_else(|| "cannot allocate a temporary file beside it".to_string())?
+        .map_err(|error| error.to_string())?;
+    let published = temp
+        .write_all(bytes)
+        .and_then(|()| temp.sync_all())
+        .map_err(|error| error.to_string())
+        .and_then(|()| {
+            before_publish();
+            check_final()
+        })
+        .and_then(|()| {
+            if unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    temp_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    final_name.as_ptr(),
+                )
+            } == -1
+            {
+                Err(io::Error::last_os_error().to_string())
+            } else {
+                Ok(())
+            }
+        });
+    if published.is_err() {
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0);
+        }
+    }
+    published
+}
+
 fn main() {
     let mut module: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
@@ -427,7 +583,7 @@ fn main() {
                 }
             },
             "--help" | "-h" => {
-                eprintln!("{USAGE}");
+                println!("{USAGE}");
                 std::process::exit(0);
             }
             other => {
@@ -468,7 +624,7 @@ fn main() {
             match out {
                 None => println!("{json}"),
                 Some(p) => {
-                    if let Err(e) = std::fs::write(&p, json) {
+                    if let Err(e) = write_private_atomically(&p, json.as_bytes()) {
                         eprintln!("p11scope-discover: write {}: {e}", p.display());
                         std::process::exit(1);
                     }
@@ -480,9 +636,83 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{close_inherited_descriptors_with, collect_proc_fd_snapshot};
+    use super::{
+        close_inherited_descriptors_with, collect_proc_fd_snapshot, write_private_atomically_with,
+    };
     use std::io::{Error, ErrorKind};
     use std::os::fd::IntoRawFd as _;
+
+    /// Review M2: the manifest is never published into a world-writable
+    /// directory without the sticky bit, where any user could rename or
+    /// replace it; a sticky shared directory (as `/tmp`) and a group-writable
+    /// one (a user-private group under umask 002) are accepted.
+    #[test]
+    fn a_shared_writable_directory_without_the_sticky_bit_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory =
+            std::env::temp_dir().join(format!("discover-shared-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let name = directory.join("manifest.json");
+        for (mode, refused) in [
+            (0o777, true),
+            (0o773, true),
+            (0o1777, false),
+            (0o775, false),
+        ] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode)).unwrap();
+            let _ = std::fs::remove_file(&name);
+            let result = super::write_private_atomically(&name, b"{}");
+            assert_eq!(result.is_err(), refused, "mode {mode:o}: {result:?}");
+            if refused {
+                assert!(
+                    result.unwrap_err().contains("writable"),
+                    "mode {mode:o} names the cause"
+                );
+                assert!(!name.exists(), "mode {mode:o}: nothing published");
+            }
+        }
+        let left: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// F-56: a name that turns into a symbolic link while the manifest is
+    /// written is re-checked before the rename: the link is left as it was,
+    /// its target untouched, and the temp file is removed.
+    #[test]
+    fn a_symlink_planted_after_the_write_is_refused_and_the_temp_removed() {
+        let directory =
+            std::env::temp_dir().join(format!("discover-publish-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let name = directory.join("manifest.json");
+        let target = directory.join("target");
+        let error = write_private_atomically_with(&name, b"{}", || {
+            std::os::unix::fs::symlink(&target, &name).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&name)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!target.exists());
+        let mut left: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["manifest.json"], "the temp file was left behind");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn overflowing_fd_name_fails_snapshot() {

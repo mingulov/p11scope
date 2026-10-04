@@ -5,7 +5,8 @@
 # SoftHSM2 workloads (tests/fixtures/public-cli/*.c, compiled into OUTDIR/fix):
 # exact per-function counts for profile/metrics/trace --pid, real function names,
 # a truthful verdict, run of a short-lived child, a 12-thread exactness cell,
-# --system admission of the real provider, SIGINT publication and -o FIFO refusal.
+# --system admission of the real provider, SIGINT publication, a second SIGINT during
+# link cleanup, and -o FIFO refusal.
 # Runs as root (sudo on a host, root inside a vng guest). Workloads run as RUNUID/RUNGID
 # (default 1000) against SoftHSM2 with an independent exact call ledger. Every cell appends
 # one JSON line to OUTDIR/results.jsonl: {"cell","pass","detail"}.
@@ -26,7 +27,11 @@ rm -rf tokens; mkdir -p tokens
 printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$OUT" > softhsm2.conf
 softhsm2-util --init-token --free --label qual --so-pin 5678 --pin 1234 >/dev/null || { echo "token init failed" >&2; exit 65; }
 chown -R "$RUNUID:$RUNGID" tokens; chmod 644 softhsm2.conf
-# Positive control: a reset background SIGINT must be deliverable here (exit 130).
+# Positive controls: signal cells are meaningless where SIGHUP is ignored (nohup
+# poisons the whole run) or a reset background SIGINT cannot be delivered.
+sh -c 'kill -HUP $$' >/dev/null 2>&1; status=$?
+[ $status = 129 ] || { echo "positive control failed: sh -c 'kill -HUP \$\$' exited $status, want 129 (SIGHUP ignored here?)" >&2; exit 65; }
+# A reset background SIGINT must be deliverable here (exit 130).
 env --default-signal=INT sh -c 'kill -INT $$' >/dev/null 2>&1 & wait $!
 [ $? = 130 ] || { echo "positive control failed: background SIGINT not deliverable (env --default-signal needs coreutils >= 8.31)" >&2; exit 65; }
 asuser() { exec setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups env SOFTHSM2_CONF="$SOFTHSM2_CONF" "$@"; }
@@ -110,6 +115,14 @@ asuser "$FIX/gated" "$MODULE" 100000000 1000 - > sig.wl 2>&1 & wl=$!; waitfor si
 # cell proves SIGINT delivery instead of relying on p11scope installing its own handler.
 env --default-signal=INT "$P" profile --pid $wl --duration 120 -o $OUT/sigint.json > sig.stdout 2> sig.stderr & pp=$!; waitfor sig.stderr "p11scope: capturing:" 180; sleep 1; kill -INT $pp; wait $pp; rc=$?; kill -TERM $wl; wait $wl 2>/dev/null
 result sigint $([ $rc = 0 ] && python3 -c 'import json; json.load(open("sigint.json"))' 2>/dev/null && echo 1 || echo 0) "rc=$rc"
+# 9b second SIGINT abandons link cleanup (SG-2SIG): the report is published before
+# cleanup, so a second Ctrl-C ends only the wait: exit 130, "cleanup incomplete",
+# report intact. The run child ignores INT/TERM, so the first SIGINT leaves it alive
+# in settlement (5 s grace) and the second, 1 s later (well past the 100 ms duplicate
+# window), is counted before publication and cleanup even start.
+env --default-signal=INT SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run -o $OUT/sigint2.json -- sh -c 'trap "" INT TERM; sleep 60' > sig2.stdout 2> sig2.stderr & pp=$!
+waitfor sig2.stderr "p11scope: capturing:" 180; sleep 1; kill -INT $pp; sleep 1; kill -INT $pp; wait $pp; rc=$?
+result second-sigint $([ $rc = 130 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa 'panicked' sig2.stderr && python3 -c 'import json; json.load(open("sigint2.json"))' 2>/dev/null && echo 1 || echo 0) "rc=$rc $(grep -a 'cleanup' sig2.stderr | tr '\n' ' ')"
 # 10 -o FIFO must be refused and left intact (B RB-1); never uses /dev
 rm -f fifo; mkfifo fifo; asuser "$FIX/gated" "$MODULE" 100000000 1000 - > fifo.wl 2>&1 & wl=$!; waitfor fifo.wl READY 30
 timeout 60 "$P" profile --pid $wl --duration 2 -o $OUT/fifo > fifo.stdout 2> fifo.stderr; rc=$?; kill -TERM $wl 2>/dev/null; wait $wl 2>/dev/null

@@ -2023,6 +2023,13 @@ struct MechanismOut {
     /// driven with. See `docs/schema/observed-profile-v2.md` for the
     /// per-shape field layout.
     params: serde_json::Value,
+    /// Why `params` is `null` (F-21), absent when it is an array:
+    /// `policy` — the allowlisted capture policy disables parameter
+    /// decoding; `no_shape` — no diagnostic shape is published for this id,
+    /// so decoding was not attempted; `decode_failed` — a shape exists but
+    /// every decode attempt failed. Never "nothing was passed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params_omitted: Option<&'static str>,
     note: &'static str,
 }
 
@@ -2269,9 +2276,10 @@ pub fn profile_json(
                 .iter()
                 .filter_map(|(&(sh, p0, p1, p2), &count)| param_combo_json(sh, p0, p1, p2, count))
                 .collect();
-            let (params, note) = if !capture.policy.uses_unsafe_decoders() {
+            let (params, params_omitted, note) = if !capture.policy.uses_unsafe_decoders() {
                 (
                     serde_json::Value::Null,
+                    Some("policy"),
                     "parameter decoding was disabled by allowlisted capture policy",
                 )
             } else if combos.is_empty() {
@@ -2283,6 +2291,7 @@ pub fn profile_json(
                     // mechanism forces nonzero).
                     (
                         serde_json::Value::Null,
+                        Some("decode_failed"),
                         "this mechanism has a diagnostic parameter shape, but every decode \
                          attempt failed in this capture (see \
                          evidence.shape_decode_total_failures and \
@@ -2292,6 +2301,7 @@ pub fn profile_json(
                 } else {
                     (
                         serde_json::Value::Null,
+                        Some("no_shape"),
                         "this mechanism has no published diagnostic parameter shape; \
                          unvalidated pointer-derived decoding was not attempted, never a \
                          partial decode",
@@ -2300,6 +2310,7 @@ pub fn profile_json(
             } else {
                 (
                     serde_json::Value::Array(combos),
+                    None,
                     "unvalidated pointer-derived metadata (RSA-PSS hash/MGF/salt, GCM \
                      IV/AAD/tag length); requested values as passed to the operation, never a \
                      partial decode",
@@ -2313,6 +2324,7 @@ pub fn profile_json(
                 errors: m.errors,
                 latency_ns: latency_out(&m.buckets, m.total_ns, m.max_ns),
                 params,
+                params_omitted,
                 note,
             }
         })
@@ -4777,6 +4789,9 @@ pub(crate) mod tests {
             "0xffffffffffffffff"
         );
         assert_eq!(value["mechanisms"][0]["params"], serde_json::Value::Null);
+        // F-21: the null names its cause, so it never reads as "nothing
+        // observed".
+        assert_eq!(value["mechanisms"][0]["params_omitted"], "policy");
         assert!(
             value["mechanisms"][0]["note"]
                 .as_str()
@@ -4933,6 +4948,11 @@ pub(crate) mod tests {
         assert_eq!(combo["mgf"], 1);
         assert_eq!(combo["salt_len"], 32);
         assert_eq!(combo["count"], 2);
+        assert!(
+            v["mechanisms"][0].get("params_omitted").is_none(),
+            "decoded params carry no omission marker: {}",
+            v["mechanisms"][0]
+        );
     }
 
     #[test]
@@ -5042,6 +5062,7 @@ pub(crate) mod tests {
         let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
 
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
+        assert_eq!(v["mechanisms"][0]["params_omitted"], "no_shape");
     }
 
     #[test]
@@ -5079,6 +5100,7 @@ pub(crate) mod tests {
         };
         let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
+        assert_eq!(v["mechanisms"][0]["params_omitted"], "decode_failed");
         let note = v["mechanisms"][0]["note"].as_str().unwrap();
         assert!(
             !note.contains("not attempted here"),
@@ -6139,6 +6161,7 @@ pub(crate) mod tests {
     // document is COMPLETE / clean_proven, with the stop-gate outcome
     // published beside it.
     #[test]
+    #[cfg(target_arch = "x86_64")] // the drain proof applies on x86_64 only
     fn a_proven_quiescence_seals_a_clean_terminal_document_complete() {
         let mut ev = evidence();
         ev.apply_stop_quiescence(stop(QuiescenceState::Proven, false, false));
@@ -6205,7 +6228,7 @@ pub(crate) mod tests {
         ev.event_loss = 1;
         ev.apply_stop_quiescence(stop(QuiescenceState::Proven, false, false));
         ev.settle_terminal(true);
-        assert!(ev.drain_proven);
+        assert_eq!(ev.drain_proven, DRAIN_PROOF_ARCH);
         assert_eq!(ev.completeness, "PARTIAL");
         assert_eq!(ev.verdict_detail, VERDICT_CONCRETE_GAP);
     }

@@ -1346,9 +1346,10 @@ fn a_device_event_log_is_refused_up_front() {
     assert!(output.stdout.is_empty(), "no success document: {stderr}");
 }
 
-/// C7 A3: `P11SCOPE_PROOF_STAT_THREADS` is read once per run. A
-/// multi-pass `inventory --system` collects every pass, yet prints the
-/// knob's stderr note exactly once (it once repeated it every pass).
+/// C7 A3/A4: `P11SCOPE_PROOF_STAT_THREADS` and `P11SCOPE_SHARD_THREADS`
+/// are read once per run. A multi-pass `inventory --system` collects every
+/// pass, yet prints each knob's stderr note exactly once (the proof-stat
+/// note once repeated every pass).
 #[test]
 fn the_proof_stat_thread_note_prints_once_per_multi_pass_run() {
     let _guard = serial_guard();
@@ -1359,6 +1360,7 @@ fn the_proof_stat_thread_note_prints_once_per_multi_pass_run() {
         .args(["--max-scan-pids", "1", "--duration", "6s", "--json", "-o"])
         .arg(&out)
         .env("P11SCOPE_PROOF_STAT_THREADS", "2")
+        .env("P11SCOPE_SHARD_THREADS", "2")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1379,6 +1381,15 @@ fn the_proof_stat_thread_note_prints_once_per_multi_pass_run() {
     assert_eq!(
         notes,
         ["p11scope: P11SCOPE_PROOF_STAT_THREADS=2 selects 2 proof-stat threads"],
+        "{passes} passes: {stderr}"
+    );
+    let notes: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("P11SCOPE_SHARD_THREADS"))
+        .collect();
+    assert_eq!(
+        notes,
+        ["p11scope: P11SCOPE_SHARD_THREADS=2 selects 2 shard threads"],
         "{passes} passes: {stderr}"
     );
 }

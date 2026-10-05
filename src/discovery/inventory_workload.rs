@@ -479,11 +479,14 @@ pub fn count_owned_pidfds(pids: &BTreeSet<u32>) -> usize {
     owned
 }
 
-/// An FD-measurement scope for an owned, quiescent process: retain the
-/// baseline resources and assert the exact number of added descriptors.
-/// Callers must exclude concurrent FD mutation, including unrelated tests.
-/// Stable resource fingerprints do not prove open-file-description identity;
-/// closing and reopening the same resource may be indistinguishable.
+/// An FD-measurement scope for an owned process: retain the baseline
+/// resources and assert the exact number of added descriptors. Each
+/// census retries until two consecutive attempts agree, so transient
+/// churn from other threads (harness capture setup/teardown at test
+/// boundaries) cannot fail the scope; sustained concurrent mutation
+/// fails loudly instead of reporting a torn census. Stable resource
+/// fingerprints do not prove open-file-description identity; closing
+/// and reopening the same resource may be indistinguishable.
 pub struct FdScope {
     before: BTreeMap<i32, FdResource>,
     label: &'static str,
@@ -499,7 +502,11 @@ struct FdResource {
     pidfd_target: Option<i32>,
 }
 
-fn fd_resources() -> std::io::Result<BTreeMap<i32, FdResource>> {
+/// One FD census attempt: enumerate `/proc/self/fd`, then resolve every
+/// entry. An entry that vanishes between enumeration and resolution (a
+/// concurrent close on another thread) is skipped, never counted; any
+/// other error stays hard.
+fn fd_resources_attempt() -> std::io::Result<BTreeMap<i32, FdResource>> {
     use std::os::unix::fs::MetadataExt as _;
 
     struct Directory(*mut libc::DIR);
@@ -549,41 +556,86 @@ fn fd_resources() -> std::io::Result<BTreeMap<i32, FdResource>> {
             return Err(std::io::Error::other("duplicate descriptor in FD census"));
         }
     }
-    // Finish enumeration before temporary fdinfo readers can affect it. Only
-    // the positively identified directory FD was excluded; every other entry
-    // must resolve, with no concurrent descriptor owner changing this process.
-    descriptors
-        .into_iter()
-        .map(|fd| {
-            let path = format!("/proc/self/fd/{fd}");
-            let link = std::fs::read_link(&path)?;
-            let metadata = std::fs::metadata(&path)?;
-            let pidfd_target = if link == std::path::Path::new("anon_inode:[pidfd]") {
-                let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
-                Some(
-                    info.lines()
-                        .find_map(|line| line.strip_prefix("Pid:"))
-                        .and_then(|pid| pid.trim().parse().ok())
-                        .ok_or_else(|| {
-                            std::io::Error::other("pidfd census lacks target identity")
-                        })?,
-                )
-            } else {
-                None
+    // Finish enumeration before temporary fdinfo readers can affect it.
+    // Only the positively identified directory FD is excluded. Entries
+    // that vanish while resolving were closed concurrently; skipping
+    // them keeps this attempt usable, and the quiescence loop below
+    // retries until two consecutive attempts agree.
+    let mut resources = BTreeMap::new();
+    for fd in descriptors {
+        let path = format!("/proc/self/fd/{fd}");
+        let link = match std::fs::read_link(&path) {
+            Ok(link) => link,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let pidfd_target = if link == std::path::Path::new("anon_inode:[pidfd]") {
+            let info = match std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")) {
+                Ok(info) => info,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
             };
-            Ok((
-                fd,
-                FdResource {
-                    link,
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                    mode: metadata.mode(),
-                    rdev: metadata.rdev(),
-                    pidfd_target,
-                },
-            ))
-        })
-        .collect()
+            Some(
+                info.lines()
+                    .find_map(|line| line.strip_prefix("Pid:"))
+                    .and_then(|pid| pid.trim().parse().ok())
+                    .ok_or_else(|| std::io::Error::other("pidfd census lacks target identity"))?,
+            )
+        } else {
+            None
+        };
+        resources.insert(
+            fd,
+            FdResource {
+                link,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                mode: metadata.mode(),
+                rdev: metadata.rdev(),
+                pidfd_target,
+            },
+        );
+    }
+    Ok(resources)
+}
+
+/// Census attempts until two consecutive attempts agree, so a burst of
+/// concurrent descriptor churn (harness capture setup/teardown at test
+/// boundaries) cannot fail the scope. A hard attempt error resets the
+/// streak; when nothing ever agrees the last error (or a never-quiesced
+/// marker) reports instead of a torn census.
+const FD_CENSUS_QUIESCE_ATTEMPTS: u32 = 100;
+
+fn quiesce_census<F>(mut attempt: F) -> std::io::Result<BTreeMap<i32, FdResource>>
+where
+    F: FnMut() -> std::io::Result<BTreeMap<i32, FdResource>>,
+{
+    let mut previous: Option<BTreeMap<i32, FdResource>> = None;
+    let mut last_error = std::io::Error::other("FD census never quiesced");
+    for _ in 0..FD_CENSUS_QUIESCE_ATTEMPTS {
+        match attempt() {
+            Ok(map) => {
+                if previous.as_ref() == Some(&map) {
+                    return Ok(map);
+                }
+                previous = Some(map);
+            }
+            Err(error) => {
+                last_error = error;
+                previous = None;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn fd_resources_quiesced() -> std::io::Result<BTreeMap<i32, FdResource>> {
+    quiesce_census(fd_resources_attempt)
 }
 
 /// The retained-FD floor: the minimum census over ten 10ms samples.
@@ -614,13 +666,13 @@ pub fn count_owned_pidfds_floor(pids: &BTreeSet<u32>) -> usize {
 impl FdScope {
     pub fn open(label: &'static str) -> Self {
         Self {
-            before: fd_resources().expect("complete baseline FD census"),
+            before: fd_resources_quiesced().expect("complete baseline FD census"),
             label,
         }
     }
 
     pub fn assert_delta(&self, expected: usize) {
-        let after = fd_resources().expect("complete final FD census");
+        let after = fd_resources_quiesced().expect("complete final FD census");
         for (fd, resource) in &self.before {
             assert_eq!(
                 after.get(fd),

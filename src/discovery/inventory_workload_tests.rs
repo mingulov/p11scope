@@ -2724,3 +2724,56 @@ mod c1b {
         }
     }
 }
+
+#[test]
+fn fd_census_quiescence_retries_until_two_attempts_agree() {
+    fn resource(tag: u64) -> FdResource {
+        FdResource {
+            link: std::path::PathBuf::from(format!("/dev/null#{tag}")),
+            dev: 1,
+            ino: tag,
+            mode: 0o20000,
+            rdev: 0,
+            pidfd_target: None,
+        }
+    }
+    fn census(entries: &[(i32, u64)]) -> std::collections::BTreeMap<i32, FdResource> {
+        entries
+            .iter()
+            .map(|(fd, tag)| (*fd, resource(*tag)))
+            .collect()
+    }
+    // Churn then settle: disagreeing attempts retry, agreement returns.
+    let mut calls = 0;
+    let map = quiesce_census(|| -> std::io::Result<_> {
+        calls += 1;
+        Ok(match calls {
+            1 => census(&[(3, 1), (4, 1)]),
+            _ => census(&[(3, 1)]),
+        })
+    })
+    .expect("agreeing attempts return");
+    assert_eq!(calls, 3, "one churned attempt plus the agreeing pair");
+    assert_eq!(map, census(&[(3, 1)]));
+    // A hard error resets the streak instead of poisoning it.
+    let mut calls = 0;
+    let map = quiesce_census(|| -> std::io::Result<_> {
+        calls += 1;
+        if calls == 1 {
+            return Err(std::io::Error::other("boom"));
+        }
+        Ok(census(&[(3, 1)]))
+    })
+    .expect("error then agreement returns");
+    assert_eq!(calls, 3, "error plus the agreeing pair");
+    assert_eq!(map.len(), 1);
+    // Sustained disagreement exhausts the bound and reports honestly.
+    let mut calls = 0;
+    let error = quiesce_census(|| -> std::io::Result<_> {
+        calls += 1;
+        Ok(census(&[(3, calls as u64)]))
+    })
+    .expect_err("eternal churn must not return a torn census");
+    assert_eq!(calls, FD_CENSUS_QUIESCE_ATTEMPTS as usize);
+    assert_eq!(error.to_string(), "FD census never quiesced");
+}

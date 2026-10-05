@@ -1897,6 +1897,7 @@ fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
     let mut tracer = trace::Tracer::new(&plan);
     let mut malformed_records = 0;
     let mut context = context(plan, []);
+    context.out_file = Some(Vec::new());
     context.drain = EventDrain::over_test_domain(
         ScriptedRecords::records([crate::events::record_bytes(&record)], usize::MAX),
         1,
@@ -1927,25 +1928,917 @@ fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
     }
     assert_eq!(malformed_records, 0);
     assert_eq!(state.sessions().opened, 1, "the record was reduced");
-    let rendered = String::from_utf8_lossy(&context.stdout).to_ascii_lowercase();
+    let rendered = String::from_utf8_lossy(&context.stdout);
     assert!(
-        rendered.contains(" c_opensession "),
+        rendered.to_ascii_lowercase().contains(" c_opensession "),
         "the call was rendered"
     );
-    for word in [
-        IP,
-        IP >> 32,
-        IP & 0xffff_ffff,
-        u64::from(EPOCH),
-        u64::from(GLOBAL),
-        u64::from(FAULT),
-        0x3A5D,
-    ] {
-        for form in [format!("{word:x}"), word.to_string()] {
+    // Task 1c: the shared exact-offset canary replaces the ad-hoc word
+    // loop, and the mirrored trace file is scanned as its own surface.
+    let canary = continuity_canary::ContinuityCanary::from_continuity(&record.continuity);
+    canary.assert_clean(&context.stdout, "trace stdout");
+    canary.assert_clean(
+        context.out_file.as_deref().unwrap_or_default(),
+        "trace file",
+    );
+}
+
+// --- Task 1c Stage A privacy evidence -----------------------------------
+// The addendum requires, before activation: (1) an exact-offset canary
+// scanner for the entry IP and stamps in the EVENTS tail and
+// INSTANCE_START, with must-detect positive controls in public outputs;
+// (2) a sentinel regression proving renderers never receive the tail.
+// The scanner is the nested `continuity_canary` module below; these tests plant
+// recognizable sentinel continuity values through the real capture ->
+// reduce -> render path and scan every public surface.
+/// The Task 1c exact-offset canary scanner, nested here (rather than in
+/// its own file) so the `instance_entry_ip_and_stamps_have_no_rendering_`
+/// `consumers` contract keeps its exact four-file user list: this test
+/// module is already an allowed reader of the private continuity fields,
+/// and no new file gains that power.
+///
+/// The reusable check behind the Stage A privacy evidence: it takes the
+/// ACTUAL private continuity bytes — the `u64` entry IP plus the 16-byte
+/// `{epoch, global, fault, file slot, flags}` stamps exactly as laid out
+/// in the `EventRecord` tail (`InstanceContinuity`) and in
+/// `INSTANCE_START` (`InstanceEntry`) — and searches any public output
+/// surface for them.
+///
+/// Every form a renderer could emit is covered, for full words and for
+/// 32-bit halves of the `u64` entry IP:
+///
+/// - raw bytes: the exact laid-out little-endian sequences — the whole
+///   40-byte tail / 24-byte entry, each 16-byte stamp, the 8-byte IP and
+///   every 4-byte word;
+/// - hex, upper/lower/mixed case (matched case-insensitively), with and
+///   without a `0x` prefix (zero-padded forms contain the unpadded
+///   needle, so they match too);
+/// - decimal.
+///
+/// The two `u16` stamp fields (file slot, flags) are covered by their
+/// rendered forms plus the enclosing 16-byte stamp raw sequence; their
+/// bare 2-byte sequences are NOT matched standalone because any two text
+/// bytes would match them (a bare `u16` raw match cannot tell a leak
+/// from prose).
+mod continuity_canary {
+    use p11scope_ebpf_common::{InstanceContinuity, InstanceEntry, InstanceStamp};
+
+    const _: () = assert!(size_of::<InstanceContinuity>() == 40);
+    const _: () = assert!(size_of::<InstanceEntry>() == 24);
+    const _: () = assert!(size_of::<InstanceStamp>() == 16);
+
+    /// The raw bytes of one `repr(C)` Pod value, exactly as laid out.
+    pub(crate) fn struct_bytes<T>(value: &T) -> Vec<u8> {
+        // SAFETY: the caller passes `repr(C)` Pod shared-transport
+        // values only (the same contract `crate::events::record_bytes`
+        // relies on); this reads exactly the value's bytes.
+        unsafe {
+            std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()).to_vec()
+        }
+    }
+
+    /// One searchable form of one private word: what to look for, and
+    /// how to describe a hit. `is_text` needles match
+    /// case-insensitively (their bytes are stored lowercase); raw
+    /// needles match byte-exact.
+    pub(crate) struct Needle {
+        pub description: String,
+        pub bytes: Vec<u8>,
+        pub is_text: bool,
+    }
+
+    /// The reusable Stage A continuity check, built from the actual
+    /// private tail/entry structs fed to the capture path under test.
+    pub(crate) struct ContinuityCanary {
+        needles: Vec<Needle>,
+    }
+
+    impl ContinuityCanary {
+        /// The scanner for an `EVENTS`-tail layout: entry IP plus the
+        /// entry and return stamps.
+        pub(crate) fn from_continuity(continuity: &InstanceContinuity) -> Self {
+            let mut words: Vec<(String, u64, usize)> = Vec::new();
+            push_u64(&mut words, "entry_ip", continuity.entry_ip);
+            push_stamp(&mut words, "entry_stamp", &continuity.entry_stamp);
+            push_stamp(&mut words, "return_stamp", &continuity.return_stamp);
+            let mut raw: Vec<(String, Vec<u8>)> = vec![
+                (
+                    "the 40-byte EVENTS tail as laid out".to_string(),
+                    struct_bytes(continuity),
+                ),
+                (
+                    "the 16-byte entry stamp as laid out".to_string(),
+                    struct_bytes(&continuity.entry_stamp),
+                ),
+                (
+                    "the 16-byte return stamp as laid out".to_string(),
+                    struct_bytes(&continuity.return_stamp),
+                ),
+            ];
+            raw.push((
+                "the 8-byte entry IP as laid out".to_string(),
+                continuity.entry_ip.to_le_bytes().to_vec(),
+            ));
+            Self::build(words, raw)
+        }
+
+        /// The scanner for an `INSTANCE_START`-value layout: entry IP
+        /// plus the single entry stamp.
+        pub(crate) fn from_entry(entry: &InstanceEntry) -> Self {
+            let mut words: Vec<(String, u64, usize)> = Vec::new();
+            push_u64(&mut words, "entry_ip", entry.entry_ip);
+            push_stamp(&mut words, "entry_stamp", &entry.entry_stamp);
+            let raw: Vec<(String, Vec<u8>)> = vec![
+                (
+                    "the 24-byte INSTANCE_START value as laid out".to_string(),
+                    struct_bytes(entry),
+                ),
+                (
+                    "the 16-byte entry stamp as laid out".to_string(),
+                    struct_bytes(&entry.entry_stamp),
+                ),
+                (
+                    "the 8-byte entry IP as laid out".to_string(),
+                    entry.entry_ip.to_le_bytes().to_vec(),
+                ),
+            ];
+            Self::build(words, raw)
+        }
+
+        fn build(words: Vec<(String, u64, usize)>, raw: Vec<(String, Vec<u8>)>) -> Self {
+            let mut needles: Vec<Needle> = Vec::new();
+            for (name, value, width) in &words {
+                // Rendered forms for every word, whatever its width.
+                for (form, text) in [
+                    ("hex", format!("{value:x}")),
+                    ("0x-prefixed hex", format!("0x{value:x}")),
+                    ("decimal", value.to_string()),
+                ] {
+                    push_needle(
+                        &mut needles,
+                        format!("{name} {form} {text}"),
+                        text.into_bytes(),
+                        true,
+                    );
+                }
+                // Raw little-endian bytes for 4- and 8-byte words only;
+                // see the module docs for why bare 2-byte matches are
+                // excluded.
+                if *width == 8 {
+                    push_needle(
+                        &mut needles,
+                        format!("{name} raw LE bytes"),
+                        value.to_le_bytes().to_vec(),
+                        false,
+                    );
+                } else if *width == 4 {
+                    push_needle(
+                        &mut needles,
+                        format!("{name} raw LE bytes"),
+                        (*value as u32).to_le_bytes().to_vec(),
+                        false,
+                    );
+                }
+            }
+            for (description, bytes) in raw {
+                push_needle(&mut needles, description, bytes, false);
+            }
+            Self { needles }
+        }
+
+        /// Every searchable form, for must-detect positive controls:
+        /// plant each into a public output and assert [`Self::hits_in`]
+        /// flags it. Text needles are stored lowercase; uppercasing them
+        /// before planting must still flag (case-insensitive match).
+        pub(crate) fn needles(&self) -> &[Needle] {
+            &self.needles
+        }
+
+        /// Descriptions of every canary form found in `output`; empty
+        /// when the surface is clean.
+        pub(crate) fn hits_in(&self, output: &[u8]) -> Vec<String> {
+            let lowered = output.to_ascii_lowercase();
+            let mut hits = Vec::new();
+            for needle in &self.needles {
+                let haystack = if needle.is_text { &lowered } else { output };
+                if haystack
+                    .windows(needle.bytes.len())
+                    .any(|window| window == needle.bytes.as_slice())
+                {
+                    hits.push(needle.description.clone());
+                }
+            }
+            hits
+        }
+
+        /// Panics when `output` carries any canary form, naming the
+        /// surface and the first hits; passes silently when clean.
+        pub(crate) fn assert_clean(&self, output: &[u8], surface: &str) {
+            let hits = self.hits_in(output);
             assert!(
-                !rendered.contains(&form),
-                "private continuity word {form} rendered"
+                hits.is_empty(),
+                "Stage A privacy: {surface} leaked {} continuity canary form(s): {}",
+                hits.len(),
+                hits.iter().take(5).cloned().collect::<Vec<_>>().join("; "),
             );
         }
+    }
+
+    /// One `u64` word plus its 32-bit halves.
+    fn push_u64(words: &mut Vec<(String, u64, usize)>, name: &str, value: u64) {
+        words.push((name.to_string(), value, 8));
+        words.push((format!("{name} high half"), value >> 32, 4));
+        words.push((format!("{name} low half"), value & 0xffff_ffff, 4));
+    }
+
+    /// One 16-byte `{epoch, global, fault, file slot, flags}` stamp.
+    fn push_stamp(words: &mut Vec<(String, u64, usize)>, name: &str, stamp: &InstanceStamp) {
+        words.push((format!("{name} epoch"), u64::from(stamp.epoch), 4));
+        words.push((format!("{name} global"), u64::from(stamp.global), 4));
+        words.push((format!("{name} fault"), u64::from(stamp.fault), 4));
+        words.push((
+            format!("{name} file slot"),
+            u64::from(stamp.file_slot_plus1),
+            2,
+        ));
+        words.push((format!("{name} flags"), u64::from(stamp.flags), 2));
+    }
+
+    /// Adds a needle unless an identical one is already present (the
+    /// entry and return stamps share flag values, for example).
+    fn push_needle(needles: &mut Vec<Needle>, description: String, bytes: Vec<u8>, is_text: bool) {
+        if needles
+            .iter()
+            .any(|needle| needle.bytes == bytes && needle.is_text == is_text)
+        {
+            return;
+        }
+        needles.push(Needle {
+            description,
+            bytes,
+            is_text,
+        });
+    }
+}
+
+use continuity_canary::{ContinuityCanary, struct_bytes};
+
+/// Sentinel entry IP, shared with the trace-only test above.
+const CANARY_IP: u64 = 0x7E5C_A1AB_1E5E_C0DE;
+
+fn canary_entry_stamp() -> p11scope_ebpf_common::InstanceStamp {
+    p11scope_ebpf_common::InstanceStamp {
+        epoch: 0x5EC1_7A11,
+        global: 0x6A0B_A15E,
+        fault: 0x7AFF_0FF1,
+        file_slot_plus1: 0x3A5D,
+        flags: p11scope_ebpf_common::instance::STAMP_VALID,
+    }
+}
+
+/// A deliberately DIFFERENT return stamp (a mid-call mutation is
+/// realistic) so the scanner's return-stamp forms get distinct values.
+fn canary_return_stamp() -> p11scope_ebpf_common::InstanceStamp {
+    p11scope_ebpf_common::InstanceStamp {
+        epoch: 0x9A2B_44D1,
+        global: 0xB3C5_55E2,
+        fault: 0xC4D6_66F3,
+        file_slot_plus1: 0x5B7E,
+        flags: p11scope_ebpf_common::instance::STAMP_VALID,
+    }
+}
+
+fn canary_continuity() -> p11scope_ebpf_common::InstanceContinuity {
+    p11scope_ebpf_common::InstanceContinuity {
+        entry_ip: CANARY_IP,
+        entry_stamp: canary_entry_stamp(),
+        return_stamp: canary_return_stamp(),
+    }
+}
+
+fn canary_record() -> p11scope_ebpf_common::EventRecord {
+    p11scope_ebpf_common::EventRecord {
+        event: open_event(11),
+        continuity: canary_continuity(),
+    }
+}
+
+struct TraceDrive {
+    state: semantics::State,
+    stdout: Vec<u8>,
+    out_file: Vec<u8>,
+    malformed: u64,
+    scheduling: SchedulingAccumulator,
+    raw_calls: u64,
+}
+
+/// The real trace capture -> reduce path, fed whole sentinel records.
+fn drive_trace_capture(record: &[u8]) -> TraceDrive {
+    let plan = open_plan();
+    let mut state = semantics::State::new(&plan);
+    let mut tracker = tracker();
+    let mut tracer = trace::Tracer::new(&plan);
+    let mut malformed_records = 0;
+    let mut context = context(plan, []);
+    context.out_file = Some(Vec::new());
+    context.drain =
+        EventDrain::over_test_domain(ScriptedRecords::records([record.to_vec()], usize::MAX), 1);
+    let mut scheduling = SchedulingAccumulator::default();
+    {
+        let mut consumers = CaptureConsumers {
+            state: &mut state,
+            tracker: &mut tracker,
+            tracer: Some(&mut tracer),
+            malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
+        };
+        capture_tick_with(
+            &mut context,
+            &mut consumers,
+            |context: &mut TickContext, _| Ok((true, true, &context.plan)),
+            |_| Ok(None),
+            |context, consumers| {
+                drain_tick(context, consumers)?;
+                Ok(None)
+            },
+            |_, consumers| Ok(consumers.state.sessions().opened),
+            |_| Ok(()),
+        )
+        .unwrap();
+    }
+    let raw_calls = tracer.raw_calls();
+    TraceDrive {
+        state,
+        stdout: context.stdout,
+        out_file: context.out_file.unwrap_or_default(),
+        malformed: malformed_records,
+        scheduling,
+        raw_calls,
+    }
+}
+
+struct ProfileDrive {
+    state: semantics::State,
+    malformed: u64,
+}
+
+/// The real profile capture -> reduce path, fed whole sentinel records.
+fn drive_profile_capture(record: &[u8]) -> ProfileDrive {
+    let plan = open_plan();
+    let mut state = semantics::State::new(&plan);
+    let mut tracker = tracker();
+    let mut malformed_records = 0;
+    let mut context = context(plan, []);
+    context.drain =
+        EventDrain::over_test_domain(ScriptedRecords::records([record.to_vec()], usize::MAX), 1);
+    let mut scheduling = SchedulingAccumulator::default();
+    {
+        let mut consumers = CaptureConsumers {
+            state: &mut state,
+            tracker: &mut tracker,
+            tracer: None,
+            malformed_records: &mut malformed_records,
+            scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
+        };
+        capture_tick_with(
+            &mut context,
+            &mut consumers,
+            |context: &mut TickContext, _| Ok((true, true, &context.plan)),
+            |_| Ok(None),
+            |context, consumers| {
+                drain_tick(context, consumers)?;
+                Ok(None)
+            },
+            |_, consumers| Ok(consumers.state.sessions().opened),
+            |_| Ok(()),
+        )
+        .unwrap();
+    }
+    ProfileDrive {
+        state,
+        malformed: malformed_records,
+    }
+}
+
+/// One aggregate row matching the reduced call, so the JSON/profile/live
+/// renderers emit a non-trivial `functions` section. Aggregate rows come
+/// from the BPF count maps, not from EVENTS records, so this fixture only
+/// supplies output shape; the reduced semantic state is the real input
+/// under test.
+fn canary_reports() -> Vec<crate::metrics::SlotReport> {
+    vec![crate::metrics::SlotReport {
+        names: vec!["C_OpenSession".into()],
+        aliased: false,
+        semantic_authorized: true,
+        module: Some(crate::plan::ModuleId(0)),
+        module_ambiguous: false,
+        module_unresolved: false,
+        calls: 1,
+        errors: 0,
+        in_flight: 0,
+        total_ns: 10,
+        max_ns: 10,
+        buckets: [0; p11scope_ebpf_common::LATENCY_BUCKETS],
+        rv_counts: std::collections::BTreeMap::from([(0u64, 1u64)]),
+        file_offset: 0x10,
+        target_object: None,
+        ordinals: Vec::new(),
+    }]
+}
+
+fn canary_capture() -> crate::render::CaptureMeta<'static> {
+    crate::render::CaptureMeta {
+        started: "t0",
+        ended: "t1",
+        kernel: "6.8.0",
+        policy: crate::attach::CapturePolicy::Allowlisted,
+        scope: "pid",
+        ring_bytes: p11scope_ebpf_common::RING_BYTES,
+        drain_interval_ms: 1000,
+    }
+}
+
+/// A small but non-trivial inventory presentation: one caller, one
+/// module, one counted edge and one gap. Inventory renderers consume
+/// `Presentation`, which carries no continuity field — the EVENTS tail
+/// cannot reach them by construction — and these surfaces are scanned to
+/// prove the fact on representative bytes.
+fn canary_presentation() -> crate::inventory_present::Presentation {
+    use crate::discovery::caller_registry::{
+        AdmissionState, CallerId, CallerLifecycle, ExeIdentity, ImageAuthority, MappingEvidence,
+        MappingState, ModuleId, ModuleLifecycle, UseCoverage,
+    };
+    use crate::inventory_present::{
+        Activity, BudgetView, CallerView, Capture, EdgeSemanticsView, EdgeView, GapView,
+        ModuleView, Presence, Presentation,
+    };
+    Presentation {
+        scope_label: "pid 4242".into(),
+        started_ns: 1_000,
+        ended_ns: 2_000,
+        passes: 1,
+        usage_feed: true,
+        native_witnesses: crate::discovery::native_binding::BindingCensus {
+            rows: 0,
+            bound: 0,
+            unbound: std::collections::BTreeMap::new(),
+            pending: 0,
+            integrity: 0,
+        },
+        witness_placement: crate::discovery::caller_registry::WitnessPlacement {
+            edge: 0,
+            module: 0,
+            ambiguous: 0,
+            unresolved: 0,
+        },
+        callers: vec![CallerView {
+            id: CallerId(0),
+            pid: 4242,
+            start_time: Some(700),
+            incarnation: 0,
+            exe: Some(ExeIdentity {
+                dev: 8,
+                ino: 90_001,
+                mtime_secs: 11,
+                mtime_nanos: 22,
+                path: Some("/usr/bin/canary-app".into()),
+            }),
+            exec_observed: false,
+            authority: ImageAuthority::ScanPinned,
+            lifecycle: CallerLifecycle::Mapped,
+            lifecycle_reason: None,
+            first_seen_ns: 1000,
+            last_seen_ns: 2000,
+            retired: false,
+        }],
+        modules: vec![ModuleView {
+            id: ModuleId(0),
+            paths: vec!["/opt/canary-provider.so".into()],
+            device_major: 8,
+            device_minor: 1,
+            inode: 100_001,
+            sha256: Some("ab".repeat(32)),
+            build_id: Some("ccdd".into()),
+            identity_source: Some("scan".into()),
+            admission: AdmissionState::Admitted,
+            admission_class: None,
+            admission_endpoints: Some(2),
+            admission_reasons: Vec::new(),
+            admission_history: Vec::new(),
+            lifecycle: ModuleLifecycle::Mapped,
+            unloaded_observed: false,
+            unbound_use: None,
+        }],
+        edges: vec![EdgeView {
+            caller: CallerId(0),
+            module: ModuleId(0),
+            mapping: MappingState::Mapped,
+            mapping_reason: None,
+            mapping_evidence: MappingEvidence::DeepScan,
+            mapping_first_seen_ns: 1000,
+            mapping_last_seen_ns: 2000,
+            mapping_interruptions: 0,
+            entry_count: 4,
+            entry_saturated: false,
+            entry_first_seen_ns: Some(1100),
+            entry_last_seen_ns: Some(1900),
+            entry_in_flight: false,
+            entry_observation: "observed",
+            coverage: UseCoverage::Counted {
+                since_ns: 1000,
+                lossy: false,
+            },
+            presence: Presence::Mapped,
+            capture: Capture::Armed,
+            activity: Activity::RecentlyObserved,
+            semantics: EdgeSemanticsView {
+                label: crate::discovery::caller_registry::SEMANTIC_UNKNOWN,
+                mechanisms: Vec::new(),
+                operations: None,
+            },
+        }],
+        gaps: vec![GapView {
+            caller: Some(CallerId(0)),
+            module: None,
+            pid: Some(4242),
+            subject: "canary gap".into(),
+            reason: "coverage demonstration gap".into(),
+            budget: None,
+            repeats: 1,
+        }],
+        gaps_suppressed: 0,
+        budgets: BudgetView {
+            callers_limit: 8,
+            callers_occupied: 1,
+            callers_refused: 0,
+            modules_limit: 8,
+            modules_occupied: 1,
+            modules_refused: 0,
+            edges_limit: 16,
+            edges_occupied: 1,
+            edges_refused: 0,
+            endpoints_limit: 32,
+            endpoints_occupied: 2,
+            endpoints_refused: 0,
+            inventory_endpoints_limit: 32,
+            inventory_endpoints_occupied: 2,
+            inventory_endpoints_refused: 0,
+            inventory_modules_limit: 8,
+            inventory_modules_occupied: 1,
+            inventory_modules_refused: 0,
+            counters_observed: 1,
+            counters_saturated: 0,
+            semantic_limit: 4,
+            semantic_occupied: 0,
+            semantic_unknown_edges: 1,
+            semantic_refused: 0,
+            retained_limit: 16,
+            retained: 1,
+            retained_suppressed: 0,
+            preadmission: None,
+        },
+    }
+}
+
+struct RenderedSurfaces {
+    surfaces: Vec<(String, Vec<u8>)>,
+    trace_sessions_opened: u64,
+    trace_rendered_call: bool,
+    profile_sessions_opened: u64,
+}
+
+/// Renders every public output surface the addendum names — JSON, JSONL,
+/// trace, profile, dashboard, logs, errors — from state reduced from
+/// whole sentinel records through the real capture path.
+fn render_all_surfaces() -> RenderedSurfaces {
+    let record = crate::events::record_bytes(&canary_record());
+    let trace = drive_trace_capture(&record);
+    let profile = drive_profile_capture(&record);
+    assert_eq!(trace.malformed, 0, "sentinel records decode");
+    assert_eq!(profile.malformed, 0, "sentinel records decode");
+
+    let reports = canary_reports();
+    let capture = canary_capture();
+    let mut evidence = crate::render::tests::evidence();
+    evidence.verdict();
+    let policy = crate::attach::CapturePolicy::Allowlisted;
+
+    let mut surfaces: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut push = |surface: &str, output: Vec<u8>| {
+        surfaces.push((surface.to_string(), output));
+    };
+
+    // Trace surfaces, straight from the driven capture.
+    let trace_rendered_call = String::from_utf8_lossy(&trace.stdout)
+        .to_ascii_lowercase()
+        .contains(" c_opensession ");
+    push("trace stdout", trace.stdout.clone());
+    push("trace file", trace.out_file.clone());
+
+    // Profile/metrics JSON and the live display, rendered from the
+    // reduced semantic state.
+    let profile_doc = crate::render::profile_json(
+        &reports,
+        crate::render::VersionedEvidence::wrap(&evidence),
+        &profile.state,
+        &capture,
+    );
+    push(
+        "profile json",
+        serde_json::to_string(&profile_doc).unwrap().into_bytes(),
+    );
+    let metrics_doc = crate::render::json(&reports, &evidence, &capture);
+    push(
+        "metrics json",
+        serde_json::to_string(&metrics_doc).unwrap().into_bytes(),
+    );
+    push(
+        "profile live display",
+        crate::render::live(
+            &reports,
+            &evidence,
+            std::time::Duration::from_secs(3),
+            "canary-provider",
+            "profile",
+            policy,
+        )
+        .into_bytes(),
+    );
+
+    // Trace terminal/log lines.
+    push(
+        "trace evidence line",
+        crate::trace::evidence_line(&evidence, policy).into_bytes(),
+    );
+    push(
+        "trace count line",
+        crate::trace::count_evidence_line(&reports, trace.raw_calls).into_bytes(),
+    );
+    push(
+        "trace capture line",
+        crate::trace::capture_line(policy).into_bytes(),
+    );
+    push(
+        "trace truncated line",
+        crate::trace::truncated_line(1000, true).into_bytes(),
+    );
+    push(
+        "longrun log line",
+        trace.scheduling.longrun_line(false).into_bytes(),
+    );
+
+    // Inventory surfaces: JSON, JSONL, dashboard frame, pager snapshot.
+    let presentation = canary_presentation();
+    let inventory_doc = crate::inventory::render_json_from_presentation(&presentation);
+    push(
+        "inventory json",
+        serde_json::to_string(&inventory_doc).unwrap().into_bytes(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    // The event writer only publishes under owner-writable ancestors;
+    // `tempfile` honors the process umask, so pin the mode explicitly
+    // and pass under any umask the gates run with.
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = crate::inventory_events::EventWriter::create(&path, 1 << 20, 5).unwrap();
+    crate::inventory_events::emit_snapshot_as_events(&mut writer, &presentation, 1).unwrap();
+    drop(writer);
+    push("inventory jsonl", std::fs::read(&path).unwrap());
+    let frame = crate::inventory_dashboard::DisplayFrame {
+        presentation: std::sync::Arc::new(presentation.clone()),
+        log: crate::inventory_dashboard::LogTail::bounded().snapshot(),
+    };
+    push(
+        "inventory dashboard frame",
+        crate::inventory_dashboard::render_frame(
+            &frame,
+            crate::inventory_dashboard::Viewport {
+                width: 100,
+                height: 30,
+            },
+            &crate::inventory_dashboard::DashboardState::new(),
+        ),
+    );
+    push(
+        "inventory pager snapshot",
+        crate::inventory_present::render_snapshot(&presentation).into_bytes(),
+    );
+
+    // Error surfaces, produced with sentinel records in flight.
+    push(
+        "drain write error",
+        failing_drain_error(&record).into_bytes(),
+    );
+    push(
+        "bounded-drain error",
+        crate::events::BoundedDrainError::UngatedWriterBeforeQ {
+            consumer: 8,
+            stop: 16,
+        }
+        .to_string()
+        .into_bytes(),
+    );
+    push(
+        "malformed lost line",
+        malformed_lost_line(&record).into_bytes(),
+    );
+
+    RenderedSurfaces {
+        surfaces,
+        trace_sessions_opened: trace.state.sessions().opened,
+        trace_rendered_call,
+        profile_sessions_opened: profile.state.sessions().opened,
+    }
+}
+
+/// A REAL error from the trace drain path with a sentinel record in
+/// flight: the stdout writer fails, so the drain returns the write
+/// error instead of rendering.
+fn failing_drain_error(record: &[u8]) -> String {
+    let mut drain =
+        EventDrain::over_test_domain(ScriptedRecords::records([record.to_vec()], usize::MAX), 1);
+    let plan = open_plan();
+    let mut state = semantics::State::new(&plan);
+    let mut tracker = tracker();
+    let mut tracer = trace::Tracer::new(&plan);
+    let mut writer = TerminalWriter {
+        fail: true,
+        bytes: Vec::new(),
+    };
+    let mut open = true;
+    let mut remaining: Option<u64> = None;
+    let mut out_file: Option<TerminalWriter> = None;
+    let error = drain_trace_events_from(
+        &mut drain,
+        &mut remaining,
+        &mut state,
+        &mut tracker,
+        &Scope::Pid(std::process::id()),
+        &mut tracer,
+        &mut writer,
+        &mut open,
+        &mut out_file,
+        Some(LIVE_POLL_QUANTUM),
+    )
+    .unwrap_err();
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("writing stdout"),
+        "the error is the real write path: {rendered}"
+    );
+    rendered
+}
+
+/// A truncated sentinel record (its tail cut short) decodes to nothing:
+/// the malformed path emits a count, never bytes. Returns the resulting
+/// `LOST` line.
+fn malformed_lost_line(record: &[u8]) -> String {
+    let truncated = record[..record.len() - 8].to_vec();
+    assert!(
+        crate::events::decode(&truncated).is_none(),
+        "a cut tail never decodes"
+    );
+    let mut drain =
+        EventDrain::over_test_domain(ScriptedRecords::records([truncated], usize::MAX), 1);
+    let plan = open_plan();
+    let mut state = semantics::State::new(&plan);
+    let mut tracker = tracker();
+    let (malformed, _) = drain_profile_events(
+        &mut drain,
+        &mut state,
+        &mut tracker,
+        &Scope::Pid(std::process::id()),
+        Some(LIVE_POLL_QUANTUM),
+    )
+    .unwrap();
+    assert_eq!(malformed, 1, "the cut record counts as malformed");
+    crate::trace::lost_line(malformed).expect("loss always gets a line")
+}
+
+/// Must-detect positive controls (R2): every surface is clean first (so
+/// the controls are non-vacuous), then every needle — plus its
+/// uppercase form for text needles — is planted into every surface and
+/// must flag. The planted path is test-only string/byte splicing.
+fn assert_must_detect(canary: &ContinuityCanary, surfaces: &[(String, Vec<u8>)]) {
+    for (surface, output) in surfaces {
+        assert!(
+            canary.hits_in(output).is_empty(),
+            "clean {surface} must pass before planting"
+        );
+        for needle in canary.needles() {
+            let mut forms = vec![needle.bytes.clone()];
+            if needle.is_text {
+                let upper = needle.bytes.to_ascii_uppercase();
+                if upper != needle.bytes {
+                    forms.push(upper);
+                }
+            }
+            for form in forms {
+                let mut dirty = output.clone();
+                let at = dirty.len() / 2;
+                dirty.splice(at..at, form.iter().cloned());
+                let hits = canary.hits_in(&dirty);
+                assert!(
+                    hits.contains(&needle.description),
+                    "planted {} in {surface} was NOT flagged",
+                    needle.description
+                );
+            }
+        }
+    }
+}
+
+/// R1+R2, EVENTS-tail layout: the scanner covers every needle form, and
+/// every planted control flags on every public surface.
+#[test]
+fn continuity_canary_flags_every_planted_form_on_every_surface() {
+    let canary = ContinuityCanary::from_continuity(&canary_continuity());
+    assert_eq!(
+        canary.needles().len(),
+        48,
+        "needle coverage contract: 13 words x 3 rendered forms (minus 3 \
+         flag-value dedups) + 12 raw sequences"
+    );
+    let rendered = render_all_surfaces();
+    assert_eq!(
+        rendered.surfaces.len(),
+        17,
+        "surface coverage contract: trace stdout/file, profile/metrics \
+         json, live display, 5 trace/log lines, inventory json/jsonl/\
+         dashboard/pager, 3 error surfaces"
+    );
+    assert_must_detect(&canary, &rendered.surfaces);
+}
+
+/// R1+R2, INSTANCE_START layout: the entry IP plus its single stamp get
+/// the same must-detect treatment on every surface.
+#[test]
+fn instance_start_entry_canary_flags_planted_controls() {
+    let entry = p11scope_ebpf_common::InstanceEntry {
+        entry_ip: CANARY_IP,
+        entry_stamp: canary_entry_stamp(),
+    };
+    let canary = ContinuityCanary::from_entry(&entry);
+    assert_eq!(
+        canary.needles().len(),
+        32,
+        "needle coverage contract: 8 words x 3 rendered forms + 8 raw sequences"
+    );
+    let rendered = render_all_surfaces();
+    assert_must_detect(&canary, &rendered.surfaces);
+}
+
+/// R3 sentinel regression: recognizable sentinel continuity through the
+/// real capture -> reduce -> render path reaches NO renderer. The
+/// decoder proof pins the drop point (`decode` hands renderers a bare
+/// `Event`); the end-to-end proof scans every rendered surface.
+#[test]
+fn instance_continuity_tail_never_reaches_any_renderer() {
+    let continuity = canary_continuity();
+    let canary = ContinuityCanary::from_continuity(&continuity);
+    let record = p11scope_ebpf_common::EventRecord {
+        event: open_event(11),
+        continuity,
+    };
+    let bytes = crate::events::record_bytes(&record);
+
+    // The drop point: what renderers decode carries no tail bytes.
+    let event = crate::events::decode(&bytes).expect("sentinel record decodes");
+    canary.assert_clean(&struct_bytes(&event), "renderer-facing bare Event");
+    // Non-vacuous: the router-facing decoder sees the planted tail.
+    let whole = crate::events::decode_record(&bytes).expect("whole record decodes");
+    assert_eq!(whole.continuity.entry_ip, CANARY_IP, "the tail was planted");
+    assert_eq!(
+        whole.continuity.entry_stamp.epoch,
+        canary_entry_stamp().epoch
+    );
+    assert_eq!(
+        whole.continuity.return_stamp.epoch,
+        canary_return_stamp().epoch
+    );
+
+    // End-to-end: the call was reduced and rendered, and every surface
+    // rendered from it is clean.
+    let rendered = render_all_surfaces();
+    assert_eq!(
+        rendered.trace_sessions_opened, 1,
+        "trace reduced the sentinel call"
+    );
+    assert!(
+        rendered.trace_rendered_call,
+        "trace rendered the sentinel call"
+    );
+    assert_eq!(
+        rendered.profile_sessions_opened, 1,
+        "profile reduced the sentinel call"
+    );
+    for (surface, output) in &rendered.surfaces {
+        canary.assert_clean(output, surface);
     }
 }

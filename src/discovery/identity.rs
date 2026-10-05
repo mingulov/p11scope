@@ -469,12 +469,22 @@ impl MapFilesDir {
     /// relative to the held directory (the entry is followed, as `stat`
     /// follows it).
     pub(crate) fn identity(&self, start: u64, end: u64) -> std::io::Result<FileIdentity> {
-        let name =
-            std::ffi::CString::new(format!("{start:x}-{end:x}")).map_err(std::io::Error::other)?;
+        let mut name = [0u8; MAP_FILES_NAME_LEN];
+        write_map_files_name(start, end, &mut name);
         let mut buf = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: a valid directory fd, a NUL-terminated relative name and
-        // a writable stat buffer, read only on success.
-        if unsafe { libc::fstatat(self.dir.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr(), 0) } != 0 {
+        // SAFETY: a valid directory fd, a writable stat buffer read only on
+        // success, and `name`, which holds `{hex}-{hex}` plus its NUL
+        // terminator with no interior NUL, so its pointer is a valid
+        // NUL-terminated relative name for the call.
+        if unsafe {
+            libc::fstatat(
+                self.dir.as_raw_fd(),
+                name.as_ptr() as *const libc::c_char,
+                buf.as_mut_ptr(),
+                0,
+            )
+        } != 0
+        {
             return Err(std::io::Error::last_os_error());
         }
         // SAFETY: initialized by the successful `fstatat`.
@@ -484,6 +494,38 @@ impl MapFilesDir {
             ino: stat.st_ino,
         })
     }
+}
+
+/// `{start:x}-{end:x}` plus the NUL terminator: 16 hex digits per bound.
+const MAP_FILES_NAME_LEN: usize = 16 + 1 + 16 + 1;
+
+/// Render `{start:x}-{end:x}` into `out` — exactly what `format!` would
+/// produce, without the per-range allocation — and NUL-terminate it.
+/// Returns the name length without the terminator.
+fn write_map_files_name(start: u64, end: u64, out: &mut [u8; MAP_FILES_NAME_LEN]) -> usize {
+    fn write_hex(value: u64, out: &mut [u8], mut index: usize) -> usize {
+        let digits = if value == 0 {
+            1
+        } else {
+            u32::div_ceil(u64::BITS - value.leading_zeros(), 4) as usize
+        };
+        for shift in (0..digits).rev() {
+            let digit = ((value >> (4 * shift)) & 0xf) as u8;
+            out[index] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
+            };
+            index += 1;
+        }
+        index
+    }
+
+    let mut len = write_hex(start, out, 0);
+    out[len] = b'-';
+    len = write_hex(end, out, len + 1);
+    out[len] = 0;
+    len
 }
 
 fn map_files_entry_identity(entry: &str) -> std::io::Result<FileIdentity> {
@@ -4992,6 +5034,142 @@ mod tests {
                 _ => panic!("the two reads disagree: {by_path:?} vs {by_dir:?}"),
             }
         }
+    }
+
+    /// The stack-rendered `map_files` entry name is exactly what
+    /// `format!("{start:x}-{end:x}")` produces, NUL-terminated with no
+    /// interior NUL: every hex width, realistic mapping bounds, the `u64`
+    /// extremes, and a deterministic pseudo-random sweep.
+    #[test]
+    fn stack_map_files_names_match_format() {
+        fn check(start: u64, end: u64) {
+            let mut name = [0u8; MAP_FILES_NAME_LEN];
+            let len = write_map_files_name(start, end, &mut name);
+            let expected = format!("{start:x}-{end:x}");
+            assert_eq!(&name[..len], expected.as_bytes(), "{start:x}-{end:x}");
+            assert_eq!(name[len], 0, "missing NUL terminator");
+            assert!(
+                !name[..len].contains(&0),
+                "interior NUL in {start:x}-{end:x}"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_bytes_with_nul(&name[..len + 1])
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                expected
+            );
+        }
+
+        let mut edges = vec![
+            0,
+            1,
+            9,
+            10,
+            15,
+            16,
+            17,
+            255,
+            256,
+            4095,
+            4096,
+            0x400000,
+            0x7f0000000000,
+            0x7fffffffffff,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for width in 0..16u32 {
+            let bound = 1u64 << (4 * width);
+            edges.extend([bound.saturating_sub(1), bound]);
+            if width < 15 {
+                edges.push(bound + 1);
+            }
+        }
+        for &start in &edges {
+            for &end in &edges {
+                check(start, end);
+            }
+        }
+        let mut state = 0x1234_5678_9abc_def1u64;
+        for _ in 0..20_000 {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            check(next(), next());
+        }
+    }
+
+    /// Heap allocations per 1,000 `map_files` entry names, `format!` +
+    /// `CString` vs the stack writer (C7 A2 measurement; run
+    /// single-threaded:
+    /// `test -- --ignored map_files_name_allocation --test-threads=1 --nocapture`).
+    #[test]
+    #[ignore]
+    fn map_files_name_allocation_count_per_thousand() {
+        let (_, old_allocs, old_bytes) = crate::test_alloc::count_allocs_during(|| {
+            for i in 0..1000u64 {
+                let start = 0x7f00_0000_0000 + i * 0x1000;
+                let name = std::ffi::CString::new(format!("{start:x}-{:x}", start + 0x1000))
+                    .map_err(std::io::Error::other)
+                    .unwrap();
+                std::hint::black_box(name);
+            }
+        });
+        let (_, stack_allocs, stack_bytes) = crate::test_alloc::count_allocs_during(|| {
+            for i in 0..1000u64 {
+                let start = 0x7f00_0000_0000 + i * 0x1000;
+                let mut name = [0u8; MAP_FILES_NAME_LEN];
+                let len = write_map_files_name(start, start + 0x1000, &mut name);
+                std::hint::black_box((name, len));
+            }
+        });
+        println!("format per 1000 names: {old_allocs} allocs, {old_bytes} bytes");
+        println!("stack per 1000 names: {stack_allocs} allocs, {stack_bytes} bytes");
+        assert!(
+            stack_allocs * 100 < old_allocs.max(1),
+            "the stack writer should not allocate: format {old_allocs}, stack {stack_allocs}"
+        );
+    }
+
+    /// Indicative wall time per `map_files` entry name, `format!` +
+    /// `CString` vs the stack writer (a criterion-free loop, not a
+    /// benchmark; run single-threaded:
+    /// `test -- --ignored map_files_name_timing --test-threads=1 --nocapture`).
+    #[test]
+    #[ignore]
+    fn map_files_name_timing_per_thousand() {
+        use std::time::Instant;
+
+        const ROUNDS: u64 = 100_000;
+        let start = Instant::now();
+        for i in 0..ROUNDS {
+            let bound = 0x7f00_0000_0000 + i * 0x1000;
+            let name = std::ffi::CString::new(format!("{bound:x}-{:x}", bound + 0x1000))
+                .map_err(std::io::Error::other)
+                .unwrap();
+            std::hint::black_box(name);
+        }
+        let old = start.elapsed();
+        let start = Instant::now();
+        for i in 0..ROUNDS {
+            let bound = 0x7f00_0000_0000 + i * 0x1000;
+            let mut name = [0u8; MAP_FILES_NAME_LEN];
+            let len = write_map_files_name(bound, bound + 0x1000, &mut name);
+            std::hint::black_box((name, len));
+        }
+        let stack = start.elapsed();
+        println!(
+            "format per 1000 names: {:.1} ns/name",
+            old.as_nanos() as f64 / ROUNDS as f64
+        );
+        println!(
+            "stack per 1000 names: {:.1} ns/name",
+            stack.as_nanos() as f64 / ROUNDS as f64
+        );
     }
 
     #[test]

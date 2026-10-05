@@ -629,7 +629,11 @@ class LifecycleBase(unittest.TestCase):
     def argv_for(self, mode, duration):
         def build(campaign, participants, capture):
             hinted = not E16.CAMPAIGNS[campaign]["foreign"]
-            spec = [{"name": p.name, "expect": p.spec["expect"], "pid": p.process.pid,
+            # The fake mirrors the product: unhinted --system never scans an
+            # object without a registry factory export, so gap cells get no row.
+            campaign_mode = E16.CAMPAIGNS[campaign]["mode"]
+            spec = [{"name": p.name, "expect": E16.expectation(p.name, campaign_mode),
+                     "pid": p.process.pid,
                      "endpoint": p.ready["endpoint"], "calls": p.ready["calls"],
                      "hint": str(self.build / p.spec["hint"]), "hinted": hinted}
                     for p in participants]
@@ -799,6 +803,14 @@ class SystemMixedCampaign(LifecycleBase):
                          cells["foreign-traffic"]["owned_identity"]["sha256"])
         self.assertNotEqual(cells["control"]["owned_identity"]["ino"],
                             cells["foreign-traffic"]["owned_identity"]["ino"])
+        for name in E16.UNHINTED_GAPS:
+            self.assertEqual(cells[name]["expect"], "unhinted-gap")
+            self.assertEqual(cells[name]["observation"]["owned_rows"], 0)
+
+    def test_an_unhinted_gap_cell_that_gains_owned_rows_is_unknown(self):
+        reasons = judge(capture([row(OWNED, OFFSET, 3)]), expect="unhinted-gap", name="static",
+                        mode="system-unhinted")
+        self.assertTrue(any("owned report rows" in reason for reason in reasons), reasons)
 
     def test_foreign_calls_credited_to_the_owned_row_are_refused(self):
         _, record, files = self.campaign("system-mixed", mode="swap-foreign")
@@ -829,6 +841,13 @@ class RunnerSurface(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("run needs root", result.stderr)
         self.assertFalse(Path("/nonexistent/e16").exists())
+
+    def test_expectations_are_fixed_per_mode(self):
+        self.assertEqual([expect for _, expect, _ in E16.required_cells("hinted")],
+                         ["supported"] * 4 + ["explicit-unsupported", "bounded-unsupported"])
+        self.assertEqual([expect for _, expect, _ in E16.required_cells("system-mixed")],
+                         ["supported", "supported", "unhinted-gap", "unhinted-gap",
+                          "unhinted-gap", "bounded-unsupported"])
 
     def test_campaign_tables_are_exact(self):
         self.assertEqual([name for name, _, _ in E16.required_cells("hinted")],

@@ -147,10 +147,27 @@ FOREIGN = {"expect": "foreign", "hint": "foreign.so", "label": "table[0]", "ordi
            "endpoint": "file",
            "argv": ("driver", "table", "@foreign.so", "C_GetFunctionList", "0", "@foreign_calls")}
 CELL_ORDER = ("control", "proxy", "static", "vendor", "direct-no-table", "anonymous-jit")
+# Unhinted --system scans an object's memory only when its .dynsym defines a
+# registry factory (C_GetFunctionList, C_GetInterfaceList, C_GetInterface,
+# NSC_/FC_GetFunctionList; scan.rs exports filter). Static, vendor-only and
+# direct-export objects are therefore skipped there without any record: an
+# `unhinted-gap` cell passes only when that silence also attributes nothing
+# and the capture does not claim COMPLETE. It is a measured coverage gap,
+# never evidence that the shape is supported or explicitly refused.
+UNHINTED_GAPS = ("static", "vendor", "direct-no-table")
 CAMPAIGNS = {
     "hinted": {"mode": "pid-hinted", "foreign": False},
     "system-mixed": {"mode": "system-unhinted", "foreign": True},
 }
+
+
+def expectation(name, mode):
+    """The fixed outcome a cell is judged against; never read from a record."""
+    if name == "foreign-traffic":
+        return FOREIGN["expect"]
+    if mode == "system-unhinted" and name in UNHINTED_GAPS:
+        return "unhinted-gap"
+    return SURFACES[name]["expect"]
 
 
 class Unknown(ValueError):
@@ -1150,8 +1167,9 @@ def reduce_run(helper, campaign, run, files, calls, foreign_calls):
     for participant in run["participants"]:
         name = participant["name"]
         spec = FOREIGN if name == "foreign-traffic" else SURFACES[name]
+        expect = expectation(name, mode)
         wanted = foreign_calls if name == "foreign-traffic" else calls
-        result = {"name": name, "expect": spec["expect"], "mode": mode, "run": run["id"]}
+        result = {"name": name, "expect": expect, "mode": mode, "run": run["id"]}
         reasons = []
         try:
             ledger = parse_ledger(files.get(f"{run['id']}/{name}/driver.stderr", b""),
@@ -1187,7 +1205,7 @@ def reduce_run(helper, campaign, run, files, calls, foreign_calls):
                             "receipt names another process birth")
             if document is not None:
                 observation = observe(document, owned, offset)
-                if spec["expect"] == "explicit-unsupported":
+                if expect == "explicit-unsupported":
                     subjects = no_table_diagnostic_subjects(stderr_text)
                     # Bound: the only no-table diagnostic names the owned
                     # object's label, unaggregated; the label names the pinned
@@ -1198,7 +1216,7 @@ def reduce_run(helper, campaign, run, files, calls, foreign_calls):
                                "bound": len(subjects) == 1
                                and subjects[0]["subject"] == participant["hint"]
                                and not subjects[0]["aggregated"]}
-                elif spec["expect"] == "bounded-unsupported":
+                elif expect == "bounded-unsupported":
                     subjects = no_table_diagnostic_subjects(stderr_text)
                     refusal = {"boundary": JIT_BOUNDARY,
                                "image_no_table_record": any(
@@ -1207,7 +1225,7 @@ def reduce_run(helper, campaign, run, files, calls, foreign_calls):
             reasons.append(str(error))
         if capture_error is not None:
             reasons.append(f"capture: {capture_error}")
-        reasons += judge_cell(name, spec["expect"], mode, ledger=ledger,
+        reasons += judge_cell(name, expect, mode, ledger=ledger,
                               observation=observation, document=document,
                               refusal=refusal, calls=wanted)
         result.update(owned_identity=owned, endpoint_file_offset=offset,
@@ -1244,7 +1262,8 @@ TIMELINE = ("drivers_ready", "receipts_pinned", "observer_spawned", "observer_re
 
 
 def required_cells(campaign):
-    return [(name, SURFACES[name]["expect"], CAMPAIGNS[campaign]["mode"]) for name in CELL_ORDER]
+    mode = CAMPAIGNS[campaign]["mode"]
+    return [(name, expectation(name, mode), mode) for name in CELL_ORDER]
 
 
 def required_runs(campaign):

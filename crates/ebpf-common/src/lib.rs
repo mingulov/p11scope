@@ -509,6 +509,15 @@ const _: () = assert!(
 pub const DISCOVERY_BYTES: u32 = 65_536;
 #[cfg(feature = "small-discovery-ring")]
 pub const DISCOVERY_BYTES: u32 = 4_096;
+/// The Inventory flavors' lifecycle (DISCOVERY) ring: 2 MiB holds 2,259
+/// records of 920 B plus an 8 B header, about 1.1 s of headroom at
+/// 1,000 execs/s against the ≤ 350 ms non-draining spans. The Detailed
+/// path keeps [`DISCOVERY_BYTES`]; the `small-discovery-ring` feature
+/// shrinks this constant to 4 KiB, as before, for the induced-loss leg.
+#[cfg(not(feature = "small-discovery-ring"))]
+pub const INVENTORY_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
+#[cfg(feature = "small-discovery-ring")]
+pub const INVENTORY_DISCOVERY_BYTES: u32 = 4_096;
 
 pub const LOADER_CONTEXT_ID_MASK: u64 = 0xff;
 pub const LOADER_STATE_PRESENT: u64 = 1 << 8;
@@ -2531,6 +2540,16 @@ mod tests {
             assert_eq!(DISCOVERY_BYTES, 4_096);
             assert_eq!(RING_BYTES, 4 * 1024 * 1024);
         }
+    }
+
+    /// The Inventory flavors compile a 2 MiB lifecycle ring (4 KiB under
+    /// the small-ring feature); Detailed keeps its 64 KiB constant above.
+    #[test]
+    fn inventory_lifecycle_ring_is_two_mebibytes() {
+        #[cfg(not(feature = "small-discovery-ring"))]
+        assert_eq!(INVENTORY_DISCOVERY_BYTES, 2 * 1024 * 1024);
+        #[cfg(feature = "small-discovery-ring")]
+        assert_eq!(INVENTORY_DISCOVERY_BYTES, 4_096);
     }
 }
 

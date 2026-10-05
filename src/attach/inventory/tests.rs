@@ -45,7 +45,15 @@ fn map_fixture(n: u32) -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)>
         ),
         ("EVIDENCE", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 9, 0),
         ("COUNTERS", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 5, 0),
-        ("DISCOVERY", K::RingBuf, MapType::RingBuf, 0, 0, 65536, 0),
+        (
+            "DISCOVERY",
+            K::RingBuf,
+            MapType::RingBuf,
+            0,
+            0,
+            EXPECTED_INVENTORY_DISCOVERY_BYTES,
+            0,
+        ),
         ("DISCOVERY_STATE", K::Hash, MapType::Hash, 24, 24, 64, 0),
         (
             "THREAD_OWNER",
@@ -162,7 +170,14 @@ fn inventory_map_contract_refuses_missing_extra_unresized_and_opportunistic_smal
         assert!(validate_inventory_maps(&map_fixture(wrong_capacity), capacity(576)).is_err());
     }
     let mut changed = original;
-    changed.get_mut("DISCOVERY").unwrap().1.max_entries = 4096;
+    // A DISCOVERY size from another flavor never loads here: the small
+    // ring in a stock build, the stock ring in a small build.
+    let other_flavor = if EXPECTED_INVENTORY_DISCOVERY_BYTES == 4_096 {
+        65_536
+    } else {
+        4_096
+    };
+    changed.get_mut("DISCOVERY").unwrap().1.max_entries = other_flavor;
     assert!(validate_inventory_maps(&changed, capacity(576)).is_err());
 }
 
@@ -214,6 +229,47 @@ fn inventory_program_contract_rejects_missing_extra_and_every_kind_change() {
         let mut changed = original.clone();
         changed.insert(extra.into(), InventoryProgramKind::Entry);
         assert!(validate_inventory_programs(&changed).is_err(), "{extra}");
+    }
+}
+
+/// The validator's expectation is the shared BPF constant in a stock
+/// build (the small-ring mirror is pinned by the embedded sizes below).
+#[cfg(not(p11scope_small_discovery_ring))]
+#[test]
+fn expected_inventory_discovery_is_the_shared_constant() {
+    assert_eq!(
+        EXPECTED_INVENTORY_DISCOVERY_BYTES,
+        p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES
+    );
+    assert_eq!(EXPECTED_INVENTORY_DISCOVERY_BYTES, 2 * 1024 * 1024);
+}
+
+/// A size pin per flavor over the embedded objects: both Inventory
+/// flavors compile this build's ring (2 MiB stock, 4 KiB small), while
+/// Detailed keeps 64 KiB (4 KiB when the small-ring feature shrank every
+/// flavor's compiled ring, as today).
+#[test]
+fn embedded_discovery_sizes_pin_each_flavor() {
+    #[cfg(p11scope_small_discovery_ring)]
+    let detailed = 4_096;
+    #[cfg(not(p11scope_small_discovery_ring))]
+    let detailed = 65_536;
+    for (flavor, bytes, expected) in [
+        ("detailed", crate::EBPF_OBJECT, detailed),
+        (
+            "inventory",
+            crate::EBPF_INVENTORY_OBJECT,
+            EXPECTED_INVENTORY_DISCOVERY_BYTES,
+        ),
+        (
+            "inventory-callers",
+            crate::EBPF_INVENTORY_CALLERS_OBJECT,
+            EXPECTED_INVENTORY_DISCOVERY_BYTES,
+        ),
+    ] {
+        let object = aya_obj::Object::parse(bytes).unwrap();
+        let discovery = object.maps.get("DISCOVERY").unwrap();
+        assert_eq!(discovery.max_entries(), expected, "{flavor}");
     }
 }
 

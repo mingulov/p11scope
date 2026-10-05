@@ -1560,8 +1560,11 @@ UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
 
 INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "CONFIG", "PID_FILTER", "CGROUP_FILTER", "TAIL_CALLS", "STACK_GUARD", "EVIDENCE",
-    "COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
+    "COUNTERS", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
 )} | {
+    # The Inventory lifecycle ring is 2 MiB (Detailed keeps 64 KiB in
+    # SAFE_MAPS); tracks ebpf-common INVENTORY_DISCOVERY_BYTES.
+    "DISCOVERY": map_def(27, 0, 0, 2 * 1024 * 1024),
     "USAGE": map_def(2, 4, 8, 1),
     "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": map_def(6, 4, 8, 3),

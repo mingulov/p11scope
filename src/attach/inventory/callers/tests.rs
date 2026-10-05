@@ -91,7 +91,15 @@ fn map_fixture() -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
         ),
         ("EVIDENCE", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 9, 0),
         ("COUNTERS", K::PerCpuArray, MapType::PerCpuArray, 4, 8, 5, 0),
-        ("DISCOVERY", K::RingBuf, MapType::RingBuf, 0, 0, 65_536, 0),
+        (
+            "DISCOVERY",
+            K::RingBuf,
+            MapType::RingBuf,
+            0,
+            0,
+            super::super::EXPECTED_INVENTORY_DISCOVERY_BYTES,
+            0,
+        ),
         ("DISCOVERY_STATE", K::Hash, MapType::Hash, 24, 24, 64, 0),
         (
             "THREAD_OWNER",

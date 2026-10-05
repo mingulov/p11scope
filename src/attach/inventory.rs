@@ -11,6 +11,8 @@ use anyhow::{Context as _, Result, bail, ensure};
 use aya::maps::{Array, Map, MapData, MapType};
 use aya::programs::{ProbeKind, Program, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
+#[cfg(not(p11scope_small_discovery_ring))]
+use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::{
     IMAGE_IDENTITY_TICKET_LIMIT, INVENTORY_OWNER_LIMIT, INVENTORY_USAGE_VERSION,
     ImageIdentityControl, InventoryUsageConfig, ThreadOwnerControl,
@@ -406,6 +408,16 @@ enum InventoryPreparation {
     RecheckCustody,
 }
 
+/// The DISCOVERY size this build's Inventory objects compiled with: the
+/// shared 2 MiB constant, or 4 KiB when `P11SCOPE_SMALL_DISCOVERY_RING=1`
+/// built them (the host dependency never carries that feature, so the
+/// small size is mirrored here from the build script's cfg). Both the
+/// exact-map validator and the lifecycle high-water share pin it.
+#[cfg(not(p11scope_small_discovery_ring))]
+pub(crate) const EXPECTED_INVENTORY_DISCOVERY_BYTES: u32 = INVENTORY_DISCOVERY_BYTES;
+#[cfg(p11scope_small_discovery_ring)]
+pub(crate) const EXPECTED_INVENTORY_DISCOVERY_BYTES: u32 = 4_096;
+
 fn inventory_capacity(budget: InventoryBudget) -> Result<NonZeroU32> {
     let n =
         u32::try_from(budget.endpoint_limit()).context("Inventory budget exceeds u32 capacity")?;
@@ -461,7 +473,13 @@ fn inventory_maps(
         (
             "DISCOVERY",
             K::RingBuf,
-            map_metadata(MapType::RingBuf, 0, 0, 65_536, 0),
+            map_metadata(
+                MapType::RingBuf,
+                0,
+                0,
+                EXPECTED_INVENTORY_DISCOVERY_BYTES,
+                0,
+            ),
         ),
         (
             "DISCOVERY_STATE",

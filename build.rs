@@ -102,6 +102,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO");
     println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC");
     println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
+    println!("cargo:rustc-check-cfg=cfg(p11scope_small_discovery_ring)");
     let small_ring = matches!(
         env::var("P11SCOPE_SMALL_RING").as_deref(),
         Ok("1") | Ok("true")
@@ -114,6 +115,11 @@ fn main() {
         env::var("P11SCOPE_SMALL_DISCOVERY_RING").as_deref(),
         Ok("1") | Ok("true")
     );
+    // The Inventory validator pins the DISCOVERY size this build compiled
+    // (2 MiB, or 4 KiB here), so the small-ring build loads again.
+    if small_discovery_ring {
+        println!("cargo:rustc-cfg=p11scope_small_discovery_ring");
+    }
     let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
 
     for flavor in [

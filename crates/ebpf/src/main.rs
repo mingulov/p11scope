@@ -60,6 +60,8 @@ use p11scope_ebpf_common::{
     TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE,
     interface_flags_class,
 };
+#[cfg(feature = "inventory-only")]
+use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
     EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_ATTRS,
@@ -185,6 +187,11 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);
 #[map]
 static EVIDENCE: PerCpuArray<u64> = PerCpuArray::with_max_entries(EVIDENCE_CELLS, 0);
 
+#[cfg(feature = "inventory-only")]
+#[map]
+static DISCOVERY: RingBuf = RingBuf::with_byte_size(INVENTORY_DISCOVERY_BYTES, 0);
+
+#[cfg(not(feature = "inventory-only"))]
 #[map]
 static DISCOVERY: RingBuf = RingBuf::with_byte_size(DISCOVERY_BYTES, 0);
 

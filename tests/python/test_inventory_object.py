@@ -22,7 +22,7 @@ MAPS = {name: checker.map_def(*shape) for name, shape in {
     "CGROUP_FILTER": (8, 4, 4, 1), "TAIL_CALLS": (3, 4, 4, 2),
     "STACK_GUARD": (3, 4, 4, 1),
     "EVIDENCE": (6, 4, 8, 9), "COUNTERS": (6, 4, 8, 5),
-    "DISCOVERY": (27, 0, 0, 65536), "DISCOVERY_STATE": (1, 24, 24, 64),
+    "DISCOVERY": (27, 0, 0, 2097152), "DISCOVERY_STATE": (1, 24, 24, 64),
     "THREAD_OWNER": (29, 4, 544, 0, 1), "OWNER_CTL": (2, 4, 56, 1),
     "USAGE": (2, 4, 8, 1), "USAGE_CONFIG": (2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": (6, 4, 8, 3),

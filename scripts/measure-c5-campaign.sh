@@ -19,9 +19,11 @@
 #   --r4-base         a release build of 570eb7d (R4; the C5.6 base before the pool)
 #   --loss-candidate  optional: the candidate built with P11SCOPE_SMALL_DISCOVERY_RING=1
 #                     (a 4 KiB DISCOVERY ring) for M0's induced loss. In v0.2.0 the
-#                     native Inventory loader refuses that build (its exact-map
-#                     validator pins DISCOVERY at 65,536 bytes, src/attach/inventory.rs),
-#                     so by default M0 induces the loss on the stock candidate with
+#                     native Inventory loader refused that build (its exact-map
+#                     validator pinned DISCOVERY at 65,536 bytes); since the 2 MiB
+#                     lifecycle ring the validator expects each build's own size,
+#                     so the small-ring build loads and M0 uses it when given.
+#                     Without it, M0 induces the loss on the stock candidate with
 #                     exec churn instead (--loss-churn, default 3000 execs/s).
 #
 # Order. M0 (harness validity) runs first and the campaign stops unless every

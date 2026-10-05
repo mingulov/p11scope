@@ -134,7 +134,10 @@ impl LaneWindows {
         retirement_cap: PRE_OUTPUT_RETIREMENT_WAIT,
         // 8,192 records of 920 B: at most about 7.2 MiB of user memory
         // (strict), over 4 s of a 1,000 execs/s host (two records per
-        // short-lived exec) behind one collection.
+        // short-lived exec) behind one collection. This userspace bound
+        // is separate from the 2 MiB kernel lifecycle ring (~2,259
+        // records): the ring keeps what this bound cannot hold, and what
+        // it cannot hold is counted lost by the kernel.
         held_records: 8192,
     };
 

@@ -1377,7 +1377,10 @@ fn privileged_instance_nonleader_exec_detaches_without_misrouting() -> Result<()
     // so the scan protocol refuses (rather than scanning an unidentified
     // process).
     let outcome = harness.scan(&target, false)?;
-    ensure!(outcome.is_none(), "post-exec scan unexpectedly worked: {outcome:?}");
+    ensure!(
+        outcome.is_none(),
+        "post-exec scan unexpectedly worked: {outcome:?}"
+    );
     ensure!(
         harness.scan.outcomes.contains_key("NoCookie"),
         "post-exec scan must refuse on the missing cookie: {:?}",

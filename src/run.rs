@@ -999,6 +999,64 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Test builds only: tie an owned fork child's life to the test thread that
+/// forked it. A test binary killed without unwinding (a harness `timeout`,
+/// SIGINT, SIGKILL, an abort) runs no `Drop`, and an owned child leads its
+/// own session, so nothing else ends it: a running pre-exec child still
+/// exits on release-pipe EOF, but one a test left stopped (SIGSTOP) or a
+/// released command lives on, adopted by init (DR-LEAKED-STOPPED-HOLD).
+/// SIGKILL is the parent-death signal because it also ends a stopped child.
+/// Applied first thing in the fork child and again after the identity
+/// change, which may clear it. A parent that
+/// already died before the prctl is caught by the parent-pid check. The
+/// observer hands a live command back on purpose, so release builds never
+/// set this, and a probe that observes production parent-death behaviour
+/// opts out with [`spawn_with_production_parent_death`].
+#[cfg(test)]
+unsafe fn die_with_test_parent(parent: libc::pid_t) -> std::result::Result<(), i32> {
+    // SAFETY: raw prctl/getppid syscalls only; async-signal-safe after fork.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(unsafe { last_errno() });
+    }
+    if unsafe { libc::getppid() } != parent {
+        unsafe { libc::_exit(127) };
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether the next `OwnedChild::spawn` on this thread ties the child
+    /// to this thread's life ([`die_with_test_parent`]). On by default in
+    /// test builds.
+    static TEST_PARENT_DEATH_SIGNAL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
+}
+
+/// Spawns as a release build does, without the test-only parent-death
+/// signal: for probes that observe what happens to an owned child when the
+/// observer itself dies.
+#[cfg(test)]
+pub(crate) fn spawn_with_production_parent_death(
+    program: OsString,
+    args: Vec<OsString>,
+) -> io::Result<OwnedChild> {
+    TEST_PARENT_DEATH_SIGNAL.with(|on| on.set(false));
+    let spawned = OwnedChild::spawn(program, args);
+    TEST_PARENT_DEATH_SIGNAL.with(|on| on.set(true));
+    spawned
+}
+
 #[cfg(test)]
 fn run_after_fork_hook() {
     if let Some(hook) = AFTER_FORK_HOOK.with(|hook| hook.borrow_mut().take()) {
@@ -1079,6 +1137,11 @@ impl OwnedChild {
         ignore_action.sa_sigaction = libc::SIG_IGN;
         // Read before the fork: the child takes no locks.
         let startup = startup_dispositions_for_child();
+        #[cfg(test)]
+        // SAFETY: getpid has no preconditions.
+        let test_parent = unsafe { libc::getpid() };
+        #[cfg(test)]
+        let test_parent_death = TEST_PARENT_DEATH_SIGNAL.with(std::cell::Cell::get);
 
         // SAFETY: all allocations and C strings were prepared above. The child
         // executes only async-signal-safe syscalls before exec/_exit.
@@ -1088,6 +1151,13 @@ impl OwnedChild {
         }
         if pid == 0 {
             unsafe {
+                // Test builds: before anything a test can observe (setsid
+                // marks the child as ready to stop), so a child stopped at
+                // any point already dies with its test thread.
+                #[cfg(test)]
+                if test_parent_death && let Err(errno) = die_with_test_parent(test_parent) {
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
+                }
                 // The observer's stop handlers belong to the observer, and the
                 // command inherits exactly what the observer inherited:
                 // restore the startup dispositions captured in `main`, so
@@ -1131,6 +1201,12 @@ impl OwnedChild {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
                 }
                 if let Err(errno) = harden_owned_child(identity) {
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
+                }
+                // Again after the identity change, which clears it when the
+                // credentials change.
+                #[cfg(test)]
+                if test_parent_death && let Err(errno) = die_with_test_parent(test_parent) {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                 }
                 let mut byte = 0u8;
@@ -9796,6 +9872,65 @@ mod tests {
         assert_eq!(child.terminate_and_reap().unwrap(), 128 + libc::SIGTERM);
     }
 
+    /// DR-LEAKED-STOPPED-HOLD regression: a test binary that dies without
+    /// unwinding runs no `Drop`. Model that by forgetting the owned children
+    /// of a test thread that then ends: both a stopped released command and
+    /// a stopped pre-exec child (whose release pipe stays open, so EOF cannot
+    /// end it) must still die by the test-only parent-death SIGKILL.
+    #[test]
+    fn stopped_children_die_with_the_test_thread_that_forked_them() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let sleeper = sleeper.to_str().unwrap().to_owned();
+        let pids = std::thread::spawn(move || {
+            let mut released = spawn(&sleeper, &[]);
+            released.release().unwrap();
+            let unreleased = spawn("/bin/sh", &["-c", "exit 0"]);
+            wait_for_session_leader(&unreleased);
+            for child in [&released, &unreleased] {
+                child.pin().send_signal(libc::SIGSTOP).unwrap();
+                wait_until(
+                    || child_is_stopped(child.pid()),
+                    "the owned child never entered the stopped state",
+                );
+            }
+            let pids = [released.pid(), unreleased.pid()];
+            // As if the test binary were killed here: no Drop, no reap, and
+            // the pre-exec child's release pipe stays open.
+            std::mem::forget(released);
+            std::mem::forget(unreleased);
+            pids
+        })
+        .join()
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut outcomes = Vec::new();
+        for pid in pids {
+            let mut status = 0;
+            loop {
+                // SAFETY: the pid is this process's own unreaped child.
+                let waited =
+                    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                if waited == pid as libc::pid_t {
+                    outcomes
+                        .push(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    for pid in pids {
+                        // SAFETY: SIGKILL to this process's own unreaped child.
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                        // SAFETY: as above; reaps the child just killed.
+                        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+                    }
+                    panic!("a stopped child outlived the test thread that forked it: {pids:?}");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(outcomes, [true, true], "both children must die by SIGKILL");
+    }
+
     fn child_is_stopped(pid: u32) -> bool {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
         stat.split(' ').nth(2).is_some_and(|state| state == "T")
@@ -14852,7 +14987,12 @@ mod tests {
             // SAFETY: _exit runs no destructors and flushes nothing.
             unsafe { libc::_exit(code) };
         };
-        let mut child = match OwnedChild::spawn(OsString::from(sleeper.as_os_str()), Vec::new()) {
+        // As a release build spawns: this probe observes production
+        // parent-death behaviour, which the test-only signal would change.
+        let mut child = match super::spawn_with_production_parent_death(
+            OsString::from(sleeper.as_os_str()),
+            Vec::new(),
+        ) {
             Ok(child) => child,
             Err(_) => exit(11),
         };

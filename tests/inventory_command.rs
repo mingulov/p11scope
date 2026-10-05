@@ -1368,7 +1368,10 @@ fn the_proof_stat_thread_note_prints_once_per_multi_pass_run() {
     assert!(output.status.success(), "{stderr}");
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
     let passes = doc["observation"]["passes"].as_u64().unwrap();
-    assert!(passes >= 2, "needs a multi-pass run, got {passes}: {stderr}");
+    assert!(
+        passes >= 2,
+        "needs a multi-pass run, got {passes}: {stderr}"
+    );
     let notes: Vec<&str> = stderr
         .lines()
         .filter(|line| line.contains("P11SCOPE_PROOF_STAT_THREADS"))

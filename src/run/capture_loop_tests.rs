@@ -1909,6 +1909,7 @@ fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
             tracer: Some(&mut tracer),
             malformed_records: &mut malformed_records,
             scheduling: &mut scheduling,
+            stop_quiescence: Default::default(),
         };
         capture_tick_with(
             &mut context,
@@ -1948,4 +1949,3 @@ fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
         }
     }
 }
-

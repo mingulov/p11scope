@@ -161,6 +161,7 @@ fn pin_and_plan(
         inode: mapping.inode,
     };
     let module = ScannedModule {
+        mapped_identity: None,
         double_loaded: false,
         view: view.id(),
         mount_namespace: view.mount_namespace(),

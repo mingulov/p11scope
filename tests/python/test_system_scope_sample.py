@@ -21,6 +21,11 @@ def process_starttime(pid):
     return int(fields[19])
 
 
+def process_state(pid):
+    raw = Path(f"/proc/{pid}/stat").read_bytes()
+    return raw.rsplit(b") ", 1)[1].split()[0].decode()
+
+
 def load_sampler():
     spec = importlib.util.spec_from_file_location("system_scope_sample", SAMPLE)
     module = importlib.util.module_from_spec(spec)
@@ -28,11 +33,13 @@ def load_sampler():
     return module
 
 
-def stat_with(stat, *, state=None, starttime=None):
+def stat_with(stat, *, state=None, starttime=None, flags=None):
     head, raw_tail = stat.rsplit(")", 1)
     tail = raw_tail.split()
     if state is not None:
         tail[0] = state
+    if flags is not None:
+        tail[6] = str(flags)
     if starttime is not None:
         tail[19] = str(starttime)
     return f"{head}) {' '.join(tail)}"
@@ -237,6 +244,101 @@ class SystemScopeSampleTests(unittest.TestCase):
                 sampler, "read_text", return_value=stat_with(stat, state=state)
             ):
                 self.assertIsNone(sampler.sample_exact(pid, birth))
+
+    def test_metrics_refused_by_a_target_that_became_a_zombie_is_exit(self):
+        # Force the DR-SCOPE-SAMPLE-EXIT-PERMISSION race on the real kernel:
+        # the first stat read sees the target live, then the target exits
+        # before the metrics reads. A real zombie's /proc/PID/fd refuses its
+        # owner with EACCES; that is the exit boundary, not a refusal.
+        sampler = load_sampler()
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            birth = process_starttime(child.pid)
+            live = Path(f"/proc/{child.pid}/stat").read_text(encoding="utf-8")
+            self.assertNotIn(live.rsplit(")", 1)[1].split()[0], ("Z", "X", "x"))
+            child.kill()
+            # Wait for the zombie without reaping it, so its PID and /proc
+            # entry stay pinned for the real reads below.
+            deadline = time.monotonic() + 10
+            while process_state(child.pid) != "Z":
+                self.assertLess(time.monotonic(), deadline, "no zombie")
+                time.sleep(0.01)
+            with self.assertRaises(PermissionError):
+                os.listdir(f"/proc/{child.pid}/fd")
+            real_read = sampler.read_text
+            reads = []
+
+            def first_stat_was_live(path):
+                reads.append(path)
+                if len(reads) == 1:
+                    return live
+                return real_read(path)
+
+            with mock.patch.object(
+                sampler, "read_text", side_effect=first_stat_was_live
+            ):
+                self.assertIsNone(sampler.sample_exact(child.pid, birth))
+            self.assertEqual(reads[-1], f"/proc/{child.pid}/stat")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+    def test_metrics_refused_inside_do_exit_is_exit(self):
+        # PF_EXITING is set before exit_mm/exit_files, so a refusal raised by
+        # teardown is always followed by a stat read that shows it.
+        sampler = load_sampler()
+        pid = os.getpid()
+        birth = process_starttime(pid)
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        exiting = stat_with(stat, state="R", flags=0x00400004)
+        with mock.patch.object(
+            sampler, "read_text", side_effect=[stat, "1 1\n", exiting],
+        ), mock.patch.object(
+            sampler.os, "listdir", side_effect=PermissionError("denied")
+        ):
+            self.assertIsNone(sampler.sample_exact(pid, birth))
+
+    def test_metrics_refused_by_a_live_target_stays_fatal(self):
+        sampler = load_sampler()
+        pid = os.getpid()
+        birth = process_starttime(pid)
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        live = stat_with(stat, state="S", flags=0x00400000)
+        for failing in ("statm", "fd"):
+            with self.subTest(failing=failing):
+                reads = [live, PermissionError("denied"), live]
+                listdir = mock.DEFAULT
+                if failing == "fd":
+                    reads = [live, "1 1\n", live]
+                    listdir = PermissionError("denied")
+                with mock.patch.object(
+                    sampler, "read_text", side_effect=reads
+                ), mock.patch.object(
+                    sampler.os, "listdir", side_effect=listdir,
+                    return_value=[],
+                ):
+                    with self.assertRaisesRegex(
+                        sampler.TargetInspectionError,
+                        "cannot inspect exact target metrics: PermissionError",
+                    ):
+                        sampler.sample_exact(pid, birth)
+
+    def test_metrics_refusal_then_replaced_birth_is_refused(self):
+        sampler = load_sampler()
+        pid = os.getpid()
+        birth = process_starttime(pid)
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        with mock.patch.object(
+            sampler, "read_text",
+            side_effect=[stat, "1 1\n", stat_with(stat, starttime=birth + 1)],
+        ), mock.patch.object(
+            sampler.os, "listdir", side_effect=PermissionError("denied")
+        ):
+            with self.assertRaisesRegex(
+                sampler.TargetInspectionError, "birth identity changed"
+            ):
+                sampler.sample_exact(pid, birth)
 
 
 if __name__ == "__main__":

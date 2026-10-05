@@ -20,6 +20,9 @@ import time
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+# include/linux/sched.h: set by exit_signals() at the start of do_exit(),
+# before exit_mm()/exit_files() tear down what the metrics reads need.
+PF_EXITING = 0x00000004
 
 
 class TargetInspectionError(RuntimeError):
@@ -112,6 +115,29 @@ def read_exact_stat(pid):
     return tail, state, starttime
 
 
+def exact_target_exited(pid, expected_starttime):
+    """Re-read the identity after a failed metrics read.
+
+    True when the retained generation is gone, dead, a zombie, or has entered
+    do_exit (PF_EXITING in the stat flags field). False when it is still the
+    same live, non-exiting process. A changed birth identity or an unknown
+    stat read stays fatal through read_exact_stat / TargetInspectionError.
+    """
+    probe = read_exact_stat(pid)
+    if probe is None:
+        return True
+    tail, state, starttime = probe
+    if starttime != expected_starttime:
+        raise TargetInspectionError("exact target birth identity changed")
+    if state in ("X", "x", "Z"):
+        return True
+    try:
+        flags = int(tail[6])
+    except (IndexError, ValueError) as error:
+        raise TargetInspectionError("exact target stat is malformed") from error
+    return bool(flags & PF_EXITING)
+
+
 def sample_exact(pid, expected_starttime):
     """Sample only one retained process generation, bracketed by stat reads."""
     before = read_exact_stat(pid)
@@ -128,7 +154,18 @@ def sample_exact(pid, expected_starttime):
         rss_bytes = int(statm[1]) * PAGE_BYTES
     except (FileNotFoundError, ProcessLookupError):
         return None
-    except (OSError, IndexError, ValueError) as error:
+    except OSError as error:
+        # The target may have begun exiting after the first stat read: exit
+        # teardown releases mm and files, and a zombie's /proc/PID/fd refuses
+        # even its owner with EACCES. Re-read the identity and treat that
+        # refusal as the exit it is. A live, non-exiting target keeps the
+        # refusal fatal.
+        if exact_target_exited(pid, expected_starttime):
+            return None
+        raise TargetInspectionError(
+            f"cannot inspect exact target metrics: {type(error).__name__}"
+        ) from error
+    except (IndexError, ValueError) as error:
         raise TargetInspectionError(
             f"cannot inspect exact target metrics: {type(error).__name__}"
         ) from error

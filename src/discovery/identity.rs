@@ -5104,11 +5104,10 @@ mod tests {
     }
 
     /// Heap allocations per 1,000 `map_files` entry names, `format!` +
-    /// `CString` vs the stack writer (C7 A2 measurement; run
-    /// single-threaded:
-    /// `test -- --ignored map_files_name_allocation --test-threads=1 --nocapture`).
+    /// `CString` vs the stack writer (C7 A2 measurement; the counter is
+    /// per thread, so this runs in the default suite; `--nocapture`
+    /// prints the counts).
     #[test]
-    #[ignore]
     fn map_files_name_allocation_count_per_thousand() {
         let (_, old_allocs, old_bytes) = crate::test_alloc::count_allocs_during(|| {
             for i in 0..1000u64 {
@@ -5130,8 +5129,13 @@ mod tests {
         println!("format per 1000 names: {old_allocs} allocs, {old_bytes} bytes");
         println!("stack per 1000 names: {stack_allocs} allocs, {stack_bytes} bytes");
         assert!(
-            stack_allocs * 100 < old_allocs.max(1),
-            "the stack writer should not allocate: format {old_allocs}, stack {stack_allocs}"
+            old_allocs >= 1000,
+            "format! + CString allocates per name: {old_allocs}"
+        );
+        assert_eq!(
+            (stack_allocs, stack_bytes),
+            (0, 0),
+            "the stack writer must not allocate"
         );
     }
 

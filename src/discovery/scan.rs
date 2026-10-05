@@ -6304,12 +6304,12 @@ mod tests {
     }
 
     /// Heap allocations per 1,000 maps reads, fresh vs reused buffers (C7
-    /// A2 measurement; run single-threaded:
-    /// `test -- --ignored maps_reuse_allocation --test-threads=1 --nocapture`).
-    /// Counts the byte-read level only, so the delta is exactly the
-    /// scratch reuse; parsing allocates identically on identical bytes.
+    /// A2 measurement; the counter is per thread, so this runs in the
+    /// default suite; `--nocapture` prints the counts). Counts the
+    /// byte-read level only, so the delta is exactly the scratch reuse;
+    /// parsing allocates identically on identical bytes. The reused
+    /// buffers allocate once each, on the first read, and never again.
     #[test]
-    #[ignore]
     fn maps_reuse_allocation_count_per_thousand_reads() {
         use std::io::Cursor;
 
@@ -6357,8 +6357,12 @@ mod tests {
         println!("fresh per 1000 reads: {fresh_allocs} allocs, {fresh_bytes} bytes");
         println!("reused per 1000 reads: {reused_allocs} allocs, {reused_bytes} bytes");
         assert!(
-            reused_allocs * 100 < fresh_allocs,
-            "reuse should remove ~2 allocs per read: fresh {fresh_allocs}, reused {reused_allocs}"
+            fresh_allocs >= 2000,
+            "a fresh read allocates its bytes and its chunk: {fresh_allocs}"
+        );
+        assert!(
+            reused_allocs <= 2,
+            "reused buffers allocate only on the first read: {reused_allocs}"
         );
     }
 

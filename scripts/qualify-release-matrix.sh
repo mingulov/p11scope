@@ -5,7 +5,8 @@
 #   qualify-release-matrix.sh --rev REV [--kernels "K1 K2..."] [options]
 #   qualify-release-matrix.sh --bin-dir DIR --rev REV [--kernels ...]
 #   qualify-release-matrix.sh --dry-run [--rev REV] [--kernels ...]
-#   qualify-release-matrix.sh --self-test
+#   qualify-release-matrix.sh --self-test   (hermetic: no vng, kernels or privilege; runs in hosted CI)
+#   qualify-release-matrix.sh --preflight   (this host: vng, kernel caches, stage and lock dirs)
 #
 # Runs, per kernel, with release binaries (cargo build --release --locked, Rust 1.98.1):
 #   1. public CLI: qualify-public-cli.sh + qualify-inventory-native.sh (scan+native)
@@ -33,6 +34,7 @@ STAGE_BASE=/home/user/.cache/p11scope-vng/rc-qualify
 TIMEOUT=5400
 DRY_RUN=0
 SELF_TEST=0
+PREFLIGHT=0
 REV=""
 BIN_DIR=""
 KERNELS_ARG=""
@@ -80,6 +82,7 @@ while [ $# -gt 0 ]; do
     --stage-base) STAGE_BASE=$2; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
+    --preflight) PREFLIGHT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --*) echo "unknown option $1" >&2; usage; exit 2 ;;
     *) POS_KERNELS+=("$1"); shift ;;
@@ -95,7 +98,7 @@ fi
 if [ "${#POS_KERNELS[@]}" -gt 0 ]; then
   KERNELS+=("${POS_KERNELS[@]}")
 fi
-if [ "${#KERNELS[@]}" -eq 0 ] && [ "$SELF_TEST" -eq 0 ]; then
+if [ "${#KERNELS[@]}" -eq 0 ] && [ "$SELF_TEST" -eq 0 ] && [ "$PREFLIGHT" -eq 0 ]; then
   mapfile -t KERNELS < <(default_kernels)
 fi
 RESOLVED=()
@@ -108,7 +111,7 @@ if [ "${#RESOLVED[@]}" -gt 0 ]; then
   KERNELS=("${RESOLVED[@]}")
 fi
 
-if [ -z "$REV" ] && [ -z "$BIN_DIR" ] && [ "$DRY_RUN" -eq 0 ] && [ "$SELF_TEST" -eq 0 ]; then
+if [ -z "$REV" ] && [ -z "$BIN_DIR" ] && [ "$DRY_RUN" -eq 0 ] && [ "$SELF_TEST" -eq 0 ] && [ "$PREFLIGHT" -eq 0 ]; then
   echo "need --rev REV or --bin-dir DIR" >&2; usage; exit 2
 fi
 if [ -n "$BIN_DIR" ]; then
@@ -138,7 +141,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
-self_test() {
+# Host readiness for a real run: tools, kernel caches and writable dirs.
+preflight() {
   fail=0
   say() { echo "$1"; }
   check() { if eval "$2"; then say "OK $1"; else say "FAIL $1"; fail=1; fi; }
@@ -160,13 +164,49 @@ self_test() {
     esac
   done
   if [ -e "$QUIET" ]; then say "WARN quiet window present: $QUIET"; fi
-  if [ $fail -eq 0 ]; then say "self-test: OK"; else say "self-test: FAIL"; fi
+  if [ $fail -eq 0 ]; then say "preflight: OK"; else say "preflight: FAIL"; fi
+  return $fail
+}
+
+# Hermetic checks of this script's own logic: no vng, kernel cache, privilege
+# or host path is needed, so hosted CI runs it.
+self_test() {
+  fail=0
+  expect() { if [ "$2" = "$3" ]; then echo "OK $1"; else echo "FAIL $1: got '$2', want '$3'"; fail=1; fi; }
+  for s in qualify-public-cli.sh qualify-inventory-native.sh run-privileged-lib-tests.sh; do
+    expect "$s executable" "$([ -x "$REPO/scripts/$s" ] && echo yes)" yes
+  done
+  expect "default kernels" "$(default_kernels | wc -l | tr -d ' ')" 4
+  expect "resolve 5.15" "$(resolve_kernel 5.15)" v5.15.221
+  expect "resolve 6.8" "$(resolve_kernel 6.8)" "/home/user/.cache/virtme-ng/ubuntu-6.8.0-142/amd64/boot/vmlinuz-6.8.0-142-generic"
+  expect "resolve 6.12" "$(resolve_kernel 6.12)" v6.12.111
+  expect "resolve 7.2" "$(resolve_kernel v7.2.6)" v7.2.6
+  expect "resolve passthrough" "$(resolve_kernel v9.9.9)" v9.9.9
+  expect "tag 6.8" "$(tag_for_kernel "$(resolve_kernel 6.8)")" 6.8.0-142-generic
+  expect "backend 5.15" "$(expected_backend 5.15.221)" per-offset
+  for k in 6.8.0-142-generic v6.12.111 v7.2.6; do
+    expect "backend $k" "$(expected_backend "$k")" uprobe-multi
+  done
+  "$0" --no-such-option >/dev/null 2>&1; expect "unknown option refused" $? 2
+  "$0" --kernels 5.15 >/dev/null 2>&1; expect "missing --rev refused" $? 2
+  d=$(mktemp -d "${TMPDIR:-/tmp}/qrm-selftest-XXXXXX")
+  "$0" --bin-dir "$d" --rev x >/dev/null 2>&1; expect "bin-dir under a hidden tmp refused" $? 2
+  rmdir "$d"
+  plan=$("$0" --dry-run --rev abc --kernels 5.15,7.2 2>&1)
+  expect "dry-run kernels" "$(echo "$plan" | grep -c 'tag=')" 2
+  expect "dry-run 5.15 backend" "$(echo "$plan" | grep -c 'v5.15.221 tag=v5.15.221 expect=per-offset')" 1
+  expect "dry-run starts nothing" "$(echo "$plan" | tail -1)" "dry-run: no build, no guests started"
+  if [ $fail -eq 0 ]; then echo "self-test: OK"; else echo "self-test: FAIL"; fi
   return $fail
 }
 
 if [ "$SELF_TEST" -eq 1 ]; then
-  print_plan
   self_test
+  exit $?
+fi
+if [ "$PREFLIGHT" -eq 1 ]; then
+  print_plan
+  preflight
   exit $?
 fi
 

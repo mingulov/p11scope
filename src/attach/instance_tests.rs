@@ -400,7 +400,11 @@ impl Harness {
         }
         let maps = self.session.instance_maps();
         let (fault, sticky) = (maps.fault()?, maps.sticky()?);
-        for (token, route) in self.router.audit(fault, sticky) {
+        // Seam: the production capture loop (Stage 2+ activation) polls
+        // `instance_hook_stats()` and raises the fault exactly like this
+        // pump does; the router's miss latch then stays a backstop for a
+        // loop that passes misses without raising (DR-T3A-1).
+        for (token, route) in self.router.audit(fault, sticky, misses) {
             self.record(token, route);
         }
         let mut count = 0;

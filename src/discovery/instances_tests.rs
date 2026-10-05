@@ -71,6 +71,32 @@ fn router() -> InstanceRouter {
     InstanceRouter::new(RouterLimits::default())
 }
 
+fn observation_for(cookie: u64, local: u64, ranges: Vec<MapRange>) -> StableObservation {
+    StableObservation {
+        file_slot: FILE,
+        reading: EpochReading {
+            cookie,
+            local,
+            record_flags: 0,
+            global: 0,
+            fault: 0,
+            sticky: 0,
+        },
+        ranges,
+    }
+}
+
+fn call_for(token: u64, cookie: u64, stamp: InstanceStamp, ip: u64) -> CallFacts {
+    CallFacts {
+        token,
+        cookie,
+        entry: stamp,
+        ret: stamp,
+        ip: EntryIp::new(ip),
+        attached_offset: Some(ip & 0xfff | TEXT),
+    }
+}
+
 fn joined(route: Route) -> InstanceId {
     match route {
         Route::Joined(id) => id,
@@ -173,6 +199,130 @@ fn every_refusal_flag_and_straddle_is_unknown() {
     let mut straddle = call(3, stamp(2, 0, 0), ip_in(BASE_A));
     straddle.ret = stamp(3, 0, 0);
     assert_eq!(r.route(straddle), Route::Unknown(UnknownReason::Straddle));
+}
+
+#[test]
+fn unknown_reasons_follow_documented_precedence() {
+    let mut r = router();
+    r.observe(observation(2, 0, 0, load(BASE_A)));
+    // A refusal flag on the return stamp only surfaces as Straddle: entry
+    // flags gate the flag reasons, and the halves differ.
+    let mut ret_only = call(1, stamp(2, 0, 0), ip_in(BASE_A));
+    ret_only.ret.flags |= STAMP_SHARED_MM;
+    assert_eq!(r.route(ret_only), Route::Unknown(UnknownReason::Straddle));
+    // Per-call facts beat the ambient era: a flagged call from a stale era
+    // reports its flag.
+    let mut flagged = stamp(2, 0, 9);
+    flagged.flags |= STAMP_OVERFLOW;
+    assert_eq!(
+        r.route(call(2, flagged, ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::Overflow)
+    );
+    // The ambient era beats process state: a stale-era call from a retired
+    // process reports FaultEra.
+    r.retire_process(COOKIE);
+    assert_eq!(
+        r.route(call(3, stamp(2, 0, 9), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::FaultEra)
+    );
+}
+
+#[test]
+fn stamps_beyond_the_supersede_window_wait_rather_than_join() {
+    let mut r = router();
+    r.observe(observation(0x8000_0001, 0, 0, load(BASE_A)));
+    // Exactly 2^31+1 behind: the wrapping window reads it as "future", so
+    // it waits; expiry keeps it unknown, never joined or evicted.
+    assert_eq!(
+        r.route(call(1, stamp(0, 0, 0), ip_in(BASE_A))),
+        Route::Pending
+    );
+    assert_eq!(
+        r.expire_pending(COOKIE),
+        vec![(1, Route::Unknown(UnknownReason::Unobserved))]
+    );
+    // Just behind the newest observation: older, unobservable, unknown.
+    assert_eq!(
+        r.route(call(2, stamp(0x8000_0000, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::Unobserved)
+    );
+}
+
+#[test]
+fn offset_arithmetic_overflow_cannot_join() {
+    let mut r = router();
+    let mut ranges = load(BASE_A);
+    ranges.push(MapRange::new(u64::MAX - 0xfff, u64::MAX, u64::MAX, true));
+    r.observe(observation(2, 0, 0, ranges));
+    // `ip - start + file_offset` wraps; the wrapped value must refuse.
+    let ip = u64::MAX - 0x100;
+    let wrapped = ip.wrapping_sub(u64::MAX - 0xfff).wrapping_add(u64::MAX);
+    let mut facts = call(1, stamp(2, 0, 0), ip);
+    facts.attached_offset = Some(wrapped);
+    assert_eq!(
+        r.route(facts),
+        Route::Unknown(UnknownReason::OffsetMismatch)
+    );
+}
+
+#[test]
+fn capacity_refusals_leave_no_zero_counts() {
+    let mut r = InstanceRouter::new(RouterLimits {
+        ranges: 6,
+        ..RouterLimits::default()
+    });
+    let mut both = load(BASE_A);
+    both.extend(load(BASE_B));
+    r.observe(observation(2, 0, 0, both));
+    assert_eq!(
+        r.observe(observation(3, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::RangeCapacity
+    );
+    assert!(
+        !r.unknown_counts()
+            .contains_key(&UnknownReason::RangeCapacity),
+        "a refusal with no failed calls must not mint a zero count"
+    );
+    let mut r = InstanceRouter::new(RouterLimits {
+        instances: 1,
+        ..RouterLimits::default()
+    });
+    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe(observation(3, 0, 0, load(BASE_A)));
+    assert!(
+        !r.unknown_counts()
+            .contains_key(&UnknownReason::InstanceCapacity),
+        "a failed mint must not mint a zero count before the call routes"
+    );
+}
+
+#[test]
+fn router_debug_redacts_cookies_and_epochs() {
+    const COOKIE_BIG: u64 = 0x1234_5678_9abc_def0;
+    const FAULT_BIG: u64 = 0xbeef;
+    let mut r = router();
+    assert!(r.audit(FAULT_BIG, 0, 0).is_empty());
+    let mut reading = reading(2, 0, FAULT_BIG);
+    reading.cookie = COOKIE_BIG;
+    r.observe(StableObservation {
+        file_slot: FILE,
+        reading,
+        ranges: load(BASE_A),
+    });
+    r.route(call_for(1, COOKIE_BIG, stamp(3, 0, 0), ip_in(BASE_A)));
+    r.retire_process(COOKIE_BIG + 1);
+    let rendered = format!("{r:?}");
+    assert!(rendered.contains("observed_keys"), "{rendered}");
+    for needle in [
+        "123456789abcdef0",
+        "1311768467463790320",
+        "beef",
+        "48879",
+        "123456789abcdef1",
+        "1311768467463790321",
+    ] {
+        assert!(!rendered.contains(needle), "{rendered} leaks {needle}");
+    }
 }
 
 #[test]
@@ -353,6 +503,113 @@ fn retained_keys_are_bounded_and_evicted_calls_are_unknown() {
 }
 
 #[test]
+fn observed_registry_eviction_degrades_late_calls_to_unobserved() {
+    const A: u64 = 0xA1;
+    const B: u64 = 0xA2;
+    const C: u64 = 0xA3;
+    let mut r = InstanceRouter::new(RouterLimits {
+        observed_keys: 2,
+        ..RouterLimits::default()
+    });
+    assert_eq!(
+        r.observe(observation_for(A, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    assert_eq!(
+        r.observe(observation_for(B, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    // The third key evicts the smallest (stalest) one, freeing its ranges.
+    assert_eq!(
+        r.observe(observation_for(C, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    assert_eq!(r.counters().observed_evictions, 1);
+    assert_eq!(r.ranges_retained(), 6);
+    // The evicted key's late calls wait, then expire: they never join.
+    assert_eq!(
+        r.route(call_for(1, A, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Pending
+    );
+    assert_eq!(
+        r.expire_pending(A),
+        vec![(1, Route::Unknown(UnknownReason::Unobserved))]
+    );
+    joined(r.route(call_for(2, C, stamp(2, 0, 0), ip_in(BASE_A))));
+}
+
+#[test]
+fn faulted_registry_eviction_degrades_late_calls_to_unobserved() {
+    const A: u64 = 0xA1;
+    const B: u64 = 0xA2;
+    let mut r = InstanceRouter::new(RouterLimits {
+        faulted_keys: 1,
+        ..RouterLimits::default()
+    });
+    let fault = |r: &mut InstanceRouter, cookie: u64| {
+        r.observe(observation_for(cookie, 2, load(BASE_A)));
+        let mut grown = load(BASE_A);
+        grown.extend(load(BASE_B));
+        assert_eq!(
+            r.observe(observation_for(cookie, 2, grown)).0,
+            ObserveOutcome::CoverageFault
+        );
+    };
+    fault(&mut r, A);
+    assert_eq!(
+        r.route(call_for(1, A, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+    fault(&mut r, B);
+    assert_eq!(r.counters().faulted_evictions, 1);
+    // The evicted fault no longer reports CoverageFault, but its calls still
+    // never join: no observation survives for them.
+    assert_eq!(
+        r.route(call_for(2, A, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Pending
+    );
+    assert_eq!(
+        r.expire_pending(A),
+        vec![(2, Route::Unknown(UnknownReason::Unobserved))]
+    );
+    assert_eq!(
+        r.route(call_for(3, B, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+}
+
+#[test]
+fn retired_registry_eviction_degrades_late_calls_to_unobserved() {
+    const A: u64 = 0xA1;
+    const B: u64 = 0xA2;
+    let mut r = InstanceRouter::new(RouterLimits {
+        retired_cookies: 1,
+        ..RouterLimits::default()
+    });
+    assert!(r.retire_process(A).is_empty());
+    assert_eq!(
+        r.route(call_for(1, A, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::Retired)
+    );
+    assert!(r.retire_process(B).is_empty());
+    assert_eq!(r.counters().retired_evictions, 1);
+    // The evicted retirement no longer reports Retired, but its calls still
+    // never join: no observation survives for them.
+    assert_eq!(
+        r.route(call_for(2, A, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Pending
+    );
+    assert_eq!(
+        r.expire_pending(A),
+        vec![(2, Route::Unknown(UnknownReason::Unobserved))]
+    );
+    assert_eq!(
+        r.route(call_for(3, B, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::Retired)
+    );
+}
+
+#[test]
 fn a_fault_era_change_ends_every_observation_and_pending_call() {
     let mut r = router();
     r.observe(observation(2, 0, 0, load(BASE_A)));
@@ -361,7 +618,7 @@ fn a_fault_era_change_ends_every_observation_and_pending_call() {
         r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))),
         Route::Pending
     );
-    let resolved = r.audit(1, 0);
+    let resolved = r.audit(1, 0, 0);
     assert_eq!(resolved, vec![(2, Route::Unknown(UnknownReason::FaultEra))]);
     assert_eq!(r.ranges_retained(), 0);
     // Calls stamped before the fault never join, even at identical epochs.
@@ -380,6 +637,72 @@ fn a_fault_era_change_ends_every_observation_and_pending_call() {
 }
 
 #[test]
+fn a_recursion_miss_increase_without_a_raise_latches_the_era() {
+    let mut r = router();
+    r.observe(observation(2, 0, 0, load(BASE_A)));
+    let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    assert_eq!(
+        r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))),
+        Route::Pending
+    );
+    // The loop passed new misses without raising the fault: the pending
+    // call fails, retained observations are dropped, and the era latches.
+    assert_eq!(
+        r.audit(0, 0, 1),
+        vec![(2, Route::Unknown(UnknownReason::FaultEra))]
+    );
+    assert_eq!(r.ranges_retained(), 0);
+    assert_eq!(r.counters().miss_eras, 1);
+    // A call stamped before the miss never joins afterwards — not even at
+    // identical epochs — and a fresh scan at the old fault is refused: a
+    // skipped relevant bump would leave stale epochs under changed ranges.
+    assert_eq!(
+        r.route(call(3, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::FaultEra)
+    );
+    assert_eq!(
+        r.observe(observation(2, 0, 0, load(BASE_A))).0,
+        ObserveOutcome::StaleEra
+    );
+    // A late raise re-coheres the era: the new fault is observable again.
+    assert!(r.audit(1, 0, 1).is_empty());
+    r.observe(observation(2, 0, 1, load(BASE_A)));
+    let new = joined(r.route(call(4, stamp(2, 0, 1), ip_in(BASE_A))));
+    assert_ne!(old, new);
+    assert_eq!(r.counters().miss_eras, 1);
+    // Any miss change latches, including a decrease (reloaded hooks restart
+    // their counters): fail closed on the unknown skip window.
+    assert_eq!(
+        r.route(call(5, stamp(3, 0, 1), ip_in(BASE_A))),
+        Route::Pending
+    );
+    assert_eq!(
+        r.audit(1, 0, 0),
+        vec![(5, Route::Unknown(UnknownReason::FaultEra))]
+    );
+    assert_eq!(
+        r.route(call(6, stamp(2, 0, 1), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::FaultEra)
+    );
+}
+
+#[test]
+fn a_raise_covering_the_miss_advances_a_single_era() {
+    let mut r = router();
+    r.observe(observation(2, 0, 0, load(BASE_A)));
+    // The normal capture-loop order (raise, then audit with both changed)
+    // advances once and needs no latch: the kernel fault covers the misses.
+    assert!(r.audit(1, 0, 1).is_empty());
+    assert_eq!(r.counters().eras, 1);
+    assert_eq!(r.counters().miss_eras, 0);
+    assert_eq!(
+        r.observe(observation(2, 0, 1, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    joined(r.route(call(1, stamp(2, 0, 1), ip_in(BASE_A))));
+}
+
+#[test]
 fn sticky_refusal_disables_routing_for_the_capture() {
     let mut r = router();
     r.observe(observation(2, 0, 0, load(BASE_A)));
@@ -388,7 +711,7 @@ fn sticky_refusal_disables_routing_for_the_capture() {
         Route::Pending
     );
     assert_eq!(
-        r.audit(0, instance::STICKY_FORK_UNMARKED),
+        r.audit(0, instance::STICKY_FORK_UNMARKED, 0),
         vec![(1, Route::Unknown(UnknownReason::Sticky))]
     );
     assert_eq!(

@@ -45,6 +45,15 @@ pub(crate) const MAX_PENDING: usize = 1_024;
 /// Retained epoch keys per (process, file): older keys are evicted and their
 /// late calls become [`UnknownReason::Evicted`].
 pub(crate) const KEYS_PER_PROCESS_FILE: usize = 4;
+/// Capture-wide registry ceilings (allowlist-v3 bounds): retained
+/// (process, file) observation keys, coverage-faulted keys and retired
+/// process cookies. Each is bounded at the instance-record ceiling; a full
+/// registry evicts its smallest key first (cookies mint in capture order,
+/// so the stalest process goes first) with a saturating counter. Eviction
+/// degrades late calls to Pending/Unobserved, never a join.
+pub(crate) const MAX_OBSERVED_KEYS: usize = 4_096;
+pub(crate) const MAX_FAULTED_KEYS: usize = 4_096;
+pub(crate) const MAX_RETIRED_COOKIES: usize = 4_096;
 
 /// The private probed runtime address of one call. Never rendered.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -321,6 +330,9 @@ pub(crate) struct RouterLimits {
     pub(crate) instances: usize,
     pub(crate) ranges: usize,
     pub(crate) pending: usize,
+    pub(crate) observed_keys: usize,
+    pub(crate) faulted_keys: usize,
+    pub(crate) retired_cookies: usize,
 }
 
 impl Default for RouterLimits {
@@ -329,6 +341,9 @@ impl Default for RouterLimits {
             instances: MAX_INSTANCES,
             ranges: MAX_RANGES,
             pending: MAX_PENDING,
+            observed_keys: MAX_OBSERVED_KEYS,
+            faulted_keys: MAX_FAULTED_KEYS,
+            retired_cookies: MAX_RETIRED_COOKIES,
         }
     }
 }
@@ -372,6 +387,12 @@ impl EpochKey {
         }
     }
 
+    /// Low-32 matching (N4): stamps carry only the low words, so identity
+    /// assumes fewer than 2^32 bumps per (process, file, global, fault)
+    /// component per capture — 4 billion file-VMA events against one
+    /// watched file. A stamp from exactly 2^32 bumps ago would match; that
+    /// rate sustained against one file is outside the capture envelope, and
+    /// the assumption is pinned by review, not by a counter.
     fn matches(&self, stamp: &InstanceStamp) -> bool {
         self.local as u32 == stamp.epoch
             && self.global as u32 == stamp.global
@@ -379,7 +400,10 @@ impl EpochKey {
     }
 
     /// Whether `stamp` names epochs strictly older than these in some
-    /// component (epochs only grow, so no later scan can observe it).
+    /// component (epochs only grow, so no later scan can observe it). The
+    /// 2^31 wrapping window reads stamps more than 2^31 behind as "future":
+    /// they wait as [`Route::Pending`] and expire [`UnknownReason::Unobserved`],
+    /// never evicted or joined — fail closed on the far past.
     fn supersedes(&self, stamp: &InstanceStamp) -> bool {
         let older = |current: u64, stamped: u32| (current as u32).wrapping_sub(stamped) as i32 > 0;
         older(self.local, stamp.epoch)
@@ -419,10 +443,20 @@ pub(crate) struct RouterCounters {
     pub(crate) continued: u64,
     pub(crate) coverage_faults: u64,
     pub(crate) eras: u64,
+    /// Era advances latched by a hook-program miss the capture loop had not
+    /// yet covered with a fault raise (a subset of `eras`).
+    pub(crate) miss_eras: u64,
+    /// Saturating registry evictions (F3): keys dropped from a full
+    /// registry, whose late calls degrade to Pending/Unobserved.
+    pub(crate) observed_evictions: u64,
+    pub(crate) faulted_evictions: u64,
+    pub(crate) retired_evictions: u64,
 }
 
-/// Capture-owned instance registry and per-call router.
-#[derive(Debug)]
+/// Capture-owned instance registry and per-call router. `Debug` is redacted
+/// (N5): image cookies key the registries, and the fault generation is a
+/// private epoch, so only lengths, limits, finite flags and public-safe
+/// counters render.
 pub(crate) struct InstanceRouter {
     limits: RouterLimits,
     /// (cookie, file slot) -> retained observations, oldest first.
@@ -432,11 +466,40 @@ pub(crate) struct InstanceRouter {
     pending: VecDeque<PendingCall>,
     fault: u64,
     sticky: u64,
+    /// Last audited hook-program `recursion_misses` total. Any change the
+    /// capture loop has not covered with a fault raise latches `miss_latched`.
+    misses: u64,
+    /// A miss arrived without a fault raise: no joins and no observations
+    /// until the fault generation moves. Clearing alone would be unsound — a
+    /// skipped relevant bump leaves stale epochs under changed ranges, which
+    /// a fresh scan would accept as a new incarnation — so the latch holds
+    /// until a kernel fault raise re-coheres the era.
+    miss_latched: bool,
     next_id: u64,
     minted: usize,
     ranges: usize,
     unknown: BTreeMap<UnknownReason, u64>,
     counters: RouterCounters,
+}
+
+impl fmt::Debug for InstanceRouter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstanceRouter")
+            .field("limits", &self.limits)
+            .field("observed_keys", &self.observed.len())
+            .field("faulted_keys", &self.faulted.len())
+            .field("retired_cookies", &self.retired.len())
+            .field("pending", &self.pending.len())
+            .field("sticky", &self.sticky)
+            .field("misses", &self.misses)
+            .field("miss_latched", &self.miss_latched)
+            .field("minted", &self.minted)
+            .field("ranges", &self.ranges)
+            .field("unknown", &self.unknown)
+            .field("counters", &self.counters)
+            .finish_non_exhaustive()
+    }
 }
 
 impl InstanceRouter {
@@ -449,6 +512,8 @@ impl InstanceRouter {
             pending: VecDeque::new(),
             fault: 0,
             sticky: 0,
+            misses: 0,
+            miss_latched: false,
             next_id: 1,
             minted: 0,
             ranges: 0,
@@ -478,19 +543,36 @@ impl InstanceRouter {
     }
 
     /// Batch audit, before routing a drained batch: the current fault
-    /// generation (which userspace also raises on hook-program misses) and
-    /// sticky bits. A changed fault ends every retained observation and
-    /// every pending call. Returns the resolved pending calls.
-    pub(crate) fn audit(&mut self, fault: u64, sticky: u64) -> Vec<(u64, Route)> {
+    /// generation (which the capture loop also raises on hook-program
+    /// misses), the sticky bits, and the hook programs' summed
+    /// `recursion_misses`. A changed fault ends every retained observation
+    /// and every pending call, and releases the miss latch. A changed miss
+    /// total WITHOUT a changed fault means the loop has not raised for those
+    /// misses: the era latches (no joins, no observations) until a fault
+    /// raise re-coheres it. Any miss change latches, including a decrease
+    /// (a reloaded hook set starts its counters over). Returns the resolved
+    /// pending calls.
+    pub(crate) fn audit(&mut self, fault: u64, sticky: u64, misses: u64) -> Vec<(u64, Route)> {
         let mut resolved = Vec::new();
         if sticky != 0 && self.sticky == 0 {
             self.sticky = sticky;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::Sticky));
         }
         self.sticky |= sticky;
-        if fault != self.fault {
+        let fault_moved = fault != self.fault;
+        let misses_moved = misses != self.misses;
+        self.misses = misses;
+        if fault_moved {
             self.fault = fault;
+            self.miss_latched = false;
             self.counters.eras += 1;
+            self.observed.clear();
+            self.ranges = 0;
+            resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
+        } else if misses_moved {
+            self.miss_latched = true;
+            self.counters.eras += 1;
+            self.counters.miss_eras += 1;
             self.observed.clear();
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
@@ -501,6 +583,12 @@ impl InstanceRouter {
     /// Ends a process incarnation (exit or exec reported by lifecycle):
     /// frees its observations; its pending calls become unknown.
     pub(crate) fn retire_process(&mut self, cookie: u64) -> Vec<(u64, Route)> {
+        evict_for_insert(
+            &mut self.retired,
+            &cookie,
+            self.limits.retired_cookies,
+            &mut self.counters.retired_evictions,
+        );
         self.retired.insert(cookie);
         let keys: Vec<_> = self
             .observed
@@ -527,11 +615,11 @@ impl InstanceRouter {
         if self.retired.contains(&cookie) {
             return (ObserveOutcome::Retired, Vec::new());
         }
-        if observation.reading.fault != self.fault {
+        if observation.reading.fault != self.fault || self.miss_latched {
             return (ObserveOutcome::StaleEra, Vec::new());
         }
         if observation.reading.sticky != 0 {
-            let resolved = self.audit(self.fault, observation.reading.sticky);
+            let resolved = self.audit(self.fault, observation.reading.sticky, self.misses);
             return (ObserveOutcome::StaleEra, resolved);
         }
         self.counters.observations += 1;
@@ -555,6 +643,12 @@ impl InstanceRouter {
                     .any(|range| ranges.binary_search(range).is_err());
                 if appeared {
                     self.counters.coverage_faults += 1;
+                    evict_for_insert(
+                        &mut self.faulted,
+                        &key,
+                        self.limits.faulted_keys,
+                        &mut self.counters.faulted_evictions,
+                    );
                     self.faulted.insert(key);
                     if let Some(list) = self.observed.remove(&key) {
                         self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
@@ -578,7 +672,6 @@ impl InstanceRouter {
                         },
                         UnknownReason::RangeCapacity,
                     );
-                    self.note_unknown_n(UnknownReason::RangeCapacity, 0);
                     return (ObserveOutcome::RangeCapacity, resolved);
                 }
                 let partitions = observation
@@ -588,6 +681,16 @@ impl InstanceRouter {
                     .map(|range| (Base(range.start), self.mint()))
                     .collect();
                 self.ranges += observation.ranges.len();
+                while self.observed.len() >= self.limits.observed_keys
+                    && !self.observed.contains_key(&key)
+                {
+                    let Some((_, evicted)) = self.observed.pop_first() else {
+                        break;
+                    };
+                    self.ranges -= evicted.iter().map(|o| o.ranges.len()).sum::<usize>();
+                    self.counters.observed_evictions =
+                        self.counters.observed_evictions.saturating_add(1);
+                }
                 let list = self.observed.entry(key).or_default();
                 list.push_back(Observed {
                     epochs,
@@ -626,6 +729,23 @@ impl InstanceRouter {
         }
     }
 
+    /// Reason precedence (N2): first match wins, in this order —
+    /// 1. capture-sticky refusal; 2. the ENTRY stamp's refusal flags
+    ///    (`Unstamped` covers `NO_TASK`, which also means "never stamped");
+    /// 3. entry/return inequality (`Straddle` — a refusal flag on the RETURN
+    ///    stamp only therefore surfaces as `Straddle`, never as its flag);
+    /// 4. the ambient era (stale fault generation or the latched miss era);
+    /// 5. process state (`Retired`, then the sticky `CoverageFault`);
+    /// 6. epoch knowledge (`Pending` while a newer-or-equal epoch may still
+    ///    be observed — including evicted epochs, which resolve only when a
+    ///    later observation arrives (no fail-on-evict) — else `Unobserved`
+    ///    or `Evicted`); 7. the IP checks (`IpOutside`, `NotExecutable`,
+    ///    `OffsetMismatch`, `Unpartitionable`, `InstanceCapacity`).
+    /// Per-call facts beat ambient state; ambient state beats process state.
+    /// (`observe` has its own gate order: `Retired`, stale era (fault or
+    /// miss latch), then a sticky reading, which audits the sticky bits and
+    /// reports `StaleEra`. Calls refused by `RangeCapacity` pend and expire
+    /// as `Unobserved`.)
     fn decide(&self, facts: &CallFacts, may_wait: bool) -> Route {
         use UnknownReason as U;
         let entry = facts.entry;
@@ -650,7 +770,10 @@ impl InstanceRouter {
         if !instance::stamp_joinable(entry, facts.ret) {
             return Route::Unknown(U::Straddle);
         }
-        if entry.fault != self.fault as u32 {
+        // The miss latch is consulted here, not plumbed per call: stamps
+        // carry no miss count, so a miss increase between the call's entry
+        // and its routing can only surface as a latched era at audit time.
+        if entry.fault != self.fault as u32 || self.miss_latched {
             return Route::Unknown(U::FaultEra);
         }
         if self.retired.contains(&facts.cookie) {
@@ -742,7 +865,6 @@ impl InstanceRouter {
 
     fn mint(&mut self) -> Option<InstanceId> {
         if self.minted >= self.limits.instances {
-            self.note_unknown_n(UnknownReason::InstanceCapacity, 0);
             return None;
         }
         let id = InstanceId(self.next_id);
@@ -757,6 +879,11 @@ impl InstanceRouter {
     }
 
     fn note_unknown_n(&mut self, reason: UnknownReason, count: u64) {
+        // A zero count must not mint an entry (N4): the map holds observed
+        // reasons only.
+        if count == 0 {
+            return;
+        }
         let cell = self.unknown.entry(reason).or_default();
         *cell = cell.saturating_add(count);
     }
@@ -764,6 +891,17 @@ impl InstanceRouter {
 
 fn stamp_file(facts: &CallFacts) -> Option<u32> {
     u32::from(facts.entry.file_slot_plus1).checked_sub(1)
+}
+
+/// Makes room for `key` in a bounded key set: evicts the smallest key first
+/// with a saturating counter. A key already present needs no room.
+fn evict_for_insert<K: Ord>(set: &mut BTreeSet<K>, key: &K, limit: usize, evictions: &mut u64) {
+    while set.len() >= limit && !set.contains(key) {
+        if set.pop_first().is_none() {
+            break;
+        }
+        *evictions = evictions.saturating_add(1);
+    }
 }
 
 fn route_ip(observed: &Observed, facts: &CallFacts) -> Route {
@@ -775,8 +913,15 @@ fn route_ip(observed: &Observed, facts: &CallFacts) -> Route {
     if !range.executable {
         return Route::Unknown(U::NotExecutable);
     }
-    // An unknown attached offset cannot be matched: fail closed.
-    if facts.attached_offset != Some(ip - range.start + range.file_offset) {
+    // An unknown attached offset cannot be matched: fail closed. The
+    // addition is checked: a wrapped offset must refuse, never join (N4).
+    let mapped = ip
+        .checked_sub(range.start)
+        .and_then(|delta| delta.checked_add(range.file_offset));
+    let Some(mapped) = mapped else {
+        return Route::Unknown(U::OffsetMismatch);
+    };
+    if facts.attached_offset != Some(mapped) {
         return Route::Unknown(U::OffsetMismatch);
     }
     match observed

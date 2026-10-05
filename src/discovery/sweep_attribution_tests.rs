@@ -76,12 +76,13 @@ fn vm_file(inode: u64) -> FileIdentity {
     }
 }
 
-/// The objects a deep scan of `entries` examined: every provider
-/// candidate, with its self-mapped `vm_file` identity.
+/// The objects a deep scan of `entries` examined: every caller range's
+/// object (as production builds them from caller groups), with its
+/// self-mapped `vm_file` identity.
 fn examined_of<'a>(entries: impl IntoIterator<Item = &'a MapEntry>) -> Vec<ExaminedObject> {
     entries
         .into_iter()
-        .filter(|entry| is_provider_mapping(entry))
+        .filter(|entry| is_caller_range(entry))
         .map(|entry| ExaminedObject {
             key: ObjectKey::of(entry),
             identity: vm_file(entry.inode),
@@ -2805,4 +2806,26 @@ fn privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4(
     assert!(read_only.losses.is_empty(), "{:?}", read_only.losses);
     assert_eq!(read_only.probed, 0);
     drop((caller, reader));
+}
+
+#[test]
+fn a_caller_range_is_any_executable_shared_object_mapping() {
+    for perms in [b"r-xp", b"--xp", b"rwxp", b"r-xs"] {
+        assert!(
+            is_caller_range(&mapping(0x1000, perms, PROVIDER, "/usr/lib/p.so")),
+            "{} must be a caller range",
+            String::from_utf8_lossy(perms)
+        );
+    }
+    for perms in [b"r--p", b"rw-p", b"---p", b"r--s"] {
+        assert!(
+            !is_caller_range(&mapping(0x1000, perms, PROVIDER, "/usr/lib/p.so")),
+            "{} must not be a caller range",
+            String::from_utf8_lossy(perms)
+        );
+    }
+    assert!(
+        !is_caller_range(&mapping(0x1000, b"r-xp", PROVIDER, "/usr/bin/tool")),
+        "an executable non-shared-object mapping is not a provider caller range"
+    );
 }

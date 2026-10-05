@@ -385,8 +385,8 @@ pub(crate) struct SweptMember {
     pub start_time: u64,
     pub exe: ExeIdentity,
     pub objects: Vec<MatchedObject>,
-    /// Provider-candidate keys in the confirmation snapshot no deep scan
-    /// examined this pass.
+    /// Caller keys (keys with a caller range) in the confirmation snapshot
+    /// no deep scan examined this pass.
     pub unexamined: usize,
 }
 
@@ -394,10 +394,10 @@ pub(crate) struct SweptMember {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SweepAttribution {
     pub members: Vec<SweptMember>,
-    /// Per unselected pid (matched or not): provider-candidate keys no
-    /// deep scan examined this pass. Only nonzero counts are kept.
+    /// Per unselected pid (matched or not): caller keys no deep scan
+    /// examined this pass. Only nonzero counts are kept.
     pub unexamined: BTreeMap<u32, usize>,
-    /// The distinct provider-candidate keys behind `unexamined`.
+    /// The distinct caller keys behind `unexamined`.
     pub unexamined_objects: BTreeSet<ObjectKey>,
     /// Unselected pids whose phase-1 snapshot was unavailable.
     pub unavailable: usize,
@@ -861,8 +861,8 @@ pub(crate) fn proof_ranges(entries: &[MapEntry], prove: &BTreeSet<ObjectKey>) ->
         .collect()
 }
 
-/// Whether a group's pathname can attribute: every mapping of the object
-/// must carry a usable path. `Err(DeletedMapping)` for ` (deleted)`,
+/// Whether a group's pathname can attribute: every caller range of the
+/// object must carry a usable path. `Err(DeletedMapping)` for ` (deleted)`,
 /// `Err(KeyRejected)` for any other unusable spelling.
 fn usable_path(group: &[&MapEntry]) -> Result<String, AttributionLoss> {
     let mut path = None;

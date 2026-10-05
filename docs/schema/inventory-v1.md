@@ -251,8 +251,8 @@ non-null values needs a new allowlist row.
   live files share make the key that file everywhere. tmpfs (32-bit
   wrapping inode numbers without `inode64`), btrfs, overlayfs (as
   rendered from 6.8 on), bcachefs, FUSE and network filesystems always
-  prove every executable range. Non-executable ranges at the key are
-  never read, so a maps-key collision on a data range cannot cost an edge
+  prove every executable range. For maps matches, non-executable ranges
+  at the key are never read, so a maps-key collision on a data range cannot cost an edge
   whose executable ranges are proven.
   Nothing about a confirmation or a proof is carried from one pass to
   the next: every pass re-reads a matched caller's maps inside its pin

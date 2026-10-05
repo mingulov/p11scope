@@ -2898,6 +2898,13 @@ pub(crate) struct MapsReadBuffers {
     chunk: Vec<u8>,
 }
 
+impl MapsReadBuffers {
+    /// The bytes [`read_maps_checked`] accepted last.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
     reader: R,
     budget: &mut CaptureWorkBudget,
@@ -2919,9 +2926,9 @@ fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
     Ok((std::mem::take(&mut bufs.bytes), reasons))
 }
 
-fn read_maps_bytes_with_buffers<R: Read, F: FnMut() -> Option<u64>>(
+fn read_maps_bytes_with_buffers<R: Read, F: FnMut() -> Option<u64>, B: MapsReadBudget + ?Sized>(
     mut reader: R,
-    budget: &mut CaptureWorkBudget,
+    budget: &mut B,
     max_bytes: u64,
     max_entries: usize,
     chunk_size: usize,
@@ -3029,9 +3036,43 @@ pub(crate) fn read_maps_or_refuse<R: Read, F: FnMut() -> Option<u64>>(
 pub(crate) fn read_maps_or_refuse_with_buffers<R: Read, F: FnMut() -> Option<u64>>(
     reader: R,
     budget: &mut CaptureWorkBudget,
-    mut now: F,
+    now: F,
     bufs: &mut MapsReadBuffers,
 ) -> Result<Vec<MapEntry>, String> {
+    read_maps_checked(reader, budget, MapsReadLimits::LIVE, now, bufs)?;
+    parse_maps(&bufs.bytes)
+}
+
+/// The per-snapshot bounds of one live maps read. Production always uses
+/// [`MapsReadLimits::LIVE`]; tests shrink them to reach the byte and entry
+/// ceilings with small fixtures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MapsReadLimits {
+    pub(crate) max_bytes: u64,
+    pub(crate) max_entries: usize,
+    pub(crate) chunk: usize,
+}
+
+impl MapsReadLimits {
+    pub(crate) const LIVE: Self = Self {
+        max_bytes: MAX_MAPS_BYTES,
+        max_entries: MAX_MAP_ENTRIES,
+        chunk: 64 * 1024,
+    };
+}
+
+/// [`read_maps_or_refuse_with_buffers`] without the parse: `Ok(())` leaves
+/// the accepted snapshot's bytes in `bufs` (see [`MapsReadBuffers::bytes`]).
+/// Every budget interaction of a live maps read happens here, against any
+/// [`MapsReadBudget`]: the sharded sweep runs it once per pid against a
+/// shard's shadow budget and replays it against the capture budget.
+pub(crate) fn read_maps_checked<R: Read, F: FnMut() -> Option<u64>, B: MapsReadBudget + ?Sized>(
+    reader: R,
+    budget: &mut B,
+    limits: MapsReadLimits,
+    mut now: F,
+    bufs: &mut MapsReadBuffers,
+) -> Result<(), String> {
     // The reader reports a stopped batch's reason only once; the refusal must
     // not depend on that, so ask the budget directly before reading.
     if budget.has_deadline()
@@ -3042,9 +3083,9 @@ pub(crate) fn read_maps_or_refuse_with_buffers<R: Read, F: FnMut() -> Option<u64
     let reasons = read_maps_bytes_with_buffers(
         reader,
         budget,
-        MAX_MAPS_BYTES,
-        MAX_MAP_ENTRIES,
-        64 * 1024,
+        limits.max_bytes,
+        limits.max_entries,
+        limits.chunk,
         now,
         bufs,
     )
@@ -3052,7 +3093,145 @@ pub(crate) fn read_maps_or_refuse_with_buffers<R: Read, F: FnMut() -> Option<u64
     if let Some(reason) = reasons.first() {
         return Err((*reason).into());
     }
-    parse_maps(&bufs.bytes)
+    Ok(())
+}
+
+/// Every budget interaction a live maps read makes, and nothing else: the
+/// deadline and sticky stop, the capture I/O allowance, and the once-only
+/// stop report. [`CaptureWorkBudget`] is the real one; [`MapsShadowBudget`]
+/// is a shard's private copy (C7 A4).
+pub(crate) trait MapsReadBudget {
+    fn has_deadline(&self) -> bool;
+    fn check_deadline(&mut self, now: Option<u64>) -> Option<&'static str>;
+    fn allowed_capture_io(&mut self, wanted: usize) -> usize;
+    fn record_io(&mut self, bytes: usize);
+    fn take_scan_stop_reason(&mut self) -> Option<&'static str>;
+}
+
+impl MapsReadBudget for CaptureWorkBudget {
+    fn has_deadline(&self) -> bool {
+        CaptureWorkBudget::has_deadline(self)
+    }
+    fn check_deadline(&mut self, now: Option<u64>) -> Option<&'static str> {
+        CaptureWorkBudget::check_deadline(self, now)
+    }
+    fn allowed_capture_io(&mut self, wanted: usize) -> usize {
+        CaptureWorkBudget::allowed_capture_io(self, wanted)
+    }
+    fn record_io(&mut self, bytes: usize) {
+        CaptureWorkBudget::record_io(self, bytes);
+    }
+    fn take_scan_stop_reason(&mut self) -> Option<&'static str> {
+        CaptureWorkBudget::take_scan_stop_reason(self)
+    }
+}
+
+/// A shard's private stand-in for the capture budget during a sharded
+/// maps sweep (C7 A4), taken from the capture budget before any shard
+/// reads. It decides exactly as the capture budget would, except that its
+/// I/O allowance is what the capture budget had left *at the start of the
+/// sweep* minus this shard's own reads, never less than what the capture
+/// budget will have left at the same pid when the reads are replayed in pid
+/// order. So a shard reads at least every byte the serial sweep would, and
+/// stops reading once even that upper bound is spent or the deadline or a
+/// sticky stop says so. It never decides anything that is published: the
+/// capture budget does, at replay.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MapsShadowBudget {
+    inventory: bool,
+    no_active_scan: bool,
+    io_left: u64,
+    deadline: Option<u64>,
+    has_deadline: bool,
+    stop: Option<&'static str>,
+    stop_reported: bool,
+}
+
+impl CaptureWorkBudget {
+    /// This budget's [`MapsShadowBudget`], as it stands now.
+    pub(crate) fn maps_shadow(&self) -> MapsShadowBudget {
+        let inventory = matches!(self.policy, DiscoveryPolicy::Inventory(_));
+        let window_deadline = self.active_window.as_ref().map(|window| window.deadline_ns);
+        let deadline = match (window_deadline, self.deadline_ns) {
+            (Some(window), Some(transaction)) => Some(window.min(transaction)),
+            (window, transaction) => window.or(transaction),
+        };
+        MapsShadowBudget {
+            inventory,
+            no_active_scan: inventory && self.active_scan.is_none(),
+            io_left: self.remaining_window_io().unwrap_or(0),
+            deadline,
+            has_deadline: self.has_deadline(),
+            stop: self.scan_stop_reason,
+            stop_reported: self.scan_stop_reported,
+        }
+    }
+
+    /// The state a maps sweep can change, for serial-vs-sharded equality.
+    #[cfg(test)]
+    pub(crate) fn maps_sweep_state_for_test(&self) -> MapsSweepBudgetState {
+        MapsSweepBudgetState {
+            attempted_io_bytes: self.attempted_io_bytes,
+            stop: self.scan_stop_reason,
+            stop_reported: self.scan_stop_reported,
+            window: self
+                .active_window
+                .as_ref()
+                .map(|window| (window.io_bytes, window.stop_reason)),
+            window_exhaustions: self.window_exhaustions,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MapsSweepBudgetState {
+    pub(crate) attempted_io_bytes: u64,
+    pub(crate) stop: Option<&'static str>,
+    pub(crate) stop_reported: bool,
+    pub(crate) window: Option<(u64, Option<&'static str>)>,
+    pub(crate) window_exhaustions: u64,
+}
+
+impl MapsReadBudget for MapsShadowBudget {
+    fn has_deadline(&self) -> bool {
+        self.has_deadline
+    }
+    fn check_deadline(&mut self, now: Option<u64>) -> Option<&'static str> {
+        if let Some(reason) = self.stop {
+            return Some(reason);
+        }
+        let deadline = self.deadline?;
+        let reason = match now {
+            Some(now) if now < deadline => return None,
+            Some(_) => SCAN_DEADLINE_REASON,
+            None => SCAN_CLOCK_REASON,
+        };
+        self.stop = Some(reason);
+        Some(reason)
+    }
+    fn allowed_capture_io(&mut self, wanted: usize) -> usize {
+        if self.no_active_scan {
+            return 0;
+        }
+        let allowed = usize::try_from(self.io_left).map_or(wanted, |left| wanted.min(left));
+        if allowed == 0 && wanted != 0 && self.inventory && self.stop.is_none() {
+            self.stop = Some(IO_CEILING_REASON);
+        }
+        allowed
+    }
+    fn record_io(&mut self, bytes: usize) {
+        self.io_left = self.io_left.saturating_sub(bytes as u64);
+    }
+    fn take_scan_stop_reason(&mut self) -> Option<&'static str> {
+        let reason = self.stop?;
+        if self.stop_reported {
+            None
+        } else {
+            self.stop_reported = true;
+            Some(reason)
+        }
+    }
 }
 
 /// One validated `MapIndex` per accepted snapshot. The order/overlap validation

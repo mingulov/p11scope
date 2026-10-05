@@ -59,10 +59,7 @@ pub(crate) trait RangeStat: Send + Sync {
 /// collects every pass, and must not repeat the note each time.
 pub(crate) fn proof_stat_threads() -> usize {
     static KNOB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let default = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(MAX_PROOF_STAT_THREADS);
+    let default = crate::discovery::sweep_shards::default_threads(MAX_PROOF_STAT_THREADS);
     let knob = *KNOB.get_or_init(|| {
         let raw = std::env::var_os("P11SCOPE_PROOF_STAT_THREADS");
         let (threads, note) = resolve_proof_stat_threads(raw.as_deref(), default);
@@ -83,42 +80,21 @@ fn resolve_proof_stat_threads(
     raw: Option<&std::ffi::OsStr>,
     default: usize,
 ) -> (Option<usize>, Option<String>) {
-    let Some(raw) = raw else {
-        return (None, None);
-    };
-    let noun = |count: usize| if count == 1 { "thread" } else { "threads" };
-    let lossy = raw.to_string_lossy();
-    let shown = crate::render::escape_controls(&lossy);
-    match raw
-        .to_str()
-        .and_then(|text| parse_proof_stat_threads(Some(text)))
-    {
-        Some(threads) => (
-            Some(threads),
-            Some(format!(
-                "p11scope: P11SCOPE_PROOF_STAT_THREADS={shown} selects {threads} proof-stat {}",
-                noun(threads)
-            )),
-        ),
-        None => (
-            None,
-            Some(format!(
-                "p11scope: ignoring invalid P11SCOPE_PROOF_STAT_THREADS={shown}; using the default {default} proof-stat {}",
-                noun(default)
-            )),
-        ),
-    }
+    crate::discovery::sweep_shards::resolve_thread_knob(
+        "P11SCOPE_PROOF_STAT_THREADS",
+        "proof-stat",
+        MAX_PROOF_STAT_THREADS,
+        raw,
+        default,
+    )
 }
 
 /// Parse `P11SCOPE_PROOF_STAT_THREADS`: `Some(threads)` when set and valid
 /// (`0`/`1` force the serial path, `N` caps at [`MAX_PROOF_STAT_THREADS`]),
 /// `None` when unset or unparsable (the caller keeps its default).
+#[cfg(test)]
 fn parse_proof_stat_threads(env: Option<&str>) -> Option<usize> {
-    match env.map(str::trim).map(str::parse::<usize>) {
-        Some(Ok(0)) | Some(Ok(1)) => Some(1),
-        Some(Ok(n)) => Some(n.min(MAX_PROOF_STAT_THREADS)),
-        _ => None,
-    }
+    crate::discovery::sweep_shards::parse_thread_knob(env, MAX_PROOF_STAT_THREADS)
 }
 
 /// [`proof_stat_threads`] without the environment read, so the override

@@ -26849,6 +26849,101 @@ fn maps_sweep_initial_failure_keeps_unknown_candidates_and_reports_the_gap() {
     );
 }
 
+/// C7 A4: the sharded phase-1 sweep is the serial one, `MapsSweep` for
+/// `MapsSweep` and gap for gap, with the capture I/O ceiling crossed in
+/// the middle of a shard and with a deadline crossed in the middle of
+/// another (the per-pid clock makes both paths see the same readings).
+#[test]
+fn sharded_maps_sweep_equals_the_serial_sweep_at_ceilings() {
+    thread_local! {
+        static PID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let pids: Vec<u32> = (1..=64).map(|i| 1000 + i * 2).collect();
+    let text = |pid: u32| -> Vec<u8> {
+        (0..(1 + pid % 5))
+            .map(|line| {
+                let start = 0x7000_0000 + u64::from(pid) * 0x10_0000 + u64::from(line) * 0x1000;
+                format!(
+                    "{start:x}-{:x} r-xp 00000000 08:01 {pid} /usr/lib/libs{pid}.so\n",
+                    start + 0x1000
+                )
+            })
+            .collect::<String>()
+            .into_bytes()
+    };
+    let open = |pid: u32| -> std::io::Result<std::io::Cursor<Vec<u8>>> {
+        PID.with(|cell| cell.set(pid));
+        if pid.is_multiple_of(9) {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(std::io::Cursor::new(text(pid)))
+    };
+    let now = || Some(PID.with(std::cell::Cell::get) as u64 * 100);
+    let first_half: u64 = pids[..21]
+        .iter()
+        .filter(|pid| !pid.is_multiple_of(9))
+        .map(|pid| text(*pid).len() as u64)
+        .sum();
+    // Ceiling inside the second of four shards (pids 16..32), deadline
+    // inside the third (pids 32..48).
+    let cases: [(&str, u64, Option<u64>); 3] = [
+        ("unbounded", u64::MAX, None),
+        ("capture I/O", first_half + 40, None),
+        ("deadline", u64::MAX, Some(u64::from(pids[40]) * 100)),
+    ];
+    for (what, total_bytes, deadline) in cases {
+        let make = || {
+            let mut budget = CaptureWorkBudget::new(crate::discovery::scan::ScanLimits {
+                per_object_bytes: 1 << 20,
+                total_bytes,
+            });
+            budget.set_deadline(deadline);
+            budget
+        };
+        let mut serial_budget = make();
+        let serial = sweep_process_maps_with(
+            &pids,
+            &mut serial_budget,
+            1,
+            MapsReadLimits::LIVE,
+            &open,
+            &now,
+        );
+        for shards in 2..=4 {
+            let mut budget = make();
+            let sharded = sweep_process_maps_with(
+                &pids,
+                &mut budget,
+                shards,
+                MapsReadLimits::LIVE,
+                &open,
+                &now,
+            );
+            assert_eq!(sharded, serial, "{what}: {shards} shards");
+            assert_eq!(
+                budget.maps_sweep_state_for_test(),
+                serial_budget.maps_sweep_state_for_test(),
+                "{what}: {shards} shards"
+            );
+        }
+        let read = serial.read();
+        let (hints, unavailable, gap) = serial.into_selection_with_unavailable();
+        assert_eq!(hints.len(), pids.len(), "{what}");
+        assert_eq!(unavailable.len(), pids.len() - read, "{what}");
+        if what != "unbounded" {
+            assert!(
+                read < 40,
+                "{what}: the ceiling must bite mid-sweep ({read} read)"
+            );
+            assert!(
+                read > 16,
+                "{what}: the ceiling must bite past the first shard ({read} read)"
+            );
+            assert!(gap.is_some(), "{what}");
+        }
+    }
+}
+
 #[test]
 fn maps_sweep_distinguishes_successful_eof_from_failed_io() {
     struct FailedRead;

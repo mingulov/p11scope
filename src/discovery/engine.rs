@@ -19,16 +19,17 @@ use crate::discovery::identity::{
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
-    CaptureWorkBudget, MapsReadBuffers, ObjectExports, ScanOutcome, ScanRequest, ScannedEntry,
-    ScannedInterface, ScannedModule, ScannedTable, Skipped, TableIdentity, decode_exact_table,
-    exact_table_addresses, exact_table_bytes, export_agreement, index_maps_or_refuse,
-    read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
-    scan_process_view_without_memory, scan_skip_truncates, spans_for, table_evidence_score,
-    table_linkage, target_layout,
+    CaptureWorkBudget, MapsReadBuffers, MapsReadLimits, ObjectExports, ScanOutcome, ScanRequest,
+    ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, TableIdentity,
+    decode_exact_table, exact_table_addresses, exact_table_bytes, export_agreement,
+    index_maps_or_refuse, read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers,
+    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, spans_for,
+    table_evidence_score, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
 };
+use crate::discovery::sweep_shards;
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
 use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
 use crate::run::OwnedChild;
@@ -4194,13 +4195,14 @@ pub(crate) fn scan_cap_reason(total: usize, selected: usize, cap: usize, live: b
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum MapsSnapshot {
     Read(Vec<MapEntry>),
     Unavailable,
 }
 
 /// Phase-1 maps snapshots, shared with `inspect --system`.
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct MapsSweep {
     snapshots: Vec<(u32, MapsSnapshot)>,
 }
@@ -4282,22 +4284,51 @@ impl MapsSweep {
 /// parsing, without decode or view allocation. Failed or budget-refused
 /// snapshots remain unavailable, independently of later deep-scan selection.
 /// Shared with `inspect --system`.
+///
+/// C7 A4: the reads are sharded by contiguous pid ranges across the
+/// observer's CPUs ([`sweep_shards`](crate::discovery::sweep_shards)),
+/// with every budget charge replayed in pid order, so the sweep is the
+/// serial one result for result; `P11SCOPE_SHARD_THREADS=1` runs the
+/// serial loop itself.
 pub(crate) fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> MapsSweep {
+    let shards = sweep_shards::shard_count(pids.len(), sweep_shards::shard_threads());
+    sweep_process_maps_with(
+        pids,
+        budget,
+        shards,
+        MapsReadLimits::LIVE,
+        &|pid| std::fs::File::open(format!("/proc/{pid}/maps")),
+        &crate::attach::monotonic_ns,
+    )
+}
+
+/// [`sweep_process_maps`] with its shard count, read bounds, opener and
+/// clock supplied (tests).
+pub(crate) fn sweep_process_maps_with<R, O, C>(
+    pids: &[u32],
+    budget: &mut CaptureWorkBudget,
+    shards: usize,
+    limits: MapsReadLimits,
+    open: &O,
+    now: &C,
+) -> MapsSweep
+where
+    R: std::io::Read,
+    O: Fn(u32) -> std::io::Result<R> + Sync,
+    C: Fn() -> Option<u64> + Sync,
+{
     let mut sweep = MapsSweep::default();
-    let mut bufs = MapsReadBuffers::default();
-    for &pid in pids {
-        let result = std::fs::File::open(format!("/proc/{pid}/maps"))
-            .map_err(|error| error.to_string())
-            .and_then(|maps| {
-                read_maps_or_refuse_with_buffers(
-                    maps,
-                    budget,
-                    crate::attach::monotonic_ns,
-                    &mut bufs,
-                )
-            });
-        sweep.record(pid, result);
-    }
+    sweep_shards::sweep_maps(
+        pids,
+        budget,
+        shards,
+        limits,
+        open,
+        now,
+        &mut |pid, result| {
+            sweep.record(pid, result);
+        },
+    );
     sweep
 }
 

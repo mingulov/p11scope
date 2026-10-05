@@ -16,6 +16,7 @@ pub(crate) mod proof_stats;
 pub mod scan;
 pub(crate) mod scheduler;
 pub(crate) mod sweep_attribution;
+pub(crate) mod sweep_shards;
 
 #[cfg(test)]
 mod test_subject;

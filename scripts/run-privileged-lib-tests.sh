@@ -55,8 +55,8 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (75 ignored tests in the default-feature lib binary): 64 run by
-# default, 4 run only with --include-long, 7 are statically skipped with a
+# Curation (77 ignored tests in the default-feature lib binary): 64 run by
+# default, 4 run only with --include-long, 9 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
 # never be silently dropped and a renamed one can never silently pass.
@@ -180,6 +180,8 @@ attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_b
 SKIP_TESTS=(
 attach::inventory::activation::privileged_tests::privileged_inventory_retirement_controlled_churn
 discovery::engine::tests::lifecycle_manifest_helper_entrypoint
+discovery::identity::tests::map_files_name_timing_per_thousand
+discovery::scan::tests::maps_reuse_timing_per_thousand_reads
 discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path
 discovery::sweep_attribution::tests::privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file
 first_use_probe::native::system_capture_observer_facts
@@ -189,6 +191,8 @@ run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pe
 SKIP_REASONS=(
 "needs an external barrier controller: P11SCOPE_I3A_RETIREMENT_MODE=worker|synchronous plus a root-owned 0700 CONTROL_DIR, a NONCE, and an external party to write the release file; no in-repo controller exists, so run once per mode by hand"
 "private helper re-executed by DiscoveryLifecycleFixture with P11SCOPE_TEST_DISCOVERY_PROVIDER/MANIFEST; its own docs say it is not a separate passing test"
+"unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
+"unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
 "needs a live root-owned target with two private cross-device mounts (same inode, distinct dev) plus P11SCOPE_ALIAS_COLLISION_PID/HINT/TARGET/HARDLINK"
 "needs TMPDIR on btrfs (it creates two subvolumes there and asserts the filesystem); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs a frozen supervisor config via P11SCOPE_FIRST_USE_PROBE_CONFIG plus an exclusive BPF lane; its verdict requires an external owned oracle"

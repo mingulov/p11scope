@@ -11,6 +11,7 @@ import copy
 import ctypes
 import hashlib
 import json
+import math
 import mmap
 import os
 from pathlib import Path
@@ -35,6 +36,29 @@ PROBE_ENTRY = ROOT / "tests" / "python" / "json_signal_lifetime_probe.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.dont_write_bytecode = True
 from _loader import load_path
+
+# SLACK hang guards (an outer `timeout` whose expiry can only mean failure)
+# scale with P11SCOPE_TEST_TIME_SCALE, as in test_lane13_evidence.py; the
+# watchdog bound a case asserts stays literal.
+DEFAULT_TIME_SCALE = 5.0
+
+
+def _time_scale():
+    raw = os.environ.get("P11SCOPE_TEST_TIME_SCALE", "").strip()
+    if not raw:
+        return DEFAULT_TIME_SCALE
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 1:
+        raise SystemExit("P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1")
+    return value
+
+
+def slack_timeout(seconds):
+    """A `timeout(1)` duration for a SLACK hang guard."""
+    return f"{seconds * _time_scale():g}s"
 
 
 def load_subject(bits):
@@ -1536,7 +1560,8 @@ class TaskStorageReaderTests(unittest.TestCase):
                 f"m['json_signal_lifetime_probe']('mask-mutation', {str(library)!r})"
             )
             result = subprocess.run(
-                ["timeout", "--kill-after=1s", "3s", sys.executable, "-I", "-c", command],
+                ["timeout", "--kill-after=1s", slack_timeout(3), sys.executable,
+                 "-I", "-c", command],
                 text=True, capture_output=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             report = json.loads(result.stdout)
@@ -1554,7 +1579,8 @@ class TaskStorageReaderTests(unittest.TestCase):
                     f"m['json_signal_lifetime_probe']({case!r})"
                 )
                 result = subprocess.run(
-                    ["timeout", "--kill-after=1s", "3s", sys.executable, "-I", "-c", command],
+                    ["timeout", "--kill-after=1s", slack_timeout(3),
+                     sys.executable, "-I", "-c", command],
                     text=True, capture_output=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 report = json.loads(result.stdout)

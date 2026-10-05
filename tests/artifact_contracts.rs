@@ -3177,12 +3177,15 @@ fn native_helper_suite_abi_routing_driver_preserves_runtime_ownership_and_failur
     let _native_suite_guard = NATIVE_SUITE_GATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SLACK hang guard for the whole shell suite; the 2 s forced-cleanup
+    // grace stays literal.
+    let bound = slack_timeout(40);
     let output = run_ok(
         "timeout",
         &[
             "--signal=TERM",
             "--kill-after=2",
-            "40",
+            &bound,
             "sh",
             "tests/shell/test_abi_routing_driver.sh",
         ],
@@ -3991,8 +3994,11 @@ PY
         ),
     )
     .expect("write launch-interrupt check");
+    // SLACK hang guard: the script's own waits are event-driven or faked,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(10);
     let output = Command::new("timeout")
-        .args(["10s", "sh"])
+        .args([bound.as_str(), "sh"])
         .arg(&check_script)
         .output()
         .expect("exercise launch-interrupt cleanup");
@@ -4133,8 +4139,11 @@ trap - EXIT
         ),
     )
     .expect("write record-mutation lifecycle");
+    // SLACK hang guard: the script's own waits are event-driven or faked,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(10);
     let output = Command::new("timeout")
-        .args(["10s", "sh"])
+        .args([bound.as_str(), "sh"])
         .arg(&script)
         .output()
         .expect("exercise record-mutation failure path");
@@ -4191,8 +4200,11 @@ grep -Fqx 'KILL 999991 10' "$WORK/signals"
         ),
     )
     .expect("write partial-owner lifecycle");
+    // SLACK hang guard: the script's own waits are event-driven or faked,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(5);
     let output = Command::new("timeout")
-        .args(["5s", "sh"])
+        .args([bound.as_str(), "sh"])
         .arg(&script)
         .output()
         .expect("exercise partial-owner signal failures");
@@ -4273,8 +4285,11 @@ set -e
         ),
     )
     .expect("write leader-exit lifecycle");
+    // SLACK hang guard: the script's own waits are event-driven or faked,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(10);
     let output = Command::new("timeout")
-        .args(["10s", "sh"])
+        .args([bound.as_str(), "sh"])
         .arg(&script)
         .output()
         .expect("exercise leader-exit cleanup");
@@ -4357,8 +4372,11 @@ PY
         ),
     )
     .expect("write forced-kill lifecycle");
+    // SLACK hang guard: the script's own waits are event-driven or faked,
+    // so expiry can only mean a hang, never a slow pass.
+    let bound = slack_timeout(20);
     let output = Command::new("timeout")
-        .args(["20s", "sh"])
+        .args([bound.as_str(), "sh"])
         .arg(&script)
         .output()
         .expect("exercise forced-kill cleanup");
@@ -6684,10 +6702,12 @@ fn clean_python_suite_gate_accepts_growth_and_refuses_loss() {
 
 #[test]
 fn canary_process_custody_lifecycle() {
+    // SLACK hang guard for the isolated suite.
+    let bound = slack_timeout(60);
     let output = Command::new("timeout")
         .args([
             "--kill-after=2s",
-            "60s",
+            &bound,
             "python3",
             "-I",
             "tests/python/test_canary_process_custody.py",

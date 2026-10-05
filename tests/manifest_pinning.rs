@@ -2007,6 +2007,26 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
                 .success()
         );
     }
+    // The per-object cap also bounds every mount-table read (read_mountinfo_with
+    // caps a table at min(per_object_bytes, MAX_MOUNTINFO_BYTES)), and pinning
+    // reads the child's mountinfo before it can judge the object. A ~16 KB
+    // `hold` made the cap below smaller than a busy host's mount table, so the
+    // case failed on the table, not the object (DR-PINNING-MOUNTINFO-HOST-SIZE).
+    // Extend `hold` with a sparse tail past the absolute 64 MiB mount-table
+    // ceiling: the cap then never binds the table before the product's own
+    // ceiling does, on any host. Bytes past the ELF's segments are never loaded.
+    const MOUNT_TABLE_CEILING: u64 = 64 * 1024 * 1024;
+    assert!(
+        include_str!("../src/discovery/scan.rs")
+            .contains("const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;"),
+        "MOUNT_TABLE_CEILING must track scan.rs MAX_MOUNTINFO_BYTES"
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&executable)
+        .unwrap()
+        .set_len(MOUNT_TABLE_CEILING + 2)
+        .unwrap();
     let mut child = ChildGuard(
         Command::new(&executable)
             .stdin(Stdio::piped())
@@ -2049,6 +2069,10 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
     assert_eq!(modules[0].path, exe.display().to_string());
     // Sized from live data: one byte under the object the scan actually reported.
     let len = std::fs::metadata(&exe).unwrap().len();
+    assert!(
+        len - 1 > MOUNT_TABLE_CEILING,
+        "hold was not extended: {len}"
+    );
     let limits = ScanLimits {
         per_object_bytes: len - 1,
         total_bytes: u64::MAX,

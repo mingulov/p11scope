@@ -944,14 +944,19 @@ fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
     );
 }
 
-/// The version-matrix fixture plus a 256 KiB *initialized* data tail, so the
-/// readable file-backed data exceeds the per-object cap under test. BSS would
-/// not do: uninitialized pages are anonymous, not attributed to the object.
-fn build_padded_fixture(dir: &Path, name: &str) -> PathBuf {
+/// The version-matrix fixture plus a `pad_bytes` *initialized* data tail, so
+/// the readable file-backed data exceeds the per-object cap under test. BSS
+/// would not do: uninitialized pages are anonymous, not attributed to the
+/// object.
+fn build_padded_fixture(dir: &Path, name: &str, pad_bytes: u64) -> PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("crates/discover/tests/fixture/version_matrix.c");
     let pad = dir.join(format!("{name}-pad.c"));
-    std::fs::write(&pad, "char a5_sparse_pad[256 * 1024] = { 1 };\n").unwrap();
+    std::fs::write(
+        &pad,
+        format!("char a5_sparse_pad[{pad_bytes}] = {{ 1 }};\n"),
+    )
+    .unwrap();
     let so = dir.join(format!("{name}.so"));
     let ok = Command::new("gcc")
         .args(["-shared", "-fPIC", "-o"])
@@ -970,13 +975,16 @@ fn build_padded_fixture(dir: &Path, name: &str) -> PathBuf {
 fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
     let _guard = serial_guard();
     let dir = tmp("scan-cap");
-    let so = build_padded_fixture(&dir, "capped");
-    load_and_populate(&so);
     // Admit earlier mount-table identity work, then refuse the memory
     // snapshot at its exact data-size boundary. The sparse export check
     // itself is ungated, so the module is still identified by its exports.
+    // The per-object cap also bounds the mount-table read, so the pad must
+    // dominate this host's table: a fixed 256 KiB pad failed the precondition
+    // below on a host with a larger mountinfo.
     let mountinfo_bytes = u64::try_from(std::fs::read("/proc/self/mountinfo").unwrap().len())
         .expect("mountinfo length fits in u64");
+    let so = build_padded_fixture(&dir, "capped", (256 * 1024).max(4 * mountinfo_bytes));
+    load_and_populate(&so);
     let file_bytes = std::fs::metadata(&so).unwrap().len();
     let data_bytes = readable_data_bytes(&so);
     assert!(

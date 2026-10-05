@@ -56,9 +56,14 @@ def _time_scale():
     return value
 
 
+def slack(seconds):
+    """Scale a wait-until bound whose expiry can only mean failure."""
+    return seconds * _time_scale()
+
+
 def slack_timeout(seconds):
     """A `timeout(1)` duration for a SLACK hang guard."""
-    return f"{seconds * _time_scale():g}s"
+    return f"{slack(seconds):g}s"
 
 
 def load_subject(bits):
@@ -548,11 +553,18 @@ class TaskStorageReaderTests(unittest.TestCase):
     def test_native_main_bounds_collection_and_never_publishes_failed_frames(self):
         dumper = load_dumper()
         real_popen, real_open, real_close = subprocess.Popen, os.pidfd_open, os.close
-        unrelated = real_popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        # The reader timeout is a SLACK bound for the cases whose reader
+        # completes (a python start must fit in it; a literal 0.2 s did not at
+        # host load ~30). The held readers below sleep 25x longer, so it still
+        # expires first where expiry is the asserted outcome.
+        reader_timeout = slack(0.2)
+        hold = 25 * reader_timeout
+        unrelated = real_popen([sys.executable, "-c", f"import time; time.sleep({hold})"])
         good = self.complete_stream()
         cases = {
-            "output": ("os.write(1, b'x' * 4349); time.sleep(5)", "output bound"),
-            "eof-timeout": (f"os.write(1, {self.frame(2)!r}); os.close(1); os.close(2); time.sleep(5)",
+            "output": (f"os.write(1, b'x' * 4349); time.sleep({hold})", "output bound"),
+            "eof-timeout": (f"os.write(1, {self.frame(2)!r}); os.close(1); os.close(2); "
+                            f"time.sleep({hold})",
                             "timed out"),
             "diagnostic": ("os.write(2, b'e' * 50000); sys.exit(7)", "failed with status 7"),
             "magic": (f"os.write(1, {b'BADMAGIC' + good[8:]!r})", "invalid magic"),
@@ -560,7 +572,7 @@ class TaskStorageReaderTests(unittest.TestCase):
             "trailing": (f"os.write(1, {good + b'x'!r})", "after terminal EOF"),
             "missing-eof": (f"os.write(1, {good[:-28]!r})", "before terminal EOF"),
             "eof-metadata": (f"os.write(1, {self.frame(2, map_id=101)!r})", "nonzero metadata"),
-            "pidfd-refusal": ("time.sleep(5)", "native pin refusal"),
+            "pidfd-refusal": (f"time.sleep({hold})", "native pin refusal"),
             "pidfd-close": (f"os.write(1, {good!r})", "native pidfd close failure"),
         }
         inventory = [{"name": "START", "id": 99, "type": "hash", "bytes_key": 8,
@@ -611,7 +623,7 @@ class TaskStorageReaderTests(unittest.TestCase):
                                 mock.patch.object(dumper.glob, "glob", return_value=[]), \
                                 mock.patch.object(dumper, "map_ids_from_fdinfo", return_value=[99, 101, 102, 103]), \
                                 mock.patch.object(dumper, "run_json", side_effect=fake_json), \
-                                mock.patch.object(dumper, "TASK_STORAGE_TIMEOUT_SECONDS", 0.2), \
+                                mock.patch.object(dumper, "TASK_STORAGE_TIMEOUT_SECONDS", reader_timeout), \
                                 mock.patch.object(dumper, "TASK_STORAGE_MAX_RECORDS", 8), \
                                 mock.patch.object(dumper, "TASK_STORAGE_MAX_BYTES", 4096), \
                                 mock.patch.object(sys, "argv", argv):

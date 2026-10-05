@@ -13,6 +13,10 @@ void *memset(void *dest, int value, unsigned long count) { return dest; }
 HELPER(p11_link_current_identity)
 HELPER(p11_link_emit_fork)
 HELPER(p11_link_fork_allowed)
+/* Task 3 Stage A continuity halves (native instance_epoch.c). */
+HELPER(p11_instance_entry)
+HELPER(p11_instance_return)
+HELPER(p11_instance_exec)
 #ifdef OWNER_GLOBAL
 #define OWNER_LINKAGE
 #else
@@ -50,4 +54,8 @@ SEC("raw_tp/sched_process_exec") int sched_process_exec(void *ctx) { return p11_
 SEC("raw_tp/sched_process_exit") int sched_process_exit(void *ctx) {
     return p11_owner_cleanup(ctx) + p11_root_current_exit(ctx);
 }
+/* Task 3 Stage A continuity witness hooks (Detailed objects only). */
+SEC("fentry/uprobe_mmap") int p11_inst_vma_map(void *ctx) { return 0; }
+SEC("fentry/uprobe_munmap") int p11_inst_vma_unmap(void *ctx) { return 0; }
+SEC("fexit/copy_vma") int p11_inst_vma_copy(void *ctx) { return 0; }
 #endif

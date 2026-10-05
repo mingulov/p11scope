@@ -446,8 +446,11 @@ def validate_private_helpers(elf, prefix, required, optional, label,
             raise RuntimeError(f"{label} helper {name} must be {linkage} DEFAULT FUNC in .text")
         if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
             raise RuntimeError(f"{label} helper {name} has invalid/empty body")
+    # Stage A hooks link into Detailed objects only; inventory flavors keep
+    # file-level semantics without them (as task_newtask).
     for name, location in EXACT_PROGRAM_SECTIONS.items():
-        if inventory and name == "task_newtask":
+        if inventory and name in ("task_newtask", "p11_inst_vma_map",
+                                  "p11_inst_vma_unmap", "p11_inst_vma_copy"):
             continue
         matches = [s for s in elf.symbols if s[0] == name]
         if (len(matches) != 1 or matches[0][1] != 0x12 or matches[0][2] != 0

@@ -168,7 +168,8 @@ class MapDefsTests(unittest.TestCase):
                         str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"), "-o", str(obj)],
                        check=True, capture_output=True)
         _, programs, symbols = checker.inspect(obj)
-        self.assertEqual(programs, {"probe", "task_newtask", "sched_process_exec", "sched_process_exit"})
+        self.assertEqual(programs, {"probe", "task_newtask", "sched_process_exec", "sched_process_exit",
+                                   "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"})
         self.assertTrue(checker.REQUIRED_GLOBAL_HELPERS <= symbols)
         body, elf, _ = self.metadata(obj)
         symbase = elf.sections[".symtab"][0][4]

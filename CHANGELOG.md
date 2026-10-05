@@ -9,6 +9,30 @@ versioned separately and are opaque, exact dispatch keys.
 
 Work toward v0.3.0.
 
+### Added
+
+- E16 execution-surface qualification checks that discovery finds, or
+  explicitly refuses, PKCS#11 code in six shapes. A control provider and a
+  synthetic client-side HSM proxy (socketpair only, no remote HSM) are
+  admitted with exact endpoint counts. A table linked statically into an
+  executable, and one reached only through `Vendor_GetFunctionList`, are
+  admitted under `--module` as 104 identity-pinned count-only endpoints.
+  Exports without a table get an explicit no-table record. Anonymous JIT
+  code is never admitted. Unhinted `--system` skips the static,
+  vendor-only and direct-export shapes without a record. E16 measures this
+  as a coverage gap rather than claiming coverage. The new parts:
+  - fixtures under `tests/fixtures/e16/` that share one hold protocol;
+  - `tests/e16_execution_surfaces.rs`;
+  - `scripts/qualify-e16-surfaces.py`, a provenance-bound privileged
+    runner built on the receipt seams, whose `--self-test` runs in CI;
+  - `tests/python/test_e16_oracle.py`, with a regression for each of the
+    eight archived-runner defects.
+
+  On the host, the hinted campaign passes all six surfaces. The
+  system-mixed campaign stops at UNKNOWN because the 512-slot attach
+  ceiling refused one surface. No product code changed. See
+  [docs/qualification/e16-execution-surfaces.md](docs/qualification/e16-execution-surfaces.md).
+
 ### Changed
 
 - A process is a caller of a provider only through an executable mapping

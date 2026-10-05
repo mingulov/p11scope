@@ -7,13 +7,13 @@ use super::*;
 use crate::discovery::identity::pin_scanned_view_objects;
 use crate::discovery::instances::{
     CallFacts, EntryIp, InstanceId, InstanceRouter, ObserveOutcome, Route, RouterLimits,
-    stable_scan,
+    UnknownReason, stable_scan,
 };
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
 use crate::plan::{AttachPlan, Slot};
 use crate::process::{PidPin, ProcessView, ProcessViewId};
 use anyhow::ensure;
-use p11scope_ebpf_common::{EventRecord, SlotSemantics, event_type};
+use p11scope_ebpf_common::{EventRecord, SlotSemantics, event_type, instance};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use p11scope_manifest::identity::{mapping_file_key, open_object};
 use p11scope_manifest::maps::{Device, ObjectKey};
@@ -243,7 +243,7 @@ fn hook_runs(harness: &Harness, program: &str) -> Result<u64> {
         .run_cnt)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Routed {
     slot: u32,
     tag: u64,
@@ -504,6 +504,130 @@ fn pump_until(harness: &mut Harness, target: &Target, calls: usize) -> Result<Ve
         std::thread::sleep(Duration::from_millis(5));
     }
     Ok(harness.take_routed())
+}
+
+/// A compiled provider+driver and a spawned `cmd` target answering READY.
+/// The tempdir lives as long as the setup, so the target's files survive.
+struct CmdSetup {
+    _directory: tempfile::TempDir,
+    provider: PathBuf,
+    target: Target,
+}
+
+fn spawn_cmd_target() -> Result<CmdSetup> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile(directory.path(), true)?;
+    let driver = compile(directory.path(), false)?;
+    let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()], &[])?;
+    let ready = target.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    Ok(CmdSetup {
+        _directory: directory,
+        provider,
+        target,
+    })
+}
+
+/// Pins one `C_GetSlotInfo` slot per provider, in order; slot 0 is the
+/// scanned and called file, so callers put their file first. Pins match
+/// providers by maps key (distinct files, distinct inodes).
+fn pin_and_plan_multi(
+    pid: u32,
+    providers: &[PathBuf],
+) -> Result<(ProcessView, PinnedObjects, AttachPlan)> {
+    let view = ProcessView::open(ProcessViewId(0), pid).map_err(anyhow::Error::msg)?;
+    let mut modules = Vec::new();
+    let mut keyed = Vec::new();
+    for provider in providers {
+        let file = open_object(provider).map_err(anyhow::Error::msg)?;
+        let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+        let elf = ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
+        ensure!(elf.abi() == ElfAbi::Lp64);
+        let key = ObjectKey {
+            device: Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        keyed.push((key, elf));
+        modules.push(ScannedModule {
+            mapped_identity: None,
+            double_loaded: false,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            path: provider.display().to_string(),
+            decoder_abi: None,
+            exports: vec![],
+            tables: vec![],
+            interfaces: vec![],
+        });
+    }
+    let (pins, skipped) =
+        pin_scanned_view_objects(&view, &modules, &mut CaptureWorkBudget::default())
+            .map_err(anyhow::Error::msg)?;
+    ensure!(skipped.is_empty(), "owned pins refused: {skipped:?}");
+    let mut slots = Vec::new();
+    for (index, ((key, elf), provider)) in keyed.iter().zip(providers).enumerate() {
+        let pinned = pins
+            .pinned()
+            .find(|pinned| pinned.key == *key)
+            .with_context(|| format!("no pin for {}", provider.display()))?;
+        let offset = elf
+            .defined_symbol("C_GetSlotInfo")
+            .map_err(anyhow::Error::msg)?
+            .with_context(|| format!("{} defines C_GetSlotInfo", provider.display()))?
+            .file_offset;
+        ensure!(elf.is_executable_offset(offset));
+        let names = vec!["C_GetSlotInfo".to_string()];
+        let (descriptor_index, ambiguous) = crate::kinds::descriptor_index(&names);
+        ensure!(!ambiguous);
+        slots.push(Slot {
+            index: index as u32,
+            descriptor_index,
+            object: pinned.id,
+            object_path: provider.display().to_string(),
+            file_offset: offset,
+            names,
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![],
+        });
+    }
+    Ok((view, pins, AttachPlan::from_slots(slots)))
+}
+
+/// Parses a `LOOPCOUNT n` / `LOOPED n` fixture reply.
+fn loop_iterations(reply: &str) -> Result<u64> {
+    reply
+        .split_whitespace()
+        .nth(1)
+        .context("loop reply shape")?
+        .parse()
+        .context("loop iteration count")
+}
+
+/// Whether `dir` lives on btrfs (statfs magic), for the fs-gated cells.
+fn dir_is_btrfs(dir: &Path) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: statfs writes the whole struct on success.
+    let rc = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    ensure!(
+        rc == 0,
+        "statfs {}: {}",
+        dir.display(),
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: success above initialized it.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.f_type as u64 == BTRFS_SUPER_MAGIC)
 }
 
 #[test]
@@ -1016,5 +1140,556 @@ fn privileged_instance_continuity_experiment_softhsm() -> Result<()> {
         "provider file was mutated during the run"
     );
     ensure!(harness.misses == 0);
+    Ok(())
+}
+
+/// Decision §3c: a pure `MREMAP_DONTUNMAP` keeps the old VMA (no munmap
+/// hook) while the new VMA reaches the copy_vma fexit hook. Both mappings
+/// stay live (the fixture mincore-checks them); the move renews the
+/// incarnation, and unmapping the pair renews it again. Zero false joins.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_mremap_dontunmap_keeps_both_and_renews() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let _stats = enable_bpf_stats()?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
+        target.command(b'c')?;
+        single_join(&pump_until(harness, target, 1)?)
+    };
+    let a = call(&mut harness, &mut target)?;
+    target.command(b'p')?;
+    let b = call(&mut harness, &mut target)?;
+    ensure!(b != a, "extra provider mapping kept the instance");
+    let copies = hook_runs(&harness, "p11_inst_vma_copy")?;
+    let moved = target.command(b'U')?;
+    ensure!(moved == "PUREMOVE", "DONTUNMAP dropped a mapping: {moved}");
+    let copied = hook_runs(&harness, "p11_inst_vma_copy")? - copies;
+    ensure!(
+        copied >= 1,
+        "DONTUNMAP move did not reach the copy_vma hook"
+    );
+    let after_move = call(&mut harness, &mut target)?;
+    ensure!(after_move != b, "DONTUNMAP move kept the instance");
+    target.command(b'P')?;
+    let after_unmap = call(&mut harness, &mut target)?;
+    ensure!(
+        after_unmap != after_move,
+        "DONTUNMAP pair unmap kept the instance"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "T3A_DONTUNMAP copied={copied} counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Decision §3c: a true vfork child (parent suspended) unmapping the
+/// shared provider page. The child is marked at fork, so the unmap goes
+/// to the file's global epoch and renews the parent's incarnation.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_vfork_unmap_globalizes() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
+        target.command(b'c')?;
+        single_join(&pump_until(harness, target, 1)?)
+    };
+    let a = call(&mut harness, &mut target)?;
+    target.command(b'p')?;
+    let b = call(&mut harness, &mut target)?;
+    ensure!(b != a, "extra provider mapping kept the instance");
+    let before = harness.session.instance_maps().counters()?;
+    let unmapped = target.command(b'V')?;
+    ensure!(unmapped == "VUNMAP", "{unmapped}");
+    let after = harness.session.instance_maps().counters()?;
+    ensure!(
+        after.shared > before.shared && after.global_bumps > before.global_bumps,
+        "vfork unmap was not globalized: {before:?} -> {after:?}"
+    );
+    let c = call(&mut harness, &mut target)?;
+    ensure!(c != b, "vfork unmap kept the instance");
+    eprintln!("T3A_VFORK counters={after:?} scans={:?}", harness.scan);
+    ensure!(harness.false_joins().is_empty());
+    ensure!(after.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Decision §3c: a punch-hole on the provider file from another process.
+/// The loaded image keeps executing from untouched text while the header
+/// page's VMAs are zapped through `unmap_mapping_range`, which must reach
+/// the munmap hook — a miss here is a hook-completeness finding, not a
+/// soft control. Static skip: needs punch-hole support under TMPDIR
+/// (btrfs/ext4/xfs; tmpfs refuses); run by hand as root with a suitable
+/// TMPDIR.
+#[test]
+#[ignore = "privileged: loads BPF; needs punch-hole-capable TMPDIR, run by hand"]
+fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
+        target.command(b'c')?;
+        single_join(&pump_until(harness, target, 1)?)
+    };
+    let a = call(&mut harness, &mut target)?;
+    let before = harness.session.instance_maps().counters()?.local_bumps;
+    let holed = target.command(b'h')?;
+    ensure!(holed == "PHOLE", "{holed}");
+    let hole_bumps = harness.session.instance_maps().counters()?.local_bumps - before;
+    ensure!(
+        hole_bumps >= 1,
+        "punch-hole did not reach uprobe_munmap (hook gap?)"
+    );
+    let b = call(&mut harness, &mut target)?;
+    ensure!(b != a, "punch-hole kept the instance");
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "T3A_PHOLE hole_bumps={hole_bumps} counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Decision §3c: exec renews the instance. The leader's record survives
+/// (same task), but the post-exec provider reload bumps past every
+/// pre-exec epoch, so post-exec calls join a new instance, never the old.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_exec_renews_the_instance() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, pid, &pins)?;
+    target.command(b'c')?;
+    let a = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let ready = target.command(b'e')?;
+    let fields: Vec<_> = ready.split_whitespace().collect();
+    ensure!(
+        fields.len() >= 2 && fields[0] == "READY" && fields[1] == pid.to_string(),
+        "not the same process after exec: {ready}"
+    );
+    target.command(b'c')?;
+    let b = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(b != a, "exec kept the instance");
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!("T3A_EXEC counters={counters:?} scans={:?}", harness.scan);
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Reads one byte of the target's memory (own child, as root).
+fn probe_byte(pid: u32, address: u64) -> Result<(isize, u8)> {
+    let mut byte = [0u8; 1];
+    let local = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let remote = libc::iovec {
+        iov_base: address as *mut libc::c_void,
+        iov_len: 1,
+    };
+    // SAFETY: two live one-byte iovecs.
+    let n = unsafe { libc::process_vm_readv(pid as i32, &local, 1, &remote, 1, 0) };
+    Ok((n, byte[0]))
+}
+
+/// Decision §3c: a non-leader thread execs. BOUND-documented outcome: the
+/// old leader dies, which silently detaches the classic (Singles) uprobe
+/// attachments — the new image's endpoint carries the original text byte,
+/// not `int3`, so post-exec calls execute untraced. No events means zero
+/// false joins (fail closed and visible); reattach on leader death is a
+/// product attach-layer gap (DR-T3A-6, Stage 5 non-leader-exec handoff),
+/// not witness misrouting. The gate pins the bound: no post-exec events
+/// with the detached-breakpoint mechanism shown, and no scan either (no
+/// traced call ever identifies the new leader, so it has no cookie).
+/// Nothing is routable, and nothing routes.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_nonleader_exec_detaches_without_misrouting() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, pid, &pins)?;
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let events_before = harness.events;
+    let ready = target.command(b'E')?;
+    let fields: Vec<_> = ready.split_whitespace().collect();
+    ensure!(
+        fields.len() >= 3 && fields[0] == "READY" && fields[1] == pid.to_string(),
+        "not the same process after nonleader exec: {ready}"
+    );
+    target.command(b'c')?;
+    for _ in 0..20 {
+        harness.pump(&target)?;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ensure!(
+        harness.events == events_before,
+        "post-exec calls unexpectedly traced"
+    );
+    // The mechanism: no breakpoint in the new mapping (original text byte,
+    // not int3). If a backend fix reattaches here, this fails and the gate
+    // must be upgraded to expect routing.
+    let base = u64::from_str_radix(fields[2], 16)?;
+    let offset = *harness.offsets.get(&0).context("slot 0 offset")?;
+    let (n, byte) = probe_byte(pid, base + offset)?;
+    ensure!(n == 1, "could not read the endpoint byte");
+    ensure!(
+        byte != 0xcc,
+        "breakpoint present after nonleader exec: reattach landed, upgrade this gate"
+    );
+    // No scan either: without a traced call the new leader has no cookie,
+    // so the scan protocol refuses (rather than scanning an unidentified
+    // process).
+    let outcome = harness.scan(&target, false)?;
+    ensure!(outcome.is_none(), "post-exec scan unexpectedly worked: {outcome:?}");
+    ensure!(
+        harness.scan.outcomes.contains_key("NoCookie"),
+        "post-exec scan must refuse on the missing cookie: {:?}",
+        harness.scan.outcomes
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "T3A_NONLEADER_EXEC_DETACHED byte={byte:02x} counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Decision §3c: fork without exec. Whether `dup_mmap` reaches the hooks
+/// is kernel behavior; the gate pins consistency (a new instance exactly
+/// when the fork bumped) and zero false joins either way.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_fork_without_exec_stays_consistent() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    target.command(b'c')?;
+    let a = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let before = harness.session.instance_maps().counters()?;
+    let forked = target.command(b'f')?;
+    ensure!(forked == "FORKED", "{forked}");
+    let after = harness.session.instance_maps().counters()?;
+    let bumps =
+        (after.local_bumps - before.local_bumps) + (after.global_bumps - before.global_bumps);
+    target.command(b'c')?;
+    let b = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        (bumps == 0) == (b == a),
+        "fork outcome inconsistent with its {bumps} bumps"
+    );
+    eprintln!(
+        "T3A_FORK bumps={bumps} counters={after:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(after.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Decision §3c fault injection: `OVERFLOW` at the 9th watched file in one
+/// process. Nine provider files load before attach (unwatched, unclaimed);
+/// post-attach reloads claim the eight record cells in order, and the
+/// ninth file's reload overflows: its mutations go to its global epoch,
+/// its calls stamp `OVERFLOW` and never join, and no other file's global
+/// moves. The record flag is process-wide, so every later call from this
+/// process is unknown — fail closed.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_overflow_at_ninth_file_is_unknown() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    // Nine distinct files (distinct inodes) with identical bytes.
+    let first = compile(directory.path(), true)?;
+    let mut copies = vec![first];
+    for n in 1..9 {
+        let copy = directory.path().join(format!("provider{n}.so"));
+        std::fs::copy(&copies[0], &copy)?;
+        copies.push(copy);
+    }
+    let driver = compile(directory.path(), false)?;
+    let mut args: Vec<&std::ffi::OsStr> = vec!["ovf".as_ref()];
+    args.extend(copies.iter().map(|path| path.as_os_str()));
+    let mut target = Target::spawn(&driver, &args, &[])?;
+    let ready = target.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    // Slot 0 is the scanned and called file (file 8); the rest follow.
+    let mut ordered = vec![copies[8].clone()];
+    ordered.extend(copies[..8].iter().cloned());
+    let (_view, pins, plan) = pin_and_plan_multi(target.pid(), &ordered)?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let file_slots: Vec<u32> = plan
+        .slots
+        .iter()
+        .map(|slot| {
+            harness
+                .session
+                .instance_tracking()
+                .watched(slot.object)
+                .map(|watched| watched.file_slot)
+                .with_context(|| format!("slot {} not watched", slot.index))
+        })
+        .collect::<Result<_>>()?;
+    for n in 0..8u8 {
+        let reopened = target.command(b'0' + n)?;
+        ensure!(reopened == format!("REOPENED {n}"), "{reopened}");
+    }
+    let maps = harness.session.instance_maps();
+    ensure!(
+        maps.counters()?.overflow == 0,
+        "eight files must fit the record"
+    );
+    let reopened = target.command(b'8')?;
+    ensure!(reopened == "REOPENED 8", "{reopened}");
+    let maps = harness.session.instance_maps();
+    ensure!(
+        maps.counters()?.overflow >= 1,
+        "the ninth file did not overflow the record"
+    );
+    let pidfd = target.pin.pidfd()?;
+    let record = maps
+        .record(pidfd)?
+        .context("the target must own a record after nine reloads")?;
+    ensure!(
+        record.flags & instance::RECORD_OVERFLOW != 0,
+        "record flags {:x} lack OVERFLOW",
+        record.flags
+    );
+    ensure!(
+        maps.global(file_slots[0])? >= 1,
+        "the ninth file's mutations must go global"
+    );
+    for (slot, file) in file_slots[1..].iter().enumerate() {
+        ensure!(
+            maps.global(*file)? == 0,
+            "file {slot}'s mutations must stay local"
+        );
+    }
+    target.command(b'c')?;
+    let routed = pump_until(&mut harness, &target, 1)?;
+    ensure!(
+        routed
+            == vec![Routed {
+                slot: 0,
+                tag: TAG_MAIN,
+                route: Route::Unknown(UnknownReason::Overflow),
+            }],
+        "the ninth file's call must be Overflow-unknown: {routed:?}"
+    );
+    ensure!(
+        harness.joined_ids().is_empty(),
+        "nothing may join past OVERFLOW"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "T3A_OVERFLOW counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Decision §3c fault injection: the registration race — attach while a
+/// second thread loops dlmopen/dlclose. The loop-iteration counts around
+/// attach prove churn overlapped it; afterwards calls join one instance
+/// with zero false joins.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_attach_during_reload_loop_has_zero_false_joins() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let looping = target.command(b'L')?;
+    ensure!(looping == "LOOPING", "{looping}");
+    let before = loop_iterations(&target.command(b'n')?)?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let during = loop_iterations(&target.command(b'n')?)?;
+    ensure!(
+        during > before,
+        "no reload churn overlapped attach ({before} -> {during})"
+    );
+    let looped = target.command(b'l')?;
+    ensure!(looped.starts_with("LOOPED"), "{looped}");
+    for _ in 0..3 {
+        target.command(b'c')?;
+    }
+    let routed = pump_until(&mut harness, &target, 3)?;
+    single_join(&routed)?;
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "T3A_RACE churned_during_attach={} counters={counters:?} scans={:?}",
+        during - before,
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// F5 LRU-eviction injection: under a small-state build (INSTANCE_START =
+/// 1) two hammer threads' overlapping in-flight calls evict each other, so
+/// evicted calls surface `Unstamped` and never join — while sequential
+/// calls still join. Static skip: needs a P11SCOPE_SMALL_STATE_MAPS=1
+/// build; run by hand as root with that variable set.
+#[test]
+#[ignore = "privileged: needs a small-state build, run by hand"]
+fn privileged_instance_small_state_lru_eviction_never_joins() -> Result<()> {
+    ensure!(
+        std::env::var("P11SCOPE_SMALL_STATE_MAPS").as_deref() == Ok("1"),
+        "run by hand under a small-state build: P11SCOPE_SMALL_STATE_MAPS=1 <libtest> --exact {} --ignored",
+        "attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins",
+    );
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    // A sequential baseline joins even at LRU=1 (no overlap, no eviction).
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    target.send(b'H')?;
+    let started = target.line(Duration::from_secs(20))?;
+    ensure!(started == "HAMMERING", "{started}");
+    // Pump while the hammers run; ring loss is tolerated (no ledger
+    // equality here), but the drain must stay non-vacuous.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut hammered = None;
+    while hammered.is_none() {
+        harness.pump(&target)?;
+        while let Ok(line) = target.lines.try_recv() {
+            ensure!(!line.starts_with("FAIL"), "fixture failed: {line}");
+            target.ledger.push(line.clone());
+            if line.starts_with("HAMMERED") {
+                hammered = Some(line);
+            }
+        }
+        ensure!(Instant::now() < deadline, "timed out waiting for HAMMERED");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let hammered = hammered.expect("loop exits only on HAMMERED");
+    ensure!(hammered == "HAMMERED 100000", "{hammered}");
+    for _ in 0..20 {
+        harness.pump(&target)?;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let unstamped = harness
+        .routed
+        .iter()
+        .filter(|routed| routed.route == Route::Unknown(UnknownReason::Unstamped))
+        .count();
+    let joined = harness
+        .routed
+        .iter()
+        .filter(|routed| matches!(routed.route, Route::Joined(_)))
+        .count();
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "T3A_EVICT observed={} joined={joined} unstamped={unstamped} unknown={:?} counters={counters:?} scans={:?}",
+        harness.events,
+        harness.unknown_reasons(),
+        harness.scan
+    );
+    ensure!(
+        unstamped >= 1,
+        "no eviction observed — is this a small-state build?"
+    );
+    ensure!(joined >= 1, "no positive routing at all");
+    ensure!(harness.events >= 100, "drain went vacuous");
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// F5 stale-key control on a live btrfs filesystem: the provider's
+/// kernel-observed `s_dev`/`i_ino` (anonymous btrfs device numbers) flows
+/// through calibration into hook keys and map_files-confirmed scans, and
+/// same-address reload still separates. Static skip: needs TMPDIR on
+/// btrfs; run by hand as root with a suitable TMPDIR.
+#[test]
+#[ignore = "privileged: needs TMPDIR on btrfs, run by hand"]
+fn privileged_instance_routing_on_btrfs_tmpdir() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    ensure!(
+        dir_is_btrfs(_directory.path())?,
+        "needs TMPDIR on btrfs, run by hand: TMPDIR=<btrfs dir> <binary> --exact {} --ignored",
+        "attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir",
+    );
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    target.command(b'c')?;
+    let a = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let reload = target.command(b'r')?;
+    let fields: Vec<_> = reload.split_whitespace().collect();
+    ensure!(
+        fields.len() == 4 && fields[2] == fields[3],
+        "not same-address: {reload}"
+    );
+    target.command(b'c')?;
+    let b = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        b != a,
+        "same-address reload on btrfs revived instance {a:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!("T3A_BTRFS counters={counters:?} scans={:?}", harness.scan);
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
     Ok(())
 }

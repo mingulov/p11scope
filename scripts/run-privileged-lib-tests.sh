@@ -59,8 +59,8 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (84 ignored tests in the default-feature lib binary): 69 run by
-# default, 5 run only with --include-long, 10 are statically skipped with a
+# Curation (94 ignored tests in the default-feature lib binary): 76 run by
+# default, 5 run only with --include-long, 13 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
 # never be silently dropped and a renamed one can never silently pass.
@@ -72,9 +72,16 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # Default campaign: every ignored test except the long cells and the static
 # skips. Order is the binary's --list order; each runs in its own process.
 DEFAULT_TESTS=(
+attach::instance_tests::privileged_instance_attach_during_reload_loop_has_zero_false_joins
+attach::instance_tests::privileged_instance_exec_renews_the_instance
+attach::instance_tests::privileged_instance_fork_without_exec_stays_consistent
 attach::instance_tests::privileged_instance_mapping_controls_never_join_old_state
+attach::instance_tests::privileged_instance_mremap_dontunmap_keeps_both_and_renews
+attach::instance_tests::privileged_instance_nonleader_exec_detaches_without_misrouting
+attach::instance_tests::privileged_instance_overflow_at_ninth_file_is_unknown
 attach::instance_tests::privileged_instance_reload_race_has_zero_false_joins
 attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and_mutation
+attach::instance_tests::privileged_instance_vfork_unmap_globalizes
 # DR-CLASSIC-PID0: classic --pid sessions (auto, singles, forced multi)
 # keep a foreign process and a PID reuser out at the kernel boundary (BPF
 # run statistics flat while they call) and in counts and call events; they
@@ -188,6 +195,9 @@ attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_b
 
 # Static skips: external fixture/driver/env the script cannot provide.
 SKIP_TESTS=(
+attach::instance_tests::privileged_instance_cross_process_punch_hole_renews
+attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir
+attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins
 attach::inventory::activation::privileged_tests::privileged_inventory_retirement_controlled_churn
 discovery::engine::tests::lifecycle_manifest_helper_entrypoint
 discovery::identity::tests::map_files_name_timing_per_thousand
@@ -200,6 +210,9 @@ process::tests::pidfd_denial::pidfd_denial_helper
 run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending
 )
 SKIP_REASONS=(
+"needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
+"needs TMPDIR on btrfs (it asserts the statfs magic); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
+"needs a P11SCOPE_SMALL_STATE_MAPS=1 libtest build (the default binary fails its build gate by design); run by hand as root from that build with the variable set"
 "needs an external barrier controller: P11SCOPE_I3A_RETIREMENT_MODE=worker|synchronous plus a root-owned 0700 CONTROL_DIR, a NONCE, and an external party to write the release file; no in-repo controller exists, so run once per mode by hand"
 "private helper re-executed by DiscoveryLifecycleFixture with P11SCOPE_TEST_DISCOVERY_PROVIDER/MANIFEST; its own docs say it is not a separate passing test"
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"

@@ -21,10 +21,25 @@
  *       Q  munmap the pair                                -> P2UNMAP
  *       R  start a racing caller thread (tag 0x72000000 + gen) -> RACING
  *       S  stop it and print its per-generation ledger    -> RACED gen:n,...
+ *       U  pure MREMAP_DONTUNMAP of that page (both stay) -> PUREMOVE
+ *       V  vfork child unmaps that shared page             -> VUNMAP
+ *       h  another process punch-holes the provider file   -> PHOLE
+ *       e  exec self (pipes survive; READY again)          -> (READY ...)
+ *       E  a non-leader thread execs self                  -> (READY ...)
+ *       f  fork a child that exits without exec            -> FORKED
+ *       L  start a dlmopen/dlclose loop thread             -> LOOPING
+ *       n  loop iterations so far (no stop)                -> LOOPCOUNT n
+ *       l  stop it and print its iterations                -> LOOPED n
+ *       H  two threads hammer tight calls (async)          -> HAMMERING/HAMMERED
  *       x  exit
  *       Reloads take a write lock that racing calls hold for reading, so a
  *       racing call never executes in an unmapped image; calls still race
  *       every stamp, scan and reload boundary.
+ *   instance-continuity ovf P0 P1 ... P8
+ *       Nine-file overflow workload: all nine files are loaded at startup
+ *       (before any attach, so unwatched), then '0'-'8' reload file N and
+ *       'c' calls C_GetSlotInfo through file 8's handle (tag 0x70000000).
+ *       'x' exits. Replies: READY, REOPENED n, CALL rv.
  *   instance-continuity churn PROVIDER UNRELATED_FILE UNRELATED_SO SECONDS RATE
  *       SoftHSM2 long-lived key workload (C_Initialize, login as user 1234,
  *       one AES-256 session key, then tagged C_GetSlotInfo + C_Encrypt calls
@@ -119,6 +134,82 @@ static atomic_uint race_gen;
 static atomic_int race_stop;
 static unsigned long race_counts[RACE_GENS];
 
+/* The main handle's resolved endpoint, cached across calls: after a
+ * punch-hole zeroes the file's header page, dlsym can no longer validate
+ * the image, while a cached pointer still executes intact text. The cache
+ * is keyed by handle, so reloads re-resolve. */
+static void *cached_handle;
+static slot_info_fn cached_call;
+
+static slot_info_fn main_call(void *handle)
+{
+    if (handle != cached_handle) {
+        cached_call = handle ? (slot_info_fn)dlsym(handle, "C_GetSlotInfo") : NULL;
+        cached_handle = handle;
+    }
+    return cached_call;
+}
+
+/* dlmopen/dlclose loop (attach race) and tight-call hammers (LRU
+ * eviction): separate handles from the main one, never reloaded. */
+static const char *loop_provider;
+static atomic_int loop_stop;
+static atomic_ulong loop_count;
+static void *hammer_handle;
+static unsigned hammer_gen;
+#define HAMMER_ITERS 50000UL
+
+static void *looper(void *unused)
+{
+    (void)unused;
+    /* dlmopen, not dlopen: reloading an already-loaded file only bumps a
+     * refcount, while a fresh namespace churns real mappings. */
+    while (!atomic_load(&loop_stop)) {
+        void *h = dlmopen(LM_ID_NEWLM, loop_provider, RTLD_NOW | RTLD_LOCAL);
+        if (!h)
+            return (void *)1;
+        dlclose(h);
+        atomic_fetch_add(&loop_count, 1);
+    }
+    return NULL;
+}
+
+static void *hammer(void *arg)
+{
+    unsigned long iters = (unsigned long)arg;
+    char info[256];
+    slot_info_fn call = hammer_handle ? (slot_info_fn)dlsym(hammer_handle, "C_GetSlotInfo") : NULL;
+    if (!call)
+        return (void *)1;
+    for (unsigned long i = 0; i < iters; i++)
+        call(0x70000000UL + hammer_gen, info);
+    return NULL;
+}
+
+static void *exec_self_thread(void *arg)
+{
+    const char *provider = arg;
+    execl("/proc/self/exe", "instance-continuity", "cmd", provider, (char *)NULL);
+    return (void *)1; /* execl failed */
+}
+
+/* Its own frame: vfork shares the parent's stack, so the caller's
+ * registers must not hold live values across it (-Wclobbered). */
+static int vfork_unmap_page(void *page)
+{
+    pid_t child = vfork();
+    int status = 0;
+    if (child < 0)
+        return -1;
+    if (child == 0) {
+        int rc = munmap(page, 4096);
+        _exit(rc == 0 ? 0 : 3);
+    }
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return -1;
+    return 0;
+}
+
 static void *racer(void *unused)
 {
     char info[256];
@@ -143,9 +234,12 @@ static int cmd_mode(const char *provider)
 {
     pthread_t race_thread;
     int racing = 0;
+    pthread_t loop_thread;
+    int looping = 0;
     void *handle = dlopen(provider, RTLD_NOW | RTLD_LOCAL);
     void *sibling = NULL;
     void *page = NULL;
+    void *moved = NULL;
     void *split = NULL;
     unsigned gen = 0;
     struct stat st;
@@ -165,7 +259,7 @@ static int cmd_mode(const char *provider)
             return 0;
         switch (command) {
         case 'c': {
-            slot_info_fn call = (slot_info_fn)dlsym(handle, "C_GetSlotInfo");
+            slot_info_fn call = main_call(handle);
             if (!call)
                 die("dlsym");
             printf("CALL %u %lu\n", gen, call(0x70000000UL + gen, info));
@@ -274,8 +368,136 @@ static int cmd_mode(const char *provider)
             if (page)
                 munmap(page, 4096);
             page = NULL;
+            if (moved)
+                munmap(moved, 4096);
+            moved = NULL;
             printf("PUNMAP\n");
             break;
+        case 'U': {
+            /* Pure MREMAP_DONTUNMAP: the old VMA stays, so only the
+             * copy_vma hook sees the new VMA. Both must stay mapped. */
+            void *fresh;
+            unsigned char vec;
+            if (!page || moved)
+                die("mremap without page");
+            fresh = mremap(page, 4096, 4096, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+            if (fresh == MAP_FAILED)
+                die("mremap provider pure");
+            if (mincore(page, 4096, &vec) != 0 || mincore(fresh, 4096, &vec) != 0)
+                die("DONTUNMAP dropped a mapping");
+            moved = fresh;
+            printf("PUREMOVE\n");
+            break;
+        }
+        case 'V':
+            /* A true vfork child (parent suspended) unmapping the shared
+             * provider page: the child is marked at fork, so the unmap
+             * goes to the file's global epoch. */
+            if (!page)
+                die("vfork unmap without page");
+            if (vfork_unmap_page(page) != 0)
+                die("vfork child unmap");
+            page = NULL;
+            printf("VUNMAP\n");
+            break;
+        case 'h': {
+            /* Another process (a forked child) punch-holes the provider
+             * file's first page: the loaded image keeps executing from
+             * untouched text while the header page's VMAs are zapped. */
+            pid_t child;
+            int status;
+            child = fork();
+            if (child < 0)
+                die("fork for punch-hole");
+            if (child == 0) {
+                int fd = open(provider, O_RDWR);
+                int rc = -1;
+                if (fd >= 0) {
+                    rc = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096);
+                    close(fd);
+                }
+                _exit(rc == 0 ? 0 : 3);
+            }
+            if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+                WEXITSTATUS(status) != 0)
+                die("punch-hole child");
+            printf("PHOLE\n");
+            break;
+        }
+        case 'e':
+            /* Exec self: pipes survive, the driver restarts and prints
+             * READY again with a reset generation. */
+            execl("/proc/self/exe", "instance-continuity", "cmd", provider, (char *)NULL);
+            die("exec self");
+            break;
+        case 'E': {
+            /* A non-leader thread execs self: de_thread kills this main
+             * thread, so the join below only returns when execl failed. */
+            pthread_t thread;
+            void *result = NULL;
+            if (pthread_create(&thread, NULL, exec_self_thread, (void *)provider) != 0)
+                die("exec thread");
+            pthread_join(thread, &result);
+            (void)result;
+            die("nonleader exec returned");
+            break;
+        }
+        case 'f': {
+            pid_t child = fork();
+            if (child < 0)
+                die("fork");
+            if (child == 0)
+                _exit(0);
+            if (waitpid(child, NULL, 0) != child)
+                die("wait fork");
+            printf("FORKED\n");
+            break;
+        }
+        case 'L':
+            loop_provider = provider;
+            atomic_store(&loop_stop, 0);
+            if (looping || pthread_create(&loop_thread, NULL, looper, NULL) != 0)
+                die("loop thread");
+            looping = 1;
+            printf("LOOPING\n");
+            break;
+        case 'n':
+            printf("LOOPCOUNT %lu\n", atomic_load(&loop_count));
+            break;
+        case 'l': {
+            void *result = NULL;
+            if (!looping)
+                die("not looping");
+            atomic_store(&loop_stop, 1);
+            pthread_join(loop_thread, &result);
+            looping = 0;
+            if (result != NULL)
+                die("loop iteration");
+            printf("LOOPED %lu\n", atomic_load(&loop_count));
+            break;
+        }
+        case 'H': {
+            /* Two hammer threads, tight calls, async protocol: HAMMERING
+             * now (the observer pumps while they run), HAMMERED when both
+             * joined. No reloads run meanwhile, so no lock is needed. */
+            pthread_t h1, h2;
+            void *r1 = NULL, *r2 = NULL;
+            hammer_handle = handle;
+            hammer_gen = gen;
+            if (pthread_create(&h1, NULL, hammer, (void *)HAMMER_ITERS) != 0)
+                die("hammer1");
+            if (pthread_create(&h2, NULL, hammer, (void *)HAMMER_ITERS) != 0)
+                die("hammer2");
+            printf("HAMMERING\n");
+            fflush(stdout);
+            pthread_join(h1, &r1);
+            pthread_join(h2, &r2);
+            hammer_handle = NULL;
+            if (r1 != NULL || r2 != NULL)
+                die("hammer call");
+            printf("HAMMERED %lu\n", 2 * HAMMER_ITERS);
+            break;
+        }
         case 'D':
             /* MADV_DONTNEED of a provider mapping: drops private pages and
              * changes no VMA (the zap path still reaches uprobe_munmap). */
@@ -537,14 +759,57 @@ static int churn_mode(int argc, char **argv)
     return 0;
 }
 
+/* Nine-file overflow workload: argv[2 + n] is provider file n, all loaded
+ * before any attach (unwatched, so unclaimed). Commands '0'-'8' reload
+ * one file each, 'c' calls through file 8's handle. */
+static int ovf_mode(int argc, char **argv)
+{
+    void *handles[9] = { NULL };
+    char info[256];
+    if (argc != 11)
+        die("ovf usage");
+    for (unsigned n = 0; n < 9; n++) {
+        handles[n] = dlopen(argv[2 + n], RTLD_NOW | RTLD_LOCAL);
+        if (!handles[n])
+            die("ovf dlopen");
+    }
+    printf("READY %d\n", getpid());
+    fflush(stdout);
+    for (;;) {
+        int command = getchar();
+        if (command == EOF || command == 'x')
+            return 0;
+        if (command >= '0' && command <= '8') {
+            unsigned n = (unsigned)(command - '0');
+            if (handles[n] == NULL || dlclose(handles[n]) != 0)
+                die("ovf dlclose");
+            handles[n] = dlopen(argv[2 + n], RTLD_NOW | RTLD_LOCAL);
+            if (!handles[n])
+                die("ovf dlopen");
+            printf("REOPENED %u\n", n);
+        } else if (command == 'c') {
+            slot_info_fn call =
+                handles[8] ? (slot_info_fn)dlsym(handles[8], "C_GetSlotInfo") : NULL;
+            if (!call)
+                die("ovf dlsym");
+            printf("CALL %lu\n", call(0x70000000UL, info));
+        } else {
+            continue;
+        }
+        fflush(stdout);
+    }
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc >= 3 && strcmp(argv[1], "cmd") == 0)
         return cmd_mode(argv[2]);
+    if (argc == 11 && strcmp(argv[1], "ovf") == 0)
+        return ovf_mode(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "churn") == 0)
         return churn_mode(argc, argv);
-    fprintf(stderr, "usage: instance-continuity cmd PROVIDER | churn ...\n");
+    fprintf(stderr, "usage: instance-continuity cmd PROVIDER | ovf P0..P8 | churn ...\n");
     return 64;
 }
 #endif

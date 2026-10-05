@@ -50,25 +50,53 @@ pub(crate) trait RangeStat: Send + Sync {
 /// observer's usable CPUs (its affinity), at most
 /// [`MAX_PROOF_STAT_THREADS`].
 ///
-/// Experiment override: `P11SCOPE_PROOF_STAT_THREADS` pins the count
-/// (`0`/`1` force the serial path, `N` caps at `N`); unset or
-/// unparsable keeps the default below.
+/// Diagnostic override: `P11SCOPE_PROOF_STAT_THREADS` pins the count
+/// (`0`/`1` force the serial path, `N` caps at [`MAX_PROOF_STAT_THREADS`]);
+/// unset or unparsable keeps the default above. When set, a stderr note
+/// reports the value used, or that the value was ignored (see the M1 row
+/// in `docs/known-limitations.md`).
 pub(crate) fn proof_stat_threads() -> usize {
     let default = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1)
         .min(MAX_PROOF_STAT_THREADS);
-    proof_stat_threads_override(std::env::var("P11SCOPE_PROOF_STAT_THREADS").ok(), default)
+    let env = std::env::var("P11SCOPE_PROOF_STAT_THREADS").ok();
+    let parsed = parse_proof_stat_threads(env.as_deref());
+    match (env.as_deref(), parsed) {
+        (Some(raw), Some(threads)) => {
+            let noun = if threads == 1 { "thread" } else { "threads" };
+            eprintln!(
+                "p11scope: P11SCOPE_PROOF_STAT_THREADS={raw} selects {threads} proof-stat {noun}"
+            );
+            threads
+        }
+        (Some(raw), None) => {
+            let noun = if default == 1 { "thread" } else { "threads" };
+            eprintln!(
+                "p11scope: ignoring invalid P11SCOPE_PROOF_STAT_THREADS={raw}; using the default {default} proof-stat {noun}"
+            );
+            default
+        }
+        (None, _) => default,
+    }
+}
+
+/// Parse `P11SCOPE_PROOF_STAT_THREADS`: `Some(threads)` when set and valid
+/// (`0`/`1` force the serial path, `N` caps at [`MAX_PROOF_STAT_THREADS`]),
+/// `None` when unset or unparsable (the caller keeps its default).
+fn parse_proof_stat_threads(env: Option<&str>) -> Option<usize> {
+    match env.map(str::trim).map(str::parse::<usize>) {
+        Some(Ok(0)) | Some(Ok(1)) => Some(1),
+        Some(Ok(n)) => Some(n.min(MAX_PROOF_STAT_THREADS)),
+        _ => None,
+    }
 }
 
 /// [`proof_stat_threads`] without the environment read, so the override
 /// is unit-testable without process-global env mutation.
+#[cfg(test)]
 fn proof_stat_threads_override(env: Option<String>, default: usize) -> usize {
-    match env.as_deref().map(str::trim).map(str::parse::<usize>) {
-        Some(Ok(0)) | Some(Ok(1)) => 1,
-        Some(Ok(n)) => n.min(MAX_PROOF_STAT_THREADS),
-        _ => default,
-    }
+    parse_proof_stat_threads(env.as_deref()).unwrap_or(default)
 }
 
 type Chunk = (usize, Vec<StatResult>);
@@ -301,6 +329,35 @@ mod tests {
             MAX_PROOF_STAT_THREADS
         );
         assert_eq!(proof_stat_threads_override(Some(" 3 ".into()), 4), 3);
+    }
+
+    /// The knob parser distinguishes set-and-valid (a count, capped) from
+    /// unset-or-unparsable (no count, so the caller keeps its default and
+    /// reports the value ignored). What counts as a number is exactly
+    /// what `usize` parses after trimming whitespace: a leading `+` is
+    /// accepted, while `-1`, fractions and overflow are not.
+    #[test]
+    fn the_thread_knob_parser_counts_valid_and_rejects_the_rest() {
+        assert_eq!(parse_proof_stat_threads(None), None);
+        assert_eq!(parse_proof_stat_threads(Some("0")), Some(1));
+        assert_eq!(parse_proof_stat_threads(Some("1")), Some(1));
+        assert_eq!(parse_proof_stat_threads(Some("2")), Some(2));
+        assert_eq!(
+            parse_proof_stat_threads(Some("99")),
+            Some(MAX_PROOF_STAT_THREADS)
+        );
+        assert_eq!(parse_proof_stat_threads(Some(" 3 ")), Some(3));
+        assert_eq!(parse_proof_stat_threads(Some("+2")), Some(2));
+        assert_eq!(parse_proof_stat_threads(Some("")), None);
+        assert_eq!(parse_proof_stat_threads(Some("   ")), None);
+        assert_eq!(parse_proof_stat_threads(Some("bogus")), None);
+        assert_eq!(parse_proof_stat_threads(Some("-1")), None);
+        assert_eq!(parse_proof_stat_threads(Some("3.5")), None);
+        assert_eq!(parse_proof_stat_threads(Some("2 threads")), None);
+        assert_eq!(
+            parse_proof_stat_threads(Some("99999999999999999999999")),
+            None
+        );
     }
 
     /// A worker that panics (or whose result never returns) does not lose

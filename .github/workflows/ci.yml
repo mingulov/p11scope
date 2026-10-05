@@ -175,7 +175,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -192,7 +192,7 @@ jobs:
       # Network acquisition is explicit and precedes every offline validation.
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - run: python3 -I scripts/ci-test-partition.py run --partition "contracts:${{ matrix.shard }}/4" -- cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets
+      - run: python3 -I scripts/ci-test-partition.py run --partition "contracts:${{ matrix.shard }}/8" -- cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets
   # Every validator --self-test, the two container-less live lanes and every
   # tests/python suite. The UNRUN block is this job's first step after
   # checkout, so the lane list reaches the log even if a later step fails.
@@ -369,7 +369,7 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
-      CHECK_JOBS: lint audit tests contracts-1 contracts-2 contracts-3 contracts-4 scripts
+      CHECK_JOBS: lint audit tests contracts-1 contracts-2 contracts-3 contracts-4 contracts-5 contracts-6 contracts-7 contracts-8 scripts
     steps:
       - run: |
           mkdir "$RUNNER_TEMP/checks-logs"
@@ -719,11 +719,14 @@ jobs:
   # .coverage-floor (raise it, never lower it); the gate fails the workflow
   # when workspace line coverage drops below it. Include the existing CLI and
   # integration tests so their exercised production paths count toward the gate.
-  # The suite runs as the same partition as the test gate (rest plus every
-  # contracts shard), each under cargo llvm-cov --no-report; every shard packs
+  # The suite runs partitioned like the test gate (rest plus every contracts
+  # shard), each under cargo llvm-cov --no-report; every shard packs
   # its profiles (named after the partition, so runners never collide) and
   # the instrumented executables they belong to, and coverage-report merges
-  # them all into one report against the floor.
+  # them all into one report against the floor. Coverage splits
+  # artifact_contracts six ways, not eight like the test gate: the free plan
+  # runs at most 20 jobs at once, and 12 check jobs + 7 coverage shards (+1
+  # release-preview on dispatch) stays within it.
   coverage:
     runs-on: ubuntu-24.04
     env:
@@ -734,7 +737,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [rest, "contracts:1/4", "contracts:2/4", "contracts:3/4", "contracts:4/4"]
+        partition: [rest, "contracts:1/6", "contracts:2/6", "contracts:3/6", "contracts:4/6", "contracts:5/6", "contracts:6/6"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -776,7 +779,7 @@ jobs:
           pattern: coverage-shard-*
           path: ${{ runner.temp }}/coverage
       # Fails unless every partition's archive is present exactly once.
-      - run: python3 -I scripts/ci-test-partition.py coverage-unpack --contracts-shards 4 --target-dir target/llvm-cov-target "$RUNNER_TEMP/coverage"
+      - run: python3 -I scripts/ci-test-partition.py coverage-unpack --contracts-shards 6 --target-dir target/llvm-cov-target "$RUNNER_TEMP/coverage"
       # --workspace, as in the single-run gate this replaces: without it the
       # merged report measures the root package alone and drops every other
       # workspace member from the line count.

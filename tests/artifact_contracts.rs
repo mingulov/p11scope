@@ -8672,9 +8672,10 @@ fn hosted_pipeline_retains_the_job_log() {
 /// The workspace test gate and the coverage gate each run as one command split
 /// across parallel jobs. The split must be a partition, so this pins it from
 /// both ends: the contracts matrix names every shard 1..=N of the N its command
-/// uses, the coverage matrix runs exactly the same partition (rest plus every
-/// contracts shard), the report unpacks exactly that many shards, and no check
-/// job runs the gate in any other form. Inside each job the partition helper
+/// uses, the coverage matrix is itself a complete partition (rest plus every
+/// contracts shard 1..=M of its own M, which may be smaller than N to stay
+/// within the hosted concurrency limit), the report unpacks exactly those M
+/// shards, and no check job runs the gate in any other form. Inside each job the partition helper
 /// fails closed on its own (its `--self-test` runs in the checks job): a
 /// contracts shard proves from libtest's summary that it ran exactly its
 /// assigned tests, and the unpack refuses a missing or duplicated shard.
@@ -8713,13 +8714,20 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
             "{job}: the workspace test gate runs only as its pinned partition"
         );
     }
-    // Coverage runs the same partition, each share under llvm-cov --no-report.
+    // Coverage runs a complete partition of the same gate, each share under
+    // llvm-cov --no-report: rest plus contracts shards 1..=M of one M.
+    let coverage_partitions = matrix_axis(coverage, "partition").unwrap();
+    let coverage_shards = coverage_partitions.len().saturating_sub(1);
+    assert!(
+        coverage_shards >= 2,
+        "a one-shard coverage split is not a split"
+    );
     let mut partitions = vec!["rest".to_string()];
-    partitions.extend((1..=shards).map(|shard| format!("contracts:{shard}/{shards}")));
+    partitions
+        .extend((1..=coverage_shards).map(|shard| format!("contracts:{shard}/{coverage_shards}")));
     assert_eq!(
-        matrix_axis(coverage, "partition").unwrap(),
-        partitions,
-        "the coverage matrix must be exactly the test-gate partition"
+        coverage_partitions, partitions,
+        "the coverage matrix must be exactly rest plus contracts:1..=M/M"
     );
     for (block, call) in [
         (
@@ -8735,7 +8743,7 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
         (
             report,
             format!(
-                "python3 -I scripts/ci-test-partition.py coverage-unpack --contracts-shards {shards} --target-dir target/llvm-cov-target \"$RUNNER_TEMP/coverage\""
+                "python3 -I scripts/ci-test-partition.py coverage-unpack --contracts-shards {coverage_shards} --target-dir target/llvm-cov-target \"$RUNNER_TEMP/coverage\""
             ),
         ),
         (

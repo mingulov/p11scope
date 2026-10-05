@@ -59,8 +59,8 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (82 ignored tests in the default-feature lib binary): 68 run by
-# default, 4 run only with --include-long, 10 are statically skipped with a
+# Curation (84 ignored tests in the default-feature lib binary): 69 run by
+# default, 5 run only with --include-long, 10 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
 # never be silently dropped and a renamed one can never silently pass.

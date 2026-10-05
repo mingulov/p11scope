@@ -231,6 +231,14 @@ processes on the host): UNKNOWN, one cell short of PASS.**
   The host's p11-kit modules were refused the same way. The runner names
   this refusal and never counts it as coverage.
 
+Both campaigns were run again with the final runner (commit `ddac4d6`, same
+observer binary). Its provenance was bound from a fresh, clean worktree.
+The results matched: hinted six of six PASS, and system-mixed UNKNOWN on the
+proxy only. The proxy reason now reads "the owned module was explicitly
+refused at the attach-slot ceiling (evidence.modules_skipped); its calls
+were not counted". The same 512/449 slot figures appeared, and observer
+readiness again took about 18 s.
+
 The UNKNOWN is the correct verdict: the proxy's calls were not measured. It
 is not a discovery defect. It is the 512-slot attach ceiling
 (`MAX_SLOTS`) applied to every admitted full table on the machine, in

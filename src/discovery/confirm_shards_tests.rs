@@ -465,3 +465,110 @@ fn sharded_confirmation_equals_serial_under_an_inventory_window() {
         );
     }
 }
+
+/// Root, through the production `/proc` reads: real `sleep` children whose
+/// libc text is a matched key. Every child is pinned, re-read and proven
+/// on the shards and replayed; the result is the serial production probe's,
+/// member for member (start times, exe identities, paths).
+#[test]
+#[ignore = "root (map_files): proves real children's ranges"]
+fn privileged_sharded_confirmation_equals_the_serial_production_probe() {
+    use crate::discovery::sweep_attribution::{OsConfirmIo, OsMemberProbe};
+    struct Kill(Vec<std::process::Child>);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let children = Kill(
+        (0..24)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    // Let every child finish loading before its maps are read.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let sweep: Vec<(u32, Vec<MapEntry>)> = children
+        .0
+        .iter()
+        .map(|child| {
+            let text = std::fs::read(format!("/proc/{}/maps", child.id())).unwrap();
+            (
+                child.id(),
+                p11scope_manifest::maps::parse_maps(&text).unwrap(),
+            )
+        })
+        .collect();
+    let (pid, entries) = &sweep[0];
+    let libc_text = entries
+        .iter()
+        .find(|entry| {
+            entry.permissions[2] == b'x'
+                && entry
+                    .raw_path
+                    .as_deref()
+                    .is_some_and(|path| path.windows(4).any(|w| w == b"libc"))
+        })
+        .expect("sleep maps libc text");
+    let identity =
+        crate::discovery::identity::map_files_identity(*pid, libc_text.start, libc_text.end)
+            .unwrap();
+    struct Held(FileIdentity);
+    impl ObjectChecks for Held {
+        fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
+            Ok(None)
+        }
+        fn unchanged(&self, _: PinnedObjectId) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
+            Ok(MappedFile {
+                identity: self.0,
+                fs_magic: None,
+            })
+        }
+    }
+    let libc = ObjectKey::of(libc_text);
+    let (index, _) = KnownKeyIndex::build(
+        [(libc, Some(OBJECT))],
+        &BTreeMap::from([(libc, OBJECT)]),
+        [],
+        &Held(identity),
+    );
+    let none = BTreeSet::new();
+    let mut serial_budget = CaptureWorkBudget::default();
+    let serial = attribute_unselected(
+        &sweep,
+        &none,
+        &none,
+        &index,
+        &mut OsMemberProbe::default(),
+        &mut serial_budget,
+    );
+    assert_eq!(serial.members.len(), sweep.len(), "{serial:?}");
+    for shards in 2..=4 {
+        let mut budget = CaptureWorkBudget::default();
+        let sharded = attribute_unselected_sharded(
+            &sweep,
+            &none,
+            &none,
+            &index,
+            &mut budget,
+            shards,
+            &OsConfirmIo::default,
+        );
+        assert_eq!(sharded, serial, "{shards} shards");
+        assert_eq!(
+            budget.confirm_state_for_test().1,
+            serial_budget.confirm_state_for_test().1,
+            "work charged ({shards} shards)"
+        );
+    }
+}

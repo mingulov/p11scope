@@ -283,27 +283,34 @@ the min..max of per-sample p95.
 
 ## Capture loss and coverage
 
-### Lifecycle ring loss under exec churn (M4) — clean at 100 exec/s, ~100/min lost at 1,000
+### Lifecycle ring loss under exec churn (M4) — clean at 100 and 1,000 exec/s with the 2 MiB ring
 
 - What the user sees: at 448 processes, native lane: 100 exec/s loses
-  nothing (0 lifecycle and 0 ring loss in all 6 samples); 1,000 exec/s
-  loses about 100 ring records per minute (84–117 across 6 samples),
-  demotes 55 edges per minute-long capture with sticky unproven share
-  1.0, and runs 1 recovery rescan per capture. The loss stays disclosed
-  (`health_unproven`, demoted edges, the gap). The 64 KiB ring holds
-  about 70 920-byte records, and the lane does not drain while a pass
-  applies its scan, attaches entries, or reads usage. Churn 0 and
-  4,096-process churn cells were not measured in this tier.
+  nothing (0 lifecycle and 0 ring loss in all 6 samples); since v0.3.0
+  (unreleased) 1,000 exec/s also loses nothing (0 ring loss, 0 demoted
+  edges, sticky unproven share 0.0, 0 recovery rescans in all 6
+  samples; lifecycle high-water 4–8% of the ring). Previously (v0.2.0,
+  64 KiB ring) 1,000 exec/s lost about 100 ring records per minute
+  (84–117 across 6 samples), demoted 55 edges per minute-long capture
+  with sticky unproven share 1.0, and ran 1 recovery rescan per
+  capture. Any loss stays disclosed (`health_unproven`, demoted edges,
+  the gap). The 2 MiB ring holds about 2,260 920-byte records, and the
+  lane does not drain while a pass applies its scan, attaches entries,
+  or reads usage. Churn 0 and 4,096-process churn cells were not
+  measured in this tier.
 - Kernels/conditions: `--system --capture native` under unrelated exec
   churn, 3 cold + 3 warm 60 s samples per cell.
 - Disclosure: `observation.lifecycle` (`records`, `ring_loss`, `malformed`,
   `failed_quanta`, `recovery_rescans`), the `native capture lifecycle
   evidence lost` gap, sticky demotion of `watched_no_use`, and an immediate
-  bounded recovery rescan (never two in a row).
+  bounded recovery rescan (never two in a row). The ring's high-water
+  fill is `P11SCOPE_STAGE_TIMINGS=1` stderr telemetry only (pass lines
+  and stop line), not a schema key.
 - Workaround: quiet host, narrower scope.
-- Planned: numbers landed in the v0.2.0 short tier; the lossless fix
-  (2 MiB inventory-only ring) is v0.3.0 (C7 batched verifier/vng
-  campaign).
+- Planned: the v0.2.0 numbers landed in the short tier; the 2 MiB
+  inventory-only ring (C7 B2) removed the 1,000 exec/s loss. At 3,000
+  exec/s and beyond any loss stays explicit, with its demotion rate
+  published.
 
 ### Data-only mappers are not callers; copied code is not inventoried (A6)
 

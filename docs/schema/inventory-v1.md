@@ -67,9 +67,11 @@ A native document adds to `observation`:
     or `"perf-task+bpf"` (each per-offset link is bound to the target's
     task); `null` under `--system`.
 - `lifecycle`: the lifecycle feed's own account. The native lane drains
-  the kernel's lifecycle (exec and exit) ring every 10 ms, including while
-  a pass collects `/proc` on a worker thread; it stages what it drained
-  after that pass's scan, in drain order.
+  the kernel's 2 MiB lifecycle (exec and exit) ring every 10 ms,
+  including while a pass collects `/proc` on a worker thread; it stages
+  what it drained after that pass's scan, in drain order. The ring's
+  high-water fill is `P11SCOPE_STAGE_TIMINGS=1` stderr telemetry only
+  (the pass lines and the stop line); it is not a key here.
   - `records`: lifecycle records drained;
   - `ring_loss`: records the kernel could not queue because the ring was
     full, as counted at the last readable health read;

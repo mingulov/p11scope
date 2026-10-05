@@ -777,7 +777,7 @@ Limits that matter in pods:
   SIGINT, SIGTERM or SIGHUP once the report is written exits at once
   (status 128 + signal; the kernel releases the remaining probes).
   Every exec and process exit in scope sends a 920-byte record through
-  the native lane's 64 KiB lifecycle ring (about 70 records). The lane
+  the native lane's 2 MiB lifecycle ring (about 2,260 records). The lane
   drains it every 10 ms, also while a pass collects `/proc` on a worker
   thread, holding at most 8,192 drained records (about 7.2 MiB) until the
   pass applies; the ring is not drained while a pass applies its scan,
@@ -787,6 +787,13 @@ Limits that matter in pods:
   gap `native capture lifecycle evidence lost`, demotes every
   `watched_no_use` interval it may affect, and starts the next pass at
   once (`recovery_rescans`; never two in a row).
+  With `P11SCOPE_STAGE_TIMINGS=1`, every pass line also reports the
+  lifecycle ring's high-water fill so far — the maximum unconsumed
+  bytes any drain saw, as bytes and share of the ring
+  (`lifecycle ring high-water: 123456 B (6% of 2097152 B)`) — and the
+  stop line reports the run's final maximum including the terminal
+  sweep. It measures headroom, never loss; it is timings output only
+  and adds no schema key.
   `--attach-backend auto|multi|singles` (default `auto`) selects how the
   native lane attaches the provider entries. `auto` decides by a
   functional probe once per run, never by the kernel version: where the

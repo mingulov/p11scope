@@ -25,6 +25,14 @@ Work toward v0.3.0.
   schema is unchanged. Proof reads drop to about one per mapped library;
   the pass-time effect is not measured yet. See
   [docs/known-limitations.md](docs/known-limitations.md).
+- The Inventory objects' lifecycle ring is 2 MiB (about 2,260 records),
+  up from 64 KiB: at 1,000 exec/s with 448 processes the M4 cell reads
+  zero ring loss, zero demoted edges and zero recovery rescans. The
+  Detailed path keeps its 64 KiB compiled ring. Each Inventory drain
+  records its producer-minus-consumer high-water fill, printed on the
+  `P11SCOPE_STAGE_TIMINGS=1` pass lines and the stop line as bytes and
+  ring share; the schema is unchanged (no new `observation.lifecycle`
+  key). See [docs/known-limitations.md](docs/known-limitations.md).
 
 ## [0.2.0] - 2026-10-05
 

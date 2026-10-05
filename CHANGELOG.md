@@ -43,6 +43,8 @@ Work toward v0.3.0.
   processes, before the confirm stage was sharded, cut the sweep stage
   p95 from about 550 ms to about 185 ms on 4 CPUs; these numbers are
   indicative. The pass time with both stages sharded is not measured yet.
+  The phase-1 maps sweep of `--cgroup` and `--system` capture discovery
+  past `--max-scan-pids` is sharded the same way.
   `P11SCOPE_SHARD_THREADS=1` (diagnostic) forces the serial path. See
   [docs/known-limitations.md](docs/known-limitations.md).
 

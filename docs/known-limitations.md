@@ -160,16 +160,22 @@ the min..max of per-sample p95.
   default. When set, one stderr note per run, not per pass, reports
   the value used, or that the value was ignored. Since v0.3.0
   (unreleased) it applies only on the serial path (see the next knob).
-  `P11SCOPE_SHARD_THREADS=N` (diagnostic, `--system` only, read once
-  per run, same parsing and stderr note): the threads the sweep and
-  confirm stages may shard over. Unset keeps the default (usable CPUs,
-  at most 4); `0`/`1` forces the serial path of both stages exactly as
-  before sharding (with the proof-stat pool).
+  `P11SCOPE_SHARD_THREADS=N` (diagnostic, read once per run, same
+  parsing and stderr note): the threads the `inventory --system` sweep
+  and confirm stages may shard over. It also covers the phase-1 maps
+  sweep of `--cgroup` and `--system` capture discovery past
+  `--max-scan-pids`. Unset keeps the default (usable CPUs, at most 4);
+  `0`/`1` forces the serial path of both stages exactly as before
+  sharding (with the proof-stat pool).
 - v0.3.0 (unreleased): past the deep-scan cap, the sweep and confirm
   stages run on up to 4 threads (the observer's usable CPUs), one
   contiguous pid range of at least 256 pids per thread. Every budget
   charge, ceiling and loss is then replayed in pid order on one thread,
-  so the result is the serial one. Indicative, single host, before the
+  so the result is the serial one. A confirmation whose thread's copy of
+  the budget had already spent more than the capture budget is redone
+  live on that one thread. Under a ceiling the threads can read past the
+  point where the serial path would stop; those extra reads are never
+  charged or published. Indicative, single host, before the
   confirm stage was sharded: interleaved runs at 4,096 processes cut the
   sweep stage p95 from about 550 ms to about 185 ms on CPUs 8–11 and to
   about 320 ms on CPUs 10,11. The pass time with both stages sharded is

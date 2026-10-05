@@ -3308,6 +3308,16 @@ assert set(record) == {"pid", "starttime", "pgid", "sid", "argv"}
 assert record["pid"] == record["pgid"] == record["sid"]
 assert record["argv"] == ["sh", "-c", 'trap "" TERM; sleep 30 & wait']
 PY
+# The leader record appears before its background child is forked, so a
+# snapshot taken immediately can see one member instead of two. Wait
+# (bounded) for the child to join before the exact assertions below; if
+# it never does, those assertions still fail with their full output.
+snapshot_attempt=0
+while [ "$snapshot_attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$USER_PROCESS_SID" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" = "2" ] && break
+    snapshot_attempt=$((snapshot_attempt + 1))
+    sleep 0.1
+done
 snapshot_user_process_session "$USER_PROCESS_SID" > "$work/ready.json"
 python3 - "$work/ready.json" "$leader" <<'PY'
 import json

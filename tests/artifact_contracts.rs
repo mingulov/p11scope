@@ -8661,8 +8661,9 @@ fn hosted_pipeline_retains_the_job_log() {
         listed.as_str(),
         "for job in $CHECK_JOBS; do",
         // Not always(): a cancelled run must not publish a truncated log under
-        // the same artifact name as a complete one.
-        "    if: ${{ !cancelled() }}\n",
+        // the same artifact name as a complete one. A deduplicated run skips
+        // every check job and has no log to keep.
+        "    if: ${{ !cancelled() && !contains(needs.*.result, 'skipped') }}\n",
         "- uses: actions/upload-artifact@",
         "if-no-files-found: error\n",
         "/actions/jobs/$JOB_ID/logs\"",
@@ -8797,6 +8798,245 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
     // The helper partitions the target the gate is split on.
     let helper = read("scripts/ci-test-partition.py");
     assert!(helper.contains("\nSHARDED_TARGET = \"artifact_contracts\"\n"));
+}
+
+/// Every `actions/cache` step (including its `restore`/`save` halves) of a
+/// block, as (step id or "", paths, key, whether it has restore-keys).
+fn cache_steps(block: &str) -> Vec<(String, Vec<String>, String, bool)> {
+    let lines: Vec<&str> = block.lines().collect();
+    let mut steps = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        if !key.starts_with("uses: actions/cache") {
+            continue;
+        }
+        // The step starts at the nearest `- ` line at or above this one.
+        let start = (0..=at)
+            .rev()
+            .find(|i| lines[*i].trim_start().starts_with("- "))
+            .expect("a step item");
+        let indent = lines[start].len() - lines[start].trim_start().len();
+        let end = (start + 1..lines.len())
+            .find(|i| {
+                let l = lines[*i];
+                let t = l.trim_start();
+                !t.is_empty() && l.len() - t.len() <= indent
+            })
+            .unwrap_or(lines.len());
+        let step = &lines[start..end];
+        let field = |name: &str| {
+            step.iter()
+                .map(|l| l.trim_start().trim_start_matches("- "))
+                .find_map(|l| l.strip_prefix(name))
+                .map(str::trim)
+        };
+        let id = field("id:").unwrap_or_default().to_string();
+        let key = field("key:").unwrap_or_default().to_string();
+        let mut paths = Vec::new();
+        if let Some(at) = step
+            .iter()
+            .position(|l| l.trim_start().starts_with("path:"))
+        {
+            let value = step[at].trim_start()["path:".len()..].trim();
+            if value == "|" {
+                let deeper = step[at].len() - step[at].trim_start().len();
+                paths.extend(
+                    step[at + 1..]
+                        .iter()
+                        .take_while(|l| l.len() - l.trim_start().len() > deeper)
+                        .map(|l| l.trim().to_string()),
+                );
+            } else {
+                paths.push(value.to_string());
+            }
+        }
+        let restore_keys = step
+            .iter()
+            .any(|l| l.trim_start().starts_with("restore-keys:"));
+        steps.push((id, paths, key, restore_keys));
+    }
+    steps
+}
+
+/// Caches cut setup time; they must never stand in for a step the offline
+/// and source-custody gates rely on. The registry, the Git checkouts and
+/// `third-party/` (the reconstructed trees and their archives) are never
+/// cached, so a broken fetch or reconstruction still fails before the
+/// `--offline` gates and `prepare-dependencies.py --check` run; the coverage
+/// build is never cached, so no stale instrumented executable or profile can
+/// reach the merged report; test and lane work directories under `target/`
+/// are never cached, so no residue carries over between runs. Tool binaries
+/// are keyed by the same variable their install step reads, so a version bump
+/// cannot be served an older binary, and every key is exact (no
+/// `restore-keys` fallback to some other state).
+#[test]
+fn hosted_caches_hold_only_tool_binaries_and_build_products() {
+    let ci = read(".github/workflows/ci.yml");
+    let tools = [
+        ("bpf-linker", "CI_TOOL_BPF_LINKER"),
+        ("cargo-llvm-cov", "CI_TOOL_LLVM_COV"),
+        ("cargo-audit", "CI_TOOL_AUDIT"),
+        ("cargo-deny", "CI_TOOL_DENY"),
+    ];
+    let build_products = [
+        "target/debug/.fingerprint",
+        "target/debug/build",
+        "target/debug/deps",
+        "target/debug/incremental",
+    ];
+    let all = cache_steps(&ci);
+    assert!(
+        !all.is_empty(),
+        "the hosted pipeline caches its tool binaries"
+    );
+    for (id, paths, key, restore_keys) in &all {
+        assert!(
+            !restore_keys,
+            "cache {key}: exact keys only, no restore-keys"
+        );
+        assert!(
+            !key.contains("github.ref") && !key.contains("github.sha"),
+            "cache {key}: keys bind inputs, not refs or commits"
+        );
+        assert!(
+            key.contains("${{ steps.keys.outputs.image }}"),
+            "cache {key}: every key binds the runner image"
+        );
+        if paths.as_slice() == build_products {
+            continue;
+        }
+        let [path] = paths.as_slice() else {
+            panic!("cache {key}: a tool cache holds exactly one binary, got {paths:?}");
+        };
+        let (tool, variable) = tools
+            .iter()
+            .find(|(tool, _)| *path == format!("~/.cargo/bin/{tool}"))
+            .unwrap_or_else(|| {
+                panic!("cache path {path:?} is neither a pinned tool binary nor a build product")
+            });
+        assert_eq!(
+            id.as_str(),
+            *tool,
+            "a tool cache step is named after its tool"
+        );
+        assert!(
+            key.starts_with(&format!("{tool}-${{{{ env.{variable} }}}}-"))
+                && key.ends_with("-rust-${{ hashFiles('.release-rust-version') }}"),
+            "cache {key}: keyed by tool, its version variable, image and building compiler"
+        );
+    }
+    // Each install is skipped only on an exact hit of its own cache, and
+    // reads the same version variable as that cache's key.
+    for (tool, variable) in tools {
+        assert!(
+            ci.contains("\nenv:\n") && ci.contains(&format!("\n  {variable}: ")),
+            "{variable} is declared once at workflow level"
+        );
+        for job in CARGO_JOBS {
+            let block = job_block(&ci, job);
+            if !block.contains(&format!("~/.cargo/bin/{tool}\n")) {
+                continue;
+            }
+            assert!(
+                block.contains(&format!(
+                    "      - if: steps.{tool}.outputs.cache-hit != 'true'\n        run: cargo +\"$(cat .release-rust-version)\" install {tool} --version \"${variable}\" --locked\n"
+                )),
+                "{job}: the {tool} install must run on a cache miss, at the cached version"
+            );
+        }
+    }
+    // Build products only where cargo's own fingerprints decide freshness:
+    // the ordinary debug build of lint, tests and the contracts shards, each
+    // under its own role key. Never the coverage build or the scripts lanes.
+    for job in CARGO_JOBS {
+        let targets: Vec<String> = cache_steps(job_block(&ci, job))
+            .into_iter()
+            .filter(|(_, paths, _, _)| paths.iter().any(|path| path.starts_with("target")))
+            .map(|(_, _, key, _)| key)
+            .collect();
+        match job {
+            "lint" | "tests" | "contracts" => assert_eq!(
+                targets,
+                [format!(
+                    "target-{job}-${{{{ steps.keys.outputs.image }}}}-cc-${{{{ steps.keys.outputs.cc }}}}-${{{{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}}}"
+                )],
+                "{job}: one build-product cache, keyed by role, image, C toolchain, Rust toolchains and lockfiles"
+            ),
+            _ => assert!(
+                targets.is_empty(),
+                "{job} must not cache a build: {targets:?}"
+            ),
+        }
+        // Restored only after the sources are reconstructed and fetched.
+        if !targets.is_empty() {
+            require_before(
+                job_block(&ci, job),
+                "run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml",
+                "            target/debug/.fingerprint\n",
+                &format!("{job}: build-product cache after the explicit fetch"),
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// One full check matrix per commit: every check and coverage job waits on
+/// the dedupe job and runs only when it says so (coverage-report follows the
+/// coverage shards). The dedupe job reads the Actions API and nothing else,
+/// and the workflow keeps its per-ref group that cancels a superseded run.
+#[test]
+fn hosted_pipeline_runs_one_full_matrix_per_commit() {
+    let ci = read(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: true\n"),
+        "a branch that moves must still cancel its superseded run"
+    );
+    let gate = "    needs: dedupe\n    if: needs.dedupe.outputs.run == 'true'\n";
+    for job in CARGO_JOBS {
+        let block = job_block(&ci, job);
+        if job == "coverage-report" {
+            assert!(block.starts_with("    needs: coverage\n"));
+        } else if job == "contracts" {
+            assert!(block.starts_with(&format!(
+                "    name: contracts-${{{{ matrix.shard }}}}\n{gate}"
+            )));
+        } else {
+            assert!(
+                block.starts_with(gate),
+                "{job} must run only when dedupe says so"
+            );
+        }
+    }
+    let dedupe = job_block(&ci, "dedupe");
+    assert_eq!(
+        block_under(dedupe, "    permissions:")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>(),
+        ["actions: read"],
+        "dedupe holds exactly actions: read"
+    );
+    for marker in [
+        // Only push runs deduplicate; pull requests and dispatches run.
+        "if [ \"$GITHUB_EVENT_NAME\" != push ]; then",
+        // Only earlier push or dispatch runs of this workflow on this commit.
+        "/runs?head_sha=$GITHUB_SHA&per_page=100",
+        "select(.id < $GITHUB_RUN_ID and (.event == \\\"push\\\" or .event == \\\"workflow_dispatch\\\"))",
+        // A covering run ran the matrix itself.
+        "select((.name == \"lint\" or .name == \"coverage-report\") and .conclusion == \"success\")",
+        "if [ \"$ran\" = 2 ]; then",
+        // An unfinished earlier run is waited for, never trusted.
+        "sleep 60",
+    ] {
+        assert!(dedupe.contains(marker), "dedupe lacks {marker:?}");
+    }
+    assert_eq!(
+        dedupe.matches("decide false ").count(),
+        1,
+        "dedupe skips the matrix on exactly one condition: a covering run"
+    );
 }
 
 /// Bind the behavioral capture helpers to production mode-specific callbacks.

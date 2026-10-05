@@ -16,23 +16,116 @@ on:
         default: false
 permissions:
   contents: read
+# Per ref, so a branch that moves cancels its superseded run. Several refs at
+# one commit (a release branch, main and the tag) each start a run; the dedupe
+# job below lets only the first of them run the check matrix.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+# The cargo-installed CI tools. Each version is read by both the install step
+# and its cache key, so a version bump can never be served an older binary.
+env:
+  CI_TOOL_BPF_LINKER: 0.10.4
+  CI_TOOL_LLVM_COV: 0.9.1
+  CI_TOOL_AUDIT: 0.22.2
+  CI_TOOL_DENY: 0.20.2
 # The hosted checks run as parallel jobs on one commit: lint, audit, tests,
 # the contracts shards and scripts (the former single checks-and-e2e job), plus the
 # coverage shards and their merged report. Each job repeats the same pinned
-# setup from scratch: no cache anywhere. The workspace test gate is ONE
-# command, partitioned by scripts/ci-test-partition.py: the tests job runs every
-# target except artifact_contracts, and the contracts shards split that target
-# so every listed test runs in exactly one shard (each shard proves its count
-# from libtest's own summary). Coverage runs the same partition under
+# setup: toolchains, apt packages, dependency reconstruction and the explicit
+# network fetch run fresh every time. Two things are cached, both keyed by the
+# runner image (ImageOS-ImageVersion), so an image update starts them cold:
+#   - the cargo-installed tool binaries, keyed by tool, version and the release
+#     compiler that built them; a hit skips only that `cargo install`.
+#   - in lint, tests and contracts, the build products under target/debug
+#     (deps, build, .fingerprint, incremental), keyed by job role, both Rust
+#     toolchains, both lockfiles and the apt C toolchain versions, exact key
+#     only, saved only by a green job. Checkout and dependency reconstruction
+#     give every source a fresh mtime, so cargo rebuilds every workspace and
+#     path crate (rustc reuses its incremental state by content hash) and
+#     reuses only third-party artifacts it can prove fresh.
+# Never cached: ~/.cargo/registry and ~/.cargo/git (a cached copy would let a
+# broken fetch still feed the --offline gates), third-party/ (the reconstructed
+# trees and their archives, which prepare-dependencies.py must rebuild and
+# digest-check every run), test and lane work directories under target/, and
+# the coverage build: cargo llvm-cov cleans every workspace member before each
+# run, so its cache could only hold dependencies, and stale instrumented
+# executables or profiles must never reach the merged report.
+# The workspace test gate is ONE command, partitioned by
+# scripts/ci-test-partition.py: the tests job runs every target except
+# artifact_contracts, and the contracts shards split that target so every
+# listed test runs in exactly one shard (each shard proves its count from
+# libtest's own summary). Coverage runs the same partition under
 # cargo llvm-cov --no-report and merges every shard's profiles and executables
 # in coverage-report, which applies the .coverage-floor gate.
 jobs:
+  # One full check matrix per commit. A push run whose exact commit already
+  # passed the full matrix in an earlier push or dispatch run of this workflow
+  # skips its check and coverage jobs and names that run in its summary. While
+  # an earlier run on the commit is unfinished, this job waits for it (75
+  # minutes at most), so a cancelled or failed earlier run never leaves the
+  # commit without a result: the matrix then runs here. Pull requests (which
+  # test a merge commit) and manual dispatches always run it, and any API
+  # error runs it too. A covering run must itself have run lint and
+  # coverage-report, so a run that only deduplicated never covers another.
+  dedupe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - id: decide
+        shell: bash
+        run: |
+          decide() {
+            echo "run=$1" >>"$GITHUB_OUTPUT"
+            echo "dedupe: $2"
+            printf '## dedupe\n\n%s\n' "$2" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          if [ "$GITHUB_EVENT_NAME" != push ]; then
+            decide true "$GITHUB_EVENT_NAME run: the check matrix runs"
+          fi
+          api="repos/$GITHUB_REPOSITORY/actions"
+          workflow=$(gh api "$api/runs/$GITHUB_RUN_ID" --jq .workflow_id) \
+            || decide true "cannot read this run; the check matrix runs"
+          deadline=$((SECONDS + 75 * 60))
+          while :; do
+            # Earlier push and dispatch runs of this workflow on this exact
+            # commit; a run id is assigned in creation order.
+            earlier=$(gh api "$api/workflows/$workflow/runs?head_sha=$GITHUB_SHA&per_page=100" \
+              --jq ".workflow_runs[] | select(.id < $GITHUB_RUN_ID and (.event == \"push\" or .event == \"workflow_dispatch\")) | \"\(.id) \(.status) \(.conclusion)\"") \
+              || decide true "cannot list the runs on $GITHUB_SHA; the check matrix runs"
+            active=
+            while read -r id status conclusion; do
+              [ -n "$id" ] || continue
+              if [ "$status" != completed ]; then
+                active="$active $id"
+              elif [ "$conclusion" = success ]; then
+                ran=$(gh api "$api/runs/$id/jobs?per_page=100" \
+                  --jq '[.jobs[] | select((.name == "lint" or .name == "coverage-report") and .conclusion == "success")] | length') \
+                  || ran=0
+                if [ "$ran" = 2 ]; then
+                  decide false "commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it"
+                fi
+              fi
+            done <<<"$earlier"
+            [ -n "$active" ] \
+              || decide true "no earlier run covers $GITHUB_SHA; the check matrix runs"
+            [ "$SECONDS" -lt "$deadline" ] \
+              || decide true "earlier run(s)$active unfinished after 75 minutes; the check matrix runs"
+            echo "dedupe: waiting for earlier run(s) on $GITHUB_SHA:$active"
+            sleep 60
+          done
   # Static gates: formatting, compilation, both clippy profiles, the
   # diagnostic-object inventory test and script lints.
   lint:
+    needs: dedupe
+    if: needs.dedupe.outputs.run == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,15 +136,42 @@ jobs:
       # read inline like .coverage-floor; crate rust-version tracks its major.minor.
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
-      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      # Cache keys (see the header): the runner image, and the apt C toolchain
+      # that build scripts invoke.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      # bpf-linker (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       # Network acquisition is explicit and precedes every offline validation.
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      # Build products only (see the header), restored after the sources are
+      # reconstructed and fetched and saved only when this job succeeds.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-lint-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
       - name: Verify prepared dependency selection
         shell: bash
         run: |
@@ -91,10 +211,13 @@ jobs:
           done
       - run: ruff check scripts/ tests/python/
   # Advisory and licence gates. Their own job because building the two pinned
-  # tools takes about five minutes; nothing here compiles the project, so the
-  # job skips bpf-linker and the apt packages but reconstructs the pinned
-  # sources and fetches both Cargo roots exactly like every other job.
+  # tools takes about five minutes when their cache is cold; nothing here
+  # compiles the project, so the job skips bpf-linker and the apt packages but
+  # reconstructs the pinned sources and fetches both Cargo roots exactly like
+  # every other job.
   audit:
+    needs: dedupe
+    if: needs.dedupe.outputs.run == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -106,8 +229,28 @@ jobs:
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - run: cargo +"$(cat .release-rust-version)" install cargo-audit --version 0.22.2 --locked
-      - run: cargo +"$(cat .release-rust-version)" install cargo-deny --version 0.20.2 --locked
+      # Cache keys (see the header): the runner image.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - id: cargo-audit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ env.CI_TOOL_AUDIT }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.cargo-audit.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install cargo-audit --version "$CI_TOOL_AUDIT" --locked
+      - id: cargo-deny
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CI_TOOL_DENY }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.cargo-deny.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install cargo-deny --version "$CI_TOOL_DENY" --locked
       - run: cargo +"$(cat .release-rust-version)" audit
       # The host and BPF crates have separate Cargo roots and license policies.
       # The BPF-only GPL-2.0-only allowance must not leak into the host graph.
@@ -116,6 +259,8 @@ jobs:
   # The workspace test gate minus artifact_contracts (the contracts shards
   # run that target), plus the standalone vendored-dependency unit tests.
   tests:
+    needs: dedupe
+    if: needs.dedupe.outputs.run == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -124,15 +269,42 @@ jobs:
           fetch-depth: 0
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
-      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      # Cache keys (see the header): the runner image, and the apt C toolchain
+      # that build scripts invoke.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      # bpf-linker (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       # Network acquisition is explicit and precedes every offline validation.
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      # Build products only (see the header), restored after the sources are
+      # reconstructed and fetched and saved only when this job succeeds.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-tests-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
       # The aya-p2 tree resolves its aya-obj dependency to the sibling p2
       # tree: its multi-backport needs fields only aya-obj-p2 has, so the
       # vendored upstream lock (crates.io aya-obj) cannot build it. Both
@@ -171,6 +343,8 @@ jobs:
   # (pinned by hosted_pipeline_partitions_the_workspace_test_gate).
   contracts:
     name: contracts-${{ matrix.shard }}
+    needs: dedupe
+    if: needs.dedupe.outputs.run == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -183,20 +357,49 @@ jobs:
           fetch-depth: 0
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
-      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      # Cache keys (see the header): the runner image, and the apt C toolchain
+      # that build scripts invoke.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      # bpf-linker (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       # Network acquisition is explicit and precedes every offline validation.
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      # Build products only (see the header), restored after the sources are
+      # reconstructed and fetched and saved only when this job succeeds.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-contracts-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
       - run: python3 -I scripts/ci-test-partition.py run --partition "contracts:${{ matrix.shard }}/8" -- cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets
   # Every validator --self-test, the two container-less live lanes and every
   # tests/python suite. The UNRUN block is this job's first step after
   # checkout, so the lane list reaches the log even if a later step fails.
   scripts:
+    needs: dedupe
+    if: needs.dedupe.outputs.run == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -271,10 +474,27 @@ jobs:
       # UNRUN lanes end
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
-      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      # Cache keys (see the header): the runner image, and the apt C toolchain
+      # that build scripts invoke.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      # bpf-linker (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       # Network acquisition is explicit and precedes every offline validation.
@@ -357,13 +577,14 @@ jobs:
   # (90 days requested; repo and org settings can cap that). CHECK_JOBS names
   # every check job as the API names it: one entry per contracts shard. Its
   # token gets actions: read and nothing else; upload-artifact uses the runtime
-  # token, not GITHUB_TOKEN. No cache anywhere.
+  # token, not GITHUB_TOKEN. It neither restores nor saves a cache.
   archive-log:
     needs: [lint, audit, tests, contracts, scripts]
     # Not always(): a cancelled run's log is truncated by definition, and
     # publishing it produces an artifact that looks like evidence of a
-    # completed job and is not. Failures still archive.
-    if: ${{ !cancelled() }}
+    # completed job and is not. Failures still archive. A run the dedupe job
+    # skipped has no check job log to keep, so it archives nothing.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -427,7 +648,7 @@ jobs:
           fetch-depth: 0
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
@@ -452,7 +673,7 @@ jobs:
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 softhsm2
       # Azure kernel tools omit bpftool. Select the generic package's real
       # executable instead of the common wrapper that dispatches by uname.
@@ -728,6 +949,8 @@ jobs:
   # runs at most 20 jobs at once, and 12 check jobs + 7 coverage shards (+1
   # release-preview on dispatch) stays within it.
   coverage:
+    needs: dedupe
+    if: needs.dedupe.outputs.run == 'true'
     runs-on: ubuntu-24.04
     env:
       # Full DWARF plus coverage makes the self-inspecting test executable
@@ -744,9 +967,29 @@ jobs:
           fetch-depth: 0
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy,llvm-tools-preview
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
-      - run: cargo +"$(cat .release-rust-version)" install cargo-llvm-cov --version 0.9.1 --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
+      # Cache keys (see the header): the runner image.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - id: cargo-llvm-cov
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ env.CI_TOOL_LLVM_COV }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.cargo-llvm-cov.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install cargo-llvm-cov --version "$CI_TOOL_LLVM_COV" --locked
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
@@ -770,7 +1013,21 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy,llvm-tools-preview
-      - run: cargo +"$(cat .release-rust-version)" install cargo-llvm-cov --version 0.9.1 --locked
+      # Cache keys (see the header): the runner image.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - id: cargo-llvm-cov
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ env.CI_TOOL_LLVM_COV }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.cargo-llvm-cov.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install cargo-llvm-cov --version "$CI_TOOL_LLVM_COV" --locked
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
@@ -795,7 +1052,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py

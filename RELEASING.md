@@ -70,10 +70,22 @@ dependency upgrade that needs the full checks and qualification again.
 ## 3. Get a green hosted CI run on the exact commit
 
 Push the frozen commit to a branch and let `ci` run. Every job of the push
-run must pass on that exact SHA: the check jobs `lint`, `audit`, `tests`,
-every `contracts-N` shard and `scripts`; every `coverage` shard and
+run must pass on that exact SHA: `dedupe`; the check jobs `lint`, `audit`,
+`tests`, every `contracts-N` shard and `scripts`; every `coverage` shard and
 `coverage-report`; and `archive-log`. `quarantine` runs only when a check
 job failed, so a green run skips it.
+
+`ci` runs the full matrix once per commit. When the same commit is pushed
+again under another ref (the release branch, then `main`, then the tag),
+the later push run's `dedupe` job finds the earlier push or dispatch run that
+already passed `lint` and `coverage-report` on that SHA, skips its own check
+and coverage jobs, and names the covering run in its summary. If the earlier
+run is still going, `dedupe` waits for it, and runs the full matrix itself
+when that run fails, is cancelled or is still unfinished after 75 minutes.
+Record the URL of the run that executed the matrix, not of a deduplicated
+one; a deduplicated run on the tag is green only because that covering run
+passed. A manual dispatch always runs the full matrix.
+
 Then dispatch `ci` manually on the same ref (Actions → ci → Run workflow,
 `release_preview` selected). Keep the `release-preview-public-assets` artifact
 and the separately labeled container SBOM. The full release receipt remains
@@ -86,7 +98,11 @@ judged environmental (a flaky coverage run, for example) is an explicit,
 written decision, never an ignored red badge.
 
 The workflow needs no secrets: it uses only the default `GITHUB_TOKEN`
-(`contents: read`, plus `actions: read` for the log-archive job).
+(`contents: read`, plus `actions: read` for the `dedupe` and log-archive
+jobs). Its caches hold only the cargo-installed tool binaries and the debug
+build products of `lint`, `tests` and `contracts`; every job still
+reconstructs and fetches its dependency sources, and coverage builds from
+scratch.
 
 ## 4. Run the privileged qualification
 

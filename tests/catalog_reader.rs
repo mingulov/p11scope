@@ -335,10 +335,82 @@ fn pid_of(pids: &BTreeMap<String, u32>, name: &str) -> u64 {
     u64::from(*pids.get(name).unwrap())
 }
 
+/// Everything the document says about the owned fixtures, for a failure
+/// message: the scan summary, every object with an observation under the
+/// fixture directory, the fixture processes, and every skipped/notes record
+/// naming a fixture pid or path. DR-CATALOG-H2-ALIAS-FLAKE lost an
+/// intermittent "exactly one object observing h2.so" failure because only the
+/// count was printed and the next run overwrote out.json.
+fn fixture_extract(doc: &Value, pids: &BTreeMap<String, u32>) -> String {
+    let fixture_pids: BTreeSet<u64> = pids.values().map(|pid| u64::from(*pid)).collect();
+    let in_fixture_dir = |path: &str| path.contains("/catalog-reader/");
+    let objects: Vec<Value> = doc["objects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|object| {
+            object["observations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|ob| ob["path"].as_str().is_some_and(in_fixture_dir))
+        })
+        .map(|object| {
+            let observations: Vec<Value> = object["observations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|ob| {
+                    serde_json::json!({
+                        "pid": ob["pid"], "path": ob["path"], "evidence": ob["evidence"],
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "path": object["path"], "inode": object["inode"],
+                "admission": object["admission"], "observations": observations,
+            })
+        })
+        .collect();
+    let processes: Vec<&Value> = doc["processes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|process| {
+            process["pid"]
+                .as_u64()
+                .is_some_and(|pid| fixture_pids.contains(&pid))
+        })
+        .collect();
+    let gaps = |key: &str| -> Vec<&Value> {
+        doc[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|gap| {
+                gap["pid"]
+                    .as_u64()
+                    .is_some_and(|pid| fixture_pids.contains(&pid))
+                    || gap["subject"].as_str().is_some_and(in_fixture_dir)
+                    || gap["reason"].as_str().is_some_and(in_fixture_dir)
+            })
+            .collect()
+    };
+    serde_json::json!({
+        "fixture_pids": pids,
+        "scan": doc["scan"],
+        "objects": objects,
+        "processes": processes,
+        "skipped": gaps("skipped"),
+        "notes": gaps("notes"),
+    })
+    .to_string()
+}
+
 /// The one catalog object whose observations map `so_name` (file name).
 /// Ambient objects never share our tmp-dir file names, so the match is
 /// exact on the file name and the rest of the machine is ignored.
-fn object_for<'a>(doc: &'a Value, so_name: &str) -> &'a Value {
+fn object_for<'a>(doc: &'a Value, pids: &BTreeMap<String, u32>, so_name: &str) -> &'a Value {
     let found: Vec<&Value> = doc["objects"]
         .as_array()
         .unwrap()
@@ -354,7 +426,8 @@ fn object_for<'a>(doc: &'a Value, so_name: &str) -> &'a Value {
     assert_eq!(
         found.len(),
         1,
-        "expected exactly one object observing {so_name}"
+        "expected exactly one object observing {so_name}; fixture extract: {}",
+        fixture_extract(doc, pids)
     );
     found[0]
 }
@@ -443,7 +516,7 @@ fn catalog_reader_finds_every_fixture_object() {
 
     // B: same-path dance, V2 bytes pinned. Three file-backed tables; the
     // 3.0 table's exported anchors corroborate the object.
-    let b = object_for(doc, "prov.so");
+    let b = object_for(doc, &run.pids, "prov.so");
     assert_eq!(
         tables_of(b),
         vec![
@@ -496,7 +569,7 @@ fn catalog_reader_finds_every_fixture_object() {
 
     // N: refused NSS shape. Eight interface-linked tables (publication
     // evidence) whose 544 endpoints exceed the 512-slot ceiling alone.
-    let n = object_for(doc, "nss.so");
+    let n = object_for(doc, &run.pids, "nss.so");
     let n_tables = tables_of(n);
     assert_eq!(n_tables.len(), 8);
     assert!(
@@ -523,7 +596,7 @@ fn catalog_reader_finds_every_fixture_object() {
 
     // C: refused p11-kit closure shape. 65 bare heuristic tables, no
     // triples, 532 endpoints that cannot fit the remaining slots.
-    let c = object_for(doc, "closure.so");
+    let c = object_for(doc, &run.pids, "closure.so");
     let c_tables = tables_of(c);
     assert_eq!(c_tables.len(), 65);
     assert!(
@@ -546,7 +619,7 @@ fn catalog_reader_finds_every_fixture_object() {
 
     // M: admitted multi-table shape. Four file-backed templates; any
     // interface triple here is spurious data, never standard linkage.
-    let m = object_for(doc, "mw.so");
+    let m = object_for(doc, &run.pids, "mw.so");
     assert_eq!(
         tables_of(m),
         vec![("3.2".to_owned(), 104, "full".to_owned(), 0); 4]
@@ -572,7 +645,7 @@ fn catalog_reader_finds_every_fixture_object() {
     }
 
     // T: mapped but never called. Zero tables, verified-absence note.
-    let t = object_for(doc, "tless.so");
+    let t = object_for(doc, &run.pids, "tless.so");
     assert_eq!(t["observations"][0]["tables"].as_array().unwrap().len(), 0);
     assert_eq!(t["admission"]["state"], "admitted");
     assert_eq!(t["admission"]["class"], "heuristic");
@@ -594,8 +667,8 @@ fn catalog_reader_finds_every_fixture_object() {
     // observations, an alias relationship — never two objects.
     let h1_path = fixtures.h1.to_str().unwrap().to_owned();
     let h2_path = fixtures.h2.to_str().unwrap().to_owned();
-    let h = object_for(doc, "h1.so");
-    assert_eq!(object_for(doc, "h2.so"), h);
+    let h = object_for(doc, &run.pids, "h1.so");
+    assert_eq!(object_for(doc, &run.pids, "h2.so"), h);
     let h_observations = h["observations"].as_array().unwrap();
     assert_eq!(h_observations.len(), 2);
     let mut h_paths: Vec<&str> = h_observations

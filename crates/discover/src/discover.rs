@@ -1826,22 +1826,21 @@ mod tests {
     const TORN_MAPS: &[u8] = b"00401000-00402000 r--p 00001000 08:01 11 /usr/lib/a.so\n\
 00400000-00401000 r-xp 00000000 08:01 11 /usr/lib/a.so\n";
 
-    fn scripted(reads: &[&'static [u8]]) -> impl FnMut() -> std::io::Result<Vec<u8>> {
-        let mut reads = reads.to_vec().into_iter();
+    fn scripted(reads: Vec<&'static [u8]>) -> impl FnMut() -> std::io::Result<Vec<u8>> {
+        let mut reads = reads.into_iter();
         move || Ok(reads.next().expect("no more scripted reads").to_vec())
     }
 
     #[test]
     fn a_torn_self_maps_snapshot_is_read_again() {
-        let entries = read_self_maps_with(scripted(&[TORN_MAPS, TORN_MAPS, GOOD_MAPS])).unwrap();
+        let entries = read_self_maps_with(scripted(vec![TORN_MAPS, TORN_MAPS, GOOD_MAPS])).unwrap();
         assert_eq!(entries.len(), 2);
         assert!(maps::MapIndex::new(&entries).is_ok());
     }
 
     #[test]
     fn a_self_maps_snapshot_torn_on_every_attempt_is_refused() {
-        let reads = [TORN_MAPS; SELF_MAPS_ATTEMPTS];
-        let err = read_self_maps_with(scripted(&reads)).unwrap_err();
+        let err = read_self_maps_with(scripted(vec![TORN_MAPS; SELF_MAPS_ATTEMPTS])).unwrap_err();
         assert!(err.contains("unsorted or overlapping"), "{err}");
     }
 

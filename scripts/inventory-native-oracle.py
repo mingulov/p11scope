@@ -103,6 +103,10 @@ COUNTED_SHORT_LIVED_REASONS = ("no_live_caller",)
 # after: before_admission); the product then reads its caller's edge unknown
 # `use_before_admission`, never a positive or a watch.
 USE_BEFORE_ADMISSION = "use_before_admission"
+# DR-LIVE-LABEL-LAG: a read-but-undecided first use of a watched edge.
+# Transient: the finish flush decides every row, so the final snapshot
+# never carries it — only mid-run frames and edge_observed records do.
+PENDING_FIRST_USE_REASON = "pending_first_use"
 SCAN_ONLY_REASON = "scan_only"
 # The only unknown reasons a scan-lane document gives (an unadmitted module
 # reads not_admitted in either lane).
@@ -620,6 +624,10 @@ def expected_activity(edge, end_ns):
     if cov.get("state") == "witnessed":
         base = ACTIVITY["used"]
     elif edge.get("mapping", {}).get("state") != MAPPING_LIVE or frozen_watch(edge):
+        base = ACTIVITY["unknown"]
+    elif cov.get("state") == UNKNOWN_STATE and cov.get("reason") == PENDING_FIRST_USE_REASON:
+        # DR-LIVE-LABEL-LAG: the edge is watched, so "not covered" would
+        # lie — a read-but-undecided first use reads unknown.
         base = ACTIVITY["unknown"]
     elif (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
         base = ACTIVITY["quiet"]
@@ -1361,21 +1369,27 @@ def check_dashboard(view, images_by_cell, res):
                   and FRAME["coverage_marker"] in data,
                   f"{len(frames)} full frames; alternate screen entered/exited and coverage header required"):
         return
+    pass_events = [e["event"] for e in view.kind("pass")]
+
+    def records_as_of(frame_pass):
+        """Each edge's last `edge_observed` record before that pass's
+        (non-final) marker, or None when the stream has no such marker
+        (the frame predates retention and cannot be judged)."""
+        if not any(p.get("pass") == frame_pass and not p.get("final") for p in pass_events):
+            return None
+        as_of = {}
+        for ev in view.events or []:
+            if ev.get("kind") == EVENT_KINDS["pass"] and ev["event"].get("pass") == frame_pass \
+                    and not ev["event"].get("final"):
+                break
+            if ev.get("kind") == "edge_observed":
+                as_of[(ev["event"].get("caller"), ev["event"].get("module"))] = ev["event"]
+        return as_of
+
     last = frames[-1]
     head = FRAME["header"].match(last[0])
     passes, ncallers, nmodules, nedges = (int(head.group(i)) for i in (2, 3, 4, 5))
-    pass_events = [e["event"] for e in view.kind("pass")]
     at = next((p for p in pass_events if p.get("pass") == passes - 1), None)
-    # Each edge's coverage as of the frame's pass: its last `edge_observed`
-    # record before that pass's (non-final) marker. The stop's final commit,
-    # which freezes every ongoing watch, comes later and no frame shows it.
-    as_of = {}
-    for ev in view.events or []:
-        if ev.get("kind") == EVENT_KINDS["pass"] and ev["event"].get("pass") == passes - 1 \
-                and not ev["event"].get("final"):
-            break
-        if ev.get("kind") == "edge_observed":
-            as_of[(ev["event"].get("caller"), ev["event"].get("module"))] = coverage(ev["event"])
     gaps_line = next((FRAME["coverage"].match(line) for line in last if FRAME["coverage"].match(line)), None)
     if at is None:
         res.add(run, "*", "DASH-TOTALS", "fail", f"final frame claims {passes} passes; the stream has no such pass")
@@ -1385,37 +1399,51 @@ def check_dashboard(view, images_by_cell, res):
         want = (at["totals"]["callers"], at["totals"]["modules"], at["totals"]["edges"], cumulative)
         res.ok(run, "*", "DASH-TOTALS", got == want,
                f"final frame (callers, modules, edges, gaps) {got} != stream pass {passes - 1} {want}")
-    shown = frame_edges(last)
     mine = {}
     for cell in view.run["cells"]:
         for image in images_by_cell.get(cell, {}).values():
             mine[(image.pid, image.start)] = cell
-    compared = 0
-    for key, frame_edge in shown.items():
-        edge = view.edges.get(key)
-        if edge is None:
-            res.add(run, "*", "DASH-EDGE-LABELS", "fail", f"frame edge {key} is not in the snapshot")
-            continue
-        caller, module = view.callers[key[0]], view.modules[key[1]]
-        items = frame_edge["items"]
-        want = {"capture": {expected_capture(caller, module, edge)},
+
+    def want_for(caller, module, edge):
+        return {"capture": {expected_capture(caller, module, edge)},
                 "entries": {expected_entries_display(edge)},
                 "semantics": {edge.get("semantics")},
                 "activity": expected_activity(edge, view.window[1])}
-        then = as_of.get(key) or {}
-        if frozen_watch(edge) and then.get("state") == WATCH_STATE and then.get("until_ns") is None \
-                and then.get("since_ns") == coverage(edge).get("since_ns"):
-            # The frame's pass predates the stop that froze this watch: it
-            # rendered the then-ongoing watch (armed, quiet, the zero a fact).
-            # A frame whose pass already carried the frozen record must read
-            # `watch ended`.
-            want["capture"].add(CAPTURE["armed"])
-            want["entries"].add(str(edge["entries"].get("count", 0)))
-            want["activity"].add(ACTIVITY["quiet"])
-        wrong = {k: (items.get(k), sorted(v)) for k, v in want.items() if items.get(k) not in v}
-        if (caller.get("pid"), caller.get("start_time")) in mine:
-            compared += 1
-        res.ok(run, "*", "DASH-EDGE-LABELS", not wrong, f"frame {key} disagrees with the snapshot: {wrong}")
+
+    # DR-ORACLE-GATE: every frame is compared with the edge state at its
+    # own pass from the event stream. A frame rendered before the stop
+    # that froze the watches, or while a first-use row was pending, must
+    # show that pass's labels — armed/quiet/0 for a then-ongoing watch,
+    # unknown/? for a then-pending edge — never the snapshot's. An edge
+    # the stream had not carried yet (deferred emission) cannot be
+    # judged, except on the final frame, which still falls back to the
+    # snapshot.
+    compared = 0
+    for index, lines in enumerate(frames):
+        final = index == len(frames) - 1
+        frame_pass = int(FRAME["header"].match(lines[0]).group(2)) - 1
+        as_of = records_as_of(frame_pass)
+        for key, frame_edge in frame_edges(lines).items():
+            edge = view.edges.get(key)
+            if edge is None:
+                res.add(run, "*", "DASH-EDGE-LABELS", "fail", f"frame edge {key} is not in the snapshot")
+                continue
+            caller, module = view.callers[key[0]], view.modules[key[1]]
+            items = frame_edge["items"]
+            record = (as_of or {}).get(key)
+            if record is not None:
+                want = want_for(caller, module, record)
+                where = f"frame {index} (pass {frame_pass}) {key} disagrees with the stream at that pass"
+            elif not final:
+                continue
+            else:
+                want = want_for(caller, module, edge)
+                where = f"frame {key} disagrees with the snapshot"
+            wrong = {k: (items.get(k), sorted(v)) for k, v in want.items() if items.get(k) not in v}
+            if final and (caller.get("pid"), caller.get("start_time")) in mine:
+                compared += 1
+            res.ok(run, "*", "DASH-EDGE-LABELS", not wrong, f"{where}: {wrong}")
+    shown = frame_edges(last)
     missing = [k for k, e in view.edges.items()
                if (view.callers[k[0]].get("pid"), view.callers[k[0]].get("start_time")) in mine and k not in shown]
     res.ok(run, "*", "DASH-VISIBLE", compared > 0 and not missing,
@@ -2314,6 +2342,30 @@ def self_test():
             next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(frozen)
             return {"frames": s.frames(live), "dash_events": out}
         case("dashboard-frame-before-freeze", None, dash_frame_before_freeze)
+
+        # DR-LIVE-LABEL-LAG: a frame rendered while a first-use row was
+        # pending shows the then-unknown edge as `coverage lost` /
+        # `unknown` / `?`, and the stream carries the pending record
+        # before the frame's pass marker plus the decided sweep after it.
+        # The fixed read passes; a frame that claims quiet/0 over the
+        # pending row — the pre-fix product read — fails DASH-EDGE-LABELS.
+        def dash_frame_pending_unknown(s, d, dash):
+            live = _deep(dash)
+            pending = _edge(live, s.dash_ids["P1"], s.mid["A"])
+            pending["entries"]["coverage"].update(
+                state=UNKNOWN_STATE, since_ns=None, reason=PENDING_FIRST_USE_REASON)
+            pending["entries"]["observation"] = "unknown (usage observation unavailable)"
+            ev = s.events(live)
+            decided = [r for r in s.events(dash) if r["kind"] == "edge_observed"]
+            at = next(i for i, r in enumerate(ev) if r["kind"] == "ended")
+            out = [dict(r, seq=i) for i, r in enumerate(ev[:at] + decided + ev[at:])]
+            next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(decided)
+            return {"frames": s.frames(live), "dash_events": out}
+        case("dashboard-frame-pending-unknown", None, dash_frame_pending_unknown)
+
+        def dash_frame_quiet_over_pending(s, d, dash):
+            return dict(dash_frame_pending_unknown(s, d, dash), frames=s.frames(dash))
+        case("dashboard-frame-quiet-over-pending", "DASH-EDGE-LABELS", dash_frame_quiet_over_pending)
 
         def frozen_quiet_event(s, d, dash):
             freeze(d, cid(s, "P3"), s.mid["C"])

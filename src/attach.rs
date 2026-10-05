@@ -3596,8 +3596,9 @@ impl Session {
 
     /// Multi half of [`Session::attach_targets`]: regroups the targets by
     /// (attach path, entry program) and attaches one return link plus one
-    /// entry link per group over the 48-loaded twins, pid-wide with the
-    /// existing in-BPF scope filter (see [`multi_link_pid`]). Late
+    /// entry link per group over the 48-loaded twins, target-named under
+    /// PID scope (probe-gated) and pid-wide otherwise, with the in-BPF
+    /// scope filter as defence in depth (see [`multi_link_pid`]). Late
     /// joiners (live discovery) form their own groups and attach as
     /// additional links; the Task 2.3 rebuild covers retirement and
     /// replacement, not coalescing live groups. A kernel without multi

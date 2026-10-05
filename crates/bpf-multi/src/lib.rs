@@ -299,10 +299,10 @@ fn is_exhaustion_err(e: &io::Error) -> bool {
 /// attach type on pre-6.6 kernels (multi landed in 6.6; on newer kernels
 /// `EINVAL` from a correctly loaded multi program means poison offsets
 /// and must bisect, never fall back). Mirrors Aya PR #1417
-/// `try_attach_uprobe_multi_link` classification. Callers only invoke
-/// multi attach where the backend policy allows it (6.9+), so under the
-/// session this predicate alone decides fallback; the doctor scratch
-/// probe adds its own EINVAL-if-old-kernel rule.
+/// `try_attach_uprobe_multi_link` classification. Callers invoke multi
+/// only where a functional probe linked one, so under the session this
+/// predicate alone decides fallback; the doctor scratch probe adds its
+/// own EINVAL-if-old-kernel rule.
 pub fn is_unsupported_kernel_errno(errno: i32) -> bool {
     errno == libc::ENOTSUP || errno == libc::EOPNOTSUPP
 }

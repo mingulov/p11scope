@@ -1,6 +1,6 @@
 [package]
 name = "p11scope"
-version = "0.2.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 license = "GPL-3.0-or-later"
@@ -36,7 +36,7 @@ signal-hook = { version = "0.4.4", default-features = false }
 
 [dev-dependencies]
 aya-obj = "=0.3.0"
-p11scope-discover = { version = "0.2.1", path = "crates/discover" }
+p11scope-discover = { version = "0.2.0", path = "crates/discover" }
 sha2 = "=0.11.0"
 tempfile = "3"
 

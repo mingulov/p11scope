@@ -5,38 +5,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [0.2.1] - 2026-10-05
-
-First public release since v0.1.0. v0.2.0 was cut and qualified but not
-published; everything in the [0.2.0] section below ships in this release.
-On top of it: two performance fixes (no schema, flag or report change)
-and a hosted-CI fix. The measurements below are indicative single-host numbers (2
-physical cores with SMT, Linux 7.0, btrfs), not guarantees. See
-[docs/known-limitations.md](docs/known-limitations.md).
-
-### Fixed
-
-- `inventory -o <out.json>` now buffers the JSON write. A 4,096-process run
-  issued about 557,000 `write` calls for the output file and now issues about
-  2,100; the pause at the end of a run before the process exits dropped from
-  about 3.5 s to about 0.1 s on that host. The document is unchanged.
-
-### Changed
-
-- The proof-stat pool (the bounded `map_files` identity-proof workers) now
-  engages only for a batch of 128 or more ranges, up from 8. Typical
-  per-process batches are 30-45 ranges, so by default a pass behaves like the
-  serial path. A quiet-window A/B of v0.2.0 against v0.2.1 at 4,096
-  processes saved about 230 ms per pass at 2 CPUs (1,797 ms vs 1,568 ms
-  pass p95) and about 625 ms at 4 CPUs (2,220 ms vs 1,595 ms), nearly
-  all of it in the confirm stage; the 2-CPU gain is smaller than the
-  indicative experiment's ~350 ms. Results are identical by
-  construction; only wall time changes. See the M1 and R4 rows in the
-  known limitations for the full ranges.
-
-## [0.2.0] - 2026-10-04
-
-Not published as a release; these changes ship in 0.2.1.
+## [0.2.0] - 2026-10-05
 
 Module/caller inventory and usage observation, Kubernetes deployment, and
 fail-closed PID-namespace and privilege handling. See
@@ -127,6 +96,16 @@ fail-closed PID-namespace and privilege handling. See
 
 ### Changed
 
+- `--system` identity proofs: the proof-stat pool (the bounded `map_files`
+  proof workers) engages only for a batch of 128 or more ranges. Typical
+  per-process batches are 30–45 ranges, so by default a pass runs the
+  serial path, which measured faster: a quiet-window A/B at 4,096
+  processes against the qualified cut (pool from 8 ranges) saved about
+  230 ms per pass at 2 CPUs (1,797 ms vs 1,568 ms pass p95) and about
+  625 ms at 4 CPUs (2,220 ms vs 1,595 ms), nearly all in the confirm
+  stage. Results are identical by construction; only wall time changes.
+  Indicative single-host numbers (2 physical cores with SMT, Linux 7.0,
+  btrfs).
 - Classic `profile`/`trace` `--attach-backend auto` is decided by functional
   probes, not the 6.9 version floor: multi only where the probe links one
   (and, under `--pid`, only where it also proves the kernel pid filter).
@@ -163,6 +142,14 @@ fail-closed PID-namespace and privilege handling. See
 
 ### Fixed
 
+- `inventory -o <out.json>` buffers the JSON write: a 4,096-process run
+  issued about 557,000 `write` calls for the output file and now about
+  2,100, and the pause before exit dropped from about 3.5 s to about
+  0.1 s on that host. The document is unchanged.
+- `p11scope-discover` re-reads its own `/proc/self/maps` (up to 4 times)
+  when another thread's `mmap` tore the snapshot, instead of refusing
+  with "unsorted or overlapping"; a provider that starts mapping threads
+  during discovery no longer fails it. A parse error is never retried.
 - PID namespaces: an observer outside the initial PID namespace no longer
   publishes a silent zero claiming exact observation. p11scope reads its PID
   namespace and checks the mounted `/proc` is that namespace's own; on either
@@ -249,8 +236,10 @@ Kernels: 5.15.221, Ubuntu 6.8.0-142, 6.12.111, 7.2.6, via
 1.98.1). The qualified binaries were built from `f824046`; the release
 candidate differs from that tree only in the classic `--pid` attach path,
 `--event-log` hardening, the `--duration` bound, a doctor refusal-string
-wording correction, and the 0.2.0 version bump. The classic `--pid` path
-was separately vng-qualified 9/9 on all 4 kernels.
+wording correction, the 128-range proof-stat pool threshold, the
+buffered `-o` write, the retried `p11scope-discover` self-maps read,
+CI and test-fixture fixes, and the 0.2.0 version. The classic `--pid`
+path was separately vng-qualified 9/9 on all 4 kernels.
 
 Checks, per kernel: `--version`, `doctor` capability tier T1
 (`capture available`), the public CLI matrix 13/0, the inventory scan
@@ -272,12 +261,12 @@ export CARGO_BUILD_JOBS=4 TMPDIR=/var/tmp/p11scope-ws-tmp
 scripts/qualify-release-matrix.sh --rev <RC> --bin-dir /home/user/.cache/p11scope-vng/rc-qualify-bins-<RC>
 ```
 
-The short measurement tier landed on release day: M0 PASS (29 of 29 units
-valid); M1 pass p95 ~0.34 s at 448 processes and ~2.20 s at 4,096 in
-both lanes, over the 1 s target at 4,096; M4 lossless at 100 exec/s and
-~100 ring records/min lost at 1,000 exec/s (448 processes, native lane);
-C5.6 pool with no gain on 2 physical cores (not a clean A/B: 570eb7d
-predates other slices). See
+The short measurement tier: M0 PASS (29 of 29 units valid, and 43 of 43
+in the re-measure); M1 pass p95 on this release's code ~0.30 s at 448
+processes and ~1.61 s (native) / ~1.70 s (scan) at 4,096, over the 1 s
+target at 4,096; M4 lossless at 100 exec/s and ~100 ring records/min
+lost at 1,000 exec/s (448 processes, native lane); proof-stat pool A/B
+as under Changed. See
 [docs/known-limitations.md](docs/known-limitations.md) for the numbers
 and method. Explicitly out of scope for v0.2.0: a long soak and a v0.1.0
 comparison (see [docs/known-limitations.md](docs/known-limitations.md)).

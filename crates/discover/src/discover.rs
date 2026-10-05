@@ -51,9 +51,7 @@ pub fn discover_with_self_memory(
         .ok_or_else(|| "--module path must be valid UTF-8 for the manifest".to_string())?;
     let memory = ProcessMemory(self_memory);
     let (module_file_key, module_identity) = identity_and_key(module_path)?;
-    let before_maps = maps::parse_maps(
-        &std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?,
-    )?;
+    let before_maps = read_self_maps()?;
     let before_index = validated_map_index(&before_maps)?;
     let before_keys: BTreeSet<ObjectKey> =
         before_index.entries().iter().map(ObjectKey::of).collect();
@@ -70,9 +68,7 @@ pub fn discover_with_self_memory(
     let legacy_acquisition = raw_exports.get_function_list.map(|_| function_list(&lib));
     let interfaces_acquisition = interface_list(&lib);
 
-    let maps_bytes =
-        std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?;
-    let maps = maps::parse_maps(&maps_bytes)?;
+    let maps = read_self_maps()?;
     let map_index = validated_map_index(&maps)?;
     let module_file = identity::open_object(module_path)
         .map_err(|e| format!("cannot open {} for reuse: {e}", module_path.display()))?;
@@ -156,9 +152,7 @@ pub fn discover_with_self_memory(
     );
     let selection_evidence = selection_records(selection_raw, &surfaces);
     let alias_groups = alias_groups(&surfaces);
-    let final_maps = maps::parse_maps(
-        &std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?,
-    )?;
+    let final_maps = read_self_maps()?;
     let final_map_index = validated_map_index(&final_maps)?;
     let (final_file_key, final_identity) = identity_and_key(module_path)?;
     if final_file_key != module_file_key
@@ -185,6 +179,34 @@ pub fn discover_with_self_memory(
         alias_groups,
         selection_evidence,
     })
+}
+
+/// Reads before giving up on a torn snapshot of this process's own maps.
+const SELF_MAPS_ATTEMPTS: usize = 4;
+
+/// One consistent snapshot of this process's own maps. The kernel serves
+/// `/proc/self/maps` over several `read` calls and drops the mmap lock
+/// between them, so another thread's `mmap` (a provider's worker, or a
+/// parallel test) can tear the snapshot. A torn snapshot fails the
+/// `MapIndex` order check and is read again, up to [`SELF_MAPS_ATTEMPTS`]
+/// times; a parse error is never retried.
+fn read_self_maps() -> Result<Vec<maps::MapEntry>, String> {
+    read_self_maps_with(|| std::fs::read("/proc/self/maps"))
+}
+
+fn read_self_maps_with(
+    mut read: impl FnMut() -> std::io::Result<Vec<u8>>,
+) -> Result<Vec<maps::MapEntry>, String> {
+    let mut torn = String::new();
+    for _ in 0..SELF_MAPS_ATTEMPTS {
+        let bytes = read().map_err(|e| format!("/proc/self/maps: {e}"))?;
+        let entries = maps::parse_maps(&bytes)?;
+        match maps::MapIndex::new(&entries) {
+            Ok(_) => return Ok(entries),
+            Err(error) => torn = format!("invalid /proc maps snapshot: {error}"),
+        }
+    }
+    Err(torn)
 }
 
 fn validated_map_index(entries: &[maps::MapEntry]) -> Result<maps::MapIndex<'_>, String> {
@@ -1796,6 +1818,62 @@ fn alias_groups(surfaces: &[SurfaceRecord]) -> Vec<AliasGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GOOD_MAPS: &[u8] = b"00400000-00401000 r-xp 00000000 08:01 11 /usr/lib/a.so\n\
+00401000-00402000 r--p 00001000 08:01 11 /usr/lib/a.so\n";
+    // What a torn read looks like: a line served after another thread's
+    // mmap moved the cursor, so ranges arrive out of order.
+    const TORN_MAPS: &[u8] = b"00401000-00402000 r--p 00001000 08:01 11 /usr/lib/a.so\n\
+00400000-00401000 r-xp 00000000 08:01 11 /usr/lib/a.so\n";
+
+    fn scripted(reads: &[&'static [u8]]) -> impl FnMut() -> std::io::Result<Vec<u8>> {
+        let mut reads = reads.to_vec().into_iter();
+        move || Ok(reads.next().expect("no more scripted reads").to_vec())
+    }
+
+    #[test]
+    fn a_torn_self_maps_snapshot_is_read_again() {
+        let entries = read_self_maps_with(scripted(&[TORN_MAPS, TORN_MAPS, GOOD_MAPS])).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(maps::MapIndex::new(&entries).is_ok());
+    }
+
+    #[test]
+    fn a_self_maps_snapshot_torn_on_every_attempt_is_refused() {
+        let reads = [TORN_MAPS; SELF_MAPS_ATTEMPTS];
+        let err = read_self_maps_with(scripted(&reads)).unwrap_err();
+        assert!(err.contains("unsorted or overlapping"), "{err}");
+    }
+
+    #[test]
+    fn a_self_maps_parse_error_is_not_retried() {
+        let mut calls = 0;
+        let err = read_self_maps_with(|| {
+            calls += 1;
+            Ok(b"not a maps line\n".to_vec())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "{err}");
+    }
+
+    #[test]
+    fn self_maps_stay_readable_while_another_thread_maps_and_unmaps() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let held: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 1 << 20]).collect();
+                    drop(held);
+                }
+            });
+            // Stop the mapper before asserting, so a failure cannot leave
+            // the scope waiting on it forever.
+            let failures: Vec<String> = (0..200).filter_map(|_| read_self_maps().err()).collect();
+            stop.store(true, Ordering::Relaxed);
+            assert!(failures.is_empty(), "torn snapshots surfaced: {failures:?}");
+        });
+    }
 
     #[test]
     fn relative_module_is_rejected_before_loading() {

@@ -69,6 +69,11 @@ mise exec -- ./scripts/cargo.sh +1.98.1 test --locked --workspace --all-targets
 mise exec -- ./scripts/cargo.sh +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
 
+When adding or changing CI, design for parallel jobs: split long checks
+(test shards, coverage shards, lint, audit, scripts) into separate jobs that
+run concurrently, within a reasonable job count (under the runner concurrency
+limit, about 20). Every split must still prove it ran the full test set.
+
 Privileged, container and VM experiments need the host owner's authorization.
 Honor authorization already given for the task, check ownership of resources,
 and clean up only resources created by the experiment. Do not disturb an

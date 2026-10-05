@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! C7 A5: the sharded confirmation is the serial one, attribution for
 //! attribution and charge for charge, at every ceiling.
 

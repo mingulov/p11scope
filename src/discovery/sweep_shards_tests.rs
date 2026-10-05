@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! C7 A4: the sharded maps sweep is the serial sweep, result for result and
 //! charge for charge, at every ceiling.
 

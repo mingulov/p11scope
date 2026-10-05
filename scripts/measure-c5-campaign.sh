@@ -12,9 +12,8 @@
 #   measure-c5-campaign.sh ... --plan     (no privilege: list the units and the duration estimate)
 #   measure-c5-campaign.sh --self-test    (no privilege: plan shapes, resume and gate logic)
 #
-# The plan is .superpowers/sdd/2026-09-30-module-caller-inventory/task6-c5-plan.md §2
-# (M0–M7) plus the C5.6 R4 pool timing (task6-c5-6-report.md: base 570eb7d vs
-# head on cores 10,11 and on the 4-core set 8,9,10,11). Binaries:
+# The campaign runs measurements M0–M7 plus the C5.6 R4 pool timing (base
+# 570eb7d vs head on cores 10,11 and on the 4-core set 8,9,10,11). Binaries:
 #   --candidate       the release build of the s2s3 tip under test
 #   --baseline        the fresh v0.1.0 tag build (M1-match, M2, M6, M7)
 #   --r4-base         a release build of 570eb7d (R4; the C5.6 base before the pool)
@@ -47,7 +46,7 @@
 # and within a cell the roles (candidate, baseline or control) alternate
 # their order every round.
 #
-# Host-load discipline (task6-c5-plan.md §2, transfer plan §5): the whole
+# Host-load discipline: the whole
 # campaign holds `flock /var/tmp/p11scope-ws-tmp/privileged.lock` (it re-executes
 # itself under flock -o); before every unit it waits (up to --gate-wait,
 # default 1800 s) for load1 < 4 (M2 also load5 < 4) and records `uptime`
@@ -80,7 +79,6 @@ ANALYSIS=$REPO/scripts/measure-c5-analysis.py
 LOCK=${LOCK:-/var/tmp/p11scope-ws-tmp/privileged.lock}
 MODULE=${MODULE:-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so}
 RUNUID=${RUNUID:-1000} RUNGID=${RUNGID:-1000}
-SDD=/home/user/src/m/p11scope-ws/p11scope/.superpowers/sdd/2026-09-30-module-caller-inventory
 
 die() { echo "measure-c5-campaign: $*" >&2; exit 70; }
 log() { echo "[$(date '+%F %T')] $*" | tee -a "${OUT:-/dev/null}/campaign.log" >&2; }
@@ -670,7 +668,7 @@ self_test() {
 # ---------------------------------------------------------------- main
 
 CANDIDATE="" BASELINE="" R4_BASE="" LOSS_CANDIDATE="" LOSS_CHURN=3000 TIER=all SCALE=full ONLY="" ROUNDS=""
-OUT="" RESUME="" REPORT=$SDD/c5-measurements.md GATE_WAIT=1800 MAX_ATTEMPTS=3 PLAN=0 MAX_LOAD1=4 MAX_BUILDS=0 M0_ADVISORY=0
+OUT="" RESUME="" REPORT="" GATE_WAIT=1800 MAX_ATTEMPTS=3 PLAN=0 MAX_LOAD1=4 MAX_BUILDS=0 M0_ADVISORY=0
 [ "${1:-}" = --self-test ] && { self_test; exit 0; }
 ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do

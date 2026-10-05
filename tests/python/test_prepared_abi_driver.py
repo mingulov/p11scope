@@ -206,10 +206,13 @@ class AbiDriverFixture:
 
 class PreparedAbiDriverTests(unittest.TestCase):
     def setUp(self):
-        superpowers = ROOT / ".superpowers"
-        superpowers.mkdir(exist_ok=True)
+        # The driver refuses an evidence root below a world-writable
+        # directory such as /tmp (unsafe_evidence_root), so the scratch
+        # space lives in the checkout's ignored build tree.
+        scratch = ROOT / "target" / "test-scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(
-            prefix="prepared-abi-driver-", dir=superpowers
+            prefix="prepared-abi-driver-", dir=scratch
         )
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)

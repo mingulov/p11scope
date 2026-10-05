@@ -275,9 +275,6 @@ class SnapshotFixture:
 
 
 class PreparedFourCallersTests(unittest.TestCase):
-    def setUp(self):
-        (REPOSITORY / ".superpowers").mkdir(exist_ok=True)
-
     def test_each_actual_finalizer_propagates_controls_mutations_and_failures(self):
         scenarios = (
             "success", "prior-nonzero", "cleanup-failure",
@@ -287,9 +284,7 @@ class PreparedFourCallersTests(unittest.TestCase):
         )
         for caller in CALLERS:
           for scenario in scenarios:
-            with self.subTest(caller=caller.name, scenario=scenario), tempfile.TemporaryDirectory(
-                dir=REPOSITORY / ".superpowers"
-            ) as raw:
+            with self.subTest(caller=caller.name, scenario=scenario), tempfile.TemporaryDirectory() as raw:
                 fixture = FinalizerFixture(Path(raw), caller)
                 result = fixture.run(scenario)
                 if scenario == "success":
@@ -340,9 +335,7 @@ class PreparedFourCallersTests(unittest.TestCase):
         )
         for caller in CALLERS:
           for scenario in scenarios:
-            with self.subTest(caller=caller.name, scenario=scenario), tempfile.TemporaryDirectory(
-                dir=REPOSITORY / ".superpowers"
-            ) as raw:
+            with self.subTest(caller=caller.name, scenario=scenario), tempfile.TemporaryDirectory() as raw:
                 base = Path(raw)
                 base.chmod(0o700)
                 prepared = EvidenceFixture(base)
@@ -477,7 +470,7 @@ class PreparedFourCallersTests(unittest.TestCase):
                 self.assertFalse(any(call.get("phase") == "final" for call in calls))
 
     def test_actual_shared_parent_hands_exact_selected_pair_to_child_build(self):
-        with tempfile.TemporaryDirectory(dir=REPOSITORY / ".superpowers") as raw:
+        with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
             base.chmod(0o700)
             prepared = EvidenceFixture(base)

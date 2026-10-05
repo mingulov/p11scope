@@ -67,7 +67,7 @@
 # bpftool (COOKIE_CTL next_ticket and limit, CALLER_USE rows and capacity)
 # into maps.tsv (M5 slopes).
 #
-# Host-load discipline (task6-c5-plan.md §2). The run holds the shared lock
+# Host-load discipline. The run holds the shared lock
 # /var/tmp/p11scope-ws-tmp/privileged.lock: either an ancestor already holds it
 # (`flock LOCK bench-inventory-native.sh ...`) or the script re-executes itself
 # under flock(1), and /proc/locks must show an ancestor holding it before

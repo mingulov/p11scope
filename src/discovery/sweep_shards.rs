@@ -486,9 +486,12 @@ pub(crate) fn replay_one<C: Fn() -> Option<u64> + ?Sized>(
                 last = Some(sample);
                 sample
             }
-            // Unreachable: a replay asks the clock at most as often as
-            // the shard's read did (see the module comment). Repeating
-            // the latest reading keeps it on the same timeline.
+            // A replay can ask the clock once more than the shard's read
+            // did: when its smaller I/O allowance splits the shard's last
+            // read, which crossed a snapshot ceiling, the replay polls
+            // again before it stops on the spent allowance. Repeating the
+            // latest reading is a valid reading of a monotonic clock
+            // there, and that poll can only stop the read.
             None => last.unwrap_or_else(now),
         },
         bufs,

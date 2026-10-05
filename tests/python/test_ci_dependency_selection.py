@@ -46,9 +46,10 @@ def patch_paths():
 
 
 def checks_job_steps():
-    """The checks-and-e2e job's steps, each as its list of raw lines."""
+    """The tests job's steps (the standalone vendored-dependency fetch and
+    test steps run there), each as its list of raw lines."""
     lines = CI_YML.read_text(encoding="utf-8").splitlines()
-    start = lines.index("  checks-and-e2e:") + 1
+    start = lines.index("  tests:") + 1
     steps = []
     for line in lines[start:]:
         if line.strip() and not line.startswith("    ") \

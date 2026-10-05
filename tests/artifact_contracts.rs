@@ -507,7 +507,10 @@ fn assert_lane14_selected_python_isolated(source: &str) -> Result<(), String> {
 }
 
 fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
-    let checks = checks_job(ci);
+    // The prepared-selection proof runs once, in the lint job; every job that
+    // runs project Cargo reconstructs the pinned sources before its first
+    // project operation.
+    let checks = job_block(ci, "lint");
     let prepare = "run: python3 -I scripts/prepare-dependencies.py";
     let root_fetch =
         "run: cargo +\"$(cat .release-rust-version)\" fetch --locked --manifest-path Cargo.toml";
@@ -537,12 +540,14 @@ fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
     ] {
         require_contract_marker(checks, marker, contract)?;
     }
-    require_before(
-        checks,
-        prepare,
-        root_fetch,
-        "dependency reconstruction before project Cargo",
-    )?;
+    for job in CARGO_JOBS {
+        require_before(
+            job_block(ci, job),
+            prepare,
+            root_fetch,
+            &format!("{job}: dependency reconstruction before project Cargo"),
+        )?;
+    }
     for pair in [
         (selection, root_metadata),
         (root_metadata, bpf_metadata),
@@ -558,21 +563,77 @@ fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn assert_hosted_offline_gates(checks: &str) -> Result<(), String> {
+/// The workspace test gate. It is one command, run as a partition: the tests
+/// job runs every target but `artifact_contracts`, the contracts shards split
+/// that target, and `scripts/ci-test-partition.py` narrows `--all-targets` for
+/// each (see `hosted_pipeline_partitions_the_workspace_test_gate`).
+const WORKSPACE_TEST_GATE: &str =
+    "cargo +\"$(cat .release-rust-version)\" test --locked --offline --workspace --all-targets";
+const PARTITION_RUN: &str = "python3 -I scripts/ci-test-partition.py run --partition ";
+
+/// The step commands of a job block, normalised by `command_of`.
+fn step_calls(block: &str) -> impl Iterator<Item = &str> {
+    block.lines().map(str::trim).filter_map(command_of)
+}
+
+/// A flow-sequence matrix axis, `key: [a, "b", c]`, as its unquoted values.
+fn matrix_axis(block: &str, key: &str) -> Result<Vec<String>, String> {
+    let prefix = format!("{key}: [");
+    let line = block
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| format!("no `{key}:` matrix axis"))?;
+    let inner = line[prefix.len()..]
+        .strip_suffix(']')
+        .ok_or_else(|| format!("the `{key}:` axis is not a one-line list"))?;
+    Ok(inner
+        .split(',')
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .collect())
+}
+
+/// N for the contracts shards, proved complete: the matrix names exactly the
+/// shards 1..=N, so no share of `artifact_contracts` can silently go unrun.
+fn contracts_shard_count(ci: &str) -> Result<usize, String> {
+    let shards = matrix_axis(job_block(ci, "contracts"), "shard")?;
+    let expected: Vec<String> = (1..=shards.len()).map(|shard| shard.to_string()).collect();
+    if shards.is_empty() || shards != expected {
+        return Err(format!(
+            "the contracts matrix must name every shard 1..=N exactly once, got {shards:?}"
+        ));
+    }
+    Ok(shards.len())
+}
+
+fn assert_hosted_offline_gates(ci: &str) -> Result<(), String> {
+    let lint = job_block(ci, "lint");
     for gate in [
         "fmt --all -- --check",
         "check --locked --offline --workspace --all-targets",
-        "test --locked --offline --workspace --all-targets",
         "clippy --locked --offline --workspace --all-targets -- -D warnings",
     ] {
-        if !checks
-            .lines()
-            .map(str::trim)
-            .filter_map(command_of)
+        if !step_calls(lint)
             .any(|call| call == format!("cargo +\"$(cat .release-rust-version)\" {gate}"))
         {
             return Err(format!(
-                "the scope line claims the {gate} gate, which no step runs"
+                "the scope line claims the {gate} gate, which no lint step runs"
+            ));
+        }
+    }
+    let shards = contracts_shard_count(ci)?;
+    for (job, partition) in [
+        ("tests", "rest".to_string()),
+        (
+            "contracts",
+            format!("\"contracts:${{{{ matrix.shard }}}}/{shards}\""),
+        ),
+    ] {
+        let expected = format!("{PARTITION_RUN}{partition} -- {WORKSPACE_TEST_GATE}");
+        if !step_calls(job_block(ci, job)).any(|call| call == expected) {
+            return Err(format!(
+                "the scope line claims the workspace test gate, which the {job} job does not \
+                 run as `{expected}`"
             ));
         }
     }
@@ -7531,10 +7592,35 @@ fn block_under<'a>(source: &'a str, header: &str) -> &'a str {
     &body[..end]
 }
 
-/// The `checks-and-e2e` job, bounded by its own header rather than by whatever
-/// happens to follow it.
+/// The hosted check jobs that together replaced the single `checks-and-e2e`
+/// job. They run on every push and pull request, in parallel, and every one of
+/// them gates the run: `archive-log` keeps each one's log and `quarantine`
+/// fires when any one fails.
+const CHECK_JOBS: [&str; 5] = ["lint", "audit", "tests", "contracts", "scripts"];
+
+/// Every job that runs project Cargo after reconstructing the pinned
+/// dependency sources: the check jobs plus the coverage shards and report.
+const CARGO_JOBS: [&str; 7] = [
+    "lint",
+    "audit",
+    "tests",
+    "contracts",
+    "scripts",
+    "coverage",
+    "coverage-report",
+];
+
+/// The `scripts` check job: it prints the UNRUN block and runs every
+/// validator `--self-test` and every lane this pipeline runs in full, so the
+/// UNRUN labels' "in this job" means this block. Bounded by its own header
+/// rather than by whatever happens to follow it.
 fn checks_job(ci: &str) -> &str {
-    block_under(ci, "  checks-and-e2e:")
+    block_under(ci, "  scripts:")
+}
+
+/// One named job's block.
+fn job_block<'a>(ci: &'a str, job: &str) -> &'a str {
+    block_under(ci, &format!("  {job}:"))
 }
 
 /// The directories the lane derivations walk, asserted to be all of them: a lane
@@ -7596,8 +7682,8 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
     let ci = read(".github/workflows/ci.yml");
     // Position is not load-bearing and pinning it made an innocent edit to a
     // neighbouring step panic inside `between()`; the step only has to be in the
-    // checks job, after the clippy gate it complements.
-    let checks = checks_job(&ci);
+    // lint job, after the clippy gate it complements.
+    let checks = job_block(&ci, "lint");
     let lines: Vec<&str> = checks.lines().map(str::trim).collect();
     let clippy_at = lines
         .iter()
@@ -7607,14 +7693,14 @@ fn hosted_pipeline_checks_the_diagnostic_inventory() {
                     == "cargo +\"$(cat .release-rust-version)\" clippy --locked --offline --workspace --all-targets -- -D warnings"
             })
         })
-        .expect("the checks job must run the clippy gate");
+        .expect("the lint job must run the clippy gate");
     // `--nocapture` so the inventory report the wave cites as exit evidence
     // actually reaches the hosted log.
     let prefix = "cargo +\"$(cat .release-rust-version)\" test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- ";
     let command_at = lines
         .iter()
         .position(|line| line.starts_with(prefix))
-        .expect("the checks job must run the diagnostic-object inventory test");
+        .expect("the lint job must run the diagnostic-object inventory test");
     assert!(
         command_at > clippy_at,
         "the diagnostic-object inventory test must run after the clippy gate"
@@ -8244,15 +8330,22 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         }
         outside = outside.replacen(block, "", 1);
     }
+    // The other check jobs and the coverage jobs name two kinds of script and
+    // no lane: the dependency helpers, and the test-gate partition helper,
+    // which only narrows the workspace test gate's `--all-targets` (every call
+    // of it is pinned verbatim by
+    // `hosted_pipeline_partitions_the_workspace_test_gate`; its own
+    // `--self-test` is an ordinary step of the checks job).
+    let partition_helper = "scripts/ci-test-partition.py";
     for line in outside.lines().map(str::trim) {
         let line = line
             .split_once(" #")
             .map_or(line, |(code, _)| code.trim_end());
         let scripts = named_scripts(line);
         let dependency_only = !scripts.is_empty()
-            && scripts
-                .iter()
-                .all(|script| dependency_helpers.contains(&script.as_str()));
+            && scripts.iter().all(|script| {
+                dependency_helpers.contains(&script.as_str()) || script == partition_helper
+            });
         assert!(
             line.starts_with('#') || !names_lane(line) || dependency_only,
             "a lane is named outside the checks job: {line:?}. The UNRUN and scope \
@@ -8385,7 +8478,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // The rest of that line is prose, so pin the steps it claims.
     // Full strings: "test --locked" alone was also matched by the diagnostic
     // step, so deleting the workspace test gate left this claim standing.
-    assert_hosted_offline_gates(checks).unwrap();
+    assert_hosted_offline_gates(&ci).unwrap();
     assert_hosted_dependency_preparation(&ci).unwrap();
     for marker in [
         "--metadata \"Cargo.toml=$RUNNER_TEMP/root-metadata.json\"",
@@ -8410,14 +8503,29 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         "dependency reconstruction after the first project operation must fail"
     );
     for gate in ["check", "test", "clippy"] {
-        let offline = format!("{gate} --locked --offline");
-        let online = format!("{gate} --locked");
-        let missing_offline = checks.replacen(&offline, &online, 1);
+        let offline = format!("{gate} --locked --offline --workspace");
+        let online = format!("{gate} --locked --workspace");
+        let missing_offline = ci.replacen(&offline, &online, 1);
         assert!(
             assert_hosted_offline_gates(&missing_offline).is_err(),
             "removing --offline from the {gate} gate must fail"
         );
     }
+    // The test gate runs in two places; dropping --offline from either share
+    // must fail, not only from the first one found.
+    let contracts = job_block(&ci, "contracts");
+    let online_contracts = ci.replacen(
+        contracts,
+        &contracts.replace(
+            "test --locked --offline --workspace",
+            "test --locked --workspace",
+        ),
+        1,
+    );
+    assert!(
+        assert_hosted_offline_gates(&online_contracts).is_err(),
+        "removing --offline from the contracts share of the test gate must fail"
+    );
     for path in &expected {
         for line in block_lines
             .iter()
@@ -8466,14 +8574,13 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
 }
 
 /// A step cannot read its own job's log, and a `tee` wrapper would break every
-/// exact-line pin above, so a second job fetches the finished job's log through
-/// the Actions API and keeps it as a run artifact. Its token gets `actions:
-/// read` and nothing else; the top-level `contents: read` and the checks job
-/// stay as they are.
+/// exact-line pin above, so a second job fetches each finished check job's log
+/// through the Actions API and keeps them as a run artifact. Its token gets
+/// `actions: read` and nothing else; the top-level `contents: read` and the
+/// check jobs stay as they are.
 #[test]
 fn hosted_pipeline_retains_the_job_log() {
     let ci = read(".github/workflows/ci.yml");
-    let checks = checks_job(&ci);
     let archive = block_under(&ci, "  archive-log:");
     // Comments and blank lines are not permissions; a trailing comment on one is
     // not part of its value either.
@@ -8490,20 +8597,49 @@ fn hosted_pipeline_retains_the_job_log() {
     assert_eq!(
         permission_lines(block_under(&ci, "permissions:")),
         ["  contents: read"],
-        "the workflow default must stay exactly contents: read — checks-and-e2e has no \
-         job-level block, so it inherits this while building third-party crates"
+        "the workflow default must stay exactly contents: read — the check and coverage \
+         jobs have no job-level block, so they inherit this while building third-party crates"
     );
-    assert!(
-        !checks.contains("    permissions:"),
-        "checks-and-e2e must not gain a job-level permissions block"
-    );
+    for job in CARGO_JOBS {
+        assert!(
+            !job_block(&ci, job).contains("    permissions:"),
+            "{job} must not gain a job-level permissions block"
+        );
+    }
     assert_eq!(
         permission_lines(block_under(archive, "    permissions:")),
         ["      actions: read"],
         "archive-log must hold exactly one permission, actions: read"
     );
+    // The archive covers every check job, as the Actions API names them: the
+    // job id, except that each contracts shard is its own job, named by the
+    // shard. A shard added to the matrix without a log, or a check job added
+    // without one, fails here.
+    let shards = contracts_shard_count(&ci).unwrap();
+    for job in ["lint", "audit", "tests", "scripts"] {
+        assert!(
+            !job_block(&ci, job).contains("\n    name:"),
+            "{job} must keep its job id as its name: archive-log finds its log by that name"
+        );
+    }
+    assert!(
+        job_block(&ci, "contracts").starts_with("    name: contracts-${{ matrix.shard }}\n"),
+        "each contracts shard must be named contracts-<shard>: archive-log finds its log by that name"
+    );
+    let mut names = Vec::new();
+    for job in CHECK_JOBS {
+        if job == "contracts" {
+            names.extend((1..=shards).map(|shard| format!("contracts-{shard}")));
+        } else {
+            names.push(job.to_string());
+        }
+    }
+    let needs = format!("    needs: [{}]\n", CHECK_JOBS.join(", "));
+    let listed = format!("      CHECK_JOBS: {}\n", names.join(" "));
     for required in [
-        "    needs: checks-and-e2e\n",
+        needs.as_str(),
+        listed.as_str(),
+        "for job in $CHECK_JOBS; do",
         // Not always(): a cancelled run must not publish a truncated log under
         // the same artifact name as a complete one.
         "    if: ${{ !cancelled() }}\n",
@@ -8511,17 +8647,128 @@ fn hosted_pipeline_retains_the_job_log() {
         "if-no-files-found: error\n",
         "/actions/jobs/$JOB_ID/logs\"",
         "for attempt in ",
+        // Exactly one id per name: none means the list rotted, two would splice
+        // two ids into one URL.
+        r#"test "$(printf '%s\n' "$JOB_ID" | grep -c '^[0-9][0-9]*$')" = 1"#,
         // Without this the loop's hardcoded exit number is load-bearing: shortening
         // the attempt list would fall through with the empty file `gh api` created.
         // A simple command, not an `&&` list: only this form aborts the step.
-        r#"test -s "$RUNNER_TEMP/checks-and-e2e.log""#,
+        r#"test -s "$RUNNER_TEMP/checks-logs/$job.log""#,
         // An attempt that wrote nothing must not count as success: the retry
         // window answers 200 with an empty body, and `if-no-files-found: error`
         // only checks that the file exists.
-        "&& [ -s \"$RUNNER_TEMP/checks-and-e2e.log\" ]; then",
+        "&& [ -s \"$RUNNER_TEMP/checks-logs/$job.log\" ]; then",
     ] {
         assert!(archive.contains(required), "archive-log lacks {required:?}");
     }
+    // Triage evidence fires on a failure of ANY check job, never only one.
+    let quarantine = job_block(&ci, "quarantine");
+    assert!(
+        quarantine.starts_with(&format!("{needs}    if: failure()\n")),
+        "quarantine must need every check job and run only on failure"
+    );
+}
+
+/// The workspace test gate and the coverage gate each run as one command split
+/// across parallel jobs. The split must be a partition, so this pins it from
+/// both ends: the contracts matrix names every shard 1..=N of the N its command
+/// uses, the coverage matrix runs exactly the same partition (rest plus every
+/// contracts shard), the report unpacks exactly that many shards, and no check
+/// job runs the gate in any other form. Inside each job the partition helper
+/// fails closed on its own (its `--self-test` runs in the checks job): a
+/// contracts shard proves from libtest's summary that it ran exactly its
+/// assigned tests, and the unpack refuses a missing or duplicated shard.
+#[test]
+fn hosted_pipeline_partitions_the_workspace_test_gate() {
+    let ci = read(".github/workflows/ci.yml");
+    let shards = contracts_shard_count(&ci).unwrap();
+    assert!(shards >= 2, "a one-shard split is not a split");
+    let contracts = job_block(&ci, "contracts");
+    let coverage = job_block(&ci, "coverage");
+    let report = job_block(&ci, "coverage-report");
+    for (job, block) in [("contracts", contracts), ("coverage", coverage)] {
+        // A failing shard must not cancel its siblings: their results are the
+        // rest of the evidence.
+        assert!(
+            block.contains("    strategy:\n      fail-fast: false\n      matrix:\n"),
+            "{job} must run every shard to completion (fail-fast: false)"
+        );
+    }
+    // Exactly the two shares of the gate, and the gate in no other form.
+    let rest = format!("{PARTITION_RUN}rest -- {WORKSPACE_TEST_GATE}");
+    let shard = format!(
+        "{PARTITION_RUN}\"contracts:${{{{ matrix.shard }}}}/{shards}\" -- {WORKSPACE_TEST_GATE}"
+    );
+    for job in CHECK_JOBS {
+        let calls: Vec<&str> = step_calls(job_block(&ci, job))
+            .filter(|call| call.contains(" test --locked --offline --workspace"))
+            .collect();
+        let expected: Vec<&str> = match job {
+            "tests" => vec![rest.as_str()],
+            "contracts" => vec![shard.as_str()],
+            _ => vec![],
+        };
+        assert_eq!(
+            calls, expected,
+            "{job}: the workspace test gate runs only as its pinned partition"
+        );
+    }
+    // Coverage runs the same partition, each share under llvm-cov --no-report.
+    let mut partitions = vec!["rest".to_string()];
+    partitions.extend((1..=shards).map(|shard| format!("contracts:{shard}/{shards}")));
+    assert_eq!(
+        matrix_axis(coverage, "partition").unwrap(),
+        partitions,
+        "the coverage matrix must be exactly the test-gate partition"
+    );
+    for (block, call) in [
+        (
+            coverage,
+            format!(
+                "{PARTITION_RUN}\"${{{{ matrix.partition }}}}\" -- cargo +\"$(cat .release-rust-version)\" llvm-cov --locked --offline --workspace --all-targets --no-report"
+            ),
+        ),
+        (
+            coverage,
+            "python3 -I scripts/ci-test-partition.py coverage-pack --partition \"${{ matrix.partition }}\" --target-dir target/llvm-cov-target --output \"$RUNNER_TEMP/coverage\"".to_string(),
+        ),
+        (
+            report,
+            format!(
+                "python3 -I scripts/ci-test-partition.py coverage-unpack --contracts-shards {shards} --target-dir target/llvm-cov-target \"$RUNNER_TEMP/coverage\""
+            ),
+        ),
+        (
+            report,
+            "cargo +\"$(cat .release-rust-version)\" llvm-cov report --locked --offline --workspace --fail-under-lines \"$(cat .coverage-floor)\"".to_string(),
+        ),
+    ] {
+        assert!(
+            step_calls(block).any(|step| step == call),
+            "the coverage gate lacks the step {call:?}"
+        );
+    }
+    // Every coverage share is a separate artifact, and the report waits for
+    // all of them and downloads exactly those.
+    for (block, marker) in [
+        (coverage, "name: coverage-shard-${{ strategy.job-index }}\n"),
+        (coverage, "if-no-files-found: error\n"),
+        (report, "pattern: coverage-shard-*\n"),
+    ] {
+        assert!(block.contains(marker), "the coverage gate lacks {marker:?}");
+    }
+    assert!(
+        report.starts_with("    needs: coverage\n"),
+        "coverage-report must wait for every coverage shard"
+    );
+    // Line tables only: full DWARF plus coverage pushes the self-inspecting
+    // test executable past the scanner's object limit.
+    for block in [coverage, report] {
+        assert!(block.contains("      CARGO_PROFILE_TEST_DEBUG: \"1\"\n"));
+    }
+    // The helper partitions the target the gate is split on.
+    let helper = read("scripts/ci-test-partition.py");
+    assert!(helper.contains("\nSHARDED_TARGET = \"artifact_contracts\"\n"));
 }
 
 /// Bind the behavioral capture helpers to production mode-specific callbacks.

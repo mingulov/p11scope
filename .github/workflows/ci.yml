@@ -19,8 +19,184 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+# The hosted checks run as parallel jobs on one commit: lint, audit, tests,
+# the contracts shards and scripts (the former single checks-and-e2e job), plus the
+# coverage shards and their merged report. Each job repeats the same pinned
+# setup from scratch: no cache anywhere. The workspace test gate is ONE
+# command, partitioned by scripts/ci-test-partition.py: the tests job runs every
+# target except artifact_contracts, and the contracts shards split that target
+# so every listed test runs in exactly one shard (each shard proves its count
+# from libtest's own summary). Coverage runs the same partition under
+# cargo llvm-cov --no-report and merges every shard's profiles and executables
+# in coverage-report, which applies the .coverage-floor gate.
 jobs:
-  checks-and-e2e:
+  # Static gates: formatting, compilation, both clippy profiles, the
+  # diagnostic-object inventory test and script lints.
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Offline/source custody tests require a self-contained commit graph.
+          fetch-depth: 0
+      # The stable toolchain is single-sourced from .release-rust-version,
+      # read inline like .coverage-floor; crate rust-version tracks its major.minor.
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      # Network acquisition is explicit and precedes every offline validation.
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Verify prepared dependency selection
+        shell: bash
+        run: |
+          . scripts/prepared-dependency-tools.sh
+          p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)"
+          RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
+            "$P11SCOPE_PREPARED_STABLE_CARGO" metadata --locked --offline --all-features --format-version 1 --manifest-path Cargo.toml >"$RUNNER_TEMP/root-metadata.json"
+          RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
+            "$P11SCOPE_PREPARED_BPF_CARGO" metadata --locked --offline --all-features --format-version 1 --manifest-path crates/ebpf/Cargo.toml >"$RUNNER_TEMP/bpf-metadata.json"
+          "$P11SCOPE_PREPARED_PYTHON" -I scripts/check-prepared-dependencies.py \
+            --sources third-party/sources.json \
+            --metadata "Cargo.toml=$RUNNER_TEMP/root-metadata.json" \
+            --metadata "crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json" --ledger
+      - run: cargo +"$(cat .release-rust-version)" fmt --all -- --check
+      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets
+      - run: cargo +"$(cat .release-rust-version)" clippy --locked --offline --workspace --all-targets -- -D warnings
+      # The wide Detailed profile changes the embedded BPF object and the slot
+      # bound; lint it so a default-only change cannot break the other profile.
+      - run: cargo +"$(cat .release-rust-version)" clippy --locked --offline -p p11scope --all-targets --features wide-detailed-2112 -- -D warnings
+      # libtest exits 0 when a filter matches nothing, so this step proves a test
+      # actually ran rather than trusting the source to keep naming one. A rename,
+      # an #[ignore], a #[cfg] that excludes it, or a deleted #[test] all empty the
+      # filter identically, and all of them fail here.
+      - shell: bash
+        run: |
+          cargo +"$(cat .release-rust-version)" test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- --exact --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
+          grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log"
+      - run: pipx install ruff==0.16.8
+      # SYSPLAN residual gates. None names a lane body: the lint step
+      # addresses directories through a shell variable, never a scripts/
+      # path (the pipeline derivation test forbids lane paths here).
+      - name: lint shell scripts (error level)
+        shell: bash
+        run: |
+          for dir in scripts scripts/matrix; do
+            shellcheck -S error "$dir"/*.sh
+          done
+      - run: ruff check scripts/ tests/python/
+  # Advisory and licence gates. Their own job because building the two pinned
+  # tools takes about five minutes; nothing here compiles the project, so the
+  # job skips bpf-linker and the apt packages but reconstructs the pinned
+  # sources and fetches both Cargo roots exactly like every other job.
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - run: cargo +"$(cat .release-rust-version)" install cargo-audit --version 0.22.2 --locked
+      - run: cargo +"$(cat .release-rust-version)" install cargo-deny --version 0.20.2 --locked
+      - run: cargo +"$(cat .release-rust-version)" audit
+      # The host and BPF crates have separate Cargo roots and license policies.
+      # The BPF-only GPL-2.0-only allowance must not leak into the host graph.
+      - run: cargo +"$(cat .release-rust-version)" deny --locked check
+      - run: cargo +"$(cat .release-rust-version)" deny --locked --manifest-path crates/ebpf/Cargo.toml --config deny-ebpf.toml check
+  # The workspace test gate minus artifact_contracts (the contracts shards
+  # run that target), plus the standalone vendored-dependency unit tests.
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Offline/source custody tests require a self-contained commit graph.
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      # Network acquisition is explicit and precedes every offline validation.
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      # The aya-p2 tree resolves its aya-obj dependency to the sibling p2
+      # tree: its multi-backport needs fields only aya-obj-p2 has, so the
+      # vendored upstream lock (crates.io aya-obj) cannot build it. Both
+      # standalone steps inject that patch and resolve unlocked; the
+      # shipped combination stays locked by the root workspace steps.
+      # Resolving unlocked rewrites the tree's vendored Cargo.lock, which is
+      # part of the recipe-pinned tree digest that the dependency check below
+      # and every later scripts/cargo.sh preparation verify, so each unlocked
+      # step restores the recipe's lock before it ends.
+      - name: Fetch the standalone aya tree
+        shell: bash
+        run: |
+          cp -p third-party/src/aya-0.14.0-p2/Cargo.lock "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock"
+          cargo +"$(cat .release-rust-version)" fetch --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml
+          cp -p "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock" third-party/src/aya-0.14.0-p2/Cargo.lock
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml
+      # The workspace gate, every target but artifact_contracts: the script
+      # rewrites --all-targets into --lib --bins --examples --benches plus one
+      # --test per integration target from cargo metadata.
+      - run: python3 -I scripts/ci-test-partition.py run --partition rest -- cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets
+      - name: Aya dependency unit tests
+        env:
+          CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
+        shell: bash
+        run: |
+          cargo +"$(cat .release-rust-version)" test --offline --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml --target-dir target/aya-tests --lib
+          cp -p "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock" third-party/src/aya-0.14.0-p2/Cargo.lock
+      - run: cargo +"$(cat .release-rust-version)" test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml --target-dir target/aya-obj-tests --lib
+      - name: Prove the prepared dependency trees are unchanged
+        run: python3 -I scripts/prepare-dependencies.py --check
+  # The same workspace test gate, narrowed to artifact_contracts and split
+  # into shards. Each shard computes the same longest-first plan from the
+  # binary's own test list and the checked-in scripts/ci-test-weights.json,
+  # runs its share with --exact, and fails unless libtest reports exactly that
+  # many tests. The matrix must name every shard 1..N of the N in the command
+  # (pinned by hosted_pipeline_partitions_the_workspace_test_gate).
+  contracts:
+    name: contracts-${{ matrix.shard }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Offline/source custody tests require a self-contained commit graph.
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
+      # toolchain that runs it (nightly); clang-18 compiles native CO-RE bitcode.
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version 0.10.4 --locked
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      # Network acquisition is explicit and precedes every offline validation.
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - run: python3 -I scripts/ci-test-partition.py run --partition "contracts:${{ matrix.shard }}/4" -- cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets
+  # Every validator --self-test, the two container-less live lanes and every
+  # tests/python suite. The UNRUN block is this job's first step after
+  # checkout, so the lane list reaches the log even if a later step fails.
+  scripts:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,7 +218,7 @@ jobs:
           TREE=$(git rev-parse 'HEAD^{tree}')
           cat >"$RUNNER_TEMP/lanes.txt" <<EOF
           commit $GITHUB_SHA tree $TREE
-          scope: printed before any step runs, so it is scope, never a result — each step's own status is the evidence. This job attempts the cargo fmt/check/test/clippy gates, the diagnostic-object inventory test, every --self-test, and these lanes in full: scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh, scripts/run-python-suites.py
+          scope: printed before any step runs, so it is scope, never a result — each step's own status is the evidence. The hosted check jobs lint, audit, tests, contracts and scripts attempt the cargo fmt/check/test/clippy gates (the workspace test gate split between the tests job and the contracts shards), the diagnostic-object inventory test and the advisory/licence gates; this job attempts every --self-test and these lanes in full: scripts/verify-inspect-doctor.sh, scripts/verify-attach-e2e.sh, scripts/run-python-suites.py
           UNRUN: scripts/attach-pod.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -93,8 +269,6 @@ jobs:
           cat "$RUNNER_TEMP/lanes.txt"
           { echo '## UNRUN lanes'; echo '```'; cat "$RUNNER_TEMP/lanes.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
       # UNRUN lanes end
-      # The stable toolchain is single-sourced from .release-rust-version,
-      # read inline like .coverage-floor; crate rust-version tracks its major.minor.
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
@@ -106,60 +280,6 @@ jobs:
       # Network acquisition is explicit and precedes every offline validation.
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      # The aya-p2 tree resolves its aya-obj dependency to the sibling p2
-      # tree: its multi-backport needs fields only aya-obj-p2 has, so the
-      # vendored upstream lock (crates.io aya-obj) cannot build it. Both
-      # standalone steps inject that patch and resolve unlocked; the
-      # shipped combination stays locked by the root workspace steps.
-      # Resolving unlocked rewrites the tree's vendored Cargo.lock, which is
-      # part of the recipe-pinned tree digest that the dependency check below
-      # and every later scripts/cargo.sh preparation verify, so each unlocked
-      # step restores the recipe's lock before it ends.
-      - name: Fetch the standalone aya tree
-        shell: bash
-        run: |
-          cp -p third-party/src/aya-0.14.0-p2/Cargo.lock "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock"
-          cargo +"$(cat .release-rust-version)" fetch --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml
-          cp -p "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock" third-party/src/aya-0.14.0-p2/Cargo.lock
-      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml
-      - name: Verify prepared dependency selection
-        shell: bash
-        run: |
-          . scripts/prepared-dependency-tools.sh
-          p11scope_prepared_tools_select "$(command -v python3)" "$(command -v rustup)"
-          RUSTC="$P11SCOPE_PREPARED_STABLE_RUSTC" \
-            "$P11SCOPE_PREPARED_STABLE_CARGO" metadata --locked --offline --all-features --format-version 1 --manifest-path Cargo.toml >"$RUNNER_TEMP/root-metadata.json"
-          RUSTC="$P11SCOPE_PREPARED_BPF_RUSTC" \
-            "$P11SCOPE_PREPARED_BPF_CARGO" metadata --locked --offline --all-features --format-version 1 --manifest-path crates/ebpf/Cargo.toml >"$RUNNER_TEMP/bpf-metadata.json"
-          "$P11SCOPE_PREPARED_PYTHON" -I scripts/check-prepared-dependencies.py \
-            --sources third-party/sources.json \
-            --metadata "Cargo.toml=$RUNNER_TEMP/root-metadata.json" \
-            --metadata "crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json" --ledger
-      - run: cargo +"$(cat .release-rust-version)" fmt --all -- --check
-      - run: cargo +"$(cat .release-rust-version)" check --locked --offline --workspace --all-targets
-      - run: cargo +"$(cat .release-rust-version)" test --locked --offline --workspace --all-targets
-      - name: Aya dependency unit tests
-        env:
-          CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
-        shell: bash
-        run: |
-          cargo +"$(cat .release-rust-version)" test --offline --config 'patch.crates-io.aya-obj.path="third-party/src/aya-obj-0.3.0-p2"' --manifest-path third-party/src/aya-0.14.0-p2/Cargo.toml --target-dir target/aya-tests --lib
-          cp -p "$RUNNER_TEMP/aya-0.14.0-p2.Cargo.lock" third-party/src/aya-0.14.0-p2/Cargo.lock
-      - run: cargo +"$(cat .release-rust-version)" test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml --target-dir target/aya-obj-tests --lib
-      - name: Prove the prepared dependency trees are unchanged
-        run: python3 -I scripts/prepare-dependencies.py --check
-      - run: cargo +"$(cat .release-rust-version)" clippy --locked --offline --workspace --all-targets -- -D warnings
-      # The wide Detailed profile changes the embedded BPF object and the slot
-      # bound; lint it so a default-only change cannot break the other profile.
-      - run: cargo +"$(cat .release-rust-version)" clippy --locked --offline -p p11scope --all-targets --features wide-detailed-2112 -- -D warnings
-      # libtest exits 0 when a filter matches nothing, so this step proves a test
-      # actually ran rather than trusting the source to keep naming one. A rename,
-      # an #[ignore], a #[cfg] that excludes it, or a deleted #[test] all empty the
-      # filter identically, and all of them fail here.
-      - shell: bash
-        run: |
-          cargo +"$(cat .release-rust-version)" test --locked --offline --features unsafe-unvalidated-metadata --test artifact_contracts -- --exact --nocapture frozen_policy_inventory_matches_embedded_object | tee "$RUNNER_TEMP/diagnostic-inventory.log"
-          grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/diagnostic-inventory.log"
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
       # Unprivileged validator self-tests: every gate oracle, plus the frozen
       # evidence/object/receipt validators and the matrix oracles: every
@@ -221,11 +341,9 @@ jobs:
       - run: python3 -I scripts/inventory-native-oracle.py --self-test
       - run: python3 -I scripts/bench-inventory-native-stats.py --self-test
       - run: python3 -I scripts/measure-c5-analysis.py --self-test
+      - run: python3 -I scripts/ci-test-partition.py --self-test
       - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh
-      # SYSPLAN residual gates. None names a lane body: the lint step
-      # addresses directories through a shell variable, never a scripts/
-      # path (the pipeline derivation test forbids lane paths here).
       # Every tests/python suite (F-62): the runner checks that each file is
       # registered exactly once (run here, driven by a named cargo test or
       # self-test, or excluded with a reason), fails on any unregistered or
@@ -234,28 +352,14 @@ jobs:
       # residual-gate suites. `--list` prints the registry.
       - name: tests/python suites (help-drift, schema, residual gates, every standalone suite)
         run: python3 -I scripts/run-python-suites.py
-      - run: cargo +"$(cat .release-rust-version)" install cargo-audit --version 0.22.2 --locked
-      - run: cargo +"$(cat .release-rust-version)" install cargo-deny --version 0.20.2 --locked
-      - run: cargo +"$(cat .release-rust-version)" audit
-      # The host and BPF crates have separate Cargo roots and license policies.
-      # The BPF-only GPL-2.0-only allowance must not leak into the host graph.
-      - run: cargo +"$(cat .release-rust-version)" deny --locked check
-      - run: cargo +"$(cat .release-rust-version)" deny --locked --manifest-path crates/ebpf/Cargo.toml --config deny-ebpf.toml check
-      - run: pipx install ruff==0.16.8
-      - name: lint shell scripts (error level)
-        shell: bash
-        run: |
-          for dir in scripts scripts/matrix; do
-            shellcheck -S error "$dir"/*.sh
-          done
-      - run: ruff check scripts/ tests/python/
-  # A step cannot read its own job's log, so a second job fetches the finished
-  # log through the Actions API and keeps it as a run artifact (90 days requested;
-  # repo and org settings can cap that). Its
+  # A step cannot read its own job's log, so a second job fetches each finished
+  # check job's log through the Actions API and keeps them as one run artifact
+  # (90 days requested; repo and org settings can cap that). CHECK_JOBS names
+  # every check job as the API names it: one entry per contracts shard. Its
   # token gets actions: read and nothing else; upload-artifact uses the runtime
   # token, not GITHUB_TOKEN. No cache anywhere.
   archive-log:
-    needs: checks-and-e2e
+    needs: [lint, audit, tests, contracts, scripts]
     # Not always(): a cancelled run's log is truncated by definition, and
     # publishing it produces an artifact that looks like evidence of a
     # completed job and is not. Failures still archive.
@@ -265,40 +369,46 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
+      CHECK_JOBS: lint audit tests contracts-1 contracts-2 contracts-3 contracts-4 scripts
     steps:
       - run: |
-          JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq '.jobs[] | select(.name == "checks-and-e2e") | .id')
-          test -n "$JOB_ID"
-          # .../jobs/<id>/logs answers 302 to blob storage and gh api follows it: a 302 in a
-          # verbose trace is the success path, not a failure. It can also 404 for a short
-          # window right after the job completes, while the log is finalized, hence the
-          # bounded retry: 3 attempts, 5s apart, fail after the third. That window
-          # also answers 200 with an empty body, so an attempt counts as success
-          # only when it produced a non-empty log; otherwise a green archive job
-          # would upload a 0-byte artifact and claim the log was retained.
-          for attempt in 1 2 3; do
-            # A job log is full of ANSI colour; without this gh refuses to emit it
-            # and writes nothing, which the emptiness check below then fails on.
-            if gh api --allow-escape-sequences "repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" > "$RUNNER_TEMP/checks-and-e2e.log" \
-              && [ -s "$RUNNER_TEMP/checks-and-e2e.log" ]; then
-              break
-            fi
-            if [ "$attempt" = 3 ]; then
-              echo "job $JOB_ID log fetch produced no content after 3 attempts" >&2
-              exit 1
-            fi
-            sleep 5
+          mkdir "$RUNNER_TEMP/checks-logs"
+          for job in $CHECK_JOBS; do
+            JOB_ID=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq ".jobs[] | select(.name == \"$job\") | .id")
+            # Exactly one job by that name: none means the list rotted, two
+            # would splice two ids into one URL.
+            test "$(printf '%s\n' "$JOB_ID" | grep -c '^[0-9][0-9]*$')" = 1
+            # .../jobs/<id>/logs answers 302 to blob storage and gh api follows it: a 302 in a
+            # verbose trace is the success path, not a failure. It can also 404 for a short
+            # window right after the job completes, while the log is finalized, hence the
+            # bounded retry: 3 attempts, 5s apart, fail after the third. That window
+            # also answers 200 with an empty body, so an attempt counts as success
+            # only when it produced a non-empty log; otherwise a green archive job
+            # would upload a 0-byte artifact and claim the log was retained.
+            for attempt in 1 2 3; do
+              # A job log is full of ANSI colour; without this gh refuses to emit it
+              # and writes nothing, which the emptiness check below then fails on.
+              if gh api --allow-escape-sequences "repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" > "$RUNNER_TEMP/checks-logs/$job.log" \
+                && [ -s "$RUNNER_TEMP/checks-logs/$job.log" ]; then
+                break
+              fi
+              if [ "$attempt" = 3 ]; then
+                echo "job $job ($JOB_ID) log fetch produced no content after 3 attempts" >&2
+                exit 1
+              fi
+              sleep 5
+            done
+            # Not just informational: the loop exits on a hardcoded attempt number,
+            # so shortening the list would fall through with the empty file `gh api`
+            # created. A simple command, NOT an `&&` list -- an `&&` list is exempt
+            # from errexit, so anywhere but the final line it would be inert.
+            test -s "$RUNNER_TEMP/checks-logs/$job.log"
+            wc -c "$RUNNER_TEMP/checks-logs/$job.log"
           done
-          # Not just informational: the loop exits on a hardcoded attempt number,
-          # so shortening the list would fall through with the empty file `gh api`
-          # created. A simple command, NOT an `&&` list -- an `&&` list is exempt
-          # from errexit, so anywhere but the final line it would be inert.
-          test -s "$RUNNER_TEMP/checks-and-e2e.log"
-          wc -c "$RUNNER_TEMP/checks-and-e2e.log"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: checks-and-e2e-log
-          path: ${{ runner.temp }}/checks-and-e2e.log
+          name: checks-logs
+          path: ${{ runner.temp }}/checks-logs/
           if-no-files-found: error
           retention-days: 90
   # SYSPLAN residual F-04: one privileged CI E2E job running the gated
@@ -606,9 +716,14 @@ jobs:
           retention-days: 30
       - run: '"$RUNNER_TEMP/release-tools/kubeconform" -summary deploy/k8s/'
   # SYSPLAN residual F-40: coverage gate with a ratchet. The floor lives in
-  # .coverage-floor (raise it, never lower it); the job fails the workflow
+  # .coverage-floor (raise it, never lower it); the gate fails the workflow
   # when workspace line coverage drops below it. Include the existing CLI and
   # integration tests so their exercised production paths count toward the gate.
+  # The suite runs as the same partition as the test gate (rest plus every
+  # contracts shard), each under cargo llvm-cov --no-report; every shard packs
+  # its profiles (named after the partition, so runners never collide) and
+  # the instrumented executables they belong to, and coverage-report merges
+  # them all into one report against the floor.
   coverage:
     runs-on: ubuntu-24.04
     env:
@@ -616,6 +731,10 @@ jobs:
       # exceed the scanner's 256 MiB object limit. Keep line information
       # and coverage instrumentation without the full type/variable data.
       CARGO_PROFILE_TEST_DEBUG: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [rest, "contracts:1/4", "contracts:2/4", "contracts:3/4", "contracts:4/4"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -629,12 +748,44 @@ jobs:
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - run: cargo +"$(cat .release-rust-version)" llvm-cov --locked --offline --workspace --all-targets --fail-under-lines "$(cat .coverage-floor)"
+      - run: python3 -I scripts/ci-test-partition.py run --partition "${{ matrix.partition }}" -- cargo +"$(cat .release-rust-version)" llvm-cov --locked --offline --workspace --all-targets --no-report
+      - run: python3 -I scripts/ci-test-partition.py coverage-pack --partition "${{ matrix.partition }}" --target-dir target/llvm-cov-target --output "$RUNNER_TEMP/coverage"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-shard-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/coverage/
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
+  coverage-report:
+    needs: coverage
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy,llvm-tools-preview
+      - run: cargo +"$(cat .release-rust-version)" install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-shard-*
+          path: ${{ runner.temp }}/coverage
+      # Fails unless every partition's archive is present exactly once.
+      - run: python3 -I scripts/ci-test-partition.py coverage-unpack --contracts-shards 4 --target-dir target/llvm-cov-target "$RUNNER_TEMP/coverage"
+      # --workspace, as in the single-run gate this replaces: without it the
+      # merged report measures the root package alone and drops every other
+      # workspace member from the line count.
+      - run: cargo +"$(cat .release-rust-version)" llvm-cov report --locked --offline --workspace --fail-under-lines "$(cat .coverage-floor)"
   # SYSPLAN residual F-29: flake quarantine. Failure-gated triage evidence:
-  # when checks fail, each ledgered flake re-runs exactly once, serially,
-  # in isolation. A green quarantine run never greens the workflow.
+  # when any check job fails, each ledgered flake re-runs exactly once,
+  # serially, in isolation. A green quarantine run never greens the workflow.
   quarantine:
-    needs: checks-and-e2e
+    needs: [lint, audit, tests, contracts, scripts]
     if: failure()
     runs-on: ubuntu-24.04
     steps:

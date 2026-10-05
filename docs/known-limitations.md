@@ -298,8 +298,19 @@ the min..max of per-sample p95.
   lane does not drain while a pass applies its scan, attaches entries,
   or reads usage. Churn 0 and 4,096-process churn cells were not
   measured in this tier.
+- Headroom is bounded by pass length, not by the ring alone: while a
+  pass collects, the lane holds at most 8,192 drained records and then
+  stops draining, so at 1,000 exec/s (about 2,100 records/s) a pass
+  absorbs about 4 s of held records plus about 1 s of ring. The peak
+  fill came at the first pass in every sample above. On a contended
+  host (builds running; excluded from the numbers above) cold first
+  passes with 3.1–3.5 s of deep scan peaked at 73–79% of the ring with
+  no loss, and one pass with 5.7 s of deep scan (load 21) filled the
+  ring: 7,557 records lost, 55 edges demoted, 3 recovery rescans, all
+  disclosed as below.
 - Kernels/conditions: `--system --capture native` under unrelated exec
-  churn, 3 cold + 3 warm 60 s samples per cell.
+  churn, 3 cold + 3 warm 60 s samples per cell, host kernel
+  7.0.0-34-generic.
 - Disclosure: `observation.lifecycle` (`records`, `ring_loss`, `malformed`,
   `failed_quanta`, `recovery_rescans`), the `native capture lifecycle
   evidence lost` gap, sticky demotion of `watched_no_use`, and an immediate

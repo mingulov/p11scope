@@ -156,7 +156,11 @@ def quiesce_after_kill(kill_path, events_path, timeout=2.0):
             while not stop.is_set():
                 if kill_path.read_bytes().startswith(b"1"):
                     observed.set()
-                    events_path.write_text("populated 0\n")
+                    # Replace, never truncate: the helper may read the file
+                    # at any moment and must see a whole populated line.
+                    staged = events_path.with_name(events_path.name + ".next")
+                    staged.write_text("populated 0\n")
+                    os.replace(staged, events_path)
                     return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

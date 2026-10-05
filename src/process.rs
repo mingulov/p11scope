@@ -1070,6 +1070,7 @@ pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::os::unix::process::CommandExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -1486,6 +1487,96 @@ mod tests {
         }
         let denied = read_stat_bytes(FailAfterInterrupt).unwrap_err();
         assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// Short reads (one byte at a time, an interrupt between every two)
+    /// accumulate to the whole stat, a stat that fills the stack buffer
+    /// exactly falls back to `read_to_end` and loses nothing, and a
+    /// non-UTF-8 stat is `InvalidData` either way.
+    #[test]
+    fn stat_read_accumulates_short_reads_and_the_buffer_overflow() {
+        struct Trickle {
+            data: Vec<u8>,
+            at: usize,
+            interrupt_next: bool,
+        }
+        impl io::Read for Trickle {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.interrupt_next = !self.interrupt_next;
+                if !self.interrupt_next {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "test intr"));
+                }
+                if self.at == self.data.len() || out.is_empty() {
+                    return Ok(0);
+                }
+                out[0] = self.data[self.at];
+                self.at += 1;
+                Ok(1)
+            }
+        }
+        let trickle = |data: Vec<u8>| Trickle {
+            data,
+            at: 0,
+            interrupt_next: false,
+        };
+        let stat = "42 (a) Z 1 (b) S 1 42 42 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 777 0";
+        assert_eq!(
+            read_stat_bytes(trickle(stat.as_bytes().to_vec())).unwrap(),
+            stat
+        );
+        for len in [4095, 4096, 4097, 9000] {
+            let big: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            let read = read_stat_bytes(io::Cursor::new(big.clone())).unwrap();
+            assert_eq!(read.as_bytes(), big.as_slice(), "{len} bytes");
+        }
+        for len in [10, 5000] {
+            let mut bad = vec![b'x'; len];
+            bad[len - 1] = 0xff;
+            let error = read_stat_bytes(io::Cursor::new(bad)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{len} bytes");
+        }
+    }
+
+    /// A comm holding `)`, spaces and a fake `Z` state field: the state
+    /// and starttime come from after the LAST `)`, so a live process with
+    /// that comm is not a zombie and its start time is its own; killed
+    /// but unreaped it is a zombie with the same start time; reaped it is
+    /// gone.
+    #[test]
+    fn stat_fields_survive_a_comm_with_parens_spaces_and_a_fake_state() {
+        let dir = tempfile::tempdir().unwrap();
+        // `comm` is the basename the exec was given (at most 15 bytes);
+        // argv[0] stays `sleep` for multi-call coreutils.
+        let link = dir.path().join("a) Z 1 (b");
+        std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
+        let mut child = Command::new(&link).arg0("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stat = loop {
+            let stat = read_proc_stat(pid).unwrap();
+            if stat.contains("(a) Z 1 (b)") || Instant::now() > deadline {
+                break stat;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(stat.contains("(a) Z 1 (b) "), "comm not applied: {stat}");
+        let own_start = process_start_time(std::process::id()).unwrap();
+        let start = process_start_time(pid).unwrap();
+        assert!(start >= own_start, "{start} < {own_start}: {stat}");
+        assert!(!process_is_zombie(pid), "a live process read as a zombie");
+        assert!(!generation_gone(pid));
+
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_zombie(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process_is_zombie(pid), "the killed child is unreaped");
+        assert_eq!(process_start_time(pid).unwrap(), start);
+        assert!(!generation_gone(pid));
+
+        child.wait().unwrap();
+        assert!(generation_gone(pid));
     }
 
     #[test]

@@ -35,6 +35,7 @@ harmless or that the current revision passes. The
 | `release_seal_denies_the_caller_path_to_every_reached_command` | `artifact_contracts` | Missing `sealed-environment` artifacts, empty output where `sudo` was expected, and related Cargo-home/sysroot closure failures in the same run. |
 | `signal_settlement_observes_second_sigint_during_fallback_term_grace` | library | Signal settlement returns `Err(Deadline)` while coordinating SIGINT/SIGTERM across threads. Retain the signal and cleanup sequence when investigating. |
 
-The quarantine lane runs these selectors once, serially, after a failed
-primary job. It is supporting evidence only: a green quarantine result
+The quarantine lane runs these selectors once, serially, after any failed
+check job (`lint`, `audit`, `tests`, a `contracts-N` shard or `scripts`).
+It is supporting evidence only: a green quarantine result
 never makes the failed workflow pass.

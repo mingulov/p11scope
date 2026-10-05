@@ -5,7 +5,8 @@ The seven recorded failure signatures from
 [`known-flakes.md`](known-flakes.md), each with its owning lane, its
 isolation, and how to triage it. Nothing here weakens a test: the main
 suite runs every flake unfiltered, and the quarantine lane
-(`scripts/run-flake-quarantine.sh`, CI `quarantine` job, failure-gated)
+(`scripts/run-flake-quarantine.sh`, CI `quarantine` job, gated on a
+failure of any check job)
 re-runs each exactly once, serially, as triage evidence. A green
 quarantine run never greens the workflow.
 

@@ -69,8 +69,11 @@ dependency upgrade that needs the full checks and qualification again.
 
 ## 3. Get a green hosted CI run on the exact commit
 
-Push the frozen commit to a branch and let `ci` run. All of
-`checks-and-e2e`, `coverage` and `archive-log` must pass on that exact SHA.
+Push the frozen commit to a branch and let `ci` run. Every job of the push
+run must pass on that exact SHA: the check jobs `lint`, `audit`, `tests`,
+every `contracts-N` shard and `scripts`; every `coverage` shard and
+`coverage-report`; and `archive-log`. `quarantine` runs only when a check
+job failed, so a green run skips it.
 Then dispatch `ci` manually on the same ref (Actions → ci → Run workflow,
 `release_preview` selected). Keep the `release-preview-public-assets` artifact
 and the separately labeled container SBOM. The full release receipt remains

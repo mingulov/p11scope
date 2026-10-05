@@ -152,7 +152,12 @@ the min..max of per-sample p95.
 - Kernels/conditions: `--system --capture scan` and `native` at 448 / 4,096
   processes, churn 0, 3 cold + 6 warm 30 s samples per cell.
 - Disclosure: `P11SCOPE_STAGE_TIMINGS=1` per-pass stage timings, the
-  `observation` block, and this row.
+  `observation` block, and this row. `P11SCOPE_PROOF_STAT_THREADS=N`
+  (diagnostic, read once per run): unset keeps the default (usable
+  CPUs, at most 4); `0`/`1` forces the serial proof path; a decimal
+  `N` uses at most 4 threads (a leading `+` and surrounding whitespace
+  are accepted); anything else keeps the default. When set, a stderr
+  note reports the value used, or that the value was ignored.
 - Workaround: narrow scope (`--pid`, `--module`).
 - Planned: the 1 s route is v0.3.0 kernel-side identity (C7). M1 at 10,000
   and the ≤15%-over-scan gate move to v0.3.0 with it.

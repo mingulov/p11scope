@@ -2270,7 +2270,9 @@ mod tests {
         assert_eq!(coordinator.lifecycle_high_water_bytes(), None);
         let domain = NativeDomainId::mint();
         let now = crate::discovery::caller_registry::now_ns();
-        for high_water in [Some(100), None, Some(50), Some(300)] {
+        // The maximum is staged before smaller and absent reports, so only
+        // a maximum (not the last report) reads 300.
+        for high_water in [Some(100), Some(300), None, Some(50)] {
             let mut batch = DiscoveryBatch::scripted(domain, Vec::new(), now);
             batch.drain_high_water_bytes = high_water;
             coordinator.stage_native(NativeBatch::Lifecycle(batch), &mut ScanOnlyIdentity, now);

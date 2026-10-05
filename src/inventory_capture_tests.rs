@@ -101,8 +101,9 @@ struct ScriptedLane {
     /// Discovery services (1-based) whose quantum fails on an undecodable
     /// record.
     failed_services: HashSet<usize>,
-    /// The drain high-water every discovery quantum reports.
-    drain_high_water_bytes: Option<u64>,
+    /// The drain high-water each discovery quantum reports, by service
+    /// (1-based: the first entry is the first service); `None` past it.
+    drain_high_water_bytes: Vec<Option<u64>>,
     services: usize,
 }
 
@@ -142,7 +143,7 @@ impl ScriptedLane {
             ring_loss: VecDeque::new(),
             malformed: VecDeque::new(),
             failed_services: HashSet::new(),
-            drain_high_water_bytes: None,
+            drain_high_water_bytes: Vec::new(),
             services: 0,
         }
     }
@@ -228,7 +229,11 @@ impl CaptureLane<Pin> for ScriptedLane {
             .map(|_| unsafe { std::mem::zeroed::<p11scope_ebpf_common::DiscoveryRecord>() })
             .collect();
         let mut batch = DiscoveryBatch::scripted(self.domain, records, self.stamps.next());
-        batch.drain_high_water_bytes = self.drain_high_water_bytes;
+        batch.drain_high_water_bytes = self
+            .drain_high_water_bytes
+            .get(self.services - 1)
+            .copied()
+            .flatten();
         // A quantum that fills its window stops at its record bound.
         batch.record_bound_reached = self.records_per_service >= window.max_rows();
         if self.failed_services.contains(&self.services) {
@@ -792,8 +797,16 @@ fn the_stop_summary_carries_the_drain_high_water() {
     let log = Log::default();
     let mut scene = Scene::new(&log);
     let mut lane = ScriptedLane::new(&log);
-    lane.drain_high_water_bytes = Some(777);
+    // The largest fill comes first and a smaller one after it, so only a
+    // maximum (not the last report) reads 777.
+    lane.drain_high_water_bytes = vec![Some(777), None, Some(50)];
     let (stopped, _) = run(&mut scene, lane, 1);
+    let services = log
+        .borrow()
+        .iter()
+        .filter(|entry| *entry == "service")
+        .count();
+    assert!(services >= 3, "the script must be consumed: {services}");
     assert_eq!(stopped.summary.lifecycle_high_water_bytes, Some(777));
 
     let log = Log::default();

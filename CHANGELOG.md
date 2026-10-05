@@ -33,6 +33,18 @@ Work toward v0.3.0.
   `P11SCOPE_STAGE_TIMINGS=1` pass lines and the stop line as bytes and
   ring share; the schema is unchanged (no new `observation.lifecycle`
   key). See [docs/known-limitations.md](docs/known-limitations.md).
+- Past the deep-scan cap, `inventory --system` runs the phase-1 maps
+  sweep and the confirmation reads on up to 4 threads (the observer's
+  usable CPUs), each over a contiguous range of at least 256 processes. The
+  reads of each thread are replayed in pid order against the capture
+  budget, so attribution, losses, gaps and budget ceilings are exactly
+  the serial ones; only wall time changes. The proof-stat pool now runs
+  only on the serial path. Interleaved runs on one host at 4,096
+  processes, before the confirm stage was sharded, cut the sweep stage
+  p95 from about 550 ms to about 185 ms on 4 CPUs; these numbers are
+  indicative. The pass time with both stages sharded is not measured yet.
+  `P11SCOPE_SHARD_THREADS=1` (diagnostic) forces the serial path. See
+  [docs/known-limitations.md](docs/known-limitations.md).
 
 ## [0.2.0] - 2026-10-05
 

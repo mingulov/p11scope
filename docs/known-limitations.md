@@ -158,7 +158,22 @@ the min..max of per-sample p95.
   path; a decimal `N` uses at most 4 threads (a leading `+` and
   surrounding whitespace are accepted); anything else keeps the
   default. When set, one stderr note per run, not per pass, reports
-  the value used, or that the value was ignored.
+  the value used, or that the value was ignored. Since v0.3.0
+  (unreleased) it applies only on the serial path (see the next knob).
+  `P11SCOPE_SHARD_THREADS=N` (diagnostic, `--system` only, read once
+  per run, same parsing and stderr note): the threads the sweep and
+  confirm stages may shard over. Unset keeps the default (usable CPUs,
+  at most 4); `0`/`1` forces the serial path of both stages exactly as
+  before sharding (with the proof-stat pool).
+- v0.3.0 (unreleased): past the deep-scan cap, the sweep and confirm
+  stages run on up to 4 threads (the observer's usable CPUs), one
+  contiguous pid range of at least 256 pids per thread. Every budget
+  charge, ceiling and loss is then replayed in pid order on one thread,
+  so the result is the serial one. Indicative, single host, before the
+  confirm stage was sharded: interleaved runs at 4,096 processes cut the
+  sweep stage p95 from about 550 ms to about 185 ms on CPUs 8–11 and to
+  about 320 ms on CPUs 10,11. The pass time with both stages sharded is
+  not measured yet.
 - Workaround: narrow scope (`--pid`, `--module`).
 - Planned: the 1 s route is v0.3.0 kernel-side identity (C7). M1 at 10,000
   and the ≤15%-over-scan gate move to v0.3.0 with it.
@@ -200,7 +215,11 @@ the min..max of per-sample p95.
 - Workaround: none needed; small batches are serial.
 - v0.3.0 (unreleased, not measured): only executable ranges are proved
   (A6, above), about one range per mapped library instead of 30–45 per
-  process, so batches reach the pool threshold even more rarely.
+  process, so batches reach the pool threshold even more rarely. When the
+  confirm stage is sharded (C7 A5: two or more usable CPUs and at least
+  512 swept processes) the pool is not used at all; it runs only on the
+  serial path (`P11SCOPE_SHARD_THREADS=1`, one usable CPU, or a smaller
+  sweep).
 - Planned: Cross-pass caching stays out (R-C56-1: inode reuse makes it
   unsound); kernel-side identity is v0.3.0 (C7).
 

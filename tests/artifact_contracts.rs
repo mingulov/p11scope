@@ -8793,7 +8793,7 @@ fn hosted_pipeline_partitions_the_workspace_test_gate() {
     // Line tables only: full DWARF plus coverage pushes the self-inspecting
     // test executable past the scanner's object limit.
     for block in [coverage, report] {
-        assert!(block.contains("      CARGO_PROFILE_TEST_DEBUG: \"1\"\n"));
+        assert!(block.contains("      CARGO_PROFILE_TEST_DEBUG: line-tables-only\n"));
     }
     // The helper partitions the target the gate is split on.
     let helper = read("scripts/ci-test-partition.py");

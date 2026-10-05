@@ -11,7 +11,7 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: v0.2.1**, a performance point release on v0.2.0, which added `inventory` (which module is used by whom:
+> **Status: v0.2.1**, the first release since v0.1.0, adds `inventory` (which module is used by whom:
 > scan and native lanes, JSON/JSONL/dashboard) and Kubernetes DaemonSet
 > manifests to `doctor`, `inspect` (now `--system`), `profile`
 > (including `--mode metrics`), `trace` and `run`. Read the

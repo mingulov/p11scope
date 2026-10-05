@@ -1,9 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Known limitations (v0.2.1)
 
-User-facing limits of p11scope v0.2.1, a point release on v0.2.0 (cut
-2026-10-04 from merged and green `s2s3-semantics`). v0.2.1 changes only the
-proof-stat pool threshold and the `-o` JSON write. The M1 and R4 rows below
+User-facing limits of p11scope v0.2.1, the first release since v0.1.0. It
+is built on the v0.2.0 cut (2026-10-04, from merged and green
+`s2s3-semantics`; v0.2.0 itself was not published) and changes only the
+proof-stat pool threshold and the `-o` JSON write on top of it. The M1 and R4 rows below
 were re-measured on v0.2.1 in a quiet window on 2026-10-05; every other
 measured number is still the v0.2.0 value. The following move to v0.3.0: C6 (semantics, churn and
 capacity, 30-minute endurance), C5b (cgroup/pod scope, namespace-aware BPF
@@ -12,7 +13,7 @@ allowlist-v3, BPF nightly bump), the full measurement set M2–M7, the full §7
 deferred closure, and the §8 Fable audit.
 
 A short measurement tier (M0, M1 at 4,096 processes, M4 churn, and the C5.6
-pool) ran on v0.2.0 release day; its numbers are in the M0, M1, M4 and R4
+pool) ran on the v0.2.0 cut day (2026-10-04); its numbers are in the M0, M1, M4 and R4
 rows below, with M1 and R4 since re-measured on v0.2.1 as noted in those
 rows. Method for every row: Linux 7.0 x86-64, observer pinned to CPUs
 10,11 (R4: 8–11, plus a v0.2.1 cell on 10,11), 3 cold + 6 warm samples

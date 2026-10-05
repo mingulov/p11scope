@@ -7,8 +7,10 @@ versioned separately and are opaque, exact dispatch keys.
 
 ## [0.2.1] - 2026-10-05
 
-Performance point release on v0.2.0: two fixes, no schema, flag or report
-change. The measurements below are indicative single-host numbers (2
+First public release since v0.1.0. v0.2.0 was cut and qualified but not
+published; everything in the [0.2.0] section below ships in this release.
+On top of it: two performance fixes (no schema, flag or report change)
+and a hosted-CI fix. The measurements below are indicative single-host numbers (2
 physical cores with SMT, Linux 7.0, btrfs), not guarantees. See
 [docs/known-limitations.md](docs/known-limitations.md).
 
@@ -33,6 +35,8 @@ physical cores with SMT, Linux 7.0, btrfs), not guarantees. See
   known limitations for the full ranges.
 
 ## [0.2.0] - 2026-10-04
+
+Not published as a release; these changes ship in 0.2.1.
 
 Module/caller inventory and usage observation, Kubernetes deployment, and
 fail-closed PID-namespace and privilege handling. See

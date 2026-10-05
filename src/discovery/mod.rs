@@ -3,6 +3,7 @@
 //! identity. Slice 1a: manifest input only (`identity`). Slice 1b adds scan/live/pause.
 pub mod attribution;
 pub(crate) mod caller_registry;
+pub(crate) mod confirm_shards;
 pub mod engine;
 pub mod hooks;
 pub mod identity;

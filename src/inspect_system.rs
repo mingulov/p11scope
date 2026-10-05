@@ -26,6 +26,7 @@
 use crate::attach::Scope;
 use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
+use crate::discovery::confirm_shards::attribute_unselected_sharded;
 use crate::discovery::engine::{
     MAX_SCAN_PIDS, scope_pids, select_deep_scan_candidates, sweep_process_maps,
     unreadable_member_skip,
@@ -42,10 +43,11 @@ use crate::discovery::scan::{
     scan_process_view_examined, scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
-    AttributionLoss, KnownKeyIndex, MatchedObject, MemberProbe, ObjectChecks, OsMemberProbe,
-    RefusedObject, SweepAttribution, SweptMember, attribute_unselected, is_caller_range,
-    retain_unchanged,
+    AttributionLoss, KnownKeyIndex, MatchedObject, MemberProbe, ObjectChecks, OsConfirmIo,
+    OsMemberProbe, RefusedObject, SweepAttribution, SweptMember, attribute_unselected,
+    is_caller_range, retain_unchanged,
 };
+use crate::discovery::sweep_shards::{shard_count, shard_threads};
 use crate::plan::{self, AdmissionPolicy, AdmissionScope};
 use crate::process::{ProcessView, ProcessViewId, generation_gone};
 use crate::timing::{StageKind, StageTimings};
@@ -817,16 +819,39 @@ pub(crate) fn collect(
     // The confirmation reads run here: after the deep scans, while the
     // aggregate pins (and their fds) are held, before the pure assembly.
     let confirm_start = monotonic_ns();
-    // The proof stats run on a bounded pool that lives for this
-    // confirmation stage only (DR-C1b-3).
-    let attributed = ProofStatPool::scoped(proof_stat_threads(), |pool| {
-        attribute_sweep(
+    // C7 A5: past the shard threshold the confirmation reads are sharded
+    // by contiguous pid ranges (and replayed in pid order). Otherwise the
+    // serial path runs, with the proof stats on a bounded pool that lives
+    // for this confirmation stage only (DR-C1b-3); the shards never nest
+    // that pool.
+    let shards = shard_count(collection.sweep.len(), shard_threads());
+    let attributed = if shards > 1 {
+        attribute_sweep_with(
             &mut collection,
             &bound,
-            &mut OsMemberProbe { pool },
             &bound.aggregate,
+            |sweep, unavailable, selected, index, budget| {
+                attribute_unselected_sharded(
+                    sweep,
+                    unavailable,
+                    selected,
+                    index,
+                    budget,
+                    shards,
+                    &OsConfirmIo::default,
+                )
+            },
         )
-    });
+    } else {
+        ProofStatPool::scoped(proof_stat_threads(), |pool| {
+            attribute_sweep(
+                &mut collection,
+                &bound,
+                &mut OsMemberProbe { pool },
+                &bound.aggregate,
+            )
+        })
+    };
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(collection, bound, attributed, policy);
@@ -953,6 +978,30 @@ fn attribute_sweep(
     probe: &mut dyn MemberProbe,
     checks: &dyn ObjectChecks,
 ) -> Option<Attributed> {
+    attribute_sweep_with(
+        collection,
+        bound,
+        checks,
+        |sweep, unavailable, selected, index, budget| {
+            attribute_unselected(sweep, unavailable, selected, index, probe, budget)
+        },
+    )
+}
+
+/// [`attribute_sweep`] with the attribution itself supplied: serial over
+/// a probe, or sharded (C7 A5).
+fn attribute_sweep_with(
+    collection: &mut Collection,
+    bound: &Bound,
+    checks: &dyn ObjectChecks,
+    attribute: impl FnOnce(
+        &[(u32, Vec<MapEntry>)],
+        &BTreeSet<u32>,
+        &BTreeSet<u32>,
+        &KnownKeyIndex,
+        &mut CaptureWorkBudget,
+    ) -> SweepAttribution,
+) -> Option<Attributed> {
     if !collection.cap_hit {
         return None;
     }
@@ -1005,12 +1054,11 @@ fn attribute_sweep(
         "p11scope: attributing {} unselected processes by maps identity...",
         collection.sweep.len().saturating_sub(selected.len())
     );
-    let mut attribution = attribute_unselected(
+    let mut attribution = attribute(
         &collection.sweep,
         &collection.sweep_unavailable,
         &selected,
         &index,
-        probe,
         &mut collection.budget,
     );
     let changed = retain_unchanged(&mut attribution, checks);

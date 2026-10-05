@@ -862,6 +862,12 @@ impl CaptureWorkBudget {
         }
     }
 
+    /// Set the work ceiling (tests of where a ceiling stops).
+    #[cfg(test)]
+    pub(crate) fn set_work_ceiling_for_test(&mut self, units: u64) {
+        self.work_ceiling = units;
+    }
+
     /// A default budget whose work ceiling is `units` (tests of where a
     /// ceiling stops).
     #[cfg(test)]
@@ -3165,6 +3171,39 @@ impl CaptureWorkBudget {
             stop: self.scan_stop_reason,
             stop_reported: self.scan_stop_reported,
         }
+    }
+
+    /// A shard's private copy of this budget (C7 A5): every allowance,
+    /// charge, window, deadline and stop as they stand now, and none of the
+    /// retained caches or cardinality state (a confirmation never touches
+    /// them). It spends and reads exactly as this budget would from here,
+    /// so a shard that runs against it never has less left than this
+    /// budget will have at the same point of a pid-order replay. Nothing it
+    /// decides is published: the replay against this budget decides.
+    pub(crate) fn shard_shadow(&self) -> Self {
+        Self {
+            limits: self.limits,
+            policy: self.policy,
+            domain: self.domain.clone(),
+            attempted_io_bytes: self.attempted_io_bytes,
+            work_ceiling: self.work_ceiling,
+            work_units: self.work_units,
+            active_window: self.active_window.clone(),
+            last_window: self.last_window,
+            active_scan: self.active_scan.clone(),
+            next_scan_serial: self.next_scan_serial,
+            window_exhaustions: self.window_exhaustions,
+            deadline_ns: self.deadline_ns,
+            scan_stop_reason: self.scan_stop_reason,
+            scan_stop_reported: self.scan_stop_reported,
+            ..Self::new(self.limits)
+        }
+    }
+
+    /// The state a confirmation can change, for serial-vs-sharded equality.
+    #[cfg(test)]
+    pub(crate) fn confirm_state_for_test(&self) -> (MapsSweepBudgetState, u64) {
+        (self.maps_sweep_state_for_test(), self.work_units)
     }
 
     /// The state a maps sweep can change, for serial-vs-sharded equality.

@@ -609,156 +609,184 @@ pub(crate) fn attribute_unselected(
     let mut out = SweepAttribution::default();
     let prove = index.map_files_keys();
     for (pid, phase_one) in sweep {
-        let pid = *pid;
-        if selected.contains(&pid) {
-            continue;
-        }
-        if unavailable.contains(&pid) {
-            out.unavailable += 1;
-            continue;
-        }
-        let mut seen = BTreeSet::new();
-        let mut first = classify_snapshot(index, phase_one);
-        // Ineligible known keys are attribution losses either way: the
-        // process maps a provider object it cannot be attributed to.
-        let note_ineligible =
-            |out: &mut SweepAttribution,
-             seen: &mut BTreeSet<AttributionLoss>,
-             ineligible: &[(ObjectKey, AttributionLoss)]| {
-                for (key, loss) in ineligible {
-                    out.note_loss(
-                        pid,
-                        *loss,
-                        format!(
-                            "maps a known provider object ({}) that cannot be matched: {}",
-                            key_detail(*key),
-                            loss.label()
-                        ),
-                        seen,
-                    );
-                }
-            };
-        // Usable phase-1 matches decide whether a confirmation is worth a
-        // read. Without one, the phase-1 facts are the verdict: an unusable
-        // (deleted) known mapping and any ineligible known key are named
-        // losses, and unexamined keys are counted.
-        let unusable: Vec<(ObjectKey, AttributionLoss)> = first
-            .matches
-            .iter()
-            .filter_map(|(key, _, group)| usable_path(group).err().map(|loss| (*key, loss)))
-            .collect();
-        // No pin is needed to prove examined keys: a range that does not
-        // stat to an examined identity only counts as unexamined. But a
-        // range that is no longer one mapping means the snapshot is stale
-        // (an unload, a remap or an exit since the sweep): only a re-read
-        // can say which, so such a pid is confirmed like a match.
-        let mut mapped = MappedIdentities::new();
-        if unusable.len() == first.matches.len() {
-            let ranges = first.pending_ranges(index);
-            if !ranges.is_empty() {
-                mapped = probe.stat_ranges(pid, &ranges, budget);
-            }
-        }
-        if unusable.len() == first.matches.len() && !first.pending_changed(&mapped) {
-            for (key, loss) in &unusable {
-                out.note_loss(
-                    pid,
-                    *loss,
-                    format!(
-                        "the mapping of {} is unusable for matching: {}",
-                        key_detail(*key),
-                        loss.label()
-                    ),
-                    &mut seen,
-                );
-            }
-            note_ineligible(&mut out, &mut seen, &first.ineligible);
-            first.settle_examined(index, &mapped);
-            out.note_unexamined(pid, &first.unexamined);
-            continue;
-        }
-        out.probed += 1;
-        let read = match probe.confirm(pid, &prove, budget) {
-            Confirmation::Confirmed(read) => read,
-            Confirmation::Exited => {
-                out.exited.insert(pid);
-                continue;
-            }
-            Confirmation::Lost(loss, detail) => {
-                out.note_loss(pid, loss, detail, &mut seen);
-                // Nothing was proven: pending examined keys are unexamined.
-                first.settle_examined(index, &MappedIdentities::new());
-                out.note_unexamined(pid, &first.unexamined);
-                continue;
-            }
-        };
-        let mut confirmed = classify_snapshot(index, &read.entries);
-        for key in confirmed.settle_examined(index, &read.mapped) {
+        attribute_one(
+            &mut out,
+            *pid,
+            phase_one,
+            unavailable,
+            selected,
+            index,
+            &prove,
+            probe,
+            budget,
+        );
+    }
+    out
+}
+
+/// One swept pid's attribution: [`attribute_unselected`]'s loop body. Its
+/// only inputs beyond the pid's own phase-1 snapshot and the pass's index
+/// are the probe's answers and the budget, so the sharded confirmation
+/// (C7 A5) can run it once against a shard's recorded reads and again,
+/// in pid order, against the capture budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attribute_one(
+    out: &mut SweepAttribution,
+    pid: u32,
+    phase_one: &[MapEntry],
+    unavailable: &BTreeSet<u32>,
+    selected: &BTreeSet<u32>,
+    index: &KnownKeyIndex,
+    prove: &BTreeSet<ObjectKey>,
+    probe: &mut dyn MemberProbe,
+    budget: &mut CaptureWorkBudget,
+) {
+    if selected.contains(&pid) {
+        return;
+    }
+    if unavailable.contains(&pid) {
+        out.unavailable += 1;
+        return;
+    }
+    let mut seen = BTreeSet::new();
+    let mut first = classify_snapshot(index, phase_one);
+    // Ineligible known keys are attribution losses either way: the
+    // process maps a provider object it cannot be attributed to.
+    let note_ineligible = |out: &mut SweepAttribution,
+                           seen: &mut BTreeSet<AttributionLoss>,
+                           ineligible: &[(ObjectKey, AttributionLoss)]| {
+        for (key, loss) in ineligible {
             out.note_loss(
                 pid,
-                AttributionLoss::MappingChanged,
+                *loss,
                 format!(
-                    "a confirmed range of {} was no longer one mapping when its map_files \
-                     entry was read",
-                    key_detail(key)
+                    "maps a known provider object ({}) that cannot be matched: {}",
+                    key_detail(*key),
+                    loss.label()
+                ),
+                seen,
+            );
+        }
+    };
+    // Usable phase-1 matches decide whether a confirmation is worth a
+    // read. Without one, the phase-1 facts are the verdict: an unusable
+    // (deleted) known mapping and any ineligible known key are named
+    // losses, and unexamined keys are counted.
+    let unusable: Vec<(ObjectKey, AttributionLoss)> = first
+        .matches
+        .iter()
+        .filter_map(|(key, _, group)| usable_path(group).err().map(|loss| (*key, loss)))
+        .collect();
+    // No pin is needed to prove examined keys: a range that does not
+    // stat to an examined identity only counts as unexamined. But a
+    // range that is no longer one mapping means the snapshot is stale
+    // (an unload, a remap or an exit since the sweep): only a re-read
+    // can say which, so such a pid is confirmed like a match.
+    let mut mapped = MappedIdentities::new();
+    if unusable.len() == first.matches.len() {
+        let ranges = first.pending_ranges(index);
+        if !ranges.is_empty() {
+            mapped = probe.stat_ranges(pid, &ranges, budget);
+        }
+    }
+    if unusable.len() == first.matches.len() && !first.pending_changed(&mapped) {
+        for (key, loss) in &unusable {
+            out.note_loss(
+                pid,
+                *loss,
+                format!(
+                    "the mapping of {} is unusable for matching: {}",
+                    key_detail(*key),
+                    loss.label()
                 ),
                 &mut seen,
             );
         }
-        note_ineligible(&mut out, &mut seen, &confirmed.ineligible);
-        let mut objects = Vec::new();
-        for (key, object, group) in &confirmed.matches {
-            let proven = match index.match_identity(*key) {
-                Some(_) if index.key_is_identity(*key) => Ok(()),
-                Some(expected) => prove_match(expected, group, &read.mapped),
-                None => Err((
-                    AttributionLoss::KeyRejected,
-                    "the key lost its proof".into(),
-                )),
-            };
-            if let Err((loss, detail)) = proven {
-                out.note_loss(
-                    pid,
-                    loss,
-                    format!("{}: {detail}", key_detail(*key)),
-                    &mut seen,
-                );
-                continue;
-            }
-            match usable_path(group) {
-                Ok(path) => objects.push(MatchedObject {
-                    key: *key,
-                    object: *object,
-                    path,
-                    double_loaded: duplicate_exec_coverage(group),
-                }),
-                Err(loss) => out.note_loss(
-                    pid,
-                    loss,
-                    format!(
-                        "the confirmed mapping of {} is unusable for matching: {}",
-                        key_detail(*key),
-                        loss.label()
-                    ),
-                    &mut seen,
-                ),
-            }
+        note_ineligible(out, &mut seen, &first.ineligible);
+        first.settle_examined(index, &mapped);
+        out.note_unexamined(pid, &first.unexamined);
+        return;
+    }
+    out.probed += 1;
+    let read = match probe.confirm(pid, prove, budget) {
+        Confirmation::Confirmed(read) => read,
+        Confirmation::Exited => {
+            out.exited.insert(pid);
+            return;
         }
-        out.note_unexamined(pid, &confirmed.unexamined);
-        if objects.is_empty() {
-            // Unloaded before the confirmation (no loss), or every known
-            // mapping was unusable (already counted above).
+        Confirmation::Lost(loss, detail) => {
+            out.note_loss(pid, loss, detail, &mut seen);
+            // Nothing was proven: pending examined keys are unexamined.
+            first.settle_examined(index, &MappedIdentities::new());
+            out.note_unexamined(pid, &first.unexamined);
+            return;
+        }
+    };
+    let mut confirmed = classify_snapshot(index, &read.entries);
+    for key in confirmed.settle_examined(index, &read.mapped) {
+        out.note_loss(
+            pid,
+            AttributionLoss::MappingChanged,
+            format!(
+                "a confirmed range of {} was no longer one mapping when its map_files \
+                 entry was read",
+                key_detail(key)
+            ),
+            &mut seen,
+        );
+    }
+    note_ineligible(out, &mut seen, &confirmed.ineligible);
+    let mut objects = Vec::new();
+    for (key, object, group) in &confirmed.matches {
+        let proven = match index.match_identity(*key) {
+            Some(_) if index.key_is_identity(*key) => Ok(()),
+            Some(expected) => prove_match(expected, group, &read.mapped),
+            None => Err((
+                AttributionLoss::KeyRejected,
+                "the key lost its proof".into(),
+            )),
+        };
+        if let Err((loss, detail)) = proven {
+            out.note_loss(
+                pid,
+                loss,
+                format!("{}: {detail}", key_detail(*key)),
+                &mut seen,
+            );
             continue;
         }
-        out.members.push(SweptMember {
-            pid,
-            start_time: read.start_time,
-            exe: read.exe,
-            objects,
-            unexamined: confirmed.unexamined.len(),
-        });
+        match usable_path(group) {
+            Ok(path) => objects.push(MatchedObject {
+                key: *key,
+                object: *object,
+                path,
+                double_loaded: duplicate_exec_coverage(group),
+            }),
+            Err(loss) => out.note_loss(
+                pid,
+                loss,
+                format!(
+                    "the confirmed mapping of {} is unusable for matching: {}",
+                    key_detail(*key),
+                    loss.label()
+                ),
+                &mut seen,
+            ),
+        }
     }
-    out
+    out.note_unexamined(pid, &confirmed.unexamined);
+    if objects.is_empty() {
+        // Unloaded before the confirmation (no loss), or every known
+        // mapping was unusable (already counted above).
+        return;
+    }
+    out.members.push(SweptMember {
+        pid,
+        start_time: read.start_time,
+        exe: read.exe,
+        objects,
+        unexamined: confirmed.unexamined.len(),
+    });
 }
 
 /// Recheck every matched object once, after every confirmation read: a
@@ -1130,12 +1158,25 @@ impl ConfirmIo for OsConfirmIo<'_> {
     }
 
     fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
-        let file = std::fs::File::open(format!("/proc/{pid}/maps")).map_err(|e| e.to_string())?;
-        crate::discovery::scan::read_maps_or_refuse(file, budget, crate::attach::monotonic_ns)
+        use crate::discovery::confirm_shards::ShardableIo as _;
+        let file = self.open_maps(pid).map_err(|e| e.to_string())?;
+        crate::discovery::scan::read_maps_or_refuse(file, budget, || self.maps_now())
     }
 
     fn gone(&self, pid: u32) -> bool {
         crate::process::generation_gone(pid) || crate::process::process_is_zombie(pid)
+    }
+}
+
+impl crate::discovery::confirm_shards::ShardableIo for OsConfirmIo<'_> {
+    type Maps = std::fs::File;
+
+    fn open_maps(&mut self, pid: u32) -> std::io::Result<Self::Maps> {
+        std::fs::File::open(format!("/proc/{pid}/maps"))
+    }
+
+    fn maps_now(&self) -> Option<u64> {
+        crate::attach::monotonic_ns()
     }
 }
 

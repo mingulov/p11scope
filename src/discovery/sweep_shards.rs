@@ -220,10 +220,7 @@ pub(crate) fn sweep_maps_serial<R, O, C>(
     }
 }
 
-/// Every shard's reads, in shard (so pid) order. Shard 0 runs on the
-/// calling thread; a shard whose thread cannot be spawned, or panics, is
-/// read again on the calling thread (its shadow is still the sweep-start
-/// copy, since nothing has been replayed yet), so a shard is never lost.
+/// Every shard's reads, in shard (so pid) order (see [`run_shards`]).
 fn read_shards<R, O, C>(
     pids: &[u32],
     ranges: &[Range<usize>],
@@ -237,24 +234,42 @@ where
     O: Fn(u32) -> std::io::Result<R> + Sync,
     C: Fn() -> Option<u64> + Sync,
 {
-    let read = |range: &Range<usize>| read_shard(&pids[range.clone()], shadow, limits, open, now);
+    run_shards(ranges, &|range: &Range<usize>| {
+        read_shard(&pids[range.clone()], shadow, limits, open, now)
+    })
+}
+
+/// `work` over every range, one scoped thread per range after the first,
+/// which runs on the calling thread; results in range order. A range whose
+/// thread cannot be spawned, or panics, is worked again on the calling
+/// thread, so no range is ever lost. `work` must therefore be repeatable:
+/// a shard's work only reads and records, against its own shadow budget,
+/// and decides nothing (the caller's replay does).
+pub(crate) fn run_shards<T, W>(ranges: &[Range<usize>], work: &W) -> Vec<T>
+where
+    T: Send,
+    W: Fn(&Range<usize>) -> T + Sync,
+{
     std::thread::scope(|scope| {
-        let handles: Vec<_> = ranges[1..]
+        let handles: Vec<_> = ranges
             .iter()
             .enumerate()
+            .skip(1)
             .map(|(index, range)| {
                 std::thread::Builder::new()
-                    .name(format!("p11scope-shard-{}", index + 1))
+                    .name(format!("p11scope-shard-{index}"))
                     .stack_size(SHARD_STACK_BYTES)
-                    .spawn_scoped(scope, move || read(range))
+                    .spawn_scoped(scope, move || work(range))
                     .ok()
             })
             .collect();
         let mut out = Vec::with_capacity(ranges.len());
-        out.push(read(&ranges[0]));
-        for (handle, range) in handles.into_iter().zip(&ranges[1..]) {
-            let reads = handle.and_then(|handle| handle.join().ok());
-            out.push(reads.unwrap_or_else(|| read(range)));
+        if let Some(first) = ranges.first() {
+            out.push(work(first));
+        }
+        for (handle, range) in handles.into_iter().zip(ranges.iter().skip(1)) {
+            let done = handle.and_then(|handle| handle.join().ok());
+            out.push(done.unwrap_or_else(|| work(range)));
         }
         out
     })
@@ -275,7 +290,7 @@ enum ShardOutcome {
 
 /// Everything one read took from the outside world, in order: the clock
 /// readings it asked for and the result of each `read` call.
-struct Transcript {
+pub(crate) struct Transcript {
     samples: Vec<Option<u64>>,
     reads: Vec<Recorded>,
     /// The bytes read, kept only when the read did not end cleanly (see
@@ -313,7 +328,7 @@ where
             let outcome = match open(pid) {
                 Err(error) => ShardOutcome::OpenFailed(error.to_string()),
                 Ok(maps) => {
-                    ShardOutcome::Read(record_read(maps, &mut shadow, limits, now, &mut bufs))
+                    ShardOutcome::Read(record_read(maps, &mut shadow, limits, now, &mut bufs).0)
                 }
             };
             ShardRead { pid, outcome }
@@ -321,13 +336,23 @@ where
         .collect()
 }
 
-fn record_read<R: Read, C: Fn() -> Option<u64>>(
+/// One maps read through [`read_maps_checked`] against `budget` (a
+/// shard's shadow), recorded for a replay. The second value is what the
+/// read gave there when it did not end cleanly (`None`: it did, and
+/// [`Transcript::clean_result`] holds the parse), so a shard can go on
+/// exactly as the serial code would.
+pub(crate) fn record_read<R, C, B>(
     maps: R,
-    shadow: &mut MapsShadowBudget,
+    budget: &mut B,
     limits: MapsReadLimits,
     now: &C,
     bufs: &mut MapsReadBuffers,
-) -> Transcript {
+) -> (Transcript, Option<Result<Vec<MapEntry>, String>>)
+where
+    R: Read,
+    C: Fn() -> Option<u64> + ?Sized,
+    B: MapsReadBudget + ?Sized,
+{
     let mut samples = Vec::new();
     let mut reader = RecordingReader {
         inner: maps,
@@ -336,7 +361,7 @@ fn record_read<R: Read, C: Fn() -> Option<u64>>(
     };
     let checked = read_maps_checked(
         &mut reader,
-        shadow,
+        budget,
         limits,
         || {
             let sample = now();
@@ -346,17 +371,28 @@ fn record_read<R: Read, C: Fn() -> Option<u64>>(
         bufs,
     );
     let reached_eof = matches!(reader.reads.last(), Some(Recorded::Eof));
-    let clean = (checked.is_ok() && reached_eof).then(|| parse_maps(bufs.bytes()));
-    let bytes = if clean.is_some() {
-        Vec::new()
+    let clean = checked.is_ok() && reached_eof;
+    let here = checked.and_then(|()| parse_maps(bufs.bytes()));
+    let (clean, unclean, bytes) = if clean {
+        (Some(here), None, Vec::new())
     } else {
-        reader.bytes
+        (None, Some(here), reader.bytes)
     };
-    Transcript {
-        samples,
-        reads: reader.reads,
-        bytes,
-        clean,
+    (
+        Transcript {
+            samples,
+            reads: reader.reads,
+            bytes,
+            clean,
+        },
+        unclean,
+    )
+}
+
+impl Transcript {
+    /// The parse of a read that ended cleanly.
+    pub(crate) fn clean_result(&self) -> Option<&Result<Vec<MapEntry>, String>> {
+        self.clean.as_ref()
     }
 }
 
@@ -396,7 +432,7 @@ fn clone_io_error(error: &std::io::Error) -> std::io::Error {
 }
 
 /// Every shard's reads, replayed in pid order against the capture budget.
-fn replay<C: Fn() -> Option<u64>>(
+fn replay<C: Fn() -> Option<u64> + ?Sized>(
     shards: Vec<Vec<ShardRead>>,
     budget: &mut CaptureWorkBudget,
     limits: MapsReadLimits,
@@ -418,7 +454,7 @@ fn replay<C: Fn() -> Option<u64>>(
 /// One recorded read, run again through [`read_maps_checked`] against
 /// `budget`: the same calls the serial sweep makes, fed from the
 /// transcript instead of procfs and the clock.
-fn replay_one<C: Fn() -> Option<u64>>(
+pub(crate) fn replay_one<C: Fn() -> Option<u64> + ?Sized>(
     transcript: Transcript,
     budget: &mut dyn MapsReadBudget,
     limits: MapsReadLimits,

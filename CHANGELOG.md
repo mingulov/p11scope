@@ -39,10 +39,11 @@ Work toward v0.3.0.
   reads of each thread are replayed in pid order against the capture
   budget, so attribution, losses, gaps and budget ceilings are exactly
   the serial ones; only wall time changes. The proof-stat pool now runs
-  only on the serial path. Interleaved runs on one host at 4,096
-  processes, before the confirm stage was sharded, cut the sweep stage
-  p95 from about 550 ms to about 185 ms on 4 CPUs; these numbers are
-  indicative. The pass time with both stages sharded is not measured yet.
+  only on the serial path. Interleaved serial and sharded runs on one
+  host at 4,096 processes cut the pass p95 from about 1.06–1.09 s to
+  about 0.61 s on 4 CPUs and from about 1.06 s to about 0.75 s on 2 CPUs
+  (one core with SMT), with identical output; these numbers are
+  indicative.
   The phase-1 maps sweep of `--cgroup` and `--system` capture discovery
   past `--max-scan-pids` is sharded the same way.
   `P11SCOPE_SHARD_THREADS=1` (diagnostic) forces the serial path. See

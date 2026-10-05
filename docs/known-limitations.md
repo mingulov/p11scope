@@ -175,11 +175,12 @@ the min..max of per-sample p95.
   the budget had already spent more than the capture budget is redone
   live on that one thread. Under a ceiling the threads can read past the
   point where the serial path would stop; those extra reads are never
-  charged or published. Indicative, single host, before the
-  confirm stage was sharded: interleaved runs at 4,096 processes cut the
-  sweep stage p95 from about 550 ms to about 185 ms on CPUs 8–11 and to
-  about 320 ms on CPUs 10,11. The pass time with both stages sharded is
-  not measured yet.
+  charged or published. Indicative, single host (2 cores with
+  SMT, Linux 7.0, btrfs, scan lane), interleaved serial and sharded runs
+  at 4,096 processes with both stages sharded: the pass p95 drops from
+  about 1.06–1.09 s to about 0.61 s on CPUs 8–11 (sweep p95 about
+  545 ms to 220 ms, confirm about 475 ms to 345 ms) and from about
+  1.06 s to about 0.75 s on CPUs 10,11, with identical output.
 - Workaround: narrow scope (`--pid`, `--module`).
 - Planned: the 1 s route is v0.3.0 kernel-side identity (C7). M1 at 10,000
   and the ≤15%-over-scan gate move to v0.3.0 with it.

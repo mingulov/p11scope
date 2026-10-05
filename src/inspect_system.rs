@@ -2526,6 +2526,82 @@ mod tests {
             assert_eq!(alone.scan_status, "complete", "{:?}", alone.skipped);
         }
 
+        /// A6 (exec-only proof ranges), end to end over the catalog: a
+        /// process past the cap that maps the provider and an unknown
+        /// library only without `x` (a scanner reading files) is neither
+        /// maps-matched nor a loss nor a coverage gap — the pass stays
+        /// complete with the same 299 callers.
+        #[test]
+        fn a_data_only_mapper_past_the_cap_is_neither_a_caller_nor_a_gap() {
+            let data_only = vec![
+                entry(0x6000_0000, b"r--p", PROVIDER.inode, PATH),
+                entry(0x6000_1000, b"rw-p", PROVIDER.inode, PATH),
+                entry(0x7000_0000, b"r--p", 77, "/opt/vendor/libunknown.so"),
+            ];
+            let mut collection = over_cap(&[]);
+            collection.sweep.push((30_000, data_only));
+            collection.enumerated.push(30_000);
+            let catalog = catalog_of(collection, HashMap::new(), false);
+            assert_eq!(
+                statuses(&catalog),
+                BTreeMap::from([("maps_matched", 299), ("not_selected", 148), ("scanned", 2)])
+            );
+            let scanner = catalog
+                .processes
+                .iter()
+                .find(|process| process.pid == 30_000)
+                .unwrap();
+            assert_eq!(scanner.status.label(), "not_selected");
+            assert_eq!(scanner.status.reason(), None);
+            assert!(scanner.objects.is_empty());
+            assert_eq!((catalog.unexamined, catalog.unexamined_objects), (0, 0));
+            assert!(
+                catalog.attribution_losses.values().all(|count| *count == 0),
+                "{:?}",
+                catalog.attribution_losses
+            );
+            assert_eq!(catalog.scan_status, "complete", "{:?}", catalog.skipped);
+            assert!(attribution_complete(&catalog));
+        }
+
+        /// A6: an object refused for non-unique inodes is a gap only where
+        /// a process past the cap maps it executable — the same rule as the
+        /// `inode_not_unique` loss it stands for.
+        #[test]
+        fn a_refused_object_mapped_only_data_only_past_the_cap_is_not_a_gap() {
+            let fuse = Checks {
+                changed: false,
+                nonunique: Some("fuse"),
+            };
+            let mut alone = over_cap(&[]);
+            alone
+                .sweep
+                .retain(|(pid, _)| !(10_001..10_300).contains(pid));
+            alone
+                .enumerated
+                .retain(|pid| !(10_001..10_300).contains(pid));
+            alone.sweep.push((
+                30_000,
+                vec![entry(0x6000_0000, b"r--p", PROVIDER.inode, PATH)],
+            ));
+            alone.enumerated.push(30_000);
+            let catalog = catalog_with(alone, &fuse);
+            assert!(
+                !catalog
+                    .skipped
+                    .iter()
+                    .any(|gap| gap.reason.starts_with("on a fuse filesystem")),
+                "{:?}",
+                catalog.skipped
+            );
+            assert!(
+                catalog.attribution_losses.values().all(|count| *count == 0),
+                "{:?}",
+                catalog.attribution_losses
+            );
+            assert_eq!(catalog.scan_status, "complete", "{:?}", catalog.skipped);
+        }
+
         fn statuses(catalog: &Catalog) -> BTreeMap<&'static str, usize> {
             let mut counts = BTreeMap::new();
             for process in &catalog.processes {

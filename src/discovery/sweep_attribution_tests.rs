@@ -139,6 +139,8 @@ struct Probe {
     mapped: HashMap<u32, MappedIdentities>,
     denied: BTreeSet<u32>,
     stat_calls: Vec<u32>,
+    /// Every range `stat_ranges` was asked for, in order.
+    statted: Vec<(u32, (u64, u64))>,
 }
 
 impl Probe {
@@ -150,6 +152,7 @@ impl Probe {
             mapped: HashMap::new(),
             denied: BTreeSet::new(),
             stat_calls: Vec::new(),
+            statted: Vec::new(),
         }
     }
 }
@@ -217,6 +220,8 @@ impl MemberProbe for Probe {
         _: &mut CaptureWorkBudget,
     ) -> MappedIdentities {
         self.stat_calls.push(pid);
+        self.statted
+            .extend(ranges.iter().map(|range| (pid, *range)));
         self.identities(pid, ranges.iter().copied())
     }
 }
@@ -1341,21 +1346,43 @@ fn create_subvolume(parent: &std::path::Path, name: &str) {
     assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
 }
 
-/// A forked, quiescent target: it maps `path` (one page, `r-x`: A6 counts
-/// only an executable mapping as a caller) and reports the address; on `s`
-/// it unmaps that page and maps `path` again at the same address (whatever
-/// file the path names now), then acknowledges.
+/// A forked, quiescent target: it maps each requested file (one page,
+/// read-only, executable when asked) and reports the addresses; on `s` it
+/// unmaps the first page and maps that path again at the same address with
+/// the same protection (whatever file the path names now), then
+/// acknowledges. A6: a caller is a process with an executable mapping, so
+/// [`Self::spawn`] maps `r-x`; [`Self::spawn_with`] can add data-only
+/// (`r--`) mappings.
 struct SwapChild {
     pid: libc::pid_t,
     command: std::os::fd::OwnedFd,
     reply: std::os::fd::OwnedFd,
     address: u64,
+    addresses: Vec<u64>,
 }
 
 impl SwapChild {
+    /// One executable mapping of `path`, as a loaded library's text.
     fn spawn(path: &std::path::Path) -> Self {
+        Self::spawn_with(&[(path, true)])
+    }
+
+    /// One page of each `(path, executable)`, in order.
+    fn spawn_with(mappings: &[(&std::path::Path, bool)]) -> Self {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert!(!mappings.is_empty());
+        let plan: Vec<(std::ffi::CString, libc::c_int)> = mappings
+            .iter()
+            .map(|(path, exec)| {
+                let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                let prot = if *exec {
+                    libc::PROT_READ | libc::PROT_EXEC
+                } else {
+                    libc::PROT_READ
+                };
+                (c_path, prot)
+            })
+            .collect();
         let (mut down, mut up) = ([0; 2], [0; 2]);
         // SAFETY: two valid two-element arrays for pipe2.
         assert_eq!(
@@ -1368,29 +1395,31 @@ impl SwapChild {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
-            // SAFETY: raw syscalls on valid fds and the preallocated path.
+            // SAFETY: raw syscalls on valid fds and the preallocated paths.
             unsafe {
-                let map = |at: *mut libc::c_void, flags| {
-                    let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY);
-                    let base = libc::mmap(
-                        at,
-                        4096,
-                        libc::PROT_READ | libc::PROT_EXEC,
-                        libc::MAP_PRIVATE | flags,
-                        fd,
-                        0,
-                    );
-                    libc::close(fd);
-                    base
-                };
-                let base = map(std::ptr::null_mut(), 0);
-                let address = (base as u64).to_ne_bytes();
-                libc::write(up[1], address.as_ptr().cast(), 8);
+                let map =
+                    |at: *mut libc::c_void,
+                     flags,
+                     (c_path, prot): &(std::ffi::CString, libc::c_int)| {
+                        let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY);
+                        let base = libc::mmap(at, 4096, *prot, libc::MAP_PRIVATE | flags, fd, 0);
+                        libc::close(fd);
+                        base
+                    };
+                let mut first = std::ptr::null_mut();
+                for (index, request) in plan.iter().enumerate() {
+                    let base = map(std::ptr::null_mut(), 0, request);
+                    if index == 0 {
+                        first = base;
+                    }
+                    let address = (base as u64).to_ne_bytes();
+                    libc::write(up[1], address.as_ptr().cast(), 8);
+                }
                 let mut byte = 0u8;
                 while libc::read(down[0], (&raw mut byte).cast(), 1) == 1 && byte == b's' {
-                    libc::munmap(base, 4096);
-                    let again = map(base, libc::MAP_FIXED_NOREPLACE);
-                    let ok = [u8::from(again == base)];
+                    libc::munmap(first, 4096);
+                    let again = map(first, libc::MAP_FIXED_NOREPLACE, &plan[0]);
+                    let ok = [u8::from(again == first)];
                     libc::write(up[1], ok.as_ptr().cast(), 1);
                 }
                 libc::_exit(0);
@@ -1402,19 +1431,25 @@ impl SwapChild {
             libc::close(up[1]);
             (OwnedFd::from_raw_fd(down[1]), OwnedFd::from_raw_fd(up[0]))
         };
-        let mut address = [0u8; 8];
-        // SAFETY: reading 8 bytes into a valid buffer.
-        assert_eq!(
-            unsafe { libc::read(reply.as_raw_fd(), address.as_mut_ptr().cast(), 8) },
-            8
-        );
-        let address = u64::from_ne_bytes(address);
-        assert_ne!(address, libc::MAP_FAILED as u64);
+        let addresses: Vec<u64> = (0..plan.len())
+            .map(|_| {
+                let mut address = [0u8; 8];
+                // SAFETY: reading 8 bytes into a valid buffer.
+                assert_eq!(
+                    unsafe { libc::read(reply.as_raw_fd(), address.as_mut_ptr().cast(), 8) },
+                    8
+                );
+                let address = u64::from_ne_bytes(address);
+                assert_ne!(address, libc::MAP_FAILED as u64, "the child's mmap failed");
+                address
+            })
+            .collect();
         Self {
             pid,
             command,
             reply,
-            address,
+            address: addresses[0],
+            addresses,
         }
     }
 
@@ -2169,4 +2204,605 @@ fn a_pooled_pass_attributes_exactly_like_a_serial_one() {
             });
         }
     }
+}
+
+// ---- A6 (owner ruling 2026-10-05): exec-only proof ranges ----
+
+/// One object's five loader mappings, as a typical shared library maps
+/// them: the `r--` header, the `r-x` text, `r--` rodata, the `r--` RELRO
+/// and the `rw-` data. Only the text is executable.
+fn lib5(base: u64, inode: u64, path: &str) -> Vec<MapEntry> {
+    [b"r--p", b"r-xp", b"r--p", b"r--p", b"rw-p"]
+        .iter()
+        .enumerate()
+        .map(|(index, perms)| {
+            let offset = index as u64 * 0x1000;
+            let mut entry = mapping(base + offset, perms, inode, path);
+            entry.file_offset = offset;
+            entry
+        })
+        .collect()
+}
+
+/// [`lib5`] without its text: what a process that maps the file without
+/// executing it (a scanner `mmap`-ing it read-only) shows.
+fn data_only(base: u64, inode: u64, path: &str) -> Vec<MapEntry> {
+    lib5(base, inode, path)
+        .into_iter()
+        .filter(|entry| entry.permissions[2] != b'x')
+        .collect()
+}
+
+const PROVIDER_PATH: &str = "/usr/lib/softhsm/libsofthsm2.so";
+const PROVIDER_TEXT: (u64, u64) = (0x1000_1000, 0x1000_2000);
+const LIBC_TEXT: (u64, u64) = (0x2000_1000, 0x2000_2000);
+
+/// A `dlopen` caller of the provider: provider and libc, five ranges each.
+fn caller5() -> Vec<MapEntry> {
+    let mut entries = lib5(0x1000_0000, PROVIDER, PROVIDER_PATH);
+    entries.extend(lib5(0x2000_0000, LIBC, "/usr/lib/libc.so.6"));
+    entries
+}
+
+/// Production confirmation reads (`confirm_with`, `stat_unpinned`) over a
+/// scripted snapshot, recording every `map_files` read. A range reads its
+/// entry's default `vm_file` unless `faults` scripts it.
+struct CountingIo<'r> {
+    base: Io,
+    pid: u32,
+    entries: Vec<MapEntry>,
+    faults: MappedIdentities,
+    reads: &'r RefCell<Vec<(u32, (u64, u64))>>,
+}
+
+impl ConfirmIo for CountingIo<'_> {
+    type Pin = u64;
+
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        self.reads.borrow_mut().push((pid, (start, end)));
+        if let Some(fault) = self.faults.get(&(start, end)) {
+            return fault.clone();
+        }
+        self.entries
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (start, end))
+            .map(|entry| vm_file(entry.inode))
+            .ok_or_else(|| RANGE_NOT_MAPPED.to_string())
+    }
+
+    fn open(&mut self, _: u32) -> Result<u64, String> {
+        Ok(u64::from(self.pid))
+    }
+
+    fn start_time(&self, _: &u64) -> Option<u64> {
+        Some(5_000 + u64::from(self.pid))
+    }
+
+    fn still_the_same(&self, pin: &u64) -> bool {
+        self.base.still_the_same(pin)
+    }
+
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        self.base.exe(pid)
+    }
+
+    fn maps(&mut self, _: u32, _: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        Ok(self.entries.clone())
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        self.base.gone(pid)
+    }
+}
+
+/// The production probe's shape over [`CountingIo`].
+struct CountingProbe {
+    snapshots: HashMap<u32, Vec<MapEntry>>,
+    faults: HashMap<u32, MappedIdentities>,
+    reads: RefCell<Vec<(u32, (u64, u64))>>,
+}
+
+impl CountingProbe {
+    fn over(sweep: &[(u32, Vec<MapEntry>)]) -> Self {
+        Self {
+            snapshots: sweep.iter().cloned().collect(),
+            faults: HashMap::new(),
+            reads: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn io(&self, pid: u32) -> CountingIo<'_> {
+        CountingIo {
+            base: Io::healthy(),
+            pid,
+            entries: self.snapshots.get(&pid).cloned().unwrap_or_default(),
+            faults: self.faults.get(&pid).cloned().unwrap_or_default(),
+            reads: &self.reads,
+        }
+    }
+
+    fn reads_of(&self, pid: u32) -> Vec<(u64, u64)> {
+        self.reads
+            .borrow()
+            .iter()
+            .filter(|(read, _)| *read == pid)
+            .map(|(_, range)| *range)
+            .collect()
+    }
+}
+
+impl MemberProbe for CountingProbe {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        confirm_with(&mut self.io(pid), pid, prove, budget)
+    }
+
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        stat_unpinned(&mut self.io(pid), pid, ranges, budget)
+    }
+}
+
+/// The index a deep scan of the `caller5` representative builds: the
+/// provider bound to `OBJECT`, libc examined without a module.
+fn caller5_index() -> KnownKeyIndex {
+    KnownKeyIndex::build(
+        [(key(PROVIDER), Some(OBJECT))],
+        &BTreeMap::from([(key(PROVIDER), OBJECT)]),
+        examined_of(&caller5()),
+        &Checks::default(),
+    )
+    .0
+}
+
+fn run_counting(
+    sweep: &[(u32, Vec<MapEntry>)],
+    probe: &mut CountingProbe,
+) -> (SweepAttribution, u64) {
+    let mut budget = CaptureWorkBudget::default();
+    let attribution = attribute_unselected(
+        sweep,
+        &BTreeSet::new(),
+        &BTreeSet::from([10_000]),
+        &caller5_index(),
+        probe,
+        &mut budget,
+    );
+    (attribution, budget.work_units_count())
+}
+
+/// The ruling's first consequence: a process that maps the provider only
+/// without `x` (a scanner reading the file) is not its caller. Nothing is
+/// confirmed or proved for it, and it is neither a loss nor a coverage gap
+/// — also for an unknown library and a known-but-ineligible key it maps
+/// data-only. Only libc's text (an examined key) is statted.
+#[test]
+fn a_data_only_mapper_of_the_provider_is_never_attributed() {
+    const REJECTED: u64 = 55;
+    let mut scanner = data_only(0x1000_0000, PROVIDER, PROVIDER_PATH);
+    scanner.extend(lib5(0x2000_0000, LIBC, "/usr/lib/libc.so.6"));
+    scanner.extend(data_only(0x4000_0000, 88, "/opt/unknown/libother.so"));
+    scanner.extend(data_only(
+        0x5000_0000,
+        REJECTED,
+        "/opt/vendor/librejected.so",
+    ));
+    let sweep = vec![(10_000, caller5()), (10_001, scanner)];
+    let index = KnownKeyIndex::build(
+        [(key(PROVIDER), Some(OBJECT)), (key(REJECTED), None)],
+        &BTreeMap::from([(key(PROVIDER), OBJECT)]),
+        examined_of(&caller5()),
+        &Checks::default(),
+    )
+    .0;
+    assert_eq!(
+        index.classify(key(REJECTED)),
+        KeyClass::Ineligible(AttributionLoss::KeyRejected)
+    );
+    let mut probe = Probe::over(&sweep);
+    let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
+    assert!(attribution.members.is_empty(), "{:?}", attribution.members);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+    assert!(
+        attribution.unexamined.is_empty(),
+        "{:?}",
+        attribution.unexamined
+    );
+    assert_eq!(attribution.probed, 0, "no confirmation read");
+    assert!(probe.calls.is_empty());
+    assert_eq!(probe.statted, vec![(10_001, LIBC_TEXT)]);
+}
+
+/// A normal `dlopen` caller is attributed, and its confirmation proves
+/// exactly the executable ranges of the keys that need proof: the
+/// provider's text and libc's text, never their eight other ranges.
+#[test]
+fn a_dlopen_caller_is_attributed_by_proving_its_executable_ranges_only() {
+    let sweep = vec![(10_000, caller5()), (10_001, caller5())];
+    let mut probe = CountingProbe::over(&sweep);
+    let (attribution, charged) = run_counting(&sweep, &mut probe);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_001], "{:?}", attribution.member_losses);
+    let object = &attribution.members[0].objects[0];
+    assert_eq!((object.key, object.object), (key(PROVIDER), OBJECT));
+    assert_eq!(object.path, PROVIDER_PATH);
+    assert!(!object.double_loaded);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+    assert!(attribution.unexamined.is_empty());
+    assert_eq!(probe.reads_of(10_001), vec![PROVIDER_TEXT, LIBC_TEXT]);
+    assert_eq!(charged, 2, "one work unit per proved range");
+}
+
+/// The ruling's second consequence: a maps-key collision (btrfs) on a
+/// non-executable range of the key no longer costs the edge when the
+/// executable range is the held file — whether the colliding identity is
+/// never read (the production path) or is in hand anyway.
+#[test]
+fn a_collision_on_a_data_range_does_not_cost_an_exec_proven_edge() {
+    let other_subvolume = Ok(FileIdentity {
+        dev: 47,
+        ino: PROVIDER,
+    });
+    let data: Vec<(u64, u64)> = data_only(0x1000_0000, PROVIDER, PROVIDER_PATH)
+        .iter()
+        .map(|entry| (entry.start, entry.end))
+        .collect();
+    let collided: MappedIdentities = data
+        .iter()
+        .map(|range| (*range, other_subvolume.clone()))
+        .collect();
+
+    let sweep = vec![(10_000, caller5()), (10_001, caller5())];
+    let mut probe = CountingProbe::over(&sweep);
+    probe.faults.insert(10_001, collided.clone());
+    let (attribution, _) = run_counting(&sweep, &mut probe);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_001], "{:?}", attribution.member_losses);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+    assert!(
+        probe
+            .reads_of(10_001)
+            .iter()
+            .all(|range| !data.contains(range)),
+        "a data range is never read"
+    );
+
+    // The confirmation hands over the colliding data-range identities too:
+    // the match still proves only its executable range.
+    let mut mapped = collided;
+    mapped.insert(PROVIDER_TEXT, Ok(vm_file(PROVIDER)));
+    mapped.insert(LIBC_TEXT, Ok(vm_file(LIBC)));
+    let mut scripted = Probe::over(&sweep);
+    scripted.overrides.insert(
+        10_001,
+        Confirmation::Confirmed(ConfirmedRead {
+            start_time: 5_001,
+            exe: exe(),
+            entries: caller5(),
+            mapped,
+        }),
+    );
+    let attribution = run(
+        &sweep,
+        &BTreeSet::from([10_000]),
+        &caller5_index(),
+        &mut scripted,
+    );
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_001], "{:?}", attribution.member_losses);
+}
+
+/// The executable range is still proved like for like: when it fails, the
+/// caller is not attributed, with that range's own reason.
+#[test]
+fn an_exec_range_that_fails_its_proof_is_not_attributed_with_its_reason() {
+    let cases = [
+        (
+            Ok(FileIdentity {
+                dev: 47,
+                ino: PROVIDER,
+            }),
+            AttributionLoss::IdentityMismatch,
+            "the range 10001000-10002000 maps another file",
+        ),
+        (
+            Err(RANGE_NOT_MAPPED.to_string()),
+            AttributionLoss::MappingChanged,
+            "the range 10001000-10002000 was no longer one mapping",
+        ),
+        (
+            Err("Operation not permitted (os error 1)".to_string()),
+            AttributionLoss::MapFilesUnavailable,
+            "the map_files identity of 10001000-10002000 could not be read",
+        ),
+    ];
+    for (fault, loss, reason) in cases {
+        let sweep = vec![(10_000, caller5()), (10_001, caller5())];
+        let mut probe = CountingProbe::over(&sweep);
+        probe
+            .faults
+            .insert(10_001, MappedIdentities::from([(PROVIDER_TEXT, fault)]));
+        let (attribution, _) = run_counting(&sweep, &mut probe);
+        assert!(attribution.members.is_empty(), "{loss:?}");
+        assert_eq!(attribution.losses, BTreeMap::from([(loss, 1)]));
+        let (first, detail) = &attribution.member_losses[&10_001];
+        assert_eq!(*first, loss);
+        assert!(detail.contains(reason), "{detail}");
+    }
+}
+
+/// A key with several executable ranges (a split or second text mapping):
+/// every one must prove; one failing costs the edge.
+#[test]
+fn every_executable_range_of_a_key_must_prove() {
+    let second_text = (0x1000_5000, 0x1000_6000);
+    let mut split = caller5();
+    let mut extra = mapping(second_text.0, b"r-xp", PROVIDER, PROVIDER_PATH);
+    extra.file_offset = 0x5000;
+    split.push(extra);
+    let sweep = vec![(10_000, caller5()), (10_001, split)];
+
+    let mut probe = CountingProbe::over(&sweep);
+    let (attribution, _) = run_counting(&sweep, &mut probe);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_001], "{:?}", attribution.member_losses);
+    assert_eq!(
+        probe.reads_of(10_001),
+        vec![PROVIDER_TEXT, LIBC_TEXT, second_text]
+    );
+
+    let mut probe = CountingProbe::over(&sweep);
+    probe.faults.insert(
+        10_001,
+        MappedIdentities::from([(second_text, Ok(vm_file(9_999)))]),
+    );
+    let (attribution, _) = run_counting(&sweep, &mut probe);
+    assert!(attribution.members.is_empty());
+    assert_eq!(
+        attribution.losses,
+        BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)])
+    );
+    let (_, detail) = &attribution.member_losses[&10_001];
+    assert!(detail.contains("10005000-10006000"), "{detail}");
+}
+
+/// The proof count, exactly, for libraries of five ranges (one
+/// executable): ten callers prove the provider's and libc's text (2 each),
+/// five idle processes prove libc's text unpinned (1 each), and a scanner
+/// mapping the provider data-only proves only libc's text (1) and is never
+/// confirmed. 26 `map_files` reads and 26 work units, where proving every
+/// range read 10 × 10 + 5 × 5 + (4 + 5) = 134.
+#[test]
+fn proof_count_for_five_range_libraries_is_one_per_executable_range() {
+    let mut sweep: Vec<(u32, Vec<MapEntry>)> =
+        (10_000..=10_010).map(|pid| (pid, caller5())).collect();
+    sweep.extend((20_001..=20_005).map(|pid| (pid, lib5(0x2000_0000, LIBC, "/usr/lib/libc.so.6"))));
+    let mut scanner = data_only(0x1000_0000, PROVIDER, PROVIDER_PATH);
+    scanner.extend(lib5(0x2000_0000, LIBC, "/usr/lib/libc.so.6"));
+    sweep.push((30_001, scanner));
+
+    let mut probe = CountingProbe::over(&sweep);
+    let (attribution, charged) = run_counting(&sweep, &mut probe);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, (10_001..=10_010).collect::<Vec<u32>>());
+    assert_eq!(attribution.probed, 10, "the scanner is never confirmed");
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+    assert!(attribution.unexamined.is_empty());
+    let reads = probe.reads.borrow().len();
+    assert_eq!(reads, 26, "{:?}", probe.reads.borrow());
+    assert_eq!(charged, 26);
+    assert_eq!(probe.reads_of(30_001), vec![LIBC_TEXT]);
+    for pid in 20_001..=20_005 {
+        assert_eq!(probe.reads_of(pid), vec![LIBC_TEXT]);
+    }
+}
+
+/// A real process (unprivileged): one page of a `.so` mapped read-only is
+/// never confirmed or proved, even with an index binding its exact key.
+#[test]
+fn a_real_data_only_mapping_is_never_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("libdataonly.so");
+    std::fs::write(&path, vec![0x22u8; 8192]).unwrap();
+    let child = SwapChild::spawn_with(&[(&path, false)]);
+    let snapshot = child.maps();
+    let line = snapshot
+        .iter()
+        .find(|entry| entry.start == child.address)
+        .expect("the child's mapping")
+        .clone();
+    assert_eq!(&line.permissions, b"r--p");
+    let index = index_binding(ObjectKey::of(&line), vm_file(line.inode), None);
+    let attribution = attribute_child(&child, snapshot, &index);
+    assert!(attribution.members.is_empty(), "{:?}", attribution.members);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+    assert_eq!(attribution.probed, 0);
+}
+
+/// A real process: an executable mapping of the same kind of file is
+/// confirmed and its range proved — attributed as root (`map_files`
+/// readable), a `map_files_unavailable` loss otherwise (fail closed).
+#[test]
+fn a_real_executable_mapping_is_confirmed_and_proved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("libexec.so");
+    std::fs::write(&path, vec![0x33u8; 8192]).unwrap();
+    let child = SwapChild::spawn(&path);
+    let snapshot = child.maps();
+    let line = snapshot
+        .iter()
+        .find(|entry| entry.start == child.address)
+        .expect("the child's mapping")
+        .clone();
+    assert_eq!(&line.permissions, b"r-xp");
+    let held =
+        crate::discovery::identity::self_mapped_identity(&std::fs::File::open(&path).unwrap());
+    let index = index_binding(
+        ObjectKey::of(&line),
+        held.clone().unwrap_or(vm_file(line.inode)),
+        None,
+    );
+    let attribution = attribute_child(&child, snapshot, &index);
+    assert_eq!(attribution.probed, 1, "confirmed");
+    if held.is_ok() {
+        let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+        assert_eq!(
+            pids,
+            vec![child.pid as u32],
+            "{:?}",
+            attribution.member_losses
+        );
+    } else {
+        assert!(attribution.members.is_empty());
+        assert_eq!(
+            attribution.losses,
+            BTreeMap::from([(AttributionLoss::MapFilesUnavailable, 1)])
+        );
+    }
+}
+
+/// Root on a btrfs TMPDIR, through the production probe: two subvolumes'
+/// files share a maps key. A caller maps the held file executable and the
+/// other one read-only under the same key: the data range is not a caller
+/// range, so the edge stands on its proven text. Swapping the roles (the
+/// other file executable) is an identity mismatch, and a process mapping
+/// the held file only read-only is not a caller at all.
+#[test]
+#[ignore = "root (map_files) on a btrfs TMPDIR: creates two subvolumes there"]
+fn privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs.
+    let magic = (unsafe { stat.assume_init().f_type }) as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "TMPDIR must be on btrfs");
+    create_subvolume(parent, "s");
+    create_subvolume(parent, "t");
+    let held_path = parent.join("s/libcollide.so");
+    let other_path = parent.join("t/libcollide.so");
+    std::fs::write(&held_path, vec![0xa5u8; 8192]).unwrap();
+    std::fs::write(&other_path, vec![0x5au8; 8192]).unwrap();
+    let (a, b) = (
+        std::fs::metadata(&held_path).unwrap(),
+        std::fs::metadata(&other_path).unwrap(),
+    );
+    assert_eq!(a.ino(), b.ino(), "fresh subvolumes repeat inode numbers");
+    assert_ne!(a.dev(), b.dev());
+    let held =
+        crate::discovery::identity::self_mapped_identity(&std::fs::File::open(&held_path).unwrap())
+            .expect("map_files is readable as root");
+
+    let line_at = |child: &SwapChild, address: u64| {
+        child
+            .maps()
+            .into_iter()
+            .find(|entry| entry.start == address)
+            .expect("the child's mapping")
+    };
+    // The held file's text plus the other file read-only, one maps key.
+    let caller = SwapChild::spawn_with(&[(&held_path, true), (&other_path, false)]);
+    let (text, data) = (
+        line_at(&caller, caller.addresses[0]),
+        line_at(&caller, caller.addresses[1]),
+    );
+    assert_eq!(&text.permissions, b"r-xp");
+    assert_eq!(&data.permissions, b"r--p");
+    assert_eq!(
+        ObjectKey::of(&text),
+        ObjectKey::of(&data),
+        "both files render one maps key"
+    );
+    let index = index_binding(ObjectKey::of(&text), held, None);
+    let attribution = attribute_child(&caller, caller.maps(), &index);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(
+        pids,
+        vec![caller.pid as u32],
+        "{:?}",
+        attribution.member_losses
+    );
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+
+    // The other file executable, the held one read-only: a mismatch.
+    let swapped = SwapChild::spawn_with(&[(&other_path, true), (&held_path, false)]);
+    let attribution = attribute_child(&swapped, swapped.maps(), &index);
+    assert!(attribution.members.is_empty(), "{:?}", attribution.members);
+    assert_eq!(
+        attribution.losses,
+        BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)])
+    );
+
+    // The held file read-only only: not a caller, nothing proved.
+    let reader = SwapChild::spawn_with(&[(&held_path, false)]);
+    let attribution = attribute_child(&reader, reader.maps(), &index);
+    assert!(attribution.members.is_empty(), "{:?}", attribution.members);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+    assert_eq!(attribution.probed, 0);
+
+    drop((caller, swapped, reader));
+    std::fs::remove_file(&held_path).unwrap();
+    std::fs::remove_file(&other_path).unwrap();
+    std::fs::remove_dir(parent.join("s")).unwrap();
+    std::fs::remove_dir(parent.join("t")).unwrap();
+}
+
+/// Root with a loop-mounted ext4: there a held file's maps key is its
+/// identity, so no per-range stat runs at all. Before A6 a process that
+/// mapped the file only read-only was attributed on the key alone; now
+/// only the executable mapper is.
+#[test]
+#[ignore = "root: mounts a loop ext4 image (mkfs.ext4, mount, umount)"]
+fn privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4() {
+    let ext4 = Ext4Loop::new();
+    let path = ext4.mount.join("libidentity.so");
+    std::fs::write(&path, vec![0x44u8; 8192]).unwrap();
+    let caller = SwapChild::spawn(&path);
+    let reader = SwapChild::spawn_with(&[(&path, false)]);
+    let line = caller
+        .maps()
+        .into_iter()
+        .find(|entry| entry.start == caller.address)
+        .expect("the caller's mapping");
+    let key_k = ObjectKey::of(&line);
+    let index = index_binding(
+        key_k,
+        FileIdentity {
+            dev: libc::makedev(key_k.device.major as u32, key_k.device.minor as u32),
+            ino: key_k.inode,
+        },
+        Some(0xef53),
+    );
+    assert!(
+        !index.map_files_keys().contains(&key_k),
+        "an identity key: no per-range proof"
+    );
+    let attributed = attribute_child(&caller, caller.maps(), &index);
+    let pids: Vec<u32> = attributed.members.iter().map(|m| m.pid).collect();
+    assert_eq!(
+        pids,
+        vec![caller.pid as u32],
+        "{:?}",
+        attributed.member_losses
+    );
+
+    let read_only = attribute_child(&reader, reader.maps(), &index);
+    assert!(read_only.members.is_empty(), "{:?}", read_only.members);
+    assert!(read_only.losses.is_empty(), "{:?}", read_only.losses);
+    assert_eq!(read_only.probed, 0);
+    drop((caller, reader));
 }

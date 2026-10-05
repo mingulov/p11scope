@@ -55,8 +55,8 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (77 ignored tests in the default-feature lib binary): 64 run by
-# default, 4 run only with --include-long, 9 are statically skipped with a
+# Curation (79 ignored tests in the default-feature lib binary): 65 run by
+# default, 4 run only with --include-long, 10 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
 # never be silently dropped and a renamed one can never silently pass.
@@ -137,6 +137,7 @@ discovery::engine::publication_tests::broad_p11kit_admission_arithmetic
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n6530
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n8192
+discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4
 discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains
 events::runtime_tests::real_retained_discovery_consumer_owns_one_exact_map
@@ -183,6 +184,7 @@ discovery::engine::tests::lifecycle_manifest_helper_entrypoint
 discovery::identity::tests::map_files_name_timing_per_thousand
 discovery::scan::tests::maps_reuse_timing_per_thousand_reads
 discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path
+discovery::sweep_attribution::tests::privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge
 discovery::sweep_attribution::tests::privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file
 first_use_probe::native::system_capture_observer_facts
 process::tests::pidfd_denial::pidfd_denial_helper
@@ -194,6 +196,7 @@ SKIP_REASONS=(
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
 "needs a live root-owned target with two private cross-device mounts (same inode, distinct dev) plus P11SCOPE_ALIAS_COLLISION_PID/HINT/TARGET/HARDLINK"
+"needs TMPDIR on btrfs (it creates two subvolumes there and asserts the filesystem); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs TMPDIR on btrfs (it creates two subvolumes there and asserts the filesystem); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs a frozen supervisor config via P11SCOPE_FIRST_USE_PROBE_CONFIG plus an exclusive BPF lane; its verdict requires an external owned oracle"
 "private seccomp helper re-executed by real_pidfd_denial_preserves_proc_identity_without_signal_authority with P11SCOPE_TEST_PIDFD_DENIAL_*; that unprivileged test is its only passing form"

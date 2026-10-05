@@ -568,6 +568,14 @@ fn lane_active_line(backend: &crate::inventory_capture::LaneBackend) -> String {
 
 /// The stderr line a native run ends with: what it attached, how its
 /// retirement ended, and its settlement.
+/// The stage-timings suffix for a lifecycle-ring high-water: bytes and
+/// share of this build's ring. Timings output only, never schema.
+fn lifecycle_high_water_suffix(high_water_bytes: u64) -> String {
+    let ring = u64::from(crate::attach::EXPECTED_INVENTORY_DISCOVERY_BYTES);
+    let percent = high_water_bytes.saturating_mul(100) / ring.max(1);
+    format!("; lifecycle ring high-water: {high_water_bytes} B ({percent}% of {ring} B)")
+}
+
 fn stop_line(summary: &LaneSummary) -> String {
     let retirement = match &summary.retirement {
         crate::inventory_capture::Retirement::Closed(cleanup) => format!(
@@ -585,7 +593,7 @@ fn stop_line(summary: &LaneSummary) -> String {
             crate::render::escape_controls(reason)
         ),
     };
-    format!(
+    let mut line = format!(
         "p11scope: native capture stopped after {} pass{}: {} endpoints attached ({} links), \
          {} failed; {retirement}; settlement {}",
         summary.passes,
@@ -594,7 +602,13 @@ fn stop_line(summary: &LaneSummary) -> String {
         summary.backend.mechanism(),
         summary.failed,
         crate::inventory_capture::SETTLEMENT,
-    )
+    );
+    if crate::inspect_system::stage_timings_requested()
+        && let Some(high_water) = summary.lifecycle_high_water_bytes
+    {
+        line.push_str(&lifecycle_high_water_suffix(high_water));
+    }
+    line
 }
 
 /// Final sinks, shared by the classic and dashboard paths: the event
@@ -1329,11 +1343,15 @@ fn progress_lines<Source: ProcessSource>(
         ));
     }
     if crate::inspect_system::stage_timings_requested() {
-        lines.push(format!(
+        let mut timings = format!(
             "p11scope: pass {}: stage timings: {}",
             report.pass,
             report.timings.ops_line()
-        ));
+        );
+        if let Some(high_water) = coordinator.lifecycle_high_water_bytes() {
+            timings.push_str(&lifecycle_high_water_suffix(high_water));
+        }
+        lines.push(timings);
     }
     // Admission failures aggregate past one per pass, like their gaps.
     let failed: Vec<(u32, &str)> = report
@@ -2110,6 +2128,7 @@ mod tests {
                 failed_quanta: 0,
                 recovery_rescans: 1,
             },
+            lifecycle_high_water_bytes: None,
         }
     }
 
@@ -2382,6 +2401,35 @@ mod tests {
         assert_eq!(set.max_edges, absent.max_edges);
         assert_eq!(set.max_endpoints, absent.max_endpoints);
         assert_eq!(set.max_semantic_states, absent.max_semantic_states);
+    }
+
+    #[test]
+    fn the_high_water_suffix_names_bytes_and_ring_share() {
+        let ring = u64::from(crate::attach::EXPECTED_INVENTORY_DISCOVERY_BYTES);
+        assert_eq!(
+            lifecycle_high_water_suffix(ring / 2),
+            format!(
+                "; lifecycle ring high-water: {} B (50% of {ring} B)",
+                ring / 2
+            )
+        );
+        assert_eq!(
+            lifecycle_high_water_suffix(0),
+            format!("; lifecycle ring high-water: 0 B (0% of {ring} B)")
+        );
+        // Past-full still renders (a torn sample never divides by zero).
+        assert!(lifecycle_high_water_suffix(u64::MAX).starts_with("; lifecycle ring high-water: "));
+    }
+
+    #[test]
+    fn the_stop_line_carries_no_high_water_without_a_native_drain() {
+        // With no native drain staged (high-water None) the stop line is
+        // unchanged whatever the environment asks for: the suffix only
+        // ever appends.
+        let line = stop_line(&lane_summary(
+            crate::inventory_capture::Retirement::Unsettled("budget passed".into()),
+        ));
+        assert!(!line.contains("high-water"), "{line}");
     }
 
     #[test]

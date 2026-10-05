@@ -1393,7 +1393,7 @@ fn pid_scope_lifecycle_loss_makes_custody_unproven() {
             error: anyhow::anyhow!("short DISCOVERY record"),
             dispatched: 0,
         };
-        (Err(failure), true)
+        (Err(failure), true, None)
     });
     assert!(batch.failure.is_some());
     assert!(!batch.head_pending && !batch.drained());
@@ -1444,7 +1444,7 @@ fn a_system_lifecycle_loss_rides_every_later_batch() {
             error: anyhow::anyhow!("short DISCOVERY record"),
             dispatched: 0,
         };
-        (Err(failure), true)
+        (Err(failure), true, None)
     });
     assert!(failed.failure.is_some());
     let batch = read_witnesses_from(None, &mut system, CapturePhase::Active, window());
@@ -1659,13 +1659,13 @@ fn a_quantum_ending_at_a_busy_head_is_tagged_and_not_drained() {
     let domain = book.domain;
 
     let batch = service_with(&mut book, window, |_, _, _| {
-        (Ok(InventoryDiscoveryService::default()), true)
+        (Ok(InventoryDiscoveryService::default()), true, None)
     });
     assert_eq!(batch.domain, domain);
     assert!(batch.head_pending && !batch.drained());
 
     let batch = service_with(&mut book, window, |_, _, _| {
-        (Ok(InventoryDiscoveryService::default()), false)
+        (Ok(InventoryDiscoveryService::default()), false, None)
     });
     assert!(!batch.head_pending && batch.drained());
 
@@ -1676,7 +1676,7 @@ fn a_quantum_ending_at_a_busy_head_is_tagged_and_not_drained() {
             deadline_reached: true,
             ..InventoryDiscoveryService::default()
         };
-        (Ok(service), true)
+        (Ok(service), true, None)
     });
     assert!(!batch.head_pending && !batch.drained());
 }
@@ -1768,7 +1768,7 @@ fn drained_service(book: &mut CaptureBook, at_ns: u64) {
     use super::super::activation::InventoryDiscoveryService;
     let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
     let batch = service_with_clock(book, window, &mut || at_ns, |_, _, _| {
-        (Ok(InventoryDiscoveryService::default()), false)
+        (Ok(InventoryDiscoveryService::default()), false, None)
     });
     assert!(batch.drained());
 }
@@ -1811,7 +1811,7 @@ fn an_undatable_lifecycle_loss_is_dated_at_the_last_proven_drain() {
                 error: anyhow::anyhow!("short DISCOVERY record"),
                 dispatched: 0,
             };
-            (Err(failure), true)
+            (Err(failure), true, None)
         });
         assert!(failed.failure.is_some());
         let at = match (book.custody(), book.lifecycle_loss()) {
@@ -1850,6 +1850,35 @@ fn an_undatable_lifecycle_loss_is_dated_at_the_last_proven_drain() {
     ));
 }
 
+#[test]
+fn a_serviced_drain_carries_its_high_water_fill() {
+    use super::super::activation::InventoryDiscoveryService;
+    let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
+    for (outcome, expected) in [
+        (Ok(InventoryDiscoveryService::default()), Some(1_234u64)),
+        (
+            Err(super::super::activation::InventoryDispatchFailure {
+                record: None,
+                error: anyhow::anyhow!("short DISCOVERY record"),
+                dispatched: 0,
+            }),
+            Some(5_678u64),
+        ),
+    ] {
+        let mut book = book_with_a_pending_bad_record(Some(40));
+        let batch = service_with_clock(&mut book, window, &mut || 100, |_, _, _| {
+            (outcome, false, expected)
+        });
+        assert_eq!(batch.drain_high_water_bytes, expected);
+    }
+    // A drain that sampled nothing reports none.
+    let mut book = book_with_a_pending_bad_record(Some(40));
+    let batch = service_with_clock(&mut book, window, &mut || 100, |_, _, _| {
+        (Ok(InventoryDiscoveryService::default()), false, None)
+    });
+    assert_eq!(batch.drain_high_water_bytes, None);
+}
+
 /// A discovery quantum that fails to decode a record at `at_ns`.
 fn failed_service(book: &mut CaptureBook, at_ns: u64) {
     let window = ReadWindow::new(8, Instant::now() + Duration::from_secs(5)).unwrap();
@@ -1859,7 +1888,7 @@ fn failed_service(book: &mut CaptureBook, at_ns: u64) {
             error: anyhow::anyhow!("short DISCOVERY record"),
             dispatched: 0,
         };
-        (Err(failure), true)
+        (Err(failure), true, None)
     });
     assert!(batch.failure.is_some());
 }
@@ -1963,7 +1992,7 @@ fn only_a_complete_drain_moves_the_undatable_floor_and_from_its_start() {
     for (service, head_pending) in partials {
         let mut book = book_with_a_pending_bad_record(Some(40));
         let batch = service_with_clock(&mut book, window, &mut || 150, |_, _, _| {
-            (Ok(service), head_pending)
+            (Ok(service), head_pending, None)
         });
         assert!(!batch.drained());
         failed_service(&mut book, 220);
@@ -1980,7 +2009,7 @@ fn only_a_complete_drain_moves_the_undatable_floor_and_from_its_start() {
             clock.set(now + 40);
             now
         },
-        |_, _, _| (Ok(InventoryDiscoveryService::default()), false),
+        |_, _, _| (Ok(InventoryDiscoveryService::default()), false, None),
     );
     assert!(batch.drained() && batch.finished_ns == 340);
     failed_service(&mut book, 400);

@@ -9088,19 +9088,19 @@ fn finish_owned_retirement_inner(
     loop {
         // The fixture consumer accounts for each typed lifecycle record in
         // constant space. Product callers supply their own actual dispatcher.
-        let service = retiring
-            .service_discovery(256, deadline, |record| {
-                if receipts {
-                    lifecycle_receipt(&record);
-                }
-                match record.kind {
-                    DISCOVERY_KIND_EXEC => execs += 1,
-                    DISCOVERY_KIND_LEADER_EXIT => exits += 1,
-                    other => bail!("unexpected Inventory lifecycle kind {other}"),
-                }
-                Ok(())
-            })
-            .map_err(|failure| anyhow::anyhow!("retirement dispatch: {failure:?}"))?;
+        let (service, _) = retiring.service_discovery(256, deadline, |record| {
+            if receipts {
+                lifecycle_receipt(&record);
+            }
+            match record.kind {
+                DISCOVERY_KIND_EXEC => execs += 1,
+                DISCOVERY_KIND_LEADER_EXIT => exits += 1,
+                other => bail!("unexpected Inventory lifecycle kind {other}"),
+            }
+            Ok(())
+        });
+        let service =
+            service.map_err(|failure| anyhow::anyhow!("retirement dispatch: {failure:?}"))?;
         if retiring.poll_completion(deadline)? {
             // A bounded final quantum, still without a quiescence claim.
             retiring
@@ -9115,6 +9115,7 @@ fn finish_owned_retirement_inner(
                     }
                     Ok(())
                 })
+                .0
                 .map_err(|failure| anyhow::anyhow!("terminal dispatch: {failure:?}"))?;
             eprintln!("OWNED_RETIREMENT_DISPATCH execs={execs} exits={exits}");
             return Ok(());

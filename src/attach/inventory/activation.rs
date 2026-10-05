@@ -1043,6 +1043,14 @@ impl InventoryState {
             .as_ref()
             .is_some_and(crate::events::discovery_head_pending)
     }
+
+    /// Unconsumed lifecycle-ring bytes now, or `None` before the reader
+    /// exists. One high-water sample; the drain takes the maximum.
+    pub(super) fn discovery_fill_bytes(&self) -> Option<u64> {
+        self.discovery.as_ref().map(|drain| {
+            crate::events::discovery_pending_bytes(crate::events::discovery_drain_positions(drain))
+        })
+    }
 }
 
 impl Drop for InventoryState {
@@ -1156,18 +1164,29 @@ impl RetiringInventory {
         }
     }
 
+    /// One retiring drain plus its high-water: the maximum fill sampled
+    /// before each dequeue, or `None` when no reader existed to sample.
     pub(super) fn service_discovery(
         &mut self,
         max_records: usize,
         deadline: Instant,
         dispatch: impl FnMut(DiscoveryRecord) -> Result<()>,
-    ) -> std::result::Result<InventoryDiscoveryService, InventoryDispatchFailure> {
-        service_inventory_discovery_with(
+    ) -> (
+        std::result::Result<InventoryDiscoveryService, InventoryDispatchFailure>,
+        Option<u64>,
+    ) {
+        let state = self.state.as_mut().unwrap();
+        let mut high_water = state.discovery_fill_bytes();
+        let result = service_inventory_discovery_with(
             max_records,
             deadline,
-            || self.state.as_mut().unwrap().discovery_dequeue(),
+            || {
+                high_water = high_water.max(state.discovery_fill_bytes());
+                state.discovery_dequeue()
+            },
             dispatch,
-        )
+        );
+        (result, high_water)
     }
 
     fn usage_snapshot(&mut self, window: InventoryReadWindow) -> InventoryUsageSnapshot {

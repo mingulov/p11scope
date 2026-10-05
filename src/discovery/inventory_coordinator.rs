@@ -164,6 +164,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     next_window: u64,
     passes: u64,
     authority_gap_recorded: bool,
+    /// The run's lifecycle-ring high-water: the maximum fill any staged
+    /// drain reported. Timings telemetry only (the stage-timings pass
+    /// lines), never schema.
+    lifecycle_high_water_bytes: Option<u64>,
 }
 
 /// The capture-lifetime Inventory endpoint budget: the engine's admission
@@ -213,7 +217,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             next_window: 0,
             passes: 0,
             authority_gap_recorded: false,
+            lifecycle_high_water_bytes: None,
         })
+    }
+
+    /// The run's lifecycle-ring high-water so far, for the stage-timings
+    /// pass lines. `None` until a native drain stages (the scan lane).
+    pub(crate) fn lifecycle_high_water_bytes(&self) -> Option<u64> {
+        self.lifecycle_high_water_bytes
     }
 
     pub(crate) fn adapter(&self) -> &CallerAdapter<Source> {
@@ -1458,7 +1469,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.binder
                     .absorb_witnesses(&batch, &self.adapter, &mut *identity);
             }
-            NativeBatch::Lifecycle(batch) => self.binder.absorb_lifecycle(&batch),
+            NativeBatch::Lifecycle(batch) => {
+                self.lifecycle_high_water_bytes = self
+                    .lifecycle_high_water_bytes
+                    .max(batch.drain_high_water_bytes);
+                self.binder.absorb_lifecycle(&batch)
+            }
             NativeBatch::Finish { domain } => self.binder.finish(domain),
         }
         self.stage_binder_output(identity, now_ns)
@@ -2246,6 +2262,20 @@ mod tests {
         assert_eq!(epochs.serviced, 1);
         assert_eq!(epochs.requested, 1);
         assert_eq!(epochs.dirty, 0);
+    }
+
+    #[test]
+    fn staged_lifecycle_batches_fold_their_high_water_maximum() {
+        let mut coordinator = coordinator();
+        assert_eq!(coordinator.lifecycle_high_water_bytes(), None);
+        let domain = NativeDomainId::mint();
+        let now = crate::discovery::caller_registry::now_ns();
+        for high_water in [Some(100), None, Some(50), Some(300)] {
+            let mut batch = DiscoveryBatch::scripted(domain, Vec::new(), now);
+            batch.drain_high_water_bytes = high_water;
+            coordinator.stage_native(NativeBatch::Lifecycle(batch), &mut ScanOnlyIdentity, now);
+        }
+        assert_eq!(coordinator.lifecycle_high_water_bytes(), Some(300));
     }
 
     #[test]

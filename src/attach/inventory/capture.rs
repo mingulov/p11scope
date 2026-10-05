@@ -798,6 +798,10 @@ pub(crate) struct DiscoveryBatch {
     /// head can hide records committed behind it, so this quantum is not a
     /// complete drain even though no bound, deadline, or failure stopped it.
     pub head_pending: bool,
+    /// The drain's high-water: the maximum producer-minus-consumer fill
+    /// sampled before each dequeue. `None` when no reader existed (an
+    /// empty or scripted batch). Timings telemetry only, never schema.
+    pub drain_high_water_bytes: Option<u64>,
 }
 
 impl DiscoveryBatch {
@@ -812,6 +816,7 @@ impl DiscoveryBatch {
             deadline_reached: false,
             failure: None,
             head_pending: false,
+            drain_high_water_bytes: None,
         }
     }
 
@@ -2059,19 +2064,23 @@ impl InventoryCapture {
             CaptureState::Active(active) => {
                 let state = active.state_mut();
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
+                    let mut high_water = state.discovery_fill_bytes();
                     let result = service_inventory_discovery_with(
                         max,
                         deadline,
-                        || state.dequeue_discovery(),
+                        || {
+                            high_water = high_water.max(state.discovery_fill_bytes());
+                            state.dequeue_discovery()
+                        },
                         dispatch,
                     );
-                    (result, state.discovery_head_pending())
+                    (result, state.discovery_head_pending(), high_water)
                 })
             }
             CaptureState::Failed { retiring, .. } => {
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
-                    let result = retiring.service_discovery(max, deadline, dispatch);
-                    (result, retiring.discovery_head_pending())
+                    let (result, high_water) = retiring.service_discovery(max, deadline, dispatch);
+                    (result, retiring.discovery_head_pending(), high_water)
                 })
             }
             CaptureState::Prepared(_) | CaptureState::Moving => {
@@ -2144,8 +2153,8 @@ impl RetiringCapture {
             RetiringInner::Unactivated(_) => DiscoveryBatch::empty(self.book.domain),
             RetiringInner::Retiring(retiring) => {
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
-                    let result = retiring.service_discovery(max, deadline, dispatch);
-                    (result, retiring.discovery_head_pending())
+                    let (result, high_water) = retiring.service_discovery(max, deadline, dispatch);
+                    (result, retiring.discovery_head_pending(), high_water)
                 })
             }
         }
@@ -2267,13 +2276,17 @@ impl RetiredCapture {
             Some(inner) => {
                 let state = inner.state_mut();
                 service_with(&mut self.book, window, |max, deadline, dispatch| {
+                    let mut high_water = state.discovery_fill_bytes();
                     let result = service_inventory_discovery_with(
                         max,
                         deadline,
-                        || state.dequeue_discovery(),
+                        || {
+                            high_water = high_water.max(state.discovery_fill_bytes());
+                            state.dequeue_discovery()
+                        },
                         dispatch,
                     );
-                    (result, state.discovery_head_pending())
+                    (result, state.discovery_head_pending(), high_water)
                 })
             }
         }
@@ -2290,37 +2303,28 @@ type Dispatch<'a> = &'a mut dyn FnMut(DiscoveryRecord) -> Result<()>;
 fn service_with(
     book: &mut CaptureBook,
     window: ReadWindow,
-    service: impl FnOnce(
-        usize,
-        Instant,
-        Dispatch<'_>,
-    ) -> (
-        std::result::Result<
-            super::activation::InventoryDiscoveryService,
-            super::activation::InventoryDispatchFailure,
-        >,
-        bool,
-    ),
+    service: impl FnOnce(usize, Instant, Dispatch<'_>) -> ServiceOutcome,
 ) -> DiscoveryBatch {
     service_with_clock(book, window, &mut monotonic_ns, service)
 }
+
+/// What one serviced drain reports: its outcome, whether the head was
+/// still pending, and the drain's high-water fill.
+type ServiceOutcome = (
+    std::result::Result<
+        super::activation::InventoryDiscoveryService,
+        super::activation::InventoryDispatchFailure,
+    >,
+    bool,
+    Option<u64>,
+);
 
 /// `service_with` over an injected CLOCK_MONOTONIC (tests script it).
 fn service_with_clock(
     book: &mut CaptureBook,
     window: ReadWindow,
     clock: &mut dyn FnMut() -> u64,
-    service: impl FnOnce(
-        usize,
-        Instant,
-        Dispatch<'_>,
-    ) -> (
-        std::result::Result<
-            super::activation::InventoryDiscoveryService,
-            super::activation::InventoryDispatchFailure,
-        >,
-        bool,
-    ),
+    service: impl FnOnce(usize, Instant, Dispatch<'_>) -> ServiceOutcome,
 ) -> DiscoveryBatch {
     let mut records = Vec::new();
     let mut dispatch = |record: DiscoveryRecord| {
@@ -2330,7 +2334,8 @@ fn service_with_clock(
     // `head_pending` is read after the service returns, so it reflects the
     // ring at (or after) the read that came back empty.
     let started_ns = clock();
-    let (result, head_pending) = service(window.max_rows, window.deadline, &mut dispatch);
+    let (result, head_pending, high_water) =
+        service(window.max_rows, window.deadline, &mut dispatch);
     let finished_ns = clock();
     for record in &records {
         book.observe_record(record);
@@ -2356,6 +2361,7 @@ fn service_with_clock(
             head_pending: head_pending
                 && !service.record_bound_reached
                 && !service.deadline_reached,
+            drain_high_water_bytes: high_water,
         },
         Err(failure) => {
             // Dispatch never fails here, so no consumed record is held back.
@@ -2372,6 +2378,7 @@ fn service_with_clock(
                 deadline_reached: false,
                 failure: Some(format!("{:#}", failure.error)),
                 head_pending: false,
+                drain_high_water_bytes: high_water,
             }
         }
     };

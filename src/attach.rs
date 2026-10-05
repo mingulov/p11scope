@@ -41,6 +41,7 @@ use std::sync::Arc;
 // I3 will consume this preparation capability; I2b installs no callers or links.
 #[allow(dead_code)]
 mod inventory;
+pub(crate) use inventory::EXPECTED_INVENTORY_DISCOVERY_BYTES;
 #[allow(unused_imports)]
 pub(crate) use inventory::PreparedInventory;
 pub(crate) use inventory::capture;

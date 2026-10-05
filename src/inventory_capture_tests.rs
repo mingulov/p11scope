@@ -101,6 +101,8 @@ struct ScriptedLane {
     /// Discovery services (1-based) whose quantum fails on an undecodable
     /// record.
     failed_services: HashSet<usize>,
+    /// The drain high-water every discovery quantum reports.
+    drain_high_water_bytes: Option<u64>,
     services: usize,
 }
 
@@ -140,6 +142,7 @@ impl ScriptedLane {
             ring_loss: VecDeque::new(),
             malformed: VecDeque::new(),
             failed_services: HashSet::new(),
+            drain_high_water_bytes: None,
             services: 0,
         }
     }
@@ -225,6 +228,7 @@ impl CaptureLane<Pin> for ScriptedLane {
             .map(|_| unsafe { std::mem::zeroed::<p11scope_ebpf_common::DiscoveryRecord>() })
             .collect();
         let mut batch = DiscoveryBatch::scripted(self.domain, records, self.stamps.next());
+        batch.drain_high_water_bytes = self.drain_high_water_bytes;
         // A quantum that fills its window stops at its record bound.
         batch.record_bound_reached = self.records_per_service >= window.max_rows();
         if self.failed_services.contains(&self.services) {
@@ -778,6 +782,24 @@ fn the_lane_follows_the_contract_order_from_startup_through_stop() {
     assert_eq!(stopped.summary.passes, 2);
     assert_eq!(stopped.summary.attached, 2);
     assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
+}
+
+/// The stop summary carries the run's drain high-water (the terminal
+/// sweep folds in with every pass drain); a lane that sampled nothing
+/// reports none.
+#[test]
+fn the_stop_summary_carries_the_drain_high_water() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.drain_high_water_bytes = Some(777);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert_eq!(stopped.summary.lifecycle_high_water_bytes, Some(777));
+
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let (stopped, _) = run(&mut scene, ScriptedLane::new(&log), 1);
+    assert_eq!(stopped.summary.lifecycle_high_water_bytes, None);
 }
 
 /// Invariant 1 end to end: the roots activate before the first scan and

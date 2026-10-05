@@ -448,6 +448,10 @@ pub(crate) struct LaneSummary {
     pub attached: usize,
     pub failed: usize,
     pub lifecycle: LifecycleTally,
+    /// The run's lifecycle-ring high-water: the maximum fill any drain
+    /// reported, including the terminal sweep. Timings telemetry only
+    /// (the stop line), never schema.
+    pub lifecycle_high_water_bytes: Option<u64>,
 }
 
 /// The lifecycle feed's own account (C5.7): what the lane drained, what the
@@ -523,6 +527,9 @@ pub(crate) struct NativeLane<L> {
     held: Vec<DiscoveryBatch>,
     held_records: usize,
     tally: LifecycleTally,
+    /// The run's lifecycle-ring high-water so far (every drained batch,
+    /// including the terminal sweep, folds in).
+    lifecycle_high_water_bytes: Option<u64>,
     /// A loss was found since the last recovery rescan was granted.
     loss_seen: bool,
     /// The pass that just ran was itself a recovery rescan.
@@ -581,6 +588,7 @@ impl<L> NativeLane<L> {
             held: Vec::new(),
             held_records: 0,
             tally: LifecycleTally::default(),
+            lifecycle_high_water_bytes: None,
             loss_seen: false,
             rescanning: false,
         })
@@ -708,6 +716,9 @@ impl<L> NativeLane<L> {
     {
         let batch = self.capture.service_discovery(window);
         self.loss_seen |= self.tally.note_quantum(&batch);
+        self.lifecycle_high_water_bytes = self
+            .lifecycle_high_water_bytes
+            .max(batch.drain_high_water_bytes);
         batch
     }
 
@@ -894,6 +905,7 @@ impl<L> NativeLane<L> {
                 attached: self.attached,
                 failed: self.failed,
                 lifecycle: self.tally,
+                lifecycle_high_water_bytes: self.lifecycle_high_water_bytes,
             },
             capture: self.capture,
         }

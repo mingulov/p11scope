@@ -815,6 +815,13 @@ pub(crate) fn discovery_head_pending<S: BoundedRecordSource>(drain: &DiscoveryDr
     positions.producer != positions.consumer
 }
 
+/// Unconsumed DISCOVERY bytes at these positions: what the producer
+/// reserved minus what the drain consumed. The lifecycle high-water is
+/// the maximum of this sample across a drain.
+pub(crate) fn discovery_pending_bytes(positions: aya::maps::ring_buf::RingBufPositions) -> u64 {
+    (positions.producer as u64).saturating_sub(positions.consumer as u64)
+}
+
 /// Drains one bounded discovery quantum up to the producer `stop`
 /// position read at Q, never consuming past it. Same
 /// `(post_q_record, backlog)` contract as the EVENTS drain, including the
@@ -881,6 +888,18 @@ mod runtime_tests;
 mod tests {
     use super::*;
     use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+    #[test]
+    fn pending_bytes_is_producer_minus_consumer() {
+        let positions = |producer: usize, consumer: usize| aya::maps::ring_buf::RingBufPositions {
+            producer,
+            consumer,
+            capacity: 65_536,
+        };
+        assert_eq!(discovery_pending_bytes(positions(100, 100)), 0);
+        assert_eq!(discovery_pending_bytes(positions(1_000, 100)), 900);
+        assert_eq!(discovery_pending_bytes(positions(100, 1_000)), 0);
+    }
 
     #[test]
     fn domain_boundary_retention_survives_session_and_temporary_drains() {

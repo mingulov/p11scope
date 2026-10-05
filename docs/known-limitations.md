@@ -466,23 +466,24 @@ the min..max of per-sample p95.
 - Planned: v0.3.0 (DR-C51-PREADMIT: upgrade to `Witnessed` when proven
   same-incarnation by cookie/start_time).
 
-### Live `quiet` lags a first use by up to one pass (decision horizon)
+### Live `quiet` no longer lags a first use (DR-LIVE-LABEL-LAG fixed)
 
 - What the user sees: on the dashboard and in mid-run `edge_observed`
-  records, an edge whose caller has just used the module for the first
-  time can still read `capture armed | activity quiet | entries 0` for
-  up to one pass (~2 s by default) before it turns `witnessed` (or
-  `unknown`). A witness row binds only after a lifecycle drain and a
-  health read that both started after the row was read, i.e. at the next
-  pass.
+  records, an edge whose caller has a read-but-undecided first use of
+  the module no longer reads `capture armed | activity quiet | entries 0`
+  while the row waits (fixed in v0.3.0). It reads
+  `capture coverage lost | activity unknown | entries ?` with
+  `entries.coverage` `unknown`/`pending_first_use` until the row binds
+  (then `witnessed`) or unbinds (then the unbound reason); the watch's
+  proven-clean instant is not extended over the undecided row either. A
+  witness row still binds only after a lifecycle drain and a health read
+  that both started after the row was read, i.e. at the next pass.
 - Kernels/conditions: every native run; first use of each (image,
   module) pair.
 - Disclosure: `observation.native_witnesses.pending`; the `-o` snapshot
   and the stream's final sweep are exact (no pending row survives stop).
-- Workaround: read the `-o` report, or wait one pass before treating a
-  live `quiet` as final.
-- Planned: v0.3.0 (present an edge with a pending row of its caller as
-  `unknown` until decided).
+- Workaround: none needed; the live read is honest now.
+- Planned: done.
 
 ### Gap retention is first-1024-wins (DR-41)
 

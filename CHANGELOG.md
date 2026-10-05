@@ -49,6 +49,21 @@ Work toward v0.3.0.
   `P11SCOPE_SHARD_THREADS=1` (diagnostic) forces the serial path. See
   [docs/known-limitations.md](docs/known-limitations.md).
 
+### Fixed
+
+- Live inventory reads no longer show a stale `quiet` while a first use
+  waits for its decision (DR-LIVE-LABEL-LAG). While the binder holds a
+  read-but-undecided witness row of a watched caller's pid on the edge's
+  module, the edge reads `unknown`/`pending_first_use`
+  (`capture coverage lost | activity unknown | entries ?`) on the
+  dashboard and in mid-run `edge_observed` records, and the watch's
+  proven-clean instant is not extended over the row. Once the row binds
+  the edge reads `witnessed` (or the unbound reason when it does not);
+  the `-o` snapshot and the final sweep are unchanged and exact. The
+  native oracle now compares every dashboard frame with the edge state
+  at that frame's pass from the event stream. See
+  [docs/known-limitations.md](docs/known-limitations.md).
+
 ## [0.2.0] - 2026-10-05
 
 Module/caller inventory and usage observation, Kubernetes deployment, and

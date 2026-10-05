@@ -275,6 +275,9 @@ class SnapshotFixture:
 
 
 class PreparedFourCallersTests(unittest.TestCase):
+    def setUp(self):
+        (REPOSITORY / ".superpowers").mkdir(exist_ok=True)
+
     def test_each_actual_finalizer_propagates_controls_mutations_and_failures(self):
         scenarios = (
             "success", "prior-nonzero", "cleanup-failure",

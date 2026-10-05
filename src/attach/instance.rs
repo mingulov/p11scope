@@ -4,7 +4,9 @@
 //! - Loads and attaches the three native fentry hooks (`uprobe_mmap`,
 //!   `uprobe_munmap`, `copy_vma`) after the mandatory lifecycle links. Any
 //!   load or attach failure leaves the capture running with instance routing
-//!   **refused** and a named reason; it never degrades the proof.
+//!   **refused** and a named reason; it never degrades the proof. An LTO
+//!   kernel — or one whose LTO status is unverifiable — is refused before
+//!   any attach, since inlined hook-target copies escape fentry (B2).
 //! - Keeps ordering I1 per pinned provider file: hooks attached, then the
 //!   file's kernel key is *calibrated* (the observer maps one page of the
 //!   pinned fd and the hook records the `vm_file->f_inode` identity it saw),
@@ -84,11 +86,61 @@ pub(crate) struct InstanceTracking {
     next_slot: u32,
 }
 
+/// Pure LTO predicate over one kernel-config text (B2): any enabled
+/// `CONFIG_LTO_*` selection other than `CONFIG_LTO_NONE` means an LTO
+/// kernel, whose inlined hook-target copies escape fentry. Arch capability
+/// lines (`CONFIG_ARCH_SUPPORTS_LTO_*`) and `# ... is not set` comments
+/// never match; a config without LTO lines predates LTO and is LTO-off.
+pub(crate) fn lto_enabled_in_config(config: &str) -> bool {
+    config.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("CONFIG_LTO") && line != "CONFIG_LTO_NONE=y" && line.ends_with("=y")
+    })
+}
+
+/// Kernel LTO preflight (B2): refuses the hooks on LTO kernels, and on
+/// kernels whose LTO status is unverifiable (no readable config for the
+/// RUNNING release), with a named reason each. Reads only the distro
+/// `/boot/config-{release}`: `/proc/config.gz` needs a gzip decoder the
+/// dependency closure does not have, and `/lib/modules` copies carry the
+/// same container-mismatch hazard as `/boot` without adding authority.
+/// Stage 5 per-cell preflight re-verifies LTO status on every matrix cell
+/// (DR-T3A-2); relaxing the unverifiable arm needs an owner decision.
+fn lto_refusal() -> Option<String> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|release| release.trim().to_owned())
+        .unwrap_or_default();
+    if release.is_empty() {
+        return Some(
+            "instance continuity hooks refused: cannot read the running kernel release".to_string(),
+        );
+    }
+    let path = format!("/boot/config-{release}");
+    let config = match std::fs::read_to_string(&path) {
+        Ok(config) => config,
+        Err(error) => {
+            return Some(format!(
+                "instance continuity hooks refused: LTO status unverifiable (no readable kernel config: {path}: {error})"
+            ));
+        }
+    };
+    if lto_enabled_in_config(&config) {
+        return Some(format!(
+            "instance continuity hooks refused: LTO kernel ({path} enables CONFIG_LTO_*; inlined hook-target copies escape fentry)"
+        ));
+    }
+    None
+}
+
 impl InstanceTracking {
     /// Loads and attaches the hooks. Never fails the session: a failure is
     /// returned as a refused tracker whose reason names the first error.
     pub(crate) fn start(ebpf: &mut Ebpf, btf: &Btf) -> Self {
         let mut tracking = Self::default();
+        if let Some(reason) = lto_refusal() {
+            tracking.refused = Some(reason);
+            return tracking;
+        }
         if let Err(error) = tracking.attach_hooks(ebpf, btf) {
             tracking.refused = Some(format!("instance continuity hooks unavailable: {error:#}"));
             for (program, link) in std::mem::take(&mut tracking.links) {
@@ -570,5 +622,36 @@ impl crate::discovery::instances::ScanReader for LiveScan<'_> {
         crate::discovery::instances::confirm_identity(ranges, self.identity, |start, end| {
             map_file_identity(&map_files, start, end)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lto_enabled_in_config;
+
+    #[test]
+    fn lto_config_predicate_matches_only_enabled_selections() {
+        for enabled in [
+            "CONFIG_LTO_CLANG=y\n",
+            "CONFIG_LTO_CLANG_THIN=y\n",
+            "CONFIG_LTO_CLANG_FULL=y\n",
+            "  CONFIG_LTO_CLANG_THIN=y  \n",
+            "CONFIG_PREEMPTION=y\nCONFIG_LTO_CLANG_FULL=y\nCONFIG_LTO_NONE is not set\n",
+        ] {
+            assert!(lto_enabled_in_config(enabled), "{enabled:?} must read LTO");
+        }
+        for disabled in [
+            "CONFIG_LTO_NONE=y\n",
+            "# CONFIG_LTO_CLANG is not set\n",
+            "# CONFIG_LTO_CLANG_THIN is not set\n",
+            "CONFIG_ARCH_SUPPORTS_LTO_CLANG=y\nCONFIG_ARCH_SUPPORTS_LTO_CLANG_THIN=y\nCONFIG_LTO_NONE=y\n",
+            "# Linux/x86 7.0.0-34-generic Kernel Configuration\nCONFIG_PREEMPTION=y\n",
+            "",
+        ] {
+            assert!(
+                !lto_enabled_in_config(disabled),
+                "{disabled:?} must read non-LTO"
+            );
+        }
     }
 }

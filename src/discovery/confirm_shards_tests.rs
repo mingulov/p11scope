@@ -572,3 +572,55 @@ fn privileged_sharded_confirmation_equals_the_serial_production_probe() {
         );
     }
 }
+
+/// A detailed budget's capture I/O ceiling refuses a maps re-read without
+/// a sticky stop, before its proofs are charged, so a replay can spend
+/// less work on a pid than its shard did: the shadow then stops on the work
+/// ceiling at a later pid where the capture budget does not. Skewed so that
+/// it happens: the first shard is I/O-heavy and work-light, the second
+/// opens with a work-heavy caller and then idle examined pids. Every cell
+/// still gives the serial attribution and budget (an uncovered pid is
+/// confirmed live, not replayed from a short record).
+#[test]
+fn sharded_confirmation_equals_serial_when_a_replay_spends_less_than_its_shard() {
+    const SOFTHSM: &str = "/usr/lib/softhsm/libsofthsm2.so";
+    let anon: String = (0..300u64)
+        .map(|i| {
+            let start = 0x5000_0000 + i * 0x2000;
+            format!("{start:x}-{:x} rw-p 00000000 00:00 0 \n", start + 0x1000)
+        })
+        .collect();
+    let mut world = BTreeMap::new();
+    for i in 0..8u32 {
+        let pid = 1_001 + i * 4;
+        let text: String = match i {
+            0..4 => object_lines(0x1000_0000, PROVIDER, SOFTHSM) + &anon,
+            4 => (0..40u64)
+                .map(|r| line(0x1000_0000 + r * 0x2000, "r-xp", PROVIDER, SOFTHSM))
+                .collect(),
+            _ => (0..10u64)
+                .map(|r| line(0x2000_0000 + r * 0x2000, "r-xp", LIBC, "/usr/lib/libc.so.6"))
+                .collect(),
+        };
+        let phase_one = p11scope_manifest::maps::parse_maps(text.as_bytes()).unwrap();
+        world.insert(
+            pid,
+            Script {
+                phase_one,
+                confirm_maps: Some(text),
+            },
+        );
+    }
+    let unbounded = run(&world, 1, &legacy(u64::MAX, u64::MAX));
+    let (io, work) = (unbounded.state.0.attempted_io_bytes, unbounded.state.1);
+    assert!(io > 30_000 && work > 40, "io {io} work {work}");
+    for io_ceiling in (0..=io + 1).step_by(usize::try_from(io / 40).unwrap()) {
+        for work_ceiling in 0..=work + 1 {
+            assert_equivalent(
+                &world,
+                &legacy(io_ceiling, work_ceiling),
+                &format!("io {io_ceiling} work {work_ceiling}"),
+            );
+        }
+    }
+}

@@ -3200,6 +3200,21 @@ impl CaptureWorkBudget {
         }
     }
 
+    /// What this budget has spent and whether it is stopped: the state a
+    /// confirmation's decisions depend on (C7 A5). The limits, deadline
+    /// and policy are fixed during a confirmation stage.
+    pub(crate) fn confirm_mark(&self) -> ConfirmMark {
+        ConfirmMark {
+            io_bytes: self.attempted_io_bytes,
+            work_units: self.work_units,
+            window: self
+                .active_window
+                .as_ref()
+                .map(|window| (window.io_bytes, window.work_units)),
+            stopped: self.scan_stop_reason.is_some(),
+        }
+    }
+
     /// The state a confirmation can change, for serial-vs-sharded equality.
     #[cfg(test)]
     pub(crate) fn confirm_state_for_test(&self) -> (MapsSweepBudgetState, u64) {
@@ -3219,6 +3234,36 @@ impl CaptureWorkBudget {
                 .map(|window| (window.io_bytes, window.stop_reason)),
             window_exhaustions: self.window_exhaustions,
         }
+    }
+}
+
+/// A [`CaptureWorkBudget::confirm_mark`]: spent I/O and work, the window's
+/// spent I/O and work, and whether a sticky stop is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConfirmMark {
+    io_bytes: u64,
+    work_units: u64,
+    window: Option<(u64, u64)>,
+    stopped: bool,
+}
+
+impl ConfirmMark {
+    /// Whether a run that started from `self` (a shard's copy of a budget)
+    /// was at least as permissive as one starting from `real` (the budget
+    /// it was copied from, later): the same limits with no more spent, and
+    /// not stopped unless `real` is. Every ceiling then trips in `real` no
+    /// later than in the copy, so a run against `real` with the same
+    /// answers asks for a prefix of what the copy's run read.
+    pub(crate) fn covers(&self, real: &ConfirmMark) -> bool {
+        let window = match (self.window, real.window) {
+            (None, None) => true,
+            (Some((io, work)), Some((real_io, real_work))) => io <= real_io && work <= real_work,
+            _ => false,
+        };
+        window
+            && self.io_bytes <= real.io_bytes
+            && self.work_units <= real.work_units
+            && (!self.stopped || real.stopped)
     }
 }
 

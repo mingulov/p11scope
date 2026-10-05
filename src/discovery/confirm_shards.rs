@@ -19,20 +19,34 @@
 //!   ceiling and loss is made where the serial path makes it, given the
 //!   same answers.
 //!
-//! Why the record always has the answer the replay asks for: a shard's
-//! shadow starts from the capture budget as it stands before any shard
-//! runs, and only its own pids spend from it, so at every point it has at
-//! least what the capture budget has at the same point of the replay. A
-//! replay can therefore only stop earlier (a ceiling, a stop), never go
+//! When the record has the answer the replay asks for: a shard's shadow
+//! starts from the capture budget as it stands before any shard runs, and
+//! only its own pids spend from it. If, when a pid is replayed, the shadow
+//! had spent no more and was not stopped unless the capture budget is
+//! ([`ConfirmMark::covers`]), every ceiling trips in the replay no later
+//! than it did in the shard, so the replay can only stop earlier, never go
 //! further: it asks for a prefix of the recorded answers. The one branch
 //! that reads more answers after an earlier one (a stale examined range
 //! escalating to a confirmation) depends only on answers both runs share.
-//! An answer the record does not have would be a bug; it is refused
+//!
+//! That is the usual case, but not guaranteed: a replay can spend less on
+//! a pid than its shard did without stopping the capture budget (the
+//! capture I/O ceiling of a detailed, non-inventory budget refuses a maps
+//! re-read without a sticky stop, before its proofs are charged), and the
+//! shadow, which still paid for that pid, can then stop on the work
+//! ceiling at a later pid where the capture budget does not. So the shard
+//! records the shadow's [`ConfirmMark`] before each pid, and a pid whose
+//! mark does not cover the capture budget's is not replayed: it is
+//! confirmed again, live, on the calling thread, against the capture
+//! budget, exactly as the serial path would confirm it there (its own pin,
+//! fresh reads; the shard's answers for it are dropped).
+//!
+//! An answer a covered record does not have would be a bug; it is refused
 //! (fail closed: unproven, unreadable) rather than read late.
 
 use crate::discovery::caller_registry::ExeIdentity;
 use crate::discovery::identity::FileIdentity;
-use crate::discovery::scan::{CaptureWorkBudget, MapsReadBuffers, MapsReadLimits};
+use crate::discovery::scan::{CaptureWorkBudget, ConfirmMark, MapsReadBuffers, MapsReadLimits};
 use crate::discovery::sweep_attribution::{
     ConfirmIo, Confirmation, KnownKeyIndex, MappedIdentities, MemberProbe, SweepAttribution,
     attribute_one, confirm_with, stat_unpinned,
@@ -96,6 +110,7 @@ where
         sweep[range.clone()]
             .iter()
             .map(|(pid, phase_one)| {
+                let start = shadow.confirm_mark();
                 let mut probe = RecordingProbe {
                     make_io,
                     answers: RefCell::new(Vec::new()),
@@ -112,16 +127,27 @@ where
                     &mut probe,
                     &mut shadow,
                 );
-                Record(probe.answers.into_inner())
+                Record {
+                    start,
+                    answers: probe.answers.into_inner(),
+                }
             })
             .collect::<Vec<_>>()
     });
     let mut out = SweepAttribution::default();
     let mut bufs = MapsReadBuffers::default();
     for ((pid, phase_one), record) in sweep.iter().zip(records.into_iter().flatten()) {
-        let mut probe = ReplayProbe {
-            answers: RefCell::new(record.0.into()),
-            bufs: &mut bufs,
+        let mut replay;
+        let mut live;
+        let probe: &mut dyn MemberProbe = if record.start.covers(&budget.confirm_mark()) {
+            replay = ReplayProbe {
+                answers: RefCell::new(record.answers.into()),
+                bufs: &mut bufs,
+            };
+            &mut replay
+        } else {
+            live = LiveProbe { make_io };
+            &mut live
         };
         attribute_one(
             &mut out,
@@ -131,15 +157,46 @@ where
             selected,
             index,
             &prove,
-            &mut probe,
+            probe,
             budget,
         );
     }
     out
 }
 
-/// One pid's answers, in the order they were read.
-struct Record(Vec<Answer>);
+/// One pid's answers, in the order they were read, and the shard's budget
+/// mark before the first of them.
+struct Record {
+    start: ConfirmMark,
+    answers: Vec<Answer>,
+}
+
+/// The serial path's probe on the calling thread, for a pid whose record
+/// may not cover its replay: a fresh [`ShardableIo`] per call, as the
+/// production probe makes one.
+struct LiveProbe<'f, F> {
+    make_io: &'f F,
+}
+
+impl<Io: ShardableIo, F: Fn() -> Io> MemberProbe for LiveProbe<'_, F> {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        confirm_with(&mut (self.make_io)(), pid, prove, budget)
+    }
+
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        stat_unpinned(&mut (self.make_io)(), pid, ranges, budget)
+    }
+}
 
 /// The shard's probe: the production probe's calls, recorded.
 struct RecordingProbe<'f, F> {

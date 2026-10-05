@@ -15,8 +15,26 @@ typedef unsigned long long u64;
 #define INST_UINT(name, value) int (*name)[value]
 #define INST_TYPE(name, value) typeof(value) *name
 
-/* INSTANCE_START capacity: the default START capacity (in-flight calls). */
+/* INSTANCE_START capacity: the default START capacity (in-flight calls).
+ * The small-state build shrinks it to one entry so LRU eviction is
+ * injectable live (any two overlapping in-flight calls evict). It is the
+ * only shrunken bound: FILE_SLOTS, RECORD_SLOTS and the slot bound keep
+ * production values because userspace mirrors them (ebpf-common has no
+ * small-state variant for them; shrinking one side would desync the ABI).
+ *
+ * N10 sizing: INSTANCE_START faces START's load plus orphans — entries
+ * recorded before store_start whose START insert then fails, return-path
+ * early exits (unmatched START, scope loss, remove failures) that never
+ * consume, and ABANDON START removals without a return. An orphan is
+ * overwritten by its key's next call or reclaimed by the LRU, so live
+ * capacity is 16384 minus transient orphans; under high refusal rates
+ * live entries evict into Unstamped (a fail-closed availability cost,
+ * never a join). */
+#ifdef P11SCOPE_SMALL_STATE_MAPS
+#define INST_START_ENTRIES 1U
+#else
 #define INST_START_ENTRIES 16384U
+#endif
 #ifndef P11SCOPE_INSTANCE_SLOT_BOUND
 #define P11SCOPE_INSTANCE_SLOT_BOUND 512U
 #endif

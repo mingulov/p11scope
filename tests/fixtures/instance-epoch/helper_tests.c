@@ -25,6 +25,14 @@ static unsigned long long test_cas(unsigned long long *cell, unsigned long long 
 }
 #include "instance_epoch.c"
 
+/* F5: small-state must shrink INSTANCE_START (LRU-eviction injection);
+ * the default capacity is unchanged. */
+#ifdef P11SCOPE_SMALL_STATE_MAPS
+_Static_assert(INST_START_ENTRIES == 1, "small-state INSTANCE_START capacity");
+#else
+_Static_assert(INST_START_ENTRIES == 16384, "default INSTANCE_START capacity");
+#endif
+
 static u32 watched_slot = 5;
 static int watched_present = 1;
 static struct instance_file_key watched_key = { 0x00800025, 4242 };

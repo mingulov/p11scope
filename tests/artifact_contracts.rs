@@ -5945,9 +5945,15 @@ fn instance_epoch_kernel_shapes_are_flavored_apart_from_other_units() {
 #[test]
 fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
     let directory = tempfile::tempdir().expect("temporary native instance test");
-    let binary = directory.path().join("instance-epoch-tests");
-    let compile = Command::new("clang-18")
-        .args([
+    // Both state sizes (F5): the small-state build must shrink
+    // INSTANCE_START (pinned by a static assert in the harness) while the
+    // native hook logic passes unchanged.
+    for small in [false, true] {
+        let binary = directory
+            .path()
+            .join(format!("instance-epoch-tests-small-{small}"));
+        let mut compiler = Command::new("clang-18");
+        compiler.args([
             "-O2",
             "-g",
             "-Wall",
@@ -5957,24 +5963,29 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
             "-I",
             "crates/ebpf/native",
             "tests/fixtures/instance-epoch/helper_tests.c",
-            "-o",
-        ])
-        .arg(&binary)
-        .output()
-        .expect("execute clang-18 for native instance regression");
-    assert!(
-        compile.status.success(),
-        "native compile failed: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-    let run = Command::new(binary)
-        .output()
-        .expect("execute native instance regression");
-    assert!(
-        run.status.success(),
-        "native instance regression failed: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+        ]);
+        if small {
+            compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+        }
+        let compile = compiler
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("execute clang-18 for native instance regression");
+        assert!(
+            compile.status.success(),
+            "native compile failed (small={small}): {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(binary)
+            .output()
+            .expect("execute native instance regression");
+        assert!(
+            run.status.success(),
+            "native instance regression failed (small={small}): {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
 }
 
 #[test]

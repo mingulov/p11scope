@@ -566,8 +566,6 @@ fn lane_active_line(backend: &crate::inventory_capture::LaneBackend) -> String {
     )
 }
 
-/// The stderr line a native run ends with: what it attached, how its
-/// retirement ended, and its settlement.
 /// The stage-timings suffix for a lifecycle-ring high-water: bytes and
 /// share of this build's ring. Timings output only, never schema.
 fn lifecycle_high_water_suffix(high_water_bytes: u64) -> String {
@@ -576,6 +574,9 @@ fn lifecycle_high_water_suffix(high_water_bytes: u64) -> String {
     format!("; lifecycle ring high-water: {high_water_bytes} B ({percent}% of {ring} B)")
 }
 
+/// The stderr line a native run ends with: what it attached, how its
+/// retirement ended, and its settlement (plus, under stage timings, the
+/// run's lifecycle-ring high-water).
 fn stop_line(summary: &LaneSummary) -> String {
     let retirement = match &summary.retirement {
         crate::inventory_capture::Retirement::Closed(cleanup) => format!(

@@ -107,7 +107,12 @@ owned_launch() {
 }
 
 owned_verify_launch() {
-    owned_deadline=$(( $(date +%s) + 3 ))
+    # The supervisor's receipt must appear for a live launch, and a wrapper
+    # that ends first stops this wait at once (below), so the ceiling only
+    # bounds a slow start. A fixed 3 s refused healthy launches under host
+    # load ~20 (DR-SCOPE-RECEIPT-SESSION-FLAKE).
+    owned_verify_seconds=${P11SCOPE_OWNED_VERIFY_SECONDS:-30}
+    owned_deadline=$(( $(date +%s) + owned_verify_seconds ))
     while :; do
         if python3 -I - "$1" "$2" "$3" <<'PY' 2>/dev/null
 import json, sys
@@ -127,7 +132,10 @@ PY
             1) ;;
             *) return 1 ;;
         esac
-        [ "$(date +%s)" -lt "$owned_deadline" ] || return 1
+        [ "$(date +%s)" -lt "$owned_deadline" ] || {
+            echo "owned launch: supervisor receipt not published within ${owned_verify_seconds}s" >&2
+            return 1
+        }
         sleep 0.01
     done
     OWNED_COMMAND_PID=$(python3 -I -c \

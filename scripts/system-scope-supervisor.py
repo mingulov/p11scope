@@ -17,6 +17,10 @@ from pathlib import Path
 
 SCHEMA = "p11scope/system-scope-supervisor/v2"
 CLEANUP_SECONDS = 12.0
+# The launching shell publishes the wrapper identity right after `$!`; the
+# file must appear for a live launch, so this only bounds a slow shell (a
+# fixed 3 s refused healthy launches under host load).
+WRAPPER_IDENTITY_SECONDS = 30.0
 DIRECT_RESERVE_SECONDS = 4.0
 DIAGNOSTIC_BYTES = 65_536
 GATED_EXEC = r"""
@@ -465,7 +469,7 @@ def main(argv=None):
 
     subreaper()
     wrapper = wait_wrapper_identity(
-        args.wrapper_identity, time.monotonic() + 3)
+        args.wrapper_identity, time.monotonic() + WRAPPER_IDENTITY_SECONDS)
     cancelled = []
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda signum, frame: cancelled.append(signum))

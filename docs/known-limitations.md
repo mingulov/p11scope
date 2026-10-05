@@ -322,8 +322,12 @@ the min..max of per-sample p95.
   capture. Any loss stays disclosed (`health_unproven`, demoted edges,
   the gap). The 2 MiB ring holds about 2,260 920-byte records, and the
   lane does not drain while a pass applies its scan, attaches entries,
-  or reads usage. Churn 0 and 4,096-process churn cells were not
-  measured in this tier.
+  or reads usage. With the sweep and confirm stages sharded (v0.3.0,
+  unreleased), 1,000 exec/s at 448 and at 4,096 processes also loses
+  nothing: 0 ring loss, 0 malformed records and 0 recovery rescans in
+  all 12 samples (3 rounds of 1 cold + 1 warm per size), high-water
+  6–11% of the ring, with one cold 448-process sample at 37%. Churn 0
+  cells were not measured in this tier.
 - Headroom is bounded by pass length, not by the ring alone: while a
   pass collects, the lane holds at most 8,192 drained records and then
   stops draining, so at 1,000 exec/s (about 2,100 records/s) a pass

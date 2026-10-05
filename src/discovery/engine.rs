@@ -19,11 +19,12 @@ use crate::discovery::identity::{
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
-    CaptureWorkBudget, ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface,
-    ScannedModule, ScannedTable, Skipped, TableIdentity, decode_exact_table, exact_table_addresses,
-    exact_table_bytes, export_agreement, index_maps_or_refuse, read_elf_snapshot,
-    read_maps_or_refuse, scan_process_view, scan_process_view_without_memory, scan_skip_truncates,
-    spans_for, table_evidence_score, table_linkage, target_layout,
+    CaptureWorkBudget, MapsReadBuffers, ObjectExports, ScanOutcome, ScanRequest, ScannedEntry,
+    ScannedInterface, ScannedModule, ScannedTable, Skipped, TableIdentity, decode_exact_table,
+    exact_table_addresses, exact_table_bytes, export_agreement, index_maps_or_refuse,
+    read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
+    scan_process_view_without_memory, scan_skip_truncates, spans_for, table_evidence_score,
+    table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -4283,10 +4284,18 @@ impl MapsSweep {
 /// Shared with `inspect --system`.
 pub(crate) fn sweep_process_maps(pids: &[u32], budget: &mut CaptureWorkBudget) -> MapsSweep {
     let mut sweep = MapsSweep::default();
+    let mut bufs = MapsReadBuffers::default();
     for &pid in pids {
         let result = std::fs::File::open(format!("/proc/{pid}/maps"))
             .map_err(|error| error.to_string())
-            .and_then(|maps| read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns));
+            .and_then(|maps| {
+                read_maps_or_refuse_with_buffers(
+                    maps,
+                    budget,
+                    crate::attach::monotonic_ns,
+                    &mut bufs,
+                )
+            });
         sweep.record(pid, result);
     }
     sweep
@@ -15211,6 +15220,7 @@ impl Engine {
         let order = DiscoveryScheduler::rotated_after(pids, self.scheduler.cursor());
         let start = crate::attach::monotonic_ns();
         let mut slice = MapsSweep::default();
+        let mut bufs = MapsReadBuffers::default();
         let mut revalidated = 0u64;
         let mut quantum_stopped = false;
         let mut clock_failed = start.is_none();
@@ -15239,7 +15249,12 @@ impl Engine {
             let result = std::fs::File::open(format!("/proc/{pid}/maps"))
                 .map_err(|error| error.to_string())
                 .and_then(|maps| {
-                    read_maps_or_refuse(maps, &mut self.budget, crate::attach::monotonic_ns)
+                    read_maps_or_refuse_with_buffers(
+                        maps,
+                        &mut self.budget,
+                        crate::attach::monotonic_ns,
+                        &mut bufs,
+                    )
                 });
             slice.record(pid, result);
             self.scheduler.advance_cursor(pid);

@@ -2887,22 +2887,61 @@ pub(crate) fn scan_skip_truncates(reason: &str) -> bool {
         || reason == "non-UTF-8 pathname")
 }
 
+/// Scratch space for one maps read, reused across a sweep so a pass does
+/// not allocate (and zero) a 64 KiB chunk per pid. Holds no identity:
+/// every read truncates the bytes before filling them, and only freshly
+/// read chunk bytes are ever consumed, so a reused buffer reads exactly
+/// what a fresh one would.
+#[derive(Debug, Default)]
+pub(crate) struct MapsReadBuffers {
+    bytes: Vec<u8>,
+    chunk: Vec<u8>,
+}
+
 fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+    max_bytes: u64,
+    max_entries: usize,
+    chunk_size: usize,
+    now: F,
+) -> std::io::Result<(Vec<u8>, Vec<&'static str>)> {
+    let mut bufs = MapsReadBuffers::default();
+    let reasons = read_maps_bytes_with_buffers(
+        reader,
+        budget,
+        max_bytes,
+        max_entries,
+        chunk_size,
+        now,
+        &mut bufs,
+    )?;
+    Ok((std::mem::take(&mut bufs.bytes), reasons))
+}
+
+fn read_maps_bytes_with_buffers<R: Read, F: FnMut() -> Option<u64>>(
     mut reader: R,
     budget: &mut CaptureWorkBudget,
     max_bytes: u64,
     max_entries: usize,
     chunk_size: usize,
     mut now: F,
-) -> std::io::Result<(Vec<u8>, Vec<&'static str>)> {
+    bufs: &mut MapsReadBuffers,
+) -> std::io::Result<Vec<&'static str>> {
     let chunk_size = chunk_size.max(1);
-    let mut bytes = Vec::new();
+    let bytes = &mut bufs.bytes;
+    // Truncate before filling: without this a reused buffer leaks the
+    // previous pid's snapshot into this read.
+    bytes.clear();
+    let chunk = &mut bufs.chunk;
+    if chunk.len() < chunk_size {
+        chunk.resize(chunk_size, 0);
+    }
     let mut newline_count = 0usize;
     let mut byte_ceiling = false;
     let mut entry_ceiling = false;
     let mut io_ceiling = false;
     let mut deadline_stop = false;
-    let mut chunk = vec![0; chunk_size];
 
     loop {
         if budget.has_deadline() && budget.check_deadline(now()).is_some() {
@@ -2969,7 +3008,7 @@ fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
             .map_or(0, |index| index + 1);
     }
     bytes.truncate(end);
-    Ok((bytes, reasons))
+    Ok(reasons)
 }
 
 /// The live engine's `/proc/<pid>/maps` snapshot. The engine decides identity
@@ -2979,7 +3018,19 @@ fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
 pub(crate) fn read_maps_or_refuse<R: Read, F: FnMut() -> Option<u64>>(
     reader: R,
     budget: &mut CaptureWorkBudget,
+    now: F,
+) -> Result<Vec<MapEntry>, String> {
+    let mut bufs = MapsReadBuffers::default();
+    read_maps_or_refuse_with_buffers(reader, budget, now, &mut bufs)
+}
+
+/// [`read_maps_or_refuse`] reusing the caller's scratch space across a
+/// sweep. Returns exactly what the fresh-buffer read would.
+pub(crate) fn read_maps_or_refuse_with_buffers<R: Read, F: FnMut() -> Option<u64>>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
     mut now: F,
+    bufs: &mut MapsReadBuffers,
 ) -> Result<Vec<MapEntry>, String> {
     // The reader reports a stopped batch's reason only once; the refusal must
     // not depend on that, so ask the budget directly before reading.
@@ -2988,19 +3039,20 @@ pub(crate) fn read_maps_or_refuse<R: Read, F: FnMut() -> Option<u64>>(
     {
         return Err(reason.into());
     }
-    let (bytes, reasons) = read_maps_with_limits(
+    let reasons = read_maps_bytes_with_buffers(
         reader,
         budget,
         MAX_MAPS_BYTES,
         MAX_MAP_ENTRIES,
         64 * 1024,
         now,
+        bufs,
     )
     .map_err(|error| error.to_string())?;
     if let Some(reason) = reasons.first() {
         return Err((*reason).into());
     }
-    parse_maps(&bytes)
+    parse_maps(&bufs.bytes)
 }
 
 /// One validated `MapIndex` per accepted snapshot. The order/overlap validation
@@ -6079,6 +6131,294 @@ mod tests {
             budget.attempted_io_bytes(),
             u64::try_from(line.len()).unwrap(),
             "a complete snapshot is charged to the capture's I/O total"
+        );
+    }
+
+    /// The buffer-reusing maps read returns exactly what the fresh-buffer
+    /// read returns: the same entries on success, the same refusal at the
+    /// byte, entry and total-I/O ceilings and at the batch deadline
+    /// (including an already-expired one), and the same I/O charge. One
+    /// shared buffer serves every case in sequence, including a small read
+    /// right after the oversized one, so cross-read reuse is covered too.
+    #[test]
+    fn reused_maps_buffers_match_fresh_reads_at_every_ceiling() {
+        use std::io::Cursor;
+
+        enum BudgetKind {
+            Default,
+            CappedTotal(u64),
+            Deadline(u64),
+        }
+        fn make_budget(kind: &BudgetKind) -> CaptureWorkBudget {
+            match *kind {
+                BudgetKind::Default => CaptureWorkBudget::default(),
+                BudgetKind::CappedTotal(total_bytes) => CaptureWorkBudget::new(ScanLimits {
+                    per_object_bytes: u64::MAX,
+                    total_bytes,
+                }),
+                BudgetKind::Deadline(at) => {
+                    let mut budget = CaptureWorkBudget::default();
+                    budget.set_deadline(Some(at));
+                    budget
+                }
+            }
+        }
+
+        let line: &[u8] = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 12345 /opt/p.so\n";
+        let long_line = [&line[..line.len() - 1], &[b'p'; 64][..], b"\n"].concat();
+        let oversized =
+            long_line.repeat(usize::try_from(MAX_MAPS_BYTES).unwrap() / long_line.len() + 1);
+        assert!(u64::try_from(oversized.len()).unwrap() > MAX_MAPS_BYTES);
+        let short_line: &[u8] = b"0-1 ---p 0 0:0 0\n";
+        let many_entries = short_line.repeat(MAX_MAP_ENTRIES + 1);
+        let two_lines = line.repeat(2);
+
+        struct Case<'a> {
+            name: &'static str,
+            input: &'a [u8],
+            kind: BudgetKind,
+            script: Vec<Option<u64>>,
+        }
+        let cases = vec![
+            Case {
+                name: "complete",
+                input: line,
+                kind: BudgetKind::Default,
+                script: vec![],
+            },
+            Case {
+                name: "byte ceiling",
+                input: &oversized,
+                kind: BudgetKind::Default,
+                script: vec![],
+            },
+            Case {
+                name: "complete after oversized",
+                input: line,
+                kind: BudgetKind::Default,
+                script: vec![],
+            },
+            Case {
+                name: "entry ceiling",
+                input: &many_entries,
+                kind: BudgetKind::Default,
+                script: vec![],
+            },
+            Case {
+                name: "total-I/O ceiling",
+                input: &two_lines,
+                kind: BudgetKind::CappedTotal(8),
+                script: vec![],
+            },
+            Case {
+                name: "deadline during read",
+                input: &two_lines,
+                kind: BudgetKind::Deadline(5),
+                script: vec![Some(0), Some(0), Some(10)],
+            },
+            Case {
+                name: "expired deadline",
+                input: line,
+                kind: BudgetKind::Deadline(5),
+                script: vec![Some(10)],
+            },
+        ];
+
+        let mut bufs = MapsReadBuffers::default();
+        for case in &cases {
+            let mut fresh_budget = make_budget(&case.kind);
+            let mut fresh_clock = case.script.clone().into_iter();
+            let fresh = read_maps_or_refuse(Cursor::new(case.input), &mut fresh_budget, || {
+                fresh_clock.next().unwrap_or(Some(0))
+            });
+            let fresh_io = fresh_budget.attempted_io_bytes();
+
+            let mut reused_budget = make_budget(&case.kind);
+            let mut reused_clock = case.script.clone().into_iter();
+            let reused = read_maps_or_refuse_with_buffers(
+                Cursor::new(case.input),
+                &mut reused_budget,
+                || reused_clock.next().unwrap_or(Some(0)),
+                &mut bufs,
+            );
+            let reused_io = reused_budget.attempted_io_bytes();
+
+            assert_eq!(
+                reused, fresh,
+                "{}: the reused-buffer read differs from the fresh read",
+                case.name
+            );
+            assert_eq!(
+                reused_io, fresh_io,
+                "{}: the reused-buffer read charges different I/O",
+                case.name
+            );
+        }
+    }
+
+    /// A maps buffer reused across reads is truncated between them: the
+    /// second read sees only its own bytes, and neither allocation grows.
+    /// (Mutation: dropping the truncate makes the short read return the
+    /// long one's entries plus its own.)
+    #[test]
+    fn reused_maps_buffer_is_truncated_between_reads() {
+        use std::io::Cursor;
+
+        let long: &[u8] = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 11 /a.so\n7f0000001000-7f0000002000 r--p 00001000 08:01 11 /a.so\n7f0000002000-7f0000003000 rw-p 00002000 00:00 0\n";
+        let short: &[u8] = b"400000-401000 r-xp 00000000 08:01 22 /b\n";
+
+        let mut bufs = MapsReadBuffers::default();
+        let mut budget = CaptureWorkBudget::default();
+        let first =
+            read_maps_or_refuse_with_buffers(Cursor::new(long), &mut budget, || Some(0), &mut bufs)
+                .unwrap();
+        assert_eq!(first.len(), 3);
+        let (bytes_cap, chunk_cap) = (bufs.bytes.capacity(), bufs.chunk.capacity());
+
+        let mut budget = CaptureWorkBudget::default();
+        let second = read_maps_or_refuse_with_buffers(
+            Cursor::new(short),
+            &mut budget,
+            || Some(0),
+            &mut bufs,
+        )
+        .unwrap();
+
+        let mut budget = CaptureWorkBudget::default();
+        let fresh = read_maps_or_refuse(Cursor::new(short), &mut budget, || Some(0)).unwrap();
+        assert_eq!(
+            second, fresh,
+            "the reused buffer leaked the previous read into this one"
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            bufs.bytes.capacity(),
+            bytes_cap,
+            "the bytes buffer reallocated between reads"
+        );
+        assert_eq!(
+            bufs.chunk.capacity(),
+            chunk_cap,
+            "the chunk buffer reallocated between reads"
+        );
+    }
+
+    /// Heap allocations per 1,000 maps reads, fresh vs reused buffers (C7
+    /// A2 measurement; run single-threaded:
+    /// `test -- --ignored maps_reuse_allocation --test-threads=1 --nocapture`).
+    /// Counts the byte-read level only, so the delta is exactly the
+    /// scratch reuse; parsing allocates identically on identical bytes.
+    #[test]
+    #[ignore]
+    fn maps_reuse_allocation_count_per_thousand_reads() {
+        use std::io::Cursor;
+
+        let line: &[u8] = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 12345 /opt/p.so\n";
+        let input = line.repeat(40);
+        let read_fresh = || {
+            let mut budget = CaptureWorkBudget::default();
+            let (bytes, reasons) = read_maps_with_limits(
+                Cursor::new(input.as_slice()),
+                &mut budget,
+                MAX_MAPS_BYTES,
+                MAX_MAP_ENTRIES,
+                64 * 1024,
+                || Some(0),
+            )
+            .unwrap();
+            assert!(reasons.is_empty());
+            assert_eq!(bytes.len(), input.len());
+        };
+        let (_, fresh_allocs, fresh_bytes) = crate::test_alloc::count_allocs_during(|| {
+            for _ in 0..1000 {
+                read_fresh();
+            }
+        });
+
+        let mut bufs = MapsReadBuffers::default();
+        let (_, reused_allocs, reused_bytes) = crate::test_alloc::count_allocs_during(|| {
+            for _ in 0..1000 {
+                let mut budget = CaptureWorkBudget::default();
+                let reasons = read_maps_bytes_with_buffers(
+                    Cursor::new(input.as_slice()),
+                    &mut budget,
+                    MAX_MAPS_BYTES,
+                    MAX_MAP_ENTRIES,
+                    64 * 1024,
+                    || Some(0),
+                    &mut bufs,
+                )
+                .unwrap();
+                assert!(reasons.is_empty());
+                assert_eq!(bufs.bytes.len(), input.len());
+            }
+        });
+
+        println!("fresh per 1000 reads: {fresh_allocs} allocs, {fresh_bytes} bytes");
+        println!("reused per 1000 reads: {reused_allocs} allocs, {reused_bytes} bytes");
+        assert!(
+            reused_allocs * 100 < fresh_allocs,
+            "reuse should remove ~2 allocs per read: fresh {fresh_allocs}, reused {reused_allocs}"
+        );
+    }
+
+    /// Indicative wall time per 1,000 maps reads, fresh vs reused buffers
+    /// (a criterion-free loop, not a benchmark; run single-threaded:
+    /// `test -- --ignored maps_reuse_timing --test-threads=1 --nocapture`).
+    #[test]
+    #[ignore]
+    fn maps_reuse_timing_per_thousand_reads() {
+        use std::io::Cursor;
+        use std::time::Instant;
+
+        let line: &[u8] = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 12345 /opt/p.so\n";
+        let input = line.repeat(40);
+        let fresh_once = || {
+            let mut budget = CaptureWorkBudget::default();
+            let (bytes, _) = read_maps_with_limits(
+                Cursor::new(input.as_slice()),
+                &mut budget,
+                MAX_MAPS_BYTES,
+                MAX_MAP_ENTRIES,
+                64 * 1024,
+                || Some(0),
+            )
+            .unwrap();
+            assert_eq!(bytes.len(), input.len());
+        };
+        fresh_once();
+        let start = Instant::now();
+        for _ in 0..1000 {
+            fresh_once();
+        }
+        let fresh = start.elapsed();
+
+        let mut bufs = MapsReadBuffers::default();
+        let start = Instant::now();
+        for _ in 0..1000 {
+            let mut budget = CaptureWorkBudget::default();
+            let reasons = read_maps_bytes_with_buffers(
+                Cursor::new(input.as_slice()),
+                &mut budget,
+                MAX_MAPS_BYTES,
+                MAX_MAP_ENTRIES,
+                64 * 1024,
+                || Some(0),
+                &mut bufs,
+            )
+            .unwrap();
+            assert!(reasons.is_empty());
+            assert_eq!(bufs.bytes.len(), input.len());
+        }
+        let reused = start.elapsed();
+
+        println!(
+            "fresh per 1000 reads: {fresh:?} ({:.1} ns/read)",
+            fresh.as_nanos() as f64 / 1000.0
+        );
+        println!(
+            "reused per 1000 reads: {reused:?} ({:.1} ns/read)",
+            reused.as_nanos() as f64 / 1000.0
         );
     }
 

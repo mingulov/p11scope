@@ -92,3 +92,5 @@ pub(crate) mod history;
 mod s1_tests;
 #[cfg(test)]
 mod s2s3_tests;
+#[cfg(test)]
+pub(crate) mod test_alloc;

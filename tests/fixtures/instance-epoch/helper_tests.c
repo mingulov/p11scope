@@ -456,6 +456,25 @@ int main(void)
     assert(tail.return_stamp.flags == INST_STAMP_VALID && tail.return_stamp.epoch == 2);
     assert(p11_instance_entry(0, 1) == 0);
 
+    /* BEGIN loss: the kernel evicts a live entry (LRU pressure on a full
+     * table) between the halves; the return faults instead of settling. */
+    reset();
+    slot_file[3] = 6;
+    map_hook(&vma); /* epoch 1 */
+    struct instance_start_key victim = { (77ULL << 32) | 78, 3, 0 };
+    assert(p11_instance_entry(&victim, 0x7f0000001230ULL) == 1);
+    assert(start_used[0] && start_values[0].entry_ip == 0x7f0000001230ULL);
+    /* The harness plays the kernel's eviction role: the slot is reclaimed
+     * out from under the in-flight call. */
+    start_used[0] = 0;
+    start_deletes = 0;
+    memset(&tail, 0xa5, sizeof(tail));
+    assert(p11_instance_return(&victim, &tail) == 0);
+    assert(tail.entry_ip == 0 && tail.entry_stamp.flags == 0);
+    assert(tail.entry_stamp.epoch == 0 && tail.entry_stamp.fault == 0);
+    assert(start_deletes == 0);
+    assert(tail.return_stamp.flags == INST_STAMP_VALID && tail.return_stamp.epoch == 1);
+
     /* The fault raise retries a lost race, and stays bounded. */
     reset();
     cas_calls = 0;

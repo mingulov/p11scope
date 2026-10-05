@@ -645,6 +645,9 @@ def judge_cell(name, expect, mode, *, ledger, observation, document, refusal, ca
         reasons.append("a report row collides with the owned dev/ino under other bytes")
     endpoint = observation["endpoint"]
     if expect in ("supported", "foreign"):
+        if observation.get("capacity_refused"):
+            reasons.append("the owned module was explicitly refused at the attach-slot "
+                           "ceiling (evidence.modules_skipped); its calls were not counted")
         if endpoint["rows"] != 1:
             reasons.append(f"owned endpoint has {endpoint['rows']} report rows, wanted 1")
         if not observation["endpoint_sole_owner"]:
@@ -1205,6 +1208,11 @@ def reduce_run(helper, campaign, run, files, calls, foreign_calls):
                             "receipt names another process birth")
             if document is not None:
                 observation = observe(document, owned, offset)
+                # modules_skipped publishes the refused module's pathname: a
+                # label, so it explains a missing row and never authorizes one.
+                observation["capacity_refused"] = any(
+                    isinstance(item, dict) and item.get("name") == participant["hint"]
+                    for item in document["evidence"].get("modules_skipped", []))
                 if expect == "explicit-unsupported":
                     subjects = no_table_diagnostic_subjects(stderr_text)
                     # Bound: the only no-table diagnostic names the owned

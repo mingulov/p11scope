@@ -406,6 +406,16 @@ class H6ReduceRawEvidence(unittest.TestCase):
         reasons = judge(capture([row(colliding, OFFSET, 4)]))
         self.assertTrue(any("collides" in reason for reason in reasons), reasons)
 
+    def test_a_capacity_refusal_is_named_and_never_a_pass(self):
+        document = capture([])
+        observation = E16.observe(document, OWNED, OFFSET)
+        observation["capacity_refused"] = True
+        reasons = E16.judge_cell("proxy", "supported", "system-unhinted",
+                                 ledger={"entered": 4, "returned": 4}, observation=observation,
+                                 document=document, refusal=None, calls=4)
+        self.assertTrue(any("attach-slot ceiling" in reason for reason in reasons), reasons)
+        self.assertTrue(any("owned count mismatch" in reason for reason in reasons), reasons)
+
     def test_unsupported_surface_must_not_be_called_complete(self):
         document = capture([], completeness="COMPLETE", skipped=self.REFUSAL)
         reasons = judge(document, expect="explicit-unsupported",

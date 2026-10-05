@@ -607,3 +607,40 @@ fn a_panicking_shard_is_read_again_on_the_calling_thread() {
     assert_eq!(sharded, serial);
     assert_eq!(budget.maps_sweep_state_for_test(), serial_state);
 }
+
+/// The legacy capture I/O ceiling does not stick, so a replay can stop
+/// early on it while its shard read on: crossed together with a deadline
+/// (and a failing clock, and the snapshot ceilings), the sharded sweep is
+/// still the serial one.
+#[test]
+fn sharded_sweep_equals_serial_at_a_legacy_io_ceiling_with_a_deadline() {
+    let world = world(&pids(40));
+    let pids: Vec<u32> = world.keys().copied().collect();
+    let total: u64 = world.values().map(snapshot_len).sum();
+    let tight = MapsReadLimits {
+        max_bytes: 300,
+        max_entries: 4,
+        chunk: 64,
+    };
+    for broken in [HashSet::new(), [pids[27]].into()] {
+        for io in (0..=total + 1).step_by(usize::try_from(total / 12).unwrap()) {
+            for pid in pids.iter().step_by(8) {
+                let deadline = T0 + 10 * u64::from(*pid) + 5;
+                let make = move || {
+                    let mut budget = legacy(io)();
+                    budget.set_deadline(Some(deadline));
+                    budget
+                };
+                for limits in [MapsReadLimits::LIVE, tight] {
+                    assert_equivalent(
+                        &world,
+                        limits,
+                        &broken,
+                        &make,
+                        &format!("io {io} deadline {deadline} {limits:?}"),
+                    );
+                }
+            }
+        }
+    }
+}

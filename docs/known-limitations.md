@@ -198,6 +198,9 @@ the min..max of per-sample p95.
   examined ranges; its benefit there is not measured.
 - Disclosure: stage timings (`confirm`), this row.
 - Workaround: none needed; small batches are serial.
+- v0.3.0 (unreleased, not measured): only executable ranges are proved
+  (A6, above), about one range per mapped library instead of 30–45 per
+  process, so batches reach the pool threshold even more rarely.
 - Planned: Cross-pass caching stays out (R-C56-1: inode reuse makes it
   unsound); kernel-side identity is v0.3.0 (C7).
 
@@ -301,6 +304,32 @@ the min..max of per-sample p95.
 - Planned: numbers landed in the v0.2.0 short tier; the lossless fix
   (2 MiB inventory-only ring) is v0.3.0 (C7 batched verifier/vng
   campaign).
+
+### Data-only mappers are not callers; copied code is not inventoried (A6)
+
+- What the user sees: since v0.3.0 (unreleased), a process is a caller of a
+  provider only when its `/proc/<pid>/maps` shows an executable (`x`)
+  mapping of the provider file and that range passes the identity proof.
+  A process that maps the file only without `x` (a scanner or backup tool
+  `mmap`-ing it read-only, or a loader between its first `r--` mapping and
+  the text) is excluded: no edge, no attribution loss, no coverage gap. A
+  process caught mid-`dlopen` is picked up by the next pass.
+- Kernels/conditions: all. Changed in v0.3.0 for callers past the
+  deep-scan cap (maps matches); a deep scan always required an executable
+  mapping.
+- Not a spoofing path: an edge still needs the target's own executable
+  range, read inside its pidfd/start-time pin and proven against the
+  observer's held file. Only the target, or something with ptrace-level
+  control over it, can change its mappings.
+- Evasion limit: p11scope is an observer, not a security boundary. A
+  process that deliberately avoids a file-backed executable mapping of the
+  provider (it `read()`s the provider into memory, or copies its code into
+  anonymous executable memory) is not inventoried in v0.3.0, and was not in
+  earlier versions either. Uprobes on the provider file do not see copied
+  code either.
+- Disclosure: none; exclusion is the definition of a caller, not a loss.
+- Workaround: none needed for ordinary loaders.
+- Planned: none.
 
 ### Settlement always `unsettled`
 

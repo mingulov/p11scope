@@ -463,7 +463,8 @@ impl Classified<'_> {
     }
 
     /// Settle the pending examined keys against `mapped`: a key whose
-    /// every range stats to an identity a deep scan examined is examined;
+    /// every caller range ([`is_caller_range`]: its groups hold no other)
+    /// stats to an identity a deep scan examined is examined;
     /// a key with a range that is no longer one mapping
     /// ([`RANGE_NOT_MAPPED`]) is returned (its mapping changed since the
     /// maps read: not a coverage gap); any other becomes unexamined.

@@ -698,7 +698,12 @@ Limits that matter in pods:
   (per physical object, with scan-only admission verdicts), and the
   caller/module edges between them with usage coverage, lifecycle, and
   explicit gaps (witness-only in this release: no per-call counts; see
-  `entries.coverage` below). `--json` prints the `p11scope/inventory/v1`
+  `entries.coverage` below). A process is a caller of a module only when
+  its maps show an executable (`x`) mapping of the module file that
+  passes the identity proof; a process that maps the file only without
+  `x` (a scanner reading it) is not a caller, and is no gap (see
+  [known limitations](known-limitations.md#data-only-mappers-are-not-callers-copied-code-is-not-inventoried-a6)).
+  `--json` prints the `p11scope/inventory/v1`
   document
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
@@ -979,7 +984,7 @@ they are never inferred from uid, seccomp mode, sysctls, or capabilities.
 `CAP_PERFMON`, `CAP_BPF`, and `CAP_CHECKPOINT_RESTORE` are diagnostic rows
 for the tier. One inventory proof does depend on them: `inventory --system`
 attributes a caller past `--max-scan-pids` by its maps only after proving
-each mapped range with `/proc/<pid>/map_files`. Following `map_files` needs
+each executable mapped range with `/proc/<pid>/map_files`. Following `map_files` needs
 `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`; without either, those past-cap
 callers are counted as `map_files_unavailable` losses and discovery stays
 incomplete rather than guessed.

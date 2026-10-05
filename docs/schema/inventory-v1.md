@@ -127,9 +127,16 @@ non-null values needs a new allowlist row.
   Under `--system`, every process with attributable mappings registers
   as a caller on every pass, whatever `--max-scan-pids` is: a process
   the deep-scan cap left unselected registers when its `/proc/<pid>/maps`
-  shows, by exact `(device, inode)`, a provider object a deep scan of
-  another process pinned in the same pass, and every such mapped range
-  is proven to be that very file (a *maps match*, below). The
+  shows an executable (`x`) mapping, by exact `(device, inode)`, of a
+  provider object a deep scan of another process pinned in the same
+  pass, and every executable range of it is proven to be that very file
+  (a *maps match*, below). A process is a caller of an object only
+  through an executable mapping of it: ranges without `x` are neither
+  proven nor counted, so a process that maps a provider file only
+  without `x` (a scanner `mmap`-ing it read-only, or a loader between
+  its first `r--` mapping and the text) is not its caller, and is no
+  loss and no coverage gap (since v0.3.0 for maps matches; a deep scan
+  has always examined only objects its process maps executable). The
   cap bounds only how many processes are deep-scanned, i.e. the
   discovery of objects no process seen so far maps. A collected member's
   mappings project onto a caller only when its generation joins the
@@ -218,10 +225,11 @@ non-null values needs a new allowlist row.
   how the latest mapping observation was established: `deep_scan` (a
   deep scan of the caller decoded it) or `maps_match` (the caller itself
   was not decoded: its maps, re-read under a pidfd/start-time pin with
-  its exe identity unchanged across the read, show the object's
-  `(device, inode)`, and — because a maps key is not one file (btrfs
-  renders one device for every subvolume while inode numbers repeat
-  across subvolumes) — each such range's `/proc/<pid>/map_files` entry,
+  its exe identity unchanged across the read, show an executable mapping
+  of the object's `(device, inode)`, and — because a maps key is not one
+  file (btrfs renders one device for every subvolume while inode numbers
+  repeat across subvolumes) — each executable range's
+  `/proc/<pid>/map_files` entry,
   read while the pin holds, is the same kernel file as a self-mapping
   of the object the deep scan pinned and still holds open. Both sides
   are the kernel's mapped file as procfs renders it, never `fstat`
@@ -243,7 +251,9 @@ non-null values needs a new allowlist row.
   live files share make the key that file everywhere. tmpfs (32-bit
   wrapping inode numbers without `inode64`), btrfs, overlayfs (as
   rendered from 6.8 on), bcachefs, FUSE and network filesystems always
-  prove every range.
+  prove every executable range. Non-executable ranges at the key are
+  never read, so a maps-key collision on a data range cannot cost an edge
+  whose executable ranges are proven.
   Nothing about a confirmation or a proof is carried from one pass to
   the next: every pass re-reads a matched caller's maps inside its pin
   and re-reads every range that needs the proof. An identical maps line
@@ -523,7 +533,8 @@ non-null values needs a new allowlist row.
   `map_files` entry was read, an unmap or remap during the read) and name a matched caller that also
   maps shared objects no deep scan examined. A shared object counts as
   examined only where a complete deep scan's own maps read opened it
-  and found no provider, and the other process's ranges are proven,
+  and found no provider, and the other process's executable ranges are
+  proven,
   the same way, to be that file. An object whose sweep matching was
   refused (non-unique inodes; only where a process past the cap maps
   it) or dropped (it changed after the confirmation reads) is a gap

@@ -5,6 +5,27 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
+## [Unreleased]
+
+Work toward v0.3.0.
+
+### Changed
+
+- A process is a caller of a provider only through an executable mapping
+  of it (owner ruling, C7 A6). Past the deep-scan cap, `inventory --system`
+  now proves and counts only the executable (`x`) ranges of a provider in
+  another process's `/proc/<pid>/maps`; ranges without `x` are neither
+  proven nor counted. A process that maps a provider file only without `x`
+  (a scanner `mmap`-ing it read-only) is no longer attributed as a caller,
+  and is not an attribution loss or a coverage gap. A maps-key collision
+  (btrfs subvolumes) on a data range no longer costs an edge whose
+  executable range is proven to be the held file. Deep scans already
+  required an executable mapping, so both paths now apply one rule. No edge
+  is reported without a passed like-for-like proof, as before, and the
+  schema is unchanged. Proof reads drop to about one per mapped library;
+  the pass-time effect is not measured yet. See
+  [docs/known-limitations.md](docs/known-limitations.md).
+
 ## [0.2.0] - 2026-10-05
 
 Module/caller inventory and usage observation, Kubernetes deployment, and

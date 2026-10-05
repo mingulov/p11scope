@@ -1345,3 +1345,37 @@ fn a_device_event_log_is_refused_up_front() {
     assert!(stderr.contains("it is a character device"), "{stderr}");
     assert!(output.stdout.is_empty(), "no success document: {stderr}");
 }
+
+/// C7 A3: `P11SCOPE_PROOF_STAT_THREADS` is read once per run. A
+/// multi-pass `inventory --system` collects every pass, yet prints the
+/// knob's stderr note exactly once (it once repeated it every pass).
+#[test]
+fn the_proof_stat_thread_note_prints_once_per_multi_pass_run() {
+    let _guard = serial_guard();
+    let private = private_dir();
+    let out = private.path().join("report.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(["inventory", "--system", "--capture", "scan"])
+        .args(["--max-scan-pids", "1", "--duration", "6s", "--json", "-o"])
+        .arg(&out)
+        .env("P11SCOPE_PROOF_STAT_THREADS", "2")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    let passes = doc["observation"]["passes"].as_u64().unwrap();
+    assert!(passes >= 2, "needs a multi-pass run, got {passes}: {stderr}");
+    let notes: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("P11SCOPE_PROOF_STAT_THREADS"))
+        .collect();
+    assert_eq!(
+        notes,
+        ["p11scope: P11SCOPE_PROOF_STAT_THREADS=2 selects 2 proof-stat threads"],
+        "{passes} passes: {stderr}"
+    );
+}

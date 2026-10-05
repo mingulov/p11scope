@@ -52,32 +52,61 @@ pub(crate) trait RangeStat: Send + Sync {
 ///
 /// Diagnostic override: `P11SCOPE_PROOF_STAT_THREADS` pins the count
 /// (`0`/`1` force the serial path, `N` caps at [`MAX_PROOF_STAT_THREADS`]);
-/// unset or unparsable keeps the default above. When set, a stderr note
-/// reports the value used, or that the value was ignored (see the M1 row
-/// in `docs/known-limitations.md`).
+/// unset or unparsable keeps the default above. The variable is read once
+/// per process, and when set, one stderr note reports the value used or
+/// that the value was ignored (see the M1 row in
+/// `docs/known-limitations.md`): a multi-pass `inventory --system` run
+/// collects every pass, and must not repeat the note each time.
 pub(crate) fn proof_stat_threads() -> usize {
+    static KNOB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let default = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1)
         .min(MAX_PROOF_STAT_THREADS);
-    let env = std::env::var("P11SCOPE_PROOF_STAT_THREADS").ok();
-    let parsed = parse_proof_stat_threads(env.as_deref());
-    match (env.as_deref(), parsed) {
-        (Some(raw), Some(threads)) => {
-            let noun = if threads == 1 { "thread" } else { "threads" };
-            eprintln!(
-                "p11scope: P11SCOPE_PROOF_STAT_THREADS={raw} selects {threads} proof-stat {noun}"
-            );
-            threads
+    let knob = *KNOB.get_or_init(|| {
+        let raw = std::env::var_os("P11SCOPE_PROOF_STAT_THREADS");
+        let (threads, note) = resolve_proof_stat_threads(raw.as_deref(), default);
+        if let Some(note) = note {
+            eprintln!("{note}");
         }
-        (Some(raw), None) => {
-            let noun = if default == 1 { "thread" } else { "threads" };
-            eprintln!(
-                "p11scope: ignoring invalid P11SCOPE_PROOF_STAT_THREADS={raw}; using the default {default} proof-stat {noun}"
-            );
-            default
-        }
-        (None, _) => default,
+        threads
+    });
+    knob.unwrap_or(default)
+}
+
+/// The knob's resolution and its stderr note, without the environment
+/// read: `(Some(threads), note)` when set and valid, `(None, note)` when
+/// set but invalid (the caller keeps `default`), `(None, None)` when
+/// unset. A value that is not UTF-8 is set, so it is reported invalid;
+/// the echoed value has its control characters escaped.
+fn resolve_proof_stat_threads(
+    raw: Option<&std::ffi::OsStr>,
+    default: usize,
+) -> (Option<usize>, Option<String>) {
+    let Some(raw) = raw else {
+        return (None, None);
+    };
+    let noun = |count: usize| if count == 1 { "thread" } else { "threads" };
+    let lossy = raw.to_string_lossy();
+    let shown = crate::render::escape_controls(&lossy);
+    match raw
+        .to_str()
+        .and_then(|text| parse_proof_stat_threads(Some(text)))
+    {
+        Some(threads) => (
+            Some(threads),
+            Some(format!(
+                "p11scope: P11SCOPE_PROOF_STAT_THREADS={shown} selects {threads} proof-stat {}",
+                noun(threads)
+            )),
+        ),
+        None => (
+            None,
+            Some(format!(
+                "p11scope: ignoring invalid P11SCOPE_PROOF_STAT_THREADS={shown}; using the default {default} proof-stat {}",
+                noun(default)
+            )),
+        ),
     }
 }
 
@@ -358,6 +387,45 @@ mod tests {
             parse_proof_stat_threads(Some("99999999999999999999999")),
             None
         );
+    }
+
+    /// The knob resolves to the parser's count with a "selects" note, to
+    /// no count with an "ignoring invalid" note naming the default, or,
+    /// unset, to neither. A non-UTF-8 value is set and so invalid, and
+    /// control characters in the echoed value are escaped.
+    #[test]
+    fn the_thread_knob_note_reports_the_value_used_or_ignored() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        assert_eq!(resolve_proof_stat_threads(None, 4), (None, None));
+        let (threads, note) = resolve_proof_stat_threads(Some(OsStr::new("2")), 4);
+        assert_eq!(threads, Some(2));
+        assert_eq!(
+            note.as_deref(),
+            Some("p11scope: P11SCOPE_PROOF_STAT_THREADS=2 selects 2 proof-stat threads")
+        );
+        let (threads, note) = resolve_proof_stat_threads(Some(OsStr::new("0")), 4);
+        assert_eq!(threads, Some(1));
+        assert!(note.unwrap().ends_with("selects 1 proof-stat thread"));
+        let (threads, note) = resolve_proof_stat_threads(Some(OsStr::new("bogus")), 1);
+        assert_eq!(threads, None);
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "p11scope: ignoring invalid P11SCOPE_PROOF_STAT_THREADS=bogus; using the default 1 proof-stat thread"
+            )
+        );
+        let (threads, note) = resolve_proof_stat_threads(Some(OsStr::from_bytes(b"2\xff")), 3);
+        assert_eq!(threads, None);
+        assert!(
+            note.as_deref().unwrap().contains("ignoring invalid"),
+            "{note:?}"
+        );
+        let (_, note) = resolve_proof_stat_threads(Some(OsStr::new("x\x1b[2J")), 4);
+        let note = note.unwrap();
+        assert!(!note.contains('\x1b'), "{note}");
+        assert!(note.contains("ignoring invalid"), "{note}");
     }
 
     /// A worker that panics (or whose result never returns) does not lose

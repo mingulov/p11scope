@@ -192,6 +192,10 @@ fn run_with_terminal(
             if let Some(warning) = crate::pidns::nested_warning(numbering) {
                 let _ = writeln!(std::io::stderr(), "{warning}");
             }
+            // Resolve the proof-stat diagnostic knob now: its one stderr
+            // note then lands before a dashboard can take the terminal,
+            // never over a frame from a later pass's collection.
+            let _ = crate::discovery::proof_stats::proof_stat_threads();
         }
     }
     // Fail fast before scanning: an unwritable `-o` or event stream

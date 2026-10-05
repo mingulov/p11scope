@@ -861,6 +861,12 @@ pub(crate) enum UnknownReason {
     /// a use before its admission): the pair's only row exists, so later
     /// use leaves no row and a watch could not see it (R-C51-1). Sticky.
     UseBeforeAdmission,
+    /// A CALLER_USE row of this caller's pid on this module is read but
+    /// undecided (its lifecycle and health horizons have not arrived):
+    /// the edge may have been used. Transient, never staged: the
+    /// presentation overlays it while the row is pending, and the staged
+    /// watch resumes once the row binds elsewhere (DR-LIVE-LABEL-LAG).
+    PendingFirstUse,
 }
 
 impl UnknownReason {
@@ -876,6 +882,7 @@ impl UnknownReason {
             Self::Loss(_) => "loss",
             Self::RetiredBeforeCoverage => "retired_before_coverage",
             Self::UseBeforeAdmission => "use_before_admission",
+            Self::PendingFirstUse => "pending_first_use",
         }
     }
 
@@ -901,6 +908,7 @@ impl UnknownReason {
             Self::Loss(reason) => format!("loss: {reason}"),
             Self::RetiredBeforeCoverage => "retired before coverage".into(),
             Self::UseBeforeAdmission => "use before admission".into(),
+            Self::PendingFirstUse => "first use undecided".into(),
         }
     }
 }
@@ -1643,11 +1651,23 @@ impl CallerRegistry {
     /// What the edge's entry columns mean, from its coverage. A positive
     /// count always reads as observed; a zero reads observed only under
     /// `WatchedNoUse` or a loss-free `Counted` feed.
+    #[cfg_attr(not(test), allow(dead_code))] // Production presents through `entry_observation_for`.
     pub(crate) fn entry_observation(&self, edge: &EdgeRecord) -> EntryObservation {
+        self.entry_observation_for(edge, &self.coverage(edge))
+    }
+
+    /// [`Self::entry_observation`] under an overlaid `coverage` (the
+    /// pending-first-use presentation): the same rule, read from the
+    /// presented coverage instead of the staged one.
+    pub(crate) fn entry_observation_for(
+        &self,
+        edge: &EdgeRecord,
+        coverage: &UseCoverage,
+    ) -> EntryObservation {
         if edge.entry_count > 0 {
             return EntryObservation::Observed;
         }
-        match self.coverage(edge) {
+        match coverage {
             UseCoverage::Counted { lossy: false, .. } | UseCoverage::WatchedNoUse { .. } => {
                 EntryObservation::Observed
             }

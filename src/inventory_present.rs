@@ -154,9 +154,12 @@ impl Capture {
 /// recency source); then used (witnessed use with no count or recency —
 /// never quiet, whatever the mapping); anything without a live mapping
 /// reads as unknown, as does a watch that ended (a fact about its
-/// interval only); then, for a live mapping, quiet only where the
-/// quiet is a fact — a loss-free counting feed or an ongoing watch with
-/// no recent entry; a lossy feed reads unknown (lossy); and an edge no
+/// interval only), and as does a watched edge whose caller's first use
+/// is read but undecided (a pending row: the use may already have
+/// happened, so quiet would lie); then, for a live mapping, quiet only
+/// where the quiet is a fact — a loss-free counting feed or an ongoing
+/// watch with no recent entry; a lossy feed reads unknown (lossy); and
+/// an edge no
 /// usage producer covers (scan only, refused, not attached, lost) reads
 /// not covered — never idle. Quiet is not unloaded: unloaded
 /// edges are never mapped, so they never read as quiet.
@@ -218,6 +221,9 @@ impl Activity {
             UseCoverage::WatchedNoUse {
                 until_ns: Some(_), ..
             } => Self::Unknown,
+            // A first use is read but undecided: the edge is watched, so
+            // "not covered" would lie — its activity is unknown.
+            UseCoverage::Unknown(UnknownReason::PendingFirstUse) => Self::Unknown,
             UseCoverage::Counted { lossy: false, .. } | UseCoverage::WatchedNoUse { .. } => {
                 Self::Quiet
             }
@@ -527,7 +533,9 @@ impl Presentation {
             let module_record = registry
                 .module(*module_id)
                 .expect("every captured edge module resolves in the registry");
-            let coverage = registry.coverage(edge);
+            // The presented coverage overlays a pending first-use row as
+            // unknown; every consumer reads through it.
+            let coverage = coordinator.presented_coverage(edge);
             // Recency comes only from counted coverage.
             let recent = matches!(coverage, UseCoverage::Counted { .. })
                 && registry.entry_recent_within(edge, now_ns, window_ns);
@@ -550,7 +558,7 @@ impl Presentation {
                 entry_first_seen_ns: edge.entry_first_seen_ns,
                 entry_last_seen_ns: edge.entry_last_seen_ns,
                 entry_in_flight: edge.entry_in_flight,
-                entry_observation: registry.entry_observation(edge).label(),
+                entry_observation: registry.entry_observation_for(edge, &coverage).label(),
                 presence: Presence::for_edge(caller_record, module_record, edge.mapping),
                 capture: Capture::for_edge(caller_record, module_record, edge.mapping, &coverage),
                 activity: Activity::for_edge(

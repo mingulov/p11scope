@@ -132,6 +132,20 @@ fn state_vocab_is_the_plans_exact_wording() {
 }
 
 #[test]
+fn a_pending_first_use_renders_unknown_not_quiet_or_not_covered() {
+    // DR-LIVE-LABEL-LAG: the edge is watched, so "not covered" would lie,
+    // and the use may already have happened, so quiet would lie.
+    let pending = UseCoverage::Unknown(UnknownReason::PendingFirstUse);
+    assert_eq!(
+        Activity::for_edge(MappingState::Mapped, false, false, false, &pending),
+        Activity::Unknown
+    );
+    assert_eq!(coverage_label(&pending), "unknown (first use undecided)");
+    assert_eq!(pending.state(), "unknown");
+    assert_eq!(UnknownReason::PendingFirstUse.code(), "pending_first_use");
+}
+
+#[test]
 fn refused_but_quiet_renders_both_states_not_one_merged_label() {
     let harness = varied_harness();
     let document = harness.render();

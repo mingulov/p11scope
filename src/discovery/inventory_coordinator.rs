@@ -34,8 +34,8 @@ use crate::attach::capture::{
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
     AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
-    CoverageNote, ImageAuthority, MappingState, ModuleInfo, ModuleKey, ProcessSource, RegistryGap,
-    RegistryLimits, UnknownReason,
+    CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleInfo, ModuleKey, ProcessSource,
+    RegistryGap, RegistryLimits, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
@@ -394,6 +394,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// falls inside an interval — what makes "nothing after stop" sound).
     /// A system-scope lifecycle loss is a sticky demotion (C5.2 D4): see
     /// `note_lifecycle_loss`; a batch carrying one is never clean.
+    /// A batch that leaves a stamped row pending is never clean either:
+    /// the row's use is undecided, so the proven-clean instant is not
+    /// extended over it (DR-LIVE-LABEL-LAG). `stage_native` absorbs the
+    /// batch before this runs, so this batch's rows are already pending.
     /// After stop it stages nothing: forward the terminal read before
     /// `end_capture_coverage`.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards batches.
@@ -424,6 +428,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             && custody_held
             && batch.lifecycle_loss.is_none()
             && capture.unproven.is_none()
+            && !self.binder.has_stamped_pending()
         {
             let clean_ns = sweep_began_ns
                 .min(batch.custody_proven_ns.unwrap_or(u64::MAX))
@@ -630,6 +635,37 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         if let Some(note) = self.capture_coverage_note(scope, attach_key, verdict) {
             self.registry.note_coverage(caller, key, note);
+        }
+    }
+
+    /// The edge's coverage as presented: the staged coverage, except a
+    /// watched edge reads unknown while the binder holds a pending row of
+    /// its caller's pid on its module (DR-LIVE-LABEL-LAG). The row is a
+    /// first use that may belong to this caller, so the watch cannot
+    /// claim quiet; the staged watch is untouched and resumes once the
+    /// row binds elsewhere. Positives, staged unknowns, and edges no
+    /// pending row matches read as staged. Every consumer (JSON, the
+    /// event stream, dashboard frames) presents through this.
+    pub(crate) fn presented_coverage(&self, edge: &EdgeRecord) -> UseCoverage {
+        let staged = self.registry.coverage(edge);
+        if !matches!(staged, UseCoverage::WatchedNoUse { .. }) {
+            return staged;
+        }
+        let pid = self.adapter.record(edge.caller).map(|record| record.pid);
+        let key = self.registry.module(edge.module).map(|record| &record.key);
+        let (Some(pid), Some(key)) = (pid, key) else {
+            return staged;
+        };
+        let pending = self.binder.pending_rows().any(|row| {
+            row.host_tgid == pid
+                && self
+                    .witness_modules(row)
+                    .is_ok_and(|modules| modules.contains(key))
+        });
+        if pending {
+            UseCoverage::Unknown(UnknownReason::PendingFirstUse)
+        } else {
+            staged
         }
     }
 
@@ -1464,10 +1500,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) -> NativeReceipt {
         match batch {
             NativeBatch::Witness(batch) => {
-                self.note_witness_batch(&batch);
-                self.record_witness_integrity(&batch);
+                // The binder absorbs before the batch's health is noted:
+                // the clean-read decision must see this batch's undecided
+                // rows (a stamped pending row withholds the proven-clean
+                // instant). Absorption stages no registry mutation, so
+                // staging order is unchanged.
                 self.binder
                     .absorb_witnesses(&batch, &self.adapter, &mut *identity);
+                self.note_witness_batch(&batch);
+                self.record_witness_integrity(&batch);
             }
             NativeBatch::Lifecycle(batch) => {
                 self.lifecycle_high_water_bytes = self
@@ -4690,6 +4731,184 @@ mod tests {
                 since_ns: 100,
                 until_ns: Some(250),
             }
+        );
+    }
+
+    // ---- DR-LIVE-LABEL-LAG: a pending first-use row reads unknown ----
+
+    /// The shared presentation over a native scene's coordinator: the one
+    /// view JSON, the event stream and dashboard frames read.
+    fn presented(native: &NativeScene) -> crate::inventory_present::Presentation {
+        crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "system",
+            0,
+            3_000,
+            3,
+            3_000,
+            crate::inventory_present::DASHBOARD_ACTIVITY_WINDOW_NS,
+        )
+    }
+
+    /// While the binder holds a pending row of the watched caller's pid
+    /// on the edge's module, the edge presents unknown (`activity
+    /// unknown`, `entries ?`); the staged watch is untouched, so the row
+    /// still binds and witnesses the same edge once decided.
+    #[test]
+    fn a_pending_first_use_row_presents_the_edge_as_unknown_until_it_binds() {
+        use crate::discovery::caller_registry::EntryObservation;
+        use crate::inventory_present::{Activity, entries_display};
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        native.read(vec![row]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.pending, census.bound), (1, 0));
+        // The staged watch stands: the overlay is presentation only.
+        assert!(watched(&native.scene.coverage(caller)));
+        let presentation = presented(&native);
+        let edge = presentation
+            .edges
+            .iter()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has a presented edge");
+        assert_eq!(
+            edge.coverage,
+            UseCoverage::Unknown(UnknownReason::PendingFirstUse)
+        );
+        assert_eq!(edge.activity, Activity::Unknown);
+        assert_eq!(entries_display(edge), "?");
+        assert_eq!(
+            edge.entry_observation,
+            EntryObservation::UnknownUnavailable.label()
+        );
+        let payload = crate::inventory::edge_json(edge);
+        assert_eq!(payload["entries"]["coverage"]["state"], "unknown");
+        assert_eq!(
+            payload["entries"]["coverage"]["reason"],
+            "pending_first_use"
+        );
+        // The horizons arrive: the row binds and the edge is witnessed.
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.pending, census.bound), (0, 1));
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Witnessed { first_ns: 200 }
+        );
+        let presentation = presented(&native);
+        let edge = presentation
+            .edges
+            .iter()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has a presented edge");
+        assert_eq!(edge.coverage, UseCoverage::Witnessed { first_ns: 200 });
+        assert_eq!(edge.activity, Activity::Used);
+    }
+
+    /// A row still pending at finish unbinds and downgrades the watch, as
+    /// today: the edge presents the staged unknown, never the transient one.
+    #[test]
+    fn a_row_unbound_at_finish_presents_the_staged_unknown() {
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        native.read(vec![row]);
+        let receipt = native.stage(NativeBatch::Finish {
+            domain: native.domain,
+        });
+        assert_eq!(receipt.decided, 1);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!(census.pending, 0);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Unknown(UnknownReason::UseBeforeAdmission)
+        );
+        let presentation = presented(&native);
+        let edge = presentation
+            .edges
+            .iter()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has a presented edge");
+        assert_eq!(
+            edge.coverage,
+            UseCoverage::Unknown(UnknownReason::UseBeforeAdmission)
+        );
+    }
+
+    /// A batch that leaves a stamped row pending never extends the
+    /// proven-clean instant; once the row decides, clean batches extend
+    /// it again.
+    #[test]
+    fn a_pending_row_withholds_the_proven_clean_instant_until_it_decides() {
+        let (mut native, _) = watched_native();
+        native.answer(7, 500, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(last_clean(&native.scene), Some(1_010));
+        let row = native.row(41, 1, 7, 200, 0);
+        native.read(vec![row]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.witness_census().pending,
+            1
+        );
+        assert_eq!(
+            last_clean(&native.scene),
+            Some(1_010),
+            "a stamped pending row withholds the clean instant"
+        );
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.witness_census().pending,
+            0
+        );
+        assert!(
+            last_clean(&native.scene).is_some_and(|clean| clean > 1_010),
+            "a decided row releases the clean instant: {:?}",
+            last_clean(&native.scene)
+        );
+    }
+
+    /// An unstamped pending row never decides before the finish flush, so
+    /// it never stalls the proven-clean instant — but the edge still
+    /// presents unknown while the row waits.
+    #[test]
+    fn an_unstamped_pending_row_does_not_stall_the_proven_clean_instant() {
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        let mut batch = native.stamps.read(native.domain, vec![row]);
+        let NativeBatch::Witness(read) = &mut batch else {
+            panic!("a witness read stages a witness batch");
+        };
+        read.rows_read_ns = u64::MAX;
+        native.stage(batch);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.witness_census().pending,
+            1
+        );
+        assert_eq!(
+            last_clean(&native.scene),
+            Some(1_010),
+            "the clean instant extends through an undecidable row"
+        );
+        let presentation = presented(&native);
+        let edge = presentation
+            .edges
+            .iter()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has a presented edge");
+        assert_eq!(
+            edge.coverage,
+            UseCoverage::Unknown(UnknownReason::PendingFirstUse)
         );
     }
 

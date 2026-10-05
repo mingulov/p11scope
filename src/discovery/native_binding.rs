@@ -483,6 +483,29 @@ impl NativeBinder {
         &self.census
     }
 
+    /// Every row still waiting for its decision, across domains (read
+    /// order within a domain). The presentation overlay matches these
+    /// against watched edges; a row's ambiguity is its presence here, not
+    /// its sighting, so only the row is exposed.
+    pub(crate) fn pending_rows(&self) -> impl Iterator<Item = &WitnessRow> + '_ {
+        self.domains
+            .iter()
+            .flat_map(|state| state.pending.iter().map(|pending| &pending.row))
+    }
+
+    /// A stamped row still waits: its read finished with a usable clock,
+    /// so its horizons may still arrive and it may still decide. An
+    /// unstamped row (`rows_read_ns` failed) never decides before the
+    /// finish flush, so it never stalls the proven-clean instant.
+    pub(crate) fn has_stamped_pending(&self) -> bool {
+        self.domains.iter().any(|state| {
+            state
+                .pending
+                .iter()
+                .any(|pending| pending.read_ns.is_some())
+        })
+    }
+
     /// Decisions made since the last take, in decision order.
     pub(crate) fn take_decisions(&mut self) -> Vec<Decision> {
         std::mem::take(&mut self.decided)

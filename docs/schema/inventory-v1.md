@@ -337,7 +337,8 @@ non-null values needs a new allowlist row.
     scan-only run), `not_admitted`, `not_attached`, `attach_failed`,
     `identity_unavailable`, `capacity_limited` (`detail` names the
     resource), `loss` (`detail` says what was lost),
-    `retired_before_coverage`, or `use_before_admission`.
+    `retired_before_coverage`, `use_before_admission`, or
+    `pending_first_use`.
   - `use_before_admission` (native lane): a `CALLER_USE` row whose pid
     is this caller's pid was not bound to it — typically a use before
     the caller's admission (`before_admission`), or any other unbound
@@ -361,6 +362,17 @@ non-null values needs a new allowlist row.
     A row that lifecycle loss left unbound (`lifecycle_loss`) downgrades
     the same way but reads `loss` (`detail`: the lost lifecycle
     evidence), since the loss, not an early use, is what it shows.
+  - `pending_first_use` (native lane, transient): a `CALLER_USE` row of
+    this caller's pid on this module is read but undecided — its
+    lifecycle and health horizons have not arrived yet, so the edge may
+    already have been used. While the row waits, the edge reads
+    `unknown` (`activity unknown`, `entries ?`) on the dashboard and in
+    mid-run `edge_observed` records, and the watch's proven-clean
+    instant is not extended over it. Once the row binds the edge reads
+    `witnessed`, or the unbound reason when it does not; the staged
+    watch resumes when the row binds elsewhere. The finish flush
+    decides every row, so the `-o` snapshot and the final sweep never
+    carry this reason.
   A zero reads `observed` only under `watched_no_use` or a loss-free
   `counted`. Positive coverage (`counted` entries, `witnessed`) is
   monotonic history: it survives loss, caller retirement, and module

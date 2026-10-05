@@ -726,8 +726,13 @@ class ProcessCustodyTest(unittest.TestCase):
             receipt = {"helper_attempts": [], "helper_failed": False}
             errors = []
             args = types.SimpleNamespace(receipt_helper=str(helper))
+            # SLACK: the helper only has to start and print. The supervisor
+            # keeps DIRECT_RESERVE_SECONDS (4 s) of the deadline for direct
+            # cleanup, so a literal 3 s deadline left the helper its 0.05 s
+            # floor, and a python start slower than that under load was
+            # SIGKILLed with nothing captured.
             SUPERVISOR_NS["run_group_helper"](
-                args, os.getpid(), 1, "KILL", time.monotonic() + 3,
+                args, os.getpid(), 1, "KILL", time.monotonic() + slack(3),
                 receipt, errors)
             attempt = receipt["helper_attempts"][0]
             self.assertEqual(len(attempt["stdout"].encode()), 65536)

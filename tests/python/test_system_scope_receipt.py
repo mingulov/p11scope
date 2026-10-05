@@ -4,9 +4,11 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import runpy
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -23,6 +25,66 @@ SUPERVISOR = ROOT / "scripts" / "system-scope-supervisor.py"
 WORKLOAD_SOURCE = ROOT / "scripts" / "system-scope-workload.c"
 RECEIPT_NS = runpy.run_path(str(RECEIPT))
 SUPERVISOR_NS = runpy.run_path(str(SUPERVISOR))
+# Wall-clock bounds in ShellOwnedLifecycleTest are of two kinds, as in
+# test_lane13_evidence.py. SEMANTIC bounds are what a case asserts (a zero
+# natural wait that forces the TERM path, a helper's own term/total budget)
+# and stay literal. SLACK bounds only wait for an event that must happen (a
+# marker, a supervisor exit, a harness cap); their expiry is a failure, so
+# they scale with P11SCOPE_TEST_TIME_SCALE. A passing case never waits a SLACK
+# bound out, so the default costs no time unloaded.
+#
+# A command whose lifetime must outlast owned_verify_launch is held on a
+# release file the case touches after verification, never a fixed sleep: a
+# 1-2 s sleep exited before verify-group ran under host load ~10, which
+# reported "owned launch did not establish a live private session group"
+# for a group that had been established (DR-SCOPE-RECEIPT-SESSION-FLAKE).
+DEFAULT_TIME_SCALE = 5.0
+
+
+def _time_scale():
+    raw = os.environ.get("P11SCOPE_TEST_TIME_SCALE", "").strip()
+    if not raw:
+        return DEFAULT_TIME_SCALE
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 1:
+        raise SystemExit("P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1")
+    return value
+
+
+TIME_SCALE = _time_scale()
+
+
+def slack(seconds):
+    """Scale a wait-until bound whose expiry can only mean failure."""
+    return seconds * TIME_SCALE
+
+
+def slack_whole(seconds):
+    """Scale a SLACK bound for shell helpers that take whole seconds."""
+    return str(math.ceil(seconds * TIME_SCALE))
+
+
+def slack_polls(count):
+    """Scale a shell poll-loop count (one `sleep .01` per iteration)."""
+    return str(math.ceil(count * TIME_SCALE))
+
+
+HOLD_CODE = (
+    "import pathlib,sys,time\n"
+    "gate=pathlib.Path(sys.argv[1]); deadline=time.monotonic()+float(sys.argv[2])\n"
+    "while not gate.exists():\n"
+    " assert time.monotonic()<deadline, 'held command was never released'\n"
+    " time.sleep(.01)\n"
+)
+
+
+def held_command(release):
+    """Shell argv for a command that lives until `release` exists."""
+    return (f"python3 -c {shlex.quote(HOLD_CODE)} "
+            f"{shlex.quote(str(release))} {slack(30)}")
 
 
 def digest(path):
@@ -1058,8 +1120,68 @@ class ProcessCustodyTest(unittest.TestCase):
                 process.wait()
 
 
+class VerifyGroupTest(unittest.TestCase):
+    """verify-group names why a launch could not be verified."""
+
+    PID = 4242
+    BIRTH = 777
+
+    def verify(self, proc_root, timeout=0.2):
+        args = argparse.Namespace(proc_root=str(proc_root), pid=self.PID,
+                                  starttime=self.BIRTH, timeout=timeout)
+        return RECEIPT_NS["verify_group"](args)
+
+    def write_stat(self, proc_root, *, state="S", pgrp=PID, session=PID):
+        directory = Path(proc_root) / str(self.PID)
+        directory.mkdir(exist_ok=True)
+        tail = [state, "1", str(pgrp), str(session)] + ["0"] * 15
+        tail += [str(self.BIRTH), "0"]
+        (directory / "stat").write_text(
+            f"{self.PID} (cmd) {' '.join(tail)}\n", encoding="utf-8")
+
+    def test_live_private_session_leader_is_verified(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self.write_stat(raw)
+            self.assertEqual(self.verify(raw)["session"], self.PID)
+
+    def test_exited_leader_fails_promptly_and_says_so(self):
+        for state in (None, "Z", "X"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as raw:
+                if state is not None:
+                    self.write_stat(raw, state=state)
+                started = time.monotonic()
+                with self.assertRaisesRegex(
+                    RECEIPT_NS["ReceiptError"],
+                    "live private session group: leader exited before "
+                    "verification",
+                ):
+                    self.verify(raw, timeout=30)
+                self.assertLess(time.monotonic() - started, 5)
+
+    def test_leader_outside_a_private_session_names_its_group(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self.write_stat(raw, pgrp=1, session=1)
+            with self.assertRaisesRegex(
+                RECEIPT_NS["ReceiptError"],
+                "live private session group: leader pgrp=1 session=1",
+            ):
+                self.verify(raw)
+
+    def test_replaced_leader_birth_is_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self.write_stat(raw)
+            args = argparse.Namespace(proc_root=raw, pid=self.PID,
+                                      starttime=self.BIRTH + 1, timeout=0.2)
+            with self.assertRaisesRegex(
+                RECEIPT_NS["ReceiptError"], "birth identity changed"
+            ):
+                RECEIPT_NS["verify_group"](args)
+
+
 class ShellOwnedLifecycleTest(unittest.TestCase):
     def run_under_subreaper(self, command, timeout):
+        # `timeout` is a harness cap (SLACK): it only bounds a hung case.
+        timeout = slack(timeout)
         driver = r'''
 import ctypes, json, os, select, signal, subprocess, sys, time
 libc = ctypes.CDLL(None, use_errno=True)
@@ -1130,7 +1252,7 @@ state=0; owned_wait_root_terminal $$ "$birth" 0 || state=$?
             result = subprocess.run(
                 ["sh", "-c", command], cwd=ROOT, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                check=False, timeout=3)
+                check=False, timeout=slack(3))
             self.assertEqual(result.returncode, 0,
                              result.stdout + result.stderr)
 
@@ -1163,10 +1285,10 @@ parent_code='import os,signal,subprocess,sys,time; p=subprocess.Popen([sys.execu
 owned_launch user - /dev/null /dev/null -- python3 -c "$parent_code" {str(child_file)!r} {str(gate)!r}
 wrapper=$OWNED_PID; birth=$OWNED_STARTTIME; receipt=$OWNED_RECEIPT
 owned_verify_launch "$wrapper" "$birth" "$receipt" || exit 20
-for ignored in $(seq 1 200); do [ -s {str(child_file)!r} ] && break; sleep .01; done
+for ignored in $(seq 1 {slack_polls(200)}); do [ -s {str(child_file)!r} ] && break; sleep .01; done
 child=$(cat {str(child_file)!r})
 touch {str(gate)!r}
-finish=0; owned_finish "$wrapper" "$birth" "$receipt" 4 || finish=$?
+finish=0; owned_finish "$wrapper" "$birth" "$receipt" {slack_whole(4)} || finish=$?
 python3 -I - "$receipt" "$child" "$finish" <<'PY'
 import json, pathlib, sys
 record = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -1185,7 +1307,7 @@ PY
             result = subprocess.run(
                 ["sh", "-c", command], cwd=ROOT, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                check=False, timeout=15,
+                check=False, timeout=slack(15),
             )
             if child_file.exists():
                 child = int(child_file.read_text())
@@ -1212,16 +1334,16 @@ parent_code='import os,signal,subprocess,sys,time; fn=getattr(os,sys.argv[3]); p
 owned_launch user - /dev/null /dev/null -- python3 -c "$parent_code" "$child_file" "$gate" {escape!r}
 root=$OWNED_PID; birth=$OWNED_STARTTIME; receipt=$OWNED_RECEIPT
 owned_verify_launch "$root" "$birth" "$receipt" || exit 20
-for ignored in $(seq 1 200); do [ -s "$child_file" ] && break; sleep .01; done
+for ignored in $(seq 1 {slack_polls(200)}); do [ -s "$child_file" ] && break; sleep .01; done
 child=$(cat "$child_file")
 touch "$gate"
-finish_rc=0; owned_finish "$root" "$birth" "$receipt" 4 || finish_rc=$?
+finish_rc=0; owned_finish "$root" "$birth" "$receipt" {slack_whole(4)} || finish_rc=$?
 echo "child=$child finish=$finish_rc owned=$OWNED_EXIT"
 rm -f "$child_file" "$gate"
 '''
         result = subprocess.run(["sh", "-c", command], cwd=ROOT, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                check=False, timeout=15)
+                                check=False, timeout=slack(15))
         match = re.search(r"child=(\d+) finish=(\d+) owned=(\d+)", result.stdout)
         self.assertIsNotNone(match, result.stdout + result.stderr)
         child = int(match.group(1))
@@ -1252,7 +1374,7 @@ owned_launch user - /dev/null /dev/null -- python3 -c "$code" "$gate"
 root=$OWNED_PID; birth=$OWNED_STARTTIME; receipt=$OWNED_RECEIPT
 owned_verify_launch "$root" "$birth" "$receipt"
 touch "$gate"
-owned_finish "$root" "$birth" "$receipt" 4
+owned_finish "$root" "$birth" "$receipt" {slack_whole(4)}
 owned_command_outcome "$receipt"
 python3 -I - "$receipt" "$OWNED_EXIT" "$OWNED_COMMAND_EXIT" "$OWNED_COMMAND_SIGNAL" <<'PY'
 import json, sys
@@ -1266,7 +1388,7 @@ rm -f "$gate"
 '''
         result = subprocess.run(["sh", "-c", command], cwd=ROOT, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                check=False, timeout=12)
+                                check=False, timeout=slack(12))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_initial_receipt_failure_cleans_blocked_command(self):
@@ -1289,7 +1411,7 @@ rm -f "$gate"
             )
             birth = RECEIPT_NS["read_birth"]("/proc", process.pid)
             wrapper.write_text(f"{process.pid} {birth}\n")
-            stdout, stderr = process.communicate(timeout=5)
+            stdout, stderr = process.communicate(timeout=slack(5))
             result = subprocess.CompletedProcess(
                 command, process.returncode, stdout, stderr)
             self.assertNotEqual(result.returncode, 0)
@@ -1322,7 +1444,7 @@ cd {str(ROOT)!r}
 PATH={str(base)!r}:$PATH
 export PATH
 . scripts/system-scope-owned.sh
-owned_launch root - /dev/null /dev/null -- python3 -c 'import time; time.sleep(10)'
+owned_launch root - /dev/null /dev/null -- python3 -c 'import time; time.sleep({slack_whole(10)})'
 wrapper=$OWNED_PID; birth=$OWNED_STARTTIME; receipt=$OWNED_RECEIPT
 owned_verify_launch "$wrapper" "$birth" "$receipt"
 owned_finish "$wrapper" "$birth" "$receipt" 1
@@ -1338,7 +1460,7 @@ PY
             result = subprocess.run(
                 ["sh", "-c", command], cwd=ROOT, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                check=False, timeout=12,
+                check=False, timeout=slack(12),
             )
             self.assertEqual(result.returncode, 0,
                              result.stdout + result.stderr)
@@ -1346,6 +1468,7 @@ PY
     def test_finish_bounds_and_kills_stalled_outer_wrapper(self):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
+            release = base / "command-release"
             fake_sudo = base / "sudo"
             fake_sudo.write_text(
                 "#!/usr/bin/python3\n"
@@ -1363,10 +1486,11 @@ PY
 set -eu
 PATH={str(base)!r}:$PATH; export PATH
 . scripts/system-scope-owned.sh
-owned_launch root - /dev/null /dev/null -- python3 -c 'import time; time.sleep(3)'
+owned_launch root - /dev/null /dev/null -- {held_command(release)}
 wrapper=$OWNED_PID; birth=$OWNED_STARTTIME; receipt=$OWNED_RECEIPT
 owned_verify_launch "$wrapper" "$birth" "$receipt"
-owned_finish "$wrapper" "$birth" "$receipt" 5
+touch {str(release)!r}
+owned_finish "$wrapper" "$birth" "$receipt" {slack_whole(5)}
 python3 -I - "$receipt" <<'PY'
 import json,sys
 r=json.load(open(sys.argv[1]))
@@ -1383,6 +1507,7 @@ PY
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
             marker = base / "wrapper-live.json"
+            command_release = base / "command-release"
             fake_sudo = base / "sudo"
             fake_sudo.write_text(
                 "#!/usr/bin/python3\n"
@@ -1410,10 +1535,11 @@ set -eu
 PATH={str(base)!r}:$PATH; export PATH
 P11SCOPE_RECEIPT_HELPER={str(helper)!r}; export P11SCOPE_RECEIPT_HELPER
 . scripts/system-scope-owned.sh
-owned_launch root - /dev/null /dev/null -- python3 -c 'import time; time.sleep(1)'
+owned_launch root - /dev/null /dev/null -- {held_command(command_release)}
 wrapper=$OWNED_PID; birth=$OWNED_STARTTIME; receipt=$OWNED_RECEIPT
 owned_verify_launch "$wrapper" "$birth" "$receipt"
-for ignored in $(seq 1 300); do [ -s {str(marker)!r} ] && break; sleep .01; done
+touch {str(command_release)!r}
+for ignored in $(seq 1 {slack_polls(300)}); do [ -s {str(marker)!r} ] && break; sleep .01; done
 [ -s {str(marker)!r} ]
 owned_finish "$wrapper" "$birth" "$receipt" 0
 '''
@@ -1426,6 +1552,7 @@ owned_finish "$wrapper" "$birth" "$receipt" 0
             base = Path(raw)
             marker = base / "wrapper-live"
             release = base / "release"
+            command_release = base / "command-release"
             fake_sudo = base / "sudo"
             fake_sudo.write_text(
                 "#!/usr/bin/python3\n"
@@ -1456,10 +1583,11 @@ set -eu
 PATH={str(base)!r}:$PATH; export PATH
 P11SCOPE_RECEIPT_HELPER={str(helper)!r}; export P11SCOPE_RECEIPT_HELPER
 . scripts/system-scope-owned.sh
-owned_launch root - /dev/null /dev/null -- python3 -c 'import time; time.sleep(1)'
+owned_launch root - /dev/null /dev/null -- {held_command(command_release)}
 wrapper=$OWNED_PID; birth=$OWNED_STARTTIME; receipt=$OWNED_RECEIPT
 owned_verify_launch "$wrapper" "$birth" "$receipt"
-for ignored in $(seq 1 300); do [ -s {str(marker)!r} ] && break; sleep .01; done
+touch {str(command_release)!r}
+for ignored in $(seq 1 {slack_polls(300)}); do [ -s {str(marker)!r} ] && break; sleep .01; done
 first=0; owned_finish "$wrapper" "$birth" "$receipt" 0 || first=$?
 touch {str(release)!r}
 second=0; owned_finish "$wrapper" "$birth" "$receipt" 0 || second=$?
@@ -1488,6 +1616,7 @@ PY
             base = Path(raw)
             marker = base / "wrapper-live"
             release = base / "release"
+            command_release = base / "command-release"
             once = base / "once"
             read_log = base / "result-reads.jsonl"
             fake_sudo = base / "sudo"
@@ -1545,10 +1674,11 @@ set -eu
 PATH={str(base)!r}:$PATH; export PATH
 P11SCOPE_RECEIPT_HELPER={str(helper)!r}; export P11SCOPE_RECEIPT_HELPER
 . scripts/system-scope-owned.sh
-owned_launch root - /dev/null /dev/null -- python3 -c 'import time; time.sleep(1)'
+owned_launch root - /dev/null /dev/null -- {held_command(command_release)}
 wrapper=$OWNED_PID; birth=$OWNED_STARTTIME; receipt=$OWNED_RECEIPT
 owned_verify_launch "$wrapper" "$birth" "$receipt"
-for ignored in $(seq 1 300); do [ -s {str(marker)!r} ] && break; sleep .01; done
+touch {str(command_release)!r}
+for ignored in $(seq 1 {slack_polls(300)}); do [ -s {str(marker)!r} ] && break; sleep .01; done
 first=0; owned_finish "$wrapper" "$birth" "$receipt" 0 || first=$?
 touch {str(release)!r}
 second=0; owned_finish "$wrapper" "$birth" "$receipt" 0 || second=$?
@@ -1605,15 +1735,17 @@ PY
 set -eu
 P11SCOPE_RECEIPT_HELPER={str(helper)!r}; export P11SCOPE_RECEIPT_HELPER
 . scripts/system-scope-owned.sh
-owned_launch user - /dev/null /dev/null -- python3 -c 'import time; time.sleep(2)'
+owned_launch user - /dev/null /dev/null -- {held_command(base / "release-first")}
 first_wrapper=$OWNED_PID; first_birth=$OWNED_STARTTIME; first_receipt=$OWNED_RECEIPT
 owned_verify_launch "$first_wrapper" "$first_birth" "$first_receipt"
-first=0; owned_finish "$first_wrapper" "$first_birth" "$first_receipt" 3 || first=$?
+touch {str(base / "release-first")!r}
+first=0; owned_finish "$first_wrapper" "$first_birth" "$first_receipt" {slack_whole(3)} || first=$?
 retry=0; owned_finish "$first_wrapper" "$first_birth" "$first_receipt" 0 || retry=$?
-owned_launch user - /dev/null /dev/null -- python3 -c 'import time; time.sleep(2)'
+owned_launch user - /dev/null /dev/null -- {held_command(base / "release-second")}
 second_wrapper=$OWNED_PID; second_birth=$OWNED_STARTTIME; second_receipt=$OWNED_RECEIPT
 owned_verify_launch "$second_wrapper" "$second_birth" "$second_receipt"
-other=0; owned_finish "$second_wrapper" "$second_birth" "$second_receipt" 3 || other=$?
+touch {str(base / "release-second")!r}
+other=0; owned_finish "$second_wrapper" "$second_birth" "$second_receipt" {slack_whole(3)} || other=$?
 python3 -I - "$first_receipt" "$second_receipt" "$first" "$retry" "$other" <<'PY'
 import json,pathlib,sys
 first=json.load(open(sys.argv[1])); second=json.load(open(sys.argv[2]))
@@ -1643,7 +1775,7 @@ PY
 set -eu
 cd {str(ROOT)!r}
 . scripts/system-scope-owned.sh
-gate_code='import pathlib,sys,time; gate=pathlib.Path(sys.argv[1]); deadline=time.monotonic()+20\nwhile not gate.exists():\n assert time.monotonic()<deadline\n time.sleep(.01)'
+gate_code='import pathlib,sys,time; gate=pathlib.Path(sys.argv[1]); deadline=time.monotonic()+{slack(20)}\nwhile not gate.exists():\n assert time.monotonic()<deadline\n time.sleep(.01)'
 
 TMPDIR={str(directories["a"])!r}; export TMPDIR
 owned_launch user - /dev/null /dev/null -- python3 -c "$gate_code" {str(releases["a"])!r}
@@ -1658,14 +1790,14 @@ b_command=$OWNED_COMMAND_PID; b_command_birth=$OWNED_COMMAND_STARTTIME
 
 TMPDIR={str(directories["scratch"])!r}; export TMPDIR
 touch {str(releases["a"])!r}
-owned_wait_supervisor_terminal "$a_receipt" 5
+owned_wait_supervisor_terminal "$a_receipt" {slack_whole(5)}
 chmod 500 {str(directories["a"])!r}
 a_first=0; owned_finish "$a_wrapper" "$a_birth" "$a_receipt" 0 || a_first=$?
 [ "$(owned_process_starttime "$b_command")" = "$b_command_birth" ]
 touch {str(base / "continued-after-a")!r}
 
 touch {str(releases["b"])!r}
-owned_wait_supervisor_terminal "$b_receipt" 5
+owned_wait_supervisor_terminal "$b_receipt" {slack_whole(5)}
 chmod 500 {str(directories["b"])!r}
 b_first=0; owned_finish "$b_wrapper" "$b_birth" "$b_receipt" 0 || b_first=$?
 
@@ -1679,7 +1811,7 @@ owned_launch user - /dev/null /dev/null -- python3 -c "$gate_code" {str(releases
 c_wrapper=$OWNED_PID; c_birth=$OWNED_STARTTIME; c_receipt=$OWNED_RECEIPT
 owned_verify_launch "$c_wrapper" "$c_birth" "$c_receipt"
 touch {str(releases["c"])!r}
-c_finish=0; owned_finish "$c_wrapper" "$c_birth" "$c_receipt" 5 || c_finish=$?
+c_finish=0; owned_finish "$c_wrapper" "$c_birth" "$c_receipt" {slack_whole(5)} || c_finish=$?
 
 python3 -I - "$a_receipt" "$b_receipt" "$c_receipt" \
     "$a_first" "$b_first" "$a_retry" "$b_retry" "$c_finish" <<'PY'
@@ -1719,16 +1851,16 @@ birth=$OWNED_STARTTIME
 receipt=$OWNED_RECEIPT
 owned_verify_launch "$root" "$birth" "$receipt"
 command_root=$OWNED_COMMAND_PID
-for ignored in $(seq 1 200); do [ -s "$child_file" ] && break; sleep .01; done
+for ignored in $(seq 1 {slack_polls(200)}); do [ -s "$child_file" ] && break; sleep .01; done
 child=$(cat "$child_file")
 kill -TERM "$command_root"
-owned_finish "$root" "$birth" "$receipt" 2
+owned_finish "$root" "$birth" "$receipt" {slack_whole(2)}
 [ ! -e "/proc/$child/stat" ] || [ "$(sed 's/.*) //' "/proc/$child/stat" | cut -d' ' -f1)" = Z ]
 rm -f "$child_file"
 '''
         result = subprocess.run(["sh", "-c", command], cwd=ROOT, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                check=False, timeout=12)
+                                check=False, timeout=slack(12))
         self.assertEqual(result.returncode, 0, result.stderr)
 
 

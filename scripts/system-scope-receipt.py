@@ -666,18 +666,27 @@ def settle_process(args):
 
 def verify_group(args):
     deadline = time.monotonic() + args.timeout
+    detail = "leader never observed"
     while time.monotonic() < deadline:
         try:
             record = read_process(args.proc_root, args.pid)
-            require(record["starttime"] == args.starttime,
-                    "owned group leader birth identity changed")
-            if (record["pgrp"] == args.pid and record["session"] == args.pid
-                    and record["state"] not in ("Z", "X", "x")):
-                return record
         except FileNotFoundError:
-            pass
+            # The PID was published after the leader's setsid/exec, so an
+            # absent entry is a leader that already exited and was reaped;
+            # it cannot become live again.
+            detail = "leader exited before verification"
+            break
+        require(record["starttime"] == args.starttime,
+                "owned group leader birth identity changed")
+        if record["state"] in ("Z", "X", "x"):
+            detail = "leader exited before verification"
+            break
+        if record["pgrp"] == args.pid and record["session"] == args.pid:
+            return record
+        detail = (f"leader pgrp={record['pgrp']} session={record['session']}")
         time.sleep(0.005)
-    raise ReceiptError("owned launch did not establish a live private session group")
+    raise ReceiptError(
+        "owned launch did not establish a live private session group: " + detail)
 
 
 def _scan_group(proc_root, leader, deadline):

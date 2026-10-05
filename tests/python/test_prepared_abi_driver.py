@@ -3,6 +3,7 @@
 """Actual-CLI prepared dependency tests for the ABI routing driver."""
 
 import json
+import math
 import os
 from pathlib import Path
 import runpy
@@ -18,6 +19,28 @@ FIXTURES = ROOT / "tests/fixtures/prepared-abi-driver"
 EvidenceFixture = runpy.run_path(
     str(ROOT / "tests/python/test_prepared_dependency_evidence.py")
 )["EvidenceFixture"]
+
+# SLACK hang guards (an outer `timeout` whose expiry can only mean failure)
+# scale with P11SCOPE_TEST_TIME_SCALE, as in test_lane13_evidence.py.
+DEFAULT_TIME_SCALE = 5.0
+
+
+def _time_scale():
+    raw = os.environ.get("P11SCOPE_TEST_TIME_SCALE", "").strip()
+    if not raw:
+        return DEFAULT_TIME_SCALE
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 1:
+        raise SystemExit("P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1")
+    return value
+
+
+def slack(seconds):
+    """Scale a wait-until bound whose expiry can only mean failure."""
+    return seconds * _time_scale()
 
 
 class AbiDriverFixture:
@@ -133,7 +156,7 @@ class AbiDriverFixture:
             env=environment,
             text=True,
             capture_output=True,
-            timeout=15,
+            timeout=slack(15),
         )
 
     def environment(self):
@@ -186,7 +209,7 @@ class AbiDriverFixture:
             env=self.environment(),
             text=True,
             capture_output=True,
-            timeout=15,
+            timeout=slack(15),
         )
 
     def events(self):
@@ -318,7 +341,7 @@ class PreparedAbiDriverTests(unittest.TestCase):
                 ["/bin/sh", str(launcher), str(command), str(record),
                  *(str(path) for path in tools), omitted],
                 cwd=fixture.root, env=fixture.environment(), text=True,
-                capture_output=True, timeout=15,
+                capture_output=True, timeout=slack(15),
             )
             return result, record
 

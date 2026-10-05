@@ -199,13 +199,9 @@ impl MemberProbe for Probe {
             return scripted.clone();
         }
         let entries = self.snapshots.get(&pid).cloned().unwrap_or_default();
-        let mapped = self.identities(
-            pid,
-            entries
-                .iter()
-                .filter(|entry| is_provider_mapping(entry) && prove.contains(&ObjectKey::of(entry)))
-                .map(|entry| (entry.start, entry.end)),
-        );
+        // The production range selection (A6: caller ranges only), so the
+        // scripted confirmation reads exactly what `confirm_with` would.
+        let mapped = self.identities(pid, proof_ranges(&entries, prove));
         Confirmation::Confirmed(ConfirmedRead {
             start_time: 5_000 + u64::from(pid),
             exe: exe(),
@@ -1026,13 +1022,16 @@ fn an_examined_key_counts_only_when_its_ranges_are_an_examined_file() {
 
 /// The confirmation reads `map_files` only for the requested keys, inside
 /// the pin: a generation change after those reads still loses the member.
+/// A6: only the requested keys' executable ranges are read (the provider's
+/// text; its `r--` header is never statted).
 #[test]
 fn the_confirmation_reads_map_files_for_requested_keys_inside_the_pin() {
     let provider_ranges: Vec<(u64, u64)> = provider_caller()
         .iter()
-        .filter(|entry| entry.inode == PROVIDER)
+        .filter(|entry| entry.inode == PROVIDER && entry.permissions[2] == b'x')
         .map(|entry| (entry.start, entry.end))
         .collect();
+    assert_eq!(provider_ranges, vec![(0x1000_1000, 0x1000_2000)]);
     let mut io = Io::healthy();
     for (start, _) in &provider_ranges {
         io.mapped.insert(*start, Ok(vm_file(PROVIDER)));
@@ -1044,7 +1043,10 @@ fn the_confirmation_reads_map_files_for_requested_keys_inside_the_pin() {
         panic!("a healthy confirmation");
     };
     let read_ranges: Vec<(u64, u64)> = read.mapped.keys().copied().collect();
-    assert_eq!(read_ranges, provider_ranges, "libc was not requested");
+    assert_eq!(
+        read_ranges, provider_ranges,
+        "libc was not requested; the provider's header is not executable"
+    );
     assert!(
         read.mapped
             .values()
@@ -1339,9 +1341,10 @@ fn create_subvolume(parent: &std::path::Path, name: &str) {
     assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
 }
 
-/// A forked, quiescent target: it maps `path` (one page) and reports the
-/// address; on `s` it unmaps that page and maps `path` again at the same
-/// address (whatever file the path names now), then acknowledges.
+/// A forked, quiescent target: it maps `path` (one page, `r-x`: A6 counts
+/// only an executable mapping as a caller) and reports the address; on `s`
+/// it unmaps that page and maps `path` again at the same address (whatever
+/// file the path names now), then acknowledges.
 struct SwapChild {
     pid: libc::pid_t,
     command: std::os::fd::OwnedFd,
@@ -1369,8 +1372,14 @@ impl SwapChild {
             unsafe {
                 let map = |at: *mut libc::c_void, flags| {
                     let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY);
-                    let base =
-                        libc::mmap(at, 4096, libc::PROT_READ, libc::MAP_PRIVATE | flags, fd, 0);
+                    let base = libc::mmap(
+                        at,
+                        4096,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_PRIVATE | flags,
+                        fd,
+                        0,
+                    );
                     libc::close(fd);
                     base
                 };
@@ -1764,7 +1773,8 @@ fn a_range_unmapped_after_the_sweep_is_confirmed_never_counted_unexamined() {
     let checks = Checks::default();
     let index = provider_index(&checks);
     let sweep = vec![(10_000, provider_caller()), (20_001, idle(None))];
-    let libc_range = (0x2000_0000, 0x2000_1000);
+    // A6: libc's text, its one proved range (the `r--` header is not read).
+    let libc_range = (0x2000_1000, 0x2000_2000);
 
     // Unloaded since the sweep: the re-read no longer maps libc.
     let mut probe = Probe::over(&sweep);
@@ -1815,7 +1825,8 @@ fn a_range_gone_inside_the_pin_is_a_mapping_changed_loss() {
     let checks = Checks::default();
     let index = provider_index(&checks);
     let sweep = vec![(10_000, provider_caller()), (10_001, provider_caller())];
-    for range in [(0x1000_0000, 0x1000_1000), (0x2000_0000, 0x2000_1000)] {
+    // A6: the provider's and libc's text, their proved ranges.
+    for range in [(0x1000_1000, 0x1000_2000), (0x2000_1000, 0x2000_2000)] {
         let mut probe = Probe::over(&sweep);
         probe.mapped.insert(
             10_001,
@@ -1829,6 +1840,19 @@ fn a_range_gone_inside_the_pin_is_a_mapping_changed_loss() {
         );
         assert!(attribution.unexamined.is_empty(), "{range:x?}");
     }
+    // A6: the same fault on the non-executable headers is never read.
+    let mut probe = Probe::over(&sweep);
+    probe.mapped.insert(
+        10_001,
+        MappedIdentities::from([
+            ((0x1000_0000, 0x1000_1000), Err(RANGE_NOT_MAPPED.into())),
+            ((0x2000_0000, 0x2000_1000), Err(RANGE_NOT_MAPPED.into())),
+        ]),
+    );
+    let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
+    assert!(attribution.losses.is_empty(), "{:?}", attribution.losses);
+    let pids: Vec<u32> = attribution.members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, vec![10_001]);
 }
 
 // ---- C5.6 owner ruling: proof stats on a bounded pool ----
@@ -1916,10 +1940,21 @@ impl ConfirmIo for PoolIo<'_> {
     }
 }
 
-/// Enough wide libs that both `wide(true)` (132 entries) and
-/// `wide(false)` (130) reach the pool: the pooled-equivalence tests below
-/// are vacuous unless the pool engages.
-const WIDE_LIBS: u64 = 64;
+/// Enough wide libs that the proof batches of both `wide(true)` (130
+/// executable ranges of 260 entries) and `wide(false)` (129 of 258) reach
+/// the pool: the pooled-equivalence tests below are vacuous unless the pool
+/// engages. A6: only executable ranges are proved, so this doubled from 64
+/// (whose 66 and 65 proof ranges now stay under `MIN_PARALLEL_BATCH`).
+const WIDE_LIBS: u64 = 128;
+
+/// The executable (proved) ranges of `entries`, in maps order.
+fn exec_ranges(entries: &[MapEntry]) -> Vec<(u64, u64)> {
+    entries
+        .iter()
+        .filter(|entry| entry.permissions[2] == b'x')
+        .map(|entry| (entry.start, entry.end))
+        .collect()
+}
 
 /// A caller (or, without the provider, an idle process) mapping enough
 /// candidate ranges for its proof batch to reach the pool.
@@ -1936,32 +1971,35 @@ fn wide(provider: bool) -> Vec<MapEntry> {
             &format!("/usr/lib/libw{lib}.so"),
         ));
     }
-    assert!(entries.len() >= MIN_PARALLEL_BATCH);
+    assert!(exec_ranges(&entries).len() >= MIN_PARALLEL_BATCH);
     entries
 }
 
-/// Faults by range for one pid, a deterministic function of the pid: a
-/// stale provider range, a refused provider range, a refused libc range,
-/// another file at a wide
-/// lib's range (an examined key that is then unexamined), another file
-/// at a provider range (an identity mismatch).
+/// Faults by range for one pid, a deterministic function of the pid, on
+/// the proved (executable) ranges: a stale provider text range, a refused
+/// one, another file at it (an identity mismatch), a refused libc text
+/// range, another file at a wide lib's text range (an examined key that is
+/// then unexamined). On a pid with several, the first listed wins. A6
+/// moved the libc refusal and the mismatch from the `r--` headers (no
+/// longer read) to the text ranges; the header faults stay, so they also
+/// show a non-executable range is never read.
 fn faults_of(pid: u32) -> BTreeMap<(u64, u64), Result<FileIdentity, String>> {
     let mut faults = BTreeMap::new();
-    if pid.is_multiple_of(7) {
-        faults.insert(
-            (0x1000_1000, 0x1000_2000),
-            Err(RANGE_NOT_MAPPED.to_string()),
-        );
-    }
+    let text = (0x1000_1000, 0x1000_2000);
     let refused = || Err("Operation not permitted (os error 1)".to_string());
-    if pid.is_multiple_of(11) {
-        faults.insert((0x1000_1000, 0x1000_2000), refused());
+    if pid.is_multiple_of(7) {
+        faults.insert(text, Err(RANGE_NOT_MAPPED.to_string()));
     }
-    if pid.is_multiple_of(19) {
-        faults.insert((0x2000_0000, 0x2000_1000), refused());
+    if pid.is_multiple_of(11) {
+        faults.entry(text).or_insert_with(refused);
     }
     if pid.is_multiple_of(13) {
+        faults.entry(text).or_insert(Ok(vm_file(9_999)));
         faults.insert((0x1000_0000, 0x1000_1000), Ok(vm_file(9_999)));
+    }
+    if pid.is_multiple_of(19) {
+        faults.insert((0x2000_1000, 0x2000_2000), refused());
+        faults.insert((0x2000_0000, 0x2000_1000), refused());
     }
     if pid.is_multiple_of(17) {
         faults.insert((0x3010_1000, 0x3010_2000), Ok(vm_file(9_998)));
@@ -1977,10 +2015,8 @@ fn faults_of(pid: u32) -> BTreeMap<(u64, u64), Result<FileIdentity, String>> {
 fn the_pool_confirms_and_stats_exactly_like_one_thread() {
     let entries = wide(true);
     let prove: BTreeSet<ObjectKey> = entries.iter().map(ObjectKey::of).collect();
-    let ranges: Vec<(u64, u64)> = entries
-        .iter()
-        .map(|entry| (entry.start, entry.end))
-        .collect();
+    // What attribution hands the unpinned path: executable ranges only.
+    let ranges = exec_ranges(&entries);
     let run = |pool: Option<&ProofStatPool>, ceiling: u64| {
         let source = SeamStat::over(&entries, faults_of(7 * 11 * 13));
         let mut io = PoolIo {
@@ -2005,7 +2041,9 @@ fn the_pool_confirms_and_stats_exactly_like_one_thread() {
         );
         (confirmed, unpinned)
     };
-    let full = entries.len() as u64;
+    // A6: a confirmation charges one unit per executable range only.
+    let full = ranges.len() as u64;
+    assert_eq!(full, 130);
     for ceiling in [0, 1, 5, 9, 15, full - 1, full, 1_000] {
         let serial = run(None, ceiling);
         if ceiling >= full {

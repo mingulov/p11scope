@@ -27,8 +27,8 @@ use crate::attach::Scope;
 use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
 use crate::discovery::engine::{
-    MAX_SCAN_PIDS, is_provider_mapping, scope_pids, select_deep_scan_candidates,
-    sweep_process_maps, unreadable_member_skip,
+    MAX_SCAN_PIDS, scope_pids, select_deep_scan_candidates, sweep_process_maps,
+    unreadable_member_skip,
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
@@ -43,7 +43,8 @@ use crate::discovery::scan::{
 };
 use crate::discovery::sweep_attribution::{
     AttributionLoss, KnownKeyIndex, MatchedObject, MemberProbe, ObjectChecks, OsMemberProbe,
-    RefusedObject, SweepAttribution, SweptMember, attribute_unselected, retain_unchanged,
+    RefusedObject, SweepAttribution, SweptMember, attribute_unselected, is_caller_range,
+    retain_unchanged,
 };
 use crate::plan::{self, AdmissionPolicy, AdmissionScope};
 use crate::process::{ProcessView, ProcessViewId, generation_gone};
@@ -990,12 +991,13 @@ fn attribute_sweep(
         .flat_map(|member| member.examined.iter().copied());
     let (index, mut refused) = KnownKeyIndex::build(modules, &match_keys, examined, checks);
     let selected: BTreeSet<u32> = collection.selected.iter().copied().collect();
-    // A refused object is a loss only where an unselected process maps it.
+    // A refused object is a loss only where an unselected process maps it
+    // as a caller would: executably (A6, the same rule as attribution).
     let unselected_keys: BTreeSet<ObjectKey> = collection
         .sweep
         .iter()
         .filter(|(pid, _)| !selected.contains(pid))
-        .flat_map(|(_, entries)| entries.iter().filter(|entry| is_provider_mapping(entry)))
+        .flat_map(|(_, entries)| entries.iter().filter(|entry| is_caller_range(entry)))
         .map(ObjectKey::of)
         .collect();
     refused.retain(|object| unselected_keys.contains(&object.key));

@@ -27,6 +27,12 @@
 //!   file is an `identity_mismatch` loss; an unprovable one (no
 //!   `CAP_SYS_ADMIN`/`CAP_CHECKPOINT_RESTORE`) a `map_files_unavailable`
 //!   loss. "Examined" keys need the same proof to count as examined.
+//! - Only executable ranges make a caller (owner ruling A6, exec-only
+//!   proof ranges): a key's non-executable ranges are neither proved nor
+//!   counted, for matched and examined keys alike, so a process that maps
+//!   a provider only without `x` (a scanner reading the file, `ld.so`'s
+//!   first `r--` mapping) is not a caller and costs no proof. Every range
+//!   selection goes through [`is_caller_range`].
 //! - ` (deleted)` (and otherwise unusable) mapping paths never match.
 //! - After the confirmations, each matched object is rechecked once
 //!   (`object_unchanged`); a changed object drops its sweep attributions.
@@ -322,8 +328,9 @@ pub(crate) struct ConfirmedRead {
     pub start_time: u64,
     pub exe: ExeIdentity,
     pub entries: Vec<MapEntry>,
-    /// The `map_files` identity of every confirmed provider-candidate
-    /// range whose key needs that proof, read while the pin held.
+    /// The `map_files` identity of every confirmed caller range
+    /// ([`is_caller_range`]) whose key needs that proof, read while the pin
+    /// held.
     pub mapped: MappedIdentities,
 }
 
@@ -339,7 +346,7 @@ pub(crate) enum Confirmation {
 /// The `/proc` side of the confirmation, behind a seam.
 pub(crate) trait MemberProbe {
     /// Confirm `pid`, statting the `map_files` entry of every confirmed
-    /// provider-candidate range whose key is in `prove`.
+    /// caller range ([`proof_ranges`]) whose key is in `prove`.
     fn confirm(
         &mut self,
         pid: u32,
@@ -521,7 +528,8 @@ fn classify_snapshot<'a>(index: &KnownKeyIndex, entries: &'a [MapEntry]) -> Clas
     classified
 }
 
-/// Whether every range of a matched group is the held object's file.
+/// Whether every range of a matched group (its caller ranges: see
+/// [`is_caller_range`]) is the held object's file.
 fn prove_match(
     expected: FileIdentity,
     group: &[&MapEntry],
@@ -810,14 +818,46 @@ pub(crate) fn retain_unchanged(
     dropped
 }
 
-/// The provider-candidate keys of one snapshot, each once, with its
-/// entries (for double-load evidence and the path).
+/// Whether `entry` is a range that makes its process a caller of the
+/// object at its key, and so the only kind of range a key must prove
+/// (owner ruling A6, 2026-10-05: exec-only proof ranges): a file-backed
+/// provider-candidate mapping with the `x` permission. A key's
+/// non-executable ranges are neither proved nor counted — not for a
+/// matched key (attribution), not for an examined key (coverage) — so a
+/// process mapping a provider only without `x` is not its caller, and a
+/// maps-key collision on a data range cannot cost an edge whose executable
+/// ranges are the held file.
+///
+/// This is the one rule for which ranges a key brings: phase-1 and
+/// confirmed classification ([`provider_groups`]) and the confirmation's
+/// proof reads ([`proof_ranges`]) both use it, and any other identity
+/// backend must take its range set from the same place (I7).
+pub(crate) fn is_caller_range(entry: &MapEntry) -> bool {
+    is_provider_mapping(entry) && entry.permissions[2] == b'x'
+}
+
+/// The caller ranges ([`is_caller_range`]) of one snapshot by key, each key
+/// once, with its entries in maps order (for the proof, double-load
+/// evidence and the path). A key with no caller range has no group.
 fn provider_groups(entries: &[MapEntry]) -> BTreeMap<ObjectKey, Vec<&MapEntry>> {
     let mut groups: BTreeMap<ObjectKey, Vec<&MapEntry>> = BTreeMap::new();
-    for entry in entries.iter().filter(|entry| is_provider_mapping(entry)) {
+    for entry in entries.iter().filter(|entry| is_caller_range(entry)) {
         groups.entry(ObjectKey::of(entry)).or_default().push(entry);
     }
     groups
+}
+
+/// The ranges whose `map_files` identity a confirmation reads: every
+/// caller range ([`is_caller_range`]) under a key in `prove`, each once,
+/// in maps order (the order the work budget is charged in).
+pub(crate) fn proof_ranges(entries: &[MapEntry], prove: &BTreeSet<ObjectKey>) -> Vec<(u64, u64)> {
+    let mut seen = BTreeSet::new();
+    entries
+        .iter()
+        .filter(|entry| is_caller_range(entry) && prove.contains(&ObjectKey::of(entry)))
+        .map(|entry| (entry.start, entry.end))
+        .filter(|range| seen.insert(*range))
+        .collect()
 }
 
 /// Whether a group's pathname can attribute: every mapping of the object
@@ -956,20 +996,11 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
     // time would charge it; only then are the charged ranges read (on the
     // proof-stat pool when there is one), so a ceiling stops at the same
     // range and never yields a partial proof.
-    let mut ranges = Vec::new();
-    let mut seen = BTreeSet::new();
-    for entry in entries
-        .iter()
-        .filter(|entry| is_provider_mapping(entry) && prove.contains(&ObjectKey::of(entry)))
-    {
-        let range = (entry.start, entry.end);
-        if !seen.insert(range) {
-            continue;
-        }
+    let ranges = proof_ranges(&entries, prove);
+    for _ in &ranges {
         if let Err(reason) = budget.spend(1) {
             return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
         }
-        ranges.push(range);
     }
     let mapped = read_ranges(io, pid, &ranges);
     let after = io.exe(pid);

@@ -33,7 +33,7 @@ fn budget() -> InventoryBudget {
     InventoryBudget::new(576, 4608).unwrap()
 }
 fn caller_budget(pairs: u64) -> CallerBudget {
-    CallerBudget::new(budget(), pairs, 4608 + 56 * pairs).unwrap()
+    CallerBudget::new(budget(), pairs, 4608 + 64 * pairs).unwrap()
 }
 fn window() -> InventoryReadWindow {
     InventoryReadWindow::new(576, Instant::now() + Duration::from_secs(3)).unwrap()

@@ -1,10 +1,11 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
 //! Shared wire records for positive caller/object Inventory evidence.
 //!
-//! Caller-use rows retain historical physical-use evidence, not process liveness,
-//! call counts or logical publisher attribution. Endpoint records only bind an
-//! endpoint to an object. Validation here checks the wire contract; the owner
-//! must separately establish map/domain and object membership.
+//! Caller-use rows retain historical physical-use evidence and a saturating
+//! lower bound of entries since the row was recorded, not process liveness,
+//! per-call times or logical publisher attribution. Endpoint records only bind
+//! an endpoint to an object. Validation here checks the wire contract; the
+//! owner must separately establish map/domain and object membership.
 
 use crate::ImageIdentity;
 
@@ -17,6 +18,15 @@ pub const CALLER_USE_POSITIVE: u32 = 1;
 /// Caller-specific evidence is separate from global Inventory usage evidence.
 pub const CALLER_EVIDENCE_CELLS: u32 = 4;
 pub const CALLER_EVIDENCE_KNOWN_MASK: u64 = 0x0f;
+/// CALLER_USE value layout: version 1 was the 32-byte witness of v0.2.x;
+/// version 2 appends the 8-byte `entry_count` (40 bytes). The BPF object and
+/// its reader always ship together, so this is an internal layout version.
+pub const CALLER_USE_LAYOUT_VERSION: u32 = 2;
+/// The entry count saturates here. A producer adds one only while the count
+/// it validated is below this ceiling, so concurrent producers can push the
+/// cell past it by at most one each (bounded by the live task count, far
+/// below `u64` wrap-around); readers clamp to the ceiling.
+pub const CALLER_ENTRY_COUNT_SATURATED: u64 = 1 << 63;
 
 /// CALLER_USE key. Object ID zero and exec ID zero are valid.
 #[repr(C)]
@@ -36,23 +46,31 @@ impl CallerObjectKey {
     }
 }
 
-/// One positive physical-use witness for a caller/object pair.
+/// One positive physical-use witness for a caller/object pair. Every field
+/// but `entry_count` is immutable once inserted; `entry_count` is a monotonic
+/// counter that BPF advances in place with a non-fetch atomic add.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CallerObjectUse {
     /// Association timestamp, including zero; not the earliest call time.
     pub recorded_at_ns: u64,
-    /// Must be zero while recency is disabled.
+    /// Must be zero: recency is derived in userspace, never stamped by BPF.
     pub recent_bucket: u64,
     pub host_tgid: u32,
     pub witness_endpoint: u32,
     pub flags: u32,
     pub reserved: u32,
+    /// Entries on attached endpoints of this object by this caller image
+    /// since the row was recorded, including the recording entry. A lower
+    /// bound while producers run; see [`CALLER_ENTRY_COUNT_SATURATED`].
+    pub entry_count: u64,
 }
 
 impl CallerObjectUse {
     /// Validate against the explicit endpoint capacity of this Inventory domain.
     /// The positive flag, rather than a timestamp sentinel, establishes evidence.
+    /// Only insert-immutable fields are checked: the concurrently advanced
+    /// `entry_count` is never an integrity input.
     #[inline(always)]
     pub const fn is_valid(self, endpoint_capacity: u32) -> bool {
         self.flags == CALLER_USE_POSITIVE
@@ -60,6 +78,22 @@ impl CallerObjectUse {
             && self.host_tgid != 0
             && self.witness_endpoint < endpoint_capacity
             && self.reserved == 0
+    }
+
+    /// Whether a producer may count one more entry on this (validated) copy.
+    #[inline(always)]
+    pub const fn counts_another_entry(self) -> bool {
+        self.entry_count < CALLER_ENTRY_COUNT_SATURATED
+    }
+
+    /// The saturating entry count a reader may publish.
+    #[inline(always)]
+    pub const fn saturated_entry_count(self) -> u64 {
+        if self.entry_count < CALLER_ENTRY_COUNT_SATURATED {
+            self.entry_count
+        } else {
+            CALLER_ENTRY_COUNT_SATURATED
+        }
     }
 }
 
@@ -153,6 +187,7 @@ mod tests {
             witness_endpoint: 0,
             flags: 1,
             reserved: 0,
+            entry_count: 1,
         }
     }
 
@@ -164,7 +199,8 @@ mod tests {
         assert_eq!(offset_of!(CallerObjectKey, object_id), 16);
         assert_eq!(offset_of!(CallerObjectKey, reserved), 20);
 
-        assert_eq!(size_of::<CallerObjectUse>(), 32);
+        assert_eq!(CALLER_USE_LAYOUT_VERSION, 2);
+        assert_eq!(size_of::<CallerObjectUse>(), 40);
         assert_eq!(align_of::<CallerObjectUse>(), 8);
         assert_eq!(offset_of!(CallerObjectUse, recorded_at_ns), 0);
         assert_eq!(offset_of!(CallerObjectUse, recent_bucket), 8);
@@ -172,6 +208,7 @@ mod tests {
         assert_eq!(offset_of!(CallerObjectUse, witness_endpoint), 20);
         assert_eq!(offset_of!(CallerObjectUse, flags), 24);
         assert_eq!(offset_of!(CallerObjectUse, reserved), 28);
+        assert_eq!(offset_of!(CallerObjectUse, entry_count), 32);
 
         assert_eq!(size_of::<EndpointObject>(), 8);
         assert_eq!(align_of::<EndpointObject>(), 4);
@@ -306,6 +343,56 @@ mod tests {
             for flags in [1 << bit, 1 | (1 << bit)] {
                 assert!(!CallerObjectUse { flags, ..value }.is_valid(1));
             }
+        }
+    }
+
+    #[test]
+    fn entry_count_is_never_an_integrity_input() {
+        for entry_count in [
+            0,
+            1,
+            CALLER_ENTRY_COUNT_SATURATED - 1,
+            CALLER_ENTRY_COUNT_SATURATED,
+            u64::MAX,
+        ] {
+            let value = CallerObjectUse {
+                entry_count,
+                ..positive_use()
+            };
+            assert!(value.is_valid(1), "{value:?}");
+            assert!(!CallerObjectUse { flags: 0, ..value }.is_valid(1));
+        }
+    }
+
+    #[test]
+    fn entry_count_saturates_at_the_ceiling_for_producers_and_readers() {
+        assert_eq!(CALLER_ENTRY_COUNT_SATURATED, 1 << 63);
+        for (entry_count, counts, published) in [
+            (0, true, 0),
+            (1, true, 1),
+            (
+                CALLER_ENTRY_COUNT_SATURATED - 1,
+                true,
+                CALLER_ENTRY_COUNT_SATURATED - 1,
+            ),
+            (
+                CALLER_ENTRY_COUNT_SATURATED,
+                false,
+                CALLER_ENTRY_COUNT_SATURATED,
+            ),
+            (
+                CALLER_ENTRY_COUNT_SATURATED + 4_194_304,
+                false,
+                CALLER_ENTRY_COUNT_SATURATED,
+            ),
+            (u64::MAX, false, CALLER_ENTRY_COUNT_SATURATED),
+        ] {
+            let value = CallerObjectUse {
+                entry_count,
+                ..positive_use()
+            };
+            assert_eq!(value.counts_another_entry(), counts, "{entry_count}");
+            assert_eq!(value.saturated_entry_count(), published, "{entry_count}");
         }
     }
 

@@ -80,6 +80,10 @@ impl InventoryBudget {
     }
 }
 
+/// One CALLER_USE pair's accounted payload: the 24-byte key plus the
+/// 40-byte value (layout version 2, with its entry count).
+pub(crate) const CALLER_PAIR_BYTES: u64 = 64;
+
 /// Explicit additional endpoint metadata and sparse caller-pair payload.
 /// This private budget has no implicit pair capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +112,7 @@ impl CallerBudget {
             .checked_mul(8)
             .and_then(|endpoints| {
                 pair_limit
-                    .checked_mul(56)
+                    .checked_mul(CALLER_PAIR_BYTES)
                     .and_then(|pairs| endpoints.checked_add(pairs))
             })
             .ok_or_else(|| "caller additional payload budget overflowed".to_string())?;

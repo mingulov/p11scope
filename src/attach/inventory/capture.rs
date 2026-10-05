@@ -260,8 +260,8 @@ fn fds_in_use() -> Result<u64> {
     Ok((count as u64).saturating_sub(1))
 }
 
-/// Initial caller-pair limit P (plan §10 ruling D6): 65,536 pairs, about
-/// 3.5 MiB of map payload. Re-tuned from C5 measurements (DR-07).
+/// Initial caller-pair limit P (plan §10 ruling D6): 65,536 pairs, 4 MiB
+/// of map payload. Re-tuned from C5 measurements (DR-07).
 pub(crate) const DEFAULT_CALLER_PAIRS: u64 = 65_536;
 
 /// The caller budget for `endpoints` with the default pair limit.
@@ -274,7 +274,7 @@ pub(crate) fn caller_budget(endpoints: InventoryBudget, pairs: u64) -> Result<Ca
     let payload = endpoints
         .endpoint_limit()
         .checked_mul(8)
-        .zip(pairs.checked_mul(56))
+        .zip(pairs.checked_mul(crate::capacity::CALLER_PAIR_BYTES))
         .and_then(|(endpoints, pairs)| endpoints.checked_add(pairs))
         .context("caller payload budget overflowed")?;
     CallerBudget::new(endpoints, pairs, payload).map_err(anyhow::Error::msg)

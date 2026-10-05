@@ -406,7 +406,7 @@ fn privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_bin
         CallerObjectKey, CallerObjectUse, EndpointObject,
     };
     let endpoint = budget(3);
-    let caller = CallerBudget::new(endpoint, 5, 304).map_err(anyhow::Error::msg)?;
+    let caller = CallerBudget::new(endpoint, 5, 344).map_err(anyhow::Error::msg)?;
     let prepared = PreparedInventory::prepare_callers(
         Scope::System,
         endpoint,
@@ -503,7 +503,7 @@ fn privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_bin
 #[ignore = "root-owned BPF lane; each caller native preparation fault retains source and releases IDs"]
 fn privileged_inventory_caller_preparation_faults_release_exact_resources() -> Result<()> {
     let endpoint = budget(3);
-    let caller = CallerBudget::new(endpoint, 5, 304).map_err(anyhow::Error::msg)?;
+    let caller = CallerBudget::new(endpoint, 5, 344).map_err(anyhow::Error::msg)?;
     for failed in [
         InventoryPreparation::WriteCallerControl,
         InventoryPreparation::ReadCallerControl,

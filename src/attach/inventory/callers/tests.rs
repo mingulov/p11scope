@@ -13,8 +13,8 @@ fn endpoint_budget(n: u64) -> InventoryBudget {
 }
 
 fn caller_budget() -> CallerBudget {
-    // N=3, P=5: additional 24 + 280 = 304 bytes; global payload is 24.
-    CallerBudget::new(endpoint_budget(3), 5, 304).unwrap()
+    // N=3, P=5: additional 24 + 5 * 64 = 344 bytes; global payload is 24.
+    CallerBudget::new(endpoint_budget(3), 5, 344).unwrap()
 }
 
 #[test]
@@ -22,12 +22,12 @@ fn caller_budget_retains_distinct_endpoint_and_pair_payloads() {
     let caller = caller_budget();
     assert_eq!(caller.endpoint_budget(), endpoint_budget(3));
     assert_eq!(caller.pair_limit(), 5);
-    assert_eq!(caller.additional_payload_bytes(), 304);
+    assert_eq!(caller.additional_payload_bytes(), 344);
     assert_eq!(caller.endpoint_budget().payload_bytes(), 24);
     let maximum = CallerBudget::new(
         endpoint_budget(4_294_967_295),
         4_294_967_295,
-        274_877_906_880,
+        309_237_645_240,
     )
     .expect("u32 maximum N and P fit checked u64 payload accounting");
     assert_eq!(maximum.pair_limit(), 4_294_967_295);
@@ -49,10 +49,10 @@ fn caller_budget_rejects_zero_out_of_range_and_overflowing_pair_counts() {
 
 #[test]
 fn caller_budget_rejects_missing_or_surplus_additional_payload() {
-    for bytes in [0, 24, 280, 303, 305, 328, u64::MAX] {
+    for bytes in [0, 24, 280, 304, 320, 343, 345, 368, u64::MAX] {
         assert!(
             CallerBudget::new(endpoint_budget(3), 5, bytes).is_err(),
-            "N=3/P=5 requires exactly 304 additional bytes, not {bytes}"
+            "N=3/P=5 requires exactly 344 additional bytes, not {bytes}"
         );
     }
 }
@@ -123,7 +123,7 @@ fn map_fixture() -> BTreeMap<String, (InventoryMapKind, ExactMapMetadata)> {
             0,
         ),
         ("ENDPOINT_OBJECT", K::Array, MapType::Array, 4, 8, 3, 128),
-        ("CALLER_USE", K::Hash, MapType::Hash, 24, 32, 5, 0),
+        ("CALLER_USE", K::Hash, MapType::Hash, 24, 40, 5, 0),
         (
             "CALLER_EVIDENCE",
             K::PerCpuArray,

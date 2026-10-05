@@ -32,7 +32,7 @@ MAPS = {name: checker.map_def(*shape) for name, shape in {
     "THREAD_OWNER": (29, 4, 544, 0, 1), "OWNER_CTL": (2, 4, 56, 1),
     "USAGE": (2, 4, 8, 1), "USAGE_CONFIG": (2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": (6, 4, 8, 3), "ENDPOINT_OBJECT": (2, 4, 8, 1, 128),
-    "CALLER_USE": (1, 24, 32, 1), "CALLER_EVIDENCE": (6, 4, 8, 4),
+    "CALLER_USE": (1, 24, 40, 1), "CALLER_EVIDENCE": (6, 4, 8, 4),
     "TASK_COOKIE": (29, 4, 8, 0, 1), "COOKIE_CTL": (2, 4, 40, 1),
 }.items()}
 PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
@@ -42,6 +42,9 @@ PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
 SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg",
            "p11_link_current_identity"}
 MASK = (1 << 64) - 1
+VALUE = 40  # CALLER_USE layout version 2: the 32-byte witness plus entry_count
+COUNT = 32  # entry_count offset: the only CALLER_USE bytes BPF may change
+SATURATED = 1 << 63
 STACK_GUARD_ID = 0x7F0000  # a map id outside every modelled map segment
 TAG = 0x50555347
 
@@ -116,7 +119,13 @@ class EntryMachine:
             self.set_array("ENDPOINT_OBJECT", endpoint, struct.pack("<II", obj, 1))
         self.next_time = 101
         self.identity_calls = self.clock_calls = self.insert_calls = 0
+        self.race = None
         self.trace = []
+
+    def code_of(self, root):
+        symbol = self.roots[root]
+        section = self.elf.sections["uprobe"][1]
+        return [struct.unpack_from("<BBhi", section, pc) for pc in range(symbol[4], symbol[4] + symbol[5], 8)]
 
     def allocate(self, name, value):
         pointer = self.next_address
@@ -154,7 +163,17 @@ class EntryMachine:
         return self.read(pointer, len(self.segment(pointer, 1)[1]))
 
     def rows(self):
-        return {key: self.read(pointer, 32) for key, pointer in self.maps["CALLER_USE"].items()}
+        return {key: self.read(pointer, VALUE) for key, pointer in self.maps["CALLER_USE"].items()}
+
+    def seed(self, key, value):
+        require(len(key) == 24 and len(value) == VALUE, "malformed seeded caller row")
+        self.maps["CALLER_USE"][key] = self.allocate("CALLER_USE", value)
+
+    def events(self, kind):
+        return [event for event in self.trace if event[0] == kind]
+
+    def caller_lookups(self):
+        return [event for event in self.events("lookup") if event[2] == "CALLER_USE"]
 
     def integer(self, index):
         require(self.regs[index] is not None, f"entry uses clobbered r{index}")
@@ -244,9 +263,12 @@ class EntryMachine:
                     result = self.maps[name].get(key, 0)
                 else:
                     require(name == "CALLER_USE" and r(4) == 1, "caller insertion must use exact BPF_NOEXIST")
-                    value = self.read(r(3), 32)
+                    value = self.read(r(3), VALUE)
                     self.trace.append(("insert", self.pc, key, value, self.writers[4]))
                     self.insert_calls += 1
+                    if self.race is not None and key not in self.maps[name]:
+                        # A concurrent producer published its row first.
+                        self.seed(key, self.race)
                     if key in self.maps[name]:
                         result = -17
                     elif len(self.maps[name]) >= self.pair_capacity:
@@ -275,9 +297,7 @@ class EntryMachine:
         self.regs, self.writers = [None] * 11, [None] * 11
         self.regs[1], self.regs[10] = self.context, self.stack + 512
         symbol = self.roots[root]
-        section = self.elf.sections["uprobe"][1]
-        self.code = [struct.unpack_from("<BBhi", section, pc)
-                     for pc in range(symbol[4], symbol[4] + symbol[5], 8)]
+        self.code = self.code_of(root)
         self.pc = 0
         self.steps = 0
         for _ in range(10000):
@@ -313,16 +333,23 @@ class EntryMachine:
                     value = r(src) if cls == 3 else immediate
                     self.write(r(dst) + offset, (value & ((1 << (8 * size)) - 1)).to_bytes(size, "little"))
             elif op == 0xdb and immediate == 0x00:
-                # Non-fetch 64-bit atomic ADD: only a per-CPU loss counter may
-                # take it. The global USAGE cell changes solely through its
-                # exact zero-to-one CAS; every fetch form stays refused.
+                # Non-fetch 64-bit atomic ADD: a per-CPU loss counter, or the
+                # one entry count of a looked-up CALLER_USE row (by exactly
+                # one). The global USAGE cell changes solely through its exact
+                # zero-to-one CAS; every fetch form stays refused.
                 pointer = r(dst) + offset
-                name = self.segment(pointer, 8)[0]
-                require(name in {"EVIDENCE", "USAGE_EVIDENCE", "CALLER_EVIDENCE"},
-                        "caller entry atomic add outside a per-CPU counter cell")
+                name, _, _, at = self.segment(pointer, 8)
                 old = int.from_bytes(self.read(pointer, 8), "little")
-                self.write(pointer, struct.pack("<Q", (old + r(src)) & MASK))
-                self.trace.append(("counter-add", self.pc, name))
+                if name == "CALLER_USE":
+                    require(self.authorized and at == COUNT and r(src) == 1,
+                            "caller row atomic add must add one to entry_count only")
+                    self.write(pointer, struct.pack("<Q", (old + 1) & MASK), setup=True)
+                    self.trace.append(("count-add", self.pc, old))
+                else:
+                    require(name in {"EVIDENCE", "USAGE_EVIDENCE", "CALLER_EVIDENCE"},
+                            "caller entry atomic add outside a per-CPU counter cell")
+                    self.write(pointer, struct.pack("<Q", (old + r(src)) & MASK))
+                    self.trace.append(("counter-add", self.pc, name))
             elif op == 0xdb and immediate == 0xf1:
                 pointer, expected, replacement = r(dst) + offset, r(0), r(src)
                 old = int.from_bytes(self.read(pointer, 8), "little")
@@ -409,11 +436,11 @@ def check_entry_cases(body):
                                       ((41, 9), 100, 8), ((41, 9), 100, 9)]:
             machine.run(root, image=image, tgid=tgid, cookie=(TAG << 32) | endpoint)
         expected = {}
-        for image, obj, timestamp, tgid, endpoint in [((41, 9), 2, 101, 100, 7),
-                                                     ((42, 9), 2, 102, 200, 7),
-                                                     ((41, 10), 2, 103, 100, 7),
-                                                     ((41, 9), 3, 104, 100, 9)]:
-            expected[struct.pack("<QQII", *image, obj, 0)] = struct.pack("<QQIIII", timestamp, 0, tgid, endpoint, 1, 0)
+        for image, obj, timestamp, tgid, endpoint, count in [((41, 9), 2, 101, 100, 7, 3),
+                                                            ((42, 9), 2, 102, 200, 7, 1),
+                                                            ((41, 10), 2, 103, 100, 7, 1),
+                                                            ((41, 9), 3, 104, 100, 9, 1)]:
+            expected[struct.pack("<QQII", *image, obj, 0)] = row_value(timestamp, tgid, endpoint, count)
         require(machine.rows() == expected, f"{root}: missing/changed exact caller-object witnesses")
         require((machine.identity_calls, machine.clock_calls, machine.insert_calls) == (6, 4, 4),
                 f"{root}: repeated caller did not preserve bounded helper work")
@@ -448,6 +475,65 @@ def check_entry_cases(body):
         require(len(machine.rows()) == 2 and machine.insert_calls == 3,
                 f"{root}: pair exhaustion erased history or retried existing pair")
         require(machine.array("CALLER_EVIDENCE", 2) == struct.pack("<Q", 1), "pair exhaustion hidden")
+        require(machine.rows() == {pair_key((41, 9)): row_value(101, 100, 7, 2),
+                                   pair_key((42, 9)): row_value(102, 200, 7, 1)},
+                f"{root}: pair exhaustion counted an unrecorded entry or lost a count")
+        check_count_cases(body, root)
+
+
+def pair_key(image, obj=2):
+    return struct.pack("<QQII", *image, obj, 0)
+
+
+def row_value(timestamp, tgid, endpoint, count, *, recent=0, flags=1):
+    return struct.pack("<QQIIIIQ", timestamp, recent, tgid, endpoint, flags, 0, count)
+
+
+def check_count_cases(body, root):
+    """Each recorded entry counts exactly once, with one CALLER_USE lookup on a hit.
+
+    hit: one lookup, one in-place add, no insert or clock. fresh: one lookup
+    (miss), one insert carrying count 1, no add. lost race: one insert, one
+    re-lookup, one add on the winner. Failures and saturation add nothing.
+    """
+    key = pair_key((41, 9))
+    for label, seeded, race, final, lookups, inserts, adds in [
+            ("fresh", None, None, row_value(101, 100, 7, 1), 1, 1, 0),
+            ("hit", row_value(77, 100, 8, 5), None, row_value(77, 100, 8, 6), 1, 0, 1),
+            ("race", None, row_value(55, 100, 8, 9), row_value(55, 100, 8, 10), 2, 1, 1),
+            ("below-ceiling", row_value(77, 100, 7, SATURATED - 1), None,
+             row_value(77, 100, 7, SATURATED), 1, 0, 1),
+            ("saturated", row_value(77, 100, 7, SATURATED), None,
+             row_value(77, 100, 7, SATURATED), 1, 0, 0),
+            ("past-ceiling", row_value(77, 100, 7, MASK), None, row_value(77, 100, 7, MASK), 1, 0, 0)]:
+        machine = EntryMachine(body)
+        if seeded is not None:
+            machine.seed(key, seeded)
+        machine.race = race
+        machine.run(root)
+        counts = (len(machine.caller_lookups()), machine.insert_calls, len(machine.events("count-add")))
+        require(machine.rows() == {key: final}, f"{root}/{label}: entry count differs")
+        require(counts == (lookups, inserts, adds),
+                f"{root}/{label}: (CALLER_USE lookups, inserts, count adds) {counts}")
+        require(machine.clock_calls == inserts, f"{root}/{label}: clock outside a fresh insert")
+        require(all(machine.array("CALLER_EVIDENCE", cell) == bytes(8) for cell in range(4)),
+                f"{root}/{label}: a counted entry raised caller evidence")
+    # Integrity failures, on a hit or on a lost race, neither repair nor count.
+    for label, seeded, race in [
+            ("foreign-tgid", row_value(77, 200, 7, 5), None),
+            ("recency-set", row_value(77, 100, 7, 5, recent=1), None),
+            ("unknown-flags", row_value(77, 100, 7, 5, flags=3), None),
+            ("other-object", row_value(77, 100, 9, 5), None),
+            ("race-foreign-tgid", None, row_value(55, 200, 8, 9))]:
+        machine = EntryMachine(body)
+        if seeded is not None:
+            machine.seed(key, seeded)
+        machine.race = race
+        machine.run(root)
+        require(machine.rows() == {key: seeded or race}, f"{root}/{label}: malformed row changed")
+        require(not machine.events("count-add"), f"{root}/{label}: integrity failure counted")
+        require(machine.array("CALLER_EVIDENCE", 3) == struct.pack("<Q", 1),
+                f"{root}/{label}: integrity failure hidden")
 
 
 @unittest.skipUnless(os.environ.get("P11SCOPE_INVENTORY_CALLERS_OBJECT"), "actual caller object supplied by Rust integration gate")
@@ -539,6 +625,60 @@ class ActualCallerTests(unittest.TestCase):
             struct.pack_into("<BBhi", changed, base + pc * 8, *instruction)
             with self.subTest(mutation=label), self.assertRaisesRegex(RuntimeError, "memset instruction shape"):
                 check_entry_cases(bytes(changed))
+
+    def count_sites(self, root):
+        """The executed count add of a hit and of a lost race, in that order."""
+        sites = []
+        for seeded, race in [(row_value(77, 100, 7, 5), None), (None, row_value(55, 100, 8, 9))]:
+            machine = EntryMachine(self.body)
+            if seeded is not None:
+                machine.seed(pair_key((41, 9)), seeded)
+            machine.race = race
+            machine.run(root)
+            adds = machine.events("count-add")
+            self.assertEqual(len(adds), 1, f"{root}: one count add per recorded entry")
+            sites.append(adds[0][1])
+        return machine, sites
+
+    def test_actual_object_has_no_fetch_add_and_one_count_add_per_entry(self):
+        """DR-57 tripwire plus the folded count's exact atomic shape.
+
+        No executable section may hold a fetch-form ADD (32- or 64-bit); the
+        pre-existing native fetch_or forms are owned by their own checkers.
+        Each entry root holds exactly one CAS (global USAGE), the per-CPU ABI
+        evidence add, and two non-fetch adds to CALLER_USE entry_count: the hit
+        site and the lost-race site, each executed exactly once on its path.
+        """
+        elf = checker.Elf(self.body)
+        fetch_adds = [(name, offset) for name, (row, raw) in elf.sections.items()
+                      if row[1] == 1 and row[2] & 4
+                      for offset in range(0, len(raw) - 7, 8)
+                      if raw[offset] in (0xc3, 0xdb) and struct.unpack_from("<i", raw, offset + 4)[0] == 0x01]
+        self.assertEqual(fetch_adds, [], "DR-57: fetch-and-use atomic add in the caller object")
+        for root in ("p11_usage_entry_lp64", "p11_usage_entry_ia32"):
+            machine, sites = self.count_sites(root)
+            code = machine.code_of(root)
+            atomics = sorted((op, immediate) for op, _, _, immediate in code
+                             if op & 7 == 3 and op & 0xe0 == 0xc0)
+            self.assertEqual(atomics, [(0xdb, 0x00)] * 3 + [(0xdb, 0xf1)], root)
+            count_adds = [pc for pc, (op, _, offset, immediate) in enumerate(code)
+                          if (op, offset, immediate) == (0xdb, COUNT, 0x00)]
+            self.assertEqual(sorted(sites), count_adds, f"{root}: an unexecuted or extra count add")
+            self.assertNotEqual(sites[0], sites[1], root)
+
+    def test_actual_count_mutants_are_rejected(self):
+        for root in ("p11_usage_entry_lp64", "p11_usage_entry_ia32"):
+            machine, sites = self.count_sites(root)
+            base = machine.elf.sections["uprobe"][0][4] + machine.roots[root][4]
+            for site, pc in zip(("hit", "race"), sites):
+                old = machine.code[pc]
+                for label, instruction in [("count-skipped", (0x05, 0, 0, 0)),
+                                           ("fetch-add", (old[0], old[1], old[2], 0x01)),
+                                           ("count-other-field", (old[0], old[1], old[2] - 8, old[3]))]:
+                    changed = bytearray(self.body)
+                    struct.pack_into("<BBhi", changed, base + pc * 8, *instruction)
+                    with self.subTest(root=root, site=site, mutation=label), self.assertRaises(RuntimeError):
+                        check_entry_cases(bytes(changed))
 
     def test_actual_new_map_dimensions_flags_and_kind_are_exact(self):
         elf = checker.Elf(self.body)

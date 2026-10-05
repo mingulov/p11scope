@@ -1,6 +1,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
-//! Positive exact image/physical-object witnesses for the caller flavor.
-//! Rows and endpoint bindings are retained for the entire owned map domain.
+//! Positive exact image/physical-object witnesses for the caller flavor,
+//! each with a saturating entry count. Rows and endpoint bindings are
+//! retained for the entire owned map domain.
 
 use super::*;
 use p11scope_ebpf_common::inventory_callers::{
@@ -27,6 +28,8 @@ pub(super) fn bump_evidence(kind: CallerEvidence) {
 struct BpfCallerEntryIo;
 
 impl CallerEntryIo for BpfCallerEntryIo {
+    type Row = *mut CallerObjectUse;
+
     #[inline(always)]
     fn endpoint_object(&mut self, endpoint: u32) -> Option<EndpointObject> {
         ENDPOINT_OBJECT.get(endpoint).copied()
@@ -47,11 +50,14 @@ impl CallerEntryIo for BpfCallerEntryIo {
     }
 
     #[inline(always)]
-    fn lookup(&mut self, key: &CallerObjectKey) -> Option<CallerObjectUse> {
+    fn lookup(&mut self, key: &CallerObjectKey) -> Option<(Self::Row, CallerObjectUse)> {
+        let row = CALLER_USE.get_ptr_mut(key)?;
         // SAFETY: this owned map has no deletion or replacement operation.
         // The loader must freeze userspace writes before any producer exists;
-        // BPF only publishes immutable values with BPF_NOEXIST.
-        unsafe { CALLER_USE.get(key).copied() }
+        // BPF publishes rows with BPF_NOEXIST, and afterwards only advances
+        // `entry_count` with a non-fetch atomic add. Every validated field is
+        // insert-immutable, so this copy validates exactly like the row.
+        Some((row, unsafe { *row }))
     }
 
     #[inline(always)]
@@ -70,6 +76,21 @@ impl CallerEntryIo for BpfCallerEntryIo {
     #[inline(always)]
     fn now_ns(&mut self) -> u64 {
         unsafe { helpers::bpf_ktime_get_ns() }
+    }
+
+    #[inline(always)]
+    fn count_entry(&mut self, row: Self::Row) {
+        // SAFETY: `row` is the live CALLER_USE value this entry just looked
+        // up; hash elements are never deleted. The deliberately unused result
+        // selects the non-fetch BPF ATOMIC ADD (classic XADD), exact under
+        // any concurrency, as in `counter_add`; a consumed fetch-add does not
+        // lower on this toolchain (DR-57).
+        let _ = unsafe {
+            core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::AcqRel }>(
+                core::ptr::addr_of_mut!((*row).entry_count),
+                1,
+            )
+        };
     }
 }
 

@@ -1,5 +1,6 @@
 //! SPDX-License-Identifier: GPL-2.0-or-later
 use super::*;
+use crate::inventory_callers::CALLER_ENTRY_COUNT_SATURATED;
 use crate::inventory_mark_used_with;
 use core::cell::Cell;
 
@@ -39,6 +40,7 @@ struct MemoryEntryIo {
     clock_reads: usize,
     insert_calls: usize,
     lookup_calls: usize,
+    count_adds: usize,
 }
 
 impl MemoryEntryIo {
@@ -65,6 +67,7 @@ impl MemoryEntryIo {
             clock_reads: 0,
             insert_calls: 0,
             lookup_calls: 0,
+            count_adds: 0,
         }
     }
 
@@ -92,6 +95,9 @@ impl MemoryEntryIo {
 }
 
 impl CallerEntryIo for MemoryEntryIo {
+    /// The row's slot; slots are never freed, like hash elements in BPF.
+    type Row = usize;
+
     fn endpoint_object(&mut self, endpoint: u32) -> Option<EndpointObject> {
         self.endpoints.get(endpoint as usize).copied()
     }
@@ -117,9 +123,15 @@ impl CallerEntryIo for MemoryEntryIo {
         self.image
     }
 
-    fn lookup(&mut self, key: &CallerObjectKey) -> Option<CallerObjectUse> {
+    fn lookup(&mut self, key: &CallerObjectKey) -> Option<(usize, CallerObjectUse)> {
         self.lookup_calls += 1;
-        self.row(key)
+        self.rows
+            .iter()
+            .enumerate()
+            .find_map(|(slot, cell)| match cell {
+                Some((candidate, value)) if candidate == key => Some((slot, *value)),
+                _ => None,
+            })
     }
 
     fn insert_noexist(
@@ -158,6 +170,13 @@ impl CallerEntryIo for MemoryEntryIo {
         self.next_ns += 1;
         now
     }
+
+    fn count_entry(&mut self, row: usize) {
+        // Models BPF XADD: an unconditional wrapping add of one, in place.
+        self.count_adds += 1;
+        let (_, value) = self.rows[row].as_mut().expect("counted a live row");
+        value.entry_count = value.entry_count.wrapping_add(1);
+    }
 }
 
 fn key(image: ImageIdentity) -> CallerObjectKey {
@@ -176,6 +195,14 @@ fn witness(recorded_at_ns: u64, host_tgid: u32) -> CallerObjectUse {
         witness_endpoint: 7,
         flags: 1,
         reserved: 0,
+        entry_count: 1,
+    }
+}
+
+fn counted(value: CallerObjectUse, entry_count: u64) -> CallerObjectUse {
+    CallerObjectUse {
+        entry_count,
+        ..value
     }
 }
 
@@ -229,11 +256,12 @@ fn a_repeat_b_and_new_exec_keep_exactly_three_physical_pairs() {
         3,
         "the global bit cannot replace caller rows"
     );
-    assert_eq!(io.row(&key(A)), Some(witness(101, 100)));
+    assert_eq!(io.row(&key(A)), Some(counted(witness(101, 100), 2)));
     assert_eq!(io.row(&key(B)), Some(witness(102, 200)));
     assert_eq!(io.row(&key(A_EXEC)), Some(witness(103, 100)));
     assert_eq!(io.clock_reads, 3);
     assert_eq!(io.insert_calls, 3);
+    assert_eq!(io.count_adds, 1);
 }
 
 #[test]
@@ -243,10 +271,16 @@ fn existing_pair_keeps_another_endpoint_witness_without_clock_or_insert() {
     enter(&mut io, A, 100, 8);
     assert_eq!(io.usage[7].get(), 1);
     assert_eq!(io.usage[8].get(), 1);
-    assert_eq!(io.row(&key(A)), Some(witness(77, 100)));
+    assert_eq!(
+        io.row(&key(A)),
+        Some(counted(witness(77, 100), 3)),
+        "an alias endpoint of the same object counts on the same pair"
+    );
     assert_eq!(io.row_count(), 1);
     assert_eq!(io.clock_reads, 0);
     assert_eq!(io.insert_calls, 0);
+    assert_eq!(io.lookup_calls, 2);
+    assert_eq!(io.count_adds, 2);
 }
 
 #[test]
@@ -300,14 +334,18 @@ fn full_pair_map_keeps_positives_and_allows_an_existing_pair() {
             CallerEvidence::PairInsertFailure
         ))
     );
-    assert_eq!(io.rows, before);
+    assert_eq!(io.rows, before, "a refused pair counts nothing anywhere");
     assert_eq!(io.usage[7].get(), 1);
     assert_eq!(io.clock_reads, 3);
     assert_eq!(io.insert_calls, 3);
+    assert_eq!(io.count_adds, 0);
     enter(&mut io, A, 100, 7);
-    assert_eq!(io.rows, before);
+    assert_eq!(io.row(&key(A)), Some(counted(witness(101, 100), 2)));
+    assert_eq!(io.row(&key(B)), Some(witness(102, 200)));
+    assert_eq!(io.row_count(), 2);
     assert_eq!(io.clock_reads, 3);
     assert_eq!(io.insert_calls, 3);
+    assert_eq!(io.count_adds, 1);
 }
 
 #[test]
@@ -326,6 +364,7 @@ fn insertion_allocation_failure_does_not_erase_global_or_existing_use() {
     assert_eq!(io.usage[7].get(), 1);
     assert_eq!(io.lookup_calls, 1);
     assert_eq!(io.insert_calls, 1);
+    assert_eq!(io.count_adds, 0);
 }
 
 #[test]
@@ -337,10 +376,15 @@ fn concurrent_valid_winner_is_read_once_and_never_overwritten() {
     };
     io.insert_behavior = InsertBehavior::Race(Some(winner));
     enter(&mut io, A, 100, 7);
-    assert_eq!(io.row(&key(A)), Some(winner));
+    assert_eq!(
+        io.row(&key(A)),
+        Some(counted(winner, 2)),
+        "the loser counts its entry on the winner's row"
+    );
     assert_eq!(io.lookup_calls, 2);
     assert_eq!(io.insert_calls, 1);
     assert_eq!(io.clock_reads, 1);
+    assert_eq!(io.count_adds, 1);
 }
 
 #[test]
@@ -370,6 +414,7 @@ fn eexist_without_a_valid_winner_is_integrity_failure_without_retry() {
         assert_eq!(io.lookup_calls, 2);
         assert_eq!(io.insert_calls, 1);
         assert_eq!(io.clock_reads, 1);
+        assert_eq!(io.count_adds, 0);
     }
 }
 
@@ -414,6 +459,7 @@ fn malformed_existing_pair_is_not_repaired_or_replaced() {
         assert_eq!(io.lookup_calls, 1);
         assert_eq!(io.insert_calls, 0);
         assert_eq!(io.clock_reads, 0);
+        assert_eq!(io.count_adds, 0);
     }
 }
 
@@ -519,4 +565,145 @@ fn zero_tgid_cannot_publish_a_malformed_positive() {
     assert_eq!(io.row_count(), 0);
     assert_eq!(io.clock_reads, 0);
     assert_eq!(io.insert_calls, 0);
+}
+
+#[test]
+fn a_fresh_pair_is_inserted_with_its_first_entry_counted_and_no_add() {
+    let mut io = MemoryEntryIo::new();
+    enter(&mut io, A, 100, 7);
+    assert_eq!(io.row(&key(A)), Some(witness(101, 100)));
+    assert_eq!(io.row(&key(A)).unwrap().entry_count, 1);
+    assert_eq!(io.lookup_calls, 1);
+    assert_eq!(io.insert_calls, 1);
+    assert_eq!(io.count_adds, 0);
+}
+
+#[test]
+fn every_hit_counts_once_in_place_with_one_lookup_and_no_insert_or_clock() {
+    let mut io = MemoryEntryIo::with_existing_a();
+    for expected in 2..=6 {
+        let (lookups, adds) = (io.lookup_calls, io.count_adds);
+        enter(&mut io, A, 100, 7);
+        assert_eq!(
+            io.lookup_calls,
+            lookups + 1,
+            "a hit performs exactly one lookup"
+        );
+        assert_eq!(io.count_adds, adds + 1, "a hit counts exactly once");
+        assert_eq!(io.row(&key(A)), Some(counted(witness(77, 100), expected)));
+    }
+    assert_eq!(io.insert_calls, 0);
+    assert_eq!(io.clock_reads, 0);
+}
+
+#[test]
+fn counts_are_per_caller_image_and_physical_object() {
+    let mut io = MemoryEntryIo::new();
+    for (image, tgid, endpoint) in [
+        (A, 100, 7),
+        (B, 200, 7),
+        (A, 100, 8),
+        (A_EXEC, 100, 7),
+        (A, 100, 9),
+        (B, 200, 8),
+        (A, 100, 7),
+    ] {
+        enter(&mut io, image, tgid, endpoint);
+    }
+    let object_3 = CallerObjectKey {
+        object_id: 3,
+        ..key(A)
+    };
+    let counts =
+        [key(A), key(B), key(A_EXEC), object_3].map(|key| io.row(&key).unwrap().entry_count);
+    assert_eq!(counts, [3, 2, 1, 1]);
+    assert_eq!(io.row_count(), 4);
+    assert_eq!(io.insert_calls, 4);
+    assert_eq!(io.count_adds, 3);
+}
+
+#[test]
+fn the_count_saturates_at_the_ceiling_without_wrapping() {
+    for (seeded, expected, adds) in [
+        (
+            CALLER_ENTRY_COUNT_SATURATED - 2,
+            CALLER_ENTRY_COUNT_SATURATED - 1,
+            1,
+        ),
+        (
+            CALLER_ENTRY_COUNT_SATURATED - 1,
+            CALLER_ENTRY_COUNT_SATURATED,
+            1,
+        ),
+        (
+            CALLER_ENTRY_COUNT_SATURATED,
+            CALLER_ENTRY_COUNT_SATURATED,
+            0,
+        ),
+        (u64::MAX, u64::MAX, 0),
+    ] {
+        let mut io = MemoryEntryIo::with_existing_a();
+        io.rows[0] = Some((key(A), counted(witness(77, 100), seeded)));
+        enter(&mut io, A, 100, 7);
+        assert_eq!(
+            io.row(&key(A)),
+            Some(counted(witness(77, 100), expected)),
+            "seeded {seeded}"
+        );
+        assert_eq!(io.count_adds, adds, "seeded {seeded}");
+        assert_eq!(
+            io.row(&key(A)).unwrap().saturated_entry_count(),
+            expected.min(CALLER_ENTRY_COUNT_SATURATED)
+        );
+    }
+}
+
+#[test]
+fn a_lost_race_counts_on_a_saturated_winner_without_wrapping() {
+    let mut io = MemoryEntryIo::new();
+    let winner = counted(witness(0, 100), u64::MAX);
+    io.insert_behavior = InsertBehavior::Race(Some(winner));
+    enter(&mut io, A, 100, 7);
+    assert_eq!(io.row(&key(A)), Some(winner));
+    assert_eq!(io.count_adds, 0);
+}
+
+#[test]
+fn every_failure_leaves_every_count_untouched() {
+    /// Arranges one failure; returns the entry's (endpoint, host TGID).
+    type Failure = fn(&mut MemoryEntryIo) -> (u32, u32);
+    let failures: [Failure; 6] = [
+        |_| (ENDPOINT_CAPACITY, 100), // endpoint outside N
+        |io| {
+            io.image = None; // identity unavailable
+            (7, 100)
+        },
+        |io| {
+            io.usage[7].set(2); // invalid global state
+            (7, 100)
+        },
+        |_| (7, 200), // existing pair, foreign tgid: integrity
+        |io| {
+            io.image = Some(B); // allocation failure
+            io.insert_behavior = InsertBehavior::Fail;
+            (7, 200)
+        },
+        |io| {
+            io.image = Some(B); // EEXIST without a winner: integrity
+            io.insert_behavior = InsertBehavior::Race(None);
+            (7, 200)
+        },
+    ];
+    for (index, failure) in failures.into_iter().enumerate() {
+        let mut io = MemoryEntryIo::with_existing_a();
+        io.rows[0] = Some((key(A), counted(witness(77, 100), 41)));
+        let before = io.rows;
+        let (endpoint, host_tgid) = failure(&mut io);
+        assert!(
+            record_caller_use_with(&mut io, endpoint, ENDPOINT_CAPACITY, host_tgid).is_err(),
+            "case {index}"
+        );
+        assert_eq!(io.rows, before, "case {index}");
+        assert_eq!(io.count_adds, 0, "case {index}");
+    }
 }

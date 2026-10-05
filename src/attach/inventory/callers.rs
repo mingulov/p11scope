@@ -51,7 +51,7 @@ pub(super) fn validate_caller_maps(
         ),
         (
             "CALLER_USE",
-            (K::Hash, map_metadata(MapType::Hash, 24, 32, p, 0)),
+            (K::Hash, map_metadata(MapType::Hash, 24, 40, p, 0)),
         ),
         (
             "CALLER_EVIDENCE",

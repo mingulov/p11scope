@@ -688,7 +688,7 @@ fn the_default_caller_budget_is_p_65536_with_exact_payload() {
     let callers = default_caller_budget(budget(4096)).unwrap();
     assert_eq!(callers.pair_limit(), 65_536);
     assert_eq!(callers.endpoint_budget(), budget(4096));
-    assert_eq!(callers.additional_payload_bytes(), 4096 * 8 + 65_536 * 56);
+    assert_eq!(callers.additional_payload_bytes(), 4096 * 8 + 65_536 * 64);
 }
 
 #[test]
@@ -699,7 +699,7 @@ fn the_seen_set_bound_is_exactly_the_caller_use_capacity() {
     use super::super::callers::{caller_use_capacity, seen_limit};
     for callers in [
         default_caller_budget(budget(4096)).unwrap(),
-        CallerBudget::new(budget(4), 5, 4 * 8 + 5 * 56).unwrap(),
+        CallerBudget::new(budget(4), 5, 4 * 8 + 5 * 64).unwrap(),
     ] {
         let capacity = caller_use_capacity(callers).unwrap();
         assert_eq!(u64::from(capacity), callers.pair_limit());
@@ -779,6 +779,7 @@ fn value(tgid: u32, endpoint: u32) -> CallerObjectUse {
         witness_endpoint: endpoint,
         flags: 1,
         reserved: 0,
+        entry_count: 1,
     }
 }
 

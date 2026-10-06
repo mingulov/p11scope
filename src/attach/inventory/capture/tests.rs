@@ -3,7 +3,7 @@
 //! attach set, its retained pins, and the entry validators are production.
 
 use super::super::activation::InventoryAttachRequest;
-use super::super::callers::{BatchUnsupported, CallerBatchStep, CallerUseIo};
+use super::super::callers::{BatchToken, BatchUnsupported, CallerBatchStep, CallerUseIo};
 use super::*;
 use crate::discovery::inventory_attach_set::tests as fx;
 use crate::plan::AdmissionPolicy;
@@ -716,14 +716,20 @@ fn the_seen_set_bound_is_exactly_the_caller_use_capacity() {
     }
 }
 
-/// A scripted CALLER_USE map in BTreeMap key order.
+/// A scripted CALLER_USE map in BTreeMap key order, with a
+/// kernel-faithful batch side: rows live in `nbuckets` hash buckets and a
+/// batch step walks whole buckets from the continuation's start bucket
+/// (v6.12 `__htab_map_lookup_and_delete_batch`: the in/out blobs carry a
+/// u32 bucket index, a step stops at the first bucket that no longer fits,
+/// and the final step reports ENOENT *with* its rows). `nbuckets == 0`
+/// (Default) means 64 buckets, so small-cookie rows keep key order.
 #[derive(Default)]
 struct FakeRows {
     rows: BTreeMap<super::super::callers::CallerRowKey, (CallerObjectKey, Option<CallerObjectUse>)>,
     syscalls: usize,
     /// lookup() fails for rows with these cookies.
     unreadable: BTreeSet<u64>,
-    /// lookup_batch() works (map order, skipping rows whose value is
+    /// lookup_batch() works (bucket order, skipping rows whose value is
     /// `None`: a real batch carries every pair's value, so a missing one
     /// vanished before the step). Otherwise it reports unsupported and the
     /// refresh falls back to per-key lookup.
@@ -731,6 +737,69 @@ struct FakeRows {
     batch_calls: usize,
     /// lookup_batch() fails with a transport error (never unsupported).
     fail_batch: bool,
+    nbuckets: u32,
+    /// Per-cookie batch visits (pairs a batch step returned): exact-once
+    /// traversal pins.
+    visits: BTreeMap<u64, usize>,
+}
+
+/// One fake batch step: the pairs, whether the walk ended (ENOENT),
+/// and the out-batch start bucket.
+type FakeBatchStep = (Vec<(CallerObjectKey, CallerObjectUse)>, bool, u32);
+
+impl FakeRows {
+    fn buckets(&self) -> u32 {
+        if self.nbuckets == 0 {
+            64
+        } else {
+            self.nbuckets
+        }
+    }
+
+    fn bucket_of(nbuckets: u32, key: &CallerObjectKey) -> u32 {
+        (key.image.task_cookie as u32) % nbuckets
+    }
+
+    /// One kernel-faithful batch step from `start`: whole buckets in
+    /// index order while they fit in `max`, exactly like v6.12
+    /// `__htab_map_lookup_and_delete_batch` (empty buckets are free, a
+    /// first bucket that never fits is ENOSPC, passing the last bucket
+    /// is ENOENT *with* the rows collected so far). Returns the pairs,
+    /// whether the walk ended, and the out-batch start bucket.
+    fn batch_step(&mut self, start: u32, max: usize) -> Result<FakeBatchStep> {
+        let nbuckets = self.buckets();
+        if start >= nbuckets {
+            // The kernel's early ENOENT: nothing collected, no out write.
+            return Ok((Vec::new(), true, start));
+        }
+        // Present rows per bucket, in key order within a bucket.
+        let mut buckets: BTreeMap<u32, Vec<(CallerObjectKey, CallerObjectUse)>> = BTreeMap::new();
+        for (key, value) in self.rows.values() {
+            if let Some(value) = value {
+                buckets
+                    .entry(Self::bucket_of(nbuckets, key))
+                    .or_default()
+                    .push((*key, *value));
+            }
+        }
+        let mut pairs = Vec::new();
+        let mut bucket = start;
+        while bucket < nbuckets {
+            let Some(rows) = buckets.get(&bucket) else {
+                bucket += 1;
+                continue;
+            };
+            if rows.len() > max.saturating_sub(pairs.len()) {
+                if pairs.is_empty() {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
+                }
+                return Ok((pairs, false, bucket));
+            }
+            pairs.extend(rows.iter().copied());
+            bucket += 1;
+        }
+        Ok((pairs, true, bucket))
+    }
 }
 
 impl FakeRows {
@@ -768,11 +837,7 @@ impl CallerUseIo for FakeRows {
             .and_then(|(_, value)| *value))
     }
 
-    fn lookup_batch(
-        &mut self,
-        after: Option<&CallerObjectKey>,
-        max: usize,
-    ) -> Result<CallerBatchStep> {
+    fn lookup_batch(&mut self, after: Option<&BatchToken>, max: usize) -> Result<CallerBatchStep> {
         self.batch_calls += 1;
         if self.fail_batch {
             bail!("injected batch failure");
@@ -780,33 +845,18 @@ impl CallerUseIo for FakeRows {
         if !self.batch_supported {
             return Err(BatchUnsupported.into());
         }
-        let ordered: Vec<(CallerObjectKey, Option<CallerObjectUse>)> = match after {
-            None => self.rows.values().copied().collect(),
-            Some(key) => self
-                .rows
-                .range((
-                    std::ops::Bound::Excluded(super::super::callers::row_key(key)),
-                    std::ops::Bound::Unbounded,
-                ))
-                .map(|(_, row)| *row)
-                .collect(),
-        };
-        let mut pairs = Vec::new();
-        let mut rest = ordered.into_iter().peekable();
-        while pairs.len() < max {
-            let Some((key, value)) = rest.next() else {
-                return Ok(CallerBatchStep {
-                    pairs,
-                    completed: true,
-                });
-            };
-            if let Some(value) = value {
-                pairs.push((key, value));
-            }
+        // Kernel-faithful: the token's first u32 is the start bucket
+        // (`None`: from the beginning), and the out token carries the
+        // next bucket — exactly what the kernel reads and writes.
+        let start = after.map_or(0, BatchToken::bucket);
+        let (pairs, completed, next) = self.batch_step(start, max)?;
+        for (key, _) in &pairs {
+            *self.visits.entry(key.image.task_cookie).or_default() += 1;
         }
         Ok(CallerBatchStep {
             pairs,
-            completed: rest.next().is_none(),
+            completed,
+            next_batch: (!completed).then(|| BatchToken::from_bucket(next)),
         })
     }
 }
@@ -2956,6 +3006,110 @@ fn count_refresh_uses_batch_where_it_works() {
     assert!(second.sweep_completed);
     assert_eq!(rows.batch_calls, 2);
     assert_eq!(rows.syscalls, 0);
+}
+
+#[test]
+fn count_refresh_batch_walks_every_bucket_exactly_once_across_quanta() {
+    // P1: the batch continuation is an opaque bucket token, never a key.
+    // A >1-quantum traversal over a kernel-faithful bucket map re-reads
+    // every tracked row exactly once and completes only past the last
+    // bucket — including the final ENOENT-with-rows step.
+    let mut rows = FakeRows {
+        batch_supported: true,
+        nbuckets: 4,
+        ..Default::default()
+    };
+    // Cookies whose low words scatter far past the last bucket: key
+    // bytes as a continuation would skip or repeat buckets.
+    for cookie in 100..=104 {
+        rows.insert(key(cookie, 0), Some(value(40, 0)));
+    }
+    let mut cursor = witnessed(&mut rows, 64);
+    for cookie in 100..=104 {
+        set_count(&mut rows, cookie, cookie);
+    }
+    let window = Instant::now() + Duration::from_secs(5);
+    let mut quanta = 0;
+    let mut updates = Vec::new();
+    let last_carried_rows = loop {
+        let read = cursor.refresh_with(&mut rows, 2, window);
+        quanta += 1;
+        assert!(quanta <= 10, "the sweep never completed");
+        assert!(read.read_failures.is_empty(), "{:?}", read.read_failures);
+        updates.extend(updates_of(&read));
+        if read.sweep_completed {
+            assert!(!read.sweep_gaps);
+            break !read.updates.is_empty();
+        }
+    };
+    assert!(quanta > 1, "the traversal must span quanta");
+    assert_eq!(updates.len(), 5, "every tracked row re-read: {updates:?}");
+    for cookie in 100..=104 {
+        assert_eq!(
+            rows.visits.get(&cookie).copied().unwrap_or(0),
+            1,
+            "row {cookie} re-read exactly once: {:?}",
+            rows.visits
+        );
+    }
+    assert!(
+        last_carried_rows,
+        "the completing step carries rows (final ENOENT with rows)"
+    );
+}
+
+#[test]
+fn count_refresh_batch_resumes_its_token_after_an_interrupted_sweep() {
+    // P1: a transport failure mid-sweep keeps the batch token: the next
+    // sweep still covers every row exactly once.
+    let mut rows = FakeRows {
+        batch_supported: true,
+        nbuckets: 4,
+        ..Default::default()
+    };
+    for cookie in 100..=104 {
+        rows.insert(key(cookie, 0), Some(value(40, 0)));
+    }
+    let mut cursor = witnessed(&mut rows, 64);
+    for cookie in 100..=104 {
+        set_count(&mut rows, cookie, cookie);
+    }
+    let window = Instant::now() + Duration::from_secs(5);
+    let first = cursor.refresh_with(&mut rows, 2, window);
+    assert!(!first.sweep_completed);
+    assert!(!first.updates.is_empty());
+    rows.fail_batch = true;
+    let failed = cursor.refresh_with(&mut rows, 2, window);
+    assert!(!failed.sweep_completed);
+    assert_eq!(failed.read_failures.len(), 1);
+    rows.fail_batch = false;
+    rows.visits.clear();
+    // Advance again so every row reports past its new baseline.
+    for cookie in 100..=104 {
+        set_count(&mut rows, cookie, cookie + 1000);
+    }
+    let mut quanta = 0;
+    let mut updates = Vec::new();
+    loop {
+        let read = cursor.refresh_with(&mut rows, 2, window);
+        quanta += 1;
+        assert!(quanta <= 10, "the resumed sweep never completed");
+        updates.extend(updates_of(&read));
+        if read.sweep_completed {
+            break;
+        }
+    }
+    // The resumed sweep continues from the retained token: every row
+    // it visits (the buckets past the interrupted quantum) is visited
+    // exactly once — rows the first quantum already reported are not
+    // owed a second visit this sweep.
+    for (key, visits) in &rows.visits {
+        assert_eq!(*visits, 1, "row {key} visited once after resume");
+    }
+    assert!(
+        updates.len() + first.updates.len() >= 5,
+        "interrupted + resumed quanta cover every row: {updates:?}"
+    );
 }
 
 #[test]

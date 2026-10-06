@@ -253,14 +253,11 @@ pub(super) trait CallerUseIo {
     fn next_key(&mut self, after: Option<&CallerObjectKey>) -> Result<Option<CallerObjectKey>>;
     fn lookup(&mut self, key: &CallerObjectKey) -> Result<Option<CallerObjectUse>>;
     /// One BPF_MAP_LOOKUP_BATCH step over CALLER_USE in kernel hash order,
-    /// starting after `after` (`None`: from the beginning), returning up to
-    /// `max` pairs. The default is unsupported: scripted maps without batch,
-    /// and the count refresh falls back to per-key lookup.
-    fn lookup_batch(
-        &mut self,
-        after: Option<&CallerObjectKey>,
-        max: usize,
-    ) -> Result<CallerBatchStep> {
+    /// continuing from the previous step's opaque `after` token (`None`:
+    /// from the beginning), returning up to `max` pairs. The default is
+    /// unsupported: scripted maps without batch, and the count refresh
+    /// falls back to per-key lookup.
+    fn lookup_batch(&mut self, after: Option<&BatchToken>, max: usize) -> Result<CallerBatchStep> {
         let _ = (after, max);
         Err(BatchUnsupported.into())
     }
@@ -281,11 +278,54 @@ impl fmt::Display for BatchUnsupported {
 impl std::error::Error for BatchUnsupported {}
 
 /// One BPF_MAP_LOOKUP_BATCH step: up to `max` map pairs in kernel hash
-/// order, and whether the walk reached the end of the map.
+/// order, whether the walk reached the end of the map, and — when it did
+/// not — the kernel's out_batch continuation for the next step's in_batch.
 #[derive(Debug, Default)]
 pub(super) struct CallerBatchStep {
     pub pairs: Vec<(CallerObjectKey, CallerObjectUse)>,
     pub completed: bool,
+    pub next_batch: Option<BatchToken>,
+}
+
+/// The opaque BPF batch continuation: the kernel's out_batch blob,
+/// retained and round-tripped as the next step's in_batch, never
+/// interpreted. For hash maps the kernel reads and writes a u32 bucket
+/// index through these pointers (v6.12
+/// `__htab_map_lookup_and_delete_batch`); key bytes are NOT a
+/// continuation. Key-sized so any map's out_batch write lands inside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BatchToken([u8; std::mem::size_of::<CallerObjectKey>()]);
+
+impl BatchToken {
+    fn zero() -> Self {
+        Self([0; std::mem::size_of::<CallerObjectKey>()])
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+
+    /// The hash-map token dialect (what the kernel reads/writes): the
+    /// blob's first u32, little-endian. Test fakes only — production
+    /// never interprets the bytes.
+    #[cfg(test)]
+    pub(super) fn from_bucket(bucket: u32) -> Self {
+        let mut token = Self::zero();
+        token.0[..4].copy_from_slice(&bucket.to_le_bytes());
+        token
+    }
+
+    /// The hash-map token dialect (what the kernel reads/writes): the
+    /// blob's first u32, little-endian. Test fakes only — production
+    /// never interprets the bytes.
+    #[cfg(test)]
+    pub(super) fn bucket(&self) -> u32 {
+        u32::from_le_bytes(self.0[..4].try_into().expect("four bytes"))
+    }
 }
 
 impl CallerUseIo for &Ebpf {
@@ -322,11 +362,7 @@ impl CallerUseIo for &Ebpf {
         }
     }
 
-    fn lookup_batch(
-        &mut self,
-        after: Option<&CallerObjectKey>,
-        max: usize,
-    ) -> Result<CallerBatchStep> {
+    fn lookup_batch(&mut self, after: Option<&BatchToken>, max: usize) -> Result<CallerBatchStep> {
         let data = match self.map("CALLER_USE").context("CALLER_USE map")? {
             Map::HashMap(data) => data,
             _ => bail!("CALLER_USE is not the exact hash map"),
@@ -336,10 +372,10 @@ impl CallerUseIo for &Ebpf {
         let count = u32::try_from(max).unwrap_or(u32::MAX).max(1);
         let mut keys = vec![CallerObjectKey::default(); count as usize];
         let mut values = vec![CallerObjectUse::default(); count as usize];
-        let mut out_batch = CallerObjectKey::default();
+        let mut out_batch = BatchToken::zero();
         let mut attr = BpfMapBatchAttr {
-            in_batch: after.map_or(0, |key| (key as *const CallerObjectKey) as u64),
-            out_batch: (&mut out_batch as *mut CallerObjectKey) as u64,
+            in_batch: after.map_or(0, |token| token.as_ptr() as u64),
+            out_batch: out_batch.as_mut_ptr() as u64,
             keys: keys.as_mut_ptr() as u64,
             values: values.as_mut_ptr() as u64,
             count,
@@ -360,10 +396,12 @@ impl CallerUseIo for &Ebpf {
             Ok(()) => Ok(CallerBatchStep {
                 pairs,
                 completed: false,
+                next_batch: Some(out_batch),
             }),
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(CallerBatchStep {
                 pairs,
                 completed: true,
+                next_batch: None,
             }),
             Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
                 Err(BatchUnsupported.into())
@@ -399,7 +437,7 @@ fn bpf_map_batch_syscall(
     size: usize,
 ) -> std::io::Result<()> {
     // SAFETY: the attr and every buffer it points at (the in/out batch
-    // keys, the key/value arrays) are live for exactly this syscall.
+    // tokens, the key/value arrays) are live for exactly this syscall.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_bpf,
@@ -441,10 +479,14 @@ pub(super) struct CallerUseCursor {
     /// The sweep in progress skipped a row (lookup failure or seen-set
     /// bound): it completes "with gaps".
     sweep_gaps: bool,
-    /// The refresh sweep's map position, in the same kernel hash order for
-    /// the batch walk and the per-key fallback, so a probe verdict never
-    /// invalidates it.
+    /// The per-key fallback's map position (the key the next
+    /// `BPF_MAP_GET_NEXT_KEY` continues after). The batch walk keeps its
+    /// own opaque token below: key bytes are not a batch continuation.
     refresh_after: Option<CallerObjectKey>,
+    /// The batch walk's opaque continuation (the last step's out_batch).
+    /// `None` starts a sweep at the map's beginning; a transport error
+    /// leaves it untouched, so the next quantum resumes the same sweep.
+    refresh_batch: Option<BatchToken>,
     /// The last saturated count read for each witnessed (valid) row. A
     /// subset of the seen set: faulted rows seed no baseline and are never
     /// re-read.
@@ -541,6 +583,7 @@ impl CallerUseCursor {
             sweeps_completed: 0,
             sweep_gaps: false,
             refresh_after: None,
+            refresh_batch: None,
             counts: BTreeMap::new(),
             batch: BatchProbe::Untried,
             refresh_sweeps_completed: 0,
@@ -656,8 +699,8 @@ impl CallerUseCursor {
     /// move up: an advance is reported, a decrease or a vanish is integrity
     /// evidence (once per row), and a reread below the last read never
     /// moves the published count. One batch step per quantum where the
-    /// probe says batch works, else a per-key walk; both visit the map in
-    /// kernel hash order from the same cursor.
+    /// probe says batch works (continuing from the retained opaque token),
+    /// else a per-key walk from its own key cursor.
     pub(super) fn refresh_with<I: CallerUseIo>(
         &mut self,
         io: &mut I,
@@ -674,7 +717,7 @@ impl CallerUseCursor {
             return read;
         }
         if self.batch != BatchProbe::Unsupported {
-            match io.lookup_batch(self.refresh_after.as_ref(), max_rows) {
+            match io.lookup_batch(self.refresh_batch.as_ref(), max_rows) {
                 Ok(step) => {
                     self.batch = BatchProbe::Works;
                     self.absorb_step(step, max_rows, &mut read);
@@ -693,20 +736,23 @@ impl CallerUseCursor {
         read
     }
 
-    /// Folds one batch step into the tracked counts.
+    /// Folds one batch step into the tracked counts, retaining the
+    /// kernel's continuation token for the next step.
     fn absorb_step(&mut self, step: CallerBatchStep, max_rows: usize, read: &mut CallerCountsRead) {
         for (key, value) in step.pairs {
             read.visited += 1;
-            self.refresh_after = Some(key);
             self.refresh_row(key, Some(value), read);
         }
         if step.completed {
             self.refresh_sweeps_completed = self.refresh_sweeps_completed.saturating_add(1);
-            self.refresh_after = None;
+            self.refresh_batch = None;
             read.sweep_completed = true;
             read.sweep_gaps = std::mem::take(&mut self.refresh_sweep_gaps);
-        } else if read.visited >= max_rows {
-            read.row_bound_reached = true;
+        } else {
+            self.refresh_batch = step.next_batch;
+            if read.visited >= max_rows {
+                read.row_bound_reached = true;
+            }
         }
     }
 

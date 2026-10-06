@@ -691,7 +691,11 @@ the min..max of per-sample p95.
   lane publishes per-edge entry counts: a bound row reads `counted` with a
   saturating lower-bound `count` since the pair's first record and
   `last_seen` at pass resolution, and a missing pair reads `unknown
-  (uncounted)` with the `PairInsertFailure` evidence, never 0.
+  (uncounted)` with the `PairInsertFailure` evidence, never 0. The C5
+  oracle pins the ledger contract: P1/P2 edges read `counted` (even
+  unattested B) with the exact attach-side count when the feed covers
+  every in-window call, and must-fail fixtures cover above-ledger,
+  published-0, absent-as-0 and pre-admission-counted outputs.
 - Kernels/conditions: all native runs.
 - Disclosure: `entries.coverage.state` (`counted` since v0.3.0,
   `witnessed` in v0.2.0), `entries.count` with its `observation`, dashboard
@@ -700,7 +704,7 @@ the min..max of per-sample p95.
 - Workaround: `profile` for exact function-level counts (aggregate maps
   stay exact under event loss).
 - Planned: v0.3.0 (C7: V1 non-fetch atomic add in `CALLER_USE`, about
-  0–300 ns/call; the C5 oracle and the M2 cost gate close DR-02 — M2 must
+  0–300 ns/call; C5 landed — the M2 cost gate closes DR-02, and M2 must
   measure V1 directly).
 
 ### `C_GetInterfaceList`/`C_GetInterface` export calls go uncounted (DR-51)

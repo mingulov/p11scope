@@ -107,6 +107,17 @@ USE_BEFORE_ADMISSION = "use_before_admission"
 # Transient: the finish flush decides every row, so the final snapshot
 # never carries it — only mid-run frames and edge_observed records do.
 PENDING_FIRST_USE_REASON = "pending_first_use"
+# C7 C4/C5: a CALLER_USE pair insert failed, so some pair has use but no
+# row and absence proves nothing. The edge reads unknown/`uncounted`
+# (never 0) with a zero no consumer reads as fact, and no watch starts
+# again in the capture. Choice 1 (controller-accepted): the trigger is
+# BPF PairInsertFailure evidence only, never the userspace pair
+# precondition — so the reason requires the gap below plus evidence
+# naming PairInsertFailure in its detail, while counted positives frozen
+# before the evidence stand (the exact-count exception).
+UNCOUNTED_REASON = "uncounted"
+PAIRS_UNCOUNTED_SUBJECT = "usage coverage pair insert failure"
+PAIR_INSERT_EVIDENCE = re.compile(r"PairInsertFailure")
 SCAN_ONLY_REASON = "scan_only"
 # The only unknown reasons a scan-lane document gives (an unadmitted module
 # reads not_admitted in either lane).
@@ -156,6 +167,11 @@ EVENT_KINDS = {
 }
 # caller_event sub-kind -> field naming the incarnation it mints.
 CALLER_EVENT_MINTS = {"admitted": "caller", "exec_retired": "new", "reused": "new"}
+# C7 C4/C5: a count change that is not a class change emits at most once
+# per edge per 10 s (EDGE_COUNT_EMIT_INTERVAL_NS); class changes —
+# including log2 bucket jumps (Choice 2, controller-accepted) — stay
+# immediate, and the final sweep stays exact.
+COUNT_EMIT_INTERVAL_NS = 10_000_000_000
 
 # --- presentation: dashboard frames and edge_observed derived states ---------
 ACTIVITY = {
@@ -203,13 +219,19 @@ class Role:
     native_states: frozenset  # coverage allowed on the role's in-window used edges
     require_counted_when_attested: bool
     what: str
+    # C7 C5: the role's used edges read counted unconditionally (the P1/P2
+    # ledger cells, Counted even for unattested B), whatever attested
+    # delivery says. Since v0.3.0 the native lane counts every bound row.
+    require_counted: bool = False
 
 
 USED = frozenset({"counted", "witnessed"})
 IDLE = frozenset({WATCH_STATE, UNKNOWN_STATE})
 ROLES = {
-    "P1": Role("required", "required", USED, True, "attested provider A with Digest/AES-GCM/HMAC"),
-    "P2": Role("required", "required", USED, False, "byte-identical copy B, distinct inode, unattested"),
+    "P1": Role("required", "required", USED, True, "attested provider A with Digest/AES-GCM/HMAC",
+               require_counted=True),
+    "P2": Role("required", "required", USED, False, "byte-identical copy B, distinct inode, unattested",
+               require_counted=True),
     "P3": Role("required", "required", IDLE, False, "maps A and C, never calls them"),
     "P4": Role("optional", "optional", USED, False, "~100 ms CLI calling A"),
     "P5": Role("optional", "optional", USED, False, "exec chain (bind per EXEC_HOW_BIND)"),
@@ -223,9 +245,15 @@ ROLES = {
 EXEC_HOW_BIND = {"initial": "required", "leader": "required", "thread": "optional"}
 # Optional-bind cells must still bind at least one image per run.
 OPTIONAL_CELL_MIN_BOUND = 1
-# Counted = a counting feed: only the Detailed subset for operator-attested
-# providers in this release. Flip if per-pair BPF counts (plan C7/D2) ship.
-COUNTED_NEEDS_ATTESTED = True
+# Counted = a counting feed. Before C7 C4 only the Detailed subset for
+# operator-attested providers counted; per-pair BPF counts shipped (C1
+# entry_count, C4 publish), so the native lane counts every bound row and
+# attestation no longer gates the state (flipped C7 C5).
+COUNTED_NEEDS_ATTESTED = False
+# C7 C5 (r1 T3.5): the P1/P2 ledger cells pin counted edges with exact
+# entry counts — including Counted for the unattested byte-copy B — via
+# Role.require_counted above, overriding COUNTED_NEEDS_ATTESTED for those
+# roles; other roles still accept the witnessed/count distinction.
 # Runs the qualification needs, and the roles each must cover.
 REQUIRED_RUNS = {
     "system": frozenset({"P1", "P2", "P3", "P4", "P5", "P7", "LX"}),
@@ -236,6 +264,12 @@ REQUIRED_RUNS = {
 SKIPPABLE_RUNS = frozenset({"dashboard"})
 
 # --- ledger -----------------------------------------------------------------------
+# C7 C5 ledger rule (binding): ledger `calls` counts ATTACH-side calls
+# only. BPF increments entry_count on entry-probe fire, so only calls
+# through attached function-table endpoints count; the dlsym C_GetFunctionList
+# entry — the call that receipts the table, not a call through it — is
+# excluded (Use.table_calls). Error-returning calls are included: entry,
+# not return, is what both the ledger and BPF count.
 SYMBOL_ENTRY_FUNCTIONS = frozenset({"C_GetFunctionList"})
 WITNESS_SLACK_NS = 20_000_000
 EXEC_GAP_MIN_NS = 4 * WITNESS_SLACK_NS
@@ -402,6 +436,30 @@ def window_count(use, since_ns, window):
         if e["t0"] >= start and e["t1"] <= end and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS:
             lo += e["n"]
     return lo, hi
+
+
+def ledger_total_table_calls(image, provider_path):
+    """Every attach-side call the image ledgered for the provider, any time:
+    the upper bound a count will never exceed (r1 T3.5 `count <= total`)."""
+    return sum(e["n"] for e in image.entries
+               if e["module"] == provider_path and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS)
+
+
+def exact_window_count(use, since_ns, window, until_ns):
+    """(exact, expected): whether the ledger pins the count with 0 error.
+
+    Exact when the counting feed provably covers every in-window call: the
+    edge is not frozen, the feed started (since) at or before the first
+    in-window call — i.e. the endpoints attached before the workload — and
+    every overlapping ledger line lies fully inside the window. Then the
+    count must equal the attach-side sum exactly (r1 T3.5); otherwise only
+    the COUNT-WINDOW/COUNT-TOTAL upper bounds apply."""
+    if until_ns is not None or since_ns > use.t_first:
+        return False, 0
+    start, end = max(since_ns, window[0]), window[1]
+    if any(e["t0"] < start or e["t1"] > end for e in use.lines):
+        return False, 0
+    return True, sum(e["n"] for e in use.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS)
 
 
 def reached_by(images, image):
@@ -617,6 +675,13 @@ def expected_presence(caller, module, edge):
 def expected_activity(edge, end_ns):
     """inventory-events-v1 `activity` from the snapshot; recency (counted only)
     may additionally read recent when last_seen is within the dashboard window."""
+    # C7 C5: Choice 3 (activity via recency window) is PENDING-RE-RULE —
+    # an outside review reversed its acceptance and a follow-up task
+    # re-rules activity to per-pass ("rose since previous pass") in the
+    # product AND this derivation together. Until then the pre-C5 5 s
+    # rule stands everywhere: note a stale counted edge reads quiet here
+    # while the current product reads recent (whole-run window), so the
+    # follow-up must change both sides or real streams fail AGREE-EDGE-EVENTS.
     entries = edge["entries"]
     cov = coverage(edge)
     if entries.get("in_flight") or (edge.get("operations") or {}).get("active"):
@@ -657,6 +722,25 @@ def expected_entries_display(edge):
             (cov.get("state") == WATCH_STATE and not frozen_watch(edge)):
         return str(count)
     return str(count) if count > 0 else "?"
+
+
+def count_bucket(count):
+    """The count's power-of-two bucket (EdgeClass): 0, 1, 2-3, 4-7, ..."""
+    return 0 if count == 0 else count.bit_length()
+
+
+def edge_class_key(record):
+    """An edge_observed record's emit class (inventory-events-v1): the
+    count bucket plus saturated/in_flight/observation, the full coverage,
+    and the three derived states. Choice 2 (controller-accepted): the
+    bucket stays in the class, so a bucket jump is an immediate class
+    change while other count drift waits out the 10 s channel."""
+    entries = record.get("entries", {})
+    cov = entries.get("coverage") or {}
+    return (count_bucket(entries.get("count", 0)), entries.get("saturated"), entries.get("in_flight"),
+            entries.get("observation"), cov.get("state"), cov.get("since_ns"), cov.get("until_ns"),
+            cov.get("first_ns"), cov.get("lossy"), cov.get("reason"), cov.get("detail"),
+            record.get("presence"), record.get("capture"), record.get("activity"))
 
 
 def settlement_verdict(doc):
@@ -719,6 +803,13 @@ def check_streams(view, res):
     res.ok(run, "*", "COVERAGE-SHAPE", not malformed,
            f"{len(malformed)} edges lack the coverage keys {sorted(COVERAGE_KEYS)}, a known state, or "
            f"until_ns > since_ns: {malformed[:4]}")
+    # C7 C5 extends the C2 DR-LIVE-LABEL-LAG oracle (which judges mid-run
+    # frames and records): the finish flush decides every row, so the
+    # final snapshot itself never carries pending_first_use.
+    pending = [k for k, e in view.edges.items() if coverage(e).get("reason") == PENDING_FIRST_USE_REASON]
+    res.ok(run, "*", "PENDING-TRANSIENT", not pending,
+           f"{len(pending)} snapshot edges read {PENDING_FIRST_USE_REASON}: {pending[:4]} "
+           "(mid-run records and frames may; the decided snapshot never does)")
     if view.events is None:
         res.add(run, "*", "STREAM", "fail", "no --event-log JSONL to compare")
         return
@@ -850,6 +941,33 @@ def check_streams(view, res):
         bad.append(("*", f"ended.edges_unretained {ended.get('edges_unretained')!r} != 0"))
     res.ok(run, "*", "AGREE-EDGE-EVENTS", not bad, f"edge_observed disagrees with the snapshot: {bad[:4]}",
            f"{len(last)} edge_observed replays agree ({len(edge_events)} records)")
+    # C7 C5 (Choice 2): a mid-run record that follows its edge's previous
+    # record by less than the 10 s count channel must carry a class change
+    # (bucket jumps included) — anything else is a spurious fast emit.
+    # First records per edge and the exact final sweep (records after the
+    # last pass marker) are exempt. Rotated streams never reach here
+    # (STREAM-ROTATED returns early), so retention re-sends cannot fail it.
+    sweep_seq = max([e.get("seq", -1) for e in events if e.get("kind") == EVENT_KINDS["pass"]], default=-1)
+    by_edge = {}
+    for e in edge_events:
+        ev = e.get("event") if isinstance(e.get("event"), dict) else {}
+        by_edge.setdefault((ev.get("caller"), ev.get("module")), []).append(e)
+    rushed = []
+    for key in sorted(by_edge, key=str):
+        rows = sorted(by_edge[key], key=lambda e: e.get("seq", 0))
+        for prev, cur in zip(rows, rows[1:]):
+            if cur.get("seq", 0) > sweep_seq:
+                continue
+            prev_at, cur_at = prev.get("at_ns"), cur.get("at_ns")
+            prev_ev = prev.get("event") if isinstance(prev.get("event"), dict) else None
+            cur_ev = cur.get("event") if isinstance(cur.get("event"), dict) else None
+            if not isinstance(prev_at, int) or not isinstance(cur_at, int) or cur_at < prev_at \
+                    or prev_ev is None or cur_ev is None:
+                continue
+            if cur_at - prev_at < COUNT_EMIT_INTERVAL_NS and edge_class_key(prev_ev) == edge_class_key(cur_ev):
+                rushed.append((key, f"seq {prev.get('seq')}->{cur.get('seq')} dt {cur_at - prev_at} ns"))
+    res.ok(run, "*", "EDGE-CADENCE", not rushed,
+           f"{len(rushed)} edge_observed records re-emit an unchanged class within 10 s: {rushed[:4]}")
 
 
 def resolve_providers(view, res, needed):
@@ -1053,6 +1171,8 @@ def check_cells(view, images_by_cell, res):
                 res.add(run, cell, "EXEC-SPLIT", "absent",
                         "same-binary re-exec and non-leader exec are invisible to exe-identity scan pins")
     check_positives(view, images_by_cell, mod, state, res)
+    check_counted_nonzero(view, res)
+    check_uncounted(view, res)
 
 
 def check_image(view, cell, spec, role, images, image, mod, lane, attested_delivery, state, res):
@@ -1131,7 +1251,8 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
                 state.exec_bound.setdefault(cell, []).append(
                     (image.gen, how, e["caller"], view.callers[e["caller"]].get("first_seen_ns") or 0))
             res.add(run, cell, check, "pass", f"{ctag}: bound to {e['caller']} ({coverage(e).get('state')})")
-            check_bound_edge(view, cell, ctag, role, prov, e, use, attested_delivery, res)
+            check_bound_edge(view, cell, ctag, role, prov, e, use, image, attested_delivery, res)
+            check_no_preadmission_positive(view, cell, ctag, image, prov["path"], e, res)
             if not alive_at_end:
                 caller = view.callers[e["caller"]]
                 res.ok(run, cell, "RETIRED-LIFECYCLE",
@@ -1181,7 +1302,7 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
                     f"({sorted(exe_ids)}) and no unbound gap naming this pid or this window")
 
 
-def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery, res):
+def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_delivery, res):
     run = view.name
     cov = coverage(edge)
     st = cov.get("state")
@@ -1191,6 +1312,8 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery,
         allowed.discard("counted")
     if role.require_counted_when_attested and attested:
         allowed = {"counted"}
+    if role.require_counted:
+        allowed = {"counted"}
     res.ok(run, cell, "COVERAGE-ALLOWED", st in allowed,
            f"{ctag}: coverage {st} not in {sorted(allowed)} (attested={attested})")
     if st == "counted":
@@ -1198,6 +1321,9 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery,
         window = (view.window[0], min(view.window[1], until)) if until is not None else view.window
         lo, hi = window_count(use, cov.get("since_ns") or 0, window)
         count = edge["entries"].get("count", 0)
+        total = ledger_total_table_calls(image, prov["path"])
+        res.ok(run, cell, "COUNT-TOTAL", count <= total,
+               f"{ctag}: count {count} above the ledger total {total} attach-side calls")
         if cov.get("lossy"):
             loss_gaps = [g for g in view.doc.get("gaps", [])
                          if LOSS_GAP.search(f"{g.get('subject', '')} {g.get('reason', '')}")]
@@ -1209,6 +1335,15 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery,
         else:
             res.ok(run, cell, "COUNT-WINDOW", lo <= count <= hi,
                    f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}")
+            exact, expected = exact_window_count(use, cov.get("since_ns") or 0, window, until)
+            if exact and not edge["entries"].get("saturated"):
+                # Ledger exactness = 0 error: attached before the workload
+                # (or provably covering every in-window call some other
+                # way) means the count equals the attach-side sum — not a
+                # range. A saturated feed stays a lower bound (COUNT-TOTAL).
+                res.ok(run, cell, "COUNT-EXACT", count == expected,
+                       f"{ctag}: count {count} != ledger {expected} attach-side calls "
+                       f"(feed covers every in-window call since {cov.get('since_ns')})")
     if st == "witnessed":
         res.ok(run, cell, "WITNESS-COUNT", edge["entries"].get("count", 0) == 0
                and edge["entries"].get("observation") != OBSERVATION_OBSERVED,
@@ -1220,6 +1355,21 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery,
         res.ok(run, cell, "SEMANTICS-ATTESTED",
                edge.get("semantics") == SEMANTICS_OBSERVED and not missing and not extra,
                f"{ctag}: semantics {edge.get('semantics')!r}; missing mechanism/ops {missing}; unledgered {extra}")
+
+
+def check_no_preadmission_positive(view, cell, ctag, image, provider_path, edge, res):
+    """R-C51-1: an image that used the module before its caller's admission
+    leaves its row unbound, so the edge reads unknown/use_before_admission
+    — never a positive. A counted (or witnessed) positive over a first call
+    that predates the caller's admission is the DR-C51-PREADMIT upgrade,
+    which v0.3.0 does not build (C7 C5 must-fail: counted-on-preadmission)."""
+    first = first_call_ns(image, provider_path)
+    admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
+    if first is None or admitted is None:
+        return
+    res.ok(view.name, cell, "PREADMISSION-POSITIVE", first >= admitted,
+           f"{ctag}: edge {edge['caller']} reads {coverage(edge).get('state')} but the image's first "
+           f"call ({first}) predates its caller's admission ({admitted}): a pre-admission row never binds")
 
 
 def check_exec_split(view, cell, bound, images, man, mod, res, counted=frozenset()):
@@ -1242,6 +1392,46 @@ def check_exec_split(view, cell, bound, images, man, mod, res, counted=frozenset
            f"exec images must each bind to their own incarnation in order: required gens {required}, "
            f"unbound {missing}, bound (gen->caller) {dict((g, c) for g, (c, _f) in sorted(by_gen.items()))}",
            f"bound (gen->caller): {dict((g, c) for g, (c, _f) in sorted(by_gen.items()))}")
+
+
+def check_counted_nonzero(view, res):
+    """C7 C5: an edge reads `counted` only with a count >= 1 — a published
+    0 is never a positive fact (r1 T3.5 must-fail). A counted-0 edge never
+    binds, so this sweeps every edge rather than riding the bound path."""
+    for key in sorted(view.edges):
+        edge = view.edges[key]
+        if coverage(edge).get("state") != "counted":
+            continue
+        count = edge["entries"].get("count", 0)
+        res.ok(view.name, "*", "COUNTED-NONZERO", count >= 1,
+               f"edge {key[0]}->{key[1]} reads counted with count {count}: "
+               "a counted edge publishes its entry count, never 0")
+
+
+def check_uncounted(view, res):
+    """C7 C5 (Choice 1): every unknown/`uncounted` edge carries BPF
+    PairInsertFailure evidence — the gap plus the evidence name in its
+    detail — and publishes no count as fact (zero with the unavailable
+    observation). Userspace-only saturation withholds watches but never
+    reads uncounted, so an uncounted edge without the BPF evidence fails.
+    Counted positives are excepted (they stand beside the gap); only the
+    uncounted edges themselves are judged here."""
+    run = view.name
+    gaps = [g for g in view.doc.get("gaps", []) if g.get("subject") == PAIRS_UNCOUNTED_SUBJECT]
+    for key in sorted(view.edges):
+        edge = view.edges[key]
+        cov = coverage(edge)
+        if cov.get("reason") != UNCOUNTED_REASON:
+            continue
+        entries = edge["entries"]
+        res.ok(run, "*", "UNCOUNTED-EVIDENCE",
+               cov.get("state") == UNKNOWN_STATE and entries.get("count", 0) == 0
+               and entries.get("observation") == "unknown (usage observation unavailable)"
+               and bool(gaps) and bool(PAIR_INSERT_EVIDENCE.search(cov.get("detail") or "")),
+               f"edge {key[0]}->{key[1]} reads {cov.get('state')}/{cov.get('reason')} with count "
+               f"{entries.get('count', 0)} {entries.get('observation')!r} detail {cov.get('detail')!r} "
+               f"and {len(gaps)} {PAIRS_UNCOUNTED_SUBJECT!r} gaps: uncounted needs the BPF "
+               "PairInsertFailure evidence and publishes no count as fact")
 
 
 def check_positives(view, images_by_cell, mod, state, res):
@@ -1799,19 +1989,20 @@ class Synth:
 
     def native_coverage(self, edge, role, use, since):
         cov = edge["entries"]["coverage"]
-        if use and self.providers[role]["attested"]:
+        if use:
+            # C7 C5: since v0.3.0 the native lane counts every bound row,
+            # attested or not (P2's unattested B reads Counted with the
+            # exact table sum). Semantic claims stay attested-only.
             cov.update(state="counted", since_ns=since, lossy=False, reason=None)
             edge["entries"].update(count=use[2], first_seen_ns=use[0] + MS, last_seen_ns=use[1], observation="observed")
-            edge["semantics"] = "observed"
-            edge["mechanisms"] = [
-                {"mechanism": m, "mechanism_hex": hex(m), "name": None, "operations": ops, "calls": 1, "errors": 0,
-                 "last_seen_ns": use[1], "evidence": {}}
-                for m, ops in [(0x250, ["digest"]), (0x251, ["sign"]), (0x350, ["generate_key"]),
-                               (0x1080, ["generate_key"]), (0x1087, ["encrypt"])]]
-            edge["operations"] = {"calls": 1, "active": []}
-        elif use:
-            cov.update(state="witnessed", first_ns=use[0] + MS, reason=None)
-            edge["entries"]["observation"] = "unknown (count unavailable; use witnessed)"
+            if self.providers[role]["attested"]:
+                edge["semantics"] = "observed"
+                edge["mechanisms"] = [
+                    {"mechanism": m, "mechanism_hex": hex(m), "name": None, "operations": ops, "calls": 1, "errors": 0,
+                     "last_seen_ns": use[1], "evidence": {}}
+                    for m, ops in [(0x250, ["digest"]), (0x251, ["sign"]), (0x350, ["generate_key"]),
+                                   (0x1080, ["generate_key"]), (0x1087, ["encrypt"])]]
+                edge["operations"] = {"calls": 1, "active": []}
         else:
             cov.update(state=WATCH_STATE, since_ns=since, reason=None)
             edge["entries"]["observation"] = "observed"
@@ -2005,7 +2196,7 @@ def self_test():
 
         def before_start(s, d, dash):
             e = _edge(d, cid(s, "P2"), s.mid["B"])
-            d["observation"]["started_ns"] = e["entries"]["coverage"]["first_ns"] + MS
+            d["observation"]["started_ns"] = positive_first_ns(e) + MS
         case("positive-before-capture-start", "POSITIVE-IN-WINDOW", before_start)
         # --- binding --------------------------------------------------------------
         def exec_merged(s, d, dash):
@@ -2193,6 +2384,7 @@ def self_test():
             return next((r for r in res.rows if r["run"] == "system" and r["check"] == "LANE"), {})
         for name, stated, reason, want in (("all-unknown-stated-native", "native", "not_admitted", "pass"),
                                            ("all-unknown-loss-unstated", None, "loss", "pass"),
+                                           ("all-unknown-uncounted-unstated", None, "uncounted", "pass"),
                                            ("all-unknown-scan-only-unstated", None, "scan_only", "fail"),
                                            ("stated-native-with-scan-only-edges", "native", "scan_only", "fail")):
             counter[0] += 1
@@ -2264,7 +2456,7 @@ def self_test():
         def watch_ending_before_use(until_offset):
             def mutate(s, d, dash):
                 e = _edge(d, cid(s, "P2"), s.mid["B"])
-                first = e["entries"]["coverage"]["first_ns"]
+                first = positive_first_ns(e)
                 until = None if until_offset is None else first + until_offset
                 e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=until, first_ns=None)
             return mutate
@@ -2503,6 +2695,33 @@ def self_test():
             if got != want:
                 failures.append(f"presence-{caller_lc}-{module_lc}-{edge['mapping']['state']}")
 
+        # Uncounted derivations (C4: they fall out of the Unknown mapping).
+        end = T0 + 60_000 * MS
+
+        def _counted(last):
+            return {"mapping": {"state": MAPPING_LIVE}, "operations": None,
+                    "entries": {"count": 5, "last_seen_ns": last, "in_flight": False, "observation": "observed",
+                                "coverage": {"state": "counted", "since_ns": T0, "until_ns": None, "first_ns": None,
+                                             "lossy": False, "reason": None, "detail": None}}}
+
+        # (No recency-window assertions: Choice 3 is PENDING-RE-RULE.)
+        unc = _counted(None)
+        unc["entries"].update(count=0, observation="unknown (usage observation unavailable)")
+        unc["entries"]["coverage"].update(state=UNKNOWN_STATE, reason=UNCOUNTED_REASON,
+                                          detail="CALLER_EVIDENCE[2] PairInsertFailure showed 1 failed pair insert(s)")
+        endpoints = ({"retired": False, "lifecycle": "mapped"},
+                     {"admission": {"state": "admitted"}, "lifecycle": "mapped"})
+        if expected_capture(*endpoints, unc) != CAPTURE["lost"]:
+            failures.append("uncounted-capture-derivation")
+        if expected_activity(unc, end) != {ACTIVITY["uncovered"]}:
+            failures.append("uncounted-activity-derivation")
+        if expected_entries_display(unc) != "?":
+            failures.append("uncounted-entries-derivation")
+        # Bucket boundaries (EdgeClass): 0, 1, 2-3, 4-7, 8-15, ...
+        for count, want in ((0, 0), (1, 1), (2, 2), (3, 2), (4, 3), (7, 3), (8, 4), (37, 6)):
+            if count_bucket(count) != want:
+                failures.append(f"bucket-{count}")
+
         def edge_presence_wrong_label(s, d, dash):
             ev = s.events(d, True)
             row = ev[_edge_rows(ev)[0]]["event"]
@@ -2600,6 +2819,151 @@ def self_test():
         def dash_totals(s, d, dash):
             return {"frames": s.frames(dash).replace(b" callers ", b"0 callers ")}
         case("dashboard-totals", "DASH-TOTALS", dash_totals)
+        # --- C5: ledger exactness + Choice 1-2 pins ---------------------------------------
+        # r1 T3.5 must-fails: a count above the ledger, a published 0,
+        # absent-as-0 (P1), counted-on-preadmission (P2).
+        def above_ledger(s, d, dash):
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] += 1
+        res = case("count-above-ledger", "COUNT-EXACT", above_ledger)
+        failed = {r["check"] for r in res.failed()}
+        if "COUNT-TOTAL" not in failed:
+            failures.append("count-above-ledger-misses-total")
+        if "COUNT-WINDOW" in failed:
+            # +1 hides inside COUNT-WINDOW's hi slack (the dlsym line): the
+            # exactness pins, not the window, must catch it.
+            failures.append("count-above-ledger-needs-exact-past-window-slack")
+
+        def zero_published(s, d, dash):
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] = 0
+        case("zero-count-published", "COUNTED-NONZERO", zero_published)
+
+        def absent_zero_p1(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=None, first_ns=None)
+            e["entries"].update(count=0, first_seen_ns=None, last_seen_ns=None, observation="observed")
+        case("absent-as-zero-p1", "USED-NOT-WATCHED", absent_zero_p1)
+
+        def preadmission_p2(s, d, dash):
+            first = min(u[0] for c, _p, _st, _g, _e, _sp, uses in s.images if c == "P2" for u in uses.values())
+            caller = next(c for c in d["callers"] if c["id"] == cid(s, "P2"))
+            caller["first_seen_ns"] = first + MS
+        case("counted-on-preadmission-p2", "PREADMISSION-POSITIVE", preadmission_p2)
+
+        # Counted for unattested B: a witnessed P2 edge fails like P1's.
+        def unattested_witnessed(s, d, dash):
+            e = _edge(d, cid(s, "P2"), s.mid["B"])
+            e["entries"]["coverage"].update(state="witnessed", first_ns=e["entries"]["first_seen_ns"],
+                                            since_ns=None)
+        case("unattested-witnessed", "COVERAGE-ALLOWED", unattested_witnessed)
+
+        # Choice 1: uncounted needs the BPF PairInsertFailure evidence.
+        def uncounted_edge(s, d):
+            e = _edge(d, cid(s, "P3"), s.mid["C"])
+            e["entries"]["coverage"].update(
+                state=UNKNOWN_STATE, since_ns=None, reason=UNCOUNTED_REASON,
+                detail="CALLER_EVIDENCE[2] PairInsertFailure showed 1 failed pair insert(s)")
+            e["entries"]["observation"] = "unknown (usage observation unavailable)"
+
+        def uncounted_no_gap(s, d, dash):
+            uncounted_edge(s, d)
+        case("uncounted-without-pair-evidence", "UNCOUNTED-EVIDENCE", uncounted_no_gap)
+
+        def uncounted_bad_detail(s, d, dash):
+            uncounted_edge(s, d)
+            _edge(d, cid(s, "P3"), s.mid["C"])["entries"]["coverage"]["detail"] = \
+                "userspace pair budget exhausted"
+            d["gaps"].append({"caller": None, "module": s.mid["C"], "pid": None,
+                              "subject": PAIRS_UNCOUNTED_SUBJECT, "reason": "synthetic", "budget": None,
+                              "repeats": 1})
+        case("uncounted-detail-without-bpf-name", "UNCOUNTED-EVIDENCE", uncounted_bad_detail)
+
+        def uncounted_count(s, d, dash):
+            uncounted_edge(s, d)
+            _edge(d, cid(s, "P3"), s.mid["C"])["entries"].update(count=3, observation="observed")
+            d["gaps"].append({"caller": None, "module": s.mid["C"], "pid": None,
+                              "subject": PAIRS_UNCOUNTED_SUBJECT, "reason": "synthetic", "budget": None,
+                              "repeats": 1})
+        case("uncounted-with-count", "UNCOUNTED-EVIDENCE", uncounted_count)
+
+        def uncounted_pass(s, d, dash):
+            uncounted_edge(s, d)
+            d["gaps"].append({"caller": None, "module": s.mid["C"], "pid": None,
+                              "subject": PAIRS_UNCOUNTED_SUBJECT, "reason": "synthetic", "budget": None,
+                              "repeats": 1})
+        res = case("uncounted-pass-with-counted-standing", None, uncounted_pass)
+        if not any(r["check"] == "UNCOUNTED-EVIDENCE" and r["status"] == "pass" for r in res.rows):
+            failures.append("uncounted-pass-exercises-evidence")
+
+        def uncounted_record(s, d):
+            uncounted_edge(s, d)
+            d["gaps"].append({"caller": None, "module": s.mid["C"], "pid": None,
+                              "subject": PAIRS_UNCOUNTED_SUBJECT, "reason": "synthetic", "budget": None,
+                              "repeats": 1})
+            ev = s.events(d)
+            return ev, next(e for e in ev if e["kind"] == "edge_observed"
+                            and e["event"]["caller"] == cid(s, "P3") and e["event"]["module"] == s.mid["C"])
+
+        def uncounted_activity(s, d, dash):
+            ev, row = uncounted_record(s, d)
+            assert row["event"]["activity"] == ACTIVITY["uncovered"], row["event"]
+            row["event"]["activity"] = ACTIVITY["unknown"]
+            return {"events": ev}
+        case("uncounted-activity-unknown", "AGREE-EDGE-EVENTS", uncounted_activity)
+
+        def uncounted_capture(s, d, dash):
+            ev, row = uncounted_record(s, d)
+            assert row["event"]["capture"] == CAPTURE["lost"], row["event"]
+            row["event"]["capture"] = CAPTURE["armed"]
+            return {"events": ev}
+        case("uncounted-capture-armed", "AGREE-EDGE-EVENTS", uncounted_capture)
+
+        # Choice 2: bucket jumps are immediate class changes; other drift
+        # waits out the 10 s channel.
+        def drift_stages(s, d, cell, stages):
+            """Replace the cell's edge records with `stages` [(count,
+            at_ns)] before the pass marker; fix accounting + seq."""
+            cid_, mid = cid(s, cell), s.mid["A"]
+            ev = s.events(d)
+            template = [e for e in ev if e["kind"] == "edge_observed"
+                        and e["event"].get("caller") == cid_ and e["event"].get("module") == mid][-1]
+            keep = [e for e in ev if not (e["kind"] == "edge_observed"
+                                          and e["event"].get("caller") == cid_
+                                          and e["event"].get("module") == mid)]
+            at = next(i for i, e in enumerate(keep) if e["kind"] == "pass_committed")
+            new = []
+            for count, at_ns in stages:
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["at_ns"] = at_ns
+                new.append(rec)
+            out = keep[:at] + new + keep[at:]
+            next(e for e in out if e["kind"] == "pass_committed")["event"]["edge_events"] += len(new) - 1
+            return {"events": _renumber(out)}
+
+        def fast_drift(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            assert n >= 2 and count_bucket(n - 1) == count_bucket(n), n
+            return drift_stages(s, d, "P1", [(n - 1, T0 + 500), (n, T0 + 500 + 1_000_000_000)])
+        case("fast-drift-same-bucket", "EDGE-CADENCE", fast_drift)
+
+        def bucket_jump(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            prev = (1 << (count_bucket(n) - 1)) - 1
+            assert count_bucket(prev) != count_bucket(n), (prev, n)
+            return drift_stages(s, d, "P1", [(prev, T0 + 500), (n, T0 + 500 + 1_000_000_000)])
+        case("bucket-jump-fast-pass", None, bucket_jump)
+
+        # Choice 3 (activity via recency window) is PENDING-RE-RULE per a
+        # binding controller steer: it will be re-ruled to per-pass in a
+        # follow-up task, so C5 pins Choices 1-2 only and adds no
+        # recency-window stream fixtures here.
+
+        # C2 extension: the decided snapshot never carries pending_first_use.
+        def pending_snapshot(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"].update(state=UNKNOWN_STATE, since_ns=None, reason=PENDING_FIRST_USE_REASON)
+            e["entries"]["observation"] = "unknown (usage observation unavailable)"
+        case("pending-in-snapshot", "PENDING-TRANSIENT", pending_snapshot)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

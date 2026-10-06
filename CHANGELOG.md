@@ -47,6 +47,13 @@ Work toward v0.3.0.
   [docs/schema/inventory-v1.md](docs/schema/inventory-v1.md) and
   [docs/privacy/allowlist-v3.md](docs/privacy/allowlist-v3.md).
 
+- The native inventory oracle checks per-edge counts against the workload
+  ledger: P1/P2 edges read `counted` (even the unattested copy) with the
+  exact attach-side count when the feed covers every in-window call, and
+  must-fail fixtures cover above-ledger, published-0, absent-as-0 and
+  pre-admission-counted outputs. DR-02 stays open pending the M2 cost
+  gate. See [docs/known-limitations.md](docs/known-limitations.md).
+
 ### Changed
 
 - A process is a caller of a provider only through an executable mapping

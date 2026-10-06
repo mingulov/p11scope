@@ -386,8 +386,9 @@ non-null values needs a new allowlist row.
     `unknown` (`activity unknown`, `entries ?`) on the dashboard and in
     mid-run `edge_observed` records, and the watch's proven-clean
     instant is not extended over it. Once the row binds the edge reads
-    `witnessed`, or the unbound reason when it does not; the staged
-    watch resumes when the row binds elsewhere. The finish flush
+    `counted` (since v0.3.0 the native lane counts every bound row), or
+    the unbound reason when it does not; the staged watch resumes when
+    the row binds elsewhere. The finish flush
     decides every row, so the `-o` snapshot and the final sweep never
     carry this reason.
   A zero reads `observed` only under `watched_no_use` or a loss-free

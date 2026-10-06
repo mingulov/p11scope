@@ -270,6 +270,12 @@ SKIPPABLE_RUNS = frozenset({"dashboard"})
 # entry — the call that receipts the table, not a call through it — is
 # excluded (Use.table_calls). Error-returning calls are included: entry,
 # not return, is what both the ledger and BPF count.
+# O8 receipt boundary: the exclusion is acquisition-only — the
+# setup-phase dlsym call, never made through an attached slot. A dlsym
+# name alone does not exempt a call made after the endpoint is armed:
+# through-table calls count whatever they are named. LEDGER-COUNTS pins
+# exactly one setup C_GetFunctionList per provider, so the fixture
+# never holds an ambiguous second setup one.
 SYMBOL_ENTRY_FUNCTIONS = frozenset({"C_GetFunctionList"})
 WITNESS_SLACK_NS = 20_000_000
 EXEC_GAP_MIN_NS = 4 * WITNESS_SLACK_NS
@@ -396,6 +402,12 @@ def parse_ledger(text, errors):
     return images
 
 
+def is_table_call(fn, phase):
+    """Whether the ledger line is a call through the function table (what
+    BPF counts). Only the setup-phase acquisition dlsym is excluded."""
+    return fn not in SYMBOL_ENTRY_FUNCTIONS or phase != "setup"
+
+
 @dataclass
 class Use:
     """One image's ledgered use of one provider, clipped to a capture window."""
@@ -407,7 +419,7 @@ class Use:
 
     @property
     def table_calls(self):
-        return sum(e["n"] for e in self.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS)
+        return sum(e["n"] for e in self.lines if is_table_call(e["fn"], e.get("phase")))
 
 
 def use_in(image, provider_path, window):
@@ -437,7 +449,7 @@ def recording_before(use, since_ns):
     recorded call however many it ledgered. A straddling attach-side
     line (or a same-tick boundary) leaves the recording call's line
     ambiguous and there is no identified recording line."""
-    attach = [e for e in use.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS]
+    attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"))]
     if any(e["t0"] <= since_ns <= e["t1"] for e in attach):
         return None
     before = [e for e in attach if e["t1"] < since_ns]
@@ -460,7 +472,7 @@ def window_count(use, since_ns, window):
             continue
         hi += e["n"]
         if e["t0"] > since_ns and e["t0"] >= window[0] and e["t1"] <= end \
-                and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS:
+                and is_table_call(e["fn"], e.get("phase")):
             lo += e["n"]
     rec = recording_before(use, since_ns)
     if rec is not None:
@@ -474,7 +486,7 @@ def ledger_total_table_calls(image, provider_path):
     """Every attach-side call the image ledgered for the provider, any time:
     the upper bound a count will never exceed (r1 T3.5 `count <= total`)."""
     return sum(e["n"] for e in image.entries
-               if e["module"] == provider_path and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS)
+               if e["module"] == provider_path and is_table_call(e["fn"], e.get("phase")))
 
 
 def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns):
@@ -507,7 +519,7 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns):
     real run and since_ns <= t_first can never gate exactness."""
     if until_ns is not None:
         return False, 0
-    attach = [e for e in use.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS]
+    attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"))]
     if not attach:
         return False, 0
     if any(e["t0"] < window[0] or e["t1"] > window[1] for e in use.lines):
@@ -2080,7 +2092,7 @@ class Synth:
                     lines.append(f"LEDGER {head} module={path} fn={fn} mech={mech} n={n} bad=0 phase={phase} "
                                  f"t0={t0} t1={self.clock}")
                     self.clock += MS
-                    if fn not in SYMBOL_ENTRY_FUNCTIONS:
+                    if is_table_call(fn, phase):
                         table += n
                 uses[role] = (first, self.clock, table)
             lines.append(f"DONE {head} status=ok")
@@ -3344,6 +3356,35 @@ def self_test():
             e = _edge(d, cid(s, "P1"), s.mid["A"])
             e["entries"].update(count=7, saturated=False, cap=7)
         case("unsaturated-count-at-cap", "COUNT-SATURATED", unsaturated_at_cap)
+
+        # --- O8: receipt boundary proof (astra A7) --------------------------
+        # The C_GetFunctionList exclusion is acquisition-only: the
+        # setup-phase dlsym call that receipts the table, never made
+        # through an attached slot. A dlsym name alone does not exempt a
+        # call made after the endpoint is armed (through-table calls
+        # count whatever they are named); LEDGER-COUNTS pins exactly one
+        # setup C_GetFunctionList per provider, so the fixture never
+        # holds an ambiguous second one.
+        def _line(fn, phase, n, t0, t1):
+            return {"module": "/prov/a/libsofthsm2.so", "fn": fn, "mech": "-", "n": n, "bad": 0,
+                    "phase": phase, "t0": t0, "t1": t1}
+        acq = _line("C_GetFunctionList", "setup", 1, T0 + 1, T0 + 2)
+        armed = _line("C_GetFunctionList", "main", 2, T0 + 3, T0 + 4)
+        digest = _line("C_Digest", "main", 3, T0 + 5, T0 + 6)
+        if Use([acq, armed, digest], [acq, armed, digest], T0 + 1, T0 + 6, {}).table_calls != 5:
+            failures.append("o8-armed-table-call-excluded")
+        if Use([acq], [acq], T0 + 1, T0 + 2, {}).table_calls != 0:
+            failures.append("o8-acquisition-not-excluded")
+
+        def armed_table_getfunctionlist(s, d, dash):
+            ident = next(l for l in s.ledgers["P1"].splitlines() if l.startswith("IDENT "))
+            main = re.search(r"phase=main t0=(\d+) t1=(\d+)", s.ledgers["P1"])
+            led = dict(s.ledgers)
+            led["P1"] += (f"LEDGER {ident.split(' ', 1)[1]} module=/prov/a/libsofthsm2.so "
+                          f"fn=C_GetFunctionList mech=- n=1 bad=0 phase=main "
+                          f"t0={main.group(1)} t1={main.group(2)}\n")
+            return {"ledgers": led}
+        case("armed-table-getfunctionlist", "LEDGER-COUNTS", armed_table_getfunctionlist)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

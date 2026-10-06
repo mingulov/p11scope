@@ -41,65 +41,76 @@ LEGACY_CELLS = {
 }
 
 
-def parse_log(path):
-    """Split a campaign log into headers, samples, DONE markers and errors.
+def parse_log_bytes(data):
+    """Split campaign-log bytes into headers, samples, DONE markers, errors.
 
     Returns (headers, samples, done_lines, errors): headers maps
     MACHINE/BINARY keys, samples is a list of dicts in log order, done_lines
     lists the line numbers of DONE completion markers, errors lists malformed
     SAMPLE lines (never silently dropped: the caller fails on them).
+
+    `data` is the single snapshot `main` hashed: parsing and the digest
+    always see identical bytes, so a log replaced between two reads can
+    never parse one campaign while hashing another. Line splitting
+    emulates text-mode universal newlines exactly.
     """
     headers = {}
     samples = []
     done_lines = []
     errors = []
-    with open(path, encoding="utf-8") as handle:
-        for lineno, raw in enumerate(handle, 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            head, _, rest = line.partition(" ")
-            if head in ("MACHINE", "BINARY"):
-                headers[head] = rest.strip()
-                continue
-            if head == "DONE":
-                done_lines.append(lineno)
-                continue
-            if head != "SAMPLE":
-                continue
-            try:
-                fields = dict(
-                    token.split("=", 1) for token in rest.split() if "=" in token
-                )
-                sample = {
-                    "cell": fields["cell"],
-                    "arm": fields["arm"],
-                    "round": int(fields["round"]),
-                    "ops": int(fields["ops"]),
-                    "wall_ns": int(fields["wall_ns"]),
-                    "mode": fields["mode"],
-                    "parallel": int(fields["parallel"]),
-                    "bpf_ns": None if fields["bpf_ns"] == "none" else int(fields["bpf_ns"]),
-                    "bpf_cnt": None if fields["bpf_cnt"] == "none" else int(fields["bpf_cnt"]),
-                    "lineno": lineno,
-                }
-            except (KeyError, ValueError) as error:
-                errors.append(f"line {lineno}: {error}: {line[:160]}")
-                continue
-            if (
-                sample["arm"] not in ("on", "off")
-                or sample["ops"] <= 0
-                or sample["wall_ns"] <= 0
-                or sample["parallel"] <= 0
-                or sample["round"] <= 0
-            ):
-                errors.append(f"line {lineno}: out-of-range fields: {line[:160]}")
-                continue
-            if (sample["bpf_ns"] is None) != (sample["bpf_cnt"] is None):
-                errors.append(f"line {lineno}: half-present bpf pair: {line[:160]}")
-                continue
-            samples.append(sample)
+    text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    for lineno, raw in enumerate(text.split("\n"), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        head, _, rest = line.partition(" ")
+        if head in ("MACHINE", "BINARY"):
+            headers[head] = rest.strip()
+            continue
+        if head == "DONE":
+            done_lines.append(lineno)
+            continue
+        if head != "SAMPLE":
+            continue
+        try:
+            fields = dict(
+                token.split("=", 1) for token in rest.split() if "=" in token
+            )
+            sample = {
+                "cell": fields["cell"],
+                "arm": fields["arm"],
+                "round": int(fields["round"]),
+                "ops": int(fields["ops"]),
+                "wall_ns": int(fields["wall_ns"]),
+                "mode": fields["mode"],
+                "parallel": int(fields["parallel"]),
+                "bpf_ns": None if fields["bpf_ns"] == "none" else int(fields["bpf_ns"]),
+                "bpf_cnt": None if fields["bpf_cnt"] == "none" else int(fields["bpf_cnt"]),
+                "lineno": lineno,
+            }
+        except (KeyError, ValueError) as error:
+            errors.append(f"line {lineno}: {error}: {line[:160]}")
+            continue
+        if (
+            sample["arm"] not in ("on", "off")
+            or sample["ops"] <= 0
+            or sample["wall_ns"] <= 0
+            or sample["parallel"] <= 0
+            or sample["round"] <= 0
+        ):
+            errors.append(f"line {lineno}: out-of-range fields: {line[:160]}")
+            continue
+        if (sample["bpf_ns"] is None) != (sample["bpf_cnt"] is None):
+            errors.append(f"line {lineno}: half-present bpf pair: {line[:160]}")
+            continue
+        samples.append(sample)
     return headers, samples, done_lines, errors
+
+
+def parse_log(path):
+    """Split a campaign log file: one read, then `parse_log_bytes`."""
+    with open(path, "rb") as handle:
+        return parse_log_bytes(handle.read())
 
 
 def load_manifest(path):
@@ -524,7 +535,12 @@ def main(argv):
     if manifest_error is not None:
         print(manifest_error, file=sys.stderr)
         return 2
-    headers, samples, done_lines, errors = parse_log(positional[0])
+    # One byte snapshot: the digest and the parse below see identical
+    # input, so a log replaced between two reads cannot certify.
+    with open(positional[0], "rb") as handle:
+        log_snapshot = handle.read()
+    log_digest = hashlib.sha256(log_snapshot).hexdigest()
+    headers, samples, done_lines, errors = parse_log_bytes(log_snapshot)
     if errors:
         for error in errors:
             print(f"malformed sample: {error}", file=sys.stderr)
@@ -532,8 +548,6 @@ def main(argv):
     if not samples:
         print("no samples in the log", file=sys.stderr)
         return 1
-    with open(positional[0], "rb") as handle:
-        log_digest = hashlib.sha256(handle.read()).hexdigest()
     incomplete = validate(samples, done_lines, manifest, log_digest)
     if incomplete:
         for problem in incomplete:
@@ -550,6 +564,7 @@ def main(argv):
 
 def self_test():
     """Pinned-numbers checks over synthetic logs, plus manifest-gate pins."""
+    import builtins
     import contextlib
     import io
     import os
@@ -801,6 +816,72 @@ DONE samples=8
         write_manifest(legacy_manifest)
         code, _, err = run([path, "--manifest", manifest_path])
         assert code == 1 and "sha256 unreadable" in err, (code, err)
+        # Replacement between the parse read and the hash read cannot
+        # certify: main() digests and parses one byte snapshot, so the
+        # swap model below (unrelated legacy-shaped bytes for parsing,
+        # historical bytes for hashing) fails the digest gate — and the
+        # log path is opened exactly once, which makes the divergence
+        # impossible by construction.
+        unrelated = [
+            "MACHINE kernel=rogue-host nproc=4",
+            "BINARY path=/tmp/unrelated sha256=deadbeef",
+        ]
+        for name in sorted(LEGACY_CELLS):
+            spec = LEGACY_CELLS[name]
+            for round_no in range(1, spec["rounds"] + 1):
+                arms = expected_arms(round_no, LEGACY_ARMS_PER_ROUND, LEGACY_FIRST_ARM)
+                for arm in arms:
+                    wall = spec["ops"] * (4100 if arm == "on" else 4000)
+                    if arm == "on":
+                        bpf = f"bpf_ns={spec['ops'] * 2 * 80} bpf_cnt={spec['ops'] * 2}"
+                    else:
+                        bpf = "bpf_ns=none bpf_cnt=none"
+                    unrelated.append(
+                        f"SAMPLE cell={name} arm={arm} round={round_no} "
+                        f"ops={spec['ops']} wall_ns={wall} mode={spec['mode']} "
+                        f"parallel={spec['parallel']} {bpf}"
+                    )
+        unrelated_text = "\n".join(unrelated) + "\n"
+        assert unrelated_text.count("SAMPLE") == 56
+        historical = b"=== historical campaign stdout (stand-in) ===\nold bytes\n"
+        swap_manifest = {
+            "cells": LEGACY_CELLS,
+            "arms_per_round": LEGACY_ARMS_PER_ROUND,
+            "first_arm": LEGACY_FIRST_ARM,
+            "events_per_op": LEGACY_EVENTS_PER_OP,
+            "completion": {"legacy_stdout": stdout_path, "note": "test"},
+        }
+        with open(stdout_path, "wb") as handle:
+            handle.write(historical)
+        write_manifest(swap_manifest)
+        write_log(unrelated_text)
+        real_open = open
+        log_opens = []
+        saved_pin = LEGACY_CAMPAIGN_SHA256
+        try:
+            globals()["LEGACY_CAMPAIGN_SHA256"] = hashlib.sha256(historical).hexdigest()
+
+            def swap_open(file, mode="r", *args, **kwargs):
+                if file == path:
+                    log_opens.append(mode)
+                    payload = (
+                        unrelated_text.encode("utf-8") if len(log_opens) == 1 else historical
+                    )
+                    if "b" in mode:
+                        return io.BytesIO(payload)
+                    return io.StringIO(payload.decode("utf-8"))
+                return real_open(file, mode, *args, **kwargs)
+
+            builtins.open = swap_open
+            try:
+                code, _, err = run([path, "--manifest", manifest_path])
+            finally:
+                builtins.open = real_open
+        finally:
+            globals()["LEGACY_CAMPAIGN_SHA256"] = saved_pin
+        assert log_opens == ["rb"], log_opens
+        assert code == 1, (code, err)
+        assert "not the reviewed historical campaign" in err, err
         # Manifest misuse is a usage error (exit 2), never a verdict.
         write_log(log)
         write_manifest(manifest)

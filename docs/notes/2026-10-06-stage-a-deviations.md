@@ -88,7 +88,10 @@ strengthens fail-closed routing, and each is pinned by the cited gate.
   or stale K2's epochs (a *detected* skip raises the global fault anyway).
   So refusing exactly K1 preserves every sound K2 join and refuses every
   unsound K1 join — strictly more availability than §1.7 with the same
-  join soundness. (F3 bounds the `faulted` set; an evicted fault degrades
-  its key to `Pending`/`Unobserved`, never a join.)
-- Pinned by: `a_range_appearing_at_unchanged_epochs_is_a_sticky_coverage_fault`
-  and `faulted_registry_eviction_degrades_late_calls_to_unobserved`.
+  join soundness. (F3 bounds the `faulted` set; a faulted eviction
+  latches capture-sticky `CoverageFault` refusal for every unknown key —
+  P2-1, since the evicted tombstone is indistinguishable from a new key —
+  while keys with a retained observation keep continuity.)
+- Pinned by: `a_range_appearing_at_unchanged_epochs_is_a_sticky_coverage_fault`,
+  `fault_evict_reobserve_same_epoch_still_refuses_route`, and
+  `faulted_registry_overflow_latches_coverage_refusal`.

@@ -539,7 +539,63 @@ fn observed_registry_eviction_degrades_late_calls_to_unobserved() {
 }
 
 #[test]
-fn faulted_registry_eviction_degrades_late_calls_to_unobserved() {
+fn faulted_registry_overflow_latches_coverage_refusal() {
+    // P2-1: the evicted tombstone is indistinguishable from a new key, so
+    // the overflow latches CoverageFault for every unknown key — while
+    // keys with a retained observation keep continuity.
+    const A: u64 = 0xA1;
+    const B: u64 = 0xA2;
+    const C: u64 = 0xA3;
+    const D: u64 = 0xA4;
+    let mut r = InstanceRouter::new(RouterLimits {
+        faulted_keys: 1,
+        ..RouterLimits::default()
+    });
+    let fault = |r: &mut InstanceRouter, cookie: u64| {
+        r.observe(observation_for(cookie, 2, load(BASE_A)));
+        let mut grown = load(BASE_A);
+        grown.extend(load(BASE_B));
+        assert_eq!(
+            r.observe(observation_for(cookie, 2, grown)).0,
+            ObserveOutcome::CoverageFault
+        );
+    };
+    assert_eq!(
+        r.observe(observation_for(D, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    fault(&mut r, A);
+    assert_eq!(
+        r.route(call_for(1, A, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+    fault(&mut r, B);
+    assert_eq!(r.counters().faulted_evictions, 1);
+    // The evicted key and any genuinely new key are refused, never joined.
+    assert_eq!(
+        r.route(call_for(2, A, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+    assert_eq!(
+        r.observe(observation_for(C, 2, load(BASE_A))).0,
+        ObserveOutcome::CoverageFault
+    );
+    assert_eq!(
+        r.route(call_for(3, B, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+    // The retained key keeps continuity and still joins.
+    assert_eq!(
+        r.observe(observation_for(D, 2, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    joined(r.route(call_for(4, D, stamp(2, 0, 0), ip_in(BASE_A))));
+}
+
+#[test]
+fn fault_evict_reobserve_same_epoch_still_refuses_route() {
+    // P2-1 (astra retro): evicting a coverage-fault tombstone must not let
+    // the same discredited epoch re-join on re-observation.
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
     let mut r = InstanceRouter::new(RouterLimits {
@@ -556,24 +612,16 @@ fn faulted_registry_eviction_degrades_late_calls_to_unobserved() {
         );
     };
     fault(&mut r, A);
-    assert_eq!(
-        r.route(call_for(1, A, stamp(2, 0, 0), ip_in(BASE_A))),
-        Route::Unknown(UnknownReason::CoverageFault)
-    );
     fault(&mut r, B);
     assert_eq!(r.counters().faulted_evictions, 1);
-    // The evicted fault no longer reports CoverageFault, but its calls still
-    // never join: no observation survives for them.
+    // Re-observing A's discredited epoch must still refuse: never New.
     assert_eq!(
-        r.route(call_for(2, A, stamp(2, 0, 0), ip_in(BASE_A))),
-        Route::Pending
+        r.observe(observation_for(A, 2, load(BASE_A))).0,
+        ObserveOutcome::CoverageFault
     );
+    // And no call at that epoch may join, directly or via pending.
     assert_eq!(
-        r.expire_pending(A),
-        vec![(2, Route::Unknown(UnknownReason::Unobserved))]
-    );
-    assert_eq!(
-        r.route(call_for(3, B, stamp(2, 0, 0), ip_in(BASE_A))),
+        r.route(call_for(1, A, stamp(2, 0, 0), ip_in(BASE_A))),
         Route::Unknown(UnknownReason::CoverageFault)
     );
 }

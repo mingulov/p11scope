@@ -49,8 +49,11 @@ pub(crate) const KEYS_PER_PROCESS_FILE: usize = 4;
 /// (process, file) observation keys, coverage-faulted keys and retired
 /// process cookies. Each is bounded at the instance-record ceiling; a full
 /// registry evicts its smallest key first (cookies mint in capture order,
-/// so the stalest process goes first) with a saturating counter. Eviction
-/// degrades late calls to Pending/Unobserved, never a join.
+/// so the stalest process goes first) with a saturating counter.
+/// Observed/retired eviction degrades late calls to Pending/Unobserved,
+/// never a join; a faulted eviction latches capture-sticky refusal for
+/// every unknown key (P2-1), since an evicted tombstone is
+/// indistinguishable from a new key.
 pub(crate) const MAX_OBSERVED_KEYS: usize = 4_096;
 pub(crate) const MAX_FAULTED_KEYS: usize = 4_096;
 pub(crate) const MAX_RETIRED_COOKIES: usize = 4_096;
@@ -447,7 +450,8 @@ pub(crate) struct RouterCounters {
     /// yet covered with a fault raise (a subset of `eras`).
     pub(crate) miss_eras: u64,
     /// Saturating registry evictions (F3): keys dropped from a full
-    /// registry, whose late calls degrade to Pending/Unobserved.
+    /// registry. Observed/retired late calls degrade to Pending/Unobserved;
+    /// a faulted eviction latches refusal (P2-1).
     pub(crate) observed_evictions: u64,
     pub(crate) faulted_evictions: u64,
     pub(crate) retired_evictions: u64,
@@ -462,6 +466,13 @@ pub(crate) struct InstanceRouter {
     /// (cookie, file slot) -> retained observations, oldest first.
     observed: BTreeMap<(u64, u32), VecDeque<Observed>>,
     faulted: BTreeSet<(u64, u32)>,
+    /// P2-1: a coverage-fault tombstone was evicted under capacity pressure.
+    /// The router can no longer name the discredited key, so every unknown
+    /// key (no retained observation) is refused with `CoverageFault` — fail
+    /// closed. Capture-sticky: set once, never cleared (a fault-era advance
+    /// clears observations, not the fault registry). Retained keys keep
+    /// continuity; only unknown keys pay the availability cost.
+    faulted_overflowed: bool,
     retired: BTreeSet<u64>,
     pending: VecDeque<PendingCall>,
     fault: u64,
@@ -489,6 +500,7 @@ impl fmt::Debug for InstanceRouter {
             .field("limits", &self.limits)
             .field("observed_keys", &self.observed.len())
             .field("faulted_keys", &self.faulted.len())
+            .field("faulted_overflowed", &self.faulted_overflowed)
             .field("retired_cookies", &self.retired.len())
             .field("pending", &self.pending.len())
             .field("sticky", &self.sticky)
@@ -508,6 +520,7 @@ impl InstanceRouter {
             limits,
             observed: BTreeMap::new(),
             faulted: BTreeSet::new(),
+            faulted_overflowed: false,
             retired: BTreeSet::new(),
             pending: VecDeque::new(),
             fault: 0,
@@ -628,6 +641,12 @@ impl InstanceRouter {
         if self.faulted.contains(&key) {
             return (ObserveOutcome::CoverageFault, Vec::new());
         }
+        if self.faulted_overflowed && !self.observed.contains_key(&key) {
+            // P2-1: a tombstone was evicted, so this unknown key may be a
+            // discredited one: refuse, never accept as a new incarnation.
+            // Keys with a retained observation keep continuity below.
+            return (ObserveOutcome::CoverageFault, Vec::new());
+        }
         let existing = self
             .observed
             .get(&key)
@@ -643,12 +662,20 @@ impl InstanceRouter {
                     .any(|range| ranges.binary_search(range).is_err());
                 if appeared {
                     self.counters.coverage_faults += 1;
+                    let evictions = self.counters.faulted_evictions;
                     evict_for_insert(
                         &mut self.faulted,
                         &key,
                         self.limits.faulted_keys,
                         &mut self.counters.faulted_evictions,
                     );
+                    if self.counters.faulted_evictions != evictions {
+                        // P2-1: capacity pressure evicted a discredited key
+                        // the router can no longer name: latch refusal for
+                        // every unknown key (fail closed; retained keys
+                        // keep continuity). Capture-sticky, like the faults.
+                        self.faulted_overflowed = true;
+                    }
                     self.faulted.insert(key);
                     if let Some(list) = self.observed.remove(&key) {
                         self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
@@ -735,7 +762,9 @@ impl InstanceRouter {
     /// 3. entry/return inequality (`Straddle` — a refusal flag on the RETURN
     ///    stamp only therefore surfaces as `Straddle`, never as its flag);
     /// 4. the ambient era (stale fault generation or the latched miss era);
-    /// 5. process state (`Retired`, then the sticky `CoverageFault`);
+    /// 5. process state (`Retired`, then the sticky `CoverageFault` —
+    ///    remembered tombstones and, after a faulted eviction, the P2-1
+    ///    overflow latch for every unknown key);
     /// 6. epoch knowledge (`Pending` while a newer-or-equal epoch may still
     ///    be observed — including evicted epochs, which resolve only when a
     ///    later observation arrives (no fail-on-evict) — else `Unobserved`
@@ -783,6 +812,11 @@ impl InstanceRouter {
         let file = u32::from(entry.file_slot_plus1) - 1;
         let key = (facts.cookie, file);
         if self.faulted.contains(&key) {
+            return Route::Unknown(U::CoverageFault);
+        }
+        if self.faulted_overflowed && !self.observed.contains_key(&key) {
+            // P2-1: the overflow latch refuses unknown keys at route time
+            // too, so an evicted tombstone can never re-join.
             return Route::Unknown(U::CoverageFault);
         }
         let Some(list) = self.observed.get(&key) else {

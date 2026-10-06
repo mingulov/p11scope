@@ -894,6 +894,102 @@ fn a_row_of_the_first_pass_binds_because_activation_precedes_the_scan() {
     );
 }
 
+/// P1-2: live publication is stamped after refresh+commit: a count that
+/// rose during the pass reads RecentlyObserved at its own pass's
+/// publication, never Quiet from a presentation clock older than the
+/// read. Driven through the actual loop with the production publish
+/// timestamp (no artificial presentation time); the read delay separates
+/// scan-start from rows-read by milliseconds, deterministically.
+#[test]
+fn a_rising_count_reads_recently_observed_at_its_own_pass_publication() {
+    use crate::inventory_present::{Activity, Presentation};
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // Pass 1 witnesses the row (first-sight count 1); pass 2's refresh
+    // raises it to 6.
+    lane.reads.push_back(vec![RowSpec {
+        endpoint: 0,
+        tgid: PID,
+        ticket: TICKET,
+    }]);
+    lane.reads.push_back(Vec::new());
+    lane.refreshes.push_back(Vec::new());
+    lane.refreshes.push_back(vec![CountSpec {
+        endpoint: 0,
+        ticket: TICKET,
+        exec: 1,
+        count: 6,
+    }]);
+    lane.read_delay = Duration::from_millis(2);
+    let started_ns = now_ns();
+    let pass_log = Rc::clone(&scene.log);
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let scans = move || {
+        pass_log
+            .borrow()
+            .iter()
+            .filter(|entry| *entry == "scan")
+            .count()
+    };
+    let stop = move || scans() >= 2;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(600)),
+        stop: &stop,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut observed: Vec<(u64, Option<u64>, Activity)> = Vec::new();
+    run_classic(
+        &mut scene,
+        Some(started),
+        &clock,
+        &mut |scene: &mut Scene, point| {
+            if let Publish::Pass { now_ns, .. } = point {
+                let presentation = Presentation::capture(
+                    &scene.coordinator,
+                    "s",
+                    started_ns,
+                    now_ns,
+                    scene.coordinator.passes(),
+                    now_ns,
+                    now_ns.saturating_sub(started_ns),
+                );
+                let caller = scene.caller(PID);
+                let edge = presentation
+                    .edges
+                    .iter()
+                    .find(|edge| edge.caller == caller)
+                    .expect("pid 7 has its edge");
+                observed.push((now_ns, edge.entry_last_seen_ns, edge.activity));
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(observed.len(), 2, "{observed:?}");
+    // Pass 1's row is still horizon-pending at its publication (both
+    // horizons must strictly cover the read): no entry last-seen yet.
+    assert_eq!(observed[0].1, None, "{:?}", observed[0]);
+    // Pass 2 decides the row and stages the rise to 6: production
+    // ordering (publication at or after the read) and a rise that reads
+    // recently observed at its own publication.
+    let (publish_ns, last_seen, activity) = &observed[1];
+    let last_seen = last_seen.expect("the decided rise has an entry last-seen");
+    assert!(
+        *publish_ns >= last_seen,
+        "publication {publish_ns} precedes its read {last_seen}"
+    );
+    assert_eq!(
+        *activity,
+        Activity::RecentlyObserved,
+        "a rise during the pass reads recently observed at its publication"
+    );
+}
+
 /// Invariant 4.2: the terminal read is staged before the coverage ends, so a
 /// watch runs until that read's clean instant (capped at the terminal
 /// drain's start), not the pass before.

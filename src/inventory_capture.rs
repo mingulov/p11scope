@@ -1143,11 +1143,16 @@ where
         }
         driver.commit(report.engine_changed)?;
         passes += 1;
+        // Publication time is sampled AFTER collection, refresh, and
+        // commit: rows this pass stamped (rows_read_ns) must not read as
+        // the future to the presentation clock, or a rising count reads
+        // Quiet live. Scan semantics keep the pass-start `now`.
+        let published_ns = now_ns();
         publish(
             driver,
             Publish::Pass {
                 report: &report,
-                now_ns: now,
+                now_ns: published_ns,
             },
         )?;
         rescan = lane.as_mut().is_some_and(NativeLane::take_recovery_rescan);

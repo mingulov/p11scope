@@ -603,6 +603,17 @@ impl CallerUseCursor {
         self.refresh_sweeps_completed
     }
 
+    /// The retirement boundary for the count refresh: abandon the
+    /// in-progress sweep's traversal (batch token, per-key key, and gap
+    /// flag) so the terminal refresh is a generation begun after stop.
+    /// Count baselines survive: rows keep their last read, and the next
+    /// sweep re-reads every witnessed row against it.
+    pub(super) fn restart_refresh_traversal(&mut self) {
+        self.refresh_batch = None;
+        self.refresh_after = None;
+        self.refresh_sweep_gaps = false;
+    }
+
     /// Visits at most `max_rows` keys (two syscalls each) before
     /// `deadline`. `binding(endpoint)` is the object this capture
     /// published for an endpoint; `extra` is the owner's further check.

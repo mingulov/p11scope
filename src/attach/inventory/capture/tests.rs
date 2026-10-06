@@ -2857,6 +2857,73 @@ fn updates_of(read: &super::super::callers::CallerCountsRead) -> Vec<(u64, u64)>
 }
 
 #[test]
+fn terminal_refresh_restarts_the_traversal_after_stop() {
+    // P1-4: the terminal refresh is a generation begun after the
+    // retirement boundary: rows the pre-stop sweep already visited are
+    // re-read, so a prefix that advanced before stop reports its rise —
+    // while count baselines survive the restart (an unchanged row stays
+    // silent, a lowered one is still integrity against its baseline).
+    let mut rows = FakeRows {
+        batch_supported: true,
+        ..Default::default()
+    };
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    rows.insert(key(2, 0), Some(value(40, 0)));
+    rows.insert(
+        key(3, 0),
+        Some(CallerObjectUse {
+            entry_count: 3,
+            ..value(40, 0)
+        }),
+    );
+    let mut cursor = witnessed(&mut rows, 64);
+    let window = Instant::now() + Duration::from_secs(5);
+    // The pre-stop sweep reads the prefix (row 1), then stops mid-sweep.
+    let prefix = cursor.refresh_with(&mut rows, 1, window);
+    assert!(!prefix.sweep_completed);
+    assert!(prefix.updates.is_empty());
+    // Before stop, row 1 advances and row 3 lowers.
+    set_count(&mut rows, 1, 9);
+    set_count(&mut rows, 3, 2);
+    // Stop restarts the traversal (what `begin_stop` does): the next
+    // sweep re-reads from the map's beginning, against kept baselines.
+    cursor.restart_refresh_traversal();
+    let mut updates = Vec::new();
+    let mut gaps = Vec::new();
+    loop {
+        let read = cursor.refresh_with(&mut rows, 100, window);
+        updates.extend(updates_of(&read));
+        gaps.extend(
+            read.gaps
+                .iter()
+                .map(|(key, _, fault)| (key.image.task_cookie, fault.clone())),
+        );
+        if read.sweep_completed {
+            break;
+        }
+    }
+    assert!(
+        updates.contains(&(1, 9)),
+        "the terminal sweep re-reads the stopped prefix: {updates:?}"
+    );
+    assert!(
+        !updates.iter().any(|(cookie, _)| *cookie == 2),
+        "the unchanged row stays silent: {updates:?}"
+    );
+    assert_eq!(
+        gaps,
+        [(
+            3,
+            CallerRowFault::CountDecrease {
+                before: 3,
+                after: 2
+            }
+        )],
+        "the lowered row is integrity against its kept baseline: {gaps:?}"
+    );
+}
+
+#[test]
 fn count_refresh_re_reads_seen_rows_in_order_across_quanta() {
     let mut rows = FakeRows::default();
     for cookie in 1..=4 {

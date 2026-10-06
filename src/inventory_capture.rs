@@ -870,9 +870,14 @@ impl<L> NativeLane<L> {
         // witnessed row's count gets its last word. Still unsettled per
         // D3: the reads happen after stop began, and retirement may not
         // have closed every link. The last read is the health horizon for
-        // rows the terminal read reported.
-        let refresh_deadline = Instant::now() + self.windows.terminal_sweep_budget;
-        loop {
+        // rows the terminal read reported. The traversal restarted at
+        // `begin_stop`, so a completed sweep is a generation begun after
+        // the retirement boundary; when the budget expires first, the
+        // incomplete refresh is reported (counts keep their last read as
+        // a lower bound, never a fresh terminal word).
+        let refresh_budget = self.windows.terminal_sweep_budget;
+        let refresh_deadline = Instant::now() + refresh_budget;
+        let exact = loop {
             let terminal = self.read();
             let exact = terminal.refresh_sweep_completed && !terminal.refresh_sweep_gaps;
             events.extend(
@@ -884,8 +889,18 @@ impl<L> NativeLane<L> {
                 .events,
             );
             if exact || Instant::now() >= refresh_deadline {
-                break;
+                break exact;
             }
+        };
+        if !exact {
+            host.note_scope_gap(
+                "native terminal count refresh incomplete".into(),
+                format!(
+                    "no gap-free count-refresh sweep completed within {} ms after stop began; \
+                     witnessed counts keep their last read as a lower bound",
+                    refresh_budget.as_millis()
+                ),
+            );
         }
         let domain = self.capture.domain();
         events.extend(

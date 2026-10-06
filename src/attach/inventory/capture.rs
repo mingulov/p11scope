@@ -2124,9 +2124,13 @@ impl InventoryCapture {
     }
 
     /// Starts owned retirement. Reads stay available and are unsettled.
+    /// The count-refresh traversal restarts (baselines kept): the
+    /// terminal refresh is then a generation begun after this boundary,
+    /// never the tail of a pre-stop sweep with stale prefix rows.
     pub(crate) fn begin_stop(self) -> RetiringCapture {
         let Self { state, mut book } = self;
         book.stopping = true;
+        book.cursor.restart_refresh_traversal();
         let (inner, failure) = match state {
             // Never activated: no producer ever existed. The PID pin stays
             // held so a read after stop still polls custody.

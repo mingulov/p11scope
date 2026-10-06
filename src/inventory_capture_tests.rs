@@ -1289,6 +1289,25 @@ fn a_terminal_refresh_that_never_completes_is_bounded() {
     assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
 }
 
+/// P1-4: when the terminal refresh budget expires without a gap-free
+/// sweep, the stop reports the incomplete refresh: witnessed counts
+/// keep their last read as a lower bound, never a fresh terminal word.
+#[test]
+fn a_terminal_refresh_that_never_completes_is_reported() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.partial_refresh_reads.extend(3..=300);
+    lane.read_delay = Duration::from_millis(10);
+    let _ = run(&mut scene, lane, 1);
+    let log = entries(&log);
+    assert!(
+        log.iter()
+            .any(|entry| entry.contains("terminal count refresh incomplete")),
+        "the stop reports its incomplete terminal refresh: {log:?}"
+    );
+}
+
 /// The terminal sweep is bounded: a sweep that never completes stops
 /// reading at the budget and the stop goes on (its reads are not clean).
 #[test]

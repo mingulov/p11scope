@@ -28,8 +28,8 @@ use super::inventory::{
 };
 use super::*;
 use crate::attach::capture::{
-    DiscoveryBatch, ExtendReceipt, LifecycleLoss, NativeDomainId, ScopeCustody, ScopeIncarnation,
-    WitnessBatch, WitnessRow,
+    CallerCountUpdate, DiscoveryBatch, DomainCookie, ExtendReceipt, LifecycleLoss, NativeDomainId,
+    ScopeCustody, ScopeIncarnation, WitnessBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
@@ -48,7 +48,10 @@ use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
+use p11scope_ebpf_common::inventory_callers::CallerEvidence;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// What one inventory pass scans: one named process, or the machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +160,16 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// The native witness binder (Task 6 C4): every native row enters
     /// through `stage_native`.
     binder: NativeBinder,
+    /// The latest known count per witnessed pair (C7 C4): first-sight
+    /// and refresh counts merge here (the maximum wins, with its
+    /// observing read) and stage to the edge once the pair binds. One
+    /// entry per CALLER_USE row at most.
+    pair_counts: HashMap<PairKey, PairCount>,
+    /// Decided pairs (C7 C4): bound pairs stage their counts to one
+    /// edge, dropped pairs (binder-unbound, ambiguous, or edgeless)
+    /// never publish — DR-C51-PREADMIT stays out. One entry per
+    /// decided row at most.
+    pair_targets: HashMap<PairKey, PairTarget>,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
     scanned_owners: BTreeSet<ProcessViewId>,
@@ -210,6 +223,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_targets: TargetDelta::default(),
             capture: None,
             binder: NativeBinder::new(BinderLimits::default()),
+            pair_counts: HashMap::new(),
+            pair_targets: HashMap::new(),
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
             scanned_owners: BTreeSet::new(),
@@ -296,6 +311,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             changed_objects: BTreeSet::new(),
             health_unproven: None,
             pairs_unproven: None,
+            pairs_uncounted: None,
             last_clean_ns: None,
             sweep_began_ns: None,
             preadmission: PreadmissionStash::new(PREADMISSION_STASH_LIMIT),
@@ -409,6 +425,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if capture.pairs_unproven.is_none() {
             capture.pairs_unproven = pair_precondition_failure(batch);
         }
+        // C7 C4: a pair insert failure is sticky evidence that some
+        // pair has use but no row. First sight only: the map never
+        // deletes, so the first failure voids no-use for the capture.
+        let uncounted_new = capture.pairs_uncounted.is_none();
+        if uncounted_new && let Some(evidence) = batch.health.caller_evidence {
+            let index = CallerEvidence::PairInsertFailure.counter_index() as usize;
+            if let Some(&failed) = evidence.get(index)
+                && failed > 0
+            {
+                capture.pairs_uncounted = Some(
+                    format!(
+                        "CALLER_EVIDENCE[{index}] PairInsertFailure showed {failed} failed pair insert(s)"
+                    )
+                    .into(),
+                );
+            }
+        }
         capture
             .changed_objects
             .extend(batch.changed_objects.iter().copied());
@@ -438,6 +471,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .last_clean_ns
                     .map_or(clean_ns, |last| last.max(clean_ns)),
             );
+        }
+        // The pair evidence demotes before the coincident loss demotion
+        // (a PairInsertFailure rise is a watch-counter rise): demotions
+        // only touch ongoing watches, so the first reason wins and
+        // `uncounted` stands while both gaps stay recorded.
+        if uncounted_new && let Some(reason) = capture.pairs_uncounted.clone() {
+            self.registry
+                .note_pairs_uncounted(reason, batch.health_baseline_ns);
         }
         if let Some(reason) = &batch.health_regression {
             self.registry.note_health_regression(
@@ -601,6 +642,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 return unknown(UnknownReason::NotAttached);
             };
             since_ns = Some(since_ns.map_or(at_ns, |since| since.max(at_ns)));
+        }
+        // C7 C4: pair-insert evidence voids no-use for good — the edge
+        // reads `uncounted`, sticky, whatever this pass proves.
+        if since_ns.is_some()
+            && let Some(reason) = &capture.pairs_uncounted
+        {
+            return unknown(UnknownReason::Uncounted(reason.clone()));
         }
         match since_ns {
             Some(_) if capture.health_unproven.is_some() || capture.pairs_unproven.is_some() => {
@@ -1509,6 +1557,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .absorb_witnesses(&batch, &self.adapter, &mut *identity);
                 self.note_witness_batch(&batch);
                 self.record_witness_integrity(&batch);
+                // Counts merge before the binder's decisions stage, so a
+                // row that binds in this batch stages with its refresh.
+                self.absorb_pair_counts(&batch);
             }
             NativeBatch::Lifecycle(batch) => {
                 self.lifecycle_high_water_bytes = self
@@ -1606,6 +1657,136 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
+    /// Merges one witness read's counts (C7 C4): each row's first-sight
+    /// `entry_count` and each refresh count join their pair by maximum
+    /// (with the observing read), and bound pairs whose count advanced
+    /// past the registry stage. Counts for dropped pairs never merge:
+    /// the row persists in the map, so its refresh would otherwise hold
+    /// memory for a pair that never publishes. Runs after stop too: a
+    /// count is a positive fact, like its witness.
+    fn absorb_pair_counts(&mut self, batch: &WitnessBatch) {
+        for row in &batch.rows {
+            let key = PairKey::of(row);
+            if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped)) {
+                continue;
+            }
+            let held = self.pair_counts.entry(key).or_insert(PairCount {
+                count: 0,
+                first_ns: row.recorded_at_ns,
+                last_ns: batch.rows_read_ns,
+            });
+            // The row sets its first record whatever arrived before: a
+            // refresh can only precede it in a scripted batch.
+            held.first_ns = row.recorded_at_ns;
+            if row.entry_count > held.count {
+                held.count = row.entry_count;
+                held.last_ns = batch.rows_read_ns;
+            }
+        }
+        let mut stage = Vec::new();
+        for update in &batch.counts {
+            let key = PairKey::of_update(batch.domain, update);
+            if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped)) {
+                continue;
+            }
+            let held = self.pair_counts.entry(key).or_insert(PairCount {
+                count: 0,
+                first_ns: batch.rows_read_ns,
+                last_ns: batch.rows_read_ns,
+            });
+            if update.count > held.count {
+                held.count = update.count;
+                held.last_ns = batch.rows_read_ns;
+            }
+            if let Some(PairTarget::Bound { caller, module }) = self.pair_targets.get(&key) {
+                stage.push((*caller, module.clone(), *held));
+            }
+        }
+        // Staging compares against the registry, not a coordinator
+        // copy: only an advance past the staged count stages, so a
+        // repeated refresh is free and several reads per commit stay
+        // sound.
+        for (caller, module, count) in stage {
+            let staged = self
+                .registry
+                .module_id_for(&module)
+                .and_then(|id| self.registry.edge(caller, id))
+                .map(|edge| edge.entry_count)
+                .unwrap_or(0);
+            if count.count > staged {
+                self.stage_pair_count(caller, &module, count);
+            }
+        }
+    }
+
+    /// Stages one pair's count to its edge (C7 C4): the absolute count
+    /// plus the counting-feed note, so the edge reads `counted`. Only
+    /// for admitted modules and counts ≥ 1 — anything else leaves the
+    /// witness standing, and the absolute staging self-heals on the
+    /// next refresh after admission.
+    fn stage_pair_count(&mut self, caller: CallerId, module: &ModuleKey, count: PairCount) {
+        if count.count == 0 {
+            return;
+        }
+        let admitted = self
+            .registry
+            .module_id_for(module)
+            .and_then(|id| self.registry.module(id))
+            .is_some_and(|record| record.admission == AdmissionState::Admitted);
+        if !admitted {
+            return;
+        }
+        self.registry
+            .note_counted_use(caller, module, count.count, count.first_ns, count.last_ns);
+        self.registry.note_coverage(
+            caller,
+            module,
+            CoverageNote::Counted {
+                since_ns: count.first_ns,
+            },
+        );
+    }
+
+    /// Records one bound row's pair target (C7 C4): counts stage only
+    /// where the witness did — exactly one edged module, mirroring
+    /// `apply_bound_witness` — and the held count (first sight merged
+    /// with any refresh) stages with the bind.
+    fn bind_pair_count(&mut self, row: &WitnessRow, caller: CallerId, modules: &[ModuleKey]) {
+        let key = PairKey::of(row);
+        let mut edged = modules.iter().filter(|module| {
+            self.registry
+                .module_id_for(module)
+                .is_some_and(|id| self.registry.edge(caller, id).is_some())
+        });
+        let single = match (edged.next(), edged.next()) {
+            (Some(module), None) => Some(module.clone()),
+            _ => None,
+        };
+        match single {
+            Some(module) => {
+                self.pair_targets.insert(
+                    key,
+                    PairTarget::Bound {
+                        caller,
+                        module: module.clone(),
+                    },
+                );
+                if let Some(count) = self.pair_counts.get(&key).copied() {
+                    self.stage_pair_count(caller, &module, count);
+                }
+            }
+            None => self.drop_pair_count(row),
+        }
+    }
+
+    /// Drops one pair's counts (C7 C4): binder-unbound, ambiguous, or
+    /// edgeless — held and later counts never publish.
+    fn drop_pair_count(&mut self, row: &WitnessRow) {
+        let key = PairKey::of(row);
+        self.pair_targets.insert(key, PairTarget::Dropped);
+        self.pair_counts.remove(&key);
+    }
+
     /// Stages one decided row against the modules its witness endpoint is
     /// admitted for. `Err` names a row whose endpoint resolves to no
     /// module.
@@ -1614,6 +1795,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let modules = match self.witness_modules(&row) {
             Ok(modules) => modules,
             Err(reason) => {
+                self.drop_pair_count(&row);
                 if let Binding::Unbound(unbound) = binding {
                     self.note_preadmission(row.host_tgid, &[None], unbound);
                 }
@@ -1622,10 +1804,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         match binding {
             Binding::Bound(caller) => {
+                self.bind_pair_count(&row, caller, &modules);
                 self.registry
                     .note_bound_witness(caller, modules, row.recorded_at_ns)
             }
             Binding::Unbound(reason) => {
+                self.drop_pair_count(&row);
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
                 self.note_preadmission(row.host_tgid, &keys, reason);
                 self.registry
@@ -1911,6 +2095,58 @@ pub(crate) struct NativeReceipt {
     pub decided: usize,
 }
 
+/// One CALLER_USE pair (C7 C4): the image that owns the row plus the
+/// object it names. A row and its refresh counts join on this: the
+/// cookie is domain-tagged (tickets are per-domain), the exec sequence
+/// disambiguates the ticket's images, and the object is the map key's
+/// (`u32`: `AttachObjectId` has no hash).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PairKey {
+    image: DomainCookie,
+    exec: u64,
+    object: u32,
+}
+
+impl PairKey {
+    fn of(row: &WitnessRow) -> Self {
+        Self {
+            image: row.cookie(),
+            exec: row.exec_id(),
+            object: row.object.index(),
+        }
+    }
+
+    fn of_update(domain: NativeDomainId, update: &CallerCountUpdate) -> Self {
+        Self {
+            image: DomainCookie::new(domain, update.image.task_cookie),
+            exec: update.image.exec_id,
+            object: update.object.index(),
+        }
+    }
+}
+
+/// The latest known count of one pair (C7 C4): an absolute saturating
+/// lower bound since the pair's first record, with the read that
+/// observed it. First-sight `entry_count` and refresh counts merge by
+/// maximum, so any arrival order stages the same count.
+#[derive(Debug, Clone, Copy)]
+struct PairCount {
+    count: u64,
+    first_ns: u64,
+    last_ns: u64,
+}
+
+/// Where one decided pair's counts go (C7 C4).
+#[derive(Debug, Clone)]
+enum PairTarget {
+    /// The pair bound to `caller` and its witness resolved to exactly
+    /// one edged module: counts stage there.
+    Bound { caller: CallerId, module: ModuleKey },
+    /// The pair never publishes: binder-unbound, ambiguous shared
+    /// endpoint, or no mapping edge. Held and later counts drop.
+    Dropped,
+}
+
 /// Per-endpoint attach state from the capture facade's receipts. Bounded by
 /// the endpoint budget N: each endpoint is attached or failed at most once.
 struct CaptureCoverage {
@@ -1933,6 +2169,11 @@ struct CaptureCoverage {
     /// full, or a row went unrecorded): no read proves no-use again, so
     /// no watch starts and no read extends one (C5.2).
     pairs_unproven: Option<String>,
+    /// Sticky: CALLER_EVIDENCE showed a pair insert failure (C7 C4), so
+    /// some pair has use but no row and absence proves nothing: edges
+    /// without positive history read `uncounted` and no watch starts
+    /// again. The map never deletes, so a full map stays full.
+    pairs_uncounted: Option<Arc<str>>,
     /// The latest witness read with proven health, no rise, and held
     /// custody: where a watch ends at stop.
     last_clean_ns: Option<u64>,
@@ -4159,6 +4400,37 @@ mod tests {
             self.stage(batch)
         }
 
+        /// One witness read carrying `counts` (C4): each `(ticket, exec,
+        /// member, count)` names the image, the member's object, and the
+        /// re-read count. `rows` ride along: a read may carry both.
+        fn counts_read(
+            &mut self,
+            rows: Vec<WitnessRow>,
+            counts: Vec<(u64, u64, usize, u64)>,
+        ) -> NativeReceipt {
+            let at = self.stamps.tick();
+            let mut batch = witness_batch();
+            batch.domain = self.domain;
+            batch.rows = rows;
+            batch.counts = counts
+                .into_iter()
+                .map(
+                    |(ticket, exec, member, count)| crate::attach::capture::CallerCountUpdate {
+                        image: p11scope_ebpf_common::ImageIdentity {
+                            task_cookie: ticket,
+                            exec_id: exec,
+                        },
+                        object: self.scene.delta.endpoints[member].object,
+                        count,
+                    },
+                )
+                .collect();
+            batch.health.discovery_counters = Some([0; 5]);
+            batch.health_read_ns = at;
+            batch.rows_read_ns = at + 1;
+            self.stage(NativeBatch::Witness(Box::new(batch)))
+        }
+
         fn drain(&mut self) -> NativeReceipt {
             let batch = self.stamps.drain(self.domain);
             self.stage(batch)
@@ -4198,18 +4470,40 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_witness_marks_its_edge_witnessed() {
+    fn a_bound_row_marks_its_edge_counted() {
+        // C7 C4: the scripted row carries a first-sight count of one, so
+        // the bound edge reads `counted`.
         let (mut native, caller) = NativeScene::new();
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
         native.witness(vec![row]);
         assert_eq!(
             native.scene.coverage(caller),
-            UseCoverage::Witnessed { first_ns: 100 }
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
         );
         assert_eq!(native.module_unbound(), None);
         let census = native.scene.coordinator.registry.witness_census();
         assert_eq!((census.rows, census.bound, census.pending), (1, 1, 0));
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 1);
+        // Counted needs a count ≥ 1: a bound row reporting zero (only
+        // scripted rows do) stays witnessed.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 0;
+        native.witness(vec![row]);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Witnessed { first_ns: 100 }
+        );
     }
 
     #[test]
@@ -4268,8 +4562,11 @@ mod tests {
         assert_eq!(adapter.live_id(7), Some(*new));
         assert_eq!(
             native.scene.coverage(caller),
-            UseCoverage::Witnessed { first_ns: 100 },
-            "the old image keeps its witness"
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            },
+            "the old image keeps its count"
         );
         assert_eq!(
             native
@@ -4309,7 +4606,9 @@ mod tests {
     }
 
     #[test]
-    fn witnessed_use_still_binds_after_capture_coverage_ended() {
+    fn counted_use_still_binds_after_capture_coverage_ended() {
+        // C7 C4: a count is a positive fact like its witness, so it
+        // stages after stop too.
         let (mut native, caller) = NativeScene::new();
         native.scene.coordinator.begin_capture_coverage(None);
         native.scene.coordinator.end_capture_coverage(90);
@@ -4318,8 +4617,408 @@ mod tests {
         native.witness(vec![row]);
         assert_eq!(
             native.scene.coverage(caller),
-            UseCoverage::Witnessed { first_ns: 100 }
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
         );
+    }
+
+    #[test]
+    fn a_bound_row_publishes_its_first_sight_count() {
+        // C7 C4: bound to an admitted caller incarnation with a count ≥
+        // 1, the edge reads `counted` — the count, first record, and
+        // pass-resolution recency publish together.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
+        );
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 3);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(1011));
+        assert_eq!(
+            registry.entry_observation(edge),
+            crate::discovery::caller_registry::EntryObservation::Observed
+        );
+    }
+
+    #[test]
+    fn refresh_counts_advance_the_published_count_at_pass_resolution() {
+        // Recency names the read that observed the rise (1011, then
+        // 1071) — never the first record, never the commit. The
+        // wrong-pass mutation restamps this and fails here.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 10)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 10);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(1071));
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
+        );
+        // A stale refresh (below the staged count) moves nothing.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 10);
+        assert_eq!(edge.entry_last_seen_ns, Some(1071));
+    }
+
+    #[test]
+    fn counts_for_a_pending_row_stage_when_it_binds() {
+        // The refresh arrives while the row waits for its horizons: the
+        // edge reads pending-unknown with no count, and binds with the
+        // maximum of first sight and refresh once the horizons arrive.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 0, "nothing stages while pending");
+        assert_eq!(
+            native.scene.coordinator.presented_coverage(edge),
+            UseCoverage::Unknown(UnknownReason::PendingFirstUse)
+        );
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 5);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(1031));
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
+        );
+    }
+
+    #[test]
+    fn counts_for_an_unbound_row_never_publish() {
+        // R-C51-1 and DR-C51-PREADMIT: the row never binds, so its
+        // first-sight count, its refreshes, and any later refresh all
+        // drop — the edge keeps `use_before_admission` with a zero no
+        // consumer reads as fact.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 99);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 7;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 20)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Unknown(UnknownReason::UseBeforeAdmission)
+        );
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 0);
+        assert_eq!(edge.entry_first_seen_ns, None);
+        assert_eq!(edge.entry_last_seen_ns, None);
+        assert_eq!(
+            native
+                .module_unbound()
+                .unwrap()
+                .reasons
+                .get("cookie_mismatch"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn counted_use_for_a_refused_module_stages_no_count() {
+        // Counted needs an admitted module: the backstop drops the
+        // count (the witness stands); the absolute staging self-heals
+        // on the next refresh after admission.
+        let (mut native, caller) = NativeScene::new();
+        let refused = ModuleKey::physical(8, 1, 77, Some("sha0077".into()), "/lib/r.so");
+        let info = ModuleInfo {
+            path: "/lib/r.so".into(),
+            key: refused.clone(),
+            double_loaded: false,
+            build_id: None,
+            identity_source: None,
+            admission: AdmissionState::Refused,
+            admission_class: None,
+            admission_endpoints: None,
+            admission_reasons: Vec::new(),
+        };
+        native
+            .scene
+            .coordinator
+            .registry_mut()
+            .note_mapping(caller, 7, info, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.stage_pair_count(
+            caller,
+            &refused,
+            PairCount {
+                count: 5,
+                first_ns: 100,
+                last_ns: 200,
+            },
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let id = registry.module_id_for(&refused).expect("edge retained");
+        let edge = registry.edge(caller, id).expect("edge retained");
+        assert_eq!(edge.entry_count, 0);
+        assert_eq!(
+            registry.coverage(edge),
+            UseCoverage::Unknown(UnknownReason::NotAdmitted)
+        );
+    }
+
+    #[test]
+    fn a_pair_insert_failure_reads_absent_pairs_uncounted() {
+        // C7 C4: CALLER_EVIDENCE[2] fires, so some pair has use but no
+        // row — absence proves nothing. The edge reads `uncounted`
+        // (never 0), the uncounted reason wins over the coincident
+        // loss demotion, and no later pass starts a watch.
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(incarnation(7, 500));
+        scene.attach_all(100, ScopeCustody::PidHeld);
+        scene.project(7, 120);
+        scene.coordinator.registry.publish();
+        assert!(watched(&scene.coverage(caller)));
+        let mut bad = witness_batch();
+        bad.health.caller_evidence = Some([0, 0, 1, 0]);
+        bad.health_regression =
+            Some("native capture health counters rose: CALLER_EVIDENCE[2] 0->1".into());
+        bad.health_baseline_ns = 120;
+        bad.health_read_ns = 160;
+        scene.coordinator.note_witness_batch(&bad);
+        scene.coordinator.registry.publish();
+        match scene.coverage(caller) {
+            UseCoverage::Unknown(UnknownReason::Uncounted(evidence)) => {
+                assert!(
+                    evidence.contains("PairInsertFailure"),
+                    "points at the evidence: {evidence}"
+                );
+            }
+            other => panic!("an absent pair reads uncounted, got {other:?}"),
+        }
+        let registry = &scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 0);
+        assert_eq!(
+            registry.entry_observation(edge),
+            crate::discovery::caller_registry::EntryObservation::UnknownUnavailable,
+            "a zero under uncounted is never observed"
+        );
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "usage coverage pair insert failure"),
+            "{:?}",
+            registry.gaps()
+        );
+        // A later pass withholds the watch: still uncounted, not watched.
+        scene.project(7, 170);
+        scene.coordinator.registry.publish();
+        assert!(
+            matches!(
+                scene.coverage(caller),
+                UseCoverage::Unknown(UnknownReason::Uncounted(_))
+            ),
+            "{:?}",
+            scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_rising_count_never_reads_quiet() {
+        // Recency is the rise: a counted edge reads recently-observed
+        // while its rise is in the window, quiet once stale — and a
+        // fresh rise always beats quiet. (Each capture is an
+        // independent snapshot; only the stamps order them.)
+        use crate::inventory_present::{Activity, Presentation};
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        let activity_at = |native: &NativeScene, now_ns: u64, window_ns: u64| {
+            Presentation::capture(
+                &native.scene.coordinator,
+                "s",
+                0,
+                now_ns,
+                1,
+                now_ns,
+                window_ns,
+            )
+            .edges
+            .into_iter()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge")
+            .activity
+        };
+        assert_eq!(activity_at(&native, 1500, 1000), Activity::RecentlyObserved);
+        assert_eq!(
+            activity_at(&native, 3000, 1000),
+            Activity::Quiet,
+            "stale with no fresh rise"
+        );
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 6)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            activity_at(&native, 1571, 1000),
+            Activity::RecentlyObserved,
+            "the rise at 1071 beats quiet"
+        );
+    }
+
+    #[test]
+    fn native_counts_render_identically_in_json_jsonl_and_dashboard() {
+        // C7 C4 three-consumer equality: a natively counted edge —
+        // count, coverage, observation, activity — reads the same in
+        // the JSON document, the JSONL edge event, the pager snapshot,
+        // and the dashboard frame.
+        use crate::inventory_dashboard::{
+            DashboardState, DisplayFrame, LogTail, Viewport, render_frame,
+        };
+        use crate::inventory_present::{
+            Presentation, coverage_label, entries_display, render_snapshot,
+        };
+        let (mut native, _) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 4;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let presentation =
+            Presentation::capture(&native.scene.coordinator, "native", 0, 2000, 1, 2000, 2000);
+        let document =
+            crate::inventory::render_json(&native.scene.coordinator, "native", 0, 2000, 1);
+        assert_eq!(presentation.edges.len(), 1);
+        let edge = &presentation.edges[0];
+        let edge_json = &document["edges"][0];
+        assert_eq!(edge_json["entries"]["count"], 9);
+        assert_eq!(edge_json["entries"]["coverage"]["state"], "counted");
+        assert_eq!(edge_json["entries"]["coverage"]["since_ns"], 100);
+        assert_eq!(edge_json["entries"]["coverage"]["lossy"], false);
+        assert_eq!(edge_json["entries"]["observation"], "observed");
+        assert_eq!(edge_json["entries"]["last_seen_ns"], 1071);
+        assert_eq!(edge.activity.label(), "recently observed");
+        assert_eq!(edge.capture.label(), "armed");
+        // JSONL: the edge event carries the JSON edge verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = crate::inventory_events::EventWriter::create(&path, 1 << 20, 5).unwrap();
+        crate::inventory_events::emit_snapshot_as_events(&mut writer, &presentation, 1).unwrap();
+        drop(writer);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| line["kind"] == "edge_observed")
+            .map(|line| line["event"].clone())
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["entries"], edge_json["entries"]);
+        assert_eq!(events[0]["activity"], "recently observed");
+        assert_eq!(events[0]["capture"], "armed");
+        // Pager snapshot and dashboard frame: the same labels.
+        let snapshot = render_snapshot(&presentation);
+        let label = coverage_label(&edge.coverage);
+        let line = snapshot
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "edge {} -> {} ",
+                    edge.caller.label(),
+                    edge.module.label()
+                ))
+            })
+            .unwrap();
+        assert!(line.contains(&format!("coverage {label}")), "{line}");
+        assert_eq!(entries_display(edge), "9");
+        let mut tail = LogTail::bounded();
+        tail.push("p11scope: pass 1: 1 scanned (1 native, 0 scan-pinned)");
+        let frame = DisplayFrame {
+            presentation: std::sync::Arc::new(presentation.clone()),
+            log: tail.snapshot(),
+        };
+        let text = String::from_utf8(render_frame(
+            &frame,
+            Viewport {
+                width: 200,
+                height: 120,
+            },
+            &DashboardState::new(),
+        ))
+        .unwrap()
+        .replace("\x1b[H", "")
+        .replace("\x1b[K", "");
+        assert!(text.contains("entries 9"), "{text}");
+        assert!(text.contains("activity recently observed"), "{text}");
+        assert!(text.contains("capture armed"), "{text}");
     }
 
     #[test]
@@ -4657,7 +5356,10 @@ mod tests {
         assert!(report.events.is_empty(), "{:?}", report.events);
         assert_eq!(
             native.scene.coverage(caller),
-            UseCoverage::Witnessed { first_ns: 210 }
+            UseCoverage::Counted {
+                since_ns: 210,
+                lossy: false
+            }
         );
     }
 
@@ -4691,7 +5393,10 @@ mod tests {
         native.scene.coordinator.commit_batch(false).unwrap();
         assert_eq!(
             native.scene.coverage(caller),
-            UseCoverage::Witnessed { first_ns: 210 }
+            UseCoverage::Counted {
+                since_ns: 210,
+                lossy: false
+            }
         );
     }
 
@@ -4757,7 +5462,7 @@ mod tests {
     /// While the binder holds a pending row of the watched caller's pid
     /// on the edge's module, the edge presents unknown (`activity
     /// unknown`, `entries ?`); the staged watch is untouched, so the row
-    /// still binds and witnesses the same edge once decided.
+    /// still binds and counts the same edge once decided.
     #[test]
     fn a_pending_first_use_row_presents_the_edge_as_unknown_until_it_binds() {
         use crate::discovery::caller_registry::EntryObservation;
@@ -4793,7 +5498,7 @@ mod tests {
             payload["entries"]["coverage"]["reason"],
             "pending_first_use"
         );
-        // The horizons arrive: the row binds and the edge is witnessed.
+        // The horizons arrive: the row binds and the edge is counted.
         native.drain();
         native.read(Vec::new());
         native.scene.coordinator.commit_batch(false).unwrap();
@@ -4801,7 +5506,10 @@ mod tests {
         assert_eq!((census.pending, census.bound), (0, 1));
         assert_eq!(
             native.scene.coverage(caller),
-            UseCoverage::Witnessed { first_ns: 200 }
+            UseCoverage::Counted {
+                since_ns: 200,
+                lossy: false
+            }
         );
         let presentation = presented(&native);
         let edge = presentation
@@ -4809,8 +5517,14 @@ mod tests {
             .iter()
             .find(|edge| edge.caller == caller)
             .expect("the caller has a presented edge");
-        assert_eq!(edge.coverage, UseCoverage::Witnessed { first_ns: 200 });
-        assert_eq!(edge.activity, Activity::Used);
+        assert_eq!(
+            edge.coverage,
+            UseCoverage::Counted {
+                since_ns: 200,
+                lossy: false
+            }
+        );
+        assert_eq!(edge.activity, Activity::RecentlyObserved);
     }
 
     /// A row still pending at finish unbinds and downgrades the watch, as
@@ -5256,13 +5970,21 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_row_of_the_same_pid_keeps_the_caller_witnessed() {
+    fn a_bound_row_of_the_same_pid_keeps_the_caller_counted() {
         // Positives stay positives: the rule only replaces a watch.
+        // C7 C4: the scripted row carries a count, so the positive is
+        // `counted`.
         let (mut native, caller) = watched_native();
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 200, 0);
         native.witness(vec![row]);
-        assert!(native.scene.coverage(caller).is_witnessed());
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 200,
+                lossy: false
+            }
+        );
         assert!(
             native
                 .scene

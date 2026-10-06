@@ -480,7 +480,7 @@ fn privileged_native_lane_pid_lp64() -> Result<()> {
     );
     let coverage = edge_coverage(&coordinator, target.pid())?;
     ensure!(
-        coverage.len() == 1 && coverage[0].is_witnessed(),
+        coverage.len() == 1 && matches!(coverage[0], UseCoverage::Counted { .. }),
         "{coverage:?}"
     );
     ensure!(
@@ -743,8 +743,12 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
     );
     let edges = doc_edges(&document, target.pid());
     ensure!(
-        edges.len() == 1 && edges[0]["entries"]["coverage"]["state"] == "witnessed",
-        "the calls during the stall were not witnessed: {edges:?}"
+        edges.len() == 1
+            && edges[0]["entries"]["coverage"]["state"] == "counted"
+            && edges[0]["entries"]["count"]
+                .as_u64()
+                .is_some_and(|count| count >= 1),
+        "the calls during the stall were not counted: {edges:?}"
     );
     let witnesses = &document["observation"]["native_witnesses"];
     ensure!(
@@ -962,18 +966,18 @@ fn privileged_native_lane_system_late_dlopen_lp64() -> Result<()> {
                 .any(|gap| gap["subject"] == "native capture lifecycle evidence lost")
         });
     if lifecycle_lost {
-        // R-C51-3: witnessed, or unknown with reason `loss` — never a
+        // R-C51-3: counted, or unknown with reason `loss` — never a
         // watch, never another unknown reason (review F6).
         let reason = &edges[0]["entries"]["coverage"]["reason"];
         ensure!(
-            *state == "witnessed" || (*state == "unknown" && *reason == "loss"),
-            "under lost lifecycle evidence the edge must read witnessed or unknown/loss: \
+            *state == "counted" || (*state == "unknown" && *reason == "loss"),
+            "under lost lifecycle evidence the edge must read counted or unknown/loss: \
              {edges:?}; witnesses {witnesses}"
         );
         eprintln!("C51_LATE_LIFECYCLE_LOSS state={state} witnesses={witnesses}");
     } else {
         ensure!(
-            *state == "witnessed",
+            *state == "counted",
             "late dlopen edge: {edges:?}; witnesses {witnesses}; ledger {:?}",
             late.lines()
         );
@@ -1057,7 +1061,11 @@ fn privileged_native_lane_stop_held_call_unsettled_lp64() -> Result<()> {
     );
     let edges = doc_edges(&document, held.pid());
     ensure!(
-        edges.len() == 1 && edges[0]["entries"]["coverage"]["state"] == "witnessed",
+        edges.len() == 1
+            && edges[0]["entries"]["coverage"]["state"] == "counted"
+            && edges[0]["entries"]["count"]
+                .as_u64()
+                .is_some_and(|count| count >= 1),
         "held-call edge: {edges:?}"
     );
     ensure!(stream_ended(&stream), "the stream did not end");

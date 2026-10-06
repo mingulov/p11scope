@@ -867,6 +867,11 @@ pub(crate) enum UnknownReason {
     /// presentation overlays it while the row is pending, and the staged
     /// watch resumes once the row binds elsewhere (DR-LIVE-LABEL-LAG).
     PendingFirstUse,
+    /// A CALLER_USE pair insert failed (the map was full): some pair has
+    /// use but no row, so absence proves nothing for every edge without
+    /// positive history. Sticky for the capture; the detail names the
+    /// `PairInsertFailure` evidence. Never a zero (C7 C4).
+    Uncounted(Arc<str>),
 }
 
 impl UnknownReason {
@@ -883,6 +888,7 @@ impl UnknownReason {
             Self::RetiredBeforeCoverage => "retired_before_coverage",
             Self::UseBeforeAdmission => "use_before_admission",
             Self::PendingFirstUse => "pending_first_use",
+            Self::Uncounted(_) => "uncounted",
         }
     }
 
@@ -892,6 +898,7 @@ impl UnknownReason {
         match self {
             Self::CapacityLimited(resource) => Some(resource),
             Self::Loss(reason) => Some(reason),
+            Self::Uncounted(evidence) => Some(evidence),
             _ => None,
         }
     }
@@ -909,6 +916,7 @@ impl UnknownReason {
             Self::RetiredBeforeCoverage => "retired before coverage".into(),
             Self::UseBeforeAdmission => "use before admission".into(),
             Self::PendingFirstUse => "first use undecided".into(),
+            Self::Uncounted(evidence) => format!("uncounted: {evidence}"),
         }
     }
 }
@@ -1170,6 +1178,7 @@ fn with_key(mut reason: String, module: Option<ModuleId>, key: &ModuleKey) -> St
 pub(crate) const MAX_SUPPRESSED_GAP_MEMORY: usize = 4096;
 
 const COVERAGE_WITHOUT_MAPPING: &str = "usage coverage without mapping evidence";
+const PAIRS_UNCOUNTED_SUBJECT: &str = "usage coverage pair insert failure";
 const COVERAGE_UNADMITTED: &str = "coverage for an unadmitted module";
 
 /// Bound on one module's admission reasons: ignored lower verdicts append
@@ -1322,6 +1331,23 @@ enum Mutation {
         caller: CallerId,
         module: ModuleKey,
         note: CoverageNote,
+    },
+    NoteCountedUse {
+        caller: CallerId,
+        module: ModuleKey,
+        /// The pair's absolute saturating lower bound (never a delta:
+        /// several reads stage before one commit, so only the maximum
+        /// is sound).
+        count: u64,
+        /// The pair's first record (`recorded_at_ns`).
+        first_ns: u64,
+        /// The read that observed `count` (`rows_read_ns`): pass
+        /// resolution, never a BPF timestamp.
+        last_ns: u64,
+    },
+    NotePairsUncounted {
+        reason: Arc<str>,
+        at_ns: u64,
     },
     NoteHealthRegression {
         subject: &'static str,
@@ -1920,6 +1946,31 @@ impl CallerRegistry {
         });
     }
 
+    /// Stage one bound pair's absolute entry count: a saturating lower
+    /// bound of entries on the module's attached endpoints since the
+    /// pair's first record (`first_ns`), observed by the read at
+    /// `last_ns` (pass resolution). Only a strict advance past the
+    /// staged count moves the edge, so several reads per commit stay
+    /// sound and recency never fakes activity. Like a witness, the
+    /// count stages for retired callers (pre-exit history); unlike a
+    /// witness it never invents an edge (one memoized gap).
+    pub(crate) fn note_counted_use(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+    ) {
+        self.staged.push(Mutation::NoteCountedUse {
+            caller,
+            module: module.clone(),
+            count,
+            first_ns,
+            last_ns,
+        });
+    }
+
     /// Stage one global health regression (a native identity, pair, or
     /// usage evidence counter rose between `at_ns`, the last clean read,
     /// and `detected_ns`, the read that saw it). The failure cannot be
@@ -1973,6 +2024,20 @@ impl CallerRegistry {
             at_ns,
             detected_ns: at_ns,
             restartable: false,
+        });
+    }
+
+    /// Stage the pair-insert-failure demotion (C7 C4): some pair has use
+    /// but no row, so every ongoing watch reads `uncounted` and no watch
+    /// starts again in this capture (the coordinator withholds them).
+    /// Positives and intervals frozen before `at_ns` stand. The caller
+    /// stages this before the batch's health regression: demotions only
+    /// touch ongoing watches, so the uncounted reason wins over the
+    /// coincident loss demotion while both gaps stay recorded.
+    pub(crate) fn note_pairs_uncounted(&mut self, reason: impl Into<Arc<str>>, at_ns: u64) {
+        self.staged.push(Mutation::NotePairsUncounted {
+            reason: reason.into(),
+            at_ns,
         });
     }
 
@@ -2183,6 +2248,63 @@ impl CallerRegistry {
                 module,
                 note,
             } => self.apply_coverage(caller, &module, note),
+            Mutation::NoteCountedUse {
+                caller,
+                module,
+                count,
+                first_ns,
+                last_ns,
+            } => {
+                let Some(edge) = self.coverage_edge(caller, &module) else {
+                    return;
+                };
+                // Absolute staging: only a strict advance moves the
+                // count or last-seen. Equal-or-less re-reads (a stale
+                // refresh, a repeated first sight) change nothing, so
+                // recency always names the read that observed the rise.
+                // Retired callers are not frozen out: like a witness,
+                // the count is pre-exit history arriving late.
+                if count > edge.entry_count {
+                    if count == MAX_EDGE_ENTRY_COUNT {
+                        edge.entry_count = MAX_EDGE_ENTRY_COUNT;
+                        edge.entry_saturated = true;
+                    } else {
+                        edge.entry_count = count;
+                    }
+                    edge.entry_first_seen_ns = Some(
+                        edge.entry_first_seen_ns
+                            .map_or(first_ns, |was| was.min(first_ns)),
+                    );
+                    // Recency survives saturation: the count stops,
+                    // last-seen does not.
+                    edge.entry_last_seen_ns = Some(last_ns);
+                }
+            }
+            Mutation::NotePairsUncounted { reason, at_ns } => {
+                let mut demoted = 0usize;
+                for edge in self.edges.values_mut() {
+                    // An interval frozen before the evidence stands.
+                    if matches!(edge.coverage.watch, Watch::Watching { until_ns, .. }
+                        if until_ns.is_none_or(|until| until > at_ns))
+                    {
+                        edge.coverage.watch =
+                            Watch::Unknown(UnknownReason::Uncounted(reason.clone()));
+                        edge.coverage.demoted = true;
+                        demoted += 1;
+                    }
+                }
+                self.push_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: PAIRS_UNCOUNTED_SUBJECT.into(),
+                    reason: format!(
+                        "{reason}; the failure cannot be localized to one pair, so {demoted} watched no-use {} read uncounted (no watch starts again in this capture)",
+                        if demoted == 1 { "edge" } else { "edges" },
+                    ),
+                    budget: None,
+                });
+            }
             Mutation::EndWatches { reason, at_ns } => {
                 if self.watches_ended_ns.is_none() {
                     self.watches_ended_ns = Some(at_ns);
@@ -5179,5 +5301,227 @@ pub(crate) mod tests {
         let kept = adapter.revalidate_admitted_before(300);
         assert!(kept.contains(&same) && kept.contains(&late));
         assert!(!kept.contains(&exec_d), "{kept:?}");
+    }
+
+    #[test]
+    fn counted_use_stages_absolute_counts_with_pass_resolution_recency() {
+        // C7 C4: a bound pair's count is an absolute saturating lower
+        // bound; only a strict advance moves the count or last-seen, so
+        // recency is never faked by a re-observed count.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_counted_use(CallerId(0), &keys[0], 5, 100, 200);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 5);
+        assert!(!edge.entry_saturated);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(200));
+        assert_eq!(
+            registry.coverage(edge),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
+        );
+        assert_eq!(registry.entry_observation(edge), EntryObservation::Observed);
+        // A strict advance moves the count and last-seen; first-seen is
+        // the earliest first record.
+        registry.note_counted_use(CallerId(0), &keys[0], 9, 100, 300);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 9);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(300));
+        // A stale re-read changes nothing: no regression, no recency.
+        registry.note_counted_use(CallerId(0), &keys[0], 7, 100, 400);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 9);
+        assert_eq!(edge.entry_last_seen_ns, Some(300));
+        // An equal count re-observed later is not activity either.
+        registry.note_counted_use(CallerId(0), &keys[0], 9, 100, 500);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 9);
+        assert_eq!(edge.entry_last_seen_ns, Some(300));
+    }
+
+    #[test]
+    fn counted_use_saturates_at_the_edge_cap() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_counted_use(CallerId(0), &keys[0], MAX_EDGE_ENTRY_COUNT, 100, 200);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, MAX_EDGE_ENTRY_COUNT);
+        assert!(edge.entry_saturated);
+        assert_eq!(edge.entry_last_seen_ns, Some(200));
+    }
+
+    #[test]
+    fn zero_counted_use_stages_nothing() {
+        // Counted needs a count ≥ 1: a bound row that reports zero (only
+        // scripted rows do; BPF inserts at one) leaves the edge to its
+        // witness.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_witness(CallerId(0), &keys[0], 100);
+        registry.note_counted_use(CallerId(0), &keys[0], 0, 100, 200);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 0);
+        assert_eq!(edge.entry_first_seen_ns, None);
+        assert_eq!(edge.entry_last_seen_ns, None);
+        assert_eq!(
+            registry.coverage(edge),
+            UseCoverage::Witnessed { first_ns: 100 }
+        );
+    }
+
+    #[test]
+    fn counted_use_is_history_for_a_retired_caller_but_never_invents_an_edge() {
+        // Like a witness (and unlike a live entry delta), a bound row's
+        // count stages for a retired caller: the use predates the exit.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.retire_caller(CallerId(0), "exited".into(), 150);
+        registry.note_counted_use(CallerId(0), &keys[0], 4, 100, 140);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 4);
+        assert_eq!(edge.entry_last_seen_ns, Some(140));
+        // Without a mapping edge the count is dropped with one memoized
+        // gap, however often the refresh repeats it.
+        let missing = ModuleKey::physical(8, 1, 99, Some("sha0099".into()), "/lib/z.so");
+        registry.note_counted_use(CallerId(0), &missing, 4, 100, 140);
+        registry.publish();
+        registry.note_counted_use(CallerId(0), &missing, 6, 100, 150);
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1);
+        assert_eq!(
+            registry.gaps()[0].subject,
+            "usage coverage without mapping evidence"
+        );
+    }
+
+    #[test]
+    fn pairs_uncounted_demotes_watches_and_keeps_positives() {
+        // C7 C4: once a pair insert fails, absence proves nothing: every
+        // ongoing watch reads `uncounted`, positives stand, and a frozen
+        // interval stands.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+                ("/lib/c.so", 13, AdmissionState::Admitted),
+                ("/lib/d.so", 14, AdmissionState::Admitted),
+            ],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.note_witness(CallerId(0), &keys[2], 110);
+        registry.note_counted_use(CallerId(0), &keys[3], 5, 100, 140);
+        registry.publish();
+        let evidence: std::sync::Arc<str> = "CALLER_EVIDENCE[2] PairInsertFailure rose 0->1".into();
+        registry.note_pairs_uncounted(evidence.clone(), 140);
+        registry.publish();
+        for key in &keys[0..2] {
+            let watched = edge_of(&registry, CallerId(0), key);
+            assert_eq!(
+                registry.coverage(watched),
+                UseCoverage::Unknown(UnknownReason::Uncounted(evidence.clone())),
+                "{key:?}"
+            );
+        }
+        let witnessed = edge_of(&registry, CallerId(0), &keys[2]);
+        assert_eq!(
+            registry.coverage(witnessed),
+            UseCoverage::Witnessed { first_ns: 110 }
+        );
+        let counted = edge_of(&registry, CallerId(0), &keys[3]);
+        assert!(matches!(
+            registry.coverage(counted),
+            UseCoverage::Counted { .. }
+        ));
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "usage coverage pair insert failure"),
+            "{:?}",
+            registry.gaps()
+        );
+        assert_eq!(UnknownReason::Uncounted(evidence).code(), "uncounted");
+    }
+
+    #[test]
+    fn pairs_uncounted_leaves_an_interval_frozen_before_the_evidence() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.publish();
+        registry.note_watch_end("stopping", 120);
+        registry.publish();
+        registry.note_pairs_uncounted(Arc::from("CALLER_EVIDENCE[2] PairInsertFailure rose"), 140);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert!(
+            matches!(
+                registry.coverage(edge),
+                UseCoverage::WatchedNoUse {
+                    until_ns: Some(120),
+                    ..
+                }
+            ),
+            "an interval frozen before the evidence stands: {:?}",
+            registry.coverage(edge)
+        );
+    }
+
+    #[test]
+    fn uncounted_reason_codes_detail_and_text() {
+        let reason = UnknownReason::Uncounted("CALLER_EVIDENCE[2] PairInsertFailure rose".into());
+        assert_eq!(reason.code(), "uncounted");
+        assert_eq!(
+            reason.detail(),
+            Some("CALLER_EVIDENCE[2] PairInsertFailure rose")
+        );
+        assert!(reason.text().starts_with("uncounted"), "{}", reason.text());
     }
 }

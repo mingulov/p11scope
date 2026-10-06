@@ -683,24 +683,25 @@ the min..max of per-sample p95.
 
 ### Witness-only usage (no per-call counts) (DR-02, C7)
 
-- What the user sees: the native lane records which caller image used which
-  module (`witnessed`, first at `first_ns`) or module-level use by an
-  unidentified caller; it never reports per-caller entry counts or recency.
-  Every unattested provider (most real providers) shows "used,
-  count/recency unavailable".
+- What the user sees (v0.2.0): the native lane records which caller image
+  used which module (`witnessed`, first at `first_ns`) or module-level use
+  by an unidentified caller; it never reports per-caller entry counts or
+  recency, so every unattested provider (most real providers) shows "used,
+  count/recency unavailable". Since v0.3.0 (C7 C4, this branch) the native
+  lane publishes per-edge entry counts: a bound row reads `counted` with a
+  saturating lower-bound `count` since the pair's first record and
+  `last_seen` at pass resolution, and a missing pair reads `unknown
+  (uncounted)` with the `PairInsertFailure` evidence, never 0.
 - Kernels/conditions: all native runs.
-- Disclosure: `entries.coverage.state: "witnessed"`, `entries.count: 0`
-  with `observation: "unknown (count unavailable; use witnessed)"`,
-  dashboard activity `used (recency unknown)`, and
-  `observation.native_witnesses`. `counted` stays a contract state the
-  producer never emits in v0.2.0; `last_seen` comes only from counted
-  entries.
+- Disclosure: `entries.coverage.state` (`counted` since v0.3.0,
+  `witnessed` in v0.2.0), `entries.count` with its `observation`, dashboard
+  activity, and `observation.native_witnesses`. `last_seen` comes only from
+  counted entries.
 - Workaround: `profile` for exact function-level counts (aggregate maps
   stay exact under event loss).
 - Planned: v0.3.0 (C7: V1 non-fetch atomic add in `CALLER_USE`, about
-  0–300 ns/call, lower-bound counts since first record, missing row means
-  "uncounted" never zero, allowlist-v3 row first; M2 must measure V1
-  directly).
+  0–300 ns/call; the C5 oracle and the M2 cost gate close DR-02 — M2 must
+  measure V1 directly).
 
 ### `C_GetInterfaceList`/`C_GetInterface` export calls go uncounted (DR-51)
 

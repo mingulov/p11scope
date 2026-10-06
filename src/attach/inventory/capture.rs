@@ -362,7 +362,7 @@ pub(crate) struct DomainCookie {
 }
 
 impl DomainCookie {
-    fn new(domain: NativeDomainId, cookie: u64) -> Self {
+    pub(crate) fn new(domain: NativeDomainId, cookie: u64) -> Self {
         Self { domain, cookie }
     }
 
@@ -2644,20 +2644,46 @@ fn row_fault_reason(key: &CallerObjectKey, fault: CallerRowFault) -> String {
     }
 }
 
+/// Re-validates one refreshed row's endpoint binding (H-C3R2): the
+/// refresh re-reads without validating, so a corrupt re-read faults
+/// into integrity here instead of indexing `published`.
+fn refreshed_object(
+    book: &CaptureBook,
+    key: &CallerObjectKey,
+    value: &CallerObjectUse,
+) -> Result<AttachObjectId, super::callers::CallerRowFault> {
+    match book.published.get(&value.witness_endpoint).copied() {
+        Some(object) if object.index() == key.object_id => Ok(object),
+        Some(object) => Err(super::callers::CallerRowFault::BindingMismatch {
+            published: object.index(),
+        }),
+        None => Err(super::callers::CallerRowFault::UnpublishedEndpoint),
+    }
+}
+
 fn absorb_counts(
     book: &mut CaptureBook,
     batch: &mut WitnessBatch,
     refreshed: super::callers::CallerCountsRead,
 ) {
-    for (key, value) in refreshed.updates {
-        let object = book.published[&value.witness_endpoint];
-        batch.counts.push(CallerCountUpdate {
-            image: key.image,
-            object,
-            count: value.saturated_entry_count(),
-        });
-    }
     let integrity_before = batch.integrity.len();
+    for (key, value) in refreshed.updates {
+        match refreshed_object(book, &key, &value) {
+            Ok(object) => batch.counts.push(CallerCountUpdate {
+                image: key.image,
+                object,
+                count: value.saturated_entry_count(),
+            }),
+            Err(fault) => {
+                let reason = row_fault_reason(&key, fault);
+                batch.integrity.push(WitnessIntegrity {
+                    key,
+                    value: Some(value),
+                    reason,
+                });
+            }
+        }
+    }
     for (key, value, fault) in refreshed.gaps {
         let reason = row_fault_reason(&key, fault);
         batch

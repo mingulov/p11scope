@@ -3164,3 +3164,72 @@ fn count_refresh_records_read_failures_and_marks_gappy_sweeps() {
     assert_eq!(updates_of(&retried), [(2, 7)]);
     assert!(retried.sweep_completed && !retried.sweep_gaps);
 }
+
+/// A corrupt re-read names an endpoint the capture never published, or
+/// one bound to another object: integrity evidence with the raw key and
+/// value, never a `published` indexing panic and never a published
+/// count (H-C3R2).
+#[test]
+fn a_refresh_value_naming_an_unpublished_or_rebound_endpoint_is_integrity() {
+    let mut book = test_book(8, 8, None);
+    let mut fixture = SetFixture::new(8);
+    let first = fixture.pass("a.so", 1);
+    let second = fixture.pass("b.so", 1);
+    for endpoint in first.endpoints.iter().chain(&second.endpoints) {
+        book.published.insert(endpoint.id.0, endpoint.object);
+    }
+    let other = second.endpoints[0];
+    assert_ne!(
+        other.object, first.endpoints[0].object,
+        "the second provider retains another object"
+    );
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    rows.insert(key(2, 0), Some(value(40, 0)));
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut seen = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut seen, window, 8);
+    assert_eq!(seen.rows.len(), 2);
+    assert!(seen.counts.is_empty());
+    // Both rows advance, but their re-read values name endpoints that
+    // no longer validate: never published, and bound to another object.
+    set_count(&mut rows, 1, 9);
+    set_count(&mut rows, 2, 9);
+    let (_, one) = rows
+        .rows
+        .get_mut(&super::super::callers::row_key(&key(1, 0)))
+        .unwrap();
+    one.as_mut().unwrap().witness_endpoint = 7;
+    let (_, two) = rows
+        .rows
+        .get_mut(&super::super::callers::row_key(&key(2, 0)))
+        .unwrap();
+    two.as_mut().unwrap().witness_endpoint = other.id.0;
+    let mut reread = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut reread, window, 8);
+    assert!(reread.counts.is_empty(), "no corrupt count publishes");
+    assert_eq!(reread.integrity.len(), 2);
+    assert_eq!(reread.integrity_total, 2);
+    assert_eq!(book.integrity_total, 2);
+    let reasons: Vec<&str> = reread
+        .integrity
+        .iter()
+        .map(|row| row.reason.as_str())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("never published")),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("bound to object")),
+        "{reasons:?}"
+    );
+    assert!(
+        reread.integrity.iter().all(|row| row.value.is_some()),
+        "the corrupt values stay as evidence"
+    );
+}

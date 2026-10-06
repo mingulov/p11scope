@@ -885,7 +885,13 @@ fn a_row_of_the_first_pass_binds_because_activation_precedes_the_scan() {
         "{census:?}"
     );
     assert_eq!(census.unbound.get(&UnboundReason::ExecCoverageGap), None);
-    assert!(scene.coverage().is_witnessed(), "{:?}", scene.coverage());
+    // C7 C4: the scripted row carries a first-sight count, so the
+    // bound edge reads `counted`.
+    assert!(
+        matches!(scene.coverage(), UseCoverage::Counted { .. }),
+        "{:?}",
+        scene.coverage()
+    );
 }
 
 /// Invariant 4.2: the terminal read is staged before the coverage ends, so a

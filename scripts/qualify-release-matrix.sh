@@ -70,6 +70,13 @@ expected_backend() {
   case "$1" in *5.15*) echo "per-offset" ;; *) echo "uprobe-multi" ;; esac
 }
 
+# Hosted CI (GitHub sets CI=true) runs --self-test only: no vng, no kernel
+# fetch and no /home/user writes may be required there. In CI mode preflight
+# downgrades the guest-gated checks to SKIP and stages under $TMPDIR, so a
+# --preflight probe stays informative where only --self-test runs. Real-run
+# behavior outside CI is unchanged: missing requirements still FAIL.
+ci_mode() { [ "${CI:-false}" = "true" ]; }
+
 # Parse args.
 POS_KERNELS=()
 while [ $# -gt 0 ]; do
@@ -146,21 +153,29 @@ preflight() {
   fail=0
   say() { echo "$1"; }
   check() { if eval "$2"; then say "OK $1"; else say "FAIL $1"; fail=1; fi; }
+  guest_check() { if eval "$2"; then say "OK $1"; elif ci_mode; then say "SKIP $1 (absent; hosted CI starts no guests and fetches no kernels)"; else say "FAIL $1"; fail=1; fi; }
   check "repo $REPO" "[ -d '$REPO/scripts' ]"
   check "qualify-public-cli.sh" "[ -x '$REPO/scripts/qualify-public-cli.sh' ]"
   check "qualify-inventory-native.sh" "[ -x '$REPO/scripts/qualify-inventory-native.sh' ]"
   check "run-privileged-lib-tests.sh" "[ -x '$REPO/scripts/run-privileged-lib-tests.sh' ]"
   check "rust $RUST" "rustup toolchain list 2>/dev/null | grep -q '$RUST'"
-  check "vng on PATH" "command -v vng >/dev/null"
+  guest_check "vng on PATH" "command -v vng >/dev/null"
   check "flock on PATH" "command -v flock >/dev/null"
   check "timeout on PATH" "command -v timeout >/dev/null"
-  check "lock parent $(dirname "$LOCK")" "[ -d '$(dirname "$LOCK")' ]"
+  lock_test="[ -d '$(dirname "$LOCK")' ]"
+  if ci_mode; then lock_test="$lock_test || mkdir -p '$(dirname "$LOCK")'"; fi
+  check "lock parent $(dirname "$LOCK")" "$lock_test"
   check "out base parent $(dirname "$OUT_BASE")" "[ -d '$(dirname "$OUT_BASE")' ] || mkdir -p '$OUT_BASE'"
-  check "stage base writable" "mkdir -p '$STAGE_BASE' && [ -w '$STAGE_BASE' ]"
+  if ci_mode; then
+    stage_probe=${TMPDIR:-/tmp}/qrm-preflight-stage
+    check "stage base writable ($stage_probe)" "mkdir -p '$stage_probe' && [ -w '$stage_probe' ]"
+  else
+    check "stage base writable" "mkdir -p '$STAGE_BASE' && [ -w '$STAGE_BASE' ]"
+  fi
   for k in $(default_kernels); do
     case "$k" in
-      /*) check "kernel file $k" "[ -f '$k' ]" ;;
-      *) check "kernel cache $k" "[ -d \"/home/user/.cache/virtme-ng/$k\" ]" ;;
+      /*) guest_check "kernel file $k" "[ -f '$k' ]" ;;
+      *) guest_check "kernel cache $k" "[ -d \"/home/user/.cache/virtme-ng/$k\" ]" ;;
     esac
   done
   if [ -e "$QUIET" ]; then say "WARN quiet window present: $QUIET"; fi
@@ -196,6 +211,22 @@ self_test() {
   expect "dry-run kernels" "$(echo "$plan" | grep -c 'tag=')" 2
   expect "dry-run 5.15 backend" "$(echo "$plan" | grep -c 'v5.15.221 tag=v5.15.221 expect=per-offset')" 1
   expect "dry-run starts nothing" "$(echo "$plan" | tail -1)" "dry-run: no build, no guests started"
+  # CI hermeticity: hosted CI runs --self-test only and must need no vng, no
+  # kernel fetch and no /home/user writes. --preflight in CI mode (CI=true)
+  # downgrades the guest-gated checks to SKIP and stages under $TMPDIR.
+  d2=$(mktemp -d "${TMPDIR:-/tmp}/qrm-selftest-XXXXXX")
+  ci_pf=$(CI=true "$0" --out-base "$d2/out" --preflight 2>&1 || true)
+  expect "CI preflight never fails vng" "$(printf '%s\n' "$ci_pf" | grep -c -F 'FAIL vng on PATH')" 0
+  expect "CI preflight never fails kernels" "$(printf '%s\n' "$ci_pf" | grep -c -F 'FAIL kernel')" 0
+  expect "CI preflight stages under TMPDIR" "$(printf '%s\n' "$ci_pf" | grep -c -F "stage base writable (${TMPDIR:-/tmp}/qrm-preflight-stage)")" 1
+  if command -v vng >/dev/null 2>&1; then
+    echo "OK CI preflight vng SKIP branch (not exercised: vng present)"
+  else
+    expect "CI preflight skips absent vng" "$(printf '%s\n' "$ci_pf" | grep -c -F 'SKIP vng on PATH')" 1
+  fi
+  CI=true "$0" --out-base "$d2/out" --stage-base "$d2/stage" --preflight >/dev/null 2>&1 || true
+  expect "CI preflight leaves STAGE_BASE untouched" "$([ -e "$d2/stage" ] && echo created || echo untouched)" untouched
+  rm -rf "$d2"
   if [ $fail -eq 0 ]; then echo "self-test: OK"; else echo "self-test: FAIL"; fi
   return $fail
 }

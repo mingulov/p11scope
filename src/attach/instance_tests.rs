@@ -1231,6 +1231,48 @@ fn privileged_instance_vfork_unmap_globalizes() -> Result<()> {
     Ok(())
 }
 
+/// P2-2: a CLONE_VM non-thread sharer that predates the attach carries no
+/// SHARED_MM mark (marking happens on forks observed after attachment);
+/// its watched mutations must still globalize — the mm has users beyond
+/// the thread group — ending this process's incarnation.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_pre_attachment_sharer_globalizes() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    // The sharer predates the attach: held here, mutating after.
+    let held = target.command(b'w')?;
+    ensure!(held.starts_with("SHARER_HELD"), "{held}");
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
+        target.command(b'c')?;
+        single_join(&pump_until(harness, target, 1)?)
+    };
+    let a = call(&mut harness, &mut target)?;
+    let before = harness.session.instance_maps().counters()?;
+    let woke = target.command(b'W')?;
+    ensure!(woke == "SHARER_WOKE", "{woke}");
+    let after = harness.session.instance_maps().counters()?;
+    ensure!(
+        after.shared >= before.shared + 2 && after.global_bumps >= before.global_bumps + 2,
+        "pre-attachment sharer was not globalized: {before:?} -> {after:?}"
+    );
+    let b = call(&mut harness, &mut target)?;
+    ensure!(
+        b != a,
+        "a pre-attachment sharer's mutation kept the instance"
+    );
+    eprintln!("T3A_PRESHARER counters={after:?} scans={:?}", harness.scan);
+    ensure!(harness.false_joins().is_empty());
+    ensure!(after.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
 /// Decision §3c: a punch-hole on the provider file from another process.
 /// The loaded image keeps executing from untouched text while the header
 /// page's VMAs are zapped through `unmap_mapping_range`, which must reach

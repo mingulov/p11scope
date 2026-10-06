@@ -46,9 +46,13 @@ struct vm_area_struct___p11inst {
     struct mm_struct___p11inst *vm_mm;
     struct file___p11inst *vm_file;
 } INST_BTF;
+struct signal_struct___p11inst {
+    int nr_threads;
+} INST_BTF;
 struct task_struct___p11inst {
     struct mm_struct___p11inst *mm;
     struct task_struct___p11inst *group_leader;
+    struct signal_struct___p11inst *signal;
 } INST_BTF;
 
 struct {
@@ -273,6 +277,7 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
     struct instance_record *rec;
     struct task_struct___p11inst *current;
     struct task_struct___p11inst *leader;
+    struct signal_struct___p11inst *sig = 0;
     struct file___p11inst *file = 0;
     struct inode___p11inst *inode = 0;
     struct super_block___p11inst *sb = 0;
@@ -281,6 +286,7 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
     unsigned long ino = 0;
     u32 dev = 0;
     int users = 0;
+    int threads = 0;
     u32 *slotp;
     u32 slot;
     u32 index;
@@ -335,6 +341,19 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
     }
     leader = current->group_leader;
     if (!leader) {
+        inst_global(slot, counters);
+        return 0;
+    }
+    /* Pre-attachment sharers carry no SHARED_MM mark: marking happens on
+     * forks observed after attachment. Every live task with this mm holds
+     * one mm_users ref — threads and non-thread sharers alike — while
+     * nr_threads counts only this thread group, so equality proves no live
+     * sharer and anything else globalizes. Racy transients (a fork between
+     * the two reads, a borrowed kernel reference) fail closed into a
+     * spurious global bump, never a local one. */
+    if (INST_READ(sig, leader->signal) || !sig || INST_READ(threads, sig->nr_threads) ||
+        users != threads) {
+        inst_count(counters ? &counters->shared : 0);
         inst_global(slot, counters);
         return 0;
     }

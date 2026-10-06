@@ -58,8 +58,9 @@ static struct file___p11inst file = { &inode };
 static struct file___p11inst other_file = { &other_inode };
 static struct mm_struct___p11inst mm = { { 2 } };
 static struct mm_struct___p11inst other_mm = { { 1 } };
+static struct signal_struct___p11inst leader_sig = { 2 };
 static struct task_struct___p11inst leader;
-static struct task_struct___p11inst thread = { &mm, &leader };
+static struct task_struct___p11inst thread = { &mm, &leader, 0 };
 static struct task_struct___p11inst child;
 static struct task_struct___p11inst *current_task = &thread;
 static struct vm_area_struct___p11inst vma = { 0x7f0000001000UL, &mm, &file };
@@ -192,6 +193,8 @@ static void reset(void)
     read_fail_at = -1;
     reads = 0;
     mm.mm_users.counter = 2;
+    leader_sig.nr_threads = 2;
+    leader.signal = &leader_sig;
     thread.mm = &mm;
     thread.group_leader = &leader;
     current_task = &thread;
@@ -315,6 +318,21 @@ int main(void)
     records[0].flags = INST_RECORD_SHARED_MM;
     map_hook(&vma);
     assert(counters.shared == 1 && g_epoch[5] == 1 && !records[0].slot_plus1[0]);
+
+    /* A pre-attachment sharer (mm users beyond the thread group) never
+     * localizes either, with or without the post-attachment mark. */
+    reset();
+    mm.mm_users.counter = 3;
+    map_hook(&vma);
+    assert(counters.shared == 1 && g_epoch[5] == 1 && !records[0].slot_plus1[0]);
+    assert(!storage_creates);
+    /* Unreadable sharing state (reads 8, 9) fails closed too. */
+    for (int at = 8; at < 10; at++) {
+        reset();
+        read_fail_at = at;
+        map_hook(&vma);
+        assert(g_epoch[5] == 1 && !storage_creates);
+    }
 
     /* Record overflow: 8 files fit; the 9th goes global and marks OVERFLOW. */
     reset();

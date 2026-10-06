@@ -23,6 +23,8 @@
  *       S  stop it and print its per-generation ledger    -> RACED gen:n,...
  *       U  pure MREMAP_DONTUNMAP of that page (both stay) -> PUREMOVE
  *       V  vfork child unmaps that shared page             -> VUNMAP
+ *       w  hold a persistent CLONE_VM sharer (pre-attach)  -> SHARER_HELD pid
+ *       W  wake it to map+unmap one provider page          -> SHARER_WOKE
  *       h  another process punch-holes the provider file   -> PHOLE
  *       e  exec self (pipes survive; READY again)          -> (READY ...)
  *       E  a non-leader thread execs self                  -> (READY ...)
@@ -102,6 +104,34 @@ static int sharer_child(void *unused)
 {
     (void)unused;
     int fd = open(sharer_provider, O_RDONLY);
+    if (fd < 0)
+        return 1;
+    void *p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED)
+        return 2;
+    munmap(p, 4096);
+    return 0;
+}
+
+/* A persistent CLONE_VM non-thread sharer, held across the observer's
+ * attach: 'w' spawns it (it blocks on a pipe), 'W' wakes it to map and
+ * unmap one provider page in the shared mm, then reaps it. CLONE_VM
+ * shares memory, so file-scope state serves both processes; the fd table
+ * is private (no CLONE_FILES), so the pipe ends stay valid in each. A
+ * wake by EOF (the parent went away) exits quietly without mutating. */
+static int held_sharer_pipe[2] = { -1, -1 };
+static const char *held_sharer_provider;
+static pid_t held_sharer;
+
+static int held_sharer_child(void *unused)
+{
+    (void)unused;
+    char gate;
+    ssize_t n = read(held_sharer_pipe[0], &gate, 1);
+    if (n != 1)
+        return 0;
+    int fd = open(held_sharer_provider, O_RDONLY);
     if (fd < 0)
         return 1;
     void *p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -347,6 +377,36 @@ static int cmd_mode(const char *provider)
                 WEXITSTATUS(status) != 0)
                 die("CLONE_VM sharer");
             printf("SHARER\n");
+            break;
+        }
+        case 'w': {
+            static char stack[64 * 1024] __attribute__((aligned(16)));
+            if (held_sharer)
+                die("sharer already held");
+            if (pipe(held_sharer_pipe) != 0)
+                die("held sharer pipe");
+            held_sharer_provider = provider;
+            pid_t child = clone(held_sharer_child, stack + sizeof(stack), CLONE_VM | SIGCHLD, NULL);
+            if (child < 0)
+                die("CLONE_VM held sharer");
+            held_sharer = child;
+            printf("SHARER_HELD %d\n", (int)child);
+            break;
+        }
+        case 'W': {
+            int status = 0;
+            if (!held_sharer)
+                die("no held sharer");
+            if (write(held_sharer_pipe[1], "g", 1) != 1)
+                die("held sharer wake");
+            if (waitpid(held_sharer, &status, 0) != held_sharer || !WIFEXITED(status) ||
+                WEXITSTATUS(status) != 0)
+                die("held sharer mutation");
+            close(held_sharer_pipe[0]);
+            close(held_sharer_pipe[1]);
+            held_sharer_pipe[0] = held_sharer_pipe[1] = -1;
+            held_sharer = 0;
+            printf("SHARER_WOKE\n");
             break;
         }
         case 'M': {

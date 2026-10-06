@@ -1553,23 +1553,37 @@ def check_uncounted(view, res):
     observation). Userspace-only saturation withholds watches but never
     reads uncounted, so an uncounted edge without the BPF evidence fails.
     Counted positives are excepted (they stand beside the gap); only the
-    uncounted edges themselves are judged here."""
+    uncounted edges themselves are judged here. O6: the registry's
+    bounded output can suppress the gap (past --max-gaps) while the
+    edge keeps valid uncounted coverage plus its PairInsertFailure
+    detail (NotePairsUncounted demotes edges regardless) — that case
+    is explicitly nonqualifying, never a pass or a fail. The detail
+    itself is never suppressed, so a missing detail still fails."""
     run = view.name
     gaps = [g for g in view.doc.get("gaps", []) if g.get("subject") == PAIRS_UNCOUNTED_SUBJECT]
+    suppressed = view.doc.get("gaps_suppressed") or 0
     for key in sorted(view.edges):
         edge = view.edges[key]
         cov = coverage(edge)
         if cov.get("reason") != UNCOUNTED_REASON:
             continue
         entries = edge["entries"]
-        res.ok(run, "*", "UNCOUNTED-EVIDENCE",
-               cov.get("state") == UNKNOWN_STATE and entries.get("count", 0) == 0
-               and entries.get("observation") == "unknown (usage observation unavailable)"
-               and bool(gaps) and bool(PAIR_INSERT_EVIDENCE.search(cov.get("detail") or "")),
-               f"edge {key[0]}->{key[1]} reads {cov.get('state')}/{cov.get('reason')} with count "
-               f"{entries.get('count', 0)} {entries.get('observation')!r} detail {cov.get('detail')!r} "
-               f"and {len(gaps)} {PAIRS_UNCOUNTED_SUBJECT!r} gaps: uncounted needs the BPF "
-               "PairInsertFailure evidence and publishes no count as fact")
+        core = (cov.get("state") == UNKNOWN_STATE and entries.get("count", 0) == 0
+                and entries.get("observation") == "unknown (usage observation unavailable)"
+                and bool(PAIR_INSERT_EVIDENCE.search(cov.get("detail") or "")))
+        if core and gaps:
+            res.add(run, "*", "UNCOUNTED-EVIDENCE", "pass", "ok")
+        elif core and suppressed:
+            res.add(run, "*", "UNCOUNTED-EVIDENCE", "nonqualifying",
+                    f"edge {key[0]}->{key[1]} reads unknown/uncounted with the BPF PairInsertFailure detail "
+                    f"but the {PAIRS_UNCOUNTED_SUBJECT!r} gap is absent while gaps_suppressed={suppressed}: "
+                    "bounded output may have suppressed the gap, so the evidence can neither pass nor fail")
+        else:
+            res.ok(run, "*", "UNCOUNTED-EVIDENCE", False,
+                   f"edge {key[0]}->{key[1]} reads {cov.get('state')}/{cov.get('reason')} with count "
+                   f"{entries.get('count', 0)} {entries.get('observation')!r} detail {cov.get('detail')!r} "
+                   f"and {len(gaps)} {PAIRS_UNCOUNTED_SUBJECT!r} gaps: uncounted needs the BPF "
+                   "PairInsertFailure evidence and publishes no count as fact")
 
 
 def check_positives(view, images_by_cell, mod, state, res):
@@ -3269,6 +3283,22 @@ def self_test():
             edge["entries"]["coverage"]["until_ns"] = int(match.group(1))
             edge["entries"]["count"] = 1
         case("counted-until-frozen-bypass", "COVERAGE-SHAPE", counted_until_bypass)
+
+        # --- O6: uncounted evidence vs gap suppression (astra A5) ------------
+        # caller_registry's bounded output can suppress the pair-insert gap
+        # while the edge retains valid uncounted coverage plus its
+        # PairInsertFailure detail — that legitimate case fails
+        # UNCOUNTED-EVIDENCE. Suppressed evidence is explicitly
+        # nonqualifying (neither pass nor fail).
+        def uncounted_suppressed(s, d, dash):
+            uncounted_edge(s, d)
+            d["gaps_suppressed"] = 1
+            return {"events": s.events(d)}
+        res = case("uncounted-gap-suppressed", None, uncounted_suppressed)
+        row = next((r for r in res.rows if r["run"] == "system" and r["check"] == "UNCOUNTED-EVIDENCE"),
+                   None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("uncounted-gap-suppressed-not-nonqualifying")
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

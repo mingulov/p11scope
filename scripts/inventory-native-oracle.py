@@ -425,16 +425,48 @@ def use_in(image, provider_path, window):
     return Use(lines, definite, max(start, min(e["t0"] for e in lines)), min(end, max(e["t1"] for e in lines)), mechs)
 
 
+def recording_before(use, since_ns):
+    """The recording line (Case A) or None.
+
+    since_ns is the first BPF row's insert stamp, taken during the
+    recording call's probe: the recording call entered strictly before
+    it, and every earlier call missed (no row existed yet). When no
+    attach-side line straddles since_ns, the recording call is the last
+    entry before it, i.e. it sits on the last attach-side line ending
+    strictly before since_ns — which then contributes exactly one
+    recorded call however many it ledgered. A straddling attach-side
+    line (or a same-tick boundary) leaves the recording call's line
+    ambiguous and there is no identified recording line."""
+    attach = [e for e in use.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS]
+    if any(e["t0"] <= since_ns <= e["t1"] for e in attach):
+        return None
+    before = [e for e in attach if e["t1"] < since_ns]
+    return max(before, key=lambda e: (e["t1"], e["t0"])) if before else None
+
+
 def window_count(use, since_ns, window):
-    """(lo, hi) calls a counting feed covering [max(since, start), end] must report."""
+    """(lo, hi) calls a counting feed covering [max(since, start), end] must report.
+
+    Lines completed strictly before since_ns missed (no row existed
+    yet) — except the recording line itself (recording_before), whose
+    recording call is included: +1 in lo when fully inside the window
+    (it contributes exactly that call), +n in hi. Lines starting
+    strictly after since_ns are recorded (the row exists); same-tick
+    boundaries are ambiguous (hi only)."""
     start, end = max(since_ns, window[0]), window[1]
     lo = hi = 0
     for e in use.lines:
         if e["t1"] < start or e["t0"] > end:
             continue
         hi += e["n"]
-        if e["t0"] >= start and e["t1"] <= end and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS:
+        if e["t0"] > since_ns and e["t0"] >= window[0] and e["t1"] <= end \
+                and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS:
             lo += e["n"]
+    rec = recording_before(use, since_ns)
+    if rec is not None:
+        hi += rec["n"]
+        if rec["t0"] >= window[0] and rec["t1"] <= end:
+            lo += 1
     return lo, hi
 
 
@@ -445,21 +477,52 @@ def ledger_total_table_calls(image, provider_path):
                if e["module"] == provider_path and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS)
 
 
-def exact_window_count(use, since_ns, window, until_ns):
+def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns):
     """(exact, expected): whether the ledger pins the count with 0 error.
 
-    Exact when the counting feed provably covers every in-window call: the
-    edge is not frozen, the feed started (since) at or before the first
-    in-window call — i.e. the endpoints attached before the workload — and
-    every overlapping ledger line lies fully inside the window. Then the
-    count must equal the attach-side sum exactly (r1 T3.5); otherwise only
-    the COUNT-WINDOW/COUNT-TOTAL upper bounds apply."""
-    if until_ns is not None or since_ns > use.t_first:
+    Exact when the counting feed provably covers every in-window call:
+    the edge is not frozen, the caller was admitted at or before its
+    first attach-side call (attachment-before-workload evidence,
+    independent of since_ns), and every overlapping ledger line lies
+    fully inside the window. Then either the row predates every
+    attach-side call (all recorded), or the recording call is the
+    first attach-side line and a singleton (Case A, included — it
+    contributes exactly its one call). Then the count must equal the
+    attach-side sum exactly (r1 T3.5); otherwise only the
+    COUNT-WINDOW/COUNT-TOTAL upper bounds apply.
+
+    since_ns is the first BPF row's insert stamp, NOT the attach time:
+    entry.rs record_caller_use_with stamps recorded_at_ns = now()
+    immediately before the first map insert
+    (crates/ebpf-common/src/inventory_callers/entry.rs:90-91), which
+    capture.rs absorb_rows copies into the witness row
+    (src/attach/inventory/capture.rs:2598), which absorb_pair_counts
+    keeps as PairCount.first_ns
+    (src/discovery/inventory_coordinator.rs:1675,1680), which
+    stage_pair_count publishes as Counted.since_ns
+    (src/discovery/inventory_coordinator.rs:1727,1745). The workload
+    stamps t0/t1 BEFORE the call
+    (tests/fixtures/public-cli/inventory-ledger.c:229), so since_ns
+    lands strictly after the recording call's entry stamp on every
+    real run and since_ns <= t_first can never gate exactness."""
+    if until_ns is not None:
         return False, 0
-    start, end = max(since_ns, window[0]), window[1]
-    if any(e["t0"] < start or e["t1"] > end for e in use.lines):
+    attach = [e for e in use.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS]
+    if not attach:
         return False, 0
-    return True, sum(e["n"] for e in use.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS)
+    if any(e["t0"] < window[0] or e["t1"] > window[1] for e in use.lines):
+        return False, 0
+    first_attach_t0 = min(e["t0"] for e in attach)
+    if caller_first_seen_ns is None or caller_first_seen_ns > first_attach_t0:
+        return False, 0
+    if since_ns < first_attach_t0:
+        # The row predates every attach-side call: all recorded in place.
+        return True, sum(e["n"] for e in attach)
+    rec = recording_before(use, since_ns)
+    first_line = min(attach, key=lambda e: (e["t0"], e["t1"]))
+    if rec is None or rec is not first_line or rec["n"] != 1:
+        return False, 0
+    return True, sum(e["n"] for e in attach)
 
 
 def reached_by(images, image):
@@ -1335,12 +1398,16 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
         else:
             res.ok(run, cell, "COUNT-WINDOW", lo <= count <= hi,
                    f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}")
-            exact, expected = exact_window_count(use, cov.get("since_ns") or 0, window, until)
+            admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
+            exact, expected = exact_window_count(use, cov.get("since_ns") or 0, window, until, admitted)
             if exact and not edge["entries"].get("saturated"):
-                # Ledger exactness = 0 error: attached before the workload
-                # (or provably covering every in-window call some other
-                # way) means the count equals the attach-side sum — not a
-                # range. A saturated feed stays a lower bound (COUNT-TOTAL).
+                # Ledger exactness = 0 error: the caller was admitted
+                # before its first attach-side call and the feed provably
+                # covers every in-window call (the row predates them, or
+                # the recording call is the first attach-side line, a
+                # singleton) means the count equals the attach-side sum —
+                # not a range. A saturated feed stays a lower bound
+                # (COUNT-TOTAL).
                 res.ok(run, cell, "COUNT-EXACT", count == expected,
                        f"{ctag}: count {count} != ledger {expected} attach-side calls "
                        f"(feed covers every in-window call since {cov.get('since_ns')})")
@@ -2964,6 +3031,44 @@ def self_test():
             e["entries"]["coverage"].update(state=UNKNOWN_STATE, since_ns=None, reason=PENDING_FIRST_USE_REASON)
             e["entries"]["observation"] = "unknown (usage observation unavailable)"
         case("pending-in-snapshot", "PENDING-TRANSIENT", pending_snapshot)
+
+        # --- O1: realistic since timing (sol 1, astra B1) -------------------
+        # Native since_ns is the first BPF row's insert stamp, taken during
+        # the recording call's probe — strictly after the workload's
+        # pre-call ledger stamp — so since<=t_first never holds on real
+        # runs. The recording call's realistic singleton line [t,t] lands
+        # entirely before since; the old window drops it from lo AND hi
+        # ([36,36] vs the correct 37) while COUNT-EXACT never engages (an
+        # incorrect 36 passes everything).
+        def realistic_since_ledger(s, d):
+            """Collapse P1's first attach line (setup C_Initialize) to a
+            realistic singleton [t,t] and stamp the first BPF record 1500
+            ns (probe latency) after its entry."""
+            led = dict(s.ledgers)
+            pat = re.compile(r"(fn=C_Initialize mech=- n=1 bad=0 phase=setup t0=)(\d+)( t1=)\d+")
+            assert len(pat.findall(led["P1"])) == 1
+            match = pat.search(led["P1"])
+            tick = int(match.group(2))
+            led["P1"] = pat.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(2)}",
+                                led["P1"], count=1)
+            since = tick + 1500
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            return {"ledgers": led}
+
+        def realistic_timing(s, d, dash):
+            return realistic_since_ledger(s, d)
+        res = case("count-exact-realistic-timing", None, realistic_timing)
+        if not any(r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"
+                   and r["status"] == "pass" for r in res.rows):
+            failures.append("count-exact-realistic-timing-misses-exact")
+
+        def realistic_timing_short(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] -= 1
+            return kw
+        case("count-below-ledger-realistic-timing", "COUNT-EXACT", realistic_timing_short)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

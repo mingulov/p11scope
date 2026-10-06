@@ -12715,14 +12715,15 @@ fn owned_mapper_bounds_partial_readiness_and_reaps_the_child() {
 /// `maps_have_executable_image`). A snapshot taken before this point sees
 /// the test runner's own mappings, including transiently dlopened
 /// `/tmp/.tmp*/provider.so` fixtures that vanish before pin time (hosted CI
-/// run 37422857664). Bounded like the snapshot loop below; on timeout FAILS
-/// LOUD naming the child and the last evidence, never silently proceeds.
+/// run 37422857664). Bounded like the snapshot loop below, with a generous
+/// deadline plus a final predicate check after the last sleep (P2-6: the
+/// child may settle during that sleep); on timeout FAILS LOUD naming the
+/// child and the last evidence, never silently proceeds.
 fn wait_for_child_exec(pid: u32) {
     let this_image = std::env::current_exe().unwrap();
     let exe = format!("/proc/{pid}/exe");
     let maps_path = format!("/proc/{pid}/maps");
-    let mut evidence = String::from("no read attempted");
-    for _ in 0..200 {
+    let settled = || {
         let image = std::fs::read_link(&exe).ok();
         let maps = std::fs::read_to_string(&maps_path).ok();
         let execed = image.as_ref().is_some_and(|image| {
@@ -12731,24 +12732,35 @@ fn wait_for_child_exec(pid: u32) {
                     .as_ref()
                     .is_some_and(|maps| maps_have_executable_image(maps, image))
         });
-        if execed {
-            return;
-        }
-        evidence = format!(
+        let evidence = format!(
             "exe={image:?} maps_head={:?}",
             maps.as_deref()
                 .map(|maps| maps.lines().take(3).collect::<Vec<_>>().join("\\n"))
         );
+        (execed, evidence)
+    };
+    let mut evidence = String::from("no read attempted");
+    for _ in 0..3000 {
+        let (execed, last) = settled();
+        evidence = last;
+        if execed {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let (execed, last) = settled();
+    if execed {
+        return;
+    }
+    evidence = last;
     panic!("sleep child {pid} never execed; last evidence: {evidence}");
 }
 
 /// Two provider modules over two distinct executable objects the live
-/// child really mapped.
-fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
-    wait_for_child_exec(view.pid());
-    for _ in 0..200 {
+/// child really mapped. Generous deadline plus a final snapshot attempt
+/// after the last sleep (P2-6).
+fn snapshot_two_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
+    let attempt = || {
         let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
         let maps = parse_maps(&bytes).unwrap();
         let map_index = MapIndex::new(&maps).expect("the live child maps snapshot is valid");
@@ -12770,12 +12782,47 @@ fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
             }
             modules.push(provider_module(view, mapping, &path, 0x1000));
             if modules.len() == 2 {
-                return modules;
+                return Some(modules);
             }
+        }
+        None
+    };
+    for _ in 0..3000 {
+        if let Some(modules) = attempt() {
+            return modules;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    if let Some(modules) = attempt() {
+        return modules;
+    }
     panic!("the live child never mapped two distinct file-backed objects");
+}
+
+fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
+    wait_for_child_exec(view.pid());
+    snapshot_two_provider_modules(view)
+}
+
+/// Settle a pipe-held pre-exec child: asserts the child is provably still
+/// a fork of the test runner (it cannot have passed the release gate),
+/// then releases it and waits for exec settle. The pre-exec assertion is
+/// what makes the RED direction deterministic: a helper that snapshots
+/// without waiting sees test-runner mappings.
+fn child_provider_modules_with_held_child(
+    view: &ProcessView,
+    child: &mut HeldChild,
+) -> Vec<ScannedModule> {
+    let test_image = std::env::current_exe().unwrap();
+    let exe = std::fs::read_link(format!("/proc/{}/exe", child.pid()))
+        .expect("the held child is alive and readable");
+    assert_eq!(
+        exe, test_image,
+        "the held child exec'd before release: the handshake is broken"
+    );
+    child.release();
+    wait_for_child_exec(child.pid());
+    snapshot_two_provider_modules(view)
 }
 
 fn pin_test_modules(view: &ProcessView, modules: &[ScannedModule]) -> PinnedObjects {
@@ -12834,37 +12881,121 @@ fn peer_candidate(engine: &mut Engine, modules: &[ScannedModule]) -> LiveCandida
     candidate
 }
 
-/// Spawn `sleep 30` through a raw fork whose child sleeps two seconds
-/// before execing, holding a deterministic pre-exec window: immediately after
-/// this returns, the child is provably still a fork of the test runner. A
-/// `Command::pre_exec` sleep cannot do this — it forces the fork path whose
+/// A raw fork held pre-exec by a parent/child pipe handshake (P2-6):
+/// the child signals readiness, then blocks on the release pipe until
+/// [`HeldChild::release`] closes it. No sleep establishes the ordering
+/// under test — the child cannot exec before release, however the host
+/// schedules. Dropping without release kills and reaps the held child.
+struct HeldChild {
+    pid: u32,
+    release: Option<std::fs::File>,
+}
+
+impl HeldChild {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Closes the release pipe: the child execs `sleep 30`.
+    fn release(&mut self) {
+        self.release.take();
+    }
+}
+
+impl Drop for HeldChild {
+    fn drop(&mut self) {
+        // SAFETY: this unprivileged fixture owns this live, unreaped child.
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(self.pid as libc::pid_t, &mut status, 0);
+        }
+    }
+}
+
+/// Spawn `sleep 30` through a raw fork whose child blocks pre-exec until
+/// release: immediately after this returns, the child is provably still a
+/// fork of the test runner (the ready byte was consumed). A
+/// `Command::pre_exec` gate cannot do this — it forces the fork path whose
 /// error pipe makes `spawn` block until the exec — and plain `spawn` only
 /// wins the pre-exec race under load (0/2000 locally, fatal on hosted CI run
 /// 37422857664).
-fn spawn_sleep_with_pre_exec_delay() -> u32 {
+fn spawn_held_sleep_child() -> HeldChild {
     let program = std::ffi::CString::new("sleep").unwrap();
     let arg0 = std::ffi::CString::new("sleep").unwrap();
     let arg1 = std::ffi::CString::new("30").unwrap();
     let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+    let mut ready = [0 as libc::c_int; 2];
+    let mut release = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 writes both fds on success; CLOEXEC keeps them out of
+    // the exec'd image.
+    assert_eq!(
+        unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "ready pipe failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        unsafe { libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "release pipe failed: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: fork in a multithreaded binary. The child calls only
-    // async-signal-safe functions before the exec (nanosleep, execvp) and
-    // `_exit(127)` if the exec fails; it never returns to test code, runs no
-    // destructors, and touches no allocator state. All pointers are parent
-    // C strings, valid across the fork.
+    // async-signal-safe functions before the exec (close, read, write,
+    // execvp) and `_exit(127)` if the exec fails; it never returns to test
+    // code, runs no destructors, and touches no allocator state. All
+    // pointers are parent C strings, valid across the fork.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
     if pid == 0 {
         unsafe {
-            let delay = libc::timespec {
-                tv_sec: 2,
-                tv_nsec: 0,
-            };
-            libc::nanosleep(&delay, std::ptr::null_mut());
+            libc::close(ready[0]);
+            libc::close(release[1]);
+            let byte = [1u8];
+            // The ready byte cannot block: the pipe is empty.
+            libc::write(ready[1], byte.as_ptr() as *const _, 1);
+            libc::close(ready[1]);
+            // Block until the parent releases (EOF) or dies (EOF): either
+            // way the child proceeds to a harmless `sleep`.
+            let mut gate = [0u8; 1];
+            libc::read(release[0], gate.as_mut_ptr() as *mut _, 1);
+            libc::close(release[0]);
             libc::execvp(program.as_ptr(), argv.as_ptr());
             libc::_exit(127);
         }
     }
-    pid as u32
+    // SAFETY: the parent owns these fresh pipe ends; closing the ends it
+    // never uses lets EOF report a dead child instead of hanging.
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(release[0]);
+    }
+    let mut byte = [0u8; 1];
+    // SAFETY: `ready[0]` is the parent's live read end.
+    let read = unsafe { libc::read(ready[0], byte.as_mut_ptr() as *mut _, 1) };
+    // SAFETY: the ready byte was consumed (or the child is dead); the read
+    // end is no longer needed.
+    unsafe {
+        libc::close(ready[0]);
+    }
+    if read != 1 {
+        // SAFETY: this unprivileged fixture owns this live, unreaped child.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+            libc::close(release[1]);
+        }
+        panic!("held child {pid} died before its ready byte (read={read})");
+    }
+    // SAFETY: `release[1]` is a fresh pipe end this process owns; `File`
+    // closes it on drop, which is the release signal.
+    let release = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(release[1]) };
+    HeldChild {
+        pid: pid as u32,
+        release: Some(release),
+    }
 }
 
 /// Dev-flake regression (hosted CI run 37422857664): the helper snapshotted
@@ -12877,22 +13008,10 @@ fn spawn_sleep_with_pre_exec_delay() -> u32 {
 /// maps its own image.
 #[test]
 fn child_provider_modules_waits_for_exec_settle() {
-    struct RawChild(u32);
-    impl Drop for RawChild {
-        fn drop(&mut self) {
-            // SAFETY: this unprivileged fixture owns this live, unreaped child.
-            unsafe {
-                libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
-                let mut status = 0;
-                libc::waitpid(self.0 as libc::pid_t, &mut status, 0);
-            }
-        }
-    }
-
-    let child = RawChild(spawn_sleep_with_pre_exec_delay());
-    let pid = child.0;
+    let mut child = spawn_held_sleep_child();
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(3), pid).unwrap();
-    let modules = child_provider_modules(&view);
+    let modules = child_provider_modules_with_held_child(&view, &mut child);
     let test_image = std::env::current_exe().unwrap();
     assert!(
         modules

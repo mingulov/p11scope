@@ -5,7 +5,8 @@
 
 use super::*;
 use crate::attach::capture::{
-    AttachedEndpoint, CaptureHealth, CapturePhase, DomainCookie, ExecCoverage, WitnessRow,
+    AttachedEndpoint, CallerCountUpdate, CaptureHealth, CapturePhase, DomainCookie, ExecCoverage,
+    WitnessRow,
 };
 use crate::discovery::caller_registry::tests::ScriptedSource;
 use crate::discovery::caller_registry::{CallerId, ExeIdentity, RegistryLimits, UseCoverage};
@@ -54,6 +55,16 @@ struct RowSpec {
     ticket: u64,
 }
 
+/// One refreshed count the scripted capture reports: the attached endpoint's
+/// index (for its object), the caller image, and the re-read count.
+#[derive(Clone, Copy)]
+struct CountSpec {
+    endpoint: usize,
+    ticket: u64,
+    exec: u64,
+    count: u64,
+}
+
 /// A scripted facade: records every call, activates on the first extend,
 /// attaches what it is given (minus a scripted deferral), reports scripted
 /// rows per read, answers scripted cookies, and retires after a scripted
@@ -68,6 +79,8 @@ struct ScriptedLane {
     defer_next: usize,
     attached: Vec<AttachEndpoint>,
     reads: VecDeque<Vec<RowSpec>>,
+    /// Refreshed counts per read, popped in read order like `reads`.
+    refreshes: VecDeque<Vec<CountSpec>>,
     /// Health instants of every read, in order.
     read_stamps: Vec<u64>,
     cookies: HashMap<Pin, u64>,
@@ -79,6 +92,10 @@ struct ScriptedLane {
     unproven_reads: usize,
     /// Reads (1-based) that stop mid-sweep.
     partial_reads: HashSet<usize>,
+    /// Reads (1-based) whose count-refresh sweep does not complete.
+    partial_refresh_reads: HashSet<usize>,
+    /// Reads (1-based) whose count-refresh sweep completes with gaps.
+    gappy_refresh_reads: HashSet<usize>,
     /// How long each read takes.
     read_delay: Duration,
     /// After this many reads, the next `.1` discovery quanta stop at their
@@ -126,6 +143,7 @@ impl ScriptedLane {
             defer_next: 0,
             attached: Vec::new(),
             reads: VecDeque::new(),
+            refreshes: VecDeque::new(),
             read_stamps: Vec::new(),
             cookies,
             stopping: false,
@@ -134,6 +152,8 @@ impl ScriptedLane {
             retired: false,
             unproven_reads: 0,
             partial_reads: HashSet::new(),
+            partial_refresh_reads: HashSet::new(),
+            gappy_refresh_reads: HashSet::new(),
             read_delay: Duration::ZERO,
             undrained_after_reads: None,
             drained_ns: 0,
@@ -279,6 +299,23 @@ impl CaptureLane<Pin> for ScriptedLane {
                 )
             })
             .collect();
+        let counts = self
+            .refreshes
+            .pop_front()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|spec| {
+                let endpoint = self.attached[spec.endpoint];
+                CallerCountUpdate {
+                    image: ImageIdentity {
+                        task_cookie: spec.ticket,
+                        exec_id: spec.exec,
+                    },
+                    object: endpoint.object,
+                    count: spec.count,
+                }
+            })
+            .collect();
         let rows_read_ns = self.stamps.next();
         let health_unproven = (self.read_stamps.len() <= self.unproven_reads)
             .then(|| "scripted unreadable health".to_string());
@@ -307,6 +344,10 @@ impl CaptureLane<Pin> for ScriptedLane {
             read_failures: Vec::new(),
             unrecorded_rows: 0,
             sweep_gaps: false,
+            counts,
+            refresh_sweep_completed: !self.partial_refresh_reads.contains(&self.read_stamps.len()),
+            refresh_sweep_gaps: self.gappy_refresh_reads.contains(&self.read_stamps.len()),
+            refresh_sweeps_completed: 1,
             seen_rows: 0,
             pair_limit: 64,
             lifecycle_loss: None,
@@ -373,6 +414,8 @@ struct Scene {
     collect_gate: Option<(mpsc::Receiver<()>, usize)>,
     /// Every staged lifecycle quantum's start stamp, in staging order.
     staged_lifecycle: Vec<u64>,
+    /// Every staged witness batch's refreshed-count size, in staging order.
+    staged_counts: Vec<usize>,
 }
 
 impl Scene {
@@ -400,6 +443,7 @@ impl Scene {
             scans: 0,
             collect_gate: None,
             staged_lifecycle: Vec::new(),
+            staged_counts: Vec::new(),
         }
     }
 
@@ -578,6 +622,9 @@ impl LaneHost<Pin> for Scene {
         });
         if let NativeBatch::Lifecycle(lifecycle) = &batch {
             self.staged_lifecycle.push(lifecycle.started_ns);
+        }
+        if let NativeBatch::Witness(witness) = &batch {
+            self.staged_counts.push(witness.counts.len());
         }
         self.coordinator.stage_native(batch, identity, now_ns)
     }
@@ -1073,6 +1120,71 @@ fn a_stop_keeps_reading_until_the_terminal_sweep_completes() {
         ]
     );
     assert_eq!(stopped.capture.read_stamps.len(), 5);
+}
+
+/// 2-C3: the terminal count refresh happens after `begin_stop`: stop keeps
+/// reading (each read staged) until a refresh sweep completes without gaps,
+/// so every witnessed row's count gets its last word.
+#[test]
+fn a_stop_refreshes_counts_after_begin_stop_until_exact() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // Read 1 is the pass's; read 2 is the pre-stop terminal sweep; reads 3
+    // and 4 (after begin_stop) leave the refresh incomplete and gappy, and
+    // read 5 exacts it.
+    lane.partial_refresh_reads.extend([3]);
+    lane.gappy_refresh_reads.extend([4]);
+    let count = |count| CountSpec {
+        endpoint: 0,
+        ticket: TICKET,
+        exec: 1,
+        count,
+    };
+    lane.refreshes
+        .extend([vec![], vec![], vec![count(9)], vec![count(12)], vec![]]);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert_eq!(stopped.capture.read_stamps.len(), 5);
+    let log = entries(&log);
+    let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
+    let after: Vec<&str> = log[stopped_at..]
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry == "read" || *entry == "stage:witness")
+        .collect();
+    assert_eq!(
+        after,
+        [
+            "read",
+            "stage:witness",
+            "read",
+            "stage:witness",
+            "read",
+            "stage:witness"
+        ]
+    );
+    assert_eq!(scene.staged_counts, [0, 0, 1, 1, 0]);
+}
+
+/// 2-C3: the terminal refresh is bounded: a refresh that never completes
+/// stops reading at the budget and the stop goes on.
+#[test]
+fn a_terminal_refresh_that_never_completes_is_bounded() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // 10 ms reads, partial up to read 300: the 500 ms budget allows ~50.
+    lane.partial_refresh_reads.extend(3..=300);
+    lane.read_delay = Duration::from_millis(10);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    let log = entries(&log);
+    let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
+    let reads = log[stopped_at..]
+        .iter()
+        .filter(|entry| *entry == "read")
+        .count();
+    assert!((1..150).contains(&reads), "{reads}");
+    assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
 }
 
 /// The terminal sweep is bounded: a sweep that never completes stops

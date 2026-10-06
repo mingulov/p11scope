@@ -581,6 +581,25 @@ fn caller_health_failed_evidence_or_control_is_unknown_not_clean() {
 }
 
 #[test]
+fn caller_batch_attr_matches_the_kernel_batch_layout() {
+    use core::mem::{offset_of, size_of};
+    // `linux/bpf.h` `bpf_attr.batch`: the in/out cursors, the key/value
+    // outputs, the in/out count, then the map fd. An EINVAL from a
+    // malformed attr is indistinguishable from "no batch support", so the
+    // shape is pinned here.
+    assert_eq!(BPF_MAP_LOOKUP_BATCH, 24);
+    assert_eq!(size_of::<BpfMapBatchAttr>(), 56);
+    assert_eq!(offset_of!(BpfMapBatchAttr, in_batch), 0);
+    assert_eq!(offset_of!(BpfMapBatchAttr, out_batch), 8);
+    assert_eq!(offset_of!(BpfMapBatchAttr, keys), 16);
+    assert_eq!(offset_of!(BpfMapBatchAttr, values), 24);
+    assert_eq!(offset_of!(BpfMapBatchAttr, count), 32);
+    assert_eq!(offset_of!(BpfMapBatchAttr, map_fd), 36);
+    assert_eq!(offset_of!(BpfMapBatchAttr, elem_flags), 40);
+    assert_eq!(offset_of!(BpfMapBatchAttr, flags), 48);
+}
+
+#[test]
 fn caller_health_expired_deadline_is_unknown_without_map_access() {
     let mut io = HealthIo::default();
     let health = read_caller_health_with(&mut io, Instant::now() - Duration::from_secs(1));

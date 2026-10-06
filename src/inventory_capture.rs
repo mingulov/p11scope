@@ -21,8 +21,10 @@
 //!    it at once.
 //! 4. Stop: at least one full pass after activation; the terminal read is
 //!    staged before `end_capture_coverage`; `begin_stop`; discovery serviced
-//!    until a complete drain while retirement is polled; one more read;
-//!    `Finish{domain}`; the caller commits and writes the final sinks.
+//!    until a complete drain while retirement is polled; reads until a
+//!    count-refresh sweep completes without gaps (the terminal refresh:
+//!    every witnessed row's final count, still unsettled); `Finish{domain}`;
+//!    the caller commits and writes the final sinks.
 //! 5. A retirement that misses its budget reads `retirement: unsettled` with
 //!    a gap; the capture is dropped after the output (the documented
 //!    blocking reclamation path).
@@ -863,16 +865,28 @@ impl<L> NativeLane<L> {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        // The health horizon for rows the terminal read reported.
-        let last = self.read();
-        events.extend(
-            host.stage_native(
-                NativeBatch::Witness(Box::new(last)),
-                &mut self.capture,
-                now_ns(),
-            )
-            .events,
-        );
+        // The terminal count refresh: after stop began, keep reading
+        // (bounded) until a refresh sweep completes without gaps, so every
+        // witnessed row's count gets its last word. Still unsettled per
+        // D3: the reads happen after stop began, and retirement may not
+        // have closed every link. The last read is the health horizon for
+        // rows the terminal read reported.
+        let refresh_deadline = Instant::now() + self.windows.terminal_sweep_budget;
+        loop {
+            let terminal = self.read();
+            let exact = terminal.refresh_sweep_completed && !terminal.refresh_sweep_gaps;
+            events.extend(
+                host.stage_native(
+                    NativeBatch::Witness(Box::new(terminal)),
+                    &mut self.capture,
+                    now_ns(),
+                )
+                .events,
+            );
+            if exact || Instant::now() >= refresh_deadline {
+                break;
+            }
+        }
         let domain = self.capture.domain();
         events.extend(
             host.stage_native(NativeBatch::Finish { domain }, &mut self.capture, now_ns())

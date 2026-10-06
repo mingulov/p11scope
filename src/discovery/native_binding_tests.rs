@@ -86,6 +86,10 @@ fn read_at(
         read_failures: Vec::new(),
         unrecorded_rows: 0,
         sweep_gaps: false,
+        counts: Vec::new(),
+        refresh_sweep_completed: true,
+        refresh_sweep_gaps: false,
+        refresh_sweeps_completed: 1,
         seen_rows: 0,
         pair_limit: 65_536,
         health: CaptureHealth {

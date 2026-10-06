@@ -3,10 +3,11 @@
 //! attach set, its retained pins, and the entry validators are production.
 
 use super::super::activation::InventoryAttachRequest;
-use super::super::callers::CallerUseIo;
+use super::super::callers::{BatchUnsupported, CallerBatchStep, CallerUseIo};
 use super::*;
 use crate::discovery::inventory_attach_set::tests as fx;
 use crate::plan::AdmissionPolicy;
+use p11scope_ebpf_common::inventory_callers::CALLER_ENTRY_COUNT_SATURATED;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -722,6 +723,14 @@ struct FakeRows {
     syscalls: usize,
     /// lookup() fails for rows with these cookies.
     unreadable: BTreeSet<u64>,
+    /// lookup_batch() works (map order, skipping rows whose value is
+    /// `None`: a real batch carries every pair's value, so a missing one
+    /// vanished before the step). Otherwise it reports unsupported and the
+    /// refresh falls back to per-key lookup.
+    batch_supported: bool,
+    batch_calls: usize,
+    /// lookup_batch() fails with a transport error (never unsupported).
+    fail_batch: bool,
 }
 
 impl FakeRows {
@@ -757,6 +766,48 @@ impl CallerUseIo for FakeRows {
             .rows
             .get(&super::super::callers::row_key(key))
             .and_then(|(_, value)| *value))
+    }
+
+    fn lookup_batch(
+        &mut self,
+        after: Option<&CallerObjectKey>,
+        max: usize,
+    ) -> Result<CallerBatchStep> {
+        self.batch_calls += 1;
+        if self.fail_batch {
+            bail!("injected batch failure");
+        }
+        if !self.batch_supported {
+            return Err(BatchUnsupported.into());
+        }
+        let ordered: Vec<(CallerObjectKey, Option<CallerObjectUse>)> = match after {
+            None => self.rows.values().copied().collect(),
+            Some(key) => self
+                .rows
+                .range((
+                    std::ops::Bound::Excluded(super::super::callers::row_key(key)),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, row)| *row)
+                .collect(),
+        };
+        let mut pairs = Vec::new();
+        let mut rest = ordered.into_iter().peekable();
+        while pairs.len() < max {
+            let Some((key, value)) = rest.next() else {
+                return Ok(CallerBatchStep {
+                    pairs,
+                    completed: true,
+                });
+            };
+            if let Some(value) = value {
+                pairs.push((key, value));
+            }
+        }
+        Ok(CallerBatchStep {
+            pairs,
+            completed: rest.next().is_none(),
+        })
     }
 }
 
@@ -1583,6 +1634,7 @@ fn cookies_compare_only_within_their_domain() {
         endpoint: EndpointId(0),
         host_tgid: 1,
         recorded_at_ns: 1,
+        entry_count: 1,
     };
     assert_eq!(row.cookie(), DomainCookie::new(two, 5));
     assert_eq!(row.cookie().domain(), two);
@@ -2718,4 +2770,397 @@ fn ring_loss_rises_only_above_what_was_seen() {
     assert_eq!(ring_loss_rose(3, Some([3, 9, 9, 9, 9])), None);
     assert_eq!(ring_loss_rose(3, Some([4, 0, 0, 0, 0])), Some(4));
     assert_eq!(ring_loss_rose(0, None), None);
+}
+
+// ---- 2-C3: the count-refresh reader ----
+
+/// Witnesses every row in `rows` (all valid: endpoint 0 of object 0), so
+/// each seeds its count baseline, and returns the cursor.
+fn witnessed(rows: &mut FakeRows, pair_limit: usize) -> CallerUseCursor {
+    let mut cursor = CallerUseCursor::new(pair_limit);
+    let read = cursor.read_with(
+        rows,
+        1_000,
+        Instant::now() + Duration::from_secs(5),
+        4,
+        |_| Some(0),
+        |_, _| None,
+    );
+    assert!(read.sweep_completed, "the seeding sweep must complete");
+    assert!(read.faults.is_empty(), "the seeding rows must be valid");
+    cursor
+}
+
+fn set_count(rows: &mut FakeRows, cookie: u64, count: u64) {
+    let (_, value) = rows
+        .rows
+        .get_mut(&super::super::callers::row_key(&key(cookie, 0)))
+        .unwrap();
+    value.as_mut().unwrap().entry_count = count;
+}
+
+fn updates_of(read: &super::super::callers::CallerCountsRead) -> Vec<(u64, u64)> {
+    read.updates
+        .iter()
+        .map(|(key, value)| (key.image.task_cookie, value.entry_count))
+        .collect()
+}
+
+#[test]
+fn count_refresh_re_reads_seen_rows_in_order_across_quanta() {
+    let mut rows = FakeRows::default();
+    for cookie in 1..=4 {
+        rows.insert(key(cookie, 0), Some(value(40, 0)));
+    }
+    // A first-sight count above one seeds the baseline: no advance, no report.
+    rows.insert(
+        key(5, 0),
+        Some(CallerObjectUse {
+            entry_count: 3,
+            ..value(40, 0)
+        }),
+    );
+    let mut cursor = witnessed(&mut rows, 64);
+    for (cookie, count) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+        set_count(&mut rows, cookie, count);
+    }
+    let window = Instant::now() + Duration::from_secs(5);
+    let first = cursor.refresh_with(&mut rows, 2, window);
+    assert_eq!(updates_of(&first), [(1, 10), (2, 20)]);
+    assert!(first.row_bound_reached && !first.sweep_completed);
+    assert!(first.gaps.is_empty() && first.read_failures.is_empty());
+    let second = cursor.refresh_with(&mut rows, 2, window);
+    assert_eq!(updates_of(&second), [(3, 30), (4, 40)]);
+    assert!(second.row_bound_reached && !second.sweep_completed);
+    let third = cursor.refresh_with(&mut rows, 2, window);
+    assert!(third.updates.is_empty(), "row 5 never advanced");
+    assert!(!third.row_bound_reached);
+    assert!(third.sweep_completed && !third.sweep_gaps);
+    assert_eq!(cursor.refresh_sweeps_completed(), 1);
+    // A quiet sweep reports nothing but still completes.
+    let fourth = cursor.refresh_with(&mut rows, 100, window);
+    assert!(fourth.updates.is_empty() && fourth.sweep_completed);
+    assert_eq!(cursor.refresh_sweeps_completed(), 2);
+}
+
+#[test]
+fn count_refresh_skips_new_and_faulted_rows() {
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    rows.insert(
+        key(2, 0),
+        Some(CallerObjectUse {
+            flags: 3,
+            ..value(40, 0)
+        }),
+    );
+    let mut cursor = CallerUseCursor::new(64);
+    let seed = cursor.read_with(
+        &mut rows,
+        100,
+        Instant::now() + Duration::from_secs(5),
+        4,
+        |_| Some(0),
+        |_, _| None,
+    );
+    assert_eq!(seed.rows.len(), 1);
+    assert_eq!(seed.faults.len(), 1);
+    // New since the witness sweep: never reported by the refresh.
+    rows.insert(key(3, 0), Some(value(40, 0)));
+    set_count(&mut rows, 1, 5);
+    let read = cursor.refresh_with(&mut rows, 100, Instant::now() + Duration::from_secs(5));
+    assert_eq!(updates_of(&read), [(1, 5)]);
+    assert!(read.gaps.is_empty());
+    assert!(read.sweep_completed);
+}
+
+#[test]
+fn a_count_decrease_is_integrity_once_and_never_published() {
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let mut cursor = witnessed(&mut rows, 64);
+    let window = Instant::now() + Duration::from_secs(5);
+    set_count(&mut rows, 1, 9);
+    let up = cursor.refresh_with(&mut rows, 100, window);
+    assert_eq!(updates_of(&up), [(1, 9)]);
+    // A decrease is an integrity gap, never an update.
+    set_count(&mut rows, 1, 4);
+    let down = cursor.refresh_with(&mut rows, 100, window);
+    assert!(down.updates.is_empty(), "a decrease is never published");
+    assert_eq!(down.gaps.len(), 1);
+    let (gap_key, gap_value, fault) = &down.gaps[0];
+    assert_eq!(gap_key.image.task_cookie, 1);
+    assert_eq!(gap_value.unwrap().entry_count, 4);
+    assert_eq!(
+        fault,
+        &CallerRowFault::CountDecrease {
+            before: 9,
+            after: 4
+        }
+    );
+    // The gap stands: rereading the same low count reports nothing new...
+    let again = cursor.refresh_with(&mut rows, 100, window);
+    assert!(again.updates.is_empty() && again.gaps.is_empty());
+    // ...and the published count never moved: only a rise past 9 reports.
+    set_count(&mut rows, 1, 7);
+    let still = cursor.refresh_with(&mut rows, 100, window);
+    assert!(still.updates.is_empty() && still.gaps.is_empty());
+    set_count(&mut rows, 1, 12);
+    let recovered = cursor.refresh_with(&mut rows, 100, window);
+    assert_eq!(updates_of(&recovered), [(1, 12)]);
+    assert!(recovered.gaps.is_empty());
+}
+
+#[test]
+fn count_refresh_reports_a_vanished_tracked_row_once_as_integrity() {
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let mut cursor = witnessed(&mut rows, 64);
+    rows.insert(key(1, 0), None); // vanished between sweeps
+    let window = Instant::now() + Duration::from_secs(5);
+    let read = cursor.refresh_with(&mut rows, 100, window);
+    assert!(read.updates.is_empty());
+    assert_eq!(read.gaps.len(), 1);
+    assert_eq!(read.gaps[0].0.image.task_cookie, 1);
+    assert_eq!(read.gaps[0].1, None);
+    assert_eq!(read.gaps[0].2, CallerRowFault::Vanished);
+    let again = cursor.refresh_with(&mut rows, 100, window);
+    assert!(again.gaps.is_empty(), "a row's gap is reported once");
+}
+
+#[test]
+fn count_refresh_uses_batch_where_it_works() {
+    let mut rows = FakeRows {
+        batch_supported: true,
+        ..Default::default()
+    };
+    for cookie in 1..=3 {
+        rows.insert(key(cookie, 0), Some(value(40, 0)));
+    }
+    let mut cursor = witnessed(&mut rows, 64);
+    // The witness sweep is always per-key.
+    assert_eq!(rows.batch_calls, 0);
+    assert!(rows.syscalls > 0);
+    rows.syscalls = 0;
+    for (cookie, count) in [(1, 11), (2, 12), (3, 13)] {
+        set_count(&mut rows, cookie, count);
+    }
+    let window = Instant::now() + Duration::from_secs(5);
+    let first = cursor.refresh_with(&mut rows, 2, window);
+    assert_eq!(updates_of(&first), [(1, 11), (2, 12)]);
+    assert!(first.row_bound_reached && !first.sweep_completed);
+    assert_eq!(rows.batch_calls, 1);
+    assert_eq!(rows.syscalls, 0, "batch issues no per-key lookup");
+    let second = cursor.refresh_with(&mut rows, 2, window);
+    assert_eq!(updates_of(&second), [(3, 13)]);
+    assert!(second.sweep_completed);
+    assert_eq!(rows.batch_calls, 2);
+    assert_eq!(rows.syscalls, 0);
+}
+
+#[test]
+fn count_refresh_falls_back_to_per_key_where_batch_is_unsupported() {
+    let mut rows = FakeRows::default(); // batch unsupported
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    rows.insert(key(2, 0), Some(value(40, 0)));
+    let mut cursor = witnessed(&mut rows, 64);
+    rows.syscalls = 0;
+    set_count(&mut rows, 1, 6);
+    set_count(&mut rows, 2, 7);
+    let window = Instant::now() + Duration::from_secs(5);
+    let first = cursor.refresh_with(&mut rows, 100, window);
+    assert_eq!(updates_of(&first), [(1, 6), (2, 7)]);
+    assert!(first.sweep_completed);
+    assert_eq!(rows.batch_calls, 1, "the probe runs once");
+    assert!(rows.syscalls > 0, "unsupported batch falls back to per-key");
+    // The latch holds: no second probe.
+    set_count(&mut rows, 1, 8);
+    let second = cursor.refresh_with(&mut rows, 100, window);
+    assert_eq!(updates_of(&second), [(1, 8)]);
+    assert_eq!(rows.batch_calls, 1, "unsupported stays latched");
+}
+
+#[test]
+fn a_batch_probe_error_fails_the_quantum_and_retries_next_pass() {
+    let mut rows = FakeRows {
+        batch_supported: true,
+        fail_batch: true,
+        ..Default::default()
+    };
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let mut cursor = witnessed(&mut rows, 64);
+    set_count(&mut rows, 1, 6);
+    let window = Instant::now() + Duration::from_secs(5);
+    let failed = cursor.refresh_with(&mut rows, 100, window);
+    assert!(failed.updates.is_empty());
+    assert!(!failed.sweep_completed);
+    assert_eq!(failed.read_failures.len(), 1);
+    assert!(
+        failed.read_failures[0].contains("count refresh"),
+        "{}",
+        failed.read_failures[0]
+    );
+    assert!(
+        failed.read_failures[0].contains("injected batch failure"),
+        "{}",
+        failed.read_failures[0]
+    );
+    // A transport error is not a probe verdict: the next pass probes again.
+    rows.fail_batch = false;
+    let retried = cursor.refresh_with(&mut rows, 100, window);
+    assert_eq!(updates_of(&retried), [(1, 6)]);
+    assert_eq!(rows.batch_calls, 2);
+}
+
+#[test]
+fn count_refresh_honors_an_expired_deadline_without_syscalls() {
+    let mut rows = FakeRows {
+        batch_supported: true,
+        ..Default::default()
+    };
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let mut cursor = witnessed(&mut rows, 64);
+    rows.syscalls = 0;
+    rows.batch_calls = 0;
+    let expired = cursor.refresh_with(&mut rows, 100, Instant::now() - Duration::from_secs(1));
+    assert!(expired.deadline_reached && expired.visited == 0);
+    assert!(expired.updates.is_empty());
+    assert_eq!(rows.syscalls, 0);
+    assert_eq!(rows.batch_calls, 0, "an expired deadline probes nothing");
+}
+
+#[test]
+fn count_refresh_with_a_zero_row_bound_reads_nothing() {
+    let mut rows = FakeRows {
+        batch_supported: true,
+        ..Default::default()
+    };
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let mut cursor = witnessed(&mut rows, 64);
+    set_count(&mut rows, 1, 6);
+    rows.syscalls = 0;
+    rows.batch_calls = 0;
+    let read = cursor.refresh_with(&mut rows, 0, Instant::now() + Duration::from_secs(5));
+    assert!(read.row_bound_reached && read.visited == 0);
+    assert!(read.updates.is_empty());
+    assert_eq!(rows.syscalls, 0);
+    assert_eq!(rows.batch_calls, 0);
+}
+
+#[test]
+fn count_refresh_clamps_at_the_saturation_ceiling() {
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let mut cursor = witnessed(&mut rows, 64);
+    set_count(&mut rows, 1, CALLER_ENTRY_COUNT_SATURATED + 4);
+    let window = Instant::now() + Duration::from_secs(5);
+    let read = cursor.refresh_with(&mut rows, 100, window);
+    assert_eq!(read.updates.len(), 1);
+    assert_eq!(
+        read.updates[0].1.saturated_entry_count(),
+        CALLER_ENTRY_COUNT_SATURATED
+    );
+    // Past the ceiling the published count rests: no further updates.
+    set_count(&mut rows, 1, u64::MAX);
+    let again = cursor.refresh_with(&mut rows, 100, window);
+    assert!(again.updates.is_empty() && again.gaps.is_empty());
+}
+
+#[test]
+fn witness_reads_carry_first_sight_counts_and_refresh_them_within_the_same_window() {
+    let mut book = test_book(8, 8, None);
+    let mut fixture = SetFixture::new(8);
+    let delta = fixture.pass("a.so", 2);
+    for endpoint in &delta.endpoints {
+        book.published.insert(endpoint.id.0, endpoint.object);
+    }
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    rows.insert(
+        key(2, 0),
+        Some(CallerObjectUse {
+            entry_count: 3,
+            ..value(40, 1)
+        }),
+    );
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_secs(5)).unwrap();
+    // First read: rows carry their first-sight counts; the refresh finds no
+    // advance past the just-seeded baselines.
+    let mut first = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut first, window, 8);
+    assert_eq!(first.rows.len(), 2);
+    assert_eq!(first.rows[0].entry_count, 1);
+    assert_eq!(first.rows[1].entry_count, 3);
+    assert!(first.counts.is_empty());
+    assert!(first.refresh_sweep_completed && !first.refresh_sweep_gaps);
+    // Second read: the new row reports with its count, the advanced row
+    // refreshes, the quiet row stays silent.
+    rows.insert(key(3, 0), Some(value(40, 0)));
+    set_count(&mut rows, 1, 9);
+    let mut second = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut second, window, 8);
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows[0].entry_count, 1);
+    assert_eq!(second.counts.len(), 1);
+    assert_eq!(second.counts[0].object, delta.endpoints[0].object);
+    assert_eq!(second.counts[0].image.task_cookie, 1);
+    assert_eq!(second.counts[0].image.exec_id, 7);
+    assert_eq!(second.counts[0].count, 9);
+    assert!(second.refresh_sweep_completed);
+}
+
+#[test]
+fn a_count_decrease_in_a_witness_read_lands_in_integrity_never_in_counts() {
+    let mut book = test_book(8, 8, None);
+    let mut fixture = SetFixture::new(8);
+    let delta = fixture.pass("a.so", 2);
+    for endpoint in &delta.endpoints {
+        book.published.insert(endpoint.id.0, endpoint.object);
+    }
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut first = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut first, window, 8);
+    set_count(&mut rows, 1, 9);
+    let mut second = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut second, window, 8);
+    assert_eq!(second.counts.len(), 1);
+    set_count(&mut rows, 1, 4);
+    let mut third = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut third, window, 8);
+    assert!(third.counts.is_empty(), "a decrease is never published");
+    assert_eq!(third.integrity.len(), 1);
+    assert_eq!(third.integrity_total, 1);
+    assert_eq!(book.integrity_total, 1);
+    assert!(
+        third.integrity[0].reason.contains("decreased 9->4")
+            && third.integrity[0].reason.contains("stays 9"),
+        "{}",
+        third.integrity[0].reason
+    );
+}
+
+#[test]
+fn count_refresh_records_read_failures_and_marks_gappy_sweeps() {
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    rows.insert(key(2, 0), Some(value(40, 0)));
+    let mut cursor = witnessed(&mut rows, 64);
+    set_count(&mut rows, 1, 6);
+    set_count(&mut rows, 2, 7);
+    rows.unreadable.insert(2);
+    let window = Instant::now() + Duration::from_secs(5);
+    let read = cursor.refresh_with(&mut rows, 100, window);
+    assert_eq!(updates_of(&read), [(1, 6)]);
+    assert_eq!(read.read_failures.len(), 1);
+    assert!(
+        read.sweep_completed && read.sweep_gaps,
+        "the sweep skipped a row"
+    );
+    // The skipped row is retried by the next sweep, never dropped.
+    rows.unreadable.clear();
+    let retried = cursor.refresh_with(&mut rows, 100, window);
+    assert_eq!(updates_of(&retried), [(2, 7)]);
+    assert!(retried.sweep_completed && !retried.sweep_gaps);
 }

@@ -1578,11 +1578,12 @@ fn privileged_instance_attach_during_reload_loop_has_zero_false_joins() -> Resul
     Ok(())
 }
 
-/// F5 LRU-eviction injection: under a small-state build (INSTANCE_START =
-/// 1) two hammer threads' overlapping in-flight calls evict each other, so
-/// evicted calls surface `Unstamped` and never join — while sequential
-/// calls still join. Static skip: needs a P11SCOPE_SMALL_STATE_MAPS=1
-/// build; run by hand as root with that variable set.
+/// F5 LRU-eviction injection: under a small-state build (one-entry
+/// `INSTANCE_START`) two hammer threads' overlapping in-flight calls evict
+/// each other, so evicted calls surface `Unstamped` and never join — while
+/// sequential calls still join. Static skip: needs a
+/// `P11SCOPE_SMALL_STATE_MAPS=1` build; run by hand as root with that
+/// variable set.
 #[test]
 #[ignore = "privileged: needs a small-state build, run by hand"]
 fn privileged_instance_small_state_lru_eviction_never_joins() -> Result<()> {

@@ -741,6 +741,7 @@ impl InstanceRouter {
     ///    later observation arrives (no fail-on-evict) — else `Unobserved`
     ///    or `Evicted`); 7. the IP checks (`IpOutside`, `NotExecutable`,
     ///    `OffsetMismatch`, `Unpartitionable`, `InstanceCapacity`).
+    ///
     /// Per-call facts beat ambient state; ambient state beats process state.
     /// (`observe` has its own gate order: `Retired`, stale era (fault or
     /// miss latch), then a sticky reading, which audits the sticky bits and

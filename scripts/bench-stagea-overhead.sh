@@ -320,7 +320,7 @@ scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --work
 DISCOVER=./target/release/p11scope-discover
 P11SCOPE=$REPO/target/release/p11scope
 test -x "$P11SCOPE" || die "release observer missing"
-mkdir -p "$WORK/bin"
+mkdir -m 0700 -p "$WORK/bin"
 gcc -O2 -Wall -Wextra -Werror -o "$WORK/bin/map_churn" "$FIX/map_churn.c" \
     || die "map_churn does not compile"
 gcc -O1 -Wall -Wextra -Werror -o "$WORK/bin/gated" tests/fixtures/public-cli/gated.c -ldl \
@@ -444,7 +444,8 @@ run_sample() {
     esac
     SAMPLE_SEQ=$((SAMPLE_SEQ + 1))
     S=$WORK/sample-$(printf '%03d' "$SAMPLE_SEQ")-$rs_cell-$rs_arm-r$rs_round
-    mkdir -p "$S" || die "sample dir"
+    # 0700 regardless of umask: the observer refuses a group-writable -o dir.
+    mkdir -m 0700 -p "$S" || die "sample dir"
     echo "--- sample $SAMPLE_SEQ: $rs_cell $rs_arm round $rs_round ---"
     wait_cool || refuse "host stayed hot (load gate $MAX_LOAD1, $COOLDOWN s)"
     record_load "$S/load.txt" start

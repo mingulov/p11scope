@@ -56,7 +56,7 @@ fn caller(harness: &Harness, index: u32) -> CallerId {
 fn presentation(harness: &Harness) -> Presentation {
     let now = harness.now_ns();
     let passes = harness.coordinator().passes();
-    Presentation::capture(harness.coordinator(), "workload", 0, now, passes, now, now)
+    Presentation::capture(harness.coordinator(), "workload", 0, now, passes)
 }
 
 fn report(pass: u64) -> PassReport {

@@ -1047,6 +1047,12 @@ pub(crate) struct EdgeRecord {
     pub entry_first_seen_ns: Option<u64>,
     pub entry_last_seen_ns: Option<u64>,
     pub entry_in_flight: bool,
+    /// The entry count rose during the latest publication (Choice 3):
+    /// the per-pass activity signal ("rose since previous pass").
+    /// Cleared at each publication's start, set on every strict count
+    /// advance; a saturated rest, an equal re-read, and a pass without
+    /// counts all read quiet.
+    pub entry_rose_since_previous_pass: bool,
     /// Per-edge semantic state (S1): `None` while semantic capture
     /// stays withheld (the scan lane never materializes it), `Some`
     /// once the semantic feed observes this edge. Materialization is
@@ -1719,11 +1725,13 @@ impl CallerRegistry {
         }
     }
 
-    /// Recency answers "active now" from entry last-seen, not from any
-    /// sticky bit: true when an entry was observed within `window_ns` of
-    /// `now_ns`, or an entry is in flight. Test-gated: unit tests pin
-    /// the combined predicate; production splits it through
-    /// [`Self::entry_recent_within`] plus the in-flight flag.
+    /// Recency answers "observed recently" from entry last-seen, not
+    /// from any sticky bit: true when an entry was observed within
+    /// `window_ns` of `now_ns`, or an entry is in flight. The dashboard
+    /// display's predicate (the recorded signal is per-pass instead).
+    /// Test-gated: unit tests pin the combined predicate; production
+    /// splits it through [`Self::entry_recent_within`] plus the
+    /// in-flight flag.
     #[cfg(test)]
     pub(crate) fn entry_active_within(
         &self,
@@ -2141,6 +2149,10 @@ impl CallerRegistry {
     pub(crate) fn publish(&mut self) -> usize {
         let staged = std::mem::take(&mut self.staged);
         let applied = staged.len();
+        // Per-pass activity starts quiet: advances below set it.
+        for edge in self.edges.values_mut() {
+            edge.entry_rose_since_previous_pass = false;
+        }
         for mutation in staged {
             self.apply(mutation);
         }
@@ -2337,6 +2349,7 @@ impl CallerRegistry {
                 // Retired callers are not frozen out: like a witness,
                 // the count is pre-exit history arriving late.
                 if count > edge.entry_count {
+                    edge.entry_rose_since_previous_pass = true;
                     if count == MAX_EDGE_ENTRY_COUNT {
                         edge.entry_count = MAX_EDGE_ENTRY_COUNT;
                         edge.entry_saturated = true;
@@ -2669,6 +2682,7 @@ impl CallerRegistry {
                         entry_first_seen_ns: None,
                         entry_last_seen_ns: None,
                         entry_in_flight: false,
+                        entry_rose_since_previous_pass: false,
                         semantics: None,
                         double_loaded: false,
                         coverage: EdgeCoverage::default(),
@@ -3173,6 +3187,9 @@ impl CallerRegistry {
             return EntryOutcome::UnknownEdge;
         };
         let (count, overflowed) = edge.entry_count.overflowing_add(delta);
+        if count > edge.entry_count {
+            edge.entry_rose_since_previous_pass = true;
+        }
         if count == MAX_EDGE_ENTRY_COUNT || overflowed {
             edge.entry_count = MAX_EDGE_ENTRY_COUNT;
             edge.entry_saturated = true;

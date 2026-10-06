@@ -5004,18 +5004,20 @@ mod tests {
     }
 
     #[test]
-    fn a_rising_count_never_reads_quiet() {
-        // Recency is the rise: a counted edge reads recently-observed
-        // while its rise is in the window, quiet once stale — and a
-        // fresh rise always beats quiet. (Each capture is an
-        // independent snapshot; only the stamps order them.)
+    fn a_rising_count_reads_recent_on_the_dashboard_display_while_in_window() {
+        // Dashboard display only: a counted edge reads recently-observed
+        // on screen while its rise is in the trailing window, quiet once
+        // stale — and a fresh rise always beats quiet. (Each capture is
+        // an independent snapshot; only the stamps order them. The
+        // recorded signal is per-pass; see
+        // `per_pass_activity_reads_a_rise_then_quiet_on_unchanged_passes`.)
         use crate::inventory_present::{Activity, Presentation};
         let (mut native, caller) = NativeScene::new();
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
         native.witness(vec![row]);
         let activity_at = |native: &NativeScene, now_ns: u64, window_ns: u64| {
-            Presentation::capture(
+            Presentation::capture_dashboard(
                 &native.scene.coordinator,
                 "s",
                 0,
@@ -5196,17 +5198,10 @@ mod tests {
             matches!(coverage, UseCoverage::Counted { lossy: true, .. }),
             "failed refreshes publish lossy freshness: {coverage:?}"
         );
-        // Live: stale past a short window withholds quiet.
+        // Live: the per-pass signal withholds quiet over the stale
+        // count, window-free.
         let last_seen = last_seen.expect("the positive read left a last-seen");
-        let live = Presentation::capture(
-            &native.scene.coordinator,
-            "s",
-            0,
-            last_seen + 2000,
-            1,
-            last_seen + 2000,
-            1000,
-        );
+        let live = Presentation::capture(&native.scene.coordinator, "s", 0, last_seen, 1);
         let activity = live
             .edges
             .iter()
@@ -5237,6 +5232,121 @@ mod tests {
     }
 
     #[test]
+    fn per_pass_activity_reads_a_rise_then_quiet_on_unchanged_passes() {
+        // ACT (Choice 3 re-rule): activity is per-pass ("rose since
+        // previous pass"), pinned with production clock ordering: a rise
+        // reads recently observed; following unchanged passes read quiet
+        // (never a window echo); unreadable refreshes read lossy; a later
+        // rise reads recently observed again.
+        use crate::inventory_present::{Activity, Presentation};
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        // Production ordering: passes commit in stamp order, and every
+        // presentation reads the pass it presents after it committed.
+        // The signal is per-pass (window-free): only the pass sequence
+        // orders it.
+        let activity_of = |native: &NativeScene| {
+            Presentation::capture(&native.scene.coordinator, "s", 0, 0, 1)
+                .edges
+                .into_iter()
+                .find(|edge| edge.caller == caller)
+                .expect("the caller has its edge")
+                .activity
+        };
+        // Rising: first sight, then an advance.
+        native.witness(vec![native.row(41, 1, 7, 100, 0)]);
+        assert_eq!(
+            activity_of(&native),
+            Activity::RecentlyObserved,
+            "first sight rose"
+        );
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 6)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            activity_of(&native),
+            Activity::RecentlyObserved,
+            "the advance rose"
+        );
+        // Unchanged, then stale: quiet, whatever any window covers.
+        for _ in 0..2 {
+            native.read(Vec::new());
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        assert_eq!(
+            activity_of(&native),
+            Activity::Quiet,
+            "unchanged passes read quiet, never a window echo"
+        );
+        // The dashboard display keeps its window: the stale rise still
+        // reads recently observed on screen while in the trailing
+        // window, quiet once past it.
+        let display_of = |native: &NativeScene, now_ns: u64| {
+            Presentation::capture_dashboard(
+                &native.scene.coordinator,
+                "s",
+                0,
+                now_ns,
+                1,
+                now_ns,
+                crate::inventory_present::DASHBOARD_ACTIVITY_WINDOW_NS,
+            )
+            .edges
+            .into_iter()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has its edge")
+            .activity
+        };
+        let last_seen = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has its edge")
+            .entry_last_seen_ns
+            .expect("the rise left a last-seen");
+        assert_eq!(
+            display_of(&native, last_seen + 1_000),
+            Activity::RecentlyObserved,
+            "the display keeps window recency"
+        );
+        assert_eq!(
+            display_of(
+                &native,
+                last_seen + crate::inventory_present::DASHBOARD_ACTIVITY_WINDOW_NS + 1
+            ),
+            Activity::Quiet,
+            "the display goes quiet past its window"
+        );
+        // Unreadable: the refresh fails persistently.
+        native.scene.coordinator.begin_capture_coverage(None);
+        for _ in 0..2 {
+            let at = native.stamps.tick();
+            let mut batch = witness_batch();
+            batch.domain = native.domain;
+            batch.read_failures = vec!["count refresh: lookup of cookie 41 failed".into()];
+            batch.health.discovery_counters = Some([0; 5]);
+            batch.health_read_ns = at;
+            batch.rows_read_ns = at + 1;
+            native.stage(NativeBatch::Witness(Box::new(batch)));
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        assert_eq!(
+            activity_of(&native),
+            Activity::Lossy,
+            "unreadable refreshes withhold quiet"
+        );
+        // A later rise beats lossy.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 12)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            activity_of(&native),
+            Activity::RecentlyObserved,
+            "a fresh rise beats lossy"
+        );
+    }
+
+    #[test]
     fn native_counts_render_identically_in_json_jsonl_and_dashboard() {
         // C7 C4 three-consumer equality: a natively counted edge —
         // count, coverage, observation, activity — reads the same in
@@ -5255,8 +5365,7 @@ mod tests {
         native.witness(vec![row]);
         native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
         native.scene.coordinator.commit_batch(false).unwrap();
-        let presentation =
-            Presentation::capture(&native.scene.coordinator, "native", 0, 2000, 1, 2000, 2000);
+        let presentation = Presentation::capture(&native.scene.coordinator, "native", 0, 2000, 1);
         let document =
             crate::inventory::render_json(&native.scene.coordinator, "native", 0, 2000, 1);
         assert_eq!(presentation.edges.len(), 1);
@@ -5309,8 +5418,18 @@ mod tests {
         assert_eq!(entries_display(edge), "9");
         let mut tail = LogTail::bounded();
         tail.push("p11scope: pass 1: 1 scanned (1 native, 0 scan-pinned)");
+        // The frame reads the dashboard display's windowed view.
+        let display = Presentation::capture_dashboard(
+            &native.scene.coordinator,
+            "native",
+            0,
+            2000,
+            1,
+            2000,
+            crate::inventory_present::DASHBOARD_ACTIVITY_WINDOW_NS,
+        );
         let frame = DisplayFrame {
-            presentation: std::sync::Arc::new(presentation.clone()),
+            presentation: std::sync::Arc::new(display),
             log: tail.snapshot(),
         };
         let text = String::from_utf8(render_frame(
@@ -5754,7 +5873,7 @@ mod tests {
     // ---- DR-LIVE-LABEL-LAG: a pending first-use row reads unknown ----
 
     /// The shared presentation over a native scene's coordinator: the one
-    /// view JSON, the event stream and dashboard frames read.
+    /// view JSON and the event stream read (per-pass activity signal).
     fn presented(native: &NativeScene) -> crate::inventory_present::Presentation {
         crate::inventory_present::Presentation::capture(
             &native.scene.coordinator,
@@ -5762,8 +5881,6 @@ mod tests {
             0,
             3_000,
             3,
-            3_000,
-            crate::inventory_present::DASHBOARD_ACTIVITY_WINDOW_NS,
         )
     }
 

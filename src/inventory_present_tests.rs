@@ -96,15 +96,7 @@ fn capture_for(harness: &Harness, document: &serde_json::Value) -> Presentation 
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
     let passes = document["observation"]["passes"].as_u64().unwrap();
-    Presentation::capture(
-        harness.coordinator(),
-        "workload",
-        started,
-        ended,
-        passes,
-        ended,
-        ended.saturating_sub(started),
-    )
+    Presentation::capture(harness.coordinator(), "workload", started, ended, passes)
 }
 
 #[test]
@@ -392,8 +384,9 @@ fn activity_splits_in_flight_from_recent_from_quiet() {
     assert_eq!(activity(c0), Activity::RecentlyObserved);
     assert_eq!(activity(c1), Activity::InFlight);
     assert_eq!(activity(c2), Activity::Quiet);
-    // An old entry outside the window reads as quiet, not recent.
-    let stale = Presentation::capture(
+    // The dashboard display keeps its window: an old entry outside it
+    // reads as quiet, not recent.
+    let stale = Presentation::capture_dashboard(
         harness.coordinator(),
         "workload",
         0,
@@ -1141,16 +1134,11 @@ fn uncovered_edges_read_neither_idle_nor_armed() {
         registry.observe_entries(caller, &scale_key(2), 2, 20);
     }
     harness.commit();
+    // One more pass without counts: per-pass activity clears the rise,
+    // so the old counted edge reads quiet.
+    harness.commit();
     let document = harness.render();
-    let presentation = Presentation::capture(
-        harness.coordinator(),
-        "workload",
-        0,
-        now,
-        2,
-        now,
-        DASHBOARD_ACTIVITY_WINDOW_NS,
-    );
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 0, now, 3);
     let view = |key: &ModuleKey| {
         let id = harness.coordinator().registry().module_id_for(key).unwrap();
         presentation

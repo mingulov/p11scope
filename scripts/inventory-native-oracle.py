@@ -189,9 +189,10 @@ CAPTURE = {
 }
 PRESENCE = {"mapped": "mapped", "unloaded": "unloaded", "exited": "process exited", "unknown": "unknown"}
 EDGE_STATES = ("presence", "capture", "activity")
-# inventory_present.rs DASHBOARD_ACTIVITY_WINDOW_NS: recency is judged against
-# the frame's now; a counted edge seen within this of the run end may read recent.
-DASHBOARD_RECENT_WINDOW_NS = 5_000_000_000
+# Choice 3 (ACT re-rule): the recorded activity signal is per-pass
+# ("rose since previous pass"), window-free. The dashboard display
+# keeps its own trailing window, but frames never reach this oracle
+# with a frame time, so DASH-EDGE-LABELS admits base-or-recent there.
 FRAME = {
     "repaint": b"\x1b[H",
     "alt_on": b"\x1b[?1049h",
@@ -760,39 +761,43 @@ def expected_presence(caller, module, edge):
     return PRESENCE["unknown"]
 
 
-def expected_activity(edge, end_ns):
-    """inventory-events-v1 `activity` from the snapshot; recency (counted only)
-    may additionally read recent when last_seen is within the dashboard window."""
-    # C7 C5: Choice 3 (activity via recency window) is PENDING-RE-RULE —
-    # an outside review reversed its acceptance and a follow-up task
-    # re-rules activity to per-pass ("rose since previous pass") in the
-    # product AND this derivation together. Until then the pre-C5 5 s
-    # rule stands everywhere: note a stale counted edge reads quiet here
-    # while the current product reads recent (whole-run window), so the
-    # follow-up must change both sides or real streams fail AGREE-EDGE-EVENTS.
-    entries = edge["entries"]
-    cov = coverage(edge)
-    if entries.get("in_flight") or (edge.get("operations") or {}).get("active"):
-        return {ACTIVITY["inflight"]}
+def expected_activity_base(payload):
+    """The activity base label for an edge-shaped payload (a snapshot
+    edge or an edge_observed record's event): everything except the
+    per-pass rise. `recent` is never the base — EDGE-ACTIVITY admits it
+    only where a rise allows it."""
+    entries = payload.get("entries") or {}
+    cov = coverage(payload)
+    if entries.get("in_flight") or (payload.get("operations") or {}).get("active"):
+        return ACTIVITY["inflight"]
     if cov.get("state") == "witnessed":
-        base = ACTIVITY["used"]
-    elif edge.get("mapping", {}).get("state") != MAPPING_LIVE or frozen_watch(edge):
-        base = ACTIVITY["unknown"]
-    elif cov.get("state") == UNKNOWN_STATE and cov.get("reason") == PENDING_FIRST_USE_REASON:
+        return ACTIVITY["used"]
+    if payload.get("mapping", {}).get("state") != MAPPING_LIVE or frozen_watch(payload):
+        return ACTIVITY["unknown"]
+    if cov.get("state") == UNKNOWN_STATE and cov.get("reason") == PENDING_FIRST_USE_REASON:
         # DR-LIVE-LABEL-LAG: the edge is watched, so "not covered" would
         # lie — a read-but-undecided first use reads unknown.
-        base = ACTIVITY["unknown"]
-    elif (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
-        base = ACTIVITY["quiet"]
-    elif cov.get("state") == "counted":
-        base = ACTIVITY["lossy"]
-    else:
-        base = ACTIVITY["uncovered"]
-    allowed = {base}
-    last = entries.get("last_seen_ns")
-    if cov.get("state") == "counted" and last is not None and end_ns - last <= DASHBOARD_RECENT_WINDOW_NS:
-        allowed.add(ACTIVITY["recent"])
-    return allowed
+        return ACTIVITY["unknown"]
+    if (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
+        return ACTIVITY["quiet"]
+    if cov.get("state") == "counted":
+        return ACTIVITY["lossy"]
+    return ACTIVITY["uncovered"]
+
+
+def per_pass_recent_allowed(payload, prev_count):
+    """Whether `recent` is legal on this counted record: a rise since
+    the edge's previous record allows it (the emission may lag the
+    rising pass), as does a first record (emission-cap deferral may
+    delay it past the rising pass). An unchanged count forbids it —
+    that is the Choice 3 pin. Non-counted payloads never allow it."""
+    cov = coverage(payload)
+    if cov.get("state") != "counted" or cov.get("lossy"):
+        return False
+    count = (payload.get("entries") or {}).get("count")
+    if prev_count is None or not isinstance(count, int) or not isinstance(prev_count, int):
+        return True
+    return count > prev_count
 
 
 def frozen_watch(edge):
@@ -858,7 +863,9 @@ def settlement_verdict(doc):
 def edge_payload_problems(view, key, ev):
     """Problems ([]) when the edge_observed payload `ev` disagrees with the
     decided snapshot edge for `key`: DR-C5-EDGE replay minus the three
-    derived states, which must match the oracle's own derivation."""
+    derived states. Presence and capture must match the oracle's own
+    derivation here; activity is per-pass and judged record-by-record
+    (with its previous record) by EDGE-ACTIVITY instead."""
     edge = view.edges.get(key)
     if edge is None:
         return [(key, "not in snapshot")]
@@ -872,8 +879,6 @@ def edge_payload_problems(view, key, ev):
         problems.append((key, f"presence {ev.get('presence')!r} != {expected_presence(caller, module, edge)!r}"))
     if ev.get("capture") != expected_capture(caller, module, edge):
         problems.append((key, f"capture {ev.get('capture')!r}"))
-    if ev.get("activity") not in expected_activity(edge, view.window[1]):
-        problems.append((key, f"activity {ev.get('activity')!r}"))
     return problems
 
 
@@ -1081,6 +1086,37 @@ def check_streams(view, res):
                 clock_bad.append((key, f"seq {pseq}->{cseq} clock regresses {prev_at}->{cur_at}"))
     res.ok(run, "*", "EDGE-CLOCK", not clock_bad,
            f"{len(clock_bad)} edge_observed records carry invalid or regressing clocks: {clock_bad[:4]}")
+    # ACT (Choice 3 pin): activity is per-pass. Every record (middle,
+    # last, and terminal — no sweep exemption: an unchanged terminal
+    # re-emission reads quiet too) is judged against its own coverage
+    # plus its edge's previous record: published counts never decrease
+    # (a strict product invariant), an unchanged counted record reads
+    # its base (a window echo fails), and a rise — or a first record,
+    # whose emission the per-pass cap may have deferred past the rising
+    # pass — admits recent-or-base. Non-counted records read base.
+    activity_bad = []
+    for key in sorted(by_edge, key=str):
+        rows = sorted(by_edge[key], key=lambda e: e.get("seq", 0))
+        prev_count = None
+        for row in rows:
+            ev = row.get("event") if isinstance(row.get("event"), dict) else None
+            if ev is None or not isinstance(ev.get("entries"), dict):
+                prev_count = None
+                continue
+            count = ev["entries"].get("count")
+            base = expected_activity_base(ev)
+            if isinstance(count, int) and isinstance(prev_count, int) and count < prev_count:
+                activity_bad.append((key, f"seq {row.get('seq')} count decreases {prev_count}->{count}"))
+            elif ev.get("activity") != base and not per_pass_recent_allowed(ev, prev_count):
+                activity_bad.append((key, f"seq {row.get('seq')} reads {ev.get('activity')!r}, "
+                                          f"want {base!r} (count {prev_count}->{count})"))
+            elif ev.get("activity") not in {base, ACTIVITY["recent"]}:
+                activity_bad.append((key, f"seq {row.get('seq')} reads {ev.get('activity')!r}, "
+                                          f"want {base!r} or {ACTIVITY['recent']!r}"))
+            prev_count = count if isinstance(count, int) else None
+    res.ok(run, "*", "EDGE-ACTIVITY", not activity_bad,
+           f"{len(activity_bad)} edge_observed records misread per-pass activity: {activity_bad[:4]}",
+           f"{sum(len(v) for v in by_edge.values())} edge_observed records read per-pass activity")
     # O2: the final sweep is exact but not exempt from scrutiny. Past the
     # last pass marker every edge carries at most one terminal record —
     # production's sweep re-emits only uncarried edges (zero when the
@@ -1782,10 +1818,17 @@ def check_dashboard(view, images_by_cell, res):
             mine[(image.pid, image.start)] = cell
 
     def want_for(caller, module, edge):
+        # Frames show the dashboard display (window recency at the frame's
+        # own time, which the oracle cannot see): a counted edge may
+        # legally read either its base or recent on screen.
+        activity = {expected_activity_base(edge)}
+        cov = coverage(edge)
+        if cov.get("state") == "counted" and not cov.get("lossy"):
+            activity.add(ACTIVITY["recent"])
         return {"capture": {expected_capture(caller, module, edge)},
                 "entries": {expected_entries_display(edge)},
                 "semantics": {edge.get("semantics")},
-                "activity": expected_activity(edge, view.window[1])}
+                "activity": activity}
 
     # DR-ORACLE-GATE: every frame is compared with the edge state at its
     # own pass from the event stream. A frame rendered before the stop
@@ -2242,7 +2285,7 @@ class Synth:
             for e in doc["edges"]:
                 ev = dict(_deep(e), presence=expected_presence(callers[e["caller"]], modules[e["module"]], e),
                           capture=expected_capture(callers[e["caller"]], modules[e["module"]], e),
-                          activity=sorted(expected_activity(e, doc["observation"]["ended_ns"]))[0])
+                          activity=expected_activity_base(e))
                 rows.append(("edge_observed", ev))
                 edge_rows += 1
         rows += extra or []
@@ -2266,7 +2309,7 @@ class Synth:
                  "--- edges 1-2 of 2 [summary] ---"]
         for e in doc["edges"]:
             c, m = callers[e["caller"]], modules[e["module"]]
-            activity = sorted(expected_activity(e, doc["observation"]["ended_ns"]))[0]
+            activity = expected_activity_base(e)
             activity = (overrides or {}).get((e["caller"], e["module"]), activity)
             lines.append(f"{e['caller']} pid {c['pid']} ({c['image']['exe']['path']}) -> {e['module']} ({m['paths'][0]})")
             lines.append(f"  mapping {e['mapping']['state']} | presence mapped | capture {expected_capture(c, m, e)} | "
@@ -2694,7 +2737,7 @@ def self_test():
                 edge = _edge(dash, s.dash_ids["P3"], s.mid["C"])
                 frames = s.frames(dash)
                 item, value = old_item
-                now = {"activity": sorted(expected_activity(edge, dash["observation"]["ended_ns"]))[0],
+                now = {"activity": expected_activity_base(edge),
                        "entries": expected_entries_display(edge)}
                 items = f"capture {expected_capture({}, {}, edge)} | activity {now['activity']} | " \
                         f"entries {now['entries']} |"
@@ -2755,7 +2798,7 @@ def self_test():
                 if row["kind"] == "edge_observed" and row["event"]["entries"]["coverage"].get("until_ns"):
                     row["event"]["activity"] = ACTIVITY["quiet"]
             return {"events": ev}
-        case("frozen-watch-event-quiet", "AGREE-EDGE-EVENTS", frozen_quiet_event)
+        case("frozen-watch-event-quiet", "EDGE-ACTIVITY", frozen_quiet_event)
 
         def empty(s, d, dash):
             d["callers"], d["edges"], d["modules"] = [], [], []
@@ -2885,15 +2928,14 @@ def self_test():
                 failures.append(f"presence-{caller_lc}-{module_lc}-{edge['mapping']['state']}")
 
         # Uncounted derivations (C4: they fall out of the Unknown mapping).
-        end = T0 + 60_000 * MS
-
         def _counted(last):
             return {"mapping": {"state": MAPPING_LIVE}, "operations": None,
                     "entries": {"count": 5, "last_seen_ns": last, "in_flight": False, "observation": "observed",
                                 "coverage": {"state": "counted", "since_ns": T0, "until_ns": None, "first_ns": None,
                                              "lossy": False, "reason": None, "detail": None}}}
 
-        # (No recency-window assertions: Choice 3 is PENDING-RE-RULE.)
+        # (Choice 3 re-ruled: activity is per-pass; the window survives
+        # only in the dashboard display, which self-test frames cover.)
         unc = _counted(None)
         unc["entries"].update(count=0, observation="unknown (usage observation unavailable)")
         unc["entries"]["coverage"].update(state=UNKNOWN_STATE, reason=UNCOUNTED_REASON,
@@ -2902,7 +2944,7 @@ def self_test():
                      {"admission": {"state": "admitted"}, "lifecycle": "mapped"})
         if expected_capture(*endpoints, unc) != CAPTURE["lost"]:
             failures.append("uncounted-capture-derivation")
-        if expected_activity(unc, end) != {ACTIVITY["uncovered"]}:
+        if expected_activity_base(unc) != ACTIVITY["uncovered"]:
             failures.append("uncounted-activity-derivation")
         if expected_entries_display(unc) != "?":
             failures.append("uncounted-entries-derivation")
@@ -3106,7 +3148,7 @@ def self_test():
             assert row["event"]["activity"] == ACTIVITY["uncovered"], row["event"]
             row["event"]["activity"] = ACTIVITY["unknown"]
             return {"events": ev}
-        case("uncounted-activity-unknown", "AGREE-EDGE-EVENTS", uncounted_activity)
+        case("uncounted-activity-unknown", "EDGE-ACTIVITY", uncounted_activity)
 
         def uncounted_capture(s, d, dash):
             ev, row = uncounted_record(s, d)
@@ -3151,10 +3193,68 @@ def self_test():
             return drift_stages(s, d, "P1", [(prev, T0 + 500), (n, T0 + 500 + 1_000_000_000)])
         case("bucket-jump-fast-pass", None, bucket_jump)
 
-        # Choice 3 (activity via recency window) is PENDING-RE-RULE per a
-        # binding controller steer: it will be re-ruled to per-pass in a
-        # follow-up task, so C5 pins Choices 1-2 only and adds no
-        # recency-window stream fixtures here.
+        # Choice 3 (ACT re-rule): activity is per-pass ("rose since
+        # previous pass"), never a recency window. An unchanged
+        # consecutive record must read quiet; a rise allows recent or
+        # quiet (the emission may lag the rising pass); counts never
+        # decrease.
+        def activity_stages(s, d, cell, stages):
+            """Like drift_stages, but each stage is (count, at_ns,
+            activity): the last stage must carry the snapshot count."""
+            cid_, mid = cid(s, cell), s.mid["A"]
+            ev = s.events(d)
+            template = [e for e in ev if e["kind"] == "edge_observed"
+                        and e["event"].get("caller") == cid_ and e["event"].get("module") == mid][-1]
+            keep = [e for e in ev if not (e["kind"] == "edge_observed"
+                                          and e["event"].get("caller") == cid_
+                                          and e["event"].get("module") == mid)]
+            at = next(i for i, e in enumerate(keep) if e["kind"] == "pass_committed")
+            new = []
+            for count, at_ns, activity in stages:
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["event"]["activity"] = activity
+                rec["at_ns"] = at_ns
+                new.append(rec)
+            out = keep[:at] + new + keep[at:]
+            next(e for e in out if e["kind"] == "pass_committed")["event"]["edge_events"] += len(new) - 1
+            return {"events": _renumber(out)}
+
+        def rise_then_quiet(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            assert n >= 2, n
+            # The rise flips quiet->recent (a class change, cadence-free);
+            # the cadence re-emission 10 s later reads quiet.
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["quiet"]),
+                                                (n, T0 + 600, ACTIVITY["recent"]),
+                                                (n, T0 + 700 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["quiet"])])
+        case("per-pass-rise-then-quiet", None, rise_then_quiet)
+
+        def fresh_last_seen(s, d):
+            # In-window at the run end, so the old window rule allows
+            # recent and only the per-pass pin can catch the echo.
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["last_seen_ns"] = \
+                d["observation"]["ended_ns"] - 1_000
+
+        def window_echo(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            assert n >= 2, n
+            fresh_last_seen(s, d)
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["quiet"]),
+                                                (n, T0 + 600, ACTIVITY["recent"]),
+                                                (n, T0 + 700 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["recent"])])
+        case("per-pass-window-echo-fails", "EDGE-ACTIVITY", window_echo)
+
+        def count_falls(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            assert n >= 2, n
+            # A decrease mid-stream (each pair 10 s apart, cadence-free);
+            # the last record still carries the snapshot count.
+            fresh_last_seen(s, d)
+            return activity_stages(s, d, "P1", [(n, T0 + 500, ACTIVITY["recent"]),
+                                                (n - 1, T0 + 600 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["quiet"]),
+                                                (n, T0 + 700 + 2 * COUNT_EMIT_INTERVAL_NS, ACTIVITY["recent"])])
+        case("per-pass-count-decreases-fails", "EDGE-ACTIVITY", count_falls)
 
         # C2 extension: the decided snapshot never carries pending_first_use.
         def pending_snapshot(s, d, dash):

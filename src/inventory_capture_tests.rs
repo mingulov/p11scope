@@ -955,8 +955,6 @@ fn a_rising_count_reads_recently_observed_at_its_own_pass_publication() {
                     started_ns,
                     now_ns,
                     scene.coordinator.passes(),
-                    now_ns,
-                    now_ns.saturating_sub(started_ns),
                 );
                 let caller = scene.caller(PID);
                 let edge = presentation

@@ -1434,6 +1434,74 @@ fn privileged_instance_fork_without_exec_stays_consistent() -> Result<()> {
     Ok(())
 }
 
+/// Task 1d overhead gate: the mapping hooks attach for profile sessions
+/// but stay down for metrics (aggregate-only) sessions, whose attach still
+/// succeeds with every slot unmapped (`NO_FILE`: no stamp can ever route).
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_hooks_attach_for_profile_but_not_metrics() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let object = plan.slots[0].object;
+    let metrics = Session::start(
+        &plan,
+        &Scope::Pid(target.pid()),
+        &pins,
+        CapturePolicy::AggregateOnly,
+        None,
+        None,
+        None,
+        BackendSelection::Singles,
+    )?;
+    ensure!(
+        metrics.attach_failures().is_empty(),
+        "metrics attach failures: {:?}",
+        metrics.attach_failures()
+    );
+    let refused = metrics
+        .instance_tracking()
+        .refused()
+        .context("a metrics session attached the instance hooks")?;
+    ensure!(
+        refused.contains("aggregate-only (metrics)"),
+        "metrics refusal names the policy: {refused}"
+    );
+    ensure!(
+        metrics.instance_tracking().watched(object).is_none(),
+        "a metrics session watched a provider file"
+    );
+    drop(metrics);
+    let profile = Session::start(
+        &plan,
+        &Scope::Pid(target.pid()),
+        &pins,
+        CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        BackendSelection::Singles,
+    )?;
+    ensure!(
+        profile.attach_failures().is_empty(),
+        "profile attach failures: {:?}",
+        profile.attach_failures()
+    );
+    ensure!(
+        profile.instance_tracking().refused().is_none(),
+        "profile refused: {:?}",
+        profile.instance_tracking().refused()
+    );
+    ensure!(
+        profile.instance_tracking().watched(object).is_some(),
+        "a profile session watched nothing"
+    );
+    Ok(())
+}
+
 /// Decision §3c fault injection: `OVERFLOW` at the 9th watched file in one
 /// process. Nine provider files load before attach (unwatched, unclaimed);
 /// post-attach reloads claim the eight record cells in order, and the

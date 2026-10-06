@@ -151,12 +151,21 @@ fn lto_refusal() -> Option<String> {
 impl InstanceTracking {
     /// Loads and attaches the hooks. Never fails the session: a failure is
     /// returned as a refused tracker whose reason names the first error.
-    pub(crate) fn start(ebpf: &mut Ebpf, btf: &Btf) -> Self {
+    /// Refusal order is measurement toggle, then policy (Task 1d: metrics
+    /// never joins per-call records, so it never pays the hooks), then LTO.
+    pub(crate) fn start(ebpf: &mut Ebpf, btf: &Btf, policy: super::CapturePolicy) -> Self {
         let mut tracking = Self::default();
         if hooks_disabled_by_env() {
             tracking.refused = Some(format!(
                 "instance continuity hooks refused: disabled by {DISABLE_HOOKS_ENV}=1 (Stage A overhead measurement)"
             ));
+            return tracking;
+        }
+        if !policy.wants_instance_hooks() {
+            tracking.refused = Some(
+                "instance continuity hooks refused: aggregate-only (metrics) sessions never join per-call records to load instances (Task 1d overhead gate)"
+                    .to_string(),
+            );
             return tracking;
         }
         if let Some(reason) = lto_refusal() {

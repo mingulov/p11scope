@@ -59,7 +59,7 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (94 ignored tests in the default-feature lib binary): 76 run by
+# Curation (95 ignored tests in the default-feature lib binary): 77 run by
 # default, 5 run only with --include-long, 13 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -75,6 +75,7 @@ DEFAULT_TESTS=(
 attach::instance_tests::privileged_instance_attach_during_reload_loop_has_zero_false_joins
 attach::instance_tests::privileged_instance_exec_renews_the_instance
 attach::instance_tests::privileged_instance_fork_without_exec_stays_consistent
+attach::instance_tests::privileged_instance_hooks_attach_for_profile_but_not_metrics
 attach::instance_tests::privileged_instance_mapping_controls_never_join_old_state
 attach::instance_tests::privileged_instance_mremap_dontunmap_keeps_both_and_renews
 attach::instance_tests::privileged_instance_nonleader_exec_detaches_without_misrouting

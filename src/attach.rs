@@ -818,6 +818,21 @@ impl CapturePolicy {
         !matches!(self, Self::AggregateOnly)
     }
 
+    /// Whether the policy can consume load-instance continuity (Task 3 Stage
+    /// A): profile/trace join per-call records to load instances, so their
+    /// sessions attach the three mapping hooks; metrics (aggregate-only)
+    /// never drains a per-call record and skips them. The split is Task 1d's
+    /// overhead gate: the hooks cost ~280-415 ns per mapping event
+    /// system-wide (plus the fentry trampoline), so a policy that cannot use
+    /// them must not pay. Explicit match, not `uses_events()`: a future
+    /// variant must decide here at compile time.
+    pub const fn wants_instance_hooks(self) -> bool {
+        match self {
+            Self::Allowlisted | Self::UnsafeUnvalidatedMetadata => true,
+            Self::AggregateOnly => false,
+        }
+    }
+
     pub const fn uses_unsafe_decoders(self) -> bool {
         matches!(self, Self::UnsafeUnvalidatedMetadata)
     }
@@ -3213,7 +3228,9 @@ impl Session {
             })?;
         // After the mandatory lifecycle links and before any endpoint link
         // (ordering I1). A failure refuses instance routing, not capture.
-        let instance = InstanceTracking::start(&mut ebpf, &btf);
+        // Metrics sessions skip the hooks (Task 1d overhead gate): they
+        // never join per-call records, so their slots stay unmapped.
+        let instance = InstanceTracking::start(&mut ebpf, &btf, policy);
 
         Ok(Self {
             stop_gate: stop_gate.expect("preparation established the stop gate"),
@@ -4567,6 +4584,17 @@ mod capture_policy {
             CapturePolicy::UnsafeUnvalidatedMetadata.config_bit(),
             CapturePolicy::AggregateOnly.config_bit()
         );
+    }
+
+    #[test]
+    fn instance_hooks_attach_only_where_per_call_records_join() {
+        // Task 1d overhead gate: the mapping hooks cost ~280-415 ns per
+        // event system-wide, so only policies that join per-call records
+        // to load instances (profile/trace) attach them; metrics
+        // (aggregate-only) never drains a per-call record and skips them.
+        assert!(CapturePolicy::Allowlisted.wants_instance_hooks());
+        assert!(CapturePolicy::UnsafeUnvalidatedMetadata.wants_instance_hooks());
+        assert!(!CapturePolicy::AggregateOnly.wants_instance_hooks());
     }
 }
 

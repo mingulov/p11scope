@@ -17,9 +17,28 @@ inconsistent (no completion marker, short rounds, parameter mismatch, no
 hook execution on an on-arm sample). Exit 2 on usage errors (bad flags, a
 missing or malformed manifest file).
 """
+import hashlib
 import json
 import statistics
 import sys
+
+# Grandfathered completion evidence: the explicitly reviewed pre-manifest 1d
+# campaign only (commit 301dde4, task-1d report). The legacy path accepts no
+# other stdout, log, or expectation set: every other campaign must carry its
+# own DONE marker. Pins: the reviewed campaign-stdout bytes plus the
+# corroborated expectations of task-devastrafix-1d-manifest.json.
+LEGACY_CAMPAIGN_SHA256 = "07b059e0a45a97c684fe28d08df11967e8902145d563150b43304908be733147"
+LEGACY_ARMS_PER_ROUND = 4
+LEGACY_FIRST_ARM = "on"
+LEGACY_EVENTS_PER_OP = 2
+LEGACY_CELLS = {
+    "relevant-mmap": {"rounds": 3, "ops": 1000000, "mode": "mmap", "parallel": 1},
+    "relevant-mmap-p8": {"rounds": 2, "ops": 8000000, "mode": "mmap", "parallel": 8},
+    "relevant-mremap": {"rounds": 2, "ops": 1000000, "mode": "mremap", "parallel": 1},
+    "unrelated-mmap": {"rounds": 3, "ops": 1000000, "mode": "mmap", "parallel": 1},
+    "unrelated-mmap-p8": {"rounds": 2, "ops": 8000000, "mode": "mmap", "parallel": 8},
+    "unrelated-mremap": {"rounds": 2, "ops": 1000000, "mode": "mremap", "parallel": 1},
+}
 
 
 def parse_log(path):
@@ -92,7 +111,9 @@ def load_manifest(path):
     {"legacy_stdout", "note"}}. Only one of the two completion forms is
     valid. "first_arm" is round 1's starting arm ("on" or "off"); each
     later round starts with the flipped arm, and arms within a round run
-    in ABBA mirror order (round 1 "on" reads on off off on).
+    in ABBA mirror order (round 1 "on" reads on off off on). The legacy
+    form is confined to the pinned historical artifact (see
+    LEGACY_CAMPAIGN_SHA256): any other campaign needs its own DONE marker.
     """
     try:
         with open(path, encoding="utf-8") as handle:
@@ -176,12 +197,14 @@ def expected_arms(round_no, arms, first_arm):
     return [start if index % 4 in (0, 3) else other for index in range(arms)]
 
 
-def validate(samples, done_lines, manifest):
+def validate(samples, done_lines, manifest, log_digest=""):
     """Check the samples against the manifest. Returns a list of problems.
 
     Every problem names the exact defect (want vs have); an empty list
     means the campaign is complete and workload-consistent. Runs before any
-    verdict math: incomplete evidence never reaches a verdict.
+    verdict math: incomplete evidence never reaches a verdict. `log_digest`
+    is the analyzed log file's sha256; the legacy path binds completion to
+    the reviewed bytes through it (an empty digest never matches).
     """
     problems = []
     cells = manifest["cells"]
@@ -199,16 +222,37 @@ def validate(samples, done_lines, manifest):
                 "the marker does not complete the log"
             )
     else:
+        if (
+            cells != LEGACY_CELLS
+            or arms != LEGACY_ARMS_PER_ROUND
+            or manifest["first_arm"] != LEGACY_FIRST_ARM
+            or expected_events != LEGACY_EVENTS_PER_OP
+        ):
+            problems.append(
+                "legacy completion requires the reviewed historical "
+                "expectations (six 1d cells, 4 arms/round from on, 2 "
+                "events/op): this manifest declares another campaign, "
+                "which needs its own DONE marker"
+            )
         evidence = completion["legacy_stdout"]
         try:
-            with open(evidence, encoding="utf-8") as handle:
-                stdout = handle.read()
+            with open(evidence, "rb") as handle:
+                evidence_digest = hashlib.sha256(handle.read()).hexdigest()
         except OSError:
-            stdout = ""
-        if "bench-stagea-overhead: DONE" not in stdout:
+            evidence_digest = ""
+        if evidence_digest != LEGACY_CAMPAIGN_SHA256:
             problems.append(
-                f"missing legacy completion evidence: {evidence} holds no "
-                "'bench-stagea-overhead: DONE' line"
+                f"legacy completion evidence {evidence} is not the reviewed "
+                f"historical artifact (sha256 {evidence_digest or 'unreadable'}, "
+                f"want {LEGACY_CAMPAIGN_SHA256}): no other stdout completes "
+                "a campaign"
+            )
+        if log_digest != LEGACY_CAMPAIGN_SHA256:
+            problems.append(
+                "the analyzed log is not the reviewed historical campaign "
+                f"(sha256 {log_digest or 'unknown'}, want "
+                f"{LEGACY_CAMPAIGN_SHA256}): legacy completion binds only "
+                "to those bytes"
             )
     have_cells = sorted({sample["cell"] for sample in samples})
     for name in sorted(cells):
@@ -488,7 +532,9 @@ def main(argv):
     if not samples:
         print("no samples in the log", file=sys.stderr)
         return 1
-    incomplete = validate(samples, done_lines, manifest)
+    with open(positional[0], "rb") as handle:
+        log_digest = hashlib.sha256(handle.read()).hexdigest()
+    incomplete = validate(samples, done_lines, manifest, log_digest)
     if incomplete:
         for problem in incomplete:
             print(f"incomplete campaign: {problem}", file=sys.stderr)
@@ -724,8 +770,10 @@ DONE samples=8
         assert code == 1, (code, err)
         assert "cell rogue-cell: sampled but absent from the manifest" in err, err
         assert "cell unrelated-mmap: expected by the manifest, sampled 0 times" in err, err
-        # Legacy completion: the pre-manifest 1d shape (completion proven by
-        # the campaign stdout, not a DONE line).
+        # Legacy completion is confined to the reviewed historical
+        # artifact: any other stdout, log, or expectation set is rejected,
+        # even carrying a DONE line. (The honest 1d pair ACCEPTS; pinned
+        # outside this sandbox by the re-validation run, not here.)
         legacy_manifest = dict(manifest)
         legacy_manifest["completion"] = {
             "legacy_stdout": os.path.join(work, "campaign.stdout"),
@@ -737,12 +785,22 @@ DONE samples=8
             handle.write("=== bench-stagea-overhead: DONE (/tmp/x/campaign.log) ===\n")
         legacy_manifest["completion"] = {"legacy_stdout": stdout_path, "note": "test"}
         write_manifest(legacy_manifest)
-        code, out, _ = run([path, "--manifest", manifest_path])
-        assert code == 0, (code, out)
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "requires the reviewed historical expectations" in err, err
+        assert "is not the reviewed historical artifact" in err, err
+        assert "not the reviewed historical campaign" in err, err
         with open(stdout_path, "w", encoding="utf-8") as handle:
             handle.write("interrupted\n")
         code, _, err = run([path, "--manifest", manifest_path])
-        assert code == 1 and "missing legacy completion evidence" in err, (code, err)
+        assert code == 1 and "is not the reviewed historical artifact" in err, (code, err)
+        legacy_manifest["completion"] = {
+            "legacy_stdout": os.path.join(work, "no-such-stdout"),
+            "note": "test",
+        }
+        write_manifest(legacy_manifest)
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1 and "sha256 unreadable" in err, (code, err)
         # Manifest misuse is a usage error (exit 2), never a verdict.
         write_log(log)
         write_manifest(manifest)

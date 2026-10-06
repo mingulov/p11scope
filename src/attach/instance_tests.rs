@@ -1353,6 +1353,50 @@ fn privileged_instance_pre_attachment_sharer_globalizes() -> Result<()> {
     Ok(())
 }
 
+/// F3 soundness: a zombie group leader still counted in `nr_threads` plus
+/// one live external CLONE_VM sharer — mm_users 2 against nr_threads 2
+/// under the old equality — must still globalize, since the zombie holds
+/// no mm reference. The window predates the attach (no fork marks); the
+/// fixture self-validates it (leader State Z, Threads 2, sharer alive)
+/// and fails loudly when it is not live.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    // The zombie window plus the sharer predate the attach.
+    let held = target.command(b'z')?;
+    ensure!(held.starts_with("ZOMBIE_HELD"), "{held}");
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    let call = |harness: &mut Harness, target: &mut Target| -> Result<InstanceId> {
+        target.command(b'c')?;
+        single_join(&pump_until(harness, target, 1)?)
+    };
+    let a = call(&mut harness, &mut target)?;
+    let before = harness.session.instance_maps().counters()?;
+    let woke = target.command(b'Z')?;
+    ensure!(woke == "ZOMBIE_WOKE", "{woke}");
+    let after = harness.session.instance_maps().counters()?;
+    ensure!(
+        after.shared >= before.shared + 2 && after.global_bumps >= before.global_bumps + 2,
+        "zombie-leader sharer was not globalized: {before:?} -> {after:?}"
+    );
+    let b = call(&mut harness, &mut target)?;
+    ensure!(
+        b != a,
+        "a zombie-leader sharer's mutation kept the instance"
+    );
+    eprintln!("T3A_ZOMBIE counters={after:?} scans={:?}", harness.scan);
+    ensure!(harness.false_joins().is_empty());
+    ensure!(after.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
 /// Decision §3c: a punch-hole on the provider file from another process.
 /// The loaded image keeps executing from untouched text while the header
 /// page's VMAs are zapped through `unmap_mapping_range`, which must reach

@@ -5937,13 +5937,13 @@ fn instance_epoch_kernel_shapes_are_flavored_apart_from_other_units() {
         );
     }
     assert_eq!(
-        shapes, 7,
-        "the seven CO-RE shapes moved; review this contract"
+        shapes, 6,
+        "the six CO-RE shapes moved; review this contract"
     );
     assert!(source.contains("\nstruct task_struct; /* "));
     assert!(
-        source.contains("struct signal_struct___p11inst {"),
-        "the pre-attachment sharer check needs the signal shape"
+        !source.contains("signal_struct___p11inst"),
+        "ownership is a single mm_users read: no signal shape may return"
     );
 }
 

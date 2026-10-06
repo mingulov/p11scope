@@ -46,13 +46,9 @@ struct vm_area_struct___p11inst {
     struct mm_struct___p11inst *vm_mm;
     struct file___p11inst *vm_file;
 } INST_BTF;
-struct signal_struct___p11inst {
-    int nr_threads;
-} INST_BTF;
 struct task_struct___p11inst {
     struct mm_struct___p11inst *mm;
     struct task_struct___p11inst *group_leader;
-    struct signal_struct___p11inst *signal;
 } INST_BTF;
 
 struct {
@@ -277,7 +273,6 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
     struct instance_record *rec;
     struct task_struct___p11inst *current;
     struct task_struct___p11inst *leader;
-    struct signal_struct___p11inst *sig = 0;
     struct file___p11inst *file = 0;
     struct inode___p11inst *inode = 0;
     struct super_block___p11inst *sb = 0;
@@ -286,7 +281,6 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
     unsigned long ino = 0;
     u32 dev = 0;
     int users = 0;
-    int threads = 0;
     u32 *slotp;
     u32 slot;
     u32 index;
@@ -345,14 +339,43 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
         return 0;
     }
     /* Pre-attachment sharers carry no SHARED_MM mark: marking happens on
-     * forks observed after attachment. Every live task with this mm holds
-     * one mm_users ref — threads and non-thread sharers alike — while
-     * nr_threads counts only this thread group, so equality proves no live
-     * sharer and anything else globalizes. Racy transients (a fork between
-     * the two reads, a borrowed kernel reference) fail closed into a
-     * spurious global bump, never a local one. */
-    if (INST_READ(sig, leader->signal) || !sig || INST_READ(threads, sig->nr_threads) ||
-        users != threads) {
+     * forks observed after attachment. Localize only when the single
+     * mm_users read above returned 1; any other count globalizes.
+     * Ownership proof. mm_users counts every user task with task->mm ==
+     * this mm (exactly one reference each, taken at fork, dropped in
+     * exit_mm) plus transient kernel mmget holders, who only inflate the
+     * count. The current_mm check above proved current is one of those
+     * users, and current cannot exit while it runs this hook — so an
+     * observed 1 is current's own reference, and no other user-task
+     * reference exists at the instant of the read:
+     * - Zombies and exiting tasks: a task past exit_mm holds no reference
+     *   and can never mutate or stamp again (it has no mm); a task still
+     *   before exit_mm holds one and would have been counted. The
+     *   exit_mm-before-release window (a zombie leader still counted in
+     *   nr_threads) cannot mask a live sharer: zombies hold no reference,
+     *   and nr_threads is not consulted at all.
+     * - Concurrent fork/share: a new mm user can only be created by
+     *   clone/fork from an existing user (CLONE_VM shares the caller's
+     *   mm). At the read instant the only user is current, which is
+     *   executing this hook rather than a clone — so no new user can
+     *   appear before the mutation is decided. Preemption changes nothing:
+     *   a new user still needs a clone from an existing user, and the only
+     *   one is current. A clone that completed before the read is already
+     *   counted (and a post-attachment CLONE_VM non-thread child is
+     *   SHARED_MM-marked anyway); a thread created after the read shares
+     *   this same leader record and sees the bump.
+     * - Kthread borrow (kthread_use_mm/mmgrab) takes an mm_count
+     *   reference, never mm_users: borrowers are invisible to this count,
+     *   and any mutation they perform takes the remote path above (their
+     *   task->mm is NULL), never a stamp. Only user tasks with task->mm ==
+     *   mm can reach this point, and each of those holds one mm_users.
+     * So the mutation is observable only within current's thread group —
+     * single live thread, no external sharer — and the group-leader record
+     * is complete. There is no second read to race: one atomic count, one
+     * decision. Cost: multi-threaded processes and transient mmget holders
+     * (a concurrent /proc reader) globalize spuriously — conservative, and
+     * the fork mark below stays as defense in depth. */
+    if (users != 1) {
         inst_count(counters ? &counters->shared : 0);
         inst_global(slot, counters);
         return 0;

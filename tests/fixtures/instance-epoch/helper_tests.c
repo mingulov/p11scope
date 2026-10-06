@@ -56,11 +56,10 @@ static struct inode___p11inst inode = { 4242, &sb };
 static struct inode___p11inst other_inode = { 9999, &sb };
 static struct file___p11inst file = { &inode };
 static struct file___p11inst other_file = { &other_inode };
-static struct mm_struct___p11inst mm = { { 2 } };
+static struct mm_struct___p11inst mm = { { 1 } };
 static struct mm_struct___p11inst other_mm = { { 1 } };
-static struct signal_struct___p11inst leader_sig = { 2 };
 static struct task_struct___p11inst leader;
-static struct task_struct___p11inst thread = { &mm, &leader, 0 };
+static struct task_struct___p11inst thread = { &mm, &leader };
 static struct task_struct___p11inst child;
 static struct task_struct___p11inst *current_task = &thread;
 static struct vm_area_struct___p11inst vma = { 0x7f0000001000UL, &mm, &file };
@@ -162,6 +161,7 @@ static struct instance_record *storage(void *map, void *task, void *init, u64 fl
     return &records[index];
 }
 
+static int interleave_armed;
 static long probe(void *dst, u32 size, const void *src)
 {
     if (reads++ == read_fail_at) {
@@ -169,6 +169,13 @@ static long probe(void *dst, u32 size, const void *src)
         return -14;
     }
     memcpy(dst, src, size);
+    /* A scripted concurrent clone landing after the single mm_users read
+     * (index 6): actual users 3->4. There is no second read to race, so
+     * the decision made on the observed count must stand. */
+    if (interleave_armed && reads == 7) {
+        mm.mm_users.counter = 4;
+        interleave_armed = 0;
+    }
     return 0;
 }
 
@@ -192,9 +199,8 @@ static void reset(void)
     cas_lose = 0;
     read_fail_at = -1;
     reads = 0;
-    mm.mm_users.counter = 2;
-    leader_sig.nr_threads = 2;
-    leader.signal = &leader_sig;
+    interleave_armed = 0;
+    mm.mm_users.counter = 1;
     thread.mm = &mm;
     thread.group_leader = &leader;
     current_task = &thread;
@@ -319,20 +325,31 @@ int main(void)
     map_hook(&vma);
     assert(counters.shared == 1 && g_epoch[5] == 1 && !records[0].slot_plus1[0]);
 
-    /* A pre-attachment sharer (mm users beyond the thread group) never
-     * localizes either, with or without the post-attachment mark. */
+    /* Ownership is a single mm_users read: 1 localizes, anything else
+     * globalizes. A pre-attachment sharer (2 users), the zombie-equality
+     * values (2 users behind a zombie leader), and the interleaved-clone
+     * actuals (4 users) never localize, with or without the
+     * post-attachment mark. */
+    for (int users = 2; users <= 4; users++) {
+        reset();
+        mm.mm_users.counter = users;
+        map_hook(&vma);
+        assert(counters.shared == 1 && g_epoch[5] == 1 && !records[0].slot_plus1[0]);
+        assert(!storage_creates);
+    }
+    /* A concurrent clone landing after the single read cannot localize:
+     * the decision was already made on the observed count. */
     reset();
     mm.mm_users.counter = 3;
+    interleave_armed = 1;
     map_hook(&vma);
-    assert(counters.shared == 1 && g_epoch[5] == 1 && !records[0].slot_plus1[0]);
-    assert(!storage_creates);
-    /* Unreadable sharing state (reads 8, 9) fails closed too. */
-    for (int at = 8; at < 10; at++) {
-        reset();
-        read_fail_at = at;
-        map_hook(&vma);
-        assert(g_epoch[5] == 1 && !storage_creates);
-    }
+    assert(counters.shared == 1 && g_epoch[5] == 1 && !storage_creates);
+    /* An unreadable ownership count fails closed (read 6 is also covered
+     * by the loop above; pinned again here for the message). */
+    reset();
+    read_fail_at = 6;
+    map_hook(&vma);
+    assert(g_epoch[5] == 1 && !storage_creates);
 
     /* Record overflow: 8 files fit; the 9th goes global and marks OVERFLOW. */
     reset();

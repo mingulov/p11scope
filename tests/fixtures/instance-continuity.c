@@ -25,6 +25,8 @@
  *       V  vfork child unmaps that shared page             -> VUNMAP
  *       w  hold a persistent CLONE_VM sharer (pre-attach)  -> SHARER_HELD pid
  *       W  wake it to map+unmap one provider page          -> SHARER_WOKE
+ *       z  hold a zombie-leader + CLONE_VM sharer scenario  -> ZOMBIE_HELD pid
+ *       Z  wake its worker to map+unmap one provider page  -> ZOMBIE_WOKE
  *       h  another process punch-holes the provider file   -> PHOLE
  *       e  exec self (pipes survive; READY again)          -> (READY ...)
  *       E  a non-leader thread execs self                  -> (READY ...)
@@ -145,6 +147,182 @@ static int held_sharer_child(void *unused)
         return 2;
     munmap(p, 4096);
     return 0;
+}
+
+/* A zombie-leader scenario (F3 soundness): 'z' forks a child whose main
+ * thread spawns a worker thread plus a held CLONE_VM sharer and then
+ * exits, leaving a zombie group leader; 'Z' wakes the worker to map and
+ * unmap one provider page while the leader is still a zombie and the
+ * external sharer holds the mm. The worker self-validates the window
+ * (leader State Z, Threads 2, sharer alive) and exits nonzero when it is
+ * not live, so a silent fixture miss fails loudly instead of passing
+ * vacuously. Only the scenario child prints ZOMBIE_HELD; only the driver
+ * prints ZOMBIE_WOKE. */
+static int zombie_wake[2] = { -1, -1 };
+static pid_t zombie_child;
+static int zombie_hold[2] = { -1, -1 };
+static const char *zombie_provider;
+static pid_t zombie_sharer;
+
+static int zombie_sharer_child(void *unused)
+{
+    (void)unused;
+    char gate;
+    /* Our own write end first (private fd table): the worker's close (or
+     * the scenario's death) then lands as EOF. Either outcome releases us;
+     * we only ever hold an mm reference, never mutate. */
+    close(zombie_hold[1]);
+    if (read(zombie_hold[0], &gate, 1) < 0)
+        return 0;
+    return 0;
+}
+
+/* Bounded reap of the scenario sharer, SIGKILL fallback: the fixture must
+ * never hang its harness. Runs in the scenario child only. */
+static void zombie_wait_sharer(void)
+{
+    int status = 0;
+    int i;
+
+    for (i = 0; i < 200; i++) {
+        if (waitpid(zombie_sharer, &status, WNOHANG) == zombie_sharer)
+            return;
+        struct timespec pause = { 0, 10 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    kill(zombie_sharer, SIGKILL);
+    waitpid(zombie_sharer, &status, 0);
+}
+
+/* True when the calling process is exactly {zombie leader, this worker}:
+ * the group leader (tid == pid) is State Z and the group has 2 threads. */
+static int zombie_window_live(void)
+{
+    char path[64];
+    char status[4096];
+    char threads[4096];
+    int fd;
+    ssize_t n;
+
+    snprintf(path, sizeof(path), "/proc/self/task/%d/status", (int)getpid());
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    n = read(fd, status, sizeof(status) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    status[n] = '\0';
+    fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    n = read(fd, threads, sizeof(threads) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    threads[n] = '\0';
+    return strstr(status, "State:\tZ") != NULL && strstr(threads, "Threads:\t2") != NULL;
+}
+
+static void *zombie_worker(void *unused)
+{
+    (void)unused;
+    char gate;
+    int fd;
+    void *p;
+    ssize_t n = read(zombie_wake[0], &gate, 1);
+    if (n != 1) {
+        /* EOF: the driver went away ('x' path) — release the sharer and
+         * leave without mutating. */
+        close(zombie_hold[1]);
+        zombie_wait_sharer();
+        exit(0);
+    }
+    /* The leader may still be exiting when the wake lands: poll for the
+     * zombie window (bounded), so the mutation below always runs inside
+     * it — or the scenario fails loudly instead of testing nothing. */
+    for (int i = 0; i < 50 && !zombie_window_live(); i++) {
+        struct timespec pause = { 0, 100 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    if (!zombie_window_live() || kill(zombie_sharer, 0) != 0) {
+        close(zombie_hold[1]);
+        zombie_wait_sharer();
+        exit(3);
+    }
+    fd = open(zombie_provider, O_RDONLY);
+    if (fd < 0) {
+        close(zombie_hold[1]);
+        zombie_wait_sharer();
+        exit(2);
+    }
+    p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) {
+        close(zombie_hold[1]);
+        zombie_wait_sharer();
+        exit(2);
+    }
+    munmap(p, 4096);
+    close(zombie_hold[1]);
+    zombie_wait_sharer();
+    exit(0);
+    return NULL;
+}
+
+/* The 'z' child: set up the worker plus the held sharer, print the Held
+ * line, then exit the main thread so the leader stays a zombie while the
+ * worker runs. Returns only on setup failure (after printing FAIL). */
+static void zombie_scenario_child(void)
+{
+    static char stack[64 * 1024] __attribute__((aligned(16)));
+    pthread_t worker;
+
+    close(zombie_wake[1]);
+    if (pipe2(zombie_hold, O_CLOEXEC) != 0) {
+        printf("FAIL zombie hold pipe %s\n", strerror(errno));
+        fflush(stdout);
+        return;
+    }
+    if (pthread_create(&worker, NULL, zombie_worker, NULL) != 0) {
+        printf("FAIL zombie worker %s\n", strerror(errno));
+        fflush(stdout);
+        return;
+    }
+    zombie_sharer = clone(zombie_sharer_child, stack + sizeof(stack), CLONE_VM | SIGCHLD, NULL);
+    if (zombie_sharer < 0) {
+        printf("FAIL zombie sharer %s\n", strerror(errno));
+        fflush(stdout);
+        return;
+    }
+    printf("ZOMBIE_HELD %d\n", (int)getpid());
+    fflush(stdout);
+    pthread_exit(NULL);
+}
+
+/* Graceful shutdown with a held zombie scenario: EOF wakes the worker,
+ * which releases the sharer and leaves; then reap the scenario. Bounded
+ * wait with a SIGKILL fallback. */
+static void release_zombie_child(void)
+{
+    int status = 0;
+    int i;
+
+    if (!zombie_child)
+        return;
+    close(zombie_wake[1]);
+    zombie_wake[1] = -1;
+    for (i = 0; i < 200; i++) {
+        if (waitpid(zombie_child, &status, WNOHANG) == zombie_child)
+            break;
+        struct timespec pause = { 0, 10 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    if (kill(zombie_child, 0) == 0) {
+        kill(zombie_child, SIGKILL);
+        waitpid(zombie_child, &status, 0);
+    }
+    zombie_child = 0;
 }
 
 /* Graceful shutdown with a held sharer: EOF wakes it (its own write end
@@ -320,6 +498,7 @@ static int cmd_mode(const char *provider)
         int command = getchar();
         if (command == EOF || command == 'x') {
             release_held_sharer();
+            release_zombie_child();
             return 0;
         }
         switch (command) {
@@ -445,6 +624,41 @@ static int cmd_mode(const char *provider)
             held_sharer_pipe[0] = held_sharer_pipe[1] = -1;
             held_sharer = 0;
             printf("SHARER_WOKE\n");
+            break;
+        }
+        case 'z': {
+            pid_t child;
+            if (zombie_child)
+                die("zombie already held");
+            if (pipe2(zombie_wake, O_CLOEXEC) != 0)
+                die("zombie wake pipe");
+            zombie_provider = provider;
+            child = fork();
+            if (child < 0)
+                die("zombie scenario fork");
+            if (child == 0) {
+                zombie_scenario_child();
+                _exit(2);
+            }
+            zombie_child = child;
+            close(zombie_wake[0]);
+            zombie_wake[0] = -1;
+            /* No reply here: the scenario child prints ZOMBIE_HELD itself. */
+            break;
+        }
+        case 'Z': {
+            int status = 0;
+            if (!zombie_child)
+                die("no zombie held");
+            if (write(zombie_wake[1], "g", 1) != 1)
+                die("zombie wake");
+            if (waitpid(zombie_child, &status, 0) != zombie_child || !WIFEXITED(status) ||
+                WEXITSTATUS(status) != 0)
+                die("zombie scenario mutation");
+            close(zombie_wake[1]);
+            zombie_wake[1] = -1;
+            zombie_child = 0;
+            printf("ZOMBIE_WOKE\n");
             break;
         }
         case 'M': {

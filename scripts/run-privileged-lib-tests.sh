@@ -59,7 +59,7 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (96 ignored tests in the default-feature lib binary): 78 run by
+# Curation (97 ignored tests in the default-feature lib binary): 79 run by
 # default, 5 run only with --include-long, 13 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -84,6 +84,7 @@ attach::instance_tests::privileged_instance_pre_attachment_sharer_globalizes
 attach::instance_tests::privileged_instance_reload_race_has_zero_false_joins
 attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and_mutation
 attach::instance_tests::privileged_instance_vfork_unmap_globalizes
+attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes
 # DR-CLASSIC-PID0: classic --pid sessions (auto, singles, forced multi)
 # keep a foreign process and a PID reuser out at the kernel boundary (BPF
 # run statistics flat while they call) and in counts and call events; they

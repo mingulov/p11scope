@@ -830,6 +830,28 @@ def settlement_verdict(doc):
     return None, "no settlement statement"
 
 
+def edge_payload_problems(view, key, ev):
+    """Problems ([]) when the edge_observed payload `ev` disagrees with the
+    decided snapshot edge for `key`: DR-C5-EDGE replay minus the three
+    derived states, which must match the oracle's own derivation."""
+    edge = view.edges.get(key)
+    if edge is None:
+        return [(key, "not in snapshot")]
+    caller, module = view.callers.get(key[0], {}), view.modules.get(key[1], {})
+    problems = []
+    replayed = {k: v for k, v in ev.items() if k not in EDGE_STATES}
+    if replayed != edge:
+        fields = sorted(k for k in set(replayed) | set(edge) if replayed.get(k) != edge.get(k))
+        problems.append((key, f"fields {fields}"))
+    if ev.get("presence") != expected_presence(caller, module, edge):
+        problems.append((key, f"presence {ev.get('presence')!r} != {expected_presence(caller, module, edge)!r}"))
+    if ev.get("capture") != expected_capture(caller, module, edge):
+        problems.append((key, f"capture {ev.get('capture')!r}"))
+    if ev.get("activity") not in expected_activity(edge, view.window[1]):
+        problems.append((key, f"activity {ev.get('activity')!r}"))
+    return problems
+
+
 class RunView:
     def __init__(self, manifest, run, rundir):
         self.manifest = manifest
@@ -959,21 +981,7 @@ def check_streams(view, res):
         last[(ev.get("caller"), ev.get("module"))] = ev
     bad = []
     for key, ev in last.items():
-        edge = view.edges.get(key)
-        if edge is None:
-            bad.append((key, "not in snapshot"))
-            continue
-        caller, module = view.callers.get(key[0], {}), view.modules.get(key[1], {})
-        replayed = {k: v for k, v in ev.items() if k not in EDGE_STATES}
-        if replayed != edge:
-            fields = sorted(k for k in set(replayed) | set(edge) if replayed.get(k) != edge.get(k))
-            bad.append((key, f"fields {fields}"))
-        if ev.get("presence") != expected_presence(caller, module, edge):
-            bad.append((key, f"presence {ev.get('presence')!r} != {expected_presence(caller, module, edge)!r}"))
-        if ev.get("capture") != expected_capture(caller, module, edge):
-            bad.append((key, f"capture {ev.get('capture')!r}"))
-        if ev.get("activity") not in expected_activity(edge, view.window[1]):
-            bad.append((key, f"activity {ev.get('activity')!r}"))
+        bad.extend(edge_payload_problems(view, key, ev))
     missing = sorted(set(view.edges) - set(last))
     if missing:
         bad.append((missing[:4], f"{len(missing)} snapshot edges have no edge_observed"))
@@ -1031,6 +1039,32 @@ def check_streams(view, res):
                 rushed.append((key, f"seq {prev.get('seq')}->{cur.get('seq')} dt {cur_at - prev_at} ns"))
     res.ok(run, "*", "EDGE-CADENCE", not rushed,
            f"{len(rushed)} edge_observed records re-emit an unchanged class within 10 s: {rushed[:4]}")
+    # O2: the final sweep is exact but not exempt from scrutiny. Past the
+    # last pass marker every edge carries at most one terminal record —
+    # production's sweep re-emits only uncarried edges (zero when the
+    # pre-marker record already carries the state), so duplicates are
+    # never legitimate in an unrotated stream — and every terminal
+    # payload must equal the decided snapshot. First records stay
+    # cadence-exempt; rotated streams never reach here (STREAM-ROTATED
+    # returns early); a stream with no pass marker is already failed by
+    # AGREE-TOTALS and has no sweep to judge.
+    if sweep_seq >= 0:
+        terminal = [e for e in edge_events if e.get("seq", 0) > sweep_seq]
+        by_terminal = {}
+        for e in terminal:
+            ev = e.get("event") if isinstance(e.get("event"), dict) else {}
+            by_terminal.setdefault((ev.get("caller"), ev.get("module")), []).append((e, ev))
+        sweep_bad = []
+        for key in sorted(by_terminal, key=str):
+            recs = by_terminal[key]
+            if len(recs) > 1:
+                sweep_bad.append((key, f"{len(recs)} terminal records past pass seq {sweep_seq} "
+                                      "(want at most 1)"))
+            for _, ev in recs:
+                sweep_bad.extend(edge_payload_problems(view, key, ev))
+        res.ok(run, "*", "TERMINAL-SWEEP", not sweep_bad,
+               f"{len(sweep_bad)} terminal sweep problems: {sweep_bad[:4]}",
+               f"{len(terminal)} terminal records agree ({len(by_terminal)} edges)")
 
 
 def resolve_providers(view, res, needed):
@@ -3069,6 +3103,68 @@ def self_test():
             _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] -= 1
             return kw
         case("count-below-ledger-realistic-timing", "COUNT-EXACT", realistic_timing_short)
+
+        # --- O2: terminal sweep hole (sol 2, astra B4) ----------------------
+        # Every record after the last pass marker skips EDGE-CADENCE while
+        # only the last record per edge must match the snapshot, so a tail
+        # disagreeing with the snapshot passes everything.
+        def tail_stages(s, d, cell, pre, post):
+            """Replace the cell's edge records with `pre` [(count, at_ns)]
+            records before the pass marker and `post` [(count, at_ns,
+            mutate)] records after it (the terminal sweep); fix
+            accounting + seq."""
+            cid_, mid = cid(s, cell), s.mid["A"]
+            ev = s.events(d)
+            template = [e for e in ev if e["kind"] == "edge_observed"
+                        and e["event"].get("caller") == cid_ and e["event"].get("module") == mid][-1]
+            keep = [e for e in ev if not (e["kind"] == "edge_observed"
+                                          and e["event"].get("caller") == cid_
+                                          and e["event"].get("module") == mid)]
+            at = next(i for i, e in enumerate(keep) if e["kind"] == "pass_committed")
+            new_pre = []
+            for count, at_ns in pre:
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["at_ns"] = at_ns
+                new_pre.append(rec)
+            new_post = []
+            for count, at_ns, mutate in post:
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["at_ns"] = at_ns
+                if mutate:
+                    mutate(rec["event"])
+                new_post.append(rec)
+            end = next(i for i, e in enumerate(keep) if e["kind"] == "ended")
+            out = keep[:at] + new_pre + keep[at:end] + new_post + keep[end:]
+            next(e for e in out if e["kind"] == "pass_committed")["event"]["edge_events"] += len(new_pre) - 1
+            next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(new_post)
+            return {"events": _renumber(out)}
+
+        def sweep_tail_disagreeing(s, d, dash):
+            # sol probe: 35 before the marker, then 36->37 at the same
+            # timestamp afterward; the first tail record disagrees.
+            return tail_stages(s, d, "P1", [(35, T0 + 500)],
+                               [(36, T0 + 600, None), (37, T0 + 600, None)])
+        case("sweep-tail-disagreeing", "TERMINAL-SWEEP", sweep_tail_disagreeing)
+
+        def sweep_tail_pending(s, d, dash):
+            # astra probe: a terminal pending_first_use record followed by
+            # an exact record.
+            def make_pending(ev):
+                ev["entries"]["coverage"].update(state=UNKNOWN_STATE, since_ns=None,
+                                                reason=PENDING_FIRST_USE_REASON)
+                ev["entries"]["observation"] = "unknown (usage observation unavailable)"
+            return tail_stages(s, d, "P1", [(37, T0 + 500)],
+                               [(37, T0 + 600, make_pending), (37, T0 + 700, None)])
+        case("sweep-tail-pending-then-exact", "TERMINAL-SWEEP", sweep_tail_pending)
+
+        def sweep_single_terminal(s, d, dash):
+            # Legitimate sweep: the edge's only record is terminal and exact.
+            return tail_stages(s, d, "P1", [], [(37, T0 + 600, None)])
+        res = case("sweep-single-terminal-pass", None, sweep_single_terminal)
+        if not any(r["check"] == "TERMINAL-SWEEP" and r["status"] == "pass" for r in res.rows):
+            failures.append("sweep-single-terminal-not-compared")
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

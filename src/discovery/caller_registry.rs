@@ -1300,6 +1300,9 @@ enum Mutation {
     NoteSemanticLoss {
         reason: String,
     },
+    NoteRefreshLoss {
+        reason: String,
+    },
     NoteWitness {
         caller: CallerId,
         module: ModuleKey,
@@ -2085,6 +2088,15 @@ impl CallerRegistry {
         self.staged.push(Mutation::NoteSemanticLoss { reason });
     }
 
+    /// Stage one pass-wide count-refresh loss boundary: a refresh
+    /// transport failure, or a refresh sweep that skipped a tracked row.
+    /// Every counted column becomes a lower bound (`lossy`, never a
+    /// quiet claim over the stale count), the observed counts stand, and
+    /// the loss itself is a gap — never silent loss.
+    pub(crate) fn note_refresh_loss(&mut self, reason: String) {
+        self.staged.push(Mutation::NoteRefreshLoss { reason });
+    }
+
     /// Stage one caller retirement: the caller's edges end with the
     /// reason and its counts freeze. Evidence is retained.
     pub(crate) fn retire_caller(&mut self, caller: CallerId, reason: String, at_ns: u64) {
@@ -2218,6 +2230,24 @@ impl CallerRegistry {
                     module: None,
                     pid: None,
                     subject: "semantic capture loss".into(),
+                    reason,
+                    budget: None,
+                });
+            }
+            Mutation::NoteRefreshLoss { reason } => {
+                for edge in self.edges.values_mut() {
+                    // A failed or skipped count re-read leaves every
+                    // counted column a lower bound: observed counts
+                    // stand, quiet claims do not.
+                    if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
+                        edge.coverage.lossy = true;
+                    }
+                }
+                self.push_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "native count refresh loss".into(),
                     reason,
                     budget: None,
                 });

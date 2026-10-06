@@ -797,6 +797,13 @@ pub(crate) struct WitnessBatch {
     pub unsettled: bool,
 }
 
+/// Whether one `WitnessBatch.read_failures` entry is a count-refresh
+/// failure (not a witness failure): the refresh stamps every transport
+/// error it hits with [`super::callers::REFRESH_FAILURE_PREFIX`].
+pub(crate) fn is_refresh_failure(failure: &str) -> bool {
+    failure.starts_with(super::callers::REFRESH_FAILURE_PREFIX)
+}
+
 /// What one `query_cookie` learned about a pinned process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CookieQuery {

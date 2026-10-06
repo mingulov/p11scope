@@ -277,6 +277,11 @@ impl fmt::Display for BatchUnsupported {
 
 impl std::error::Error for BatchUnsupported {}
 
+/// The read-failure attribution prefix the count refresh stamps: the
+/// coordinator consumes refresh failures (not witness failures) through
+/// [`super::capture::is_refresh_failure`].
+pub(super) const REFRESH_FAILURE_PREFIX: &str = "count refresh: ";
+
 /// One BPF_MAP_LOOKUP_BATCH step: up to `max` map pairs in kernel hash
 /// order, whether the walk reached the end of the map, and — when it did
 /// not — the kernel's out_batch continuation for the next step's in_batch.
@@ -738,7 +743,8 @@ impl CallerUseCursor {
                     self.batch = BatchProbe::Unsupported;
                 }
                 Err(error) => {
-                    read.read_failures.push(format!("count refresh: {error:#}"));
+                    read.read_failures
+                        .push(format!("{REFRESH_FAILURE_PREFIX}{error:#}"));
                     return read;
                 }
             }
@@ -784,7 +790,8 @@ impl CallerUseCursor {
             let next = match io.next_key(self.refresh_after.as_ref()) {
                 Ok(next) => next,
                 Err(error) => {
-                    read.read_failures.push(format!("count refresh: {error:#}"));
+                    read.read_failures
+                        .push(format!("{REFRESH_FAILURE_PREFIX}{error:#}"));
                     return;
                 }
             };
@@ -805,7 +812,8 @@ impl CallerUseCursor {
                 Ok(value) => value,
                 Err(error) => {
                     // Unchanged baseline: the next sweep retries it.
-                    read.read_failures.push(format!("count refresh: {error:#}"));
+                    read.read_failures
+                        .push(format!("{REFRESH_FAILURE_PREFIX}{error:#}"));
                     self.refresh_sweep_gaps = true;
                     continue;
                 }

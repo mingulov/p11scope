@@ -55,7 +55,9 @@ pub(crate) const KEYS_PER_PROCESS_FILE: usize = 4;
 /// unknown key (P2-1), since an evicted tombstone is indistinguishable
 /// from a new key; a retired eviction advances a per-era watermark that
 /// preserves retirement refusal for evicted cookies while newer cookies
-/// keep joining.
+/// keep joining; and a fault-era advance bumps the observation
+/// publication fence, refusing scans acquired before the reset (even at
+/// the new fault) while fresh scans re-observe freely.
 pub(crate) const MAX_OBSERVED_KEYS: usize = 4_096;
 pub(crate) const MAX_FAULTED_KEYS: usize = 4_096;
 pub(crate) const MAX_RETIRED_COOKIES: usize = 4_096;
@@ -217,6 +219,11 @@ pub(crate) struct StableObservation {
     pub(crate) file_slot: u32,
     pub(crate) reading: EpochReading,
     pub(crate) ranges: Vec<MapRange>,
+    /// The router's publication fence as read before the scan started
+    /// (see [`stable_scan`]). A fault-era advance bumps the router's
+    /// fence, so a scan cached across the reset observes as `StaleEra`
+    /// even when its fault reading already matches the new era.
+    pub(crate) fence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,10 +237,18 @@ pub(crate) enum ScanRefusal {
 
 /// The scan-validation protocol: epochs, maps, epochs again; accept only
 /// equal brackets, retrying at most `tries` times.
+///
+/// `fence` is the router's current publication fence, read BEFORE the scan
+/// starts, and is stamped onto the observation unchanged. The capture loop
+/// audits only in its pump, so no reset can interleave a scan; a scan whose
+/// observation is cached past a later fault-era advance then observes as
+/// `StaleEra` (see [`InstanceRouter::observe`]). Stamping at observe time
+/// instead would revalidate stale scans and defeat the fence.
 pub(crate) fn stable_scan(
     reader: &mut impl ScanReader,
     file_slot: u32,
     tries: u32,
+    fence: u64,
 ) -> Result<StableObservation, ScanRefusal> {
     for _ in 0..tries {
         let before = reader.epochs().map_err(ScanRefusal::Read)?;
@@ -249,6 +264,7 @@ pub(crate) fn stable_scan(
                 file_slot,
                 reading: before,
                 ranges,
+                fence,
             });
         }
     }
@@ -362,7 +378,8 @@ pub(crate) enum ObserveOutcome {
     Continued,
     /// A range appeared at unchanged epochs: sticky coverage fault.
     CoverageFault,
-    /// The observation's fault era is not the router's current era.
+    /// The observation's fault era is not the router's current era, or
+    /// the scan was acquired before the current publication fence.
     StaleEra,
     /// The process cookie is retired.
     Retired,
@@ -492,9 +509,19 @@ pub(crate) struct InstanceRouter {
     /// refusing is sound for both. Cookies above the mark and cookies with
     /// a retained observation keep joining, so unlike the faulted latch
     /// this costs new and continuing processes nothing. A fault-era advance
-    /// resets it: old-era evidence is `StaleEra`-refused anyway, so no
-    /// delayed observation can slip through the reset.
+    /// resets it: old-era evidence is `StaleEra`-refused anyway, and a
+    /// scan cached before the reset — even one whose fault reading
+    /// already matches the new era — is `StaleEra`-refused by the
+    /// publication fence, so no delayed observation slips through.
     retired_watermark: u64,
+    /// Observation publication fence: bumped on every fault-era advance.
+    /// Scans stamp this value at acquisition time (see [`stable_scan`]);
+    /// [`InstanceRouter::observe`] refuses any observation whose stamp is
+    /// not current. Retirement implies death and cookies are never
+    /// reassigned, so a post-reset scan of an evicted-retired cookie
+    /// cannot exist — only pre-reset cached scans need refusing, and the
+    /// fence refuses all of them while fresh scans re-observe freely.
+    fence: u64,
     pending: VecDeque<PendingCall>,
     fault: u64,
     sticky: u64,
@@ -544,6 +571,7 @@ impl InstanceRouter {
             faulted_overflowed: false,
             retired: BTreeSet::new(),
             retired_watermark: 0,
+            fence: 0,
             pending: VecDeque::new(),
             fault: 0,
             sticky: 0,
@@ -567,6 +595,12 @@ impl InstanceRouter {
 
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// The current observation publication fence, for scan stamping (see
+    /// [`stable_scan`]). Read before the scan starts, never after.
+    pub(crate) fn fence(&self) -> u64 {
+        self.fence
     }
 
     pub(crate) fn counters(&self) -> RouterCounters {
@@ -602,13 +636,18 @@ impl InstanceRouter {
         if fault_moved {
             self.fault = fault;
             self.miss_latched = false;
-            // The retirement watermark is per-era: every delayed
-            // observation from the old era is StaleEra-refused from here
-            // on, so forgetting the evicted cookies reopens no gap — and
-            // long-lived processes re-observe freely in the new era. (The
-            // miss latch below keeps the watermark: the fault is unchanged,
-            // so old-era evidence would still match.)
+            // The retirement watermark is per-era: old-era evidence is
+            // StaleEra-refused from here on, so forgetting the evicted
+            // cookies reopens no gap — and long-lived processes re-observe
+            // freely in the new era. But a scan cached before this reset
+            // may already carry the NEW fault, so the reset also bumps the
+            // publication fence: only scans acquired after it observe.
+            // (The miss latch below keeps both: the fault is unchanged, so
+            // old-era evidence would still match, and the latched era
+            // refuses every observation until a fault raise re-coheres it —
+            // at which point this path bumps the fence.)
             self.retired_watermark = 0;
+            self.fence = self.fence.wrapping_add(1);
             self.counters.eras += 1;
             self.observed.clear();
             self.ranges = 0;
@@ -682,7 +721,14 @@ impl InstanceRouter {
             // with a retained observation keep continuity below.
             return (ObserveOutcome::Retired, Vec::new());
         }
-        if observation.reading.fault != self.fault || self.miss_latched {
+        if observation.fence != self.fence
+            || observation.reading.fault != self.fault
+            || self.miss_latched
+        {
+            // A scan acquired before the last fault-era reset is stale even
+            // when its fault reading already matches the new era: the reset
+            // cleared the observations and the retirement watermark it was
+            // validated against. Fresh scans re-observe below.
             return (ObserveOutcome::StaleEra, Vec::new());
         }
         if observation.reading.sticky != 0 {
@@ -828,10 +874,10 @@ impl InstanceRouter {
     ///    `OffsetMismatch`, `Unpartitionable`, `InstanceCapacity`).
     ///
     /// Per-call facts beat ambient state; ambient state beats process state.
-    /// (`observe` has its own gate order: `Retired`, stale era (fault or
-    /// miss latch), then a sticky reading, which audits the sticky bits and
-    /// reports `StaleEra`. Calls refused by `RangeCapacity` pend and expire
-    /// as `Unobserved`.)
+    /// (`observe` has its own gate order: `Retired`, stale era (scan
+    /// fence, fault, or miss latch), then a sticky reading, which audits
+    /// the sticky bits and reports `StaleEra`. Calls refused by
+    /// `RangeCapacity` pend and expire as `Unobserved`.)
     fn decide(&self, facts: &CallFacts, may_wait: bool) -> Route {
         use UnknownReason as U;
         let entry = facts.entry;

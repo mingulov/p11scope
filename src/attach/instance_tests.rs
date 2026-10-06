@@ -334,6 +334,9 @@ impl Harness {
     /// One stable scan of (pid, provider), observed by the router.
     fn scan(&mut self, target: &Target, pending: bool) -> Result<Option<ObserveOutcome>> {
         let started = Instant::now();
+        // The fence is read before the scan starts: a scan cached past a
+        // later fault-era reset must observe as StaleEra, never as New.
+        let fence = self.router.fence();
         let observation = {
             let pidfd = target.pin.pidfd()?;
             let mut reader = LiveScan {
@@ -344,7 +347,7 @@ impl Harness {
                 maps_keys: &self.maps_keys,
                 identity: self.identity,
             };
-            stable_scan(&mut reader, self.file_slot, 8)
+            stable_scan(&mut reader, self.file_slot, 8, fence)
         };
         let elapsed = started.elapsed().as_nanos();
         self.scan.scans += 1;

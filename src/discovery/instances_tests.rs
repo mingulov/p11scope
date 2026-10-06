@@ -38,7 +38,18 @@ fn observation(local: u64, global: u64, fault: u64, ranges: Vec<MapRange>) -> St
         file_slot: FILE,
         reading: reading(local, global, fault),
         ranges,
+        // Acquired at fence 0 (no audit yet); post-audit acceptances use
+        // `fresh` to stamp the router's current fence instead.
+        fence: 0,
     }
+}
+
+/// A scan acquired now: stamps the router's current publication fence, as
+/// the capture loop does before scanning. Pre-reset cached scans keep
+/// their old stamp and observe as `StaleEra`.
+fn fresh(router: &InstanceRouter, mut observation: StableObservation) -> StableObservation {
+    observation.fence = router.fence();
+    observation
 }
 
 fn stamp(local: u32, global: u32, fault: u32) -> InstanceStamp {
@@ -83,6 +94,7 @@ fn observation_for(cookie: u64, local: u64, ranges: Vec<MapRange>) -> StableObse
             sticky: 0,
         },
         ranges,
+        fence: 0,
     }
 }
 
@@ -308,6 +320,7 @@ fn router_debug_redacts_cookies_and_epochs() {
         file_slot: FILE,
         reading,
         ranges: load(BASE_A),
+        fence: r.fence(),
     });
     r.route(call_for(1, COOKIE_BIG, stamp(3, 0, 0), ip_in(BASE_A)));
     r.retire_process(COOKIE_BIG + 1);
@@ -628,6 +641,7 @@ fn latched_overflow_plus_era_change_refuses_everything_until_recreation() {
     assert!(r.audit(1, 0, 0).is_empty());
     let mut fresh = observation_for(D, 2, load(BASE_A));
     fresh.reading.fault = 1;
+    fresh.fence = r.fence();
     assert_eq!(r.observe(fresh).0, ObserveOutcome::CoverageFault);
     assert_eq!(
         r.route(call_for(1, D, stamp(2, 0, 1), ip_in(BASE_A))),
@@ -638,6 +652,7 @@ fn latched_overflow_plus_era_change_refuses_everything_until_recreation() {
     assert!(recreated.audit(1, 0, 0).is_empty());
     let mut fresh = observation_for(D, 2, load(BASE_A));
     fresh.reading.fault = 1;
+    fresh.fence = recreated.fence();
     assert_eq!(recreated.observe(fresh).0, ObserveOutcome::New);
     joined(recreated.route(call_for(1, D, stamp(2, 0, 1), ip_in(BASE_A))));
 }
@@ -707,6 +722,39 @@ fn retired_cookie_eviction_still_refuses_delayed_observations() {
 }
 
 #[test]
+fn delayed_new_era_observation_across_retirement_eviction_and_reset_is_refused() {
+    // Astra round-2 advisory (taken as blocking): the kernel fault
+    // advances to 1 while the router still knows 0; A's valid new-era
+    // observation is cached; A retires, then B at capacity 1, evicting
+    // A's tombstone; audit(1,0,0) resets the watermark. The delayed
+    // pre-reset observation must not become New, and matching late
+    // calls must never join on it.
+    const A: u64 = 0xA1;
+    const B: u64 = 0xA2;
+    let mut r = InstanceRouter::new(RouterLimits {
+        retired_cookies: 1,
+        ..RouterLimits::default()
+    });
+    let mut cached = observation_for(A, 2, load(BASE_A));
+    cached.reading.fault = 1;
+    // Acquired before the router learns of the new era (fence 0).
+    cached.fence = r.fence();
+    assert!(r.retire_process(A).is_empty());
+    assert!(r.retire_process(B).is_empty());
+    assert_eq!(r.counters().retired_evictions, 1);
+    assert!(r.audit(1, 0, 0).is_empty());
+    assert_eq!(r.observe(cached).0, ObserveOutcome::StaleEra);
+    assert_eq!(
+        r.route(call_for(9, A, stamp(2, 0, 1), ip_in(BASE_A))),
+        Route::Pending
+    );
+    assert_eq!(
+        r.expire_pending(A),
+        vec![(9, Route::Unknown(UnknownReason::Unobserved))]
+    );
+}
+
+#[test]
 fn retired_registry_eviction_preserves_retirement_refusal() {
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
@@ -762,9 +810,9 @@ fn retired_watermark_costs_retained_and_new_era_keys_nothing() {
     let mut old_era = observation_for(LIVE, 2, load(BASE_A));
     old_era.reading.fault = 0;
     assert_eq!(r.observe(old_era).0, ObserveOutcome::StaleEra);
-    let mut fresh = observation_for(LIVE, 2, load(BASE_A));
-    fresh.reading.fault = 1;
-    assert_eq!(r.observe(fresh).0, ObserveOutcome::New);
+    let mut rescanned = observation_for(LIVE, 2, load(BASE_A));
+    rescanned.reading.fault = 1;
+    assert_eq!(r.observe(fresh(&r, rescanned)).0, ObserveOutcome::New);
     joined(r.route(call_for(2, LIVE, stamp(2, 0, 1), ip_in(BASE_A))));
 }
 
@@ -790,7 +838,7 @@ fn a_fault_era_change_ends_every_observation_and_pending_call() {
         r.observe(observation(2, 0, 0, load(BASE_A))).0,
         ObserveOutcome::StaleEra
     );
-    r.observe(observation(2, 0, 1, load(BASE_A)));
+    r.observe(fresh(&r, observation(2, 0, 1, load(BASE_A))));
     let new = joined(r.route(call(4, stamp(2, 0, 1), ip_in(BASE_A))));
     assert_ne!(old, new);
 }
@@ -825,7 +873,7 @@ fn a_recursion_miss_increase_without_a_raise_latches_the_era() {
     );
     // A late raise re-coheres the era: the new fault is observable again.
     assert!(r.audit(1, 0, 1).is_empty());
-    r.observe(observation(2, 0, 1, load(BASE_A)));
+    r.observe(fresh(&r, observation(2, 0, 1, load(BASE_A))));
     let new = joined(r.route(call(4, stamp(2, 0, 1), ip_in(BASE_A))));
     assert_ne!(old, new);
     assert_eq!(r.counters().miss_eras, 1);
@@ -855,7 +903,7 @@ fn a_raise_covering_the_miss_advances_a_single_era() {
     assert_eq!(r.counters().eras, 1);
     assert_eq!(r.counters().miss_eras, 0);
     assert_eq!(
-        r.observe(observation(2, 0, 1, load(BASE_A))).0,
+        r.observe(fresh(&r, observation(2, 0, 1, load(BASE_A)))).0,
         ObserveOutcome::New
     );
     joined(r.route(call(1, stamp(2, 0, 1), ip_in(BASE_A))));
@@ -954,8 +1002,9 @@ fn stable_scan_requires_equal_brackets_and_bounds_retries() {
         ranges: load(BASE_A),
         maps_reads: 0,
     };
-    let observed = stable_scan(&mut moving, FILE, 3).expect("second attempt is stable");
+    let observed = stable_scan(&mut moving, FILE, 3, 7).expect("second attempt is stable");
     assert_eq!(observed.reading, reading(2, 0, 0));
+    assert_eq!(observed.fence, 7);
     assert_eq!(moving.maps_reads, 2);
 
     let mut never = Scripted {
@@ -969,7 +1018,10 @@ fn stable_scan_requires_equal_brackets_and_bounds_retries() {
         ranges: load(BASE_A),
         maps_reads: 0,
     };
-    assert_eq!(stable_scan(&mut never, FILE, 2), Err(ScanRefusal::Unstable));
+    assert_eq!(
+        stable_scan(&mut never, FILE, 2, 0),
+        Err(ScanRefusal::Unstable)
+    );
 
     let mut global_moved = Scripted {
         epochs: [reading(1, 0, 0), reading(1, 1, 0)].into(),
@@ -977,7 +1029,7 @@ fn stable_scan_requires_equal_brackets_and_bounds_retries() {
         maps_reads: 0,
     };
     assert_eq!(
-        stable_scan(&mut global_moved, FILE, 1),
+        stable_scan(&mut global_moved, FILE, 1, 0),
         Err(ScanRefusal::Unstable)
     );
 
@@ -987,7 +1039,7 @@ fn stable_scan_requires_equal_brackets_and_bounds_retries() {
         maps_reads: 0,
     };
     assert_eq!(
-        stable_scan(&mut no_cookie, FILE, 1),
+        stable_scan(&mut no_cookie, FILE, 1, 0),
         Err(ScanRefusal::NoCookie)
     );
 }

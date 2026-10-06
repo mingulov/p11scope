@@ -1039,6 +1039,23 @@ def check_streams(view, res):
                 rushed.append((key, f"seq {prev.get('seq')}->{cur.get('seq')} dt {cur_at - prev_at} ns"))
     res.ok(run, "*", "EDGE-CADENCE", not rushed,
            f"{len(rushed)} edge_observed records re-emit an unchanged class within 10 s: {rushed[:4]}")
+    # O3: invalid clocks fail closed. A missing/non-integer at_ns, or a
+    # regressing per-edge stamp, makes its pair unjudgeable for cadence
+    # (which keeps skipping it above) — but the stream must fail here
+    # instead of passing silently.
+    clock_bad = []
+    for key in sorted(by_edge, key=str):
+        rows = sorted(by_edge[key], key=lambda e: e.get("seq", 0))
+        for row in rows:
+            at = row.get("at_ns")
+            if not isinstance(at, int):
+                clock_bad.append((key, f"seq {row.get('seq')} at_ns {at!r} is not an int"))
+        stamps = [(row.get("seq"), row.get("at_ns")) for row in rows]
+        for (pseq, prev_at), (cseq, cur_at) in zip(stamps, stamps[1:]):
+            if isinstance(prev_at, int) and isinstance(cur_at, int) and cur_at < prev_at:
+                clock_bad.append((key, f"seq {pseq}->{cseq} clock regresses {prev_at}->{cur_at}"))
+    res.ok(run, "*", "EDGE-CLOCK", not clock_bad,
+           f"{len(clock_bad)} edge_observed records carry invalid or regressing clocks: {clock_bad[:4]}")
     # O2: the final sweep is exact but not exempt from scrutiny. Past the
     # last pass marker every edge carries at most one terminal record —
     # production's sweep re-emits only uncarried edges (zero when the
@@ -3165,6 +3182,29 @@ def self_test():
         res = case("sweep-single-terminal-pass", None, sweep_single_terminal)
         if not any(r["check"] == "TERMINAL-SWEEP" and r["status"] == "pass" for r in res.rows):
             failures.append("sweep-single-terminal-not-compared")
+
+        # --- O3: invalid clocks fail open (sol 3) ---------------------------
+        # Missing/non-integer/backwards timestamps skip cadence silently
+        # with no other check failing. Each pair below is a bucket jump
+        # (a class change), so cadence itself stays quiet and only the
+        # clock verdict can fail.
+        def clock_stages(s, d, first_at, second_at):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            prev = (1 << (count_bucket(n) - 1)) - 1
+            assert count_bucket(prev) != count_bucket(n), (prev, n)
+            return drift_stages(s, d, "P1", [(prev, first_at), (n, second_at)])
+
+        def clock_null(s, d, dash):
+            return clock_stages(s, d, T0 + 500, None)
+        case("edge-clock-null", "EDGE-CLOCK", clock_null)
+
+        def clock_string(s, d, dash):
+            return clock_stages(s, d, T0 + 500, "not-a-clock")
+        case("edge-clock-string", "EDGE-CLOCK", clock_string)
+
+        def clock_backwards(s, d, dash):
+            return clock_stages(s, d, T0 + 1500, T0 + 500)
+        case("edge-clock-backwards", "EDGE-CLOCK", clock_backwards)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

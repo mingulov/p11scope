@@ -647,16 +647,29 @@ def coverage(edge):
 
 
 def coverage_ok(edge):
-    """The documented seven keys, a known state, and an interval whose non-null
-    until_ns lies strictly after since_ns."""
+    """The documented seven keys, a known state, and fields valid for the
+    state (O5, grounded in inventory.rs coverage_json: until_ns only on
+    a watched interval — never on counted — since_ns on counted and
+    watched, first_ns on witnessed, lossy on counted; anything else is
+    an invented boundary)."""
     cov = edge.get("entries", {}).get("coverage")
     if not (isinstance(cov, dict) and set(cov) == COVERAGE_KEYS and cov.get("state") in COVERAGE_STATES):
         return False
+    state = cov.get("state")
     since, until = cov.get("since_ns"), cov.get("until_ns")
-    if until is not None:
-        if not isinstance(until, int) or (since is not None and until <= since):
-            return False
-    return True
+    first, lossy = cov.get("first_ns"), cov.get("lossy")
+    reason, detail = cov.get("reason"), cov.get("detail")
+    if state == "counted":
+        return (isinstance(since, int) and until is None and first is None
+                and isinstance(lossy, bool) and reason is None and detail is None)
+    if state == "witnessed":
+        return (since is None and until is None and isinstance(first, int)
+                and lossy is None and reason is None and detail is None)
+    if state == WATCH_STATE:
+        return (isinstance(since, int) and (until is None or (isinstance(until, int) and until > since))
+                and first is None and lossy is None and reason is None and detail is None)
+    # unknown: only the reason/detail carry meaning; no instant applies.
+    return since is None and until is None and first is None and lossy is None
 
 
 def doc_lane(doc):
@@ -2417,7 +2430,8 @@ def self_test():
         # first call must bind; count coverage never excuses it.
         def admitted_live_counted(s, d, dash):
             e = _edge(d, cid(s, "P1"), s.mid["A"])
-            e["entries"]["coverage"].update(state="unknown", first_ns=None, since_ns=None, reason="not_attached")
+            e["entries"]["coverage"].update(state="unknown", first_ns=None, since_ns=None, reason="not_attached",
+                                                lossy=None)
             e["entries"]["observation"] = "unknown (usage observation unavailable)"
             caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
             first = min(u[0] for c, _p, _s, _g, _e, _sp, uses in s.images if c == "P1" for u in uses.values())
@@ -2460,7 +2474,7 @@ def self_test():
             def mutate(s, d, dash):
                 e = _edge(d, cid(s, "P1"), s.mid["A"])
                 e["entries"]["coverage"].update(state="unknown", first_ns=None, since_ns=None,
-                                                reason="use_before_admission")
+                                                reason="use_before_admission", lossy=None)
                 e["entries"]["observation"] = "unknown (usage observation unavailable)"
                 caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
                 first = min(u[0] for c, _p, _s, _g, _e, _sp, uses in s.images if c == "P1" for u in uses.values())
@@ -2527,7 +2541,7 @@ def self_test():
             g1["entries"]["first_seen_ns"] = g0["entries"]["first_seen_ns"]
         case("exec-cross-attribution", "NO-CROSS-ATTRIBUTION", exec_cross)
         case("watched-on-used", "USED-NOT-WATCHED", lambda s, d, dash: _edge(d, cid(s, "P2"), s.mid["B"])["entries"]
-             ["coverage"].update(state=WATCH_STATE, since_ns=T0, first_ns=None))
+             ["coverage"].update(state=WATCH_STATE, since_ns=T0, first_ns=None, lossy=None))
 
         def cross(s, d, dash):
             e = _deep(_edge(d, cid(s, "P2"), s.mid["B"]))
@@ -2561,7 +2575,7 @@ def self_test():
         case("lossy-without-loss-gap", "COUNT-LOSSY", lossy)
         case("attested-only-witnessed", "COVERAGE-ALLOWED", lambda s, d, dash: _edge(d, cid(s, "P1"), s.mid["A"])
              ["entries"]["coverage"].update(state="witnessed", first_ns=_edge(d, cid(s, "P1"), s.mid["A"])
-                                            ["entries"]["first_seen_ns"], since_ns=None))
+                                            ["entries"]["first_seen_ns"], since_ns=None, lossy=None))
 
         def no_cov(s, d, dash):
             for e in d["edges"]:
@@ -2583,7 +2597,8 @@ def self_test():
                 e = _edge(d, cid(s, "P2"), s.mid["B"])
                 first = positive_first_ns(e)
                 until = None if until_offset is None else first + until_offset
-                e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=until, first_ns=None)
+                e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=until, first_ns=None,
+                                                lossy=None)
             return mutate
         # A frozen watch that ended before the ledgered use claims nothing about it ...
         res = case("watch-until-before-use", "USED-POSITIVE", watch_ending_before_use(-50 * MS))
@@ -2964,7 +2979,8 @@ def self_test():
 
         def absent_zero_p1(s, d, dash):
             e = _edge(d, cid(s, "P1"), s.mid["A"])
-            e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=None, first_ns=None)
+            e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=None, first_ns=None,
+                                                lossy=None)
             e["entries"].update(count=0, first_seen_ns=None, last_seen_ns=None, observation="observed")
         case("absent-as-zero-p1", "USED-NOT-WATCHED", absent_zero_p1)
 
@@ -2986,7 +3002,7 @@ def self_test():
         def unattested_witnessed(s, d, dash):
             e = _edge(d, cid(s, "P2"), s.mid["B"])
             e["entries"]["coverage"].update(state="witnessed", first_ns=e["entries"]["first_seen_ns"],
-                                            since_ns=None)
+                                            since_ns=None, lossy=None)
         case("unattested-witnessed", "COVERAGE-ALLOWED", unattested_witnessed)
 
         # Choice 1: uncounted needs the BPF PairInsertFailure evidence.
@@ -3094,7 +3110,8 @@ def self_test():
         # C2 extension: the decided snapshot never carries pending_first_use.
         def pending_snapshot(s, d, dash):
             e = _edge(d, cid(s, "P1"), s.mid["A"])
-            e["entries"]["coverage"].update(state=UNKNOWN_STATE, since_ns=None, reason=PENDING_FIRST_USE_REASON)
+            e["entries"]["coverage"].update(state=UNKNOWN_STATE, since_ns=None, reason=PENDING_FIRST_USE_REASON,
+                                                lossy=None)
             e["entries"]["observation"] = "unknown (usage observation unavailable)"
         case("pending-in-snapshot", "PENDING-TRANSIENT", pending_snapshot)
 
@@ -3239,6 +3256,19 @@ def self_test():
             sd["edges"][0]["entries"]["coverage"]["since_ns"] = row
             return {"stop_doc": sd}
         case("preadmission-held-table-before-observer", None, preadmission_legit_held)
+
+        # --- O5: invented frozen-count bypass (astra B3) ---------------------
+        # Native Counted has no until_ns (frozen ends belong to
+        # WatchedNoUse), yet the oracle accepts a non-null counted end,
+        # clips COUNT-WINDOW to it and skips COUNT-EXACT — so an early
+        # until_ns with 37->1 calls passes everything.
+        def counted_until_bypass(s, d, dash):
+            match = re.search(r"fn=C_Initialize mech=- n=1 bad=0 phase=setup t0=\d+ t1=(\d+)",
+                              s.ledgers["P2"])
+            edge = _edge(d, cid(s, "P2"), s.mid["B"])
+            edge["entries"]["coverage"]["until_ns"] = int(match.group(1))
+            edge["entries"]["count"] = 1
+        case("counted-until-frozen-bypass", "COVERAGE-SHAPE", counted_until_bypass)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

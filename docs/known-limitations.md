@@ -253,6 +253,14 @@ the min..max of per-sample p95.
   ~10 µs/op with ±9% spread; the +100/+215 ns/op deltas sit inside the
   noise), but BPF-side per-event cost rose under contention (602 ns
   watched, 424 ns unrelated), so the tax grows when the host is busiest.
+- Scale (D1 deviation, 2026-10-06): the 1d brief asked for churn "at
+  4,096 processes"; the campaign ran single-process churn plus 8-worker
+  parallel cells only. Contention already raises the per-event cost
+  (BPF run-time 602 ns watched / 424 ns unrelated under p8 vs 416/410
+  and 282/280 ns solo), so the medians above are plausibly a
+  system-scale LOWER bound: expect the per-event tax to grow, not
+  shrink, toward full scale. A 4,096-process cell is deferred to the
+  Stage 5 qualification windows (M1-4096/M1-10k); see DR-T3A-7.
 - Kernels/conditions: any kernel where the hooks attach (non-LTO with a
   readable `/boot/config`; LTO or unverifiable status refuses, as
   before). Campaign: Linux 7.0.0-34-generic x86-64, AMD Ryzen AI 9 HX

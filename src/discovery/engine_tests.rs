@@ -12708,9 +12708,46 @@ fn owned_mapper_bounds_partial_readiness_and_reaps_the_child() {
     assert_owned_child_reaped(&view);
 }
 
+/// Block until `pid` has exec'd past its fork-of-the-test-runner phase:
+/// its exe link no longer names this test binary AND its maps already carry
+/// that image's executable mapping (the exe link alone switches in
+/// `begin_new_exec()`, before the new segments are mapped — see
+/// `maps_have_executable_image`). A snapshot taken before this point sees
+/// the test runner's own mappings, including transiently dlopened
+/// `/tmp/.tmp*/provider.so` fixtures that vanish before pin time (hosted CI
+/// run 37422857664). Bounded like the snapshot loop below; on timeout FAILS
+/// LOUD naming the child and the last evidence, never silently proceeds.
+fn wait_for_child_exec(pid: u32) {
+    let this_image = std::env::current_exe().unwrap();
+    let exe = format!("/proc/{pid}/exe");
+    let maps_path = format!("/proc/{pid}/maps");
+    let mut evidence = String::from("no read attempted");
+    for _ in 0..200 {
+        let image = std::fs::read_link(&exe).ok();
+        let maps = std::fs::read_to_string(&maps_path).ok();
+        let execed = image.as_ref().is_some_and(|image| {
+            image != &this_image
+                && maps
+                    .as_ref()
+                    .is_some_and(|maps| maps_have_executable_image(maps, image))
+        });
+        if execed {
+            return;
+        }
+        evidence = format!(
+            "exe={image:?} maps_head={:?}",
+            maps.as_deref()
+                .map(|maps| maps.lines().take(3).collect::<Vec<_>>().join("\\n"))
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("sleep child {pid} never execed; last evidence: {evidence}");
+}
+
 /// Two provider modules over two distinct executable objects the live
 /// child really mapped.
 fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
+    wait_for_child_exec(view.pid());
     for _ in 0..200 {
         let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
         let maps = parse_maps(&bytes).unwrap();
@@ -12795,6 +12832,81 @@ fn peer_candidate(engine: &mut Engine, modules: &[ScannedModule]) -> LiveCandida
     );
     assert_eq!(candidate.plan.slots.len(), 2);
     candidate
+}
+
+/// Spawn `sleep 30` through a raw fork whose child sleeps two seconds
+/// before execing, holding a deterministic pre-exec window: immediately after
+/// this returns, the child is provably still a fork of the test runner. A
+/// `Command::pre_exec` sleep cannot do this — it forces the fork path whose
+/// error pipe makes `spawn` block until the exec — and plain `spawn` only
+/// wins the pre-exec race under load (0/2000 locally, fatal on hosted CI run
+/// 37422857664).
+fn spawn_sleep_with_pre_exec_delay() -> u32 {
+    let program = std::ffi::CString::new("sleep").unwrap();
+    let arg0 = std::ffi::CString::new("sleep").unwrap();
+    let arg1 = std::ffi::CString::new("30").unwrap();
+    let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+    // SAFETY: fork in a multithreaded binary. The child calls only
+    // async-signal-safe functions before the exec (nanosleep, execvp) and
+    // `_exit(127)` if the exec fails; it never returns to test code, runs no
+    // destructors, and touches no allocator state. All pointers are parent
+    // C strings, valid across the fork.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+    if pid == 0 {
+        unsafe {
+            let delay = libc::timespec {
+                tv_sec: 2,
+                tv_nsec: 0,
+            };
+            libc::nanosleep(&delay, std::ptr::null_mut());
+            libc::execvp(program.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+    pid as u32
+}
+
+/// Dev-flake regression (hosted CI run 37422857664): the helper snapshotted
+/// a freshly spawned child before it exec'd and returned the TEST RUNNER's
+/// own mappings — including transiently dlopened `/tmp/.tmp*/provider.so`
+/// fixtures — which then vanished before pin time (ENOENT `Skipped`). The
+/// child below is provably pre-exec when the helper runs, so the old code
+/// deterministically returned the test binary as its first module. The
+/// settled helper never returns test-runner mappings, and the settled child
+/// maps its own image.
+#[test]
+fn child_provider_modules_waits_for_exec_settle() {
+    struct RawChild(u32);
+    impl Drop for RawChild {
+        fn drop(&mut self) {
+            // SAFETY: this unprivileged fixture owns this live, unreaped child.
+            unsafe {
+                libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(self.0 as libc::pid_t, &mut status, 0);
+            }
+        }
+    }
+
+    let child = RawChild(spawn_sleep_with_pre_exec_delay());
+    let pid = child.0;
+    let view = ProcessView::open(ProcessViewId(3), pid).unwrap();
+    let modules = child_provider_modules(&view);
+    let test_image = std::env::current_exe().unwrap();
+    assert!(
+        modules
+            .iter()
+            .all(|module| Path::new(&module.path) != test_image),
+        "pre-exec garbage: the helper returned test-runner mappings: {modules:?}"
+    );
+    let image = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert!(
+        modules
+            .iter()
+            .any(|module| Path::new(&module.path) == image),
+        "the settled child maps its own image {image:?}: {modules:?}"
+    );
 }
 
 /// `entries` endpoints of one heuristic table at `0x1000, 0x1008, …` of

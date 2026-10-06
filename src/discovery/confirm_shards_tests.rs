@@ -493,8 +493,42 @@ fn privileged_sharded_confirmation_equals_the_serial_production_probe() {
             })
             .collect(),
     );
-    // Let every child finish loading before its maps are read.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Exec-settle (dev-flake): a pre-exec child still maps this test binary
+    // (including its libc), so a fixed sleep cannot prove readiness. Only
+    // read maps once every child exec'd sleep AND mapped libc text — the
+    // condition this sweep actually consumes below. Bounded; on timeout
+    // FAILS LOUD naming the child, never silently proceeds.
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let maps_path = format!("/proc/{pid}/maps");
+        let mut settled = false;
+        let mut evidence = String::from("no read attempted");
+        for _ in 0..200 {
+            let image = std::fs::read_link(&exe).ok();
+            let execed = image.as_ref().is_some_and(|image| image != &self_exe);
+            let libc_mapped = std::fs::read(&maps_path)
+                .ok()
+                .and_then(|text| p11scope_manifest::maps::parse_maps(&text).ok())
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.permissions[2] == b'x'
+                            && entry
+                                .raw_path
+                                .as_deref()
+                                .is_some_and(|path| path.windows(4).any(|w| w == b"libc"))
+                    })
+                });
+            if execed && libc_mapped {
+                settled = true;
+                break;
+            }
+            evidence = format!("exe={image:?} libc_mapped={libc_mapped}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(settled, "sleep child {pid} never settled; last {evidence}");
+    }
     let sweep: Vec<(u32, Vec<MapEntry>)> = children
         .0
         .iter()

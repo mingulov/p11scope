@@ -238,7 +238,15 @@ def validate(samples, done_lines, manifest):
                     f"round {sample['round']} on-arm sample has no hook "
                     "run-time sample: the hooks never fired under the workload"
                 )
-            elif sample["bpf_cnt"] < sample["ops"] or sample["bpf_ns"] <= 0:
+            elif sample["bpf_ns"] <= 0:
+                problems.append(
+                    f"line {sample['lineno']}: cell {sample['cell']} "
+                    f"round {sample['round']} on-arm hook run-time "
+                    f"(bpf_ns={sample['bpf_ns']} over bpf_cnt={sample['bpf_cnt']}) "
+                    "is not positive: the run-time counter never advanced "
+                    "under the workload"
+                )
+            elif sample["bpf_cnt"] < sample["ops"]:
                 problems.append(
                     f"line {sample['lineno']}: cell {sample['cell']} "
                     f"round {sample['round']} on-arm hook execution "
@@ -607,6 +615,49 @@ DONE samples=8
         code, _, err = run([path, "--manifest", manifest_path])
         assert code == 1, (code, err)
         assert "'ops' is 2000, manifest wants 1000" in err, err
+        write_log(log.replace("wall_ns=4100000 mode=mmap", "wall_ns=4100000 mode=mremap"))
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "'mode' is mremap, manifest wants mmap" in err, err
+        write_log(log.replace("wall_ns=4100000 mode=mmap parallel=1", "wall_ns=4100000 mode=mmap parallel=2"))
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "'parallel' is 2, manifest wants 1" in err, err
+        # A whole missing round names the missing rounds exactly.
+        noround2 = "\n".join(line for line in log.splitlines() if " round=2 " not in line) + "\n"
+        write_log(noround2)
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "cell relevant-mmap: want rounds [1, 2], have [1]" in err, err
+        assert "cell unrelated-mmap: want rounds [1, 2], have [1]" in err, err
+        # Present-but-zero counters/runtime fail with the exact split
+        # diagnostic: a zero run-time never reports "below one event per op".
+        write_log(log.replace("bpf_ns=160000 bpf_cnt=2000", "bpf_ns=100 bpf_cnt=0"))
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "(bpf_cnt=0 over ops=1000) is below one event per op" in err, err
+        write_log(log.replace("bpf_ns=160000 bpf_cnt=2000", "bpf_ns=0 bpf_cnt=2000"))
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "on-arm hook run-time (bpf_ns=0 over bpf_cnt=2000) is not positive" in err, err
+        assert "below one event per op" not in err, err
+        # Events/op outside 2x of expected names the ratio exactly, high
+        # and low alike.
+        flooded = log
+        for old in ("bpf_cnt=2000", "bpf_cnt=2050", "bpf_cnt=2010", "bpf_cnt=1990"):
+            flooded = flooded.replace(old, "bpf_cnt=10000")
+        write_log(flooded)
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "hook events per op are 10.00, want 2 within 2x" in err, err
+        hungry = dict(manifest)
+        hungry["events_per_op"] = 10
+        write_log(log)
+        write_manifest(hungry)
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "hook events per op are 2.02, want 10 within 2x" in err, err
+        write_manifest(manifest)
         write_log(log.replace("cell=unrelated-mmap", "cell=rogue-cell"))
         code, _, err = run([path, "--manifest", manifest_path])
         assert code == 1, (code, err)

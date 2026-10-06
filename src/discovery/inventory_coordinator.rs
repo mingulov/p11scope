@@ -1684,6 +1684,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         }
         let mut stage = Vec::new();
+        let mut retry = Vec::new();
         for update in &batch.counts {
             let key = PairKey::of_update(batch.domain, update);
             if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped)) {
@@ -1698,8 +1699,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 held.count = update.count;
                 held.last_ns = batch.rows_read_ns;
             }
-            if let Some(PairTarget::Bound { caller, module }) = self.pair_targets.get(&key) {
-                stage.push((*caller, module.clone(), *held));
+            match self.pair_targets.get(&key) {
+                Some(PairTarget::Bound { caller, module }) => {
+                    stage.push((*caller, module.clone(), *held));
+                }
+                Some(PairTarget::Pending {
+                    caller,
+                    modules,
+                    staged,
+                }) => retry.push((key, *caller, modules.clone(), *held, *staged)),
+                _ => {}
+            }
+        }
+        // Pending pairs retry their placement against the committed
+        // registry: a resolved pair converts to Bound and stages placed;
+        // an advance past what is staged re-stages pending.
+        for (key, caller, modules, count, staged) in retry {
+            if let Some(module) = self.committed_placement(caller, &modules) {
+                self.pair_targets.insert(
+                    key,
+                    PairTarget::Bound {
+                        caller,
+                        module: module.clone(),
+                    },
+                );
+                stage.push((caller, module, count));
+            } else if count.count > staged {
+                self.stage_pending_count(caller, &modules, count);
+                if let Some(PairTarget::Pending { staged: was, .. }) =
+                    self.pair_targets.get_mut(&key)
+                {
+                    *was = count.count;
+                }
             }
         }
         // Staging compares against the registry, not a coordinator
@@ -1747,22 +1778,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         );
     }
 
-    /// Records one bound row's pair target (C7 C4): counts stage only
-    /// where the witness did — exactly one edged module, mirroring
-    /// `apply_bound_witness` — and the held count (first sight merged
-    /// with any refresh) stages with the bind.
-    fn bind_pair_count(&mut self, row: &WitnessRow, caller: CallerId, modules: &[ModuleKey]) {
-        let key = PairKey::of(row);
+    /// The committed-registry placement of one bound row's counts (C7
+    /// C4): exactly one edged module, mirroring `apply_bound_witness`.
+    /// `None` means "not yet" (or ambiguous), never "never": the caller
+    /// keeps the pair pending.
+    fn committed_placement(&self, caller: CallerId, modules: &[ModuleKey]) -> Option<ModuleKey> {
         let mut edged = modules.iter().filter(|module| {
             self.registry
                 .module_id_for(module)
                 .is_some_and(|id| self.registry.edge(caller, id).is_some())
         });
-        let single = match (edged.next(), edged.next()) {
+        match (edged.next(), edged.next()) {
             (Some(module), None) => Some(module.clone()),
             _ => None,
-        };
-        match single {
+        }
+    }
+
+    /// Records one bound row's pair target (C7 C4): counts stage only
+    /// where the witness did — exactly one edged module, mirroring
+    /// `apply_bound_witness` — and the held count (first sight merged
+    /// with any refresh) stages with the bind. A placement the committed
+    /// registry cannot resolve yet (its mapping stages in this same
+    /// window) stays pending and resolves at publication, alongside the
+    /// witness — never dropped for arriving before its mapping.
+    fn bind_pair_count(&mut self, row: &WitnessRow, caller: CallerId, modules: &[ModuleKey]) {
+        let key = PairKey::of(row);
+        match self.committed_placement(caller, modules) {
             Some(module) => {
                 self.pair_targets.insert(
                     key,
@@ -1775,12 +1816,47 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     self.stage_pair_count(caller, &module, count);
                 }
             }
-            None => self.drop_pair_count(row),
+            None => {
+                self.pair_targets.insert(
+                    key,
+                    PairTarget::Pending {
+                        caller,
+                        modules: modules.to_vec(),
+                        staged: 0,
+                    },
+                );
+                if let Some(count) = self.pair_counts.get(&key).copied()
+                    && count.count > 0
+                {
+                    self.stage_pending_count(caller, modules, count);
+                    if let Some(PairTarget::Pending { staged, .. }) =
+                        self.pair_targets.get_mut(&key)
+                    {
+                        *staged = count.count;
+                    }
+                }
+            }
         }
     }
 
-    /// Drops one pair's counts (C7 C4): binder-unbound, ambiguous, or
-    /// edgeless — held and later counts never publish.
+    /// Stages one pending pair's held count for publication-time
+    /// placement (C7 C4): only for counts ≥ 1 — anything else leaves the
+    /// witness standing, and a later advance re-stages.
+    fn stage_pending_count(&mut self, caller: CallerId, modules: &[ModuleKey], count: PairCount) {
+        if count.count == 0 {
+            return;
+        }
+        self.registry.note_pending_count(
+            caller,
+            modules.to_vec(),
+            count.count,
+            count.first_ns,
+            count.last_ns,
+        );
+    }
+
+    /// Drops one pair's counts (C7 C4): binder-unbound, or no module at
+    /// all — held and later counts never publish.
     fn drop_pair_count(&mut self, row: &WitnessRow) {
         let key = PairKey::of(row);
         self.pair_targets.insert(key, PairTarget::Dropped);
@@ -2142,8 +2218,19 @@ enum PairTarget {
     /// The pair bound to `caller` and its witness resolved to exactly
     /// one edged module: counts stage there.
     Bound { caller: CallerId, module: ModuleKey },
-    /// The pair never publishes: binder-unbound, ambiguous shared
-    /// endpoint, or no mapping edge. Held and later counts drop.
+    /// The pair bound to `caller` but its witness modules are not
+    /// committed-edged yet (their mapping stages in this same window, for
+    /// example): counts stage pending and resolve at publication,
+    /// alongside the witness. `staged` is the count staged so far, so
+    /// only advances re-stage. Retried against the committed registry on
+    /// every advance (a resolved pair converts to [`Self::Bound`]).
+    Pending {
+        caller: CallerId,
+        modules: Vec<ModuleKey>,
+        staged: u64,
+    },
+    /// The pair never publishes: binder-unbound, or no module at all.
+    /// Held and later counts drop.
     Dropped,
 }
 
@@ -3550,6 +3637,11 @@ mod tests {
         }
 
         fn project(&mut self, pid: u32, now_ns: u64) {
+            let path = self.path.clone();
+            self.project_paths(pid, &[&path], now_ns);
+        }
+
+        fn project_paths(&mut self, pid: u32, paths: &[&std::path::Path], now_ns: u64) {
             // Collected under the incarnation reconcile holds for the pid.
             let generation = self
                 .coordinator
@@ -3560,7 +3652,7 @@ mod tests {
                     start_time: record.start_time,
                     exe: record.exe.clone(),
                 });
-            let catalog = capture_catalog(&self.pins, &[&self.path], pid, generation);
+            let catalog = capture_catalog(&self.pins, paths, pid, generation);
             self.coordinator
                 .project_catalog(&catalog, &self.verdicts, now_ns);
         }
@@ -4925,6 +5017,105 @@ mod tests {
             activity_at(&native, 1571, 1000),
             Activity::RecentlyObserved,
             "the rise at 1071 beats quiet"
+        );
+    }
+
+    #[test]
+    fn a_late_mapped_module_keeps_its_first_use_count() {
+        // P1-3: a caller already bound through module A loads module B;
+        // the pass that stages B's mapping also reads B's first-use row
+        // (bound at once through the cached caller identity) before
+        // committing the mapping. The witness resolves onto the committed
+        // edge — and so must the count: later refreshes advance it,
+        // never skip a permanently dropped pair.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        // Bound through A first: the image's identity is cached.
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        assert!(
+            matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+            "the A edge is counted: {:?}",
+            native.scene.coverage(caller)
+        );
+        // The late module: absorbed (attach set knows it at once, like
+        // the scan's absorb_lowering) but mapped only in the same
+        // staging window as its first-use row.
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &b, &fx::offsets(2))),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        let endpoint_b = absorbed_b.delta.endpoints[0];
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        // One staging window, no commit between: project A+B (B's mapping
+        // stages, uncommitted) then read B's first-use row (immediate
+        // bind through the cached identity).
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        let row_b = WitnessRow::scripted(
+            native.domain,
+            41,
+            1,
+            endpoint_b.object,
+            endpoint_b.id,
+            7,
+            210,
+        );
+        native.read(vec![row_b]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_b = |native: &NativeScene| {
+            let registry = &native.scene.coordinator.registry;
+            let edge = registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry
+                            .module(edge.module)
+                            .is_some_and(|module| module.paths.iter().any(|p| p.contains("b.so")))
+                })
+                .expect("the caller has its B edge");
+            (edge.entry_count, registry.coverage(edge))
+        };
+        // Premise: the witness resolved onto the committed edge.
+        assert!(
+            matches!(
+                edge_b(&native).1,
+                UseCoverage::Witnessed { .. } | UseCoverage::Counted { .. }
+            ),
+            "the B witness resolved: {:?}",
+            edge_b(&native).1
+        );
+        // A later count increase must advance the edge, not skip it.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: endpoint_b.object,
+            count: 9,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let (count, coverage) = edge_b(&native);
+        assert_eq!(count, 9, "the B edge advanced to 9");
+        assert!(
+            matches!(coverage, UseCoverage::Counted { .. }),
+            "the B edge reads counted: {coverage:?}"
         );
     }
 

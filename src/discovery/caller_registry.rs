@@ -1345,6 +1345,16 @@ enum Mutation {
         /// resolution, never a BPF timestamp.
         last_ns: u64,
     },
+    NotePendingCount {
+        caller: CallerId,
+        /// The candidate modules (the witness's): placement resolves at
+        /// publication, alongside the witness, against the mappings this
+        /// same publication commits.
+        modules: Vec<ModuleKey>,
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+    },
     NotePairsUncounted {
         reason: Arc<str>,
         at_ns: u64,
@@ -1971,6 +1981,31 @@ impl CallerRegistry {
         });
     }
 
+    /// Stage one bound pair's absolute entry count whose edge placement
+    /// is not yet committed (its mapping stages in this same window and
+    /// commits at publication, for example): placement resolves at
+    /// publication, alongside the
+    /// witness, against the mappings the publication commits — exactly
+    /// one edged module takes the count, like the witness. Anything else
+    /// (no edge, ambiguity, no admission) drops silently: the witness
+    /// records the placement gaps, and a count never invents an edge.
+    pub(crate) fn note_pending_count(
+        &mut self,
+        caller: CallerId,
+        modules: Vec<ModuleKey>,
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+    ) {
+        self.staged.push(Mutation::NotePendingCount {
+            caller,
+            modules,
+            count,
+            first_ns,
+            last_ns,
+        });
+    }
+
     /// Stage one global health regression (a native identity, pair, or
     /// usage evidence counter rose between `at_ns`, the last clean read,
     /// and `detected_ns`, the read that saw it). The failure cannot be
@@ -2248,6 +2283,13 @@ impl CallerRegistry {
                 module,
                 note,
             } => self.apply_coverage(caller, &module, note),
+            Mutation::NotePendingCount {
+                caller,
+                modules,
+                count,
+                first_ns,
+                last_ns,
+            } => self.apply_pending_count(caller, &modules, count, first_ns, last_ns),
             Mutation::NoteCountedUse {
                 caller,
                 module,
@@ -2701,6 +2743,55 @@ impl CallerRegistry {
             ([], []) => self.witness_placement.unresolved += 1,
             _ => self.apply_shared_endpoint(modules, "bound to a caller incarnation"),
         }
+    }
+
+    /// One pending count's publication: placement mirrors
+    /// [`Self::apply_bound_witness`] — exactly one edged module takes
+    /// the count — and admission mirrors the coordinator's
+    /// `stage_pair_count` (only admitted modules count). On placement
+    /// the count and its `Counted` coverage apply exactly as if staged
+    /// placed; anything else drops silently (the witness records the
+    /// placement gaps, and no gap is owed twice).
+    fn apply_pending_count(
+        &mut self,
+        caller: CallerId,
+        modules: &[ModuleKey],
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+    ) {
+        let placed = modules
+            .iter()
+            .filter(|key| {
+                self.modules_by_key
+                    .get(*key)
+                    .is_some_and(|id| self.edges.contains_key(&(caller, *id)))
+            })
+            .collect::<Vec<_>>();
+        let [module] = placed.as_slice() else {
+            return;
+        };
+        let admitted = self
+            .modules_by_key
+            .get(*module)
+            .and_then(|id| self.modules.get(id))
+            .is_some_and(|record| record.admission == AdmissionState::Admitted);
+        if !admitted {
+            return;
+        }
+        let module = (*module).clone();
+        self.apply(Mutation::NoteCountedUse {
+            caller,
+            module: module.clone(),
+            count,
+            first_ns,
+            last_ns,
+        });
+        self.apply(Mutation::NoteCoverage {
+            caller,
+            module,
+            note: CoverageNote::Counted { since_ns: first_ns },
+        });
     }
 
     /// One row whose endpoint several admitted modules share, with no

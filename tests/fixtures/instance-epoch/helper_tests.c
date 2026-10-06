@@ -59,8 +59,9 @@ static struct file___p11inst other_file = { &other_inode };
 static struct mm_struct___p11inst mm = { { 1 } };
 static struct mm_struct___p11inst other_mm = { { 1 } };
 static struct task_struct___p11inst leader;
-static struct task_struct___p11inst thread = { &mm, &leader };
+static struct task_struct___p11inst thread = { &mm, &leader, 0 };
 static struct task_struct___p11inst child;
+static struct task_struct___p11inst borrower;
 static struct task_struct___p11inst *current_task = &thread;
 static struct vm_area_struct___p11inst vma = { 0x7f0000001000UL, &mm, &file };
 static struct vm_area_struct___p11inst other_vma = { 0x7f0000009000UL, &mm, &other_file };
@@ -139,6 +140,8 @@ static int task_index(void *task)
         return 1;
     if (task == &thread)
         return 2;
+    if (task == &borrower)
+        return 3;
     assert(!"storage on an unexpected task");
     return -1;
 }
@@ -203,6 +206,12 @@ static void reset(void)
     mm.mm_users.counter = 1;
     thread.mm = &mm;
     thread.group_leader = &leader;
+    thread.flags = 0;
+    leader.flags = 0;
+    child.flags = 0;
+    borrower.mm = 0;
+    borrower.group_leader = 0;
+    borrower.flags = 0;
     current_task = &thread;
 }
 
@@ -272,7 +281,7 @@ int main(void)
     unmap_hook(&vma);
     assert(counters.teardown_skips == 1 && !storage_creates && !g_epoch[5]);
 
-    /* Remote mm (or kernel thread): the global epoch moves. */
+    /* Remote mm: the global epoch moves. */
     reset();
     thread.mm = &other_mm;
     unmap_hook(&vma);
@@ -280,6 +289,39 @@ int main(void)
     thread.mm = 0;
     unmap_hook(&vma);
     assert(counters.remote == 2 && g_epoch[5] == 2);
+
+    /* A kthread_use_mm borrower: task->mm is this mm (borrowed) while the
+     * single mm_users reference belongs to another group — so it passes
+     * the current-mm check and must still globalize via PF_KTHREAD. The
+     * owner's record and stamps are untouched; the global epoch carries
+     * the mutation. */
+    reset();
+    borrower.mm = &mm;
+    borrower.group_leader = &borrower;
+    borrower.flags = INST_PF_KTHREAD;
+    record_present[0] = 1;
+    records[0].slot_plus1[0] = 6;
+    records[0].epoch[0] = 1;
+    slot_file[3] = 6;
+    struct instance_stamp before = stamp(3);
+    current_task = &borrower;
+    unmap_hook(&vma);
+    assert(counters.remote == 1 && g_epoch[5] == 1 && counters.global_bumps == 1);
+    assert(!record_present[3] && !counters.local_bumps && !storage_creates);
+    assert(records[0].epoch[0] == 1);
+    current_task = &thread;
+    struct instance_stamp after = stamp(3);
+    assert(before.epoch == 1 && after.epoch == 1);
+    assert(before.global == 0 && after.global == 1);
+    /* A borrower without the kthread bit is indistinguishable from the
+     * owner by shape alone: the flags field is the whole exclusion. */
+    reset();
+    borrower.mm = &mm;
+    borrower.group_leader = &borrower;
+    current_task = &borrower;
+    map_hook(&vma);
+    assert(counters.local_bumps == 1 && !g_epoch[5]);
+    current_task = &thread;
 
     /* No current task, no leader, storage failure: global, never silent. */
     reset();
@@ -295,9 +337,10 @@ int main(void)
     map_hook(&vma);
     assert(g_epoch[5] == 3 && counters.storage_null == 1);
 
-    /* Unreadable vm_mm/mm_users: global. Unreadable file metadata: no
-     * identity, so no watched file can be named (read 0..4 are file side). */
-    for (int at = 0; at < 7; at++) {
+    /* Unreadable vm_mm/mm_users/task flags/current-mm: global. Unreadable
+     * file metadata: no identity, so no watched file can be named (reads
+     * 0..4 are file side, 5 is vm_mm, 6 mm_users, 7 flags, 8 current-mm). */
+    for (int at = 0; at < 9; at++) {
         reset();
         read_fail_at = at;
         map_hook(&vma);
@@ -345,11 +388,16 @@ int main(void)
     map_hook(&vma);
     assert(counters.shared == 1 && g_epoch[5] == 1 && !storage_creates);
     /* An unreadable ownership count fails closed (read 6 is also covered
-     * by the loop above; pinned again here for the message). */
+     * by the loop above; pinned again here for the message). So do
+     * unreadable task flags (read 7): borrowers fail closed too. */
     reset();
     read_fail_at = 6;
     map_hook(&vma);
     assert(g_epoch[5] == 1 && !storage_creates);
+    reset();
+    read_fail_at = 7;
+    map_hook(&vma);
+    assert(g_epoch[5] == 1 && counters.remote == 1 && !storage_creates);
 
     /* Record overflow: 8 files fit; the 9th goes global and marks OVERFLOW. */
     reset();

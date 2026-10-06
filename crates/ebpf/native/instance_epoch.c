@@ -49,6 +49,7 @@ struct vm_area_struct___p11inst {
 struct task_struct___p11inst {
     struct mm_struct___p11inst *mm;
     struct task_struct___p11inst *group_leader;
+    unsigned int flags;
 } INST_BTF;
 
 struct {
@@ -280,6 +281,7 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
     struct mm_struct___p11inst *current_mm = 0;
     unsigned long ino = 0;
     u32 dev = 0;
+    unsigned int task_flags = 0;
     int users = 0;
     u32 *slotp;
     u32 slot;
@@ -327,8 +329,16 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
         inst_global(slot, counters);
         return 0;
     }
+    if (INST_READ(task_flags, current->flags) || (task_flags & INST_PF_KTHREAD)) {
+        /* A kernel thread — possibly borrowing this mm through
+         * kthread_use_mm, which sets task->mm without an mm_users
+         * reference — or unreadable flags: not localizable. */
+        inst_count(counters ? &counters->remote : 0);
+        inst_global(slot, counters);
+        return 0;
+    }
     if (INST_READ(current_mm, current->mm) || current_mm != mm) {
-        /* Remote zap/truncate, or a kernel thread: not localizable. */
+        /* Remote zap/truncate: not localizable. */
         inst_count(counters ? &counters->remote : 0);
         inst_global(slot, counters);
         return 0;
@@ -344,10 +354,11 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
      * Ownership proof. mm_users counts every user task with task->mm ==
      * this mm (exactly one reference each, taken at fork, dropped in
      * exit_mm) plus transient kernel mmget holders, who only inflate the
-     * count. The current_mm check above proved current is one of those
-     * users, and current cannot exit while it runs this hook — so an
-     * observed 1 is current's own reference, and no other user-task
-     * reference exists at the instant of the read:
+     * count. The PF_KTHREAD check above proved current is a user task and
+     * the current_mm check proved current is one of those users; current
+     * cannot exit while it runs this hook — so an observed 1 is current's
+     * own reference, and no other user-task reference exists at the
+     * instant of the read:
      * - Zombies and exiting tasks: a task past exit_mm holds no reference
      *   and can never mutate or stamp again (it has no mm); a task still
      *   before exit_mm holds one and would have been counted. The
@@ -364,11 +375,29 @@ static INST_INLINE int inst_note_vma(u64 vma_addr, int calibrate)
      *   counted (and a post-attachment CLONE_VM non-thread child is
      *   SHARED_MM-marked anyway); a thread created after the read shares
      *   this same leader record and sees the bump.
-     * - Kthread borrow (kthread_use_mm/mmgrab) takes an mm_count
-     *   reference, never mm_users: borrowers are invisible to this count,
-     *   and any mutation they perform takes the remote path above (their
-     *   task->mm is NULL), never a stamp. Only user tasks with task->mm ==
-     *   mm can reach this point, and each of those holds one mm_users.
+     * - Kthread borrow (kthread_use_mm/use_mm) takes an mm_count
+     *   reference, never mm_users — but it DOES set the borrower's
+     *   task->mm to the borrowed mm, so a borrower passes the
+     *   current-mm check while the sole mm_users reference belongs to
+     *   another group. (The old "borrowers have task->mm == NULL"
+     *   premise was false.) Borrowers are kernel threads, so the
+     *   PF_KTHREAD check above globalizes them — and any task whose
+     *   flags cannot be read — before the count is consulted. A
+     *   borrower's mutation therefore always lands in the global
+     *   epoch, never in a user record and never in a stamp. Only user
+     *   tasks with task->mm == mm can reach this point, and each of
+     *   those holds one mm_users.
+     * - Transient mmget (mmget_not_zero, e.g. a concurrent /proc
+     *   reader): such references CAN appear asynchronously after the
+     *   read — the old "no async references" assumption was false —
+     *   but they change nothing. A bare mmget holder runs no hook in
+     *   this mm's context and takes no stamp, so it can neither
+     *   execute a localizable mutation nor witness one. Only tasks
+     *   that mutate through this mm matter — users (only current, at
+     *   the read instant) and borrowers (excluded above) — while
+     *   remote zappers take the remote path. A transient holder
+     *   present AT the read only inflates the count into a spurious
+     *   (conservative) globalization.
      * So the mutation is observable only within current's thread group —
      * single live thread, no external sharer — and the group-leader record
      * is complete. There is no second read to race: one atomic count, one

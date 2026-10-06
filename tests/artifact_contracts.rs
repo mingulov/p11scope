@@ -5945,6 +5945,23 @@ fn instance_epoch_kernel_shapes_are_flavored_apart_from_other_units() {
         !source.contains("signal_struct___p11inst"),
         "ownership is a single mm_users read: no signal shape may return"
     );
+    // The borrower exclusion is the flags field: kthread_use_mm sets
+    // task->mm without an mm_users reference, so the task shape must
+    // carry flags and the hook must consult PF_KTHREAD before localizing.
+    assert!(
+        source.contains("unsigned int flags;"),
+        "the task CO-RE shape must carry flags for the borrower exclusion"
+    );
+    assert!(
+        source.contains("INST_PF_KTHREAD"),
+        "the hook must exclude PF_KTHREAD borrowers before localizing"
+    );
+    // PF_KTHREAD is kernel ABI (sched.h bit 21): pin the literal so a
+    // typo cannot silently disable the exclusion on live kernels.
+    assert!(
+        read("crates/ebpf/native/instance_epoch.h").contains("0x00200000"),
+        "INST_PF_KTHREAD must be the sched.h PF_KTHREAD bit"
+    );
 }
 
 #[test]

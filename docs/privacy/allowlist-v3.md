@@ -340,9 +340,10 @@ Kernel-side state, owned by the exact observer:
 
 Kernel metadata read transiently by the hooks and never stored except as
 the counters above: `vm_file`, `f_inode`, `i_ino`, `i_sb->s_dev`, `vm_mm`,
-`mm_users`, `current->mm`, `group_leader`, `clone_flags`. No syscall
-argument, user address or length, target memory, or kernel pointer is
-captured or emitted.
+`mm_users`, `current->mm`, `current->flags` (the `PF_KTHREAD` bit only, to
+exclude mm borrowers from localization), `group_leader`, `clone_flags`. No
+syscall argument, user address or length, target memory, or kernel pointer
+is captured or emitted.
 
 Wire: each EVENTS record carries a private 40-byte tail `{entry_ip,
 entry_stamp, return_stamp}` after the unchanged 328-byte `Event`.

@@ -43,6 +43,9 @@ typedef unsigned long long u64;
 #define INST_CAS_TRIES 8
 #define INST_CLONE_VM 0x00000100ULL
 #define INST_CLONE_THREAD 0x00010000ULL
+/* sched.h PF_KTHREAD: a kernel thread, which may borrow an mm without an
+ * mm_users reference (kthread_use_mm). Borrowers never localize. */
+#define INST_PF_KTHREAD 0x00200000U
 
 /* Stamp flags; the record flag bits equal their stamp bits. Tracks
  * p11scope_ebpf_common::instance; change both together. */

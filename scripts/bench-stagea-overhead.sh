@@ -103,9 +103,10 @@ is_positive_int() {
 
 # write_manifest: pre-declares the campaign for the analyzer (P2-4): every
 # expected cell with its rounds and workload parameters, the ABBA
-# arms-per-round, hook events per op, and the DONE completion marker. Runs
-# before the first sample; the analyzer rejects any campaign that does not
-# match it or lacks the DONE line. Writes $WORK/campaign.manifest.json.
+# arms-per-round, round 1's starting arm, hook events per op, and the DONE
+# completion marker. Runs before the first sample; the analyzer rejects any
+# campaign that does not match it or lacks the DONE line. Writes
+# $WORK/campaign.manifest.json.
 write_manifest() {
     CELLS="$CELLS" OPS="$OPS" PARALLEL="$PARALLEL" ROUNDS_MMAP="$ROUNDS_MMAP" \
     ROUNDS_MREMAP="$ROUNDS_MREMAP" ROUNDS_PARALLEL="$ROUNDS_PARALLEL" \
@@ -124,8 +125,8 @@ for cell in os.environ["CELLS"].split():
         raise SystemExit(f"unknown cell {cell}")
     ops = int(os.environ["OPS"]) * parallel
     cells[cell] = {"rounds": rounds, "ops": ops, "mode": mode, "parallel": parallel}
-print(json.dumps({"cells": cells, "arms_per_round": 4, "events_per_op": 2,
-                  "completion": {"marker": "DONE"}}))
+print(json.dumps({"cells": cells, "arms_per_round": 4, "first_arm": "on",
+                  "events_per_op": 2, "completion": {"marker": "DONE"}}))
 EOF
 }
 
@@ -174,6 +175,7 @@ assert doc["cells"]["relevant-mmap"] == {
 assert doc["cells"]["unrelated-mmap-p8"] == {
     "rounds": 2, "ops": 8000, "mode": "mmap", "parallel": 8}, doc
 assert doc["arms_per_round"] == 4 and doc["events_per_op"] == 2, doc
+assert doc["first_arm"] == "on", doc
 assert doc["completion"] == {"marker": "DONE"}, doc
 EOF
     python3 -I scripts/bench-stagea-overhead-analyze.py --self-test \

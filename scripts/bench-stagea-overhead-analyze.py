@@ -87,9 +87,12 @@ def load_manifest(path):
     """Read a campaign manifest. Returns (manifest, error).
 
     The manifest pre-declares the campaign: {"cells": {name: {"rounds",
-    "ops", "mode", "parallel"}}, "arms_per_round", "events_per_op",
-    "completion": {"marker": "DONE"} or {"legacy_stdout", "note"}}. Only one
-    of the two completion forms is valid.
+    "ops", "mode", "parallel"}}, "arms_per_round", "first_arm",
+    "events_per_op", "completion": {"marker": "DONE"} or
+    {"legacy_stdout", "note"}}. Only one of the two completion forms is
+    valid. "first_arm" is round 1's starting arm ("on" or "off"); each
+    later round starts with the flipped arm, and arms within a round run
+    in ABBA mirror order (round 1 "on" reads on off off on).
     """
     try:
         with open(path, encoding="utf-8") as handle:
@@ -126,6 +129,11 @@ def load_manifest(path):
             None,
             f"malformed manifest {path}: 'arms_per_round' is not a positive even integer",
         )
+    if manifest.get("first_arm") not in ("on", "off"):
+        return (
+            None,
+            f"malformed manifest {path}: 'first_arm' is not on or off",
+        )
     events = manifest.get("events_per_op")
     if not isinstance(events, (int, float)) or isinstance(events, bool) or events <= 0:
         return (
@@ -152,6 +160,20 @@ def load_manifest(path):
             "{'marker': 'DONE'} nor {'legacy_stdout', 'note'}",
         )
     return manifest, None
+
+
+def expected_arms(round_no, arms, first_arm):
+    """The declared arm order for one round: ABBA mirror, start alternating.
+
+    Round 1 starts with first_arm; each later round flips the start; arms
+    within the round mirror (positions 0 and 3 take the start). A 4-arm
+    round 1 "on" reads on off off on; round 2 reads off on on off. The
+    mirror is what protects the comparison against linear host drift, so
+    totals alone never suffice.
+    """
+    start = first_arm if round_no % 2 == 1 else ("off" if first_arm == "on" else "on")
+    other = "off" if start == "on" else "on"
+    return [start if index % 4 in (0, 3) else other for index in range(arms)]
 
 
 def validate(samples, done_lines, manifest):
@@ -208,11 +230,14 @@ def validate(samples, done_lines, manifest):
                 f"cell {name}: want rounds {want_rounds}, have {rounds}"
             )
         for round_no in want_rounds:
-            bucket = [
-                sample
-                for sample in samples
-                if sample["cell"] == name and sample["round"] == round_no
-            ]
+            bucket = sorted(
+                (
+                    sample
+                    for sample in samples
+                    if sample["cell"] == name and sample["round"] == round_no
+                ),
+                key=lambda sample: sample["lineno"],
+            )
             on = [sample for sample in bucket if sample["arm"] == "on"]
             off = [sample for sample in bucket if sample["arm"] == "off"]
             if len(bucket) != arms or len(on) != arms // 2 or len(off) != arms // 2:
@@ -220,6 +245,15 @@ def validate(samples, done_lines, manifest):
                     f"cell {name} round {round_no}: want {arms} samples "
                     f"({arms // 2} on + {arms // 2} off), have {len(bucket)} "
                     f"({len(on)} on + {len(off)} off)"
+                )
+            elif [sample["arm"] for sample in bucket] != expected_arms(
+                round_no, arms, manifest["first_arm"]
+            ):
+                want = " ".join(expected_arms(round_no, arms, manifest["first_arm"]))
+                have = " ".join(sample["arm"] for sample in bucket)
+                problems.append(
+                    f"cell {name} round {round_no}: want arm order {want}, "
+                    f"have {have}"
                 )
     for sample in samples:
         spec = cells.get(sample["cell"])
@@ -493,6 +527,7 @@ DONE samples=8
             "unrelated-mmap": {"rounds": 2, "ops": 1000, "mode": "mmap", "parallel": 1},
         },
         "arms_per_round": 2,
+        "first_arm": "off",
         "events_per_op": 2,
         "completion": {"marker": "DONE"},
     }
@@ -586,6 +621,7 @@ DONE samples=8
             {
                 "cells": {"x": {"rounds": 1, "ops": 1000, "mode": "mmap", "parallel": 1}},
                 "arms_per_round": 2,
+                "first_arm": "off",
                 "events_per_op": 2,
                 "completion": {"marker": "DONE"},
             }
@@ -611,6 +647,31 @@ DONE samples=8
         code, _, err = run([path, "--manifest", manifest_path])
         assert code == 1, (code, err)
         assert "cell unrelated-mmap round 2: want 2 samples (1 on + 1 off)" in err, err
+        # Right totals in the wrong order lose the drift mirror: rejected.
+        swapped = log.splitlines()
+        first = next(
+            index
+            for index, line in enumerate(swapped)
+            if "cell=relevant-mmap arm=off round=1" in line
+        )
+        second = next(
+            index
+            for index, line in enumerate(swapped)
+            if "cell=relevant-mmap arm=on round=1" in line
+        )
+        swapped[first], swapped[second] = swapped[second], swapped[first]
+        write_log("\n".join(swapped) + "\n")
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "cell relevant-mmap round 1: want arm order off on, have on off" in err, err
+        # A manifest without the declared order is a usage error, not a verdict.
+        orderless = dict(manifest)
+        del orderless["first_arm"]
+        write_log(log)
+        write_manifest(orderless)
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 2 and "'first_arm' is not on or off" in err, (code, err)
+        write_manifest(manifest)
         write_log(log.replace("ops=1000 wall_ns=4100000", "ops=2000 wall_ns=8200000"))
         code, _, err = run([path, "--manifest", manifest_path])
         assert code == 1, (code, err)

@@ -86,6 +86,22 @@ pub(crate) struct InstanceTracking {
     next_slot: u32,
 }
 
+/// Test-only Stage A measurement toggle (Task 1d): `P11SCOPE_T3A_DISABLE_HOOKS`
+/// set to exactly `1` refuses the hooks with a named reason, so the ABBA
+/// overhead gate (`scripts/bench-stagea-overhead.sh`) can compare with and
+/// without the hooks on one binary. Anything else, including unset, attaches
+/// as usual; default paths are behavior-identical.
+const DISABLE_HOOKS_ENV: &str = "P11SCOPE_T3A_DISABLE_HOOKS";
+
+/// Pure predicate over the toggle value: only exactly `1` disables.
+fn hooks_disabled_by_env_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+fn hooks_disabled_by_env() -> bool {
+    hooks_disabled_by_env_value(std::env::var_os(DISABLE_HOOKS_ENV).as_deref())
+}
+
 /// Pure LTO predicate over one kernel-config text (B2): any enabled
 /// `CONFIG_LTO_*` selection other than `CONFIG_LTO_NONE` means an LTO
 /// kernel, whose inlined hook-target copies escape fentry. Arch capability
@@ -137,6 +153,12 @@ impl InstanceTracking {
     /// returned as a refused tracker whose reason names the first error.
     pub(crate) fn start(ebpf: &mut Ebpf, btf: &Btf) -> Self {
         let mut tracking = Self::default();
+        if hooks_disabled_by_env() {
+            tracking.refused = Some(format!(
+                "instance continuity hooks refused: disabled by {DISABLE_HOOKS_ENV}=1 (Stage A overhead measurement)"
+            ));
+            return tracking;
+        }
         if let Some(reason) = lto_refusal() {
             tracking.refused = Some(reason);
             return tracking;
@@ -627,7 +649,26 @@ impl crate::discovery::instances::ScanReader for LiveScan<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::lto_enabled_in_config;
+    use super::{hooks_disabled_by_env_value, lto_enabled_in_config};
+
+    #[test]
+    fn disable_hooks_toggle_reads_only_exact_one() {
+        use std::ffi::OsStr;
+        assert!(hooks_disabled_by_env_value(Some(OsStr::new("1"))));
+        for other in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("true")),
+            Some(OsStr::new(" 1")),
+            Some(OsStr::new("1 ")),
+        ] {
+            assert!(
+                !hooks_disabled_by_env_value(other),
+                "{other:?} must not disable the hooks"
+            );
+        }
+    }
 
     #[test]
     fn lto_config_predicate_matches_only_enabled_selections() {

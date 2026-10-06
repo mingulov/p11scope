@@ -267,6 +267,9 @@ jobs:
         with:
           # Offline/source custody tests require a self-contained commit graph.
           fetch-depth: 0
+      # Private TMPDIR on the runner disk: /tmp is a small tmpfs and the test
+      # trees exceed its quota (EDQUOT); later steps inherit this via the env.
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
@@ -355,6 +358,9 @@ jobs:
         with:
           # Offline/source custody tests require a self-contained commit graph.
           fetch-depth: 0
+      # Private TMPDIR on the runner disk: /tmp is a small tmpfs and the test
+      # trees exceed its quota (EDQUOT); later steps inherit this via the env.
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
@@ -474,6 +480,9 @@ jobs:
           cat "$RUNNER_TEMP/lanes.txt"
           { echo '## UNRUN lanes'; echo '```'; cat "$RUNNER_TEMP/lanes.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
       # UNRUN lanes end
+      # Private TMPDIR on the runner disk: /tmp is a small tmpfs and the test
+      # trees exceed its quota (EDQUOT); later steps inherit this via the env.
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
@@ -972,6 +981,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # Private TMPDIR on the runner disk: /tmp is a small tmpfs and the test
+      # trees exceed its quota (EDQUOT); later steps inherit this via the env.
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy,llvm-tools-preview
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 softhsm2
@@ -1002,6 +1014,20 @@ jobs:
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
       - run: python3 -I scripts/ci-test-partition.py run --partition "${{ matrix.partition }}" -- cargo +"$(cat .release-rust-version)" llvm-cov --locked --offline --workspace --all-targets --no-report
+      # The scanner rejects objects at or above 256 MiB; fail here after the
+      # instrumented build rather than mid-merge when an executable outgrows
+      # it. cargo-llvm-cov builds under target/llvm-cov-target (see the pack
+      # step below), so a pre-run check over target/ would pass vacuously.
+      - name: Assert test executables are under the 256 MiB object limit
+        shell: bash
+        run: |
+          if [ -d target/llvm-cov-target/debug/deps ]; then
+            oversized=$(find target/llvm-cov-target/debug/deps -type f -size +268435455c)
+            if [ -n "$oversized" ]; then
+              echo "$oversized"
+              exit 1
+            fi
+          fi
       - run: python3 -I scripts/ci-test-partition.py coverage-pack --partition "${{ matrix.partition }}" --target-dir target/llvm-cov-target --output "$RUNNER_TEMP/coverage"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1019,6 +1045,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # Private TMPDIR on the runner disk: /tmp is a small tmpfs and the test
+      # trees exceed its quota (EDQUOT); later steps inherit this via the env.
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy,llvm-tools-preview
       # Cache keys (see the header): the runner image.
       - name: Cache keys

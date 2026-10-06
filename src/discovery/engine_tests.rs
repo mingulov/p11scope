@@ -12739,20 +12739,16 @@ fn wait_for_child_exec(pid: u32) {
         );
         (execed, evidence)
     };
-    let mut evidence = String::from("no read attempted");
     for _ in 0..3000 {
-        let (execed, last) = settled();
-        evidence = last;
-        if execed {
+        if settled().0 {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let (execed, last) = settled();
+    let (execed, evidence) = settled();
     if execed {
         return;
     }
-    evidence = last;
     panic!("sleep child {pid} never execed; last evidence: {evidence}");
 }
 

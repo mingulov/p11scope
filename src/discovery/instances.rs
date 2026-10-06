@@ -50,10 +50,12 @@ pub(crate) const KEYS_PER_PROCESS_FILE: usize = 4;
 /// process cookies. Each is bounded at the instance-record ceiling; a full
 /// registry evicts its smallest key first (cookies mint in capture order,
 /// so the stalest process goes first) with a saturating counter.
-/// Observed/retired eviction degrades late calls to Pending/Unobserved,
-/// never a join; a faulted eviction latches capture-sticky refusal for
-/// every unknown key (P2-1), since an evicted tombstone is
-/// indistinguishable from a new key.
+/// Observed eviction degrades late calls to Pending/Unobserved, never a
+/// join; a faulted eviction latches capture-sticky refusal for every
+/// unknown key (P2-1), since an evicted tombstone is indistinguishable
+/// from a new key; a retired eviction advances a per-era watermark that
+/// preserves retirement refusal for evicted cookies while newer cookies
+/// keep joining.
 pub(crate) const MAX_OBSERVED_KEYS: usize = 4_096;
 pub(crate) const MAX_FAULTED_KEYS: usize = 4_096;
 pub(crate) const MAX_RETIRED_COOKIES: usize = 4_096;
@@ -450,8 +452,9 @@ pub(crate) struct RouterCounters {
     /// yet covered with a fault raise (a subset of `eras`).
     pub(crate) miss_eras: u64,
     /// Saturating registry evictions (F3): keys dropped from a full
-    /// registry. Observed/retired late calls degrade to Pending/Unobserved;
-    /// a faulted eviction latches refusal (P2-1).
+    /// registry. Observed late calls degrade to Pending/Unobserved; a
+    /// faulted eviction latches refusal (P2-1); a retired eviction advances
+    /// the retirement watermark, which preserves refusal for the evicted.
     pub(crate) observed_evictions: u64,
     pub(crate) faulted_evictions: u64,
     pub(crate) retired_evictions: u64,
@@ -474,6 +477,19 @@ pub(crate) struct InstanceRouter {
     /// continuity; only unknown keys pay the availability cost.
     faulted_overflowed: bool,
     retired: BTreeSet<u64>,
+    /// The greatest retired cookie evicted under capacity pressure in this
+    /// fault era (0 when none: cookie 0 is never assigned, so the watermark
+    /// refuses nothing while unset). Eviction pops the smallest cookie
+    /// first and cookies mint in capture order, so every evicted cookie is
+    /// at or below this mark: a cookie at or below it with no retained
+    /// observation is refused as `Retired` — either it was retired and
+    /// forgotten, or it is a live process the router never observed, and
+    /// refusing is sound for both. Cookies above the mark and cookies with
+    /// a retained observation keep joining, so unlike the faulted latch
+    /// this costs new and continuing processes nothing. A fault-era advance
+    /// resets it: old-era evidence is `StaleEra`-refused anyway, so no
+    /// delayed observation can slip through the reset.
+    retired_watermark: u64,
     pending: VecDeque<PendingCall>,
     fault: u64,
     sticky: u64,
@@ -522,6 +538,7 @@ impl InstanceRouter {
             faulted: BTreeSet::new(),
             faulted_overflowed: false,
             retired: BTreeSet::new(),
+            retired_watermark: 0,
             pending: VecDeque::new(),
             fault: 0,
             sticky: 0,
@@ -578,6 +595,13 @@ impl InstanceRouter {
         if fault_moved {
             self.fault = fault;
             self.miss_latched = false;
+            // The retirement watermark is per-era: every delayed
+            // observation from the old era is StaleEra-refused from here
+            // on, so forgetting the evicted cookies reopens no gap — and
+            // long-lived processes re-observe freely in the new era. (The
+            // miss latch below keeps the watermark: the fault is unchanged,
+            // so old-era evidence would still match.)
+            self.retired_watermark = 0;
             self.counters.eras += 1;
             self.observed.clear();
             self.ranges = 0;
@@ -593,15 +617,32 @@ impl InstanceRouter {
         resolved
     }
 
+    /// Whether `cookie` retired before its tombstone was evicted (or was
+    /// never observed at all): at or below the watermark with no retained
+    /// observation. Cookie 0 is never assigned, so it never matches.
+    fn retired_before_eviction(&self, cookie: u64) -> bool {
+        cookie != 0
+            && cookie <= self.retired_watermark
+            && self
+                .observed
+                .range((cookie, 0)..=(cookie, u32::MAX))
+                .next()
+                .is_none()
+    }
+
     /// Ends a process incarnation (exit or exec reported by lifecycle):
-    /// frees its observations; its pending calls become unknown.
+    /// frees its observations; its pending calls become unknown. A
+    /// retirement evicted under capacity pressure advances the per-era
+    /// watermark, which preserves refusal for the evicted cookie.
     pub(crate) fn retire_process(&mut self, cookie: u64) -> Vec<(u64, Route)> {
-        evict_for_insert(
+        if let Some(evicted) = evict_for_insert(
             &mut self.retired,
             &cookie,
             self.limits.retired_cookies,
             &mut self.counters.retired_evictions,
-        );
+        ) {
+            self.retired_watermark = self.retired_watermark.max(evicted);
+        }
         self.retired.insert(cookie);
         let keys: Vec<_> = self
             .observed
@@ -626,6 +667,12 @@ impl InstanceRouter {
         let cookie = observation.reading.cookie;
         let file = observation.file_slot;
         if self.retired.contains(&cookie) {
+            return (ObserveOutcome::Retired, Vec::new());
+        }
+        if self.retired_before_eviction(cookie) {
+            // A delayed observation for a retirement lost to capacity
+            // pressure: refuse, never accept as a new incarnation. Cookies
+            // with a retained observation keep continuity below.
             return (ObserveOutcome::Retired, Vec::new());
         }
         if observation.reading.fault != self.fault || self.miss_latched {
@@ -663,7 +710,7 @@ impl InstanceRouter {
                 if appeared {
                     self.counters.coverage_faults += 1;
                     let evictions = self.counters.faulted_evictions;
-                    evict_for_insert(
+                    let _ = evict_for_insert(
                         &mut self.faulted,
                         &key,
                         self.limits.faulted_keys,
@@ -762,7 +809,9 @@ impl InstanceRouter {
     /// 3. entry/return inequality (`Straddle` — a refusal flag on the RETURN
     ///    stamp only therefore surfaces as `Straddle`, never as its flag);
     /// 4. the ambient era (stale fault generation or the latched miss era);
-    /// 5. process state (`Retired`, then the sticky `CoverageFault` —
+    /// 5. process state (`Retired` — remembered tombstones plus, after a
+    ///    retired eviction, the per-era watermark for cookies with no
+    ///    retained observation — then the sticky `CoverageFault`:
     ///    remembered tombstones and, after a faulted eviction, the P2-1
     ///    overflow latch for every unknown key);
     /// 6. epoch knowledge (`Pending` while a newer-or-equal epoch may still
@@ -807,6 +856,11 @@ impl InstanceRouter {
             return Route::Unknown(U::FaultEra);
         }
         if self.retired.contains(&facts.cookie) {
+            return Route::Unknown(U::Retired);
+        }
+        if self.retired_before_eviction(facts.cookie) {
+            // The P2-1 analogue for retirements: an evicted tombstone
+            // refuses its cookie's calls, never Pendings them.
             return Route::Unknown(U::Retired);
         }
         let file = u32::from(entry.file_slot_plus1) - 1;
@@ -930,13 +984,22 @@ fn stamp_file(facts: &CallFacts) -> Option<u32> {
 
 /// Makes room for `key` in a bounded key set: evicts the smallest key first
 /// with a saturating counter. A key already present needs no room.
-fn evict_for_insert<K: Ord>(set: &mut BTreeSet<K>, key: &K, limit: usize, evictions: &mut u64) {
+fn evict_for_insert<K: Ord + Clone>(
+    set: &mut BTreeSet<K>,
+    key: &K,
+    limit: usize,
+    evictions: &mut u64,
+) -> Option<K> {
+    let mut evicted = None;
     while set.len() >= limit && !set.contains(key) {
-        if set.pop_first().is_none() {
+        let Some(first) = set.pop_first() else {
             break;
-        }
+        };
+        // Pops run smallest-first, so the last pop is the greatest evicted.
+        evicted = Some(first);
         *evictions = evictions.saturating_add(1);
     }
+    evicted
 }
 
 fn route_ip(observed: &Observed, facts: &CallFacts) -> Route {

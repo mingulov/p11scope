@@ -627,7 +627,37 @@ fn fault_evict_reobserve_same_epoch_still_refuses_route() {
 }
 
 #[test]
-fn retired_registry_eviction_degrades_late_calls_to_unobserved() {
+fn retired_cookie_eviction_still_refuses_delayed_observations() {
+    // Astra follow-up: a saved StableObservation submitted after its
+    // retirement was evicted must not be accepted as New.
+    const A: u64 = 0xA1;
+    const B: u64 = 0xA2;
+    const C: u64 = 0xA3;
+    let mut r = InstanceRouter::new(RouterLimits {
+        retired_cookies: 1,
+        ..RouterLimits::default()
+    });
+    let saved = observation_for(A, 2, load(BASE_A));
+    assert_eq!(r.observe(saved.clone()).0, ObserveOutcome::New);
+    assert!(r.retire_process(A).is_empty());
+    assert!(r.retire_process(B).is_empty());
+    assert_eq!(r.counters().retired_evictions, 1);
+    // The delayed observation is refused, never New; its calls never join.
+    assert_eq!(r.observe(saved).0, ObserveOutcome::Retired);
+    assert_eq!(
+        r.route(call_for(9, A, stamp(2, 0, 0), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::Retired)
+    );
+    // A genuinely new cookie still joins: the watermark costs nothing new.
+    assert_eq!(
+        r.observe(observation_for(C, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    joined(r.route(call_for(10, C, stamp(2, 0, 0), ip_in(BASE_A))));
+}
+
+#[test]
+fn retired_registry_eviction_preserves_retirement_refusal() {
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
     let mut r = InstanceRouter::new(RouterLimits {
@@ -641,20 +671,51 @@ fn retired_registry_eviction_degrades_late_calls_to_unobserved() {
     );
     assert!(r.retire_process(B).is_empty());
     assert_eq!(r.counters().retired_evictions, 1);
-    // The evicted retirement no longer reports Retired, but its calls still
-    // never join: no observation survives for them.
+    // The evicted retirement still reports Retired: the per-era watermark
+    // preserves refusal for the evicted cookie.
     assert_eq!(
         r.route(call_for(2, A, stamp(2, 0, 0), ip_in(BASE_A))),
-        Route::Pending
-    );
-    assert_eq!(
-        r.expire_pending(A),
-        vec![(2, Route::Unknown(UnknownReason::Unobserved))]
+        Route::Unknown(UnknownReason::Retired)
     );
     assert_eq!(
         r.route(call_for(3, B, stamp(2, 0, 0), ip_in(BASE_A))),
         Route::Unknown(UnknownReason::Retired)
     );
+}
+
+#[test]
+fn retired_watermark_costs_retained_and_new_era_keys_nothing() {
+    const LIVE: u64 = 0xA0;
+    const A: u64 = 0xA1;
+    const B: u64 = 0xA2;
+    let mut r = InstanceRouter::new(RouterLimits {
+        retired_cookies: 1,
+        ..RouterLimits::default()
+    });
+    // A live cookie below the coming watermark keeps continuity through its
+    // retained observation.
+    assert_eq!(
+        r.observe(observation_for(LIVE, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    assert!(r.retire_process(A).is_empty());
+    assert!(r.retire_process(B).is_empty());
+    assert_eq!(r.counters().retired_evictions, 1);
+    assert_eq!(
+        r.observe(observation_for(LIVE, 2, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    joined(r.route(call_for(1, LIVE, stamp(2, 0, 0), ip_in(BASE_A))));
+    // A fault-era advance resets the watermark: old-era evidence is stale
+    // anyway, and long-lived cookies re-observe freely in the new era.
+    assert!(r.audit(1, 0, 0).is_empty());
+    let mut old_era = observation_for(LIVE, 2, load(BASE_A));
+    old_era.reading.fault = 0;
+    assert_eq!(r.observe(old_era).0, ObserveOutcome::StaleEra);
+    let mut fresh = observation_for(LIVE, 2, load(BASE_A));
+    fresh.reading.fault = 1;
+    assert_eq!(r.observe(fresh).0, ObserveOutcome::New);
+    joined(r.route(call_for(2, LIVE, stamp(2, 0, 1), ip_in(BASE_A))));
 }
 
 #[test]

@@ -12879,9 +12879,10 @@ fn peer_candidate(engine: &mut Engine, modules: &[ScannedModule]) -> LiveCandida
 
 /// A raw fork held pre-exec by a parent/child pipe handshake (P2-6):
 /// the child signals readiness, then blocks on the release pipe until
-/// [`HeldChild::release`] closes it. No sleep establishes the ordering
-/// under test — the child cannot exec before release, however the host
-/// schedules. Dropping without release kills and reaps the held child.
+/// [`HeldChild::release`] writes the release byte. No sleep establishes
+/// the ordering under test — the child cannot exec before release, however
+/// the host schedules. Dropping without release kills and reaps the held
+/// child.
 struct HeldChild {
     pid: u32,
     release: Option<std::fs::File>,
@@ -12892,9 +12893,32 @@ impl HeldChild {
         self.pid
     }
 
-    /// Closes the release pipe: the child execs `sleep 30`.
+    /// Writes the release byte, then closes the pipe: the child execs
+    /// `sleep 30`. An explicit byte, not EOF: `O_CLOEXEC` does not cross
+    /// fork, so an unrelated forked-but-never-exec'd child may inherit the
+    /// writer and an EOF-close release would hang until it exits. A write
+    /// failure means the child is already dead; the exec wait then fails
+    /// loudly instead of hanging.
     fn release(&mut self) {
-        self.release.take();
+        if let Some(release) = self.release.take() {
+            use std::os::unix::io::AsRawFd as _;
+            let fd = release.as_raw_fd();
+            let byte = [1u8];
+            loop {
+                // SAFETY: one byte into the live release pipe. Rust ignores
+                // SIGPIPE process-wide, so a dead child surfaces as EPIPE.
+                let wrote = unsafe { libc::write(fd, byte.as_ptr() as *const _, 1) };
+                if wrote == 1 {
+                    break;
+                }
+                if wrote == -1
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -12952,10 +12976,21 @@ fn spawn_held_sleep_child() -> HeldChild {
             // The ready byte cannot block: the pipe is empty.
             libc::write(ready[1], byte.as_ptr() as *const _, 1);
             libc::close(ready[1]);
-            // Block until the parent releases (EOF) or dies (EOF): either
-            // way the child proceeds to a harmless `sleep`.
+            // Block until the parent's release byte arrives, or EOF if the
+            // parent died without releasing: either way the child proceeds
+            // to a harmless `sleep`. Interrupted reads retry; any other
+            // outcome proceeds to exec rather than hanging.
             let mut gate = [0u8; 1];
-            libc::read(release[0], gate.as_mut_ptr() as *mut _, 1);
+            loop {
+                let got = libc::read(release[0], gate.as_mut_ptr() as *mut _, 1);
+                if got == 1 || got == 0 {
+                    break;
+                }
+                if got == -1 && *libc::__errno_location() == libc::EINTR {
+                    continue;
+                }
+                break;
+            }
             libc::close(release[0]);
             libc::execvp(program.as_ptr(), argv.as_ptr());
             libc::_exit(127);
@@ -12967,9 +13002,28 @@ fn spawn_held_sleep_child() -> HeldChild {
         libc::close(ready[1]);
         libc::close(release[0]);
     }
+    // Bound the wait with a poll: a stuck child must fail loudly, never
+    // hang the suite; interrupted polls retry inside the helper.
+    let readable = system_scope_poll_fd(ready[0], std::time::Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("held child {pid} readiness poll failed: {error}"));
     let mut byte = [0u8; 1];
     // SAFETY: `ready[0]` is the parent's live read end.
-    let read = unsafe { libc::read(ready[0], byte.as_mut_ptr() as *mut _, 1) };
+    let read = if readable {
+        loop {
+            let got = unsafe { libc::read(ready[0], byte.as_mut_ptr() as *mut _, 1) };
+            if got == 1 || got == 0 {
+                break got;
+            }
+            if got == -1
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            break got;
+        }
+    } else {
+        -2
+    };
     // SAFETY: the ready byte was consumed (or the child is dead); the read
     // end is no longer needed.
     unsafe {
@@ -12992,6 +13046,70 @@ fn spawn_held_sleep_child() -> HeldChild {
         pid: pid as u32,
         release: Some(release),
     }
+}
+
+/// A forked-but-never-exec'd child that inherits every fd (astra A4):
+/// models a concurrent test's `SwapChild` outliving the release. Killed
+/// and reaped on drop; exits on its own after 60 s if drop never runs.
+struct FdInheritor {
+    pid: libc::pid_t,
+}
+
+impl FdInheritor {
+    fn spawn() -> Self {
+        // SAFETY: fork in a multithreaded binary. The child calls only
+        // async-signal-safe functions (nanosleep on a stack timespec,
+        // _exit) and never returns to test code.
+        let pid = unsafe { libc::fork() };
+        assert!(
+            pid >= 0,
+            "inheritor fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if pid == 0 {
+            unsafe {
+                let delay = libc::timespec {
+                    tv_sec: 60,
+                    tv_nsec: 0,
+                };
+                libc::nanosleep(&delay, std::ptr::null_mut());
+                libc::_exit(0);
+            }
+        }
+        Self { pid }
+    }
+}
+
+impl Drop for FdInheritor {
+    fn drop(&mut self) {
+        // SAFETY: this unprivileged fixture owns this live, unreaped child.
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(self.pid, &mut status, 0);
+        }
+    }
+}
+
+/// Astra A4: `O_CLOEXEC` does not cross fork, so a concurrent test's
+/// forked-but-never-exec'd child inherits the release writer; an EOF-close
+/// release would hang until that child exits. The explicit release byte
+/// wakes the held child regardless of unrelated inheritors.
+#[test]
+fn held_child_release_byte_ignores_unrelated_inheritors() {
+    let mut child = spawn_held_sleep_child();
+    let pid = child.pid();
+    let _inheritor = FdInheritor::spawn();
+    let test_image = std::env::current_exe().unwrap();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert_eq!(exe, test_image, "the held child exec'd before release");
+    child.release();
+    wait_for_child_exec(pid);
+    let image = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert_ne!(
+        image, test_image,
+        "release did not exec the held child past the inheritor"
+    );
 }
 
 /// Dev-flake regression (hosted CI run 37422857664): the helper snapshotted

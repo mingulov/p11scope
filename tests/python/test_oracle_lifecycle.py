@@ -789,6 +789,9 @@ class OracleLifecycleTests(unittest.TestCase):
             sibling.mkdir(mode=0o700)
             work.mkdir(mode=0o700)
             reports.mkdir(mode=0o755)
+            # mkdir honors the process umask (0700 under 077); the
+            # subtree must stay non-private for the rejection below.
+            reports.chmod(0o755)
             child = reports / "child"
             child.write_text("unchanged\n")
             child.chmod(0o600)

@@ -1857,6 +1857,19 @@ mod tests {
         AdmissionState, ImageAuthority, ModuleInfo, ModuleKey,
     };
 
+    /// A tempdir the event-writer trust check accepts under any umask:
+    /// `tempfile` honors the process umask (0775 under the default 0002),
+    /// and the writer refuses group-writable ancestors.
+    fn private_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        dir
+    }
+
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
         InventoryCoordinator::new(
             Scope::Pid(std::process::id()),
@@ -2213,12 +2226,7 @@ mod tests {
                 "unsettled",
             ),
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::set_permissions(
-                dir.path(),
-                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-            )
-            .unwrap();
+            let dir = private_tempdir();
             let out = dir.path().join("doc.json");
             let sink = AtomicFile::create(&out).unwrap();
             let mut stdout = Vec::new();
@@ -2320,7 +2328,7 @@ mod tests {
         let mut coordinator = coordinator();
         coordinator.note_scope_gap("first".into(), "pass gap".into());
         coordinator.commit_batch(false).unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("events.jsonl");
         let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
         let mut state = StreamState::new();
@@ -2479,7 +2487,7 @@ mod tests {
         use crate::discovery::caller_registry::RegistryGap;
         use crate::discovery::engine::inventory_coordinator::PassReport;
         let mut coordinator = coordinator();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("events.jsonl");
         let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
         let mut state = StreamState::new();
@@ -2578,7 +2586,7 @@ mod tests {
         use crate::discovery::caller_registry::RegistryGap;
         use crate::discovery::engine::inventory_coordinator::PassReport;
         let mut coordinator = coordinator();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("events.jsonl");
         let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
         let mut state = StreamState::new();
@@ -2733,7 +2741,7 @@ mod tests {
             events: Vec::new(),
             timings: crate::timing::StageTimings::new(),
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let stream = |name: &str, view: &Presentation| {
             let path = dir.path().join(name);
             let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();

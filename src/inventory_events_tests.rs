@@ -8,6 +8,19 @@ use crate::discovery::caller_registry::{ImageAuthority, RegistryLimits};
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use std::collections::BTreeSet;
 
+/// A tempdir the event-writer trust check accepts under any umask:
+/// `tempfile` honors the process umask (0775 under the default 0002),
+/// and the writer refuses group-writable ancestors.
+fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    dir
+}
+
 fn limited(callers: usize) -> Harness {
     Harness::new(RegistryLimits::new(callers, 64, 256, 64, 1 << 20, 64).unwrap()).unwrap()
 }
@@ -85,7 +98,7 @@ fn stream_gaps_are_identical_in_meaning_to_snapshot_gaps() {
     let (presentation, document) = presentation_for(&harness);
     assert_eq!(document["budgets"]["callers"]["refused"], 1);
     assert_eq!(document["gaps"].as_array().unwrap().len(), 1);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
     emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
@@ -147,7 +160,7 @@ fn stream_gaps_are_identical_in_meaning_to_snapshot_gaps() {
 fn rotation_never_loses_an_event_silently() {
     let harness = refused_harness();
     let (presentation, _) = presentation_for(&harness);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     // A tiny threshold forces several rotations; wide retention keeps
     // every file, so every event must be present exactly once.
@@ -192,7 +205,7 @@ fn rotation_never_loses_an_event_silently() {
 fn retention_eviction_is_accounted_not_silent() {
     let harness = refused_harness();
     let (presentation, _) = presentation_for(&harness);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     // Two files retained against many rotations: evictions must occur,
     // each accounted in a retained event.
@@ -253,7 +266,7 @@ fn retention_eviction_is_accounted_not_silent() {
 fn stream_privacy_bounds_match_snapshots_exactly() {
     let harness = refused_harness();
     let (presentation, document) = presentation_for(&harness);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
     emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
@@ -340,7 +353,7 @@ fn incremental_pass_events_match_the_final_snapshot() {
     // markers), replayed through the harness exactly as the run loops
     // emit it.
     let mut harness = refused_harness();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
     // One more pass with an exit, emitted incrementally (the
@@ -407,7 +420,7 @@ fn incremental_pass_events_match_the_final_snapshot() {
 
 #[test]
 fn rotation_sequences_never_collide_across_runs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut first = EventWriter::create(&path, 256, 10).unwrap();
     for index in 0..20 {
@@ -504,7 +517,7 @@ fn snapshot_events_and_dashboard_agree_on_a_repeated_gap() {
     assert_eq!(view, vec![20, 1]);
     // The event stream: one gap_recorded per distinct gap, carrying the
     // same payload as the snapshot entry.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 4).unwrap();
     emit_snapshot_as_events(&mut writer, &presentation, 999).unwrap();
@@ -538,9 +551,7 @@ fn snapshot_events_and_dashboard_agree_on_a_repeated_gap() {
 /// (a plain `OpenOptions` open would truncate through it).
 #[test]
 fn event_log_refuses_a_symlink_and_leaves_its_target_untouched() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, b"do not truncate").unwrap();
     let link = dir.path().join("events.jsonl");
@@ -566,8 +577,7 @@ fn event_log_refuses_a_symlink_and_leaves_its_target_untouched() {
 #[test]
 fn event_log_creates_private_0600_and_truncates_an_existing_file_to_0600() {
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     drop(EventWriter::create(&path, 1 << 20, 5).unwrap());
     assert_eq!(
@@ -593,9 +603,7 @@ fn event_log_creates_private_0600_and_truncates_an_existing_file_to_0600() {
 #[test]
 fn event_log_refuses_a_fifo_without_blocking() {
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let fifo = dir.path().join("events.jsonl");
     let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL in temp path");
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
@@ -611,9 +619,7 @@ fn event_log_refuses_a_fifo_without_blocking() {
 /// B1: a directory at the name is refused (non-regular final component).
 #[test]
 fn event_log_refuses_a_directory() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let subdir = dir.path().join("events.jsonl");
     std::fs::create_dir(&subdir).unwrap();
     let Err(error) = EventWriter::create(&subdir, 1 << 20, 5) else {
@@ -646,8 +652,7 @@ fn event_log_refuses_a_device() {
 #[test]
 fn event_log_refuses_an_untrusted_parent_directory() {
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let loose = dir.path().join("loose");
     std::fs::create_dir(&loose).unwrap();
     std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -667,9 +672,7 @@ fn event_log_refuses_an_untrusted_parent_directory() {
 /// target untouched.
 #[test]
 fn event_log_rotation_refuses_a_planted_symlink_target() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let live = dir.path().join("events.jsonl");
     std::fs::write(&live, b"live").unwrap();
     let victim = dir.path().join("victim.txt");
@@ -693,9 +696,7 @@ fn event_log_rotation_refuses_a_planted_symlink_target() {
 /// rotation symlink instead of writing through it.
 #[test]
 fn event_log_append_rotation_does_not_follow_a_planted_symlink() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 512, 5).unwrap();
     writer.append("first", serde_json::json!({}), 1).unwrap();
@@ -722,9 +723,7 @@ fn event_log_append_rotation_does_not_follow_a_planted_symlink() {
 /// leaves both the link and its target untouched.
 #[test]
 fn event_log_eviction_refuses_a_symlink_victim() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, b"do not touch").unwrap();
     let link = dir.path().join("events.jsonl.1");
@@ -763,7 +762,7 @@ fn the_dump_fit_bound_is_exact_at_its_boundary() {
     harness.commit();
     let (presentation, _) = presentation_for(&harness);
     assert_eq!(presentation.edges.len(), 6);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let mut writer = EventWriter::create(&dir.path().join("big.jsonl"), 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
     emitter

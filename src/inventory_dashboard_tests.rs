@@ -2315,6 +2315,14 @@ fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
 
     // JSONL: every edge event carries the JSON edge verbatim.
     let dir = tempfile::tempdir().unwrap();
+    // The event writer only publishes under owner-writable ancestors;
+    // `tempfile` honors the process umask, so pin the mode explicitly
+    // and pass under any umask the gates run with.
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let path = dir.path().join("events.jsonl");
     let mut writer = crate::inventory_events::EventWriter::create(&path, 1 << 20, 5).unwrap();
     crate::inventory_events::emit_snapshot_as_events(&mut writer, &presentation, 1).unwrap();

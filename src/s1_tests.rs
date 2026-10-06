@@ -2140,6 +2140,14 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
     );
     let dashboard = String::from_utf8_lossy(&bytes);
     let dir = tempfile::tempdir().unwrap();
+    // The event writer only publishes under owner-writable ancestors;
+    // `tempfile` honors the process umask, so pin the mode explicitly
+    // and pass under any umask the gates run with.
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let path = dir.path().join("s1-events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 30, 5).unwrap();
     emit_snapshot_as_events(&mut writer, presentation, 999).unwrap();

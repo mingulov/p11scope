@@ -13,6 +13,19 @@ use crate::inventory_present::EdgeView;
 
 const FIRST_PID: u32 = 91_000;
 
+/// A tempdir the event-writer trust check accepts under any umask:
+/// `tempfile` honors the process umask (0775 under the default 0002),
+/// and the writer refuses group-writable ancestors.
+fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    dir
+}
+
 fn harness(callers: usize, modules: usize) -> Harness {
     let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
     harness.stage_scale(&ScaleSpec {
@@ -117,7 +130,7 @@ fn pass_lines(all: &[serde_json::Value], pass: u64) -> (usize, serde_json::Value
 #[test]
 fn edge_records_follow_class_changes_mid_run_not_every_pass() {
     let mut harness = harness(1, 2);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut state = StreamState::new();
@@ -177,7 +190,7 @@ fn edge_records_follow_class_changes_mid_run_not_every_pass() {
 #[test]
 fn the_final_sweep_makes_the_replayed_edges_equal_the_snapshot() {
     let mut harness = harness(2, 2);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut state = StreamState::new();
@@ -294,7 +307,7 @@ fn edge_records(path: &std::path::Path) -> Vec<String> {
 fn a_pass_writes_at_most_4096_edge_records_and_defers_the_rest() {
     assert_eq!(EDGE_EVENTS_PER_PASS, 4096);
     let edges = synthetic_edges(5000);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 30, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
@@ -317,7 +330,7 @@ fn a_pass_writes_at_most_4096_edge_records_and_defers_the_rest() {
 #[test]
 fn deferred_edges_carry_to_the_next_pass_in_arrival_order() {
     let mut edges = synthetic_edges(5);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::with_cap(2);
@@ -364,7 +377,7 @@ fn deferred_edges_carry_to_the_next_pass_in_arrival_order() {
 #[test]
 fn edge_digests_are_bounded_by_the_edge_limit() {
     let edges = synthetic_edges(3);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
@@ -396,7 +409,7 @@ fn edge_digests_are_bounded_by_the_edge_limit() {
 #[test]
 fn a_deferred_change_that_reverts_is_not_written() {
     let mut edges = synthetic_edges(2);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::with_cap(1);
@@ -455,7 +468,7 @@ fn retained_edges(path: &std::path::Path) -> BTreeMap<String, serde_json::Value>
 #[test]
 fn the_sweep_resends_an_unchanged_edge_whose_record_was_evicted() {
     let mut edges = synthetic_edges(2);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 4096, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
@@ -484,7 +497,7 @@ fn the_sweep_resends_an_unchanged_edge_whose_record_was_evicted() {
 #[test]
 fn a_sweep_larger_than_the_retention_reports_its_unretained_edges() {
     let edges = synthetic_edges(200);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 8192, 3).unwrap();
     let mut emitter = EdgeEmitter::new();
@@ -502,7 +515,7 @@ fn a_sweep_larger_than_the_retention_reports_its_unretained_edges() {
 #[test]
 fn a_sweep_that_rotates_out_a_needed_record_dumps_every_edge_when_it_fits() {
     let mut edges = synthetic_edges(10);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 16 * 1024, 4).unwrap();
     let mut emitter = EdgeEmitter::new();
@@ -547,7 +560,7 @@ fn a_sweep_that_rotates_out_a_needed_record_dumps_every_edge_when_it_fits() {
 fn evicted_edges_are_refreshed_mid_run_only_when_the_records_fit() {
     for (max_bytes, files, refreshed) in [(16 * 1024, 4, 3), (4096, 2, 0)] {
         let edges = synthetic_edges(3);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("events.jsonl");
         let mut writer = EventWriter::create(&path, max_bytes, files).unwrap();
         let mut emitter = EdgeEmitter::new();
@@ -573,7 +586,7 @@ fn presence_capture_and_activity_each_trigger_a_record_alone() {
     edges[0].presence = Presence::Mapped;
     edges[0].capture = Capture::ScanOnly;
     edges[0].activity = Activity::Uncovered;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
@@ -621,7 +634,7 @@ struct Outcome {
 }
 
 fn run_shape(shape: &Shape, mut edges: Vec<EdgeView>, changed: &[usize]) -> Outcome {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, shape.max_bytes, shape.files).unwrap();
     let mut emitter = EdgeEmitter::new();
@@ -851,7 +864,7 @@ fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
         registry.observe_entries(c0, &key(0), 3, at);
     }
     harness.commit();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let dashboard_path = dir.path().join("dashboard.jsonl");
     let classic_path = dir.path().join("classic.jsonl");
     let mut dashboard = EventWriter::create(&dashboard_path, 1 << 20, 2).unwrap();

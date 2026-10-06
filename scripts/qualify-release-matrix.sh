@@ -204,9 +204,21 @@ self_test() {
   done
   "$0" --no-such-option >/dev/null 2>&1; expect "unknown option refused" $? 2
   "$0" --kernels 5.15 >/dev/null 2>&1; expect "missing --rev refused" $? 2
-  d=$(mktemp -d "${TMPDIR:-/tmp}/qrm-selftest-XXXXXX")
-  "$0" --bin-dir "$d" --rev x >/dev/null 2>&1; expect "bin-dir under a hidden tmp refused" $? 2
-  rmdir "$d"
+  # Negative test: a bin-dir under a guest-hidden tmp (/tmp, /var/tmp) must
+  # be refused by the parse-time guard with the exact diagnostic — before
+  # any real setup runs. Out/stage bases point into scratch, so entry into
+  # real setup (which would mkdir $OUT_REV/$STAGE_REV) fails the test
+  # instead of touching real paths. The hidden dir is deliberately NOT
+  # under $TMPDIR: with a $TMPDIR under /home the guard would not fire and
+  # the run would reach real setup, passing for the wrong reason.
+  neg_iso=$(mktemp -d "${TMPDIR:-/tmp}/qrm-selftest-neg-XXXXXX")
+  neg_hidden=$(mktemp -d /var/tmp/qrm-selftest-hidden-XXXXXX)
+  neg_out=$("$0" --bin-dir "$neg_hidden" --rev x --out-base "$neg_iso/out" --stage-base "$neg_iso/stage" 2>&1); neg_rc=$?
+  expect "bin-dir under hidden tmp refused" "$neg_rc" 2
+  expect "bin-dir refusal diagnostic" "$neg_out" "bin-dir must be under /home (vng hides /tmp and /var/tmp)"
+  expect "refusal precedes real setup (out untouched)" "$([ -e "$neg_iso/out" ] && echo created || echo untouched)" untouched
+  expect "refusal precedes real setup (stage untouched)" "$([ -e "$neg_iso/stage" ] && echo created || echo untouched)" untouched
+  rm -rf "$neg_iso" "$neg_hidden"
   plan=$("$0" --dry-run --rev abc --kernels 5.15,7.2 2>&1)
   expect "dry-run kernels" "$(echo "$plan" | grep -c 'tag=')" 2
   expect "dry-run 5.15 backend" "$(echo "$plan" | grep -c 'v5.15.221 tag=v5.15.221 expect=per-offset')" 1

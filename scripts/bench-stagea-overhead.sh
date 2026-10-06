@@ -212,7 +212,7 @@ EOF
 
 # Another capture's hooks would charge both arms equally and flatten the
 # comparison, so a live p11scope or live p11_inst_* programs refuse the run.
-if pgrep -x p11scope >/dev/null 2>&1 || pgrep -x p11scope-discover >/dev/null 2>&1; then
+if pgrep -x p11scope >/dev/null 2>&1; then
     refuse "a p11scope process is already running"
 fi
 if sudo -n bpftool prog show 2>/dev/null | grep -q "p11_inst_vma_"; then

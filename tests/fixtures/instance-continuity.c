@@ -128,7 +128,12 @@ static int held_sharer_child(void *unused)
 {
     (void)unused;
     char gate;
-    ssize_t n = read(held_sharer_pipe[0], &gate, 1);
+    ssize_t n;
+    /* The fd table is private (no CLONE_FILES): drop our own write end
+     * first, so the parent's close (or death) lands as EOF instead of
+     * blocking here forever behind our inherited copy. */
+    close(held_sharer_pipe[1]);
+    n = read(held_sharer_pipe[0], &gate, 1);
     if (n != 1)
         return 0;
     int fd = open(held_sharer_provider, O_RDONLY);
@@ -140,6 +145,34 @@ static int held_sharer_child(void *unused)
         return 2;
     munmap(p, 4096);
     return 0;
+}
+
+/* Graceful shutdown with a held sharer: EOF wakes it (its own write end
+ * is closed, so this close lands), then reap it. Bounded wait with a
+ * SIGKILL fallback: the fixture must never hang its harness. */
+static void release_held_sharer(void)
+{
+    int status = 0;
+    int i;
+
+    if (!held_sharer)
+        return;
+    close(held_sharer_pipe[1]);
+    held_sharer_pipe[1] = -1;
+    for (i = 0; i < 200; i++) {
+        if (waitpid(held_sharer, &status, WNOHANG) == held_sharer)
+            break;
+        struct timespec pause = { 0, 10 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    if (kill(held_sharer, 0) == 0) {
+        kill(held_sharer, SIGKILL);
+        waitpid(held_sharer, &status, 0);
+    }
+    if (held_sharer_pipe[0] >= 0)
+        close(held_sharer_pipe[0]);
+    held_sharer_pipe[0] = -1;
+    held_sharer = 0;
 }
 
 static uintptr_t base_of(void *handle)
@@ -285,8 +318,10 @@ static int cmd_mode(const char *provider)
     fflush(stdout);
     for (;;) {
         int command = getchar();
-        if (command == EOF || command == 'x')
+        if (command == EOF || command == 'x') {
+            release_held_sharer();
             return 0;
+        }
         switch (command) {
         case 'c': {
             slot_info_fn call = main_call(handle);
@@ -383,7 +418,10 @@ static int cmd_mode(const char *provider)
             static char stack[64 * 1024] __attribute__((aligned(16)));
             if (held_sharer)
                 die("sharer already held");
-            if (pipe(held_sharer_pipe) != 0)
+            /* CLOEXEC: an exec reaps this image's state (fresh BSS forgets
+             * the sharer), so the pipe must not survive it — EOF wakes the
+             * stranded child, which exits quietly. */
+            if (pipe2(held_sharer_pipe, O_CLOEXEC) != 0)
                 die("held sharer pipe");
             held_sharer_provider = provider;
             pid_t child = clone(held_sharer_child, stack + sizeof(stack), CLONE_VM | SIGCHLD, NULL);

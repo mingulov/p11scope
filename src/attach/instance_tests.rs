@@ -1231,6 +1231,86 @@ fn privileged_instance_vfork_unmap_globalizes() -> Result<()> {
     Ok(())
 }
 
+/// Best-effort killer for a fixture sharer pid: the leak regressions must
+/// not leave a blocked child behind when they fail (RED) or flake.
+struct SharerGuard {
+    pid: u32,
+}
+
+impl Drop for SharerGuard {
+    fn drop(&mut self) {
+        // SAFETY: signaling a possibly-dead pid by number; ESRCH is fine.
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn hold_sharer(target: &mut Target) -> u32 {
+    let held = target.command(b'w').unwrap();
+    assert!(held.starts_with("SHARER_HELD"), "{held}");
+    let pid: u32 = held.split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert!(process_alive(pid), "the fixture held no live sharer");
+    pid
+}
+
+/// Sol B2 (`w` -> `x`): graceful shutdown wakes (EOF) and reaps the held
+/// sharer — the driver exits promptly and no child is left behind.
+#[test]
+fn held_sharer_is_reaped_on_graceful_exit() {
+    let mut setup = spawn_cmd_target().unwrap();
+    let sharer = hold_sharer(&mut setup.target);
+    let _guard = SharerGuard { pid: sharer };
+    let start = Instant::now();
+    setup.target.send(b'x').unwrap();
+    let mut exited = false;
+    for _ in 0..1000 {
+        if setup.target.child.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(exited, "the driver did not exit after w -> x");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "graceful shutdown took too long"
+    );
+    assert!(
+        !process_alive(sharer),
+        "held sharer {sharer} leaked after w -> x"
+    );
+}
+
+/// Sol B2 (failure before `W`): when the parent dies without cleanup (as
+/// on a Rust setup failure), the held sharer must see EOF and exit on its
+/// own instead of blocking forever on its inherited write end.
+#[test]
+fn held_sharer_exits_when_parent_dies_before_wake() {
+    let mut setup = spawn_cmd_target().unwrap();
+    let sharer = hold_sharer(&mut setup.target);
+    let _guard = SharerGuard { pid: sharer };
+    // SIGKILL: no handlers, no cleanup — the leak shape under test.
+    setup.target.child.kill().unwrap();
+    setup.target.child.wait().unwrap();
+    let mut gone = false;
+    for _ in 0..500 {
+        if !process_alive(sharer) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        gone,
+        "held sharer {sharer} leaked after its parent died before W"
+    );
+}
+
 /// P2-2: a CLONE_VM non-thread sharer that predates the attach carries no
 /// SHARED_MM mark (marking happens on forks observed after attachment);
 /// its watched mutations must still globalize — the mm has users beyond

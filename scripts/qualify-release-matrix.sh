@@ -211,8 +211,19 @@ self_test() {
   # instead of touching real paths. The hidden dir is deliberately NOT
   # under $TMPDIR: with a $TMPDIR under /home the guard would not fire and
   # the run would reach real setup, passing for the wrong reason.
-  neg_iso=$(mktemp -d "${TMPDIR:-/tmp}/qrm-selftest-neg-XXXXXX")
-  neg_hidden=$(mktemp -d /var/tmp/qrm-selftest-hidden-XXXXXX)
+  if ! neg_iso=$(mktemp -d "${TMPDIR:-/tmp}/qrm-selftest-neg-XXXXXX"); then
+    echo "FAIL negative-test scratch allocation (neg_iso)"
+    fail=1
+    echo "self-test: FAIL"
+    return 1
+  fi
+  if ! neg_hidden=$(mktemp -d /var/tmp/qrm-selftest-hidden-XXXXXX); then
+    echo "FAIL negative-test scratch allocation (neg_hidden)"
+    rm -rf "$neg_iso"
+    fail=1
+    echo "self-test: FAIL"
+    return 1
+  fi
   neg_out=$("$0" --bin-dir "$neg_hidden" --rev x --out-base "$neg_iso/out" --stage-base "$neg_iso/stage" 2>&1); neg_rc=$?
   expect "bin-dir under hidden tmp refused" "$neg_rc" 2
   expect "bin-dir refusal diagnostic" "$neg_out" "bin-dir must be under /home (vng hides /tmp and /var/tmp)"

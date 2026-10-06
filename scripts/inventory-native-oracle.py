@@ -1366,7 +1366,7 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
                     (image.gen, how, e["caller"], view.callers[e["caller"]].get("first_seen_ns") or 0))
             res.add(run, cell, check, "pass", f"{ctag}: bound to {e['caller']} ({coverage(e).get('state')})")
             check_bound_edge(view, cell, ctag, role, prov, e, use, image, attested_delivery, res)
-            check_no_preadmission_positive(view, cell, ctag, image, prov["path"], e, res)
+            check_no_preadmission_positive(view, cell, ctag, e, res)
             if not alive_at_end:
                 caller = view.callers[e["caller"]]
                 res.ok(run, cell, "RETIRED-LIFECYCLE",
@@ -1475,19 +1475,26 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
                f"{ctag}: semantics {edge.get('semantics')!r}; missing mechanism/ops {missing}; unledgered {extra}")
 
 
-def check_no_preadmission_positive(view, cell, ctag, image, provider_path, edge, res):
-    """R-C51-1: an image that used the module before its caller's admission
-    leaves its row unbound, so the edge reads unknown/use_before_admission
-    — never a positive. A counted (or witnessed) positive over a first call
-    that predates the caller's admission is the DR-C51-PREADMIT upgrade,
-    which v0.3.0 does not build (C7 C5 must-fail: counted-on-preadmission)."""
-    first = first_call_ns(image, provider_path)
+def check_no_preadmission_positive(view, cell, ctag, edge, res):
+    """R-C51-1: a row recorded before its caller's admission never binds
+    (Rule 3, native_binding.rs:777: row.recorded_at_ns < first_seen_ns),
+    so the edge reads unknown/use_before_admission — never a positive.
+    The judged event is the ROW (the edge's first-seen: the earliest
+    insert stamp), not the ledger's first call: a table obtained before
+    the observer started (the acquisition dlsym) with use recorded
+    after admission and attachment binds legitimately. A counted (or
+    witnessed) positive over a row recorded before admission is the
+    DR-C51-PREADMIT upgrade, which v0.3.0 does not build (must-fail:
+    counted-on-preadmission). This only narrows failures: a true
+    pre-admission row implies a pre-admission ledger call (the entry
+    precedes the insert on the same clock)."""
+    row_ns = positive_first_ns(edge)
     admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
-    if first is None or admitted is None:
+    if row_ns is None or admitted is None:
         return
-    res.ok(view.name, cell, "PREADMISSION-POSITIVE", first >= admitted,
-           f"{ctag}: edge {edge['caller']} reads {coverage(edge).get('state')} but the image's first "
-           f"call ({first}) predates its caller's admission ({admitted}): a pre-admission row never binds")
+    res.ok(view.name, cell, "PREADMISSION-POSITIVE", row_ns >= admitted,
+           f"{ctag}: edge {edge['caller']} reads {coverage(edge).get('state')} but its row was recorded "
+           f"({row_ns}) before its caller's admission ({admitted}): a pre-admission row never binds")
 
 
 def check_exec_split(view, cell, bound, images, man, mod, res, counted=frozenset()):
@@ -2962,9 +2969,17 @@ def self_test():
         case("absent-as-zero-p1", "USED-NOT-WATCHED", absent_zero_p1)
 
         def preadmission_p2(s, d, dash):
+            # The ROW predates admission (admitted after the first
+            # attach-side entry, row stamped between the entry and the
+            # admission): a bound positive over it is the
+            # DR-C51-PREADMIT upgrade, which v0.3.0 does not build.
             first = min(u[0] for c, _p, _st, _g, _e, _sp, uses in s.images if c == "P2" for u in uses.values())
+            attach_t0 = first + 3 * MS  # setup lines run 3 ms apart: dlsym, then C_Initialize
             caller = next(c for c in d["callers"] if c["id"] == cid(s, "P2"))
-            caller["first_seen_ns"] = first + MS
+            caller["first_seen_ns"] = attach_t0 + MS
+            edge = _edge(d, cid(s, "P2"), s.mid["B"])
+            edge["entries"]["first_seen_ns"] = attach_t0 + MS // 2
+            edge["entries"]["coverage"]["since_ns"] = attach_t0 + MS // 2
         case("counted-on-preadmission-p2", "PREADMISSION-POSITIVE", preadmission_p2)
 
         # Counted for unattested B: a witnessed P2 edge fails like P1's.
@@ -3205,6 +3220,25 @@ def self_test():
         def clock_backwards(s, d, dash):
             return clock_stages(s, d, T0 + 1500, T0 + 500)
         case("edge-clock-backwards", "EDGE-CLOCK", clock_backwards)
+
+        # --- O4: preadmission checks the wrong event (astra B2) --------------
+        # The binder's Rule 3 rejects ROWS recorded before admission
+        # (native_binding.rs:777: row.recorded_at_ns < first_seen_ns),
+        # but the oracle compared the ledger's first call — including the
+        # excluded acquisition C_GetFunctionList — against admission, so a
+        # legitimate table-before-observer + use-after-admission edge
+        # fails. The rejection must rest on evidence that an attached
+        # entry produced a row before admission.
+        def preadmission_legit_held(s, d, dash):
+            sd = s.stop_doc()
+            first = min(u[0] for c, _p, _st, _g, _e, _sp, uses in s.images if c == "P6"
+                        for u in uses.values())
+            row = first + MS
+            sd["callers"][0]["first_seen_ns"] = first + MS // 2
+            sd["edges"][0]["entries"]["first_seen_ns"] = row
+            sd["edges"][0]["entries"]["coverage"]["since_ns"] = row
+            return {"stop_doc": sd}
+        case("preadmission-held-table-before-observer", None, preadmission_legit_held)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

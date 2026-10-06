@@ -1299,6 +1299,7 @@ def check_cells(view, images_by_cell, res):
                         "same-binary re-exec and non-leader exec are invisible to exe-identity scan pins")
     check_positives(view, images_by_cell, mod, state, res)
     check_counted_nonzero(view, res)
+    check_saturated(view, res)
     check_uncounted(view, res)
 
 
@@ -1460,8 +1461,13 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
                    f"{ctag}: lossy count {count} (upper bound {hi}) needs a loss gap "
                    f"({len(loss_gaps)} found) and, at zero, observation {OBSERVATION_LOSSY_ZERO!r} (got {label!r})")
         else:
-            res.ok(run, cell, "COUNT-WINDOW", lo <= count <= hi,
-                   f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}")
+            # O7: a saturated feed is clamped at the cap, so the lower
+            # bound cannot hold it (the true calls run past the cap);
+            # the upper bound still can.
+            saturated = bool(edge["entries"].get("saturated"))
+            res.ok(run, cell, "COUNT-WINDOW", (saturated or lo <= count) and count <= hi,
+                   f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
+                   + (" (saturated: lower bound clamped at the cap)" if saturated else ""))
             admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
             exact, expected = exact_window_count(use, cov.get("since_ns") or 0, window, until, admitted)
             if exact and not edge["entries"].get("saturated"):
@@ -1544,6 +1550,23 @@ def check_counted_nonzero(view, res):
         res.ok(view.name, "*", "COUNTED-NONZERO", count >= 1,
                f"edge {key[0]}->{key[1]} reads counted with count {count}: "
                "a counted edge publishes its entry count, never 0")
+
+
+def check_saturated(view, res):
+    """O7: the saturation/cap relationship holds on every edge — the
+    product stops the count at MAX_EDGE_ENTRY_COUNT (u64::MAX) and sets
+    saturated exactly then, so saturated reads the cap and a count at
+    the cap reads saturated. Edges without an int cap cannot be judged
+    and are skipped."""
+    for key in sorted(view.edges):
+        entries = view.edges[key]["entries"]
+        cap = entries.get("cap")
+        if not isinstance(cap, int):
+            continue
+        count, saturated = entries.get("count", 0), bool(entries.get("saturated"))
+        res.ok(view.name, "*", "COUNT-SATURATED", saturated == (count == cap),
+               f"edge {key[0]}->{key[1]} reads count {count} saturated {saturated} cap {cap}: "
+               "a saturated feed reads the cap, and a count at the cap reads saturated")
 
 
 def check_uncounted(view, res):
@@ -3299,6 +3322,28 @@ def self_test():
                    None)
         if row is None or row["status"] != "nonqualifying":
             failures.append("uncounted-gap-suppressed-not-nonqualifying")
+
+        # --- O7: saturation cap bounds (astra A6) ---------------------------
+        # Skipping COUNT-EXACT leaves COUNT-WINDOW's unclamped lower
+        # bound: a legitimate saturated count fails against a ledger
+        # longer than the cap. The small cap below stands in for
+        # u64::MAX (same clamped-bound shape, ledger-sized numbers).
+        def saturated_clamped(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=7, saturated=True, cap=7)
+        res = case("saturated-count-clamped-pass", None, saturated_clamped)
+        if not any(r["check"] == "COUNT-SATURATED" and r["status"] == "pass" for r in res.rows):
+            failures.append("saturated-count-clamped-not-compared")
+
+        def saturated_off_cap(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=5, saturated=True, cap=7)
+        case("saturated-count-off-cap", "COUNT-SATURATED", saturated_off_cap)
+
+        def unsaturated_at_cap(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=7, saturated=False, cap=7)
+        case("unsaturated-count-at-cap", "COUNT-SATURATED", unsaturated_at_cap)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

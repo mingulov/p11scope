@@ -593,6 +593,56 @@ fn faulted_registry_overflow_latches_coverage_refusal() {
 }
 
 #[test]
+fn latched_overflow_plus_era_change_refuses_everything_until_recreation() {
+    // Availability cost, on record: once the P2-1 latch is set, a
+    // fault-era change clears the retained observations that kept
+    // continuity, after which every key is unknown and refused — fresh
+    // observations included — until the router is recreated.
+    const A: u64 = 0xA1;
+    const B: u64 = 0xA2;
+    const D: u64 = 0xA4;
+    let limits = RouterLimits {
+        faulted_keys: 1,
+        ..RouterLimits::default()
+    };
+    let mut r = InstanceRouter::new(limits);
+    assert_eq!(
+        r.observe(observation_for(D, 2, load(BASE_A))).0,
+        ObserveOutcome::New
+    );
+    let fault = |r: &mut InstanceRouter, cookie: u64| {
+        r.observe(observation_for(cookie, 2, load(BASE_A)));
+        let mut grown = load(BASE_A);
+        grown.extend(load(BASE_B));
+        assert_eq!(
+            r.observe(observation_for(cookie, 2, grown)).0,
+            ObserveOutcome::CoverageFault
+        );
+    };
+    fault(&mut r, A);
+    fault(&mut r, B);
+    assert_eq!(
+        r.observe(observation_for(D, 2, load(BASE_A))).0,
+        ObserveOutcome::Continued
+    );
+    assert!(r.audit(1, 0, 0).is_empty());
+    let mut fresh = observation_for(D, 2, load(BASE_A));
+    fresh.reading.fault = 1;
+    assert_eq!(r.observe(fresh).0, ObserveOutcome::CoverageFault);
+    assert_eq!(
+        r.route(call_for(1, D, stamp(2, 0, 1), ip_in(BASE_A))),
+        Route::Unknown(UnknownReason::CoverageFault)
+    );
+    // A recreated router accepts the same evidence again.
+    let mut recreated = InstanceRouter::new(limits);
+    assert!(recreated.audit(1, 0, 0).is_empty());
+    let mut fresh = observation_for(D, 2, load(BASE_A));
+    fresh.reading.fault = 1;
+    assert_eq!(recreated.observe(fresh).0, ObserveOutcome::New);
+    joined(recreated.route(call_for(1, D, stamp(2, 0, 1), ip_in(BASE_A))));
+}
+
+#[test]
 fn fault_evict_reobserve_same_epoch_still_refuses_route() {
     // P2-1 (astra retro): evicting a coverage-fault tombstone must not let
     // the same discredited epoch re-join on re-observation.

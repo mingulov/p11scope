@@ -92,6 +92,11 @@ strengthens fail-closed routing, and each is pinned by the cited gate.
   latches capture-sticky `CoverageFault` refusal for every unknown key —
   P2-1, since the evicted tombstone is indistinguishable from a new key —
   while keys with a retained observation keep continuity.)
+- Availability cost, on record: once the P2-1 latch is set, a fault-era
+  change clears all observations, after which every key is unknown and
+  every instance join stays refused until router recreation. Conservative
+  and sound — the forgotten tombstones could be any of the cleared keys.
 - Pinned by: `a_range_appearing_at_unchanged_epochs_is_a_sticky_coverage_fault`,
-  `fault_evict_reobserve_same_epoch_still_refuses_route`, and
-  `faulted_registry_overflow_latches_coverage_refusal`.
+  `fault_evict_reobserve_same_epoch_still_refuses_route`,
+  `faulted_registry_overflow_latches_coverage_refusal`, and
+  `latched_overflow_plus_era_change_refuses_everything_until_recreation`.

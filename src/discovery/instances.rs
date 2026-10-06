@@ -474,7 +474,12 @@ pub(crate) struct InstanceRouter {
     /// key (no retained observation) is refused with `CoverageFault` — fail
     /// closed. Capture-sticky: set once, never cleared (a fault-era advance
     /// clears observations, not the fault registry). Retained keys keep
-    /// continuity; only unknown keys pay the availability cost.
+    /// continuity; only unknown keys pay the availability cost — until a
+    /// fault-era change clears all observations, after which every key is
+    /// unknown and every observation and route is refused until the router
+    /// is recreated. That total refusal is conservative and sound (the
+    /// forgotten tombstones could be any of the cleared keys), and it is
+    /// the documented price of bounding the fault registry.
     faulted_overflowed: bool,
     retired: BTreeSet<u64>,
     /// The greatest retired cookie evicted under capacity pressure in this
@@ -576,7 +581,9 @@ impl InstanceRouter {
     /// generation (which the capture loop also raises on hook-program
     /// misses), the sticky bits, and the hook programs' summed
     /// `recursion_misses`. A changed fault ends every retained observation
-    /// and every pending call, and releases the miss latch. A changed miss
+    /// and every pending call, and releases the miss latch. While the P2-1
+    /// overflow latch is set, this clearing refuses every later observation
+    /// and route until router recreation (see `faulted_overflowed`). A changed miss
     /// total WITHOUT a changed fault means the loop has not raised for those
     /// misses: the era latches (no joins, no observations) until a fault
     /// raise re-coheres it. Any miss change latches, including a decrease

@@ -28,12 +28,19 @@
 # cargo/rustc; bounded COOLDOWN, default 300 s, else the campaign is refused),
 # anchor READY, observer attach line with >0 probes and no "attach failed",
 # bpftool hook presence (exactly the 3 p11_inst_vma_* programs on, none off),
-# exact churn op count and mode, observer exit 0, profile.json parses with
+# exactly this observer's 3 attached hook links on (none off; P2-3: loaded
+# programs alone would certify an attach failure), a watched file on (none
+# off), workload-consistent hook execution on (>= 1 event per churn op,
+# positive run time, within 4x above — a zero delta fails), exact churn op
+# count and mode, observer exit 0, profile.json parses with
 # evidence.attached_probes > 0. BPF run-time deltas (kernel.bpf_stats_enabled,
 # set for the campaign and restored after) corroborate the workload-side
-# numbers independently; the verdict math lives in
-# scripts/bench-stagea-overhead-analyze.py, which also runs standalone on the
-# campaign log.
+# numbers independently. The campaign pre-declares a manifest
+# ($WORK/campaign.manifest.json: expected cells, rounds, workload params)
+# before the first sample and closes the log with a DONE marker; the verdict
+# math lives in scripts/bench-stagea-overhead-analyze.py, which also runs
+# standalone on the campaign log with --manifest and rejects any campaign
+# that does not match its manifest or lacks completion.
 #
 # Usage: flock "$LOCK" scripts/bench-stagea-overhead.sh [--self-test]
 # The script refuses unless an ancestor holds LOCK (default
@@ -94,6 +101,34 @@ is_positive_int() {
     [ "$1" -gt 0 ]
 }
 
+# write_manifest: pre-declares the campaign for the analyzer (P2-4): every
+# expected cell with its rounds and workload parameters, the ABBA
+# arms-per-round, hook events per op, and the DONE completion marker. Runs
+# before the first sample; the analyzer rejects any campaign that does not
+# match it or lacks the DONE line. Writes $WORK/campaign.manifest.json.
+write_manifest() {
+    CELLS="$CELLS" OPS="$OPS" PARALLEL="$PARALLEL" ROUNDS_MMAP="$ROUNDS_MMAP" \
+    ROUNDS_MREMAP="$ROUNDS_MREMAP" ROUNDS_PARALLEL="$ROUNDS_PARALLEL" \
+    python3 -I - > "$WORK/campaign.manifest.json" <<'EOF' || die "manifest write failed"
+import json, os
+cells = {}
+for cell in os.environ["CELLS"].split():
+    if cell in ("relevant-mmap", "unrelated-mmap"):
+        rounds, mode, parallel = int(os.environ["ROUNDS_MMAP"]), "mmap", 1
+    elif cell in ("relevant-mremap", "unrelated-mremap"):
+        rounds, mode, parallel = int(os.environ["ROUNDS_MREMAP"]), "mremap", 1
+    elif cell in ("relevant-mmap-p8", "unrelated-mmap-p8"):
+        rounds, mode, parallel = (
+            int(os.environ["ROUNDS_PARALLEL"]), "mmap", int(os.environ["PARALLEL"]))
+    else:
+        raise SystemExit(f"unknown cell {cell}")
+    ops = int(os.environ["OPS"]) * parallel
+    cells[cell] = {"rounds": rounds, "ops": ops, "mode": mode, "parallel": parallel}
+print(json.dumps({"cells": cells, "arms_per_round": 4, "events_per_op": 2,
+                  "completion": {"marker": "DONE"}}))
+EOF
+}
+
 if [ "${1-}" = "--self-test" ]; then
     [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
     # Unprivileged: churn fixture compile + exact-count smokes + usage
@@ -126,6 +161,21 @@ if [ "${1-}" = "--self-test" ]; then
     if "$SELF_TEST_WORK/map_churn" "$SELF_TEST_WORK/no-such-file" 10 mmap >/dev/null 2>&1; then
         echo "self-test: missing file accepted" >&2; exit 1
     fi
+    CELLS="relevant-mmap unrelated-mmap-p8" OPS=1000 PARALLEL=8 ROUNDS_MMAP=3 \
+    ROUNDS_MREMAP=2 ROUNDS_PARALLEL=2 WORK="$SELF_TEST_WORK" write_manifest \
+        || { echo "self-test: manifest write failed" >&2; exit 1; }
+    python3 -I - "$SELF_TEST_WORK/campaign.manifest.json" <<'EOF' \
+        || { echo "self-test: bad manifest" >&2; exit 1; }
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert set(doc["cells"]) == {"relevant-mmap", "unrelated-mmap-p8"}, doc
+assert doc["cells"]["relevant-mmap"] == {
+    "rounds": 3, "ops": 1000, "mode": "mmap", "parallel": 1}, doc
+assert doc["cells"]["unrelated-mmap-p8"] == {
+    "rounds": 2, "ops": 8000, "mode": "mmap", "parallel": 8}, doc
+assert doc["arms_per_round"] == 4 and doc["events_per_op"] == 2, doc
+assert doc["completion"] == {"marker": "DONE"}, doc
+EOF
     python3 -I scripts/bench-stagea-overhead-analyze.py --self-test \
         || { echo "self-test: analyzer self-test failed" >&2; exit 1; }
     echo "bench-stagea-overhead self-test: OK"
@@ -292,6 +342,64 @@ hook_prog_count() {
     sudo -n bpftool prog show 2>/dev/null | grep -c "p11_inst_vma_" || true
 }
 
+# hook_link_count: tracing links attached to the three p11_inst_vma_*
+# programs (P2-3: loaded programs alone prove nothing — an attach failure
+# detaches links while leaving programs loaded — so the on-arm sample must
+# read exactly 3 attached links and off exactly 0; the preflight proved
+# zero, so these links belong to this observer). Prints the count; fails
+# when bpftool output is unusable.
+hook_link_count() {
+    sudo -n bpftool -j prog show 2>/dev/null > "$WORK/bpf-prog.json" || return 1
+    sudo -n bpftool -j link show 2>/dev/null > "$WORK/bpf-link.json" || return 1
+    python3 -I - "$WORK/bpf-prog.json" "$WORK/bpf-link.json" <<'EOF'
+import json, sys
+try:
+    progs = json.load(open(sys.argv[1]))
+    links = json.load(open(sys.argv[2]))
+except Exception:
+    sys.exit(1)
+want = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"}
+ids = {p.get("id") for p in progs if p.get("name") in want}
+if not ids:
+    print(0)
+elif len(ids) != 3:
+    sys.exit(1)
+else:
+    print(sum(1 for link in links if link.get("prog_id") in ids))
+EOF
+}
+
+# watched_file_count: entries in this observer's WATCHED_FILES map (P2-3:
+# hooks without a watched file never take the per-(process,file) path, so
+# the on-arm sample must read at least 1 and off exactly 0; the preflight
+# proved no p11scope was live, so the map is this observer's). Prints the
+# count; a missing map reads 0.
+watched_file_count() {
+    sudo -n bpftool -j map show 2>/dev/null | python3 -I -c '
+import json, subprocess, sys
+try:
+    maps = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+ids = [m["id"] for m in maps if m.get("name") == "WATCHED_FILES"]
+if not ids:
+    print(0)
+    sys.exit(0)
+if len(ids) != 1:
+    sys.exit(1)
+dumped = subprocess.run(
+    ["sudo", "-n", "bpftool", "-j", "map", "dump", "id", str(ids[0])],
+    capture_output=True, text=True)
+if dumped.returncode != 0:
+    sys.exit(1)
+try:
+    entries = json.loads(dumped.stdout or "[]")
+except Exception:
+    sys.exit(1)
+print(len(entries) if isinstance(entries, list) else 0)
+'
+}
+
 # bpf_hook_totals: "<run_time_ns sum> <run_cnt sum>" over the three hooks
 # (kernel.bpf_stats_enabled=1 for the campaign). Fails unless all three are
 # present with counters.
@@ -358,6 +466,8 @@ echo "cells: $CELLS"
 echo "ops: $OPS parallel workers: $PARALLEL"
 say "MACHINE kernel=$KERNEL cpu=$CPU nproc=$(nproc) date=$(date -u +%FT%TZ) host=$(uname -n)"
 say "BINARY path=$P11SCOPE sha256=$BIN_SHA commit=$COMMIT"
+write_manifest
+echo "campaign manifest: $WORK/campaign.manifest.json"
 
 if command -v docker >/dev/null 2>&1 && docker inspect "$KIND" >/dev/null 2>&1; then
     if [ "$(docker inspect -f '{{.State.Status}}' "$KIND" 2>/dev/null)" = running ]; then
@@ -481,10 +591,24 @@ run_sample() {
     else
         [ "$rs_hooks" = 0 ] || { echo "off-arm sample has $rs_hooks hook programs, want 0" >&2; return 1; }
     fi
+    # P2-3: loaded programs alone prove nothing — an attach failure detaches
+    # links while leaving programs loaded — so the on-arm sample must also
+    # hold exactly this observer's 3 attached links and a watched file.
+    rs_links=$(hook_link_count) || { echo "hook link query failed" >&2; return 1; }
+    rs_watched=$(watched_file_count) || { echo "watched-file query failed" >&2; return 1; }
+    if [ "$rs_arm" = on ]; then
+        [ "$rs_links" = 3 ] || { echo "on-arm sample has $rs_links hook links, want 3 (loaded but unattached?)" >&2; return 1; }
+        [ "$rs_watched" -ge 1 ] || { echo "on-arm sample watches $rs_watched files, want >= 1" >&2; return 1; }
+    else
+        [ "$rs_links" = 0 ] || { echo "off-arm sample has $rs_links hook links, want 0" >&2; return 1; }
+        [ "$rs_watched" = 0 ] || { echo "off-arm sample watches $rs_watched files, want 0" >&2; return 1; }
+    fi
     if [ "$rs_arm" = on ]; then
         rs_bpf_before=$(bpf_hook_totals) || { echo "bpf before-read failed" >&2; return 1; }
     fi
     run_churn "$rs_file" "$OPS" "$rs_mode" "$rs_n" "$S" || { echo "churn window failed" >&2; return 1; }
+    rs_totals=$(churn_totals "$S") || { echo "churn totals failed" >&2; return 1; }
+    rs_tops=${rs_totals% *} rs_twall=${rs_totals#* }
     if [ "$rs_arm" = on ]; then
         rs_bpf_after=$(bpf_hook_totals) || { echo "bpf after-read failed" >&2; return 1; }
         rs_bns0=${rs_bpf_before% *} rs_bcnt0=${rs_bpf_before#* }
@@ -492,6 +616,12 @@ run_sample() {
         [ "$rs_bns1" -ge "$rs_bns0" ] && [ "$rs_bcnt1" -ge "$rs_bcnt0" ] \
             || { echo "bpf counters went backwards" >&2; return 1; }
         rs_bpf_ns=$((rs_bns1 - rs_bns0)) rs_bpf_cnt=$((rs_bcnt1 - rs_bcnt0))
+        # P2-3: a zero delta would certify unattached hooks. The workload
+        # runs ~2 hook events per op (map+unmap / copy+unmap), so require at
+        # least one event per op and positive run time, within 4x above.
+        [ "$rs_bpf_ns" -gt 0 ] || { echo "on-arm sample ran $rs_tops ops with zero hook run time" >&2; return 1; }
+        [ "$rs_bpf_cnt" -ge "$rs_tops" ] || { echo "on-arm sample ran $rs_tops ops with $rs_bpf_cnt hook events (< 1/op)" >&2; return 1; }
+        [ "$rs_bpf_cnt" -le $((rs_tops * 4)) ] || { echo "on-arm sample ran $rs_tops ops with $rs_bpf_cnt hook events (> 4/op)" >&2; return 1; }
     else
         rs_bpf_ns=none rs_bpf_cnt=none
     fi
@@ -513,8 +643,6 @@ EOF
     wait "$APID" 2>/dev/null || true
     APID=
     record_load "$S/load.txt" end
-    rs_totals=$(churn_totals "$S") || { echo "churn totals failed" >&2; return 1; }
-    rs_tops=${rs_totals% *} rs_twall=${rs_totals#* }
     say "SAMPLE cell=$rs_cell arm=$rs_arm round=$rs_round ops=$rs_tops wall_ns=$rs_twall mode=$rs_mode parallel=$rs_n bpf_ns=$rs_bpf_ns bpf_cnt=$rs_bpf_cnt"
 }
 
@@ -542,6 +670,8 @@ for cell in $CELLS; do
     done
 done
 
+say "DONE samples=$SAMPLE_SEQ"
 echo "=== results ==="
-python3 -I scripts/bench-stagea-overhead-analyze.py "$LOG" || exit 1
+python3 -I scripts/bench-stagea-overhead-analyze.py "$LOG" \
+    --manifest "$WORK/campaign.manifest.json" || exit 1
 echo "=== bench-stagea-overhead: DONE ($LOG) ==="

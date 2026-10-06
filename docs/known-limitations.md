@@ -272,7 +272,10 @@ the min..max of per-sample p95.
   per round; off-arm drift under 1% on every resolved cell). Reproduce:
   `flock /var/tmp/p11scope-ws-tmp/privileged.lock
   scripts/bench-stagea-overhead.sh` on that commit, then
-  `scripts/bench-stagea-overhead-analyze.py` on the campaign log.
+  `scripts/bench-stagea-overhead-analyze.py` on the campaign log with
+  `--manifest` (the campaign writes `$WORK/campaign.manifest.json`; the
+  pre-manifest 1d log re-validates against a derived manifest with legacy
+  stdout completion — same MATERIAL table).
 - Disclosure: none in product output (no reader consumes the refusal
   yet; Stage B will); `bpftool prog show` names the three attached
   `p11_inst_vma_*` programs while a profile/trace capture is live, and

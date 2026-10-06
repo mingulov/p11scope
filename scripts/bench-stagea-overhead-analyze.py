@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Stage A overhead ABBA analysis (Task 1d).
+"""Stage A overhead ABBA analysis (Task 1d; completeness-hardened, P2-4).
 
 Reads a scripts/bench-stagea-overhead.sh campaign log: MACHINE/BINARY header
-lines plus one SAMPLE line per valid sample, and prints the per-cell
-with/without comparison (median ns/op + min..max spread), the absolute and
-relative overhead, the BPF run-time corroboration, a drift check, and a
-verdict against the materiality bar.
+lines, one SAMPLE line per valid sample, and a DONE completion marker — and
+validates it against the campaign manifest (expected cells, rounds, workload
+parameters, completion marker) BEFORE any verdict math. Missing or
+inconsistent evidence is rejected; nothing certifies on partial input.
 
 Usage:
-  scripts/bench-stagea-overhead-analyze.py LOG [--rel-pct 5.0] [--abs-ns 1000.0]
+  scripts/bench-stagea-overhead-analyze.py LOG --manifest MANIFEST [--rel-pct PCT] [--abs-ns NS]
   scripts/bench-stagea-overhead-analyze.py --self-test
 
-Exit 0 prints the table and verdict. Exit 1 when a cell cannot be compared
-(samples missing for an arm) or the log holds no samples.
+Exit 0 prints the table and verdict. Exit 1 when the evidence is missing or
+inconsistent (no completion marker, short rounds, parameter mismatch, no
+hook execution on an on-arm sample). Exit 2 on usage errors (bad flags, a
+missing or malformed manifest file).
 """
+import json
 import statistics
 import sys
 
 
 def parse_log(path):
-    """Split a campaign log into headers and samples.
+    """Split a campaign log into headers, samples, DONE markers and errors.
 
-    Returns (headers, samples, errors): headers maps MACHINE/BINARY keys,
-    samples is a list of dicts in log order, errors lists malformed SAMPLE
-    lines (never silently dropped: the caller fails on them).
+    Returns (headers, samples, done_lines, errors): headers maps
+    MACHINE/BINARY keys, samples is a list of dicts in log order, done_lines
+    lists the line numbers of DONE completion markers, errors lists malformed
+    SAMPLE lines (never silently dropped: the caller fails on them).
     """
     headers = {}
     samples = []
+    done_lines = []
     errors = []
     with open(path, encoding="utf-8") as handle:
         for lineno, raw in enumerate(handle, 1):
@@ -37,6 +42,9 @@ def parse_log(path):
             head, _, rest = line.partition(" ")
             if head in ("MACHINE", "BINARY"):
                 headers[head] = rest.strip()
+                continue
+            if head == "DONE":
+                done_lines.append(lineno)
                 continue
             if head != "SAMPLE":
                 continue
@@ -72,7 +80,192 @@ def parse_log(path):
                 errors.append(f"line {lineno}: half-present bpf pair: {line[:160]}")
                 continue
             samples.append(sample)
-    return headers, samples, errors
+    return headers, samples, done_lines, errors
+
+
+def load_manifest(path):
+    """Read a campaign manifest. Returns (manifest, error).
+
+    The manifest pre-declares the campaign: {"cells": {name: {"rounds",
+    "ops", "mode", "parallel"}}, "arms_per_round", "events_per_op",
+    "completion": {"marker": "DONE"} or {"legacy_stdout", "note"}}. Only one
+    of the two completion forms is valid.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except OSError as error:
+        return None, f"cannot read manifest {path}: {error}"
+    except ValueError as error:
+        return None, f"malformed manifest {path}: {error}"
+    if not isinstance(manifest, dict):
+        return None, f"malformed manifest {path}: top level is not an object"
+    cells = manifest.get("cells")
+    if not isinstance(cells, dict) or not cells:
+        return None, f"malformed manifest {path}: 'cells' is empty or missing"
+    for name, cell in cells.items():
+        if not isinstance(cell, dict):
+            return None, f"malformed manifest {path}: cell {name} is not an object"
+        for key in ("rounds", "ops", "parallel"):
+            value = cell.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                return (
+                    None,
+                    f"malformed manifest {path}: cell {name} field '{key}' "
+                    f"is not a positive integer",
+                )
+        if cell.get("mode") not in ("mmap", "mremap"):
+            return (
+                None,
+                f"malformed manifest {path}: cell {name} field 'mode' "
+                "is not mmap or mremap",
+            )
+    arms = manifest.get("arms_per_round")
+    if not isinstance(arms, int) or isinstance(arms, bool) or arms <= 0 or arms % 2:
+        return (
+            None,
+            f"malformed manifest {path}: 'arms_per_round' is not a positive even integer",
+        )
+    events = manifest.get("events_per_op")
+    if not isinstance(events, (int, float)) or isinstance(events, bool) or events <= 0:
+        return (
+            None,
+            f"malformed manifest {path}: 'events_per_op' is not a positive number",
+        )
+    completion = manifest.get("completion")
+    if not isinstance(completion, dict):
+        return None, f"malformed manifest {path}: 'completion' is missing"
+    if completion.get("marker") == "DONE" and "legacy_stdout" not in completion:
+        pass
+    elif (
+        isinstance(completion.get("legacy_stdout"), str)
+        and completion["legacy_stdout"]
+        and isinstance(completion.get("note"), str)
+        and completion["note"]
+        and "marker" not in completion
+    ):
+        pass
+    else:
+        return (
+            None,
+            f"malformed manifest {path}: 'completion' is neither "
+            "{'marker': 'DONE'} nor {'legacy_stdout', 'note'}",
+        )
+    return manifest, None
+
+
+def validate(samples, done_lines, manifest):
+    """Check the samples against the manifest. Returns a list of problems.
+
+    Every problem names the exact defect (want vs have); an empty list
+    means the campaign is complete and workload-consistent. Runs before any
+    verdict math: incomplete evidence never reaches a verdict.
+    """
+    problems = []
+    cells = manifest["cells"]
+    arms = manifest["arms_per_round"]
+    expected_events = manifest["events_per_op"]
+    completion = manifest["completion"]
+    if "marker" in completion:
+        if not done_lines:
+            problems.append(
+                "missing completion marker DONE: the campaign did not finish"
+            )
+        elif any(sample["lineno"] > done_lines[0] for sample in samples):
+            problems.append(
+                f"samples past the DONE marker at line {done_lines[0]}: "
+                "the marker does not complete the log"
+            )
+    else:
+        evidence = completion["legacy_stdout"]
+        try:
+            with open(evidence, encoding="utf-8") as handle:
+                stdout = handle.read()
+        except OSError:
+            stdout = ""
+        if "bench-stagea-overhead: DONE" not in stdout:
+            problems.append(
+                f"missing legacy completion evidence: {evidence} holds no "
+                "'bench-stagea-overhead: DONE' line"
+            )
+    have_cells = sorted({sample["cell"] for sample in samples})
+    for name in sorted(cells):
+        if name not in have_cells:
+            problems.append(
+                f"cell {name}: expected by the manifest, sampled 0 times"
+            )
+    for name in have_cells:
+        if name not in cells:
+            problems.append(
+                f"cell {name}: sampled but absent from the manifest"
+            )
+    for name in sorted(cells):
+        spec = cells[name]
+        rounds = sorted({sample["round"] for sample in samples if sample["cell"] == name})
+        want_rounds = list(range(1, spec["rounds"] + 1))
+        if rounds != want_rounds:
+            problems.append(
+                f"cell {name}: want rounds {want_rounds}, have {rounds}"
+            )
+        for round_no in want_rounds:
+            bucket = [
+                sample
+                for sample in samples
+                if sample["cell"] == name and sample["round"] == round_no
+            ]
+            on = [sample for sample in bucket if sample["arm"] == "on"]
+            off = [sample for sample in bucket if sample["arm"] == "off"]
+            if len(bucket) != arms or len(on) != arms // 2 or len(off) != arms // 2:
+                problems.append(
+                    f"cell {name} round {round_no}: want {arms} samples "
+                    f"({arms // 2} on + {arms // 2} off), have {len(bucket)} "
+                    f"({len(on)} on + {len(off)} off)"
+                )
+    for sample in samples:
+        spec = cells.get(sample["cell"])
+        if spec is None:
+            continue
+        for key in ("ops", "mode", "parallel"):
+            if sample[key] != spec[key]:
+                problems.append(
+                    f"line {sample['lineno']}: cell {sample['cell']} field "
+                    f"'{key}' is {sample[key]}, manifest wants {spec[key]}"
+                )
+        if sample["arm"] == "on":
+            if sample["bpf_cnt"] is None or sample["bpf_ns"] is None:
+                problems.append(
+                    f"line {sample['lineno']}: cell {sample['cell']} "
+                    f"round {sample['round']} on-arm sample has no hook "
+                    "run-time sample: the hooks never fired under the workload"
+                )
+            elif sample["bpf_cnt"] < sample["ops"] or sample["bpf_ns"] <= 0:
+                problems.append(
+                    f"line {sample['lineno']}: cell {sample['cell']} "
+                    f"round {sample['round']} on-arm hook execution "
+                    f"(bpf_cnt={sample['bpf_cnt']} over ops={sample['ops']}) "
+                    "is below one event per op: the hooks never fired "
+                    "under the workload"
+                )
+    for name in sorted(cells):
+        on = [
+            sample
+            for sample in samples
+            if sample["cell"] == name
+            and sample["arm"] == "on"
+            and sample["bpf_cnt"] is not None
+        ]
+        if not on:
+            continue
+        ratio = sum(sample["bpf_cnt"] for sample in on) / sum(
+            sample["ops"] for sample in on
+        )
+        if not expected_events / 2 <= ratio <= expected_events * 2:
+            problems.append(
+                f"cell {name}: hook events per op are {ratio:.2f}, want "
+                f"{expected_events:g} within 2x: the workload did not run "
+                "under the hooks"
+            )
+    return problems
 
 
 def summarize(values):
@@ -90,7 +283,8 @@ def analyze(samples, rel_bar, abs_bar):
 
     rows holds one dict per cell with on/off summaries, absolute + relative
     overhead, bpf corroboration and drift; problems lists cells that cannot
-    be compared (an arm with no samples).
+    be compared (an arm with no samples). Runs only after `validate`
+    accepted the campaign; its problems are a backstop, not the gate.
     """
     rows = []
     problems = []
@@ -212,7 +406,7 @@ def main(argv):
             return 2
         self_test()
         return 0
-    rel_bar, abs_bar, positional = 5.0, 1000.0, []
+    rel_bar, abs_bar, positional, manifest_path = 5.0, 1000.0, [], None
     index = 0
     while index < len(args):
         if args[index] == "--rel-pct" and index + 1 < len(args):
@@ -221,26 +415,41 @@ def main(argv):
         elif args[index] == "--abs-ns" and index + 1 < len(args):
             abs_bar = float(args[index + 1])
             index += 2
+        elif args[index] == "--manifest" and index + 1 < len(args):
+            manifest_path = args[index + 1]
+            index += 2
+        elif args[index].startswith("--manifest="):
+            manifest_path = args[index].partition("=")[2]
+            index += 1
         elif args[index].startswith("--"):
             print(f"unknown flag {args[index]}", file=sys.stderr)
             return 2
         else:
             positional.append(args[index])
             index += 1
-    if len(positional) != 1:
+    if len(positional) != 1 or not manifest_path:
         print(
-            "usage: bench-stagea-overhead-analyze.py LOG "
+            "usage: bench-stagea-overhead-analyze.py LOG --manifest MANIFEST "
             "[--rel-pct PCT] [--abs-ns NS]",
             file=sys.stderr,
         )
         return 2
-    headers, samples, errors = parse_log(positional[0])
+    manifest, manifest_error = load_manifest(manifest_path)
+    if manifest_error is not None:
+        print(manifest_error, file=sys.stderr)
+        return 2
+    headers, samples, done_lines, errors = parse_log(positional[0])
     if errors:
         for error in errors:
             print(f"malformed sample: {error}", file=sys.stderr)
         return 1
     if not samples:
         print("no samples in the log", file=sys.stderr)
+        return 1
+    incomplete = validate(samples, done_lines, manifest)
+    if incomplete:
+        for problem in incomplete:
+            print(f"incomplete campaign: {problem}", file=sys.stderr)
         return 1
     rows, problems = analyze(samples, rel_bar, abs_bar)
     if problems:
@@ -252,7 +461,9 @@ def main(argv):
 
 
 def self_test():
-    """Pinned-numbers checks over synthetic logs."""
+    """Pinned-numbers checks over synthetic logs, plus manifest-gate pins."""
+    import contextlib
+    import io
     import os
     import tempfile
 
@@ -266,15 +477,43 @@ SAMPLE cell=unrelated-mmap arm=off round=1 ops=1000 wall_ns=4000000 mode=mmap pa
 SAMPLE cell=unrelated-mmap arm=on round=1 ops=1000 wall_ns=4020000 mode=mmap parallel=1 bpf_ns=140000 bpf_cnt=2010
 SAMPLE cell=unrelated-mmap arm=on round=2 ops=1000 wall_ns=4040000 mode=mmap parallel=1 bpf_ns=150000 bpf_cnt=1990
 SAMPLE cell=unrelated-mmap arm=off round=2 ops=1000 wall_ns=4000000 mode=mmap parallel=1 bpf_ns=none bpf_cnt=none
+DONE samples=8
 """
+    manifest = {
+        "cells": {
+            "relevant-mmap": {"rounds": 2, "ops": 1000, "mode": "mmap", "parallel": 1},
+            "unrelated-mmap": {"rounds": 2, "ops": 1000, "mode": "mmap", "parallel": 1},
+        },
+        "arms_per_round": 2,
+        "events_per_op": 2,
+        "completion": {"marker": "DONE"},
+    }
     with tempfile.TemporaryDirectory(prefix="stagea-analyze-") as work:
         path = os.path.join(work, "campaign.log")
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(log)
-        headers, samples, errors = parse_log(path)
+        manifest_path = os.path.join(work, "campaign.manifest.json")
+
+        def write_log(text):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+
+        def write_manifest(doc):
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(doc, handle)
+
+        def run(argv):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = main(argv)
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        write_log(log)
+        write_manifest(manifest)
+        headers, samples, done_lines, errors = parse_log(path)
         assert not errors, errors
         assert len(samples) == 8, len(samples)
+        assert done_lines == [11], done_lines
         assert headers["MACHINE"] == "kernel=7.0 test-cpu nproc=12"
+        assert validate(samples, done_lines, manifest) == []
         rows, problems = analyze(samples, 5.0, 1000.0)
         assert not problems, problems
         assert [row["cell"] for row in rows] == ["relevant-mmap", "unrelated-mmap"]
@@ -294,6 +533,9 @@ SAMPLE cell=unrelated-mmap arm=off round=2 ops=1000 wall_ns=4000000 mode=mmap pa
         text = report(headers, rows, 5.0, 1000.0)
         assert "OVERALL: immaterial on every cell" in text, text
         assert "overhead +100.0 ns/op (+2.44%)" in text, text
+        code, out, _ = run([path, "--manifest", manifest_path])
+        assert code == 0, (code, out)
+        assert "OVERALL: immaterial on every cell" in out, out
         # A cell over the relative bar reads MATERIAL.
         hot = log.replace(
             "cell=relevant-mmap arm=on round=1 ops=1000 wall_ns=4100000",
@@ -302,27 +544,104 @@ SAMPLE cell=unrelated-mmap arm=off round=2 ops=1000 wall_ns=4000000 mode=mmap pa
             "cell=relevant-mmap arm=on round=2 ops=1000 wall_ns=4300000",
             "cell=relevant-mmap arm=on round=2 ops=1000 wall_ns=4500000",
         )
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(hot)
-        _, hot_samples, hot_errors = parse_log(path)
+        write_log(hot)
+        _, hot_samples, _, hot_errors = parse_log(path)
         assert not hot_errors
         hot_rows, _ = analyze(hot_samples, 5.0, 1000.0)
         assert hot_rows[0]["material"], "400ns/9.8% must read MATERIAL"
         assert "OVERALL: MATERIAL (relevant-mmap)" in report(headers, hot_rows, 5.0, 1000.0)
         # Missing arm, malformed lines and empty logs fail, never pass quietly.
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("SAMPLE cell=x arm=on round=1 ops=1 wall_ns=2 mode=mmap parallel=1 bpf_ns=none bpf_cnt=none\n")
-        _, one_arm, _ = parse_log(path)
+        write_log(
+            "SAMPLE cell=x arm=on round=1 ops=1 wall_ns=2 mode=mmap parallel=1 bpf_ns=none bpf_cnt=none\n"
+        )
+        _, one_arm, _, _ = parse_log(path)
         _, problems = analyze(one_arm, 5.0, 1000.0)
         assert problems, "a cell with one arm must not compare"
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("SAMPLE cell=x arm=maybe round=1 ops=1 wall_ns=2 mode=mmap parallel=1 bpf_ns=none bpf_cnt=none\n")
-        _, _, bad = parse_log(path)
+        write_log(
+            "SAMPLE cell=x arm=maybe round=1 ops=1 wall_ns=2 mode=mmap parallel=1 bpf_ns=none bpf_cnt=none\n"
+        )
+        _, _, _, bad = parse_log(path)
         assert bad, "a bad arm must be reported"
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("MACHINE nothing here\n")
-        _, empty, _ = parse_log(path)
+        write_log("MACHINE nothing here\n")
+        _, empty, _, _ = parse_log(path)
         assert not empty
+        # P2-4: the astra trivial input (one equal on/off pair, one cell,
+        # zero hook executions) is rejected, never certified.
+        write_log(
+            "MACHINE kernel=test\n"
+            "BINARY path=/tmp/p sha256=abc\n"
+            "SAMPLE cell=x arm=off round=1 ops=1000 wall_ns=4000000 mode=mmap parallel=1 bpf_ns=none bpf_cnt=none\n"
+            "SAMPLE cell=x arm=on round=1 ops=1000 wall_ns=4000000 mode=mmap parallel=1 bpf_ns=none bpf_cnt=none\n"
+            "DONE samples=2\n"
+        )
+        write_manifest(
+            {
+                "cells": {"x": {"rounds": 1, "ops": 1000, "mode": "mmap", "parallel": 1}},
+                "arms_per_round": 2,
+                "events_per_op": 2,
+                "completion": {"marker": "DONE"},
+            }
+        )
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "the hooks never fired under the workload" in err, err
+        assert "OVERALL" not in err
+        # Every completeness defect names itself exactly.
+        write_log(log.replace("DONE samples=8\n", ""))
+        write_manifest(manifest)
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1 and "missing completion marker DONE" in err, (code, err)
+        write_log(log + "SAMPLE cell=relevant-mmap arm=off round=2 ops=1000 wall_ns=1 mode=mmap parallel=1 bpf_ns=none bpf_cnt=none\n")
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1 and "past the DONE marker" in err, (code, err)
+        short = "\n".join(
+            line
+            for line in log.splitlines()
+            if "cell=unrelated-mmap arm=on round=2" not in line
+        ) + "\n"
+        write_log(short)
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "cell unrelated-mmap round 2: want 2 samples (1 on + 1 off)" in err, err
+        write_log(log.replace("ops=1000 wall_ns=4100000", "ops=2000 wall_ns=8200000"))
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "'ops' is 2000, manifest wants 1000" in err, err
+        write_log(log.replace("cell=unrelated-mmap", "cell=rogue-cell"))
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1, (code, err)
+        assert "cell rogue-cell: sampled but absent from the manifest" in err, err
+        assert "cell unrelated-mmap: expected by the manifest, sampled 0 times" in err, err
+        # Legacy completion: the pre-manifest 1d shape (completion proven by
+        # the campaign stdout, not a DONE line).
+        legacy_manifest = dict(manifest)
+        legacy_manifest["completion"] = {
+            "legacy_stdout": os.path.join(work, "campaign.stdout"),
+            "note": "pre-manifest campaign; completion proven by its stdout",
+        }
+        write_log(log.replace("DONE samples=8\n", ""))
+        stdout_path = os.path.join(work, "campaign.stdout")
+        with open(stdout_path, "w", encoding="utf-8") as handle:
+            handle.write("=== bench-stagea-overhead: DONE (/tmp/x/campaign.log) ===\n")
+        legacy_manifest["completion"] = {"legacy_stdout": stdout_path, "note": "test"}
+        write_manifest(legacy_manifest)
+        code, out, _ = run([path, "--manifest", manifest_path])
+        assert code == 0, (code, out)
+        with open(stdout_path, "w", encoding="utf-8") as handle:
+            handle.write("interrupted\n")
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 1 and "missing legacy completion evidence" in err, (code, err)
+        # Manifest misuse is a usage error (exit 2), never a verdict.
+        write_log(log)
+        write_manifest(manifest)
+        code, _, err = run([path])
+        assert code == 2 and "--manifest" in err, (code, err)
+        code, _, err = run([path, "--manifest", os.path.join(work, "no-such.json")])
+        assert code == 2 and "cannot read manifest" in err, (code, err)
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            handle.write('{"cells": {}}')
+        code, _, err = run([path, "--manifest", manifest_path])
+        assert code == 2 and "malformed manifest" in err, (code, err)
     print("bench-stagea-overhead-analyze self-test: OK")
 
 

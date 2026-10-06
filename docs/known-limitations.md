@@ -230,6 +230,54 @@ the min..max of per-sample p95.
 - Planned: Cross-pass caching stays out (R-C56-1: inode reuse makes it
   unsound); kernel-side identity is v0.3.0 (C7).
 
+### Stage A continuity-hook overhead (1d) — ~280-415 ns per mapping event; metrics skips the hooks
+
+- What the user sees (v0.3.0, unreleased): while a profile/trace capture
+  is live, its three mapping hooks (`uprobe_mmap`, `uprobe_munmap`, and
+  the `copy_vma` fexit) fire on every file-mapping event system-wide.
+  Workload-side ABBA medians on the measured host (below): watched
+  provider-file churn +1,030 ns per mmap+munmap op (+26.5%, range
+  4,849–5,183 vs 3,826–3,922 ns/op) and +1,119 ns per mremap op
+  (+33.8%, 4,358–4,516 vs 3,240–3,337 ns/op); unrelated-file churn +782
+  ns per mmap+munmap op (+20.4%, 4,566–4,814 vs 3,805–3,865 ns/op) and
+  +831 ns per mremap op (+25.3%, 4,097–4,143 vs 3,264–3,303 ns/op).
+  Per hook event (2 events per op): about 515 ns watched and 391 ns
+  unrelated, of which BPF run-time accounts for about 416/410 ns
+  watched and 282/280 ns unrelated; the ~100 ns/event remainder is the
+  fentry trampoline, which `run_time_ns` does not time. The miss path is
+  not "one hash miss": five CO-RE reads plus two array lookups precede
+  it. Metrics (aggregate-only) captures never attach the hooks (the 1d
+  gate): they never join per-call records to load instances, so they
+  neither pay nor charge the tax. Eight-worker parallel churn could not
+  resolve the effect (shared-file lock contention inflates the base to
+  ~10 µs/op with ±9% spread; the +100/+215 ns/op deltas sit inside the
+  noise), but BPF-side per-event cost rose under contention (602 ns
+  watched, 424 ns unrelated), so the tax grows when the host is busiest.
+- Kernels/conditions: any kernel where the hooks attach (non-LTO with a
+  readable `/boot/config`; LTO or unverifiable status refuses, as
+  before). Campaign: Linux 7.0.0-34-generic x86-64, AMD Ryzen AI 9 HX
+  PRO 370, 12 CPUs, commit 301dde4 (binary sha256
+  cf6dbcb7e8fcddba14ca0b44991420c169307c3384a507f8a7e7cac902ba843f),
+  2026-10-06, quiet host (load gate 4, kind paused),
+  `scripts/bench-stagea-overhead.sh` defaults (OPS 1,000,000, 6 cells,
+  56 valid samples, ABBA within a round with the starting arm alternating
+  per round; off-arm drift under 1% on every resolved cell). Reproduce:
+  `flock /var/tmp/p11scope-ws-tmp/privileged.lock
+  scripts/bench-stagea-overhead.sh` on that commit, then
+  `scripts/bench-stagea-overhead-analyze.py` on the campaign log.
+- Disclosure: none in product output (no reader consumes the refusal
+  yet; Stage B will); `bpftool prog show` names the three attached
+  `p11_inst_vma_*` programs while a profile/trace capture is live, and
+  metrics sessions carry the internal refusal
+  `aggregate-only (metrics) sessions never join per-call records to load
+  instances (Task 1d overhead gate)`.
+- Workaround: `metrics` mode for the lowest overhead (no hooks attached);
+  profile/trace pay the per-event tax above while live.
+- Planned: stays gated (metrics skips; profile/trace attach). Open for
+  the owner: if the profile/trace-time tax matters on churn-heavy hosts,
+  attach the hooks only while Stage B routing is armed, or add a
+  documented operator opt-out.
+
 ### Harness validity (M0) — PASS
 
 - What the user sees: PASS: all 5 legs classified as expected (29 of 29

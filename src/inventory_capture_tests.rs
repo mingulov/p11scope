@@ -643,6 +643,11 @@ impl LaneHost<Pin> for Scene {
         self.note(format!("gap:{subject}"));
         self.coordinator.note_scope_gap(subject, reason);
     }
+
+    fn note_refresh_loss(&mut self, reason: String) {
+        self.note(format!("refresh-loss:{reason}"));
+        self.coordinator.note_refresh_loss(reason);
+    }
 }
 
 impl PassDriver<Pin> for Scene {
@@ -1290,11 +1295,19 @@ fn a_terminal_refresh_that_never_completes_is_bounded() {
 /// P1-4: when the terminal refresh budget expires without a gap-free
 /// sweep, the stop reports the incomplete refresh: witnessed counts
 /// keep their last read as a lower bound, never a fresh terminal word.
+/// P1-5 terminal-first: the retained count demotes to lossy, so the
+/// terminal observation withholds quiet (a scope gap alone would leave
+/// the edge loss-free).
 #[test]
 fn a_terminal_refresh_that_never_completes_is_reported() {
     let log = Log::default();
     let mut scene = Scene::new(&log);
     let mut lane = ScriptedLane::new(&log);
+    lane.reads.push_back(vec![RowSpec {
+        endpoint: 0,
+        tgid: PID,
+        ticket: TICKET,
+    }]);
     lane.partial_refresh_reads.extend(3..=300);
     lane.read_delay = Duration::from_millis(10);
     let _ = run(&mut scene, lane, 1);
@@ -1303,6 +1316,11 @@ fn a_terminal_refresh_that_never_completes_is_reported() {
         log.iter()
             .any(|entry| entry.contains("terminal count refresh incomplete")),
         "the stop reports its incomplete terminal refresh: {log:?}"
+    );
+    assert!(
+        matches!(scene.coverage(), UseCoverage::Counted { lossy: true, .. }),
+        "the incomplete terminal refresh demotes the retained count: {:?}",
+        scene.coverage()
     );
 }
 

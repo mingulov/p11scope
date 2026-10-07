@@ -273,6 +273,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
+    /// Stages one pass-wide count-refresh loss boundary from the lane
+    /// itself (P1-5 terminal-first): an incomplete terminal refresh
+    /// demotes the retained counts to lower bounds exactly like a
+    /// failed live read — a scope gap alone would leave them
+    /// loss-free. The loss is a gap too, never silent loss.
+    pub(crate) fn note_refresh_loss(&mut self, reason: String) {
+        self.registry.note_refresh_loss(reason);
+    }
+
     // Test seam: production stages only through `scan_pass` (and, from
     // Task 6 C5, the native staging call).
     #[cfg(test)]
@@ -414,10 +423,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// the row's use is undecided, so the proven-clean instant is not
     /// extended over it (DR-LIVE-LABEL-LAG). `stage_native` absorbs the
     /// batch before this runs, so this batch's rows are already pending.
-    /// After stop it stages nothing: forward the terminal read before
-    /// `end_capture_coverage`.
+    /// After stop the watch half stages nothing (forward the terminal
+    /// read before `end_capture_coverage`), but count freshness still
+    /// consumes: the post-stop terminal refresh stages through this
+    /// same call, and a failure beginning there demotes the retained
+    /// counts exactly like a live one (P1-5 terminal-first).
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards batches.
     pub(crate) fn note_witness_batch(&mut self, batch: &WitnessBatch) {
+        self.note_count_freshness(batch);
         let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
             return;
         };
@@ -480,12 +493,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.registry
                 .note_pairs_uncounted(reason, batch.health_baseline_ns);
         }
-        // C7 C4 refresh loss: the batch's refresh failures (and a
-        // completed-with-gaps refresh sweep) are count freshness, never
-        // silent: observed counts stand as lower bounds while every
-        // counted column reads lossy, withholding quiet. Bounded: one
-        // reason per batch (the first failure plus the count), memoized
-        // into gap repeats by the registry.
+        if let Some(reason) = &batch.health_regression {
+            self.registry.note_health_regression(
+                reason.clone(),
+                batch.health_baseline_ns,
+                batch.health_read_ns,
+            );
+        }
+        if let Some(loss) = &batch.lifecycle_loss {
+            self.note_lifecycle_loss(loss);
+        }
+        self.note_capture_custody(&batch.custody);
+    }
+
+    /// Consumes one witness batch's count freshness (C7 C4 refresh
+    /// loss): the batch's refresh failures (and a completed-with-gaps
+    /// refresh sweep) are count freshness, never silent: observed
+    /// counts stand as lower bounds while every counted column reads
+    /// lossy, withholding quiet. Bounded: one reason per batch (the
+    /// first failure plus the count), memoized into gap repeats by the
+    /// registry. Runs before AND after stop: a terminal-first failure
+    /// demotes exactly like a live one (P1-5).
+    fn note_count_freshness(&mut self, batch: &WitnessBatch) {
         let refresh_failures: Vec<&String> = batch
             .read_failures
             .iter()
@@ -505,17 +534,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             self.registry.note_refresh_loss(reason);
         }
-        if let Some(reason) = &batch.health_regression {
-            self.registry.note_health_regression(
-                reason.clone(),
-                batch.health_baseline_ns,
-                batch.health_read_ns,
-            );
-        }
-        if let Some(loss) = &batch.lifecycle_loss {
-            self.note_lifecycle_loss(loss);
-        }
-        self.note_capture_custody(&batch.custody);
     }
 
     /// System scope: lifecycle evidence was lost (C5.2 D4). A lost exec or
@@ -5218,6 +5236,91 @@ mod tests {
         let end_ns = last_seen + 2000;
         native.scene.coordinator.end_capture_coverage(end_ns);
         let document = crate::inventory::render_json(&native.scene.coordinator, "s", 0, end_ns, 1);
+        assert_eq!(document["edges"][0]["entries"]["count"], 1);
+        assert_eq!(
+            document["edges"][0]["entries"]["coverage"]["lossy"], true,
+            "{}",
+            document["edges"][0]["entries"]["coverage"]
+        );
+        assert_ne!(
+            document["edges"][0]["activity"], "quiet",
+            "{}",
+            document["edges"][0]
+        );
+    }
+
+    #[test]
+    fn a_refresh_failure_beginning_after_stop_withholds_quiet() {
+        // P1-5 terminal-first (sol#1 + astra#2): reads succeed while
+        // live, then stop begins, and only the post-stop terminal
+        // refresh fails. The stale count must demote to lossy — quiet
+        // is withheld even though no live loss was ever recorded.
+        use crate::inventory_present::{Activity, Presentation};
+        let (mut native, caller) = NativeScene::new();
+        native.scene.coordinator.begin_capture_coverage(None);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        let edge_of = |native: &NativeScene| {
+            let registry = &native.scene.coordinator.registry;
+            let edge = registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the caller has its edge");
+            (
+                edge.entry_count,
+                edge.entry_last_seen_ns,
+                registry.coverage(edge),
+            )
+        };
+        assert!(
+            matches!(
+                edge_of(&native).2,
+                UseCoverage::Counted { lossy: false, .. }
+            ),
+            "live reads succeed loss-free: {:?}",
+            edge_of(&native).2
+        );
+        // Stop begins (production order: the coverage ends before the
+        // post-stop terminal refresh, inventory_capture.rs).
+        let live_last_seen = edge_of(&native).1.expect("the positive read left a last-seen");
+        let end_ns = live_last_seen + 2000;
+        native.scene.coordinator.end_capture_coverage(end_ns);
+        // The terminal refresh fails after stop: reads carrying only
+        // the failure, staged the way the terminal loop stages them.
+        for _ in 0..2 {
+            let at = native.stamps.tick();
+            let mut batch = witness_batch();
+            batch.domain = native.domain;
+            batch.read_failures = vec!["count refresh: lookup of cookie 41 failed".into()];
+            batch.health.discovery_counters = Some([0; 5]);
+            batch.health_read_ns = at;
+            batch.rows_read_ns = at + 1;
+            native.stage(NativeBatch::Witness(Box::new(batch)));
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        let (count, _, coverage) = edge_of(&native);
+        assert_eq!(count, 1, "the observed lower bound stands");
+        assert!(
+            matches!(coverage, UseCoverage::Counted { lossy: true, .. }),
+            "a terminal-first refresh failure publishes lossy freshness: {coverage:?}"
+        );
+        // Terminal: the stale count withholds quiet.
+        let live =
+            Presentation::capture(&native.scene.coordinator, "s", 0, end_ns, 1);
+        let activity = live
+            .edges
+            .iter()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has its edge")
+            .activity;
+        assert_eq!(
+            activity,
+            Activity::Lossy,
+            "a stale count under failed terminal refresh withholds quiet"
+        );
+        let document =
+            crate::inventory::render_json(&native.scene.coordinator, "s", 0, end_ns, 1);
         assert_eq!(document["edges"][0]["entries"]["count"], 1);
         assert_eq!(
             document["edges"][0]["entries"]["coverage"]["lossy"], true,

@@ -369,6 +369,9 @@ pub(crate) trait LaneHost<Pin> {
     /// `not_attached`, never `scan_only`.
     fn note_native_lane(&mut self);
     fn note_scope_gap(&mut self, subject: String, reason: String);
+    /// The lane's terminal count refresh never completed: demote the
+    /// retained counts to lower bounds (P1-5 terminal-first).
+    fn note_refresh_loss(&mut self, reason: String);
 }
 
 impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
@@ -415,6 +418,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn note_scope_gap(&mut self, subject: String, reason: String) {
         InventoryCoordinator::note_scope_gap(self, subject, reason);
+    }
+
+    fn note_refresh_loss(&mut self, reason: String) {
+        InventoryCoordinator::note_refresh_loss(self, reason);
     }
 }
 
@@ -873,8 +880,8 @@ impl<L> NativeLane<L> {
         // rows the terminal read reported. The traversal restarted at
         // `begin_stop`, so a completed sweep is a generation begun after
         // the retirement boundary; when the budget expires first, the
-        // incomplete refresh is reported (counts keep their last read as
-        // a lower bound, never a fresh terminal word).
+        // incomplete refresh demotes the retained counts to lower bounds
+        // (lossy, never a fresh terminal word) and is reported.
         let refresh_budget = self.windows.terminal_sweep_budget;
         let refresh_deadline = Instant::now() + refresh_budget;
         let exact = loop {
@@ -893,14 +900,16 @@ impl<L> NativeLane<L> {
             }
         };
         if !exact {
-            host.note_scope_gap(
-                "native terminal count refresh incomplete".into(),
-                format!(
-                    "no gap-free count-refresh sweep completed within {} ms after stop began; \
-                     witnessed counts keep their last read as a lower bound",
-                    refresh_budget.as_millis()
-                ),
-            );
+            // P1-5 terminal-first: the incomplete refresh is a loss
+            // boundary, not a scope gap alone — the retained counts
+            // demote to lower bounds (lossy), so the terminal
+            // observation withholds quiet over them.
+            host.note_refresh_loss(format!(
+                "terminal count refresh incomplete: no gap-free count-refresh sweep completed \
+                 within {} ms after stop began; witnessed counts keep their last read as a \
+                 lower bound",
+                refresh_budget.as_millis()
+            ));
         }
         let domain = self.capture.domain();
         events.extend(

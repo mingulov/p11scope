@@ -437,10 +437,48 @@ def parse_ledger(text, errors):
     return images
 
 
-def is_table_call(fn, phase):
-    """Whether the ledger line is a call through the function table (what
-    BPF counts). Only the setup-phase acquisition dlsym is excluded."""
+def legacy_table_call(fn, phase):
+    """The phase-only classifier: every call through the function table
+    except the setup-phase acquisition dlsym. The acquisition's arming
+    question (below) is asked against this set — never against a set
+    that already assumes the answer."""
     return fn not in SYMBOL_ENTRY_FUNCTIONS or phase != "setup"
+
+
+def legacy_first_attach_t0(entries):
+    """The first attach-side entry stamp under the legacy classifier —
+    the workload-side half of the acquisition arming evidence. None
+    when no legacy-attach line exists. Only lines that made calls
+    (n > 0, the counted population) qualify."""
+    starts = [e["t0"] for e in entries
+              if e["n"] > 0 and legacy_table_call(e["fn"], e.get("phase"))]
+    return min(starts) if starts else None
+
+
+def is_table_call(fn, phase, entry=None, arming=None):
+    """Whether the ledger line is a call through the function table (what
+    BPF counts). The setup-phase acquisition dlsym is excluded ONLY with
+    evidence its invocation precedes endpoint arming (O8r1): `arming` is
+    (since_ns, first_attach_t0) — the edge's first BPF row and the
+    workload's first legacy-attach stamp. Without timing context, or
+    when the row predates the workload (the synth counting convention —
+    real rows stamp during their recording call, strictly after its
+    entry), the legacy exclusion stands. Otherwise the line must end
+    strictly before the first row — it preceded the recording call,
+    hence arming; an overlapping or later acquisition may have
+    traversed an armed endpoint (SoftHSM: export == table slot) and
+    counts."""
+    if legacy_table_call(fn, phase):
+        return True
+    if entry is None or arming is None:
+        return False
+    since_ns, first_attach_t0 = arming
+    if type(since_ns) is not int:
+        return False
+    if first_attach_t0 is not None and since_ns <= first_attach_t0:
+        return False
+    t1 = entry.get("t1")
+    return type(t1) is int and t1 >= since_ns
 
 
 @dataclass
@@ -451,6 +489,7 @@ class Use:
     t_first: int
     t_last: int
     mechs: dict
+    first_attach_t0: object = None  # first legacy-attach stamp over ALL image lines (unclipped)
 
     @property
     def table_calls(self):
@@ -469,7 +508,9 @@ def use_in(image, provider_path, window):
     for e in definite:
         if e["mech"] != "-" and e["fn"] in OP_CATEGORY:
             mechs.setdefault(int(e["mech"], 16), set()).add(OP_CATEGORY[e["fn"]])
-    return Use(lines, definite, max(start, min(e["t0"] for e in lines)), min(end, max(e["t1"] for e in lines)), mechs)
+    first_attach = legacy_first_attach_t0([e for e in image.entries if e["module"] == provider_path])
+    return Use(lines, definite, max(start, min(e["t0"] for e in lines)), min(end, max(e["t1"] for e in lines)),
+               mechs, first_attach)
 
 
 def recording_before(use, since_ns):
@@ -484,7 +525,8 @@ def recording_before(use, since_ns):
     recorded call however many it ledgered. A straddling attach-side
     line (or a same-tick boundary) leaves the recording call's line
     ambiguous and there is no identified recording line."""
-    attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"))]
+    arming = (since_ns, use.first_attach_t0)
+    attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"), e, arming)]
     if any(e["t0"] <= since_ns <= e["t1"] for e in attach):
         return None
     before = [e for e in attach if e["t1"] < since_ns]
@@ -502,12 +544,13 @@ def window_count(use, since_ns, window):
     boundaries are ambiguous (hi only)."""
     start, end = max(since_ns, window[0]), window[1]
     lo = hi = 0
+    arming = (since_ns, use.first_attach_t0)
     for e in use.lines:
         if e["t1"] < start or e["t0"] > end:
             continue
         hi += e["n"]
         if e["t0"] > since_ns and e["t0"] >= window[0] and e["t1"] <= end \
-                and is_table_call(e["fn"], e.get("phase")):
+                and is_table_call(e["fn"], e.get("phase"), e, arming):
             lo += e["n"]
     rec = recording_before(use, since_ns)
     if rec is not None:
@@ -517,11 +560,13 @@ def window_count(use, since_ns, window):
     return lo, hi
 
 
-def ledger_total_table_calls(image, provider_path):
+def ledger_total_table_calls(image, provider_path, since_ns=None):
     """Every attach-side call the image ledgered for the provider, any time:
-    the upper bound a count will never exceed (r1 T3.5 `count <= total`)."""
-    return sum(e["n"] for e in image.entries
-               if e["module"] == provider_path and is_table_call(e["fn"], e.get("phase")))
+    the upper bound a count will never exceed (r1 T3.5 `count <= total`).
+    `since_ns` arms the acquisition rule (None: the legacy exclusion)."""
+    entries = [e for e in image.entries if e["module"] == provider_path]
+    arming = (since_ns, legacy_first_attach_t0(entries))
+    return sum(e["n"] for e in entries if is_table_call(e["fn"], e.get("phase"), e, arming))
 
 
 def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns):
@@ -554,7 +599,8 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns):
     real run and since_ns <= t_first can never gate exactness."""
     if until_ns is not None:
         return False, 0
-    attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"))]
+    arming = (since_ns, use.first_attach_t0)
+    attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"), e, arming)]
     if not attach:
         return False, 0
     if any(e["t0"] < window[0] or e["t1"] > window[1] for e in use.lines):
@@ -1594,7 +1640,7 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
         window = (view.window[0], min(view.window[1], until)) if until is not None else view.window
         lo, hi = window_count(use, cov.get("since_ns") or 0, window)
         count = edge["entries"].get("count", 0)
-        total = ledger_total_table_calls(image, prov["path"])
+        total = ledger_total_table_calls(image, prov["path"], cov.get("since_ns"))
         res.ok(run, cell, "COUNT-TOTAL", count <= total,
                f"{ctag}: count {count} above the ledger total {total} attach-side calls")
         if cov.get("lossy"):
@@ -3692,13 +3738,15 @@ def self_test():
         case("saturated-count-bool", "COUNT-SATURATED", count_bool)
 
         # --- O8: receipt boundary proof (astra A7) --------------------------
-        # The C_GetFunctionList exclusion is acquisition-only: the
-        # setup-phase dlsym call that receipts the table, never made
-        # through an attached slot. A dlsym name alone does not exempt a
-        # call made after the endpoint is armed (through-table calls
-        # count whatever they are named); LEDGER-COUNTS pins exactly one
-        # setup C_GetFunctionList per provider, so the fixture never
-        # holds an ambiguous second one.
+        # The C_GetFunctionList exclusion is acquisition-only AND
+        # pre-arming-only (fix round 1): the setup-phase dlsym call that
+        # receipts the table counts unless its line ends strictly before
+        # the edge's first BPF row (it preceded the recording call,
+        # hence arming). Phase, name, and mechanism alone never exempt
+        # it — a dlsym after arming traverses an armed slot (SoftHSM:
+        # export == table slot). LEDGER-COUNTS pins exactly one setup
+        # C_GetFunctionList per provider, so the fixture never holds an
+        # ambiguous second one.
         def _line(fn, phase, n, t0, t1):
             return {"module": "/prov/a/libsofthsm2.so", "fn": fn, "mech": "-", "n": n, "bad": 0,
                     "phase": phase, "t0": t0, "t1": t1}
@@ -3709,6 +3757,16 @@ def self_test():
             failures.append("o8-armed-table-call-excluded")
         if Use([acq], [acq], T0 + 1, T0 + 2, {}).table_calls != 0:
             failures.append("o8-acquisition-not-excluded")
+        late = _line("C_GetFunctionList", "setup", 1, T0 + 5, T0 + 6)
+        # Armed (after the first row, realistic since): counts.
+        if not is_table_call("C_GetFunctionList", "setup", late, (T0 + 4, T0 + 1)):
+            failures.append("o8-armed-acquisition-excluded")
+        # Pre-arming (before the first row): excluded.
+        if is_table_call("C_GetFunctionList", "setup", late, (T0 + 7, T0 + 1)):
+            failures.append("o8-prearming-acquisition-counted")
+        # Predating row (synth convention): the legacy exclusion stands.
+        if is_table_call("C_GetFunctionList", "setup", late, (T0, T0 + 1)):
+            failures.append("o8-predating-acquisition-counted")
 
         def armed_table_getfunctionlist(s, d, dash):
             ident = next(l for l in s.ledgers["P1"].splitlines() if l.startswith("IDENT "))
@@ -3719,6 +3777,43 @@ def self_test():
                           f"t0={main.group(1)} t1={main.group(2)}\n")
             return {"ledgers": led}
         case("armed-table-getfunctionlist", "LEDGER-COUNTS", armed_table_getfunctionlist)
+
+        # O8 post-arming acquisition (fix round 1): P7 loads the
+        # provider, waits, then invokes C_GetFunctionList through dlsym
+        # — after the first BPF row, so the acquisition provably
+        # traversed an armed endpoint (SoftHSM: export == table slot)
+        # and counts. 28 (27 table + the armed acquisition) qualifies;
+        # 27 (dropping it) fails.
+        def armed_acquisition_ledger(s, d, count):
+            led = dict(s.ledgers)
+            pat_acq = re.compile(r"(fn=C_GetFunctionList mech=- n=1 bad=0 phase=setup t0=)(\d+)( t1=)(\d+)")
+            pat_init = re.compile(r"(fn=C_Initialize mech=- n=1 bad=0 phase=setup t0=)(\d+)( t1=)(\d+)")
+            assert len(pat_acq.findall(led["P7"])) == 1
+            assert len(pat_init.findall(led["P7"])) == 1
+            acq = pat_acq.search(led["P7"])
+            init = pat_init.search(led["P7"])
+            # Swap the two setup lines' stamps wholesale, so the phase
+            # intervals (and LEDGER-COUNTS/PHASES) are unchanged but the
+            # acquisition dlsym lands after C_Initialize ...
+            led["P7"] = pat_acq.sub(
+                lambda m: f"{m.group(1)}{init.group(2)}{m.group(3)}{init.group(4)}", led["P7"], count=1)
+            led["P7"] = pat_init.sub(
+                lambda m: f"{m.group(1)}{acq.group(2)}{m.group(3)}{acq.group(4)}", led["P7"], count=1)
+            # ... with the first BPF row between them (mid-gap).
+            since = (int(acq.group(4)) + int(init.group(2))) // 2
+            edge = _edge(d, cid(s, "P7"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            edge["entries"]["count"] = count
+            return {"ledgers": led}
+
+        def armed_acquisition_correct(s, d, dash):
+            return armed_acquisition_ledger(s, d, 28)
+        case("armed-acquisition-counted-pass", None, armed_acquisition_correct)
+
+        def armed_acquisition_short(s, d, dash):
+            return armed_acquisition_ledger(s, d, 27)
+        case("armed-acquisition-missing-fails", "COUNT-EXACT", armed_acquisition_short)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

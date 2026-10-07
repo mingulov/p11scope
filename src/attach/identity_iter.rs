@@ -3785,7 +3785,16 @@ mod tests {
         let Some((path, tail)) = read_rust_path(text) else {
             return fallback(rest);
         };
-        let tail = tail.trim_start();
+        let mut tail = tail.trim_start();
+        // Generic trait arguments (`impl AsRef<OwnedFd> for AnchorMaps`):
+        // skip one balanced `<…>` span after the trait path before
+        // matching `for`, or the header misreads as inherent silence.
+        if tail.starts_with('<') {
+            let Some(after) = skip_rust_generics(tail) else {
+                return fallback(rest);
+            };
+            tail = after.trim_start();
+        }
         if let Some(tail) = strip_rust_word(tail, "for") {
             let tail = tail.trim_start();
             let Some((subject, _)) = read_rust_path(tail) else {
@@ -3795,7 +3804,12 @@ mod tests {
             return (false, last == "AnchorMaps");
         }
         let last = path.rsplit("::").next().unwrap_or(&path);
-        (last == "AnchorMaps", false)
+        if last == "AnchorMaps" {
+            return (true, false);
+        }
+        // A strict miss that still names whole-word `for` + `AnchorMaps`
+        // defeated the shape above — fall back loudly, never to silence.
+        fallback(rest)
     }
 
     /// Every `impl` block touching `AnchorMaps` in noise-blanked
@@ -4072,6 +4086,22 @@ mod tests {
             2,
             "commented inherent impl must count"
         );
+        // Generic trait arguments on the trait path (fix round 4, item
+        // 04): the trait name parses, then a balanced `<…>` span, then
+        // `for AnchorMaps` — each must read as a trait impl, never
+        // silence (the `AsRef<OwnedFd>` spelling is a working fd leak
+        // via `as_ref`).
+        for header in [
+            "impl<T> Evil<T> for AnchorMaps {}",
+            "impl Evil2<T> for AnchorMaps {}",
+            "impl AsRef<OwnedFd> for AnchorMaps {}",
+        ] {
+            let mutated = format!("{code}\n{header}\n");
+            assert!(
+                scan_anchor_impls(&blank_rust_noise(&mutated)).1,
+                "`{header}` must read as a trait impl"
+            );
+        }
     }
 
     /// Macros cannot smuggle handle methods (astra N5, design decision

@@ -2894,11 +2894,19 @@ mod tests {
             .expect("create WRONLY hash (run as root)");
         let slots = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 8, ANCHOR_SLOTS, BPF_F_WRONLY)
             .expect("create WRONLY array (run as root)");
-        AnchorMaps::new(
+        let maps = AnchorMaps::new(
             hash.as_fd().try_clone_to_owned().expect("clone"),
             slots.as_fd().try_clone_to_owned().expect("clone"),
         )
         .expect("genuine WRONLY anchor maps construct");
+        // Teardown primitives work on the real maps: slot bookkeeping
+        // writes, and deleting an absent key fails ENOENT (already clear).
+        maps.set_slot(0, 0x1234_5678)
+            .expect("slot write on a real slots map");
+        let err = maps
+            .remove(0x1234_5678)
+            .expect_err("absent key deletes fail");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
         // Swapped roles: the hash is no ARRAY and the slots no HASH.
         // (No `Debug` on `AnchorMaps`, so no `expect_err`: match instead.)
         let err = match AnchorMaps::new(

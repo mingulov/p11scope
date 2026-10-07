@@ -322,7 +322,16 @@ fn identity_loader_strict_gate_requires_btf_and_both_programs() {
         }
     };
     // The strict constructor required both program fds; prove they are
-    // open and distinct here.
+    // open and distinct here, and that the receipt's object still carries
+    // both verified programs.
+    assert!(
+        loaded.ebpf.program(ii::ANCHOR_PROGRAM).is_some(),
+        "receipt object carries the anchor program"
+    );
+    assert!(
+        loaded.ebpf.program(ii::TARGET_PROGRAM).is_some(),
+        "receipt object carries the target program"
+    );
     use std::os::fd::AsRawFd as _;
     let anchor = loaded.anchor_fd.as_raw_fd();
     let target = loaded.target_fd.as_raw_fd();

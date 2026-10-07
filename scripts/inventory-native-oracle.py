@@ -1280,6 +1280,20 @@ def check_streams(view, res):
         for (pseq, prev_at), (cseq, cur_at) in zip(stamps, stamps[1:]):
             if is_u64_clock(prev_at) and is_u64_clock(cur_at) and cur_at < prev_at:
                 clock_bad.append((key, f"seq {pseq}->{cseq} clock regresses {prev_at}->{cur_at}"))
+    # Round 2: cross-edge order. Per-edge monotonicity cannot see a
+    # reversal across edges, so edge records must also read
+    # nondecreasing in global sequence order. Equal stamps stay
+    # permitted (production reuses commit timestamps); invalid clocks
+    # already failed per-row above and are skipped here.
+    last_at = None
+    for row in sorted(edge_events, key=lambda e: e.get("seq", 0)):
+        at = row.get("at_ns")
+        if not is_u64_clock(at):
+            continue
+        if last_at is not None and at < last_at:
+            clock_bad.append(("*", f"seq {row.get('seq')} clock {at} regresses across edges "
+                                   f"(previous {last_at})"))
+        last_at = at
     res.ok(run, "*", "EDGE-CLOCK", not clock_bad,
            f"{len(clock_bad)} edge_observed records carry invalid or regressing clocks: {clock_bad[:4]}")
     # ACT (Choice 3 pin): activity is per-pass. Every record (middle,
@@ -3019,6 +3033,18 @@ def self_test():
         case("frozen-watch-frame-quiet", "DASH-EDGE-LABELS", frozen_frame_claims(("activity", ACTIVITY["quiet"])))
         case("frozen-watch-frame-zero", "DASH-EDGE-LABELS", frozen_frame_claims(("entries", "0")))
 
+        def restamp_merged(out):
+            # Spliced sweep records carry their own stream's stamps;
+            # restamp them to the merged order so cross-edge clocks stay
+            # sane (round 2: EDGE-CLOCK judges global sequence order).
+            last = None
+            for r in out:
+                if r["kind"] != "edge_observed":
+                    continue
+                if last is not None and r["at_ns"] < last:
+                    r["at_ns"] = last
+                last = r["at_ns"]
+
         # A frame rendered before the stop that froze the watches: the
         # snapshot is frozen, the frame shows the then-ongoing watches as
         # armed/quiet/0, and the stream carries the ongoing records before
@@ -3034,6 +3060,7 @@ def self_test():
             frozen = [r for r in s.events(dash) if r["kind"] == "edge_observed"]
             at = next(i for i, r in enumerate(ev) if r["kind"] == "ended")
             out = [dict(r, seq=i) for i, r in enumerate(ev[:at] + frozen + ev[at:])]
+            restamp_merged(out)
             next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(frozen)
             return {"frames": s.frames(live), "dash_events": out}
         case("dashboard-frame-before-freeze", None, dash_frame_before_freeze)
@@ -3054,6 +3081,7 @@ def self_test():
             decided = [r for r in s.events(dash) if r["kind"] == "edge_observed"]
             at = next(i for i, r in enumerate(ev) if r["kind"] == "ended")
             out = [dict(r, seq=i) for i, r in enumerate(ev[:at] + decided + ev[at:])]
+            restamp_merged(out)
             next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(decided)
             return {"frames": s.frames(live), "dash_events": out}
         case("dashboard-frame-pending-unknown", None, dash_frame_pending_unknown)
@@ -3899,6 +3927,30 @@ def self_test():
         def clock_above_u64(s, d, dash):
             return clock_stages(s, d, T0 + 500, 2**64)
         case("edge-clock-above-u64", "EDGE-CLOCK", clock_above_u64)
+
+        # O3 cross-edge order (round 2): per-edge monotonicity cannot
+        # see a reversal across edges — A@late followed by B@early in
+        # sequence order fails EDGE-CLOCK, while equal stamps stay
+        # permitted (production reuses commit timestamps).
+        def cross_edge_reversal(s, d, dash):
+            ev = s.events(d)
+            a = next(e for e in ev if e["kind"] == "edge_observed"
+                     and e["event"].get("caller") == cid(s, "P1") and e["event"].get("module") == s.mid["A"])
+            b = next(e for e in ev if e["kind"] == "edge_observed"
+                     and e["event"].get("caller") == cid(s, "P2") and e["event"].get("module") == s.mid["B"])
+            a["at_ns"], b["at_ns"] = b["at_ns"], a["at_ns"]
+            return {"events": ev}
+        case("edge-clock-cross-edge-reversal", "EDGE-CLOCK", cross_edge_reversal)
+
+        def cross_edge_equal(s, d, dash):
+            ev = s.events(d)
+            a = next(e for e in ev if e["kind"] == "edge_observed"
+                     and e["event"].get("caller") == cid(s, "P1") and e["event"].get("module") == s.mid["A"])
+            b = next(e for e in ev if e["kind"] == "edge_observed"
+                     and e["event"].get("caller") == cid(s, "P2") and e["event"].get("module") == s.mid["B"])
+            b["at_ns"] = a["at_ns"]
+            return {"events": ev}
+        case("edge-clock-cross-edge-equal-pass", None, cross_edge_equal)
 
         # --- O4: preadmission checks the wrong event (astra B2) --------------
         # The binder's Rule 3 rejects ROWS recorded before admission

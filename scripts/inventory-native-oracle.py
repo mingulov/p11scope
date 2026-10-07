@@ -219,6 +219,30 @@ def is_u64_clock(value):
     """Whether `value` is a well-formed u64 clock stamp."""
     return type(value) is int and 0 <= value <= U64_MAX
 
+
+def saturation_coherent(count, saturated, cap):
+    """O7 coherence arithmetic: saturated holds exactly at the cap."""
+    return saturated == (count == cap)
+
+
+def count_window_ok(count, saturated, lo, hi):
+    """O7 window arithmetic: a saturated feed is clamped at the cap, so
+    the lower bound cannot hold it; the upper bound still can."""
+    return (saturated or lo <= count) and count <= hi
+
+
+def is_saturated_artifact(entries):
+    """Whether the edge's saturation triple earns the saturated
+    exemptions: production-shaped (fixed u64::MAX cap, u64 count,
+    Boolean flag) and actually saturated at the cap. Anything else —
+    a forged cap, a non-u64 count, a non-Boolean flag — earns no
+    exemption (COUNT-SATURATED fails it separately)."""
+    cap, count, saturated = entries.get("cap"), entries.get("count"), entries.get("saturated")
+    return (type(cap) is int and cap == U64_MAX
+            and type(count) is int and 0 <= count <= U64_MAX
+            and type(saturated) is bool
+            and saturated and count == cap)
+
 # --- CLI probe ----------------------------------------------------------------
 HELP_PROBE = {"usage": "p11scope inventory", "flags": {"capture": "--capture", "manifest": "--manifest"}}
 
@@ -1520,16 +1544,17 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
                    f"{ctag}: lossy count {count} (upper bound {hi}) needs a loss gap "
                    f"({len(loss_gaps)} found) and, at zero, observation {OBSERVATION_LOSSY_ZERO!r} (got {label!r})")
         else:
-            # O7: a saturated feed is clamped at the cap, so the lower
-            # bound cannot hold it (the true calls run past the cap);
-            # the upper bound still can.
-            saturated = bool(edge["entries"].get("saturated"))
-            res.ok(run, cell, "COUNT-WINDOW", (saturated or lo <= count) and count <= hi,
+            # O7: only a production-shaped saturated triple (fixed
+            # u64::MAX cap, u64 count, Boolean flag, saturated at the
+            # cap) earns the clamped-bound exemption; a forged triple
+            # is judged unclamped (and fails COUNT-SATURATED).
+            saturated = is_saturated_artifact(edge["entries"])
+            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated, lo, hi),
                    f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
                    + (" (saturated: lower bound clamped at the cap)" if saturated else ""))
             admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
             exact, expected = exact_window_count(use, cov.get("since_ns") or 0, window, until, admitted)
-            if exact and not edge["entries"].get("saturated"):
+            if exact and not saturated:
                 # Ledger exactness = 0 error: the caller was admitted
                 # before its first attach-side call and the feed provably
                 # covers every in-window call (the row predates them, or
@@ -1612,20 +1637,22 @@ def check_counted_nonzero(view, res):
 
 
 def check_saturated(view, res):
-    """O7: the saturation/cap relationship holds on every edge — the
-    product stops the count at MAX_EDGE_ENTRY_COUNT (u64::MAX) and sets
-    saturated exactly then, so saturated reads the cap and a count at
-    the cap reads saturated. Edges without an int cap cannot be judged
-    and are skipped."""
+    """O7: the saturation triple is production-shaped on every edge and
+    coherent — production always publishes the fixed cap u64::MAX
+    (MAX_EDGE_ENTRY_COUNT, src/inventory.rs edge_json), a u64 count,
+    and a Boolean saturated set exactly when the count reached the cap.
+    A forged cap, a non-u64 count, or a non-Boolean flag fails: the
+    document can never invent its own saturation exemption."""
     for key in sorted(view.edges):
         entries = view.edges[key]["entries"]
-        cap = entries.get("cap")
-        if not isinstance(cap, int):
-            continue
-        count, saturated = entries.get("count", 0), bool(entries.get("saturated"))
-        res.ok(view.name, "*", "COUNT-SATURATED", saturated == (count == cap),
-               f"edge {key[0]}->{key[1]} reads count {count} saturated {saturated} cap {cap}: "
-               "a saturated feed reads the cap, and a count at the cap reads saturated")
+        cap, count, saturated = entries.get("cap"), entries.get("count"), entries.get("saturated")
+        wellformed = (type(cap) is int and cap == U64_MAX
+                      and type(count) is int and 0 <= count <= U64_MAX
+                      and type(saturated) is bool)
+        ok = wellformed and saturation_coherent(count, saturated, cap)
+        res.ok(view.name, "*", "COUNT-SATURATED", ok,
+               f"edge {key[0]}->{key[1]} reads count {count!r} saturated {saturated!r} cap {cap!r}: "
+               "production publishes cap=u64::MAX, a u64 count, and saturated exactly at the cap")
 
 
 def check_uncounted(view, res):
@@ -3462,26 +3489,51 @@ def self_test():
             failures.append("uncounted-gap-suppressed-not-nonqualifying")
 
         # --- O7: saturation cap bounds (astra A6) ---------------------------
-        # Skipping COUNT-EXACT leaves COUNT-WINDOW's unclamped lower
-        # bound: a legitimate saturated count fails against a ledger
-        # longer than the cap. The small cap below stands in for
-        # u64::MAX (same clamped-bound shape, ledger-sized numbers).
-        def saturated_clamped(s, d, dash):
+        # Production's cap is fixed at u64::MAX (MAX_EDGE_ENTRY_COUNT,
+        # src/inventory.rs edge_json): the document can never invent its
+        # own saturation exemption. Small-cap arithmetic lives here as
+        # unit checks, separate from artifact qualification (which
+        # requires the fixed cap).
+        arith = [
+            saturation_coherent(7, True, 7),
+            count_window_ok(7, True, 36, 37),
+            not saturation_coherent(5, True, 7),
+            not saturation_coherent(7, False, 7),
+            count_window_ok(36, False, 36, 37),
+            not count_window_ok(5, False, 36, 37),
+        ]
+        if not all(arith):
+            failures.append("saturated-arithmetic-shape")
+
+        def forged_cap_one(s, d, dash):
             e = _edge(d, cid(s, "P1"), s.mid["A"])
-            e["entries"].update(count=7, saturated=True, cap=7)
-        res = case("saturated-count-clamped-pass", None, saturated_clamped)
-        if not any(r["check"] == "COUNT-SATURATED" and r["status"] == "pass" for r in res.rows):
-            failures.append("saturated-count-clamped-not-compared")
+            e["entries"].update(count=1, saturated=True, cap=1)
+        case("saturated-forged-cap-one", "COUNT-SATURATED", forged_cap_one)
+
+        def cap_none(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(cap=None)
+        case("saturated-cap-none", "COUNT-SATURATED", cap_none)
 
         def saturated_off_cap(s, d, dash):
             e = _edge(d, cid(s, "P1"), s.mid["A"])
-            e["entries"].update(count=5, saturated=True, cap=7)
+            e["entries"].update(count=5, saturated=True)
         case("saturated-count-off-cap", "COUNT-SATURATED", saturated_off_cap)
 
         def unsaturated_at_cap(s, d, dash):
             e = _edge(d, cid(s, "P1"), s.mid["A"])
-            e["entries"].update(count=7, saturated=False, cap=7)
+            e["entries"].update(count=U64_MAX, saturated=False)
         case("unsaturated-count-at-cap", "COUNT-SATURATED", unsaturated_at_cap)
+
+        def flag_nonbool(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=U64_MAX, saturated=1)
+        case("saturated-flag-nonbool", "COUNT-SATURATED", flag_nonbool)
+
+        def count_bool(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=True)
+        case("saturated-count-bool", "COUNT-SATURATED", count_bool)
 
         # --- O8: receipt boundary proof (astra A7) --------------------------
         # The C_GetFunctionList exclusion is acquisition-only: the

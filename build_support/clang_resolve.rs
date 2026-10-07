@@ -13,19 +13,29 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// Absolute `test` binaries for the executability probe, in order.
+/// Never resolved via `PATH`: a `PATH` search would execute whatever
+/// `test` shadows the lookup during resolution, and abort the build
+/// where no external `test` exists at all.
+const TEST_PROBES: [&str; 2] = ["/usr/bin/test", "/bin/test"];
+
 /// Whether `path` is a regular file the CURRENT user can execute:
 /// the `execvp` selection rule (what process spawning would run).
 /// Mode bits alone mislead — a file can carry exec bits yet refuse
 /// the builder with `EACCES` (e.g. owner-only `x` for a foreign owner,
 /// or `0641` for a builder without owner-x) — so this probes `X_OK`
-/// access instead of reading the mode. The probe is `test -x`, i.e.
-/// `access(X_OK)` (real-ids `faccessat`, identical to the effective-ids
-/// form for builds, which are never setuid): the kernel decides, so
-/// noexec mounts, ACLs, and MAC agree with the probe by construction.
+/// access instead of reading the mode. The probe is an absolute-path
+/// `test -x` (an effective-access probe; equivalent for non-setuid
+/// builds, which is all builds here): the kernel decides, so noexec
+/// mounts, ACLs, and MAC agree with the probe by construction.
 /// Deliberately std-only: a `faccessat` binding would need a libc
 /// build-dependency — a workspace-manifest change outside the identity
-/// files — and probing never executes the candidate itself (unlike a
-/// spawn probe, a hostile `PATH` hit gains no code execution here).
+/// files. The probe path is absolute, so ambient `PATH` shadows can
+/// neither divert nor break it, and probing never executes the
+/// candidate itself (unlike a spawn probe, a hostile `PATH` hit gains
+/// no code execution here). Where neither probe binary exists the
+/// predicate fails closed (`false`), and resolution aborts loudly
+/// instead of guessing.
 pub fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     if !path.is_file() {
@@ -34,7 +44,14 @@ pub fn is_executable_file(path: &Path) -> bool {
     if path.as_os_str().as_bytes().contains(&0) {
         return false;
     }
-    std::process::Command::new("test")
+    let probe = TEST_PROBES
+        .iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file());
+    let Some(probe) = probe else {
+        return false;
+    };
+    std::process::Command::new(probe)
         .arg("-x")
         .arg(path)
         .status()

@@ -779,6 +779,83 @@ fn compiler_resolution_skips_non_executable_decoys() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The executability probe ignores ambient-PATH `test` shadows (fix
+/// round 4, item 12): a hostile `test` earlier on `PATH` — one that
+/// always fails and marks a canary when executed — must change
+/// neither the probe outcome nor execute at all, because the probe
+/// runs an absolute path, never a `PATH` search. The supervisor
+/// stages the shadow and re-runs this same test binary as a child
+/// with the hostile `PATH` (mutating the process `PATH` in-thread
+/// would race parallel tests); the child asserts the probe outcomes.
+#[test]
+fn compiler_probe_ignores_ambient_path_test_shadows() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if std::env::var_os("P11SCOPE_PROBE_SHADOW_CHILD").is_some() {
+        let usable = std::env::var_os("P11SCOPE_PROBE_USABLE").expect("child usable path");
+        let refused = std::env::var_os("P11SCOPE_PROBE_REFUSED").expect("child refused path");
+        let canary = std::env::var_os("P11SCOPE_PROBE_CANARY").expect("child canary path");
+        assert!(
+            clang_resolve::is_executable_file(std::path::Path::new(&usable)),
+            "a usable file must probe executable under a hostile PATH test shadow"
+        );
+        assert!(
+            !clang_resolve::is_executable_file(std::path::Path::new(&refused)),
+            "a non-executable file must probe refused under a hostile PATH test shadow"
+        );
+        assert!(
+            !std::path::Path::new(&canary).is_file(),
+            "the hostile PATH test must never execute"
+        );
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("p11scope-test-shadow-{}", std::process::id()));
+    let hostile = root.join("hostile");
+    std::fs::create_dir_all(&hostile).expect("hostile dir");
+    let canary = root.join("test-executed");
+    std::fs::write(
+        hostile.join("test"),
+        format!("#!/bin/sh\ntouch {}\nexit 1\n", canary.display()),
+    )
+    .expect("hostile test");
+    std::fs::set_permissions(hostile.join("test"), std::fs::Permissions::from_mode(0o755))
+        .expect("hostile executable");
+    let usable = root.join("usable");
+    let refused = root.join("refused");
+    std::fs::write(&usable, "#!/bin/sh\nexit 0\n").expect("usable file");
+    std::fs::write(&refused, "not executable\n").expect("refused file");
+    std::fs::set_permissions(&usable, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o644)).expect("mode");
+    // At least one absolute probe binary must exist for this proof to
+    // mean anything (a bare loader environment has coreutils).
+    assert!(
+        std::path::Path::new("/usr/bin/test").is_file()
+            || std::path::Path::new("/bin/test").is_file(),
+        "an absolute test probe must exist"
+    );
+    let saved = std::env::var_os("PATH").unwrap_or_default();
+    let mut shadowed = hostile.as_os_str().to_os_string();
+    if !saved.is_empty() {
+        shadowed.push(":");
+        shadowed.push(&saved);
+    }
+    let child = std::process::Command::new(std::env::current_exe().expect("own test binary"))
+        .arg("--exact")
+        .arg("compiler_probe_ignores_ambient_path_test_shadows")
+        .env("PATH", &shadowed)
+        .env("P11SCOPE_PROBE_SHADOW_CHILD", "1")
+        .env("P11SCOPE_PROBE_USABLE", &usable)
+        .env("P11SCOPE_PROBE_REFUSED", &refused)
+        .env("P11SCOPE_PROBE_CANARY", &canary)
+        .output()
+        .expect("spawn shadowed probe child");
+    assert!(
+        child.status.success(),
+        "shadowed probe child must pass:\n{}",
+        String::from_utf8_lossy(&child.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Extract the kernel errno from a loader failure's syscall-carrying variants.
 /// Object-side variants (parse, relocation) yield `None`: they never touched
 /// the kernel, so they must fail the gate rather than pass as unprivileged.

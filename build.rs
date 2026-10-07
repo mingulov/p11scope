@@ -434,8 +434,9 @@ fn build_variant(
 }
 
 /// Resolve `clang-18` like process spawning does: the first `X_OK`
-/// hit on `PATH` (an `access` probe, so an unusable-but-bit-set entry
-/// is skipped exactly as `execvp` would skip it), as an absolute path.
+/// hit on `PATH` (an effective-access probe via an absolute `test`
+/// path, so an unusable-but-bit-set entry is skipped exactly as
+/// `execvp` would skip it), as an absolute path.
 /// The identity build executes this path directly and records its
 /// digest — the receipt names the compiler that actually ran, never a
 /// decoy execution skipped.

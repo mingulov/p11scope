@@ -609,12 +609,23 @@ fn anchor_host_harness_replay_and_arena_behavior() {
             &["ASSERT bad_shape_on_straddle", "ASSERT nothing_installed"][..],
         ),
         (
+            "straddle-contained-length",
+            &[
+                "ASSERT bad_shape_on_contained_length_straddle",
+                "ASSERT contained_length_straddle_installs_nothing",
+            ][..],
+        ),
+        (
             "shape-cases",
             &[
                 "ASSERT bad_shape_on_misaligned",
+                "ASSERT no_install_on_misaligned",
                 "ASSERT bad_shape_on_oversized",
+                "ASSERT no_install_on_oversized",
                 "ASSERT bad_shape_past_slots",
+                "ASSERT no_install_past_slots",
                 "ASSERT bad_shape_on_zero_inode",
+                "ASSERT no_install_on_zero_inode",
                 "ASSERT anon_silently_skipped",
                 "ASSERT nothing_installed_anywhere",
             ][..],

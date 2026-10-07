@@ -5,8 +5,10 @@
  * maps and captured emits: the BPF helper pointers are renamed to
  * host-owned function pointers (assigned in `main` before any program
  * runs), `P11_READ` becomes a byte copy (exactly what the probe read
- * delivers), and `p11_field_exists` is true (the anchor program never
- * consults it). Zero production-C changes: this TU only adds
+ * delivers), and `p11_field_exists` is true (the driven anchor path
+ * never consults it; the sole use is the target-run `VM_EXEC`
+ * pre-filter at `vma_identity.c:296`, undriven here). Zero
+ * production-C changes: this TU only adds
  * preprocessor renames around the real sources, so a guard regression
  * in `vma_identity.c` fails these scenarios. Built and driven by the
  * `anchor_host_harness_replay_and_arena_behavior` test; never shipped.
@@ -403,6 +405,28 @@ static void scenario_straddle_bad_shape(void)
                "nothing_installed");
 }
 
+/* (e2) A page-sized, aligned, in-slots VMA that still extends past the
+ * reservation end isolates the `end > base + len` disjunct: every
+ * other guard passes (length is exactly a page, offset is
+ * stride-aligned, the slot is installed), so only the containment
+ * predicate can reject it. Deleting that disjunct installs slot 1. */
+static void scenario_straddle_contained_length(void)
+{
+    const u64 base = 0x7F0000000000ULL;
+    const u64 stride = P11_IDENT_ANCHOR_STRIDE;
+    const u64 page = P11_IDENT_PAGE;
+    const u64 x = 0xFFFF888000001000ULL;
+    host_reset(7, base, 9000, 4, 100);
+    host_observe(base + stride, base + stride + page, x, 100);
+    host_print_record(0);
+    HOST_CHECK(host_capture_n == 1 &&
+                   host_capture[0].verdict == P11_IDENT_ANCHOR_BAD_SHAPE &&
+                   host_capture[0].a == 1,
+               "bad_shape_on_contained_length_straddle");
+    HOST_CHECK(host_anchors_used() == 0 && host_slots[1] == 0 && host_observed[1] == 0,
+               "contained_length_straddle_installs_nothing");
+}
+
 /* (f) Misaligned / oversized / past-slots / zero-inode shapes fail;
  * anonymous VMAs are silently skipped; nothing installs anywhere. */
 static void scenario_shape_cases(void)
@@ -417,10 +441,12 @@ static void scenario_shape_cases(void)
     HOST_CHECK(host_capture_n - at == 1 &&
                    host_capture[at].verdict == P11_IDENT_ANCHOR_BAD_SHAPE,
                "bad_shape_on_misaligned");
+    HOST_CHECK(host_anchors_used() == 0, "no_install_on_misaligned");
     at = host_observe(base, base + 2 * page, x, 100);
     HOST_CHECK(host_capture_n - at == 1 &&
                    host_capture[at].verdict == P11_IDENT_ANCHOR_BAD_SHAPE,
                "bad_shape_on_oversized");
+    HOST_CHECK(host_anchors_used() == 0, "no_install_on_oversized");
     host_reset(7, base, 16 * stride, 4, 100);
     at = host_observe(base + 10 * stride, base + 10 * stride + page, x, 100);
     host_print_record(at);
@@ -428,12 +454,14 @@ static void scenario_shape_cases(void)
                    host_capture[at].verdict == P11_IDENT_ANCHOR_BAD_SHAPE &&
                    host_capture[at].a == 10,
                "bad_shape_past_slots");
+    HOST_CHECK(host_anchors_used() == 0, "no_install_past_slots");
     host_reset(7, base, 4 * stride, 4, 100);
     at = host_observe(base, base + page, 0, 100);
     HOST_CHECK(host_capture_n - at == 1 &&
                    host_capture[at].verdict == P11_IDENT_ANCHOR_BAD_SHAPE &&
                    host_capture[at].a == 0,
                "bad_shape_on_zero_inode");
+    HOST_CHECK(host_anchors_used() == 0, "no_install_on_zero_inode");
     at = host_observe_anon(base, base + page, 100);
     HOST_CHECK(host_capture_n - at == 0, "anon_silently_skipped");
     HOST_CHECK(host_anchors_used() == 0 && host_slots[0] == 0 && host_observed[0] == 0,
@@ -469,6 +497,7 @@ static const struct {
     {"same-address-replay", scenario_same_address_replay},
     {"fresh-gen-after-conflict", scenario_fresh_gen_after_conflict},
     {"straddle-bad-shape", scenario_straddle_bad_shape},
+    {"straddle-contained-length", scenario_straddle_contained_length},
     {"shape-cases", scenario_shape_cases},
     {"contained-install", scenario_contained_install},
 };

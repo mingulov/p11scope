@@ -34,8 +34,8 @@ use crate::attach::capture::{
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
     AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
-    CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleInfo, ModuleKey, ProcessSource,
-    RegistryGap, RegistryLimits, UnknownReason, UseCoverage,
+    CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleInfo, ModuleKey,
+    PendingCountOutcome, ProcessSource, RegistryGap, RegistryLimits, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
@@ -170,6 +170,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// never publish — DR-C51-PREADMIT stays out. One entry per
     /// decided row at most.
     pair_targets: HashMap<PairKey, PairTarget>,
+    /// Outstanding publication-time count placements (P3): each staged
+    /// pending count's opaque handle back to its pair. Drained with the
+    /// publication's decisions; one entry per staged pending count.
+    pending_ids: HashMap<u64, PairKey>,
+    /// The next pending-count handle (P3): minted in staging order.
+    next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
     scanned_owners: BTreeSet<ProcessViewId>,
@@ -225,6 +231,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             binder: NativeBinder::new(BinderLimits::default()),
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
+            pending_ids: HashMap::new(),
+            next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
             scanned_owners: BTreeSet::new(),
@@ -1754,21 +1762,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 _ => {}
             }
         }
-        // Pending pairs retry their placement against the committed
-        // registry: a resolved pair converts to Bound and stages placed;
-        // an advance past what is staged re-stages pending.
+        // Pending pairs never resolve against the pre-publish
+        // committed snapshot here (P3): a mapping staged in this same
+        // window is invisible to it, and a later mapping must not
+        // promote a count whose witness already went module-level. An
+        // advance past what is staged re-stages pending; the publication
+        // decides, and its decisions finalize the target.
         for (key, caller, modules, count, staged) in retry {
-            if let Some(module) = self.committed_placement(caller, &modules) {
-                self.pair_targets.insert(
-                    key,
-                    PairTarget::Bound {
-                        caller,
-                        module: module.clone(),
-                    },
-                );
-                stage.push((caller, module, count));
-            } else if count.count > staged {
-                self.stage_pending_count(caller, &modules, count);
+            if count.count > staged {
+                self.stage_pending_count(key, caller, &modules, count);
                 if let Some(PairTarget::Pending { staged: was, .. }) =
                     self.pair_targets.get_mut(&key)
                 {
@@ -1821,81 +1823,97 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         );
     }
 
-    /// The committed-registry placement of one bound row's counts (C7
-    /// C4): exactly one edged module, mirroring `apply_bound_witness`.
-    /// `None` means "not yet" (or ambiguous), never "never": the caller
-    /// keeps the pair pending.
-    fn committed_placement(&self, caller: CallerId, modules: &[ModuleKey]) -> Option<ModuleKey> {
-        let mut edged = modules.iter().filter(|module| {
-            self.registry
-                .module_id_for(module)
-                .is_some_and(|id| self.registry.edge(caller, id).is_some())
-        });
-        match (edged.next(), edged.next()) {
-            (Some(module), None) => Some(module.clone()),
-            _ => None,
-        }
-    }
-
-    /// Records one bound row's pair target (C7 C4): counts stage only
-    /// where the witness did — exactly one edged module, mirroring
-    /// `apply_bound_witness` — and the held count (first sight merged
-    /// with any refresh) stages with the bind. A placement the committed
-    /// registry cannot resolve yet (its mapping stages in this same
-    /// window) stays pending and resolves at publication, alongside the
-    /// witness — never dropped for arriving before its mapping.
+    /// Records one bound row's pair target (P3): the pair always
+    /// starts pending — placement resolves at publication, together
+    /// with the witness, against the mappings the publication commits
+    /// (including this same window's). Nothing here reads the
+    /// pre-publish committed snapshot: a single committed edge proves
+    /// nothing while a second mapping stages, and caching `Bound` from
+    /// it would attribute the count where the witness reads ambiguous.
+    /// The held count (first sight merged with any refresh) stages
+    /// pending with the bind; the publication's decisions finalize the
+    /// target as `Bound` or `Dropped`.
     fn bind_pair_count(&mut self, row: &WitnessRow, caller: CallerId, modules: &[ModuleKey]) {
         let key = PairKey::of(row);
-        match self.committed_placement(caller, modules) {
-            Some(module) => {
-                self.pair_targets.insert(
-                    key,
-                    PairTarget::Bound {
-                        caller,
-                        module: module.clone(),
-                    },
-                );
-                if let Some(count) = self.pair_counts.get(&key).copied() {
-                    self.stage_pair_count(caller, &module, count);
-                }
-            }
-            None => {
-                self.pair_targets.insert(
-                    key,
-                    PairTarget::Pending {
-                        caller,
-                        modules: modules.to_vec(),
-                        staged: 0,
-                    },
-                );
-                if let Some(count) = self.pair_counts.get(&key).copied()
-                    && count.count > 0
-                {
-                    self.stage_pending_count(caller, modules, count);
-                    if let Some(PairTarget::Pending { staged, .. }) =
-                        self.pair_targets.get_mut(&key)
-                    {
-                        *staged = count.count;
-                    }
-                }
+        self.pair_targets.insert(
+            key,
+            PairTarget::Pending {
+                caller,
+                modules: modules.to_vec(),
+                staged: 0,
+            },
+        );
+        if let Some(count) = self.pair_counts.get(&key).copied()
+            && count.count > 0
+        {
+            self.stage_pending_count(key, caller, modules, count);
+            if let Some(PairTarget::Pending { staged, .. }) = self.pair_targets.get_mut(&key) {
+                *staged = count.count;
             }
         }
     }
 
     /// Stages one pending pair's held count for publication-time
-    /// placement (C7 C4): only for counts ≥ 1 — anything else leaves the
-    /// witness standing, and a later advance re-stages.
-    fn stage_pending_count(&mut self, caller: CallerId, modules: &[ModuleKey], count: PairCount) {
+    /// placement (P3): only for counts ≥ 1 — anything else leaves the
+    /// witness standing, and a later advance re-stages. The minted
+    /// handle maps the publication's decision back to the pair.
+    fn stage_pending_count(
+        &mut self,
+        key: PairKey,
+        caller: CallerId,
+        modules: &[ModuleKey],
+        count: PairCount,
+    ) {
         if count.count == 0 {
             return;
         }
+        let pending_id = self.next_pending_id;
+        self.next_pending_id = self.next_pending_id.wrapping_add(1);
+        self.pending_ids.insert(pending_id, key);
         self.registry.note_pending_count(
+            pending_id,
             caller,
             modules.to_vec(),
             count.count,
             count.first_ns,
             count.last_ns,
         );
+    }
+
+    /// Finalizes pending pair placements from the publication's
+    /// decisions (P3): a placed pair caches `Bound` — only now, after
+    /// the publication decided — so later advances stage to its edge; a
+    /// rejected pair (ambiguity, no edge) finalizes `Dropped` with its
+    /// held count removed, so a later mapping can never promote a count
+    /// whose witness already went module-level. An unadmitted single
+    /// stays pending and re-resolves on the next advance. Unknown
+    /// handles (a pair re-bound after its decision staged) are ignored:
+    /// the newer bind's own decision finalizes it.
+    fn finalize_pending_counts(&mut self) {
+        for decision in self.registry.take_pending_count_decisions() {
+            let Some(key) = self.pending_ids.remove(&decision.pending_id) else {
+                continue;
+            };
+            match decision.outcome {
+                PendingCountOutcome::Placed { module } => {
+                    if let Some(PairTarget::Pending { caller, .. }) = self.pair_targets.get(&key) {
+                        let caller = *caller;
+                        self.pair_targets
+                            .insert(key, PairTarget::Bound { caller, module });
+                    }
+                }
+                PendingCountOutcome::Rejected { .. } => {
+                    if matches!(
+                        self.pair_targets.get(&key),
+                        Some(PairTarget::Pending { .. })
+                    ) {
+                        self.pair_targets.insert(key, PairTarget::Dropped);
+                        self.pair_counts.remove(&key);
+                    }
+                }
+                PendingCountOutcome::Unadmitted { .. } => {}
+            }
+        }
     }
 
     /// Drops one pair's counts (C7 C4): binder-unbound, or no module at
@@ -2177,6 +2195,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {
         self.engine.publish_batch_tail(engine_changed)?;
         let registry_applied = self.registry.publish();
+        self.finalize_pending_counts();
         Ok(BatchReceipt {
             engine_facts: self.engine.facts_revision,
             engine_published: self.engine.published_facts_revision,
@@ -2261,12 +2280,12 @@ enum PairTarget {
     /// The pair bound to `caller` and its witness resolved to exactly
     /// one edged module: counts stage there.
     Bound { caller: CallerId, module: ModuleKey },
-    /// The pair bound to `caller` but its witness modules are not
-    /// committed-edged yet (their mapping stages in this same window, for
-    /// example): counts stage pending and resolve at publication,
-    /// alongside the witness. `staged` is the count staged so far, so
-    /// only advances re-stage. Retried against the committed registry on
-    /// every advance (a resolved pair converts to [`Self::Bound`]).
+    /// The pair bound to `caller` and waiting on its publication-time
+    /// placement: counts stage pending and resolve at publication,
+    /// together with the witness. `staged` is the count staged so far,
+    /// so only advances re-stage. The publication's decisions finalize
+    /// it as [`Self::Bound`] or [`Self::Dropped`]; an unadmitted single
+    /// stays pending and re-resolves on the next advance.
     Pending {
         caller: CallerId,
         modules: Vec<ModuleKey>,
@@ -5165,6 +5184,276 @@ mod tests {
     }
 
     #[test]
+    fn a_count_never_lands_where_its_witness_reads_ambiguous() {
+        // P3 commit-visibility (astra#1): the caller is already cached
+        // (bound through A); A's edge is committed; B's mapping stages
+        // in the same window; A and B share the witnessed endpoint.
+        // The witness resolves ambiguous at publication — and so must
+        // the count: a Bound(A) cached from the pre-publish committed
+        // snapshot would attribute the shared use to A.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        // Bound through A first: the image's identity is cached and A's
+        // edge is committed with its first-sight count.
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        // B shares A's first endpoint: its table targets A's object.
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        let members: Vec<_> = native
+            .scene
+            .coordinator
+            .attach_set
+            .modules_with_member(shared.id)
+            .collect();
+        assert_eq!(
+            members.len(),
+            2,
+            "A and B share the witnessed endpoint: {members:?}"
+        );
+        // One staging window, no commit between: project A+B (B's mapping
+        // stages, uncommitted — the committed snapshot sees only A) then
+        // read the shared endpoint's row with a risen first-sight count.
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        let mut row = WitnessRow::scripted(native.domain, 41, 1, shared.object, shared.id, 7, 210);
+        row.entry_count = 9;
+        native.read(vec![row]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Premise: the witness resolved ambiguous at publication.
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(
+            placement.ambiguous, 1,
+            "the shared-endpoint witness reads ambiguous: {placement:?}"
+        );
+        let counts = |native: &NativeScene| {
+            let registry = &native.scene.coordinator.registry;
+            let mut counts: Vec<(String, u64)> = registry
+                .edges()
+                .filter(|edge| edge.caller == caller)
+                .map(|edge| {
+                    let path = registry
+                        .module(edge.module)
+                        .map(|module| module.paths.iter().next().cloned().unwrap_or_default())
+                        .unwrap_or_default();
+                    (path, edge.entry_count)
+                })
+                .collect();
+            counts.sort();
+            counts
+        };
+        let counts = counts(&native);
+        assert_eq!(counts.len(), 2, "both edges exist: {counts:?}");
+        assert!(
+            counts.iter().all(|(_, count)| *count <= 1),
+            "no edge carries the ambiguous use's count: {counts:?}"
+        );
+        assert_eq!(
+            counts
+                .iter()
+                .find(|(path, _)| path.contains("a.so"))
+                .map(|(_, count)| *count),
+            Some(1),
+            "A keeps only its own first-sight count: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_count_is_never_promoted_by_a_later_mapping() {
+        // P3 finalization (sol#2): a bound row with no mapping edge
+        // places its witness module-level and rejects its count; the
+        // rejection finalizes — a mapping that appears later must not
+        // promote the held count onto the new edge.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        // B is known to the attach set (admitted) but never projected:
+        // no mapping edge exists for it.
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &b, &fx::offsets(2))),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        let endpoint_b = absorbed_b.delta.endpoints[0];
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        // B's first-use row binds through the cached identity with no
+        // mapping staged at all.
+        let row_b = WitnessRow::scripted(
+            native.domain,
+            41,
+            1,
+            endpoint_b.object,
+            endpoint_b.id,
+            7,
+            210,
+        );
+        native.read(vec![row_b]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Premise: the witness went module-level (no edge to place on).
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(
+            (placement.edge, placement.module + placement.unresolved),
+            (1, 1),
+            "A's witness took its edge, B's went module-level: {placement:?}"
+        );
+        // The mapping appears later and the count advances: the rejected
+        // count must not promote onto the new edge.
+        native.scene.project_paths(7, &[&a_path, &b], 300);
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: endpoint_b.object,
+            count: 9,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge_b = registry
+            .edges()
+            .find(|edge| {
+                edge.caller == caller
+                    && registry
+                        .module(edge.module)
+                        .is_some_and(|module| module.paths.iter().any(|p| p.contains("b.so")))
+            })
+            .expect("the later mapping created the B edge");
+        assert_eq!(
+            edge_b.entry_count, 0,
+            "the rejected count never promotes onto the later edge"
+        );
+        assert!(
+            !matches!(registry.coverage(edge_b), UseCoverage::Counted { .. }),
+            "the B edge never reads counted: {:?}",
+            registry.coverage(edge_b)
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_count_finalizes_dropped_and_stays_there() {
+        // P3 finalization (sol#2): a shared-endpoint use both edges hold
+        // reads ambiguous — its count finalizes Dropped with its held
+        // count removed, so later advances can never attribute it.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        // B shares A's first endpoint; both mappings commit up front,
+        // so the committed snapshot itself reads ambiguous.
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // The shared use with a risen first-sight count.
+        let mut row = WitnessRow::scripted(native.domain, 41, 1, shared.object, shared.id, 7, 210);
+        row.entry_count = 9;
+        let key = PairKey::of(&row);
+        native.read(vec![row]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Premise: the witness read ambiguous.
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(
+            placement.ambiguous, 1,
+            "the shared-endpoint witness reads ambiguous: {placement:?}"
+        );
+        // The rejection finalizes: Dropped, held count removed.
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Dropped)
+            ),
+            "the ambiguous pair finalizes Dropped: {:?}",
+            native.scene.coordinator.pair_targets.get(&key)
+        );
+        assert!(
+            !native.scene.coordinator.pair_counts.contains_key(&key),
+            "the rejected held count is removed"
+        );
+        // Permanence: a later advance attributes nowhere.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 12,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        for edge in registry.edges().filter(|edge| edge.caller == caller) {
+            let path = registry
+                .module(edge.module)
+                .map(|module| module.paths.iter().next().cloned().unwrap_or_default())
+                .unwrap_or_default();
+            let count = edge.entry_count;
+            if path.contains("a.so") {
+                assert_eq!(count, 1, "A keeps only its own first-sight count");
+            } else {
+                assert_eq!(count, 0, "B never carries the ambiguous use: {path}");
+            }
+        }
+    }
+
+    #[test]
     fn persistent_refresh_failure_keeps_the_lower_bound_but_withholds_quiet() {
         // P1-5: after a successful positive read, persistent refresh
         // failures keep the observed count as a lower bound while the
@@ -5283,7 +5572,9 @@ mod tests {
         );
         // Stop begins (production order: the coverage ends before the
         // post-stop terminal refresh, inventory_capture.rs).
-        let live_last_seen = edge_of(&native).1.expect("the positive read left a last-seen");
+        let live_last_seen = edge_of(&native)
+            .1
+            .expect("the positive read left a last-seen");
         let end_ns = live_last_seen + 2000;
         native.scene.coordinator.end_capture_coverage(end_ns);
         // The terminal refresh fails after stop: reads carrying only
@@ -5306,8 +5597,7 @@ mod tests {
             "a terminal-first refresh failure publishes lossy freshness: {coverage:?}"
         );
         // Terminal: the stale count withholds quiet.
-        let live =
-            Presentation::capture(&native.scene.coordinator, "s", 0, end_ns, 1);
+        let live = Presentation::capture(&native.scene.coordinator, "s", 0, end_ns, 1);
         let activity = live
             .edges
             .iter()
@@ -5319,8 +5609,7 @@ mod tests {
             Activity::Lossy,
             "a stale count under failed terminal refresh withholds quiet"
         );
-        let document =
-            crate::inventory::render_json(&native.scene.coordinator, "s", 0, end_ns, 1);
+        let document = crate::inventory::render_json(&native.scene.coordinator, "s", 0, end_ns, 1);
         assert_eq!(document["edges"][0]["entries"]["count"], 1);
         assert_eq!(
             document["edges"][0]["entries"]["coverage"]["lossy"], true,

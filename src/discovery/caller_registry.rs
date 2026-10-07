@@ -1135,6 +1135,56 @@ pub(crate) struct WitnessPlacement {
     pub unresolved: u64,
 }
 
+/// One publication-time pending-count placement (P3): where the count
+/// landed — decided together with its witness, from the same committed
+/// state, so the two can never diverge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingCountDecision {
+    /// The coordinator's handle from [`Mutation::NotePendingCount`].
+    pub pending_id: u64,
+    pub outcome: PendingCountOutcome,
+}
+
+/// A pending count's publication-time outcome (P3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingCountOutcome {
+    /// Exactly one edged, admitted module took the count (and the
+    /// witness): the pair binds there.
+    Placed { module: ModuleKey },
+    /// The count dropped with its witness (module-level or ambiguous):
+    /// the pair finalizes, never to promote later.
+    Rejected { reason: PendingRejection },
+    /// Exactly one edged module, but it is not admitted: the witness
+    /// sits on the edge while the count waits — the pair stays pending
+    /// and re-resolves on the next advance (self-healing after
+    /// admission, like the placed-count path).
+    Unadmitted { module: ModuleKey },
+}
+
+/// Why a publication rejected a pending count (P3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingRejection {
+    /// Two or more edged modules (or none of several candidates): the
+    /// witness reads ambiguous.
+    Ambiguous,
+    /// No edged module: the witness went module-level or unresolved.
+    NoEdge,
+}
+
+/// One bound row's publication-time placement (P3): the shared witness
+/// and count verdict from [`CallerRegistry::place_bound_row`].
+#[derive(Debug, Clone)]
+enum RowPlacement {
+    /// Exactly one edged module takes the witness and the count.
+    Edge { key: ModuleKey, id: ModuleId },
+    /// No edged module, one candidate: module-level use.
+    NoMapping { key: ModuleKey },
+    /// No candidate at all.
+    Unresolved,
+    /// Several candidates with no single edge: ambiguous.
+    Shared,
+}
+
 impl WitnessPlacement {
     #[cfg(test)]
     pub(crate) fn total(&self) -> u64 {
@@ -1355,6 +1405,8 @@ enum Mutation {
         last_ns: u64,
     },
     NotePendingCount {
+        /// The coordinator's opaque handle, echoed in the decision.
+        pending_id: u64,
         caller: CallerId,
         /// The candidate modules (the witness's): placement resolves at
         /// publication, alongside the witness, against the mappings this
@@ -1445,6 +1497,9 @@ pub(crate) struct CallerRegistry {
     witness_census: BindingCensus,
     /// Where decided witness rows went (published with the batch).
     witness_placement: WitnessPlacement,
+    /// Pending-count placements the last publication decided, in apply
+    /// order (P3): drained by the coordinator after each publish.
+    pending_count_decisions: Vec<PendingCountDecision>,
     facts_revision: u64,
     published_revision: u64,
     endpoints_total: usize,
@@ -1483,6 +1538,7 @@ impl CallerRegistry {
             coverage_gap_memo: BTreeSet::new(),
             witness_gap_memo: BTreeSet::new(),
             witness_placement: WitnessPlacement::default(),
+            pending_count_decisions: Vec::new(),
             witness_census: BindingCensus::default(),
             facts_revision: 1,
             published_revision: 0,
@@ -1992,16 +2048,18 @@ impl CallerRegistry {
         });
     }
 
-    /// Stage one bound pair's absolute entry count whose edge placement
-    /// is not yet committed (its mapping stages in this same window and
-    /// commits at publication, for example): placement resolves at
-    /// publication, alongside the
-    /// witness, against the mappings the publication commits — exactly
-    /// one edged module takes the count, like the witness. Anything else
-    /// (no edge, ambiguity, no admission) drops silently: the witness
-    /// records the placement gaps, and a count never invents an edge.
+    /// Stage one bound pair's absolute entry count for
+    /// publication-time placement (P3): the witness and the count
+    /// resolve together at publication, against the mappings the
+    /// publication commits — exactly one edged module takes both. A
+    /// rejection (no edge, ambiguity) drops the count silently: the
+    /// witness records the placement gaps, and a count never invents
+    /// an edge. `pending_id` is the coordinator's opaque handle: the
+    /// publication reports every pending count's placement through
+    /// [`Self::take_pending_count_decisions`].
     pub(crate) fn note_pending_count(
         &mut self,
+        pending_id: u64,
         caller: CallerId,
         modules: Vec<ModuleKey>,
         count: u64,
@@ -2009,12 +2067,20 @@ impl CallerRegistry {
         last_ns: u64,
     ) {
         self.staged.push(Mutation::NotePendingCount {
+            pending_id,
             caller,
             modules,
             count,
             first_ns,
             last_ns,
         });
+    }
+
+    /// Drains the last publication's pending-count placements, in apply
+    /// order: one decision per staged pending count. The coordinator
+    /// finalizes its pair targets from these (P3).
+    pub(crate) fn take_pending_count_decisions(&mut self) -> Vec<PendingCountDecision> {
+        std::mem::take(&mut self.pending_count_decisions)
     }
 
     /// Stage one global health regression (a native identity, pair, or
@@ -2326,12 +2392,13 @@ impl CallerRegistry {
                 note,
             } => self.apply_coverage(caller, &module, note),
             Mutation::NotePendingCount {
+                pending_id,
                 caller,
                 modules,
                 count,
                 first_ns,
                 last_ns,
-            } => self.apply_pending_count(caller, &modules, count, first_ns, last_ns),
+            } => self.apply_pending_count(pending_id, caller, &modules, count, first_ns, last_ns),
             Mutation::NoteCountedUse {
                 caller,
                 module,
@@ -2743,18 +2810,42 @@ impl CallerRegistry {
         self.push_gap(gap);
     }
 
+    /// One bound row's publication-time placement (P3): the caller
+    /// edge its witness and count take together, from the same committed
+    /// state — exactly one edged module, or the rejection the witness
+    /// records. Both [`Self::apply_bound_witness`] and
+    /// [`Self::apply_pending_count`] decide through this one function, so
+    /// a count lands exactly where its witness did, or drops exactly
+    /// where its witness went module-level.
+    fn place_bound_row(&self, caller: CallerId, modules: &[ModuleKey]) -> RowPlacement {
+        let edged: Vec<(&ModuleKey, ModuleId)> = modules
+            .iter()
+            .filter_map(|key| {
+                self.modules_by_key
+                    .get(key)
+                    .copied()
+                    .filter(|id| self.edges.contains_key(&(caller, *id)))
+                    .map(|id| (key, id))
+            })
+            .collect();
+        match (edged.as_slice(), modules) {
+            ([(key, id)], _) => RowPlacement::Edge {
+                key: (*key).clone(),
+                id: *id,
+            },
+            ([], [key]) => RowPlacement::NoMapping { key: key.clone() },
+            ([], []) => RowPlacement::Unresolved,
+            _ => RowPlacement::Shared,
+        }
+    }
+
     /// The edge a coverage note names, or `None` with a gap: coverage
     /// notes never invent edges. Retired callers stay addressable —
     /// positive history survives retirement.
     fn apply_bound_witness(&mut self, caller: CallerId, modules: &[ModuleKey], first_ns: u64) {
-        let edged: Vec<ModuleId> = modules
-            .iter()
-            .filter_map(|key| self.modules_by_key.get(key).copied())
-            .filter(|id| self.edges.contains_key(&(caller, *id)))
-            .collect();
-        match (edged.as_slice(), modules) {
-            ([id], _) => {
-                let edge = self.edges.get_mut(&(caller, *id)).expect("edged");
+        match self.place_bound_row(caller, modules) {
+            RowPlacement::Edge { id, .. } => {
+                let edge = self.edges.get_mut(&(caller, id)).expect("edged");
                 let first = edge
                     .coverage
                     .witnessed_first_ns
@@ -2762,12 +2853,12 @@ impl CallerRegistry {
                 edge.coverage.witnessed_first_ns = Some(first);
                 self.witness_placement.edge += 1;
             }
-            ([], [key]) => {
+            RowPlacement::NoMapping { key } => {
                 // The caller is identified; only its mapping is missing.
-                let id = self.modules_by_key.get(key).copied();
+                let id = self.modules_by_key.get(&key).copied();
                 self.push_coverage_gap(
                     caller,
-                    key,
+                    &key,
                     id,
                     WITNESS_WITHOUT_MAPPING,
                     format!(
@@ -2777,64 +2868,74 @@ impl CallerRegistry {
                     ),
                 );
                 self.apply_unbound_use(
-                    key,
+                    &key,
                     first_ns,
                     NO_MAPPING_EDGE,
                     "the bound caller has no mapping edge to the module",
                     false,
                 );
             }
-            ([], []) => self.witness_placement.unresolved += 1,
-            _ => self.apply_shared_endpoint(modules, "bound to a caller incarnation"),
+            RowPlacement::Unresolved => self.witness_placement.unresolved += 1,
+            RowPlacement::Shared => {
+                self.apply_shared_endpoint(modules, "bound to a caller incarnation");
+            }
         }
     }
 
-    /// One pending count's publication: placement mirrors
-    /// [`Self::apply_bound_witness`] — exactly one edged module takes
-    /// the count — and admission mirrors the coordinator's
-    /// `stage_pair_count` (only admitted modules count). On placement
-    /// the count and its `Counted` coverage apply exactly as if staged
-    /// placed; anything else drops silently (the witness records the
-    /// placement gaps, and no gap is owed twice).
+    /// One pending count's publication: placement comes from
+    /// [`Self::place_bound_row`] — the same decision its witness took —
+    /// and admission mirrors the coordinator's `stage_pair_count` (only
+    /// admitted modules count). On placement the count and its `Counted`
+    /// coverage apply exactly as if staged placed; anything else drops
+    /// silently (the witness records the placement gaps, and no gap is
+    /// owed twice). Every outcome is reported through
+    /// [`Self::take_pending_count_decisions`].
     fn apply_pending_count(
         &mut self,
+        pending_id: u64,
         caller: CallerId,
         modules: &[ModuleKey],
         count: u64,
         first_ns: u64,
         last_ns: u64,
     ) {
-        let placed = modules
-            .iter()
-            .filter(|key| {
-                self.modules_by_key
-                    .get(*key)
-                    .is_some_and(|id| self.edges.contains_key(&(caller, *id)))
-            })
-            .collect::<Vec<_>>();
-        let [module] = placed.as_slice() else {
-            return;
+        let outcome = match self.place_bound_row(caller, modules) {
+            RowPlacement::Edge { key, .. } => {
+                let admitted = self
+                    .modules_by_key
+                    .get(&key)
+                    .and_then(|id| self.modules.get(id))
+                    .is_some_and(|record| record.admission == AdmissionState::Admitted);
+                if !admitted {
+                    PendingCountOutcome::Unadmitted { module: key }
+                } else {
+                    self.apply(Mutation::NoteCountedUse {
+                        caller,
+                        module: key.clone(),
+                        count,
+                        first_ns,
+                        last_ns,
+                    });
+                    self.apply(Mutation::NoteCoverage {
+                        caller,
+                        module: key.clone(),
+                        note: CoverageNote::Counted { since_ns: first_ns },
+                    });
+                    PendingCountOutcome::Placed { module: key }
+                }
+            }
+            RowPlacement::NoMapping { .. } | RowPlacement::Unresolved => {
+                PendingCountOutcome::Rejected {
+                    reason: PendingRejection::NoEdge,
+                }
+            }
+            RowPlacement::Shared => PendingCountOutcome::Rejected {
+                reason: PendingRejection::Ambiguous,
+            },
         };
-        let admitted = self
-            .modules_by_key
-            .get(*module)
-            .and_then(|id| self.modules.get(id))
-            .is_some_and(|record| record.admission == AdmissionState::Admitted);
-        if !admitted {
-            return;
-        }
-        let module = (*module).clone();
-        self.apply(Mutation::NoteCountedUse {
-            caller,
-            module: module.clone(),
-            count,
-            first_ns,
-            last_ns,
-        });
-        self.apply(Mutation::NoteCoverage {
-            caller,
-            module,
-            note: CoverageNote::Counted { since_ns: first_ns },
+        self.pending_count_decisions.push(PendingCountDecision {
+            pending_id,
+            outcome,
         });
     }
 
@@ -5361,6 +5462,79 @@ pub(crate) mod tests {
             .filter(|gap| gap.subject == WITNESS_SHARED_ENDPOINT)
             .count();
         assert_eq!(shared_gaps, 2, "once per sharing module");
+    }
+
+    #[test]
+    fn pending_counts_resolve_with_their_witness_and_report_decisions() {
+        // P3: a pending count resolves at publication from the same
+        // committed state its witness does — same edge or same
+        // rejection — and every pending count reports its placement.
+        let mut registry = registry();
+        let a = module_info("/lib/a.so", 11, AdmissionState::Admitted);
+        let b = module_info("/lib/b.so", 12, AdmissionState::Admitted);
+        let (ka, kb) = (a.key.clone(), b.key.clone());
+        // A committed; B's mapping stages in the same window as the use.
+        registry.note_mapping(CallerId(0), 50, a.clone(), 100);
+        registry.publish();
+        registry.note_mapping(CallerId(0), 51, b.clone(), 110);
+        registry.note_pending_count(7, CallerId(0), vec![ka.clone(), kb.clone()], 9, 120, 130);
+        registry.note_bound_witness(CallerId(0), vec![ka.clone(), kb.clone()], 120);
+        registry.publish();
+        // Together: the witness reads ambiguous and the count drops.
+        assert_eq!(registry.witness_placement().ambiguous, 1);
+        let decisions = registry.take_pending_count_decisions();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].pending_id, 7);
+        assert!(
+            matches!(
+                decisions[0].outcome,
+                PendingCountOutcome::Rejected {
+                    reason: PendingRejection::Ambiguous
+                }
+            ),
+            "{decisions:?}"
+        );
+        let count_of = |registry: &CallerRegistry, key: &ModuleKey| {
+            registry
+                .module_id_for(key)
+                .and_then(|id| registry.edge(CallerId(0), id))
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(count_of(&registry, &ka), Some(0));
+        assert_eq!(count_of(&registry, &kb), Some(0));
+        assert!(registry.take_pending_count_decisions().is_empty());
+        // A single edged module places witness and count together.
+        registry.note_pending_count(8, CallerId(0), vec![ka.clone()], 12, 140, 150);
+        registry.note_bound_witness(CallerId(0), vec![ka.clone()], 140);
+        registry.publish();
+        let decisions = registry.take_pending_count_decisions();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert!(
+            matches!(
+                decisions[0].outcome,
+                PendingCountOutcome::Placed { ref module } if module == &ka
+            ),
+            "{decisions:?}"
+        );
+        assert_eq!(count_of(&registry, &ka), Some(12));
+        // No mapping edge: the witness goes module-level and the count
+        // rejects with it.
+        registry.note_pending_count(9, CallerId(3), vec![ka.clone()], 4, 160, 170);
+        registry.note_bound_witness(CallerId(3), vec![ka.clone()], 160);
+        registry.publish();
+        let decisions = registry.take_pending_count_decisions();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert!(
+            matches!(
+                decisions[0].outcome,
+                PendingCountOutcome::Rejected {
+                    reason: PendingRejection::NoEdge
+                }
+            ),
+            "{decisions:?}"
+        );
+        assert_eq!(registry.witness_placement().module, 1);
+        assert_eq!(count_of(&registry, &ka), Some(12));
     }
 
     /// M4 (C4 review): a bound row without a mapping edge names its caller

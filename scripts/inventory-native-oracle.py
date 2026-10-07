@@ -209,6 +209,16 @@ FRAME = {
 # Frame item key -> how the oracle derives the expected value.
 FRAME_ITEMS = ("capture", "activity", "entries", "semantics")
 
+# O3: at_ns stamps are u64 CLOCK_MONOTONIC nanoseconds (the JSON writer
+# emits Rust u64s): exact int type within 0..u64::MAX. isinstance is
+# bool-blind and unbounded, so it must never gate a clock.
+U64_MAX = 2**64 - 1
+
+
+def is_u64_clock(value):
+    """Whether `value` is a well-formed u64 clock stamp."""
+    return type(value) is int and 0 <= value <= U64_MAX
+
 # --- CLI probe ----------------------------------------------------------------
 HELP_PROBE = {"usage": "p11scope inventory", "flags": {"capture": "--capture", "manifest": "--manifest"}}
 
@@ -1069,20 +1079,21 @@ def check_streams(view, res):
                 rushed.append((key, f"seq {prev.get('seq')}->{cur.get('seq')} dt {cur_at - prev_at} ns"))
     res.ok(run, "*", "EDGE-CADENCE", not rushed,
            f"{len(rushed)} edge_observed records re-emit an unchanged class within 10 s: {rushed[:4]}")
-    # O3: invalid clocks fail closed. A missing/non-integer at_ns, or a
-    # regressing per-edge stamp, makes its pair unjudgeable for cadence
-    # (which keeps skipping it above) — but the stream must fail here
-    # instead of passing silently.
+    # O3: invalid clocks fail closed. A missing/non-integer/out-of-range
+    # at_ns, or a regressing per-edge stamp, makes its pair unjudgeable
+    # for cadence (which keeps skipping it above) — but the stream must
+    # fail here instead of passing silently. Monotonicity judges valid
+    # clocks only; anything else already failed above.
     clock_bad = []
     for key in sorted(by_edge, key=str):
         rows = sorted(by_edge[key], key=lambda e: e.get("seq", 0))
         for row in rows:
             at = row.get("at_ns")
-            if not isinstance(at, int):
-                clock_bad.append((key, f"seq {row.get('seq')} at_ns {at!r} is not an int"))
+            if not is_u64_clock(at):
+                clock_bad.append((key, f"seq {row.get('seq')} at_ns {at!r} is not a u64 clock"))
         stamps = [(row.get("seq"), row.get("at_ns")) for row in rows]
         for (pseq, prev_at), (cseq, cur_at) in zip(stamps, stamps[1:]):
-            if isinstance(prev_at, int) and isinstance(cur_at, int) and cur_at < prev_at:
+            if is_u64_clock(prev_at) and is_u64_clock(cur_at) and cur_at < prev_at:
                 clock_bad.append((key, f"seq {pseq}->{cseq} clock regresses {prev_at}->{cur_at}"))
     res.ok(run, "*", "EDGE-CLOCK", not clock_bad,
            f"{len(clock_bad)} edge_observed records carry invalid or regressing clocks: {clock_bad[:4]}")
@@ -3386,6 +3397,21 @@ def self_test():
         def clock_backwards(s, d, dash):
             return clock_stages(s, d, T0 + 1500, T0 + 500)
         case("edge-clock-backwards", "EDGE-CLOCK", clock_backwards)
+
+        # O3 unsigned range (fix round 1): at_ns is a u64 CLOCK_MONOTONIC
+        # stamp — exact int type (never bool) within 0..u64::MAX. Each
+        # invalid stamp sits where monotonicity alone cannot catch it.
+        def clock_negative(s, d, dash):
+            return clock_stages(s, d, -1, T0 + 500)
+        case("edge-clock-negative", "EDGE-CLOCK", clock_negative)
+
+        def clock_bool(s, d, dash):
+            return clock_stages(s, d, True, T0 + 500)
+        case("edge-clock-bool", "EDGE-CLOCK", clock_bool)
+
+        def clock_above_u64(s, d, dash):
+            return clock_stages(s, d, T0 + 500, 2**64)
+        case("edge-clock-above-u64", "EDGE-CLOCK", clock_above_u64)
 
         # --- O4: preadmission checks the wrong event (astra B2) --------------
         # The binder's Rule 3 rejects ROWS recorded before admission

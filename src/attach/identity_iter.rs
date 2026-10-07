@@ -2814,8 +2814,15 @@ mod tests {
     /// each other. C block comments do not nest. A char literal keeps a
     /// `0` placeholder operand (same length): without it `-'x' & addr`
     /// would blank into a false unary-`&` shape and lose its taint.
+    /// Before all of that, translation phase 2 runs file-wide: a
+    /// backslash immediately before a newline is deleted (operands,
+    /// comments, and strings alike), so `mask-\<newline>-` reads as
+    /// the `mask--` operand the compiler sees. Spliced lines merge —
+    /// line numbers past a splice differ from the raw text, exactly as
+    /// they do for the compiler.
     fn strip_c_noise(text: &str) -> String {
-        let bytes = text.as_bytes();
+        let spliced = text.replace("\\\r\n", "").replace("\\\n", "");
+        let bytes = spliced.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
         let mut index = 0;
         while index < bytes.len() {
@@ -3523,6 +3530,26 @@ mod tests {
             .is_err(),
             "`(x) += …` must keep taint on the unwrapped target"
         );
+        // Line-spliced postfix (fix round 5): C translation phase 2
+        // joins `mask-\<newline>-` into `mask--` before anything else,
+        // so the audit must see the operand too — `& addr` stays binary
+        // and taints.
+        assert!(
+            audit_c_chunk(
+                "    start = mask-\\\n- & addr;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+                "chunk"
+            )
+            .is_err(),
+            "a line-spliced postfix operand must keep binary-`&` taint"
+        );
+        // A splice inside a line comment continues it (phase 2 precedes
+        // comment stripping): the emit below is commented out, so the
+        // chunk passes for a different reason than the live-emit case.
+        audit_c_chunk(
+            "    start = addr; // trailing \\\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+            "chunk",
+        )
+        .expect("a spliced line comment must swallow the emit");
         // Legitimate address-of uses stay untainted: `&addr` as a lookup
         // key never taints the result — while binary `&` does.
         audit_c_chunk(

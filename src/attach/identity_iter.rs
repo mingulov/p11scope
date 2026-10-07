@@ -873,11 +873,15 @@ pub fn iter_create(link_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
 // ---------------------------------------------------------------------------
 
 /// Writer for the kernel-only anchor maps. Holds the two `WRONLY` fds;
-/// exposes teardown (delete + slot bookkeeping) only. There is
-/// intentionally no `get`, `lookup`, `iter`, `keys`, `insert`, or `Debug`
-/// implementation: only the anchor program installs identity assertions;
-/// userspace can clear them but never manufacture one. Inode addresses
-/// enter the kernel here and never come back.
+/// production code constructs (validates) only. There is intentionally
+/// no `get`, `lookup`, `iter`, `keys`, `insert`, or `Debug`
+/// implementation: only the anchor program installs identity assertions.
+/// Teardown lives behind `#[cfg(test)]` as an interim test-only
+/// primitive — unrestricted bookkeeping has no place in the non-test API
+/// (a stray `set_slot` could otherwise clear the slot cell the anchor
+/// program's conflict guard reads); production teardown is W3-2's
+/// kernel-side slot/generation command. Inode addresses enter the kernel
+/// here and never come back.
 pub struct AnchorMaps {
     hash: OwnedFd,
     slots: OwnedFd,
@@ -940,6 +944,7 @@ impl AnchorMaps {
         Ok(Self { hash, slots })
     }
 
+    #[cfg(test)]
     fn update(fd: BorrowedFd<'_>, key: &[u8], value: &[u8]) -> io::Result<()> {
         let attr = MapElemAttr {
             map_fd: fd.as_raw_fd() as u32,
@@ -957,6 +962,7 @@ impl AnchorMaps {
         Ok(())
     }
 
+    #[cfg(test)]
     fn delete(fd: BorrowedFd<'_>, key: &[u8]) -> io::Result<()> {
         let attr = MapElemAttr {
             map_fd: fd.as_raw_fd() as u32,
@@ -978,18 +984,23 @@ impl AnchorMaps {
     /// the caller treats as already clear. Deletion can only clear an
     /// assertion, never manufacture one the target program would trust.
     ///
-    /// Interim teardown primitive: the address must come from the caller's
-    /// own bookkeeping (never from a kernel read — these fds refuse
-    /// reads). W3-2 replaces address-keyed teardown with a kernel-side
-    /// slot/generation command that removes the entry without userspace
-    /// ever handling an inode address.
+    /// Test-only interim teardown primitive: the address must come from
+    /// the caller's own bookkeeping (never from a kernel read — these fds
+    /// refuse reads). W3-2 replaces address-keyed teardown with a
+    /// kernel-side slot/generation command that removes the entry without
+    /// userspace ever handling an inode address.
+    #[cfg(test)]
     pub fn remove(&self, addr: u64) -> io::Result<()> {
         Self::delete(self.hash.as_fd(), &addr.to_ne_bytes())
     }
 
     /// Record `addr` as slot `slot`'s last-installed address. Mirrors the
     /// program's own bookkeeping for slots userspace tears down directly.
-    /// Interim alongside [`AnchorMaps::remove`]: same W3-2 replacement.
+    /// Test-only interim alongside [`AnchorMaps::remove`]: same W3-2
+    /// replacement. (Unrestricted bookkeeping must stay out of the
+    /// non-test API: clearing a slot cell without clearing its hash
+    /// assertion would blind the program's conflict guard to a reinstall.)
+    #[cfg(test)]
     pub fn set_slot(&self, slot: u32, addr: u64) -> io::Result<()> {
         Self::update(self.slots.as_fd(), &slot.to_ne_bytes(), &addr.to_ne_bytes())
     }
@@ -2790,7 +2801,11 @@ mod tests {
     /// API — no read method under any name, no second impl block, no
     /// trait impl anywhere in the file. Renamed reads (`get_slot`,
     /// `lookup_raw`, `AsRawFd`, manual `Debug`) all fail here, where the
-    /// old exact-name grep passed. The literal `derive(Debug)` mutation
+    /// old exact-name grep passed. The interim teardown primitives
+    /// (`remove`/`set_slot` plus their `update`/`delete` helpers) must be
+    /// `#[cfg(test)]`-gated: unrestricted bookkeeping has no place in the
+    /// non-test API (production teardown is W3-2's kernel-side
+    /// slot/generation command). The literal `derive(Debug)` mutation
     /// test is kept below as well.
     #[test]
     fn anchor_handle_exposes_exact_write_api() {
@@ -2823,13 +2838,26 @@ mod tests {
             .expect("impl block end");
         let mut public = BTreeSet::new();
         let mut private = BTreeSet::new();
+        let mut gated = BTreeSet::new();
+        let mut previous = String::new();
         for line in block.lines().take(end) {
             let trimmed = line.trim_start();
+            // The gate attribute sits immediately above its method.
+            let is_gated = previous.trim_start() == "#[cfg(test)]";
             if let Some(rest) = trimmed.strip_prefix("pub fn ") {
-                public.insert(rest.split('(').next().expect("method name").to_string());
+                let name = rest.split('(').next().expect("method name").to_string();
+                if is_gated {
+                    gated.insert(name.clone());
+                }
+                public.insert(name);
             } else if let Some(rest) = trimmed.strip_prefix("fn ") {
-                private.insert(rest.split('(').next().expect("method name").to_string());
+                let name = rest.split('(').next().expect("method name").to_string();
+                if is_gated {
+                    gated.insert(name.clone());
+                }
+                private.insert(name);
             }
+            previous = line.to_string();
         }
         assert_eq!(
             public,
@@ -2844,6 +2872,16 @@ mod tests {
             private,
             BTreeSet::from(["update".to_string(), "delete".to_string()]),
             "private AnchorMaps helpers must stay exactly update/delete"
+        );
+        assert_eq!(
+            gated,
+            BTreeSet::from([
+                "remove".to_string(),
+                "set_slot".to_string(),
+                "update".to_string(),
+                "delete".to_string()
+            ]),
+            "interim teardown must be #[cfg(test)]-gated out of the non-test API"
         );
         // Kept: the literal `Debug`-derive mutation test (M4).
         let handle = rust

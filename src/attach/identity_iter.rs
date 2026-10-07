@@ -2695,30 +2695,105 @@ mod tests {
         <AnchorMaps as AmbiguousIfSerialize<_>>::probe();
     }
 
-    /// Audit one identity C source for record-leak shape: every
-    /// `seq_write` call passes the ABI record struct, and no `emit(...)`
-    /// argument text — definition or call site, however wrapped — names
-    /// an inode-derived value. Returns the rejection reason instead of
-    /// panicking so mutation proofs can assert rejection.
-    fn audit_identity_c_source(source: &str, path: &str) -> Result<(), String> {
-        for (number, line) in source.lines().enumerate() {
-            if line.contains("seq_write(seq") && !line.contains("&record") {
-                return Err(format!("{path}:{} seq_write must pass &record", number + 1));
+    /// Whether `text` mentions `word` as a whole C identifier — `addr`
+    /// matches `addr` and `*addr`, never `my_addr`.
+    fn mentions_word(text: &str, word: &str) -> bool {
+        let mut rest = text;
+        while let Some(found) = rest.find(word) {
+            let boundary =
+                |side: Option<char>| side.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            let before = rest[..found].chars().next_back();
+            let after = rest[found + word.len()..].chars().next();
+            if boundary(before) && boundary(after) {
+                return true;
             }
+            rest = &rest[found + word.len()..];
         }
-        // Every `emit(` argument list, balanced across wrapped lines.
-        let bytes = source.as_bytes();
+        false
+    }
+
+    /// Byte index of a plain `=` assignment in `code` (`=`, `+=`, `|=`…
+    /// count; `==`, `!=`, `<=`, `>=` never do), or `None`.
+    fn find_assignment(code: &str) -> Option<usize> {
+        let bytes = code.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'=' {
+                let prev = if index > 0 { bytes[index - 1] } else { b' ' };
+                let next = bytes.get(index + 1).copied().unwrap_or(b' ');
+                if prev != b'=' && prev != b'!' && prev != b'<' && prev != b'>' && next != b'=' {
+                    return Some(index);
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Remove `&ident` (address-of) tokens from `expr`, never `&&`
+    /// (logical and): `p11_map_lookup(&anchors, &addr)` passes stack
+    /// pointers as keys, not the inode address itself, so the result is
+    /// not inode-derived.
+    fn strip_address_of(expr: &str) -> String {
+        let mut out = String::with_capacity(expr.len());
+        let mut chars = expr.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '&' && chars.peek() != Some(&'&') {
+                let mut lookahead = chars.clone();
+                if lookahead
+                    .next()
+                    .is_some_and(|next| next.is_alphabetic() || next == '_')
+                {
+                    let rest = lookahead
+                        .take_while(|next| next.is_alphanumeric() || *next == '_')
+                        .count();
+                    for _ in 0..rest + 1 {
+                        chars.next();
+                    }
+                    out.push(' ');
+                    continue;
+                }
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    fn expr_is_tainted(expr: &str, tainted: &BTreeSet<String>) -> bool {
+        let value = strip_address_of(expr);
+        tainted.iter().any(|var| mentions_word(&value, var))
+    }
+
+    /// Audit one C function body: no `emit(...)` argument (checked at its
+    /// call site, against the taint set at that point) carries an
+    /// inode-derived value, and no `record.<field>` store takes one.
+    /// Taint sources (sticky, never cleared): `addr` (the inode pointer),
+    /// `old` (the slot cell's stored address), `f_inode` (the inode field
+    /// itself). Assignments propagate taint to plain-variable targets
+    /// (across intermediates); clean reassignment clears non-source
+    /// variables, whose value was replaced; stores through `*p`, `p.f`,
+    /// `p->f`, `a[i]` are map or struct writes, not variable taint —
+    /// except `record.*` stores, which feed `seq_write` and are checked.
+    /// `P11_READ(dst, src)` counts as `dst = src`.
+    fn audit_c_chunk(chunk: &str, path: &str) -> Result<(), String> {
+        const SOURCES: [&str; 3] = ["addr", "old", "f_inode"];
+        // Every `emit(` call's start line and argument text, balanced
+        // across wrapped lines. (The `emit` definition itself matches
+        // `emit(` too; its parameter list carries no tainted value.)
+        let mut calls: Vec<(usize, String)> = Vec::new();
+        let bytes = chunk.as_bytes();
         let mut at = 0;
-        while let Some(found) = source[at..].find("emit(") {
+        while let Some(found) = chunk[at..].find("emit(") {
+            let start = at + found;
             let mut depth = 0usize;
             let mut end = None;
-            for (offset, byte) in bytes[at + found..].iter().enumerate() {
+            for (offset, byte) in bytes[start..].iter().enumerate() {
                 match byte {
                     b'(' => depth += 1,
                     b')' => {
                         depth -= 1;
                         if depth == 0 {
-                            end = Some(at + found + offset);
+                            end = Some(start + offset);
                             break;
                         }
                     }
@@ -2726,17 +2801,113 @@ mod tests {
                 }
             }
             let Some(close) = end else {
-                return Err(format!("{path}: unbalanced emit( past byte {}", at + found));
+                return Err(format!("{path}: unbalanced emit( in chunk"));
             };
-            let args = &source[at + found..=close];
-            for forbidden in ["addr", "inode"] {
-                if args.contains(forbidden) {
-                    return Err(format!(
-                        "{path}: emit(...) argument names {forbidden:?}: {args}"
-                    ));
+            calls.push((
+                chunk[..start].matches('\n').count(),
+                chunk[start..=close].to_string(),
+            ));
+            at = close + 1;
+        }
+        let mut tainted: BTreeSet<String> = SOURCES.iter().map(|name| name.to_string()).collect();
+        for (number, line) in chunk.lines().enumerate() {
+            for (start_line, args) in &calls {
+                if *start_line != number {
+                    continue;
+                }
+                for forbidden in ["addr", "inode"] {
+                    if args.contains(forbidden) {
+                        return Err(format!(
+                            "{path}: emit(...) argument names {forbidden:?}: {args}"
+                        ));
+                    }
+                }
+                for var in &tainted {
+                    if mentions_word(args, var) {
+                        return Err(format!(
+                            "{path}: emit(...) argument carries tainted {var:?}: {args}"
+                        ));
+                    }
                 }
             }
-            at = close + 1;
+            let code = line.split("//").next().unwrap_or("");
+            if let Some(read) = code.find("P11_READ(") {
+                let args = &code[read + "P11_READ(".len()..];
+                if let Some((dst, src)) = args.split_once(',') {
+                    let dst = dst.trim().to_string();
+                    if expr_is_tainted(src, &tainted) {
+                        tainted.insert(dst);
+                    } else if !SOURCES.contains(&dst.as_str()) {
+                        tainted.remove(&dst);
+                    }
+                }
+                continue;
+            }
+            let Some(eq) = find_assignment(code) else {
+                continue;
+            };
+            let (lhs, rhs) = code.split_at(eq);
+            let rhs = &rhs[1..];
+            let lhs = lhs
+                .trim()
+                .trim_end_matches(['+', '-', '*', '/', '%', '&', '|', '^'])
+                .trim();
+            if lhs.contains("record.") || lhs.contains("record->") {
+                if expr_is_tainted(rhs, &tainted) {
+                    return Err(format!(
+                        "{path}: record field store of tainted value: {line}"
+                    ));
+                }
+                continue;
+            }
+            if lhs.contains(['*', '.', '[']) || lhs.contains("->") {
+                continue;
+            }
+            let Some(name) = lhs.split_whitespace().next_back() else {
+                continue;
+            };
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            if expr_is_tainted(rhs, &tainted) {
+                tainted.insert(name.to_string());
+            } else if !SOURCES.contains(&name) {
+                tainted.remove(name);
+            }
+        }
+        Ok(())
+    }
+
+    /// Audit one identity C source for record-leak shape, per function:
+    /// every `seq_write` call passes the ABI record struct, and no
+    /// `emit(...)` argument carries an inode-derived value — tracked by a
+    /// taint analysis over assignments ([`audit_c_chunk`]), so `start =
+    /// addr` before an `emit(..., start, ...)` fails even though the
+    /// argument text is clean. Returns the rejection reason instead of
+    /// panicking so mutation proofs can assert rejection. The analysis is
+    /// intra-procedural and alias-insensitive by design; the object digest
+    /// pin stays as the complementary tripwire for anything it cannot see.
+    fn audit_identity_c_source(source: &str, path: &str) -> Result<(), String> {
+        for (number, line) in source.lines().enumerate() {
+            if line.contains("seq_write(seq") && !line.contains("&record") {
+                return Err(format!("{path}:{} seq_write must pass &record", number + 1));
+            }
+        }
+        // Per-function chunks at top-level closing braces, so taint never
+        // leaks across functions (C nests no functions; maps and structs
+        // close with `};`).
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for line in source.lines() {
+            current.push_str(line);
+            current.push('\n');
+            if line == "}" {
+                chunks.push(std::mem::take(&mut current));
+            }
+        }
+        chunks.push(current);
+        for chunk in &chunks {
+            audit_c_chunk(chunk, path)?;
         }
         Ok(())
     }
@@ -2744,9 +2915,12 @@ mod tests {
     /// The kernel never receives an inode address in a record struct: the
     /// record fields are exactly the ABI names, `seq_write` passes
     /// `&record`, and no `emit(...)` argument smuggles an inode-derived
-    /// value into an existing record field. Producer mutations (an inode
-    /// address written into `start`, into the DUP alias field) must fail
-    /// the audit — proven by mutating the real sources in memory.
+    /// value into an existing record field — directly, or renamed through
+    /// an assignment (`start = addr`) the argument text hides. Producer
+    /// mutations (an inode address into `start`, into the DUP alias
+    /// field, through a pre-emit assignment, through an intermediate)
+    /// must fail the audit — proven by mutating the real sources in
+    /// memory.
     #[test]
     fn kernel_records_carry_no_inode_addresses() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2795,6 +2969,208 @@ mod tests {
             audit_identity_c_source(&mutated, path).is_err(),
             "mutation 2 (addr into DUP field) must fail the audit"
         );
+        // Producer mutation 3: rename the leak through an assignment —
+        // `start = addr` immediately before the existing target emit.
+        // The argument text stays clean (`start`), so a lexical audit
+        // survives this; the data-flow audit must fail it.
+        let mutated = c.replacen(
+            "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            "    start = addr;\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            1,
+        );
+        assert_ne!(mutated, c, "mutation 3 must apply");
+        assert!(
+            audit_identity_c_source(&mutated, path).is_err(),
+            "mutation 3 (start = addr before emit) must fail the audit"
+        );
+        // Producer mutation 4: the same leak through an intermediate —
+        // taint must propagate across assignments.
+        let mutated = c.replacen(
+            "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            "    u64 smuggled = addr;\n    start = smuggled;\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            1,
+        );
+        assert_ne!(mutated, c, "mutation 4 must apply");
+        assert!(
+            audit_identity_c_source(&mutated, path).is_err(),
+            "mutation 4 (addr through an intermediate) must fail the audit"
+        );
+    }
+
+    /// Strip `//` comments and `"..."` string literals (with `\"`
+    /// escapes) from one line: what remains is code shape (braces, item
+    /// keywords). Single-quote char literals are passed through — the
+    /// audited block holds none with braces.
+    fn strip_line_noise(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut chars = line.chars().peekable();
+        let mut in_string = false;
+        while let Some(ch) = chars.next() {
+            if in_string {
+                if ch == '\\' {
+                    chars.next();
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_string = true;
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'/') {
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    /// Parse one `impl AnchorMaps` method line: `Some((name, public))`
+    /// for any visibility/modifier spelling (`fn`, `pub fn`,
+    /// `pub(crate) fn`, `pub const fn`, `const unsafe fn`, ...), `None`
+    /// otherwise. Only lines that START an item match — a method body
+    /// cannot start with these qualifiers, so `let f: fn(u32)` inside a
+    /// body never matches — and `fn` must be followed by a name plus
+    /// `(` or `<`.
+    fn parse_impl_method(line: &str) -> Option<(String, bool)> {
+        let code = strip_line_noise(line);
+        let trimmed = code.trim_start();
+        if !(trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("unsafe ")
+            || trimmed.starts_with("async "))
+        {
+            return None;
+        }
+        let (before, after) = trimmed.split_once("fn ")?;
+        // `before` must be qualifiers only: strip one balanced `pub(...)`
+        // span, then every remaining token must be a plain qualifier.
+        let mut qualifiers = before.to_string();
+        if let Some(start) = qualifiers.find("pub(") {
+            let tail = &qualifiers[start..];
+            let mut depth = 0;
+            let mut end = None;
+            for (offset, ch) in tail.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            qualifiers.replace_range(start..start + end?, " ");
+        }
+        if !qualifiers
+            .split_whitespace()
+            .all(|token| matches!(token, "pub" | "const" | "unsafe" | "async"))
+        {
+            return None;
+        }
+        let name: String = after
+            .chars()
+            .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+            .collect();
+        if name.is_empty() {
+            return None;
+        }
+        let rest = after[name.len()..].trim_start();
+        if !(rest.starts_with('(') || rest.starts_with('<')) {
+            return None;
+        }
+        Some((name, before.contains("pub")))
+    }
+
+    /// Enumerate the methods of an `impl AnchorMaps` block (the text
+    /// after `impl AnchorMaps`): (public, private, `#[cfg(test)]`-gated)
+    /// name sets. The block range comes from brace matching (immune to a
+    /// body brace dedented to column 0, which would truncate a
+    /// first-`}` scan and hide later methods); method lines parse with
+    /// [`parse_impl_method`], any visibility/modifier spelling. Shared by
+    /// the exact-API test and the bypass-mutation proofs below.
+    fn anchor_maps_api(block: &str) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+        let mut depth = 0i32;
+        let mut started = false;
+        let mut end = None;
+        for (index, line) in block.lines().enumerate() {
+            for ch in strip_line_noise(line).chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        started = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if started && depth == 0 {
+                end = Some(index);
+                break;
+            }
+        }
+        let end = end.expect("impl block end");
+        let mut public = BTreeSet::new();
+        let mut private = BTreeSet::new();
+        let mut gated = BTreeSet::new();
+        let mut previous = String::new();
+        for line in block.lines().take(end) {
+            // The gate attribute sits immediately above its method.
+            let is_gated = previous.trim_start() == "#[cfg(test)]";
+            if let Some((name, is_public)) = parse_impl_method(line) {
+                if is_gated {
+                    gated.insert(name.clone());
+                }
+                if is_public {
+                    public.insert(name);
+                } else {
+                    private.insert(name);
+                }
+            }
+            previous = strip_line_noise(line);
+        }
+        (public, private, gated)
+    }
+
+    /// The API enumeration sees through visibility and modifier bypasses:
+    /// a `pub(crate) fn` fd accessor and a `pub const fn` reader, added to
+    /// a copy of the real sources in memory, must both show up in the
+    /// public set (where the exact-set assertion would then fail).
+    #[test]
+    fn anchor_api_enumeration_catches_bypass_signatures() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rust =
+            std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
+        let code = rust.split_once("mod tests").expect("test module").0;
+        let api_of = |code: &str| {
+            let block = code.split_once("impl AnchorMaps").expect("impl block").1;
+            anchor_maps_api(block)
+        };
+        for smuggled in [
+            "    pub(crate) fn raw_hash_fd(&self) -> i32 { 0 }\n",
+            "    pub const fn fd_accessor(&self) -> i32 { 0 }\n",
+        ] {
+            let mutated =
+                code.replacen("    pub fn new(", &format!("{smuggled}    pub fn new("), 1);
+            assert_ne!(mutated, code, "mutation must apply");
+            let (public, _, _) = api_of(&mutated);
+            let name = smuggled
+                .split("fn ")
+                .nth(1)
+                .expect("fn name")
+                .split('(')
+                .next()
+                .expect("name end");
+            assert!(
+                public.contains(name),
+                "enumeration must catch the bypass signature {name}"
+            );
+        }
     }
 
     /// Structural I6: the anchor handle exposes exactly its write-only
@@ -2817,48 +3193,24 @@ mod tests {
         // Exactly one inherent impl, and no trait impl for the handle
         // anywhere in production code (manual `Debug`/`Display`/`AsRawFd`/
         // `Deref` included; `anchor_maps_implements_no_leak_traits`
-        // backs this structurally for the whole crate).
+        // backs this structurally for the whole crate). Both match on
+        // whitespace-normalized shape, so extra spaces or newlines
+        // (`impl  AnchorMaps`, `for\nAnchorMaps`) cannot smuggle a block
+        // past the predicates.
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
-            code.lines()
-                .filter(|line| line.trim_start().starts_with("impl AnchorMaps"))
-                .count(),
+            flat.match_indices("impl AnchorMaps").count(),
             1,
             "exactly one inherent impl AnchorMaps block"
         );
         assert!(
-            !code.contains("for AnchorMaps"),
+            !flat.contains("for AnchorMaps"),
             "no trait impl for AnchorMaps in production code"
         );
         // The block's method names, exactly: any added method — read,
         // write, or otherwise — fails here.
         let block = code.split_once("impl AnchorMaps").expect("impl block").1;
-        let end = block
-            .lines()
-            .position(|line| line == "}")
-            .expect("impl block end");
-        let mut public = BTreeSet::new();
-        let mut private = BTreeSet::new();
-        let mut gated = BTreeSet::new();
-        let mut previous = String::new();
-        for line in block.lines().take(end) {
-            let trimmed = line.trim_start();
-            // The gate attribute sits immediately above its method.
-            let is_gated = previous.trim_start() == "#[cfg(test)]";
-            if let Some(rest) = trimmed.strip_prefix("pub fn ") {
-                let name = rest.split('(').next().expect("method name").to_string();
-                if is_gated {
-                    gated.insert(name.clone());
-                }
-                public.insert(name);
-            } else if let Some(rest) = trimmed.strip_prefix("fn ") {
-                let name = rest.split('(').next().expect("method name").to_string();
-                if is_gated {
-                    gated.insert(name.clone());
-                }
-                private.insert(name);
-            }
-            previous = line.to_string();
-        }
+        let (public, private, gated) = anchor_maps_api(block);
         assert_eq!(
             public,
             BTreeSet::from([

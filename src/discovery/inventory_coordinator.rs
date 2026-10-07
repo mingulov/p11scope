@@ -1868,7 +1868,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn absorb_pair_counts(&mut self, batch: &WitnessBatch) {
         for row in &batch.rows {
             let key = PairKey::of(row);
-            if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped)) {
+            if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped { .. })) {
                 continue;
             }
             let held = self.pair_counts.entry(key).or_insert(PairCount {
@@ -1888,7 +1888,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut retry = Vec::new();
         for update in &batch.counts {
             let key = PairKey::of_update(batch.domain, update);
-            if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped)) {
+            if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped { .. })) {
                 continue;
             }
             let held = {
@@ -2075,31 +2075,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Records one bound row's pair target (P3): the pair always
-    /// starts pending — placement resolves at publication, together
+    /// (re-)binds pending — placement resolves at publication, together
     /// with the witness, against the mappings the publication commits
     /// (including this same window's). Nothing here reads the
     /// pre-publish committed snapshot: a single committed edge proves
     /// nothing while a second mapping stages, and caching `Bound` from
     /// it would attribute the count where the witness reads ambiguous.
-    /// The held count (first sight merged with any refresh) stages
-    /// pending with the bind; the publication's decisions finalize the
-    /// target as `Bound` or `Dropped`.
+    /// A rebind carries the pair's attributed history: rebinding over a
+    /// live or dropped target keeps its base (and staged absolute), so
+    /// only a genuine advance past what is staged stages — and demoted
+    /// past what the base holds (round 4, rebind). The publication's
+    /// decisions finalize the target as `Bound` or `Dropped`.
     fn bind_pair_count(&mut self, row: &WitnessRow, caller: CallerId, modules: &[ModuleKey]) {
         let key = PairKey::of(row);
+        let held = self.pair_counts.get(&key).map(|count| count.count).unwrap_or(0);
+        let (base, staged) = match self.pair_targets.get(&key) {
+            Some(PairTarget::Pending { base, staged, .. }) => (*base, *staged),
+            Some(PairTarget::Bound {
+                caller: bound_caller,
+                module,
+                base,
+                ..
+            }) => {
+                // Attributed so far: the base plus the bound edge's
+                // post-base growth, capped at the held absolute (the
+                // edge may carry another pair's maximum, which must
+                // never gate this pair's growth).
+                let edge = self
+                    .registry
+                    .module_id_for(module)
+                    .and_then(|id| self.registry.edge(*bound_caller, id))
+                    .map(|edge| edge.entry_count)
+                    .unwrap_or(0);
+                (*base, base.saturating_add(edge).min(held))
+            }
+            Some(PairTarget::Dropped { base }) => (*base, *base),
+            None => (0, 0),
+        };
         self.pair_targets.insert(
             key,
             PairTarget::Pending {
                 caller,
                 modules: modules.to_vec(),
-                staged: 0,
+                staged,
                 endpoint: row.endpoint,
-                base: 0,
+                base,
             },
         );
         if let Some(count) = self.pair_counts.get(&key).copied()
-            && count.count > 0
+            && count.count > staged
         {
-            self.stage_pending_count(key, caller, modules, count, false);
+            let demoted = base > 0;
+            self.stage_pending_count(key, caller, modules, rebased_count(count, base), demoted);
             if let Some(PairTarget::Pending { staged, .. }) = self.pair_targets.get_mut(&key) {
                 *staged = count.count;
             }
@@ -2174,11 +2201,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }
                 }
                 PendingCountOutcome::Rejected { .. } => {
-                    if matches!(
-                        self.pair_targets.get(&key),
-                        Some(PairTarget::Pending { .. })
-                    ) {
-                        self.pair_targets.insert(key, PairTarget::Dropped);
+                    if let Some(PairTarget::Pending { staged, .. }) = self.pair_targets.get(&key) {
+                        // The drop remembers the absolute staged so far:
+                        // a later row rebinds past it (round 4, rebind).
+                        let base = *staged;
+                        self.pair_targets.insert(key, PairTarget::Dropped { base });
                         self.pair_counts.remove(&key);
                     }
                 }
@@ -2188,10 +2215,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Drops one pair's counts (C7 C4): binder-unbound, or no module at
-    /// all — held and later counts never publish.
+    /// all — held and later counts never publish. The drop still
+    /// remembers the held absolute, so a later row rebinds past it
+    /// instead of attributing pre-drop calls to a new owner (round 4,
+    /// rebind).
     fn drop_pair_count(&mut self, row: &WitnessRow) {
         let key = PairKey::of(row);
-        self.pair_targets.insert(key, PairTarget::Dropped);
+        let base = self.pair_counts.get(&key).map(|count| count.count).unwrap_or(0);
+        self.pair_targets.insert(key, PairTarget::Dropped { base });
         self.pair_counts.remove(&key);
     }
 
@@ -2605,9 +2636,13 @@ enum PairTarget {
         endpoint: EndpointId,
         base: u64,
     },
-    /// The pair never publishes: binder-unbound, or no module at all.
-    /// Held and later counts drop.
-    Dropped,
+    /// The pair never publishes from here: binder-unbound, no module
+    /// at all, or a rejected publication. Held and later counts drop —
+    /// but `base` remembers the absolute count through the drop
+    /// (attributed or disclosed history), so a later witness row for
+    /// the same pair rebinds past it instead of re-absorbing it (round
+    /// 4, rebind).
+    Dropped { base: u64 },
 }
 
 /// Per-endpoint attach state from the capture facade's receipts. Bounded by
@@ -6723,6 +6758,180 @@ mod tests {
     }
 
     #[test]
+    fn repeated_witness_row_after_demotion_keeps_the_base() {
+        // Round 4, rebind (R4-N1 R1): A=5 transfers to B=1 at absolute 6;
+        // a repeated witness row plus an advance to 7 must not reset the
+        // demotion base — B reads 2 (its growth), never the absolute 7.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 6)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // A repeated witness row plus an advance, in one read.
+        let repeat = native.row(41, 1, 7, 100, 0);
+        native.counts_read(vec![repeat], vec![(41, 1, 0, 7)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_count = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(
+            edge_count(&native, "a.so"),
+            Some(5),
+            "A keeps exactly its history"
+        );
+        assert_eq!(
+            edge_count(&native, "b.so"),
+            Some(2),
+            "a repeated row after demote+place stages growth, never the absolute"
+        );
+        assert_eq!(
+            edge_count(&native, "a.so").unwrap() + edge_count(&native, "b.so").unwrap(),
+            7,
+            "no duplication: the edges sum to the pair's absolute count"
+        );
+        let _ = shared;
+    }
+
+    #[test]
+    fn dropped_pair_revival_rebases_past_the_drop() {
+        // Round 4, rebind (R4-N1 R2): demote (A=1) then reject over 19
+        // disclosed calls; sharing resolves; a repeated row plus an
+        // advance to 22 must stage only post-drop growth (B=2) — never
+        // re-absorb the dropped absolute.
+        use crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 20)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Sharing resolves: A leaves, B stays the sole admitted member.
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        // A repeated witness row rebinds the dropped pair (its refresh
+        // was skipped while dropped, so nothing stages yet).
+        let repeat = native.row(41, 1, 7, 100, 0);
+        native.read(vec![repeat]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // The next advance stages only post-drop growth.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 22)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_count = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(
+            edge_count(&native, "a.so"),
+            Some(1),
+            "A keeps exactly its history"
+        );
+        assert_eq!(
+            edge_count(&native, "b.so"),
+            Some(2),
+            "a revived pair stages post-drop growth, never the dropped absolute"
+        );
+        let gaps: Vec<_> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "the drop's disclosure stands exactly once: {:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+        let _ = shared;
+    }
+
+    #[test]
     fn a_rejected_count_is_never_promoted_by_a_later_mapping() {
         // P3 finalization (sol#2): a bound row with no mapping edge
         // places its witness module-level and rejects its count; the
@@ -6859,7 +7068,7 @@ mod tests {
         assert!(
             matches!(
                 native.scene.coordinator.pair_targets.get(&key),
-                Some(PairTarget::Dropped)
+                Some(PairTarget::Dropped { .. })
             ),
             "the ambiguous pair finalizes Dropped: {:?}",
             native.scene.coordinator.pair_targets.get(&key)

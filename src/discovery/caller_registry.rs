@@ -2075,6 +2075,7 @@ impl CallerRegistry {
     /// silently (F3-02). `pending_id` is the coordinator's opaque
     /// handle: the publication reports every pending count's placement
     /// through [`Self::take_pending_count_decisions`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn note_pending_count(
         &mut self,
         pending_id: u64,
@@ -2959,6 +2960,7 @@ impl CallerRegistry {
     /// gaps, and no gap is owed twice), while a demoted rejection
     /// mirrors the witness gaps instead (F3-02). Every outcome is
     /// reported through [`Self::take_pending_count_decisions`].
+    #[allow(clippy::too_many_arguments)]
     fn apply_pending_count(
         &mut self,
         pending_id: u64,

@@ -225,17 +225,21 @@ fn default_objects_byte_identical_to_base() {
 /// `000caca5…`; round 2 adds the fifth map plus the end-containment
 /// check; round 3 re-pins comment-only — the observed-map doc comment
 /// was rewritten with identical line numbers, so code/maps/BTF are
-/// byte-identical and only the DWARF `.debug_line` source MD5 moved);
-/// the build-info test below binds the pin to the compiler digest and
-/// CPU baseline it was recorded with.
+/// byte-identical and only the DWARF `.debug_line` source MD5 moved;
+/// round 4 re-pins comment-only again — the marker-outcome phrase was
+/// narrowed to the explicit triple with identical line numbers, so
+/// `iter/task_vma`, `.maps`, `license`, `.BTF`, and `.BTF.ext` are
+/// byte-identical and only `.debug_line` moved); the build-info test
+/// below binds the pin to the compiler digest and CPU baseline it was
+/// recorded with.
 #[test]
 fn identity_object_digest_pinned() {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(OBJECT);
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
-        hex, "f43fb78f2ec1aee9e0a664ad5dae1cbcdc08801b966632e6ff0ade6cbc6ee9ce",
-        "p11scope-ebpf-identity must stay byte-identical to the round-3 pin"
+        hex, "e948001ed065c7f731ae3753a3bc59c4923d38e4fffb64bfb789527e9c4a5420",
+        "p11scope-ebpf-identity must stay byte-identical to the round-4 pin"
     );
 }
 

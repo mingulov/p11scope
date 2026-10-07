@@ -87,6 +87,8 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/vma_identity.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/vma_identity.h");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.lock");
     println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
@@ -137,6 +139,11 @@ fn main() {
             wide_detailed,
         );
     }
+    // The identity flavor is a standalone clang invocation, not a fourth
+    // `build_variant` arm (the `native_units` match text is pinned by the
+    // image-identity contract test): adding or changing it cannot alter the
+    // three objects above.
+    build_identity_object();
     println!(
         "cargo:rustc-env=P11SCOPE_INVENTORY_VARIANT={}",
         if small_discovery_ring {
@@ -413,4 +420,49 @@ fn build_variant(
         }),
     )
     .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));
+}
+
+/// Stage 3 Wave D identity object (D2a): `crates/ebpf/native/vma_identity.c`
+/// compiled by clang-18 straight to a BPF ELF. No Rust crate, no nightly,
+/// and no bpf-linker take part, so this object is independent of the B1
+/// blockers by construction. It carries no small-ring or diagnostic variant:
+/// the anchor and scope maps have fixed capacities.
+fn build_identity_object() {
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+
+    let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
+        Ok("big") => "bpfeb",
+        _ => "bpfel",
+    };
+    // Same reproducibility rules as the bitcode builds above: fixed source
+    // prefix, fixed compilation directory, no recorded command line, so the
+    // object never records the build host's checkout path.
+    let mut file_prefix_map = OsString::from("-ffile-prefix-map=");
+    file_prefix_map.push(manifest_dir.as_os_str());
+    file_prefix_map.push("=/p11scope");
+    let status = Command::new("clang-18")
+        .current_dir(&out_dir)
+        .args([
+            "-target",
+            target,
+            "-O2",
+            "-g",
+            "-gno-record-gcc-switches",
+            "-fdebug-compilation-dir=/p11scope/native",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-c",
+        ])
+        .arg(&file_prefix_map)
+        .arg(manifest_dir.join("crates/ebpf/native/vma_identity.c"))
+        .args(["-o", "p11scope-ebpf-identity"])
+        .status()
+        .expect("failed to spawn clang-18 for the identity object");
+    assert!(
+        status.success(),
+        "building the identity object failed: {status}"
+    );
 }

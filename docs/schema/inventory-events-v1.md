@@ -94,9 +94,13 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     it. The class is the edge's entries (the count's power-of-two
     bucket — 0, 1, 2–3, 4–7, … — plus `saturated`, `in_flight` and
     `observation`), its full `entries.coverage`, and `presence`,
-    `capture` and `activity` (as of the whole-run activity window).
-    Other fields (mapping instants and interruptions, semantics) do not
-    trigger a record by themselves.
+    `capture` and `activity` (per-pass: `recently observed` iff the
+    count rose since the previous pass). Other fields (mapping instants
+    and interruptions, semantics) do not trigger a record by
+    themselves. The recorded `activity` is window-free; only the
+    dashboard display renders its own trailing 5 s `recently observed`
+    window (`DASHBOARD_ACTIVITY_WINDOW_NS`) from `last_seen_ns`, which
+    never appears in records or the snapshot.
   - Since v0.3.0 (C7), a count change that is not a class change emits
     at most once per edge per 10 s, with the latest count: an edge whose
     exact count drifted past its last carried count becomes due again

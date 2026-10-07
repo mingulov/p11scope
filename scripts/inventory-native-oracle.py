@@ -820,15 +820,21 @@ def expected_activity_base(payload):
 
 
 def per_pass_recent_allowed(payload, prev_count):
-    """Whether `recent` is legal on this counted record: a rise since
-    the edge's previous record allows it (the emission may lag the
-    rising pass), as does a first record (emission-cap deferral may
-    delay it past the rising pass). An unchanged count forbids it —
-    that is the Choice 3 pin. Non-counted payloads never allow it."""
+    """Whether `recent` is legal on this counted record, matching
+    production precedence (Activity::for_edge): a rise since the edge's
+    previous record allows it (the emission may lag the rising pass),
+    as does a first record (emission-cap deferral may delay it past
+    the rising pass) — even over lossy coverage (a fresh rise beats
+    lossy). An unchanged count forbids it — that is the Choice 3 pin —
+    and so does in-flight (production reads in-flight over a rise).
+    Non-counted payloads never allow it."""
     cov = coverage(payload)
-    if cov.get("state") != "counted" or cov.get("lossy"):
+    entries = payload.get("entries") or {}
+    if cov.get("state") != "counted":
         return False
-    count = (payload.get("entries") or {}).get("count")
+    if entries.get("in_flight") or (payload.get("operations") or {}).get("active"):
+        return False
+    count = entries.get("count")
     if prev_count is None or not isinstance(count, int) or not isinstance(prev_count, int):
         return True
     return count > prev_count
@@ -1129,19 +1135,74 @@ def check_streams(view, res):
     # its base (a window echo fails), and a rise — or a first record,
     # whose emission the per-pass cap may have deferred past the rising
     # pass — admits recent-or-base. Non-counted records read base.
+    # Proven comparison (fix round 1): consecutive records in ADJACENT
+    # pass segments with zero deferred records on the proving markers
+    # show what each pass saw — a rise across them must read recent
+    # (or in-flight where recent is forbidden), never base. Non-adjacent
+    # records stay lenient: the rise may predate the latest pass.
+    markers = [e for e in events if e.get("kind") in (EVENT_KINDS["pass"], EVENT_KINDS["ended"])]
+    markers.sort(key=lambda e: e.get("seq", 0))
+    after = {}
+    for cur, nxt in zip(markers, markers[1:] + [None]):
+        after[cur.get("seq")] = nxt
+    before = {}
+    for prev, cur in zip([None] + markers, markers):
+        before[cur.get("seq")] = prev
+
+    def closing_marker(row_seq):
+        for marker in markers:
+            if marker.get("seq", 0) > row_seq:
+                return marker
+        return None
+
+    def deferred_is_zero(marker):
+        return type(marker.get("event", {}).get("edge_events_deferred")) is int \
+            and marker["event"]["edge_events_deferred"] == 0
+
+    def proven_rise(prev_row, row):
+        """Whether consecutive records prove a pass-to-pass rise: they
+        close in adjacent marker segments, the earlier record is fresh
+        (no wait past its previous marker — or the first marker, where
+        it is the edge's first record), the later one is fresh (no wait
+        past the earlier segment's marker — or a sweep record, which is
+        always exact-final), and the exact-int counts rise."""
+        if prev_row is None:
+            return False
+        m1, m2 = closing_marker(prev_row.get("seq", 0)), closing_marker(row.get("seq", 0))
+        if m1 is None or m2 is None or after.get(m1.get("seq")) is not m2:
+            return False
+        m0 = before.get(m1.get("seq"))
+        if m0 is not None and not deferred_is_zero(m0):
+            return False
+        if m2.get("kind") != EVENT_KINDS["ended"] and not deferred_is_zero(m1):
+            return False
+        prev_ev = prev_row.get("event") if isinstance(prev_row.get("event"), dict) else {}
+        cur_ev = row.get("event") if isinstance(row.get("event"), dict) else {}
+        prev_seen = (prev_ev.get("entries") or {}).get("count")
+        seen = (cur_ev.get("entries") or {}).get("count")
+        return type(prev_seen) is int and type(seen) is int and seen > prev_seen
+
     activity_bad = []
     for key in sorted(by_edge, key=str):
         rows = sorted(by_edge[key], key=lambda e: e.get("seq", 0))
         prev_count = None
+        prev_row = None
         for row in rows:
             ev = row.get("event") if isinstance(row.get("event"), dict) else None
             if ev is None or not isinstance(ev.get("entries"), dict):
                 prev_count = None
+                prev_row = row
                 continue
             count = ev["entries"].get("count")
             base = expected_activity_base(ev)
             if isinstance(count, int) and isinstance(prev_count, int) and count < prev_count:
                 activity_bad.append((key, f"seq {row.get('seq')} count decreases {prev_count}->{count}"))
+            elif proven_rise(prev_row, row):
+                want = ACTIVITY["recent"] if per_pass_recent_allowed(ev, prev_count) else base
+                if ev.get("activity") != want:
+                    activity_bad.append((key, f"seq {row.get('seq')} reads {ev.get('activity')!r}, "
+                                              f"want {want!r}: consecutive passes prove "
+                                              f"{prev_count}->{count}"))
             elif ev.get("activity") != base and not per_pass_recent_allowed(ev, prev_count):
                 activity_bad.append((key, f"seq {row.get('seq')} reads {ev.get('activity')!r}, "
                                           f"want {base!r} (count {prev_count}->{count})"))
@@ -1149,6 +1210,7 @@ def check_streams(view, res):
                 activity_bad.append((key, f"seq {row.get('seq')} reads {ev.get('activity')!r}, "
                                           f"want {base!r} or {ACTIVITY['recent']!r}"))
             prev_count = count if isinstance(count, int) else None
+            prev_row = row
     res.ok(run, "*", "EDGE-ACTIVITY", not activity_bad,
            f"{len(activity_bad)} edge_observed records misread per-pass activity: {activity_bad[:4]}",
            f"{sum(len(v) for v in by_edge.values())} edge_observed records read per-pass activity")
@@ -3293,6 +3355,100 @@ def self_test():
                                                 (n - 1, T0 + 600 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["quiet"]),
                                                 (n, T0 + 700 + 2 * COUNT_EMIT_INTERVAL_NS, ACTIVITY["recent"])])
         case("per-pass-count-decreases-fails", "EDGE-ACTIVITY", count_falls)
+
+        # ACT precedence (fix round 1): production reads a fresh rise as
+        # recent even over lossy coverage (a rise beats lossy), while
+        # in-flight beats a rise (never recent over in_flight). The
+        # oracle must match both directions.
+        def make_lossy_p1(s, d):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"]["lossy"] = True
+            d["gaps"].append({"caller": None, "module": None, "pid": None,
+                              "subject": "native count refresh loss",
+                              "reason": "1 count-refresh read failure: scripted",
+                              "budget": None, "repeats": 1})
+
+        def lossy_rise_recent(s, d, dash):
+            make_lossy_p1(s, d)
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["lossy"]),
+                                                (n, T0 + 600, ACTIVITY["recent"])])
+        case("per-pass-lossy-rise-recent-pass", None, lossy_rise_recent)
+
+        def lossy_echo(s, d, dash):
+            make_lossy_p1(s, d)
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            return activity_stages(s, d, "P1", [(n, T0 + 500, ACTIVITY["lossy"]),
+                                                (n, T0 + 600 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["recent"])])
+        case("per-pass-lossy-unchanged-recent-fails", "EDGE-ACTIVITY", lossy_echo)
+
+        def inflight_recent(s, d, dash):
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["in_flight"] = True
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["inflight"]),
+                                                (n, T0 + 600, ACTIVITY["recent"])])
+        case("per-pass-inflight-recent-fails", "EDGE-ACTIVITY", inflight_recent)
+
+        def inflight_over_rise(s, d, dash):
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["in_flight"] = True
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            # Same bucket, same activity: the re-emission rides the 10 s
+            # count channel, like production's within-bucket drift.
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["inflight"]),
+                                                (n, T0 + 600 + COUNT_EMIT_INTERVAL_NS,
+                                                 ACTIVITY["inflight"])])
+        case("per-pass-inflight-over-rise-pass", None, inflight_over_rise)
+
+        # ACT proven comparison (fix round 1): consecutive pass segments
+        # with zero deferred records prove what each pass saw — a rise
+        # across them must read recent (the reviewer's 17 -> 37
+        # quiet-quiet instance). One segment per record; both markers
+        # carry deferred 0.
+        def two_pass_activity(s, d, cell, first, second):
+            """Adjacent single-record pass segments: `first`/`second`
+            are (count, at_ns, activity); the last stage must carry the
+            snapshot count."""
+            cid_, mid = cid(s, cell), s.mid["A"]
+            ev = s.events(d)
+            template = [e for e in ev if e["kind"] == "edge_observed"
+                        and e["event"].get("caller") == cid_ and e["event"].get("module") == mid][-1]
+            keep = [e for e in ev if not (e["kind"] == "edge_observed"
+                                          and e["event"].get("caller") == cid_
+                                          and e["event"].get("module") == mid)]
+            at = next(i for i, e in enumerate(keep) if e["kind"] == "pass_committed")
+            end = next(i for i, e in enumerate(keep) if e["kind"] == "ended")
+
+            def rec(stage):
+                count, at_ns, activity = stage
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["event"]["activity"] = activity
+                rec["at_ns"] = at_ns
+                return rec
+
+            first_marker = _deep(keep[at])
+            first_marker["event"]["pass"] -= 1
+            second_marker = _deep(keep[at])
+            second_marker["event"].update(edge_events=1, edge_events_deferred=0, new_gaps=0,
+                                          suppressed_delta=0)
+            out = keep[:at] + [rec(first)] + [first_marker] + [rec(second)] + [second_marker] + keep[end:]
+            return {"events": _renumber(out)}
+
+        def proven_quiet(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            prev = (1 << (count_bucket(n) - 1)) - 1
+            assert count_bucket(prev) != count_bucket(n), (prev, n)
+            return two_pass_activity(s, d, "P1", (prev, T0 + 500, ACTIVITY["quiet"]),
+                                     (n, T0 + 600, ACTIVITY["quiet"]))
+        case("per-pass-proven-rise-quiet-fails", "EDGE-ACTIVITY", proven_quiet)
+
+        def proven_recent(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            prev = (1 << (count_bucket(n) - 1)) - 1
+            assert count_bucket(prev) != count_bucket(n), (prev, n)
+            return two_pass_activity(s, d, "P1", (prev, T0 + 500, ACTIVITY["quiet"]),
+                                     (n, T0 + 600, ACTIVITY["recent"]))
+        case("per-pass-proven-rise-recent-pass", None, proven_recent)
 
         # C2 extension: the decided snapshot never carries pending_first_use.
         def pending_snapshot(s, d, dash):

@@ -1193,6 +1193,19 @@ impl WitnessPlacement {
     }
 }
 
+/// One edge's demoted growth this publication (round 4, re-place): the
+/// edge's count before this publication's demoted installs plus the
+/// maximum growth staged for it. Every staging rebases past the pair's
+/// accounted base, so the maximum is the latest growth and the install
+/// is exact no matter how many reads staged before the commit.
+#[derive(Debug, Clone, Copy)]
+struct DemotedGrowth {
+    base_edge: u64,
+    growth: u64,
+    first_ns: u64,
+    last_ns: u64,
+}
+
 /// One budget refusal, carried structurally so the rendered gap names
 /// the resource, its limit, and the requested occupancy — never a bare
 /// sentence a reader must parse.
@@ -1397,13 +1410,21 @@ enum Mutation {
         module: ModuleKey,
         /// The pair's absolute saturating lower bound (never a delta:
         /// several reads stage before one commit, so only the maximum
-        /// is sound).
+        /// is sound) — or, when `demoted`, growth past the pair's
+        /// accounted base (likewise max-sound: every staging rebases
+        /// past the same base, so the maximum is the latest growth).
         count: u64,
-        /// The pair's first record (`recorded_at_ns`).
+        /// The pair's first record (`recorded_at_ns`) — or, when
+        /// `demoted`, the observing read (growth never inherits the
+        /// pair's backdated first sight).
         first_ns: u64,
         /// The read that observed `count` (`rows_read_ns`): pass
         /// resolution, never a BPF timestamp.
         last_ns: u64,
+        /// The count rebases past an accounted base (round 4,
+        /// re-place): it accumulates onto the edge instead of
+        /// installing absolute.
+        demoted: bool,
     },
     NotePendingCount {
         /// The coordinator's opaque handle, echoed in the decision.
@@ -1516,6 +1537,9 @@ pub(crate) struct CallerRegistry {
     /// Pending-count placements the last publication decided, in apply
     /// order (P3): drained by the coordinator after each publish.
     pending_count_decisions: Vec<PendingCountDecision>,
+    /// Demoted growth staged per edge this publication (round 4,
+    /// re-place): cleared at every `publish`.
+    demoted_place_growth: HashMap<(CallerId, ModuleId), DemotedGrowth>,
     facts_revision: u64,
     published_revision: u64,
     endpoints_total: usize,
@@ -1555,6 +1579,7 @@ impl CallerRegistry {
             witness_gap_memo: BTreeSet::new(),
             witness_placement: WitnessPlacement::default(),
             pending_count_decisions: Vec::new(),
+            demoted_place_growth: HashMap::new(),
             witness_census: BindingCensus::default(),
             facts_revision: 1,
             published_revision: 0,
@@ -2046,7 +2071,9 @@ impl CallerRegistry {
     /// staged count moves the edge, so several reads per commit stay
     /// sound and recency never fakes activity. Like a witness, the
     /// count stages for retired callers (pre-exit history); unlike a
-    /// witness it never invents an edge (one memoized gap).
+    /// witness it never invents an edge (one memoized gap). When
+    /// `demoted`, `count` is growth past the pair's accounted base and
+    /// accumulates onto the edge instead of installing absolute.
     pub(crate) fn note_counted_use(
         &mut self,
         caller: CallerId,
@@ -2054,6 +2081,7 @@ impl CallerRegistry {
         count: u64,
         first_ns: u64,
         last_ns: u64,
+        demoted: bool,
     ) {
         self.staged.push(Mutation::NoteCountedUse {
             caller,
@@ -2061,6 +2089,7 @@ impl CallerRegistry {
             count,
             first_ns,
             last_ns,
+            demoted,
         });
     }
 
@@ -2267,6 +2296,7 @@ impl CallerRegistry {
         for edge in self.edges.values_mut() {
             edge.entry_rose_since_previous_pass = false;
         }
+        self.demoted_place_growth.clear();
         for mutation in staged {
             self.apply(mutation);
         }
@@ -2456,31 +2486,12 @@ impl CallerRegistry {
                 count,
                 first_ns,
                 last_ns,
+                demoted,
             } => {
-                let Some(edge) = self.coverage_edge(caller, &module) else {
-                    return;
-                };
-                // Absolute staging: only a strict advance moves the
-                // count or last-seen. Equal-or-less re-reads (a stale
-                // refresh, a repeated first sight) change nothing, so
-                // recency always names the read that observed the rise.
-                // Retired callers are not frozen out: like a witness,
-                // the count is pre-exit history arriving late.
-                if count > edge.entry_count {
-                    edge.entry_rose_since_previous_pass = true;
-                    if count == MAX_EDGE_ENTRY_COUNT {
-                        edge.entry_count = MAX_EDGE_ENTRY_COUNT;
-                        edge.entry_saturated = true;
-                    } else {
-                        edge.entry_count = count;
-                    }
-                    edge.entry_first_seen_ns = Some(
-                        edge.entry_first_seen_ns
-                            .map_or(first_ns, |was| was.min(first_ns)),
-                    );
-                    // Recency survives saturation: the count stops,
-                    // last-seen does not.
-                    edge.entry_last_seen_ns = Some(last_ns);
+                if demoted {
+                    self.apply_demoted_use(caller, &module, count, first_ns, last_ns);
+                } else {
+                    self.apply_counted_install(caller, &module, count, first_ns, last_ns);
                 }
             }
             Mutation::NotePairsUncounted { reason, at_ns } => {
@@ -2955,11 +2966,12 @@ impl CallerRegistry {
     /// [`Self::place_bound_row`] — the same decision its witness took —
     /// and admission mirrors the coordinator's `stage_pair_count` (only
     /// admitted modules count). On placement the count and its `Counted`
-    /// coverage apply exactly as if staged placed; a first-sight
-    /// rejection drops silently (the witness records the placement
-    /// gaps, and no gap is owed twice), while a demoted rejection
-    /// mirrors the witness gaps instead (F3-02). Every outcome is
-    /// reported through [`Self::take_pending_count_decisions`].
+    /// coverage apply exactly as if staged placed — a demoted count
+    /// accumulates its growth onto the edge (round 4, re-place); a
+    /// first-sight rejection drops silently (the witness records the
+    /// placement gaps, and no gap is owed twice), while a demoted
+    /// rejection discloses under its own subject instead (F3-02). Every
+    /// outcome is reported through [`Self::take_pending_count_decisions`].
     #[allow(clippy::too_many_arguments)]
     fn apply_pending_count(
         &mut self,
@@ -2987,6 +2999,7 @@ impl CallerRegistry {
                         count,
                         first_ns,
                         last_ns,
+                        demoted,
                     });
                     self.apply(Mutation::NoteCoverage {
                         caller,
@@ -3195,6 +3208,83 @@ impl CallerRegistry {
             reason: with_key(reason, module, key),
             budget: None,
         });
+    }
+
+    /// One absolute count install: only a strict advance moves the
+    /// count or last-seen. Equal-or-less re-reads (a stale refresh, a
+    /// repeated first sight) change nothing, so recency always names
+    /// the read that observed the rise. Retired callers are not frozen
+    /// out: like a witness, the count is pre-exit history arriving
+    /// late. Coverage notes never invent edges (one memoized gap).
+    fn apply_counted_install(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+    ) {
+        let Some(edge) = self.coverage_edge(caller, module) else {
+            return;
+        };
+        if count > edge.entry_count {
+            edge.entry_rose_since_previous_pass = true;
+            if count == MAX_EDGE_ENTRY_COUNT {
+                edge.entry_count = MAX_EDGE_ENTRY_COUNT;
+                edge.entry_saturated = true;
+            } else {
+                edge.entry_count = count;
+            }
+            edge.entry_first_seen_ns = Some(
+                edge.entry_first_seen_ns
+                    .map_or(first_ns, |was| was.min(first_ns)),
+            );
+            // Recency survives saturation: the count stops,
+            // last-seen does not.
+            edge.entry_last_seen_ns = Some(last_ns);
+        }
+    }
+
+    /// One demoted count install (round 4, re-place): growth past the
+    /// pair's accounted base accumulates onto the edge. The install is
+    /// the edge's publication-start count plus the maximum growth
+    /// staged this publication — exact across any number of reads per
+    /// commit — and still honors strict advance (an edge another pair
+    /// already carried past the install keeps its maximum).
+    fn apply_demoted_use(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        growth: u64,
+        first_ns: u64,
+        last_ns: u64,
+    ) {
+        let id = self.modules_by_key.get(module).copied();
+        let base_edge = id.and_then(|id| self.edges.get(&(caller, id)).map(|edge| edge.entry_count));
+        let Some((id, base_edge)) = id.zip(base_edge) else {
+            let _ = self.coverage_edge(caller, module);
+            return;
+        };
+        let state = self
+            .demoted_place_growth
+            .entry((caller, id))
+            .or_insert(DemotedGrowth {
+                base_edge,
+                growth: 0,
+                first_ns,
+                last_ns,
+            });
+        if growth >= state.growth {
+            state.growth = growth;
+            state.first_ns = first_ns;
+            state.last_ns = last_ns;
+        }
+        let (install, first_ns, last_ns) = (
+            state.base_edge.saturating_add(state.growth),
+            state.first_ns,
+            state.last_ns,
+        );
+        self.apply_counted_install(caller, module, install, first_ns, last_ns);
     }
 
     fn coverage_edge(&mut self, caller: CallerId, module: &ModuleKey) -> Option<&mut EdgeRecord> {
@@ -5795,7 +5885,7 @@ pub(crate) mod tests {
             CallerId(0),
             &[("/lib/a.so", 11, AdmissionState::Admitted)],
         );
-        registry.note_counted_use(CallerId(0), &keys[0], 5, 100, 200);
+        registry.note_counted_use(CallerId(0), &keys[0], 5, 100, 200, false);
         registry.publish();
         let edge = edge_of(&registry, CallerId(0), &keys[0]);
         assert_eq!(edge.entry_count, 5);
@@ -5812,20 +5902,20 @@ pub(crate) mod tests {
         assert_eq!(registry.entry_observation(edge), EntryObservation::Observed);
         // A strict advance moves the count and last-seen; first-seen is
         // the earliest first record.
-        registry.note_counted_use(CallerId(0), &keys[0], 9, 100, 300);
+        registry.note_counted_use(CallerId(0), &keys[0], 9, 100, 300, false);
         registry.publish();
         let edge = edge_of(&registry, CallerId(0), &keys[0]);
         assert_eq!(edge.entry_count, 9);
         assert_eq!(edge.entry_first_seen_ns, Some(100));
         assert_eq!(edge.entry_last_seen_ns, Some(300));
         // A stale re-read changes nothing: no regression, no recency.
-        registry.note_counted_use(CallerId(0), &keys[0], 7, 100, 400);
+        registry.note_counted_use(CallerId(0), &keys[0], 7, 100, 400, false);
         registry.publish();
         let edge = edge_of(&registry, CallerId(0), &keys[0]);
         assert_eq!(edge.entry_count, 9);
         assert_eq!(edge.entry_last_seen_ns, Some(300));
         // An equal count re-observed later is not activity either.
-        registry.note_counted_use(CallerId(0), &keys[0], 9, 100, 500);
+        registry.note_counted_use(CallerId(0), &keys[0], 9, 100, 500, false);
         registry.publish();
         let edge = edge_of(&registry, CallerId(0), &keys[0]);
         assert_eq!(edge.entry_count, 9);
@@ -5840,7 +5930,7 @@ pub(crate) mod tests {
             CallerId(0),
             &[("/lib/a.so", 11, AdmissionState::Admitted)],
         );
-        registry.note_counted_use(CallerId(0), &keys[0], MAX_EDGE_ENTRY_COUNT, 100, 200);
+        registry.note_counted_use(CallerId(0), &keys[0], MAX_EDGE_ENTRY_COUNT, 100, 200, false);
         registry.publish();
         let edge = edge_of(&registry, CallerId(0), &keys[0]);
         assert_eq!(edge.entry_count, MAX_EDGE_ENTRY_COUNT);
@@ -5860,7 +5950,7 @@ pub(crate) mod tests {
             &[("/lib/a.so", 11, AdmissionState::Admitted)],
         );
         registry.note_witness(CallerId(0), &keys[0], 100);
-        registry.note_counted_use(CallerId(0), &keys[0], 0, 100, 200);
+        registry.note_counted_use(CallerId(0), &keys[0], 0, 100, 200, false);
         registry.publish();
         let edge = edge_of(&registry, CallerId(0), &keys[0]);
         assert_eq!(edge.entry_count, 0);
@@ -5883,7 +5973,7 @@ pub(crate) mod tests {
             &[("/lib/a.so", 11, AdmissionState::Admitted)],
         );
         registry.retire_caller(CallerId(0), "exited".into(), 150);
-        registry.note_counted_use(CallerId(0), &keys[0], 4, 100, 140);
+        registry.note_counted_use(CallerId(0), &keys[0], 4, 100, 140, false);
         registry.publish();
         let edge = edge_of(&registry, CallerId(0), &keys[0]);
         assert_eq!(edge.entry_count, 4);
@@ -5891,9 +5981,9 @@ pub(crate) mod tests {
         // Without a mapping edge the count is dropped with one memoized
         // gap, however often the refresh repeats it.
         let missing = ModuleKey::physical(8, 1, 99, Some("sha0099".into()), "/lib/z.so");
-        registry.note_counted_use(CallerId(0), &missing, 4, 100, 140);
+        registry.note_counted_use(CallerId(0), &missing, 4, 100, 140, false);
         registry.publish();
-        registry.note_counted_use(CallerId(0), &missing, 6, 100, 150);
+        registry.note_counted_use(CallerId(0), &missing, 6, 100, 150, false);
         registry.publish();
         assert_eq!(registry.gaps().len(), 1);
         assert_eq!(
@@ -5929,7 +6019,7 @@ pub(crate) mod tests {
             CoverageNote::Watched { since_ns: 100 },
         );
         registry.note_witness(CallerId(0), &keys[2], 110);
-        registry.note_counted_use(CallerId(0), &keys[3], 5, 100, 140);
+        registry.note_counted_use(CallerId(0), &keys[3], 5, 100, 140, false);
         registry.publish();
         let evidence: std::sync::Arc<str> = "CALLER_EVIDENCE[2] PairInsertFailure rose 0->1".into();
         registry.note_pairs_uncounted(evidence.clone(), 140);

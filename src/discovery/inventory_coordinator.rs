@@ -1868,7 +1868,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn absorb_pair_counts(&mut self, batch: &WitnessBatch) {
         for row in &batch.rows {
             let key = PairKey::of(row);
-            if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped { .. })) {
+            if matches!(
+                self.pair_targets.get(&key),
+                Some(PairTarget::Dropped { .. })
+            ) {
                 continue;
             }
             let held = self.pair_counts.entry(key).or_insert(PairCount {
@@ -1888,7 +1891,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut retry = Vec::new();
         for update in &batch.counts {
             let key = PairKey::of_update(batch.domain, update);
-            if matches!(self.pair_targets.get(&key), Some(PairTarget::Dropped { .. })) {
+            if matches!(
+                self.pair_targets.get(&key),
+                Some(PairTarget::Dropped { .. })
+            ) {
                 continue;
             }
             let held = {
@@ -2023,9 +2029,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     let growth = rebased_count(count, base);
                     self.stage_pair_count(caller, &module, growth, base_since, base);
                     if let Some(PairTarget::Bound {
-                        staged,
-                        staged_ns,
-                        ..
+                        staged, staged_ns, ..
                     }) = self.pair_targets.get_mut(&key)
                     {
                         *staged = count.count;
@@ -2129,11 +2133,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             count.last_ns,
             base,
         );
-        self.registry.note_coverage(
-            caller,
-            module,
-            CoverageNote::Counted { since_ns },
-        );
+        self.registry
+            .note_coverage(caller, module, CoverageNote::Counted { since_ns });
     }
 
     /// Records one bound row's pair target (P3): the pair always
@@ -2170,7 +2171,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base_since,
                 ..
             }) => (*base, *staged, *staged_ns, *base_since),
-            Some(PairTarget::Dropped { base, base_since }) => (*base, *base, *base_since, *base_since),
+            Some(PairTarget::Dropped { base, base_since }) => {
+                (*base, *base, *base_since, *base_since)
+            }
             None => (0, 0, 0, held_first),
         };
         self.pair_targets.insert(
@@ -2197,9 +2200,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base,
             );
             if let Some(PairTarget::Pending {
-                staged,
-                staged_ns,
-                ..
+                staged, staged_ns, ..
             }) = self.pair_targets.get_mut(&key)
             {
                 *staged = count.count;
@@ -2291,15 +2292,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
                 PendingCountOutcome::Rejected { .. } => {
                     if let Some(PairTarget::Pending {
-                        staged,
-                        staged_ns,
-                        ..
+                        staged, staged_ns, ..
                     }) = self.pair_targets.get(&key)
                     {
                         // The drop remembers the absolute staged so far:
                         // a later row rebinds past it (round 4, rebind).
                         let (base, base_since) = (*staged, *staged_ns);
-                        self.pair_targets.insert(key, PairTarget::Dropped { base, base_since });
+                        self.pair_targets
+                            .insert(key, PairTarget::Dropped { base, base_since });
                         self.pair_counts.remove(&key);
                     }
                 }
@@ -2320,7 +2320,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .get(&key)
             .map(|count| (count.count, count.last_ns))
             .unwrap_or((0, 0));
-        self.pair_targets.insert(key, PairTarget::Dropped { base, base_since });
+        self.pair_targets
+            .insert(key, PairTarget::Dropped { base, base_since });
         self.pair_counts.remove(&key);
     }
 
@@ -6514,7 +6515,12 @@ mod tests {
         let placement = registry.witness_placement();
         let census = registry.witness_census();
         assert_eq!(
-            (placement.edge, placement.module, placement.ambiguous, placement.unresolved),
+            (
+                placement.edge,
+                placement.module,
+                placement.ambiguous,
+                placement.unresolved
+            ),
             (1, 0, 0, 0),
             "one decided row accounts exactly one edge placement: {placement:?}"
         );
@@ -6524,7 +6530,9 @@ mod tests {
             "the placement census sums to the decided rows: {placement:?} vs {census:?}"
         );
         assert!(
-            registry.modules().all(|module| module.unbound_use.is_none()),
+            registry
+                .modules()
+                .all(|module| module.unbound_use.is_none()),
             "a rejected count invents no module-level use row"
         );
         let _ = at;
@@ -6606,7 +6614,12 @@ mod tests {
         let placement = registry.witness_placement();
         let census = registry.witness_census();
         assert_eq!(
-            (placement.edge, placement.module, placement.ambiguous, placement.unresolved),
+            (
+                placement.edge,
+                placement.module,
+                placement.ambiguous,
+                placement.unresolved
+            ),
             (1, 0, 0, 0),
             "one decided row accounts exactly one edge placement: {placement:?}"
         );
@@ -6616,7 +6629,9 @@ mod tests {
             "the placement census sums to the decided rows: {placement:?} vs {census:?}"
         );
         assert!(
-            registry.modules().all(|module| module.unbound_use.is_none()),
+            registry
+                .modules()
+                .all(|module| module.unbound_use.is_none()),
             "a rejected count invents no module-level use row"
         );
         let _ = at;
@@ -6634,7 +6649,10 @@ mod tests {
         native.answer(7, 500, 41);
         native.answer(8, 500, 42);
         native.scene.source.spawn(8, 500);
-        native.scene.coordinator.adapter
+        native
+            .scene
+            .coordinator
+            .adapter
             .admit(8, ImageAuthority::ScanPinned, 50)
             .unwrap();
         let row_a = native.row(41, 1, 7, 100, 0);
@@ -6716,7 +6734,10 @@ mod tests {
         native.answer(7, 500, 41);
         native.answer(8, 500, 42);
         native.scene.source.spawn(8, 500);
-        native.scene.coordinator.adapter
+        native
+            .scene
+            .coordinator
+            .adapter
             .admit(8, ImageAuthority::ScanPinned, 50)
             .unwrap();
         native.scene.project(8, 60);
@@ -6812,7 +6833,10 @@ mod tests {
         native.answer(7, 500, 41);
         native.answer(8, 500, 42);
         native.scene.source.spawn(8, 500);
-        native.scene.coordinator.adapter
+        native
+            .scene
+            .coordinator
+            .adapter
             .admit(8, ImageAuthority::ScanPinned, 50)
             .unwrap();
         let row_a = native.row(41, 1, 7, 100, 0);
@@ -7096,9 +7120,9 @@ mod tests {
             .edges()
             .find(|edge| {
                 edge.caller == caller
-                    && registry.module(edge.module).is_some_and(|module| {
-                        module.paths.iter().any(|path| path.contains("a.so"))
-                    })
+                    && registry
+                        .module(edge.module)
+                        .is_some_and(|module| module.paths.iter().any(|path| path.contains("a.so")))
             })
             .expect("A keeps its edge");
         assert_eq!(
@@ -7465,9 +7489,9 @@ mod tests {
             .edges()
             .find(|edge| {
                 edge.caller == caller
-                    && registry.module(edge.module).is_some_and(|module| {
-                        module.paths.iter().any(|path| path.contains("a.so"))
-                    })
+                    && registry
+                        .module(edge.module)
+                        .is_some_and(|module| module.paths.iter().any(|path| path.contains("a.so")))
             })
             .expect("A keeps its edge");
         assert_eq!(

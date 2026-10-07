@@ -1210,8 +1210,11 @@ struct DemotedGrowth {
 impl DemotedGrowth {
     /// The covered growth: the union measure of `(base, absolute)`.
     fn total(&self) -> u64 {
-        let mut spans: Vec<(u64, u64)> =
-            self.segments.iter().map(|&(base, abs, _, _)| (base, abs)).collect();
+        let mut spans: Vec<(u64, u64)> = self
+            .segments
+            .iter()
+            .map(|&(base, abs, _, _)| (base, abs))
+            .collect();
         spans.sort();
         let mut total = 0u64;
         let mut covered = 0u64;
@@ -3058,7 +3061,9 @@ impl CallerRegistry {
                 reason: PendingRejection::Ambiguous,
             },
         };
-        if base > 0 && let PendingCountOutcome::Rejected { reason } = &outcome {
+        if base > 0
+            && let PendingCountOutcome::Rejected { reason } = &outcome
+        {
             self.disclose_demoted_rejection(caller, modules, count, *reason);
         }
         self.pending_count_decisions.push(PendingCountDecision {
@@ -3304,7 +3309,8 @@ impl CallerRegistry {
         base: u64,
     ) {
         let id = self.modules_by_key.get(module).copied();
-        let base_edge = id.and_then(|id| self.edges.get(&(caller, id)).map(|edge| edge.entry_count));
+        let base_edge =
+            id.and_then(|id| self.edges.get(&(caller, id)).map(|edge| edge.entry_count));
         let Some((id, base_edge)) = id.zip(base_edge) else {
             let _ = self.coverage_edge(caller, module);
             return;
@@ -5777,7 +5783,16 @@ pub(crate) mod tests {
         registry.note_mapping(CallerId(0), 50, a.clone(), 100);
         registry.publish();
         registry.note_mapping(CallerId(0), 51, b.clone(), 110);
-        registry.note_pending_count(7, CallerId(0), vec![ka.clone(), kb.clone()], 9, 120, 130, 120, 0);
+        registry.note_pending_count(
+            7,
+            CallerId(0),
+            vec![ka.clone(), kb.clone()],
+            9,
+            120,
+            130,
+            120,
+            0,
+        );
         registry.note_bound_witness(CallerId(0), vec![ka.clone(), kb.clone()], 120);
         registry.publish();
         // Together: the witness reads ambiguous and the count drops.

@@ -1790,7 +1790,9 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
             saturated = is_saturated_artifact(edge["entries"])
             partial = has_partial_attach(view, edge)
             suppressed = view.doc.get("gaps_suppressed") or 0
-            concealed = suppressed > 0
+            # A malformed counter fails closed (F3-07, F2-08 style): a
+            # concealment may hide behind it — never raises.
+            concealed = suppressed > 0 if type(suppressed) is int else True
             res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated or partial or concealed, lo, hi),
                    f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
                    + (" (saturated: lower bound clamped at the cap)" if saturated else "")
@@ -3865,6 +3867,26 @@ def self_test():
                     if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
         if row is None or row["status"] != "nonqualifying":
             failures.append("count-window-suppressed-not-nonqualifying")
+
+        # F3-07: a malformed gaps_suppressed (truthy non-int —
+        # production always emits int) fails closed to nonqualifying,
+        # never raises TypeError. The stream stays well-formed
+        # (production ints — events render before the doc field is
+        # poisoned); only the snapshot field is malformed, so the
+        # AGREE-* mismatch failures are the structured verdict.
+        for malformed in ("1", [1], {"n": 1}):
+            def suppressed_malformed(s, d, dash, malformed=malformed):
+                kw = realistic_since_ledger(s, d)
+                kw["events"] = s.events(d)
+                d["gaps_suppressed"] = malformed
+                return kw
+            tag = type(malformed).__name__
+            res = case(f"count-exact-suppressed-malformed-{tag}-nonqualifying",
+                       "AGREE-GAP-ACCOUNTING", suppressed_malformed)
+            row = next((r for r in res.rows
+                        if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+            if row is None or row["status"] != "nonqualifying":
+                failures.append(f"count-exact-suppressed-malformed-{tag}-not-nonqualifying")
 
         # --- O2: terminal sweep hole (sol 2, astra B4) ----------------------
         # Every record after the last pass marker skips EDGE-CADENCE while

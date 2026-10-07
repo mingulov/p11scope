@@ -1905,13 +1905,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     caller,
                     module,
                     endpoint,
-                }) => recheck.push((key, *caller, module.clone(), *endpoint, update.object, held)),
+                    base,
+                }) => recheck.push((
+                    key,
+                    *caller,
+                    module.clone(),
+                    *endpoint,
+                    update.object,
+                    held,
+                    *base,
+                )),
                 Some(PairTarget::Pending {
                     caller,
                     modules,
                     staged,
+                    base,
                     ..
-                }) => retry.push((key, *caller, modules.clone(), held, *staged)),
+                }) => retry.push((key, *caller, modules.clone(), held, *staged, *base)),
                 _ => {}
             }
         }
@@ -1921,9 +1931,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // promote a count whose witness already went module-level. An
         // advance past what is staged re-stages pending; the publication
         // decides, and its decisions finalize the target.
-        for (key, caller, modules, count, staged) in retry {
+        for (key, caller, modules, count, staged, base) in retry {
             if count.count > staged {
-                self.stage_pending_count(key, caller, &modules, count);
+                self.stage_pending_count(key, caller, &modules, rebased_count(count, base));
                 if let Some(PairTarget::Pending { staged: was, .. }) =
                     self.pair_targets.get_mut(&key)
                 {
@@ -1938,7 +1948,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // coordinator copy: only an advance past the staged count
         // stages, so a repeated refresh is free and several reads per
         // commit stay sound.
-        for (key, caller, module, endpoint, object, count) in recheck {
+        for (key, caller, module, endpoint, object, count, base) in recheck {
             let admitted = self.update_modules_for_endpoint(endpoint, object);
             let confirmed = match &admitted {
                 Ok(modules) => {
@@ -1969,23 +1979,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .map(|edge| edge.entry_count)
                 .unwrap_or(0);
             if confirmed {
-                if count.count > staged {
-                    self.stage_pair_count(caller, &module, count);
+                let growth = rebased_count(count, base);
+                if growth.count > staged {
+                    self.stage_pair_count(caller, &module, growth);
                 }
                 continue;
             }
             let modules = admitted.unwrap_or_default();
+            // The demoted total stays behind (F3-03): history attributed
+            // so far — the old base plus the bound edge's count — is the
+            // new base, so only post-demotion growth ever stages
+            // elsewhere; the stale edge keeps exactly its history.
+            let new_base = base.saturating_add(staged);
             self.pair_targets.insert(
                 key,
                 PairTarget::Pending {
                     caller,
                     modules: modules.clone(),
-                    staged,
+                    staged: new_base,
                     endpoint,
+                    base: new_base,
                 },
             );
-            if count.count > staged {
-                self.stage_pending_count(key, caller, &modules, count);
+            if count.count > new_base {
+                self.stage_pending_count(key, caller, &modules, rebased_count(count, new_base));
                 if let Some(PairTarget::Pending { staged: was, .. }) =
                     self.pair_targets.get_mut(&key)
                 {
@@ -2012,11 +2029,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.admitted_modules_for_endpoint(endpoint).map_err(|_| ())
     }
 
-    /// Stages one pair's count to its edge (C7 C4): the absolute count
+    /// Stages one pair's count to its edge (C7 C4): the (base-rebased,
+    /// growth-only past demotion — absolute for an unbased pair) count
     /// plus the counting-feed note, so the edge reads `counted`. Only
     /// for admitted modules and counts ≥ 1 — anything else leaves the
-    /// witness standing, and the absolute staging self-heals on the
-    /// next refresh after admission.
+    /// witness standing, and the staging self-heals on the next
+    /// refresh after admission.
     fn stage_pair_count(&mut self, caller: CallerId, module: &ModuleKey, count: PairCount) {
         if count.count == 0 {
             return;
@@ -2059,6 +2077,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 modules: modules.to_vec(),
                 staged: 0,
                 endpoint: row.endpoint,
+                base: 0,
             },
         );
         if let Some(count) = self.pair_counts.get(&key).copied()
@@ -2072,9 +2091,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Stages one pending pair's held count for publication-time
-    /// placement (P3): only for counts ≥ 1 — anything else leaves the
-    /// witness standing, and a later advance re-stages. The minted
-    /// handle maps the publication's decision back to the pair.
+    /// placement (P3): the (base-rebased, growth-only past demotion —
+    /// absolute for an unbased pair) count, only for counts ≥ 1 —
+    /// anything else leaves the witness standing, and a later advance
+    /// re-stages. The minted handle maps the publication's decision
+    /// back to the pair.
     fn stage_pending_count(
         &mut self,
         key: PairKey,
@@ -2115,16 +2136,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             match decision.outcome {
                 PendingCountOutcome::Placed { module } => {
                     if let Some(PairTarget::Pending {
-                        caller, endpoint, ..
+                        caller,
+                        endpoint,
+                        base,
+                        ..
                     }) = self.pair_targets.get(&key)
                     {
-                        let (caller, endpoint) = (*caller, *endpoint);
+                        let (caller, endpoint, base) = (*caller, *endpoint, *base);
                         self.pair_targets.insert(
                             key,
                             PairTarget::Bound {
                                 caller,
                                 module,
                                 endpoint,
+                                base,
                             },
                         );
                     }
@@ -2511,29 +2536,55 @@ struct PairCount {
     last_ns: u64,
 }
 
+/// Rebase one held absolute count past `base` (F3-03): what stages is
+/// only growth previous owners do not already carry. The first sight
+/// travels with the base: an unbased count keeps the pair's first
+/// record, while rebased growth starts at the observing read — a new
+/// owner never inherits the pair's backdated history.
+fn rebased_count(count: PairCount, base: u64) -> PairCount {
+    PairCount {
+        count: count.count.saturating_sub(base),
+        first_ns: if base == 0 {
+            count.first_ns
+        } else {
+            count.last_ns
+        },
+        last_ns: count.last_ns,
+    }
+}
+
 /// Where one decided pair's counts go (C7 C4).
 #[derive(Debug, Clone)]
 enum PairTarget {
     /// The pair bound to `caller` and its witness resolved to exactly
     /// one edged module: counts stage there — after re-resolving the
     /// endpoint's placement (F7), since sharing that appeared after
-    /// the pair bound makes further growth ambiguous.
+    /// the pair bound makes further growth ambiguous. `base` is the
+    /// absolute count previous owners already carry (0 for a
+    /// first-bound pair): only growth past it ever stages, so a
+    /// re-resolved pair never duplicates history elsewhere (F3-03).
     Bound {
         caller: CallerId,
         module: ModuleKey,
         endpoint: EndpointId,
+        base: u64,
     },
     /// The pair bound to `caller` and waiting on its publication-time
     /// placement: counts stage pending and resolve at publication,
-    /// together with the witness. `staged` is the count staged so far,
-    /// so only advances re-stage. The publication's decisions finalize
-    /// it as [`Self::Bound`] or [`Self::Dropped`]; an unadmitted single
-    /// stays pending and re-resolves on the next advance.
+    /// together with the witness. `staged` is the absolute count
+    /// staged so far, so only advances re-stage; `base` is the
+    /// absolute count previous owners already carry (0 for a
+    /// first-sight pair, the demoted total for a re-resolved one):
+    /// only growth past it stages. The publication's decisions
+    /// finalize it as [`Self::Bound`] or [`Self::Dropped`]; an
+    /// unadmitted single stays pending and re-resolves on the next
+    /// advance.
     Pending {
         caller: CallerId,
         modules: Vec<ModuleKey>,
         staged: u64,
         endpoint: EndpointId,
+        base: u64,
     },
     /// The pair never publishes: binder-unbound, or no module at all.
     /// Held and later counts drop.
@@ -5905,6 +5956,115 @@ mod tests {
             edge_count(&native, "b.so"),
             Some(0),
             "the window's growth never lands on B either"
+        );
+    }
+
+    #[test]
+    fn ownership_transfer_forwards_only_post_demotion_growth() {
+        // P3 ownership transfer (round 3, F3-03): the pair binds to A
+        // while A is the sole owner and builds history; then B shares
+        // the endpoint and commits edged, and A's endpoint membership
+        // is removed (per-pass re-lowering re-records A memberless)
+        // while B stays the sole admitted member. The next count
+        // advance demotes: B must carry only post-demotion growth and
+        // A keeps exactly its history — never `Placed`-elsewhere with
+        // the absolute count (duplication plus backdated `first_ns`).
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        // History while A is the sole owner.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        // Sharing appears and commits: B's edge exists alongside A's.
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // A's membership is removed (re-record memberless); B stays
+        // the sole admitted member, edged.
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        let members: Vec<_> = native
+            .scene
+            .coordinator
+            .attach_set
+            .modules_with_member(shared.id)
+            .collect();
+        assert_eq!(
+            members.len(),
+            1,
+            "B is the sole admitted member after A's membership is removed: {members:?}"
+        );
+        // One advance past the history.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 6,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_of = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| (edge.entry_count, edge.entry_first_seen_ns))
+        };
+        let (a_count, _) = edge_of(&native, "a.so").expect("A keeps its edge");
+        assert_eq!(a_count, 5, "A keeps exactly its history");
+        let (b_count, b_first) = edge_of(&native, "b.so").expect("B keeps its edge");
+        assert_eq!(b_count, 1, "B carries only post-demotion growth");
+        assert_eq!(
+            a_count + b_count,
+            6,
+            "no duplication: the edges sum to the pair's absolute count"
+        );
+        assert_eq!(
+            b_first,
+            Some(at + 1),
+            "B's first sight is the demoting read, never the pair's backdated history"
         );
     }
 

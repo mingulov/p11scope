@@ -1202,3 +1202,48 @@ fn uncovered_edges_read_neither_idle_nor_armed() {
         .unwrap();
     assert_eq!(lossy_json["entries"]["coverage"]["lossy"], true);
 }
+
+// F3-06 doc-accuracy pin (round-2 F2-07): `docs/schema/inventory-events-v1.md`
+// states the per-pass `recently observed` precedence exception (an in-flight
+// edge, or one with active operations, reads `operation initialized /
+// in flight` over a rise — production `Activity::for_edge`) and the
+// `last_seen_ns` correction (records and the snapshot DO carry
+// `entries.last_seen_ns`, serialized by `edge_json` verbatim into
+// `edge_observed` payloads — only the dashboard's trailing 5 s window
+// over it is display-only). Either old sentence returning fails the pin.
+#[test]
+fn event_doc_pins_activity_precedence_and_last_seen_presence() {
+    const DOC: &str = include_str!("../docs/schema/inventory-events-v1.md");
+    let counted = UseCoverage::Counted {
+        since_ns: 7,
+        lossy: false,
+    };
+    assert_eq!(
+        Activity::for_edge(MappingState::Mapped, true, true, false, &counted),
+        Activity::InFlight,
+        "in-flight takes precedence over a rise"
+    );
+    assert_eq!(
+        Activity::for_edge(MappingState::Mapped, false, true, true, &counted),
+        Activity::InFlight,
+        "active operations take precedence over a rise"
+    );
+    assert_eq!(Activity::RecentlyObserved.label(), "recently observed");
+    assert!(
+        DOC.contains("take precedence") && DOC.contains("over a rise"),
+        "the precedence exception is stated"
+    );
+    assert!(
+        !DOC.contains("`recently observed` iff"),
+        "the old unconditional `iff` must not return"
+    );
+    assert!(
+        DOC.contains("do carry `entries.last_seen_ns`")
+            && DOC.contains("display-only, never the recorded signal"),
+        "the `last_seen_ns` display-only correction is stated"
+    );
+    assert!(
+        !DOC.contains("never appears in records or the snapshot"),
+        "the old `never appears` claim must not return"
+    );
+}

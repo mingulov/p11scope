@@ -3328,6 +3328,212 @@ mod tests {
         );
     }
 
+    /// Blank Rust noise length-preservingly (every byte becomes a space
+    /// or stays, newlines kept): block comments `/*…*/` (nesting, as Rust
+    /// allows), line comments `//…`, and string/char literal contents
+    /// (normal, raw `r#*"…"*#`, and byte forms). The lexer is aware of
+    /// each form so markers inside one never open another (`/*` in a
+    /// string, `//` in a block comment, `"` in a comment); `'` opens a
+    /// char literal only for `'x'`/`'\…'` shapes, never for lifetimes
+    /// (`'a`, `'static`). What remains is code shape at identical byte
+    /// offsets. An unterminated block comment blanks through EOF — the
+    /// audited code compiles, so that only bites player-made mutations,
+    /// which then fail loudly (hidden methods break the exact sets).
+    fn blank_rust_noise(code: &str) -> String {
+        let bytes = code.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        // Copy the byte verbatim (code shape); blank it (noise).
+        while index < bytes.len() {
+            let byte = bytes[index];
+            let next = bytes.get(index + 1).copied().unwrap_or(0);
+            // Line comment: pass through to (and including) the newline
+            // — its contents are never code, but it ends there.
+            if byte == b'/' && next == b'/' {
+                out.push(b' ');
+                out.push(b' ');
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    out.push(b' ');
+                    index += 1;
+                }
+                continue;
+            }
+            // Block comment, nesting.
+            if byte == b'/' && next == b'*' {
+                let mut depth = 0i32;
+                while index < bytes.len() {
+                    let pair = (bytes[index], bytes.get(index + 1).copied().unwrap_or(0));
+                    if pair == (b'/', b'*') {
+                        depth += 1;
+                        out.push(b' ');
+                        out.push(b' ');
+                        index += 2;
+                    } else if pair == (b'*', b'/') {
+                        depth -= 1;
+                        out.push(b' ');
+                        out.push(b' ');
+                        index += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        out.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                        index += 1;
+                    }
+                }
+                continue;
+            }
+            // Raw string `r"…"`, `r#"…"#`, … (optionally `br`-prefixed):
+            // copy the opener, blank the contents, copy the closer.
+            let raw_hashes = |at: usize| -> Option<(usize, usize)> {
+                let mut hashes = 0;
+                let mut cursor = at;
+                if bytes.get(cursor) == Some(&b'b') {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'r') {
+                    return None;
+                }
+                cursor += 1;
+                while bytes.get(cursor) == Some(&b'#') {
+                    hashes += 1;
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'"') {
+                    return None;
+                }
+                Some((at, cursor + 1))
+            };
+            if let Some((start, contents)) = raw_hashes(index) {
+                for byte in &bytes[start..contents] {
+                    out.push(*byte);
+                }
+                let mut hashes = 0;
+                let mut probe = start + usize::from(bytes[start] == b'b') + 1;
+                while bytes.get(probe) == Some(&b'#') {
+                    hashes += 1;
+                    probe += 1;
+                }
+                index = contents;
+                // Blank to the closing quote plus the same hashes.
+                loop {
+                    if index < bytes.len() && bytes[index] == b'"' {
+                        let mut cursor = index + 1;
+                        let mut seen = 0;
+                        while seen < hashes && bytes.get(cursor) == Some(&b'#') {
+                            seen += 1;
+                            cursor += 1;
+                        }
+                        if seen == hashes {
+                            out.push(b'"');
+                            for _ in 0..hashes {
+                                out.push(b'#');
+                            }
+                            index = cursor;
+                            break;
+                        }
+                    }
+                    if index >= bytes.len() {
+                        break;
+                    }
+                    out.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+                continue;
+            }
+            // Normal or byte string: copy the quotes/prefix, blank the
+            // contents (`\"` and `\\` escapes respected).
+            if byte == b'"' || (byte == b'b' && next == b'"') {
+                if byte == b'b' {
+                    out.push(b'b');
+                    index += 1;
+                }
+                out.push(b'"');
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    if bytes[index] == b'\\' {
+                        out.push(b' ');
+                        index += 1;
+                        if index < bytes.len() {
+                            out.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    // A newline ends a normal (non-raw) string in valid
+                    // code; blank it as newline regardless.
+                    out.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+                if index < bytes.len() {
+                    out.push(b'"');
+                    index += 1;
+                }
+                continue;
+            }
+            // Char literal vs lifetime: `'x'` / `'\…'` copy through (with
+            // blanked contents); `'a` / `'static` are lifetimes — the
+            // quote is code shape, pass it through untouched.
+            if byte == b'\'' {
+                let is_char =
+                    (next == b'\\') || bytes.get(index + 2).is_some_and(|third| *third == b'\'');
+                if is_char {
+                    out.push(b'\'');
+                    index += 1;
+                    while index < bytes.len() && bytes[index] != b'\'' {
+                        if bytes[index] == b'\\' {
+                            out.push(b' ');
+                            index += 1;
+                            if index < bytes.len() {
+                                out.push(b' ');
+                                index += 1;
+                            }
+                            continue;
+                        }
+                        out.push(b' ');
+                        index += 1;
+                    }
+                    if index < bytes.len() {
+                        out.push(b'\'');
+                        index += 1;
+                    }
+                } else {
+                    out.push(byte);
+                    index += 1;
+                }
+                continue;
+            }
+            out.push(byte);
+            index += 1;
+        }
+        String::from_utf8(out).expect("blanking keeps UTF-8 boundaries")
+    }
+
+    /// The Rust noise blanker is lexically sound: nested block
+    /// comments blank fully, markers inside strings/chars/comments never
+    /// open a comment, lifetimes never open a char literal, and every
+    /// output is byte-identical in length (offsets survive).
+    #[test]
+    fn rust_noise_blanker_is_lexically_sound() {
+        for (input, expected) in [
+            ("a /* x /* y */ z */ b", "a                   b"),
+            ("let s = \"/* no */\";", "let s = \"        \";"),
+            ("// /* \ncode();", "      \ncode();"),
+            ("fn f(x: &'a str) {}", "fn f(x: &'a str) {}"),
+            ("let c = '{';", "let c = ' ';"),
+            ("r#\"a\"b\"#;", "r#\"   \"#;"),
+            ("b\"byte\";", "b\"    \";"),
+        ] {
+            let blanked = blank_rust_noise(input);
+            assert_eq!(blanked, expected, "blanker input {input:?}");
+            assert_eq!(blanked.len(), input.len(), "length preserved");
+        }
+        // A brace hidden in a block comment cannot truncate matching;
+        // one in code still counts.
+        assert_eq!(blank_rust_noise("/* } */ {}").matches('{').count(), 1);
+    }
+
     /// Strip `//` comments and `"..."` string literals (with `\"`
     /// escapes) from one line: what remains is code shape (braces, item
     /// keywords). Single-quote char literals are passed through — the
@@ -3357,16 +3563,69 @@ mod tests {
         out
     }
 
-    /// Parse one `impl AnchorMaps` method line: `Some((name, public))`
-    /// for any visibility/modifier spelling (`fn`, `pub fn`,
-    /// `pub(crate) fn`, `pub const fn`, `const unsafe fn`, ...), `None`
-    /// otherwise. Only lines that START an item match — a method body
-    /// cannot start with these qualifiers, so `let f: fn(u32)` inside a
-    /// body never matches — and `fn` must be followed by a name plus
-    /// `(` or `<`.
-    fn parse_impl_method(line: &str) -> Option<(String, bool)> {
+    /// Parse one `impl AnchorMaps` method line: `Some((name, public,
+    /// same_line_gate))` for any visibility/modifier spelling (`fn`, `pub
+    /// fn`, `pub(crate) fn`, `pub const fn`, `const unsafe fn`, ...),
+    /// `None` otherwise. Leading same-line attributes (`#[inline] pub
+    /// fn …`) are scanned past to the item start, and a same-line
+    /// `#[cfg(test)]` gate is reported. Only lines that START an item
+    /// match — a method body cannot start with these qualifiers, so `let
+    /// f: fn(u32)` inside a body never matches — and `fn` must be
+    /// followed by a name plus `(` or `<`.
+    fn parse_impl_method(line: &str) -> Option<(String, bool, bool)> {
         let code = strip_line_noise(line);
-        let trimmed = code.trim_start();
+        let mut rest = code.trim_start();
+        let mut same_line_gate = false;
+        loop {
+            let probe = rest.trim_start();
+            if !probe.starts_with("#[") {
+                rest = probe;
+                break;
+            }
+            // Strip one balanced `#[…]` span (string-aware, for
+            // `#[doc = "…[…]…"]`).
+            let bytes = probe.as_bytes();
+            let mut depth = 0i32;
+            let mut end = None;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (offset, byte) in bytes.iter().enumerate() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if *byte == b'\\' {
+                        escaped = true;
+                    } else if *byte == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match byte {
+                    b'"' => in_string = true,
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                return None;
+            };
+            let flat: String = probe[..=end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if flat == "#[cfg(test)]" {
+                same_line_gate = true;
+            }
+            rest = &probe[end + 1..];
+        }
+        let trimmed = rest;
         if !(trimmed.starts_with("fn ")
             || trimmed.starts_with("pub")
             || trimmed.starts_with("const ")
@@ -3415,7 +3674,247 @@ mod tests {
         if !(rest.starts_with('(') || rest.starts_with('<')) {
             return None;
         }
-        Some((name, before.contains("pub")))
+        Some((name, before.contains("pub"), same_line_gate))
+    }
+
+    /// Whether `word` occurs in `text` as a whole Rust identifier.
+    fn contains_rust_word(text: &str, word: &str) -> bool {
+        let mut rest = text;
+        while let Some(found) = rest.find(word) {
+            let boundary =
+                |side: Option<char>| side.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            let before = rest[..found].chars().next_back();
+            let after = rest[found + word.len()..].chars().next();
+            if boundary(before) && boundary(after) {
+                return true;
+            }
+            rest = &rest[found + word.len()..];
+        }
+        false
+    }
+
+    /// Strip one whole-word keyword from the front of `text`.
+    fn strip_rust_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+        let tail = text.strip_prefix(word)?;
+        if tail
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        Some(tail)
+    }
+
+    /// Read a Rust path (`ident`, `self::x::Y`, `::x::Y`) from the front
+    /// of `text`: the path plus the remainder, or `None`.
+    fn read_rust_path(text: &str) -> Option<(String, &str)> {
+        let mut rest = text.strip_prefix("::").unwrap_or(text);
+        let mut path = String::new();
+        loop {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() || name.chars().next().is_some_and(|c| c.is_numeric()) {
+                return None;
+            }
+            path.push_str(&name);
+            rest = &rest[name.len()..];
+            if let Some(tail) = rest.strip_prefix("::") {
+                path.push_str("::");
+                rest = tail;
+            } else {
+                return Some((path, rest));
+            }
+        }
+    }
+
+    /// Skip one balanced `<…>` span (generic params) from the front of
+    /// `text`: the remainder, or `None` when unbalanced.
+    fn skip_rust_generics(text: &str) -> Option<&str> {
+        let mut depth = 0i32;
+        for (offset, byte) in text.bytes().enumerate() {
+            match byte {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[offset + 1..]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Classify one `impl` header (the text after the `impl` keyword):
+    /// (counts-as-inherent-`AnchorMaps`, is-trait-impl-for-`AnchorMaps`).
+    /// Headers that defeat the strict parse fall back to a conservative
+    /// substring heuristic — never to silence.
+    fn classify_impl_header(rest: &str) -> (bool, bool) {
+        let fallback = |rest: &str| {
+            let head = rest.split('{').next().unwrap_or(rest);
+            let head = &head[..head.len().min(300)];
+            if !contains_rust_word(head, "AnchorMaps") {
+                return (false, false);
+            }
+            let before = head.split("AnchorMaps").next().unwrap_or("");
+            // `for` ahead of the name reads as a trait impl; anything
+            // else reads as an inherent block. Either fails the exact
+            // counts loudly.
+            let is_trait = contains_rust_word(before, "for");
+            (!is_trait, is_trait)
+        };
+        let mut text = rest.trim_start();
+        // Unstable `impl const Trait` (parsed defensively; stable code
+        // has none).
+        if let Some(tail) = strip_rust_word(text, "const") {
+            text = tail.trim_start();
+        }
+        if text.starts_with('<') {
+            let Some(tail) = skip_rust_generics(text) else {
+                return fallback(rest);
+            };
+            text = tail.trim_start();
+        }
+        // Unstable negative impls (`impl !Send`).
+        if let Some(tail) = text.strip_prefix('!') {
+            text = tail.trim_start();
+        }
+        let Some((path, tail)) = read_rust_path(text) else {
+            return fallback(rest);
+        };
+        let tail = tail.trim_start();
+        if let Some(tail) = strip_rust_word(tail, "for") {
+            let tail = tail.trim_start();
+            let Some((subject, _)) = read_rust_path(tail) else {
+                return (false, true);
+            };
+            let last = subject.rsplit("::").next().unwrap_or(&subject);
+            return (false, last == "AnchorMaps");
+        }
+        let last = path.rsplit("::").next().unwrap_or(&path);
+        (last == "AnchorMaps", false)
+    }
+
+    /// Every `impl` block touching `AnchorMaps` in noise-blanked
+    /// production `code`: (byte offset of the `impl` keyword,
+    /// is-trait-impl). `unsafe`/`default` qualifiers ahead of `impl`
+    /// need no handling — the scan keys on the keyword itself.
+    fn anchor_impls(code: &str) -> Vec<(usize, bool)> {
+        let bytes = code.as_bytes();
+        let mut found = Vec::new();
+        let mut index = 0;
+        while index + 4 <= bytes.len() {
+            let Some(rel) = code[index..].find("impl") else {
+                break;
+            };
+            let at = index + rel;
+            let prev_ok =
+                at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let next_ok = bytes
+                .get(at + 4)
+                .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+            if prev_ok && next_ok {
+                let (inherent, is_trait) = classify_impl_header(&code[at + 4..]);
+                found.push((at, inherent, is_trait));
+            }
+            index = at + 4;
+        }
+        found
+            .into_iter()
+            .filter_map(|(at, inherent, is_trait)| {
+                if inherent || is_trait {
+                    Some((at, is_trait))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Scan production code for `impl` blocks touching `AnchorMaps`:
+    /// (inherent-block count, any-trait-impl). Matches trait impls on
+    /// `for` + optional path + `AnchorMaps` (`for self::AnchorMaps`,
+    /// `for crate::x::AnchorMaps`), and inherent blocks under any
+    /// qualifier/generic spelling. Exotic headers that defeat the
+    /// strict parse fall back to a conservative substring heuristic —
+    /// never to silence.
+    fn scan_anchor_impls(code: &str) -> (usize, bool) {
+        let mut inherent = 0;
+        let mut trait_impl = false;
+        for (_, is_trait) in anchor_impls(code) {
+            if is_trait {
+                trait_impl = true;
+            } else {
+                inherent += 1;
+            }
+        }
+        (inherent, trait_impl)
+    }
+
+    /// Byte offset of the inherent `impl AnchorMaps` keyword in
+    /// noise-blanked production `code`, or `None`.
+    fn find_inherent_anchor_impl(code: &str) -> Option<usize> {
+        anchor_impls(code)
+            .into_iter()
+            .find_map(|(at, is_trait)| (!is_trait).then_some(at))
+    }
+
+    /// Forbid macros in the handle region: no `macro_rules` in
+    /// production code at all, and no macro invocations inside the
+    /// `impl AnchorMaps` block except the two allowlisted
+    /// `std::ptr::addr_of_mut!` call sites (pinned by count). An
+    /// invocation is `!` preceded by an identifier char and followed by
+    /// `(`, `[`, or `{` — `!=` and unary `!` never match. Returns the
+    /// rejection reason instead of panicking so proofs can assert
+    /// rejection.
+    fn check_handle_region_has_no_macros(code: &str) -> Result<(), String> {
+        if code.contains("macro_rules") {
+            return Err("production code must not define macro_rules".to_string());
+        }
+        let offset = find_inherent_anchor_impl(code)
+            .ok_or_else(|| "no inherent impl AnchorMaps".to_string())?;
+        let end = offset + impl_block_end(&code[offset..]);
+        let region = &code[offset..end];
+        let bytes = region.as_bytes();
+        let mut allowlisted = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'!' {
+                let prev = bytes.get(index.wrapping_sub(1)).copied().unwrap_or(b' ');
+                let next = bytes.get(index + 1).copied().unwrap_or(b' ');
+                let prev_ident = prev.is_ascii_alphanumeric() || prev == b'_';
+                let next_delim = next == b'(' || next == b'[' || next == b'{';
+                if prev_ident && next_delim {
+                    let mut start = index;
+                    while start > 0
+                        && (bytes[start - 1].is_ascii_alphanumeric()
+                            || bytes[start - 1] == b'_'
+                            || bytes[start - 1] == b':')
+                    {
+                        start -= 1;
+                    }
+                    if &region[start..index] == "std::ptr::addr_of_mut" {
+                        allowlisted += 1;
+                    } else {
+                        return Err(format!(
+                            "macro invocation in the handle region: {}!",
+                            &region[start..index]
+                        ));
+                    }
+                }
+            }
+            index += 1;
+        }
+        if allowlisted != 2 {
+            return Err(format!(
+                "expected exactly 2 allowlisted addr_of_mut! sites, found {allowlisted}"
+            ));
+        }
+        Ok(())
     }
 
     /// Enumerate the methods of an `impl AnchorMaps` block (the text
@@ -3425,11 +3924,14 @@ mod tests {
     /// first-`}` scan and hide later methods); method lines parse with
     /// [`parse_impl_method`], any visibility/modifier spelling. Shared by
     /// the exact-API test and the bypass-mutation proofs below.
-    fn anchor_maps_api(block: &str) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    /// Byte offset just past the `impl` block's closing brace in
+    /// `block` (the text from the `impl` keyword): brace matching from
+    /// the first `{`, immune to a body brace dedented to column 0.
+    fn impl_block_end(block: &str) -> usize {
         let mut depth = 0i32;
         let mut started = false;
-        let mut end = None;
-        for (index, line) in block.lines().enumerate() {
+        let mut offset = 0;
+        for line in block.split_inclusive('\n') {
             for ch in strip_line_noise(line).chars() {
                 match ch {
                     '{' => {
@@ -3440,21 +3942,26 @@ mod tests {
                     _ => {}
                 }
             }
+            offset += line.len();
             if started && depth == 0 {
-                end = Some(index);
-                break;
+                return offset;
             }
         }
-        let end = end.expect("impl block end");
+        panic!("impl block end");
+    }
+
+    fn anchor_maps_api(block: &str) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+        let end = impl_block_end(block);
         let mut public = BTreeSet::new();
         let mut private = BTreeSet::new();
         let mut gated = BTreeSet::new();
         let mut previous = String::new();
-        for line in block.lines().take(end) {
-            // The gate attribute sits immediately above its method.
-            let is_gated = previous.trim_start() == "#[cfg(test)]";
-            if let Some((name, is_public)) = parse_impl_method(line) {
-                if is_gated {
+        for line in block[..end].lines() {
+            // The gate attribute sits immediately above its method — or
+            // on the same line ahead of it.
+            let prev_gated = previous.trim_start() == "#[cfg(test)]";
+            if let Some((name, is_public, same_line_gate)) = parse_impl_method(line) {
+                if prev_gated || same_line_gate {
                     gated.insert(name.clone());
                 }
                 if is_public {
@@ -3479,8 +3986,11 @@ mod tests {
             std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
         let code = rust.split_once("mod tests").expect("test module").0;
         let api_of = |code: &str| {
-            let block = code.split_once("impl AnchorMaps").expect("impl block").1;
-            anchor_maps_api(block)
+            // Re-blank inside: bypass mutations land after any outer
+            // blanking, so the enumeration must see through them here.
+            let blanked = blank_rust_noise(code);
+            let offset = find_inherent_anchor_impl(&blanked).expect("impl block");
+            anchor_maps_api(&blanked[offset..])
         };
         for smuggled in [
             "    pub(crate) fn raw_hash_fd(&self) -> i32 { 0 }\n",
@@ -3502,6 +4012,136 @@ mod tests {
                 "enumeration must catch the bypass signature {name}"
             );
         }
+        // Block-comment-hidden method (astra N2a): a `/* } */` line ends
+        // a naive brace scan early, hiding the live method after it.
+        let hidden = code.replacen(
+            "        Self::update(self.slots.as_fd(), &slot.to_ne_bytes(), &addr.to_ne_bytes())\n    }\n}",
+            "        Self::update(self.slots.as_fd(), &slot.to_ne_bytes(), &addr.to_ne_bytes())\n    }\n    /* } */\n    pub fn smuggled_block(&self) -> i32 { 0 }\n}",
+            1,
+        );
+        assert_ne!(hidden, code, "comment-hiding mutation must apply");
+        let (public, _, _) = api_of(&hidden);
+        assert!(
+            public.contains("smuggled_block"),
+            "enumeration must see through block comments"
+        );
+        // Same-line-attributed method (astra N3): the line starts with
+        // `#`, not a qualifier.
+        let attributed = code.replacen(
+            "    pub fn new(",
+            "    #[inline] pub fn smuggled_attr(&self) -> i32 { 0 }\n    pub fn new(",
+            1,
+        );
+        assert_ne!(attributed, code, "attribute mutation must apply");
+        let (public, _, _) = api_of(&attributed);
+        assert!(
+            public.contains("smuggled_attr"),
+            "enumeration must parse fn after same-line attributes"
+        );
+    }
+
+    /// The impl-block predicates see through comments and paths: a
+    /// trait impl for `self::AnchorMaps` (sol F1/S5), a commented
+    /// `for` (astra N2b), and a commented inherent header (a second
+    /// inherent block must count) — each proven by appending the
+    /// bypass to a copy of the real production code in memory.
+    #[test]
+    fn anchor_impl_predicates_catch_comment_and_path_bypasses() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rust =
+            std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
+        let blanked = blank_rust_noise(&rust);
+        let code = blanked.split_once("mod tests").expect("test module").0;
+        assert_eq!(
+            scan_anchor_impls(code),
+            (1, false),
+            "real code: exactly one inherent block, no trait impl"
+        );
+        let slf = format!("{code}\nimpl std::fmt::Debug for self::AnchorMaps {{}}\n");
+        assert!(
+            scan_anchor_impls(&blank_rust_noise(&slf)).1,
+            "`for self::AnchorMaps` must read as a trait impl"
+        );
+        let commented = format!("{code}\nimpl Foo for /*x*/ AnchorMaps {{}}\n");
+        assert!(
+            scan_anchor_impls(&blank_rust_noise(&commented)).1,
+            "commented `for` impl must read as a trait impl"
+        );
+        let second = format!("{code}\nimpl /*x*/ AnchorMaps {{}}\n");
+        assert_eq!(
+            scan_anchor_impls(&blank_rust_noise(&second)).0,
+            2,
+            "commented inherent impl must count"
+        );
+    }
+
+    /// Macros cannot smuggle handle methods (astra N5, design decision
+    /// (i)): text enumeration is blind to macro-generated methods, so
+    /// macros are forbidden instead — no `macro_rules!` in production
+    /// code, and no invocations in the `impl AnchorMaps` region except
+    /// the two allowlisted `std::ptr::addr_of_mut!` call sites the map
+    /// syscalls need. (`rustc`-based enumeration was the alternative;
+    /// the forbid is proportionate: the handle region legitimately
+    /// contains no macros but those two call sites.)
+    #[test]
+    fn anchor_impl_region_forbids_macros() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rust =
+            std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
+        let blanked = blank_rust_noise(&rust);
+        let code = blanked.split_once("mod tests").expect("test module").0;
+        // The blind spot this closes: a macro-generated read method is
+        // invisible to text enumeration AND trips no other pin — the
+        // enumeration still reports the pinned sets under the mutation.
+        let mutated = code.replacen(
+            "    pub fn new(",
+            "    macro_rules! smuggled_method { () => { pub fn smuggled_macro(&self) -> i32 { 0 } } }\n    smuggled_method!();\n    pub fn new(",
+            1,
+        );
+        assert_ne!(mutated, code, "macro mutation must apply");
+        let blanked_mut = blank_rust_noise(&mutated);
+        let offset = find_inherent_anchor_impl(&blanked_mut).expect("impl block");
+        let (public, private, _) = anchor_maps_api(&blanked_mut[offset..]);
+        assert_eq!(
+            public,
+            BTreeSet::from([
+                "new".to_string(),
+                "remove".to_string(),
+                "set_slot".to_string()
+            ]),
+            "hole demo: enumeration misses macro-generated methods"
+        );
+        assert_eq!(
+            private,
+            BTreeSet::from(["update".to_string(), "delete".to_string()]),
+            "hole demo: private set also blind to macro methods"
+        );
+        assert_eq!(
+            scan_anchor_impls(&blanked_mut),
+            (1, false),
+            "hole demo: impl predicates miss macro methods"
+        );
+        // The close: real code passes the forbid, every macro mutation
+        // fails it.
+        check_handle_region_has_no_macros(code).expect("real code passes the macro forbid");
+        assert!(
+            check_handle_region_has_no_macros(&blanked_mut).is_err(),
+            "forbid must reject the macro-generated method"
+        );
+        // Invocation-only proof (the definition lives outside the
+        // region — the invocation still fails).
+        let invoked = code.replacen("    pub fn new(", "    smuggled!();\n    pub fn new(", 1);
+        assert_ne!(invoked, code, "invocation mutation must apply");
+        assert!(
+            check_handle_region_has_no_macros(&blank_rust_noise(&invoked)).is_err(),
+            "forbid must reject a bare macro invocation in the region"
+        );
+        // Definition-only proof (outside the region, still forbidden).
+        let defined = format!("{code}\nmacro_rules! evil {{ () => {{}} }}\n");
+        assert!(
+            check_handle_region_has_no_macros(&blank_rust_noise(&defined)).is_err(),
+            "forbid must reject macro_rules in production code"
+        );
     }
 
     /// Structural I6: the anchor handle exposes exactly its write-only
@@ -3520,28 +4160,25 @@ mod tests {
         let rust =
             std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
         // Production code only: this test's own needles live in `mod tests`.
-        let code = rust.split_once("mod tests").expect("test module").0;
+        // Noise-blanked throughout, so comments and strings shape neither
+        // the predicates nor the enumeration.
+        let blanked = blank_rust_noise(&rust);
+        let code = blanked.split_once("mod tests").expect("test module").0;
         // Exactly one inherent impl, and no trait impl for the handle
         // anywhere in production code (manual `Debug`/`Display`/`AsRawFd`/
         // `Deref` included; `anchor_maps_implements_no_leak_traits`
-        // backs this structurally for the whole crate). Both match on
-        // whitespace-normalized shape, so extra spaces or newlines
-        // (`impl  AnchorMaps`, `for\nAnchorMaps`) cannot smuggle a block
-        // past the predicates.
-        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        // backs this structurally for the whole crate). The scan sees
+        // through comments and paths (`impl /*x*/ AnchorMaps`,
+        // `for self::AnchorMaps`).
         assert_eq!(
-            flat.match_indices("impl AnchorMaps").count(),
-            1,
-            "exactly one inherent impl AnchorMaps block"
-        );
-        assert!(
-            !flat.contains("for AnchorMaps"),
-            "no trait impl for AnchorMaps in production code"
+            scan_anchor_impls(code),
+            (1, false),
+            "exactly one inherent impl AnchorMaps block, no trait impl for it"
         );
         // The block's method names, exactly: any added method — read,
         // write, or otherwise — fails here.
-        let block = code.split_once("impl AnchorMaps").expect("impl block").1;
-        let (public, private, gated) = anchor_maps_api(block);
+        let offset = find_inherent_anchor_impl(code).expect("impl block");
+        let (public, private, gated) = anchor_maps_api(&code[offset..]);
         assert_eq!(
             public,
             BTreeSet::from([
@@ -3566,14 +4203,16 @@ mod tests {
             ]),
             "interim teardown must be #[cfg(test)]-gated out of the non-test API"
         );
-        // Kept: the literal `Debug`-derive mutation test (M4).
-        let handle = rust
-            .split_once("Write-only anchor handle")
-            .expect("AnchorMaps block")
-            .1
-            .split_once("// aya loader")
-            .expect("handle block end")
-            .0;
+        // Kept: the literal `Debug`-derive mutation test (M4), on the
+        // blanked handle region (a `derive` in a comment cannot trip it).
+        let handle = blank_rust_noise(
+            rust.split_once("Write-only anchor handle")
+                .expect("AnchorMaps block")
+                .1
+                .split_once("// aya loader")
+                .expect("handle block end")
+                .0,
+        );
         for forbidden in ["derive(Debug)", "derive (Debug)"] {
             assert!(
                 !handle.contains(forbidden),

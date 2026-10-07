@@ -3373,9 +3373,7 @@ mod tests {
         for stmt in ["    start\n    = addr;", "    start =\n    addr;"] {
             let mutated = c.replacen(
                 "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
-                &format!(
-                    "{stmt}\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,"
-                ),
+                &format!("{stmt}\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,"),
                 1,
             );
             assert_ne!(mutated, c, "mutation 7 ({stmt:?}) must apply");
@@ -3779,9 +3777,8 @@ mod tests {
         while let Some(rel) = qualifiers[search..].find("pub") {
             let at = search + rel;
             let bytes = qualifiers.as_bytes();
-            let boundary = |side: Option<u8>| {
-                side.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
-            };
+            let boundary =
+                |side: Option<u8>| side.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
             let before_ok = boundary(at.checked_sub(1).and_then(|i| bytes.get(i).copied()));
             let after_pub = &qualifiers[at + 3..];
             let gap = after_pub.len() - after_pub.trim_start().len();
@@ -4384,8 +4381,11 @@ mod tests {
             "    include! (\"extra_methods.rs\");\n",
             "    smuggled /*c*/ ! /*c*/ ();\n",
         ] {
-            let mutated =
-                code.replacen("    pub fn new(", &format!("{invocation}    pub fn new("), 1);
+            let mutated = code.replacen(
+                "    pub fn new(",
+                &format!("{invocation}    pub fn new("),
+                1,
+            );
             assert_ne!(mutated, code, "spacing mutation {invocation:?} must apply");
             assert!(
                 check_handle_region_has_no_macros(&blank_rust_noise(&mutated)).is_err(),

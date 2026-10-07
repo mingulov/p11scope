@@ -2924,12 +2924,13 @@ mod tests {
     /// variables, whose value was replaced, while compound `<op>=` keeps
     /// taint when either side is tainted (it reads the old value).
     /// Through-deref stores (`*p = …`, including paren-wrapped
-    /// `(*p)` / `*(…)` spellings) of tainted values fail unless the
-    /// statement is the exact bookkeeping allowlist (`*slot_cell =
-    /// addr`); `record.*` stores (bare or paren-wrapped) feed
-    /// `seq_write` and are checked; `p.f`, `p->f`, `a[i]` stores stay
-    /// map/struct writes outside the envelope (with wrapper functions
-    /// and inter-procedural flows — all pin-backstopped; see the test
+    /// `(*p)` / `*(…)` and unbraced-control-prefixed `if (…) *p`
+    /// spellings) of tainted values fail unless the statement is the
+    /// exact bookkeeping allowlist (`*slot_cell = addr`); `record.*`
+    /// stores (bare or paren-wrapped) feed `seq_write` and are
+    /// checked; `p.f`, `p->f`, `a[i]` stores stay map/struct writes
+    /// outside the envelope (with wrapper functions and
+    /// inter-procedural flows — all pin-backstopped; see the test
     /// docs).
     fn audit_c_chunk(chunk: &str, path: &str) -> Result<(), String> {
         const SOURCES: [&str; 3] = ["addr", "old", "f_inode"];
@@ -3137,6 +3138,53 @@ mod tests {
                     }
                     if let Some(unmatched) = opens.last() {
                         cut = cut.max(unmatched + 1);
+                    }
+                    // A balanced `(…)` group that opens away from the cut
+                    // after a condition/call suffix (`if (1)start`,
+                    // `if (ok) *pp`) is a control-flow prefix, not the
+                    // target: cut after its close, or the prefix either
+                    // glues onto the name or trips the `*`-skip below and
+                    // the store vanishes. Wraps (`(` AT the cut),
+                    // deref operands (`(` after `*`), and anything else
+                    // keep their existing handling.
+                    loop {
+                        let rest = &lhs[cut..];
+                        let stripped = rest.trim_start();
+                        let Some(first) = stripped.as_bytes().first() else {
+                            break;
+                        };
+                        if *first == b'(' {
+                            break;
+                        }
+                        let base = cut + (rest.len() - stripped.len());
+                        let Some(rel) = lhs[base..].find('(') else {
+                            break;
+                        };
+                        let open = base + rel;
+                        let suffix = lhs[..open].trim_end().chars().next_back();
+                        let is_suffix = suffix.is_some_and(|c| {
+                            c.is_alphanumeric() || c == '_' || c == ']' || c == ')'
+                        });
+                        if !is_suffix {
+                            break;
+                        }
+                        let mut depth = 1i32;
+                        let mut close = None;
+                        for (offset, byte) in lhs.as_bytes()[open + 1..].iter().enumerate() {
+                            match byte {
+                                b'(' => depth += 1,
+                                b')' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        close = Some(open + 1 + offset);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let Some(close) = close else { break };
+                        cut = close + 1;
                     }
                     let core = lhs[cut..].trim();
                     let mut unwrapped = strip_wrapping_parens(core);
@@ -3445,6 +3493,35 @@ mod tests {
             )
             .is_err(),
             "a parenthesized store must propagate taint to the emit"
+        );
+        // Control-flow-prefixed stores (fix round 5): an unbraced `if`
+        // prefix must not hide a tainted store from the emit check, nor
+        // a through-deref store from the deref check — the balanced
+        // condition is not the target.
+        for stmt in [
+            "    if (1)start = addr;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+            "    if (*word_cell) start = addr;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+        ] {
+            assert!(
+                audit_c_chunk(stmt, "chunk").is_err(),
+                "control-flow-prefixed store must propagate taint: {stmt:?}"
+            );
+        }
+        for stmt in ["    if (ok) *pp = addr;\n", "    if (1) *pp = addr;\n"] {
+            assert!(
+                audit_c_chunk(stmt, "chunk").is_err(),
+                "control-flow-prefixed deref store must fail: {stmt:?}"
+            );
+        }
+        // No-regression control: a compound operator outside parens
+        // (`(x) += …`) still tracks taint on the unwrapped target.
+        assert!(
+            audit_c_chunk(
+                "    start = addr;\n    (start) += 0;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+                "chunk"
+            )
+            .is_err(),
+            "`(x) += …` must keep taint on the unwrapped target"
         );
         // Legitimate address-of uses stay untainted: `&addr` as a lookup
         // key never taints the result — while binary `&` does.

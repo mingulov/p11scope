@@ -3937,10 +3937,14 @@ mod tests {
     /// production code at all, and no macro invocations inside the
     /// `impl AnchorMaps` block except the two allowlisted
     /// `std::ptr::addr_of_mut!` call sites (pinned by count). An
-    /// invocation is `!` preceded by an identifier char and followed by
-    /// `(`, `[`, or `{` — `!=` and unary `!` never match. Returns the
-    /// rejection reason instead of panicking so proofs can assert
-    /// rejection.
+    /// invocation is `!` preceded (across whitespace) by an identifier
+    /// char and followed (across whitespace) by `(`, `[`, or `{` — a
+    /// spaced `mac ! ()` compiles, and comments blank to spaces
+    /// upstream, so adjacency is not required. `!=` and unary `!`
+    /// never match. An external `#[macro_use]` definition needs no
+    /// in-file search: whatever defines the macro, invoking it in the
+    /// region fails this scan. Returns the rejection reason instead of
+    /// panicking so proofs can assert rejection.
     fn check_handle_region_has_no_macros(code: &str) -> Result<(), String> {
         if code.contains("macro_rules") {
             return Err("production code must not define macro_rules".to_string());
@@ -3954,12 +3958,23 @@ mod tests {
         let mut index = 0;
         while index < bytes.len() {
             if bytes[index] == b'!' {
-                let prev = bytes.get(index.wrapping_sub(1)).copied().unwrap_or(b' ');
-                let next = bytes.get(index + 1).copied().unwrap_or(b' ');
+                let mut back = index;
+                while back > 0 && bytes[back - 1].is_ascii_whitespace() {
+                    back -= 1;
+                }
+                let prev = back
+                    .checked_sub(1)
+                    .and_then(|at| bytes.get(at).copied())
+                    .unwrap_or(b' ');
+                let mut fwd = index + 1;
+                while fwd < bytes.len() && bytes[fwd].is_ascii_whitespace() {
+                    fwd += 1;
+                }
+                let next = bytes.get(fwd).copied().unwrap_or(b' ');
                 let prev_ident = prev.is_ascii_alphanumeric() || prev == b'_';
                 let next_delim = next == b'(' || next == b'[' || next == b'{';
                 if prev_ident && next_delim {
-                    let mut start = index;
+                    let mut start = back;
                     while start > 0
                         && (bytes[start - 1].is_ascii_alphanumeric()
                             || bytes[start - 1] == b'_'
@@ -3967,12 +3982,12 @@ mod tests {
                     {
                         start -= 1;
                     }
-                    if &region[start..index] == "std::ptr::addr_of_mut" {
+                    if &region[start..back] == "std::ptr::addr_of_mut" {
                         allowlisted += 1;
                     } else {
                         return Err(format!(
                             "macro invocation in the handle region: {}!",
-                            &region[start..index]
+                            &region[start..back]
                         ));
                     }
                 }
@@ -4257,6 +4272,26 @@ mod tests {
             check_handle_region_has_no_macros(&blank_rust_noise(&defined)).is_err(),
             "forbid must reject macro_rules in production code"
         );
+        // Spacing bypasses (fix round 4, item 07): `mac! ()`,
+        // `mac ! ()`, and comment-separated equivalents all compile,
+        // as does a spaced `include!` — every spelling must fail the
+        // forbid (comments blank to spaces upstream, like whitespace).
+        for invocation in [
+            "    smuggled ! ();\n",
+            "    smuggled! ();\n",
+            "    mkacc! ();\n",
+            "    mkacc ! ();\n",
+            "    include! (\"extra_methods.rs\");\n",
+            "    smuggled /*c*/ ! /*c*/ ();\n",
+        ] {
+            let mutated =
+                code.replacen("    pub fn new(", &format!("{invocation}    pub fn new("), 1);
+            assert_ne!(mutated, code, "spacing mutation {invocation:?} must apply");
+            assert!(
+                check_handle_region_has_no_macros(&blank_rust_noise(&mutated)).is_err(),
+                "forbid must reject the spaced invocation {invocation:?}"
+            );
+        }
     }
 
     /// Structural I6: the anchor handle exposes exactly its write-only

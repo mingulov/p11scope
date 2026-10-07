@@ -183,6 +183,9 @@ fn default_objects_byte_identical_to_base() {
         return;
     }
     use sha2::Digest as _;
+    // The identity object has no feature variants: its pin (below) applies
+    // to every build, while these three skip under small-ring/diagnostic
+    // features.
     for (name, bytes, pinned) in [
         (
             "p11scope-ebpf",
@@ -204,6 +207,65 @@ fn default_objects_byte_identical_to_base() {
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(hex, pinned, "{name} must stay byte-identical to BASE");
     }
+}
+
+/// Digest pin for the identity object itself (F-build): any source or
+/// toolchain drift changes these bytes, and the pin fails loudly. Pinned
+/// at round-1 HEAD in this toolchain; the build-info test below binds the
+/// pin to the compiler digest and CPU baseline it was recorded with.
+#[test]
+fn identity_object_digest_pinned() {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(OBJECT);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex, "000caca5338654fd8c1d993057b66fa453047c104be7fe935ab78303e94da3ba",
+        "p11scope-ebpf-identity must stay byte-identical to the round-1 pin"
+    );
+}
+
+/// Qualification binding (F-build): the build records the resolved
+/// compiler digest, the explicit CPU baseline, and the object digest in
+/// `p11scope-identity-build-info.txt`; this test pins that record's shape
+/// and its agreement with the object under test. Ordinary builds still
+/// trust their tool environment (PATH `clang-18`, system headers) — the
+/// record makes qualification reproducible, not the build hermetic.
+#[test]
+fn identity_build_info_binds_compiler_and_baseline() {
+    let info = std::fs::read_to_string(concat!(
+        env!("OUT_DIR"),
+        "/p11scope-identity-build-info.txt"
+    ))
+    .expect("build must record identity build info");
+    let field = |name: &str| -> String {
+        info.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("build info lacks {name}"))
+            .to_string()
+    };
+    let compiler = field("compiler_sha256");
+    assert_eq!(compiler.len(), 64, "compiler digest must be sha256 hex");
+    assert!(
+        compiler.chars().all(|c| c.is_ascii_hexdigit()),
+        "compiler digest must be hex"
+    );
+    assert!(
+        ["bpfel", "bpfeb"].contains(&field("target").as_str()),
+        "target must be a BPF endian flavor"
+    );
+    assert_eq!(field("mcpu"), "v1", "CPU baseline must be explicit v1");
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(OBJECT);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        field("object_sha256"),
+        hex,
+        "recorded object digest must match the object under test"
+    );
+    assert!(
+        field("compiler_path").contains("clang-18"),
+        "compiler path must name the resolved clang-18"
+    );
 }
 
 /// Extract the kernel errno from a loader failure's syscall-carrying variants.

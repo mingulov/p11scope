@@ -106,6 +106,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
     println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_CARGO");
     println!("cargo:rerun-if-env-changed=P11SCOPE_PREPARED_BPF_RUSTC");
+    // The identity build resolves clang-18 via PATH and records the hit.
+    println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
     println!("cargo:rustc-check-cfg=cfg(p11scope_small_discovery_ring)");
     let small_ring = matches!(
@@ -423,11 +425,42 @@ fn build_variant(
     .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));
 }
 
+/// Resolve `clang-18` exactly like process spawning does: the first hit
+/// on `PATH`. The identity build records (not trusts blindly) the digest
+/// of whatever this resolves to.
+fn resolve_clang18() -> PathBuf {
+    for dir in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+        let candidate = dir.join("clang-18");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!("clang-18 not found on PATH");
+}
+
+/// Hex sha256 of a file's bytes.
+fn sha256_file_hex(path: &std::path::Path) -> String {
+    let bytes = std::fs::read(path).expect("reading file for digest");
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Stage 3 Wave D identity object (D2a): `crates/ebpf/native/vma_identity.c`
 /// compiled by clang-18 straight to a BPF ELF. No Rust crate, no nightly,
 /// and no bpf-linker take part, so this object is independent of the B1
 /// blockers by construction. It carries no small-ring or diagnostic variant:
 /// the anchor and scope maps have fixed capacities.
+///
+/// Tool trust, stated plainly: ordinary builds trust their tool
+/// environment — the `PATH` `clang-18` above plus the system headers.
+/// Qualification does not: this function records the resolved compiler
+/// path, the compiler binary's digest, the explicit CPU baseline, and the
+/// object digest in `p11scope-identity-build-info.txt`, and the harness
+/// pins the object digest plus that record. A changed compiler or CPU
+/// baseline shows up as a changed record (and usually a changed object),
+/// never as a silent identical build.
 fn build_identity_object() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
@@ -439,24 +472,28 @@ fn build_identity_object() {
     };
     // Same reproducibility rules as the bitcode builds above: fixed source
     // prefix, fixed compilation directory, no recorded command line, so the
-    // object never records the build host's checkout path.
+    // object never records the build host's checkout path. The CPU baseline
+    // is explicit (`v1`, the clang default, verified byte-identical to the
+    // flagless build) so it cannot drift silently with compiler upgrades.
     let mut file_prefix_map = OsString::from("-ffile-prefix-map=");
     file_prefix_map.push(manifest_dir.as_os_str());
     file_prefix_map.push("=/p11scope");
+    let cflags = [
+        "-target",
+        target,
+        "-mcpu=v1",
+        "-O2",
+        "-g",
+        "-gno-record-gcc-switches",
+        "-fdebug-compilation-dir=/p11scope/native",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-c",
+    ];
     let status = Command::new("clang-18")
         .current_dir(&out_dir)
-        .args([
-            "-target",
-            target,
-            "-O2",
-            "-g",
-            "-gno-record-gcc-switches",
-            "-fdebug-compilation-dir=/p11scope/native",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-c",
-        ])
+        .args(cflags)
         .arg(&file_prefix_map)
         .arg(manifest_dir.join("crates/ebpf/native/vma_identity.c"))
         .args(["-o", "p11scope-ebpf-identity"])
@@ -466,6 +503,26 @@ fn build_identity_object() {
         status.success(),
         "building the identity object failed: {status}"
     );
+    // Qualification record: resolved compiler identity, CPU baseline, and
+    // the object digest. A compiler upgrade re-runs this build (via the
+    // rerun lines below) and re-records; the digest pin in the harness
+    // then either still matches (same bytes) or fails loudly.
+    let compiler_path = resolve_clang18();
+    println!("cargo:rerun-if-changed={}", compiler_path.display());
+    let compiler_realpath = compiler_path
+        .canonicalize()
+        .unwrap_or_else(|_| compiler_path.clone());
+    let object_path = out_dir.join("p11scope-ebpf-identity");
+    let info = format!(
+        "compiler_path={}\ncompiler_realpath={}\ncompiler_sha256={}\ntarget={target}\nmcpu=v1\ncflags={}\nobject_sha256={}\n",
+        compiler_path.display(),
+        compiler_realpath.display(),
+        sha256_file_hex(&compiler_path),
+        cflags.join(" "),
+        sha256_file_hex(&object_path),
+    );
+    std::fs::write(out_dir.join("p11scope-identity-build-info.txt"), info)
+        .expect("writing identity build info");
     // Reproducible UAPI assertion check (F-uapi): the host <linux/bpf.h>
     // must agree with the layouts `identity_iter.rs` mirrors. Syntax-only
     // (the `_Static_assert`s are the product); any mismatch fails the

@@ -650,6 +650,10 @@ pub const BPF_MAP_TYPE_HASH: u32 = 1;
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 /// `BPF_TRACE_ITER` attach type for `iter/task_vma` links.
 pub const BPF_TRACE_ITER: u32 = 28;
+/// `BPF_F_WRONLY` map flag: the kernel-only anchor maps.
+pub const BPF_F_WRONLY: u32 = 16;
+/// `BPF_F_MMAPABLE` map flag: the scope bitmap.
+pub const BPF_F_MMAPABLE: u32 = 1024;
 /// `BPF_ANY`: create or update.
 pub const BPF_ANY: u64 = 0;
 
@@ -2437,7 +2441,15 @@ mod tests {
         assert_eq!(offset_of!(IterLinkInfo, pid_fd), 8);
         assert_eq!(BPF_LINK_CREATE, 28);
         assert_eq!(BPF_ITER_CREATE, 33);
+        assert_eq!(BPF_MAP_CREATE, 0);
+        assert_eq!(BPF_MAP_UPDATE_ELEM, 2);
+        assert_eq!(BPF_MAP_DELETE_ELEM, 3);
+        assert_eq!(BPF_OBJ_GET_INFO_BY_FD, 15);
+        assert_eq!(BPF_MAP_TYPE_HASH, 1);
+        assert_eq!(BPF_MAP_TYPE_ARRAY, 2);
         assert_eq!(BPF_TRACE_ITER, 28);
+        assert_eq!(BPF_F_WRONLY, 16);
+        assert_eq!(BPF_F_MMAPABLE, 1024);
         assert_eq!(size_of::<LinkCreateAttr>(), 32);
         assert_eq!(offset_of!(LinkCreateAttr, iter_info), 16);
         assert_eq!(offset_of!(LinkCreateAttr, iter_info_len), 24);
@@ -2446,6 +2458,15 @@ mod tests {
         assert_eq!(offset_of!(MapElemAttr, key), 8);
         assert_eq!(offset_of!(MapElemAttr, value), 16);
         assert_eq!(offset_of!(MapElemAttr, flags), 24);
+        assert_eq!(size_of::<ObjGetInfoAttr>(), 16);
+        assert_eq!(offset_of!(ObjGetInfoAttr, bpf_fd), 0);
+        assert_eq!(offset_of!(ObjGetInfoAttr, info_len), 4);
+        assert_eq!(offset_of!(ObjGetInfoAttr, info), 8);
+        assert_eq!(size_of::<MapInfoPrefix>(), 24);
+        assert_eq!(offset_of!(MapInfoPrefix, key_size), 8);
+        assert_eq!(offset_of!(MapInfoPrefix, value_size), 12);
+        assert_eq!(offset_of!(MapInfoPrefix, max_entries), 16);
+        assert_eq!(offset_of!(MapInfoPrefix, map_flags), 20);
         // The syscall number comes from libc, not a hardcoded copy.
         assert_eq!(libc::SYS_bpf as u32, 321);
     }
@@ -2869,9 +2890,9 @@ mod tests {
     #[ignore = "privileged: creates real BPF maps for handle validation"]
     fn anchor_maps_validate_real_handles() {
         // Genuine pair first: must construct.
-        let hash = test_create_map(BPF_MAP_TYPE_HASH, 8, 16, ANCHOR_SLOTS, 16)
+        let hash = test_create_map(BPF_MAP_TYPE_HASH, 8, 16, ANCHOR_SLOTS, BPF_F_WRONLY)
             .expect("create WRONLY hash (run as root)");
-        let slots = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 8, ANCHOR_SLOTS, 16)
+        let slots = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 8, ANCHOR_SLOTS, BPF_F_WRONLY)
             .expect("create WRONLY array (run as root)");
         AnchorMaps::new(
             hash.as_fd().try_clone_to_owned().expect("clone"),
@@ -2891,7 +2912,7 @@ mod tests {
         // Size-mismatched map as `slots`: ARRAY key 4 value 16. Without
         // validation, `set_slot` would hand the kernel an 8-byte buffer
         // for a 16-byte value — a stack over-read into the map.
-        let wide = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 16, ANCHOR_SLOTS, 16)
+        let wide = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 16, ANCHOR_SLOTS, BPF_F_WRONLY)
             .expect("create WRONLY wide array");
         let err = match AnchorMaps::new(
             hash.as_fd().try_clone_to_owned().expect("clone"),
@@ -2913,7 +2934,8 @@ mod tests {
         };
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
         // Wrong capacity.
-        let short = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 512, 16).expect("create short array");
+        let short = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 512, BPF_F_WRONLY)
+            .expect("create short array");
         let err = match AnchorMaps::new(
             hash.as_fd().try_clone_to_owned().expect("clone"),
             short.as_fd().try_clone_to_owned().expect("clone"),

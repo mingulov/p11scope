@@ -334,13 +334,83 @@ fn none_btf_load_never_verifies_programs() {
     }
 }
 
-/// F6 uapi constants cross-checked against aya's generated bindings, an
-/// independent copy of `linux/bpf.h`.
+/// F6 uapi surface cross-checked against aya's generated bindings, an
+/// independent copy of `linux/bpf.h`: every command number, the attach
+/// type, map types, map flags, and the attr layouts bindgen exposes as
+/// plain structs. (The `link_create` prefix with `iter_info`, the
+/// `bpf_iter_link_info` task member, and the `bpf_map_info` prefix are
+/// asserted against the host headers by the build-time C check instead:
+/// bindgen nests those in anonymous unions awkward for `offset_of!`.)
 #[test]
 fn identity_uapi_constants_match_aya_bindings() {
-    use aya_obj::generated::bpf_cmd;
+    use aya_obj::generated::{
+        BPF_F_MMAPABLE as GEN_MMAPABLE, BPF_F_WRONLY as GEN_WRONLY, bpf_attach_type, bpf_cmd,
+        bpf_map_type,
+    };
     assert_eq!(ii::BPF_LINK_CREATE, bpf_cmd::BPF_LINK_CREATE as u32);
     assert_eq!(ii::BPF_ITER_CREATE, bpf_cmd::BPF_ITER_CREATE as u32);
+    assert_eq!(ii::BPF_MAP_CREATE, bpf_cmd::BPF_MAP_CREATE as u32);
     assert_eq!(ii::BPF_MAP_UPDATE_ELEM, bpf_cmd::BPF_MAP_UPDATE_ELEM as u32);
     assert_eq!(ii::BPF_MAP_DELETE_ELEM, bpf_cmd::BPF_MAP_DELETE_ELEM as u32);
+    assert_eq!(
+        ii::BPF_OBJ_GET_INFO_BY_FD,
+        bpf_cmd::BPF_OBJ_GET_INFO_BY_FD as u32
+    );
+    assert_eq!(ii::BPF_TRACE_ITER, bpf_attach_type::BPF_TRACE_ITER as u32);
+    assert_eq!(
+        ii::BPF_MAP_TYPE_HASH,
+        bpf_map_type::BPF_MAP_TYPE_HASH as u32
+    );
+    assert_eq!(
+        ii::BPF_MAP_TYPE_ARRAY,
+        bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
+    );
+    assert_eq!(ii::BPF_F_WRONLY, GEN_WRONLY as u32);
+    assert_eq!(ii::BPF_F_MMAPABLE, GEN_MMAPABLE as u32);
+    // Attr layouts bindgen exposes as plain structs.
+    use aya_obj::generated::{
+        bpf_attr__bindgen_ty_2 as gen_map_elem, bpf_attr__bindgen_ty_9 as gen_obj_info,
+        bpf_attr__bindgen_ty_18 as gen_iter_create,
+    };
+    use std::mem::offset_of;
+    assert_eq!(
+        size_of::<ii::IterCreateAttr>(),
+        size_of::<gen_iter_create>()
+    );
+    assert_eq!(
+        offset_of!(ii::IterCreateAttr, link_fd),
+        offset_of!(gen_iter_create, link_fd)
+    );
+    assert_eq!(
+        offset_of!(ii::IterCreateAttr, flags),
+        offset_of!(gen_iter_create, flags)
+    );
+    assert_eq!(size_of::<ii::ObjGetInfoAttr>(), size_of::<gen_obj_info>());
+    assert_eq!(
+        offset_of!(ii::ObjGetInfoAttr, bpf_fd),
+        offset_of!(gen_obj_info, bpf_fd)
+    );
+    assert_eq!(
+        offset_of!(ii::ObjGetInfoAttr, info_len),
+        offset_of!(gen_obj_info, info_len)
+    );
+    assert_eq!(
+        offset_of!(ii::ObjGetInfoAttr, info),
+        offset_of!(gen_obj_info, info)
+    );
+    // The map-elem member carries `value`/`next_key` as a union at 16;
+    // our attr fixes the update shape (`value`), same size and offsets.
+    assert_eq!(size_of::<ii::MapElemAttr>(), size_of::<gen_map_elem>());
+    assert_eq!(
+        offset_of!(ii::MapElemAttr, map_fd),
+        offset_of!(gen_map_elem, map_fd)
+    );
+    assert_eq!(
+        offset_of!(ii::MapElemAttr, key),
+        offset_of!(gen_map_elem, key)
+    );
+    assert_eq!(
+        offset_of!(ii::MapElemAttr, flags),
+        offset_of!(gen_map_elem, flags)
+    );
 }

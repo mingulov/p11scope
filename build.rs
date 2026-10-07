@@ -89,6 +89,7 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/vma_identity.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/vma_identity.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/uapi_check.c");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.lock");
     println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
@@ -464,5 +465,18 @@ fn build_identity_object() {
     assert!(
         status.success(),
         "building the identity object failed: {status}"
+    );
+    // Reproducible UAPI assertion check (F-uapi): the host <linux/bpf.h>
+    // must agree with the layouts `identity_iter.rs` mirrors. Syntax-only
+    // (the `_Static_assert`s are the product); any mismatch fails the
+    // build here instead of mis-issuing syscalls at runtime.
+    let check = Command::new("clang-18")
+        .args(["-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+        .arg(manifest_dir.join("crates/ebpf/native/uapi_check.c"))
+        .status()
+        .expect("failed to spawn clang-18 for the UAPI check");
+    assert!(
+        check.success(),
+        "the UAPI header check failed: host <linux/bpf.h> disagrees with identity_iter.rs"
     );
 }

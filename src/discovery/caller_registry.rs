@@ -1119,7 +1119,7 @@ const UNBOUND_USE_SUBJECT: &str = "used by an unidentified caller image";
 const WITNESS_WITHOUT_MAPPING: &str = "native witness without mapping evidence";
 const WITNESS_UNKNOWN_MODULE: &str = "native witness for an unknown module";
 pub(crate) const WITNESS_SHARED_ENDPOINT: &str = "ambiguous shared endpoint";
-const DEMOTED_COUNT_REJECTED: &str = "rejected demoted count";
+pub(crate) const DEMOTED_COUNT_REJECTED: &str = "rejected demoted count";
 
 /// Where every decided native witness row went, each row exactly once
 /// (C4 review M3): `edge` witnessed one caller edge, `module` became one
@@ -3021,10 +3021,15 @@ impl CallerRegistry {
     /// rejected demoted count never finalizes silently. The disclosure
     /// is gap-only: the rejected count has no witness row, so it must
     /// never account a witness placement or invent a module-level use
-    /// row (round 4, census). Ambiguity takes the shared-endpoint gap
-    /// shape; a single unedged candidate records a caller-scoped gap
-    /// naming the missing edge; no candidate at all reports
-    /// caller-wide (the endpoint left the attach set entirely).
+    /// row (round 4, census). Every arm pushes direct under its own
+    /// subject, memoized nowhere: count disclosures share no memo
+    /// bucket with witness gaps in either direction, and repeat
+    /// rejections each disclose (identical repeats fold into the gap's
+    /// repeat count; distinct ones stand on their own, bounded by the
+    /// gap retention bound like every other gap). Ambiguity takes one
+    /// gap per sharer; a single unedged candidate records a
+    /// caller-scoped gap naming the missing edge; no candidate at all
+    /// reports caller-wide (the endpoint left the attach set entirely).
     fn disclose_demoted_rejection(
         &mut self,
         caller: CallerId,
@@ -3034,25 +3039,47 @@ impl CallerRegistry {
     ) {
         match (reason, modules) {
             (PendingRejection::Ambiguous, _) => {
-                self.push_shared_endpoint_gaps(
-                    modules,
-                    &format!("re-resolved with {count} unattributed calls after sharing appeared"),
-                );
+                for key in modules {
+                    let id = self.modules_by_key.get(key).copied();
+                    self.push_gap(RegistryGap {
+                        caller: None,
+                        module: id,
+                        pid: None,
+                        subject: DEMOTED_COUNT_REJECTED.into(),
+                        reason: with_key(
+                            format!(
+                                "a native witness endpoint is shared by {} admitted modules \
+                                 (re-resolved with {count} unattributed calls after sharing appeared): \
+                                 which module was used is ambiguous, so no edge and no module-level use \
+                                 is recorded",
+                                modules.len()
+                            ),
+                            id,
+                            key,
+                        ),
+                        budget: None,
+                    });
+                }
             }
             (PendingRejection::NoEdge, [key]) => {
                 let id = self.modules_by_key.get(key).copied();
-                self.push_coverage_gap(
-                    caller,
-                    key,
-                    id,
-                    WITNESS_WITHOUT_MAPPING,
-                    format!(
-                        "{} has no mapping edge to this module: the re-resolved count ({count} calls) names \
-                         no carrier, so no edge and no module-level use is recorded; a count never invents a \
-                         mapping",
-                        caller.label()
+                self.push_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: id,
+                    pid: None,
+                    subject: DEMOTED_COUNT_REJECTED.into(),
+                    reason: with_key(
+                        format!(
+                            "{} has no mapping edge to this module: the re-resolved count ({count} calls) \
+                             names no carrier, so no edge and no module-level use is recorded; a count never \
+                             invents a mapping",
+                            caller.label()
+                        ),
+                        id,
+                        key,
                     ),
-                );
+                    budget: None,
+                });
             }
             (PendingRejection::NoEdge, []) => {
                 self.push_gap(RegistryGap {
@@ -3078,12 +3105,6 @@ impl CallerRegistry {
     /// no edge, no module-level use.
     fn apply_shared_endpoint(&mut self, modules: &[ModuleKey], text: &str) {
         self.witness_placement.ambiguous += 1;
-        self.push_shared_endpoint_gaps(modules, text);
-    }
-
-    /// The shared-endpoint gaps without the witness placement: a rejected
-    /// demoted count discloses through these (it has no row to account).
-    fn push_shared_endpoint_gaps(&mut self, modules: &[ModuleKey], text: &str) {
         for key in modules {
             let id = self.modules_by_key.get(key).copied();
             self.push_witness_gap(

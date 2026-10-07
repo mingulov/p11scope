@@ -6213,7 +6213,7 @@ mod tests {
         // pair's witness resolved cleanly when A was sole owner, so no
         // witness gap covers this window), while history withholds on
         // the stale edge.
-        use crate::discovery::caller_registry::WITNESS_SHARED_ENDPOINT;
+        use crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED;
         use crate::discovery::inventory_attach_set::tests as fx;
         let (mut native, caller) = NativeScene::new();
         native.answer(7, 500, 41);
@@ -6286,12 +6286,12 @@ mod tests {
             .registry
             .gaps()
             .iter()
-            .filter(|gap| gap.subject == WITNESS_SHARED_ENDPOINT)
+            .filter(|gap| gap.subject == DEMOTED_COUNT_REJECTED)
             .collect();
         assert_eq!(
             gaps.len(),
             2,
-            "the rejected demoted growth stages one shared-endpoint gap per sharer: {:?}",
+            "the rejected demoted growth stages one disclosure gap per sharer: {:?}",
             native.scene.coordinator.registry.gaps()
         );
         assert!(
@@ -6460,6 +6460,264 @@ mod tests {
         assert!(
             registry.modules().all(|module| module.unbound_use.is_none()),
             "a rejected count invents no module-level use row"
+        );
+        let _ = at;
+    }
+
+    #[test]
+    fn demoted_rejection_discloses_despite_an_earlier_witness_gap() {
+        // Round 4, memo (sol F3-02 hole): an earlier ambiguous witness
+        // involving A and B records the generic shared-endpoint gaps; a
+        // later demoted count rejecting Ambiguous must still disclose —
+        // the witness memo must not swallow the count disclosure.
+        use crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.answer(8, 500, 42);
+        native.scene.source.spawn(8, 500);
+        native.scene.coordinator.adapter
+            .admit(8, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.project_paths(8, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Another caller's first-sight shared row fails closed at the
+        // witness: the generic gaps memoize (module, subject),
+        // caller-blind and endpoint-blind.
+        let row_wit = native.row(42, 1, 8, 100, 0);
+        native.witness(vec![row_wit]);
+        // The demoted count rejects Ambiguous on the same modules.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 20,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.reason.contains("19 unattributed calls"))
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "the demoted rejection discloses despite the earlier witness gap: {:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+        assert!(
+            gaps.iter().all(|gap| gap.subject == DEMOTED_COUNT_REJECTED),
+            "count disclosures carry their own subject: {:?}",
+            gaps.iter().map(|gap| &gap.subject).collect::<Vec<_>>()
+        );
+        let _ = at;
+    }
+
+    #[test]
+    fn repeated_demoted_rejections_each_disclose() {
+        // Round 4, memo (R4-N3a): two demoted rejects over the same
+        // modules must each disclose — the first disclosure must not
+        // memoize the second away.
+        use crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.answer(8, 500, 42);
+        native.scene.source.spawn(8, 500);
+        native.scene.coordinator.adapter
+            .admit(8, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(8, 60);
+        // Two bound pairs on one endpoint, one per caller (one cookie
+        // answers each caller).
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let row_b = native.row(42, 1, 8, 100, 0);
+        native.witness(vec![row_b]);
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.project_paths(8, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Both pairs advance in one window; both demote and reject.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![
+            crate::attach::capture::CallerCountUpdate {
+                image: p11scope_ebpf_common::ImageIdentity {
+                    task_cookie: 41,
+                    exec_id: 1,
+                },
+                object: shared.object,
+                count: 20,
+            },
+            crate::attach::capture::CallerCountUpdate {
+                image: p11scope_ebpf_common::ImageIdentity {
+                    task_cookie: 42,
+                    exec_id: 1,
+                },
+                object: shared.object,
+                count: 6,
+            },
+        ];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        for (growth, want) in [("19 unattributed calls", 2), ("5 unattributed calls", 2)] {
+            let gaps: Vec<_> = registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.reason.contains(growth))
+                .collect();
+            assert_eq!(
+                gaps.len(),
+                want,
+                "each rejected demoted count discloses its own growth ({growth}): {:?}",
+                registry.gaps()
+            );
+        }
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.reason.contains("unattributed calls"))
+                .all(|gap| gap.subject == DEMOTED_COUNT_REJECTED),
+            "count disclosures carry their own subject: {:?}",
+            registry.gaps()
+        );
+        let _ = at;
+    }
+
+    #[test]
+    fn demoted_rejection_leaves_later_witness_gaps_undisturbed() {
+        // Round 4, memo (R4-N3b): a demoted rejection must not memoize
+        // the witness subjects — a later first-sight ambiguous witness
+        // over the same modules still records its own witness gaps.
+        use crate::discovery::caller_registry::WITNESS_SHARED_ENDPOINT;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.answer(8, 500, 42);
+        native.scene.source.spawn(8, 500);
+        native.scene.coordinator.adapter
+            .admit(8, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.project_paths(8, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // The demoted count rejects first.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 20,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Then another caller's first-sight shared row fails closed
+        // at the witness.
+        let row_b = native.row(42, 1, 8, 100, 0);
+        native.witness(vec![row_b]);
+        let gaps: Vec<_> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.subject == WITNESS_SHARED_ENDPOINT
+                    && gap.reason.contains("bound to a caller incarnation")
+            })
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "the later witness records its own gaps: {:?}",
+            native.scene.coordinator.registry.gaps()
         );
         let _ = at;
     }

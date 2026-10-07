@@ -123,6 +123,14 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
     cfg = ident_config();
     if (!cfg)
         return 0;
+    /* Observer binding: the anchor run is per-pid on the observer. Any
+     * other task (a wrong-scope walk) is skipped before it can install. */
+    {
+        int tgid = 0;
+        P11_READ(tgid, task->tgid);
+        if (tgid < 0 || (u32)tgid != cfg->observer_tgid)
+            return 0;
+    }
     base = cfg->arena_base;
     len = cfg->arena_len;
     slots = cfg->slots;
@@ -159,10 +167,19 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
         return 0;
     }
     /* Clear stale: only a previous generation's entry may go; a current-gen
-     * entry under another slot is a live `DUP` alias, never garbage. */
+     * entry under another slot is a live `DUP` alias, never garbage. A
+     * current-gen entry owned by THIS slot for a different inode means the
+     * slot changed installer mid-pass (a wrong-scope second installer, or
+     * the anchor page remapped during the walk): emit `CONFLICT` (never a
+     * second `OK`) and install nothing — the slot is contested. */
     old = *slot_cell;
     if (old != 0 && old != addr) {
         struct p11_anchor_entry *stale = p11_map_lookup(&anchors, &old);
+        if (stale && stale->gen == gen && stale->slot == slot) {
+            emit(ctx, P11_IDENT_KIND_ANCHOR, slot, 0, 0, P11_IDENT_ANCHOR_CONFLICT,
+                 (u32)gen);
+            return 0;
+        }
         if (stale && stale->gen != gen)
             p11_map_delete(&anchors, &old);
     }

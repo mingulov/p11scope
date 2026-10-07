@@ -47,6 +47,10 @@ typedef unsigned char u8;
 #define P11_IDENT_ANCHOR_DUP 1
 #define P11_IDENT_ANCHOR_FULL 2
 #define P11_IDENT_ANCHOR_BAD_SHAPE 3
+/* A current-generation slot changed inode mid-pass (a second installer from
+ * a wrong-scope walk, or a remapped anchor page): contested, not installed.
+ * Never a second `OK` for the same slot. */
+#define P11_IDENT_ANCHOR_CONFLICT 4
 
 struct p11_vma_identity_record {
     u16 magic;
@@ -79,19 +83,23 @@ _Static_assert(sizeof(struct p11_anchor_entry) == 16, "anchor entry ABI");
 _Static_assert(__builtin_offsetof(struct p11_anchor_entry, slot) == 0, "slot");
 _Static_assert(__builtin_offsetof(struct p11_anchor_entry, gen) == 8, "entry gen");
 
-/* `config[0]`: observer addresses and counters only, never kernel pointers. */
+/* `config[0]`: observer addresses and counters only, never kernel pointers.
+ * The anchor run is always per-pid on the observer: the anchor program
+ * installs only for the task whose tgid matches `observer_tgid` and skips
+ * every other task, so a wrong-scope walk cannot install foreign inodes. */
 struct p11_identity_config {
     u64 gen;
     u64 arena_base;
     u64 arena_len;
     u32 slots;
-    u32 pad;
+    u32 observer_tgid;
 };
 _Static_assert(sizeof(struct p11_identity_config) == 32, "config ABI");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, gen) == 0, "config gen");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, arena_base) == 8, "arena base");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, arena_len) == 16, "arena len");
 _Static_assert(__builtin_offsetof(struct p11_identity_config, slots) == 24, "slots");
+_Static_assert(__builtin_offsetof(struct p11_identity_config, observer_tgid) == 28, "observer");
 
 /* Stable iterator context: fixed kernel offsets, never CO-RE. */
 struct p11_iter_meta {

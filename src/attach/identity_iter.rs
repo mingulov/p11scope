@@ -39,6 +39,10 @@ pub const ANCHOR_DUP: u32 = 1;
 pub const ANCHOR_FULL: u32 = 2;
 /// Anchor verdict: the arena VMA failed the shape check.
 pub const ANCHOR_BAD_SHAPE: u32 = 3;
+/// Anchor verdict: a current-generation slot changed inode mid-pass (a
+/// wrong-scope second installer, or the anchor page remapped during the
+/// walk). Contested, never installed — and never a second `OK`.
+pub const ANCHOR_CONFLICT: u32 = 4;
 /// Anchor slots in the kernel maps.
 pub const ANCHOR_SLOTS: u32 = 1024;
 /// Words in the scope bitmap; covers `PID_MAX_LIMIT` (2^22).
@@ -53,7 +57,10 @@ pub const PAGE_GRANULE: u64 = 4096;
 // ---------------------------------------------------------------------------
 
 /// Userspace view of `struct p11_identity_config`: observer addresses and
-/// counters only, never kernel pointers.
+/// counters only, never kernel pointers. The anchor run is always per-pid
+/// on the observer: userspace installs its own tgid here and the anchor
+/// program skips every other task, so a wrong-scope walk cannot install
+/// foreign inodes under observer slots.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdentityConfig {
@@ -65,8 +72,8 @@ pub struct IdentityConfig {
     pub arena_len: u64,
     /// Slots installed this pass (`<= ANCHOR_SLOTS`).
     pub slots: u32,
-    /// Reserved, always zero.
-    pub pad: u32,
+    /// Observer's tgid: the only task the anchor program installs for.
+    pub observer_tgid: u32,
 }
 
 const _: () = assert!(size_of::<IdentityConfig>() == 32);
@@ -74,6 +81,7 @@ const _: () = assert!(std::mem::offset_of!(IdentityConfig, generation) == 0);
 const _: () = assert!(std::mem::offset_of!(IdentityConfig, arena_base) == 8);
 const _: () = assert!(std::mem::offset_of!(IdentityConfig, arena_len) == 16);
 const _: () = assert!(std::mem::offset_of!(IdentityConfig, slots) == 24);
+const _: () = assert!(std::mem::offset_of!(IdentityConfig, observer_tgid) == 28);
 
 /// Value of an `anchors` entry, for documentation and tests. The kernel owns
 /// these entries; userspace never reads them (I6).
@@ -171,6 +179,10 @@ pub enum AnchorOutcome {
     Dup(u32),
     Full,
     BadShape,
+    /// The slot changed inode mid-pass (a wrong-scope second installer,
+    /// or the anchor page remapped during the walk). Contested: never
+    /// installed, and never confused with `Ok`.
+    Conflict,
 }
 
 /// A parsed run: the exact-range join input plus anchor outcomes. Records
@@ -385,6 +397,15 @@ pub fn parse(bytes: &[u8], expect: &Expect) -> Result<Run, Invalid> {
                         }
                         // Any slot value: a shape failure never installs.
                         AnchorOutcome::BadShape
+                    }
+                    ANCHOR_CONFLICT => {
+                        if start != 0 || end != 0 {
+                            return Err(Invalid::AnchorPayload);
+                        }
+                        if a >= expect.slots {
+                            return Err(Invalid::VerdictRange);
+                        }
+                        AnchorOutcome::Conflict
                     }
                     _ => return Err(Invalid::VerdictRange),
                 };
@@ -1235,6 +1256,53 @@ mod tests {
         assert_eq!(run.by_pid.get(&100).expect("pid 100").len(), 1);
     }
 
+    /// A current-gen slot changing inode must surface as a distinct
+    /// `Conflict` outcome — never a second `OK`.
+    #[test]
+    fn anchor_conflict_outcome_marks_slot_contested() {
+        let empty_scope = BTreeSet::new();
+        let anchor = anchor_expect(&empty_scope);
+        let bytes = [
+            record(KIND_ANCHOR, 0, 0, 0, ANCHOR_CONFLICT, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        let run = parse(&bytes, &anchor).expect("CONFLICT must parse to a contested slot");
+        assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::Conflict));
+        // A contested slot never counts as installed, even beside an OK:
+        // mixed repeats still downgrade the slot.
+        let bytes = [
+            record(KIND_ANCHOR, 1, 0, 0, ANCHOR_OK, 7).to_vec(),
+            record(KIND_ANCHOR, 1, 0, 0, ANCHOR_CONFLICT, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        let run = parse(&bytes, &anchor).expect("mixed repeats stay per-key");
+        assert_eq!(run.anchors.get(&1), Some(&AnchorOutcome::BadShape));
+        // Identical CONFLICT repeats collapse like any other outcome.
+        let bytes = [
+            record(KIND_ANCHOR, 2, 0, 0, ANCHOR_CONFLICT, 7).to_vec(),
+            record(KIND_ANCHOR, 2, 0, 0, ANCHOR_CONFLICT, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        let run = parse(&bytes, &anchor).expect("identical repeats collapse");
+        assert_eq!(run.anchors.get(&2), Some(&AnchorOutcome::Conflict));
+        // CONFLICT carries no payload and names a real slot.
+        let mut dirty = record(KIND_ANCHOR, 0, 0, 0, ANCHOR_CONFLICT, 7);
+        dirty[8] = 1;
+        assert_eq!(
+            parse(&[dirty.to_vec(), end(7).to_vec()].concat(), &anchor),
+            Err(Invalid::AnchorPayload)
+        );
+        let wide = [
+            record(KIND_ANCHOR, 4, 0, 0, ANCHOR_CONFLICT, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        assert_eq!(parse(&wide, &anchor), Err(Invalid::VerdictRange));
+    }
+
     #[test]
     fn conflicting_anchor_repeats_downgrade_the_slot() {
         let empty_scope = BTreeSet::new();
@@ -1590,6 +1658,7 @@ mod tests {
             dec("P11_IDENT_ANCHOR_BAD_SHAPE"),
             u64::from(ANCHOR_BAD_SHAPE)
         );
+        assert_eq!(dec("P11_IDENT_ANCHOR_CONFLICT"), u64::from(ANCHOR_CONFLICT));
         assert_eq!(dec("P11_IDENT_ANCHOR_SLOTS"), u64::from(ANCHOR_SLOTS));
         assert_eq!(dec("P11_IDENT_SCOPE_WORDS"), SCOPE_WORDS as u64);
         assert_eq!(dec("P11_IDENT_F_WRONLY"), 16);
@@ -1745,6 +1814,23 @@ mod tests {
             ))),
             None
         );
+    }
+
+    /// The anchor run is per-pid on the observer: `config[0]` carries
+    /// the observer tgid the anchor program installs for (offset 28,
+    /// layout pinned against the C header by the compile-time asserts).
+    #[test]
+    fn identity_config_binds_observer_tgid() {
+        let config = IdentityConfig {
+            generation: 7,
+            arena_base: 0x1000,
+            arena_len: 8192,
+            slots: 1,
+            observer_tgid: 4242,
+        };
+        assert_eq!(size_of::<IdentityConfig>(), 32);
+        assert_eq!(std::mem::offset_of!(IdentityConfig, observer_tgid), 28);
+        assert_eq!(config.observer_tgid, 4242);
     }
 
     #[test]

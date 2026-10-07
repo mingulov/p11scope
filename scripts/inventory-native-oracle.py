@@ -571,10 +571,9 @@ def window_count(use, since_ns, window):
 
 def endpoint_coverage_ok(lines, admission_endpoints):
     """O1 pigeonhole: every distinctly-called endpoint needs an admitted
-    endpoint. An unknown admission count skips (can't judge — the shape
-    checks fail it elsewhere)."""
-    if type(admission_endpoints) is not int:
-        return True
+    endpoint. The caller proves the count is an int first: a missing
+    or malformed admission count is explicitly nonqualifying (round
+    2), never silently assumed sufficient."""
     return len({e["fn"] for e in lines}) <= admission_endpoints
 
 
@@ -657,20 +656,27 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
         return "inexact", 0, ""
     if type(caller_first_seen_ns) is not int:
         return "inexact", 0, ""
+    # Round 2: the coverage and hold evidence must be present and
+    # well-formed before it proves anything — a missing admission
+    # count or mapping first-seen is explicitly nonqualifying, never
+    # silently skipped or defaulted to admission alone.
+    if type(admission_endpoints) is not int:
+        return "nonqualifying", 0, "admission endpoint count missing or malformed: endpoint coverage unprovable"
+    if type(mapping_first_seen_ns) is not int:
+        return "nonqualifying", 0, "mapping first-seen missing or malformed: mapping-hold risk unprovable"
     if any(e["t0"] <= since_ns <= e["t1"] for e in attach):
         return "nonqualifying", 0, "an attach-side line spans the first row: recorded split unknowable"
     if partial_attach:
         return "nonqualifying", 0, "a partial-attach gap clouds the module: counted uses are lower bounds"
     first_attach_t0 = min(e["t0"] for e in attach)
     whole_in_window = not any(e["t0"] < window[0] or e["t1"] > window[1] for e in use.lines)
-    mapping_missing = type(mapping_first_seen_ns) is not int
     # Legacy predating branch (verbatim + evidenced overrides): the row
     # predates every attach-side call (the synth counting convention —
     # real rows stamp during their recording call): all recorded.
     if since_ns < first_attach_t0:
         if caller_first_seen_ns > first_attach_t0 or not whole_in_window:
             return "inexact", 0, ""
-        if not mapping_missing and mapping_first_seen_ns > first_attach_t0:
+        if mapping_first_seen_ns > first_attach_t0:
             return "nonqualifying", 0, "mapping first seen after the first call: mapping-hold risk"
         if not endpoint_coverage_ok(attach, admission_endpoints):
             return "nonqualifying", 0, "more distinct endpoints called than admitted"
@@ -682,7 +688,7 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
         first_post_t0 = min(e["t0"] for e in post)
         if caller_first_seen_ns > first_post_t0:
             return "nonqualifying", 0, "admission after the covered segment: hold/eviction risk"
-        if not mapping_missing and mapping_first_seen_ns > first_post_t0:
+        if mapping_first_seen_ns > first_post_t0:
             return "nonqualifying", 0, "mapping first seen after the covered segment: mapping-hold risk"
         if not endpoint_coverage_ok(post, admission_endpoints):
             return "nonqualifying", 0, "more distinct endpoints called than admitted"
@@ -705,7 +711,7 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
     if rec is not first_line or rec["n"] != 1 \
             or caller_first_seen_ns > first_attach_t0 or not whole_in_window:
         return "nonqualifying", 0, "recording line neither pre-attachment nor first-singleton"
-    if not mapping_missing and mapping_first_seen_ns > first_attach_t0:
+    if mapping_first_seen_ns > first_attach_t0:
         return "nonqualifying", 0, "mapping first seen after the first call: mapping-hold risk"
     if not endpoint_coverage_ok(attach, admission_endpoints):
         return "nonqualifying", 0, "more distinct endpoints called than admitted"
@@ -3748,6 +3754,31 @@ def self_test():
                     if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
         if row is None or row["status"] != "nonqualifying":
             failures.append("o1-admission-coverage-not-nonqualifying")
+
+        # O1 evidence validation (round 2): a missing admission
+        # endpoint count or mapping first-seen cannot prove endpoint
+        # coverage or mapping hold — COUNT-EXACT is explicitly
+        # nonqualifying, never exact on assumed evidence.
+        def admission_endpoints_missing(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            mod = next(m for m in d["modules"] if m["id"] == s.mid["A"])
+            mod["admission"]["endpoints"] = None
+            return kw
+        res = case("o1-admission-endpoints-missing-nonqualifying", None, admission_endpoints_missing)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-admission-endpoints-missing-not-nonqualifying")
+
+        def mapping_first_seen_missing(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            _edge(d, cid(s, "P1"), s.mid["A"])["mapping"]["first_seen_ns"] = None
+            return kw
+        res = case("o1-mapping-first-seen-missing-nonqualifying", None, mapping_first_seen_missing)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-mapping-first-seen-missing-not-nonqualifying")
 
         # --- O2: terminal sweep hole (sol 2, astra B4) ----------------------
         # Every record after the last pass marker skips EDGE-CADENCE while

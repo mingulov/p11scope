@@ -4511,9 +4511,11 @@ mod tests {
         false
     }
 
-    fn anchor_maps_api(
-        block: &str,
-    ) -> Result<(BTreeSet<String>, BTreeSet<String>, BTreeSet<String>), String> {
+    /// Enumerated `impl AnchorMaps` API: (public, private,
+    /// `#[cfg(test)]`-gated) name sets.
+    type AnchorApiSets = (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
+
+    fn anchor_maps_api(block: &str) -> Result<AnchorApiSets, String> {
         require_ascii_audit_input(block, "API enumeration input")?;
         let end = impl_block_end(block);
         let mut public = BTreeSet::new();

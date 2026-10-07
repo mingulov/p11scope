@@ -539,18 +539,18 @@ def recording_before(use, since_ns):
     return max(before, key=lambda e: (e["t1"], e["t0"])) if before else None
 
 
-def window_count(use, since_ns, window, cover_start=None):
+def window_count(use, since_ns, window):
     """(lo, hi) calls a counting feed covering [max(since, start), end] must report.
 
     Lines completed strictly before since_ns missed (no row existed
     yet) — except the recording line itself (recording_before), whose
-    recording call is included: +1 in lo when fully inside the window
-    (it contributes exactly that call), +n in hi. Lines starting
-    strictly after since_ns are recorded (the row exists); same-tick
-    boundaries are ambiguous (hi only). A recording line proven
-    pre-attachment (ending strictly before cover_start: attachment
-    follows admission and mapping, so no row came from it) contributes
-    nothing, not even the +1."""
+    recording call is always included: +1 in lo when fully inside the
+    window (that call created the row, so it is counted), +n in hi.
+    Lines starting strictly after since_ns are recorded (the row
+    exists); same-tick boundaries are ambiguous (hi only). No entry
+    timing proves the recording call contributed zero: the workload
+    stamps t0/t1 before invocation, so admission or attachment may
+    have landed between the stamp and the recorded entry."""
     start, end = max(since_ns, window[0]), window[1]
     lo = hi = 0
     arming = (since_ns, use.first_attach_t0)
@@ -564,8 +564,7 @@ def window_count(use, since_ns, window, cover_start=None):
     rec = recording_before(use, since_ns)
     if rec is not None:
         hi += rec["n"]
-        rowless = cover_start is not None and rec["t1"] < cover_start
-        if rec["t0"] >= window[0] and rec["t1"] <= end and not rowless:
+        if rec["t0"] >= window[0] and rec["t1"] <= end:
             lo += 1
     return lo, hi
 
@@ -615,10 +614,8 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
     strictly after since_ns recorded (the row proves live probes). A
     line spanning since_ns splits unknowably (aggregation) — explicit
     nonqualifying. The recording line (last attach line ending before
-    since_ns) is known zero when proven pre-attachment (ending strictly
-    before cover_start = max(admission, mapping first-seen):
-    attachment follows admission and mapping, so no row came from it);
-    otherwise it is row-possible. A row-possible recording line takes
+    since_ns) is always row-possible: entry stamps precede invocation,
+    so no entry timing proves it executed before attachment. It takes
     the legacy Case A (first attach line, singleton, admitted before
     it — full-sum equality, attachment-before-workload convention) or
     is insufficient evidence. Equality additionally requires endpoint
@@ -647,6 +644,13 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
     # Structural, legacy-verbatim: frozen, empty, or unadmitted (a
     # malformed admission stamp is unadmitted too — the shape checks
     # fail it elsewhere; the oracle never crashes on it).
+    # NOTE (round 2): no entry timing proves the recording call
+    # contributed zero, so there is no pre-attachment exact arm: the
+    # workload stamps t0/t1 before invocation
+    # (tests/fixtures/public-cli/inventory-ledger.c:236), and
+    # admission/attachment may land between the stamp and the recorded
+    # entry. A row-possible recording line takes the legacy Case A
+    # below or is insufficient evidence.
     if until_ns is not None:
         return "inexact", 0, ""
     if not attach:
@@ -691,14 +695,12 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
         # every attach line starts after the row, and the recording call
         # sits ledgered inside the first one.
         return "exact", sum(e["n"] for e in post), ""
-    cover = caller_first_seen_ns if mapping_missing else max(caller_first_seen_ns, mapping_first_seen_ns)
-    if rec["t1"] < cover:
-        # Pre-attachment (causal: attachment follows admission and
-        # mapping): no row came from it — known zero.
-        return "exact", sum(e["n"] for e in post), ""
     # Row-possible recording line: legacy Case A verbatim (first attach
     # line, singleton, admitted before it — full-sum equality) or
     # insufficient evidence (held-then-bound or an aggregation split).
+    # A recording line ending before admission/mapping is NOT known
+    # zero: entry stamps precede invocation, so the recording call may
+    # have executed after attachment and been counted.
     first_line = min(attach, key=lambda e: (e["t0"], e["t1"]))
     if rec is not first_line or rec["n"] != 1 \
             or caller_first_seen_ns > first_attach_t0 or not whole_in_window:
@@ -1732,11 +1734,7 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
         window = (view.window[0], min(view.window[1], until)) if until is not None else view.window
         admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
         mapping_first = edge.get("mapping", {}).get("first_seen_ns")
-        cover = None
-        for stamp in (admitted, mapping_first):
-            if type(stamp) is int and (cover is None or stamp > cover):
-                cover = stamp
-        lo, hi = window_count(use, cov.get("since_ns") or 0, window, cover)
+        lo, hi = window_count(use, cov.get("since_ns") or 0, window)
         count = edge["entries"].get("count", 0)
         total = ledger_total_table_calls(image, prov["path"], cov.get("since_ns"))
         res.ok(run, cell, "COUNT-TOTAL", count <= total,
@@ -3649,12 +3647,15 @@ def self_test():
             return kw
         case("count-below-ledger-realistic-timing", "COUNT-EXACT", realistic_timing_short)
 
-        # --- O1: covered-segment exactness (fix round 1) ------------------
-        # Setup-before-attachment: four setup calls precede attachment (no
-        # rows: proven missed); all 30 main + 3 teardown calls are
-        # captured. Admission lands in the setup->main gap with the first
-        # row after it: the proven covered segment is main+teardown (33).
-        # 33 qualifies with COUNT-EXACT engaged; 32 fails it.
+        # --- O1: covered-segment exactness (fix round 1, corrected round 2)
+        # Setup-before-attachment: four setup calls precede attachment;
+        # all 30 main + 3 teardown calls are captured. Admission lands
+        # in the setup->main gap with the first row after it. The
+        # recording call (on the last setup line) created the row, so
+        # the correct count is 34 = 33 post-since calls + the recording
+        # call; COUNT-EXACT is nonqualifying (entry stamps cannot prove
+        # the recording call executed before attachment), and 33 or
+        # fewer fails COUNT-WINDOW.
         def setup_before_attachment(s, d, count):
             login = re.search(r"fn=C_Login mech=- n=1 bad=0 phase=setup t0=\d+ t1=(\d+)",
                               s.ledgers["P1"])
@@ -3672,13 +3673,28 @@ def self_test():
             edge["entries"]["count"] = count
             return since
 
+        # The covered segment's correct count includes the recording
+        # call (34 = 33 post-since calls + the call that created the
+        # first row): the window keeps the recording-call bound, while
+        # COUNT-EXACT is explicitly nonqualifying — entry stamps cannot
+        # prove the recording call executed before attachment (round 2).
         def covered_segment_correct(s, d, dash):
+            setup_before_attachment(s, d, 34)
+        res = case("o1-covered-segment-counts-recording-call", None, covered_segment_correct)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-covered-segment-not-nonqualifying")
+
+        # An undercount missing exactly the recording call (33) fails
+        # the window's lower bound — it no longer passes as exact.
+        def covered_segment_missing_recording(s, d, dash):
             setup_before_attachment(s, d, 33)
-        case("o1-covered-segment-pass", None, covered_segment_correct)
+        case("o1-recording-call-missing-fails", "COUNT-WINDOW", covered_segment_missing_recording)
 
         def covered_segment_short(s, d, dash):
             setup_before_attachment(s, d, 32)
-        case("o1-covered-segment-short-fails", "COUNT-EXACT", covered_segment_short)
+        case("o1-covered-segment-short-fails", "COUNT-WINDOW", covered_segment_short)
 
         # O1 partial attach: the module reports failed endpoints (verbatim
         # production shape — PARTIAL_ATTACH_SUBJECT in
@@ -3724,7 +3740,7 @@ def self_test():
         # segment but only one admitted — some called endpoint missed, so
         # COUNT-EXACT is explicitly nonqualifying.
         def admitted_endpoints_short(s, d, dash):
-            setup_before_attachment(s, d, 33)
+            setup_before_attachment(s, d, 34)
             mod = next(m for m in d["modules"] if m["id"] == s.mid["A"])
             mod["admission"]["endpoints"] = 1
         res = case("o1-admission-coverage-nonqualifying", None, admitted_endpoints_short)

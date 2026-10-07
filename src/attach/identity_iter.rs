@@ -3964,9 +3964,12 @@ mod tests {
     }
 
     /// Read a Rust path (`ident`, `self::x::Y`, `::x::Y`) from the front
-    /// of `text`: the path plus the remainder, or `None`.
+    /// of `text`: the path plus the remainder, or `None`. Gaps around
+    /// `::` compile (`self :: Y`, comments blank to spaces upstream),
+    /// so segment joints skip whitespace — but only across a real
+    /// `::`, never between bare tokens.
     fn read_rust_path(text: &str) -> Option<(String, &str)> {
-        let mut rest = text.strip_prefix("::").unwrap_or(text);
+        let mut rest = text.strip_prefix("::").map(str::trim_start).unwrap_or(text);
         let mut path = String::new();
         loop {
             let name: String = rest
@@ -3978,9 +3981,10 @@ mod tests {
             }
             path.push_str(&name);
             rest = &rest[name.len()..];
-            if let Some(tail) = rest.strip_prefix("::") {
+            let joint = rest.trim_start();
+            if let Some(tail) = joint.strip_prefix("::") {
                 path.push_str("::");
-                rest = tail;
+                rest = tail.trim_start();
             } else {
                 return Some((path, rest));
             }
@@ -4467,6 +4471,21 @@ mod tests {
             "impl<T> Evil<T> for AnchorMaps {}",
             "impl Evil2<T> for AnchorMaps {}",
             "impl AsRef<OwnedFd> for AnchorMaps {}",
+        ] {
+            let mutated = format!("{code}\n{header}\n");
+            assert!(
+                scan_anchor_impls(&blank_rust_noise(&mutated)).1,
+                "`{header}` must read as a trait impl"
+            );
+        }
+        // Spaced qualified subject paths (fix round 5): gaps around
+        // `::` compile (`for self :: AnchorMaps`, comment-separated —
+        // blanked to spaces upstream — and leading `:: AnchorMaps`),
+        // so each must read as a trait impl, never silence.
+        for header in [
+            "impl Evil for self :: AnchorMaps {}",
+            "impl AsRef<OwnedFd> for self /*gap*/ :: AnchorMaps {}",
+            "impl Evil for :: AnchorMaps {}",
         ] {
             let mutated = format!("{code}\n{header}\n");
             assert!(

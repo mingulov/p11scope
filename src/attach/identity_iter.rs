@@ -4134,6 +4134,68 @@ mod tests {
             .find_map(|(at, is_trait)| (!is_trait).then_some(at))
     }
 
+    /// Whether `name` is a Rust strict or reserved keyword (`if`,
+    /// `return`, …): keywords can never name a macro, so `!` after one
+    /// is unary negation, never an invocation. A `r#`-quoted ident
+    /// still counts as an invocation (syntactically one); the caller
+    /// checks the `#`.
+    fn is_rust_keyword(name: &str) -> bool {
+        matches!(
+            name,
+            "as" | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+                | "async"
+                | "await"
+                | "dyn"
+                | "gen"
+                | "abstract"
+                | "become"
+                | "box"
+                | "do"
+                | "final"
+                | "macro"
+                | "override"
+                | "priv"
+                | "typeof"
+                | "unsized"
+                | "virtual"
+                | "yield"
+                | "try"
+        )
+    }
+
     /// Forbid macros in the handle region: no `macro_rules` in
     /// production code at all, and no macro invocations inside the
     /// `impl AnchorMaps` block except the two allowlisted
@@ -4141,11 +4203,13 @@ mod tests {
     /// invocation is `!` preceded (across whitespace) by an identifier
     /// char and followed (across whitespace) by `(`, `[`, or `{` — a
     /// spaced `mac ! ()` compiles, and comments blank to spaces
-    /// upstream, so adjacency is not required. `!=` and unary `!`
-    /// never match. An external `#[macro_use]` definition needs no
-    /// in-file search: whatever defines the macro, invoking it in the
-    /// region fails this scan. Returns the rejection reason instead of
-    /// panicking so proofs can assert rejection.
+    /// upstream, so adjacency is not required. `!=` never matches, and
+    /// neither does unary `!` after a strict keyword (`if !(…)`,
+    /// `return !(…)`): keywords can never name a macro. An external
+    /// `#[macro_use]` definition needs no in-file search: whatever
+    /// defines the macro, invoking it in the region fails this scan.
+    /// Returns the rejection reason instead of panicking so proofs can
+    /// assert rejection.
     fn check_handle_region_has_no_macros(code: &str) -> Result<(), String> {
         if code.contains("macro_rules") {
             return Err("production code must not define macro_rules".to_string());
@@ -4183,13 +4247,19 @@ mod tests {
                     {
                         start -= 1;
                     }
-                    if &region[start..back] == "std::ptr::addr_of_mut" {
+                    let name = &region[start..back];
+                    // A strict keyword ahead of `!` is unary negation
+                    // (`if !(…)`), never an invocation — unless the
+                    // ident is `r#`-quoted, which still reads as one.
+                    let raw = start > 0 && bytes[start - 1] == b'#';
+                    if !raw && is_rust_keyword(name) {
+                        index += 1;
+                        continue;
+                    }
+                    if name == "std::ptr::addr_of_mut" {
                         allowlisted += 1;
                     } else {
-                        return Err(format!(
-                            "macro invocation in the handle region: {}!",
-                            &region[start..back]
-                        ));
+                        return Err(format!("macro invocation in the handle region: {name}!"));
                     }
                 }
             }
@@ -4495,6 +4565,19 @@ mod tests {
                 check_handle_region_has_no_macros(&blank_rust_noise(&mutated)).is_err(),
                 "forbid must reject the spaced invocation {invocation:?}"
             );
+        }
+        // Keyword-led unary `!` (fix round 5): `if !(…)` and `return
+        // !(…)` are ordinary negation — a strict keyword can never name
+        // a macro, spaced or tight — so each must pass the forbid.
+        for stmt in [
+            "    if !(ready) { return; }\n",
+            "    if!(ready) { return; }\n",
+            "    return !(ready);\n",
+        ] {
+            let mutated = code.replacen("    pub fn new(", &format!("{stmt}    pub fn new("), 1);
+            assert_ne!(mutated, code, "unary mutation {stmt:?} must apply");
+            check_handle_region_has_no_macros(&blank_rust_noise(&mutated))
+                .expect("forbid must accept keyword-led unary `!`");
         }
     }
 

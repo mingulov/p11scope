@@ -576,10 +576,18 @@ pub fn read_run(
 pub const BPF_LINK_CREATE: u32 = 28;
 /// `BPF_ITER_CREATE` command number.
 pub const BPF_ITER_CREATE: u32 = 33;
+/// `BPF_MAP_CREATE` command number.
+pub const BPF_MAP_CREATE: u32 = 0;
 /// `BPF_MAP_UPDATE_ELEM` command number.
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
 /// `BPF_MAP_DELETE_ELEM` command number.
 pub const BPF_MAP_DELETE_ELEM: u32 = 3;
+/// `BPF_OBJ_GET_INFO_BY_FD` command number.
+pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
+/// `BPF_MAP_TYPE_HASH` map type.
+pub const BPF_MAP_TYPE_HASH: u32 = 1;
+/// `BPF_MAP_TYPE_ARRAY` map type.
+pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 /// `BPF_TRACE_ITER` attach type for `iter/task_vma` links.
 pub const BPF_TRACE_ITER: u32 = 28;
 /// `BPF_ANY`: create or update.
@@ -649,6 +657,41 @@ const _: () = assert!(std::mem::offset_of!(MapElemAttr, map_fd) == 0);
 const _: () = assert!(std::mem::offset_of!(MapElemAttr, key) == 8);
 const _: () = assert!(std::mem::offset_of!(MapElemAttr, value) == 16);
 const _: () = assert!(std::mem::offset_of!(MapElemAttr, flags) == 24);
+
+/// `BPF_OBJ_GET_INFO_BY_FD` attr: `{bpf_fd@0, info_len@4, info@8}`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjGetInfoAttr {
+    pub bpf_fd: u32,
+    pub info_len: u32,
+    pub info: u64,
+}
+
+const _: () = assert!(size_of::<ObjGetInfoAttr>() == 16);
+const _: () = assert!(std::mem::offset_of!(ObjGetInfoAttr, bpf_fd) == 0);
+const _: () = assert!(std::mem::offset_of!(ObjGetInfoAttr, info_len) == 4);
+const _: () = assert!(std::mem::offset_of!(ObjGetInfoAttr, info) == 8);
+
+/// Prefix of `struct bpf_map_info` the handle check reads: the kernel
+/// fills what fits, so a short buffer is a supported query for exactly
+/// these fields. Metadata only — keys and values are never read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MapInfoPrefix {
+    pub map_type: u32,
+    pub id: u32,
+    pub key_size: u32,
+    pub value_size: u32,
+    pub max_entries: u32,
+    pub map_flags: u32,
+}
+
+const _: () = assert!(size_of::<MapInfoPrefix>() == 24);
+const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, map_type) == 0);
+const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, key_size) == 8);
+const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, value_size) == 12);
+const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, max_entries) == 16);
+const _: () = assert!(std::mem::offset_of!(MapInfoPrefix, map_flags) == 20);
 
 fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
     // SAFETY: raw bpf() with a caller-sized attr; exactly what libbpf does.
@@ -759,11 +802,61 @@ pub struct AnchorMaps {
     slots: OwnedFd,
 }
 
+/// Check one anchor-map handle: a `WRONLY` fd (`EBADF` otherwise) for a
+/// map with exactly the expected type, key/value sizes, and capacity
+/// (`EINVAL` otherwise), via `BPF_OBJ_GET_INFO_BY_FD`. The creation-time
+/// `WRONLY` map flag is NOT re-checked here: the kernel reports the live
+/// shape in `map_info` but the write-only-ness on the fd itself (a
+/// `WRONLY` map yields `O_WRONLY` fds, and reads through them fail with
+/// `EPERM`). Metadata only — keys and values are never read.
+fn validated_map_fd(
+    fd: BorrowedFd<'_>,
+    want_type: u32,
+    want_key: u32,
+    want_value: u32,
+    want_max: u32,
+) -> io::Result<()> {
+    // SAFETY: `fcntl(F_GETFL)` on a live owned fd.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_ACCMODE != libc::O_WRONLY {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    let mut info = MapInfoPrefix::default();
+    let mut attr = ObjGetInfoAttr {
+        bpf_fd: fd.as_raw_fd() as u32,
+        info_len: size_of::<MapInfoPrefix>() as u32,
+        info: std::ptr::addr_of_mut!(info).addr() as u64,
+    };
+    bpf(
+        BPF_OBJ_GET_INFO_BY_FD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<ObjGetInfoAttr>(),
+    )?;
+    if info.map_type != want_type
+        || info.key_size != want_key
+        || info.value_size != want_value
+        || info.max_entries != want_max
+    {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(())
+}
+
 impl AnchorMaps {
-    /// Wrap the two anchor-map fds (cloned from the loaded object). No
-    /// validation reads are possible: the fds refuse them with `EPERM`.
-    pub fn new(hash: OwnedFd, slots: OwnedFd) -> Self {
-        Self { hash, slots }
+    /// Wrap the two anchor-map fds (cloned from the loaded object). The
+    /// handles are validated: each must be a `WRONLY` fd for a map with
+    /// exactly the expected type, key/value sizes, and capacity (checked
+    /// via `BPF_OBJ_GET_INFO_BY_FD` plus the fd access mode) — otherwise
+    /// a size-mismatched map would turn updates into kernel over-reads of
+    /// caller memory. No validation reads of map CONTENTS are possible:
+    /// the fds refuse them with `EPERM`.
+    pub fn new(hash: OwnedFd, slots: OwnedFd) -> io::Result<Self> {
+        validated_map_fd(hash.as_fd(), BPF_MAP_TYPE_HASH, 8, 16, ANCHOR_SLOTS)?;
+        validated_map_fd(slots.as_fd(), BPF_MAP_TYPE_ARRAY, 4, 8, ANCHOR_SLOTS)?;
+        Ok(Self { hash, slots })
     }
 
     fn update(fd: BorrowedFd<'_>, key: &[u8], value: &[u8]) -> io::Result<()> {
@@ -2417,19 +2510,157 @@ mod tests {
         );
         let iter = iter_create(null.as_fd());
         assert!(iter.is_err(), "iter create on /dev/null must fail");
-        let maps = AnchorMaps::new(
-            null.as_fd().try_clone_to_owned().expect("clone"),
-            null.as_fd().try_clone_to_owned().expect("clone"),
+        // The constructor rejects non-map fds outright now; the raw
+        // update/delete paths below still fail closed at the syscall.
+        assert!(
+            AnchorMaps::new(
+                null.as_fd().try_clone_to_owned().expect("clone"),
+                null.as_fd().try_clone_to_owned().expect("clone"),
+            )
+            .is_err(),
+            "AnchorMaps::new on /dev/null must fail"
         );
         assert!(
-            maps.insert(1, 0, 1).is_err(),
-            "map insert on /dev/null must fail"
+            AnchorMaps::update(null.as_fd(), &1u64.to_ne_bytes(), &[0u8; 16]).is_err(),
+            "map update on /dev/null must fail"
         );
-        assert!(maps.remove(1).is_err(), "map delete on /dev/null must fail");
         assert!(
-            maps.set_slot(0, 1).is_err(),
-            "slot write on /dev/null must fail"
+            AnchorMaps::delete(null.as_fd(), &1u64.to_ne_bytes()).is_err(),
+            "map delete on /dev/null must fail"
         );
+    }
+
+    /// `AnchorMaps::new` validates handles, not just ownership: a
+    /// read-mode fd and a write-mode non-map fd must both fail — the
+    /// first at the access-mode check, the second at `GET_INFO`.
+    #[test]
+    fn anchor_maps_reject_invalid_handles() {
+        let null_ro = std::fs::File::open("/dev/null").expect("open /dev/null");
+        // (`AnchorMaps` has no `Debug` by design, so `expect_err` is
+        // unavailable: match explicitly instead.)
+        let err = match AnchorMaps::new(
+            null_ro.as_fd().try_clone_to_owned().expect("clone"),
+            null_ro.as_fd().try_clone_to_owned().expect("clone"),
+        ) {
+            Ok(_) => panic!("read-mode fds must fail the WRONLY check"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        let null_wo = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null O_WRONLY");
+        assert_ne!(
+            unsafe { libc::fcntl(null_wo.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+            libc::O_RDONLY,
+            "test needs a write-mode fd"
+        );
+        assert!(
+            AnchorMaps::new(
+                null_wo.as_fd().try_clone_to_owned().expect("clone"),
+                null_wo.as_fd().try_clone_to_owned().expect("clone"),
+            )
+            .is_err(),
+            "a write-mode non-map fd must fail GET_INFO validation"
+        );
+    }
+
+    /// Test-only raw map creation (`BPF_MAP_CREATE` prefix
+    /// `{type@0,key@4,value@8,max@12,flags@16}` per `linux/bpf.h`).
+    fn test_create_map(
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32,
+    ) -> io::Result<OwnedFd> {
+        #[repr(C)]
+        struct CreateAttr {
+            map_type: u32,
+            key_size: u32,
+            value_size: u32,
+            max_entries: u32,
+            map_flags: u32,
+            reserved: [u64; 8],
+        }
+        let mut attr = CreateAttr {
+            map_type,
+            key_size,
+            value_size,
+            max_entries,
+            map_flags,
+            reserved: [0; 8],
+        };
+        let fd = bpf(
+            BPF_MAP_CREATE,
+            std::ptr::addr_of_mut!(attr).cast(),
+            size_of::<CreateAttr>(),
+        )?;
+        // SAFETY: the syscall returned a new owned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Privileged: the constructor accepts genuine `WRONLY` anchor maps
+    /// and rejects every wrong handle — swapped roles, a size-mismatched
+    /// map (the over-read shape: ARRAY 4/16 as `slots`), a readable map,
+    /// and a non-map fd. Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: creates real BPF maps for handle validation"]
+    fn anchor_maps_validate_real_handles() {
+        // Genuine pair first: must construct.
+        let hash = test_create_map(BPF_MAP_TYPE_HASH, 8, 16, ANCHOR_SLOTS, 16)
+            .expect("create WRONLY hash (run as root)");
+        let slots = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 8, ANCHOR_SLOTS, 16)
+            .expect("create WRONLY array (run as root)");
+        AnchorMaps::new(
+            hash.as_fd().try_clone_to_owned().expect("clone"),
+            slots.as_fd().try_clone_to_owned().expect("clone"),
+        )
+        .expect("genuine WRONLY anchor maps construct");
+        // Swapped roles: the hash is no ARRAY and the slots no HASH.
+        // (No `Debug` on `AnchorMaps`, so no `expect_err`: match instead.)
+        let err = match AnchorMaps::new(
+            slots.as_fd().try_clone_to_owned().expect("clone"),
+            hash.as_fd().try_clone_to_owned().expect("clone"),
+        ) {
+            Ok(_) => panic!("swapped map roles must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        // Size-mismatched map as `slots`: ARRAY key 4 value 16. Without
+        // validation, `set_slot` would hand the kernel an 8-byte buffer
+        // for a 16-byte value — a stack over-read into the map.
+        let wide = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 16, ANCHOR_SLOTS, 16)
+            .expect("create WRONLY wide array");
+        let err = match AnchorMaps::new(
+            hash.as_fd().try_clone_to_owned().expect("clone"),
+            wide.as_fd().try_clone_to_owned().expect("clone"),
+        ) {
+            Ok(_) => panic!("a value-16 map as slots must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        // Readable (non-WRONLY) maps: same shape, wrong access mode.
+        let hash_rd = test_create_map(BPF_MAP_TYPE_HASH, 8, 16, ANCHOR_SLOTS, 0)
+            .expect("create readable hash");
+        let err = match AnchorMaps::new(
+            hash_rd.as_fd().try_clone_to_owned().expect("clone"),
+            slots.as_fd().try_clone_to_owned().expect("clone"),
+        ) {
+            Ok(_) => panic!("a readable hash fd must fail the WRONLY check"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        // Wrong capacity.
+        let short = test_create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 512, 16).expect("create short array");
+        let err = match AnchorMaps::new(
+            hash.as_fd().try_clone_to_owned().expect("clone"),
+            short.as_fd().try_clone_to_owned().expect("clone"),
+        ) {
+            Ok(_) => panic!("a short slots map must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]

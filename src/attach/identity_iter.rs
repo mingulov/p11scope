@@ -3566,26 +3566,34 @@ mod tests {
 
     /// Parse one `impl AnchorMaps` method line: `Some((name, public,
     /// same_line_gate))` for any visibility/modifier spelling (`fn`, `pub
-    /// fn`, `pub(crate) fn`, `pub const fn`, `const unsafe fn`, ...),
-    /// `None` otherwise. Leading same-line attributes (`#[inline] pub
-    /// fn …`) are scanned past to the item start, and a same-line
-    /// `#[cfg(test)]` gate is reported. Only lines that START an item
-    /// match — a method body cannot start with these qualifiers, so `let
-    /// f: fn(u32)` inside a body never matches — and `fn` must be
-    /// followed by a name plus `(` or `<`.
+    /// fn`, `pub(crate) fn`, `pub (crate) fn`, `pub const fn`, `const
+    /// unsafe fn`, ...), `None` otherwise. Leading same-line attributes
+    /// (`#[inline] pub fn …`, including spaced `# [inline]` — comments
+    /// blank to spaces upstream) are scanned past to the item start,
+    /// and a same-line `#[cfg(test)]` gate is reported. Only lines that
+    /// START an item match — a method body cannot start with these
+    /// qualifiers, so `let f: fn(u32)` inside a body never matches —
+    /// and `fn` must be followed by a name plus `(` or `<`.
     fn parse_impl_method(line: &str) -> Option<(String, bool, bool)> {
         let code = strip_line_noise(line);
         let mut rest = code.trim_start();
         let mut same_line_gate = false;
         loop {
             let probe = rest.trim_start();
-            if !probe.starts_with("#[") {
+            // An attribute opener: `#`, optional whitespace (a spaced
+            // `# [attr]` compiles; comments blank to spaces upstream),
+            // then `[`. Anything else starts the item.
+            let bracketed = probe
+                .strip_prefix('#')
+                .map(|tail| tail.trim_start())
+                .filter(|tail| tail.starts_with('['));
+            let Some(bracketed) = bracketed else {
                 rest = probe;
                 break;
-            }
-            // Strip one balanced `#[…]` span (string-aware, for
+            };
+            // Strip one balanced `[…]` span (string-aware, for
             // `#[doc = "…[…]…"]`).
-            let bytes = probe.as_bytes();
+            let bytes = bracketed.as_bytes();
             let mut depth = 0i32;
             let mut end = None;
             let mut in_string = false;
@@ -3615,14 +3623,14 @@ mod tests {
                 }
             }
             let end = end?;
-            let flat: String = probe[..=end]
-                .chars()
+            let flat: String = std::iter::once('#')
+                .chain(bracketed[..=end].chars())
                 .filter(|c| !c.is_whitespace())
                 .collect();
             if flat == "#[cfg(test)]" {
                 same_line_gate = true;
             }
-            rest = &probe[end + 1..];
+            rest = &bracketed[end + 1..];
         }
         let trimmed = rest;
         if !(trimmed.starts_with("fn ")
@@ -3634,11 +3642,32 @@ mod tests {
             return None;
         }
         let (before, after) = trimmed.split_once("fn ")?;
-        // `before` must be qualifiers only: strip one balanced `pub(...)`
-        // span, then every remaining token must be a plain qualifier.
+        // `before` must be qualifiers only: strip one balanced `pub(…)`
+        // span (whitespace-tolerant: `pub (crate)` compiles), then every
+        // remaining token must be a plain qualifier.
         let mut qualifiers = before.to_string();
-        if let Some(start) = qualifiers.find("pub(") {
-            let tail = &qualifiers[start..];
+        let mut search = 0;
+        let mut span = None;
+        while let Some(rel) = qualifiers[search..].find("pub") {
+            let at = search + rel;
+            let bytes = qualifiers.as_bytes();
+            let boundary = |side: Option<u8>| {
+                side.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+            };
+            let before_ok = boundary(at.checked_sub(1).and_then(|i| bytes.get(i).copied()));
+            let after_pub = &qualifiers[at + 3..];
+            let gap = after_pub.len() - after_pub.trim_start().len();
+            if before_ok
+                && boundary(after_pub.as_bytes().first().copied())
+                && after_pub[gap..].starts_with('(')
+            {
+                span = Some((at, gap));
+                break;
+            }
+            search = at + 3;
+        }
+        if let Some((start, gap)) = span {
+            let tail = &qualifiers[start + 3 + gap..];
             let mut depth = 0;
             let mut end = None;
             for (offset, ch) in tail.char_indices() {
@@ -3654,7 +3683,7 @@ mod tests {
                     _ => {}
                 }
             }
-            qualifiers.replace_range(start..start + end?, " ");
+            qualifiers.replace_range(start..start + 3 + gap + end?, " ");
         }
         if !qualifiers
             .split_whitespace()
@@ -3971,8 +4000,11 @@ mod tests {
         let mut previous = String::new();
         for line in block[..end].lines() {
             // The gate attribute sits immediately above its method — or
-            // on the same line ahead of it.
-            let prev_gated = previous.trim_start() == "#[cfg(test)]";
+            // on the same line ahead of it. Whitespace-insensitive: a
+            // spaced `# [cfg(test)]` line gates exactly like the tight
+            // spelling.
+            let prev_flat: String = previous.chars().filter(|c| !c.is_whitespace()).collect();
+            let prev_gated = prev_flat == "#[cfg(test)]";
             if let Some((name, is_public, same_line_gate)) = parse_impl_method(line) {
                 if prev_gated || same_line_gate {
                     gated.insert(name.clone());
@@ -4051,6 +4083,32 @@ mod tests {
             public.contains("smuggled_attr"),
             "enumeration must parse fn after same-line attributes"
         );
+        // Spaced attributes and visibility (fix round 4, item 05):
+        // `# [inline]`, `# /*gap*/ [inline]`, and `pub (crate) fn`
+        // all compile — each smuggled accessor must still enumerate.
+        for (smuggled, name) in [
+            (
+                "    # [inline] pub fn smuggled_spaced_attr(&self) -> i32 { 0 }\n",
+                "smuggled_spaced_attr",
+            ),
+            (
+                "    # /*gap*/ [inline] pub fn smuggled_gap_attr(&self) -> i32 { 0 }\n",
+                "smuggled_gap_attr",
+            ),
+            (
+                "    pub (crate) fn smuggled_spaced_vis(&self) -> i32 { 0 }\n",
+                "smuggled_spaced_vis",
+            ),
+        ] {
+            let mutated =
+                code.replacen("    pub fn new(", &format!("{smuggled}    pub fn new("), 1);
+            assert_ne!(mutated, code, "spacing mutation {name} must apply");
+            let (public, _, _) = api_of(&mutated);
+            assert!(
+                public.contains(name),
+                "enumeration must catch the spaced spelling {name}"
+            );
+        }
     }
 
     /// The impl-block predicates see through comments and paths: a

@@ -1942,12 +1942,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let admitted = self.update_modules_for_endpoint(endpoint, object);
             let confirmed = match &admitted {
                 Ok(modules) => {
-                    let mut edged = modules.iter().filter(|key| {
-                        self.registry
-                            .module_id_for(key)
-                            .is_some_and(|id| self.registry.edge(caller, id).is_some())
-                    });
-                    matches!((edged.next(), edged.next()), (Some(only), None) if *only == module)
+                    // The admitted set itself must be exactly the cached
+                    // module (round 3, F3-01): an admitted-but-unpublished
+                    // sharer (its mapping stages, no commit yet) reads
+                    // edged == [cached] against the committed snapshot,
+                    // and confirming there would stage up to one pass's
+                    // shared growth to the cached arm. Anything else
+                    // re-resolves pending and lets publication decide.
+                    if modules.len() != 1 || modules[0] != module {
+                        false
+                    } else {
+                        let mut edged = modules.iter().filter(|key| {
+                            self.registry
+                                .module_id_for(key)
+                                .is_some_and(|id| self.registry.edge(caller, id).is_some())
+                        });
+                        matches!((edged.next(), edged.next()), (Some(only), None) if *only == module)
+                    }
                 }
                 Err(()) => false,
             };
@@ -5816,6 +5827,84 @@ mod tests {
             edge_count(&native, "b.so"),
             Some(0),
             "ambiguous growth never lands on B either"
+        );
+    }
+
+    #[test]
+    fn staged_but_unpublished_sharer_withholds_count_only_growth() {
+        // P3 sharing window (round 3, F3-01): the pair binds to A while
+        // A is the sole owner and commits Bound(A) with its history;
+        // then B is admitted (extend) and its mapping stages but does
+        // NOT commit before a production-shaped count-only update
+        // arrives in the same window. Admitted [A, B] but edged [A]:
+        // the cached arm must NOT confirm — the growth withholds from
+        // A and the publication (which commits B's mapping alongside)
+        // resolves the pair ambiguous.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        // One staging window, no commit between: B's mapping stages
+        // (admitted, uncommitted — the committed snapshot still sees A
+        // only), then the risen count arrives.
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 20,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_count = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(
+            edge_count(&native, "a.so"),
+            Some(1),
+            "staged-but-unpublished sharing withholds the window's growth from the cached edge"
+        );
+        assert_eq!(
+            edge_count(&native, "b.so"),
+            Some(0),
+            "the window's growth never lands on B either"
         );
     }
 

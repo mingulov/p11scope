@@ -646,21 +646,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Consumes one witness batch's count freshness (C7 C4 refresh
-    /// loss): the batch's refresh failures (and a completed-with-gaps
-    /// refresh sweep) are count freshness, never silent: observed
-    /// counts stand as lower bounds while every counted column reads
-    /// lossy, withholding quiet. Bounded: one reason per batch (the
-    /// first failure plus the count), memoized into gap repeats by the
-    /// registry. Runs before AND after stop: a terminal-first failure
-    /// demotes exactly like a live one (P1-5).
+    /// loss): the batch's refresh failures, a completed-with-gaps
+    /// refresh sweep, and a deadline-starved refresh sweep are count
+    /// freshness, never silent: observed counts stand as lower bounds
+    /// while every counted column reads lossy, withholding quiet.
+    /// Bounded: one reason per batch (the first failure plus the
+    /// count), memoized into gap repeats by the registry. Runs before
+    /// AND after stop: a terminal-first failure demotes exactly like a
+    /// live one (P1-5).
     fn note_count_freshness(&mut self, batch: &WitnessBatch) {
         let refresh_failures: Vec<&String> = batch
             .read_failures
             .iter()
             .filter(|failure| crate::attach::capture::is_refresh_failure(failure))
             .collect();
-        if !refresh_failures.is_empty() || batch.refresh_sweep_gaps {
+        // F1: a starved refresh (the window deadline hit before the
+        // sweep completed) leaves tracked rows unvisited with no
+        // failures or gaps — their counts may be stale, so quiet is
+        // withheld exactly like a failed read.
+        let starved = batch.refresh_deadline_reached && !batch.refresh_sweep_completed;
+        if !refresh_failures.is_empty() || batch.refresh_sweep_gaps || starved {
             let mut reason = match refresh_failures.as_slice() {
+                [] if starved && !batch.refresh_sweep_gaps => {
+                    "the count-refresh sweep was starved by the window deadline before completing; \
+                     tracked rows went unvisited and their counts may be stale"
+                        .to_string()
+                }
                 [] => "a count-refresh sweep skipped a tracked row".to_string(),
                 [first] => format!("1 count-refresh read failure: {first}"),
                 [first, ..] => format!(
@@ -670,6 +681,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             };
             if batch.refresh_sweep_gaps && !refresh_failures.is_empty() {
                 reason.push_str("; the sweep skipped a tracked row");
+            }
+            if starved && (!refresh_failures.is_empty() || batch.refresh_sweep_gaps) {
+                reason.push_str("; the refresh sweep was also starved by the window deadline");
             }
             self.registry.note_refresh_loss(reason);
         }
@@ -4091,6 +4105,7 @@ mod tests {
             counts: Vec::new(),
             refresh_sweep_completed: true,
             refresh_sweep_gaps: false,
+            refresh_deadline_reached: false,
             refresh_sweeps_completed: 1,
             seen_rows: 0,
             pair_limit: 64,
@@ -5857,6 +5872,73 @@ mod tests {
             document["edges"][0]["activity"], "quiet",
             "{}",
             document["edges"][0]
+        );
+    }
+
+    #[test]
+    fn repeated_refresh_starvation_keeps_the_lower_bound_but_withholds_quiet() {
+        // F1: after a successful positive read, repeated deadline
+        // starvation of the refresh — no failures, no gaps, no sweep —
+        // keeps the observed count as a lower bound while the coverage
+        // reads lossy, so live output withholds a quiet claim over the
+        // stale count.
+        use crate::inventory_present::{Activity, Presentation};
+        let (mut native, caller) = NativeScene::new();
+        native.scene.coordinator.begin_capture_coverage(None);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row]);
+        let edge_of = |native: &NativeScene| {
+            let registry = &native.scene.coordinator.registry;
+            let edge = registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the caller has its edge");
+            (
+                edge.entry_count,
+                edge.entry_last_seen_ns,
+                registry.coverage(edge),
+            )
+        };
+        assert!(
+            matches!(
+                edge_of(&native).2,
+                UseCoverage::Counted { lossy: false, .. }
+            ),
+            "a clean positive read is loss-free: {:?}",
+            edge_of(&native).2
+        );
+        // Repeated starvation: reads carrying only the starved flag.
+        for _ in 0..2 {
+            let at = native.stamps.tick();
+            let mut batch = witness_batch();
+            batch.domain = native.domain;
+            batch.refresh_deadline_reached = true;
+            batch.refresh_sweep_completed = false;
+            batch.health.discovery_counters = Some([0; 5]);
+            batch.health_read_ns = at;
+            batch.rows_read_ns = at + 1;
+            native.stage(NativeBatch::Witness(Box::new(batch)));
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        let (count, last_seen, coverage) = edge_of(&native);
+        assert_eq!(count, 1, "the observed lower bound stands");
+        assert!(
+            matches!(coverage, UseCoverage::Counted { lossy: true, .. }),
+            "starved refreshes publish lossy freshness: {coverage:?}"
+        );
+        let last_seen = last_seen.expect("the positive read left a last-seen");
+        let live = Presentation::capture(&native.scene.coordinator, "s", 0, last_seen, 1);
+        let activity = live
+            .edges
+            .iter()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has its edge")
+            .activity;
+        assert_eq!(
+            activity,
+            Activity::Lossy,
+            "a stale count under starved refresh withholds quiet"
         );
     }
 

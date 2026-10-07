@@ -89,6 +89,7 @@ fn read_at(
         counts: Vec::new(),
         refresh_sweep_completed: true,
         refresh_sweep_gaps: false,
+        refresh_deadline_reached: false,
         refresh_sweeps_completed: 1,
         seen_rows: 0,
         pair_limit: 65_536,

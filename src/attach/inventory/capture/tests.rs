@@ -3264,6 +3264,43 @@ fn count_refresh_honors_an_expired_deadline_without_syscalls() {
 }
 
 #[test]
+fn a_deadline_starved_refresh_reports_starvation_on_the_batch() {
+    // F1: the witness and refresh share the window's deadline and the
+    // witness runs first — when the witness scan consumes the window,
+    // the refresh reports deadline_reached with no failures, no gaps,
+    // and no sweep, and the batch carries that starvation beside the
+    // witness flag so discovery withholds quiet.
+    let mut book = test_book(8, 8, None);
+    let mut fixture = SetFixture::new(8);
+    let delta = fixture.pass("a.so", 2);
+    for endpoint in &delta.endpoints {
+        book.published.insert(endpoint.id.0, endpoint.object);
+    }
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut first = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut first, window, 8);
+    assert!(first.refresh_sweep_completed);
+    assert!(!first.refresh_deadline_reached);
+    // The next pass's window expires during the witness scan: the
+    // refresh never runs.
+    let starved = ReadWindow::new(16, Instant::now() - Duration::from_secs(1)).unwrap();
+    let mut second = read_witnesses_from(None, &mut book, CapturePhase::Active, starved);
+    read_rows_from_with(&mut rows, &mut book, &mut second, starved, 8);
+    assert!(second.deadline_reached, "the witness hit the expired deadline");
+    assert!(
+        second.refresh_deadline_reached,
+        "starvation rides the batch beside the witness flag"
+    );
+    assert!(!second.refresh_sweep_completed);
+    assert!(
+        second.read_failures.is_empty() && !second.refresh_sweep_gaps,
+        "starvation carries no failures or gaps"
+    );
+}
+
+#[test]
 fn count_refresh_with_a_zero_row_bound_reads_nothing() {
     let mut rows = FakeRows {
         batch_supported: true,

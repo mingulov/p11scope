@@ -743,6 +743,14 @@ pub(crate) struct WitnessBatch {
     /// lookup failure): that row's count is stale, and the next sweep
     /// retries it.
     pub refresh_sweep_gaps: bool,
+    /// The refresh quantum hit the window deadline before completing
+    /// its sweep (F1): tracked rows went unvisited this pass, so
+    /// their counts may be stale. The witness and refresh share the
+    /// window's deadline and the witness runs first, so a witness
+    /// scan that consumes the window starves the refresh with no
+    /// failures or gaps. Discovery treats a starved refresh as
+    /// count-refresh loss (lossy, never quiet).
+    pub refresh_deadline_reached: bool,
     pub refresh_sweeps_completed: u64,
     /// The userspace seen-set size: distinct CALLER_USE rows this capture
     /// has reported (bounded by `pair_limit`). Not the kernel map's
@@ -2460,6 +2468,7 @@ fn read_witnesses_from(
         counts: Vec::new(),
         refresh_sweep_completed: false,
         refresh_sweep_gaps: false,
+        refresh_deadline_reached: false,
         refresh_sweeps_completed: book.cursor.refresh_sweeps_completed(),
         seen_rows: book.cursor.occupancy(),
         pair_limit: book.pair_limit,
@@ -2707,6 +2716,7 @@ fn absorb_counts(
     batch.integrity_total = book.integrity_total;
     batch.refresh_sweep_completed = refreshed.sweep_completed;
     batch.refresh_sweep_gaps = refreshed.sweep_gaps;
+    batch.refresh_deadline_reached = refreshed.deadline_reached;
     batch.refresh_sweeps_completed = book.cursor.refresh_sweeps_completed();
     batch.read_failures.extend(refreshed.read_failures);
 }

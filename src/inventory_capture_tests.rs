@@ -347,6 +347,7 @@ impl CaptureLane<Pin> for ScriptedLane {
             counts,
             refresh_sweep_completed: !self.partial_refresh_reads.contains(&self.read_stamps.len()),
             refresh_sweep_gaps: self.gappy_refresh_reads.contains(&self.read_stamps.len()),
+            refresh_deadline_reached: false,
             refresh_sweeps_completed: 1,
             seen_rows: 0,
             pair_limit: 64,

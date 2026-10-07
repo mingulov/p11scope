@@ -1914,10 +1914,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     caller,
                     module,
                     endpoint,
-                    base,
                     staged,
                     staged_ns,
-                    base_since,
+                    ..
                 }) => recheck.push((
                     key,
                     *caller,
@@ -1925,10 +1924,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     *endpoint,
                     update.object,
                     held,
-                    *base,
                     *staged,
                     *staged_ns,
-                    *base_since,
                 )),
                 Some(PairTarget::Pending {
                     caller,
@@ -1983,19 +1980,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // coordinator copy: only an advance past the staged count
         // stages, so a repeated refresh is free and several reads per
         // commit stay sound.
-        for (
-            key,
-            caller,
-            module,
-            endpoint,
-            object,
-            count,
-            base,
-            staged_abs,
-            staged_ns,
-            base_since,
-        ) in recheck
-        {
+        for (key, caller, module, endpoint, object, count, staged_abs, staged_ns) in recheck {
             let admitted = self.update_modules_for_endpoint(endpoint, object);
             let confirmed = match &admitted {
                 Ok(modules) => {
@@ -2022,18 +2007,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if confirmed {
                 // Only an advance past the absolute staged so far stages
                 // (round 4, re-place): growth stages rebased past the
-                // accounted base and the publication accumulates it onto
-                // the edge, so a re-place onto the history holder adds
-                // instead of `max`ing growth against history.
+                // staged absolute and the publication accumulates it
+                // onto the edge, so a re-place onto the history holder
+                // adds instead of `max`ing growth against history. The
+                // staging folds into the base (round 5, confirmed path):
+                // staging past a frozen base would re-add, on every
+                // later publish, growth the edge already holds.
                 if count.count > staged_abs {
-                    let growth = rebased_count(count, base);
-                    self.stage_pair_count(caller, &module, growth, base_since, base);
+                    let growth = rebased_count(count, staged_abs);
+                    self.stage_pair_count(caller, &module, growth, staged_ns, staged_abs);
                     if let Some(PairTarget::Bound {
-                        staged, staged_ns, ..
+                        base,
+                        staged,
+                        staged_ns,
+                        base_since,
+                        ..
                     }) = self.pair_targets.get_mut(&key)
                     {
+                        *base = count.count;
                         *staged = count.count;
                         *staged_ns = count.last_ns;
+                        *base_since = count.last_ns;
                     }
                 }
                 continue;
@@ -2710,7 +2704,8 @@ enum PairTarget {
     /// endpoint's placement (F7), since sharing that appeared after
     /// the pair bound makes further growth ambiguous. `base` is the
     /// absolute count accounted so far (placed or disclosed; folded
-    /// from `staged` at every placement): only growth past it ever
+    /// from `staged` at every placement and every confirmed staging):
+    /// only growth past it ever
     /// stages, so a re-resolved pair never duplicates history
     /// elsewhere (F3-03), and a re-place onto the history holder
     /// accumulates onto its edge instead of `max`ing growth against
@@ -7498,6 +7493,237 @@ mod tests {
             edge_a.entry_count, 3,
             "disjoint same-publish segments both accumulate"
         );
+    }
+
+    #[test]
+    fn continued_confirmed_growth_installs_each_absolute() {
+        // Round 5, confirmed-path base (sol-N1 + astra-R5-N1): a
+        // sole-owner pair advancing 1,2,3,4 across four publishes
+        // installs exactly each absolute — confirmed staging folds
+        // staged into base, so no publish re-adds growth since a
+        // frozen base.
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let edge_a = |native: &NativeScene| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains("a.so"))
+                        })
+                })
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(
+            edge_a(&native),
+            Some(1),
+            "the first sight installs the absolute"
+        );
+        for absolute in [2, 3, 4] {
+            native.counts_read(Vec::new(), vec![(41, 1, 0, absolute)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                edge_a(&native),
+                Some(absolute),
+                "confirmed publish installs the absolute, never growth since a frozen base"
+            );
+        }
+    }
+
+    #[test]
+    fn rebound_pair_advance_conserves() {
+        // Round 5, rebind continuation (sol-N1 + astra-R5-N1): the R1
+        // scene (A=5 transfers to B=2 at absolute 7) advanced once
+        // more — B reads 3 (its growth), A keeps 5, the edges sum to
+        // the absolute 8.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 6)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let repeat = native.row(41, 1, 7, 100, 0);
+        native.counts_read(vec![repeat], vec![(41, 1, 0, 7)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // The continuation: one more advancing refresh past the rebind.
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 8)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_count = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(
+            edge_count(&native, "a.so"),
+            Some(5),
+            "A keeps exactly its history"
+        );
+        assert_eq!(
+            edge_count(&native, "b.so"),
+            Some(3),
+            "the post-rebind advance stages growth, never the absolute"
+        );
+        assert_eq!(
+            edge_count(&native, "a.so").unwrap() + edge_count(&native, "b.so").unwrap(),
+            8,
+            "no duplication: the edges sum to the pair's absolute count"
+        );
+        let _ = shared;
+    }
+
+    #[test]
+    fn aba_return_advance_conserves() {
+        // Round 5, ABA continuation (sol-N1 + astra-R5-N1): the ABA
+        // scene (A=6, B=1 at absolute 7) advanced twice past the
+        // return — A reads 7 then 8, B keeps 1, the edges sum to each
+        // absolute.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 6)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let rejoined = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[0x1000])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(rejoined.verdicts);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &b, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_count = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(
+            edge_count(&native, "a.so"),
+            Some(6),
+            "premise: the return leg accumulates the new call onto A's history"
+        );
+        // The continuation: two advancing refreshes past the return.
+        for (absolute, want_a) in [(8, 7), (9, 8)] {
+            native.counts_read(Vec::new(), vec![(41, 1, 0, absolute)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                edge_count(&native, "a.so"),
+                Some(want_a),
+                "the post-return advance stages growth at absolute {absolute}"
+            );
+            assert_eq!(
+                edge_count(&native, "b.so"),
+                Some(1),
+                "B's stale edge keeps exactly its history at absolute {absolute}"
+            );
+            assert_eq!(
+                edge_count(&native, "a.so").unwrap() + edge_count(&native, "b.so").unwrap(),
+                absolute,
+                "no duplication, no loss at absolute {absolute}"
+            );
+        }
     }
 
     #[test]

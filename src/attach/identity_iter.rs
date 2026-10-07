@@ -3155,17 +3155,26 @@ mod tests {
         Ok(())
     }
 
-    /// The kernel never receives an inode address in a record struct: the
-    /// record fields are exactly the ABI names, `seq_write` passes
-    /// `&record`, and no `emit(...)` argument smuggles an inode-derived
-    /// value into an existing record field — directly, or renamed through
-    /// an assignment (`start = addr`) the argument text hides. Producer
-    /// mutations (an inode address into `start`, into the DUP alias
-    /// field, through a pre-emit assignment, through an intermediate)
-    /// must fail the audit — proven by mutating the real sources in
-    /// memory.
+    /// The kernel never receives an inode address in a record struct
+    /// through an audited flow: the record fields are exactly the ABI
+    /// names, `seq_write` passes `&record`, and no `emit(...)` argument
+    /// smuggles an inode-derived value into an existing record field —
+    /// directly, renamed through an assignment (`start = addr`) the
+    /// argument text hides, laundered through a compound assignment,
+    /// laid out across a line break, computed with binary `&`, or
+    /// stored through a dereference. Producer mutations (an inode
+    /// address into `start`, into the DUP alias field, through a
+    /// pre-emit assignment, through an intermediate, through each
+    /// compound operator, same-line, split-line, binary-`&`, and
+    /// through-deref) must fail the audit — proven by mutating the
+    /// real sources in memory. Outside the envelope by design, and
+    /// backstopped by the object digest pin instead (any such source
+    /// change trips `identity_object_digest_pinned`): inter-procedural
+    /// flows (wrapper functions), `p->f`/`p.f`/`a[i]` and
+    /// pointer-declaration aliasing, `memcpy`-style block copies, and
+    /// `&(`-forms.
     #[test]
-    fn kernel_records_carry_no_inode_addresses() {
+    fn kernel_records_carry_no_inode_addresses_in_audited_flows() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         for path in [
             "crates/ebpf/native/vma_identity.h",

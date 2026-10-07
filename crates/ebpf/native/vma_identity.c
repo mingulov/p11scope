@@ -20,15 +20,15 @@ struct {
     __type(value, u64);
 } anchor_slots SEC(".maps");
 
-/* Per-slot last-observed generation marker: `gen + 1` of the pass that
- * last observed the slot (any terminal outcome: `OK`, `DUP`, or `FULL`),
- * or 0 for never observed. The `+ 1` reserves the array zero-init for
- * "never observed" so generation 0 passes work. Written only by the
- * anchor program, alongside `anchor_slots`; never by userspace (no
- * handle is exposed), so bookkeeping tampering cannot clear it. Lets a
- * replay distinguish a current-pass slot change (contested) from stale
- * previous-pass bookkeeping (a legitimate reinstall). Generations must
- * be fresh per pass (reusing one fails closed into `CONFLICT`s). */
+/* Per-slot last-observed generation marker: `gen + 1` of the pass that last
+ * observed the slot (any terminal outcome), or 0 for never observed (the
+ * `+ 1` keeps generation 0 working). Written only by the anchor program,
+ * alongside `anchor_slots`; no `AnchorMaps` handle exists (the WRONLY map
+ * stays user-writable, but userspace is trusted here). Lets a replay
+ * distinguish a same-pass slot change (contested) from stale previous-pass
+ * bookkeeping (a legitimate reinstall). Generation freshness is a caller
+ * obligation (W3-2 mints a fresh generation per pass): same-address reuse
+ * returns `OK` by design; only changed-inode reuse `CONFLICT`s. */
 struct {
     __uint(type, P11_IDENT_MAP_ARRAY);
     __uint(map_flags, P11_IDENT_F_WRONLY);

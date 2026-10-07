@@ -223,16 +223,19 @@ fn default_objects_byte_identical_to_base() {
 /// toolchain drift changes these bytes, and the pin fails loudly. Pinned
 /// at the arena-containment commit in this toolchain (round 1:
 /// `000caca5…`; round 2 adds the fifth map plus the end-containment
-/// check); the build-info test below binds the pin to the compiler
-/// digest and CPU baseline it was recorded with.
+/// check; round 3 re-pins comment-only — the observed-map doc comment
+/// was rewritten with identical line numbers, so code/maps/BTF are
+/// byte-identical and only the DWARF `.debug_line` source MD5 moved);
+/// the build-info test below binds the pin to the compiler digest and
+/// CPU baseline it was recorded with.
 #[test]
 fn identity_object_digest_pinned() {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(OBJECT);
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
-        hex, "f48ecf91965f7432444b39da088f0ec281c5f7db0d17ffeee951bc50ab9b30d4",
-        "p11scope-ebpf-identity must stay byte-identical to the arena-containment pin"
+        hex, "f43fb78f2ec1aee9e0a664ad5dae1cbcdc08801b966632e6ff0ade6cbc6ee9ce",
+        "p11scope-ebpf-identity must stay byte-identical to the round-3 pin"
     );
 }
 

@@ -429,18 +429,25 @@ pub enum ReadError {
 
 /// Drain `fd` to EOF. Retries `EINTR` and `EAGAIN` (F4: a 1M-object read
 /// with no output keeps the iterator state, so the next `read()` continues
-/// the same walk), bounded by `deadline`, which is checked between reads.
-/// Stops after the END record plus the EOF read; the parser then proves the
-/// stream held exactly one END. `max_bytes` caps a runaway stream.
+/// the same walk). Stops after the END record plus the EOF read; the parser
+/// then proves the stream held exactly one END. `max_bytes` caps a runaway
+/// stream.
+///
+/// The `deadline` is mandatory (a plain `Instant`, never optional): every
+/// kernel run must bound its retries. It is checked before every read and
+/// after every read returns, including EOF — a result that arrives after
+/// expiry is rejected. This is a COOPERATIVE deadline only: a single
+/// blocked `read()` cannot be interrupted, so the wait for one read is
+/// unbounded; the guarantee is that overdue RESULTS are never accepted.
 pub fn read_run(
     fd: BorrowedFd<'_>,
-    deadline: Option<Instant>,
+    deadline: Instant,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ReadError> {
     let mut out = Vec::new();
     let mut chunk = [0u8; READ_BUF_LEN];
     loop {
-        if deadline.is_some_and(|at| Instant::now() >= at) {
+        if Instant::now() >= deadline {
             return Err(ReadError::Deadline);
         }
         // SAFETY: `read()` writes at most `chunk.len()` bytes into `chunk`.
@@ -453,6 +460,11 @@ pub fn read_run(
                 continue;
             }
             return Err(ReadError::Errno(errno));
+        }
+        // The read itself may have crossed the deadline (a blocked read is
+        // uninterruptible): reject overdue results, EOF included.
+        if Instant::now() >= deadline {
+            return Err(ReadError::Deadline);
         }
         if got == 0 {
             return Ok(out);
@@ -1376,7 +1388,12 @@ mod tests {
         write_all(write_end.as_fd(), &payload[..40]);
         write_all(write_end.as_fd(), &payload[40..]);
         drop(write_end);
-        let out = read_run(read_end.as_fd(), None, 1 << 20).expect("drain to EOF");
+        let out = read_run(
+            read_end.as_fd(),
+            Instant::now() + Duration::from_secs(60),
+            1 << 20,
+        )
+        .expect("drain to EOF");
         assert_eq!(out, payload);
     }
 
@@ -1409,12 +1426,32 @@ mod tests {
         });
         let out = read_run(
             read_end.as_fd(),
-            Some(Instant::now() + Duration::from_secs(10)),
+            Instant::now() + Duration::from_secs(10),
             1 << 20,
         )
         .expect("EAGAIN must retry until data, not return EOF early");
         writer.join().expect("writer thread");
         assert_eq!(out.len(), 2 * RECORD_LEN);
+    }
+
+    /// EOF arriving after the deadline must fail, not succeed: the
+    /// blocking read below sleeps past the deadline (uninterruptible) and
+    /// then delivers EOF with no data. The reader must reject the
+    /// overdue empty result instead of returning `Ok`.
+    #[test]
+    fn reader_eof_after_deadline_is_rejected() {
+        let (read_end, write_end) = pipe();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(write_end);
+        });
+        assert_eq!(
+            read_run(read_end.as_fd(), deadline, 1 << 20),
+            Err(ReadError::Deadline),
+            "EOF past the deadline must fail the run"
+        );
+        writer.join().expect("writer thread");
     }
 
     #[test]
@@ -1435,8 +1472,38 @@ mod tests {
         // No writer activity: EAGAIN spins until the (already past) deadline.
         let _held = write_end;
         assert_eq!(
-            read_run(read_end.as_fd(), Some(Instant::now()), 1 << 20),
+            read_run(read_end.as_fd(), Instant::now(), 1 << 20),
             Err(ReadError::Deadline)
+        );
+        // A future deadline is reached through repeated retries, not just
+        // observed already-expired: the spin below must terminate at the
+        // deadline with no data delivered.
+        let (read_end, write_end) = pipe();
+        let flags = unsafe { libc::fcntl(read_end.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    read_end.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            },
+            0,
+            "nonblock"
+        );
+        let _held = write_end;
+        let before = Instant::now();
+        assert_eq!(
+            read_run(
+                read_end.as_fd(),
+                before + Duration::from_millis(100),
+                1 << 20
+            ),
+            Err(ReadError::Deadline)
+        );
+        assert!(
+            before.elapsed() >= Duration::from_millis(100),
+            "the retry spin must last until the deadline"
         );
         // A stream past the cap fails even with a live deadline.
         let (read_end, write_end) = pipe();
@@ -1444,7 +1511,11 @@ mod tests {
         write_all(write_end.as_fd(), &payload);
         drop(write_end);
         assert_eq!(
-            read_run(read_end.as_fd(), None, RECORD_LEN),
+            read_run(
+                read_end.as_fd(),
+                Instant::now() + Duration::from_secs(60),
+                RECORD_LEN
+            ),
             Err(ReadError::TooLarge)
         );
     }

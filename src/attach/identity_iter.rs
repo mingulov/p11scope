@@ -4028,6 +4028,32 @@ mod tests {
         let fallback = |rest: &str| {
             let head = rest.split('{').next().unwrap_or(rest);
             let head = &head[..head.len().min(300)];
+            // Generic arguments are not the impl subject: `impl
+            // Wrapper<AnchorMaps>` is an unrelated inherent block, so
+            // blank balanced `<…>` spans before the substring
+            // heuristic — a name occurring only inside them reads as
+            // neither. Unbalanced input keeps the loud heuristic.
+            let mut spans = String::with_capacity(head.len());
+            let mut depth = 0i32;
+            let mut balanced = true;
+            for ch in head.chars() {
+                match ch {
+                    '<' => {
+                        depth += 1;
+                        spans.push(' ');
+                    }
+                    '>' if depth > 0 => {
+                        depth -= 1;
+                        spans.push(' ');
+                    }
+                    _ if depth > 0 => spans.push(' '),
+                    _ => spans.push(ch),
+                }
+            }
+            if depth != 0 {
+                balanced = false;
+            }
+            let head: &str = if balanced { &spans } else { head };
             if !contains_rust_word(head, "AnchorMaps") {
                 return (false, false);
             }
@@ -4522,6 +4548,15 @@ mod tests {
             scan_anchor_impls(&blank_rust_noise(&inherent)),
             (2, false),
             "`impl r#AnchorMaps` must read as a second inherent block"
+        );
+        // Generic-nested names (fix round 5): `impl Wrapper<AnchorMaps>`
+        // is an unrelated inherent block — `AnchorMaps` occurs only
+        // inside `<…>` — so the scan must stay `(1, false)`.
+        let wrapped = format!("{code}\nimpl Wrapper<AnchorMaps> {{}}\n");
+        assert_eq!(
+            scan_anchor_impls(&blank_rust_noise(&wrapped)),
+            (1, false),
+            "`impl Wrapper<AnchorMaps>` must not count as an AnchorMaps block"
         );
     }
 

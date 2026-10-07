@@ -1933,7 +1933,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // decides, and its decisions finalize the target.
         for (key, caller, modules, count, staged, base) in retry {
             if count.count > staged {
-                self.stage_pending_count(key, caller, &modules, rebased_count(count, base));
+                let demoted = base > 0;
+                self.stage_pending_count(key, caller, &modules, rebased_count(count, base), demoted);
                 if let Some(PairTarget::Pending { staged: was, .. }) =
                     self.pair_targets.get_mut(&key)
                 {
@@ -2002,7 +2003,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 },
             );
             if count.count > new_base {
-                self.stage_pending_count(key, caller, &modules, rebased_count(count, new_base));
+                self.stage_pending_count(
+                    key,
+                    caller,
+                    &modules,
+                    rebased_count(count, new_base),
+                    true,
+                );
                 if let Some(PairTarget::Pending { staged: was, .. }) =
                     self.pair_targets.get_mut(&key)
                 {
@@ -2083,7 +2090,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if let Some(count) = self.pair_counts.get(&key).copied()
             && count.count > 0
         {
-            self.stage_pending_count(key, caller, modules, count);
+            self.stage_pending_count(key, caller, modules, count, false);
             if let Some(PairTarget::Pending { staged, .. }) = self.pair_targets.get_mut(&key) {
                 *staged = count.count;
             }
@@ -2094,14 +2101,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// placement (P3): the (base-rebased, growth-only past demotion —
     /// absolute for an unbased pair) count, only for counts ≥ 1 —
     /// anything else leaves the witness standing, and a later advance
-    /// re-stages. The minted handle maps the publication's decision
-    /// back to the pair.
+    /// re-stages. `demoted` marks a re-resolved bound pair, whose
+    /// rejection the publication discloses (F3-02). The minted handle
+    /// maps the publication's decision back to the pair.
     fn stage_pending_count(
         &mut self,
         key: PairKey,
         caller: CallerId,
         modules: &[ModuleKey],
         count: PairCount,
+        demoted: bool,
     ) {
         if count.count == 0 {
             return;
@@ -2116,6 +2125,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             count.count,
             count.first_ns,
             count.last_ns,
+            demoted,
         );
     }
 
@@ -6066,6 +6076,104 @@ mod tests {
             Some(at + 1),
             "B's first sight is the demoting read, never the pair's backdated history"
         );
+    }
+
+    #[test]
+    fn demote_then_reject_discloses_the_unattributed_growth() {
+        // P3 demotion disclosure (round 3, F3-02): A commits count 1
+        // sole-owned; B shares and commits; a count-only advance to 20
+        // demotes and rejects ambiguous. The 19-call growth must not
+        // finalize silently: a shared-endpoint gap records it (the
+        // pair's witness resolved cleanly when A was sole owner, so no
+        // witness gap covers this window), while history withholds on
+        // the stale edge.
+        use crate::discovery::caller_registry::WITNESS_SHARED_ENDPOINT;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        // Sharing appears and commits: B's edge exists alongside A's.
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Production-shaped count-only growth, 1 -> 20.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 20,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge_count = |native: &NativeScene, needle: &str| {
+            let registry = &native.scene.coordinator.registry;
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(
+            edge_count(&native, "a.so"),
+            Some(1),
+            "history is preserved while ambiguous growth is withheld"
+        );
+        assert_eq!(
+            edge_count(&native, "b.so"),
+            Some(0),
+            "ambiguous growth never lands on B either"
+        );
+        let gaps: Vec<_> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == WITNESS_SHARED_ENDPOINT)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "the rejected demoted growth stages one shared-endpoint gap per sharer: {:?}",
+            native.scene.coordinator.registry.gaps()
+        );
+        assert!(
+            gaps.iter().all(|gap| gap.reason.contains("19 unattributed calls")),
+            "the gap discloses the unattributed growth: {:?}",
+            gaps.iter().map(|gap| &gap.reason).collect::<Vec<_>>()
+        );
+        let _ = at;
     }
 
     #[test]

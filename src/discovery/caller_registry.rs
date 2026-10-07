@@ -1118,7 +1118,8 @@ pub(crate) const NO_MAPPING_EDGE: &str = "no_mapping_edge";
 const UNBOUND_USE_SUBJECT: &str = "used by an unidentified caller image";
 const WITNESS_WITHOUT_MAPPING: &str = "native witness without mapping evidence";
 const WITNESS_UNKNOWN_MODULE: &str = "native witness for an unknown module";
-const WITNESS_SHARED_ENDPOINT: &str = "ambiguous shared endpoint";
+pub(crate) const WITNESS_SHARED_ENDPOINT: &str = "ambiguous shared endpoint";
+const DEMOTED_COUNT_REJECTED: &str = "rejected demoted count";
 
 /// Where every decided native witness row went, each row exactly once
 /// (C4 review M3): `edge` witnessed one caller edge, `module` became one
@@ -1415,6 +1416,11 @@ enum Mutation {
         count: u64,
         first_ns: u64,
         last_ns: u64,
+        /// The count re-resolves a bound pair (F3-02): its first-sight
+        /// witness resolved cleanly when the pair was sole-owned, so no
+        /// witness in this window discloses a rejection — the
+        /// publication mirrors the witness gaps itself.
+        demoted: bool,
     },
     NotePairsUncounted {
         reason: Arc<str>,
@@ -2048,15 +2054,17 @@ impl CallerRegistry {
         });
     }
 
-    /// Stage one bound pair's absolute entry count for
-    /// publication-time placement (P3): the witness and the count
-    /// resolve together at publication, against the mappings the
-    /// publication commits — exactly one edged module takes both. A
-    /// rejection (no edge, ambiguity) drops the count silently: the
-    /// witness records the placement gaps, and a count never invents
-    /// an edge. `pending_id` is the coordinator's opaque handle: the
-    /// publication reports every pending count's placement through
-    /// [`Self::take_pending_count_decisions`].
+    /// Stage one bound pair's entry count for publication-time
+    /// placement (P3): the witness and the count resolve together at
+    /// publication, against the mappings the publication commits —
+    /// exactly one edged module takes both. A first-sight rejection
+    /// (no edge, ambiguity) drops the count silently: the witness
+    /// records the placement gaps, and a count never invents an edge.
+    /// A demoted (`demoted`) rejection has no witness in this window,
+    /// so the publication mirrors the witness gaps instead of dropping
+    /// silently (F3-02). `pending_id` is the coordinator's opaque
+    /// handle: the publication reports every pending count's placement
+    /// through [`Self::take_pending_count_decisions`].
     pub(crate) fn note_pending_count(
         &mut self,
         pending_id: u64,
@@ -2065,6 +2073,7 @@ impl CallerRegistry {
         count: u64,
         first_ns: u64,
         last_ns: u64,
+        demoted: bool,
     ) {
         self.staged.push(Mutation::NotePendingCount {
             pending_id,
@@ -2073,6 +2082,7 @@ impl CallerRegistry {
             count,
             first_ns,
             last_ns,
+            demoted,
         });
     }
 
@@ -2398,7 +2408,16 @@ impl CallerRegistry {
                 count,
                 first_ns,
                 last_ns,
-            } => self.apply_pending_count(pending_id, caller, &modules, count, first_ns, last_ns),
+                demoted,
+            } => self.apply_pending_count(
+                pending_id,
+                caller,
+                &modules,
+                count,
+                first_ns,
+                last_ns,
+                demoted,
+            ),
             Mutation::NoteCountedUse {
                 caller,
                 module,
@@ -2886,10 +2905,11 @@ impl CallerRegistry {
     /// [`Self::place_bound_row`] — the same decision its witness took —
     /// and admission mirrors the coordinator's `stage_pair_count` (only
     /// admitted modules count). On placement the count and its `Counted`
-    /// coverage apply exactly as if staged placed; anything else drops
-    /// silently (the witness records the placement gaps, and no gap is
-    /// owed twice). Every outcome is reported through
-    /// [`Self::take_pending_count_decisions`].
+    /// coverage apply exactly as if staged placed; a first-sight
+    /// rejection drops silently (the witness records the placement
+    /// gaps, and no gap is owed twice), while a demoted rejection
+    /// mirrors the witness gaps instead (F3-02). Every outcome is
+    /// reported through [`Self::take_pending_count_decisions`].
     fn apply_pending_count(
         &mut self,
         pending_id: u64,
@@ -2898,6 +2918,7 @@ impl CallerRegistry {
         count: u64,
         first_ns: u64,
         last_ns: u64,
+        demoted: bool,
     ) {
         let outcome = match self.place_bound_row(caller, modules) {
             RowPlacement::Edge { key, .. } => {
@@ -2933,10 +2954,79 @@ impl CallerRegistry {
                 reason: PendingRejection::Ambiguous,
             },
         };
+        if demoted
+            && let PendingCountOutcome::Rejected { reason } = &outcome
+        {
+            self.disclose_demoted_rejection(caller, modules, count, first_ns, *reason);
+        }
         self.pending_count_decisions.push(PendingCountDecision {
             pending_id,
             outcome,
         });
+    }
+
+    /// One demoted count's rejection disclosure (F3-02): the pair's
+    /// witness resolved cleanly when the pair was sole-owned, so no
+    /// witness in this window records the placement — the count mirrors
+    /// the witness gaps itself, naming the unattributed growth, so a
+    /// rejected demoted count never finalizes silently. Ambiguity takes
+    /// the shared-endpoint shape; a single unedged candidate goes
+    /// module-level like a witness without mapping evidence; no
+    /// candidate at all reports caller-wide (the endpoint left the
+    /// attach set entirely).
+    fn disclose_demoted_rejection(
+        &mut self,
+        caller: CallerId,
+        modules: &[ModuleKey],
+        count: u64,
+        first_ns: u64,
+        reason: PendingRejection,
+    ) {
+        match (reason, modules) {
+            (PendingRejection::Ambiguous, _) => {
+                self.apply_shared_endpoint(
+                    modules,
+                    &format!("re-resolved with {count} unattributed calls after sharing appeared"),
+                );
+            }
+            (PendingRejection::NoEdge, [key]) => {
+                let id = self.modules_by_key.get(key).copied();
+                self.push_coverage_gap(
+                    caller,
+                    key,
+                    id,
+                    WITNESS_WITHOUT_MAPPING,
+                    format!(
+                        "{} has no mapping edge to this module: the re-resolved count ({count} calls) stays \
+                         module-level; a count never invents a mapping",
+                        caller.label()
+                    ),
+                );
+                self.apply_unbound_use(
+                    key,
+                    first_ns,
+                    NO_MAPPING_EDGE,
+                    "the bound caller has no mapping edge to the module",
+                    false,
+                );
+            }
+            (PendingRejection::NoEdge, []) => {
+                self.push_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: None,
+                    pid: None,
+                    subject: DEMOTED_COUNT_REJECTED.into(),
+                    reason: format!(
+                        "the pair re-resolved after its endpoint left the attach set ({count} calls): no module \
+                         can carry them, so no edge and no module-level use is recorded; history stands on the \
+                         stale edge"
+                    ),
+                    budget: None,
+                });
+            }
+            // Multi-candidate placements reject ambiguous, never NoEdge.
+            (PendingRejection::NoEdge, _) => {}
+        }
     }
 
     /// One row whose endpoint several admitted modules share, with no
@@ -5477,7 +5567,7 @@ pub(crate) mod tests {
         registry.note_mapping(CallerId(0), 50, a.clone(), 100);
         registry.publish();
         registry.note_mapping(CallerId(0), 51, b.clone(), 110);
-        registry.note_pending_count(7, CallerId(0), vec![ka.clone(), kb.clone()], 9, 120, 130);
+        registry.note_pending_count(7, CallerId(0), vec![ka.clone(), kb.clone()], 9, 120, 130, false);
         registry.note_bound_witness(CallerId(0), vec![ka.clone(), kb.clone()], 120);
         registry.publish();
         // Together: the witness reads ambiguous and the count drops.
@@ -5504,7 +5594,7 @@ pub(crate) mod tests {
         assert_eq!(count_of(&registry, &kb), Some(0));
         assert!(registry.take_pending_count_decisions().is_empty());
         // A single edged module places witness and count together.
-        registry.note_pending_count(8, CallerId(0), vec![ka.clone()], 12, 140, 150);
+        registry.note_pending_count(8, CallerId(0), vec![ka.clone()], 12, 140, 150, false);
         registry.note_bound_witness(CallerId(0), vec![ka.clone()], 140);
         registry.publish();
         let decisions = registry.take_pending_count_decisions();
@@ -5519,7 +5609,7 @@ pub(crate) mod tests {
         assert_eq!(count_of(&registry, &ka), Some(12));
         // No mapping edge: the witness goes module-level and the count
         // rejects with it.
-        registry.note_pending_count(9, CallerId(3), vec![ka.clone()], 4, 160, 170);
+        registry.note_pending_count(9, CallerId(3), vec![ka.clone()], 4, 160, 170, false);
         registry.note_bound_witness(CallerId(3), vec![ka.clone()], 160);
         registry.publish();
         let decisions = registry.take_pending_count_decisions();

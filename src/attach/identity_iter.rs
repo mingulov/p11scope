@@ -1675,25 +1675,48 @@ mod tests {
     fn legal_single_bit_flips_yield_different_valid_runs() {
         let scope: BTreeSet<u32> = [100].into_iter().collect();
         let expect = target_expect(&scope);
-        let mut vma = record(KIND_VMA, 100, 0x1000, 0x2000, 2, 7);
+        let vma = record(KIND_VMA, 100, 0x1000, 0x2000, 2, 7);
         assert_eq!(vma[24], 0x02);
-        vma[24] = 0x03;
-        let run = parse(&[vma.to_vec(), end(7).to_vec()].concat(), &expect)
+        let before = parse(&[vma.to_vec(), end(7).to_vec()].concat(), &expect)
+            .expect("original verdict parses");
+        assert_eq!(
+            before
+                .by_pid
+                .get(&100)
+                .and_then(|ranges| ranges.get(&(0x1000, 0x2000))),
+            Some(&TargetVerdict::Slot(2))
+        );
+        let mut flipped = vma;
+        flipped[24] = 0x03;
+        let after = parse(&[flipped.to_vec(), end(7).to_vec()].concat(), &expect)
             .expect("in-range verdict flip stays valid");
         assert_eq!(
-            run.by_pid
+            after
+                .by_pid
                 .get(&100)
                 .and_then(|ranges| ranges.get(&(0x1000, 0x2000))),
             Some(&TargetVerdict::Slot(3))
         );
+        assert_ne!(
+            before, after,
+            "the flip must change the run, not merely stay valid"
+        );
         let empty = BTreeSet::new();
         let anchor = anchor_expect(&empty);
-        let mut full = record(KIND_ANCHOR, 0, 0, 0, ANCHOR_FULL, 7);
+        let full = record(KIND_ANCHOR, 0, 0, 0, ANCHOR_FULL, 7);
         assert_eq!(full[24], 0x02);
-        full[24] = 0x00;
-        let run = parse(&[full.to_vec(), end(7).to_vec()].concat(), &anchor)
+        let before = parse(&[full.to_vec(), end(7).to_vec()].concat(), &anchor)
+            .expect("original FULL parses");
+        assert_eq!(before.anchors.get(&0), Some(&AnchorOutcome::Full));
+        let mut cleared = full;
+        cleared[24] = 0x00;
+        let after = parse(&[cleared.to_vec(), end(7).to_vec()].concat(), &anchor)
             .expect("FULL->OK single-bit clear stays valid");
-        assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::Ok));
+        assert_eq!(after.anchors.get(&0), Some(&AnchorOutcome::Ok));
+        assert_ne!(
+            before, after,
+            "the clear must change the run, not merely stay valid"
+        );
     }
 
     /// `Dup` must alias an installed slot: self-reference, cycles, and
@@ -1823,12 +1846,97 @@ mod tests {
         assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::BadShape));
     }
 
+    /// Independent little-endian decoders for the oracle and the
+    /// correspondence check. Deliberately NOT shared with the production
+    /// `u16_at`/`u32_at`/`u64_at` above (shift-OR instead of
+    /// `from_le_bytes`): a byte-order defect in one implementation cannot
+    /// hide inside agreement with the other, and the known-answer test
+    /// below pins both against literals.
+    fn oracle_u16_at(record: &[u8], at: usize) -> u16 {
+        (record[at] as u16) | ((record[at + 1] as u16) << 8)
+    }
+
+    fn oracle_u32_at(record: &[u8], at: usize) -> u32 {
+        (record[at] as u32)
+            | ((record[at + 1] as u32) << 8)
+            | ((record[at + 2] as u32) << 16)
+            | ((record[at + 3] as u32) << 24)
+    }
+
+    fn oracle_u64_at(record: &[u8], at: usize) -> u64 {
+        (record[at] as u64)
+            | ((record[at + 1] as u64) << 8)
+            | ((record[at + 2] as u64) << 16)
+            | ((record[at + 3] as u64) << 24)
+            | ((record[at + 4] as u64) << 32)
+            | ((record[at + 5] as u64) << 40)
+            | ((record[at + 6] as u64) << 48)
+            | ((record[at + 7] as u64) << 56)
+    }
+
+    /// Both decoder implementations agree with known answers: byte order
+    /// is pinned against literals, so a byte-swap defect in either one
+    /// (the round-2 oracle finding) fails here instead of hiding inside
+    /// oracle agreement.
+    #[test]
+    fn decoders_match_known_answers() {
+        let bytes: Vec<u8> = (1u8..=32).collect();
+        assert_eq!(u16_at(&bytes, 0), 0x0201);
+        assert_eq!(oracle_u16_at(&bytes, 0), 0x0201);
+        assert_eq!(u32_at(&bytes, 0), 0x0403_0201);
+        assert_eq!(oracle_u32_at(&bytes, 0), 0x0403_0201);
+        assert_eq!(u64_at(&bytes, 0), 0x0807_0605_0403_0201);
+        assert_eq!(oracle_u64_at(&bytes, 0), 0x0807_0605_0403_0201);
+        // The finding's distinguisher: bytes 4/5 (05 06 here) land in the
+        // 0x0000_0605_0000_0000 position, never swapped.
+        assert_eq!(u64_at(&bytes, 0) & 0xFFFF_0000_0000, 0x0605_0000_0000);
+        assert_eq!(
+            oracle_u64_at(&bytes, 0) & 0xFFFF_0000_0000,
+            0x0605_0000_0000
+        );
+        // Unaligned offsets too.
+        assert_eq!(u32_at(&bytes, 5), 0x0908_0706);
+        assert_eq!(oracle_u32_at(&bytes, 5), 0x0908_0706);
+        assert_eq!(u64_at(&bytes, 8), 0x100F_0E0D_0C0B_0A09);
+        assert_eq!(oracle_u64_at(&bytes, 8), 0x100F_0E0D_0C0B_0A09);
+    }
+
+    /// The two decoder implementations agree on random inputs at every
+    /// valid offset, so they cannot silently diverge.
+    #[test]
+    fn decoder_implementations_agree() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200 {
+            let mut bytes = vec![0u8; 32];
+            for slot in &mut bytes {
+                *slot = (next() & 0xFF) as u8;
+            }
+            for at in 0..=30 {
+                assert_eq!(u16_at(&bytes, at), oracle_u16_at(&bytes, at), "u16 at {at}");
+            }
+            for at in 0..=28 {
+                assert_eq!(u32_at(&bytes, at), oracle_u32_at(&bytes, at), "u32 at {at}");
+            }
+            for at in 0..=24 {
+                assert_eq!(u64_at(&bytes, at), oracle_u64_at(&bytes, at), "u64 at {at}");
+            }
+        }
+    }
+
     /// Independent oracle: accept/reject re-derived from the contract,
-    /// never by calling [`parse`]. Every byte-flip and randomized mutation
-    /// below must agree with it — that turns "parse compares with itself"
-    /// into "parse agrees with an independent decision procedure".
-    /// (Kept in sync with `parse` by construction: any rule change must
-    /// update both, and the agreement tests fail otherwise.)
+    /// never by calling [`parse`], and decoded with the independent
+    /// `oracle_*` readers above — never the production `u*_at` ones.
+    /// Every byte-flip and randomized mutation below must agree with it —
+    /// that turns "parse compares with itself" into "parse agrees with an
+    /// independent decision procedure". (Kept in sync with `parse` by
+    /// construction: any rule change must update both, and the agreement
+    /// tests fail otherwise.)
     fn oracle_accepts(bytes: &[u8], expect: &Expect) -> bool {
         if expect.slots > ANCHOR_SLOTS {
             return false;
@@ -1844,10 +1952,10 @@ mod tests {
         // in the walk below.
         let tail = &bytes[(records - 1) * RECORD_LEN..records * RECORD_LEN];
         if tail[3] != KIND_END
-            || u32_at(tail, 4) != 0
-            || u64_at(tail, 8) != 0
-            || u64_at(tail, 16) != 0
-            || u32_at(tail, 24) != 0
+            || oracle_u32_at(tail, 4) != 0
+            || oracle_u64_at(tail, 8) != 0
+            || oracle_u64_at(tail, 16) != 0
+            || oracle_u32_at(tail, 24) != 0
         {
             return false;
         }
@@ -1859,16 +1967,16 @@ mod tests {
         let mut raw_anchor: Vec<(u32, AnchorOutcome)> = Vec::new();
         for index in 0..records {
             let record = &bytes[index * RECORD_LEN..(index + 1) * RECORD_LEN];
-            if u16_at(record, 0) != RECORD_MAGIC || record[2] != RECORD_VERSION {
+            if oracle_u16_at(record, 0) != RECORD_MAGIC || record[2] != RECORD_VERSION {
                 return false;
             }
-            if u32_at(record, 28) != want_gen {
+            if oracle_u32_at(record, 28) != want_gen {
                 return false;
             }
-            let a = u32_at(record, 4);
-            let start = u64_at(record, 8);
-            let end = u64_at(record, 16);
-            let verdict = u32_at(record, 24);
+            let a = oracle_u32_at(record, 4);
+            let start = oracle_u64_at(record, 8);
+            let end = oracle_u64_at(record, 16);
+            let verdict = oracle_u32_at(record, 24);
             match record[3] {
                 KIND_END => {
                     if index != records - 1 {
@@ -2005,17 +2113,19 @@ mod tests {
     /// Correspondence check: an accepted `Run` must match the raw bytes it
     /// was parsed from — every parsed entry traces to raw record(s) with
     /// the correctly-mapped verdict, demotions trace to genuine raw
-    /// conflicts, and nothing is invented. Never calls [`parse`].
+    /// conflicts, and nothing is invented. Never calls [`parse`], and
+    /// decodes with the independent `oracle_*` readers (so a production
+    /// decoder defect shows up as parsed-vs-raw mismatch, not agreement).
     fn assert_run_matches_bytes(bytes: &[u8], expect: &Expect, run: &Run) {
         let records = bytes.len() / RECORD_LEN;
         let mut raw_vma: Vec<(u32, u64, u64, TargetVerdict)> = Vec::new();
         let mut raw_anchor: Vec<(u32, AnchorOutcome)> = Vec::new();
         for index in 0..records {
             let record = &bytes[index * RECORD_LEN..(index + 1) * RECORD_LEN];
-            let a = u32_at(record, 4);
-            let start = u64_at(record, 8);
-            let end = u64_at(record, 16);
-            let verdict = u32_at(record, 24);
+            let a = oracle_u32_at(record, 4);
+            let start = oracle_u64_at(record, 8);
+            let end = oracle_u64_at(record, 16);
+            let verdict = oracle_u32_at(record, 24);
             match record[3] {
                 KIND_VMA => {
                     let mapped = if verdict == VERDICT_NONE {

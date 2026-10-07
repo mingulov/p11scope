@@ -390,8 +390,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn note_partial_attach(&mut self, receipt: &ExtendReceipt) {
         // Deferred endpoints dedupe: a receipt may carry the same
         // endpoint twice across its defer calls.
-        let deferred: BTreeSet<EndpointId> =
-            receipt.deferred.endpoints.iter().map(|endpoint| endpoint.id).collect();
+        let deferred: BTreeSet<EndpointId> = receipt
+            .deferred
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id)
+            .collect();
         if receipt.failed.is_empty() && deferred.is_empty() {
             return;
         }
@@ -415,11 +419,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         }
         for id in &deferred {
-            let owners: Vec<AttachModuleKey> = self
-                .attach_set
-                .modules_with_member(*id)
-                .cloned()
-                .collect();
+            let owners: Vec<AttachModuleKey> =
+                self.attach_set.modules_with_member(*id).cloned().collect();
             if owners.is_empty() {
                 unclaimed.1 += 1;
             } else {
@@ -1942,9 +1943,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let confirmed = match &admitted {
                 Ok(modules) => {
                     let mut edged = modules.iter().filter(|key| {
-                        self.registry.module_id_for(key).is_some_and(|id| {
-                            self.registry.edge(caller, id).is_some()
-                        })
+                        self.registry
+                            .module_id_for(key)
+                            .is_some_and(|id| self.registry.edge(caller, id).is_some())
                     });
                     matches!((edged.next(), edged.next()), (Some(only), None) if *only == module)
                 }
@@ -2102,8 +2103,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             };
             match decision.outcome {
                 PendingCountOutcome::Placed { module } => {
-                    if let Some(PairTarget::Pending { caller, endpoint, .. }) =
-                        self.pair_targets.get(&key)
+                    if let Some(PairTarget::Pending {
+                        caller, endpoint, ..
+                    }) = self.pair_targets.get(&key)
                     {
                         let (caller, endpoint) = (*caller, *endpoint);
                         self.pair_targets.insert(

@@ -3288,7 +3288,10 @@ fn a_deadline_starved_refresh_reports_starvation_on_the_batch() {
     let starved = ReadWindow::new(16, Instant::now() - Duration::from_secs(1)).unwrap();
     let mut second = read_witnesses_from(None, &mut book, CapturePhase::Active, starved);
     read_rows_from_with(&mut rows, &mut book, &mut second, starved, 8);
-    assert!(second.deadline_reached, "the witness hit the expired deadline");
+    assert!(
+        second.deadline_reached,
+        "the witness hit the expired deadline"
+    );
     assert!(
         second.refresh_deadline_reached,
         "starvation rides the batch beside the witness flag"

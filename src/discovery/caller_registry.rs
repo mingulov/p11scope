@@ -3006,7 +3006,7 @@ impl CallerRegistry {
             },
         };
         if demoted && let PendingCountOutcome::Rejected { reason } = &outcome {
-            self.disclose_demoted_rejection(caller, modules, count, first_ns, *reason);
+            self.disclose_demoted_rejection(caller, modules, count, *reason);
         }
         self.pending_count_decisions.push(PendingCountDecision {
             pending_id,
@@ -3016,24 +3016,25 @@ impl CallerRegistry {
 
     /// One demoted count's rejection disclosure (F3-02): the pair's
     /// witness resolved cleanly when the pair was sole-owned, so no
-    /// witness in this window records the placement — the count mirrors
-    /// the witness gaps itself, naming the unattributed growth, so a
-    /// rejected demoted count never finalizes silently. Ambiguity takes
-    /// the shared-endpoint shape; a single unedged candidate goes
-    /// module-level like a witness without mapping evidence; no
-    /// candidate at all reports caller-wide (the endpoint left the
-    /// attach set entirely).
+    /// witness in this window records the placement — the count records
+    /// its own disclosure gaps, naming the unattributed growth, so a
+    /// rejected demoted count never finalizes silently. The disclosure
+    /// is gap-only: the rejected count has no witness row, so it must
+    /// never account a witness placement or invent a module-level use
+    /// row (round 4, census). Ambiguity takes the shared-endpoint gap
+    /// shape; a single unedged candidate records a caller-scoped gap
+    /// naming the missing edge; no candidate at all reports
+    /// caller-wide (the endpoint left the attach set entirely).
     fn disclose_demoted_rejection(
         &mut self,
         caller: CallerId,
         modules: &[ModuleKey],
         count: u64,
-        first_ns: u64,
         reason: PendingRejection,
     ) {
         match (reason, modules) {
             (PendingRejection::Ambiguous, _) => {
-                self.apply_shared_endpoint(
+                self.push_shared_endpoint_gaps(
                     modules,
                     &format!("re-resolved with {count} unattributed calls after sharing appeared"),
                 );
@@ -3046,17 +3047,11 @@ impl CallerRegistry {
                     id,
                     WITNESS_WITHOUT_MAPPING,
                     format!(
-                        "{} has no mapping edge to this module: the re-resolved count ({count} calls) stays \
-                         module-level; a count never invents a mapping",
+                        "{} has no mapping edge to this module: the re-resolved count ({count} calls) names \
+                         no carrier, so no edge and no module-level use is recorded; a count never invents a \
+                         mapping",
                         caller.label()
                     ),
-                );
-                self.apply_unbound_use(
-                    key,
-                    first_ns,
-                    NO_MAPPING_EDGE,
-                    "the bound caller has no mapping edge to the module",
-                    false,
                 );
             }
             (PendingRejection::NoEdge, []) => {
@@ -3083,6 +3078,12 @@ impl CallerRegistry {
     /// no edge, no module-level use.
     fn apply_shared_endpoint(&mut self, modules: &[ModuleKey], text: &str) {
         self.witness_placement.ambiguous += 1;
+        self.push_shared_endpoint_gaps(modules, text);
+    }
+
+    /// The shared-endpoint gaps without the witness placement: a rejected
+    /// demoted count discloses through these (it has no row to account).
+    fn push_shared_endpoint_gaps(&mut self, modules: &[ModuleKey], text: &str) {
         for key in modules {
             let id = self.modules_by_key.get(key).copied();
             self.push_witness_gap(

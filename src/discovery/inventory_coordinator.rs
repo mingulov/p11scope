@@ -6304,6 +6304,167 @@ mod tests {
     }
 
     #[test]
+    fn demoted_rejection_discloses_without_inventing_witness_placements() {
+        // Round 4, census (sol-N1 / R4-N5): the F3-02 shape — one decided
+        // row (A's first sight, edged) plus a count-only demoted
+        // rejection — must keep the placement census exact: the rejected
+        // count has no witness row, so disclosing it must not account
+        // another witness (`ambiguous` stays 0, the total stays 1).
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 20,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let placement = registry.witness_placement();
+        let census = registry.witness_census();
+        assert_eq!(
+            (placement.edge, placement.module, placement.ambiguous, placement.unresolved),
+            (1, 0, 0, 0),
+            "one decided row accounts exactly one edge placement: {placement:?}"
+        );
+        assert_eq!(
+            placement.total(),
+            census.bound + census.unbound_total(),
+            "the placement census sums to the decided rows: {placement:?} vs {census:?}"
+        );
+        assert!(
+            registry.modules().all(|module| module.unbound_use.is_none()),
+            "a rejected count invents no module-level use row"
+        );
+        let _ = at;
+    }
+
+    #[test]
+    fn demoted_no_edge_rejection_discloses_without_module_rows() {
+        // Round 4, census (sol-N1 / R4-N5), NoEdge-single arm: B is the
+        // sole admitted member but never projected (no edge), so the
+        // demoted count rejects with no edge. Disclosing it must neither
+        // account a witness placement nor invent a module-level use row.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        // A's membership is removed (re-record memberless); B stays the
+        // sole admitted member but is never projected: no B edge exists.
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        let members: Vec<_> = native
+            .scene
+            .coordinator
+            .attach_set
+            .modules_with_member(shared.id)
+            .collect();
+        assert_eq!(
+            members.len(),
+            1,
+            "B is the sole admitted member after A's membership is removed: {members:?}"
+        );
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 6,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let placement = registry.witness_placement();
+        let census = registry.witness_census();
+        assert_eq!(
+            (placement.edge, placement.module, placement.ambiguous, placement.unresolved),
+            (1, 0, 0, 0),
+            "one decided row accounts exactly one edge placement: {placement:?}"
+        );
+        assert_eq!(
+            placement.total(),
+            census.bound + census.unbound_total(),
+            "the placement census sums to the decided rows: {placement:?} vs {census:?}"
+        );
+        assert!(
+            registry.modules().all(|module| module.unbound_use.is_none()),
+            "a rejected count invents no module-level use row"
+        );
+        let _ = at;
+    }
+
+    #[test]
     fn a_rejected_count_is_never_promoted_by_a_later_mapping() {
         // P3 finalization (sol#2): a bound row with no mapping edge
         // places its witness module-level and rejects its count; the

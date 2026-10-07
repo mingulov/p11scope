@@ -3150,7 +3150,16 @@ fn count_refresh_batch_resumes_its_token_after_an_interrupted_sweep() {
     assert!(!failed.sweep_completed);
     assert_eq!(failed.read_failures.len(), 1);
     rows.fail_batch = false;
-    rows.visits.clear();
+    // The visitation history is retained across the failure: the resumed
+    // sweep continues from the retained token, so the interrupted +
+    // resumed quanta together visit every row exactly once. A
+    // restart-from-zero would re-visit the first quantum's buckets.
+    let first_visits = rows.visits.clone();
+    assert_eq!(
+        first_visits.values().sum::<usize>(),
+        first.updates.len(),
+        "the first quantum visits exactly what it reports: {first_visits:?}"
+    );
     // Advance again so every row reports past its new baseline.
     for cookie in 100..=104 {
         set_count(&mut rows, cookie, cookie + 1000);
@@ -3166,16 +3175,20 @@ fn count_refresh_batch_resumes_its_token_after_an_interrupted_sweep() {
             break;
         }
     }
-    // The resumed sweep continues from the retained token: every row
-    // it visits (the buckets past the interrupted quantum) is visited
-    // exactly once — rows the first quantum already reported are not
-    // owed a second visit this sweep.
-    for (key, visits) in &rows.visits {
-        assert_eq!(*visits, 1, "row {key} visited once after resume");
+    // The resumed sweep continues from the retained token: rows the
+    // first quantum already reported are not owed a second visit.
+    for cookie in 100..=104 {
+        assert_eq!(
+            rows.visits.get(&cookie).copied().unwrap_or(0),
+            1,
+            "row {cookie} visited exactly once across the failure: {:?}",
+            rows.visits
+        );
     }
-    assert!(
-        updates.len() + first.updates.len() >= 5,
-        "interrupted + resumed quanta cover every row: {updates:?}"
+    assert_eq!(
+        updates.len() + first.updates.len(),
+        5,
+        "interrupted + resumed quanta report every row exactly once: {updates:?}"
     );
 }
 

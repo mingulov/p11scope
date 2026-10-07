@@ -245,6 +245,9 @@ pub enum Invalid {
     /// passes would accept identical records, so the run identity is
     /// ambiguous.
     ExpectGen,
+    /// A `DUP` alias names a missing, failed, self, or cyclic destination:
+    /// aliases must resolve to a valid installed (`OK`) root.
+    Alias,
 }
 
 fn u16_at(record: &[u8], at: usize) -> u16 {
@@ -266,6 +269,30 @@ fn u64_at(record: &[u8], at: usize) -> u64 {
         record[at + 6],
         record[at + 7],
     ])
+}
+
+/// Follow `slot` through the collapsed alias graph to its installed
+/// root. Only `Ok` slots are installed: `Full`, `BadShape`, and
+/// `Conflict` destinations fail, as do missing slots, self-reference,
+/// and cycles.
+fn resolve_anchor_root(anchors: &BTreeMap<u32, AnchorOutcome>, slot: u32) -> Result<u32, Invalid> {
+    let mut seen = BTreeSet::new();
+    let mut at = slot;
+    loop {
+        if !seen.insert(at) {
+            return Err(Invalid::Alias);
+        }
+        match anchors.get(&at) {
+            Some(AnchorOutcome::Dup(next)) => {
+                if *next == at {
+                    return Err(Invalid::Alias);
+                }
+                at = *next;
+            }
+            Some(AnchorOutcome::Ok) => return Ok(at),
+            _ => return Err(Invalid::Alias),
+        }
+    }
 }
 
 /// Parse one run's bytes. Pure: no syscalls, no allocation past the output,
@@ -451,6 +478,20 @@ pub fn parse(bytes: &[u8], expect: &Expect) -> Result<Run, Invalid> {
     let tail = &bytes[(records - 1) * RECORD_LEN..records * RECORD_LEN];
     if tail[3] != KIND_END {
         return Err(Invalid::MissingEnd);
+    }
+    // Alias validation runs after ALL conflicts collapsed: a destination
+    // downgraded by a later repeat must fail the aliases pointing at it.
+    // Aliases are exposed resolved to their installed root, so consumers
+    // never chase chains.
+    let dup_slots: Vec<u32> = run
+        .anchors
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, AnchorOutcome::Dup(_)))
+        .map(|(slot, _)| *slot)
+        .collect();
+    for slot in dup_slots {
+        let root = resolve_anchor_root(&run.anchors, slot)?;
+        run.anchors.insert(slot, AnchorOutcome::Dup(root));
     }
     Ok(run)
 }
@@ -1493,6 +1534,90 @@ mod tests {
         assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::Ok));
     }
 
+    /// `Dup` must alias an installed slot: self-reference, cycles, and
+    /// missing/failed destinations all fail the run — bounds checks alone
+    /// do not establish "aliases an installed slot".
+    #[test]
+    fn anchor_alias_graph_is_validated_after_conflicts() {
+        let empty = BTreeSet::new();
+        let anchor = anchor_expect(&empty);
+        let dup = |slot: u32, dest: u32| {
+            let mut rec = record(KIND_ANCHOR, slot, 0, 0, ANCHOR_DUP, 7);
+            rec[8..16].copy_from_slice(&u64::from(dest).to_le_bytes());
+            rec.to_vec()
+        };
+        // Self-DUP.
+        let bytes = [dup(1, 1), end(7).to_vec()].concat();
+        assert_eq!(parse(&bytes, &anchor), Err(Invalid::Alias));
+        // Missing destination: {1: Dup(2)} with no slot 2.
+        let bytes = [dup(1, 2), end(7).to_vec()].concat();
+        assert_eq!(parse(&bytes, &anchor), Err(Invalid::Alias));
+        // Reciprocal cycle.
+        let bytes = [dup(1, 2), dup(2, 1), end(7).to_vec()].concat();
+        assert_eq!(parse(&bytes, &anchor), Err(Invalid::Alias));
+        // Longer cycle through an installed-looking chain.
+        let bytes = [
+            record(KIND_ANCHOR, 0, 0, 0, ANCHOR_OK, 7).to_vec(),
+            dup(1, 2),
+            dup(2, 3),
+            dup(3, 1),
+            end(7).to_vec(),
+        ]
+        .concat();
+        assert_eq!(parse(&bytes, &anchor), Err(Invalid::Alias));
+        // DUP to a failed destination.
+        let bytes = [
+            record(KIND_ANCHOR, 2, 0, 0, ANCHOR_FULL, 7).to_vec(),
+            dup(1, 2),
+            end(7).to_vec(),
+        ]
+        .concat();
+        assert_eq!(parse(&bytes, &anchor), Err(Invalid::Alias));
+        // DUP to a contested destination.
+        let bytes = [
+            record(KIND_ANCHOR, 2, 0, 0, ANCHOR_CONFLICT, 7).to_vec(),
+            dup(1, 2),
+            end(7).to_vec(),
+        ]
+        .concat();
+        assert_eq!(parse(&bytes, &anchor), Err(Invalid::Alias));
+        // DUP to a destination later downgraded by conflict.
+        let bytes = [
+            record(KIND_ANCHOR, 2, 0, 0, ANCHOR_OK, 7).to_vec(),
+            record(KIND_ANCHOR, 2, 0, 0, ANCHOR_FULL, 7).to_vec(),
+            dup(1, 2),
+            end(7).to_vec(),
+        ]
+        .concat();
+        assert_eq!(parse(&bytes, &anchor), Err(Invalid::Alias));
+    }
+
+    /// Valid aliases are exposed resolved to their installed root, so
+    /// consumers never chase chains.
+    #[test]
+    fn anchor_aliases_resolve_to_installed_root() {
+        let empty = BTreeSet::new();
+        let anchor = anchor_expect(&empty);
+        let dup = |slot: u32, dest: u32| {
+            let mut rec = record(KIND_ANCHOR, slot, 0, 0, ANCHOR_DUP, 7);
+            rec[8..16].copy_from_slice(&u64::from(dest).to_le_bytes());
+            rec.to_vec()
+        };
+        let bytes = [
+            record(KIND_ANCHOR, 0, 0, 0, ANCHOR_OK, 7).to_vec(),
+            dup(2, 0),
+            dup(1, 2),
+            end(7).to_vec(),
+        ]
+        .concat();
+        let run = parse(&bytes, &anchor).expect("rooted chains parse");
+        assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::Ok));
+        assert_eq!(run.anchors.get(&1), Some(&AnchorOutcome::Dup(0)));
+        assert_eq!(run.anchors.get(&2), Some(&AnchorOutcome::Dup(0)));
+        assert!(oracle_accepts(&bytes, &anchor));
+        assert_run_matches_bytes(&bytes, &anchor, &run);
+    }
+
     #[test]
     fn conflicting_anchor_repeats_downgrade_the_slot() {
         let empty_scope = BTreeSet::new();
@@ -1538,6 +1663,7 @@ mod tests {
         let want_gen = expect.generation as u32;
         let mut last_tgid: Option<u32> = None;
         let mut only_tgid: Option<u32> = None;
+        let mut raw_anchor: Vec<(u32, AnchorOutcome)> = Vec::new();
         for index in 0..records {
             let record = &bytes[index * RECORD_LEN..(index + 1) * RECORD_LEN];
             if u16_at(record, 0) != RECORD_MAGIC || record[2] != RECORD_VERSION {
@@ -1596,24 +1722,85 @@ mod tests {
                     if start >= POINTER_GUARD || end >= POINTER_GUARD {
                         return false;
                     }
-                    let payload_ok = match verdict {
-                        ANCHOR_OK => start == 0 && end == 0 && a < expect.slots,
+                    let outcome = match verdict {
+                        ANCHOR_OK => (start == 0 && end == 0 && a < expect.slots)
+                            .then_some(AnchorOutcome::Ok),
                         ANCHOR_DUP => {
-                            end == 0 && a < expect.slots && start < u64::from(expect.slots)
+                            (end == 0 && a < expect.slots && start < u64::from(expect.slots))
+                                .then_some(AnchorOutcome::Dup(start as u32))
                         }
-                        ANCHOR_FULL => start == 0 && end == 0 && a < expect.slots,
-                        ANCHOR_BAD_SHAPE => start == 0 && end == 0,
-                        ANCHOR_CONFLICT => start == 0 && end == 0 && a < expect.slots,
-                        _ => false,
+                        ANCHOR_FULL => (start == 0 && end == 0 && a < expect.slots)
+                            .then_some(AnchorOutcome::Full),
+                        ANCHOR_BAD_SHAPE => {
+                            (start == 0 && end == 0).then_some(AnchorOutcome::BadShape)
+                        }
+                        ANCHOR_CONFLICT => (start == 0 && end == 0 && a < expect.slots)
+                            .then_some(AnchorOutcome::Conflict),
+                        _ => None,
                     };
-                    if !payload_ok {
-                        return false;
+                    match outcome {
+                        Some(mapped) => raw_anchor.push((a, mapped)),
+                        None => return false,
                     }
                 }
                 _ => return false,
             }
         }
+        // Alias validation after all conflicts, mirroring `parse`.
+        if matches!(expect.run, RunKind::Anchor) && oracle_collapsed_anchors(&raw_anchor).is_none()
+        {
+            return false;
+        }
         true
+    }
+
+    /// Test-side alias collapse + resolution (shared by the oracle and
+    /// the correspondence check; independent of `resolve_anchor_root`):
+    /// collapse each slot's raw outcomes (mixed repeats downgrade), then
+    /// resolve every `Dup` to its installed root. `None` rejects the run:
+    /// self-reference, cycles, and missing/failed destinations.
+    fn oracle_collapsed_anchors(
+        raw: &[(u32, AnchorOutcome)],
+    ) -> Option<BTreeMap<u32, AnchorOutcome>> {
+        let mut per_slot: BTreeMap<u32, Vec<AnchorOutcome>> = BTreeMap::new();
+        for (slot, outcome) in raw {
+            per_slot.entry(*slot).or_default().push(*outcome);
+        }
+        let mut collapsed = BTreeMap::new();
+        for (slot, outcomes) in &per_slot {
+            let first = outcomes[0];
+            if outcomes.iter().all(|one| *one == first) {
+                collapsed.insert(*slot, first);
+            } else {
+                collapsed.insert(*slot, AnchorOutcome::BadShape);
+            }
+        }
+        let slots: Vec<u32> = collapsed.keys().copied().collect();
+        for slot in slots {
+            if !matches!(collapsed[&slot], AnchorOutcome::Dup(_)) {
+                continue;
+            }
+            let mut visited = Vec::new();
+            let mut at = slot;
+            let root = loop {
+                if visited.contains(&at) || visited.len() > collapsed.len() {
+                    return None;
+                }
+                visited.push(at);
+                match collapsed.get(&at) {
+                    Some(AnchorOutcome::Dup(next)) => {
+                        if *next == at {
+                            return None;
+                        }
+                        at = *next;
+                    }
+                    Some(AnchorOutcome::Ok) => break at,
+                    _ => return None,
+                }
+            };
+            collapsed.insert(slot, AnchorOutcome::Dup(root));
+        }
+        Some(collapsed)
     }
 
     /// Correspondence check: an accepted `Run` must match the raw bytes it
@@ -1719,39 +1906,11 @@ mod tests {
                     "anchor runs carry no target verdicts"
                 );
                 assert!(run.demoted_pids.is_empty(), "anchor runs demote nothing");
-                // Collapse by debug text: `Dup` carries data, so outcomes
-                // are compared by value below, multiplicities ignored.
-                let mut fingerprints: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
-                for (slot, outcome) in &raw_anchor {
-                    fingerprints
-                        .entry(*slot)
-                        .or_default()
-                        .insert(format!("{outcome:?}"));
-                }
-                for (slot, outcome) in run.anchors.iter() {
-                    let distinct = fingerprints.get(slot).expect("parsed slot has raw source");
-                    if distinct.len() == 1 {
-                        let raw_outcome = raw_anchor
-                            .iter()
-                            .find(|(s, _)| s == slot)
-                            .map(|(_, o)| o)
-                            .expect("raw source");
-                        assert_eq!(
-                            outcome, raw_outcome,
-                            "slot {slot} with one distinct raw outcome keeps it"
-                        );
-                    } else {
-                        assert_eq!(
-                            outcome,
-                            &AnchorOutcome::BadShape,
-                            "slot {slot} with mixed raw outcomes downgrades"
-                        );
-                    }
-                }
+                let expected = oracle_collapsed_anchors(&raw_anchor)
+                    .expect("accepted runs collapse and resolve");
                 assert_eq!(
-                    run.anchors.len(),
-                    fingerprints.len(),
-                    "every raw anchor slot is represented exactly once"
+                    run.anchors, expected,
+                    "parsed anchors must equal collapsed+resolved raw outcomes"
                 );
             }
         }

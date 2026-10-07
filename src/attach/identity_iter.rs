@@ -2507,79 +2507,100 @@ mod tests {
         assert_eq!(dec("P11_IDENT_F_MMAPABLE"), 1024);
     }
 
-    /// Userspace must not manufacture the identity assertions the target
-    /// program trusts: `AnchorMaps` offers no arbitrary insertion.
+    /// Structural I6: `AnchorMaps` implements no leak trait — no
+    /// `Debug`, no `Display`, no `Serialize`, however derived, manual, or
+    /// renamed. Ambiguity-based negative assertions: if the handle
+    /// implemented the probed trait, both impls below would apply and this
+    /// function would fail to compile. (Liveness is proven by experiment:
+    /// adding any of these impls breaks the build; see the round-1 report.)
     #[test]
-    fn anchor_handle_offers_no_identity_manufacture() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let rust =
-            std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
-        let handle = rust
-            .split_once("Write-only anchor handle")
-            .expect("AnchorMaps block")
-            .1
-            .split_once("// aya loader")
-            .expect("handle block end")
-            .0;
-        assert!(
-            !handle.contains("pub fn insert("),
-            "AnchorMaps must not offer arbitrary insertion"
-        );
+    fn anchor_maps_implements_no_leak_traits() {
+        struct Probe;
+        trait AmbiguousIfDebug<T> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfDebug<()> for T {}
+        impl<T: ?Sized + std::fmt::Debug> AmbiguousIfDebug<Probe> for T {}
+        <AnchorMaps as AmbiguousIfDebug<_>>::probe();
+
+        trait AmbiguousIfDisplay<T> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfDisplay<()> for T {}
+        impl<T: ?Sized + std::fmt::Display> AmbiguousIfDisplay<Probe> for T {}
+        <AnchorMaps as AmbiguousIfDisplay<_>>::probe();
+
+        trait AmbiguousIfSerialize<T> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSerialize<()> for T {}
+        impl<T: ?Sized + serde::Serialize> AmbiguousIfSerialize<Probe> for T {}
+        <AnchorMaps as AmbiguousIfSerialize<_>>::probe();
     }
 
-    /// I6 grep test: the anchor handle exposes no read API and no `Debug`,
-    /// and the kernel never receives an inode address in a record struct.
-    #[test]
-    fn anchor_handle_has_no_read_api_or_debug() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let rust =
-            std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
-        let handle = rust
-            .split_once("Write-only anchor handle")
-            .expect("AnchorMaps block")
-            .1
-            .split_once("// aya loader")
-            .expect("handle block end")
-            .0;
-        for forbidden in [
-            "derive(Debug)",
-            "derive (Debug)",
-            "fn get(",
-            "fn lookup(",
-            "fn iter(",
-            "fn keys(",
-        ] {
-            assert!(
-                !handle.contains(forbidden),
-                "AnchorMaps must not contain {forbidden:?}"
-            );
+    /// Audit one identity C source for record-leak shape: every
+    /// `seq_write` call passes the ABI record struct, and no `emit(...)`
+    /// argument text — definition or call site, however wrapped — names
+    /// an inode-derived value. Returns the rejection reason instead of
+    /// panicking so mutation proofs can assert rejection.
+    fn audit_identity_c_source(source: &str, path: &str) -> Result<(), String> {
+        for (number, line) in source.lines().enumerate() {
+            if line.contains("seq_write(seq") && !line.contains("&record") {
+                return Err(format!("{path}:{} seq_write must pass &record", number + 1));
+            }
         }
-        assert!(
-            !handle.contains("pub fn insert("),
-            "no insertion API: userspace cannot manufacture assertions"
-        );
-        assert!(handle.contains("pub fn remove("), "delete API present");
-        assert!(handle.contains("pub fn set_slot("), "slot API present");
+        // Every `emit(` argument list, balanced across wrapped lines.
+        let bytes = source.as_bytes();
+        let mut at = 0;
+        while let Some(found) = source[at..].find("emit(") {
+            let mut depth = 0usize;
+            let mut end = None;
+            for (offset, byte) in bytes[at + found..].iter().enumerate() {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(at + found + offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = end else {
+                return Err(format!("{path}: unbalanced emit( past byte {}", at + found));
+            };
+            let args = &source[at + found..=close];
+            for forbidden in ["addr", "inode"] {
+                if args.contains(forbidden) {
+                    return Err(format!(
+                        "{path}: emit(...) argument names {forbidden:?}: {args}"
+                    ));
+                }
+            }
+            at = close + 1;
+        }
+        Ok(())
+    }
+
+    /// The kernel never receives an inode address in a record struct: the
+    /// record fields are exactly the ABI names, `seq_write` passes
+    /// `&record`, and no `emit(...)` argument smuggles an inode-derived
+    /// value into an existing record field. Producer mutations (an inode
+    /// address written into `start`, into the DUP alias field) must fail
+    /// the audit — proven by mutating the real sources in memory.
+    #[test]
+    fn kernel_records_carry_no_inode_addresses() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         for path in [
             "crates/ebpf/native/vma_identity.h",
             "crates/ebpf/native/vma_identity.c",
         ] {
-            let c = std::fs::read_to_string(root.join(path)).expect("read C source");
-            // Every `seq_write` call passes the ABI record struct, never a
-            // raw inode address: a mutation smuggling `f_inode` out through
-            // any other buffer fails here.
-            for (number, line) in c.lines().enumerate() {
-                // Call sites only (the helper declaration shares the name).
-                if line.contains("seq_write(seq") {
-                    assert!(
-                        line.contains("&record"),
-                        "{path}:{} seq_write must pass &record",
-                        number + 1
-                    );
-                }
-            }
+            let source = std::fs::read_to_string(root.join(path)).expect("read C source");
+            audit_identity_c_source(&source, path).expect("real sources pass the audit");
         }
-        // Stronger: the record struct's fields are exactly the ABI names.
+        // The record struct's fields are exactly the ABI names.
         let header = std::fs::read_to_string(root.join("crates/ebpf/native/vma_identity.h"))
             .expect("header");
         let record = header
@@ -2593,6 +2614,117 @@ mod tests {
             !record.contains("inode"),
             "record struct must not mention inodes"
         );
+        // Producer mutation 1: the inode address into `start`.
+        let path = "crates/ebpf/native/vma_identity.c";
+        let c = std::fs::read_to_string(root.join(path)).expect("read C source");
+        let mutated = c.replacen(
+            "emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            "emit(ctx, P11_IDENT_KIND_VMA, tgid_u, addr, end, verdict,",
+            1,
+        );
+        assert_ne!(mutated, c, "mutation 1 must apply");
+        assert!(
+            audit_identity_c_source(&mutated, path).is_err(),
+            "mutation 1 (addr into start) must fail the audit"
+        );
+        // Producer mutation 2: the inode address into the DUP alias field.
+        let mutated = c.replacen(
+            "emit(ctx, P11_IDENT_KIND_ANCHOR, slot, found->slot, 0,",
+            "emit(ctx, P11_IDENT_KIND_ANCHOR, slot, addr, 0,",
+            1,
+        );
+        assert_ne!(mutated, c, "mutation 2 must apply");
+        assert!(
+            audit_identity_c_source(&mutated, path).is_err(),
+            "mutation 2 (addr into DUP field) must fail the audit"
+        );
+    }
+
+    /// Structural I6: the anchor handle exposes exactly its write-only
+    /// API — no read method under any name, no second impl block, no
+    /// trait impl anywhere in the file. Renamed reads (`get_slot`,
+    /// `lookup_raw`, `AsRawFd`, manual `Debug`) all fail here, where the
+    /// old exact-name grep passed. The literal `derive(Debug)` mutation
+    /// test is kept below as well.
+    #[test]
+    fn anchor_handle_exposes_exact_write_api() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rust =
+            std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
+        // Production code only: this test's own needles live in `mod tests`.
+        let code = rust.split_once("mod tests").expect("test module").0;
+        // Exactly one inherent impl, and no trait impl for the handle
+        // anywhere in production code (manual `Debug`/`Display`/`AsRawFd`/
+        // `Deref` included; `anchor_maps_implements_no_leak_traits`
+        // backs this structurally for the whole crate).
+        assert_eq!(
+            code.lines()
+                .filter(|line| line.trim_start().starts_with("impl AnchorMaps"))
+                .count(),
+            1,
+            "exactly one inherent impl AnchorMaps block"
+        );
+        assert!(
+            !code.contains("for AnchorMaps"),
+            "no trait impl for AnchorMaps in production code"
+        );
+        // The block's method names, exactly: any added method — read,
+        // write, or otherwise — fails here.
+        let block = code.split_once("impl AnchorMaps").expect("impl block").1;
+        let end = block
+            .lines()
+            .position(|line| line == "}")
+            .expect("impl block end");
+        let mut public = BTreeSet::new();
+        let mut private = BTreeSet::new();
+        for line in block.lines().take(end) {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+                public.insert(rest.split('(').next().expect("method name").to_string());
+            } else if let Some(rest) = trimmed.strip_prefix("fn ") {
+                private.insert(rest.split('(').next().expect("method name").to_string());
+            }
+        }
+        assert_eq!(
+            public,
+            BTreeSet::from([
+                "new".to_string(),
+                "remove".to_string(),
+                "set_slot".to_string()
+            ]),
+            "public AnchorMaps API must stay exactly the write-only set"
+        );
+        assert_eq!(
+            private,
+            BTreeSet::from(["update".to_string(), "delete".to_string()]),
+            "private AnchorMaps helpers must stay exactly update/delete"
+        );
+        // Kept: the literal `Debug`-derive mutation test (M4).
+        let handle = rust
+            .split_once("Write-only anchor handle")
+            .expect("AnchorMaps block")
+            .1
+            .split_once("// aya loader")
+            .expect("handle block end")
+            .0;
+        for forbidden in ["derive(Debug)", "derive (Debug)"] {
+            assert!(
+                !handle.contains(forbidden),
+                "AnchorMaps must not contain {forbidden:?}"
+            );
+        }
+    }
+
+    /// The pointer guard is exactly 2^56 and the page granule exactly
+    /// 4 KiB: value pins so a guard-coarsening mutation (2^57 admits
+    /// contract-forbidden addresses) fails structurally. Behavioral
+    /// endpoints (start/end at exactly 2^56, the mid-range case, the
+    /// below-guard accept) live in
+    /// `pointer_guard_rejects_each_endpoint_at_2pow56`.
+    #[test]
+    fn pointer_guard_constant_is_exact() {
+        assert_eq!(POINTER_GUARD, 1u64 << 56);
+        assert_eq!(PAGE_GRANULE, 4096);
     }
 
     /// Selector encoding: a pidfd numbered 0 must be rejected, never

@@ -3794,10 +3794,12 @@ mod tests {
         out
     }
 
-    /// Parse one `impl AnchorMaps` method line: `Some((name, public,
-    /// same_line_gate))` for any visibility/modifier spelling (`fn`, `pub
-    /// fn`, `pub(crate) fn`, `pub (crate) fn`, `pub const fn`, `const
-    /// unsafe fn`, ...), `None` otherwise. Leading same-line attributes
+    /// Parse one `impl AnchorMaps` method (logical) line: `Some((name,
+    /// public, same_line_gate))` for any visibility/modifier spelling
+    /// (`fn`, `pub fn`, `pub(crate) fn`, `pub (crate) fn`, `pub const
+    /// fn`, `const unsafe fn`, ...), `None` otherwise. The caller joins
+    /// newline-split signatures before calling, so a logical line may
+    /// span physical lines. Leading same-line attributes
     /// (`#[inline] pub fn …`, including spaced `# [inline]` — comments
     /// blank to spaces upstream) are scanned past to the item start,
     /// and a same-line `#[cfg(test)]` gate is reported. Only lines that
@@ -4373,6 +4375,142 @@ mod tests {
         panic!("impl block end");
     }
 
+    /// Whether a stripped, still-unparsed candidate could be an
+    /// incomplete method signature whose remainder follows on the next
+    /// line: optional complete attributes, `pub` (plus an optionally
+    /// still-open `(...)` group), qualifier words, then `fn` plus at
+    /// most a bare name (or a still-open `<...>` group). Anything else
+    /// never continues: bodies (`unsafe {`), associated items
+    /// (`const X: ...`, `type ...`), bare `#` lines (split attributes
+    /// stay out of scope), and complete trailing tokens.
+    fn signature_prefix_open(candidate: &str) -> bool {
+        let mut text = candidate.trim_start();
+        // Leading complete `# [...]` spans (string-aware, as in the
+        // method parser); a trailing bare `#` never continues.
+        loop {
+            let probe = text.trim_start();
+            let Some(bracketed) = probe
+                .strip_prefix('#')
+                .map(str::trim_start)
+                .filter(|tail| tail.starts_with('['))
+            else {
+                text = probe;
+                break;
+            };
+            let mut depth = 0i32;
+            let mut end = None;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (offset, byte) in bracketed.bytes().enumerate() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match byte {
+                    b'"' => in_string = true,
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = end else {
+                return false;
+            };
+            text = bracketed[close + 1..].trim_start();
+        }
+        // An attribute-only line gates from above (the `previous`
+        // path), it never continues a signature.
+        if text.is_empty() || text.starts_with('#') {
+            return false;
+        }
+        if let Some(tail) = strip_rust_word(text, "pub") {
+            text = tail.trim_start();
+            if text.starts_with('(') {
+                let mut depth = 0i32;
+                let mut closed = None;
+                for (offset, ch) in text.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                closed = Some(offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // A still-open visibility group continues on the next
+                // line.
+                let Some(close) = closed else {
+                    return true;
+                };
+                text = text[close + 1..].trim_start();
+            }
+        }
+        // Qualifier words (order-insensitive here: complete lines
+        // parse before this check ever runs).
+        loop {
+            let mut advanced = false;
+            for word in ["const", "unsafe", "async"] {
+                if let Some(tail) = strip_rust_word(text, word) {
+                    text = tail.trim_start();
+                    advanced = true;
+                    break;
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+        if text.is_empty() {
+            // Bare qualifiers (`pub`, `pub const`) continue.
+            return true;
+        }
+        let Some(tail) = strip_rust_word(text, "fn") else {
+            return false;
+        };
+        let tail = tail.trim_start();
+        let name: String = tail
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() || name.chars().next().is_some_and(|c| c.is_numeric()) {
+            // `fn` alone continues; anything else non-name closes.
+            return tail.is_empty();
+        }
+        let after = tail[name.len()..].trim_start();
+        if after.is_empty() {
+            return true;
+        }
+        // A still-open generic group continues; anything else closes.
+        if after.starts_with('<') {
+            let mut depth = 0i32;
+            for ch in after.chars() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => depth -= 1,
+                    _ => {}
+                }
+            }
+            return depth > 0;
+        }
+        false
+    }
+
     fn anchor_maps_api(
         block: &str,
     ) -> Result<(BTreeSet<String>, BTreeSet<String>, BTreeSet<String>), String> {
@@ -4382,14 +4520,30 @@ mod tests {
         let mut private = BTreeSet::new();
         let mut gated = BTreeSet::new();
         let mut previous = String::new();
+        // A signature broken across lines (`pub` / `(crate) fn ...`,
+        // `pub fn name` / `(...)`) still enumerates: an unparsed
+        // candidate that is a strict signature prefix continues on the
+        // next line. A pending prefix that derails — or dangles at the
+        // block end — fails loudly instead of vanishing.
+        let mut pending = String::new();
         for line in block[..end].lines() {
+            // Strip each physical line BEFORE joining: a trailing `//`
+            // comment ends at its own newline, never swallowing the
+            // continuation line (re-stripping inside the method parser
+            // is idempotent on valid code).
+            let clean = strip_line_noise(line);
+            let candidate = if pending.is_empty() {
+                clean
+            } else {
+                format!("{pending}\n{clean}")
+            };
             // The gate attribute sits immediately above its method — or
             // on the same line ahead of it. Whitespace-insensitive: a
             // spaced `# [cfg(test)]` line gates exactly like the tight
             // spelling.
             let prev_flat: String = previous.chars().filter(|c| !c.is_whitespace()).collect();
             let prev_gated = prev_flat == "#[cfg(test)]";
-            if let Some((name, is_public, same_line_gate)) = parse_impl_method(line) {
+            if let Some((name, is_public, same_line_gate)) = parse_impl_method(&candidate) {
                 if prev_gated || same_line_gate {
                     gated.insert(name.clone());
                 }
@@ -4398,8 +4552,22 @@ mod tests {
                 } else {
                     private.insert(name);
                 }
+                previous = candidate;
+                pending.clear();
+            } else if signature_prefix_open(&candidate) {
+                pending = candidate;
+            } else if pending.is_empty() {
+                previous = candidate;
+            } else {
+                return Err(format!(
+                    "unclassifiable method-like text in the AnchorMaps impl: {candidate:?}"
+                ));
             }
-            previous = strip_line_noise(line);
+        }
+        if !pending.is_empty() {
+            return Err(format!(
+                "dangling signature prefix at the end of the AnchorMaps impl: {pending:?}"
+            ));
         }
         Ok((public, private, gated))
     }
@@ -4526,6 +4694,28 @@ mod tests {
             assert!(
                 api_of(&mutated).is_err(),
                 "enumeration must fail loudly on non-ASCII gaps: {smuggled:?}"
+            );
+        }
+        // Newline-split signatures (fix round 5): `rustc` accepts a
+        // method signature broken across lines, so each smuggled
+        // spelling must still enumerate.
+        for (smuggled, name) in [
+            (
+                "    pub\n    (crate) fn smuggled_split_vis(&self) -> i32 { 0 }\n",
+                "smuggled_split_vis",
+            ),
+            (
+                "    pub fn smuggled_split_params\n    (&self) -> i32 { 0 }\n",
+                "smuggled_split_params",
+            ),
+        ] {
+            let mutated =
+                code.replacen("    pub fn new(", &format!("{smuggled}    pub fn new("), 1);
+            assert_ne!(mutated, code, "split mutation {name} must apply");
+            let (public, _, _) = api_of(&mutated).expect("split api scans");
+            assert!(
+                public.contains(name),
+                "enumeration must catch the split spelling {name}"
             );
         }
     }

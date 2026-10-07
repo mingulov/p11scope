@@ -88,6 +88,12 @@ MAPPING_LIVE = "mapped"
 MAPPING_ENDED = "ended"
 # A counted feed that lost records must say so in gaps[] (plan §3.5 note_capture_loss).
 LOSS_GAP = re.compile(r"\bloss\b|\blost\b|lossy", re.I)
+# O1 partial attach (fix round 1): failed endpoints make their module
+# undercount (PARTIAL_ATTACH_SUBJECT in
+# src/discovery/inventory_coordinator.rs) — counted uses are lower
+# bounds, so COUNT-EXACT over the module is explicitly nonqualifying
+# and the COUNT-WINDOW lower bound is clamped (saturation-shaped).
+PARTIAL_ATTACH = re.compile(r"endpoint attach fail", re.I)
 # Unbound positive (plan §3.3, "used by an unidentified caller image").
 UNBOUND_GAP = re.compile(r"unidentified caller|unbound (caller|witness)", re.I)
 # A gap field naming when the unbound use happened (first match wins).
@@ -533,7 +539,7 @@ def recording_before(use, since_ns):
     return max(before, key=lambda e: (e["t1"], e["t0"])) if before else None
 
 
-def window_count(use, since_ns, window):
+def window_count(use, since_ns, window, cover_start=None):
     """(lo, hi) calls a counting feed covering [max(since, start), end] must report.
 
     Lines completed strictly before since_ns missed (no row existed
@@ -541,7 +547,10 @@ def window_count(use, since_ns, window):
     recording call is included: +1 in lo when fully inside the window
     (it contributes exactly that call), +n in hi. Lines starting
     strictly after since_ns are recorded (the row exists); same-tick
-    boundaries are ambiguous (hi only)."""
+    boundaries are ambiguous (hi only). A recording line proven
+    pre-attachment (ending strictly before cover_start: attachment
+    follows admission and mapping, so no row came from it) contributes
+    nothing, not even the +1."""
     start, end = max(since_ns, window[0]), window[1]
     lo = hi = 0
     arming = (since_ns, use.first_attach_t0)
@@ -555,9 +564,31 @@ def window_count(use, since_ns, window):
     rec = recording_before(use, since_ns)
     if rec is not None:
         hi += rec["n"]
-        if rec["t0"] >= window[0] and rec["t1"] <= end:
+        rowless = cover_start is not None and rec["t1"] < cover_start
+        if rec["t0"] >= window[0] and rec["t1"] <= end and not rowless:
             lo += 1
     return lo, hi
+
+
+def endpoint_coverage_ok(lines, admission_endpoints):
+    """O1 pigeonhole: every distinctly-called endpoint needs an admitted
+    endpoint. An unknown admission count skips (can't judge — the shape
+    checks fail it elsewhere)."""
+    if type(admission_endpoints) is not int:
+        return True
+    return len({e["fn"] for e in lines}) <= admission_endpoints
+
+
+def has_partial_attach(view, edge):
+    """Whether a partial-attach gap clouds the edge's module (O1): a
+    module-scoped gap naming the edge's module, or a run-wide
+    (module-less) one — either voids endpoint coverage."""
+    for gap in view.doc.get("gaps", []):
+        if not PARTIAL_ATTACH.search(f"{gap.get('subject', '')} {gap.get('reason', '')}"):
+            continue
+        if gap.get("module") is None or gap.get("module") == edge.get("module"):
+            return True
+    return False
 
 
 def ledger_total_table_calls(image, provider_path, since_ns=None):
@@ -569,19 +600,33 @@ def ledger_total_table_calls(image, provider_path, since_ns=None):
     return sum(e["n"] for e in entries if is_table_call(e["fn"], e.get("phase"), e, arming))
 
 
-def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns):
-    """(exact, expected): whether the ledger pins the count with 0 error.
+def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
+                       mapping_first_seen_ns=None, admission_endpoints=None,
+                       partial_attach=False):
+    """(verdict, expected, detail): whether the ledger pins the count.
 
-    Exact when the counting feed provably covers every in-window call:
-    the edge is not frozen, the caller was admitted at or before its
-    first attach-side call (attachment-before-workload evidence,
-    independent of since_ns), and every overlapping ledger line lies
-    fully inside the window. Then either the row predates every
-    attach-side call (all recorded), or the recording call is the
-    first attach-side line and a singleton (Case A, included — it
-    contributes exactly its one call). Then the count must equal the
-    attach-side sum exactly (r1 T3.5); otherwise only the
-    COUNT-WINDOW/COUNT-TOTAL upper bounds apply.
+    Verdicts: "exact" (equality required over the proven covered
+    workload segment), "inexact" (window bounds judge — frozen, empty,
+    clipped, or unadmitted), "nonqualifying" (insufficient evidence to
+    judge either way — recorded explicitly, never a pass or fail).
+
+    The covered segment is BPF-side: lines completed strictly before
+    since_ns missed (no row existed — certain zero); lines starting
+    strictly after since_ns recorded (the row proves live probes). A
+    line spanning since_ns splits unknowably (aggregation) — explicit
+    nonqualifying. The recording line (last attach line ending before
+    since_ns) is known zero when proven pre-attachment (ending strictly
+    before cover_start = max(admission, mapping first-seen):
+    attachment follows admission and mapping, so no row came from it);
+    otherwise it is row-possible. A row-possible recording line takes
+    the legacy Case A (first attach line, singleton, admitted before
+    it — full-sum equality, attachment-before-workload convention) or
+    is insufficient evidence. Equality additionally requires endpoint
+    coverage over the equated lines (every distinctly-called endpoint
+    admitted — pigeonhole; no partial-attach gap clouds the module)
+    and identity/mapping hold-safety (admission and mapping at or
+    before the segment start, so rows bind immediately instead of
+    risking hold eviction).
 
     since_ns is the first BPF row's insert stamp, NOT the attach time:
     entry.rs record_caller_use_with stamps recorded_at_ns = now()
@@ -597,25 +642,72 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns):
     (tests/fixtures/public-cli/inventory-ledger.c:229), so since_ns
     lands strictly after the recording call's entry stamp on every
     real run and since_ns <= t_first can never gate exactness."""
-    if until_ns is not None:
-        return False, 0
     arming = (since_ns, use.first_attach_t0)
     attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"), e, arming)]
+    # Structural, legacy-verbatim: frozen, empty, or unadmitted (a
+    # malformed admission stamp is unadmitted too — the shape checks
+    # fail it elsewhere; the oracle never crashes on it).
+    if until_ns is not None:
+        return "inexact", 0, ""
     if not attach:
-        return False, 0
-    if any(e["t0"] < window[0] or e["t1"] > window[1] for e in use.lines):
-        return False, 0
+        return "inexact", 0, ""
+    if type(caller_first_seen_ns) is not int:
+        return "inexact", 0, ""
+    if any(e["t0"] <= since_ns <= e["t1"] for e in attach):
+        return "nonqualifying", 0, "an attach-side line spans the first row: recorded split unknowable"
+    if partial_attach:
+        return "nonqualifying", 0, "a partial-attach gap clouds the module: counted uses are lower bounds"
     first_attach_t0 = min(e["t0"] for e in attach)
-    if caller_first_seen_ns is None or caller_first_seen_ns > first_attach_t0:
-        return False, 0
+    whole_in_window = not any(e["t0"] < window[0] or e["t1"] > window[1] for e in use.lines)
+    mapping_missing = type(mapping_first_seen_ns) is not int
+    # Legacy predating branch (verbatim + evidenced overrides): the row
+    # predates every attach-side call (the synth counting convention —
+    # real rows stamp during their recording call): all recorded.
     if since_ns < first_attach_t0:
-        # The row predates every attach-side call: all recorded in place.
-        return True, sum(e["n"] for e in attach)
+        if caller_first_seen_ns > first_attach_t0 or not whole_in_window:
+            return "inexact", 0, ""
+        if not mapping_missing and mapping_first_seen_ns > first_attach_t0:
+            return "nonqualifying", 0, "mapping first seen after the first call: mapping-hold risk"
+        if not endpoint_coverage_ok(attach, admission_endpoints):
+            return "nonqualifying", 0, "more distinct endpoints called than admitted"
+        return "exact", sum(e["n"] for e in attach), ""
+    # Segment branch: pre-since lines are known zero (no row); post-since
+    # lines recorded (the row proves live probes).
+    post = [e for e in attach if e["t0"] > since_ns]
+    if post:
+        first_post_t0 = min(e["t0"] for e in post)
+        if caller_first_seen_ns > first_post_t0:
+            return "nonqualifying", 0, "admission after the covered segment: hold/eviction risk"
+        if not mapping_missing and mapping_first_seen_ns > first_post_t0:
+            return "nonqualifying", 0, "mapping first seen after the covered segment: mapping-hold risk"
+        if not endpoint_coverage_ok(post, admission_endpoints):
+            return "nonqualifying", 0, "more distinct endpoints called than admitted"
+    if any(e["t0"] < window[0] or e["t1"] > window[1] for e in post):
+        return "inexact", 0, ""
     rec = recording_before(use, since_ns)
+    if rec is None:
+        # Unreachable (a missing recording line with a non-predating row
+        # means the first line spans it — caught above), kept defensive:
+        # every attach line starts after the row, and the recording call
+        # sits ledgered inside the first one.
+        return "exact", sum(e["n"] for e in post), ""
+    cover = caller_first_seen_ns if mapping_missing else max(caller_first_seen_ns, mapping_first_seen_ns)
+    if rec["t1"] < cover:
+        # Pre-attachment (causal: attachment follows admission and
+        # mapping): no row came from it — known zero.
+        return "exact", sum(e["n"] for e in post), ""
+    # Row-possible recording line: legacy Case A verbatim (first attach
+    # line, singleton, admitted before it — full-sum equality) or
+    # insufficient evidence (held-then-bound or an aggregation split).
     first_line = min(attach, key=lambda e: (e["t0"], e["t1"]))
-    if rec is None or rec is not first_line or rec["n"] != 1:
-        return False, 0
-    return True, sum(e["n"] for e in attach)
+    if rec is not first_line or rec["n"] != 1 \
+            or caller_first_seen_ns > first_attach_t0 or not whole_in_window:
+        return "nonqualifying", 0, "recording line neither pre-attachment nor first-singleton"
+    if not mapping_missing and mapping_first_seen_ns > first_attach_t0:
+        return "nonqualifying", 0, "mapping first seen after the first call: mapping-hold risk"
+    if not endpoint_coverage_ok(attach, admission_endpoints):
+        return "nonqualifying", 0, "more distinct endpoints called than admitted"
+    return "exact", sum(e["n"] for e in attach), ""
 
 
 def reached_by(images, image):
@@ -1638,7 +1730,13 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
     if st == "counted":
         until = cov.get("until_ns")
         window = (view.window[0], min(view.window[1], until)) if until is not None else view.window
-        lo, hi = window_count(use, cov.get("since_ns") or 0, window)
+        admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
+        mapping_first = edge.get("mapping", {}).get("first_seen_ns")
+        cover = None
+        for stamp in (admitted, mapping_first):
+            if type(stamp) is int and (cover is None or stamp > cover):
+                cover = stamp
+        lo, hi = window_count(use, cov.get("since_ns") or 0, window, cover)
         count = edge["entries"].get("count", 0)
         total = ledger_total_table_calls(image, prov["path"], cov.get("since_ns"))
         res.ok(run, cell, "COUNT-TOTAL", count <= total,
@@ -1655,24 +1753,33 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
             # O7: only a production-shaped saturated triple (fixed
             # u64::MAX cap, u64 count, Boolean flag, saturated at the
             # cap) earns the clamped-bound exemption; a forged triple
-            # is judged unclamped (and fails COUNT-SATURATED).
+            # is judged unclamped (and fails COUNT-SATURATED). O1: a
+            # partial-attach gap clamps the lower bound the same way —
+            # missed endpoints void it; the upper bound still holds.
             saturated = is_saturated_artifact(edge["entries"])
-            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated, lo, hi),
+            partial = has_partial_attach(view, edge)
+            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated or partial, lo, hi),
                    f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
-                   + (" (saturated: lower bound clamped at the cap)" if saturated else ""))
-            admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
-            exact, expected = exact_window_count(use, cov.get("since_ns") or 0, window, until, admitted)
-            if exact and not saturated:
-                # Ledger exactness = 0 error: the caller was admitted
-                # before its first attach-side call and the feed provably
-                # covers every in-window call (the row predates them, or
-                # the recording call is the first attach-side line, a
-                # singleton) means the count equals the attach-side sum —
-                # not a range. A saturated feed stays a lower bound
-                # (COUNT-TOTAL).
+                   + (" (saturated: lower bound clamped at the cap)" if saturated else "")
+                   + (" (partial attach: lower bound clamped; counted uses are lower bounds)"
+                      if partial and not saturated else ""))
+            doc_module = view.modules.get(edge["module"], {})
+            verdict, expected, detail = exact_window_count(
+                use, cov.get("since_ns") or 0, window, until, admitted,
+                mapping_first, doc_module.get("admission", {}).get("endpoints"), partial)
+            if verdict == "exact" and not saturated:
+                # Ledger exactness = 0 error over the proven covered
+                # workload segment (pre-since lines missed for certain;
+                # post-since lines recorded; the recording line either
+                # proven pre-attachment or the legacy first-singleton):
+                # the count equals the segment sum — not a range. A
+                # saturated feed stays a lower bound (COUNT-TOTAL).
                 res.ok(run, cell, "COUNT-EXACT", count == expected,
                        f"{ctag}: count {count} != ledger {expected} attach-side calls "
                        f"(feed covers every in-window call since {cov.get('since_ns')})")
+            elif verdict == "nonqualifying" and not saturated:
+                res.add(run, cell, "COUNT-EXACT", "nonqualifying",
+                        f"{ctag}: insufficient evidence for exactness: {detail}")
     if st == "witnessed":
         res.ok(run, cell, "WITNESS-COUNT", edge["entries"].get("count", 0) == 0
                and edge["entries"].get("observation") != OBSERVATION_OBSERVED,
@@ -3541,6 +3648,90 @@ def self_test():
             _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] -= 1
             return kw
         case("count-below-ledger-realistic-timing", "COUNT-EXACT", realistic_timing_short)
+
+        # --- O1: covered-segment exactness (fix round 1) ------------------
+        # Setup-before-attachment: four setup calls precede attachment (no
+        # rows: proven missed); all 30 main + 3 teardown calls are
+        # captured. Admission lands in the setup->main gap with the first
+        # row after it: the proven covered segment is main+teardown (33).
+        # 33 qualifies with COUNT-EXACT engaged; 32 fails it.
+        def setup_before_attachment(s, d, count):
+            login = re.search(r"fn=C_Login mech=- n=1 bad=0 phase=setup t0=\d+ t1=(\d+)",
+                              s.ledgers["P1"])
+            digest_init = re.search(r"fn=C_DigestInit mech=0x250 n=3 bad=0 phase=main t0=(\d+)",
+                                    s.ledgers["P1"])
+            setup_end, main_start = int(login.group(1)), int(digest_init.group(1))
+            assert setup_end < main_start, (setup_end, main_start)
+            admitted = setup_end + (main_start - setup_end) // 4
+            since = setup_end + (main_start - setup_end) // 2
+            caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
+            caller["first_seen_ns"] = admitted
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            edge["entries"]["count"] = count
+            return since
+
+        def covered_segment_correct(s, d, dash):
+            setup_before_attachment(s, d, 33)
+        case("o1-covered-segment-pass", None, covered_segment_correct)
+
+        def covered_segment_short(s, d, dash):
+            setup_before_attachment(s, d, 32)
+        case("o1-covered-segment-short-fails", "COUNT-EXACT", covered_segment_short)
+
+        # O1 partial attach: the module reports failed endpoints (verbatim
+        # production shape — PARTIAL_ATTACH_SUBJECT in
+        # src/discovery/inventory_coordinator.rs): counted uses are lower
+        # bounds, so COUNT-EXACT is explicitly nonqualifying.
+        def partial_attach_gap(s, d, dash):
+            setup_before_attachment(s, d, 33)
+            d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
+                              "subject": "native endpoint attach failed",
+                              "reason": "2 of 68 endpoints failed to attach (sticky, never retried); "
+                                        "counted uses are lower bounds",
+                              "budget": None, "repeats": 1})
+        res = case("o1-partial-attach-nonqualifying", None, partial_attach_gap)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-partial-attach-not-nonqualifying")
+
+        # O1 straddling first row (the reviewer's repro shape): the first
+        # row lands inside an aggregated ledger line, so the recorded
+        # split is unknowable — explicitly nonqualifying.
+        def straddling_first_row(s, d, dash):
+            login = re.search(r"fn=C_Login mech=- n=1 bad=0 phase=setup t0=\d+ t1=(\d+)",
+                              s.ledgers["P1"])
+            digest_init = re.search(
+                r"fn=C_DigestInit mech=0x250 n=3 bad=0 phase=main t0=(\d+) t1=(\d+)", s.ledgers["P1"])
+            setup_end = int(login.group(1))
+            dt0, dt1 = int(digest_init.group(1)), int(digest_init.group(2))
+            caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
+            caller["first_seen_ns"] = setup_end + (dt0 - setup_end) // 2
+            since = (dt0 + dt1) // 2
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            edge["entries"]["count"] = 33
+        res = case("o1-straddling-row-nonqualifying", None, straddling_first_row)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-straddling-row-not-nonqualifying")
+
+        # O1 admission coverage: eleven distinct endpoints called in the
+        # segment but only one admitted — some called endpoint missed, so
+        # COUNT-EXACT is explicitly nonqualifying.
+        def admitted_endpoints_short(s, d, dash):
+            setup_before_attachment(s, d, 33)
+            mod = next(m for m in d["modules"] if m["id"] == s.mid["A"])
+            mod["admission"]["endpoints"] = 1
+        res = case("o1-admission-coverage-nonqualifying", None, admitted_endpoints_short)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-admission-coverage-not-nonqualifying")
 
         # --- O2: terminal sweep hole (sol 2, astra B4) ----------------------
         # Every record after the last pass marker skips EDGE-CADENCE while

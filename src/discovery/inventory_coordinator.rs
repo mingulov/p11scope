@@ -49,7 +49,7 @@ use crate::discovery::scan::{
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -94,6 +94,10 @@ pub(crate) struct BatchReceipt {
 /// refresh request stays pending (no commit ran), so the next pass with
 /// a fresh deadline retries the same owner.
 const DEADLINE_DEFERRED: &str = "inventory scan deadline passed; the scan defers to the next pass";
+
+/// O1 endpoint evidence: failed endpoints make their module undercount.
+/// Pinned verbatim: the oracle matches this subject.
+const PARTIAL_ATTACH_SUBJECT: &str = "native endpoint attach failed";
 
 /// Per-pid authority resolution with a native open attempt: the open is
 /// the check, so the native path is attempted honestly on every pass
@@ -366,8 +370,94 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             capture.attached_at.remove(&failed.id);
             capture.failed.insert(failed.id);
         }
+        self.note_partial_attach(receipt);
         if let Some(custody) = &receipt.custody {
             self.note_capture_custody(custody);
+        }
+    }
+
+    /// O1 endpoint evidence: one gap per module with new failures in this
+    /// receipt (bounded: every failed endpoint lands in exactly one
+    /// receipt — failed endpoints are never retried). Failed members make
+    /// the module undercount, so its counted uses are lower bounds; the
+    /// oracle withholds COUNT-EXACT over it (explicitly nonqualifying).
+    /// Endpoints no module claims (evicted before the receipt) report
+    /// run-wide. The subject and reason shapes are pinned verbatim: the
+    /// oracle matches them.
+    fn note_partial_attach(&mut self, receipt: &ExtendReceipt) {
+        if receipt.failed.is_empty() {
+            return;
+        }
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        let mut by_module: BTreeMap<AttachModuleKey, usize> = BTreeMap::new();
+        let mut unclaimed = 0usize;
+        for failed in &receipt.failed {
+            let owners: Vec<AttachModuleKey> = self
+                .attach_set
+                .modules_with_member(failed.id)
+                .cloned()
+                .collect();
+            if owners.is_empty() {
+                unclaimed += 1;
+            } else {
+                for key in owners {
+                    *by_module.entry(key).or_default() += 1;
+                }
+            }
+        }
+        for (key, failed_here) in by_module {
+            let (total, failed_total) = match self.attach_set.module_members(&key) {
+                Some(ModuleMembers::Known(members)) => (
+                    members.len(),
+                    members
+                        .iter()
+                        .filter(|id| capture.failed.contains(id))
+                        .count(),
+                ),
+                _ => (0, failed_here),
+            };
+            let registry_key = ModuleKey::physical(
+                key.object.device.major,
+                key.object.device.minor,
+                key.object.inode,
+                Some(key.sha256.clone()),
+                "",
+            );
+            let module = self.registry.module_id_for(&registry_key);
+            let reason = if total > 0 {
+                format!(
+                    "{failed_total} of {total} endpoints failed to attach (sticky, never retried); \
+                     counted uses are lower bounds"
+                )
+            } else {
+                format!(
+                    "{failed_total} endpoints failed to attach (sticky, never retried); counted uses \
+                     are lower bounds"
+                )
+            };
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module,
+                pid: None,
+                subject: PARTIAL_ATTACH_SUBJECT.into(),
+                reason,
+                budget: None,
+            });
+        }
+        if unclaimed > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: PARTIAL_ATTACH_SUBJECT.into(),
+                reason: format!(
+                    "{unclaimed} endpoint(s) with no recorded module failed to attach (sticky, never \
+                     retried); counted uses are lower bounds"
+                ),
+                budget: None,
+            });
         }
     }
 
@@ -3568,6 +3658,109 @@ mod tests {
             ),
             "{:?}",
             coverage_of(&coordinator, &a)
+        );
+    }
+
+    #[test]
+    fn failed_endpoints_stage_a_partial_attach_gap_per_module() {
+        // O1 endpoint evidence (fix round 1): failed endpoints are sticky
+        // (never retried), so a module with failed members undercounts —
+        // its counted uses are lower bounds. Each receipt with new
+        // failures stages one gap per affected module (bounded: every
+        // failed endpoint lands in exactly one receipt): the oracle
+        // withholds COUNT-EXACT over it. The subject and reason shapes
+        // are pinned verbatim: the oracle matches them.
+        use crate::attach::capture::{AttachedEndpoint, EndpointFailure, ExtendReceipt};
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(3))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(None);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
+        let failed = |id: u32| EndpointFailure {
+            id: endpoint(id).id,
+            object: endpoint(id).object,
+            reason: "kernel refused".into(),
+            link_retained: false,
+        };
+        // One attached, one failed: partial attach.
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: endpoint(0).id,
+                object: endpoint(0).object,
+                at_ns: 100,
+            }],
+            failed: vec![failed(1)],
+            ..ExtendReceipt::default()
+        });
+        // A second failure for the same module: a second gap with the
+        // cumulative count.
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            failed: vec![failed(2)],
+            ..ExtendReceipt::default()
+        });
+        // An endpoint no module claims: unattributed, run-wide.
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            failed: vec![EndpointFailure {
+                id: crate::discovery::inventory_attach_set::EndpointId(9999),
+                object: endpoint(0).object,
+                reason: "kernel refused".into(),
+                link_retained: false,
+            }],
+            ..ExtendReceipt::default()
+        });
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            3,
+            "one gap per module per failure receipt, plus the unattributed one: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            gaps[0].reason,
+            "1 of 3 endpoints failed to attach (sticky, never retried); counted uses are lower bounds"
+        );
+        assert_eq!(
+            gaps[1].reason,
+            "2 of 3 endpoints failed to attach (sticky, never retried); counted uses are lower bounds"
+        );
+        assert!(
+            gaps[0].module.is_some() && gaps[1].module.is_some(),
+            "attributed to the failed module: {:?}",
+            gaps[0].module
+        );
+        assert_eq!(
+            gaps[2].module, None,
+            "the unclaimed endpoint reports run-wide"
         );
     }
 

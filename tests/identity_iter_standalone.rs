@@ -468,6 +468,28 @@ fn identity_build_info_watches_path_and_pins_candidate_modes() {
         .expect("recorded candidate bits must match the live files");
 }
 
+/// Rerun-line emission pin (fix round 4, item 10N): the build must
+/// print `cargo:rerun-if-changed` for every existing PATH directory
+/// and every non-selected candidate — the recorded-set test pins the
+/// receipt, but only this pin fails when the emission loop itself is
+/// deleted while receipt generation stays. Source-text pin over
+/// `build.rs`: deleting either `println` line fails here (proven by
+/// mutation, see the report).
+#[test]
+fn identity_build_emits_rerun_lines_for_path_watches() {
+    let build = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"))
+        .expect("read build.rs");
+    for needle in [
+        "println!(\"cargo:rerun-if-changed={}\", dir.display());",
+        "println!(\"cargo:rerun-if-changed={}\", candidate.display());",
+    ] {
+        assert!(
+            build.contains(needle),
+            "build.rs must emit rerun-if-changed for PATH watches: missing {needle:?}"
+        );
+    }
+}
+
 /// Hermetic proof for the chmod window: `path_dirs_in` resolves
 /// absolute, empty (= cwd), and relative entries to absolute dirs
 /// (deduped), and the recorded-vs-live bit comparison passes

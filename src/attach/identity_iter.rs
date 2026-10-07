@@ -2882,6 +2882,35 @@ mod tests {
         !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
     }
 
+    /// Strip one fully-wrapping paren pair from `text` (`(x)` → `x`,
+    /// `((x))` → `(x)`), or return it unchanged. Only strips when the
+    /// open paren at index 0 matches the final close — `(a) + (b)`
+    /// stays put. Callers loop for nested pairs.
+    fn strip_wrapping_parens(text: &str) -> &str {
+        let bytes = text.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return text;
+        }
+        let mut depth = 0i32;
+        for (offset, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return if offset == bytes.len() - 1 {
+                            &text[1..bytes.len() - 1]
+                        } else {
+                            text
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        text
+    }
+
     /// Audit one C function body: no `emit(...)` argument (checked at its
     /// call site, against the taint set at that point) carries an
     /// inode-derived value, and no `record.<field>` store takes one.
@@ -2894,12 +2923,14 @@ mod tests {
     /// before the check; plain `=` with a clean rhs clears non-source
     /// variables, whose value was replaced, while compound `<op>=` keeps
     /// taint when either side is tainted (it reads the old value).
-    /// Through-deref stores (`*p = …`) of tainted values fail unless the
+    /// Through-deref stores (`*p = …`, including paren-wrapped
+    /// `(*p)` / `*(…)` spellings) of tainted values fail unless the
     /// statement is the exact bookkeeping allowlist (`*slot_cell =
-    /// addr`); `record.*` stores feed `seq_write` and are checked;
-    /// `p.f`, `p->f`, `a[i]` stores stay map/struct writes outside the
-    /// envelope (with wrapper functions and inter-procedural flows —
-    /// all pin-backstopped; see the test docs).
+    /// addr`); `record.*` stores (bare or paren-wrapped) feed
+    /// `seq_write` and are checked; `p.f`, `p->f`, `a[i]` stores stay
+    /// map/struct writes outside the envelope (with wrapper functions
+    /// and inter-procedural flows — all pin-backstopped; see the test
+    /// docs).
     fn audit_c_chunk(chunk: &str, path: &str) -> Result<(), String> {
         const SOURCES: [&str; 3] = ["addr", "old", "f_inode"];
         // The only through-deref store of a tainted value the audit
@@ -3076,17 +3107,61 @@ mod tests {
                 Event::Assign { lhs, rhs, stmt, .. } => {
                     // The assignment target: text after the last
                     // structural character (a statement can open with
-                    // `}`/`{`/`)` from control flow before its
-                    // assignment, e.g. `}\n *slot_cell = addr`).
-                    let core = lhs
-                        .rsplit(['{', '}', '(', ')', ','])
-                        .next()
-                        .unwrap_or(&lhs)
-                        .trim();
-                    let target = core
+                    // `}`/`{` from control flow before its assignment,
+                    // e.g. `}\n *slot_cell = addr`), with fully-wrapping
+                    // paren pairs stripped — `(record.start)`,
+                    // `(*pp)`, and `(start)` audit exactly like the
+                    // bare spellings instead of vanishing into an
+                    // empty target. Never split on parens: that
+                    // erased every wrapped lhs before the sink
+                    // checks.
+                    // Split off control-flow/call prefixes: `{`, `}`, and
+                    // `,` always cut; `(` cuts only when it never closes
+                    // inside the lhs (`if (x = …`) — a balanced wrap
+                    // (`(record.start)`) stays for unwrapping below.
+                    let lhs_bytes = lhs.as_bytes();
+                    let mut cut = 0;
+                    let mut opens: Vec<usize> = Vec::new();
+                    for (index, byte) in lhs_bytes.iter().enumerate() {
+                        match byte {
+                            b'{' | b'}' | b',' => {
+                                cut = index + 1;
+                                opens.clear();
+                            }
+                            b'(' => opens.push(index),
+                            b')' => {
+                                opens.pop();
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(unmatched) = opens.last() {
+                        cut = cut.max(unmatched + 1);
+                    }
+                    let core = lhs[cut..].trim();
+                    let mut unwrapped = strip_wrapping_parens(core);
+                    loop {
+                        let narrower = strip_wrapping_parens(unwrapped.trim());
+                        if narrower.len() == unwrapped.trim().len() {
+                            break;
+                        }
+                        unwrapped = narrower;
+                    }
+                    let deop = unwrapped
                         .trim_end_matches(['+', '-', '*', '/', '%', '&', '|', '^', '<', '>'])
                         .trim();
-                    let compound = target != core;
+                    let compound = deop != unwrapped.trim();
+                    // A compound operator sits outside the parens
+                    // (`(x) += …`): unwrap once more past it.
+                    let mut target = strip_wrapping_parens(deop);
+                    loop {
+                        let narrower = strip_wrapping_parens(target.trim());
+                        if narrower.len() == target.trim().len() {
+                            break;
+                        }
+                        target = narrower;
+                    }
+                    let target = target.trim();
                     if target.contains("record.") || target.contains("record->") {
                         if expr_is_tainted(&rhs, &tainted) {
                             return Err(format!(
@@ -3348,6 +3423,31 @@ mod tests {
                 "mutation 9 (deref store `{to}`) must fail the audit"
             );
         }
+        // Parenthesized assignment targets (fix round 4, item 08):
+        // the record/deref checks run on the full lhs, so
+        // paren-wrapped spellings fail exactly like the bare ones —
+        // plus a plain `record.field` store, previously unproven.
+        for stmt in [
+            "(record.start) = addr;",
+            "(*pp) = addr;",
+            "*(&start) = addr;",
+            "record.start = addr;",
+        ] {
+            assert!(
+                audit_c_chunk(stmt, "chunk").is_err(),
+                "record/deref store `{stmt}` must fail the audit"
+            );
+        }
+        // `(start) = addr` must taint `start`, so a later emit of it
+        // fails.
+        assert!(
+            audit_c_chunk(
+                "    (start) = addr;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+                "chunk"
+            )
+            .is_err(),
+            "a parenthesized store must propagate taint to the emit"
+        );
         // Legitimate address-of uses stay untainted: `&addr` as a lookup
         // key never taints the result — while binary `&` does.
         audit_c_chunk(

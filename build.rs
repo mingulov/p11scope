@@ -487,9 +487,15 @@ fn sha256_file_hex(path: &std::path::Path) -> String {
 /// acts AT REBUILD TIME: a skipped rebuild leaves a stale-but-
 /// consistent object+receipt pair where the pins pass by design — the
 /// record binds the compiler that ran, not custody across invocations.
-/// Remaining envelope: concurrent mid-build compiler replacement
-/// (standard build-time trust) and nonexistent `PATH` directories
-/// (listed in the receipt, unwatched until they exist).
+/// Remaining envelope (three shapes): concurrent mid-build compiler
+/// replacement (standard build-time trust); nonexistent `PATH`
+/// directories (listed in the receipt, unwatched until they exist);
+/// and executability-only changes — a named-user ACL grant or a
+/// noexec remount flips executability with no mtime/mode change, so
+/// no rebuild fires and the pins pass (the receipt stays true; any
+/// rebuild re-records, and the digest pin fails loudly on a byte
+/// change). No test re-resolves the winner: the recorded-vs-live
+/// comparison covers `mode & 0o7777` bits only.
 fn build_identity_object() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));

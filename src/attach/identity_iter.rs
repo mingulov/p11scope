@@ -815,7 +815,9 @@ pub fn verifier_log_of(error: &LoadError) -> Option<String> {
         _ => return None,
     };
     match program {
-        aya::programs::ProgramError::LoadError { verifier_log, .. } => Some(verifier_log.to_string()),
+        aya::programs::ProgramError::LoadError { verifier_log, .. } => {
+            Some(verifier_log.to_string())
+        }
         _ => None,
     }
 }
@@ -1667,7 +1669,9 @@ mod tests {
         assert_eq!(verifier_log_of(&nested).as_deref(), Some("back-edge\n"));
         assert_eq!(verifier_log_of(&LoadError::MissingProgram("x")), None);
         assert_eq!(
-            verifier_log_of(&LoadError::FdClone(io::Error::from_raw_os_error(libc::EMFILE))),
+            verifier_log_of(&LoadError::FdClone(io::Error::from_raw_os_error(
+                libc::EMFILE
+            ))),
             None
         );
     }

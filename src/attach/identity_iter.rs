@@ -45,6 +45,8 @@ pub const ANCHOR_BAD_SHAPE: u32 = 3;
 pub const ANCHOR_CONFLICT: u32 = 4;
 /// Anchor slots in the kernel maps.
 pub const ANCHOR_SLOTS: u32 = 1024;
+/// Slot arena stride in bytes: an anchor page plus its guard page (§3.3).
+pub const ANCHOR_STRIDE: u64 = 8192;
 /// Words in the scope bitmap; covers `PID_MAX_LIMIT` (2^22).
 pub const SCOPE_WORDS: usize = 65_536;
 /// I6 kernel-pointer guard: no record address field may reach 2^56.
@@ -127,6 +129,46 @@ pub fn scope_test_bit(bitmap: &[u64], tgid: u32) -> bool {
     bitmap.get(word).is_some_and(|cell| cell & bit != 0)
 }
 
+/// Why an anchor-arena config was rejected before iteration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArenaConfigError {
+    /// More slots than the kernel maps hold.
+    TooManySlots,
+    /// The arena reservation exceeds the full-capacity extent.
+    ArenaTooLong,
+    /// The arena base is not page-aligned, so stride math cannot work.
+    BaseMisaligned,
+    /// `base + len` wraps: the kernel's range filter would misbehave.
+    RangeOverflow,
+    /// A nonzero slot count with an empty arena installs nothing by
+    /// construction — certainly a bug, rejected loudly.
+    EmptyArena,
+}
+
+/// Validate an anchor-arena config BEFORE writing it to `config[0]` and
+/// iterating. An oversized arena lets the kernel's slot quotient exceed
+/// the u32 record field (the truncation this gate exists to prevent);
+/// every other rejection is a nonsense config that would silently
+/// install nothing or mis-filter. W3-2 calls this on every pass setup.
+pub fn validate_arena_config(config: &IdentityConfig) -> Result<(), ArenaConfigError> {
+    if config.slots > ANCHOR_SLOTS {
+        return Err(ArenaConfigError::TooManySlots);
+    }
+    if config.arena_len > u64::from(ANCHOR_SLOTS) * ANCHOR_STRIDE {
+        return Err(ArenaConfigError::ArenaTooLong);
+    }
+    if config.arena_base & (PAGE_GRANULE - 1) != 0 {
+        return Err(ArenaConfigError::BaseMisaligned);
+    }
+    if config.arena_base.checked_add(config.arena_len).is_none() {
+        return Err(ArenaConfigError::RangeOverflow);
+    }
+    if config.slots > 0 && config.arena_len == 0 {
+        return Err(ArenaConfigError::EmptyArena);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Parser (§5). Pure and unprivileged; every anomaly rejects the whole run.
 // ---------------------------------------------------------------------------
@@ -194,6 +236,12 @@ pub struct Run {
     /// Anchor outcomes by slot. A slot with conflicting repeats downgrades
     /// to `BadShape` (never installed): per-key fail-closed, not run failure.
     pub anchors: BTreeMap<u32, AnchorOutcome>,
+    /// `BAD_SHAPE` diagnostics for slots outside the installed range:
+    /// arena VMAs past `slots` (stale mappings from a wider pass), or
+    /// saturated unrepresentable quotients. Never installed, never
+    /// aliases — reported separately so they cannot poison a legitimate
+    /// slot's outcome.
+    pub outer_bad_shape: BTreeSet<u32>,
     /// Pids whose exact-range duplicates conflicted (F5): that pid alone
     /// falls back to the userspace proof, and its records are dropped here so
     /// no consumer can use them.
@@ -416,6 +464,17 @@ pub fn parse(bytes: &[u8], expect: &Expect) -> Result<Run, Invalid> {
                 if start >= POINTER_GUARD || end >= POINTER_GUARD {
                     return Err(Invalid::PointerShape);
                 }
+                // Out-of-range shape diagnostics never enter the slot
+                // namespace: route them to the separate report set. (Only
+                // BAD_SHAPE admits out-of-range `a`; every other outcome
+                // bounds-checks below.)
+                if verdict == ANCHOR_BAD_SHAPE && a >= expect.slots {
+                    if start != 0 || end != 0 {
+                        return Err(Invalid::AnchorPayload);
+                    }
+                    run.outer_bad_shape.insert(a);
+                    continue;
+                }
                 let outcome = match verdict {
                     ANCHOR_OK => {
                         if start != 0 || end != 0 {
@@ -448,7 +507,8 @@ pub fn parse(bytes: &[u8], expect: &Expect) -> Result<Run, Invalid> {
                         if start != 0 || end != 0 {
                             return Err(Invalid::AnchorPayload);
                         }
-                        // Any slot value: a shape failure never installs.
+                        // In-range here (out-of-range routed above): a shape
+                        // failure downgrades its slot, never installs.
                         AnchorOutcome::BadShape
                     }
                     ANCHOR_CONFLICT => {
@@ -1161,7 +1221,9 @@ mod tests {
         assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::Ok));
         assert_eq!(run.anchors.get(&1), Some(&AnchorOutcome::Dup(0)));
         assert_eq!(run.anchors.get(&2), Some(&AnchorOutcome::Full));
-        assert_eq!(run.anchors.get(&99), Some(&AnchorOutcome::BadShape));
+        // Slot 99 is outside the 4 installed slots: reported separately.
+        assert!(!run.anchors.contains_key(&99));
+        assert_eq!(run.outer_bad_shape, BTreeSet::from([99]));
         assert!(run.by_pid.is_empty());
     }
 
@@ -1699,6 +1761,35 @@ mod tests {
         assert_run_matches_bytes(&bytes, &anchor, &run);
     }
 
+    /// Out-of-range `BAD_SHAPE` diagnostics must not land in the
+    /// valid-slot namespace: with 4 installed slots, a `BAD_SHAPE(99)`
+    /// (stale mapping from a wider pass) and a saturated `BAD_SHAPE(MAX)`
+    /// (unrepresentable quotient) report separately, and a legitimate
+    /// `OK(2)` beside them stays `Ok`.
+    #[test]
+    fn outer_bad_shape_diagnostics_stay_out_of_slots() {
+        let empty = BTreeSet::new();
+        let anchor = anchor_expect(&empty);
+        let bytes = [
+            record(KIND_ANCHOR, 2, 0, 0, ANCHOR_OK, 7).to_vec(),
+            record(KIND_ANCHOR, 99, 0, 0, ANCHOR_BAD_SHAPE, 7).to_vec(),
+            record(KIND_ANCHOR, u32::MAX, 0, 0, ANCHOR_BAD_SHAPE, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        let run = parse(&bytes, &anchor).expect("outer diagnostics never fail the run");
+        assert_eq!(run.anchors.get(&2), Some(&AnchorOutcome::Ok));
+        assert!(
+            !run.anchors.contains_key(&99),
+            "BAD_SHAPE(99) must not appear as a slot outcome"
+        );
+        assert!(
+            !run.anchors.contains_key(&u32::MAX),
+            "saturated diagnostics must not appear as slot outcomes"
+        );
+        assert_eq!(run.outer_bad_shape, BTreeSet::from([99, u32::MAX]));
+    }
+
     #[test]
     fn conflicting_anchor_repeats_downgrade_the_slot() {
         let empty_scope = BTreeSet::new();
@@ -1744,6 +1835,8 @@ mod tests {
         let want_gen = expect.generation as u32;
         let mut last_tgid: Option<u32> = None;
         let mut only_tgid: Option<u32> = None;
+        // In-range anchor outcomes collapse into `anchors`; out-of-range
+        // BAD_SHAPE diagnostics report separately (mirrors `parse`).
         let mut raw_anchor: Vec<(u32, AnchorOutcome)> = Vec::new();
         for index in 0..records {
             let record = &bytes[index * RECORD_LEN..(index + 1) * RECORD_LEN];
@@ -1820,7 +1913,13 @@ mod tests {
                         _ => None,
                     };
                     match outcome {
-                        Some(mapped) => raw_anchor.push((a, mapped)),
+                        Some(mapped) => {
+                            // Out-of-range shape diagnostics bypass the
+                            // slot namespace exactly like `parse` routes.
+                            if mapped != AnchorOutcome::BadShape || a < expect.slots {
+                                raw_anchor.push((a, mapped));
+                            }
+                        }
                         None => return false,
                     }
                 }
@@ -1926,6 +2025,10 @@ mod tests {
                     run.anchors.is_empty(),
                     "target runs carry no anchor outcomes"
                 );
+                assert!(
+                    run.outer_bad_shape.is_empty(),
+                    "target runs carry no anchor diagnostics"
+                );
                 // Every parsed entry traces to identical raw record(s), and
                 // no raw record for a kept pid disagrees with it.
                 for (pid, ranges) in &run.by_pid {
@@ -1987,11 +2090,24 @@ mod tests {
                     "anchor runs carry no target verdicts"
                 );
                 assert!(run.demoted_pids.is_empty(), "anchor runs demote nothing");
-                let expected = oracle_collapsed_anchors(&raw_anchor)
+                let mut in_range = Vec::new();
+                let mut outer = BTreeSet::new();
+                for (slot, outcome) in &raw_anchor {
+                    if *outcome == AnchorOutcome::BadShape && *slot >= expect.slots {
+                        outer.insert(*slot);
+                    } else {
+                        in_range.push((*slot, *outcome));
+                    }
+                }
+                let expected = oracle_collapsed_anchors(&in_range)
                     .expect("accepted runs collapse and resolve");
                 assert_eq!(
                     run.anchors, expected,
                     "parsed anchors must equal collapsed+resolved raw outcomes"
+                );
+                assert_eq!(
+                    run.outer_bad_shape, outer,
+                    "parsed outer diagnostics must match out-of-range raw records"
                 );
             }
         }
@@ -2384,6 +2500,8 @@ mod tests {
         );
         assert_eq!(dec("P11_IDENT_ANCHOR_CONFLICT"), u64::from(ANCHOR_CONFLICT));
         assert_eq!(dec("P11_IDENT_ANCHOR_SLOTS"), u64::from(ANCHOR_SLOTS));
+        assert_eq!(dec("P11_IDENT_ANCHOR_STRIDE"), ANCHOR_STRIDE);
+        assert_eq!(dec("P11_IDENT_PAGE"), PAGE_GRANULE);
         assert_eq!(dec("P11_IDENT_SCOPE_WORDS"), SCOPE_WORDS as u64);
         assert_eq!(dec("P11_IDENT_F_WRONLY"), 16);
         assert_eq!(dec("P11_IDENT_F_MMAPABLE"), 1024);
@@ -2716,6 +2834,87 @@ mod tests {
         assert_eq!(size_of::<IdentityConfig>(), 32);
         assert_eq!(std::mem::offset_of!(IdentityConfig, observer_tgid), 28);
         assert_eq!(config.observer_tgid, 4242);
+    }
+
+    /// Arena configs are validated before iteration: oversized slot
+    /// counts, over-long arenas (the truncation shape), misaligned bases,
+    /// wrapping ranges, and empty arenas with live slots all fail loudly.
+    #[test]
+    fn validate_arena_config_rejects_nonsense() {
+        let good = IdentityConfig {
+            generation: 7,
+            arena_base: 0x7f00_0000_0000,
+            arena_len: 4 * ANCHOR_STRIDE,
+            slots: 4,
+            observer_tgid: 4242,
+        };
+        assert_eq!(validate_arena_config(&good), Ok(()));
+        // Full capacity is fine.
+        let full = IdentityConfig {
+            slots: ANCHOR_SLOTS,
+            arena_len: u64::from(ANCHOR_SLOTS) * ANCHOR_STRIDE,
+            ..good
+        };
+        assert_eq!(validate_arena_config(&full), Ok(()));
+        // Zero slots with an empty arena is coherent (installs nothing).
+        let idle = IdentityConfig {
+            slots: 0,
+            arena_len: 0,
+            ..good
+        };
+        assert_eq!(validate_arena_config(&idle), Ok(()));
+        let bad_slots = IdentityConfig {
+            slots: ANCHOR_SLOTS + 1,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&bad_slots),
+            Err(ArenaConfigError::TooManySlots)
+        );
+        let bad_len = IdentityConfig {
+            arena_len: u64::from(ANCHOR_SLOTS) * ANCHOR_STRIDE + 1,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&bad_len),
+            Err(ArenaConfigError::ArenaTooLong)
+        );
+        // The finding's trigger shape: an arena big enough for the slot
+        // quotient to exceed u32.
+        let huge = IdentityConfig {
+            arena_len: (u64::from(u32::MAX) + 2) * ANCHOR_STRIDE,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&huge),
+            Err(ArenaConfigError::ArenaTooLong)
+        );
+        let bad_base = IdentityConfig {
+            arena_base: good.arena_base + 1,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&bad_base),
+            Err(ArenaConfigError::BaseMisaligned)
+        );
+        let wrapped = IdentityConfig {
+            arena_base: u64::MAX - 0x1000 + 1,
+            arena_len: 0x2000,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&wrapped),
+            Err(ArenaConfigError::RangeOverflow)
+        );
+        let empty = IdentityConfig {
+            arena_len: 0,
+            slots: 4,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&empty),
+            Err(ArenaConfigError::EmptyArena)
+        );
     }
 
     #[test]

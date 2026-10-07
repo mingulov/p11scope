@@ -147,15 +147,22 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
      * the reservation, or one past the installed slots, is `BAD_SHAPE`, never
      * a silent slot alias. */
     off = start - base;
-    /* Compared in 64 bits before truncation: a corrupt oversized arena must
-     * report `BAD_SHAPE`, never alias a truncated slot. */
-    if (end - start != P11_IDENT_PAGE || off % P11_IDENT_ANCHOR_STRIDE != 0 ||
-        off / P11_IDENT_ANCHOR_STRIDE >= slots) {
-        emit(ctx, P11_IDENT_KIND_ANCHOR, (u32)(off / P11_IDENT_ANCHOR_STRIDE), 0, 0,
-             P11_IDENT_ANCHOR_BAD_SHAPE, (u32)gen);
-        return 0;
+    /* Compared in 64 bits before narrowing: a corrupt oversized arena must
+     * report `BAD_SHAPE`, never alias a truncated slot. The diagnostic
+     * slot saturates instead of truncating, so an unrepresentable
+     * quotient lands outside the valid-slot namespace (validated configs
+     * keep it under 1024; this is defense in depth for the rest). */
+    {
+        u64 q = off / P11_IDENT_ANCHOR_STRIDE;
+        if (end - start != P11_IDENT_PAGE || off % P11_IDENT_ANCHOR_STRIDE != 0 ||
+            q >= slots) {
+            u32 diag = q > 0xFFFFFFFFUL ? 0xFFFFFFFFU : (u32)q;
+            emit(ctx, P11_IDENT_KIND_ANCHOR, diag, 0, 0, P11_IDENT_ANCHOR_BAD_SHAPE,
+                 (u32)gen);
+            return 0;
+        }
+        slot = (u32)q;
     }
-    slot = (u32)(off / P11_IDENT_ANCHOR_STRIDE);
     P11_READ(addr, vm_file->f_inode);
     if (!addr) {
         emit(ctx, P11_IDENT_KIND_ANCHOR, slot, 0, 0, P11_IDENT_ANCHOR_BAD_SHAPE, (u32)gen);

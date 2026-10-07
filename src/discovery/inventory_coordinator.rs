@@ -1937,7 +1937,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         for (key, caller, modules, count, staged, base) in retry {
             if count.count > staged {
                 let demoted = base > 0;
-                self.stage_pending_count(key, caller, &modules, rebased_count(count, base), demoted);
+                self.stage_pending_count(
+                    key,
+                    caller,
+                    &modules,
+                    rebased_count(count, base),
+                    demoted,
+                );
                 if let Some(PairTarget::Pending { staged: was, .. }) =
                     self.pair_targets.get_mut(&key)
                 {
@@ -4149,9 +4155,9 @@ mod tests {
         let b_module = registry
             .edges()
             .find(|edge| {
-                registry.module(edge.module).is_some_and(|module| {
-                    module.paths.iter().any(|path| path.contains("b.so"))
-                })
+                registry
+                    .module(edge.module)
+                    .is_some_and(|module| module.paths.iter().any(|path| path.contains("b.so")))
             })
             .map(|edge| edge.module);
         assert_eq!(
@@ -6289,7 +6295,8 @@ mod tests {
             native.scene.coordinator.registry.gaps()
         );
         assert!(
-            gaps.iter().all(|gap| gap.reason.contains("19 unattributed calls")),
+            gaps.iter()
+                .all(|gap| gap.reason.contains("19 unattributed calls")),
             "the gap discloses the unattributed growth: {:?}",
             gaps.iter().map(|gap| &gap.reason).collect::<Vec<_>>()
         );

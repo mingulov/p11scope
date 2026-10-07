@@ -2447,13 +2447,7 @@ impl CallerRegistry {
                 last_ns,
                 demoted,
             } => self.apply_pending_count(
-                pending_id,
-                caller,
-                &modules,
-                count,
-                first_ns,
-                last_ns,
-                demoted,
+                pending_id, caller, &modules, count, first_ns, last_ns, demoted,
             ),
             Mutation::NoteCountedUse {
                 caller,
@@ -3009,9 +3003,7 @@ impl CallerRegistry {
                 reason: PendingRejection::Ambiguous,
             },
         };
-        if demoted
-            && let PendingCountOutcome::Rejected { reason } = &outcome
-        {
+        if demoted && let PendingCountOutcome::Rejected { reason } = &outcome {
             self.disclose_demoted_rejection(caller, modules, count, first_ns, *reason);
         }
         self.pending_count_decisions.push(PendingCountDecision {
@@ -5622,7 +5614,15 @@ pub(crate) mod tests {
         registry.note_mapping(CallerId(0), 50, a.clone(), 100);
         registry.publish();
         registry.note_mapping(CallerId(0), 51, b.clone(), 110);
-        registry.note_pending_count(7, CallerId(0), vec![ka.clone(), kb.clone()], 9, 120, 130, false);
+        registry.note_pending_count(
+            7,
+            CallerId(0),
+            vec![ka.clone(), kb.clone()],
+            9,
+            120,
+            130,
+            false,
+        );
         registry.note_bound_witness(CallerId(0), vec![ka.clone(), kb.clone()], 120);
         registry.publish();
         // Together: the witness reads ambiguous and the count drops.

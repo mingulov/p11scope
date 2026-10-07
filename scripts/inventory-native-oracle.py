@@ -94,6 +94,13 @@ LOSS_GAP = re.compile(r"\bloss\b|\blost\b|lossy", re.I)
 # bounds, so COUNT-EXACT over the module is explicitly nonqualifying
 # and the COUNT-WINDOW lower bound is clamped (saturation-shaped).
 PARTIAL_ATTACH = re.compile(r"endpoint attach fail", re.I)
+# Demoted edge (fix round 4, R4-N2): a demoted placement marks its edge
+# (DEMOTED_COUNT_PLACED in src/discovery/caller_registry.rs) — the
+# count is segment-relative growth from the base read, so the window
+# judges the upper bound only and COUNT-EXACT is explicitly
+# nonqualifying. Distinct from the rejected-demoted-count disclosure
+# subject ("rejected demoted count": no edge carries that growth).
+DEMOTED_PLACED = re.compile(r"demoted count placed", re.I)
 # Unbound positive (plan §3.3, "used by an unidentified caller image").
 UNBOUND_GAP = re.compile(r"unidentified caller|unbound (caller|witness)", re.I)
 # A gap field naming when the unbound use happened (first match wins).
@@ -598,6 +605,21 @@ def has_partial_attach(view, edge):
     return False
 
 
+def has_demoted_edge(view, edge):
+    """Whether a demotion marker clouds the edge (round 4, R4-N2): a
+    caller-AND-module-scoped gap naming exactly this edge — its count
+    is segment-relative growth from the base read, so the window
+    judges the upper bound only and exactness is explicitly
+    nonqualifying. Sibling edges keep full judgment (no run-wide or
+    module-wide poison)."""
+    for gap in view.doc.get("gaps", []):
+        if not DEMOTED_PLACED.search(f"{gap.get('subject', '')} {gap.get('reason', '')}"):
+            continue
+        if gap.get("caller") == edge.get("caller") and gap.get("module") == edge.get("module"):
+            return True
+    return False
+
+
 def ledger_total_table_calls(image, provider_path, since_ns=None):
     """Every attach-side call the image ledgered for the provider, any time:
     the upper bound a count will never exceed (r1 T3.5 `count <= total`).
@@ -646,7 +668,12 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
     stamps t0/t1 BEFORE the call
     (tests/fixtures/public-cli/inventory-ledger.c:229), so since_ns
     lands strictly after the recording call's entry stamp on every
-    real run and since_ns <= t_first can never gate exactness."""
+    real run and since_ns <= t_first can never gate exactness.
+    Demoted edges are the exception (round 4, R4-N2): their since_ns
+    is the base-observing read (pass resolution, not a BPF insert)
+    and their count is post-base growth — judged upper-bound-only
+    with COUNT-EXACT explicitly nonqualifying (see has_demoted_edge),
+    never by this function."""
     arming = (since_ns, legacy_end_before_since(use.lines, since_ns))
     attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"), e, arming)]
     # Structural, legacy-verbatim: frozen, empty, or unadmitted (a
@@ -1789,23 +1816,30 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
             # explicitly nonqualifying rather than trusted or failed.
             saturated = is_saturated_artifact(edge["entries"])
             partial = has_partial_attach(view, edge)
+            demoted = has_demoted_edge(view, edge)
             suppressed = view.doc.get("gaps_suppressed") or 0
             # A malformed counter fails closed (F3-07, F2-08 style): a
             # concealment may hide behind it — never raises.
             concealed = suppressed > 0 if type(suppressed) is int else True
-            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated or partial or concealed, lo, hi),
+            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated or partial or concealed or demoted, lo, hi),
                    f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
                    + (" (saturated: lower bound clamped at the cap)" if saturated else "")
                    + (" (partial attach: lower bound clamped; counted uses are lower bounds)"
                       if partial and not saturated else "")
+                   + (" (demoted: lower bound clamped; the edge carries post-base-read growth only)"
+                      if demoted and not saturated and not partial else "")
                    + (f" ({suppressed} gaps suppressed: a partial-attach gap may be concealed; "
                        "lower bound clamped)"
-                      if concealed and not saturated and not partial else ""))
+                      if concealed and not saturated and not partial and not demoted else ""))
             doc_module = view.modules.get(edge["module"], {})
             verdict, expected, detail = exact_window_count(
                 use, cov.get("since_ns") or 0, window, until, admitted,
                 mapping_first, doc_module.get("admission", {}).get("endpoints"), partial)
-            if verdict == "exact" and not saturated and concealed:
+            if demoted and not saturated:
+                res.add(run, cell, "COUNT-EXACT", "nonqualifying",
+                        f"{ctag}: insufficient evidence for exactness: a demoted edge carries "
+                        f"post-base-read growth, so no whole-workload equality holds")
+            elif verdict == "exact" and not saturated and concealed:
                 res.add(run, cell, "COUNT-EXACT", "nonqualifying",
                         f"{ctag}: insufficient evidence for exactness: {suppressed} gaps suppressed, "
                         "a partial-attach gap may be concealed")
@@ -3802,6 +3836,60 @@ def self_test():
                       if r["run"] == "system" and r["cell"] == "P2" and r["check"] == "COUNT-EXACT"), None)
         if row_b is None or row_b["status"] != "nonqualifying" or "partial-attach" not in row_b["detail"]:
             failures.append("o1-partial-attach-scoped-own-not-nonqualifying")
+
+        # Round 4 (R4-N2): a demoted edge carries segment-relative
+        # growth (post-base-read calls only) and marks itself with the
+        # production demotion gap (DEMOTED_COUNT_PLACED in
+        # src/discovery/caller_registry.rs). The ledger window judges
+        # the upper bound only (the lower bound cannot hold a
+        # segment), and COUNT-EXACT is explicitly nonqualifying (no
+        # segment equality to judge).
+        def demoted_segment_genuine(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            # The base call stays on the previous owner; the edge
+            # carries post-base growth only.
+            edge["entries"]["count"] -= 1
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                              "subject": "demoted count placed",
+                              "reason": "a demoted count placed post-demotion growth on this edge",
+                              "budget": None, "repeats": 1})
+            return kw
+        res = case("demoted-growth-window-passes-exact-nonqualifying", None, demoted_segment_genuine)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-WINDOW"), None)
+        if row is None or row["status"] != "pass":
+            failures.append("demoted-growth-window-not-passing")
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying" or "demot" not in row["detail"]:
+            failures.append("demoted-growth-exact-not-nonqualifying")
+
+        # Same co-design over the setup-before-attachment shape: the
+        # recording call belongs to the base, so genuine growth (33)
+        # sits below the unclamped lower bound (34).
+        def demoted_segment_setup_shape(s, d, dash):
+            setup_before_attachment(s, d, 33)
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                              "subject": "demoted count placed",
+                              "reason": "a demoted count placed post-demotion growth on this edge",
+                              "budget": None, "repeats": 1})
+        res = case("demoted-growth-setup-shape-window-passes", None, demoted_segment_setup_shape)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-WINDOW"), None)
+        if row is None or row["status"] != "pass":
+            failures.append("demoted-growth-setup-window-not-passing")
+
+        # The upper bound still judges demoted edges: an absolute
+        # count re-installed on a demoted edge (37 over a 34 window)
+        # fails COUNT-WINDOW — the clamp voids the lower bound only.
+        def demoted_segment_corrupt(s, d, dash):
+            setup_before_attachment(s, d, 37)
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                              "subject": "demoted count placed",
+                              "reason": "a demoted count placed post-demotion growth on this edge",
+                              "budget": None, "repeats": 1})
+        case("demoted-growth-absolute-fails-upper", "COUNT-WINDOW", demoted_segment_corrupt)
 
         # O1 straddling first row (the reviewer's repro shape): the first
         # row lands inside an aggregated ledger line, so the recorded

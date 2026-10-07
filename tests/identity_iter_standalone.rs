@@ -238,41 +238,67 @@ fn syscall_errno(error: &aya::EbpfError) -> Option<i32> {
     }
 }
 
-/// D2a loader gate: aya takes the clang object through parse, relocation,
-/// and map creation to program verification. Privileged runners verify both
-/// programs outright; unprivileged runners must fail only with a permission
-/// errno from a syscall, never with an object-side (parse/relocation) error.
+/// D2a STRICT loader gate (mandatory, privileged): aya takes the clang
+/// object through parse, CO-RE relocation against READABLE host BTF, map
+/// creation, and verification of BOTH programs. Every program-load error
+/// fails this gate — no permission-errno acceptance here, because
+/// verifier rejections arrive as `EACCES` and must never pass as
+/// "unprivileged". Run as root with `--ignored`. Records the kernel
+/// release, the BTF identity (path, size, sha256), and both verified
+/// program fds; on failure the kernel verifier log is printed.
 #[test]
-fn identity_loader_reaches_syscall_or_loads() {
-    let btf = aya::Btf::from_sys_fs().ok();
-    match ii::load_identity_object(btf.as_ref()) {
-        Ok(_) => eprintln!("W3-1 loader gate: identity object LOADED (privileged run)"),
-        Err(ii::LoadError::MissingProgram(name)) => {
-            panic!("program {name} missing from identity object");
+#[ignore = "privileged: verifies both identity programs through the kernel verifier"]
+fn identity_loader_strict_gate_requires_btf_and_both_programs() {
+    let btf = aya::Btf::from_sys_fs().expect("strict gate requires readable host BTF");
+    let loaded = match ii::load_identity_object_strict(&btf) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            if let Some(log) = ii::verifier_log_of(&error) {
+                eprintln!("W3-1 strict gate verifier log:\n{log}");
+            }
+            panic!("strict gate: identity object failed to verify: {error:#}");
         }
-        Err(ii::LoadError::Program(error))
-            if matches!(prog_errno(&error), Some(libc::EPERM) | Some(libc::EACCES)) =>
-        {
-            eprintln!(
-                "W3-1 loader gate NEEDS_CONTEXT for full load: unprivileged program load; parse+relocation proven above"
-            );
-        }
-        Err(ii::LoadError::Program(error)) => {
-            panic!("program verification failure: {error:#?}");
-        }
-        Err(ii::LoadError::Ebpf(aya::EbpfError::ParseError(_)))
-        | Err(ii::LoadError::Ebpf(aya::EbpfError::BtfRelocationError(_)))
-        | Err(ii::LoadError::Ebpf(aya::EbpfError::RelocationError(_)))
-        | Err(ii::LoadError::Ebpf(aya::EbpfError::NoBTF))
-        | Err(ii::LoadError::Ebpf(aya::EbpfError::UnexpectedPinningType { .. }))
-        | Err(ii::LoadError::Ebpf(aya::EbpfError::FileError { .. })) => {
-            panic!("object-side loader failure");
-        }
-        Err(ii::LoadError::Ebpf(aya::EbpfError::BtfError(not_load)))
-            if !matches!(not_load, aya::BtfError::LoadError { .. }) =>
-        {
-            panic!("BTF-side loader failure: {not_load}");
-        }
+    };
+    // The strict constructor required both program fds; prove they are
+    // open and distinct here.
+    use std::os::fd::AsRawFd as _;
+    let anchor = loaded.anchor_fd.as_raw_fd();
+    let target = loaded.target_fd.as_raw_fd();
+    assert_ne!(anchor, target, "both programs must hold distinct fds");
+    for (name, fd) in [("anchor", anchor), ("target", target)] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "{name} program fd {fd} must be open");
+    }
+    // BTF identity: the exact bytes relocation consumed.
+    let btf_bytes = std::fs::read("/sys/kernel/btf/vmlinux").expect("read host BTF for identity");
+    let mut release = [0 as libc::c_char; 65];
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::uname(&mut uts) }, 0, "uname");
+    for (slot, byte) in release.iter_mut().zip(uts.release.iter()) {
+        *slot = *byte;
+    }
+    let release = unsafe { std::ffi::CStr::from_ptr(release.as_ptr()) }.to_string_lossy();
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(&btf_bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    eprintln!(
+        "W3-1 strict gate LOADED: kernel {release}, BTF /sys/kernel/btf/vmlinux ({} bytes, sha256 {hex}), anchor fd {anchor}, target fd {target}",
+        btf_bytes.len()
+    );
+}
+
+/// Explicitly-unprivileged smoke: the clang object parses, relocates, and
+/// reaches map-creation syscalls. Accepts ONLY a permission errno from a
+/// syscall (an unprivileged runner) or a full unverified load (a
+/// privileged context); object-side failures panic. Makes NO verification
+/// claim — programs are never loaded on this path (pinned by
+/// `none_btf_load_never_verifies_programs` below).
+#[test]
+fn identity_loader_unprivileged_smoke() {
+    match ii::load_identity_object_unverified(None) {
+        Ok(_) => eprintln!(
+            "W3-1 loader smoke: object parsed, maps created (privileged context); programs NOT verified here"
+        ),
         Err(ii::LoadError::Ebpf(other))
             if matches!(
                 syscall_errno(&other),
@@ -280,10 +306,31 @@ fn identity_loader_reaches_syscall_or_loads() {
             ) =>
         {
             eprintln!(
-                "W3-1 loader gate NEEDS_CONTEXT for full load: unprivileged ({other:#}); parse+relocation proven above"
+                "W3-1 loader smoke NEEDS_CONTEXT for verification: permission errno ({other:#}); parse+relocation proven above"
             );
         }
-        Err(other) => panic!("unexpected loader failure (not a permission errno): {other:#?}"),
+        Err(other) => panic!("smoke: object-side or unexpected loader failure: {other:#?}"),
+    }
+}
+
+/// The unverified path must never yield loaded programs: with `None` BTF
+/// a privileged load creates maps but loads nothing, and an unprivileged
+/// load fails at map creation. Either way no program verifies here.
+#[test]
+fn none_btf_load_never_verifies_programs() {
+    match ii::load_identity_object_unverified(None) {
+        Ok(ebpf) => {
+            for name in [ii::ANCHOR_PROGRAM, ii::TARGET_PROGRAM] {
+                let program = ebpf
+                    .program(name)
+                    .unwrap_or_else(|| panic!("{name} missing from loaded object"));
+                assert!(
+                    program.fd().is_err(),
+                    "{name} must stay unloaded without BTF-backed verification"
+                );
+            }
+        }
+        Err(_) => {}
     }
 }
 

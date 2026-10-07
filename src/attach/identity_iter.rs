@@ -760,6 +760,8 @@ pub enum LoadError {
     Program(aya::programs::ProgramError),
     /// A program the object must contain is missing.
     MissingProgram(&'static str),
+    /// A verified program fd could not be cloned for the strict receipt.
+    FdClone(io::Error),
 }
 
 impl From<aya::EbpfError> for LoadError {
@@ -774,12 +776,19 @@ impl From<aya::programs::ProgramError> for LoadError {
     }
 }
 
+impl From<io::Error> for LoadError {
+    fn from(error: io::Error) -> Self {
+        Self::FdClone(error)
+    }
+}
+
 impl std::fmt::Display for LoadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ebpf(error) => write!(formatter, "{error:#}"),
             Self::Program(error) => write!(formatter, "{error:#}"),
             Self::MissingProgram(name) => write!(formatter, "program {name} missing from object"),
+            Self::FdClone(error) => write!(formatter, "program fd clone failed: {error}"),
         }
     }
 }
@@ -790,29 +799,78 @@ impl std::error::Error for LoadError {
             Self::Ebpf(error) => Some(error),
             Self::Program(error) => Some(error),
             Self::MissingProgram(_) => None,
+            Self::FdClone(error) => Some(error),
         }
     }
 }
 
-/// Load the identity object: maps plus both `iter/task_vma` programs, with
-/// CO-RE relocated against `btf` (`None` disables relocation and leaves the
-/// programs unverified). With BTF, a successful return means both programs
-/// passed the verifier and the object is ready to attach. Attaching itself
-/// is W3-2's probe.
-pub fn load_identity_object(btf: Option<&aya::Btf>) -> Result<aya::Ebpf, LoadError> {
+/// Extract the kernel verifier log carried by a loader failure, if any.
+/// Program-load failures always carry one (even permission-looking
+/// `EACCES`: verifier rejections arrive with that errno); object-side
+/// failures carry none.
+pub fn verifier_log_of(error: &LoadError) -> Option<String> {
+    let program = match error {
+        LoadError::Program(program) => program,
+        LoadError::Ebpf(aya::EbpfError::ProgramError(program)) => program,
+        _ => return None,
+    };
+    match program {
+        aya::programs::ProgramError::LoadError { verifier_log, .. } => Some(verifier_log.to_string()),
+        _ => None,
+    }
+}
+
+/// Unverified load: parse, CO-RE relocation, and map creation only.
+/// `None` disables relocation and leaves the programs unloaded; even with
+/// `Some`, this function never loads a program. It exists for the
+/// explicitly-unprivileged smoke test, which proves parsing and syscall
+/// reachability. It MUST never back a "verified" or "loaded" claim: use
+/// [`load_identity_object_strict`], which requires readable BTF and both
+/// verified program fds.
+pub fn load_identity_object_unverified(btf: Option<&aya::Btf>) -> Result<aya::Ebpf, LoadError> {
     let mut loader = aya::EbpfLoader::new();
     loader.btf(btf);
-    let mut ebpf = loader.load(IDENTITY_OBJECT)?;
-    if let Some(btf) = btf {
-        for name in [ANCHOR_PROGRAM, TARGET_PROGRAM] {
-            let program: &mut aya::programs::Iter = ebpf
-                .program_mut(name)
-                .ok_or(LoadError::MissingProgram(name))?
-                .try_into()?;
-            program.load(ITER_TYPE_TASK_VMA, btf)?;
-        }
-    }
+    let ebpf = loader.load(IDENTITY_OBJECT)?;
     Ok(ebpf)
+}
+
+/// A verified identity object: both `iter/task_vma` programs passed the
+/// kernel verifier, and their fds are retained here as the receipt.
+pub struct StrictIdentity {
+    /// The loaded object (maps + both verified programs).
+    pub ebpf: aya::Ebpf,
+    /// Cloned fd of the verified anchor program.
+    pub anchor_fd: OwnedFd,
+    /// Cloned fd of the verified target program.
+    pub target_fd: OwnedFd,
+}
+
+/// Strict load: maps plus both `iter/task_vma` programs, with CO-RE
+/// relocated against readable `btf`. A successful return means both
+/// programs passed the verifier and both fds are retained. EVERY
+/// program-load error fails here — callers must not classify any of them
+/// as "unprivileged" (verifier rejections arrive as `EACCES`).
+/// Attaching itself is W3-2's probe.
+pub fn load_identity_object_strict(btf: &aya::Btf) -> Result<StrictIdentity, LoadError> {
+    let mut loader = aya::EbpfLoader::new();
+    loader.btf(Some(btf));
+    let mut ebpf = loader.load(IDENTITY_OBJECT)?;
+    for name in [ANCHOR_PROGRAM, TARGET_PROGRAM] {
+        let program: &mut aya::programs::Iter = ebpf
+            .program_mut(name)
+            .ok_or(LoadError::MissingProgram(name))?
+            .try_into()?;
+        program.load(ITER_TYPE_TASK_VMA, btf)?;
+    }
+    let fd_of = |ebpf: &aya::Ebpf, name: &'static str| -> Result<OwnedFd, LoadError> {
+        let program = ebpf.program(name).ok_or(LoadError::MissingProgram(name))?;
+        Ok(program.fd()?.as_fd().try_clone_to_owned()?)
+    };
+    Ok(StrictIdentity {
+        anchor_fd: fd_of(&ebpf, ANCHOR_PROGRAM)?,
+        target_fd: fd_of(&ebpf, TARGET_PROGRAM)?,
+        ebpf,
+    })
 }
 
 #[cfg(test)]
@@ -1586,6 +1644,31 @@ mod tests {
         assert!(
             maps.set_slot(0, 1).is_err(),
             "slot write on /dev/null must fail"
+        );
+    }
+
+    #[test]
+    fn verifier_log_extraction_reports_kernel_log() {
+        let denial = LoadError::Program(aya::programs::ProgramError::LoadError {
+            io_error: io::Error::from_raw_os_error(libc::EACCES),
+            verifier_log: aya_obj::VerifierLog::new("R1 invalid mem access\n".to_string()),
+        });
+        assert_eq!(
+            verifier_log_of(&denial).as_deref(),
+            Some("R1 invalid mem access\n"),
+            "a verifier EACCES must retain its log, never pass as unprivileged"
+        );
+        let nested = LoadError::Ebpf(aya::EbpfError::ProgramError(
+            aya::programs::ProgramError::LoadError {
+                io_error: io::Error::from_raw_os_error(libc::EACCES),
+                verifier_log: aya_obj::VerifierLog::new("back-edge\n".to_string()),
+            },
+        ));
+        assert_eq!(verifier_log_of(&nested).as_deref(), Some("back-edge\n"));
+        assert_eq!(verifier_log_of(&LoadError::MissingProgram("x")), None);
+        assert_eq!(
+            verifier_log_of(&LoadError::FdClone(io::Error::from_raw_os_error(libc::EMFILE))),
+            None
         );
     }
 

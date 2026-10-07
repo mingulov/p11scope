@@ -2817,7 +2817,7 @@ mod tests {
     /// Before all of that, translation phase 2 runs file-wide: a
     /// backslash immediately before a newline is deleted (operands,
     /// comments, and strings alike), so `mask-\<newline>-` reads as
-    /// the `mask--` operand the compiler sees. Spliced lines merge —
+    /// the `mask--` operand the compiler sees. Spliced lines merge --
     /// line numbers past a splice differ from the raw text, exactly as
     /// they do for the compiler.
     fn strip_c_noise(text: &str) -> String {
@@ -2931,13 +2931,13 @@ mod tests {
     /// variables, whose value was replaced, while compound `<op>=` keeps
     /// taint when either side is tainted (it reads the old value).
     /// Through-deref stores (`*p = …`, including paren-wrapped
-    /// `(*p)` / `*(…)` and unbraced-control-prefixed `if (…) *p`
+    /// `(*p)` / `*(...)` and unbraced-control-prefixed `if (...) *p`
     /// spellings) of tainted values fail unless the statement is the
     /// exact bookkeeping allowlist (`*slot_cell = addr`); `record.*`
     /// stores (bare or paren-wrapped) feed `seq_write` and are
     /// checked; `p.f`, `p->f`, `a[i]` stores stay map/struct writes
     /// outside the envelope (with wrapper functions and
-    /// inter-procedural flows — all pin-backstopped; see the test
+    /// inter-procedural flows -- all pin-backstopped; see the test
     /// docs).
     fn audit_c_chunk(chunk: &str, path: &str) -> Result<(), String> {
         const SOURCES: [&str; 3] = ["addr", "old", "f_inode"];
@@ -3146,7 +3146,7 @@ mod tests {
                     if let Some(unmatched) = opens.last() {
                         cut = cut.max(unmatched + 1);
                     }
-                    // A balanced `(…)` group that opens away from the cut
+                    // A balanced `(...)` group that opens away from the cut
                     // after a condition/call suffix (`if (1)start`,
                     // `if (ok) *pp`) is a control-flow prefix, not the
                     // target: cut after its close, or the prefix either
@@ -3503,7 +3503,7 @@ mod tests {
         );
         // Control-flow-prefixed stores (fix round 5): an unbraced `if`
         // prefix must not hide a tainted store from the emit check, nor
-        // a through-deref store from the deref check — the balanced
+        // a through-deref store from the deref check -- the balanced
         // condition is not the target.
         for stmt in [
             "    if (1)start = addr;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
@@ -3521,18 +3521,18 @@ mod tests {
             );
         }
         // No-regression control: a compound operator outside parens
-        // (`(x) += …`) still tracks taint on the unwrapped target.
+        // (`(x) += ...`) still tracks taint on the unwrapped target.
         assert!(
             audit_c_chunk(
                 "    start = addr;\n    (start) += 0;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
                 "chunk"
             )
             .is_err(),
-            "`(x) += …` must keep taint on the unwrapped target"
+            "`(x) += ...` must keep taint on the unwrapped target"
         );
         // Line-spliced postfix (fix round 5): C translation phase 2
         // joins `mask-\<newline>-` into `mask--` before anything else,
-        // so the audit must see the operand too — `& addr` stays binary
+        // so the audit must see the operand too -- `& addr` stays binary
         // and taints.
         assert!(
             audit_c_chunk(
@@ -3968,14 +3968,14 @@ mod tests {
     /// Read a Rust path (`ident`, `self::x::Y`, `::x::Y`) from the front
     /// of `text`: the path plus the remainder, or `None`. Gaps around
     /// `::` compile (`self :: Y`, comments blank to spaces upstream),
-    /// so segment joints skip whitespace — but only across a real
+    /// so segment joints skip whitespace -- but only across a real
     /// `::`, never between bare tokens. A `r#`-quoted segment
     /// (`r#AnchorMaps`) denotes its bare name.
     fn read_rust_path(text: &str) -> Option<(String, &str)> {
         let mut rest = text.strip_prefix("::").map(str::trim_start).unwrap_or(text);
         let mut path = String::new();
         loop {
-            // Raw identifier: `r#` (adjacent — a gap is the ident `r`
+            // Raw identifier: `r#` (adjacent -- a gap is the ident `r`
             // followed by an attribute) plus the quoted name, which
             // denotes the bare ident.
             if rest.starts_with('r') && rest[1..].starts_with('#') {
@@ -4032,8 +4032,8 @@ mod tests {
             let head = &head[..head.len().min(300)];
             // Generic arguments are not the impl subject: `impl
             // Wrapper<AnchorMaps>` is an unrelated inherent block, so
-            // blank balanced `<…>` spans before the substring
-            // heuristic — a name occurring only inside them reads as
+            // blank balanced `<...>` spans before the substring
+            // heuristic -- a name occurring only inside them reads as
             // neither. Unbalanced input keeps the loud heuristic.
             let mut spans = String::with_capacity(head.len());
             let mut depth = 0i32;
@@ -4152,7 +4152,7 @@ mod tests {
     /// bytes: the scanners below are ASCII-shape based (`trim_start`,
     /// `split_whitespace`, `is_ascii_whitespace`), while `rustc`
     /// accepts non-ASCII inter-token gaps (U+200E, U+0085) and
-    /// non-ASCII idents those tests cannot see — so any non-ASCII in
+    /// non-ASCII idents those tests cannot see -- so any non-ASCII in
     /// the audited regions rejects instead of risking silence. Real
     /// production code blanks to pure ASCII (its non-ASCII lives in
     /// comments and strings), so this only bites smuggled spellings.
@@ -4202,7 +4202,7 @@ mod tests {
     }
 
     /// Whether `name` is a Rust strict or reserved keyword (`if`,
-    /// `return`, …): keywords can never name a macro, so `!` after one
+    /// `return`, ...): keywords can never name a macro, so `!` after one
     /// is unary negation, never an invocation. A `r#`-quoted ident
     /// still counts as an invocation (syntactically one); the caller
     /// checks the `#`.
@@ -4318,7 +4318,7 @@ mod tests {
                     }
                     let name = &region[start..back];
                     // A strict keyword ahead of `!` is unary negation
-                    // (`if !(…)`), never an invocation — unless the
+                    // (`if !(...)`), never an invocation -- unless the
                     // ident is `r#`-quoted, which still reads as one.
                     let raw = start > 0 && bytes[start - 1] == b'#';
                     if !raw && is_rust_keyword(name) {
@@ -4523,8 +4523,8 @@ mod tests {
         // A signature broken across lines (`pub` / `(crate) fn ...`,
         // `pub fn name` / `(...)`) still enumerates: an unparsed
         // candidate that is a strict signature prefix continues on the
-        // next line. A pending prefix that derails — or dangles at the
-        // block end — fails loudly instead of vanishing.
+        // next line. A pending prefix that derails -- or dangles at the
+        // block end -- fails loudly instead of vanishing.
         let mut pending = String::new();
         for line in block[..end].lines() {
             // Strip each physical line BEFORE joining: a trailing `//`
@@ -4778,8 +4778,8 @@ mod tests {
             );
         }
         // Spaced qualified subject paths (fix round 5): gaps around
-        // `::` compile (`for self :: AnchorMaps`, comment-separated —
-        // blanked to spaces upstream — and leading `:: AnchorMaps`),
+        // `::` compile (`for self :: AnchorMaps`, comment-separated --
+        // blanked to spaces upstream -- and leading `:: AnchorMaps`),
         // so each must read as a trait impl, never silence.
         for header in [
             "impl Evil for self :: AnchorMaps {}",
@@ -4796,7 +4796,7 @@ mod tests {
         }
         // Raw-identifier subjects (fix round 5): `r#AnchorMaps` denotes
         // the same type, so a trait impl for it must read as a trait
-        // impl — and a bare `impl r#AnchorMaps` as a second inherent
+        // impl -- and a bare `impl r#AnchorMaps` as a second inherent
         // block, never silence.
         for header in [
             "impl AsRef<OwnedFd> for r#AnchorMaps {}",
@@ -4817,8 +4817,8 @@ mod tests {
             "`impl r#AnchorMaps` must read as a second inherent block"
         );
         // Generic-nested names (fix round 5): `impl Wrapper<AnchorMaps>`
-        // is an unrelated inherent block — `AnchorMaps` occurs only
-        // inside `<…>` — so the scan must stay `(1, false)`.
+        // is an unrelated inherent block -- `AnchorMaps` occurs only
+        // inside `<...>` -- so the scan must stay `(1, false)`.
         let wrapped = format!("{code}\nimpl Wrapper<AnchorMaps> {{}}\n");
         assert_eq!(
             scan_anchor_impls(&blank_rust_noise(&wrapped)).expect("wrapped header scans"),
@@ -4935,9 +4935,9 @@ mod tests {
                 "forbid must reject the spaced invocation {invocation:?}"
             );
         }
-        // Keyword-led unary `!` (fix round 5): `if !(…)` and `return
-        // !(…)` are ordinary negation — a strict keyword can never name
-        // a macro, spaced or tight — so each must pass the forbid.
+        // Keyword-led unary `!` (fix round 5): `if !(...)` and `return
+        // !(...)` are ordinary negation -- a strict keyword can never name
+        // a macro, spaced or tight -- so each must pass the forbid.
         for stmt in [
             "    if !(ready) { return; }\n",
             "    if!(ready) { return; }\n",

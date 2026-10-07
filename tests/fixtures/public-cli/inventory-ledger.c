@@ -454,6 +454,15 @@ static void mech_generation(long iters, int gated) {
         if (opt.single_call >= 0 && opt.single_call < split) die("--single-call module is not late");
         if (opt.single_call >= 0 && (!opt.gate2 || !strcmp(opt.gate2, "-")))
             die("--single-call needs --gate2");
+        /* AB only: one eager call after the gate (post-capture, the
+         * capture started before gate1 opened) and before B maps, so
+         * the lane caches the caller through A first — P3's
+         * cached-caller sequence needs A counted before B is ever
+         * observed (round 2, F5). */
+        if (opt.single_call >= 0 && split > 0) {
+            iteration(0, s[0]);
+            flush_ledger();
+        }
         for (int m = split; m < module_count; m++) load_module(m);
         if (opt.single_call < 0) {
             sleep_ms(opt.delay_ms);

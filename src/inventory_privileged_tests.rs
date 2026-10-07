@@ -1132,15 +1132,163 @@ fn ab_helpers_parse_a_canned_ledger_and_stream() {
     assert_eq!(series[1].count, 1);
 }
 
+/// Whether the edge's final state survives lifecycle loss honestly
+/// (round 2, F6): counted, or unknown with reason `loss` — never a
+/// watch, never another unknown reason.
+fn ab_edge_survives_lifecycle_loss(edge: &serde_json::Value) -> bool {
+    let state = edge["entries"]["coverage"]["state"].as_str();
+    let reason = edge["entries"]["coverage"]["reason"].as_str();
+    state == Some("counted") || (state == Some("unknown") && reason == Some("loss"))
+}
+
+/// Whether B's first count demonstrably held still across the idle
+/// window (round 2, F5/S7): the first counted record published
+/// strictly before gate2, plus a later counted record with the same
+/// unchanged count — also before gate2 — with a pass commit between
+/// the two in stream order (so a distinct idle pass carried the
+/// unchanged count). A lone pre-gate2 record, or two records from the
+/// same commit, proves no idle hold.
+fn ab_idle_hold_across_commits(
+    lines: &[serde_json::Value],
+    caller_id: &str,
+    module_id: &str,
+    first: &EdgeRecord,
+    gate2_ns: u64,
+) -> bool {
+    if first.at_ns >= gate2_ns {
+        return false;
+    }
+    let mut hits = Vec::new();
+    let mut commits = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        match line["kind"].as_str() {
+            Some("pass_committed") => commits.push(index),
+            Some("edge_observed") => {
+                if line["event"]["caller"] != caller_id || line["event"]["module"] != module_id {
+                    continue;
+                }
+                let at = line["at_ns"].as_u64();
+                let count = line["event"]["entries"]
+                    .get("count")
+                    .and_then(|count| count.as_u64());
+                let state = line["event"]["entries"]["coverage"]["state"].as_str();
+                if let (Some(at), Some(count), Some(state)) = (at, count, state)
+                    && at < gate2_ns
+                    && state == "counted"
+                    && count == first.count
+                {
+                    hits.push(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    if hits.len() < 2 {
+        return false;
+    }
+    let (lo, hi) = (hits[0], hits[hits.len() - 1]);
+    commits.iter().any(|commit| *commit > lo && *commit < hi)
+}
+
+#[test]
+fn ab_lifecycle_loss_predicate_accepts_only_honest_states() {
+    let edge = |state: &str, reason: Option<&str>| serde_json::json!({"entries": {"coverage": {"state": state, "reason": reason}}});
+    assert!(ab_edge_survives_lifecycle_loss(&edge("counted", None)));
+    assert!(ab_edge_survives_lifecycle_loss(&edge(
+        "unknown",
+        Some("loss")
+    )));
+    assert!(!ab_edge_survives_lifecycle_loss(&edge(
+        "watched_no_use",
+        None
+    )));
+    assert!(!ab_edge_survives_lifecycle_loss(&edge(
+        "unknown",
+        Some("scan_only")
+    )));
+    assert!(!ab_edge_survives_lifecycle_loss(&edge("unknown", None)));
+}
+
+#[test]
+fn ab_idle_hold_requires_two_unchanged_records_across_a_commit() {
+    let record = |at_ns: u64, count: u64, state: &str| {
+        serde_json::json!({"kind": "edge_observed", "at_ns": at_ns, "event": {
+            "caller": "c0", "module": "m1",
+            "entries": {"count": count, "coverage": {"state": state}}}})
+    };
+    let commit = serde_json::json!({"kind": "pass_committed", "event": {}});
+    let first = EdgeRecord {
+        at_ns: 10,
+        count: 1,
+        state: "counted".to_string(),
+    };
+    // Vacuous: a lone pre-gate2 record proves no hold.
+    assert!(!ab_idle_hold_across_commits(
+        &[record(10, 1, "counted")],
+        "c0",
+        "m1",
+        &first,
+        100
+    ));
+    // Same-commit pair: no idle pass between them.
+    assert!(!ab_idle_hold_across_commits(
+        &[record(10, 1, "counted"), record(20, 1, "counted")],
+        "c0",
+        "m1",
+        &first,
+        100
+    ));
+    // Cross-commit pair: a distinct idle pass carried the count.
+    assert!(ab_idle_hold_across_commits(
+        &[
+            record(10, 1, "counted"),
+            commit.clone(),
+            record(20, 1, "counted")
+        ],
+        "c0",
+        "m1",
+        &first,
+        100
+    ));
+    // First counted at/after gate2: not an idle hold.
+    let late = EdgeRecord {
+        at_ns: 100,
+        count: 1,
+        state: "counted".to_string(),
+    };
+    assert!(!ab_idle_hold_across_commits(
+        &[
+            record(10, 1, "counted"),
+            commit.clone(),
+            record(20, 1, "counted")
+        ],
+        "c0",
+        "m1",
+        &late,
+        100
+    ));
+    // Changed count: not unchanged.
+    assert!(!ab_idle_hold_across_commits(
+        &[record(10, 1, "counted"), commit, record(20, 2, "counted")],
+        "c0",
+        "m1",
+        &first,
+        100
+    ));
+}
+
 /// C5.1 cell 4: `--system`, production path. A-then-B: the caller maps and
-/// uses provider A from the start (admitted, cached), then maps provider B
-/// — a second provider instance — strictly after capture starts. B sits
-/// mapped-but-idle through a quarantine, publishes exactly one counted
-/// call (`C_Initialize`), waits several passes idle, then runs the rest.
-/// The stream must show B discovered after its gate with the caller already
-/// admitted (P3's cached-caller sequence), B's first counted record at
-/// exactly that one call, no increment across the idle passes, growth
-/// after release, and ledger-exact final counts for both edges.
+/// uses provider A from the start (admitted), performs one A call after
+/// capture starts (the post-gate1 eager call, caching the caller), then
+/// maps provider B — a second provider instance — strictly after capture
+/// starts. B sits mapped-but-idle through a quarantine, publishes exactly
+/// one counted call (`C_Initialize`), waits several passes idle, then runs
+/// the rest. The stream must show B discovered after its gate with A
+/// already counted (P3's cached-caller sequence), B's first counted record
+/// (published before gate2) at exactly that one call, an unchanged counted
+/// observation across a distinct idle commit, growth after release, and
+/// ledger-exact final counts for both edges. Lifecycle loss voids the
+/// cell (it fails) instead of passing vacuously.
 #[test]
 #[ignore = "root-owned live BPF lane; native lane --system counts a late second module's first call exactly"]
 fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
@@ -1366,16 +1514,18 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
         // R-C51-3: counted, or unknown with reason `loss` — never a
         // watch, never another unknown reason (review F6).
         for edge in [edge_a, edge_b] {
-            let state = &edge["entries"]["coverage"]["state"];
-            let reason = &edge["entries"]["coverage"]["reason"];
             ensure!(
-                *state == "counted" || (*state == "unknown" && *reason == "loss"),
+                ab_edge_survives_lifecycle_loss(edge),
                 "under lost lifecycle evidence the edge must read counted or unknown/loss: \
                  {edge}; witnesses {witnesses}"
             );
         }
-        eprintln!("C51_AB_LIFECYCLE_LOSS witnesses={witnesses}");
-        return Ok(());
+        // Round 2 (F6/S6): honest loss is checked above, but it voids
+        // this qualification cell — returning success here would record
+        // PASS without checking first-count, growth, finals, or stream
+        // end. Honest-loss degradation itself is pinned by
+        // `ab_lifecycle_loss_predicate_accepts_only_honest_states`.
+        bail!("lifecycle loss voids the AB first-count qualification: {witnesses}");
     }
 
     // P3's sequence: the caller was admitted before B was ever observed,
@@ -1413,6 +1563,14 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
         .iter()
         .find(|record| record.state == "counted")
         .context(format!("B never counted in {}", render(&series_b)))?;
+    // Round 2 (F5/S7): the first count must publish before the idle
+    // window ends — otherwise the idle hold below is vacuous.
+    ensure!(
+        first_counted.at_ns < gate2_ns.get(),
+        "B first counted at {}, gate2 opened at {}: the first count must publish before the idle window ends",
+        first_counted.at_ns,
+        gate2_ns.get()
+    );
     ensure!(
         series_b
             .iter()
@@ -1434,13 +1592,20 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
         first_counted.count
     );
     // No increment across the idle passes: nothing above the first count
-    // before gate2 opened, then growth after the release.
+    // before gate2 opened — plus a nonvacuous hold (round 2, F5/S7):
+    // an unchanged counted observation across a distinct idle commit
+    // before the release — then growth after the release.
     ensure!(
         series_b
             .iter()
             .filter(|record| record.at_ns < gate2_ns.get())
             .all(|record| record.count <= first_counted.count),
         "B incremented before gate2"
+    );
+    ensure!(
+        ab_idle_hold_across_commits(&lines, caller_id, mod_b, first_counted, gate2_ns.get()),
+        "B's first count never held still across an idle commit before gate2 in {}",
+        render(&series_b)
     );
     ensure!(
         series_b
@@ -1454,14 +1619,26 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
             .all(|pair| pair[0].count <= pair[1].count),
         "B counts went backwards"
     );
-    // A's main phase runs after the release too.
+    // P3's cached-caller premise (round 2, F5): the workload performs
+    // an A call after capture starts (the post-gate1 eager call,
+    // before B maps), so A counts strictly before B's first counted
+    // record — the caller is cached before B is ever observed. (A's
+    // main phase runs after the release too.)
     let a_first_counted = series_a
         .iter()
         .find(|record| record.state == "counted")
         .context("A never counted")?;
     ensure!(
-        a_first_counted.at_ns > gate2_ns.get(),
-        "A counted before gate2"
+        a_first_counted.at_ns > gate1_ns.get(),
+        "A first counted at {}, gate1 opened at {}: the premise call must run after capture starts",
+        a_first_counted.at_ns,
+        gate1_ns.get()
+    );
+    ensure!(
+        a_first_counted.at_ns < first_counted.at_ns,
+        "A first counted at {}, B first counted at {}: the cached-caller premise needs A first",
+        a_first_counted.at_ns,
+        first_counted.at_ns
     );
     // Ledger-exact finals: B missed nothing (its only pre-attach call is
     // the uncounted dlsym acquisition); A missed exactly its pre-capture

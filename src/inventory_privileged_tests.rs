@@ -1141,6 +1141,52 @@ fn ab_edge_survives_lifecycle_loss(edge: &serde_json::Value) -> bool {
     state == Some("counted") || (state == Some("unknown") && reason == Some("loss"))
 }
 
+/// Whether the AB run lost lifecycle evidence (round 3, F3-05): the
+/// unbound `lifecycle_loss` reason, the `native capture lifecycle
+/// evidence lost` gap, or a nonzero `observation.lifecycle.ring_loss`
+/// (a DISCOVERY-ring window the lane never serviced overflows exactly
+/// the lifecycle records the other two signals name).
+fn ab_lifecycle_loss_detected(document: &serde_json::Value) -> bool {
+    let witnesses = &document["observation"]["native_witnesses"];
+    witnesses["unbound_reasons"].get("lifecycle_loss").is_some()
+        || document["gaps"].as_array().is_some_and(|gaps| {
+            gaps.iter()
+                .any(|gap| gap["subject"] == "native capture lifecycle evidence lost")
+        })
+        || document["observation"]["lifecycle"]["ring_loss"]
+            .as_u64()
+            .is_some_and(|loss| loss > 0)
+}
+
+/// The AB cell's lifecycle-loss verdict (round 3, F3-05): `Ok` when no
+/// loss was detected and the cell may proceed; `Err` (the cell FAILS,
+/// never passes-or-skips) when loss voids the qualification — after
+/// proving the honest-loss shape on both edges first.
+fn ab_lifecycle_loss_verdict(
+    detected: bool,
+    edge_a: &serde_json::Value,
+    edge_b: &serde_json::Value,
+    witnesses: &serde_json::Value,
+) -> Result<()> {
+    if !detected {
+        return Ok(());
+    }
+    // R-C51-3: counted, or unknown with reason `loss` — never a
+    // watch, never another unknown reason (review F6).
+    for edge in [edge_a, edge_b] {
+        ensure!(
+            ab_edge_survives_lifecycle_loss(edge),
+            "under lost lifecycle evidence the edge must read counted or unknown/loss: \
+             {edge}; witnesses {witnesses}"
+        );
+    }
+    // Round 2 (F6/S6): honest loss is checked above, but it voids
+    // this qualification cell — returning success here would record
+    // PASS without checking first-count, growth, finals, or stream
+    // end. Pinned by `ab_lifecycle_loss_branch_fails_the_cell`.
+    bail!("lifecycle loss voids the AB first-count qualification: {witnesses}");
+}
+
 /// Whether B's first count demonstrably held still across the idle
 /// window (round 2, F5/S7): the first counted record published
 /// strictly before gate2, plus a later counted record with the same
@@ -1207,6 +1253,69 @@ fn ab_lifecycle_loss_predicate_accepts_only_honest_states() {
         Some("scan_only")
     )));
     assert!(!ab_edge_survives_lifecycle_loss(&edge("unknown", None)));
+}
+
+// F3-05 branch-forcing pin: detected loss voids the AB cell — the
+// verdict is Err (the runner records FAIL: rc != 0, no
+// `test result: ok. 1 passed` line), never Ok (PASS-or-skip) — even
+// when both edges degrade honestly. Reverting the tail to `Ok(())`
+// turns this pin red.
+#[test]
+fn ab_lifecycle_loss_branch_fails_the_cell() {
+    let edge = |state: &str, reason: Option<&str>| serde_json::json!({"entries": {"coverage": {"state": state, "reason": reason}}});
+    let honest = edge("counted", None);
+    let witnesses = serde_json::json!({"unbound_reasons": {"lifecycle_loss": 1}});
+    assert!(
+        ab_lifecycle_loss_verdict(true, &honest, &honest, &witnesses).is_err(),
+        "honest loss still voids the qualification"
+    );
+    assert!(
+        ab_lifecycle_loss_verdict(false, &honest, &honest, &witnesses).is_ok(),
+        "a clean run proceeds past the loss branch"
+    );
+    let watched = edge("watched_no_use", None);
+    assert!(
+        ab_lifecycle_loss_verdict(true, &honest, &watched, &witnesses).is_err(),
+        "dishonest degradation under loss fails the shape check"
+    );
+}
+
+// F3-05 (astra S4): detection covers the unbound reason, the gap, and
+// a nonzero `observation.lifecycle.ring_loss` — each alone detects,
+// and a clean document (or one with no lifecycle block) does not.
+#[test]
+fn ab_lifecycle_loss_detection_covers_ring_loss() {
+    let doc = |witnesses: serde_json::Value,
+               gaps: serde_json::Value,
+               lifecycle: serde_json::Value| {
+        serde_json::json!({"observation": {"native_witnesses": witnesses, "lifecycle": lifecycle}, "gaps": gaps})
+    };
+    let clean_witnesses = serde_json::json!({"unbound_reasons": {}});
+    let no_gaps = serde_json::json!([]);
+    let no_loss = serde_json::json!({"ring_loss": 0});
+    assert!(!ab_lifecycle_loss_detected(&doc(
+        clean_witnesses.clone(),
+        no_gaps.clone(),
+        no_loss.clone()
+    )));
+    assert!(ab_lifecycle_loss_detected(&doc(
+        serde_json::json!({"unbound_reasons": {"lifecycle_loss": 1}}),
+        no_gaps.clone(),
+        no_loss.clone()
+    )));
+    assert!(ab_lifecycle_loss_detected(&doc(
+        clean_witnesses.clone(),
+        serde_json::json!([{"subject": "native capture lifecycle evidence lost"}]),
+        no_loss.clone()
+    )));
+    assert!(ab_lifecycle_loss_detected(&doc(
+        clean_witnesses.clone(),
+        no_gaps.clone(),
+        serde_json::json!({"ring_loss": 1})
+    )));
+    assert!(!ab_lifecycle_loss_detected(&serde_json::json!(
+        {"observation": {"native_witnesses": clean_witnesses}, "gaps": []}
+    )));
 }
 
 #[test]
@@ -1505,28 +1614,12 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     // the lane does not service: then the edge is honestly counted, or
     // unknown with reason `loss` — never a watch (the C5.2 demotion).
     let witnesses = &document["observation"]["native_witnesses"];
-    let lifecycle_lost = witnesses["unbound_reasons"].get("lifecycle_loss").is_some()
-        || document["gaps"].as_array().is_some_and(|gaps| {
-            gaps.iter()
-                .any(|gap| gap["subject"] == "native capture lifecycle evidence lost")
-        });
-    if lifecycle_lost {
-        // R-C51-3: counted, or unknown with reason `loss` — never a
-        // watch, never another unknown reason (review F6).
-        for edge in [edge_a, edge_b] {
-            ensure!(
-                ab_edge_survives_lifecycle_loss(edge),
-                "under lost lifecycle evidence the edge must read counted or unknown/loss: \
-                 {edge}; witnesses {witnesses}"
-            );
-        }
-        // Round 2 (F6/S6): honest loss is checked above, but it voids
-        // this qualification cell — returning success here would record
-        // PASS without checking first-count, growth, finals, or stream
-        // end. Honest-loss degradation itself is pinned by
-        // `ab_lifecycle_loss_predicate_accepts_only_honest_states`.
-        bail!("lifecycle loss voids the AB first-count qualification: {witnesses}");
-    }
+    ab_lifecycle_loss_verdict(
+        ab_lifecycle_loss_detected(&document),
+        edge_a,
+        edge_b,
+        witnesses,
+    )?;
 
     // P3's sequence: the caller was admitted before B was ever observed,
     // and B was observed strictly after its gate opened.

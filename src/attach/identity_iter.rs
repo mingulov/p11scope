@@ -560,34 +560,63 @@ fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
     }
 }
 
+/// Encode the `iter_info` selector for a task_vma link: `None` is the
+/// explicit whole-system walk (zero info, len 0); `Some(pidfd)` is the
+/// per-pid walk (info carrying the pidfd, len 16). A pidfd numbered 0 is
+/// rejected with `EINVAL`: the kernel narrows the task iterator only on
+/// `pid_fd != 0`, so encoding fd 0 would silently select a whole-system
+/// walk. Callers that close stdin must `F_DUPFD_CLOEXEC` the pidfd to ≥1
+/// (retained through link creation) before calling.
+fn encode_task_vma_selector(pid_fd: Option<BorrowedFd<'_>>) -> io::Result<(IterLinkInfo, u32)> {
+    match pid_fd {
+        None => Ok((
+            IterLinkInfo {
+                tid: 0,
+                pid: 0,
+                pid_fd: 0,
+                reserved: 0,
+            },
+            0,
+        )),
+        Some(fd) => {
+            let raw = fd.as_raw_fd();
+            if raw == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            Ok((
+                IterLinkInfo {
+                    tid: 0,
+                    pid: 0,
+                    pid_fd: raw as u32,
+                    reserved: 0,
+                },
+                size_of::<IterLinkInfo>() as u32,
+            ))
+        }
+    }
+}
+
 /// Create a `task_vma` iterator link for `prog_fd`: whole-system with
 /// `pid_fd = None`, or one process with `Some(pidfd)`. The pidfd names the
 /// task only at attach (F2); generation proof stays the confirm pin's job.
+/// A pidfd numbered 0 fails with `EINVAL` before any syscall (see
+/// [`encode_task_vma_selector`]); it must never encode as `pid_fd: 0`.
 pub fn link_create_task_vma(
     prog_fd: BorrowedFd<'_>,
     pid_fd: Option<BorrowedFd<'_>>,
 ) -> io::Result<OwnedFd> {
-    let info = IterLinkInfo {
-        tid: 0,
-        pid: 0,
-        pid_fd: pid_fd.map_or(0, |fd| fd.as_raw_fd() as u32),
-        reserved: 0,
-    };
+    let (info, len) = encode_task_vma_selector(pid_fd)?;
     let attr = LinkCreateAttr {
         prog_fd: prog_fd.as_raw_fd() as u32,
         target_fd: 0,
         attach_type: BPF_TRACE_ITER,
         flags: 0,
-        iter_info: if pid_fd.is_some() {
+        iter_info: if len == 0 {
+            0
+        } else {
             std::ptr::addr_of!(info).addr() as u64
-        } else {
-            0
         },
-        iter_info_len: if pid_fd.is_some() {
-            size_of::<IterLinkInfo>() as u32
-        } else {
-            0
-        },
+        iter_info_len: len,
         reserved: 0,
     };
     let mut attr = attr;
@@ -1499,6 +1528,36 @@ mod tests {
             !record.contains("inode"),
             "record struct must not mention inodes"
         );
+    }
+
+    /// Selector encoding: a pidfd numbered 0 must be rejected, never
+    /// encoded. The kernel narrows the task iterator only on `pid_fd != 0`,
+    /// so encoding fd 0 with `iter_info_len = 16` silently selects a
+    /// whole-system walk. `None` stays the only whole-system encoding.
+    #[test]
+    fn pidfd_zero_selector_is_rejected_not_whole_system() {
+        // Borrowed, never owned or closed: fd 0 here stands in for a
+        // caller's pidfd that landed on descriptor 0 (stdin closed).
+        let zero = unsafe { BorrowedFd::borrow_raw(0) };
+        let err = encode_task_vma_selector(Some(zero))
+            .expect_err("pidfd 0 must be rejected, never encoded");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EINVAL),
+            "fd-0 rejection must be EINVAL raised before any syscall"
+        );
+        // A nonzero pidfd still selects the per-pid walk.
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert_ne!(null.as_raw_fd(), 0, "test needs a nonzero fd");
+        let (info, len) = encode_task_vma_selector(Some(null.as_fd())).expect("nonzero encodes");
+        assert_eq!(info.pid_fd, null.as_raw_fd() as u32);
+        assert_eq!(info.tid, 0);
+        assert_eq!(info.pid, 0);
+        assert_eq!(len, size_of::<IterLinkInfo>() as u32);
+        // `None` is the only whole-system encoding.
+        let (info, len) = encode_task_vma_selector(None).expect("None encodes");
+        assert_eq!(info.pid_fd, 0);
+        assert_eq!(len, 0);
     }
 
     /// Raw syscalls fail closed (not panic, not success) on invalid fds.

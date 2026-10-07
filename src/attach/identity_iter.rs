@@ -238,6 +238,13 @@ pub enum Invalid {
     EndPayload,
     /// An ANCHOR record carries a malformed payload.
     AnchorPayload,
+    /// The expected slot count exceeds `ANCHOR_SLOTS`: no kernel run can
+    /// produce slots the maps cannot hold.
+    ExpectSlots,
+    /// The expected generation exceeds the u32 record field: distinct
+    /// passes would accept identical records, so the run identity is
+    /// ambiguous.
+    ExpectGen,
 }
 
 fn u16_at(record: &[u8], at: usize) -> u16 {
@@ -263,7 +270,26 @@ fn u64_at(record: &[u8], at: usize) -> u64 {
 
 /// Parse one run's bytes. Pure: no syscalls, no allocation past the output,
 /// and no panic on any input (the byte-flip tests pin this).
+///
+/// Structural decode, NOT authentication: an accepted `Run` is proven
+/// well-formed against the contract, not proven genuine. Legal in-range
+/// mutations — a single-bit `Slot(2)→Slot(3)` verdict flip, or
+/// `FULL→OK` — yield a *different* valid `Run`; corruption detection
+/// needs encoding help (checksums live outside this 32-byte ABI), and
+/// hostile-kernel assertions need independent validation (a parser cannot
+/// authenticate the stream it parses). What the parser does guarantee:
+/// every structural anomaly fails the whole run closed.
 pub fn parse(bytes: &[u8], expect: &Expect) -> Result<Run, Invalid> {
+    // The expectation itself is validated first: an oversized slot count
+    // would admit impossible kernel slots, and a generation wider than
+    // the u32 record field would let distinct passes (7 vs 0x1_00000007)
+    // accept identical records. The `as u32` below is lossless past this.
+    if expect.slots > ANCHOR_SLOTS {
+        return Err(Invalid::ExpectSlots);
+    }
+    if expect.generation > u64::from(u32::MAX) {
+        return Err(Invalid::ExpectGen);
+    }
     if !bytes.len().is_multiple_of(RECORD_LEN) {
         return Err(Invalid::Length);
     }
@@ -966,6 +992,8 @@ mod tests {
         bytes.extend_from_slice(&record(KIND_VMA, 200, 0x1000, 0x2000, 1, 7));
         bytes.extend_from_slice(&end(7));
         let run = parse(&bytes, &target_expect(&scope)).expect("valid target run");
+        assert!(oracle_accepts(&bytes, &target_expect(&scope)));
+        assert_run_matches_bytes(&bytes, &target_expect(&scope), &run);
         assert_eq!(run.demoted_pids, BTreeSet::new());
         assert!(run.anchors.is_empty());
         assert_eq!(
@@ -1005,6 +1033,8 @@ mod tests {
         bytes.extend_from_slice(&record(KIND_ANCHOR, 99, 0, 0, ANCHOR_BAD_SHAPE, 7));
         bytes.extend_from_slice(&end(7));
         let run = parse(&bytes, &anchor_expect(&scope)).expect("valid anchor run");
+        assert!(oracle_accepts(&bytes, &anchor_expect(&scope)));
+        assert_run_matches_bytes(&bytes, &anchor_expect(&scope), &run);
         // Slot 1 repeats (identical DUP): allowed, collapses to one outcome.
         assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::Ok));
         assert_eq!(run.anchors.get(&1), Some(&AnchorOutcome::Dup(0)));
@@ -1216,6 +1246,80 @@ mod tests {
         );
     }
 
+    /// The parser must validate the expectation itself, not just the
+    /// stream: `slots` past the kernel capacity admits impossible slots,
+    /// and a generation wider than the u32 record field makes distinct
+    /// passes accept identical records.
+    #[test]
+    fn parse_validates_expect_width_and_slots() {
+        let scope: BTreeSet<u32> = [100].into_iter().collect();
+        let bytes = [
+            record(KIND_VMA, 100, 0x1000, 0x2000, 3, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        let oversized = Expect {
+            generation: 7,
+            slots: ANCHOR_SLOTS + 1,
+            scope: &scope,
+            mode: RunMode::WholeSystem,
+            run: RunKind::Target,
+        };
+        assert_eq!(
+            parse(&bytes, &oversized),
+            Err(Invalid::ExpectSlots),
+            "slots past ANCHOR_SLOTS must reject the run"
+        );
+        let wide = Expect {
+            generation: 0x1_0000_0007,
+            slots: 4,
+            scope: &scope,
+            mode: RunMode::WholeSystem,
+            run: RunKind::Target,
+        };
+        assert_eq!(
+            parse(&bytes, &wide),
+            Err(Invalid::ExpectGen),
+            "a generation wider than u32 must reject the run"
+        );
+        // Boundary accepts: exactly the capacity, exactly u32::MAX, and
+        // the zero-slot all-NONE target run stay valid.
+        let full = Expect {
+            generation: 7,
+            slots: ANCHOR_SLOTS,
+            scope: &scope,
+            mode: RunMode::WholeSystem,
+            run: RunKind::Target,
+        };
+        parse(&bytes, &full).expect("slots == ANCHOR_SLOTS parses");
+        let gen_bytes = [
+            record(KIND_VMA, 100, 0x1000, 0x2000, 3, u32::MAX).to_vec(),
+            end(u32::MAX).to_vec(),
+        ]
+        .concat();
+        let max_gen = Expect {
+            generation: u64::from(u32::MAX),
+            slots: 4,
+            scope: &scope,
+            mode: RunMode::WholeSystem,
+            run: RunKind::Target,
+        };
+        parse(&gen_bytes, &max_gen).expect("generation == u32::MAX parses");
+        let none_bytes = [
+            record(KIND_VMA, 100, 0x1000, 0x2000, VERDICT_NONE, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        let zero_slots = Expect {
+            generation: 7,
+            slots: 0,
+            scope: &scope,
+            mode: RunMode::WholeSystem,
+            run: RunKind::Target,
+        };
+        parse(&none_bytes, &zero_slots).expect("zero slots admit NONE-only runs");
+    }
+
     #[test]
     fn conflicting_duplicates_demote_one_pid_not_the_run() {
         let scope: BTreeSet<u32> = [100, 200].into_iter().collect();
@@ -1303,6 +1407,92 @@ mod tests {
         assert_eq!(parse(&wide, &anchor), Err(Invalid::VerdictRange));
     }
 
+    /// Each address endpoint is guarded independently at exactly 2^56:
+    /// `start` at the guard rejects even with a higher end, `end` at the
+    /// guard rejects even with a lower start, and the highest fully
+    /// below-guard range parses. (A coarser guard such as 2^57 would admit
+    /// the contract-forbidden range between them.)
+    #[test]
+    fn pointer_guard_rejects_each_endpoint_at_2pow56() {
+        let scope: BTreeSet<u32> = [100].into_iter().collect();
+        let expect = target_expect(&scope);
+        let guarded = POINTER_GUARD;
+        // start exactly at the guard.
+        let bytes = [
+            record(KIND_VMA, 100, guarded, guarded + 0x1000, 3, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        assert_eq!(parse(&bytes, &expect), Err(Invalid::PointerShape));
+        // end exactly at the guard.
+        let bytes = [
+            record(KIND_VMA, 100, guarded - 0x1000, guarded, 3, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        assert_eq!(parse(&bytes, &expect), Err(Invalid::PointerShape));
+        // A forbidden range strictly between 2^56 and 2^57.
+        let bytes = [
+            record(KIND_VMA, 100, guarded + 0x1000, guarded + 0x2000, 3, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        assert_eq!(parse(&bytes, &expect), Err(Invalid::PointerShape));
+        // The highest fully below-guard range parses.
+        let bytes = [
+            record(KIND_VMA, 100, guarded - 0x2000, guarded - 0x1000, 3, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        parse(&bytes, &expect).expect("below-guard range parses");
+        // Anchor address fields get the same per-endpoint guard (checked
+        // before payload shape, so the guard names the failure).
+        let empty = BTreeSet::new();
+        let anchor = anchor_expect(&empty);
+        let mut start_guarded = record(KIND_ANCHOR, 0, 0, 0, ANCHOR_OK, 7);
+        start_guarded[8..16].copy_from_slice(&guarded.to_le_bytes());
+        assert_eq!(
+            parse(&[start_guarded.to_vec(), end(7).to_vec()].concat(), &anchor),
+            Err(Invalid::PointerShape)
+        );
+        let mut end_guarded = record(KIND_ANCHOR, 0, 0, 0, ANCHOR_OK, 7);
+        end_guarded[16..24].copy_from_slice(&guarded.to_le_bytes());
+        assert_eq!(
+            parse(&[end_guarded.to_vec(), end(7).to_vec()].concat(), &anchor),
+            Err(Invalid::PointerShape)
+        );
+    }
+
+    /// Structural decode, pinned: legal single-bit flips yield *different*
+    /// valid runs rather than rejections. `Slot(2)→Slot(3)` flips one bit
+    /// of the verdict word; `FULL(2)→OK(0)` clears one bit. (By contrast
+    /// `NONE→Slot` needs 30 bits.) This is the documented
+    /// structural-decode-not-authentication property, not a gap.
+    #[test]
+    fn legal_single_bit_flips_yield_different_valid_runs() {
+        let scope: BTreeSet<u32> = [100].into_iter().collect();
+        let expect = target_expect(&scope);
+        let mut vma = record(KIND_VMA, 100, 0x1000, 0x2000, 2, 7);
+        assert_eq!(vma[24], 0x02);
+        vma[24] = 0x03;
+        let run = parse(&[vma.to_vec(), end(7).to_vec()].concat(), &expect)
+            .expect("in-range verdict flip stays valid");
+        assert_eq!(
+            run.by_pid
+                .get(&100)
+                .and_then(|ranges| ranges.get(&(0x1000, 0x2000))),
+            Some(&TargetVerdict::Slot(3))
+        );
+        let empty = BTreeSet::new();
+        let anchor = anchor_expect(&empty);
+        let mut full = record(KIND_ANCHOR, 0, 0, 0, ANCHOR_FULL, 7);
+        assert_eq!(full[24], 0x02);
+        full[24] = 0x00;
+        let run = parse(&[full.to_vec(), end(7).to_vec()].concat(), &anchor)
+            .expect("FULL->OK single-bit clear stays valid");
+        assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::Ok));
+    }
+
     #[test]
     fn conflicting_anchor_repeats_downgrade_the_slot() {
         let empty_scope = BTreeSet::new();
@@ -1317,12 +1507,264 @@ mod tests {
         assert_eq!(run.anchors.get(&0), Some(&AnchorOutcome::BadShape));
     }
 
+    /// Independent oracle: accept/reject re-derived from the contract,
+    /// never by calling [`parse`]. Every byte-flip and randomized mutation
+    /// below must agree with it — that turns "parse compares with itself"
+    /// into "parse agrees with an independent decision procedure".
+    /// (Kept in sync with `parse` by construction: any rule change must
+    /// update both, and the agreement tests fail otherwise.)
+    fn oracle_accepts(bytes: &[u8], expect: &Expect) -> bool {
+        if expect.slots > ANCHOR_SLOTS {
+            return false;
+        }
+        if expect.generation > u64::from(u32::MAX) {
+            return false;
+        }
+        if !bytes.len().is_multiple_of(RECORD_LEN) || bytes.is_empty() {
+            return false;
+        }
+        let records = bytes.len() / RECORD_LEN;
+        // The tail must be a zero-payload END; any other END position dies
+        // in the walk below.
+        let tail = &bytes[(records - 1) * RECORD_LEN..records * RECORD_LEN];
+        if tail[3] != KIND_END
+            || u32_at(tail, 4) != 0
+            || u64_at(tail, 8) != 0
+            || u64_at(tail, 16) != 0
+            || u32_at(tail, 24) != 0
+        {
+            return false;
+        }
+        let want_gen = expect.generation as u32;
+        let mut last_tgid: Option<u32> = None;
+        let mut only_tgid: Option<u32> = None;
+        for index in 0..records {
+            let record = &bytes[index * RECORD_LEN..(index + 1) * RECORD_LEN];
+            if u16_at(record, 0) != RECORD_MAGIC || record[2] != RECORD_VERSION {
+                return false;
+            }
+            if u32_at(record, 28) != want_gen {
+                return false;
+            }
+            let a = u32_at(record, 4);
+            let start = u64_at(record, 8);
+            let end = u64_at(record, 16);
+            let verdict = u32_at(record, 24);
+            match record[3] {
+                KIND_END => {
+                    if index != records - 1 {
+                        return false;
+                    }
+                }
+                KIND_VMA => {
+                    if !matches!(expect.run, RunKind::Target) {
+                        return false;
+                    }
+                    if start >= end
+                        || start & (PAGE_GRANULE - 1) != 0
+                        || end & (PAGE_GRANULE - 1) != 0
+                    {
+                        return false;
+                    }
+                    if start >= POINTER_GUARD || end >= POINTER_GUARD {
+                        return false;
+                    }
+                    if verdict != VERDICT_NONE && verdict >= expect.slots {
+                        return false;
+                    }
+                    if !expect.scope.contains(&a) {
+                        return false;
+                    }
+                    match expect.mode {
+                        RunMode::WholeSystem => {
+                            if last_tgid.is_some_and(|last| a < last) {
+                                return false;
+                            }
+                            last_tgid = Some(a);
+                        }
+                        RunMode::PerPid => match only_tgid {
+                            None => only_tgid = Some(a),
+                            Some(first) if first == a => {}
+                            Some(_) => return false,
+                        },
+                    }
+                }
+                KIND_ANCHOR => {
+                    if !matches!(expect.run, RunKind::Anchor) {
+                        return false;
+                    }
+                    if start >= POINTER_GUARD || end >= POINTER_GUARD {
+                        return false;
+                    }
+                    let payload_ok = match verdict {
+                        ANCHOR_OK => start == 0 && end == 0 && a < expect.slots,
+                        ANCHOR_DUP => {
+                            end == 0 && a < expect.slots && start < u64::from(expect.slots)
+                        }
+                        ANCHOR_FULL => start == 0 && end == 0 && a < expect.slots,
+                        ANCHOR_BAD_SHAPE => start == 0 && end == 0,
+                        ANCHOR_CONFLICT => start == 0 && end == 0 && a < expect.slots,
+                        _ => false,
+                    };
+                    if !payload_ok {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Correspondence check: an accepted `Run` must match the raw bytes it
+    /// was parsed from — every parsed entry traces to raw record(s) with
+    /// the correctly-mapped verdict, demotions trace to genuine raw
+    /// conflicts, and nothing is invented. Never calls [`parse`].
+    fn assert_run_matches_bytes(bytes: &[u8], expect: &Expect, run: &Run) {
+        let records = bytes.len() / RECORD_LEN;
+        let mut raw_vma: Vec<(u32, u64, u64, TargetVerdict)> = Vec::new();
+        let mut raw_anchor: Vec<(u32, AnchorOutcome)> = Vec::new();
+        for index in 0..records {
+            let record = &bytes[index * RECORD_LEN..(index + 1) * RECORD_LEN];
+            let a = u32_at(record, 4);
+            let start = u64_at(record, 8);
+            let end = u64_at(record, 16);
+            let verdict = u32_at(record, 24);
+            match record[3] {
+                KIND_VMA => {
+                    let mapped = if verdict == VERDICT_NONE {
+                        TargetVerdict::Unmatched
+                    } else {
+                        TargetVerdict::Slot(verdict)
+                    };
+                    raw_vma.push((a, start, end, mapped));
+                }
+                KIND_ANCHOR => {
+                    let mapped = match verdict {
+                        ANCHOR_OK => AnchorOutcome::Ok,
+                        ANCHOR_DUP => AnchorOutcome::Dup(start as u32),
+                        ANCHOR_FULL => AnchorOutcome::Full,
+                        ANCHOR_BAD_SHAPE => AnchorOutcome::BadShape,
+                        _ => AnchorOutcome::Conflict,
+                    };
+                    raw_anchor.push((a, mapped));
+                }
+                _ => {}
+            }
+        }
+        match expect.run {
+            RunKind::Target => {
+                assert!(
+                    run.anchors.is_empty(),
+                    "target runs carry no anchor outcomes"
+                );
+                // Every parsed entry traces to identical raw record(s), and
+                // no raw record for a kept pid disagrees with it.
+                for (pid, ranges) in &run.by_pid {
+                    assert!(
+                        !run.demoted_pids.contains(pid),
+                        "kept pid {pid} must not be demoted"
+                    );
+                    for (range, verdict) in ranges {
+                        let mut sources = 0;
+                        for (a, start, end, mapped) in &raw_vma {
+                            if a == pid && (*start, *end) == *range {
+                                assert_eq!(
+                                    mapped, verdict,
+                                    "parsed verdict for {pid}:{range:?} must match its raw records"
+                                );
+                                sources += 1;
+                            }
+                        }
+                        assert!(sources > 0, "parsed {pid}:{range:?} invents no raw record");
+                    }
+                }
+                // Every demotion traces to a genuine raw conflict, and every
+                // raw record is either reflected or its pid demoted.
+                for pid in &run.demoted_pids {
+                    assert!(
+                        !run.by_pid.contains_key(pid),
+                        "demoted pid {pid} keeps no records"
+                    );
+                    let mut conflict = false;
+                    for i in 0..raw_vma.len() {
+                        for j in 0..raw_vma.len() {
+                            if raw_vma[i].0 == *pid
+                                && raw_vma[j].0 == *pid
+                                && (raw_vma[i].1, raw_vma[i].2) == (raw_vma[j].1, raw_vma[j].2)
+                                && raw_vma[i].3 != raw_vma[j].3
+                            {
+                                conflict = true;
+                            }
+                        }
+                    }
+                    assert!(conflict, "demoted pid {pid} needs a genuine raw conflict");
+                }
+                for (a, start, end, mapped) in &raw_vma {
+                    if run.demoted_pids.contains(a) {
+                        continue;
+                    }
+                    assert_eq!(
+                        run.by_pid
+                            .get(a)
+                            .and_then(|ranges| ranges.get(&(*start, *end))),
+                        Some(mapped),
+                        "raw record {a}:({start}, {end}) must be reflected when kept"
+                    );
+                }
+            }
+            RunKind::Anchor => {
+                assert!(
+                    run.by_pid.is_empty(),
+                    "anchor runs carry no target verdicts"
+                );
+                assert!(run.demoted_pids.is_empty(), "anchor runs demote nothing");
+                // Collapse by debug text: `Dup` carries data, so outcomes
+                // are compared by value below, multiplicities ignored.
+                let mut fingerprints: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+                for (slot, outcome) in &raw_anchor {
+                    fingerprints
+                        .entry(*slot)
+                        .or_default()
+                        .insert(format!("{outcome:?}"));
+                }
+                for (slot, outcome) in run.anchors.iter() {
+                    let distinct = fingerprints.get(slot).expect("parsed slot has raw source");
+                    if distinct.len() == 1 {
+                        let raw_outcome = raw_anchor
+                            .iter()
+                            .find(|(s, _)| s == slot)
+                            .map(|(_, o)| o)
+                            .expect("raw source");
+                        assert_eq!(
+                            outcome, raw_outcome,
+                            "slot {slot} with one distinct raw outcome keeps it"
+                        );
+                    } else {
+                        assert_eq!(
+                            outcome,
+                            &AnchorOutcome::BadShape,
+                            "slot {slot} with mixed raw outcomes downgrades"
+                        );
+                    }
+                }
+                assert_eq!(
+                    run.anchors.len(),
+                    fingerprints.len(),
+                    "every raw anchor slot is represented exactly once"
+                );
+            }
+        }
+    }
+
     /// The design's byte-flip property, stated precisely. The literal "same
     /// `Run` or `Invalid`" holds for the END-only stream: it carries no
     /// payload byte whose flip stays valid, so this test pins all 32 × 255
     /// flips exhaustively. Payload streams cannot satisfy the literal form
     /// (an in-range verdict flip yields a *different* valid `Run`), so the
     /// companion test below pins no-panic plus determinism there instead.
+    /// Both tests additionally pin oracle agreement plus parsed-bytes
+    /// correspondence on every flip.
     #[test]
     fn every_byte_flip_of_end_only_is_same_or_invalid() {
         let scope = BTreeSet::new();
@@ -1344,9 +1786,20 @@ mod tests {
                             run, baseline,
                             "flip at {at} to {value:#x} must not change the run"
                         );
+                        assert!(
+                            oracle_accepts(&flipped, &expect),
+                            "oracle must agree: flip at {at} to {value:#x} accepted"
+                        );
+                        assert_run_matches_bytes(&flipped, &expect, &run);
                         same += 1;
                     }
-                    Err(_) => invalid += 1,
+                    Err(_) => {
+                        assert!(
+                            !oracle_accepts(&flipped, &expect),
+                            "oracle must agree: flip at {at} to {value:#x} rejected"
+                        );
+                        invalid += 1;
+                    }
                 }
             }
         }
@@ -1355,7 +1808,10 @@ mod tests {
     }
 
     /// Payload-stream flips never panic and parse deterministically: any two
-    /// parses of the same flipped bytes agree.
+    /// parses of the same flipped bytes agree. Every flip additionally pins
+    /// oracle agreement (rejection assertions for structural mutations via
+    /// the independent decision procedure) plus parsed-bytes correspondence
+    /// for accepted streams.
     #[test]
     fn every_byte_flip_of_payload_streams_is_panic_free_and_deterministic() {
         let scope: BTreeSet<u32> = [100, 200].into_iter().collect();
@@ -1388,11 +1844,21 @@ mod tests {
                         first, second,
                         "flip at {at} to {value:#x} parses deterministically"
                     );
+                    assert_eq!(
+                        first.is_ok(),
+                        oracle_accepts(&flipped, expect),
+                        "flip at {at} to {value:#x} must agree with the oracle"
+                    );
+                    if let Ok(run) = first {
+                        assert_run_matches_bytes(&flipped, expect, &run);
+                    }
                 }
             }
         }
     }
 
+    /// Randomized mutations never panic, and every outcome agrees with
+    /// the oracle (accepted streams additionally match their raw bytes).
     #[test]
     fn randomized_mutations_never_panic() {
         // Small xorshift; deterministic seed, no RNG dependency.
@@ -1418,14 +1884,32 @@ mod tests {
                 let at = (next() % bytes.len() as u64) as usize;
                 bytes[at] = (next() & 0xFF) as u8;
             }
-            let _ = parse(&bytes, &expect);
+            let parsed = parse(&bytes, &expect);
+            assert_eq!(
+                parsed.is_ok(),
+                oracle_accepts(&bytes, &expect),
+                "randomized mutation must agree with the oracle"
+            );
+            if let Ok(run) = parsed {
+                assert_run_matches_bytes(&bytes, &expect, &run);
+            }
         }
         // Truncated and overlong inputs too.
         for len in 0..seed.len() + 64 {
-            let _ = parse(&seed[..len.min(seed.len())], &expect);
+            let cut = &seed[..len.min(seed.len())];
+            assert_eq!(
+                parse(cut, &expect).is_ok(),
+                oracle_accepts(cut, &expect),
+                "truncation to {len} bytes must agree with the oracle"
+            );
             let mut long = seed.clone();
             long.extend(std::iter::repeat_n(0xA5, len.saturating_sub(seed.len())));
-            let _ = parse(&long, &expect);
+            assert_eq!(
+                parse(&long, &expect).is_ok(),
+                oracle_accepts(&long, &expect),
+                "extension to {} bytes must agree with the oracle",
+                long.len()
+            );
         }
     }
 

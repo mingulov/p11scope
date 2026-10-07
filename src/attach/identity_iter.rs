@@ -2712,16 +2712,26 @@ mod tests {
         false
     }
 
-    /// Byte index of a plain `=` assignment in `code` (`=`, `+=`, `|=`…
-    /// count; `==`, `!=`, `<=`, `>=` never do), or `None`.
+    /// Byte index of a plain or compound `=` assignment in `code` (`=`,
+    /// `+=`, `<<=` … count; `==`, `!=`, `<=`, `>=` never do), or `None`.
+    /// `<<=`/`>>=` assign (the `=` follows a second shift chevron);
+    /// `<=`/`>=` compare.
     fn find_assignment(code: &str) -> Option<usize> {
         let bytes = code.as_bytes();
         let mut index = 0;
         while index < bytes.len() {
             if bytes[index] == b'=' {
                 let prev = if index > 0 { bytes[index - 1] } else { b' ' };
+                let prev_prev = if index > 1 { bytes[index - 2] } else { b' ' };
                 let next = bytes.get(index + 1).copied().unwrap_or(b' ');
-                if prev != b'=' && prev != b'!' && prev != b'<' && prev != b'>' && next != b'=' {
+                if next == b'=' || prev == b'=' || prev == b'!' {
+                    // `==`, `!=`: never an assignment.
+                } else if prev == b'<' || prev == b'>' {
+                    // `<<=` / `>>=` assign; `<=` / `>=` compare.
+                    if prev_prev == prev {
+                        return Some(index);
+                    }
+                } else {
                     return Some(index);
                 }
             }
@@ -2730,31 +2740,52 @@ mod tests {
         None
     }
 
-    /// Remove `&ident` (address-of) tokens from `expr`, never `&&`
-    /// (logical and): `p11_map_lookup(&anchors, &addr)` passes stack
-    /// pointers as keys, not the inode address itself, so the result is
-    /// not inode-derived.
+    /// Remove `&ident` (address-of) tokens from `expr`, never binary
+    /// `&` (bitwise and) or `&&` (logical and):
+    /// `p11_map_lookup(&anchors, &addr)` passes stack pointers as keys,
+    /// not the inode address itself, so the result is not inode-derived
+    /// — while `~0ULL & addr` computes with the address and stays
+    /// tainted. A `&` is address-of only in unary position (expression
+    /// start, or after `(`, `,`, `=`, or another operator — never after
+    /// an operand: identifier, number, `)`, `]`, or a second `&`), with
+    /// an identifier after it (whitespace allowed).
     fn strip_address_of(expr: &str) -> String {
+        let chars: Vec<char> = expr.chars().collect();
         let mut out = String::with_capacity(expr.len());
-        let mut chars = expr.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '&' && chars.peek() != Some(&'&') {
-                let mut lookahead = chars.clone();
-                if lookahead
-                    .next()
-                    .is_some_and(|next| next.is_alphabetic() || next == '_')
-                {
-                    let rest = lookahead
-                        .take_while(|next| next.is_alphanumeric() || *next == '_')
-                        .count();
-                    for _ in 0..rest + 1 {
-                        chars.next();
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index] == '&' && chars.get(index + 1) != Some(&'&') {
+                let mut back = index;
+                while back > 0 && chars[back - 1].is_whitespace() {
+                    back -= 1;
+                }
+                let prev = if back > 0 {
+                    Some(chars[back - 1])
+                } else {
+                    None
+                };
+                let unary = prev.is_none_or(|c| {
+                    !(c.is_alphanumeric() || c == '_' || c == ')' || c == ']' || c == '&')
+                });
+                let mut fwd = index + 1;
+                while fwd < chars.len() && chars[fwd].is_whitespace() {
+                    fwd += 1;
+                }
+                let next_ident = chars
+                    .get(fwd)
+                    .is_some_and(|c| c.is_alphabetic() || *c == '_');
+                if unary && next_ident {
+                    let mut end = fwd + 1;
+                    while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                        end += 1;
                     }
+                    index = end;
                     out.push(' ');
                     continue;
                 }
             }
-            out.push(ch);
+            out.push(chars[index]);
+            index += 1;
         }
         out
     }
@@ -2764,26 +2795,112 @@ mod tests {
         tainted.iter().any(|var| mentions_word(&value, var))
     }
 
+    /// Strip C block comments (`/*…*/`, multi-line aware), line comments
+    /// (`//…`), and string/char literal contents from `text`, blanking
+    /// them to spaces (newlines kept) so byte offsets and line numbers
+    /// survive. What remains is code shape. A single lexer pass keeps
+    /// comment markers inside strings (and vice versa) from confusing
+    /// each other. C block comments do not nest.
+    fn strip_c_noise(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            let next = bytes.get(index + 1).copied().unwrap_or(0);
+            if byte == b'/' && next == b'/' {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    out.push(b' ');
+                    index += 1;
+                }
+                continue;
+            }
+            if byte == b'/' && next == b'*' {
+                out.push(b' ');
+                out.push(b' ');
+                index += 2;
+                while index < bytes.len()
+                    && !(bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/'))
+                {
+                    out.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+                if index < bytes.len() {
+                    out.push(b' ');
+                    out.push(b' ');
+                    index += 2;
+                }
+                continue;
+            }
+            if byte == b'"' || byte == b'\'' {
+                let quote = byte;
+                out.push(b' ');
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        out.push(b' ');
+                        index += 1;
+                        if index < bytes.len() {
+                            out.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    out.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+                if index < bytes.len() {
+                    out.push(b' ');
+                    index += 1;
+                }
+                continue;
+            }
+            out.push(byte);
+            index += 1;
+        }
+        String::from_utf8(out).expect("blanking keeps UTF-8 boundaries")
+    }
+
+    /// Whether `name` is a plain C variable name (no operators, no member
+    /// access, no dereference).
+    fn is_plain_c_var(name: &str) -> bool {
+        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    }
+
     /// Audit one C function body: no `emit(...)` argument (checked at its
     /// call site, against the taint set at that point) carries an
     /// inode-derived value, and no `record.<field>` store takes one.
     /// Taint sources (sticky, never cleared): `addr` (the inode pointer),
     /// `old` (the slot cell's stored address), `f_inode` (the inode field
-    /// itself). Assignments propagate taint to plain-variable targets
-    /// (across intermediates); clean reassignment clears non-source
-    /// variables, whose value was replaced; stores through `*p`, `p.f`,
-    /// `p->f`, `a[i]` are map or struct writes, not variable taint —
-    /// except `record.*` stores, which feed `seq_write` and are checked.
-    /// `P11_READ(dst, src)` counts as `dst = src`.
+    /// itself). Transfers (assignments across intermediates, `P11_READ`
+    /// as `dst = src`) and emit checks run in chunk-offset order over
+    /// `;`-separated statements, so same-line (`start = addr;
+    /// emit(...)`) and split-line (`start =` / `addr;`) layouts taint
+    /// before the check; plain `=` with a clean rhs clears non-source
+    /// variables, whose value was replaced, while compound `<op>=` keeps
+    /// taint when either side is tainted (it reads the old value).
+    /// Through-deref stores (`*p = …`) of tainted values fail unless the
+    /// statement is the exact bookkeeping allowlist (`*slot_cell =
+    /// addr`); `record.*` stores feed `seq_write` and are checked;
+    /// `p.f`, `p->f`, `a[i]` stores stay map/struct writes outside the
+    /// envelope (with wrapper functions and inter-procedural flows —
+    /// all pin-backstopped; see the test docs).
     fn audit_c_chunk(chunk: &str, path: &str) -> Result<(), String> {
         const SOURCES: [&str; 3] = ["addr", "old", "f_inode"];
-        // Every `emit(` call's start line and argument text, balanced
+        // The only through-deref store of a tainted value the audit
+        // allows, exactly: `*slot_cell = addr` installs the slot's
+        // observed address into the kernel map (never into a record).
+        // Compared on trimmed statement text — reformatting the line
+        // fails loudly.
+        const DEREF_ALLOWLIST: [&str; 1] = ["*slot_cell = addr"];
+        let clean = strip_c_noise(chunk);
+        let bytes = clean.as_bytes();
+        // Every `emit(` call's byte range and argument text, balanced
         // across wrapped lines. (The `emit` definition itself matches
-        // `emit(` too; its parameter list carries no tainted value.)
-        let mut calls: Vec<(usize, String)> = Vec::new();
-        let bytes = chunk.as_bytes();
+        // too; its parameter list carries no tainted value.)
+        let mut calls: Vec<(usize, usize, String)> = Vec::new();
         let mut at = 0;
-        while let Some(found) = chunk[at..].find("emit(") {
+        while let Some(found) = clean[at..].find("emit(") {
             let start = at + found;
             let mut depth = 0usize;
             let mut end = None;
@@ -2803,76 +2920,198 @@ mod tests {
             let Some(close) = end else {
                 return Err(format!("{path}: unbalanced emit( in chunk"));
             };
-            calls.push((
-                chunk[..start].matches('\n').count(),
-                chunk[start..=close].to_string(),
-            ));
+            calls.push((start, close, clean[start..=close].to_string()));
             at = close + 1;
         }
+        let in_call = |offset: usize| calls.iter().any(|(s, e, _)| offset > *s && offset < *e);
+        // Statements at paren-depth-0 `;` (a `for (;;)` header never
+        // splits), each with its chunk offset.
+        let mut statements: Vec<(usize, &str)> = Vec::new();
+        let mut depth = 0i32;
+        let mut stmt_start = 0;
+        for (offset, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b';' if depth == 0 => {
+                    statements.push((stmt_start, &clean[stmt_start..offset]));
+                    stmt_start = offset + 1;
+                }
+                _ => {}
+            }
+        }
+        statements.push((stmt_start, &clean[stmt_start..]));
+        enum Event {
+            Read {
+                offset: usize,
+                dst: String,
+                src: String,
+            },
+            Assign {
+                offset: usize,
+                lhs: String,
+                rhs: String,
+                stmt: String,
+            },
+            Emit {
+                offset: usize,
+                args: String,
+            },
+        }
+        let offset_of = |event: &Event| match event {
+            Event::Read { offset, .. }
+            | Event::Assign { offset, .. }
+            | Event::Emit { offset, .. } => *offset,
+        };
+        let mut events: Vec<Event> = Vec::new();
+        for (start, _, args) in &calls {
+            events.push(Event::Emit {
+                offset: *start,
+                args: args.clone(),
+            });
+        }
+        for (stmt_start, text) in &statements {
+            let mut rest = *text;
+            let mut rest_off = *stmt_start;
+            while let Some(found) = rest.find("P11_READ(") {
+                // Balance from the call's open paren; split dst/src at
+                // the first top-level comma.
+                let call_off = rest_off + found;
+                let mut paren = 0i32;
+                let mut comma = None;
+                let mut close = None;
+                for (offset, byte) in rest[found..].bytes().enumerate() {
+                    match byte {
+                        b'(' => paren += 1,
+                        b',' if paren == 1 && comma.is_none() => comma = Some(found + offset),
+                        b')' => {
+                            paren -= 1;
+                            if paren == 0 {
+                                close = Some(found + offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let (Some(comma), Some(close)) = (comma, close) else {
+                    return Err(format!("{path}: unbalanced P11_READ( in chunk"));
+                };
+                if !in_call(call_off) {
+                    events.push(Event::Read {
+                        offset: call_off,
+                        dst: rest[found + "P11_READ(".len()..comma].to_string(),
+                        src: rest[comma + 1..close].to_string(),
+                    });
+                }
+                rest = &rest[close + 1..];
+                rest_off += close + 1;
+            }
+            // Assignments, first `=` per fragment (chained `x = y = …`
+            // fragments recurse so every target transfers).
+            let mut frag = *text;
+            let mut frag_off = *stmt_start;
+            while let Some(eq) = find_assignment(frag) {
+                let (lhs, rhs) = frag.split_at(eq);
+                let rhs = &rhs[1..];
+                let eq_off = frag_off + eq;
+                if !in_call(eq_off) {
+                    events.push(Event::Assign {
+                        offset: eq_off,
+                        lhs: lhs.to_string(),
+                        rhs: rhs.to_string(),
+                        stmt: text.trim().to_string(),
+                    });
+                }
+                frag = rhs;
+                frag_off = eq_off + 1;
+            }
+        }
+        events.sort_by_key(offset_of);
         let mut tainted: BTreeSet<String> = SOURCES.iter().map(|name| name.to_string()).collect();
-        for (number, line) in chunk.lines().enumerate() {
-            for (start_line, args) in &calls {
-                if *start_line != number {
-                    continue;
-                }
-                for forbidden in ["addr", "inode"] {
-                    if args.contains(forbidden) {
-                        return Err(format!(
-                            "{path}: emit(...) argument names {forbidden:?}: {args}"
-                        ));
+        for event in events {
+            match event {
+                Event::Emit { args, .. } => {
+                    for forbidden in ["addr", "inode"] {
+                        if args.contains(forbidden) {
+                            return Err(format!(
+                                "{path}: emit(...) argument names {forbidden:?}: {args}"
+                            ));
+                        }
+                    }
+                    for var in &tainted {
+                        if mentions_word(&args, var) {
+                            return Err(format!(
+                                "{path}: emit(...) argument carries tainted {var:?}: {args}"
+                            ));
+                        }
                     }
                 }
-                for var in &tainted {
-                    if mentions_word(args, var) {
-                        return Err(format!(
-                            "{path}: emit(...) argument carries tainted {var:?}: {args}"
-                        ));
+                Event::Read { dst, src, .. } => {
+                    let dst = dst.trim();
+                    if !is_plain_c_var(dst) {
+                        continue;
+                    }
+                    if expr_is_tainted(&src, &tainted) {
+                        tainted.insert(dst.to_string());
+                    } else if !SOURCES.contains(&dst) {
+                        tainted.remove(dst);
                     }
                 }
-            }
-            let code = line.split("//").next().unwrap_or("");
-            if let Some(read) = code.find("P11_READ(") {
-                let args = &code[read + "P11_READ(".len()..];
-                if let Some((dst, src)) = args.split_once(',') {
-                    let dst = dst.trim().to_string();
-                    if expr_is_tainted(src, &tainted) {
-                        tainted.insert(dst);
-                    } else if !SOURCES.contains(&dst.as_str()) {
-                        tainted.remove(&dst);
+                Event::Assign { lhs, rhs, stmt, .. } => {
+                    // The assignment target: text after the last
+                    // structural character (a statement can open with
+                    // `}`/`{`/`)` from control flow before its
+                    // assignment, e.g. `}\n *slot_cell = addr`).
+                    let core = lhs
+                        .rsplit(['{', '}', '(', ')', ','])
+                        .next()
+                        .unwrap_or(&lhs)
+                        .trim();
+                    let target = core
+                        .trim_end_matches(['+', '-', '*', '/', '%', '&', '|', '^', '<', '>'])
+                        .trim();
+                    let compound = target != core;
+                    if target.contains("record.") || target.contains("record->") {
+                        if expr_is_tainted(&rhs, &tainted) {
+                            return Err(format!(
+                                "{path}: record field store of tainted value: {stmt}"
+                            ));
+                        }
+                        continue;
+                    }
+                    if target.starts_with('*') {
+                        let stmt_core = stmt.rsplit(['{', '}']).next().unwrap_or(&stmt).trim();
+                        if expr_is_tainted(&rhs, &tainted) && !DEREF_ALLOWLIST.contains(&stmt_core)
+                        {
+                            return Err(format!(
+                                "{path}: through-deref store of tainted value: {stmt}"
+                            ));
+                        }
+                        continue;
+                    }
+                    if target.contains(['*', '.', '[']) || target.contains("->") {
+                        continue;
+                    }
+                    let Some(name) = target.split_whitespace().next_back() else {
+                        continue;
+                    };
+                    if !is_plain_c_var(name) {
+                        continue;
+                    }
+                    let rhs_tainted = expr_is_tainted(&rhs, &tainted);
+                    if compound {
+                        if rhs_tainted || tainted.contains(name) {
+                            tainted.insert(name.to_string());
+                        } else if !SOURCES.contains(&name) {
+                            tainted.remove(name);
+                        }
+                    } else if rhs_tainted {
+                        tainted.insert(name.to_string());
+                    } else if !SOURCES.contains(&name) {
+                        tainted.remove(name);
                     }
                 }
-                continue;
-            }
-            let Some(eq) = find_assignment(code) else {
-                continue;
-            };
-            let (lhs, rhs) = code.split_at(eq);
-            let rhs = &rhs[1..];
-            let lhs = lhs
-                .trim()
-                .trim_end_matches(['+', '-', '*', '/', '%', '&', '|', '^'])
-                .trim();
-            if lhs.contains("record.") || lhs.contains("record->") {
-                if expr_is_tainted(rhs, &tainted) {
-                    return Err(format!(
-                        "{path}: record field store of tainted value: {line}"
-                    ));
-                }
-                continue;
-            }
-            if lhs.contains(['*', '.', '[']) || lhs.contains("->") {
-                continue;
-            }
-            let Some(name) = lhs.split_whitespace().next_back() else {
-                continue;
-            };
-            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                continue;
-            }
-            if expr_is_tainted(rhs, &tainted) {
-                tainted.insert(name.to_string());
-            } else if !SOURCES.contains(&name) {
-                tainted.remove(name);
             }
         }
         Ok(())
@@ -2888,7 +3127,11 @@ mod tests {
     /// intra-procedural and alias-insensitive by design; the object digest
     /// pin stays as the complementary tripwire for anything it cannot see.
     fn audit_identity_c_source(source: &str, path: &str) -> Result<(), String> {
-        for (number, line) in source.lines().enumerate() {
+        // Comment/string-blind throughout: braces and `seq_write` tokens
+        // inside comments or literals must shape neither the chunking
+        // nor the checks.
+        let clean = strip_c_noise(source);
+        for (number, line) in clean.lines().enumerate() {
             if line.contains("seq_write(seq") && !line.contains("&record") {
                 return Err(format!("{path}:{} seq_write must pass &record", number + 1));
             }
@@ -2898,7 +3141,7 @@ mod tests {
         // close with `};`).
         let mut chunks: Vec<String> = Vec::new();
         let mut current = String::new();
-        for line in source.lines() {
+        for line in clean.lines() {
             current.push_str(line);
             current.push('\n');
             if line == "}" {
@@ -2994,6 +3237,94 @@ mod tests {
         assert!(
             audit_identity_c_source(&mutated, path).is_err(),
             "mutation 4 (addr through an intermediate) must fail the audit"
+        );
+        // Producer mutation 5: launder taint through a compound
+        // assignment — `+=` reads the tainted old value, so a clean rhs
+        // must NOT clear it.
+        for op in ["+=", "-=", "|=", "&=", "<<="] {
+            let mutated = c.replacen(
+                "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+                &format!(
+                    "    start = addr;\n    start {op} 0;\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,"
+                ),
+                1,
+            );
+            assert_ne!(mutated, c, "mutation 5 ({op}) must apply");
+            assert!(
+                audit_identity_c_source(&mutated, path).is_err(),
+                "mutation 5 (launder through `{op}`) must fail the audit"
+            );
+        }
+        // Producer mutation 6: same-line `start = addr; emit(...)` — the
+        // emit check must see the assignment before it on its own line.
+        let mutated = c.replacen(
+            "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            "    start = addr; emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            1,
+        );
+        assert_ne!(mutated, c, "mutation 6 must apply");
+        assert!(
+            audit_identity_c_source(&mutated, path).is_err(),
+            "mutation 6 (same-line start = addr; emit) must fail the audit"
+        );
+        // Producer mutation 7: split-line assignment — `start =` /
+        // `addr;` must taint across the line break, not clear on an
+        // empty-looking rhs.
+        let mutated = c.replacen(
+            "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            "    start\n    = addr;\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+            1,
+        );
+        assert_ne!(mutated, c, "mutation 7 must apply");
+        assert!(
+            audit_identity_c_source(&mutated, path).is_err(),
+            "mutation 7 (split-line assignment) must fail the audit"
+        );
+        // Producer mutation 8: binary `&` is not address-of —
+        // `start = ~0ULL & addr` must taint, spaced or spaceless.
+        for rhs in ["~0ULL & addr", "~0ULL&addr"] {
+            let mutated = c.replacen(
+                "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+                &format!(
+                    "    start = {rhs};\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,"
+                ),
+                1,
+            );
+            assert_ne!(mutated, c, "mutation 8 ({rhs}) must apply");
+            assert!(
+                audit_identity_c_source(&mutated, path).is_err(),
+                "mutation 8 (binary `&` in `{rhs}`) must fail the audit"
+            );
+        }
+        // Producer mutation 9: a tainted through-deref store outside the
+        // bookkeeping allowlist — `*pp = addr` must fail (the real
+        // `*slot_cell = addr` line passes by exact-text allowlist, and a
+        // reformatted twin fails loudly).
+        for (from, to) in [
+            ("    *slot_cell = addr;", "    *pp = addr;"),
+            ("    *slot_cell = addr;", "    *slot_cell=addr;"),
+        ] {
+            let mutated = c.replacen(from, to, 1);
+            assert_ne!(mutated, c, "mutation 9 ({to}) must apply");
+            assert!(
+                audit_identity_c_source(&mutated, path).is_err(),
+                "mutation 9 (deref store `{to}`) must fail the audit"
+            );
+        }
+        // Legitimate address-of uses stay untainted: `&addr` as a lookup
+        // key never taints the result — while binary `&` does.
+        audit_c_chunk(
+            "    x = f(&addr);\n    emit(ctx, 1, 2, x, 0, 0, 0);\n",
+            "chunk",
+        )
+        .expect("address-of must not taint");
+        assert!(
+            audit_c_chunk(
+                "    x = y & addr;\n    emit(ctx, 1, 2, x, 0, 0, 0);\n",
+                "chunk"
+            )
+            .is_err(),
+            "binary `&` must taint"
         );
     }
 

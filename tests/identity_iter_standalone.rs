@@ -882,6 +882,62 @@ fn compiler_probe_ignores_ambient_path_test_shadows() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The executability probe falls through to the next absolute probe
+/// when the first existing probe fails to spawn (fix round 5): with
+/// probes `[broken-but-existing, real-test]`, a usable file must
+/// still probe executable and a refused file still refused. Where no
+/// probe answers (no probes, or every spawn fails) the predicate
+/// fails closed.
+#[test]
+fn compiler_probe_falls_through_to_next_probe_on_spawn_failure() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!("p11scope-test-probefall-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("probefall dir");
+    let broken = root.join("broken-test");
+    let usable = root.join("usable");
+    let refused = root.join("refused");
+    std::fs::write(&broken, "not an executable\n").expect("broken probe");
+    std::fs::write(&usable, "#!/bin/sh\nexit 0\n").expect("usable file");
+    std::fs::write(&refused, "not executable\n").expect("refused file");
+    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o644)).expect("mode");
+    std::fs::set_permissions(&usable, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o644)).expect("mode");
+    let candidates = ["/usr/bin/test", "/bin/test"];
+    let real = candidates
+        .iter()
+        .map(std::path::Path::new)
+        .find(|probe| probe.is_file())
+        .expect("an absolute test probe must exist");
+    // The broken probe exists as a file but cannot spawn (no exec
+    // bits: EACCES even for root).
+    assert!(broken.is_file(), "the broken probe must exist");
+    assert!(
+        std::process::Command::new(&broken)
+            .arg("-x")
+            .arg(&usable)
+            .status()
+            .is_err(),
+        "spawning the broken probe must fail"
+    );
+    assert!(
+        clang_resolve::is_executable_file_with_probes(&usable, &[broken.as_path(), real]),
+        "a usable file must probe executable when the first probe fails to spawn"
+    );
+    assert!(
+        !clang_resolve::is_executable_file_with_probes(&refused, &[broken.as_path(), real]),
+        "a refused file must probe refused through the fallthrough"
+    );
+    assert!(
+        !clang_resolve::is_executable_file_with_probes(&usable, &[broken.as_path()]),
+        "all probes failing to spawn must fail closed"
+    );
+    assert!(
+        !clang_resolve::is_executable_file_with_probes(&usable, &[]),
+        "no probes at all must fail closed"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Extract the kernel errno from a loader failure's syscall-carrying variants.
 /// Object-side variants (parse, relocation) yield `None`: they never touched
 /// the kernel, so they must fail the gate rather than pass as unprivileged.

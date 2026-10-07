@@ -37,6 +37,16 @@ const TEST_PROBES: [&str; 2] = ["/usr/bin/test", "/bin/test"];
 /// predicate fails closed (`false`), and resolution aborts loudly
 /// instead of guessing.
 pub fn is_executable_file(path: &Path) -> bool {
+    let probes: Vec<&Path> = TEST_PROBES.iter().map(Path::new).collect();
+    is_executable_file_with_probes(path, &probes)
+}
+
+/// [`is_executable_file`] with explicit probe binaries, in order: the
+/// first existing probe answers (a spawn failure falls through to the
+/// next probe; where no probe answers the predicate fails closed).
+/// The absolute-probe list is a parameter so tests can stage a broken
+/// first probe without touching the system binaries.
+pub fn is_executable_file_with_probes(path: &Path, probes: &[&Path]) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     if !path.is_file() {
         return false;
@@ -44,18 +54,21 @@ pub fn is_executable_file(path: &Path) -> bool {
     if path.as_os_str().as_bytes().contains(&0) {
         return false;
     }
-    let probe = TEST_PROBES
-        .iter()
-        .map(Path::new)
-        .find(|candidate| candidate.is_file());
-    let Some(probe) = probe else {
-        return false;
-    };
-    std::process::Command::new(probe)
-        .arg("-x")
-        .arg(path)
-        .status()
-        .is_ok_and(|status| status.success())
+    for probe in probes.iter().filter(|candidate| candidate.is_file()) {
+        match std::process::Command::new(probe)
+            .arg("-x")
+            .arg(path)
+            .status()
+        {
+            // The probe answered: its exit status is the verdict.
+            Ok(status) => return status.success(),
+            // Spawn failed (missing loader, EACCES on the probe
+            // itself, ...): try the next probe instead of failing
+            // a file a working probe would accept.
+            Err(_) => continue,
+        }
+    }
+    false
 }
 
 /// Resolve `file` against `path_env` like process spawning: the first

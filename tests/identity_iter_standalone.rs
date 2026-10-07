@@ -218,18 +218,18 @@ fn default_objects_byte_identical_to_base() {
 
 /// Digest pin for the identity object itself (F-build): any source or
 /// toolchain drift changes these bytes, and the pin fails loudly. Pinned
-/// at the mid-pass-guard commit in this toolchain (round 1:
-/// `000caca5…`; the guard adds the fifth map); the build-info test below
-/// binds the pin to the compiler digest and CPU baseline it was recorded
-/// with.
+/// at the arena-containment commit in this toolchain (round 1:
+/// `000caca5…`; round 2 adds the fifth map plus the end-containment
+/// check); the build-info test below binds the pin to the compiler
+/// digest and CPU baseline it was recorded with.
 #[test]
 fn identity_object_digest_pinned() {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(OBJECT);
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
-        hex, "289c8cae22ece224d006014a0ea0744a1b3e54a40abdf58631e87223c7441e59",
-        "p11scope-ebpf-identity must stay byte-identical to the mid-pass-guard pin"
+        hex, "f48ecf91965f7432444b39da088f0ec281c5f7db0d17ffeee951bc50ab9b30d4",
+        "p11scope-ebpf-identity must stay byte-identical to the arena-containment pin"
     );
 }
 

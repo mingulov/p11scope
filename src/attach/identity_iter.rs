@@ -143,13 +143,22 @@ pub enum ArenaConfigError {
     /// A nonzero slot count with an empty arena installs nothing by
     /// construction — certainly a bug, rejected loudly.
     EmptyArena,
+    /// The arena length is not page-aligned, so it cannot map whole pages.
+    LenMisaligned,
+    /// The arena is shorter than `slots * ANCHOR_STRIDE`: at least one
+    /// slot's page would lie outside the reservation.
+    ArenaTooShort,
 }
 
 /// Validate an anchor-arena config BEFORE writing it to `config[0]` and
 /// iterating. An oversized arena lets the kernel's slot quotient exceed
-/// the u32 record field (the truncation this gate exists to prevent);
-/// every other rejection is a nonsense config that would silently
-/// install nothing or mis-filter. W3-2 calls this on every pass setup.
+/// the u32 record field (the truncation this gate exists to prevent); an
+/// undersized or misaligned one admits VMAs the reservation cannot
+/// contain; every other rejection is a nonsense config that would
+/// silently install nothing or mis-filter. W3-2 calls this on every pass
+/// setup. The reservation model: `slots` stride-spaced pages starting at
+/// a page-aligned `arena_base`, so the length must be page-aligned and
+/// cover at least `slots * ANCHOR_STRIDE` bytes.
 pub fn validate_arena_config(config: &IdentityConfig) -> Result<(), ArenaConfigError> {
     if config.slots > ANCHOR_SLOTS {
         return Err(ArenaConfigError::TooManySlots);
@@ -165,6 +174,12 @@ pub fn validate_arena_config(config: &IdentityConfig) -> Result<(), ArenaConfigE
     }
     if config.slots > 0 && config.arena_len == 0 {
         return Err(ArenaConfigError::EmptyArena);
+    }
+    if config.arena_len & (PAGE_GRANULE - 1) != 0 {
+        return Err(ArenaConfigError::LenMisaligned);
+    }
+    if config.arena_len < u64::from(config.slots) * ANCHOR_STRIDE {
+        return Err(ArenaConfigError::ArenaTooShort);
     }
     Ok(())
 }
@@ -3109,6 +3124,61 @@ mod tests {
         assert_eq!(
             validate_arena_config(&empty),
             Err(ArenaConfigError::EmptyArena)
+        );
+        // The round-2 finding's shape: a 1-byte arena cannot contain any
+        // page VMA, yet the start-address filter alone would admit one.
+        let sliver = IdentityConfig {
+            arena_base: 0x1000,
+            arena_len: 1,
+            slots: 1,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&sliver),
+            Err(ArenaConfigError::LenMisaligned)
+        );
+        // A single page cannot hold a stride-spaced slot either.
+        let short = IdentityConfig {
+            arena_len: PAGE_GRANULE,
+            slots: 1,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&short),
+            Err(ArenaConfigError::ArenaTooShort)
+        );
+        // Three strides cannot hold four slots.
+        let narrow = IdentityConfig {
+            arena_len: 3 * ANCHOR_STRIDE,
+            slots: 4,
+            ..good
+        };
+        assert_eq!(
+            validate_arena_config(&narrow),
+            Err(ArenaConfigError::ArenaTooShort)
+        );
+        // A larger-than-needed reservation stays coherent: extra strides
+        // simply never install (their quotients miss the slot range).
+        let roomy = IdentityConfig {
+            arena_len: 5 * ANCHOR_STRIDE,
+            slots: 4,
+            ..good
+        };
+        assert_eq!(validate_arena_config(&roomy), Ok(()));
+    }
+
+    /// The anchor program enforces full VMA containment in the arena, not
+    /// just the start address: a VMA starting inside the reservation but
+    /// extending past its end is a shape failure, never an install.
+    /// Structural pin (live containment coverage needs attach, W3-2).
+    #[test]
+    fn anchor_program_enforces_vma_containment() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let c = std::fs::read_to_string(root.join("crates/ebpf/native/vma_identity.c"))
+            .expect("read C source");
+        assert!(
+            c.contains("end > base + len"),
+            "anchor C must check VMA end containment against the arena"
         );
     }
 

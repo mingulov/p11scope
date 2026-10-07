@@ -162,8 +162,8 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
         return 0;
     /* `vm_start` identifies the slot exactly: even pages hold anchors, odd
      * pages are anonymous guard. A misaligned or oversized file VMA inside
-     * the reservation, or one past the installed slots, is `BAD_SHAPE`, never
-     * a silent slot alias. */
+     * the reservation, one past the installed slots, or one extending past
+     * the reservation end is `BAD_SHAPE`, never a silent slot alias. */
     off = start - base;
     /* Compared in 64 bits before narrowing: a corrupt oversized arena must
      * report `BAD_SHAPE`, never alias a truncated slot. The diagnostic
@@ -173,7 +173,7 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
     {
         u64 q = off / P11_IDENT_ANCHOR_STRIDE;
         if (end - start != P11_IDENT_PAGE || off % P11_IDENT_ANCHOR_STRIDE != 0 ||
-            q >= slots) {
+            q >= slots || end > base + len) {
             u32 diag = q > 0xFFFFFFFFUL ? 0xFFFFFFFFU : (u32)q;
             emit(ctx, P11_IDENT_KIND_ANCHOR, diag, 0, 0, P11_IDENT_ANCHOR_BAD_SHAPE,
                  (u32)gen);

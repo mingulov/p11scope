@@ -2747,8 +2747,9 @@ mod tests {
     /// — while `~0ULL & addr` computes with the address and stays
     /// tainted. A `&` is address-of only in unary position (expression
     /// start, or after `(`, `,`, `=`, or another operator — never after
-    /// an operand: identifier, number, `)`, `]`, or a second `&`), with
-    /// an identifier after it (whitespace allowed).
+    /// an operand: identifier, number, `)`, `]`, a second `&`, or a
+    /// postfix `++`/`--`), with an identifier after it (whitespace
+    /// allowed).
     fn strip_address_of(expr: &str) -> String {
         let chars: Vec<char> = expr.chars().collect();
         let mut out = String::with_capacity(expr.len());
@@ -2764,9 +2765,19 @@ mod tests {
                 } else {
                     None
                 };
-                let unary = prev.is_none_or(|c| {
-                    !(c.is_alphanumeric() || c == '_' || c == ')' || c == ']' || c == '&')
+                // A trailing `++`/`--` is a postfix operand (`mask-- &
+                // addr` computes with the address), never a unary slot.
+                let postfix = prev.is_some_and(|c| {
+                    (c == '+' || c == '-')
+                        && back
+                            .checked_sub(2)
+                            .and_then(|at| chars.get(at))
+                            .is_some_and(|before| *before == c)
                 });
+                let unary = !postfix
+                    && prev.is_none_or(|c| {
+                        !(c.is_alphanumeric() || c == '_' || c == ')' || c == ']' || c == '&')
+                    });
                 let mut fwd = index + 1;
                 while fwd < chars.len() && chars[fwd].is_whitespace() {
                     fwd += 1;
@@ -2800,7 +2811,9 @@ mod tests {
     /// them to spaces (newlines kept) so byte offsets and line numbers
     /// survive. What remains is code shape. A single lexer pass keeps
     /// comment markers inside strings (and vice versa) from confusing
-    /// each other. C block comments do not nest.
+    /// each other. C block comments do not nest. A char literal keeps a
+    /// `0` placeholder operand (same length): without it `-'x' & addr`
+    /// would blank into a false unary-`&` shape and lose its taint.
     fn strip_c_noise(text: &str) -> String {
         let bytes = text.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
@@ -2834,7 +2847,9 @@ mod tests {
             }
             if byte == b'"' || byte == b'\'' {
                 let quote = byte;
-                out.push(b' ');
+                // A char literal is an operand: keep a `0` placeholder
+                // so neighbors still read operand-shaped after blanking.
+                out.push(if quote == b'\'' { b'0' } else { b' ' });
                 index += 1;
                 while index < bytes.len() && bytes[index] != quote {
                     if bytes[index] == b'\\' {
@@ -3276,22 +3291,35 @@ mod tests {
             audit_identity_c_source(&mutated, path).is_err(),
             "mutation 6 (same-line start = addr; emit) must fail the audit"
         );
-        // Producer mutation 7: split-line assignment — `start =` /
-        // `addr;` must taint across the line break, not clear on an
-        // empty-looking rhs.
-        let mutated = c.replacen(
-            "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
-            "    start\n    = addr;\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
-            1,
-        );
-        assert_ne!(mutated, c, "mutation 7 must apply");
-        assert!(
-            audit_identity_c_source(&mutated, path).is_err(),
-            "mutation 7 (split-line assignment) must fail the audit"
-        );
+        // Producer mutation 7: split-line assignment — both the
+        // before-`=` split (`start` / `= addr;`) and the brief-exact
+        // after-`=` split (`start =` / `addr;`) must taint across the
+        // line break, not clear on an empty-looking rhs.
+        for stmt in ["    start\n    = addr;", "    start =\n    addr;"] {
+            let mutated = c.replacen(
+                "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
+                &format!(
+                    "{stmt}\n    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,"
+                ),
+                1,
+            );
+            assert_ne!(mutated, c, "mutation 7 ({stmt:?}) must apply");
+            assert!(
+                audit_identity_c_source(&mutated, path).is_err(),
+                "mutation 7 (split-line assignment {stmt:?}) must fail the audit"
+            );
+        }
         // Producer mutation 8: binary `&` is not address-of —
-        // `start = ~0ULL & addr` must taint, spaced or spaceless.
-        for rhs in ["~0ULL & addr", "~0ULL&addr"] {
+        // `start = ~0ULL & addr` must taint, spaced or spaceless, and so
+        // must `&` after a postfix operand (`mask-- & addr`, `p++ &
+        // addr`) or a char-literal operand (`-'x' & addr`).
+        for rhs in [
+            "~0ULL & addr",
+            "~0ULL&addr",
+            "mask-- & addr",
+            "p++ & addr",
+            "-'x' & addr",
+        ] {
             let mutated = c.replacen(
                 "    emit(ctx, P11_IDENT_KIND_VMA, tgid_u, start, end, verdict,",
                 &format!(

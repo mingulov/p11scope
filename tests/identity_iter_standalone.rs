@@ -14,6 +14,9 @@
 #[path = "../src/attach/identity_iter.rs"]
 mod identity_iter;
 
+#[path = "../build_support/clang_resolve.rs"]
+mod clang_resolve;
+
 use identity_iter as ii;
 
 /// The clang-built identity object out of this package's `OUT_DIR`. This is
@@ -235,10 +238,13 @@ fn identity_object_digest_pinned() {
 
 /// Qualification binding (F-build): the build records the resolved
 /// compiler digest, the explicit CPU baseline, and the object digest in
-/// `p11scope-identity-build-info.txt`; this test pins that record's shape
-/// and its agreement with the object under test. Ordinary builds still
-/// trust their tool environment (PATH `clang-18`, system headers) — the
-/// record makes qualification reproducible, not the build hermetic.
+/// `p11scope-identity-build-info.txt`; this test pins that record's shape,
+/// the compiler's IDENTITY (not just digest format: the recorded file
+/// must exist, be executable, and re-hash to the recorded digest), the
+/// complete argument record, and its agreement with the object under
+/// test. Ordinary builds still trust their tool environment (PATH
+/// `clang-18`, system headers) — the record makes qualification
+/// reproducible, not the build hermetic.
 #[test]
 fn identity_build_info_binds_compiler_and_baseline() {
     let info = std::fs::read_to_string(concat!(
@@ -263,7 +269,54 @@ fn identity_build_info_binds_compiler_and_baseline() {
         "target must be a BPF endian flavor"
     );
     assert_eq!(field("mcpu"), "v1", "CPU baseline must be explicit v1");
+    // The recorded compiler must be the executed one: an absolute path to
+    // an executable file whose bytes re-hash to the recorded digest, with
+    // the recorded realpath agreeing. A non-executable PATH decoy (or any
+    // file that did not compile the object) fails here.
+    use std::os::unix::fs::PermissionsExt as _;
+    let compiler_path = std::path::PathBuf::from(field("compiler_path"));
+    assert!(
+        compiler_path.is_absolute(),
+        "compiler path must be absolute, got {compiler_path:?}"
+    );
+    assert!(
+        compiler_path.is_file(),
+        "compiler path must exist, got {compiler_path:?}"
+    );
+    assert!(
+        compiler_path
+            .metadata()
+            .expect("compiler metadata")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0,
+        "compiler path must be executable, got {compiler_path:?}"
+    );
+    let realpath = compiler_path
+        .canonicalize()
+        .expect("compiler path must canonicalize");
+    assert_eq!(
+        realpath,
+        std::path::PathBuf::from(field("compiler_realpath")),
+        "recorded realpath must match the resolved compiler"
+    );
     use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(std::fs::read(&realpath).expect("read compiler"));
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex, compiler,
+        "recorded compiler digest must match the resolved compiler's bytes"
+    );
+    // The complete argument record, pinned: any flag change fails loudly.
+    let target = field("target");
+    assert_eq!(
+        field("cflags"),
+        format!(
+            "-target {target} -mcpu=v1 -O2 -g -gno-record-gcc-switches -fdebug-compilation-dir=/p11scope/native -Wall -Wextra -Werror -c"
+        ),
+        "recorded cflags must match the qualification baseline"
+    );
     let digest = sha2::Sha256::digest(OBJECT);
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
@@ -275,6 +328,70 @@ fn identity_build_info_binds_compiler_and_baseline() {
         field("compiler_path").contains("clang-18"),
         "compiler path must name the resolved clang-18"
     );
+}
+
+/// Compiler resolution skips non-executable PATH decoys: an earlier
+/// readable-but-not-executable `clang-18` must not win over the real
+/// executable later on PATH (the round-2 provenance finding). Hermetic:
+/// synthetic PATH roots under `TMPDIR`, no rebuild needed. Relative PATH
+/// entries resolve against the given cwd to an absolute path, so the
+/// caller executes exactly what was resolved.
+#[test]
+fn compiler_resolution_skips_non_executable_decoys() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!("p11scope-clang-resolve-{}", std::process::id()));
+    let decoy = root.join("decoy");
+    let real = root.join("real");
+    std::fs::create_dir_all(&decoy).expect("decoy dir");
+    std::fs::create_dir_all(&real).expect("real dir");
+    std::fs::write(decoy.join("clang-18"), "not a compiler\n").expect("decoy file");
+    std::fs::write(real.join("clang-18"), "#!/bin/sh\nexit 0\n").expect("real file");
+    std::fs::set_permissions(
+        decoy.join("clang-18"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("decoy non-executable");
+    std::fs::set_permissions(
+        real.join("clang-18"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("real executable");
+    // The absolute `PATH` hit itself (the caller canonicalizes
+    // separately for the realpath field).
+    let hit = real.join("clang-18");
+    // The fixture discriminates: the old `is_file` predicate would have
+    // taken the decoy.
+    assert!(decoy.join("clang-18").is_file());
+    assert!(!clang_resolve::is_executable_file(&decoy.join("clang-18")));
+    assert!(clang_resolve::is_executable_file(&real.join("clang-18")));
+    let path = std::env::join_paths([&decoy, &real]).expect("join");
+    let resolved =
+        clang_resolve::resolve_executable_in("clang-18", &path, &root).expect("must resolve");
+    assert!(resolved.is_absolute());
+    assert_eq!(resolved, hit);
+    // No executable anywhere resolves to nothing.
+    let empty = root.join("empty");
+    std::fs::create_dir_all(&empty).expect("empty dir");
+    let path = std::env::join_paths([&decoy, &empty]).expect("join");
+    assert_eq!(
+        clang_resolve::resolve_executable_in("clang-18", &path, &root),
+        None
+    );
+    // Relative PATH entries resolve against the given cwd, absolutely.
+    let resolved =
+        clang_resolve::resolve_executable_in("clang-18", std::ffi::OsStr::new("real"), &root)
+            .expect("relative entry resolves");
+    assert!(resolved.is_absolute());
+    assert_eq!(resolved, hit);
+    // Candidates list every existing file, executable or not.
+    let path = std::env::join_paths([&decoy, &real]).expect("join");
+    let mut candidates = clang_resolve::candidate_files_in("clang-18", &path, &root);
+    candidates.sort();
+    assert_eq!(
+        candidates,
+        vec![decoy.join("clang-18"), real.join("clang-18")]
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Extract the kernel errno from a loader failure's syscall-carrying variants.

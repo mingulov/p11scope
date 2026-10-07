@@ -23,6 +23,8 @@ use std::{env, ffi::OsString, path::PathBuf, process::Command};
 
 #[path = "build_support/bpf_tools.rs"]
 mod bpf_tools;
+#[path = "build_support/clang_resolve.rs"]
+mod clang_resolve;
 
 #[derive(Clone, Copy)]
 enum BpfFlavor {
@@ -96,6 +98,7 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf-common/src");
     println!("cargo:rerun-if-changed=crates/ebpf-common/Cargo.toml");
     println!("cargo:rerun-if-changed=build_support/bpf_tools.rs");
+    println!("cargo:rerun-if-changed=build_support/clang_resolve.rs");
     // Gate G2 induced-gap test (Task 7): forces a tiny RING_BYTES so a high
     // call rate overflows the ring buffer deliberately. Unset (the default)
     // leaves the build byte-for-byte identical to before this flag existed.
@@ -425,17 +428,15 @@ fn build_variant(
     .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));
 }
 
-/// Resolve `clang-18` exactly like process spawning does: the first hit
-/// on `PATH`. The identity build records (not trusts blindly) the digest
-/// of whatever this resolves to.
+/// Resolve `clang-18` exactly like process spawning does: the first
+/// EXECUTABLE hit on `PATH`, as an absolute path. The identity build
+/// executes this path directly and records its digest — the receipt names
+/// the compiler that actually ran, never a non-executable decoy that
+/// execution skipped.
 fn resolve_clang18() -> PathBuf {
-    for dir in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
-        let candidate = dir.join("clang-18");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("clang-18 not found on PATH");
+    let cwd = env::current_dir().expect("build cwd");
+    clang_resolve::resolve_executable_in("clang-18", &env::var_os("PATH").unwrap_or_default(), &cwd)
+        .expect("an executable clang-18 on PATH")
 }
 
 /// Hex sha256 of a file's bytes.
@@ -454,17 +455,29 @@ fn sha256_file_hex(path: &std::path::Path) -> String {
 /// the anchor and scope maps have fixed capacities.
 ///
 /// Tool trust, stated plainly: ordinary builds trust their tool
-/// environment — the `PATH` `clang-18` above plus the system headers.
-/// Qualification does not: this function records the resolved compiler
-/// path, the compiler binary's digest, the explicit CPU baseline, and the
-/// object digest in `p11scope-identity-build-info.txt`, and the harness
-/// pins the object digest plus that record. A changed compiler or CPU
-/// baseline shows up as a changed record (and usually a changed object),
-/// never as a silent identical build.
+/// environment — the `PATH` `clang-18` below plus the system headers.
+/// Qualification does not trust it blindly: this function resolves the
+/// first EXECUTABLE `clang-18` on `PATH` to an absolute path ONCE,
+/// executes that path directly for both the compile and the UAPI check,
+/// and records that same path, its realpath, its binary digest, the
+/// explicit CPU baseline, and the object digest in
+/// `p11scope-identity-build-info.txt`; the harness pins the object digest
+/// plus that record, including the compiler's identity. A changed
+/// compiler or CPU baseline shows up as a changed record (and usually a
+/// changed object), never as a silent identical build. Every `PATH`
+/// candidate file plus `PATH` itself re-triggers the build; the one
+/// unwatched case is a brand-new shadowing file under an unchanged
+/// `PATH` (cargo cannot watch files that do not exist yet) — the object
+/// digest pin backstops that, since a different compiler's bytes fail
+/// loudly.
 fn build_identity_object() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    // Resolve the compiler ONCE, before compiling: this absolute path is
+    // both executed and recorded, so no PATH decoy, relative entry, or
+    // later working directory can split execution from the receipt.
+    let compiler_path = resolve_clang18();
 
     let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
         Ok("big") => "bpfeb",
@@ -491,7 +504,7 @@ fn build_identity_object() {
         "-Werror",
         "-c",
     ];
-    let status = Command::new("clang-18")
+    let status = Command::new(&compiler_path)
         .current_dir(&out_dir)
         .args(cflags)
         .arg(&file_prefix_map)
@@ -507,8 +520,16 @@ fn build_identity_object() {
     // the object digest. A compiler upgrade re-runs this build (via the
     // rerun lines below) and re-records; the digest pin in the harness
     // then either still matches (same bytes) or fails loudly.
-    let compiler_path = resolve_clang18();
     println!("cargo:rerun-if-changed={}", compiler_path.display());
+    for candidate in clang_resolve::candidate_files_in(
+        "clang-18",
+        &env::var_os("PATH").unwrap_or_default(),
+        &env::current_dir().expect("build cwd"),
+    ) {
+        if candidate != compiler_path {
+            println!("cargo:rerun-if-changed={}", candidate.display());
+        }
+    }
     let compiler_realpath = compiler_path
         .canonicalize()
         .unwrap_or_else(|_| compiler_path.clone());
@@ -527,7 +548,7 @@ fn build_identity_object() {
     // must agree with the layouts `identity_iter.rs` mirrors. Syntax-only
     // (the `_Static_assert`s are the product); any mismatch fails the
     // build here instead of mis-issuing syscalls at runtime.
-    let check = Command::new("clang-18")
+    let check = Command::new(&compiler_path)
         .args(["-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
         .arg(manifest_dir.join("crates/ebpf/native/uapi_check.c"))
         .status()

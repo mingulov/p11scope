@@ -21,12 +21,12 @@ use identity_iter as ii;
 /// here keeps the object-contract tests independent of the loader path.
 static OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/p11scope-ebpf-identity"));
 
-/// D2a gate: exactly 2 `iter/task_vma` programs and 4 maps with the expected
-/// types, sizes and flags (`WRONLY` on the two anchor maps, `MMAPABLE` on the
-/// scope bitmap). Kills the D2a mutations: a dropped `WRONLY` flag or a third
-/// program fails here.
+/// D2a gate: exactly 2 `iter/task_vma` programs and 5 maps with the expected
+/// types, sizes and flags (`WRONLY` on the three kernel-only anchor maps,
+/// `MMAPABLE` on the scope bitmap). Kills the D2a mutations: a dropped
+/// `WRONLY` flag or a third program fails here.
 #[test]
-fn identity_object_has_two_iter_programs_and_four_maps() {
+fn identity_object_has_two_iter_programs_and_five_maps() {
     let object = aya_obj::Object::parse(OBJECT).expect("parse identity object");
     assert_eq!(object.programs.len(), 2, "exactly two programs");
     for name in ["p11_anchor_vma", "p11_identity_vma"] {
@@ -45,11 +45,12 @@ fn identity_object_has_two_iter_programs_and_four_maps() {
             program.section
         );
     }
-    assert_eq!(object.maps.len(), 4, "exactly four maps");
+    assert_eq!(object.maps.len(), 5, "exactly five maps");
     // (name, type, key_size, value_size, max_entries, flags)
     for (name, map_type, key_size, value_size, max_entries, flags) in [
         ("anchors", 1u32, 8u32, 16u32, 1024u32, 16u32), // HASH, WRONLY
         ("anchor_slots", 2u32, 4u32, 8u32, 1024u32, 16u32), // ARRAY, WRONLY
+        ("anchor_observed", 2u32, 4u32, 8u32, 1024u32, 16u32), // ARRAY, WRONLY
         ("config", 2u32, 4u32, 32u32, 1u32, 0u32),      // ARRAY
         ("scope_bitmap", 2u32, 4u32, 8u32, 65_536u32, 1024u32), // ARRAY, MMAPABLE
     ] {
@@ -101,7 +102,13 @@ fn identity_object_relocates_without_syscalls() {
         .filter(|instruction| instruction.code == 0x18 && instruction.src_reg() == 1)
         .map(|instruction| instruction.imm)
         .collect();
-    for name in ["anchors", "anchor_slots", "config", "scope_bitmap"] {
+    for name in [
+        "anchors",
+        "anchor_slots",
+        "anchor_observed",
+        "config",
+        "scope_bitmap",
+    ] {
         assert!(
             referenced.contains(&descriptors[name]),
             "map {name} must retain its own descriptor after relocation"
@@ -211,16 +218,18 @@ fn default_objects_byte_identical_to_base() {
 
 /// Digest pin for the identity object itself (F-build): any source or
 /// toolchain drift changes these bytes, and the pin fails loudly. Pinned
-/// at round-1 HEAD in this toolchain; the build-info test below binds the
-/// pin to the compiler digest and CPU baseline it was recorded with.
+/// at the mid-pass-guard commit in this toolchain (round 1:
+/// `000caca5…`; the guard adds the fifth map); the build-info test below
+/// binds the pin to the compiler digest and CPU baseline it was recorded
+/// with.
 #[test]
 fn identity_object_digest_pinned() {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(OBJECT);
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
-        hex, "000caca5338654fd8c1d993057b66fa453047c104be7fe935ab78303e94da3ba",
-        "p11scope-ebpf-identity must stay byte-identical to the round-1 pin"
+        hex, "289c8cae22ece224d006014a0ea0744a1b3e54a40abdf58631e87223c7441e59",
+        "p11scope-ebpf-identity must stay byte-identical to the mid-pass-guard pin"
     );
 }
 

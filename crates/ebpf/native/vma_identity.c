@@ -20,6 +20,23 @@ struct {
     __type(value, u64);
 } anchor_slots SEC(".maps");
 
+/* Per-slot last-observed generation marker: `gen + 1` of the pass that
+ * last observed the slot (any terminal outcome: `OK`, `DUP`, or `FULL`),
+ * or 0 for never observed. The `+ 1` reserves the array zero-init for
+ * "never observed" so generation 0 passes work. Written only by the
+ * anchor program, alongside `anchor_slots`; never by userspace (no
+ * handle is exposed), so bookkeeping tampering cannot clear it. Lets a
+ * replay distinguish a current-pass slot change (contested) from stale
+ * previous-pass bookkeeping (a legitimate reinstall). Generations must
+ * be fresh per pass (reusing one fails closed into `CONFLICT`s). */
+struct {
+    __uint(type, P11_IDENT_MAP_ARRAY);
+    __uint(map_flags, P11_IDENT_F_WRONLY);
+    __uint(max_entries, P11_IDENT_ANCHOR_SLOTS);
+    __type(key, u32);
+    __type(value, u64);
+} anchor_observed SEC(".maps");
+
 struct {
     __uint(type, P11_IDENT_MAP_ARRAY);
     __uint(max_entries, 1);
@@ -108,6 +125,7 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
     u64 off;
     u64 old;
     u64 *slot_cell;
+    u64 *observed_cell;
     u64 base;
     u64 len;
     u64 gen;
@@ -173,13 +191,30 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
         emit(ctx, P11_IDENT_KIND_ANCHOR, slot, 0, 0, P11_IDENT_ANCHOR_BAD_SHAPE, (u32)gen);
         return 0;
     }
-    /* Clear stale: only a previous generation's entry may go; a current-gen
-     * entry under another slot is a live `DUP` alias, never garbage. A
-     * current-gen entry owned by THIS slot for a different inode means the
-     * slot changed installer mid-pass (a wrong-scope second installer, or
-     * the anchor page remapped during the walk): emit `CONFLICT` (never a
-     * second `OK`) and install nothing — the slot is contested. */
+    observed_cell = p11_map_lookup(&anchor_observed, &slot);
+    if (!observed_cell) {
+        emit(ctx, P11_IDENT_KIND_ANCHOR, slot, 0, 0, P11_IDENT_ANCHOR_BAD_SHAPE, (u32)gen);
+        return 0;
+    }
+    /* Mid-pass change detection first: the slot was already observed this
+     * pass (an `OK`, `DUP`, or `FULL` whose side effects the kernel kept
+     * even if its emission overflowed) with a different address — the
+     * anchor page was remapped during the walk, or an overflow-discarded
+     * `DUP` is replaying with a new inode. Emit `CONFLICT` (never a
+     * second `OK`) and install nothing — the slot is contested. A
+     * first observation this pass skips this check even for a live `DUP`
+     * alias address: that is a legitimate between-passes reinstall.
+     * Below, clear stale: only a previous generation's entry may go; a
+     * current-gen entry under another slot is a live `DUP` alias, never
+     * garbage. A current-gen entry still owned by THIS slot for a
+     * different inode on a first observation is inconsistent bookkeeping:
+     * `CONFLICT` as well, fail closed. */
     old = *slot_cell;
+    if (*observed_cell == gen + 1 && old != addr) {
+        emit(ctx, P11_IDENT_KIND_ANCHOR, slot, 0, 0, P11_IDENT_ANCHOR_CONFLICT,
+             (u32)gen);
+        return 0;
+    }
     if (old != 0 && old != addr) {
         struct p11_anchor_entry *stale = p11_map_lookup(&anchors, &old);
         if (stale && stale->gen == gen && stale->slot == slot) {
@@ -210,6 +245,7 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
         }
     }
     *slot_cell = addr;
+    *observed_cell = gen + 1;
     return 0;
 }
 

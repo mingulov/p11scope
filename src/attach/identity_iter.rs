@@ -2998,6 +2998,39 @@ mod tests {
         assert_eq!(config.observer_tgid, 4242);
     }
 
+    /// The anchor program detects a mid-pass slot change — the anchor page
+    /// remapped during the walk, or an overflow-discarded `DUP` followed by
+    /// a replay carrying a new inode. A per-slot observed-generation marker
+    /// distinguishes a current-pass change (contested: `CONFLICT`, installs
+    /// nothing) from stale previous-pass bookkeeping (a legitimate
+    /// between-passes reinstall). Structural pin on the C source: the guard
+    /// must consult the observed map before installation. Live
+    /// overflow-replay coverage needs attach + arena control (W3-2); until
+    /// then the strict verifier gate proves the guarded program loads.
+    #[test]
+    fn anchor_program_guards_mid_pass_slot_changes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let c = std::fs::read_to_string(root.join("crates/ebpf/native/vma_identity.c"))
+            .expect("read C source");
+        for needle in [
+            "anchor_observed",
+            "observed_cell == gen + 1",
+            "old != addr",
+            "*observed_cell = gen + 1",
+        ] {
+            assert!(
+                c.contains(needle),
+                "anchor C must contain the mid-pass guard piece {needle:?}"
+            );
+        }
+        let guard = c.find("observed_cell == gen").expect("guard");
+        let install = c.find("p11_map_update(&anchors").expect("install");
+        assert!(
+            guard < install,
+            "the mid-pass guard must precede installation"
+        );
+    }
+
     /// Arena configs are validated before iteration: oversized slot
     /// counts, over-long arenas (the truncation shape), misaligned bases,
     /// wrapping ranges, and empty arenas with live slots all fail loudly.

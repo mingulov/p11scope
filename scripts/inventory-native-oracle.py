@@ -3781,6 +3781,28 @@ def self_test():
         if row is None or row["status"] != "nonqualifying":
             failures.append("o1-partial-attach-not-nonqualifying")
 
+        # F3-04: a module-scoped partial-attach gap voids only its own
+        # module's exactness — other modules' edges keep COUNT-EXACT
+        # (no run-wide poison). The B deferral below is the production
+        # shape a pre-publish deferral now stages (keyed attribution).
+        def scoped_partial_attach(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            d["gaps"].append({"caller": None, "module": s.mid["B"], "pid": None,
+                              "subject": "native endpoint attach failed",
+                              "reason": "1 endpoint(s) still deferred when the receipt closed; "
+                                        "counted uses are lower bounds",
+                              "budget": None, "repeats": 1})
+            return kw
+        res = case("o1-partial-attach-scoped-keeps-other-exact", None, scoped_partial_attach)
+        row_a = next((r for r in res.rows
+                      if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row_a is None or row_a["status"] != "pass":
+            failures.append("o1-partial-attach-scoped-other-not-exact")
+        row_b = next((r for r in res.rows
+                      if r["run"] == "system" and r["cell"] == "P2" and r["check"] == "COUNT-EXACT"), None)
+        if row_b is None or row_b["status"] != "nonqualifying" or "partial-attach" not in row_b["detail"]:
+            failures.append("o1-partial-attach-scoped-own-not-nonqualifying")
+
         # O1 straddling first row (the reviewer's repro shape): the first
         # row lands inside an aggregated ledger line, so the recorded
         # split is unknowable — explicitly nonqualifying.

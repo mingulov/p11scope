@@ -1456,6 +1456,16 @@ enum Mutation {
     RecordGap {
         gap: RegistryGap,
     },
+    RecordKeyedGap {
+        /// The module key, resolved to an ID at apply time — after the
+        /// publication's mappings commit (F3-04).
+        key: ModuleKey,
+        caller: Option<CallerId>,
+        pid: Option<u32>,
+        subject: String,
+        reason: String,
+        budget: Option<BudgetRefusal>,
+    },
 }
 
 /// The caller/module registry. Mutations stage in batch order and apply
@@ -2220,6 +2230,33 @@ impl CallerRegistry {
         self.staged.push(Mutation::RecordGap { gap });
     }
 
+    /// Stage one gap for the module `key` names, resolving the ID at
+    /// publication (F3-04): `record_gap` resolves eagerly against the
+    /// committed snapshot, which misses a first-discovered module whose
+    /// mapping stages in this same publication (receipts process
+    /// pre-commit — scan → extend → commit) and would report its gap
+    /// run-wide. This resolves at apply, after the publication's
+    /// mappings commit; a module that never commits stays unattributed
+    /// (genuinely unclaimable).
+    pub(crate) fn record_gap_for_key(
+        &mut self,
+        caller: Option<CallerId>,
+        key: ModuleKey,
+        pid: Option<u32>,
+        subject: String,
+        reason: String,
+        budget: Option<BudgetRefusal>,
+    ) {
+        self.staged.push(Mutation::RecordKeyedGap {
+            key,
+            caller,
+            pid,
+            subject,
+            reason,
+            budget,
+        });
+    }
+
     /// Apply every staged mutation in order and publish the snapshot.
     /// Returns the number of applied mutations.
     pub(crate) fn publish(&mut self) -> usize {
@@ -2576,6 +2613,24 @@ impl CallerRegistry {
                 }
             }
             Mutation::RecordGap { gap } => self.push_gap(gap),
+            Mutation::RecordKeyedGap {
+                key,
+                caller,
+                pid,
+                subject,
+                reason,
+                budget,
+            } => {
+                let module = self.modules_by_key.get(&key).copied();
+                self.push_gap(RegistryGap {
+                    caller,
+                    module,
+                    pid,
+                    subject,
+                    reason,
+                    budget,
+                });
+            }
         }
     }
 

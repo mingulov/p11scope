@@ -449,7 +449,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Some(key.sha256.clone()),
                 "",
             );
-            let module = self.registry.module_id_for(&registry_key);
             let mut parts = Vec::new();
             if failed_total > 0 {
                 if total > 0 {
@@ -468,14 +467,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ));
             }
             parts.push("counted uses are lower bounds".to_string());
-            self.registry.record_gap(RegistryGap {
-                caller: None,
-                module,
-                pid: None,
-                subject: PARTIAL_ATTACH_SUBJECT.into(),
-                reason: parts.join("; "),
-                budget: None,
-            });
+            // Keyed (F3-04): the module may be staged-but-uncommitted
+            // (first-discovered this pass — receipts run pre-commit),
+            // so the ID resolves at publication, after its mapping
+            // commits, instead of reporting run-wide.
+            self.registry.record_gap_for_key(
+                None,
+                registry_key,
+                None,
+                PARTIAL_ATTACH_SUBJECT.into(),
+                parts.join("; "),
+                None,
+            );
         }
         if unclaimed.0 > 0 || unclaimed.1 > 0 {
             let mut parts = Vec::new();
@@ -4064,6 +4067,123 @@ mod tests {
             gaps[0].reason.contains("still deferred"),
             "the reason names the deferral: {}",
             gaps[0].reason
+        );
+    }
+
+    #[test]
+    fn pre_publish_deferral_attributes_to_the_staged_module() {
+        // O1 endpoint evidence (round 3, F3-04): a module
+        // first-discovered this pass has no committed ID when its
+        // deferred receipt processes (receipts run pre-commit), but its
+        // mapping stages in the same publication — so the partial-attach
+        // gap attributes to the staged module instead of reporting
+        // run-wide (a module-less gap would void every edge's COUNT-EXACT
+        // in the oracle). No call happens before the deferral, and a
+        // clean attach next pass adds no second gap.
+        use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let b = fx::provider(&dir, "b.so", "provider-b");
+        let pins = fx::pass_pins(&[(&a, "sha-a"), (&b, "sha-b")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed_a = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let mut verdicts = absorbed_a.verdicts;
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed_b = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &b, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        verdicts.extend(absorbed_b.verdicts);
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        // A commits; B's mapping stages but does NOT publish before its
+        // deferred receipt.
+        let catalog_a = capture_catalog(&pins, &[&a], pid, generation.clone());
+        coordinator.begin_capture_coverage(None);
+        coordinator.project_catalog(&catalog_a, &verdicts, 60);
+        coordinator.registry.publish();
+        let catalog_b = capture_catalog(&pins, &[&b], pid, generation);
+        coordinator.project_catalog(&catalog_b, &verdicts, 70);
+        let b_endpoint = absorbed_b.delta.endpoints[0];
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints: vec![b_endpoint],
+                objects: vec![b_endpoint.object],
+            },
+            ..ExtendReceipt::default()
+        });
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the pre-publish deferral stages one gap: {:?}",
+            coordinator.registry.gaps()
+        );
+        let registry = &coordinator.registry;
+        let b_module = registry
+            .edges()
+            .find(|edge| {
+                registry.module(edge.module).is_some_and(|module| {
+                    module.paths.iter().any(|path| path.contains("b.so"))
+                })
+            })
+            .map(|edge| edge.module);
+        assert_eq!(
+            gaps[0].module, b_module,
+            "the gap attributes to the staged module, never run-wide: {:?}",
+            gaps[0]
+        );
+        assert!(
+            gaps[0].reason.contains("still deferred"),
+            "the reason names the deferral: {}",
+            gaps[0].reason
+        );
+        // A clean attach next pass adds no second gap.
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: b_endpoint.id,
+                object: b_endpoint.object,
+                at_ns: 200,
+            }],
+            ..ExtendReceipt::default()
+        });
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+                .count(),
+            1,
+            "the clean retry adds no gap: {:?}",
+            coordinator.registry.gaps()
         );
     }
 

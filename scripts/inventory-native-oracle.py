@@ -1783,24 +1783,37 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
             # is judged unclamped (and fails COUNT-SATURATED). O1: a
             # partial-attach gap clamps the lower bound the same way —
             # missed endpoints void it; the upper bound still holds.
+            # Round 2 (S4): the gap list is bounded, so when any gap
+            # was suppressed a partial-attach gap may have been
+            # concealed — the lower bound clamps and exactness is
+            # explicitly nonqualifying rather than trusted or failed.
             saturated = is_saturated_artifact(edge["entries"])
             partial = has_partial_attach(view, edge)
-            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated or partial, lo, hi),
+            suppressed = view.doc.get("gaps_suppressed") or 0
+            concealed = suppressed > 0
+            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated or partial or concealed, lo, hi),
                    f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
                    + (" (saturated: lower bound clamped at the cap)" if saturated else "")
                    + (" (partial attach: lower bound clamped; counted uses are lower bounds)"
-                      if partial and not saturated else ""))
+                      if partial and not saturated else "")
+                   + (f" ({suppressed} gaps suppressed: a partial-attach gap may be concealed; "
+                       "lower bound clamped)"
+                      if concealed and not saturated and not partial else ""))
             doc_module = view.modules.get(edge["module"], {})
             verdict, expected, detail = exact_window_count(
                 use, cov.get("since_ns") or 0, window, until, admitted,
                 mapping_first, doc_module.get("admission", {}).get("endpoints"), partial)
-            if verdict == "exact" and not saturated:
+            if verdict == "exact" and not saturated and concealed:
+                res.add(run, cell, "COUNT-EXACT", "nonqualifying",
+                        f"{ctag}: insufficient evidence for exactness: {suppressed} gaps suppressed, "
+                        "a partial-attach gap may be concealed")
+            elif verdict == "exact" and not saturated:
                 # Ledger exactness = 0 error over the proven covered
                 # workload segment (pre-since lines missed for certain;
-                # post-since lines recorded; the recording line either
-                # proven pre-attachment or the legacy first-singleton):
-                # the count equals the segment sum — not a range. A
-                # saturated feed stays a lower bound (COUNT-TOTAL).
+                # post-since lines recorded; the recording line the
+                # legacy first-singleton): the count equals the segment
+                # sum — not a range. A saturated feed stays a lower
+                # bound (COUNT-TOTAL).
                 res.ok(run, cell, "COUNT-EXACT", count == expected,
                        f"{ctag}: count {count} != ledger {expected} attach-side calls "
                        f"(feed covers every in-window call since {cov.get('since_ns')})")
@@ -3826,6 +3839,32 @@ def self_test():
                     if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
         if row is None or row["status"] != "nonqualifying":
             failures.append("o1-mapping-first-seen-missing-not-nonqualifying")
+
+        # O1 gap suppression (round 2, S4): production's gap list is
+        # bounded, so a partial-attach gap may have been suppressed —
+        # COUNT-EXACT is explicitly nonqualifying whenever any gap was
+        # suppressed, and the window clamps its lower bound rather than
+        # failing a true undercount.
+        def suppressed_exact(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            d["gaps_suppressed"] = 1
+            kw["events"] = s.events(d)
+            return kw
+        res = case("count-exact-suppressed-gaps-nonqualifying", None, suppressed_exact)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("count-exact-suppressed-gaps-not-nonqualifying")
+
+        def suppressed_undercount(s, d, dash):
+            setup_before_attachment(s, d, 33)
+            d["gaps_suppressed"] = 1
+            return {"events": s.events(d)}
+        res = case("count-window-suppressed-clamps-lower-bound", None, suppressed_undercount)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("count-window-suppressed-not-nonqualifying")
 
         # --- O2: terminal sweep hole (sol 2, astra B4) ----------------------
         # Every record after the last pass marker skips EDGE-CADENCE while

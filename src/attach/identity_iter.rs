@@ -794,8 +794,10 @@ pub fn iter_create(link_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
 // ---------------------------------------------------------------------------
 
 /// Writer for the kernel-only anchor maps. Holds the two `WRONLY` fds;
-/// exposes inserts and deletes only. There is intentionally no `get`,
-/// `lookup`, `iter`, `keys`, or `Debug` implementation: inode addresses
+/// exposes teardown (delete + slot bookkeeping) only. There is
+/// intentionally no `get`, `lookup`, `iter`, `keys`, `insert`, or `Debug`
+/// implementation: only the anchor program installs identity assertions;
+/// userspace can clear them but never manufacture one. Inode addresses
 /// enter the kernel here and never come back.
 pub struct AnchorMaps {
     hash: OwnedFd,
@@ -893,36 +895,22 @@ impl AnchorMaps {
         Ok(())
     }
 
-    /// Insert `(addr -> (slot, generation))` into `anchors`. Used only to clear a
-    /// slot the kernel reported `FULL` for, or to drop a torn-down anchor
-    /// before its slot is reused; the anchor program itself installs entries.
-    pub fn insert(&self, addr: u64, slot: u32, generation: u64) -> io::Result<()> {
-        let entry = AnchorEntry {
-            slot,
-            pad: 0,
-            generation,
-        };
-        Self::update(
-            self.hash.as_fd(),
-            &addr.to_ne_bytes(),
-            // SAFETY: `AnchorEntry` is `#[repr(C)]` plain data.
-            unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::addr_of!(entry).cast::<u8>(),
-                    size_of::<AnchorEntry>(),
-                )
-            },
-        )
-    }
-
     /// Delete `addr` from `anchors`. Absent keys fail with `ENOENT`, which
-    /// the caller treats as already clear.
+    /// the caller treats as already clear. Deletion can only clear an
+    /// assertion, never manufacture one the target program would trust.
+    ///
+    /// Interim teardown primitive: the address must come from the caller's
+    /// own bookkeeping (never from a kernel read — these fds refuse
+    /// reads). W3-2 replaces address-keyed teardown with a kernel-side
+    /// slot/generation command that removes the entry without userspace
+    /// ever handling an inode address.
     pub fn remove(&self, addr: u64) -> io::Result<()> {
         Self::delete(self.hash.as_fd(), &addr.to_ne_bytes())
     }
 
     /// Record `addr` as slot `slot`'s last-installed address. Mirrors the
     /// program's own bookkeeping for slots userspace tears down directly.
+    /// Interim alongside [`AnchorMaps::remove`]: same W3-2 replacement.
     pub fn set_slot(&self, slot: u32, addr: u64) -> io::Result<()> {
         Self::update(self.slots.as_fd(), &slot.to_ne_bytes(), &addr.to_ne_bytes())
     }
@@ -2401,6 +2389,26 @@ mod tests {
         assert_eq!(dec("P11_IDENT_F_MMAPABLE"), 1024);
     }
 
+    /// Userspace must not manufacture the identity assertions the target
+    /// program trusts: `AnchorMaps` offers no arbitrary insertion.
+    #[test]
+    fn anchor_handle_offers_no_identity_manufacture() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rust =
+            std::fs::read_to_string(root.join("src/attach/identity_iter.rs")).expect("read self");
+        let handle = rust
+            .split_once("Write-only anchor handle")
+            .expect("AnchorMaps block")
+            .1
+            .split_once("// aya loader")
+            .expect("handle block end")
+            .0;
+        assert!(
+            !handle.contains("pub fn insert("),
+            "AnchorMaps must not offer arbitrary insertion"
+        );
+    }
+
     /// I6 grep test: the anchor handle exposes no read API and no `Debug`,
     /// and the kernel never receives an inode address in a record struct.
     #[test]
@@ -2428,7 +2436,10 @@ mod tests {
                 "AnchorMaps must not contain {forbidden:?}"
             );
         }
-        assert!(handle.contains("pub fn insert("), "write API present");
+        assert!(
+            !handle.contains("pub fn insert("),
+            "no insertion API: userspace cannot manufacture assertions"
+        );
         assert!(handle.contains("pub fn remove("), "delete API present");
         assert!(handle.contains("pub fn set_slot("), "slot API present");
         for path in [

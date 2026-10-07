@@ -825,11 +825,22 @@ fn run_product(
     events: &Path,
     stop: &dyn Fn() -> bool,
 ) -> Result<(serde_json::Value, String)> {
+    run_product_modules(scope, &[module.to_path_buf()], events, stop)
+}
+
+/// `run_product` over several provider hints (the A-then-B cell attaches
+/// two provider instances).
+fn run_product_modules(
+    scope: InspectScope,
+    modules: &[PathBuf],
+    events: &Path,
+    stop: &dyn Fn() -> bool,
+) -> Result<(serde_json::Value, String)> {
     let mut stdout = Vec::new();
     let reported = std::cell::Cell::new(None::<Instant>);
     let code = run_with_writer(
         scope,
-        &[module.to_path_buf()],
+        modules,
         &HookRegistry::builtin(),
         true,
         None,
@@ -993,6 +1004,502 @@ fn privileged_native_lane_system_late_dlopen_lp64() -> Result<()> {
         "C51_LATE pid={} passes={} witnesses={witnesses}",
         late.pid(),
         document["observation"]["passes"]
+    );
+    Ok(())
+}
+
+/// CLOCK_MONOTONIC in nanoseconds: the capture clock basis the stream's
+/// `at_ns` stamps use (same host, same time namespace).
+fn monotonic_ns() -> u64 {
+    let mut stamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut stamp) },
+        0
+    );
+    stamp.tv_sec as u64 * 1_000_000_000 + stamp.tv_nsec as u64
+}
+
+/// One parsed `LEDGER` line: module path, function, phase, and counts.
+struct LedgerEntry {
+    module: String,
+    func: String,
+    phase: String,
+    n: u64,
+    bad: u64,
+}
+
+fn parse_ledger(text: &str) -> Vec<LedgerEntry> {
+    text.lines()
+        .filter(|line| line.starts_with("LEDGER "))
+        .filter_map(|line| {
+            let (mut module, mut func, mut phase) = (None, None, None);
+            let (mut n, mut bad) = (None, None);
+            for token in line.split_whitespace() {
+                let Some((key, value)) = token.split_once('=') else {
+                    continue;
+                };
+                match key {
+                    "module" => module = Some(value.to_string()),
+                    "fn" => func = Some(value.to_string()),
+                    "phase" => phase = Some(value.to_string()),
+                    "n" => n = value.parse().ok(),
+                    "bad" => bad = value.parse().ok(),
+                    _ => {}
+                }
+            }
+            Some(LedgerEntry {
+                module: module?,
+                func: func?,
+                phase: phase?,
+                n: n?,
+                bad: bad?,
+            })
+        })
+        .collect()
+}
+
+/// One `edge_observed` record for a single edge, in stream order.
+struct EdgeRecord {
+    at_ns: u64,
+    count: u64,
+    state: String,
+}
+
+fn edge_series(
+    lines: &[serde_json::Value],
+    caller_id: &str,
+    module_id: &str,
+) -> (Vec<EdgeRecord>, usize) {
+    let mut series = Vec::new();
+    let mut malformed = 0;
+    for line in lines.iter().filter(|line| {
+        line["kind"] == "edge_observed"
+            && line["event"]["caller"] == caller_id
+            && line["event"]["module"] == module_id
+    }) {
+        match (
+            line["at_ns"].as_u64(),
+            line["event"]["entries"]
+                .get("count")
+                .and_then(serde_json::Value::as_u64),
+            line["event"]["entries"]["coverage"]["state"].as_str(),
+        ) {
+            (Some(at_ns), Some(count), Some(state)) => series.push(EdgeRecord {
+                at_ns,
+                count,
+                state: state.to_string(),
+            }),
+            _ => malformed += 1,
+        }
+    }
+    (series, malformed)
+}
+
+/// The A-then-B parsers over canned lines (no lane needed).
+#[test]
+fn ab_helpers_parse_a_canned_ledger_and_stream() {
+    let ledger = parse_ledger(
+        "IDENT cell=AB pid=7 start=1 gen=0 exe=/bin/ledger\n\
+         MAPPED cell=AB pid=7 start=1 gen=0 exe=/bin/ledger module=/p/a.so ino=1\n\
+         LEDGER cell=AB pid=7 start=1 gen=0 exe=/bin/ledger module=/p/a.so fn=C_Init mech=- n=2 bad=0 phase=setup t0=1 t1=2\n\
+         LEDGER cell=AB pid=7 start=1 gen=0 exe=/bin/ledger module=/p/b.so fn=C_Init mech=- n=1 bad=0 phase=setup t0=3 t1=3\n",
+    );
+    assert_eq!(ledger.len(), 2);
+    assert_eq!(ledger[0].module, "/p/a.so");
+    assert_eq!(ledger[0].n, 2);
+    assert_eq!(ledger[1].func, "C_Init");
+    assert!(ledger.iter().all(|entry| entry.bad == 0));
+    let lines: Vec<serde_json::Value> = [
+        serde_json::json!({"kind": "edge_observed", "at_ns": 10, "event": {
+            "caller": "c0", "module": "m1",
+            "entries": {"count": 0, "coverage": {"state": "quiet"}}}}),
+        serde_json::json!({"kind": "edge_observed", "at_ns": 20, "event": {
+            "caller": "c0", "module": "m1",
+            "entries": {"count": 1, "coverage": {"state": "counted"}}}}),
+        serde_json::json!({"kind": "edge_observed", "at_ns": 30, "event": {
+            "caller": "c0", "module": "m1", "entries": {"coverage": {}}}}),
+    ]
+    .into_iter()
+    .collect();
+    let (series, malformed) = edge_series(&lines, "c0", "m1");
+    assert_eq!(malformed, 1);
+    assert_eq!(series.len(), 2);
+    assert_eq!(series[0].count, 0);
+    assert_eq!(series[0].state, "quiet");
+    assert_eq!(series[1].count, 1);
+}
+
+/// C5.1 cell 4: `--system`, production path. A-then-B: the caller maps and
+/// uses provider A from the start (admitted, cached), then maps provider B
+/// — a second provider instance — strictly after capture starts. B sits
+/// mapped-but-idle through a quarantine, publishes exactly one counted
+/// call (`C_Initialize`), waits several passes idle, then runs the rest.
+/// The stream must show B discovered after its gate with the caller already
+/// admitted (P3's cached-caller sequence), B's first counted record at
+/// exactly that one call, no increment across the idle passes, growth
+/// after release, and ledger-exact final counts for both edges.
+#[test]
+#[ignore = "root-owned live BPF lane; native lane --system counts a late second module's first call exactly"]
+fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
+    let workload = Workload::build()?;
+    // B is a second copy of the provider: a distinct (path, ino) module.
+    let b_path = workload.path("b-provider.so");
+    std::fs::copy(SOFTHSM, &b_path)?;
+    let gate = workload.path("gate");
+    let gate2 = workload.path("gate2");
+    let gate_arg = gate.to_str().context("gate path")?.to_string();
+    let gate2_arg = gate2.to_str().context("gate2 path")?.to_string();
+    let b_arg = b_path.to_str().context("B path")?.to_string();
+    let ab = workload.spawn(
+        "AB",
+        &[
+            "mech",
+            "--cell",
+            "AB",
+            "--module",
+            SOFTHSM,
+            "--module",
+            &b_arg,
+            "--iters",
+            "2",
+            "--late-from",
+            "1",
+            "--gate",
+            &gate_arg,
+            "--delay-ms",
+            "5000",
+            "--single-call",
+            "1",
+            "--gate2",
+            &gate2_arg,
+            "--hold",
+        ],
+    )?;
+    let ab_out = workload.path("AB.out");
+    let ab_text = || std::fs::read_to_string(&ab_out).unwrap_or_default();
+    ensure!(
+        !ab_text()
+            .lines()
+            .any(|line| line.starts_with("MAPPED ") && line.contains("b-provider.so")),
+        "B mapped before its gate"
+    );
+    let started = Instant::now();
+    let gate1_ns = Cell::new(0u64);
+    let gate2_ns = Cell::new(0u64);
+    let init_seen_at = RefCell::new(None::<Instant>);
+    let done_at = RefCell::new(None::<Instant>);
+    let events = workload.path("system.jsonl");
+    let stop = || {
+        if gate1_ns.get() == 0 && started.elapsed() > Duration::from_secs(3) {
+            let _ = std::fs::write(&gate, b"");
+            gate1_ns.set(monotonic_ns());
+        }
+        if gate1_ns.get() != 0
+            && init_seen_at.borrow().is_none()
+            && ab_text().lines().any(|line| {
+                line.starts_with("LEDGER ")
+                    && line.contains("b-provider.so")
+                    && line.contains("fn=C_Initialize")
+            })
+        {
+            *init_seen_at.borrow_mut() = Some(Instant::now());
+        }
+        // B's single call is done; hold it idle across several passes so
+        // the first count must sit still before any later increment.
+        if gate2_ns.get() == 0
+            && init_seen_at
+                .borrow()
+                .is_some_and(|at| at.elapsed() > Duration::from_secs(6))
+        {
+            let _ = std::fs::write(&gate2, b"");
+            gate2_ns.set(monotonic_ns());
+        }
+        if done_at.borrow().is_none() && ab.has("DONE ") {
+            *done_at.borrow_mut() = Some(Instant::now());
+        }
+        done_at
+            .borrow()
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
+            || started.elapsed() > Duration::from_secs(120)
+    };
+    let modules = vec![PathBuf::from(SOFTHSM), b_path.clone()];
+    let (document, stream) = run_product_modules(InspectScope::System, &modules, &events, &stop)?;
+    ensure!(gate1_ns.get() != 0, "gate1 never opened");
+    ensure!(gate2_ns.get() != 0, "gate2 never opened");
+    ensure!(done_at.borrow().is_some(), "the AB ledger never finished");
+    ensure!(
+        document["observation"]["lane"] == "native",
+        "{}",
+        document["observation"]
+    );
+    ensure!(document["observation"]["settlement"] == "unsettled");
+    // R-C51-4 bounds the pre-report detach wait to 10 s; a system scope's
+    // detach (136 endpoints here) can outlast it on a loaded host. Then
+    // the report must say so: retirement unsettled with its gap.
+    let retirement = &document["observation"]["retirement"];
+    ensure!(
+        retirement == "closed"
+            || (retirement == "unsettled"
+                && document["gaps"].as_array().is_some_and(|gaps| {
+                    gaps.iter()
+                        .any(|gap| gap["subject"] == "native capture retirement unsettled")
+                })),
+        "{}",
+        document["observation"]
+    );
+
+    // The workload's ground truth: every call rv==0, B's Initialize alone.
+    let ledger = parse_ledger(&ab_text());
+    ensure!(
+        ledger.iter().all(|entry| entry.bad == 0),
+        "workload calls failed"
+    );
+    let sum = |module: &str, want: &dyn Fn(&LedgerEntry) -> bool| -> u64 {
+        ledger
+            .iter()
+            .filter(|entry| entry.module.ends_with(module) && want(entry))
+            .map(|entry| entry.n)
+            .sum()
+    };
+    let always = |_: &LedgerEntry| true;
+    let a_total = sum("libsofthsm2.so", &always);
+    let a_setup = sum("libsofthsm2.so", &|entry| entry.phase == "setup");
+    let b_total = sum("b-provider.so", &always);
+    let b_gfl = sum("b-provider.so", &|entry| entry.func == "C_GetFunctionList");
+    let b_init = sum("b-provider.so", &|entry| {
+        entry.func == "C_Initialize" && entry.phase == "setup"
+    });
+    ensure!(a_total > a_setup, "A ledger has no main-phase calls");
+    ensure!(b_init == 1, "B ledger Initialize count: {b_init}");
+    ensure!(b_total > b_gfl + b_init, "B ledger has no post-gate2 calls");
+    ensure!(
+        ab_text()
+            .lines()
+            .filter(|line| line.starts_with("MAPPED "))
+            .count()
+            == 2,
+        "expected A and B mappings"
+    );
+
+    // Two distinct module instances, one caller, two edges. Same-file
+    // instances are distinct (another host process may map the provider
+    // too), so our modules resolve through our caller's edges — never by
+    // a bare path match — with the instance inode cross-checked.
+    let callers = document["callers"].as_array().context("callers")?;
+    let caller_id = callers
+        .iter()
+        .find(|caller| caller["pid"] == ab.pid())
+        .and_then(|caller| caller["id"].as_str())
+        .context("AB caller missing")?;
+    let doc_modules = document["modules"].as_array().context("modules")?;
+    let edges = doc_edges(&document, ab.pid());
+    ensure!(edges.len() == 2, "AB edges: {edges:?}");
+    let (mut edge_a, mut edge_b) = (None, None);
+    for edge in &edges {
+        let module = doc_modules
+            .iter()
+            .find(|module| module["id"] == edge["module"])
+            .context(format!("edge module missing: {edge}"))?;
+        let paths = module["paths"].as_array().context("module paths")?;
+        let is = |suffix: &str| {
+            paths
+                .iter()
+                .any(|path| path.as_str().is_some_and(|p| p.ends_with(suffix)))
+        };
+        if is("b-provider.so") {
+            edge_b = Some((*edge, module));
+        } else if is("libsofthsm2.so") {
+            edge_a = Some((*edge, module));
+        }
+    }
+    let (edge_a, module_a) = edge_a.context(format!("A edge missing in {edges:?}"))?;
+    let (edge_b, module_b) = edge_b.context(format!("B edge missing in {edges:?}"))?;
+    ensure!(module_a["id"] != module_b["id"], "A and B share one module");
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        module_a["identity"]["inode"] == std::fs::metadata(SOFTHSM)?.ino(),
+        "A module inode: {}",
+        module_a["identity"]
+    );
+    ensure!(
+        module_b["identity"]["inode"] == std::fs::metadata(&b_path)?.ino(),
+        "B module inode: {}",
+        module_b["identity"]
+    );
+    let mod_a = edge_a["module"].as_str().context("A edge module id")?;
+    let mod_b = edge_b["module"].as_str().context("B edge module id")?;
+
+    let lines: Vec<serde_json::Value> = stream
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let admitted_ns = lines
+        .iter()
+        .find(|line| {
+            line["kind"] == "caller_event"
+                && line["event"]["event"] == "admitted"
+                && line["event"]["caller"] == caller_id
+        })
+        .and_then(|line| line["at_ns"].as_u64())
+        .context("AB caller never admitted")?;
+    let (series_a, malformed_a) = edge_series(&lines, caller_id, mod_a);
+    let (series_b, malformed_b) = edge_series(&lines, caller_id, mod_b);
+    ensure!(
+        malformed_a == 0 && malformed_b == 0,
+        "malformed edge records"
+    );
+    ensure!(!series_b.is_empty(), "B never observed");
+
+    // Host exec churn can still overflow the DISCOVERY ring in a window
+    // the lane does not service: then the edge is honestly counted, or
+    // unknown with reason `loss` — never a watch (the C5.2 demotion).
+    let witnesses = &document["observation"]["native_witnesses"];
+    let lifecycle_lost = witnesses["unbound_reasons"].get("lifecycle_loss").is_some()
+        || document["gaps"].as_array().is_some_and(|gaps| {
+            gaps.iter()
+                .any(|gap| gap["subject"] == "native capture lifecycle evidence lost")
+        });
+    if lifecycle_lost {
+        // R-C51-3: counted, or unknown with reason `loss` — never a
+        // watch, never another unknown reason (review F6).
+        for edge in [edge_a, edge_b] {
+            let state = &edge["entries"]["coverage"]["state"];
+            let reason = &edge["entries"]["coverage"]["reason"];
+            ensure!(
+                *state == "counted" || (*state == "unknown" && *reason == "loss"),
+                "under lost lifecycle evidence the edge must read counted or unknown/loss: \
+                 {edge}; witnesses {witnesses}"
+            );
+        }
+        eprintln!("C51_AB_LIFECYCLE_LOSS witnesses={witnesses}");
+        return Ok(());
+    }
+
+    // P3's sequence: the caller was admitted before B was ever observed,
+    // and B was observed strictly after its gate opened.
+    ensure!(
+        admitted_ns < series_b[0].at_ns,
+        "caller admitted at {admitted_ns}, B first observed at {}",
+        series_b[0].at_ns
+    );
+    ensure!(
+        series_b[0].at_ns > gate1_ns.get(),
+        "B first observed at {}, gate1 opened at {}",
+        series_b[0].at_ns,
+        gate1_ns.get()
+    );
+    // B mapped-but-idle through the quarantine, then exactly one call:
+    // every record before the first counted one carries no calls (the
+    // lane's idle vocabulary — unknown, watched_no_use, quiet — is its
+    // own business), and nothing is ever dropped in this run.
+    let render = |series: &[EdgeRecord]| {
+        series
+            .iter()
+            .map(|record| {
+                format!(
+                    "+{}ms:{}:{}",
+                    record.at_ns.saturating_sub(gate1_ns.get()) / 1_000_000,
+                    record.state,
+                    record.count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let first_counted = series_b
+        .iter()
+        .find(|record| record.state == "counted")
+        .context(format!("B never counted in {}", render(&series_b)))?;
+    ensure!(
+        series_b
+            .iter()
+            .take_while(|record| record.state != "counted")
+            .all(|record| record.count == 0 && record.state != "dropped"),
+        "B claimed calls before its first use in {}",
+        render(&series_b)
+    );
+    ensure!(
+        series_a
+            .iter()
+            .chain(series_b.iter())
+            .all(|record| record.state != "dropped"),
+        "a count was dropped"
+    );
+    ensure!(
+        first_counted.count == b_init,
+        "B first count {} != ledger Initialize {b_init}",
+        first_counted.count
+    );
+    // No increment across the idle passes: nothing above the first count
+    // before gate2 opened, then growth after the release.
+    ensure!(
+        series_b
+            .iter()
+            .filter(|record| record.at_ns < gate2_ns.get())
+            .all(|record| record.count <= first_counted.count),
+        "B incremented before gate2"
+    );
+    ensure!(
+        series_b
+            .iter()
+            .any(|record| record.at_ns > gate2_ns.get() && record.count > first_counted.count),
+        "B never grew after gate2"
+    );
+    ensure!(
+        series_b
+            .windows(2)
+            .all(|pair| pair[0].count <= pair[1].count),
+        "B counts went backwards"
+    );
+    // A's main phase runs after the release too.
+    let a_first_counted = series_a
+        .iter()
+        .find(|record| record.state == "counted")
+        .context("A never counted")?;
+    ensure!(
+        a_first_counted.at_ns > gate2_ns.get(),
+        "A counted before gate2"
+    );
+    // Ledger-exact finals: B missed nothing (its only pre-attach call is
+    // the uncounted dlsym acquisition); A missed exactly its pre-capture
+    // setup.
+    ensure!(
+        edge_b["entries"]["coverage"]["state"] == "counted",
+        "B final edge: {edge_b}"
+    );
+    ensure!(
+        edge_b["entries"]["count"] == b_total - b_gfl,
+        "B final count {} != ledger {}",
+        edge_b["entries"]["count"],
+        b_total - b_gfl
+    );
+    ensure!(
+        edge_a["entries"]["coverage"]["state"] == "counted",
+        "A final edge: {edge_a}"
+    );
+    ensure!(
+        edge_a["entries"]["count"] == a_total - a_setup,
+        "A final count {} != ledger {}",
+        edge_a["entries"]["count"],
+        a_total - a_setup
+    );
+    ensure!(
+        witnesses["unbound_reasons"]
+            .get("exec_coverage_gap")
+            .is_none(),
+        "{witnesses}"
+    );
+    ensure!(stream_ended(&stream), "the stream did not end");
+    eprintln!(
+        "C51_AB pid={} passes={} a_final={} b_first={} b_final={} witnesses={witnesses}",
+        ab.pid(),
+        document["observation"]["passes"],
+        edge_a["entries"]["count"],
+        first_counted.count,
+        edge_b["entries"]["count"],
     );
     Ok(())
 }

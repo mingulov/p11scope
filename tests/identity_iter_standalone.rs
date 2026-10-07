@@ -320,6 +320,57 @@ fn identity_build_info_binds_compiler_and_baseline() {
         ),
         "recorded cflags must match the qualification baseline"
     );
+    // The full argv record, pinned element by element: any dropped or
+    // changed argument (prefix-map, source/object paths, cwd, UAPI
+    // argv) fails loudly.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let argv_of = |prefix: &str| -> Vec<String> {
+        let argc: usize = field(&format!("{prefix}_argc"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{prefix}_argc must be a number"));
+        (0..argc)
+            .map(|i| field(&format!("{prefix}_arg{i}")))
+            .collect()
+    };
+    assert_eq!(
+        argv_of("compile"),
+        vec![
+            field("compiler_path"),
+            "-target".to_string(),
+            target.clone(),
+            "-mcpu=v1".to_string(),
+            "-O2".to_string(),
+            "-g".to_string(),
+            "-gno-record-gcc-switches".to_string(),
+            "-fdebug-compilation-dir=/p11scope/native".to_string(),
+            "-Wall".to_string(),
+            "-Wextra".to_string(),
+            "-Werror".to_string(),
+            "-c".to_string(),
+            format!("-ffile-prefix-map={manifest}=/p11scope"),
+            format!("{manifest}/crates/ebpf/native/vma_identity.c"),
+            "-o".to_string(),
+            "p11scope-ebpf-identity".to_string(),
+        ],
+        "recorded compile argv must match the executed invocation"
+    );
+    assert_eq!(
+        argv_of("uapi"),
+        vec![
+            field("compiler_path"),
+            "-fsyntax-only".to_string(),
+            "-Wall".to_string(),
+            "-Wextra".to_string(),
+            "-Werror".to_string(),
+            format!("{manifest}/crates/ebpf/native/uapi_check.c"),
+        ],
+        "recorded UAPI argv must match the executed check"
+    );
+    assert_eq!(
+        field("compile_cwd"),
+        env!("OUT_DIR"),
+        "the compile must run with cwd at OUT_DIR"
+    );
     let digest = sha2::Sha256::digest(OBJECT);
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
@@ -331,6 +382,140 @@ fn identity_build_info_binds_compiler_and_baseline() {
         field("compiler_path").contains("clang-18"),
         "compiler path must name the resolved clang-18"
     );
+}
+
+/// Compare recorded candidate permission bits against the live files:
+/// `Ok` when every recorded path still exists with identical
+/// `mode & 0o7777` bits, `Err` describing the first stale entry
+/// otherwise. Shared by the receipt test (real candidates) and the
+/// hermetic chmod-strategem proof below.
+fn candidate_modes_match_live(candidates: &[(std::path::PathBuf, u32)]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    for (path, recorded) in candidates {
+        let live = path
+            .metadata()
+            .map(|meta| meta.permissions().mode() & 0o7777)
+            .map_err(|error| format!("candidate {} unreadable: {error}", path.display()))?;
+        if live != *recorded {
+            return Err(format!(
+                "candidate {} bits drifted: recorded {recorded:04o}, live {live:04o}",
+                path.display(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Watch + chmod closure (fix round 3, item 3W1F3-10): the build
+/// records the `PATH` directories it watches and the candidate
+/// permission bits it resolved; this test recomputes both from the
+/// recorded `PATH` and fails loudly on any drift. A chmod-only flip
+/// (no mtime change, so no rebuild) leaves a stale receipt the
+/// bit comparison catches here.
+#[test]
+fn identity_build_info_watches_path_and_pins_candidate_modes() {
+    let info = std::fs::read_to_string(concat!(
+        env!("OUT_DIR"),
+        "/p11scope-identity-build-info.txt"
+    ))
+    .expect("build must record identity build info");
+    let field = |name: &str| -> String {
+        info.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("build info lacks {name}"))
+            .to_string()
+    };
+    // The recorded watch set must equal what the resolver computes
+    // from the recorded PATH + cwd (the build prints a
+    // `rerun-if-changed` for each existing one).
+    let path_env = field("path_env");
+    let build_cwd = std::path::PathBuf::from(field("build_cwd"));
+    let expected_dirs = clang_resolve::path_dirs_in(std::ffi::OsStr::new(&path_env), &build_cwd);
+    let dir_count: usize = field("path_dir_count")
+        .parse()
+        .expect("path_dir_count must be a number");
+    let recorded_dirs: Vec<std::path::PathBuf> = (0..dir_count)
+        .map(|i| std::path::PathBuf::from(field(&format!("path_dir{i}"))))
+        .collect();
+    assert_eq!(
+        recorded_dirs, expected_dirs,
+        "recorded PATH dirs must match the resolver's enumeration"
+    );
+    assert!(
+        !recorded_dirs.is_empty(),
+        "at least one PATH dir must be watched"
+    );
+    // The recorded candidates must equal the resolver's enumeration,
+    // and their live permission bits must still match.
+    let expected_cands =
+        clang_resolve::candidate_files_in("clang-18", std::ffi::OsStr::new(&path_env), &build_cwd);
+    let cand_count: usize = field("candidate_count")
+        .parse()
+        .expect("candidate_count must be a number");
+    let recorded: Vec<(std::path::PathBuf, u32)> = (0..cand_count)
+        .map(|i| {
+            let path = std::path::PathBuf::from(field(&format!("candidate{i}_path")));
+            let mode = u32::from_str_radix(&field(&format!("candidate{i}_mode")), 8)
+                .unwrap_or_else(|_| panic!("candidate{i}_mode must be octal"));
+            (path, mode)
+        })
+        .collect();
+    let recorded_paths: Vec<std::path::PathBuf> =
+        recorded.iter().map(|(path, _)| path.clone()).collect();
+    assert_eq!(
+        recorded_paths, expected_cands,
+        "recorded candidates must match the resolver's enumeration"
+    );
+    candidate_modes_match_live(&recorded)
+        .expect("recorded candidate bits must match the live files");
+}
+
+/// Hermetic proof for the chmod window: `path_dirs_in` resolves
+/// absolute, empty (= cwd), and relative entries to absolute dirs
+/// (deduped), and the recorded-vs-live bit comparison passes
+/// unflipped but fails after a chmod-only flip.
+#[test]
+fn path_dirs_and_candidate_modes_close_the_chmod_window() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!("p11scope-path-dirs-{}", std::process::id()));
+    let first = root.join("first");
+    let second = root.join("second");
+    std::fs::create_dir_all(&first).expect("first dir");
+    std::fs::create_dir_all(&second).expect("second dir");
+    std::fs::write(first.join("clang-18"), "#!/bin/sh\nexit 0\n").expect("first file");
+    std::fs::write(second.join("clang-18"), "#!/bin/sh\nexit 0\n").expect("second file");
+    for file in [first.join("clang-18"), second.join("clang-18")] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    }
+    // Absolute entries resolve as-is, in order, deduped.
+    let path = std::env::join_paths([&first, &second, &first]).expect("join");
+    assert_eq!(
+        clang_resolve::path_dirs_in(&path, &root),
+        vec![first.clone(), second.clone()]
+    );
+    // Empty entries mean the cwd; relative entries join it.
+    let rel = std::env::join_paths(["", "second"]).expect("join");
+    assert_eq!(
+        clang_resolve::path_dirs_in(&rel, &root),
+        vec![root.clone(), second.clone()]
+    );
+    // Unflipped bits compare clean …
+    let recorded = vec![
+        (first.join("clang-18"), 0o755),
+        (second.join("clang-18"), 0o755),
+    ];
+    candidate_modes_match_live(&recorded).expect("unflipped bits match");
+    // … and a chmod-only flip (no mtime cargo watches) fails loudly.
+    std::fs::set_permissions(
+        second.join("clang-18"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("flip");
+    assert!(
+        candidate_modes_match_live(&recorded).is_err(),
+        "a chmod-only flip must fail the bit comparison"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Behavioral anchor coverage (fix round 3, items 3W1F3-01/02): the

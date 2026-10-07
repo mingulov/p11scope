@@ -49,6 +49,29 @@ pub fn resolve_executable_in(file: &str, path_env: &OsStr, cwd: &Path) -> Option
     None
 }
 
+/// Every `PATH` directory as an absolute path, in order, deduped:
+/// empty entries mean `cwd`, relative entries join it. The build
+/// watches the existing ones, so a brand-new shadowing file bumps its
+/// directory and re-runs the build instead of silently shadowing the
+/// recorded compiler. Nonexistent entries are still listed (the test
+/// recomputes this exact set from the recorded `PATH`) but unwatched.
+pub fn path_dirs_in(path_env: &OsStr, cwd: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in std::env::split_paths(path_env) {
+        let absolute = if dir.as_os_str().is_empty() {
+            cwd.to_path_buf()
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            cwd.join(dir)
+        };
+        if !out.contains(&absolute) {
+            out.push(absolute);
+        }
+    }
+    out
+}
+
 /// Every `PATH` entry's `file` that exists (executable or not): the build
 /// watches all of them, so a resolution-affecting change re-runs the
 /// build instead of silently keeping a stale compiler binding.

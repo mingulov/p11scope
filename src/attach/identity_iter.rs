@@ -3395,7 +3395,7 @@ mod tests {
             }
             // Raw string `r"…"`, `r#"…"#`, … (optionally `br`-prefixed):
             // copy the opener, blank the contents, copy the closer.
-            let raw_hashes = |at: usize| -> Option<(usize, usize)> {
+            let raw_opener = |at: usize| -> Option<(usize, usize)> {
                 let mut hashes = 0;
                 let mut cursor = at;
                 if bytes.get(cursor) == Some(&b'b') {
@@ -3412,17 +3412,11 @@ mod tests {
                 if bytes.get(cursor) != Some(&b'"') {
                     return None;
                 }
-                Some((at, cursor + 1))
+                Some((cursor + 1, hashes))
             };
-            if let Some((start, contents)) = raw_hashes(index) {
-                for byte in &bytes[start..contents] {
+            if let Some((contents, hashes)) = raw_opener(index) {
+                for byte in &bytes[index..contents] {
                     out.push(*byte);
-                }
-                let mut hashes = 0;
-                let mut probe = start + usize::from(bytes[start] == b'b') + 1;
-                while bytes.get(probe) == Some(&b'#') {
-                    hashes += 1;
-                    probe += 1;
                 }
                 index = contents;
                 // Blank to the closing quote plus the same hashes.
@@ -3436,9 +3430,7 @@ mod tests {
                         }
                         if seen == hashes {
                             out.push(b'"');
-                            for _ in 0..hashes {
-                                out.push(b'#');
-                            }
+                            out.extend(std::iter::repeat_n(b'#', hashes));
                             index = cursor;
                             break;
                         }
@@ -3622,9 +3614,7 @@ mod tests {
                     _ => {}
                 }
             }
-            let Some(end) = end else {
-                return None;
-            };
+            let end = end?;
             let flat: String = probe[..=end]
                 .chars()
                 .filter(|c| !c.is_whitespace())

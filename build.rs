@@ -19,7 +19,12 @@
 //! Task 3 used and copy the artifact into OUT_DIR ourselves.
 //!
 use sha2::{Digest, Sha256};
-use std::{env, ffi::OsString, path::PathBuf, process::Command};
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+    process::Command,
+};
 
 #[path = "build_support/bpf_tools.rs"]
 mod bpf_tools;
@@ -439,6 +444,12 @@ fn resolve_clang18() -> PathBuf {
         .expect("an executable clang-18 on PATH")
 }
 
+/// Lossy `OsStr` for the receipt (paths are UTF-8 in practice; a
+/// non-UTF-8 path records lossy, and the pin compares lossy too).
+fn lossy(arg: &OsStr) -> String {
+    arg.to_string_lossy().into_owned()
+}
+
 /// Hex sha256 of a file's bytes.
 fn sha256_file_hex(path: &std::path::Path) -> String {
     let bytes = std::fs::read(path).expect("reading file for digest");
@@ -460,16 +471,24 @@ fn sha256_file_hex(path: &std::path::Path) -> String {
 /// first EXECUTABLE `clang-18` on `PATH` to an absolute path ONCE,
 /// executes that path directly for both the compile and the UAPI check,
 /// and records that same path, its realpath, its binary digest, the
-/// explicit CPU baseline, and the object digest in
-/// `p11scope-identity-build-info.txt`; the harness pins the object digest
-/// plus that record, including the compiler's identity. A changed
-/// compiler or CPU baseline shows up as a changed record (and usually a
-/// changed object), never as a silent identical build. Every `PATH`
-/// candidate file plus `PATH` itself re-triggers the build; the one
-/// unwatched case is a brand-new shadowing file under an unchanged
-/// `PATH` (cargo cannot watch files that do not exist yet) — the object
-/// digest pin backstops that, since a different compiler's bytes fail
-/// loudly.
+/// full compile and UAPI argv, the explicit CPU baseline, the `PATH`
+/// directories watched, the candidate permission bits, and the object
+/// digest in `p11scope-identity-build-info.txt`; the harness pins the
+/// object digest plus that record, including the compiler's identity.
+/// Every existing `PATH` directory is watched (a brand-new shadowing
+/// file bumps its directory and re-runs the build), every candidate
+/// file is watched (content changes re-run), and `PATH` itself is
+/// watched (list changes re-run) — so a compiler change shows up as a
+/// changed record (and usually a changed object), never as a silent
+/// identical build. Chmod-only flips change no mtime cargo sees; they
+/// are caught instead by the recorded-vs-live permission comparison
+/// in the harness, which fails loudly on a stale receipt. All of this
+/// acts AT REBUILD TIME: a skipped rebuild leaves a stale-but-
+/// consistent object+receipt pair where the pins pass by design — the
+/// record binds the compiler that ran, not custody across invocations.
+/// Remaining envelope: concurrent mid-build compiler replacement
+/// (standard build-time trust) and nonexistent `PATH` directories
+/// (listed in the receipt, unwatched until they exist).
 fn build_identity_object() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
@@ -504,29 +523,60 @@ fn build_identity_object() {
         "-Werror",
         "-c",
     ];
+    // The compile argv, built once and used for BOTH execution and the
+    // receipt below, so the record cannot drift from what ran.
+    let source = manifest_dir.join("crates/ebpf/native/vma_identity.c");
+    let mut compile_args: Vec<OsString> = cflags.iter().map(OsString::from).collect();
+    compile_args.push(file_prefix_map);
+    compile_args.push(source.into_os_string());
+    compile_args.push(OsString::from("-o"));
+    compile_args.push(OsString::from("p11scope-ebpf-identity"));
     let status = Command::new(&compiler_path)
         .current_dir(&out_dir)
-        .args(cflags)
-        .arg(&file_prefix_map)
-        .arg(manifest_dir.join("crates/ebpf/native/vma_identity.c"))
-        .args(["-o", "p11scope-ebpf-identity"])
+        .args(&compile_args)
         .status()
         .expect("failed to spawn clang-18 for the identity object");
     assert!(
         status.success(),
         "building the identity object failed: {status}"
     );
-    // Qualification record: resolved compiler identity, CPU baseline, and
-    // the object digest. A compiler upgrade re-runs this build (via the
-    // rerun lines below) and re-records; the digest pin in the harness
-    // then either still matches (same bytes) or fails loudly.
+    // Reproducible UAPI assertion check (F-uapi): the host <linux/bpf.h>
+    // must agree with the layouts `identity_iter.rs` mirrors. Syntax-only
+    // (the `_Static_assert`s are the product); any mismatch fails the
+    // build here instead of mis-issuing syscalls at runtime. Its argv is
+    // recorded alongside the compile argv.
+    let uapi_source = manifest_dir.join("crates/ebpf/native/uapi_check.c");
+    let uapi_args = [
+        OsString::from("-fsyntax-only"),
+        OsString::from("-Wall"),
+        OsString::from("-Wextra"),
+        OsString::from("-Werror"),
+        uapi_source.into_os_string(),
+    ];
+    let check = Command::new(&compiler_path)
+        .args(&uapi_args)
+        .status()
+        .expect("failed to spawn clang-18 for the UAPI check");
+    assert!(
+        check.success(),
+        "the UAPI header check failed: host <linux/bpf.h> disagrees with identity_iter.rs"
+    );
+    // Qualification record: resolved compiler identity, full argv, CPU
+    // baseline, watch set, candidate bits, and the object digest. A
+    // compiler upgrade re-runs this build (via the rerun lines below)
+    // and re-records; the digest pin in the harness then either still
+    // matches (same bytes) or fails loudly.
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    let build_cwd = env::current_dir().expect("build cwd");
     println!("cargo:rerun-if-changed={}", compiler_path.display());
-    for candidate in clang_resolve::candidate_files_in(
-        "clang-18",
-        &env::var_os("PATH").unwrap_or_default(),
-        &env::current_dir().expect("build cwd"),
-    ) {
-        if candidate != compiler_path {
+    for dir in clang_resolve::path_dirs_in(&path_env, &build_cwd) {
+        if dir.is_dir() {
+            println!("cargo:rerun-if-changed={}", dir.display());
+        }
+    }
+    let candidates = clang_resolve::candidate_files_in("clang-18", &path_env, &build_cwd);
+    for candidate in &candidates {
+        if *candidate != compiler_path {
             println!("cargo:rerun-if-changed={}", candidate.display());
         }
     }
@@ -534,27 +584,54 @@ fn build_identity_object() {
         .canonicalize()
         .unwrap_or_else(|_| compiler_path.clone());
     let object_path = out_dir.join("p11scope-ebpf-identity");
-    let info = format!(
-        "compiler_path={}\ncompiler_realpath={}\ncompiler_sha256={}\ntarget={target}\nmcpu=v1\ncflags={}\nobject_sha256={}\n",
+    let mut info = format!(
+        "compiler_path={}\ncompiler_realpath={}\ncompiler_sha256={}\ntarget={target}\nmcpu=v1\ncflags={}\ncompile_cwd={}\n",
         compiler_path.display(),
         compiler_realpath.display(),
         sha256_file_hex(&compiler_path),
         cflags.join(" "),
-        sha256_file_hex(&object_path),
+        out_dir.display(),
     );
+    let mut compile_argv = vec![lossy(compiler_path.as_os_str())];
+    compile_argv.extend(compile_args.iter().map(|arg| lossy(arg)));
+    info.push_str(&format!("compile_argc={}\n", compile_argv.len()));
+    for (index, arg) in compile_argv.iter().enumerate() {
+        info.push_str(&format!("compile_arg{index}={arg}\n"));
+    }
+    let mut uapi_argv = vec![lossy(compiler_path.as_os_str())];
+    uapi_argv.extend(uapi_args.iter().map(|arg| lossy(arg)));
+    info.push_str(&format!("uapi_argc={}\n", uapi_argv.len()));
+    for (index, arg) in uapi_argv.iter().enumerate() {
+        info.push_str(&format!("uapi_arg{index}={arg}\n"));
+    }
+    info.push_str(&format!(
+        "path_env={}\nbuild_cwd={}\n",
+        path_env.to_string_lossy(),
+        build_cwd.display(),
+    ));
+    let dirs = clang_resolve::path_dirs_in(&path_env, &build_cwd);
+    info.push_str(&format!("path_dir_count={}\n", dirs.len()));
+    for (index, dir) in dirs.iter().enumerate() {
+        info.push_str(&format!("path_dir{index}={}\n", dir.display()));
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    info.push_str(&format!("candidate_count={}\n", candidates.len()));
+    for (index, candidate) in candidates.iter().enumerate() {
+        let mode = candidate
+            .metadata()
+            .expect("candidate metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        info.push_str(&format!(
+            "candidate{index}_path={}\ncandidate{index}_mode={mode:04o}\n",
+            candidate.display(),
+        ));
+    }
+    info.push_str(&format!(
+        "object_sha256={}\n",
+        sha256_file_hex(&object_path),
+    ));
     std::fs::write(out_dir.join("p11scope-identity-build-info.txt"), info)
         .expect("writing identity build info");
-    // Reproducible UAPI assertion check (F-uapi): the host <linux/bpf.h>
-    // must agree with the layouts `identity_iter.rs` mirrors. Syntax-only
-    // (the `_Static_assert`s are the product); any mismatch fails the
-    // build here instead of mis-issuing syscalls at runtime.
-    let check = Command::new(&compiler_path)
-        .args(["-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
-        .arg(manifest_dir.join("crates/ebpf/native/uapi_check.c"))
-        .status()
-        .expect("failed to spawn clang-18 for the UAPI check");
-    assert!(
-        check.success(),
-        "the UAPI header check failed: host <linux/bpf.h> disagrees with identity_iter.rs"
-    );
 }

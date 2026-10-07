@@ -273,10 +273,10 @@ fn identity_build_info_binds_compiler_and_baseline() {
     );
     assert_eq!(field("mcpu"), "v1", "CPU baseline must be explicit v1");
     // The recorded compiler must be the executed one: an absolute path to
-    // an executable file whose bytes re-hash to the recorded digest, with
-    // the recorded realpath agreeing. A non-executable PATH decoy (or any
+    // an effectively-executable file (same predicate the build resolved
+    // with) whose bytes re-hash to the recorded digest, with the
+    // recorded realpath agreeing. A non-executable PATH decoy (or any
     // file that did not compile the object) fails here.
-    use std::os::unix::fs::PermissionsExt as _;
     let compiler_path = std::path::PathBuf::from(field("compiler_path"));
     assert!(
         compiler_path.is_absolute(),
@@ -287,14 +287,8 @@ fn identity_build_info_binds_compiler_and_baseline() {
         "compiler path must exist, got {compiler_path:?}"
     );
     assert!(
-        compiler_path
-            .metadata()
-            .expect("compiler metadata")
-            .permissions()
-            .mode()
-            & 0o111
-            != 0,
-        "compiler path must be executable, got {compiler_path:?}"
+        clang_resolve::is_executable_file(&compiler_path),
+        "compiler path must be effectively executable, got {compiler_path:?}"
     );
     let realpath = compiler_path
         .canonicalize()
@@ -696,6 +690,59 @@ fn compiler_resolution_skips_non_executable_decoys() {
         clang_resolve::resolve_executable_in("clang-18", &path, &root).expect("must resolve");
     assert!(resolved.is_absolute());
     assert_eq!(resolved, hit);
+    // Unusable-but-bit-set shadowing file (fix round 3, item 12):
+    // mode 0641 carries an exec bit yet refuses a builder who holds
+    // no owner-x — `execvp` skips it, and so must the resolver. (Root
+    // bypasses permission checks, so under euid 0 the shadow IS
+    // executable and must resolve first — `execvp` agreement either
+    // way.)
+    let shadow = root.join("shadow");
+    std::fs::create_dir_all(&shadow).expect("shadow dir");
+    std::fs::write(shadow.join("clang-18"), "#!/bin/sh\nexit 0\n").expect("shadow file");
+    std::fs::set_permissions(
+        shadow.join("clang-18"),
+        std::fs::Permissions::from_mode(0o641),
+    )
+    .expect("shadow mode");
+    assert!(shadow.join("clang-18").is_file());
+    assert_ne!(
+        shadow
+            .join("clang-18")
+            .metadata()
+            .expect("shadow metadata")
+            .permissions()
+            .mode()
+            & 0o111,
+        0,
+        "the fixture must carry exec bits (else it proves nothing)"
+    );
+    if unsafe { libc::geteuid() } == 0 {
+        assert!(clang_resolve::is_executable_file(&shadow.join("clang-18")));
+        let path = std::env::join_paths([&shadow, &real]).expect("join");
+        assert_eq!(
+            clang_resolve::resolve_executable_in("clang-18", &path, &root),
+            Some(shadow.join("clang-18")),
+            "root executes any exec-bit file, like execvp-as-root"
+        );
+    } else {
+        // The fixture is genuinely unusable: spawning it fails EACCES …
+        let err = std::process::Command::new(shadow.join("clang-18"))
+            .output()
+            .expect_err("spawning the shadow must fail");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EACCES),
+            "the shadow must refuse execution with EACCES"
+        );
+        // … and the resolver must skip it for the usable hit.
+        assert!(!clang_resolve::is_executable_file(&shadow.join("clang-18")));
+        let path = std::env::join_paths([&shadow, &real]).expect("join");
+        assert_eq!(
+            clang_resolve::resolve_executable_in("clang-18", &path, &root),
+            Some(real.join("clang-18")),
+            "an EACCES shadow must not win over a usable compiler"
+        );
+    }
     // No executable anywhere resolves to nothing.
     let empty = root.join("empty");
     std::fs::create_dir_all(&empty).expect("empty dir");

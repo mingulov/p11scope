@@ -13,23 +13,41 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-/// Whether `path` is a regular file with any execute bit set: the
-/// `execvp` selection approximation (what process spawning would run).
+/// Whether `path` is a regular file the CURRENT user can execute:
+/// the `execvp` selection rule (what process spawning would run).
+/// Mode bits alone mislead — a file can carry exec bits yet refuse
+/// the builder with `EACCES` (e.g. owner-only `x` for a foreign owner,
+/// or `0641` for a builder without owner-x) — so this probes effective
+/// executability with `faccessat(X_OK)` instead of reading the mode.
 pub fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    path.is_file()
-        && path
-            .metadata()
-            .is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+    if !path.is_file() {
+        return false;
+    }
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+    let Ok(path_c) = std::ffi::CString::new(bytes) else {
+        return false;
+    };
+    // SAFETY: `faccessat` with `AT_FDCWD` reads no memory beyond the
+    // NUL-terminated path; `AT_EACCESS` tests the effective ids, as
+    // execution would.
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            path_c.as_ptr(),
+            libc::X_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 /// Resolve `file` against `path_env` like process spawning: the first
-/// executable hit, returned as an absolute path (the `PATH` hit itself —
-/// the caller canonicalizes separately for the realpath field). Relative
-/// `PATH` entries are interpreted against `cwd` once, here — the caller
-/// must execute the returned path directly (never re-search `PATH`, never
-/// relative), so no later working directory can divert execution
-/// elsewhere. `None` when no `PATH` entry holds an executable `file`.
+/// EFFECTIVELY-EXECUTABLE hit, returned as an absolute path (the `PATH`
+/// hit itself — the caller canonicalizes separately for the realpath
+/// field). Relative `PATH` entries are interpreted against `cwd` once,
+/// here — the caller must execute the returned path directly (never
+/// re-search `PATH`, never relative), so no later working directory can
+/// divert execution elsewhere. `None` when no `PATH` entry holds an
+/// executable `file`.
 pub fn resolve_executable_in(file: &str, path_env: &OsStr, cwd: &Path) -> Option<PathBuf> {
     if file.is_empty() || file.contains('/') {
         return None;

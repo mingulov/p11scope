@@ -41,6 +41,7 @@ sha2 = "=0.11.0"
 tempfile = "3"
 
 [build-dependencies]
+libc = "0.2"
 sha2 = "=0.11.0"
 
 [workspace]

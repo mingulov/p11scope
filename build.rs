@@ -433,11 +433,12 @@ fn build_variant(
     .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));
 }
 
-/// Resolve `clang-18` exactly like process spawning does: the first
-/// EXECUTABLE hit on `PATH`, as an absolute path. The identity build
-/// executes this path directly and records its digest — the receipt names
-/// the compiler that actually ran, never a non-executable decoy that
-/// execution skipped.
+/// Resolve `clang-18` like process spawning does: the first
+/// EFFECTIVELY-EXECUTABLE hit on `PATH` (effective-uid `X_OK`, so an
+/// unusable-but-bit-set entry is skipped exactly as `execvp` would skip
+/// it), as an absolute path. The identity build executes this path
+/// directly and records its digest — the receipt names the compiler
+/// that actually ran, never a decoy execution skipped.
 fn resolve_clang18() -> PathBuf {
     let cwd = env::current_dir().expect("build cwd");
     clang_resolve::resolve_executable_in("clang-18", &env::var_os("PATH").unwrap_or_default(), &cwd)

@@ -3967,11 +3967,21 @@ mod tests {
     /// of `text`: the path plus the remainder, or `None`. Gaps around
     /// `::` compile (`self :: Y`, comments blank to spaces upstream),
     /// so segment joints skip whitespace — but only across a real
-    /// `::`, never between bare tokens.
+    /// `::`, never between bare tokens. A `r#`-quoted segment
+    /// (`r#AnchorMaps`) denotes its bare name.
     fn read_rust_path(text: &str) -> Option<(String, &str)> {
         let mut rest = text.strip_prefix("::").map(str::trim_start).unwrap_or(text);
         let mut path = String::new();
         loop {
+            // Raw identifier: `r#` (adjacent — a gap is the ident `r`
+            // followed by an attribute) plus the quoted name, which
+            // denotes the bare ident.
+            if rest.starts_with('r') && rest[1..].starts_with('#') {
+                rest = &rest[1..];
+                while rest.starts_with('#') {
+                    rest = &rest[1..];
+                }
+            }
             let name: String = rest
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -4493,6 +4503,26 @@ mod tests {
                 "`{header}` must read as a trait impl"
             );
         }
+        // Raw-identifier subjects (fix round 5): `r#AnchorMaps` denotes
+        // the same type, so a trait impl for it must read as a trait
+        // impl — and a bare `impl r#AnchorMaps` as a second inherent
+        // block, never silence.
+        for header in [
+            "impl AsRef<OwnedFd> for r#AnchorMaps {}",
+            "impl std::fmt::Debug for r#AnchorMaps {}",
+        ] {
+            let mutated = format!("{code}\n{header}\n");
+            assert!(
+                scan_anchor_impls(&blank_rust_noise(&mutated)).1,
+                "`{header}` must read as a trait impl"
+            );
+        }
+        let inherent = format!("{code}\nimpl r#AnchorMaps {{}}\n");
+        assert_eq!(
+            scan_anchor_impls(&blank_rust_noise(&inherent)),
+            (2, false),
+            "`impl r#AnchorMaps` must read as a second inherent block"
+        );
     }
 
     /// Macros cannot smuggle handle methods (astra N5, design decision

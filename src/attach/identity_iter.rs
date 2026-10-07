@@ -4146,14 +4146,39 @@ mod tests {
             .collect()
     }
 
+    /// Fail loudly when noise-blanked audit input carries non-ASCII
+    /// bytes: the scanners below are ASCII-shape based (`trim_start`,
+    /// `split_whitespace`, `is_ascii_whitespace`), while `rustc`
+    /// accepts non-ASCII inter-token gaps (U+200E, U+0085) and
+    /// non-ASCII idents those tests cannot see — so any non-ASCII in
+    /// the audited regions rejects instead of risking silence. Real
+    /// production code blanks to pure ASCII (its non-ASCII lives in
+    /// comments and strings), so this only bites smuggled spellings.
+    fn require_ascii_audit_input(text: &str, what: &str) -> Result<(), String> {
+        if text.is_ascii() {
+            return Ok(());
+        }
+        let (offset, found) = text
+            .char_indices()
+            .find(|(_, ch)| !ch.is_ascii())
+            .expect("a non-ASCII char exists");
+        Err(format!(
+            "{what} must be ASCII after blanking: found {found:?} (U+{:04X}) at byte {offset}",
+            u32::from(found)
+        ))
+    }
+
     /// Scan production code for `impl` blocks touching `AnchorMaps`:
     /// (inherent-block count, any-trait-impl). Matches trait impls on
     /// `for` + optional path + `AnchorMaps` (`for self::AnchorMaps`,
     /// `for crate::x::AnchorMaps`), and inherent blocks under any
     /// qualifier/generic spelling. Exotic headers that defeat the
     /// strict parse fall back to a conservative substring heuristic —
-    /// never to silence.
-    fn scan_anchor_impls(code: &str) -> (usize, bool) {
+    /// never to silence. Non-ASCII bytes fail loudly: the scanners are
+    /// ASCII-shape based, and `rustc` accepts non-ASCII inter-token
+    /// gaps (U+200E, U+0085) the ASCII tests cannot see.
+    fn scan_anchor_impls(code: &str) -> Result<(usize, bool), String> {
+        require_ascii_audit_input(code, "impl scan input")?;
         let mut inherent = 0;
         let mut trait_impl = false;
         for (_, is_trait) in anchor_impls(code) {
@@ -4163,7 +4188,7 @@ mod tests {
                 inherent += 1;
             }
         }
-        (inherent, trait_impl)
+        Ok((inherent, trait_impl))
     }
 
     /// Byte offset of the inherent `impl AnchorMaps` keyword in
@@ -4244,13 +4269,15 @@ mod tests {
     /// char and followed (across whitespace) by `(`, `[`, or `{` — a
     /// spaced `mac ! ()` compiles, and comments blank to spaces
     /// upstream, so adjacency is not required. `!=` never matches, and
-    /// neither does unary `!` after a strict keyword (`if !(…)`,
-    /// `return !(…)`): keywords can never name a macro. An external
-    /// `#[macro_use]` definition needs no in-file search: whatever
-    /// defines the macro, invoking it in the region fails this scan.
-    /// Returns the rejection reason instead of panicking so proofs can
-    /// assert rejection.
+    /// neither does unary `!` after a strict keyword (`if !(...)`,
+    /// `return !(...)`): keywords can never name a macro. Non-ASCII
+    /// bytes fail loudly (the gap/ident scans are ASCII-shape based).
+    /// An external `#[macro_use]` definition needs no in-file search:
+    /// whatever defines the macro, invoking it in the region fails
+    /// this scan. Returns the rejection reason instead of panicking so
+    /// proofs can assert rejection.
     fn check_handle_region_has_no_macros(code: &str) -> Result<(), String> {
+        require_ascii_audit_input(code, "macro forbid input")?;
         if code.contains("macro_rules") {
             return Err("production code must not define macro_rules".to_string());
         }
@@ -4346,7 +4373,10 @@ mod tests {
         panic!("impl block end");
     }
 
-    fn anchor_maps_api(block: &str) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    fn anchor_maps_api(
+        block: &str,
+    ) -> Result<(BTreeSet<String>, BTreeSet<String>, BTreeSet<String>), String> {
+        require_ascii_audit_input(block, "API enumeration input")?;
         let end = impl_block_end(block);
         let mut public = BTreeSet::new();
         let mut private = BTreeSet::new();
@@ -4371,7 +4401,7 @@ mod tests {
             }
             previous = strip_line_noise(line);
         }
-        (public, private, gated)
+        Ok((public, private, gated))
     }
 
     /// The API enumeration sees through visibility and modifier bypasses:
@@ -4398,7 +4428,7 @@ mod tests {
             let mutated =
                 code.replacen("    pub fn new(", &format!("{smuggled}    pub fn new("), 1);
             assert_ne!(mutated, code, "mutation must apply");
-            let (public, _, _) = api_of(&mutated);
+            let (public, _, _) = api_of(&mutated).expect("bypass api scans");
             let name = smuggled
                 .split("fn ")
                 .nth(1)
@@ -4419,7 +4449,7 @@ mod tests {
             1,
         );
         assert_ne!(hidden, code, "comment-hiding mutation must apply");
-        let (public, _, _) = api_of(&hidden);
+        let (public, _, _) = api_of(&hidden).expect("hidden api scans");
         assert!(
             public.contains("smuggled_block"),
             "enumeration must see through block comments"
@@ -4432,7 +4462,7 @@ mod tests {
             1,
         );
         assert_ne!(attributed, code, "attribute mutation must apply");
-        let (public, _, _) = api_of(&attributed);
+        let (public, _, _) = api_of(&attributed).expect("attributed api scans");
         assert!(
             public.contains("smuggled_attr"),
             "enumeration must parse fn after same-line attributes"
@@ -4457,10 +4487,45 @@ mod tests {
             let mutated =
                 code.replacen("    pub fn new(", &format!("{smuggled}    pub fn new("), 1);
             assert_ne!(mutated, code, "spacing mutation {name} must apply");
-            let (public, _, _) = api_of(&mutated);
+            let (public, _, _) = api_of(&mutated).expect("spaced api scans");
             assert!(
                 public.contains(name),
                 "enumeration must catch the spaced spelling {name}"
+            );
+        }
+        // Non-ASCII inter-token gaps (fix round 5): `rustc` accepts
+        // U+200E and U+0085 where the ASCII spacing checks look
+        // (`pub`/`(crate)`, `#`/`[`), so each smuggled spelling must
+        // fail the audit loudly instead of vanishing. Fixtures are
+        // byte-built (`char::from_u32`, never literal non-ASCII) and
+        // byte-asserted.
+        let lrm = char::from_u32(0x200E).expect("U+200E exists");
+        let nel = char::from_u32(0x0085).expect("U+0085 exists");
+        let unicode: [(String, &[u8]); 3] = [
+            (
+                format!("    pub{lrm}(crate) fn smuggled_unicode_vis(&self) -> i32 {{ 0 }}\n"),
+                &[0xE2, 0x80, 0x8E],
+            ),
+            (
+                format!("    #{lrm}[inline] pub fn smuggled_unicode_attr(&self) -> i32 {{ 0 }}\n"),
+                &[0xE2, 0x80, 0x8E],
+            ),
+            (
+                format!("    pub{nel}(crate) fn smuggled_unicode_nel(&self) -> i32 {{ 0 }}\n"),
+                &[0xC2, 0x85],
+            ),
+        ];
+        for (smuggled, utf8) in unicode {
+            assert!(
+                smuggled.as_bytes().windows(utf8.len()).any(|w| w == utf8),
+                "fixture must carry the {utf8:02X?} bytes"
+            );
+            let mutated =
+                code.replacen("    pub fn new(", &format!("{smuggled}    pub fn new("), 1);
+            assert_ne!(mutated, code, "unicode mutation must apply");
+            assert!(
+                api_of(&mutated).is_err(),
+                "enumeration must fail loudly on non-ASCII gaps: {smuggled:?}"
             );
         }
     }
@@ -4478,23 +4543,29 @@ mod tests {
         let blanked = blank_rust_noise(&rust);
         let code = blanked.split_once("mod tests").expect("test module").0;
         assert_eq!(
-            scan_anchor_impls(code),
+            scan_anchor_impls(code).expect("real code scans"),
             (1, false),
             "real code: exactly one inherent block, no trait impl"
         );
         let slf = format!("{code}\nimpl std::fmt::Debug for self::AnchorMaps {{}}\n");
         assert!(
-            scan_anchor_impls(&blank_rust_noise(&slf)).1,
+            scan_anchor_impls(&blank_rust_noise(&slf))
+                .expect("path bypass scans")
+                .1,
             "`for self::AnchorMaps` must read as a trait impl"
         );
         let commented = format!("{code}\nimpl Foo for /*x*/ AnchorMaps {{}}\n");
         assert!(
-            scan_anchor_impls(&blank_rust_noise(&commented)).1,
+            scan_anchor_impls(&blank_rust_noise(&commented))
+                .expect("commented bypass scans")
+                .1,
             "commented `for` impl must read as a trait impl"
         );
         let second = format!("{code}\nimpl /*x*/ AnchorMaps {{}}\n");
         assert_eq!(
-            scan_anchor_impls(&blank_rust_noise(&second)).0,
+            scan_anchor_impls(&blank_rust_noise(&second))
+                .expect("second inherent scans")
+                .0,
             2,
             "commented inherent impl must count"
         );
@@ -4510,7 +4581,9 @@ mod tests {
         ] {
             let mutated = format!("{code}\n{header}\n");
             assert!(
-                scan_anchor_impls(&blank_rust_noise(&mutated)).1,
+                scan_anchor_impls(&blank_rust_noise(&mutated))
+                    .expect("generic header scans")
+                    .1,
                 "`{header}` must read as a trait impl"
             );
         }
@@ -4525,7 +4598,9 @@ mod tests {
         ] {
             let mutated = format!("{code}\n{header}\n");
             assert!(
-                scan_anchor_impls(&blank_rust_noise(&mutated)).1,
+                scan_anchor_impls(&blank_rust_noise(&mutated))
+                    .expect("spaced header scans")
+                    .1,
                 "`{header}` must read as a trait impl"
             );
         }
@@ -4539,13 +4614,15 @@ mod tests {
         ] {
             let mutated = format!("{code}\n{header}\n");
             assert!(
-                scan_anchor_impls(&blank_rust_noise(&mutated)).1,
+                scan_anchor_impls(&blank_rust_noise(&mutated))
+                    .expect("raw-ident header scans")
+                    .1,
                 "`{header}` must read as a trait impl"
             );
         }
         let inherent = format!("{code}\nimpl r#AnchorMaps {{}}\n");
         assert_eq!(
-            scan_anchor_impls(&blank_rust_noise(&inherent)),
+            scan_anchor_impls(&blank_rust_noise(&inherent)).expect("inherent raw scans"),
             (2, false),
             "`impl r#AnchorMaps` must read as a second inherent block"
         );
@@ -4554,9 +4631,27 @@ mod tests {
         // inside `<…>` — so the scan must stay `(1, false)`.
         let wrapped = format!("{code}\nimpl Wrapper<AnchorMaps> {{}}\n");
         assert_eq!(
-            scan_anchor_impls(&blank_rust_noise(&wrapped)),
+            scan_anchor_impls(&blank_rust_noise(&wrapped)).expect("wrapped header scans"),
             (1, false),
             "`impl Wrapper<AnchorMaps>` must not count as an AnchorMaps block"
+        );
+        // Non-ASCII in an impl header (fix round 5): a U+200E gap
+        // between `for` and the subject must fail the scan loudly.
+        // Byte-built (`char::from_u32`, never literal non-ASCII) and
+        // byte-asserted.
+        let lrm = char::from_u32(0x200E).expect("U+200E exists");
+        let header = format!("impl Evil for{lrm}AnchorMaps {{}}");
+        assert!(
+            header
+                .as_bytes()
+                .windows(3)
+                .any(|w| w == [0xE2, 0x80, 0x8E]),
+            "fixture must carry the U+200E bytes"
+        );
+        let mutated = format!("{code}\n{header}\n");
+        assert!(
+            scan_anchor_impls(&blank_rust_noise(&mutated)).is_err(),
+            "scan must fail loudly on non-ASCII: {header:?}"
         );
     }
 
@@ -4586,7 +4681,7 @@ mod tests {
         assert_ne!(mutated, code, "macro mutation must apply");
         let blanked_mut = blank_rust_noise(&mutated);
         let offset = find_inherent_anchor_impl(&blanked_mut).expect("impl block");
-        let (public, private, _) = anchor_maps_api(&blanked_mut[offset..]);
+        let (public, private, _) = anchor_maps_api(&blanked_mut[offset..]).expect("hole demo api");
         assert_eq!(
             public,
             BTreeSet::from([
@@ -4602,7 +4697,7 @@ mod tests {
             "hole demo: private set also blind to macro methods"
         );
         assert_eq!(
-            scan_anchor_impls(&blanked_mut),
+            scan_anchor_impls(&blanked_mut).expect("hole demo scans"),
             (1, false),
             "hole demo: impl predicates miss macro methods"
         );
@@ -4663,6 +4758,35 @@ mod tests {
             check_handle_region_has_no_macros(&blank_rust_noise(&mutated))
                 .expect("forbid must accept keyword-led unary `!`");
         }
+        // Non-ASCII macro gaps and idents (fix round 5): `mm!` plus a
+        // U+0085/U+200E gap, and a non-ASCII invocation (U+00E9
+        // `!()`), all compile -- each must fail the forbid loudly.
+        // Fixtures are byte-built (`char::from_u32`, never literal
+        // non-ASCII) and byte-asserted.
+        let lrm = char::from_u32(0x200E).expect("U+200E exists");
+        let nel = char::from_u32(0x0085).expect("U+0085 exists");
+        let eacute = char::from_u32(0xE9).expect("U+00E9 exists");
+        let unicode: [(String, &[u8]); 3] = [
+            (format!("    mm!{nel}();\n"), &[0xC2, 0x85]),
+            (format!("    mm!{lrm}();\n"), &[0xE2, 0x80, 0x8E]),
+            (format!("    {eacute}!();\n"), &[0xC3, 0xA9]),
+        ];
+        for (invocation, utf8) in unicode {
+            assert!(
+                invocation.as_bytes().windows(utf8.len()).any(|w| w == utf8),
+                "fixture must carry the {utf8:02X?} bytes"
+            );
+            let mutated = code.replacen(
+                "    pub fn new(",
+                &format!("{invocation}    pub fn new("),
+                1,
+            );
+            assert_ne!(mutated, code, "unicode mutation {invocation:?} must apply");
+            assert!(
+                check_handle_region_has_no_macros(&blank_rust_noise(&mutated)).is_err(),
+                "forbid must fail loudly on non-ASCII: {invocation:?}"
+            );
+        }
     }
 
     /// Structural I6: the anchor handle exposes exactly its write-only
@@ -4692,14 +4816,14 @@ mod tests {
         // through comments and paths (`impl /*x*/ AnchorMaps`,
         // `for self::AnchorMaps`).
         assert_eq!(
-            scan_anchor_impls(code),
+            scan_anchor_impls(code).expect("real code scans"),
             (1, false),
             "exactly one inherent impl AnchorMaps block, no trait impl for it"
         );
         // The block's method names, exactly: any added method — read,
         // write, or otherwise — fails here.
         let offset = find_inherent_anchor_impl(code).expect("impl block");
-        let (public, private, gated) = anchor_maps_api(&code[offset..]);
+        let (public, private, gated) = anchor_maps_api(&code[offset..]).expect("real code api");
         assert_eq!(
             public,
             BTreeSet::from([

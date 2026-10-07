@@ -611,9 +611,11 @@ def has_demoted_edge(view, edge):
     is segment-relative growth from the base read, so the window
     judges the upper bound only and exactness is explicitly
     nonqualifying. Sibling edges keep full judgment (no run-wide or
-    module-wide poison)."""
+    module-wide poison). The marker matches the subject only (round
+    5, sol-N2): reasons embed provider paths, so an adversarial path
+    naming the marker must not demote an ordinary edge."""
     for gap in view.doc.get("gaps", []):
-        if not DEMOTED_PLACED.search(f"{gap.get('subject', '')} {gap.get('reason', '')}"):
+        if not DEMOTED_PLACED.search(gap.get("subject", "")):
             continue
         if gap.get("caller") == edge.get("caller") and gap.get("module") == edge.get("module"):
             return True
@@ -3890,6 +3892,25 @@ def self_test():
                               "reason": "a demoted count placed post-demotion growth on this edge",
                               "budget": None, "repeats": 1})
         case("demoted-growth-absolute-fails-upper", "COUNT-WINDOW", demoted_segment_corrupt)
+
+        # Round 5 (sol-N2): the demotion marker matches the gap subject
+        # only — an ordinary "module admission changed" gap whose
+        # reason embeds an adversarial provider path naming "demoted
+        # count placed" marks nothing demoted: the edge keeps full
+        # judgment (COUNT-EXACT engaged).
+        def demoted_subject_only(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": 7,
+                              "subject": "module admission changed",
+                              "reason": "/lib/demoted count placed/provider.so: admission changed "
+                                        "from staged to admitted",
+                              "budget": None, "repeats": 1})
+            return kw
+        res = case("demoted-subject-only-ignores-adversarial-reason", None, demoted_subject_only)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "pass":
+            failures.append("demoted-subject-only-exact-not-engaged")
 
         # O1 straddling first row (the reviewer's repro shape): the first
         # row lands inside an aggregated ledger line, so the recorded

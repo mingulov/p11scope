@@ -376,23 +376,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// O1 endpoint evidence: one gap per module with new failures in this
-    /// receipt (bounded: every failed endpoint lands in exactly one
-    /// receipt — failed endpoints are never retried). Failed members make
-    /// the module undercount, so its counted uses are lower bounds; the
-    /// oracle withholds COUNT-EXACT over it (explicitly nonqualifying).
-    /// Endpoints no module claims (evicted before the receipt) report
-    /// run-wide. The subject and reason shapes are pinned verbatim: the
-    /// oracle matches them.
+    /// O1 endpoint evidence: one gap per module with new failures or
+    /// deferrals in this receipt. Failed endpoints are sticky (never
+    /// retried — bounded: every failed endpoint lands in exactly one
+    /// receipt); deferred endpoints are retried, but the deferral
+    /// window's calls never come back, so the gap is sticky too even
+    /// when a later receipt attaches the endpoint. Failed or deferred
+    /// members make the module undercount, so its counted uses are
+    /// lower bounds; the oracle withholds COUNT-EXACT over it
+    /// (explicitly nonqualifying). Endpoints no module claims (evicted
+    /// before the receipt) report run-wide. The subject and reason
+    /// shapes are pinned verbatim: the oracle matches them.
     fn note_partial_attach(&mut self, receipt: &ExtendReceipt) {
-        if receipt.failed.is_empty() {
+        // Deferred endpoints dedupe: a receipt may carry the same
+        // endpoint twice across its defer calls.
+        let deferred: BTreeSet<EndpointId> =
+            receipt.deferred.endpoints.iter().map(|endpoint| endpoint.id).collect();
+        if receipt.failed.is_empty() && deferred.is_empty() {
             return;
         }
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
-        let mut by_module: BTreeMap<AttachModuleKey, usize> = BTreeMap::new();
-        let mut unclaimed = 0usize;
+        let mut by_module: BTreeMap<AttachModuleKey, (usize, usize)> = BTreeMap::new();
+        let mut unclaimed = (0usize, 0usize);
         for failed in &receipt.failed {
             let owners: Vec<AttachModuleKey> = self
                 .attach_set
@@ -400,14 +407,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .cloned()
                 .collect();
             if owners.is_empty() {
-                unclaimed += 1;
+                unclaimed.0 += 1;
             } else {
                 for key in owners {
-                    *by_module.entry(key).or_default() += 1;
+                    by_module.entry(key).or_default().0 += 1;
                 }
             }
         }
-        for (key, failed_here) in by_module {
+        for id in &deferred {
+            let owners: Vec<AttachModuleKey> = self
+                .attach_set
+                .modules_with_member(*id)
+                .cloned()
+                .collect();
+            if owners.is_empty() {
+                unclaimed.1 += 1;
+            } else {
+                for key in owners {
+                    by_module.entry(key).or_default().1 += 1;
+                }
+            }
+        }
+        for (key, (failed_here, deferred_here)) in by_module {
             let (total, failed_total) = match self.attach_set.module_members(&key) {
                 Some(ModuleMembers::Known(members)) => (
                     members.len(),
@@ -416,6 +437,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         .filter(|id| capture.failed.contains(id))
                         .count(),
                 ),
+                // Unrecorded membership: no cumulative total exists, so
+                // the reason carries this receipt's new failures.
                 _ => (0, failed_here),
             };
             let registry_key = ModuleKey::physical(
@@ -426,36 +449,54 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 "",
             );
             let module = self.registry.module_id_for(&registry_key);
-            let reason = if total > 0 {
-                format!(
-                    "{failed_total} of {total} endpoints failed to attach (sticky, never retried); \
-                     counted uses are lower bounds"
-                )
-            } else {
-                format!(
-                    "{failed_total} endpoints failed to attach (sticky, never retried); counted uses \
-                     are lower bounds"
-                )
-            };
+            let mut parts = Vec::new();
+            if failed_total > 0 {
+                if total > 0 {
+                    parts.push(format!(
+                        "{failed_total} of {total} endpoints failed to attach (sticky, never retried)"
+                    ));
+                } else {
+                    parts.push(format!(
+                        "{failed_total} endpoints failed to attach (sticky, never retried)"
+                    ));
+                }
+            }
+            if deferred_here > 0 {
+                parts.push(format!(
+                    "{deferred_here} endpoint(s) still deferred when the receipt closed"
+                ));
+            }
+            parts.push("counted uses are lower bounds".to_string());
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module,
                 pid: None,
                 subject: PARTIAL_ATTACH_SUBJECT.into(),
-                reason,
+                reason: parts.join("; "),
                 budget: None,
             });
         }
-        if unclaimed > 0 {
+        if unclaimed.0 > 0 || unclaimed.1 > 0 {
+            let mut parts = Vec::new();
+            if unclaimed.0 > 0 {
+                parts.push(format!(
+                    "{} endpoint(s) with no recorded module failed to attach (sticky, never retried)",
+                    unclaimed.0
+                ));
+            }
+            if unclaimed.1 > 0 {
+                parts.push(format!(
+                    "{} endpoint(s) with no recorded module still deferred when the receipt closed",
+                    unclaimed.1
+                ));
+            }
+            parts.push("counted uses are lower bounds".to_string());
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
                 pid: None,
                 subject: PARTIAL_ATTACH_SUBJECT.into(),
-                reason: format!(
-                    "{unclaimed} endpoint(s) with no recorded module failed to attach (sticky, never \
-                     retried); counted uses are lower bounds"
-                ),
+                reason: parts.join("; "),
                 budget: None,
             });
         }
@@ -3761,6 +3802,94 @@ mod tests {
         assert_eq!(
             gaps[2].module, None,
             "the unclaimed endpoint reports run-wide"
+        );
+    }
+
+    #[test]
+    fn deferred_endpoints_stage_a_partial_attach_gap() {
+        // O1 endpoint evidence (fix round 2, F3): attachment deferred
+        // past the receipt leaves the endpoint's calls uncounted, so a
+        // module with deferred members undercounts exactly like one
+        // with failed members — its counted uses are lower bounds and
+        // the oracle withholds COUNT-EXACT over it. The gap is sticky
+        // even when a later receipt attaches the endpoint: calls made
+        // while it was unattached never come back.
+        use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(3))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(None);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
+        let deferred = |id: u32| crate::discovery::inventory_attach_set::TargetDelta {
+            endpoints: vec![endpoint(id)],
+            objects: vec![endpoint(id).object],
+        };
+        // One attached, one deferred: partial attach.
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: endpoint(0).id,
+                object: endpoint(0).object,
+                at_ns: 100,
+            }],
+            deferred: deferred(1),
+            ..ExtendReceipt::default()
+        });
+        // A retry attaches the deferred endpoint: no new gap, but the
+        // earlier one stands (the deferral window's calls are lost).
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: endpoint(1).id,
+                object: endpoint(1).object,
+                at_ns: 200,
+            }],
+            ..ExtendReceipt::default()
+        });
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == PARTIAL_ATTACH_SUBJECT)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the deferred receipt stages one gap, the clean retry none: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert!(
+            gaps[0].module.is_some(),
+            "attributed to the deferred module: {:?}",
+            gaps[0].module
+        );
+        assert!(
+            gaps[0].reason.contains("still deferred"),
+            "the reason names the deferral: {}",
+            gaps[0].reason
         );
     }
 

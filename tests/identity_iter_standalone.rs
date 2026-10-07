@@ -330,6 +330,145 @@ fn identity_build_info_binds_compiler_and_baseline() {
     );
 }
 
+/// Behavioral anchor coverage (fix round 3, items 3W1F3-01/02): the
+/// host harness compiles the REAL `vma_identity.c` for host (stub maps +
+/// captured emits, zero production-C changes) and stages the
+/// replay/arena sequences against the real C logic: (a)
+/// X→DUP→drop→Y-remap→replay → CONFLICT + no install + no second OK;
+/// (b) between-pass change → OK; (c) same-address replay → OK; (d)
+/// fresh generation after CONFLICT → clean OK; (e) straddling VMA →
+/// BAD_SHAPE; (f) misaligned/oversized/past-slots/zero-inode shapes →
+/// BAD_SHAPE (+ anonymous VMAs silently skipped); (g) contained VMA →
+/// OK. Unprivileged and permanent; the strict verifier gate still proves
+/// the BPF object loads (re-run as root, see the report).
+#[test]
+fn anchor_host_harness_replay_and_arena_behavior() {
+    let native = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/ebpf/native");
+    let source = native.join("vma_identity_harness.c");
+    assert!(
+        source.is_file(),
+        "harness source {} must exist",
+        source.display()
+    );
+    let work = std::env::temp_dir().join(format!("p11scope-anchor-harness-{}", std::process::id()));
+    std::fs::create_dir_all(&work).expect("harness work dir");
+    let binary = work.join("vma_identity_harness");
+    let cwd = std::env::current_dir().expect("cwd");
+    let compiler = clang_resolve::resolve_executable_in(
+        "clang-18",
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &cwd,
+    )
+    .expect("host harness needs an executable clang-18 on PATH");
+    let compile = std::process::Command::new(&compiler)
+        // Default language mode (GNU `typeof` for the map macros, as in
+        // the BPF build); only the BPF-only attribute is silenced.
+        .args([
+            "-O1",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("spawn host cc for the harness");
+    assert!(
+        compile.status.success(),
+        "harness must compile -Werror-clean: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    // (scenario, ASSERT lines that must appear — the harness exits
+    // nonzero on any failed check, and these lines pin the evidence
+    // shape so a vacuous PASS cannot slip through).
+    for (scenario, asserts) in [
+        (
+            "replay-remap-conflict",
+            &[
+                "ASSERT slot0_installs_x",
+                "ASSERT dup_aliases_slot0",
+                "ASSERT conflict_on_remap_replay",
+                "ASSERT no_second_ok",
+                "ASSERT y_not_installed",
+                "ASSERT x_still_rooted_at_slot0",
+                "ASSERT slot1023_bookkeeping_kept",
+            ][..],
+        ),
+        (
+            "between-pass-change",
+            &[
+                "ASSERT ok_first_install",
+                "ASSERT ok_on_between_pass_change",
+                "ASSERT stale_x_cleared",
+                "ASSERT y_installed_at_slot5",
+                "ASSERT bookkeeping_follows_new_gen",
+            ][..],
+        ),
+        (
+            "same-address-replay",
+            &[
+                "ASSERT ok_first_install",
+                "ASSERT ok_on_same_address_replay",
+                "ASSERT anchors_unchanged",
+            ][..],
+        ),
+        (
+            "fresh-gen-after-conflict",
+            &[
+                "ASSERT conflict_in_old_gen",
+                "ASSERT ok_after_conflict_in_fresh_gen",
+                "ASSERT y_installed_cleanly",
+            ][..],
+        ),
+        (
+            "straddle-bad-shape",
+            &["ASSERT bad_shape_on_straddle", "ASSERT nothing_installed"][..],
+        ),
+        (
+            "shape-cases",
+            &[
+                "ASSERT bad_shape_on_misaligned",
+                "ASSERT bad_shape_on_oversized",
+                "ASSERT bad_shape_past_slots",
+                "ASSERT bad_shape_on_zero_inode",
+                "ASSERT anon_silently_skipped",
+                "ASSERT nothing_installed_anywhere",
+            ][..],
+        ),
+        (
+            "contained-install",
+            &[
+                "ASSERT ok_on_contained_install",
+                "ASSERT contained_vma_installed",
+            ][..],
+        ),
+    ] {
+        let run = std::process::Command::new(&binary)
+            .arg(scenario)
+            .output()
+            .expect("run harness scenario");
+        let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+        assert!(
+            run.status.success(),
+            "harness scenario {scenario} must pass:\n{stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("SCENARIO {scenario} PASS")),
+            "scenario {scenario} must print PASS:\n{stdout}"
+        );
+        for needle in asserts {
+            assert!(
+                stdout.contains(needle),
+                "scenario {scenario} must show {needle}:\n{stdout}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&work);
+}
+
 /// Compiler resolution skips non-executable PATH decoys: an earlier
 /// readable-but-not-executable `clang-18` must not win over the real
 /// executable later on PATH (the round-2 provenance finding). Hermetic:

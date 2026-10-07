@@ -3519,9 +3519,10 @@ mod tests {
     /// distinguishes a current-pass change (contested: `CONFLICT`, installs
     /// nothing) from stale previous-pass bookkeeping (a legitimate
     /// between-passes reinstall). Structural pin on the C source: the guard
-    /// must consult the observed map before installation. Live
-    /// overflow-replay coverage needs attach + arena control (W3-2); until
-    /// then the strict verifier gate proves the guarded program loads.
+    /// must consult the observed map before installation. Behavioral
+    /// C-logic coverage lives in the host harness
+    /// (`anchor_host_harness_replay_and_arena_behavior`); live
+    /// overflow-replay coverage needs attach + arena control (W3-2).
     #[test]
     fn anchor_program_guards_mid_pass_slot_changes() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3670,7 +3671,8 @@ mod tests {
     /// The anchor program enforces full VMA containment in the arena, not
     /// just the start address: a VMA starting inside the reservation but
     /// extending past its end is a shape failure, never an install.
-    /// Structural pin (live containment coverage needs attach, W3-2).
+    /// Structural pin (behavioral C-logic cases live in the host
+    /// harness; live containment coverage needs attach, W3-2).
     #[test]
     fn anchor_program_enforces_vma_containment() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

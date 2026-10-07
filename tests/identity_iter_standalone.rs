@@ -389,19 +389,16 @@ fn identity_loader_unprivileged_smoke() {
 /// load fails at map creation. Either way no program verifies here.
 #[test]
 fn none_btf_load_never_verifies_programs() {
-    match ii::load_identity_object_unverified(None) {
-        Ok(ebpf) => {
-            for name in [ii::ANCHOR_PROGRAM, ii::TARGET_PROGRAM] {
-                let program = ebpf
-                    .program(name)
-                    .unwrap_or_else(|| panic!("{name} missing from loaded object"));
-                assert!(
-                    program.fd().is_err(),
-                    "{name} must stay unloaded without BTF-backed verification"
-                );
-            }
+    if let Ok(ebpf) = ii::load_identity_object_unverified(None) {
+        for name in [ii::ANCHOR_PROGRAM, ii::TARGET_PROGRAM] {
+            let program = ebpf
+                .program(name)
+                .unwrap_or_else(|| panic!("{name} missing from loaded object"));
+            assert!(
+                program.fd().is_err(),
+                "{name} must stay unloaded without BTF-backed verification"
+            );
         }
-        Err(_) => {}
     }
 }
 
@@ -436,8 +433,8 @@ fn identity_uapi_constants_match_aya_bindings() {
         ii::BPF_MAP_TYPE_ARRAY,
         bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
     );
-    assert_eq!(ii::BPF_F_WRONLY, GEN_WRONLY as u32);
-    assert_eq!(ii::BPF_F_MMAPABLE, GEN_MMAPABLE as u32);
+    assert_eq!(ii::BPF_F_WRONLY, GEN_WRONLY);
+    assert_eq!(ii::BPF_F_MMAPABLE, GEN_MMAPABLE);
     // Attr layouts bindgen exposes as plain structs.
     use aya_obj::generated::{
         bpf_attr__bindgen_ty_2 as gen_map_elem, bpf_attr__bindgen_ty_9 as gen_obj_info,

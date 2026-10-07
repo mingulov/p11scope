@@ -1897,15 +1897,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ) {
                 continue;
             }
+            // Count-side stamps come from the lookup stamp (round 5,
+            // anchor skew): the refresh observed every update here at
+            // or after it, so a base read anchors at-or-before its
+            // own lookup — never after the whole quantum.
             let held = {
                 let held = self.pair_counts.entry(key).or_insert(PairCount {
                     count: 0,
-                    first_ns: batch.rows_read_ns,
-                    last_ns: batch.rows_read_ns,
+                    first_ns: batch.counts_read_ns,
+                    last_ns: batch.counts_read_ns,
                 });
                 if update.count > held.count {
                     held.count = update.count;
-                    held.last_ns = batch.rows_read_ns;
+                    held.last_ns = batch.counts_read_ns;
                 }
                 *held
             };
@@ -4553,6 +4557,7 @@ mod tests {
             health_baseline_ns: 0,
             health_read_ns: 150,
             rows_read_ns: 151,
+            counts_read_ns: 151,
             changed_objects: Vec::new(),
             custody: ScopeCustody::PidHeld,
             custody_proven_ns: None,
@@ -5247,6 +5252,7 @@ mod tests {
             read.health.discovery_counters = Some([0; 5]);
             read.health_read_ns = at;
             read.rows_read_ns = at + 1;
+            read.counts_read_ns = at + 1;
             NativeBatch::Witness(Box::new(read))
         }
 
@@ -5357,6 +5363,7 @@ mod tests {
             batch.health.discovery_counters = Some([0; 5]);
             batch.health_read_ns = at;
             batch.rows_read_ns = at + 1;
+            batch.counts_read_ns = at + 1;
             self.stage(NativeBatch::Witness(Box::new(batch)))
         }
 
@@ -5950,6 +5957,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let (count, coverage) = edge_b(&native);
@@ -6156,6 +6164,7 @@ mod tests {
             batch.health.discovery_counters = Some([0; 5]);
             batch.health_read_ns = at;
             batch.rows_read_ns = at + 1;
+            batch.counts_read_ns = at + 1;
             native.stage(NativeBatch::Witness(Box::new(batch)));
             native.scene.coordinator.commit_batch(false).unwrap();
         }
@@ -6223,6 +6232,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let edge_count = |native: &NativeScene, needle: &str| {
@@ -6328,6 +6338,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let edge_of = |native: &NativeScene, needle: &str| {
@@ -6410,6 +6421,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let edge_count = |native: &NativeScene, needle: &str| {
@@ -6504,6 +6516,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let registry = &native.scene.coordinator.registry;
@@ -6603,6 +6616,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let registry = &native.scene.coordinator.registry;
@@ -6694,6 +6708,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let gaps: Vec<_> = native
@@ -6789,6 +6804,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let registry = &native.scene.coordinator.registry;
@@ -6873,6 +6889,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         // Then another caller's first-sight shared row fails closed
@@ -7274,6 +7291,7 @@ mod tests {
         history.health.discovery_counters = Some([0; 5]);
         history.health_read_ns = h;
         history.rows_read_ns = h + 1;
+        history.counts_read_ns = h + 1;
         native.stage(NativeBatch::Witness(Box::new(history)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
@@ -7323,6 +7341,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         assert_ne!(h + 1, at + 1, "the base read predates the demoting read");
@@ -7356,6 +7375,112 @@ mod tests {
                 lossy: false
             },
             "the history holder keeps the pair's first record as its anchor"
+        );
+    }
+
+    #[test]
+    fn demoted_edge_windows_from_the_lookup_stamp() {
+        // Round 5, anchor skew (astra-R5-N2): the base read's lookup
+        // stamp predates its late batch stamp (the count lookup ran
+        // mid-quantum, the batch stamped after it) — the demoted
+        // edge's coverage anchors at the lookup, so genuine growth
+        // between the lookup and the late stamp lands at or after its
+        // own anchor instead of strictly before it.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let row_a = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![row_a]);
+        // History while A is the sole owner, at a skewed read: looked
+        // up at `h`, batch-stamped after the quantum.
+        let h = native.stamps.tick();
+        let mut history = witness_batch();
+        history.domain = native.domain;
+        history.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: native.scene.delta.endpoints[0].object,
+            count: 5,
+        }];
+        history.health.discovery_counters = Some([0; 5]);
+        history.health_read_ns = h;
+        history.rows_read_ns = h + 20;
+        history.counts_read_ns = h;
+        native.stage(NativeBatch::Witness(Box::new(history)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        // One advance past the history, at a later read.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 6,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge_of = |needle: &str| {
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .unwrap()
+        };
+        let edge_b = edge_of("b.so");
+        assert_eq!(edge_b.entry_count, 1, "B carries only post-demotion growth");
+        assert_eq!(
+            registry.coverage(edge_b),
+            UseCoverage::Counted {
+                since_ns: h,
+                lossy: false
+            },
+            "the demoted edge windows from the base lookup, not the late batch stamp"
         );
     }
 
@@ -7791,6 +7916,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let registry = &native.scene.coordinator.registry;
@@ -7887,6 +8013,7 @@ mod tests {
         batch.health.discovery_counters = Some([0; 5]);
         batch.health_read_ns = at;
         batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
         native.stage(NativeBatch::Witness(Box::new(batch)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let registry = &native.scene.coordinator.registry;
@@ -7947,6 +8074,7 @@ mod tests {
             batch.health.discovery_counters = Some([0; 5]);
             batch.health_read_ns = at;
             batch.rows_read_ns = at + 1;
+            batch.counts_read_ns = at + 1;
             native.stage(NativeBatch::Witness(Box::new(batch)));
             native.scene.coordinator.commit_batch(false).unwrap();
         }
@@ -8032,6 +8160,7 @@ mod tests {
             batch.health.discovery_counters = Some([0; 5]);
             batch.health_read_ns = at;
             batch.rows_read_ns = at + 1;
+            batch.counts_read_ns = at + 1;
             native.stage(NativeBatch::Witness(Box::new(batch)));
             native.scene.coordinator.commit_batch(false).unwrap();
         }
@@ -8105,6 +8234,7 @@ mod tests {
             batch.health.discovery_counters = Some([0; 5]);
             batch.health_read_ns = at;
             batch.rows_read_ns = at + 1;
+            batch.counts_read_ns = at + 1;
             native.stage(NativeBatch::Witness(Box::new(batch)));
             native.scene.coordinator.commit_batch(false).unwrap();
         }
@@ -8238,6 +8368,7 @@ mod tests {
             batch.health.discovery_counters = Some([0; 5]);
             batch.health_read_ns = at;
             batch.rows_read_ns = at + 1;
+            batch.counts_read_ns = at + 1;
             native.stage(NativeBatch::Witness(Box::new(batch)));
             native.scene.coordinator.commit_batch(false).unwrap();
         }
@@ -8942,6 +9073,7 @@ mod tests {
             panic!("a witness read stages a witness batch");
         };
         read.rows_read_ns = u64::MAX;
+        read.counts_read_ns = u64::MAX;
         native.stage(batch);
         native.scene.coordinator.commit_batch(false).unwrap();
         assert_eq!(

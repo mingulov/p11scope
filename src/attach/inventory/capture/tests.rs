@@ -3304,6 +3304,40 @@ fn a_deadline_starved_refresh_reports_starvation_on_the_batch() {
 }
 
 #[test]
+fn count_lookup_stamp_precedes_the_batch_stamp() {
+    // Round 5, anchor skew (astra-R5-N2): the count-refresh lookup
+    // stamp is taken when the refresh begins (before the quantum)
+    // while the batch stamp is taken after it — every count here was
+    // observed at or after the lookup stamp.
+    let mut book = test_book(8, 8, None);
+    let mut fixture = SetFixture::new(8);
+    let delta = fixture.pass("a.so", 2);
+    for endpoint in &delta.endpoints {
+        book.published.insert(endpoint.id.0, endpoint.object);
+    }
+    let mut rows = FakeRows::default();
+    rows.insert(key(1, 0), Some(value(40, 0)));
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut batch = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with(&mut rows, &mut book, &mut batch, window, 8);
+    assert_ne!(
+        batch.counts_read_ns, 0,
+        "the lookup stamp is taken when the refresh begins"
+    );
+    assert_ne!(
+        batch.counts_read_ns,
+        u64::MAX,
+        "the lookup clock read succeeded"
+    );
+    assert!(
+        batch.counts_read_ns <= batch.rows_read_ns,
+        "the lookup begins before the batch stamp: {} <= {}",
+        batch.counts_read_ns,
+        batch.rows_read_ns
+    );
+}
+
+#[test]
 fn count_refresh_with_a_zero_row_bound_reads_nothing() {
     let mut rows = FakeRows {
         batch_supported: true,

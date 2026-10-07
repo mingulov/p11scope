@@ -778,6 +778,14 @@ pub(crate) struct WitnessBatch {
     /// when nothing was read). Stamped after the count refresh too, so it
     /// also bounds every count here.
     pub rows_read_ns: u64,
+    /// CLOCK_MONOTONIC when this read's count-refresh lookup began (round
+    /// 5, anchor skew): every count here was observed at or after it
+    /// (`u64::MAX` when the clock read failed, `0` when nothing was
+    /// read). Count anchors (base reads) stamp from here, never from
+    /// the post-quantum `rows_read_ns` — genuine growth between a
+    /// pair's lookup and the late batch stamp must land at or after
+    /// its own anchor, never strictly before it.
+    pub counts_read_ns: u64,
     /// Held objects whose retained pin no longer matches (modified in
     /// place) or could not be rechecked, first reported in this batch:
     /// their modules' coverage is unknown from now on.
@@ -2478,6 +2486,7 @@ fn read_witnesses_from(
         health_baseline_ns: book.health_ns,
         health_read_ns: 0,
         rows_read_ns: 0,
+        counts_read_ns: 0,
         changed_objects: Vec::new(),
         custody: book.custody(),
         custody_proven_ns: book.scope.map(|_| book.held_ns),
@@ -2594,6 +2603,12 @@ fn read_rows_from_with<I: CallerUseIo>(
         |endpoint| published.get(&endpoint).map(|object| object.index()),
         |_, value| witness_rejection(failed, scope_pid, value),
     );
+    // The count-lookup stamp goes down before the refresh quantum
+    // (round 5, anchor skew): every refreshed count is observed at or
+    // after it, so a base read anchors at-or-before its own lookup.
+    // The batch stamp stays after the quantum — binding horizons
+    // prove their starts strictly after the rows' read finished.
+    batch.counts_read_ns = monotonic_ns();
     let refreshed = book
         .cursor
         .refresh_with(io, window.max_rows, window.deadline);

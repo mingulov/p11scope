@@ -102,6 +102,7 @@ fn read_at(
         health_baseline_ns: 0,
         health_read_ns: at_ns,
         rows_read_ns: at_ns + 1,
+        counts_read_ns: at_ns + 1,
         changed_objects: Vec::new(),
         custody: ScopeCustody::System,
         custody_proven_ns: None,

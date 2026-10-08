@@ -1083,7 +1083,6 @@ impl CaptureWorkBudget {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn window_exhaustions(&self) -> u64 {
         self.window_exhaustions
     }

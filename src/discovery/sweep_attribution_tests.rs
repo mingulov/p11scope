@@ -170,7 +170,10 @@ impl Probe {
             .into_iter()
             .map(|range| {
                 if self.denied.contains(&pid) {
-                    return (range, Err("Operation not permitted (os error 1)".into()));
+                    return (
+                        range,
+                        RangeProof::Unavailable("Operation not permitted (os error 1)".into()),
+                    );
                 }
                 let found = known
                     .and_then(|mapped| mapped.get(&range))
@@ -182,8 +185,12 @@ impl Probe {
                                     .iter()
                                     .find(|entry| (entry.start, entry.end) == range)
                             })
-                            .map(|entry| vm_file(entry.inode))
-                            .ok_or_else(|| "No such file or directory (os error 2)".into())
+                            .map(|entry| RangeProof::MapFiles(vm_file(entry.inode)))
+                            .unwrap_or_else(|| {
+                                RangeProof::Unavailable(
+                                    "No such file or directory (os error 2)".into(),
+                                )
+                            })
                     });
                 (range, found)
             })
@@ -862,7 +869,7 @@ fn ranges_reading(entries: &[MapEntry], inode: u64, identity: FileIdentity) -> M
     entries
         .iter()
         .filter(|entry| entry.inode == inode)
-        .map(|entry| ((entry.start, entry.end), Ok(identity)))
+        .map(|entry| ((entry.start, entry.end), RangeProof::MapFiles(identity)))
         .collect()
 }
 
@@ -912,7 +919,7 @@ fn every_range_of_a_matched_group_must_be_the_held_file() {
         10_001,
         MappedIdentities::from([(
             (text.start, text.end),
-            Ok(FileIdentity {
+            RangeProof::MapFiles(FileIdentity {
                 dev: 47,
                 ino: PROVIDER,
             }),
@@ -1056,7 +1063,7 @@ fn the_confirmation_reads_map_files_for_requested_keys_inside_the_pin() {
     assert!(
         read.mapped
             .values()
-            .all(|identity| identity == &Ok(vm_file(PROVIDER)))
+            .all(|identity| identity == &RangeProof::MapFiles(vm_file(PROVIDER)))
     );
 
     let mut turned = Io {
@@ -1759,7 +1766,12 @@ fn a_held_map_files_directory_is_the_given_processes() {
         .map(|entry| (entry.start, entry.end))
         .collect();
     ranges.push((range.0, range.1 + 4096));
-    let source = Arc::new(HeldMapFiles(held));
+    let source = Arc::new(HeldMapFiles {
+        dir: Some(held),
+        lease: None,
+        closed: DropFence::default(),
+        observer: None,
+    });
     let serial: Vec<_> = ranges.iter().map(|&(s, e)| source.stat(s, e)).collect();
     for threads in 1..=MAX_PROOF_STAT_THREADS {
         ProofStatPool::scoped(threads, |pool| {
@@ -1816,7 +1828,7 @@ fn a_range_unmapped_after_the_sweep_is_confirmed_never_counted_unexamined() {
     let mut probe = Probe::over(&sweep);
     probe.mapped.insert(
         20_001,
-        MappedIdentities::from([(libc_range, Err(RANGE_NOT_MAPPED.into()))]),
+        MappedIdentities::from([(libc_range, RangeProof::NotMapped)]),
     );
     probe.snapshots.insert(20_001, Vec::new());
     let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
@@ -1832,7 +1844,7 @@ fn a_range_unmapped_after_the_sweep_is_confirmed_never_counted_unexamined() {
     let mut probe = Probe::over(&sweep);
     probe.mapped.insert(
         20_001,
-        MappedIdentities::from([(libc_range, Err(RANGE_NOT_MAPPED.into()))]),
+        MappedIdentities::from([(libc_range, RangeProof::NotMapped)]),
     );
     probe.overrides.insert(20_001, Confirmation::Exited);
     let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
@@ -1866,7 +1878,7 @@ fn a_range_gone_inside_the_pin_is_a_mapping_changed_loss() {
         let mut probe = Probe::over(&sweep);
         probe.mapped.insert(
             10_001,
-            MappedIdentities::from([(range, Err(RANGE_NOT_MAPPED.into()))]),
+            MappedIdentities::from([(range, RangeProof::NotMapped)]),
         );
         let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
         assert_eq!(
@@ -1881,8 +1893,8 @@ fn a_range_gone_inside_the_pin_is_a_mapping_changed_loss() {
     probe.mapped.insert(
         10_001,
         MappedIdentities::from([
-            ((0x1000_0000, 0x1000_1000), Err(RANGE_NOT_MAPPED.into())),
-            ((0x2000_0000, 0x2000_1000), Err(RANGE_NOT_MAPPED.into())),
+            ((0x1000_0000, 0x1000_1000), RangeProof::NotMapped),
+            ((0x2000_0000, 0x2000_1000), RangeProof::NotMapped),
         ]),
     );
     let attribution = run(&sweep, &BTreeSet::from([10_000]), &index, &mut probe);
@@ -2262,7 +2274,12 @@ impl ConfirmIo for CountingIo<'_> {
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
         self.reads.borrow_mut().push((pid, (start, end)));
         if let Some(fault) = self.faults.get(&(start, end)) {
-            return fault.clone();
+            return match fault {
+                RangeProof::MapFiles(identity) => Ok(*identity),
+                RangeProof::NotMapped => Err(RANGE_NOT_MAPPED.into()),
+                RangeProof::Unavailable(error) => Err(error.clone()),
+                _ => panic!("the OS seam emits no kernel evidence"),
+            };
         }
         self.entries
             .iter()
@@ -2448,7 +2465,7 @@ fn a_dlopen_caller_is_attributed_by_proving_its_executable_ranges_only() {
 /// never read (the production path) or is in hand anyway.
 #[test]
 fn a_collision_on_a_data_range_does_not_cost_an_exec_proven_edge() {
-    let other_subvolume = Ok(FileIdentity {
+    let other_subvolume = RangeProof::MapFiles(FileIdentity {
         dev: 47,
         ino: PROVIDER,
     });
@@ -2479,8 +2496,8 @@ fn a_collision_on_a_data_range_does_not_cost_an_exec_proven_edge() {
     // The confirmation hands over the colliding data-range identities too:
     // the match still proves only its executable range.
     let mut mapped = collided;
-    mapped.insert(PROVIDER_TEXT, Ok(vm_file(PROVIDER)));
-    mapped.insert(LIBC_TEXT, Ok(vm_file(LIBC)));
+    mapped.insert(PROVIDER_TEXT, RangeProof::MapFiles(vm_file(PROVIDER)));
+    mapped.insert(LIBC_TEXT, RangeProof::MapFiles(vm_file(LIBC)));
     let mut scripted = Probe::over(&sweep);
     scripted.overrides.insert(
         10_001,
@@ -2528,9 +2545,10 @@ fn an_exec_range_that_fails_its_proof_is_not_attributed_with_its_reason() {
     for (fault, loss, reason) in cases {
         let sweep = vec![(10_000, caller5()), (10_001, caller5())];
         let mut probe = CountingProbe::over(&sweep);
-        probe
-            .faults
-            .insert(10_001, MappedIdentities::from([(PROVIDER_TEXT, fault)]));
+        probe.faults.insert(
+            10_001,
+            MappedIdentities::from([(PROVIDER_TEXT, RangeProof::from(fault))]),
+        );
         let (attribution, _) = run_counting(&sweep, &mut probe);
         assert!(attribution.members.is_empty(), "{loss:?}");
         assert_eq!(attribution.losses, BTreeMap::from([(loss, 1)]));
@@ -2563,7 +2581,7 @@ fn every_executable_range_of_a_key_must_prove() {
     let mut probe = CountingProbe::over(&sweep);
     probe.faults.insert(
         10_001,
-        MappedIdentities::from([(second_text, Ok(vm_file(9_999)))]),
+        MappedIdentities::from([(second_text, RangeProof::MapFiles(vm_file(9_999)))]),
     );
     let (attribution, _) = run_counting(&sweep, &mut probe);
     assert!(attribution.members.is_empty());
@@ -2989,4 +3007,326 @@ fn cgroup_review_confirmation_without_stop_preserves_both_members() {
     assert_eq!(*probe.opens.borrow(), vec![10_001, 10_002]);
     assert_eq!(attribution.members.len(), 2);
     assert!(budget.stopped_reason().is_none());
+}
+
+/// Reconciliation must keep each normally returning operation behind the
+/// scoped collector's cancellation fence, including the live finish checks.
+struct CgroupOrderedIo {
+    inner: OrderedIo,
+    control: crate::scope::inventory_cgroup::CollectionControl,
+    stop_after: &'static str,
+}
+
+impl CgroupOrderedIo {
+    fn returned(&self, operation: &str) {
+        if operation == self.stop_after {
+            self.control.cancel();
+        }
+    }
+}
+
+impl ConfirmIo for CgroupOrderedIo {
+    type Pin = u64;
+
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        self.mapped_files(pid, &[(start, end)]).remove(0)
+    }
+
+    fn mapped_files(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+    ) -> Vec<Result<FileIdentity, String>> {
+        let answer = self.inner.mapped_files(pid, ranges);
+        self.returned("proof");
+        answer
+    }
+
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        let answer = self.inner.open(pid);
+        self.returned("open");
+        answer
+    }
+
+    fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
+        self.inner.record("start_time");
+        self.inner.start_time(pin)
+    }
+
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        let answer = self.inner.still_the_same(pin);
+        self.returned("same");
+        answer
+    }
+
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        let finishing = self.inner.read();
+        let answer = self.inner.exe(pid);
+        self.returned(if finishing { "after" } else { "before" });
+        answer
+    }
+
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        let answer = self.inner.maps(pid, budget);
+        self.returned("maps");
+        answer
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        self.inner.gone(pid)
+    }
+}
+
+#[test]
+fn d3a_cgroup_stop_checks_each_confirmation_boundary() {
+    let order = [
+        "open",
+        "exe",
+        "maps",
+        "mapped_files",
+        "exe",
+        "still_the_same",
+    ];
+    for (stop_after, completed) in [
+        ("already_stopped", 0),
+        ("open", 1),
+        ("before", 2),
+        ("maps", 3),
+        ("proof", 4),
+        ("after", 5),
+        ("same", 6),
+    ] {
+        let control = crate::scope::inventory_cgroup::CollectionControl::new(None);
+        let checked = control.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(crate::discovery::scan::CollectionWork::new(move |_| {
+            checked.check().is_ok()
+        }));
+        if completed == 0 {
+            control.cancel();
+        }
+        let mut io = CgroupOrderedIo {
+            inner: OrderedIo::new(false),
+            control,
+            stop_after,
+        };
+        let policy = SegmentPolicy::from_headroom(3, 4, 1);
+        let owner = ReservationOwner::new(policy);
+        let resources = owner.immediate();
+        let confirmation = confirm_with_resources(
+            &mut io,
+            10_001,
+            &BTreeSet::from([key(PROVIDER)]),
+            &mut budget,
+            Some(&resources),
+        );
+        assert!(
+            matches!(confirmation, Confirmation::Lost(AttributionLoss::Budget, _)),
+            "stop after {stop_after} published a completed confirmation: {confirmation:?}"
+        );
+        assert_eq!(
+            &*io.inner.calls.borrow(),
+            &order[..completed],
+            "{stop_after}"
+        );
+        assert!(budget.stopped_reason().is_some(), "{stop_after}");
+        assert_eq!(owner.state_for_test().0, [0; 4], "{stop_after}");
+    }
+}
+
+/// A zero-request proof must not create a directory FD or depend on access to
+/// a process that the operation never needs to inspect.
+#[test]
+fn d3a_empty_proof_does_not_open_a_directory() {
+    let mut io = OsConfirmIo::default();
+    assert!(io.mapped_files(std::process::id(), &[]).is_empty());
+    assert!(
+        io.map_files.is_none(),
+        "an empty proof retained an unnecessary directory"
+    );
+}
+
+/// Catches treating unsupported/missing kernel evidence as a positive, using
+/// a numeric file identity as a slot, or accepting only one text range.
+#[test]
+fn d3a_kernel_proofs_require_complete_slot_expectations() {
+    let checks = Checks::default();
+    let mut index = provider_index(&checks);
+    let mut entries = provider_caller();
+    entries.push(mapping(
+        0x1000_3000,
+        b"r-xp",
+        PROVIDER,
+        "/usr/lib/softhsm/libsofthsm2.so",
+    ));
+    let sweep = vec![(10_001, entries.clone())];
+    let first = (0x1000_1000, 0x1000_2000);
+    let second = (0x1000_3000, 0x1000_4000);
+    let libc = (0x2000_1000, 0x2000_2000);
+    index
+        .set_kernel_slots(key(PROVIDER), BTreeSet::from([Slot(1), Slot(2)]))
+        .unwrap();
+    index
+        .set_kernel_slots(key(LIBC), BTreeSet::from([Slot(3), Slot(4)]))
+        .unwrap();
+    for (proof, loss) in [
+        (
+            RangeProof::Kernel(Slot(99)),
+            Some(AttributionLoss::IdentityMismatch),
+        ),
+        (
+            RangeProof::KernelNone,
+            Some(AttributionLoss::IdentityMismatch),
+        ),
+        (RangeProof::NotMapped, Some(AttributionLoss::MappingChanged)),
+        (
+            RangeProof::Unavailable("unvisited requested range".into()),
+            Some(AttributionLoss::MapFilesUnavailable),
+        ),
+        (RangeProof::Kernel(Slot(2)), None),
+    ] {
+        let mut probe = Probe::over(&sweep);
+        probe.mapped.insert(
+            10_001,
+            MappedIdentities::from([
+                (first, RangeProof::Kernel(Slot(1))),
+                (second, proof),
+                (libc, RangeProof::Kernel(Slot(4))),
+            ]),
+        );
+        let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+        assert!(
+            out.unexamined.is_empty(),
+            "validated examined alias must remain examined"
+        );
+        match loss {
+            Some(loss) => {
+                assert!(out.members.is_empty());
+                assert_eq!(out.member_losses[&10_001].0, loss);
+                if loss == AttributionLoss::IdentityMismatch {
+                    assert!(!out.member_losses[&10_001].1.contains("st_dev"));
+                    assert!(!out.member_losses[&10_001].1.contains("st_ino"));
+                }
+            }
+            None => {
+                assert_eq!(
+                    out.members
+                        .iter()
+                        .map(|member| member.pid)
+                        .collect::<Vec<_>>(),
+                    [10_001]
+                );
+                assert!(out.losses.is_empty());
+            }
+        }
+    }
+    index
+        .set_kernel_slots(key(PROVIDER), BTreeSet::new())
+        .unwrap();
+    let mut probe = Probe::over(&sweep);
+    probe.mapped.insert(
+        10_001,
+        MappedIdentities::from([
+            (first, RangeProof::Kernel(Slot(1))),
+            (second, RangeProof::Kernel(Slot(1))),
+            (libc, RangeProof::Kernel(Slot(4))),
+        ]),
+    );
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert!(out.members.is_empty());
+    assert_eq!(
+        out.member_losses[&10_001].0,
+        AttributionLoss::IdentityMismatch
+    );
+}
+
+#[test]
+fn d3a_global_reservations_enforce_each_envelope() {
+    for (headroom, workers, retained) in [
+        (0, 0, 0),
+        (3, 0, 0),
+        (4, 0, 0),
+        (5, 0, 0),
+        (6, 1, 1),
+        (9, 2, 2),
+        (12, 3, 3),
+        (64, 4, 53),
+    ] {
+        let policy = SegmentPolicy::from_headroom(headroom, 4, 100);
+        assert_eq!((policy.workers, policy.retained), (workers, retained));
+        let owner = ReservationOwner::new(policy);
+        let batch = owner.batch();
+        let pins: Vec<_> = (0..retained).map(|_| batch.pin().unwrap()).collect();
+        assert!(batch.pin().is_err());
+        let workers: Vec<_> = (0..workers).map(|_| batch.transient().unwrap()).collect();
+        assert!(batch.transient().is_err());
+        let immediate = owner.immediate();
+        let immediate_pin = immediate.pin();
+        let immediate_io = immediate.transient();
+        if headroom >= 3 {
+            assert!(immediate_pin.is_ok());
+            assert!(immediate_io.is_ok());
+        } else {
+            assert!(immediate_pin.is_err());
+            assert!(immediate_io.is_err());
+        }
+        assert!(immediate.pin().is_err());
+        assert!(immediate.transient().is_err());
+        assert!(owner.state_for_test().2 <= headroom);
+        assert!(owner.state_for_test().3 <= headroom);
+        drop((pins, workers, immediate_pin, immediate_io));
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+    }
+    let policy = SegmentPolicy::from_headroom(usize::MAX, usize::MAX, 2);
+    assert_eq!((policy.workers, policy.retained), (2, 2));
+    assert_eq!(ReservationOwner::new(policy).state_for_test().3, 9);
+}
+
+/// A delivered reply does not release the worker's source Arc. The observer
+/// owns no source, and the next immediate operation awaits real destruction.
+#[test]
+fn d3a_directory_final_drop_fences_immediate_reuse() {
+    let policy = SegmentPolicy::from_headroom(3, 4, 2);
+    let owner = ReservationOwner::new(policy);
+    let resources = owner.immediate();
+    let lease = resources.transient().unwrap();
+    let held = Arc::new(HeldMapFiles {
+        dir: Some(MapFilesDir::open(std::process::id()).unwrap()),
+        lease: Some(lease),
+        closed: DropFence::default(),
+        observer: None,
+    });
+    let weak = Arc::downgrade(&held);
+    let observer = held.closed.clone(); // no source Arc in the observer
+    let delivered = std::sync::Barrier::new(2);
+    let release = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let worker_source = held.clone();
+        scope.spawn(|| {
+            delivered.wait(); // analogous to proof result delivery
+            release.wait();
+            drop(worker_source);
+        });
+        drop(held);
+        delivered.wait();
+        assert!(
+            weak.upgrade()
+                .unwrap()
+                .dir
+                .as_ref()
+                .unwrap()
+                .directory_metadata()
+                .is_ok()
+        );
+        assert_eq!(owner.state_for_test().0, [0, 0, 0, 2]);
+        assert!(resources.transient().is_err());
+        assert!(!*observer.0.0.lock().unwrap());
+        release.wait();
+        observer.wait();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+        let next = resources.transient().unwrap();
+        drop(next);
+    });
+    assert_eq!(owner.state_for_test().0, [0; 4]);
 }

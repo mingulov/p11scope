@@ -42,6 +42,9 @@ pub mod inventory;
 pub(crate) mod inventory_capture;
 pub mod inventory_dashboard;
 pub mod inventory_events;
+// The inventory finalizer consumes this transport in the next integration step.
+#[allow(dead_code)]
+pub(crate) mod inventory_output;
 pub mod inventory_present;
 pub mod kinds;
 pub mod longrun;

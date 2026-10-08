@@ -1253,8 +1253,13 @@ impl OwnedIds {
             ensure!(info.raw.id == id && ids.programs.contains(&info.raw.prog_id));
             ids.links.insert(id);
         }
+        // Stage A continuity hooks are owned session links attached to the
+        // session's programs, but retained in `Session.instance`, not
+        // `Session.links`: the kernel enumeration finds them, so the
+        // expected count includes both (0 hooks when refused).
+        let expected = session.links.len() + session.instance.hook_link_count();
         ensure!(
-            ids.links.len() == session.links.len(),
+            ids.links.len() == expected,
             "Detailed link IDs differ from retained links"
         );
         Ok(ids)

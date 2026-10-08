@@ -149,6 +149,15 @@ fn lto_refusal() -> Option<String> {
 }
 
 impl InstanceTracking {
+    /// Number of owned hook links currently attached (0 when refused).
+    /// The privileged link-inventory gates add this to `Session.links`
+    /// when reconciling kernel-owned link IDs: continuity hooks are
+    /// attached to the session's programs but retained here, not in
+    /// `Session.links`.
+    pub(crate) fn hook_link_count(&self) -> usize {
+        self.links.len()
+    }
+
     /// Loads and attaches the hooks. Never fails the session: a failure is
     /// returned as a refused tracker whose reason names the first error.
     /// Refusal order is measurement toggle, then policy (Task 1d: metrics

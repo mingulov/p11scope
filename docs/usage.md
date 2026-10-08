@@ -700,7 +700,28 @@ Limits that matter in pods:
   (per physical object, with scan-only admission verdicts), and the
   caller/module edges between them with usage coverage, lifecycle, and
   explicit gaps; the native lane counts entries per edge (see
-  `entries.coverage` below). A process is a caller of a module only when
+  `entries.coverage` below). Text snapshots begin with an application/module
+  overview, followed by detailed retained paths, identities, states and
+  coverage. The application label is the observed executable's basename,
+  not a desktop or package identity: an interpreter remains `python3`,
+  `java`, etc. Caller/module IDs and PID/incarnation are secondary detail;
+  equal basenames remain separate rows for their existing identities.
+  Missing retained names read `Unknown executable` or `Unknown module`;
+  an observed ` (deleted)` path marker stays on the executable label.
+  Retired images say `Application executed a new image`, and exited
+  callers say `Process exited`; these labels describe retained observations.
+  For example, a scan of an owned fixture with
+  `p11scope inventory --pid "$fixture_pid" --capture scan` can show:
+
+  ```text
+  application app-first-driver [c0 pid 4242 incarnation 0] -> module app-p1.so [m0]: Module mapped; activity not captured; coverage unknown (scan only)
+  ```
+
+  The fixture PID and IDs vary by run. Mapping alone does not prove use;
+  `At least N entries observed` counts entries, a lower bound, rather than
+  completed operations. Capture loss, unknown counts and no-use intervals
+  remain explicit in the overview and details. A process is a caller of a
+  module only when
   its maps show an executable (`x`) mapping of the module file that
   passes the identity proof; a process that maps the file only without
   `x` (a scanner reading it) is not a caller, and is no gap (see
@@ -712,7 +733,13 @@ Limits that matter in pods:
   report requires a file). `--dashboard` runs the live read-only
   dashboard on stdout when it is a terminal (scrollable edge table with
   presence/capture/activity states, coverage header, bounded log tail;
-  `q` quits, `--duration` bounds the run); on a pipe it degrades
+  `j`/`k` scroll, `tab` cycles summary/evidence/gaps, `q` quits, and
+  `--duration` bounds the run). At 40x10, the compact summary keeps an
+  executable/module pair, their IDs and observation meaning visible;
+  scrolling reaches later associations while totals still cover the whole
+  capture. Enlarge the terminal to see the fuller state and evidence view.
+  Below the useful compact size, the view asks for enlargement. On a pipe
+  it degrades
   honestly to snapshots (or JSON under `--json`), never ANSI. The
   dashboard runs the same loop as the classic path (passes, native
   service ticks, witness reads, stop) and only draws inside its service

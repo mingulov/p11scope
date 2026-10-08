@@ -635,6 +635,104 @@ fn b3_sigkill_freezes_evidence_with_exit_state() {
 }
 
 #[test]
+fn inventory_snapshot_names_the_observed_executable_and_module() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-app-first");
+    let private = private_dir();
+    let file = private.path().join("snapshot.json");
+    let ready = dir.join("app-first.ready");
+    let driver = gcc(
+        &dir,
+        "app-first-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let provider = gcc(
+        &dir,
+        "app-first-provider.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let text_file = dir.join("snapshot.txt");
+    // Like the JSON parity journey below, the shell becomes the observer,
+    // preserving parent custody of its single owned fixture under Yama.
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan", "--duration", "2s", "-o"])
+        .arg(&file)
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", "plain")
+        .env("INV_PROV", &provider)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &text_file)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let ready_text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = ready_text
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let _driver_guard = FixtureGuard { pids: vec![pid] };
+    assert!(output.status.success(), "{output:?}");
+    let text = std::fs::read_to_string(&text_file).unwrap();
+    assert!(!text.contains('\u{1b}'), "snapshot contains ANSI: {text}");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    assert_eq!(doc["scope"], format!("pid:{pid}"));
+    let callers = doc["callers"].as_array().unwrap();
+    assert_eq!(
+        callers.len(),
+        1,
+        "single-PID scope retains no unrelated caller"
+    );
+    let caller = &callers[0];
+    assert_eq!(caller["pid"], pid);
+    let exe = caller["image"]["exe"]["path"].as_str().unwrap();
+    assert_eq!(exe, driver.to_str().unwrap());
+    let module = module_for(&doc, "app-first-provider.so");
+    let path = module["paths"][0].as_str().unwrap();
+    assert_eq!(path, provider.to_str().unwrap());
+    let caller_id = caller["id"].as_str().unwrap();
+    let module_id = module["id"].as_str().unwrap();
+    let edges = edges_for(&doc, caller_id, module_id);
+    assert_eq!(edges.len(), 1);
+    assert_scan_only_entries(edges[0], "app-first owned mapping");
+    let overview = format!(
+        "application {} [{caller_id} pid {pid} incarnation {}] -> module {} [{module_id}]: Module mapped; activity not captured",
+        Path::new(exe).file_name().unwrap().to_str().unwrap(),
+        caller["incarnation"].as_u64().unwrap(),
+        Path::new(path).file_name().unwrap().to_str().unwrap(),
+    );
+    assert!(
+        text.lines().any(|line| line.starts_with(&overview)),
+        "{text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("application "))
+            .count(),
+        1
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("caller ") && line.contains(exe)),
+        "full executable detail: {text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("module ") && line.contains(path)),
+        "full module detail: {text}"
+    );
+    assert!(text.contains("coverage unknown (scan only)"), "{text}");
+}
+
+#[test]
 fn out_file_matches_stdout_document() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-outfile");

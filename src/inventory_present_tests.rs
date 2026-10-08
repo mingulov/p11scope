@@ -405,6 +405,452 @@ fn activity_splits_in_flight_from_recent_from_quiet() {
 }
 
 #[test]
+fn app_first_snapshot_joins_retained_identities_without_merging() {
+    // Joining by basename instead of ID would merge these distinct physical
+    // modules and caller incarnations, or borrow the wrong retained path.
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.callers[0].exe.as_mut().unwrap().path = Some("/opt/a/python3".into());
+    presentation.callers[1].exe.as_mut().unwrap().path = Some("/opt/b/python3".into());
+    presentation.modules[0].paths = vec!["/opt/a/provider.so".into()];
+    presentation.modules[1].paths = vec!["/opt/b/provider.so".into()];
+    presentation.edges[0].entry_count = 128;
+    let before = serde_json::to_vec(&crate::inventory::render_json_from_presentation(
+        &presentation,
+    ))
+    .unwrap();
+    assert_eq!(
+        application_label(&presentation, presentation.callers[0].id),
+        "python3"
+    );
+    assert_eq!(
+        application_label(&presentation, presentation.callers[1].id),
+        "python3"
+    );
+    assert_eq!(
+        module_label(&presentation, presentation.modules[0].id),
+        "provider.so"
+    );
+    assert_eq!(
+        module_label(&presentation, presentation.modules[1].id),
+        "provider.so"
+    );
+    for caller in &presentation.callers {
+        let _ = caller_lifecycle_label(caller);
+    }
+    for edge in &presentation.edges {
+        let _ = observation_label(edge);
+    }
+    let snapshot = render_snapshot(&presentation);
+    let overview: Vec<_> = snapshot
+        .lines()
+        .filter(|line| line.starts_with("application "))
+        .collect();
+    assert_eq!(overview.len(), presentation.edges.len(), "{snapshot}");
+    for (line, edge) in overview.iter().zip(&presentation.edges) {
+        assert!(
+            line.contains(&format!("[{} pid ", edge.caller.label())),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("[{}]: ", edge.module.label())),
+            "{line}"
+        );
+    }
+    for caller in &presentation.callers[..2] {
+        let rows: Vec<_> = overview
+            .iter()
+            .filter(|line| line.contains(&format!("[{} pid ", caller.id.label())))
+            .collect();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|line| line.starts_with("application python3 ["))
+        );
+    }
+    for module in &presentation.modules[..2] {
+        assert!(
+            overview
+                .iter()
+                .filter(|line| line.contains(&format!("[{}]: ", module.id.label())))
+                .all(|line| line.contains("-> module provider.so ["))
+        );
+    }
+    for path in [
+        "/opt/a/python3",
+        "/opt/b/python3",
+        "/opt/a/provider.so",
+        "/opt/b/provider.so",
+    ] {
+        assert!(
+            snapshot.lines().any(|line| (line.starts_with("caller ")
+                || line.starts_with("module "))
+                && line.contains(path)),
+            "{snapshot}"
+        );
+    }
+    let detail_edges: Vec<_> = snapshot
+        .lines()
+        .filter(|line| line.starts_with("edge "))
+        .collect();
+    assert_eq!(detail_edges.len(), presentation.edges.len());
+    for (line, edge) in detail_edges.iter().zip(&presentation.edges) {
+        assert!(line.starts_with(&format!(
+            "edge {} -> {} mapping ",
+            edge.caller.label(),
+            edge.module.label()
+        )));
+        assert!(line.contains(&format!("entries {} (", edge.entry_count)));
+    }
+    assert!(overview[0].contains("At least 128 entries observed"));
+    assert_eq!(
+        snapshot.lines().nth(1).unwrap(),
+        format!(
+            "coverage: {} gaps, {} refusals, {} suppressed",
+            presentation.gaps.len(),
+            presentation.budgets.refusals(),
+            presentation.gaps_suppressed
+        )
+    );
+    let marker = "Details: retained paths, identities, states and coverage follow.";
+    assert!(snapshot.contains(&format!("\n{marker}\nbudgets: ")));
+    assert_eq!(
+        before,
+        serde_json::to_vec(&crate::inventory::render_json_from_presentation(
+            &presentation
+        ))
+        .unwrap()
+    );
+
+    presentation.edges.clear();
+    let empty = render_snapshot(&presentation);
+    assert!(empty.contains("No application/module associations observed; this does not prove that no PKCS#11 activity occurred."));
+    assert!(!empty.lines().any(|line| line.starts_with("application ")));
+}
+
+#[test]
+fn retained_labels_preserve_unknown_deleted_and_incarnation() {
+    // A live-PID lookup would overwrite a retired incarnation's name; an
+    // unescaped retained path could inject terminal control sequences.
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let caller0 = presentation.callers[0].id;
+    let caller1 = presentation.callers[1].id;
+    let module = presentation.modules[0].id;
+    presentation.callers[0].pid = 4242;
+    presentation.callers[0].incarnation = 0;
+    presentation.callers[0].lifecycle = CallerLifecycle::ExecRetired;
+    presentation.callers[0].exe.as_mut().unwrap().path = Some("/opt/a/python3".into());
+    presentation.callers[1].pid = 4242;
+    presentation.callers[1].incarnation = 1;
+    presentation.callers[1].lifecycle = CallerLifecycle::Exited;
+    presentation.callers[1].exe.as_mut().unwrap().path = Some("/opt/firefox (deleted)".into());
+    presentation.modules[0].paths = vec!["/opt/provider.so".into()];
+    let template = presentation.edges[0].clone();
+    presentation.edges = [caller0, caller1]
+        .into_iter()
+        .map(|caller| EdgeView {
+            caller,
+            module,
+            ..template.clone()
+        })
+        .collect();
+    let snapshot = render_snapshot(&presentation);
+    assert!(
+        snapshot.contains(&format!(
+            "application python3 [{} pid 4242 incarnation 0]",
+            caller0.label()
+        )),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains(&format!(
+            "application firefox (deleted) [{} pid 4242 incarnation 1]",
+            caller1.label()
+        )),
+        "{snapshot}"
+    );
+    assert!(snapshot.contains("Application executed a new image"));
+    assert!(snapshot.contains("Process exited"));
+    assert!(snapshot.contains("(/opt/firefox (deleted))"));
+    assert_eq!(
+        application_label(&presentation, caller1),
+        "firefox (deleted)"
+    );
+    assert_eq!(
+        caller_lifecycle_label(&presentation.callers[0]),
+        Some("Application executed a new image")
+    );
+    assert_eq!(
+        caller_lifecycle_label(&presentation.callers[1]),
+        Some("Process exited")
+    );
+    presentation.callers[0].lifecycle = CallerLifecycle::Mapped;
+    assert_eq!(caller_lifecycle_label(&presentation.callers[0]), None);
+    for (path, label) in [
+        ("/opt/a/python3///", "python3"),
+        ("////", "Unknown executable"),
+        (" (deleted)", "Unknown executable"),
+        ("/opt/app (deleted elsewhere)", "app (deleted elsewhere)"),
+    ] {
+        presentation.callers[0].exe.as_mut().unwrap().path = Some(path.into());
+        assert_eq!(application_label(&presentation, caller0), label);
+    }
+
+    presentation.edges.truncate(1);
+    for exe in [
+        None,
+        Some(ExeIdentity {
+            path: None,
+            ..presentation.callers[0].exe.clone().unwrap()
+        }),
+        Some(ExeIdentity {
+            path: Some(String::new()),
+            ..presentation.callers[0].exe.clone().unwrap()
+        }),
+    ] {
+        presentation.callers[0].exe = exe;
+        let snapshot = render_snapshot(&presentation);
+        assert!(
+            snapshot.contains(&format!(
+                "application Unknown executable [{} pid 4242 incarnation 0]",
+                caller0.label()
+            )),
+            "{snapshot}"
+        );
+    }
+    for paths in [vec![], vec![String::new()]] {
+        presentation.modules[0].paths = paths;
+        let snapshot = render_snapshot(&presentation);
+        assert!(
+            snapshot.contains(&format!("-> module Unknown module [{}]:", module.label())),
+            "{snapshot}"
+        );
+    }
+    presentation.callers[0].exe = Some(ExeIdentity {
+        dev: 1,
+        ino: 1,
+        mtime_secs: 0,
+        mtime_nanos: 0,
+        path: Some("/opt/日本語\u{1b}[31m\u{7}\u{9b}\u{7f}".into()),
+    });
+    presentation.callers[0].lifecycle = CallerLifecycle::Unknown;
+    assert_eq!(
+        caller_lifecycle_label(&presentation.callers[0]),
+        Some("Process state unknown")
+    );
+    presentation.modules[0].paths = vec!["/opt/provider\u{1b}[2J\u{7}\u{9b}\u{7f}.so".into()];
+    let snapshot = render_snapshot(&presentation);
+    assert!(
+        snapshot.contains("application 日本語\\u{1b}[31m\\u{7}\\u{9b}\\u{7f}"),
+        "{snapshot}"
+    );
+    assert!(snapshot.contains("Process state unknown"));
+    for control in ['\u{1b}', '\u{7}', '\u{9b}', '\u{7f}'] {
+        assert!(!snapshot.contains(control), "{snapshot:?}");
+    }
+    presentation.edges[0].caller = CallerId(u32::MAX);
+    presentation.edges[0].module = ModuleId(u32::MAX);
+    assert_eq!(
+        application_label(&presentation, CallerId(u32::MAX)),
+        "Unknown executable"
+    );
+    assert_eq!(
+        module_label(&presentation, ModuleId(u32::MAX)),
+        "Unknown module"
+    );
+    let snapshot = render_snapshot(&presentation);
+    let overview = snapshot
+        .lines()
+        .find(|line| line.starts_with("application "))
+        .unwrap();
+    assert!(
+        overview.starts_with(
+            "application Unknown executable [c4294967295] -> module Unknown module [m4294967295]:"
+        ),
+        "{overview}"
+    );
+    assert!(!overview.contains("pid "), "{overview}");
+}
+
+#[test]
+fn overview_observations_preserve_evidence_meaning() {
+    // Erasing positive history on retirement, interpreting an unknown as
+    // zero, or dropping a frozen watch interval would misstate evidence.
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.edges.truncate(1);
+    let counted = |lossy| UseCoverage::Counted {
+        since_ns: 10,
+        lossy,
+    };
+    let cases = [
+        (
+            128,
+            false,
+            counted(false),
+            MappingState::Ended,
+            "At least 128 entries observed",
+            None,
+        ),
+        (
+            128,
+            false,
+            counted(true),
+            MappingState::Uncertain,
+            "At least 128 entries observed (capture incomplete)",
+            None,
+        ),
+        (
+            128,
+            true,
+            counted(true),
+            MappingState::Ended,
+            "At least 128 entries observed (counter saturated) (capture incomplete)",
+            None,
+        ),
+        (
+            128,
+            true,
+            UseCoverage::Unknown(UnknownReason::RetiredBeforeCoverage),
+            MappingState::Ended,
+            "At least 128 entries observed (counter saturated)",
+            Some("unknown (retired before coverage)"),
+        ),
+        (
+            0,
+            false,
+            UseCoverage::Witnessed { first_ns: 10 },
+            MappingState::Ended,
+            "Use observed; count unavailable",
+            None,
+        ),
+        (
+            0,
+            false,
+            counted(false),
+            MappingState::Mapped,
+            "No entries observed in counted interval",
+            Some("counted since 10"),
+        ),
+        (
+            0,
+            false,
+            counted(true),
+            MappingState::Mapped,
+            "Activity unknown; capture incomplete",
+            Some("counted since 10 (lossy)"),
+        ),
+        (
+            0,
+            false,
+            UseCoverage::WatchedNoUse {
+                since_ns: 10,
+                until_ns: None,
+            },
+            MappingState::Mapped,
+            "No entries observed during the covered interval",
+            Some("no use since 10"),
+        ),
+        (
+            0,
+            false,
+            UseCoverage::WatchedNoUse {
+                since_ns: 10,
+                until_ns: Some(20),
+            },
+            MappingState::Ended,
+            "No entries observed during the covered interval",
+            Some("no use from 10 to 20"),
+        ),
+        (
+            0,
+            false,
+            UseCoverage::Unknown(UnknownReason::PendingFirstUse),
+            MappingState::Mapped,
+            "Observation pending",
+            Some("unknown (first use undecided)"),
+        ),
+        (
+            0,
+            false,
+            UseCoverage::Unknown(UnknownReason::ScanOnly),
+            MappingState::Mapped,
+            "Module mapped; activity not captured",
+            Some("unknown (scan only)"),
+        ),
+        (
+            0,
+            false,
+            UseCoverage::Unknown(UnknownReason::ScanOnly),
+            MappingState::Ended,
+            "Activity not captured",
+            Some("unknown (scan only)"),
+        ),
+        (
+            0,
+            false,
+            UseCoverage::Unknown(UnknownReason::Loss("bad\u{1b}[2J\u{7}\u{9b}\u{7f}".into())),
+            MappingState::Mapped,
+            "Activity unknown",
+            Some("unknown (loss: bad\\u{1b}[2J\\u{7}\\u{9b}\\u{7f})"),
+        ),
+    ];
+    for (count, saturated, coverage, mapping, explanation, interval) in cases {
+        let edge = &mut presentation.edges[0];
+        edge.entry_count = count;
+        edge.entry_saturated = saturated;
+        edge.coverage = coverage;
+        edge.mapping = mapping;
+        let before = serde_json::to_vec(&crate::inventory::render_json_from_presentation(
+            &presentation,
+        ))
+        .unwrap();
+        let label = observation_label(&presentation.edges[0]);
+        if matches!(
+            presentation.edges[0].coverage,
+            UseCoverage::Unknown(UnknownReason::Loss(_))
+        ) {
+            assert_eq!(
+                label,
+                "Activity unknown; unknown (loss: bad\\u{1b}[2J\\u{7}\\u{9b}\\u{7f})"
+            );
+        } else {
+            assert_eq!(label, explanation);
+        }
+        let snapshot = render_snapshot(&presentation);
+        let overview = snapshot
+            .lines()
+            .find(|line| line.starts_with("application "))
+            .unwrap_or_else(|| panic!("missing overview:\n{snapshot}"));
+        assert!(
+            overview.contains(&format!("]: {explanation}")),
+            "{overview}"
+        );
+        if let Some(interval) = interval {
+            assert!(overview.contains(interval), "{overview}");
+        }
+        if explanation == "Observation pending"
+            || explanation.starts_with("Activity unknown")
+            || explanation.ends_with("not captured")
+        {
+            assert!(
+                !overview.contains("No entries") && !overview.contains("0 entries"),
+                "{overview}"
+            );
+        }
+        assert!(!overview.chars().any(char::is_control), "{overview:?}");
+        assert_eq!(
+            before,
+            serde_json::to_vec(&crate::inventory::render_json_from_presentation(
+                &presentation
+            ))
+            .unwrap()
+        );
+    }
+}
+
+#[test]
 fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
     let harness = varied_harness();
     let document = harness.render();
@@ -435,7 +881,10 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
     assert!(lines[0].contains(&format!("{passes} pass")), "{}", lines[0]);
 
     // Budgets line matches every budget row.
-    let budgets = lines[1];
+    let budgets = lines
+        .iter()
+        .find(|line| line.starts_with("budgets: "))
+        .unwrap();
     assert!(budgets.starts_with("budgets: "), "{budgets}");
     for row in ["callers", "modules", "edges", "endpoints"] {
         let limit = document["budgets"][row]["limit"].as_u64().unwrap();
@@ -1011,7 +1460,10 @@ fn budgets_carry_the_inventory_attach_set_endpoints() {
         serde_json::json!({"limit": 4096, "occupied": 0, "refused": 0})
     );
     let snapshot = render_snapshot(&presentation);
-    let budgets = snapshot.lines().nth(1).unwrap();
+    let budgets = snapshot
+        .lines()
+        .find(|line| line.starts_with("budgets: "))
+        .unwrap();
     assert!(
         budgets.ends_with(
             " | inventory_endpoints 0/4096 refused 0 | inventory_attach_modules 0/4096 refused 0"

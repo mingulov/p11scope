@@ -639,11 +639,12 @@ the min..max of per-sample p95.
 - What the user sees: `inventory --json` writes the whole document to
   stdout at exit; on a stalled terminal (for example after Ctrl-S) the
   write blocks and the process does not exit until the terminal resumes.
-  A second signal does not exit early: the report is armed as written
-  only after that write completes.
+  A second signal does not exit early: the escape gate is armed only
+  after the final output attempts return.
 - Kernels/conditions: all; stdout is a terminal with stopped output.
-- Disclosure: none while stalled. No data is lost: `-o` and the event
-  stream's `ended` are already written.
+- Disclosure: none while stalled. A successfully committed `-o` report
+  and a sync-confirmed event stream remain available; an earlier failure
+  of either sink means its respective guarantee does not hold.
 - Workaround: redirect stdout to a file, or rely on `-o` for the report.
 - Planned: v0.3.0 (review follow-up; pre-existing).
 

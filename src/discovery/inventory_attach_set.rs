@@ -950,7 +950,9 @@ pub(crate) mod tests {
 
     /// A scanned module at `path` whose one table's entries target
     /// `(object path, offset)` pairs — its own object or another one.
-    fn module_with_targets(
+    /// Cross-object targets share the target's endpoints (P3
+    /// shared-endpoint fixtures).
+    pub(crate) fn module_with_targets(
         pins: &PinnedObjects,
         path: &Path,
         targets: &[(&Path, u64)],

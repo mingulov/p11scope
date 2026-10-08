@@ -292,15 +292,7 @@ fn run_with_terminal(
         );
     }
     if let Some(writer) = stream.as_mut() {
-        let prologue = Presentation::capture(
-            &coordinator,
-            &scope_label,
-            started_ns,
-            started_ns,
-            0,
-            started_ns,
-            0,
-        );
+        let prologue = Presentation::capture(&coordinator, &scope_label, started_ns, started_ns, 0);
         writer
             .append(
                 "started",
@@ -378,16 +370,8 @@ fn run_with_terminal(
     }
     let ended_ns = now_ns();
     let passes = coordinator.passes();
-    let window_ns = ended_ns.saturating_sub(started_ns);
-    let presentation = Presentation::capture(
-        &coordinator,
-        &scope_label,
-        started_ns,
-        ended_ns,
-        passes,
-        ended_ns,
-        window_ns,
-    );
+    let presentation =
+        Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
     // The report first; only then may an unsettled retirement's drop
     // block (invariant 5), and a second signal then exits at once
     // (R-C51-4).
@@ -963,8 +947,6 @@ fn stream_presentation<S: ProcessSource>(
         started_ns,
         now_ns,
         coordinator.passes(),
-        now_ns,
-        now_ns.saturating_sub(started_ns),
     )
 }
 
@@ -978,7 +960,7 @@ fn dashboard_pass_views<S: ProcessSource>(
     started_ns: u64,
     now_ns: u64,
 ) -> (Presentation, Presentation) {
-    let display = Presentation::capture(
+    let display = Presentation::capture_dashboard(
         coordinator,
         scope_label,
         started_ns,
@@ -1075,15 +1057,7 @@ fn run_dashboard(
     let quit = display.quit_flag();
     let mut stream_state = StreamState::new();
     if let Some(writer) = stream.as_mut() {
-        let prologue = Presentation::capture(
-            &coordinator,
-            &scope_label,
-            started_ns,
-            started_ns,
-            0,
-            started_ns,
-            0,
-        );
+        let prologue = Presentation::capture(&coordinator, &scope_label, started_ns, started_ns, 0);
         writer
             .append(
                 "started",
@@ -1191,16 +1165,8 @@ fn run_dashboard(
         display.notice(&line);
     }
     let ended_ns = now_ns();
-    let window_ns = ended_ns.saturating_sub(started_ns);
-    let presentation = Presentation::capture(
-        &coordinator,
-        &scope_label,
-        started_ns,
-        ended_ns,
-        passes,
-        ended_ns,
-        window_ns,
-    );
+    let presentation =
+        Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
     // The report first (R-C51-4), silent text: the live view showed it.
     let code = crate::inventory_capture::finish_native(
         stopped,
@@ -1645,16 +1611,8 @@ pub(crate) fn render_json<Source: ProcessSource>(
     ended_ns: u64,
     passes: u64,
 ) -> serde_json::Value {
-    let window_ns = ended_ns.saturating_sub(started_ns);
-    let presentation = Presentation::capture(
-        coordinator,
-        scope_label,
-        started_ns,
-        ended_ns,
-        passes,
-        ended_ns,
-        window_ns,
-    );
+    let presentation =
+        Presentation::capture(coordinator, scope_label, started_ns, ended_ns, passes);
     render_json_from_presentation(&presentation)
 }
 
@@ -1837,16 +1795,8 @@ pub(crate) fn render_text<Source: ProcessSource>(
 ) -> String {
     // The pager-friendly snapshot IS the text summary: the same
     // presentation model the JSON renders, in diffable text form.
-    let window_ns = ended_ns.saturating_sub(started_ns);
-    let presentation = Presentation::capture(
-        coordinator,
-        scope_label,
-        started_ns,
-        ended_ns,
-        passes,
-        ended_ns,
-        window_ns,
-    );
+    let presentation =
+        Presentation::capture(coordinator, scope_label, started_ns, ended_ns, passes);
     render_snapshot(&presentation)
 }
 
@@ -2156,7 +2106,7 @@ mod tests {
         use crate::inventory_capture::{LaneBackend, Retirement};
         let mut coordinator = coordinator();
         coordinator.commit_batch(false).unwrap();
-        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1, 2, 1);
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
         let multi = LaneBackend {
             selection: BackendSelection::Auto,
             backend: AttachBackend::Multi,
@@ -2215,7 +2165,7 @@ mod tests {
         use crate::inventory_capture::Retirement;
         let mut coordinator = coordinator();
         coordinator.commit_batch(false).unwrap();
-        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1, 2, 1);
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
         for (summary, retirement) in [
             (
                 lane_summary(Retirement::Closed(Default::default())),
@@ -2332,7 +2282,7 @@ mod tests {
         let path = dir.path().join("events.jsonl");
         let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
         let mut state = StreamState::new();
-        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1, 2, 1);
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
         let report = PassReport {
             pass: 0,
             scanned: 1,
@@ -2347,7 +2297,7 @@ mod tests {
         emit_pass_events(&mut writer, &mut state, &report, &presentation, 2).unwrap();
         coordinator.note_scope_gap("native capture retirement unsettled".into(), "x".into());
         coordinator.commit_batch(false).unwrap();
-        let presentation = Presentation::capture(&coordinator, "system", 1, 3, 1, 3, 2);
+        let presentation = Presentation::capture(&coordinator, "system", 1, 3, 1);
         let exited = CallerEvent::Exited {
             id: crate::discovery::caller_registry::CallerId(4),
             reason: "gone".into(),
@@ -2522,12 +2472,11 @@ mod tests {
                 events: Vec::new(),
                 timings: crate::timing::StageTimings::new(),
             };
-            let presentation =
-                Presentation::capture(&coordinator, "pid", 0, pass, pass, pass, pass);
+            let presentation = Presentation::capture(&coordinator, "pid", 0, pass, pass);
             emit_pass_events(&mut writer, &mut state, &report, &presentation, pass).unwrap();
         }
         // The pre-`ended` flush makes the last value per index exact.
-        let last = Presentation::capture(&coordinator, "pid", 0, 3, 3, 3, 3);
+        let last = Presentation::capture(&coordinator, "pid", 0, 3, 3);
         // Through the real terminal path: flush, then `ended`.
         let mut sink = Vec::new();
         finish_output(
@@ -2613,13 +2562,12 @@ mod tests {
                 events: Vec::new(),
                 timings: crate::timing::StageTimings::new(),
             };
-            let presentation =
-                Presentation::capture(&coordinator, "pid", 0, pass, pass, pass, pass);
+            let presentation = Presentation::capture(&coordinator, "pid", 0, pass, pass);
             let before = writer.live_events();
             emit_pass_events(&mut writer, &mut state, &report, &presentation, pass).unwrap();
             per_pass.push(writer.live_events() - before);
         }
-        let last = Presentation::capture(&coordinator, "pid", 0, passes, passes, passes, passes);
+        let last = Presentation::capture(&coordinator, "pid", 0, passes, passes);
         state
             .gaps
             .emit(&mut writer, &last.gaps, true, passes)

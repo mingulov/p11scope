@@ -59,7 +59,7 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (97 ignored tests in the default-feature lib binary): 79 run by
+# Curation (98 ignored tests in the default-feature lib binary): 80 run by
 # default, 5 run only with --include-long, 13 are statically skipped with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
@@ -174,6 +174,10 @@ inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64
 inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64
 inventory::privileged_tests::privileged_native_lane_system_exec_churn_lp64
 inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
+# Task 6 C5.1 cell 4: A-then-B — a late second provider instance for a cached
+# caller publishes exactly one first count, holds it across idle passes,
+# then grows; ledger-exact finals. Prints C51_AB (about 20 s).
+inventory::privileged_tests::privileged_native_lane_system_ab_first_count_lp64
 # Task 6 C5.11: --system over 544 endpoints (8 mapped copies of SoftHSM2)
 # retires closed under uprobe-multi (per-offset links may read unsettled);
 # under auto on a kernel whose functional probe links uprobe-multi it must

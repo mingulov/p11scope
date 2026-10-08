@@ -641,10 +641,12 @@ Limits that matter in pods:
   `concrete_gap`), and `doctor` reports `PID scope unavailable`. Use
   `--cgroup` (the entry script's `--pod-uid`), whose counts stay exact there;
   see [PID namespaces](#pid-namespaces).
-- `inventory` usage is witness-only in this release: the native lane
-  records which caller image used which module (no per-call counts), and
-  needs the observer's BPF privileges; without them `--capture auto`
-  falls back to callers and mappings with a named gap.
+- `inventory` usage is counted per edge since v0.3.0: the native lane
+  records which caller image used which module and how many entries it
+  observed (a saturating lower bound at pass resolution, never per
+  function or per call time), and needs the observer's BPF privileges;
+  without them `--capture auto` falls back to callers and mappings with
+  a named gap.
 - Results live in the pod's `/tmp` emptyDir: copy them out before a rollout.
   Nothing else persists between observer pods, and a capture running during
   a rollout is lost.
@@ -697,7 +699,7 @@ Limits that matter in pods:
   rescanning passes, reporting callers (per process incarnation), modules
   (per physical object, with scan-only admission verdicts), and the
   caller/module edges between them with usage coverage, lifecycle, and
-  explicit gaps (witness-only in this release: no per-call counts; see
+  explicit gaps; the native lane counts entries per edge (see
   `entries.coverage` below). A process is a caller of a module only when
   its maps show an executable (`x`) mapping of the module file that
   passes the identity proof; a process that maps the file only without
@@ -761,10 +763,13 @@ Limits that matter in pods:
   covered` — never armed, never quiet — and the full coverage on its
   evidence page. `native` also loads the Inventory BPF object, attaches
   every admitted provider entry, and binds each positive use to the exact
-  caller image (`witnessed`) or reports it as module-level use by an
-  unidentified caller; an edge whose provider entries were all attached
-  and whose health stayed proven reads `watched_no_use` over that
-  interval. A native run states `observation.lane: "native"`,
+  caller image with its entry count (`counted`: a saturating lower bound
+  since the pair's first record, at pass resolution) or reports it as
+  module-level use by an unidentified caller; an edge whose provider
+  entries were all attached and whose health stayed proven reads
+  `watched_no_use` over that interval, or `uncounted` once a pair insert
+  failed (absence proves nothing then). A native run states
+  `observation.lane: "native"`,
   `observation.settlement: "unsettled"` (Inventory has no quiescence
   protocol, so a call in flight at stop may still be unrecorded), and
   `observation.retirement` (`closed`, or `unsettled` when the probes did

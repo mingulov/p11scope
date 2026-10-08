@@ -56,7 +56,7 @@ fn caller(harness: &Harness, index: u32) -> CallerId {
 fn presentation(harness: &Harness) -> Presentation {
     let now = harness.now_ns();
     let passes = harness.coordinator().passes();
-    Presentation::capture(harness.coordinator(), "workload", 0, now, passes, now, now)
+    Presentation::capture(harness.coordinator(), "workload", 0, now, passes)
 }
 
 fn report(pass: u64) -> PassReport {
@@ -925,4 +925,115 @@ fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
         std::fs::read(&dashboard_path).unwrap(),
         std::fs::read(&classic_path).unwrap()
     );
+}
+
+/// C7 C4 (D-C7-5): a count change that is not a class change emits at
+/// most once per edge per 10 s, with the latest count. Within-bucket
+/// drift waits; the 10 s record carries every rise since the last one.
+#[test]
+fn count_drift_emits_at_most_once_per_edge_per_ten_seconds() {
+    use crate::discovery::caller_registry::UseCoverage;
+    use crate::inventory_events::EDGE_COUNT_EMIT_INTERVAL_NS;
+    use crate::inventory_present::Activity;
+    assert_eq!(EDGE_COUNT_EMIT_INTERVAL_NS, 10_000_000_000);
+    let mut edges = synthetic_edges(1);
+    edges[0].coverage = UseCoverage::Counted {
+        since_ns: 100,
+        lossy: false,
+    };
+    edges[0].entry_count = 4;
+    edges[0].entry_observation = "observed";
+    edges[0].activity = Activity::Quiet;
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
+    let mut emitter = EdgeEmitter::new();
+    assert_eq!(emitter.emit(&mut writer, &edges, 64, 1).unwrap().emitted, 1);
+    // Same power-of-two bucket (4-7): drift, never a class change.
+    edges[0].entry_count = 5;
+    assert_eq!(emitter.emit(&mut writer, &edges, 64, 2).unwrap().emitted, 0);
+    edges[0].entry_count = 6;
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, 64, 5_000_000_000)
+            .unwrap()
+            .emitted,
+        0
+    );
+    edges[0].entry_count = 7;
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, 64, 10_000_000_001)
+            .unwrap()
+            .emitted,
+        1,
+        "ten seconds after the last record the drift goes out"
+    );
+    // No new drift since the 10 s record: nothing goes out.
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, 64, 11_000_000_000)
+            .unwrap()
+            .emitted,
+        0
+    );
+    drop(writer);
+    let last = lines(&path).pop().unwrap();
+    assert_eq!(last["event"]["entries"]["count"], 7);
+}
+
+/// A class emission carries the latest count, so it resets the 10 s
+/// cadence; a bucket jump is a class change and still goes out at
+/// once, never waiting for the cadence.
+#[test]
+fn class_emissions_reset_the_count_cadence_and_buckets_stay_immediate() {
+    use crate::discovery::caller_registry::UseCoverage;
+    use crate::inventory_present::Activity;
+    let mut edges = synthetic_edges(1);
+    edges[0].coverage = UseCoverage::Counted {
+        since_ns: 100,
+        lossy: false,
+    };
+    edges[0].entry_count = 4;
+    edges[0].entry_observation = "observed";
+    edges[0].activity = Activity::Quiet;
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
+    let mut emitter = EdgeEmitter::new();
+    assert_eq!(emitter.emit(&mut writer, &edges, 64, 1).unwrap().emitted, 1);
+    edges[0].entry_count = 5;
+    assert_eq!(emitter.emit(&mut writer, &edges, 64, 2).unwrap().emitted, 0);
+    // A class change goes out at once, carrying the drifted count.
+    edges[0].activity = Activity::RecentlyObserved;
+    assert_eq!(emitter.emit(&mut writer, &edges, 64, 3).unwrap().emitted, 1);
+    edges[0].entry_count = 6;
+    assert_eq!(
+        emitter.emit(&mut writer, &edges, 64, 4).unwrap().emitted,
+        0,
+        "the class record carried 5, so 6 waits a fresh ten seconds"
+    );
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, 64, 10_000_000_004)
+            .unwrap()
+            .emitted,
+        1
+    );
+    // A bucket jump (7 to 8) is a class change: immediate.
+    edges[0].entry_count = 8;
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, 64, 10_000_000_005)
+            .unwrap()
+            .emitted,
+        1
+    );
+    drop(writer);
+    let counts: Vec<u64> = lines(&path)
+        .iter()
+        .filter(|line| line["kind"] == "edge_observed")
+        .map(|line| line["event"]["entries"]["count"].as_u64().unwrap())
+        .collect();
+    assert_eq!(counts, [4, 5, 6, 8]);
 }

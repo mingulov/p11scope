@@ -426,6 +426,15 @@ inspect outputs are untouched).
 | --- | --- | --- | --- |
 | Inventory caller `pid`, `start_time`, `image.exe` (`dev`, `ino`, `mtime_secs`, `mtime_nanos`, `path`) | `/proc/<pid>/stat` starttime and the `/proc/<pid>/exe` link (readlink plus stat) of a process whose maps hold an admitted provider object, read by the scan lane at admission and revalidation. No `cmdline`, `environ`, `comm`, argument or memory read. The native lane adds none: CALLER_USE rows bind through a pidfd TASK_COOKIE query, and their kernel tgid is never published. | Public per caller incarnation in `p11scope/inventory/v1` (`callers[]`), the inventory event stream's caller records, and the inventory dashboard/pager. PIDs are in the observer's `/proc` numbering (`pid_namespace`). `gaps[].pid` repeats the `/proc` pid of the caller or admission subject a gap names; no native witness gap carries a row's kernel tgid. | An unreadable value is `null`, never guessed. The path is the exe link observed at admission, not identity: incarnation identity is the pidfd/start-time pin plus `dev`/`ino`/`mtime`. Documented in [inventory v1](../schema/inventory-v1.md#privacy). |
 
+**Status of the row below: IMPLEMENTED on this branch per owner ruling
+D-C7-1 (2026-10-05); the controller shows this final text to the owner
+before merge.** It adds no target-memory or argument capture: the only
+new kernel-side state is the per-pair entry counter BPF already keeps.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Per-edge entry count and last activity (C7 C4) | The uprobe firing on an admitted endpoint, counted in BPF against the existing CALLER_USE key for the (caller image, provider object) pair. No target-memory read, no argument read, no BPF timestamp: recency is derived in userspace from the read instant. | Public per (caller incarnation × module) edge in `p11scope/inventory/v1` (`edges[].entries`: saturating lower-bound `count` of entries on attached endpoints since the pair's first record, including calls that returned errors, with `last_seen_ns` at pass resolution), the inventory event stream's `edge_observed` records, and the inventory dashboard/pager. Never per function, per thread, or per call time. A pair with no row reads `unknown (uncounted)` and names the `PairInsertFailure` evidence, never 0. | A count read mid-capture is a lower bound; only the post-stop read is final, and settlement stays `unsettled`. An unreadable health cell withholds watches without inventing counts. Documented in [inventory v1](../schema/inventory-v1.md) (`edges[].entries.coverage`) and [inventory events v1](../schema/inventory-events-v1.md) (`edge_observed`). |
+
 ## Required evidence before activation
 
 Every lane binds the exact source, BPF object, observer binary, target ABI,

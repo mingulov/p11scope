@@ -33,6 +33,27 @@ Work toward v0.3.0.
   ceiling refused one surface. No product code changed. See
   [docs/qualification/e16-execution-surfaces.md](docs/qualification/e16-execution-surfaces.md).
 
+- The native inventory lane publishes per-edge entry counts: an edge whose
+  CALLER_USE row binds to an admitted caller incarnation reads `counted`
+  with a saturating lower-bound `count` of entries since the pair's first
+  record (including calls that returned errors), `since_ns` at that first
+  record, and `last_seen_ns` at pass resolution — in the JSON document, the
+  `edge_observed` event stream, and the dashboard/pager alike. A pair
+  insert failure (the CALLER_USE map was full) reads `unknown` with the new
+  reason `uncounted`, never 0, naming the `PairInsertFailure` evidence; no
+  watch starts again in that capture. `edge_observed` also emits count
+  changes at most once per edge per 10 s with the latest count; class
+  changes still go out at once and the final sweep stays exact. See
+  [docs/schema/inventory-v1.md](docs/schema/inventory-v1.md) and
+  [docs/privacy/allowlist-v3.md](docs/privacy/allowlist-v3.md).
+
+- The native inventory oracle checks per-edge counts against the workload
+  ledger: P1/P2 edges read `counted` (even the unattested copy) with the
+  exact attach-side count when the feed covers every in-window call, and
+  must-fail fixtures cover above-ledger, published-0, absent-as-0 and
+  pre-admission-counted outputs. DR-02 stays open pending the M2 cost
+  gate. See [docs/known-limitations.md](docs/known-limitations.md).
+
 ### Changed
 
 - A process is a caller of a provider only through an executable mapping

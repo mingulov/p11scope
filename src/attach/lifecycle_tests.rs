@@ -596,6 +596,7 @@ fn map_data(map: &Map) -> Result<&MapData> {
         Map::Array(data)
         | Map::CgroupArray(data)
         | Map::HashMap(data)
+        | Map::LruHashMap(data)
         | Map::PerCpuArray(data)
         | Map::PerCpuHashMap(data)
         | Map::ProgramArray(data)

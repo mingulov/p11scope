@@ -94,15 +94,29 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     it. The class is the edge's entries (the count's power-of-two
     bucket — 0, 1, 2–3, 4–7, … — plus `saturated`, `in_flight` and
     `observation`), its full `entries.coverage`, and `presence`,
-    `capture` and `activity` (as of the whole-run activity window).
-    Other fields (mapping instants and interruptions, semantics) do not
-    trigger a record by themselves.
+    `capture` and `activity` (per-pass: `recently observed` when the
+    count rose since the previous pass — except an in-flight edge, or
+    one with active operations, which reads `operation initialized /
+    in flight` instead: in-flight and operation state take precedence
+    over a rise). Other fields (mapping instants
+    and interruptions, semantics) do not trigger a record by
+    themselves. The recorded `activity` is window-free; only the
+    dashboard display renders its own trailing 5 s `recently observed`
+    window (`DASHBOARD_ACTIVITY_WINDOW_NS`) from `entries.last_seen_ns`.
+    Records and the snapshot do carry `entries.last_seen_ns` (the
+    edge's last observed rise, exactly as serialized) — the trailing
+    window over it is display-only, never the recorded signal.
+  - Since v0.3.0 (C7), a count change that is not a class change emits
+    at most once per edge per 10 s, with the latest count: an edge whose
+    exact count drifted past its last carried count becomes due again
+    once 10 s passed since that record. Every record carries the latest
+    count, so a class record resets the cadence too.
   - Each record is exact as of its write (`at_ns`), but mid-run values
     lag between records: until the edge's next record or the final
-    sweep, `entries.count` may have grown within its power-of-two bucket
-    (so a mid-run count is a lower bound), and the mapping instants,
-    `entries.last_seen_ns` and the semantics may be stale. Only the
-    sweep's records are exact for the run's end.
+    sweep, `entries.count` may have grown (so a mid-run count is a lower
+    bound — within its power-of-two bucket, or within the 10 s cadence),
+    and the mapping instants, `entries.last_seen_ns` and the semantics
+    may be stale. Only the sweep's records are exact for the run's end.
   - At most 4,096 records per commit. Further changed edges wait in
     arrival order (first in, first out), are counted in that commit's
     `edge_events_deferred`, and are written by the next commits with
@@ -148,8 +162,9 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   - Volume: a record is typically 0.7–0.8 KiB, more with semantic
     mechanisms and operations. A commit writes at most 4,096 records
     (about 3 MB), which happens only while that many edges change class
-    every pass (for example repeated health regressions demoting and
-    restarting every watch). The sweep writes up to one record per edge
+    or drift past their 10 s count cadence every pass (for example
+    repeated health regressions demoting and restarting every watch).
+    The sweep writes up to one record per edge
     (32,768 at the limit, about 24 MB), twice in the fallback above.
     Size `--event-rotate-bytes` × (`--event-max-files` − 1) to at least
     the live edges × the record size, plus that margin, for the replay

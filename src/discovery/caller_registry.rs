@@ -867,6 +867,11 @@ pub(crate) enum UnknownReason {
     /// presentation overlays it while the row is pending, and the staged
     /// watch resumes once the row binds elsewhere (DR-LIVE-LABEL-LAG).
     PendingFirstUse,
+    /// A CALLER_USE pair insert failed (the map was full): some pair has
+    /// use but no row, so absence proves nothing for every edge without
+    /// positive history. Sticky for the capture; the detail names the
+    /// `PairInsertFailure` evidence. Never a zero (C7 C4).
+    Uncounted(Arc<str>),
 }
 
 impl UnknownReason {
@@ -883,6 +888,7 @@ impl UnknownReason {
             Self::RetiredBeforeCoverage => "retired_before_coverage",
             Self::UseBeforeAdmission => "use_before_admission",
             Self::PendingFirstUse => "pending_first_use",
+            Self::Uncounted(_) => "uncounted",
         }
     }
 
@@ -892,6 +898,7 @@ impl UnknownReason {
         match self {
             Self::CapacityLimited(resource) => Some(resource),
             Self::Loss(reason) => Some(reason),
+            Self::Uncounted(evidence) => Some(evidence),
             _ => None,
         }
     }
@@ -909,6 +916,7 @@ impl UnknownReason {
             Self::RetiredBeforeCoverage => "retired before coverage".into(),
             Self::UseBeforeAdmission => "use before admission".into(),
             Self::PendingFirstUse => "first use undecided".into(),
+            Self::Uncounted(evidence) => format!("uncounted: {evidence}"),
         }
     }
 }
@@ -1039,6 +1047,12 @@ pub(crate) struct EdgeRecord {
     pub entry_first_seen_ns: Option<u64>,
     pub entry_last_seen_ns: Option<u64>,
     pub entry_in_flight: bool,
+    /// The entry count rose during the latest publication (Choice 3):
+    /// the per-pass activity signal ("rose since previous pass").
+    /// Cleared at each publication's start, set on every strict count
+    /// advance; a saturated rest, an equal re-read, and a pass without
+    /// counts all read quiet.
+    pub entry_rose_since_previous_pass: bool,
     /// Per-edge semantic state (S1): `None` while semantic capture
     /// stays withheld (the scan lane never materializes it), `Some`
     /// once the semantic feed observes this edge. Materialization is
@@ -1104,7 +1118,9 @@ pub(crate) const NO_MAPPING_EDGE: &str = "no_mapping_edge";
 const UNBOUND_USE_SUBJECT: &str = "used by an unidentified caller image";
 const WITNESS_WITHOUT_MAPPING: &str = "native witness without mapping evidence";
 const WITNESS_UNKNOWN_MODULE: &str = "native witness for an unknown module";
-const WITNESS_SHARED_ENDPOINT: &str = "ambiguous shared endpoint";
+pub(crate) const WITNESS_SHARED_ENDPOINT: &str = "ambiguous shared endpoint";
+pub(crate) const DEMOTED_COUNT_REJECTED: &str = "rejected demoted count";
+pub(crate) const DEMOTED_COUNT_PLACED: &str = "demoted count placed";
 
 /// Where every decided native witness row went, each row exactly once
 /// (C4 review M3): `edge` witnessed one caller edge, `module` became one
@@ -1121,10 +1137,105 @@ pub(crate) struct WitnessPlacement {
     pub unresolved: u64,
 }
 
+/// One publication-time pending-count placement (P3): where the count
+/// landed — decided together with its witness, from the same committed
+/// state, so the two can never diverge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingCountDecision {
+    /// The coordinator's handle from [`Mutation::NotePendingCount`].
+    pub pending_id: u64,
+    pub outcome: PendingCountOutcome,
+}
+
+/// A pending count's publication-time outcome (P3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingCountOutcome {
+    /// Exactly one edged, admitted module took the count (and the
+    /// witness): the pair binds there.
+    Placed { module: ModuleKey },
+    /// The count dropped with its witness (module-level or ambiguous):
+    /// the pair finalizes, never to promote later.
+    Rejected { reason: PendingRejection },
+    /// Exactly one edged module, but it is not admitted: the witness
+    /// sits on the edge while the count waits — the pair stays pending
+    /// and re-resolves on the next advance (self-healing after
+    /// admission, like the placed-count path).
+    Unadmitted { module: ModuleKey },
+}
+
+/// Why a publication rejected a pending count (P3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingRejection {
+    /// Two or more edged modules (or none of several candidates): the
+    /// witness reads ambiguous.
+    Ambiguous,
+    /// No edged module: the witness went module-level or unresolved.
+    NoEdge,
+}
+
+/// One bound row's publication-time placement (P3): the shared witness
+/// and count verdict from [`CallerRegistry::place_bound_row`].
+#[derive(Debug, Clone)]
+enum RowPlacement {
+    /// Exactly one edged module takes the witness and the count.
+    Edge { key: ModuleKey, id: ModuleId },
+    /// No edged module, one candidate: module-level use.
+    NoMapping { key: ModuleKey },
+    /// No candidate at all.
+    Unresolved,
+    /// Several candidates with no single edge: ambiguous.
+    Shared,
+}
+
 impl WitnessPlacement {
     #[cfg(test)]
     pub(crate) fn total(&self) -> u64 {
         self.edge + self.module + self.ambiguous + self.unresolved
+    }
+}
+
+/// One edge's demoted growth this publication (round 4, re-place): the
+/// edge's count before this publication's demoted installs plus the
+/// growth segments staged for it. Each segment is `(base, absolute)`
+/// with the observing read's stamps: the install adds the covered
+/// measure (overlaps merge, restages add nothing), so the install is
+/// exact no matter how many reads staged before the commit — including
+/// a mid-publish rebase, whose disjoint segments all accumulate.
+#[derive(Debug, Clone, Default)]
+struct DemotedGrowth {
+    base_edge: u64,
+    segments: Vec<(u64, u64, u64, u64)>,
+}
+
+impl DemotedGrowth {
+    /// The covered growth: the union measure of `(base, absolute)`.
+    fn total(&self) -> u64 {
+        let mut spans: Vec<(u64, u64)> = self
+            .segments
+            .iter()
+            .map(|&(base, abs, _, _)| (base, abs))
+            .collect();
+        spans.sort();
+        let mut total = 0u64;
+        let mut covered = 0u64;
+        for (base, abs) in spans {
+            if abs > covered {
+                total = total.saturating_add(abs - base.max(covered));
+                covered = covered.max(abs);
+            }
+        }
+        total
+    }
+
+    /// The stamps of the furthest-reaching segment (ties: latest).
+    fn stamps(&self) -> (u64, u64) {
+        let mut best = (0u64, 0u64, 0u64);
+        for &(_, abs, first_ns, last_ns) in &self.segments {
+            if abs >= best.0 {
+                best = (abs, first_ns, last_ns);
+            }
+        }
+        (best.1, best.2)
     }
 }
 
@@ -1170,6 +1281,7 @@ fn with_key(mut reason: String, module: Option<ModuleId>, key: &ModuleKey) -> St
 pub(crate) const MAX_SUPPRESSED_GAP_MEMORY: usize = 4096;
 
 const COVERAGE_WITHOUT_MAPPING: &str = "usage coverage without mapping evidence";
+const PAIRS_UNCOUNTED_SUBJECT: &str = "usage coverage pair insert failure";
 const COVERAGE_UNADMITTED: &str = "coverage for an unadmitted module";
 
 /// Bound on one module's admission reasons: ignored lower verdicts append
@@ -1291,6 +1403,9 @@ enum Mutation {
     NoteSemanticLoss {
         reason: String,
     },
+    NoteRefreshLoss {
+        reason: String,
+    },
     NoteWitness {
         caller: CallerId,
         module: ModuleKey,
@@ -1323,6 +1438,52 @@ enum Mutation {
         module: ModuleKey,
         note: CoverageNote,
     },
+    NoteCountedUse {
+        caller: CallerId,
+        module: ModuleKey,
+        /// The pair's absolute saturating lower bound (never a delta:
+        /// several reads stage before one commit, so only the maximum
+        /// is sound) — or, when `base` is nonzero, growth past that
+        /// accounted base. Growth stagings accumulate by covered
+        /// segment, so restages never double-count and disjoint
+        /// segments (a mid-publish rebase) never lose.
+        count: u64,
+        /// The pair's first record (`recorded_at_ns`) — or, for
+        /// growth, the observing read (growth never inherits the
+        /// pair's backdated first sight).
+        first_ns: u64,
+        /// The read that observed `count` (`rows_read_ns`): pass
+        /// resolution, never a BPF timestamp.
+        last_ns: u64,
+        /// The accounted absolute the count rebases past (round 4,
+        /// re-place): nonzero growth accumulates onto the edge instead
+        /// of installing absolute. 0 installs absolute (first sight).
+        base: u64,
+    },
+    NotePendingCount {
+        /// The coordinator's opaque handle, echoed in the decision.
+        pending_id: u64,
+        caller: CallerId,
+        /// The candidate modules (the witness's): placement resolves at
+        /// publication, alongside the witness, against the mappings this
+        /// same publication commits.
+        modules: Vec<ModuleKey>,
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+        /// The read that observed `base` (round 4, window anchor): a
+        /// placement windows its coverage from there.
+        since_ns: u64,
+        /// The accounted absolute the count rebases past (0 for a
+        /// first-sight pair): a nonzero base marks a re-resolved pair,
+        /// whose rejection the publication discloses (F3-02) and whose
+        /// placement accumulates by segment.
+        base: u64,
+    },
+    NotePairsUncounted {
+        reason: Arc<str>,
+        at_ns: u64,
+    },
     NoteHealthRegression {
         subject: &'static str,
         reason: Arc<str>,
@@ -1352,6 +1513,16 @@ enum Mutation {
     },
     RecordGap {
         gap: RegistryGap,
+    },
+    RecordKeyedGap {
+        /// The module key, resolved to an ID at apply time — after the
+        /// publication's mappings commit (F3-04).
+        key: ModuleKey,
+        caller: Option<CallerId>,
+        pid: Option<u32>,
+        subject: String,
+        reason: String,
+        budget: Option<BudgetRefusal>,
     },
 }
 
@@ -1400,6 +1571,12 @@ pub(crate) struct CallerRegistry {
     witness_census: BindingCensus,
     /// Where decided witness rows went (published with the batch).
     witness_placement: WitnessPlacement,
+    /// Pending-count placements the last publication decided, in apply
+    /// order (P3): drained by the coordinator after each publish.
+    pending_count_decisions: Vec<PendingCountDecision>,
+    /// Demoted growth staged per edge this publication (round 4,
+    /// re-place): cleared at every `publish`.
+    demoted_place_growth: HashMap<(CallerId, ModuleId), DemotedGrowth>,
     facts_revision: u64,
     published_revision: u64,
     endpoints_total: usize,
@@ -1438,6 +1615,8 @@ impl CallerRegistry {
             coverage_gap_memo: BTreeSet::new(),
             witness_gap_memo: BTreeSet::new(),
             witness_placement: WitnessPlacement::default(),
+            pending_count_decisions: Vec::new(),
+            demoted_place_growth: HashMap::new(),
             witness_census: BindingCensus::default(),
             facts_revision: 1,
             published_revision: 0,
@@ -1680,11 +1859,13 @@ impl CallerRegistry {
         }
     }
 
-    /// Recency answers "active now" from entry last-seen, not from any
-    /// sticky bit: true when an entry was observed within `window_ns` of
-    /// `now_ns`, or an entry is in flight. Test-gated: unit tests pin
-    /// the combined predicate; production splits it through
-    /// [`Self::entry_recent_within`] plus the in-flight flag.
+    /// Recency answers "observed recently" from entry last-seen, not
+    /// from any sticky bit: true when an entry was observed within
+    /// `window_ns` of `now_ns`, or an entry is in flight. The dashboard
+    /// display's predicate (the recorded signal is per-pass instead).
+    /// Test-gated: unit tests pin the combined predicate; production
+    /// splits it through [`Self::entry_recent_within`] plus the
+    /// in-flight flag.
     #[cfg(test)]
     pub(crate) fn entry_active_within(
         &self,
@@ -1920,6 +2101,79 @@ impl CallerRegistry {
         });
     }
 
+    /// Stage one bound pair's absolute entry count: a saturating lower
+    /// bound of entries on the module's attached endpoints since the
+    /// pair's first record (`first_ns`), observed by the read at
+    /// `last_ns` (pass resolution). Only a strict advance past the
+    /// staged count moves the edge, so several reads per commit stay
+    /// sound and recency never fakes activity. Like a witness, the
+    /// count stages for retired callers (pre-exit history); unlike a
+    /// witness it never invents an edge (one memoized gap). When
+    /// `base` is nonzero, `count` is growth past that accounted base
+    /// and accumulates onto the edge instead of installing absolute.
+    pub(crate) fn note_counted_use(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+        base: u64,
+    ) {
+        self.staged.push(Mutation::NoteCountedUse {
+            caller,
+            module: module.clone(),
+            count,
+            first_ns,
+            last_ns,
+            base,
+        });
+    }
+
+    /// Stage one bound pair's entry count for publication-time
+    /// placement (P3): the witness and the count resolve together at
+    /// publication, against the mappings the publication commits —
+    /// exactly one edged module takes both. A first-sight rejection
+    /// (no edge, ambiguity) drops the count silently: the witness
+    /// records the placement gaps, and a count never invents an edge.
+    /// A re-resolved (`base` nonzero) rejection has no witness in this
+    /// window, so the publication discloses under its own subject
+    /// instead of dropping silently (F3-02); its placement accumulates
+    /// by segment and windows its coverage from `since_ns` (the read
+    /// that observed `base`). `pending_id` is the coordinator's opaque
+    /// handle: the publication reports every pending count's placement
+    /// through [`Self::take_pending_count_decisions`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn note_pending_count(
+        &mut self,
+        pending_id: u64,
+        caller: CallerId,
+        modules: Vec<ModuleKey>,
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+        since_ns: u64,
+        base: u64,
+    ) {
+        self.staged.push(Mutation::NotePendingCount {
+            pending_id,
+            caller,
+            modules,
+            count,
+            first_ns,
+            last_ns,
+            since_ns,
+            base,
+        });
+    }
+
+    /// Drains the last publication's pending-count placements, in apply
+    /// order: one decision per staged pending count. The coordinator
+    /// finalizes its pair targets from these (P3).
+    pub(crate) fn take_pending_count_decisions(&mut self) -> Vec<PendingCountDecision> {
+        std::mem::take(&mut self.pending_count_decisions)
+    }
+
     /// Stage one global health regression (a native identity, pair, or
     /// usage evidence counter rose between `at_ns`, the last clean read,
     /// and `detected_ns`, the read that saw it). The failure cannot be
@@ -1976,6 +2230,20 @@ impl CallerRegistry {
         });
     }
 
+    /// Stage the pair-insert-failure demotion (C7 C4): some pair has use
+    /// but no row, so every ongoing watch reads `uncounted` and no watch
+    /// starts again in this capture (the coordinator withholds them).
+    /// Positives and intervals frozen before `at_ns` stand. The caller
+    /// stages this before the batch's health regression: demotions only
+    /// touch ongoing watches, so the uncounted reason wins over the
+    /// coincident loss demotion while both gaps stay recorded.
+    pub(crate) fn note_pairs_uncounted(&mut self, reason: impl Into<Arc<str>>, at_ns: u64) {
+        self.staged.push(Mutation::NotePairsUncounted {
+            reason: reason.into(),
+            at_ns,
+        });
+    }
+
     /// Stage one pass-wide semantic capture-loss boundary: every live
     /// operation on every semantically-tracked edge ends unknown with
     /// explicit accounting, and the loss itself is a gap — never
@@ -1983,6 +2251,15 @@ impl CallerRegistry {
     #[allow(dead_code)] // Privileged semantic-feed seam; unit tests pin the semantics.
     pub(crate) fn note_capture_loss(&mut self, reason: String) {
         self.staged.push(Mutation::NoteSemanticLoss { reason });
+    }
+
+    /// Stage one pass-wide count-refresh loss boundary: a refresh
+    /// transport failure, or a refresh sweep that skipped a tracked row.
+    /// Every counted column becomes a lower bound (`lossy`, never a
+    /// quiet claim over the stale count), the observed counts stand, and
+    /// the loss itself is a gap — never silent loss.
+    pub(crate) fn note_refresh_loss(&mut self, reason: String) {
+        self.staged.push(Mutation::NoteRefreshLoss { reason });
     }
 
     /// Stage one caller retirement: the caller's edges end with the
@@ -2024,11 +2301,43 @@ impl CallerRegistry {
         self.staged.push(Mutation::RecordGap { gap });
     }
 
+    /// Stage one gap for the module `key` names, resolving the ID at
+    /// publication (F3-04): `record_gap` resolves eagerly against the
+    /// committed snapshot, which misses a first-discovered module whose
+    /// mapping stages in this same publication (receipts process
+    /// pre-commit — scan → extend → commit) and would report its gap
+    /// run-wide. This resolves at apply, after the publication's
+    /// mappings commit; a module that never commits stays unattributed
+    /// (genuinely unclaimable).
+    pub(crate) fn record_gap_for_key(
+        &mut self,
+        caller: Option<CallerId>,
+        key: ModuleKey,
+        pid: Option<u32>,
+        subject: String,
+        reason: String,
+        budget: Option<BudgetRefusal>,
+    ) {
+        self.staged.push(Mutation::RecordKeyedGap {
+            key,
+            caller,
+            pid,
+            subject,
+            reason,
+            budget,
+        });
+    }
+
     /// Apply every staged mutation in order and publish the snapshot.
     /// Returns the number of applied mutations.
     pub(crate) fn publish(&mut self) -> usize {
         let staged = std::mem::take(&mut self.staged);
         let applied = staged.len();
+        // Per-pass activity starts quiet: advances below set it.
+        for edge in self.edges.values_mut() {
+            edge.entry_rose_since_previous_pass = false;
+        }
+        self.demoted_place_growth.clear();
         for mutation in staged {
             self.apply(mutation);
         }
@@ -2122,6 +2431,24 @@ impl CallerRegistry {
                     budget: None,
                 });
             }
+            Mutation::NoteRefreshLoss { reason } => {
+                for edge in self.edges.values_mut() {
+                    // A failed or skipped count re-read leaves every
+                    // counted column a lower bound: observed counts
+                    // stand, quiet claims do not.
+                    if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
+                        edge.coverage.lossy = true;
+                    }
+                }
+                self.push_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "native count refresh loss".into(),
+                    reason,
+                    budget: None,
+                });
+            }
             Mutation::NoteWitness {
                 caller,
                 module,
@@ -2183,6 +2510,57 @@ impl CallerRegistry {
                 module,
                 note,
             } => self.apply_coverage(caller, &module, note),
+            Mutation::NotePendingCount {
+                pending_id,
+                caller,
+                modules,
+                count,
+                first_ns,
+                last_ns,
+                since_ns,
+                base,
+            } => self.apply_pending_count(
+                pending_id, caller, &modules, count, first_ns, last_ns, since_ns, base,
+            ),
+            Mutation::NoteCountedUse {
+                caller,
+                module,
+                count,
+                first_ns,
+                last_ns,
+                base,
+            } => {
+                if base > 0 {
+                    self.apply_demoted_use(caller, &module, count, first_ns, last_ns, base);
+                } else {
+                    self.apply_counted_install(caller, &module, count, first_ns, last_ns);
+                }
+            }
+            Mutation::NotePairsUncounted { reason, at_ns } => {
+                let mut demoted = 0usize;
+                for edge in self.edges.values_mut() {
+                    // An interval frozen before the evidence stands.
+                    if matches!(edge.coverage.watch, Watch::Watching { until_ns, .. }
+                        if until_ns.is_none_or(|until| until > at_ns))
+                    {
+                        edge.coverage.watch =
+                            Watch::Unknown(UnknownReason::Uncounted(reason.clone()));
+                        edge.coverage.demoted = true;
+                        demoted += 1;
+                    }
+                }
+                self.push_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: PAIRS_UNCOUNTED_SUBJECT.into(),
+                    reason: format!(
+                        "{reason}; the failure cannot be localized to one pair, so {demoted} watched no-use {} read uncounted (no watch starts again in this capture)",
+                        if demoted == 1 { "edge" } else { "edges" },
+                    ),
+                    budget: None,
+                });
+            }
             Mutation::EndWatches { reason, at_ns } => {
                 if self.watches_ended_ns.is_none() {
                     self.watches_ended_ns = Some(at_ns);
@@ -2283,6 +2661,24 @@ impl CallerRegistry {
                 }
             }
             Mutation::RecordGap { gap } => self.push_gap(gap),
+            Mutation::RecordKeyedGap {
+                key,
+                caller,
+                pid,
+                subject,
+                reason,
+                budget,
+            } => {
+                let module = self.modules_by_key.get(&key).copied();
+                self.push_gap(RegistryGap {
+                    caller,
+                    module,
+                    pid,
+                    subject,
+                    reason,
+                    budget,
+                });
+            }
         }
     }
 
@@ -2475,6 +2871,7 @@ impl CallerRegistry {
                         entry_first_seen_ns: None,
                         entry_last_seen_ns: None,
                         entry_in_flight: false,
+                        entry_rose_since_previous_pass: false,
                         semantics: None,
                         double_loaded: false,
                         coverage: EdgeCoverage::default(),
@@ -2535,18 +2932,42 @@ impl CallerRegistry {
         self.push_gap(gap);
     }
 
+    /// One bound row's publication-time placement (P3): the caller
+    /// edge its witness and count take together, from the same committed
+    /// state — exactly one edged module, or the rejection the witness
+    /// records. Both [`Self::apply_bound_witness`] and
+    /// [`Self::apply_pending_count`] decide through this one function, so
+    /// a count lands exactly where its witness did, or drops exactly
+    /// where its witness went module-level.
+    fn place_bound_row(&self, caller: CallerId, modules: &[ModuleKey]) -> RowPlacement {
+        let edged: Vec<(&ModuleKey, ModuleId)> = modules
+            .iter()
+            .filter_map(|key| {
+                self.modules_by_key
+                    .get(key)
+                    .copied()
+                    .filter(|id| self.edges.contains_key(&(caller, *id)))
+                    .map(|id| (key, id))
+            })
+            .collect();
+        match (edged.as_slice(), modules) {
+            ([(key, id)], _) => RowPlacement::Edge {
+                key: (*key).clone(),
+                id: *id,
+            },
+            ([], [key]) => RowPlacement::NoMapping { key: key.clone() },
+            ([], []) => RowPlacement::Unresolved,
+            _ => RowPlacement::Shared,
+        }
+    }
+
     /// The edge a coverage note names, or `None` with a gap: coverage
     /// notes never invent edges. Retired callers stay addressable —
     /// positive history survives retirement.
     fn apply_bound_witness(&mut self, caller: CallerId, modules: &[ModuleKey], first_ns: u64) {
-        let edged: Vec<ModuleId> = modules
-            .iter()
-            .filter_map(|key| self.modules_by_key.get(key).copied())
-            .filter(|id| self.edges.contains_key(&(caller, *id)))
-            .collect();
-        match (edged.as_slice(), modules) {
-            ([id], _) => {
-                let edge = self.edges.get_mut(&(caller, *id)).expect("edged");
+        match self.place_bound_row(caller, modules) {
+            RowPlacement::Edge { id, .. } => {
+                let edge = self.edges.get_mut(&(caller, id)).expect("edged");
                 let first = edge
                     .coverage
                     .witnessed_first_ns
@@ -2554,12 +2975,12 @@ impl CallerRegistry {
                 edge.coverage.witnessed_first_ns = Some(first);
                 self.witness_placement.edge += 1;
             }
-            ([], [key]) => {
+            RowPlacement::NoMapping { key } => {
                 // The caller is identified; only its mapping is missing.
-                let id = self.modules_by_key.get(key).copied();
+                let id = self.modules_by_key.get(&key).copied();
                 self.push_coverage_gap(
                     caller,
-                    key,
+                    &key,
                     id,
                     WITNESS_WITHOUT_MAPPING,
                     format!(
@@ -2569,15 +2990,171 @@ impl CallerRegistry {
                     ),
                 );
                 self.apply_unbound_use(
-                    key,
+                    &key,
                     first_ns,
                     NO_MAPPING_EDGE,
                     "the bound caller has no mapping edge to the module",
                     false,
                 );
             }
-            ([], []) => self.witness_placement.unresolved += 1,
-            _ => self.apply_shared_endpoint(modules, "bound to a caller incarnation"),
+            RowPlacement::Unresolved => self.witness_placement.unresolved += 1,
+            RowPlacement::Shared => {
+                self.apply_shared_endpoint(modules, "bound to a caller incarnation");
+            }
+        }
+    }
+
+    /// One pending count's publication: placement comes from
+    /// [`Self::place_bound_row`] — the same decision its witness took —
+    /// and admission mirrors the coordinator's `stage_pair_count` (only
+    /// admitted modules count). On placement the count and its `Counted`
+    /// coverage apply exactly as if staged placed — a demoted count
+    /// accumulates its growth onto the edge (round 4, re-place); a
+    /// first-sight rejection drops silently (the witness records the
+    /// placement gaps, and no gap is owed twice), while a demoted
+    /// rejection discloses under its own subject instead (F3-02). Every
+    /// outcome is reported through [`Self::take_pending_count_decisions`].
+    #[allow(clippy::too_many_arguments)]
+    fn apply_pending_count(
+        &mut self,
+        pending_id: u64,
+        caller: CallerId,
+        modules: &[ModuleKey],
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+        since_ns: u64,
+        base: u64,
+    ) {
+        let outcome = match self.place_bound_row(caller, modules) {
+            RowPlacement::Edge { key, .. } => {
+                let admitted = self
+                    .modules_by_key
+                    .get(&key)
+                    .and_then(|id| self.modules.get(id))
+                    .is_some_and(|record| record.admission == AdmissionState::Admitted);
+                if !admitted {
+                    PendingCountOutcome::Unadmitted { module: key }
+                } else {
+                    self.apply(Mutation::NoteCountedUse {
+                        caller,
+                        module: key.clone(),
+                        count,
+                        first_ns,
+                        last_ns,
+                        base,
+                    });
+                    self.apply(Mutation::NoteCoverage {
+                        caller,
+                        module: key.clone(),
+                        note: CoverageNote::Counted { since_ns },
+                    });
+                    PendingCountOutcome::Placed { module: key }
+                }
+            }
+            RowPlacement::NoMapping { .. } | RowPlacement::Unresolved => {
+                PendingCountOutcome::Rejected {
+                    reason: PendingRejection::NoEdge,
+                }
+            }
+            RowPlacement::Shared => PendingCountOutcome::Rejected {
+                reason: PendingRejection::Ambiguous,
+            },
+        };
+        if base > 0
+            && let PendingCountOutcome::Rejected { reason } = &outcome
+        {
+            self.disclose_demoted_rejection(caller, modules, count, *reason);
+        }
+        self.pending_count_decisions.push(PendingCountDecision {
+            pending_id,
+            outcome,
+        });
+    }
+
+    /// One demoted count's rejection disclosure (F3-02): the pair's
+    /// witness resolved cleanly when the pair was sole-owned, so no
+    /// witness in this window records the placement — the count records
+    /// its own disclosure gaps, naming the unattributed growth, so a
+    /// rejected demoted count never finalizes silently. The disclosure
+    /// is gap-only: the rejected count has no witness row, so it must
+    /// never account a witness placement or invent a module-level use
+    /// row (round 4, census). Every arm pushes direct under its own
+    /// subject, memoized nowhere: count disclosures share no memo
+    /// bucket with witness gaps in either direction, and repeat
+    /// rejections each disclose (identical repeats fold into the gap's
+    /// repeat count; distinct ones stand on their own, bounded by the
+    /// gap retention bound like every other gap). Ambiguity takes one
+    /// gap per sharer; a single unedged candidate records a
+    /// caller-scoped gap naming the missing edge; no candidate at all
+    /// reports caller-wide (the endpoint left the attach set entirely).
+    fn disclose_demoted_rejection(
+        &mut self,
+        caller: CallerId,
+        modules: &[ModuleKey],
+        count: u64,
+        reason: PendingRejection,
+    ) {
+        match (reason, modules) {
+            (PendingRejection::Ambiguous, _) => {
+                for key in modules {
+                    let id = self.modules_by_key.get(key).copied();
+                    self.push_gap(RegistryGap {
+                        caller: None,
+                        module: id,
+                        pid: None,
+                        subject: DEMOTED_COUNT_REJECTED.into(),
+                        reason: with_key(
+                            format!(
+                                "a native witness endpoint is shared by {} admitted modules \
+                                 (re-resolved with {count} unattributed calls after sharing appeared): \
+                                 which module was used is ambiguous, so no edge and no module-level use \
+                                 is recorded",
+                                modules.len()
+                            ),
+                            id,
+                            key,
+                        ),
+                        budget: None,
+                    });
+                }
+            }
+            (PendingRejection::NoEdge, [key]) => {
+                let id = self.modules_by_key.get(key).copied();
+                self.push_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: id,
+                    pid: None,
+                    subject: DEMOTED_COUNT_REJECTED.into(),
+                    reason: with_key(
+                        format!(
+                            "{} has no mapping edge to this module: the re-resolved count ({count} calls) \
+                             names no carrier, so no edge and no module-level use is recorded; a count never \
+                             invents a mapping",
+                            caller.label()
+                        ),
+                        id,
+                        key,
+                    ),
+                    budget: None,
+                });
+            }
+            (PendingRejection::NoEdge, []) => {
+                self.push_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: None,
+                    pid: None,
+                    subject: DEMOTED_COUNT_REJECTED.into(),
+                    reason: format!(
+                        "the pair re-resolved after its endpoint left the attach set ({count} calls): no module \
+                         can carry them, so no edge and no module-level use is recorded; history stands on the \
+                         stale edge"
+                    ),
+                    budget: None,
+                });
+            }
+            // Multi-candidate placements reject ambiguous, never NoEdge.
+            (PendingRejection::NoEdge, _) => {}
         }
     }
 
@@ -2676,6 +3253,93 @@ impl CallerRegistry {
             reason: with_key(reason, module, key),
             budget: None,
         });
+    }
+
+    /// One absolute count install: only a strict advance moves the
+    /// count or last-seen. Equal-or-less re-reads (a stale refresh, a
+    /// repeated first sight) change nothing, so recency always names
+    /// the read that observed the rise. Retired callers are not frozen
+    /// out: like a witness, the count is pre-exit history arriving
+    /// late. Coverage notes never invent edges (one memoized gap).
+    fn apply_counted_install(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        count: u64,
+        first_ns: u64,
+        last_ns: u64,
+    ) {
+        let Some(edge) = self.coverage_edge(caller, module) else {
+            return;
+        };
+        if count > edge.entry_count {
+            edge.entry_rose_since_previous_pass = true;
+            if count == MAX_EDGE_ENTRY_COUNT {
+                edge.entry_count = MAX_EDGE_ENTRY_COUNT;
+                edge.entry_saturated = true;
+            } else {
+                edge.entry_count = count;
+            }
+            edge.entry_first_seen_ns = Some(
+                edge.entry_first_seen_ns
+                    .map_or(first_ns, |was| was.min(first_ns)),
+            );
+            // Recency survives saturation: the count stops,
+            // last-seen does not.
+            edge.entry_last_seen_ns = Some(last_ns);
+        }
+    }
+
+    /// One demoted count install (round 4, re-place): growth past the
+    /// pair's accounted `base` accumulates onto the edge. The install
+    /// is the edge's publication-start count plus the covered growth
+    /// staged this publication — exact across any number of reads per
+    /// commit — and still honors strict advance (an edge another pair
+    /// already carried past the install keeps its maximum). Growth
+    /// starting past the edge's publication-start count marks the edge
+    /// (once per caller and module): its count is segment-relative, so
+    /// per-segment exactness is unverifiable (round 4, window anchor).
+    fn apply_demoted_use(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        growth: u64,
+        first_ns: u64,
+        last_ns: u64,
+        base: u64,
+    ) {
+        let id = self.modules_by_key.get(module).copied();
+        let base_edge =
+            id.and_then(|id| self.edges.get(&(caller, id)).map(|edge| edge.entry_count));
+        let Some((id, base_edge)) = id.zip(base_edge) else {
+            let _ = self.coverage_edge(caller, module);
+            return;
+        };
+        if base > base_edge {
+            self.push_coverage_gap(
+                caller,
+                module,
+                Some(id),
+                DEMOTED_COUNT_PLACED,
+                "a demoted count placed post-demotion growth on this edge: the edge's count covers \
+                 a workload segment starting at the base read, never the whole workload, so \
+                 per-segment exactness is unverifiable and only the ledger window's upper bound \
+                 applies"
+                    .into(),
+            );
+        }
+        let absolute = base.saturating_add(growth);
+        let state = self
+            .demoted_place_growth
+            .entry((caller, id))
+            .or_insert(DemotedGrowth {
+                base_edge,
+                segments: Vec::new(),
+            });
+        state.segments.push((base, absolute, first_ns, last_ns));
+        let (first_ns, last_ns) = state.stamps();
+        let install = state.base_edge.saturating_add(state.total());
+        self.apply_counted_install(caller, module, install, first_ns, last_ns);
     }
 
     fn coverage_edge(&mut self, caller: CallerId, module: &ModuleKey) -> Option<&mut EdgeRecord> {
@@ -2930,6 +3594,9 @@ impl CallerRegistry {
             return EntryOutcome::UnknownEdge;
         };
         let (count, overflowed) = edge.entry_count.overflowing_add(delta);
+        if count > edge.entry_count {
+            edge.entry_rose_since_previous_pass = true;
+        }
         if count == MAX_EDGE_ENTRY_COUNT || overflowed {
             edge.entry_count = MAX_EDGE_ENTRY_COUNT;
             edge.entry_saturated = true;
@@ -5103,6 +5770,88 @@ pub(crate) mod tests {
         assert_eq!(shared_gaps, 2, "once per sharing module");
     }
 
+    #[test]
+    fn pending_counts_resolve_with_their_witness_and_report_decisions() {
+        // P3: a pending count resolves at publication from the same
+        // committed state its witness does — same edge or same
+        // rejection — and every pending count reports its placement.
+        let mut registry = registry();
+        let a = module_info("/lib/a.so", 11, AdmissionState::Admitted);
+        let b = module_info("/lib/b.so", 12, AdmissionState::Admitted);
+        let (ka, kb) = (a.key.clone(), b.key.clone());
+        // A committed; B's mapping stages in the same window as the use.
+        registry.note_mapping(CallerId(0), 50, a.clone(), 100);
+        registry.publish();
+        registry.note_mapping(CallerId(0), 51, b.clone(), 110);
+        registry.note_pending_count(
+            7,
+            CallerId(0),
+            vec![ka.clone(), kb.clone()],
+            9,
+            120,
+            130,
+            120,
+            0,
+        );
+        registry.note_bound_witness(CallerId(0), vec![ka.clone(), kb.clone()], 120);
+        registry.publish();
+        // Together: the witness reads ambiguous and the count drops.
+        assert_eq!(registry.witness_placement().ambiguous, 1);
+        let decisions = registry.take_pending_count_decisions();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].pending_id, 7);
+        assert!(
+            matches!(
+                decisions[0].outcome,
+                PendingCountOutcome::Rejected {
+                    reason: PendingRejection::Ambiguous
+                }
+            ),
+            "{decisions:?}"
+        );
+        let count_of = |registry: &CallerRegistry, key: &ModuleKey| {
+            registry
+                .module_id_for(key)
+                .and_then(|id| registry.edge(CallerId(0), id))
+                .map(|edge| edge.entry_count)
+        };
+        assert_eq!(count_of(&registry, &ka), Some(0));
+        assert_eq!(count_of(&registry, &kb), Some(0));
+        assert!(registry.take_pending_count_decisions().is_empty());
+        // A single edged module places witness and count together.
+        registry.note_pending_count(8, CallerId(0), vec![ka.clone()], 12, 140, 150, 140, 0);
+        registry.note_bound_witness(CallerId(0), vec![ka.clone()], 140);
+        registry.publish();
+        let decisions = registry.take_pending_count_decisions();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert!(
+            matches!(
+                decisions[0].outcome,
+                PendingCountOutcome::Placed { ref module } if module == &ka
+            ),
+            "{decisions:?}"
+        );
+        assert_eq!(count_of(&registry, &ka), Some(12));
+        // No mapping edge: the witness goes module-level and the count
+        // rejects with it.
+        registry.note_pending_count(9, CallerId(3), vec![ka.clone()], 4, 160, 170, 160, 0);
+        registry.note_bound_witness(CallerId(3), vec![ka.clone()], 160);
+        registry.publish();
+        let decisions = registry.take_pending_count_decisions();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert!(
+            matches!(
+                decisions[0].outcome,
+                PendingCountOutcome::Rejected {
+                    reason: PendingRejection::NoEdge
+                }
+            ),
+            "{decisions:?}"
+        );
+        assert_eq!(registry.witness_placement().module, 1);
+        assert_eq!(count_of(&registry, &ka), Some(12));
+    }
+
     /// M4 (C4 review): a bound row without a mapping edge names its caller
     /// (the caller is identified) and never reads as an unidentified image;
     /// no witness gap publishes a tgid.
@@ -5179,5 +5928,227 @@ pub(crate) mod tests {
         let kept = adapter.revalidate_admitted_before(300);
         assert!(kept.contains(&same) && kept.contains(&late));
         assert!(!kept.contains(&exec_d), "{kept:?}");
+    }
+
+    #[test]
+    fn counted_use_stages_absolute_counts_with_pass_resolution_recency() {
+        // C7 C4: a bound pair's count is an absolute saturating lower
+        // bound; only a strict advance moves the count or last-seen, so
+        // recency is never faked by a re-observed count.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_counted_use(CallerId(0), &keys[0], 5, 100, 200, 0);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 5);
+        assert!(!edge.entry_saturated);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(200));
+        assert_eq!(
+            registry.coverage(edge),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
+        );
+        assert_eq!(registry.entry_observation(edge), EntryObservation::Observed);
+        // A strict advance moves the count and last-seen; first-seen is
+        // the earliest first record.
+        registry.note_counted_use(CallerId(0), &keys[0], 9, 100, 300, 0);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 9);
+        assert_eq!(edge.entry_first_seen_ns, Some(100));
+        assert_eq!(edge.entry_last_seen_ns, Some(300));
+        // A stale re-read changes nothing: no regression, no recency.
+        registry.note_counted_use(CallerId(0), &keys[0], 7, 100, 400, 0);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 9);
+        assert_eq!(edge.entry_last_seen_ns, Some(300));
+        // An equal count re-observed later is not activity either.
+        registry.note_counted_use(CallerId(0), &keys[0], 9, 100, 500, 0);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 9);
+        assert_eq!(edge.entry_last_seen_ns, Some(300));
+    }
+
+    #[test]
+    fn counted_use_saturates_at_the_edge_cap() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_counted_use(CallerId(0), &keys[0], MAX_EDGE_ENTRY_COUNT, 100, 200, 0);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, MAX_EDGE_ENTRY_COUNT);
+        assert!(edge.entry_saturated);
+        assert_eq!(edge.entry_last_seen_ns, Some(200));
+    }
+
+    #[test]
+    fn zero_counted_use_stages_nothing() {
+        // Counted needs a count ≥ 1: a bound row that reports zero (only
+        // scripted rows do; BPF inserts at one) leaves the edge to its
+        // witness.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_witness(CallerId(0), &keys[0], 100);
+        registry.note_counted_use(CallerId(0), &keys[0], 0, 100, 200, 0);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 0);
+        assert_eq!(edge.entry_first_seen_ns, None);
+        assert_eq!(edge.entry_last_seen_ns, None);
+        assert_eq!(
+            registry.coverage(edge),
+            UseCoverage::Witnessed { first_ns: 100 }
+        );
+    }
+
+    #[test]
+    fn counted_use_is_history_for_a_retired_caller_but_never_invents_an_edge() {
+        // Like a witness (and unlike a live entry delta), a bound row's
+        // count stages for a retired caller: the use predates the exit.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.retire_caller(CallerId(0), "exited".into(), 150);
+        registry.note_counted_use(CallerId(0), &keys[0], 4, 100, 140, 0);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert_eq!(edge.entry_count, 4);
+        assert_eq!(edge.entry_last_seen_ns, Some(140));
+        // Without a mapping edge the count is dropped with one memoized
+        // gap, however often the refresh repeats it.
+        let missing = ModuleKey::physical(8, 1, 99, Some("sha0099".into()), "/lib/z.so");
+        registry.note_counted_use(CallerId(0), &missing, 4, 100, 140, 0);
+        registry.publish();
+        registry.note_counted_use(CallerId(0), &missing, 6, 100, 150, 0);
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1);
+        assert_eq!(
+            registry.gaps()[0].subject,
+            "usage coverage without mapping evidence"
+        );
+    }
+
+    #[test]
+    fn pairs_uncounted_demotes_watches_and_keeps_positives() {
+        // C7 C4: once a pair insert fails, absence proves nothing: every
+        // ongoing watch reads `uncounted`, positives stand, and a frozen
+        // interval stands.
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+                ("/lib/c.so", 13, AdmissionState::Admitted),
+                ("/lib/d.so", 14, AdmissionState::Admitted),
+            ],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[1],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.note_witness(CallerId(0), &keys[2], 110);
+        registry.note_counted_use(CallerId(0), &keys[3], 5, 100, 140, 0);
+        registry.publish();
+        let evidence: std::sync::Arc<str> = "CALLER_EVIDENCE[2] PairInsertFailure rose 0->1".into();
+        registry.note_pairs_uncounted(evidence.clone(), 140);
+        registry.publish();
+        for key in &keys[0..2] {
+            let watched = edge_of(&registry, CallerId(0), key);
+            assert_eq!(
+                registry.coverage(watched),
+                UseCoverage::Unknown(UnknownReason::Uncounted(evidence.clone())),
+                "{key:?}"
+            );
+        }
+        let witnessed = edge_of(&registry, CallerId(0), &keys[2]);
+        assert_eq!(
+            registry.coverage(witnessed),
+            UseCoverage::Witnessed { first_ns: 110 }
+        );
+        let counted = edge_of(&registry, CallerId(0), &keys[3]);
+        assert!(matches!(
+            registry.coverage(counted),
+            UseCoverage::Counted { .. }
+        ));
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "usage coverage pair insert failure"),
+            "{:?}",
+            registry.gaps()
+        );
+        assert_eq!(UnknownReason::Uncounted(evidence).code(), "uncounted");
+    }
+
+    #[test]
+    fn pairs_uncounted_leaves_an_interval_frozen_before_the_evidence() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        registry.note_coverage(
+            CallerId(0),
+            &keys[0],
+            CoverageNote::Watched { since_ns: 100 },
+        );
+        registry.publish();
+        registry.note_watch_end("stopping", 120);
+        registry.publish();
+        registry.note_pairs_uncounted(Arc::from("CALLER_EVIDENCE[2] PairInsertFailure rose"), 140);
+        registry.publish();
+        let edge = edge_of(&registry, CallerId(0), &keys[0]);
+        assert!(
+            matches!(
+                registry.coverage(edge),
+                UseCoverage::WatchedNoUse {
+                    until_ns: Some(120),
+                    ..
+                }
+            ),
+            "an interval frozen before the evidence stands: {:?}",
+            registry.coverage(edge)
+        );
+    }
+
+    #[test]
+    fn uncounted_reason_codes_detail_and_text() {
+        let reason = UnknownReason::Uncounted("CALLER_EVIDENCE[2] PairInsertFailure rose".into());
+        assert_eq!(reason.code(), "uncounted");
+        assert_eq!(
+            reason.detail(),
+            Some("CALLER_EVIDENCE[2] PairInsertFailure rose")
+        );
+        assert!(reason.text().starts_with("uncounted"), "{}", reason.text());
     }
 }

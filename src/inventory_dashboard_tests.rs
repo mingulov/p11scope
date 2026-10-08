@@ -83,7 +83,7 @@ fn varied_presentation() -> Presentation {
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
     let passes = document["observation"]["passes"].as_u64().unwrap();
-    Presentation::capture(
+    Presentation::capture_dashboard(
         harness.coordinator(),
         "workload",
         started,
@@ -191,7 +191,7 @@ fn capture_from_harness(harness: &Harness) -> Presentation {
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
     let passes = document["observation"]["passes"].as_u64().unwrap();
-    Presentation::capture(
+    Presentation::capture_dashboard(
         harness.coordinator(),
         "workload",
         started,
@@ -489,7 +489,7 @@ fn unicode_and_control_paths_render_safely() {
         let document = harness.render();
         let started = document["observation"]["started_ns"].as_u64().unwrap();
         let ended = document["observation"]["ended_ns"].as_u64().unwrap();
-        Presentation::capture(
+        Presentation::capture_dashboard(
             harness.coordinator(),
             "workload",
             started,
@@ -641,7 +641,7 @@ fn dashboard_on_off_capture_totals_identical_with_measured_overhead() {
         // handoff, then frames at several scroll positions.
         let started = document["observation"]["started_ns"].as_u64().unwrap();
         let ended = document["observation"]["ended_ns"].as_u64().unwrap();
-        let presentation = Presentation::capture(
+        let presentation = Presentation::capture_dashboard(
             harness.coordinator(),
             "workload",
             started,
@@ -1517,7 +1517,7 @@ fn pty_large_inventory_renders_through_bounded_views() {
     let document = harness.render();
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
-    let presentation = Presentation::capture(
+    let presentation = Presentation::capture_dashboard(
         harness.coordinator(),
         "workload",
         started,
@@ -1600,7 +1600,7 @@ fn capture_presentation(harness: &Harness) -> Presentation {
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
     let passes = document["observation"]["passes"].as_u64().unwrap();
-    Presentation::capture(
+    Presentation::capture_dashboard(
         harness.coordinator(),
         "workload",
         started,

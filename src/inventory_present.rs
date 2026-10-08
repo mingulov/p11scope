@@ -30,10 +30,10 @@ use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::render::escape_controls;
 use crate::semantics_edge::{EdgeEvidence, EdgeSemantics};
 
-/// Trailing window for dashboard "recently observed": an entry whose
-/// last-seen falls inside this window (of the frame's `now_ns`) reads
-/// as recent. Snapshots instead use the observation window
-/// (`ended_ns - started_ns`), matching the historical "active" flag.
+/// Trailing window for the dashboard display's "recently observed":
+/// an entry whose last-seen falls inside this window (of the frame's
+/// `now_ns`) reads as recent on screen. The recorded activity signal
+/// is per-pass instead ("rose since previous pass"), window-free.
 pub(crate) const DASHBOARD_ACTIVITY_WINDOW_NS: u64 = 5_000_000_000;
 
 /// Presence of one caller/module association: the plan's exact labels.
@@ -190,23 +190,23 @@ impl Activity {
         }
     }
 
-    /// `recent` comes from the registry's recency predicate (the
-    /// same window math the historical "active" flag uses); this maps
-    /// states, never recomputes windows. `op_active` is genuine S1
-    /// operation state (a live machine), never recency. `coverage` is
-    /// the edge's usage coverage: it decides whether a silent live edge
-    /// is quiet (a fact) or uncovered.
+    /// `active` is the pass rise (the recorded per-pass signal) or
+    /// window recency (the dashboard display only); this maps states,
+    /// never recomputes either. `op_active` is genuine S1 operation
+    /// state (a live machine), never activity. `coverage` is the
+    /// edge's usage coverage: it decides whether a silent live edge is
+    /// quiet (a fact) or uncovered.
     pub(crate) fn for_edge(
         mapping: MappingState,
         in_flight: bool,
-        recent: bool,
+        active: bool,
         op_active: bool,
         coverage: &UseCoverage,
     ) -> Self {
         if in_flight || op_active {
             return Self::InFlight;
         }
-        if recent {
+        if active {
             return Self::RecentlyObserved;
         }
         if coverage.is_witnessed() {
@@ -437,12 +437,43 @@ pub(crate) struct Presentation {
     pub budgets: BudgetView,
 }
 
+/// What an edge's activity label answers (Choice 3).
+#[derive(Debug, Clone, Copy)]
+enum ActivityBasis {
+    /// Per-pass ("rose since previous pass"): the recorded activity
+    /// signal (JSON, JSONL, pager). Window-free.
+    PerPass,
+    /// Recency within `window_ns` of `now_ns`: the dashboard display's
+    /// trailing "recently observed" only.
+    Recency { now_ns: u64, window_ns: u64 },
+}
+
 impl Presentation {
     /// Capture the coordinator's published state into an immutable
-    /// snapshot. `now_ns`/`window_ns` parameterize activity recency
-    /// (snapshots pass the observation end/width; dashboard frames pass
-    /// the frame time and [`DASHBOARD_ACTIVITY_WINDOW_NS`]).
+    /// snapshot, with the per-pass activity signal ("rose since
+    /// previous pass"). JSON, the event stream, and the pager read this.
     pub(crate) fn capture<Source: ProcessSource>(
+        coordinator: &InventoryCoordinator<Source>,
+        scope_label: &str,
+        started_ns: u64,
+        ended_ns: u64,
+        passes: u64,
+    ) -> Self {
+        Self::capture_inner(
+            coordinator,
+            scope_label,
+            started_ns,
+            ended_ns,
+            passes,
+            ActivityBasis::PerPass,
+        )
+    }
+
+    /// Capture for the dashboard display: as [`Self::capture`], but the
+    /// activity label answers window recency (last-seen within
+    /// `window_ns` of the frame's `now_ns`) instead of the pass rise.
+    /// Production passes [`DASHBOARD_ACTIVITY_WINDOW_NS`].
+    pub(crate) fn capture_dashboard<Source: ProcessSource>(
         coordinator: &InventoryCoordinator<Source>,
         scope_label: &str,
         started_ns: u64,
@@ -450,6 +481,24 @@ impl Presentation {
         passes: u64,
         now_ns: u64,
         window_ns: u64,
+    ) -> Self {
+        Self::capture_inner(
+            coordinator,
+            scope_label,
+            started_ns,
+            ended_ns,
+            passes,
+            ActivityBasis::Recency { now_ns, window_ns },
+        )
+    }
+
+    fn capture_inner<Source: ProcessSource>(
+        coordinator: &InventoryCoordinator<Source>,
+        scope_label: &str,
+        started_ns: u64,
+        ended_ns: u64,
+        passes: u64,
+        basis: ActivityBasis,
     ) -> Self {
         let registry = coordinator.registry();
         let mut caller_ids: Vec<CallerId> = coordinator
@@ -536,9 +585,16 @@ impl Presentation {
             // The presented coverage overlays a pending first-use row as
             // unknown; every consumer reads through it.
             let coverage = coordinator.presented_coverage(edge);
-            // Recency comes only from counted coverage.
-            let recent = matches!(coverage, UseCoverage::Counted { .. })
-                && registry.entry_recent_within(edge, now_ns, window_ns);
+            // Activity comes only from counted coverage: the pass rise
+            // (the signal), or window recency (the dashboard display).
+            let counted = matches!(coverage, UseCoverage::Counted { .. });
+            let active = counted
+                && match basis {
+                    ActivityBasis::PerPass => edge.entry_rose_since_previous_pass,
+                    ActivityBasis::Recency { now_ns, window_ns } => {
+                        registry.entry_recent_within(edge, now_ns, window_ns)
+                    }
+                };
             let semantics = semantics_view(edge.semantics.as_ref());
             let op_active = edge
                 .semantics
@@ -564,7 +620,7 @@ impl Presentation {
                 activity: Activity::for_edge(
                     edge.mapping,
                     edge.entry_in_flight,
-                    recent,
+                    active,
                     op_active,
                     &coverage,
                 ),

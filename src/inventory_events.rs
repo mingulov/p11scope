@@ -733,6 +733,12 @@ pub(crate) fn edge_payload(edge: &EdgeView) -> serde_json::Value {
 /// commit) writes; the rest wait, counted in `edge_events_deferred`.
 pub(crate) const EDGE_EVENTS_PER_PASS: usize = 4096;
 
+/// How often a count change that is not a class change may emit per
+/// edge (C7 C4, D-C7-5): at most one record per edge per 10 s, with
+/// the latest count. Class changes (including bucket jumps) still go
+/// out at once; the final sweep stays exact.
+pub(crate) const EDGE_COUNT_EMIT_INTERVAL_NS: u64 = 10_000_000_000;
+
 /// Bytes the mid-run refresh condition reserves for the lines that end a
 /// stream after a contiguous copy of every edge (the sweep itself uses the
 /// measured `ended` size).
@@ -785,14 +791,18 @@ impl EdgeClass {
 }
 
 /// What the stream last carried for one edge: its class, a 128-bit keyed
-/// digest of the exact payload (the sweep's comparison), and where and
-/// how large that record is (the retention checks).
+/// digest of the exact payload (the sweep's comparison), where and
+/// how large that record is (the retention checks), and the count and
+/// instant it carried (the 10 s count cadence: every record carries
+/// the latest count, so every record resets it).
 #[derive(Debug)]
 struct EdgeDigest {
     class: EdgeClass,
     exact: (u64, u64),
     generation: u64,
     bytes: u64,
+    emitted_count: u64,
+    emitted_ns: u64,
 }
 
 /// One pass's edge output: records written and records still waiting.
@@ -821,12 +831,14 @@ pub(crate) struct EdgeSweep {
 /// directly**, or the replayed stream diverges from the snapshot.
 ///
 /// Per pass ([`EdgeEmitter::emit`]) an edge is due when it is new, when
-/// its [`EdgeClass`] differs from the one the stream last carried, or when
-/// retention evicted its last record while the edges' records fit the
-/// retention ([`EdgeEmitter::fits`]). Due edges queue in arrival order;
-/// at most `EDGE_EVENTS_PER_PASS` records go out per pass, each with the
-/// edge's current payload, and the rest stay queued (FIFO, so a deferred
-/// edge is never starved) and are counted as deferred.
+/// its [`EdgeClass`] differs from the one the stream last carried, when
+/// its count drifted past the last carried count and the 10 s count
+/// cadence expired ([`EDGE_COUNT_EMIT_INTERVAL_NS`]), or when retention
+/// evicted its last record while the edges' records fit the retention
+/// ([`EdgeEmitter::fits`]). Due edges queue in arrival order; at most
+/// `EDGE_EVENTS_PER_PASS` records go out per pass, each with the edge's
+/// current payload, and the rest stay queued (FIFO, so a deferred edge
+/// is never starved) and are counted as deferred.
 ///
 /// The sweep ([`EdgeEmitter::sweep`]), made once before `ended` on every
 /// clean termination, writes every edge whose exact payload differs from
@@ -925,6 +937,15 @@ impl EdgeEmitter {
             .is_some_and(|digest| digest.generation < oldest)
     }
 
+    /// Whether the edge's count drifted past its last carried count and
+    /// the 10 s cadence expired: due with the latest count. Counts only
+    /// move up, so drift is one-sided; a record older than `at_ns`
+    /// (scripted time running backwards) never qualifies.
+    fn count_due(digest: &EdgeDigest, edge: &EdgeView, at_ns: u64) -> bool {
+        edge.entry_count != digest.emitted_count
+            && at_ns.saturating_sub(digest.emitted_ns) >= EDGE_COUNT_EMIT_INTERVAL_NS
+    }
+
     /// Write one record and remember it, within `limit`.
     fn write(
         &mut self,
@@ -946,6 +967,8 @@ impl EdgeEmitter {
             exact,
             generation: writer.generation(),
             bytes,
+            emitted_count: edge.entry_count,
+            emitted_ns: at_ns,
         };
         self.carried_bytes = self.carried_bytes.saturating_add(bytes);
         if let Some(old) = self.digests.insert(key, digest) {
@@ -954,10 +977,10 @@ impl EdgeEmitter {
         Ok(())
     }
 
-    /// One pass: queue every new, class-changed or (while the records fit
-    /// the retention) evicted edge, then write up to the per-pass cap from
-    /// the queue's head. `edges` is the presentation's (sorted by (caller,
-    /// module)); `limit` its edge limit.
+    /// One pass: queue every new, class-changed, count-due or (while
+    /// the records fit the retention) evicted edge, then write up to the
+    /// per-pass cap from the queue's head. `edges` is the presentation's
+    /// (sorted by (caller, module)); `limit` its edge limit.
     pub(crate) fn emit(
         &mut self,
         writer: &mut EventWriter,
@@ -976,6 +999,7 @@ impl EdgeEmitter {
                 Some(digest) => {
                     digest.class != EdgeClass::of(edge)
                         || (refresh && digest.generation < writer.oldest_generation())
+                        || Self::count_due(digest, edge, at_ns)
                 }
             };
             if due {
@@ -996,11 +1020,9 @@ impl EdgeEmitter {
             let edge = &edges[position];
             // A change that reverted while it waited is already carried,
             // unless its record has since been evicted.
-            if self
-                .digests
-                .get(&key)
-                .is_some_and(|digest| digest.class == EdgeClass::of(edge))
-                && !self.evicted(&key, writer)
+            if self.digests.get(&key).is_some_and(|digest| {
+                digest.class == EdgeClass::of(edge) && edge.entry_count == digest.emitted_count
+            }) && !self.evicted(&key, writer)
             {
                 continue;
             }

@@ -21,8 +21,10 @@
 //!    it at once.
 //! 4. Stop: at least one full pass after activation; the terminal read is
 //!    staged before `end_capture_coverage`; `begin_stop`; discovery serviced
-//!    until a complete drain while retirement is polled; one more read;
-//!    `Finish{domain}`; the caller commits and writes the final sinks.
+//!    until a complete drain while retirement is polled; reads until a
+//!    count-refresh sweep completes without gaps (the terminal refresh:
+//!    every witnessed row's final count, still unsettled); `Finish{domain}`;
+//!    the caller commits and writes the final sinks.
 //! 5. A retirement that misses its budget reads `retirement: unsettled` with
 //!    a gap; the capture is dropped after the output (the documented
 //!    blocking reclamation path).
@@ -367,6 +369,9 @@ pub(crate) trait LaneHost<Pin> {
     /// `not_attached`, never `scan_only`.
     fn note_native_lane(&mut self);
     fn note_scope_gap(&mut self, subject: String, reason: String);
+    /// The lane's terminal count refresh never completed: demote the
+    /// retained counts to lower bounds (P1-5 terminal-first).
+    fn note_refresh_loss(&mut self, reason: String);
 }
 
 impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
@@ -413,6 +418,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn note_scope_gap(&mut self, subject: String, reason: String) {
         InventoryCoordinator::note_scope_gap(self, subject, reason);
+    }
+
+    fn note_refresh_loss(&mut self, reason: String) {
+        InventoryCoordinator::note_refresh_loss(self, reason);
     }
 }
 
@@ -863,16 +872,45 @@ impl<L> NativeLane<L> {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        // The health horizon for rows the terminal read reported.
-        let last = self.read();
-        events.extend(
-            host.stage_native(
-                NativeBatch::Witness(Box::new(last)),
-                &mut self.capture,
-                now_ns(),
-            )
-            .events,
-        );
+        // The terminal count refresh: after stop began, keep reading
+        // (bounded) until a refresh sweep completes without gaps, so every
+        // witnessed row's count gets its last word. Still unsettled per
+        // D3: the reads happen after stop began, and retirement may not
+        // have closed every link. The last read is the health horizon for
+        // rows the terminal read reported. The traversal restarted at
+        // `begin_stop`, so a completed sweep is a generation begun after
+        // the retirement boundary; when the budget expires first, the
+        // incomplete refresh demotes the retained counts to lower bounds
+        // (lossy, never a fresh terminal word) and is reported.
+        let refresh_budget = self.windows.terminal_sweep_budget;
+        let refresh_deadline = Instant::now() + refresh_budget;
+        let exact = loop {
+            let terminal = self.read();
+            let exact = terminal.refresh_sweep_completed && !terminal.refresh_sweep_gaps;
+            events.extend(
+                host.stage_native(
+                    NativeBatch::Witness(Box::new(terminal)),
+                    &mut self.capture,
+                    now_ns(),
+                )
+                .events,
+            );
+            if exact || Instant::now() >= refresh_deadline {
+                break exact;
+            }
+        };
+        if !exact {
+            // P1-5 terminal-first: the incomplete refresh is a loss
+            // boundary, not a scope gap alone — the retained counts
+            // demote to lower bounds (lossy), so the terminal
+            // observation withholds quiet over them.
+            host.note_refresh_loss(format!(
+                "terminal count refresh incomplete: no gap-free count-refresh sweep completed \
+                 within {} ms after stop began; witnessed counts keep their last read as a \
+                 lower bound",
+                refresh_budget.as_millis()
+            ));
+        }
         let domain = self.capture.domain();
         events.extend(
             host.stage_native(NativeBatch::Finish { domain }, &mut self.capture, now_ns())
@@ -1129,11 +1167,16 @@ where
         }
         driver.commit(report.engine_changed)?;
         passes += 1;
+        // Publication time is sampled AFTER collection, refresh, and
+        // commit: rows this pass stamped (rows_read_ns) must not read as
+        // the future to the presentation clock, or a rising count reads
+        // Quiet live. Scan semantics keep the pass-start `now`.
+        let published_ns = now_ns();
         publish(
             driver,
             Publish::Pass {
                 report: &report,
-                now_ns: now,
+                now_ns: published_ns,
             },
         )?;
         rescan = lane.as_mut().is_some_and(NativeLane::take_recovery_rescan);

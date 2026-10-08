@@ -70,7 +70,7 @@ pub(crate) struct SinkWriter<W: Write + AsRawFd> {
 pub(crate) enum StdoutInner {
     /// A pipe or terminal reopened as a private description (whose own
     /// flags the sink may set), or a shared regular file or block device
-    /// (whose writes never block, so no flag is set at all).
+    /// (whose kernel I/O is not bounded by O_NONBLOCK).
     File(std::fs::File),
     /// A shared socket, written with per-call `MSG_DONTWAIT`, so no flag
     /// change is needed either.
@@ -178,10 +178,28 @@ fn try_diagnostic_line_on_fd(fd: RawFd, line: &str) -> io::Result<SinkDrops> {
 /// dispatching on file type so the shared description's status flags
 /// are never changed: pipes and terminals are reopened as private
 /// descriptions, sockets use per-call nonblocking sends, and regular
-/// files are shared without any flag change (their writes never block,
-/// and sharing keeps the observer's and the child's file offsets
-/// advancing together).
+/// files are shared without any flag change. Sharing keeps the observer's
+/// and child's file offsets advancing together; filesystem and block-device
+/// calls can still wait inside the kernel regardless of O_NONBLOCK.
 fn stdout_sink_from(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
+    Ok(SinkWriter::without_flag_change(stdout_transport_on_fd(fd)?))
+}
+
+/// Acquires the unbuffered transport without mutating inherited status flags.
+/// A failed private reopen is an error; there is no blocking fallback.
+pub(crate) fn stdout_transport_on_fd(fd: RawFd) -> io::Result<StdoutInner> {
+    stdout_transport_with_reopen(fd, |fd| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{fd}"))
+    })
+}
+
+fn stdout_transport_with_reopen(
+    fd: RawFd,
+    reopen: impl FnOnce(RawFd) -> io::Result<std::fs::File>,
+) -> io::Result<StdoutInner> {
     // SAFETY: `fstat` only reads the fd's metadata.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &raw mut stat) } != 0 {
@@ -194,22 +212,16 @@ fn stdout_sink_from(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
             // aliasing the description the way `dup` does.
             // `O_NONBLOCK` at open so a readerless FIFO fails instead of
             // blocking the observer here.
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(format!("/proc/self/fd/{fd}"))?;
-            SinkWriter::new(StdoutInner::File(file))
+            Ok(StdoutInner::File(reopen(fd)?))
         }
         libc::S_IFSOCK => {
             let duped = dup_cloexec(fd)?;
-            Ok(SinkWriter::without_flag_change(StdoutInner::Socket(
-                SocketWriter::new(duped),
-            )))
+            Ok(StdoutInner::Socket(SocketWriter::new(duped)))
         }
         libc::S_IFREG | libc::S_IFBLK => {
             use std::os::fd::FromRawFd as _;
             let file = unsafe { std::fs::File::from_raw_fd(dup_cloexec(fd)?.into_raw_fd()) };
-            Ok(SinkWriter::without_flag_change(StdoutInner::File(file)))
+            Ok(StdoutInner::File(file))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -219,6 +231,14 @@ fn stdout_sink_from(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
             ),
         )),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_transport_with_reopen(
+    fd: RawFd,
+    reopen: impl FnOnce(RawFd) -> io::Result<std::fs::File>,
+) -> io::Result<StdoutInner> {
+    stdout_transport_with_reopen(fd, reopen)
 }
 
 /// `dup` with `CLOEXEC`: the sink fd must not leak into owned children.
@@ -253,10 +273,10 @@ impl<W: Write + AsRawFd> SinkWriter<W> {
         Ok(Self::without_flag_change(inner))
     }
 
-    /// Wraps an fd whose writes already cannot block — a socket using
-    /// per-call flags, or a regular file — without touching its status
-    /// flags. (Regular files ignore `O_NONBLOCK` in the kernel, so
-    /// sharing their description changes nothing.)
+    /// Wraps an acquired transport without touching its status flags. Private
+    /// descriptions and per-call socket flags bound ordinary backpressure;
+    /// regular-file/block-device writes can still wait in the kernel and
+    /// ignore O_NONBLOCK, so setting that flag would not add a latency bound.
     pub(crate) fn without_flag_change(inner: W) -> Self {
         Self {
             inner,

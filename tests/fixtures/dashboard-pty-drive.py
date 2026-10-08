@@ -52,6 +52,46 @@ import termios
 import time
 
 
+class PtyChild:
+    """Keep a forked child's PID owned until its one reap, then retire it."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.reaped = False
+
+    def wait(self, options: int) -> tuple[int, int]:
+        try:
+            done, status = os.waitpid(self.pid, options)
+        except ChildProcessError:
+            self.reaped = True
+            raise
+        if done != 0:
+            self.reaped = True
+        return done, status
+
+    def cleanup(self) -> None:
+        if self.reaped:
+            return
+        # Reap an exited child without signaling it; ECHILD also retires
+        # custody if another wait has already consumed this child's exit.
+        try:
+            done, _ = self.wait(os.WNOHANG)
+        except OSError:
+            return
+        if done != 0:
+            return
+        # This single-threaded driver has no competing reaper. Until the
+        # wait below, even an intervening exit keeps this PID reserved.
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            self.wait(0)
+        except OSError:
+            pass
+
+
 def main() -> int:
     if len(sys.argv) > 5 and sys.argv[5] == "stall":
         return stall_mode()
@@ -73,6 +113,7 @@ def main() -> int:
     if child == 0:
         os.execv(binary, argv)
         os._exit(127)  # unreachable; pacifies linters
+    child = PtyChild(child)
     # A real 80x24 window (openpty defaults to 0x0, which the dashboard
     # would only fall back from — here the queried size is asserted).
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -119,7 +160,7 @@ def main() -> int:
         status = None
         eof = False
         while time.monotonic() - start < budget:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -154,14 +195,7 @@ def main() -> int:
                 break
             output.extend(chunk)
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
 
     elapsed = time.monotonic() - start
@@ -201,6 +235,7 @@ def app_first_mode() -> int:
         os.close(launch_read)
         os.execv(binary, argv)
         os._exit(127)
+    child = PtyChild(child)
     os.close(launch_read)
     output = bytearray()
     start = time.monotonic()
@@ -292,7 +327,7 @@ def app_first_mode() -> int:
         os.write(master, b"q")
         eof = False
         while time.monotonic() - start < budget:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -315,14 +350,7 @@ def app_first_mode() -> int:
     except (AssertionError, OSError) as error:
         return fail(str(error), output, child)
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
         os.close(launch_write)
 
@@ -358,6 +386,7 @@ def stall_mode() -> int:
     if child == 0:
         os.execv(binary, argv)
         os._exit(127)
+    child = PtyChild(child)
     # A large window: big frames fill the pty buffer within seconds.
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 200, 0, 0))
     output = bytearray()
@@ -372,15 +401,15 @@ def stall_mode() -> int:
         stall_mark = len(output)
         stall_began = time.monotonic()
         while time.monotonic() - stall_began < stall_secs:
-            done, _ = os.waitpid(child, os.WNOHANG)
+            done, _ = child.wait(os.WNOHANG)
             if done != 0:
                 return fail("the dashboard exited during the stall", output, child)
             time.sleep(0.5)
-        os.kill(child, signal.SIGINT)
+        os.kill(child.pid, signal.SIGINT)
         interrupted = time.monotonic()
         eof = False
         while time.monotonic() - interrupted < budget:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -394,14 +423,7 @@ def stall_mode() -> int:
         while read_some(master, output, 0.2) and select.select([master], [], [], 0)[0]:
             pass
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
 
     exit_code = os.waitstatus_to_exitcode(status)
@@ -461,6 +483,7 @@ def stderr_mode() -> int:
             os.dup2(fd, 2)
         os.execv(binary, argv)
         os._exit(127)
+    child = PtyChild(child)
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
     output = bytearray()
     start = time.monotonic()
@@ -469,7 +492,7 @@ def stderr_mode() -> int:
         eof = False
         while time.monotonic() - start < budget:
             sleeper.poll()
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -482,14 +505,7 @@ def stderr_mode() -> int:
         while read_some(master, output, 0.2) and select.select([master], [], [], 0)[0]:
             pass
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
         sleeper.kill()
         sleeper.wait()
@@ -531,6 +547,7 @@ def xoff_mode() -> int:
     if child == 0:
         os.execv(binary, argv)
         os._exit(127)
+    child = PtyChild(child)
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     output = bytearray()
     start = time.monotonic()
@@ -546,7 +563,7 @@ def xoff_mode() -> int:
         os.write(master, b"q")
         quit_at = time.monotonic()
         while time.monotonic() - quit_at < 4.0:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 return fail("exited before the terminal read again", output, child)
             read_some(master, output, 0.1)
@@ -554,7 +571,7 @@ def xoff_mode() -> int:
         os.write(master, b"\x11")  # Ctrl-Q: the terminal reads again.
         eof = False
         while time.monotonic() - quit_at < budget:
-            done, code = os.waitpid(child, os.WNOHANG)
+            done, code = child.wait(os.WNOHANG)
             if done != 0:
                 status = code
                 break
@@ -568,14 +585,7 @@ def xoff_mode() -> int:
         while read_some(master, output, 0.2) and select.select([master], [], [], 0)[0]:
             pass
     finally:
-        try:
-            os.kill(child, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(child, 0)
-        except OSError:
-            pass
+        child.cleanup()
         os.close(master)
 
     exit_code = os.waitstatus_to_exitcode(status)
@@ -596,17 +606,10 @@ def xoff_mode() -> int:
     return 0
 
 
-def fail(message: str, output: bytearray, child: int) -> int:
+def fail(message: str, output: bytearray, child: PtyChild) -> int:
     print(f"pty-dashboard FAILED: {message}")
     print(output[-2000:].decode("utf-8", "replace"))
-    try:
-        os.kill(child, 9)
-    except OSError:
-        pass
-    try:
-        os.waitpid(child, 0)
-    except OSError:
-        pass
+    child.cleanup()
     return 1
 
 

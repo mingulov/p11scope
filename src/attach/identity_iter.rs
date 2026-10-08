@@ -4814,6 +4814,59 @@ mod tests {
             .expect("a plain spliced comment still swallows the emit");
     }
 
+    /// L1 (W3-2 evaluated, NOT gated): the prefix cut already behaves
+    /// as specified on every valid-C spelling — a call/comma prefix
+    /// always executes, so its store still kills taint (the `,` cut
+    /// predates the paren loop), while `if`/`while`/`for`/`switch`
+    /// cuts suppress the kill, and declaration specifiers after a
+    /// keyword cut still normalize to their name. Gating the paren
+    /// loop on literal keywords was rejected: on valid C the gate is
+    /// a no-op (a non-keyword `word(` with a trailing bare target is
+    /// not valid C outside macros), and on macro-wrapped control flow
+    /// (`IF(c) y = 0`) it would restore the kill — silence on a store
+    /// that may not execute. The over-approximation is load-bearing.
+    /// This test pins the evaluated behavior against regressions.
+    #[test]
+    fn c_prefix_cut_keyword_and_comma_behavior() {
+        // A call-comma prefix always executes: the kill applies, so the
+        // chunk passes.
+        audit_c_chunk(
+            "    start = addr;\n    f(x), start = 0;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+            "chunk",
+        )
+        .expect("a call-comma prefix always executes: the kill applies");
+        // Keyword cuts still suppress the kill (the store may not run).
+        for keyword in ["if (c)", "while (c)", "for (;;)", "switch (c)"] {
+            let chunk = format!(
+                "    start = addr;\n    {keyword} start = 0;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n"
+            );
+            assert!(
+                audit_c_chunk(&chunk, "chunk").is_err(),
+                "{keyword} must keep taint (the store may not execute)"
+            );
+        }
+        // Declaration specifiers after a keyword cut still normalize:
+        // the kill targets `start`, and stays suppressed.
+        assert!(
+            audit_c_chunk(
+                "    start = addr;\n    if (c) unsigned start = 0;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+                "chunk"
+            )
+            .is_err(),
+            "a declaration after `if` still normalizes to its name"
+        );
+        // Macro-wrapped control flow stays loud: a keyword gate would
+        // restore the kill here — silence on a conditional store.
+        assert!(
+            audit_c_chunk(
+                "    start = addr;\n    IF(c) start = 0;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+                "chunk"
+            )
+            .is_err(),
+            "a macro-wrapped conditional store must keep taint"
+        );
+    }
+
     /// Blank Rust noise length-preservingly (every byte becomes a space
     /// or stays, newlines kept): block comments `/*…*/` (nesting, as Rust
     /// allows), line comments `//…`, and string/char literal contents

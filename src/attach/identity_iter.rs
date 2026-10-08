@@ -3960,9 +3960,36 @@ mod tests {
     /// the `mask--` operand the compiler sees. Spliced lines merge --
     /// line numbers past a splice differ from the raw text, exactly as
     /// they do for the compiler.
+    /// Translation phase 2, single-pass (sol-F2 fix-forward): a
+    /// backslash immediately before a newline (`\n` or `\r\n`) is
+    /// deleted with the newline, scanning strictly left to right.
+    /// Already-emitted chars are never rescanned, so a `\\`+CRLF+LF
+    /// sequence cannot cascade the way chained `replace` calls did
+    /// (which commented out a live statement — silence on
+    /// compiler-valid code). Byte-level: only ASCII is removed.
+    fn unsplice_phase2(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'\\' {
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    index += 2;
+                    continue;
+                }
+                if bytes.get(index + 1) == Some(&b'\r') && bytes.get(index + 2) == Some(&b'\n') {
+                    index += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[index]);
+            index += 1;
+        }
+        out
+    }
+
     fn strip_c_noise(text: &str) -> String {
-        let spliced = text.replace("\\\r\n", "").replace("\\\n", "");
-        let bytes = spliced.as_bytes();
+        let spliced = unsplice_phase2(text.as_bytes());
+        let bytes = spliced.as_slice();
         let mut out = Vec::with_capacity(bytes.len());
         let mut index = 0;
         while index < bytes.len() {
@@ -4747,6 +4774,44 @@ mod tests {
             .is_err(),
             "binary `&` must taint"
         );
+    }
+
+    /// sol-F2 (W3-2 fix-forward): translation phase 2 is single-pass —
+    /// on `// gap \\<CR><LF><LF>start = addr;` the first backslash is
+    /// kept (followed by `\`, not a newline) and the second splices the
+    /// CRLF, so the LF ends the comment and the assignment stays live.
+    /// The two-pass cascade re-scanned the first pass's output and
+    /// spliced the created `\`+LF adjacency, commenting out a live
+    /// tainted emit (silence). `clang -E` retains the live statement.
+    #[test]
+    fn c_phase_2_unfolds_single_pass() {
+        assert_eq!(unsplice_phase2(b"a\\\n b"), b"a b", "backslash-LF splices");
+        assert_eq!(
+            unsplice_phase2(b"a\\\r\nb"),
+            b"ab",
+            "backslash-CRLF splices"
+        );
+        assert_eq!(
+            unsplice_phase2(b"a\\\\\n b"),
+            b"a\\ b",
+            "the first of two backslashes is kept"
+        );
+        assert_eq!(
+            unsplice_phase2(b"a\\\\\r\n\nb"),
+            b"a\\\nb",
+            "the F2 shape: no rescan of emitted chars"
+        );
+        assert!(
+            audit_c_chunk(
+                "// gap \\\\\r\n\nstart = addr;\nemit(ctx, 1, 2, start, 0, 0, 0);\n",
+                "chunk"
+            )
+            .is_err(),
+            "the spliced comment must end at the LF: the tainted emit stays live"
+        );
+        // Control: a lone backslash-newline still continues the comment.
+        audit_c_chunk("// gap \\\nemit(ctx, 1, 2, start, 0, 0, 0);\n", "chunk")
+            .expect("a plain spliced comment still swallows the emit");
     }
 
     /// Blank Rust noise length-preservingly (every byte becomes a space

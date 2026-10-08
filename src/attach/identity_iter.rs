@@ -657,6 +657,15 @@ pub const BPF_MAP_CREATE: u32 = 0;
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
 /// `BPF_MAP_DELETE_ELEM` command number.
 pub const BPF_MAP_DELETE_ELEM: u32 = 3;
+/// `BPF_MAP_LOOKUP_ELEM` command number (I6 read surface: tests only).
+pub const BPF_MAP_LOOKUP_ELEM: u32 = 1;
+/// `BPF_MAP_GET_NEXT_KEY` command number (I6 read surface: tests only).
+pub const BPF_MAP_GET_NEXT_KEY: u32 = 4;
+/// `BPF_MAP_LOOKUP_AND_DELETE_ELEM` command number (I6 read surface:
+/// tests only).
+pub const BPF_MAP_LOOKUP_AND_DELETE_ELEM: u32 = 21;
+/// `BPF_MAP_LOOKUP_BATCH` command number (I6 read surface: tests only).
+pub const BPF_MAP_LOOKUP_BATCH: u32 = 24;
 /// `BPF_OBJ_GET_INFO_BY_FD` command number.
 pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 /// `BPF_MAP_TYPE_HASH` map type.
@@ -736,6 +745,32 @@ const _: () = assert!(std::mem::offset_of!(MapElemAttr, map_fd) == 0);
 const _: () = assert!(std::mem::offset_of!(MapElemAttr, key) == 8);
 const _: () = assert!(std::mem::offset_of!(MapElemAttr, value) == 16);
 const _: () = assert!(std::mem::offset_of!(MapElemAttr, flags) == 24);
+
+/// `BPF_MAP_*_BATCH` attr: `{in_batch@0, out_batch@8, keys@16,
+/// values@24, count@32, map_fd@36, elem_flags@40, flags@48}` (56 bytes).
+/// Test-only use (I6): production code never reads the anchor maps.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapBatchAttr {
+    pub in_batch: u64,
+    pub out_batch: u64,
+    pub keys: u64,
+    pub values: u64,
+    pub count: u32,
+    pub map_fd: u32,
+    pub elem_flags: u64,
+    pub flags: u64,
+}
+
+const _: () = assert!(size_of::<MapBatchAttr>() == 56);
+const _: () = assert!(std::mem::offset_of!(MapBatchAttr, in_batch) == 0);
+const _: () = assert!(std::mem::offset_of!(MapBatchAttr, out_batch) == 8);
+const _: () = assert!(std::mem::offset_of!(MapBatchAttr, keys) == 16);
+const _: () = assert!(std::mem::offset_of!(MapBatchAttr, values) == 24);
+const _: () = assert!(std::mem::offset_of!(MapBatchAttr, count) == 32);
+const _: () = assert!(std::mem::offset_of!(MapBatchAttr, map_fd) == 36);
+const _: () = assert!(std::mem::offset_of!(MapBatchAttr, elem_flags) == 40);
+const _: () = assert!(std::mem::offset_of!(MapBatchAttr, flags) == 48);
 
 /// `BPF_OBJ_GET_INFO_BY_FD` attr: `{bpf_fd@0, info_len@4, info@8}`.
 #[repr(C)]
@@ -6214,5 +6249,181 @@ mod tests {
             }
             Err(error) => panic!("host BTF unreadable: {error}"),
         }
+    }
+
+    // -- D2c EPERM on WRONLY fds (RED-first) ----------------------------------
+
+    /// Borrow a loaded identity map's fd. Panics loudly on a missing map
+    /// or an unexpected variant: the object contract pins both.
+    #[cfg(test)]
+    fn loaded_map_fd<'a>(ebpf: &'a aya::Ebpf, name: &str) -> BorrowedFd<'a> {
+        let map = ebpf
+            .map(name)
+            .unwrap_or_else(|| panic!("{name} map missing from the loaded object"));
+        let data = match map {
+            aya::maps::Map::HashMap(data) | aya::maps::Map::Array(data) => data,
+            _ => panic!("{name} map has an unexpected variant"),
+        };
+        data.fd().as_fd()
+    }
+
+    /// Raw `BPF_MAP_LOOKUP_ELEM` through `fd`. Test-only: production code
+    /// must never read the anchor maps (I6).
+    #[cfg(test)]
+    fn raw_map_lookup(fd: BorrowedFd<'_>, key: &[u8], value: &mut [u8]) -> io::Result<()> {
+        let mut attr = MapElemAttr {
+            map_fd: fd.as_raw_fd() as u32,
+            reserved: 0,
+            key: key.as_ptr().addr() as u64,
+            value: value.as_mut_ptr().addr() as u64,
+            flags: 0,
+        };
+        bpf(
+            BPF_MAP_LOOKUP_ELEM,
+            std::ptr::addr_of_mut!(attr).cast(),
+            size_of::<MapElemAttr>(),
+        )?;
+        Ok(())
+    }
+
+    /// Raw `BPF_MAP_GET_NEXT_KEY` through `fd`: `None` asks for the first
+    /// key. Test-only (I6).
+    #[cfg(test)]
+    fn raw_map_next_key(fd: BorrowedFd<'_>, key: Option<&[u8]>, next: &mut [u8]) -> io::Result<()> {
+        let mut attr = MapElemAttr {
+            map_fd: fd.as_raw_fd() as u32,
+            reserved: 0,
+            key: key.map_or(0, |key| key.as_ptr().addr() as u64),
+            value: next.as_mut_ptr().addr() as u64,
+            flags: 0,
+        };
+        bpf(
+            BPF_MAP_GET_NEXT_KEY,
+            std::ptr::addr_of_mut!(attr).cast(),
+            size_of::<MapElemAttr>(),
+        )?;
+        Ok(())
+    }
+
+    /// Raw `BPF_MAP_LOOKUP_AND_DELETE_ELEM` through `fd`. Test-only (I6).
+    /// On a WRONLY fd the permission check fires before any map-type
+    /// dispatch, so nothing is ever deleted here.
+    #[cfg(test)]
+    fn raw_map_lookup_and_delete(
+        fd: BorrowedFd<'_>,
+        key: &[u8],
+        value: &mut [u8],
+    ) -> io::Result<()> {
+        let mut attr = MapElemAttr {
+            map_fd: fd.as_raw_fd() as u32,
+            reserved: 0,
+            key: key.as_ptr().addr() as u64,
+            value: value.as_mut_ptr().addr() as u64,
+            flags: 0,
+        };
+        bpf(
+            BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+            std::ptr::addr_of_mut!(attr).cast(),
+            size_of::<MapElemAttr>(),
+        )?;
+        Ok(())
+    }
+
+    /// Raw single-element `BPF_MAP_LOOKUP_BATCH` through `fd`, starting
+    /// from the beginning. Returns the filled count. Test-only (I6).
+    #[cfg(test)]
+    fn raw_map_lookup_batch(
+        fd: BorrowedFd<'_>,
+        keys: &mut [u8],
+        values: &mut [u8],
+    ) -> io::Result<u32> {
+        let mut out_batch = [0u8; 8];
+        let mut attr = MapBatchAttr {
+            in_batch: 0,
+            out_batch: out_batch.as_mut_ptr().addr() as u64,
+            keys: keys.as_mut_ptr().addr() as u64,
+            values: values.as_mut_ptr().addr() as u64,
+            count: 1,
+            map_fd: fd.as_raw_fd() as u32,
+            elem_flags: 0,
+            flags: 0,
+        };
+        bpf(
+            BPF_MAP_LOOKUP_BATCH,
+            std::ptr::addr_of_mut!(attr).cast(),
+            size_of::<MapBatchAttr>(),
+        )?;
+        Ok(attr.count)
+    }
+
+    #[cfg(test)]
+    fn assert_eperm(result: io::Result<()>, operation: &str, map: &str) {
+        match result {
+            Ok(()) => panic!("{operation} on WRONLY map {map} unexpectedly succeeded"),
+            Err(error) => assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EPERM),
+                "{operation} on WRONLY map {map} must fail EPERM"
+            ),
+        }
+    }
+
+    /// D2c/I6: every syscall read through the loaded object's WRONLY
+    /// anchor-map fds fails with `EPERM` (F3): lookup, get-next-key,
+    /// lookup-and-delete, and batch lookup, on all three WRONLY maps
+    /// (`anchors`, `anchor_slots`, `anchor_observed`). The readable
+    /// `config` map is the non-vacuity control: the same syscalls there
+    /// succeed, proving the test issues well-formed calls. Run as root
+    /// with `--ignored`: the strict load fails loudly without privileges
+    /// and the test never passes vacuously.
+    #[test]
+    #[ignore = "privileged: WRONLY anchor fds refuse all syscall reads with EPERM"]
+    fn wronly_anchor_fds_refuse_reads_with_eperm() {
+        let btf = aya::Btf::from_sys_fs().expect("EPERM gate requires readable host BTF");
+        let loaded =
+            load_identity_object_strict(&btf).expect("EPERM gate requires the strict load");
+        // (name, key bytes, value bytes) per WRONLY map, from the object
+        // contract (`identity_object_has_two_iter_programs_and_five_maps`).
+        for (name, key_len, value_len) in [
+            ("anchors", 8usize, 16usize),
+            ("anchor_slots", 4, 8),
+            ("anchor_observed", 4, 8),
+        ] {
+            let fd = loaded_map_fd(&loaded.ebpf, name);
+            let key = vec![0u8; key_len];
+            let mut value = vec![0u8; value_len];
+            assert_eperm(raw_map_lookup(fd, &key, &mut value), "lookup", name);
+            let mut next = vec![0u8; key_len];
+            assert_eperm(raw_map_next_key(fd, None, &mut next), "get_next_key", name);
+            assert_eperm(
+                raw_map_lookup_and_delete(fd, &key, &mut value),
+                "lookup_and_delete",
+                name,
+            );
+            let mut batch_keys = vec![0u8; key_len];
+            let mut batch_values = vec![0u8; value_len];
+            match raw_map_lookup_batch(fd, &mut batch_keys, &mut batch_values) {
+                Ok(count) => panic!("batch lookup on WRONLY map {name} filled {count}"),
+                Err(error) => assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM),
+                    "batch lookup on WRONLY map {name} must fail EPERM"
+                ),
+            }
+        }
+        // Non-vacuity control: the readable `config` ARRAY (key 4, value
+        // 32, one entry) answers the same calls.
+        let config = loaded_map_fd(&loaded.ebpf, "config");
+        let key = [0u8; 4];
+        let mut value = [0u8; 32];
+        raw_map_lookup(config, &key, &mut value).expect("readable-map lookup succeeds");
+        let mut next = [0xFFu8; 4];
+        raw_map_next_key(config, None, &mut next).expect("readable-map next-key succeeds");
+        assert_eq!(next, [0, 0, 0, 0], "the first (only) config key is 0");
+        let mut batch_keys = [0u8; 4];
+        let mut batch_values = [0u8; 32];
+        let filled = raw_map_lookup_batch(config, &mut batch_keys, &mut batch_values)
+            .expect("readable-map batch lookup succeeds");
+        assert_eq!(filled, 1, "the one config entry is returned");
     }
 }

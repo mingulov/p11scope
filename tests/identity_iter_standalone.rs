@@ -1084,6 +1084,20 @@ fn identity_uapi_constants_match_aya_bindings() {
     assert_eq!(ii::BPF_MAP_CREATE, bpf_cmd::BPF_MAP_CREATE as u32);
     assert_eq!(ii::BPF_MAP_UPDATE_ELEM, bpf_cmd::BPF_MAP_UPDATE_ELEM as u32);
     assert_eq!(ii::BPF_MAP_DELETE_ELEM, bpf_cmd::BPF_MAP_DELETE_ELEM as u32);
+    // W3-2 EPERM read surface (I6/F3): the four read commands.
+    assert_eq!(ii::BPF_MAP_LOOKUP_ELEM, bpf_cmd::BPF_MAP_LOOKUP_ELEM as u32);
+    assert_eq!(
+        ii::BPF_MAP_GET_NEXT_KEY,
+        bpf_cmd::BPF_MAP_GET_NEXT_KEY as u32
+    );
+    assert_eq!(
+        ii::BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+        bpf_cmd::BPF_MAP_LOOKUP_AND_DELETE_ELEM as u32
+    );
+    assert_eq!(
+        ii::BPF_MAP_LOOKUP_BATCH,
+        bpf_cmd::BPF_MAP_LOOKUP_BATCH as u32
+    );
     assert_eq!(
         ii::BPF_OBJ_GET_INFO_BY_FD,
         bpf_cmd::BPF_OBJ_GET_INFO_BY_FD as u32
@@ -1101,8 +1115,8 @@ fn identity_uapi_constants_match_aya_bindings() {
     assert_eq!(ii::BPF_F_MMAPABLE, GEN_MMAPABLE);
     // Attr layouts bindgen exposes as plain structs.
     use aya_obj::generated::{
-        bpf_attr__bindgen_ty_2 as gen_map_elem, bpf_attr__bindgen_ty_9 as gen_obj_info,
-        bpf_attr__bindgen_ty_18 as gen_iter_create,
+        bpf_attr__bindgen_ty_2 as gen_map_elem, bpf_attr__bindgen_ty_3 as gen_map_batch,
+        bpf_attr__bindgen_ty_9 as gen_obj_info, bpf_attr__bindgen_ty_18 as gen_iter_create,
     };
     use std::mem::offset_of;
     assert_eq!(
@@ -1144,5 +1158,40 @@ fn identity_uapi_constants_match_aya_bindings() {
     assert_eq!(
         offset_of!(ii::MapElemAttr, flags),
         offset_of!(gen_map_elem, flags)
+    );
+    // The batch member: `{in_batch@0, out_batch@8, keys@16, values@24,
+    // count@32, map_fd@36, elem_flags@40, flags@48}` (56 bytes).
+    assert_eq!(size_of::<ii::MapBatchAttr>(), size_of::<gen_map_batch>());
+    assert_eq!(
+        offset_of!(ii::MapBatchAttr, in_batch),
+        offset_of!(gen_map_batch, in_batch)
+    );
+    assert_eq!(
+        offset_of!(ii::MapBatchAttr, out_batch),
+        offset_of!(gen_map_batch, out_batch)
+    );
+    assert_eq!(
+        offset_of!(ii::MapBatchAttr, keys),
+        offset_of!(gen_map_batch, keys)
+    );
+    assert_eq!(
+        offset_of!(ii::MapBatchAttr, values),
+        offset_of!(gen_map_batch, values)
+    );
+    assert_eq!(
+        offset_of!(ii::MapBatchAttr, count),
+        offset_of!(gen_map_batch, count)
+    );
+    assert_eq!(
+        offset_of!(ii::MapBatchAttr, map_fd),
+        offset_of!(gen_map_batch, map_fd)
+    );
+    assert_eq!(
+        offset_of!(ii::MapBatchAttr, elem_flags),
+        offset_of!(gen_map_batch, elem_flags)
+    );
+    assert_eq!(
+        offset_of!(ii::MapBatchAttr, flags),
+        offset_of!(gen_map_batch, flags)
     );
 }

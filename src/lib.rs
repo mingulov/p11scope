@@ -41,6 +41,7 @@ pub mod inspect_system;
 pub mod inventory;
 pub(crate) mod inventory_capture;
 pub mod inventory_dashboard;
+pub mod inventory_diff;
 pub mod inventory_events;
 // The inventory finalizer consumes this transport in the next integration step.
 #[allow(dead_code)]

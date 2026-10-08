@@ -673,7 +673,7 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
         &stop,
         &|| reported.set(Some(Instant::now())),
         true,
-        &mut stdout,
+        &mut crate::inventory_output::WriterStdout(&mut stdout),
         &terminal,
     )?;
     drop(slave);
@@ -856,7 +856,7 @@ fn run_product_modules(
         stop,
         &|| reported.set(Some(Instant::now())),
         false,
-        &mut stdout,
+        &mut crate::inventory_output::WriterStdout(&mut stdout),
     )?;
     // Evidence for DR-C51-DETACH: the blocking detach after the report.
     if let Some(at) = reported.get() {

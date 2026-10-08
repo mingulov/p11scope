@@ -1574,7 +1574,7 @@ fn stop_event_failure_keeps_native_cleanup_report_and_stdout() {
                 &view,
                 true,
                 false,
-                &mut stdout,
+                &mut crate::inventory_output::WriterStdout(&mut stdout),
                 summary,
             )
         },
@@ -1660,6 +1660,273 @@ fn after_the_report_a_second_signal_exits_at_once() {
         Some(128 + libc::SIGTERM),
         "{output:?}"
     );
+}
+
+/// The actual generic loop and finalizer consume the same Retiring action as
+/// the production classic/dashboard callbacks. A delivery inside that action
+/// must not be absorbed by a boundary captured after native stop returns.
+fn native_output_boundary_control(
+    dashboard: bool,
+    key_stop: bool,
+    before: usize,
+    during: bool,
+    with_sinks: bool,
+) {
+    use crate::inventory::{
+        EventLogState, StreamState, begin_scan_stdout, finish_output, retiring_stdout,
+    };
+    use crate::inventory_output::{FdStdout, FinalStdout, StdoutResult};
+    use std::cell::Cell;
+    use std::os::fd::AsRawFd;
+    struct Recorded<'a> {
+        inner: FdStdout<'a>,
+        log: Log,
+        sinks: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    }
+    impl FinalStdout for Recorded<'_> {
+        fn begin_finalization(&mut self) {
+            self.log.borrow_mut().push("stdout:begin".into());
+            self.inner.begin_finalization();
+        }
+        fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+            self.log.borrow_mut().push("stdout:attempt".into());
+            if let Some((report, events)) = &self.sinks {
+                assert_eq!(
+                    std::fs::read(report).unwrap(),
+                    bytes,
+                    "requested report was not committed before stdout cancellation/acquisition"
+                );
+                assert!(
+                    std::fs::read_to_string(events)
+                        .unwrap()
+                        .lines()
+                        .any(
+                            |line| serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                                == "ended"
+                        ),
+                    "requested event completion was not attempted before stdout"
+                );
+            }
+            self.inner.write_document(bytes)
+        }
+    }
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    let lane = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let delivered = Cell::new(0);
+    let key = Cell::new(false);
+    let stop = || delivered.get() > 0 || key.get();
+    let clock = LoopClock {
+        deadline: (!key_stop && before == 0).then(Instant::now),
+        stop: &stop,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let count = || delivered.get();
+    let sinks = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        sinks.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let report = sinks.path().join("report.json");
+    let events = sinks.path().join("events.jsonl");
+    let mut stdout = Recorded {
+        inner: FdStdout::new(file.as_raw_fd(), &count),
+        log: log.clone(),
+        sinks: with_sinks.then(|| (report.clone(), events.clone())),
+    };
+    let stopped = run_classic(
+        &mut scene,
+        Some(lane),
+        &clock,
+        &mut |scene: &mut Scene, point| {
+            match point {
+                Publish::Pass { .. } => {
+                    delivered.set(before);
+                    key.set(key_stop);
+                    scene.note("publish:pass");
+                }
+                Publish::Retiring { .. } => {
+                    scene.note("publish:retiring");
+                    retiring_stdout(&mut stdout, || {
+                        scene.note(if dashboard {
+                            "restore"
+                        } else {
+                            "classic-notice"
+                        });
+                        if during {
+                            delivered.set(1);
+                            scene.note("delivery:acknowledged-1");
+                        }
+                    });
+                }
+                Publish::Stop { .. } => {
+                    scene.note("publish:stop");
+                    assert_eq!(delivered.get(), if during { 1 } else { before });
+                }
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    begin_scan_stdout(&mut stdout, stopped.is_some());
+    let now = now_ns();
+    let view =
+        crate::inventory_present::Presentation::capture(&scene.coordinator, "system", now, now, 1);
+    let sink = with_sinks.then(|| crate::output::AtomicFile::create(&report).unwrap());
+    let writer = with_sinks
+        .then(|| crate::inventory_events::EventWriter::create(&events, 1 << 20, 2).unwrap());
+    let outcome = finish_native(
+        stopped,
+        |summary| {
+            let outcome = finish_output(
+                sink,
+                &mut EventLogState::new(writer),
+                &mut StreamState::new(),
+                &view,
+                true,
+                false,
+                &mut stdout,
+                summary,
+            );
+            log.borrow_mut().push("output:result".into());
+            outcome
+        },
+        &|| log.borrow_mut().push("armed".into()),
+        &mut |_| {},
+    );
+    let cancelled = during || before == 2;
+    assert_eq!(
+        outcome.exit_code(),
+        i32::from(cancelled),
+        "{outcome:?}; {:?}",
+        entries(&log)
+    );
+    assert_eq!(outcome.stdout_cancelled(), cancelled, "{outcome:?}");
+    let bytes = std::fs::read(file.path()).unwrap();
+    if cancelled {
+        assert!(
+            bytes.is_empty(),
+            "cancelled output accepted a late document"
+        );
+    } else {
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["observation"]["lane"], "native");
+    }
+    let entries = entries(&log);
+    let at = |name| entries.iter().position(|entry| entry == name).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.as_str() == "stdout:begin")
+            .count(),
+        1
+    );
+    assert!(
+        at("stdout:begin")
+            < at(if dashboard {
+                "restore"
+            } else {
+                "classic-notice"
+            })
+    );
+    assert!(at("stdout:begin") < at("begin_stop"));
+    assert!(at("begin_stop") < at("publish:stop"));
+    assert!(at("publish:stop") < at("stdout:attempt"));
+    assert!(at("output:result") < at("armed") && at("armed") < at("drop"));
+}
+
+#[test]
+fn native_signal_during_retiring_cancels_stdout() {
+    for dashboard in [false, true] {
+        for key in [false, true] {
+            native_output_boundary_control(dashboard, key, 0, true, false);
+        }
+    }
+}
+
+#[test]
+fn native_first_capture_stop_signal_preserves_stdout() {
+    for dashboard in [false, true] {
+        native_output_boundary_control(dashboard, false, 1, false, false);
+    }
+}
+
+#[test]
+fn native_second_delivery_before_retiring_cancels_stdout() {
+    for dashboard in [false, true] {
+        native_output_boundary_control(dashboard, false, 2, false, false);
+    }
+}
+
+#[test]
+fn native_retiring_signal_preserves_requested_event_and_report() {
+    for dashboard in [false, true] {
+        for key in [false, true] {
+            native_output_boundary_control(dashboard, key, 0, true, true);
+        }
+        native_output_boundary_control(dashboard, false, 1, false, true);
+    }
+}
+
+#[test]
+fn stop_flag_counts_distinct_deliveries_child() {
+    if std::env::var_os("P11SCOPE_COUNT_CHILD").is_none() {
+        return;
+    }
+    let flag = crate::inventory_dashboard::StopFlag::install();
+    assert_eq!(flag.signal_count(), 0);
+    for (signal, expected) in [(libc::SIGINT, 1), (libc::SIGTERM, 2), (libc::SIGHUP, 2)] {
+        unsafe {
+            libc::raise(signal);
+        }
+        assert_eq!(
+            flag.signal_count(),
+            expected,
+            "delivered-handler count lost a distinct signal"
+        );
+        assert!(flag.stopped());
+    }
+}
+
+#[test]
+fn distinct_stop_deliveries_saturate_without_arming_force_exit() {
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut child = Owned(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "inventory_capture::tests::stop_flag_counts_distinct_deliveries_child",
+                "--nocapture",
+            ])
+            .env("P11SCOPE_COUNT_CHILD", "1")
+            .spawn()
+            .unwrap(),
+    );
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            panic!("owned signal-count child watchdog");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(status.success(), "delivered-count child failed: {status}");
 }
 
 /// The auto fallback seam: a refused activation hands the capture back and

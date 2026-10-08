@@ -634,19 +634,32 @@ the min..max of per-sample p95.
 - Planned: v0.3.0 (C5 R5 `bench-overhead.sh` with and without the double
   probe; C6).
 
-### `--json` to a stalled terminal blocks exit (C5.3 F7)
+### Final inventory stdout can be incomplete after backpressure or cancellation (C5.3 F7)
 
-- What the user sees: `inventory --json` writes the whole document to
-  stdout at exit; on a stalled terminal (for example after Ctrl-S) the
-  write blocks and the process does not exit until the terminal resumes.
-  A second signal does not exit early: the escape gate is armed only
-  after the final output attempts return.
-- Kernels/conditions: all; stdout is a terminal with stopped output.
-- Disclosure: none while stalled. A successfully committed `-o` report
-  and a sync-confirmed event stream remain available; an earlier failure
-  of either sink means its respective guarantee does not hold.
-- Workaround: redirect stdout to a file, or rely on `-o` for the report.
-- Planned: v0.3.0 (review follow-up; pre-existing).
+- What the user sees: final inventory JSON/text continues while stdout
+  accepts bytes, even when the complete document takes more than five
+  seconds. Five seconds without a positive write fails stdout; a reader
+  pausing at least that long can receive only a prefix and lose the suffix.
+  A later delivered SIGINT/SIGTERM/SIGHUP cancels final stdout; the signal
+  already used to stop capture permits healthy output. A first signal after
+  a duration/key stop begins finalization also cancels. Incomplete output
+  gives exit 1. Dashboard text has no final stdout document.
+- Kernels/conditions: ordinary Linux pipe/FIFO and TTY/PTY backpressure
+  waits. Regular-file/block-device or arbitrary driver writes already in
+  the kernel, event sync, atomic report publication, scheduling and
+  unsettled native detach have no new wall-clock guarantee. Dashboard may
+  separately spend its existing bounded restore/notices budgets.
+- Disclosure: best-effort bounded stderr names no progress, cancellation
+  or I/O failure and exact locally accepted/total/remaining bytes. A
+  stopped stderr can hide the notice; exit 1 remains. Accepted bytes do not
+  prove consumer parsing, screen display or durability. A successfully
+  committed `-o` report and a sync-confirmed event stream remain available;
+  a failure of either sink means its respective guarantee does not hold.
+- Workaround: request independent `-o` output and keep stdout's reader
+  progressing. A truncated JSON prefix cannot be repaired by the unwritten
+  suffix. Dashboard restores saved termios before JSON, but a permanently
+  stopped screen may still need `reset` after output resumes; deliberate
+  stdout cancellation gives screen-restore retry zero wait budget.
 
 ### Returned event-log errors preserve independent reports (C5.4 I-4, fixed)
 

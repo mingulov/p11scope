@@ -214,18 +214,18 @@ fn the_final_sweep_makes_the_replayed_edges_equal_the_snapshot() {
     harness.commit();
     let last = presentation(&harness);
     let mut text = Vec::new();
-    finish_output(
+    let outcome = finish_output(
         None,
-        Some(&mut writer),
+        &mut EventLogState::new(Some(writer)),
         &mut state,
         &last,
         false,
         false,
         &mut text,
         None,
-    )
-    .unwrap();
-    drop(writer);
+    );
+    assert_eq!(outcome.exit_code(), 0);
+    assert_eq!(outcome.event_log_confirmed, Some(true));
     let all = lines(&path);
     assert_eq!(all.last().unwrap()["kind"], "ended");
     assert_eq!(all.last().unwrap()["event"]["edge_events"], 2, "swept");
@@ -867,27 +867,38 @@ fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
     let dir = private_tempdir();
     let dashboard_path = dir.path().join("dashboard.jsonl");
     let classic_path = dir.path().join("classic.jsonl");
-    let mut dashboard = EventWriter::create(&dashboard_path, 1 << 20, 2).unwrap();
-    let mut classic = EventWriter::create(&classic_path, 1 << 20, 2).unwrap();
+    let mut dashboard = EventLogState::new(Some(
+        EventWriter::create(&dashboard_path, 1 << 20, 2).unwrap(),
+    ));
+    let mut classic = EventLogState::new(Some(
+        EventWriter::create(&classic_path, 1 << 20, 2).unwrap(),
+    ));
     let mut dashboard_state = StreamState::new();
     let mut classic_state = StreamState::new();
     let mut display_activity = Vec::new();
     for (pass, age) in [(1u64, 1_000_000_000u64), (2, 10_000_000_000)] {
         let now = at + age;
         let coordinator = harness.coordinator();
-        let display = dashboard_stream_pass(
-            Some(&mut dashboard),
+        let (display, error) = dashboard_stream_pass(
+            &mut dashboard,
             &mut dashboard_state,
             &report(pass),
             coordinator,
             "pid",
             started,
             now,
-        )
-        .unwrap();
+        );
+        assert!(error.is_none());
         display_activity.push(display.edges[0].activity.label());
         let view = stream_presentation(coordinator, "pid", started, now);
-        emit_pass_events(&mut classic, &mut classic_state, &report(pass), &view, now).unwrap();
+        emit_pass_events(
+            classic.writer.as_mut().unwrap(),
+            &mut classic_state,
+            &report(pass),
+            &view,
+            now,
+        )
+        .unwrap();
     }
     assert_eq!(
         display_activity,
@@ -901,17 +912,9 @@ fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
         (&mut classic, &mut classic_state),
     ] {
         let mut sink = Vec::new();
-        finish_output(
-            None,
-            Some(writer),
-            state,
-            &last,
-            false,
-            true,
-            &mut sink,
-            None,
-        )
-        .unwrap();
+        let outcome = finish_output(None, writer, state, &last, false, true, &mut sink, None);
+        assert_eq!(outcome.exit_code(), 0);
+        assert_eq!(outcome.event_log_confirmed, Some(true));
     }
     drop((dashboard, classic));
     let dashboard_lines = lines(&dashboard_path);

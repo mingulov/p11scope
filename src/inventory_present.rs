@@ -900,6 +900,96 @@ pub(crate) fn semantic_status(budgets: &BudgetView) -> &'static str {
     }
 }
 
+/// Resolve a retained caller incarnation, never the current image of its PID.
+fn retained_caller(presentation: &Presentation, caller: CallerId) -> Option<&CallerView> {
+    presentation
+        .callers
+        .binary_search_by_key(&caller, |view| view.id)
+        .ok()
+        .map(|index| &presentation.callers[index])
+}
+
+/// Last nonempty Linux path component, preserving only the retained deletion
+/// marker. Escaping happens before a label reaches any terminal layout.
+fn retained_path_label(path: Option<&str>, unknown: &str) -> String {
+    let Some(path) = path else {
+        return unknown.into();
+    };
+    let (path, deleted) = path
+        .strip_suffix(" (deleted)")
+        .map_or((path, ""), |path| (path, " (deleted)"));
+    let Some(basename) = path.rsplit('/').find(|part| !part.is_empty()) else {
+        return unknown.into();
+    };
+    escape_controls(&format!("{basename}{deleted}")).into_owned()
+}
+
+/// Executable name from the retained caller ID; labels are not identity keys.
+pub(crate) fn application_label(presentation: &Presentation, caller: CallerId) -> String {
+    retained_path_label(
+        retained_caller(presentation, caller)
+            .and_then(|caller| caller.exe.as_ref())
+            .and_then(|exe| exe.path.as_deref()),
+        "Unknown executable",
+    )
+}
+
+/// Module name from its first retained path, keeping physical IDs separate.
+pub(crate) fn module_label(presentation: &Presentation, module: ModuleId) -> String {
+    let path = presentation
+        .modules
+        .binary_search_by_key(&module, |view| view.id)
+        .ok()
+        .and_then(|index| presentation.modules[index].paths.first())
+        .map(String::as_str);
+    retained_path_label(path, "Unknown module")
+}
+
+/// Human explanation of existing evidence, with positive history first.
+pub(crate) fn observation_label(edge: &EdgeView) -> String {
+    if edge.entry_count > 0 {
+        let mut label = format!("At least {} entries observed", edge.entry_count);
+        if edge.entry_saturated {
+            label.push_str(" (counter saturated)");
+        }
+        if matches!(edge.coverage, UseCoverage::Counted { lossy: true, .. }) {
+            label.push_str(" (capture incomplete)");
+        }
+        return label;
+    }
+    match &edge.coverage {
+        UseCoverage::Witnessed { .. } => "Use observed; count unavailable".into(),
+        UseCoverage::WatchedNoUse { .. } => {
+            "No entries observed during the covered interval".into()
+        }
+        UseCoverage::Counted { lossy: false, .. } => {
+            "No entries observed in counted interval".into()
+        }
+        UseCoverage::Counted { lossy: true, .. } => "Activity unknown; capture incomplete".into(),
+        UseCoverage::Unknown(UnknownReason::PendingFirstUse) => "Observation pending".into(),
+        UseCoverage::Unknown(UnknownReason::ScanOnly) if edge.mapping == MappingState::Mapped => {
+            "Module mapped; activity not captured".into()
+        }
+        UseCoverage::Unknown(UnknownReason::ScanOnly) => "Activity not captured".into(),
+        UseCoverage::Unknown(_) => {
+            format!(
+                "Activity unknown; {}",
+                escape_controls(&coverage_label(&edge.coverage))
+            )
+        }
+    }
+}
+
+/// Lifecycle explanation of this retained incarnation, secondary to its name.
+pub(crate) fn caller_lifecycle_label(caller: &CallerView) -> Option<&'static str> {
+    match caller.lifecycle {
+        CallerLifecycle::Mapped => None,
+        CallerLifecycle::ExecRetired => Some("Application executed a new image"),
+        CallerLifecycle::Exited => Some("Process exited"),
+        CallerLifecycle::Unknown => Some("Process state unknown"),
+    }
+}
+
 /// Pager-friendly snapshot: a deterministic, stable text rendering of a
 /// whole inventory (fit for `| less`, diffing, and test goldens).
 /// Sorted, total-first, with the same identities, states, totals, and
@@ -933,6 +1023,67 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
         } else {
             "s"
         },
+    );
+    let _ = writeln!(
+        out,
+        "coverage: {} gaps, {} refusals, {} suppressed",
+        presentation.gaps.len(),
+        budgets.refusals(),
+        presentation.gaps_suppressed,
+    );
+    for edge in &presentation.edges {
+        let caller = retained_caller(presentation, edge.caller);
+        let identity = caller.map_or_else(
+            || edge.caller.label(),
+            |caller| {
+                format!(
+                    "{} pid {} incarnation {}",
+                    caller.id.label(),
+                    caller.pid,
+                    caller.incarnation
+                )
+            },
+        );
+        let _ = write!(
+            out,
+            "application {} [{identity}] -> module {} [{}]: {}",
+            application_label(presentation, edge.caller),
+            module_label(presentation, edge.module),
+            edge.module.label(),
+            observation_label(edge),
+        );
+        if let Some(lifecycle) = caller.and_then(caller_lifecycle_label) {
+            let _ = write!(out, "; {lifecycle}");
+        }
+        // Other unknown reasons already accompany the zero-count explanation;
+        // positive history still keeps its unknown coverage reason alongside it.
+        let show_coverage = match edge.coverage {
+            UseCoverage::Counted { .. } => edge.entry_count == 0,
+            UseCoverage::WatchedNoUse { .. }
+            | UseCoverage::Unknown(UnknownReason::PendingFirstUse | UnknownReason::ScanOnly) => {
+                true
+            }
+            UseCoverage::Unknown(_) => edge.entry_count > 0,
+            UseCoverage::Witnessed { .. } => false,
+        };
+        if show_coverage {
+            let _ = write!(
+                out,
+                "; coverage {}",
+                escape_controls(&coverage_label(&edge.coverage))
+            );
+        }
+        out.push('\n');
+    }
+    if presentation.edges.is_empty() {
+        let _ = writeln!(
+            out,
+            "No application/module associations observed; this does not prove that no PKCS#11 activity occurred."
+        );
+    }
+    let _ = writeln!(
+        out,
+        "Details: retained paths, identities, states and coverage follow."
     );
     let _ = writeln!(
         out,

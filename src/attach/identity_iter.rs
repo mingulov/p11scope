@@ -1152,6 +1152,312 @@ pub fn load_identity_object_strict(btf: &aya::Btf) -> Result<StrictIdentity, Loa
     })
 }
 
+// ---------------------------------------------------------------------------
+// Kernel eligibility (D2c §6.1): the deny is a BTF member check of the
+// named fix, never a version range. `uname -r` cannot express the floor
+// (Debian 12 ships `6.1.0-NN` with a 6.1.1xx base, F0). This module
+// therefore scans raw vmlinux BTF itself: aya's `Btf` answers existence
+// by name and kind, but exposes no member list, so the `mm` check needs
+// the wire format. Pure and unprivileged; every anomaly denies.
+// ---------------------------------------------------------------------------
+
+/// Where the running kernel exposes its raw BTF blob.
+pub const VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
+
+/// BTF type-kind numbers (uapi `struct btf_type`: kind in info bits
+/// 24..29, vlen in bits 0..16, kind-flag in bit 31). Pinned against
+/// `aya_obj::btf::BtfKind` by `btf_kind_consts_match_aya`.
+pub const BTF_KIND_STRUCT: u32 = 4;
+/// Union kind: named so the wrong-kind test reads as a uapi pin.
+pub const BTF_KIND_UNION: u32 = 5;
+/// Enum kind (the `pid_fd` fallback witness).
+pub const BTF_KIND_ENUM: u32 = 6;
+/// Func kind (the `pid_fd` primary witness).
+pub const BTF_KIND_FUNC: u32 = 12;
+
+/// The iterator seq-info struct that gained `mm` with the fix (F0).
+pub const TASK_VMA_INFO_STRUCT: &str = "bpf_iter_seq_task_vma_info";
+/// The member the fix adds: the iterator's own mm reference.
+pub const TASK_VMA_INFO_MM_MEMBER: &str = "mm";
+/// Parameterized task iterators (v6.1+, F0 row 2): either witness proves
+/// `pid_fd` support, the second covering stripped-FUNC BTF.
+pub const TASK_ITER_ATTACH_FUNC: &str = "bpf_iter_attach_task";
+/// Enum witness for parameterized task iterators (§6.1 item 4).
+pub const TASK_ITER_TYPE_ENUM: &str = "bpf_iter_task_type";
+
+/// The named fix, quoted in every `kernel_fix_missing` diagnostic (§7).
+pub const MM_FIX_TEXT: &str = "upstream 7ff94f276f8e \"bpf: keep a reference to the mm, in case the task is dead.\" (v6.2; 6.1.8+)";
+
+/// Why raw BTF could not be scanned. Every variant denies (fail closed):
+/// an unscannable blob is treated as fix-missing, never as eligible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BtfScanError {
+    /// Fewer than the 24 header bytes.
+    TooShort,
+    /// Not a BTF blob (magic `0xE_B9F`).
+    BadMagic,
+    /// Wrong version, short header length, or incoherent offsets.
+    BadHeader,
+    /// A claimed region extends past the end of the bytes.
+    Truncated,
+    /// A name offset escapes the string section or lacks a NUL.
+    BadString(u32),
+    /// A type kind with no known record layout (carries the kind).
+    UnknownKind(u32),
+}
+
+impl std::fmt::Display for BtfScanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => write!(formatter, "BTF shorter than its header"),
+            Self::BadMagic => write!(formatter, "not a BTF blob"),
+            Self::BadHeader => write!(formatter, "bad BTF header"),
+            Self::Truncated => write!(formatter, "BTF region past end of bytes"),
+            Self::BadString(offset) => write!(formatter, "bad BTF string at {offset}"),
+            Self::UnknownKind(kind) => write!(formatter, "unknown BTF kind {kind}"),
+        }
+    }
+}
+
+impl std::error::Error for BtfScanError {}
+
+/// Selection-time deny reasons (§7). Labels are the published vocabulary;
+/// D3d discloses them verbatim in `observation.identity.fallback`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KernelDeny {
+    /// BTF lacks `bpf_iter_seq_task_vma_info.mm`: 5.15.y and 6.1.0–6.1.7.
+    FixMissing,
+    /// Neither `pid_fd` witness present: unparameterized task iterators.
+    NoTaskIterPidfd,
+    /// vmlinux BTF unreadable (carries the path and io error).
+    NoBtf(String),
+}
+
+impl KernelDeny {
+    /// The §7 reason label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FixMissing => "kernel_fix_missing",
+            Self::NoTaskIterPidfd => "no_task_iter_pidfd",
+            Self::NoBtf(_) => "no_btf",
+        }
+    }
+
+    /// The full `"<label>: <detail>"` reason. The fix-missing text names
+    /// the upstream commit; no reason mentions release strings.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::FixMissing => format!(
+                "kernel_fix_missing: BTF struct {TASK_VMA_INFO_STRUCT} has no member `{TASK_VMA_INFO_MM_MEMBER}` ({MM_FIX_TEXT})"
+            ),
+            Self::NoTaskIterPidfd => format!(
+                "no_task_iter_pidfd: BTF has neither FUNC {TASK_ITER_ATTACH_FUNC} nor ENUM {TASK_ITER_TYPE_ENUM}"
+            ),
+            Self::NoBtf(detail) => format!("no_btf: {detail}"),
+        }
+    }
+}
+
+impl std::fmt::Display for KernelDeny {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason())
+    }
+}
+
+impl std::error::Error for KernelDeny {}
+
+const BTF_MAGIC: u16 = 0xE_B9F;
+const BTF_HEADER_LEN: usize = 24;
+
+fn btf_u32_at(raw: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(raw[at..at + 4].try_into().unwrap_or([0; 4]))
+}
+
+/// Split a raw BTF blob into its type and string sections. vmlinux BTF
+/// matches host endianness; this observer is little-endian-only
+/// (Linux x86-64-first), so a big-endian blob fails as `BadMagic`.
+fn btf_sections(raw: &[u8]) -> Result<(&[u8], &[u8]), BtfScanError> {
+    if raw.len() < BTF_HEADER_LEN {
+        return Err(BtfScanError::TooShort);
+    }
+    if u16::from_le_bytes(raw[0..2].try_into().unwrap_or([0; 2])) != BTF_MAGIC {
+        return Err(BtfScanError::BadMagic);
+    }
+    if raw[2] != 1 {
+        return Err(BtfScanError::BadHeader);
+    }
+    let header_len = btf_u32_at(raw, 4) as usize;
+    let type_off = btf_u32_at(raw, 8) as usize;
+    let type_len = btf_u32_at(raw, 12) as usize;
+    let str_off = btf_u32_at(raw, 16) as usize;
+    let str_len = btf_u32_at(raw, 20) as usize;
+    if header_len < BTF_HEADER_LEN {
+        return Err(BtfScanError::BadHeader);
+    }
+    let types_at = header_len
+        .checked_add(type_off)
+        .ok_or(BtfScanError::BadHeader)?;
+    let types_end = types_at
+        .checked_add(type_len)
+        .ok_or(BtfScanError::BadHeader)?;
+    let strings_at = header_len
+        .checked_add(str_off)
+        .ok_or(BtfScanError::BadHeader)?;
+    let strings_end = strings_at
+        .checked_add(str_len)
+        .ok_or(BtfScanError::BadHeader)?;
+    if types_end > raw.len() || strings_end > raw.len() {
+        return Err(BtfScanError::Truncated);
+    }
+    Ok((&raw[types_at..types_end], &raw[strings_at..strings_end]))
+}
+
+/// Resolve a BTF string offset. Offset 0 is the anonymous empty name.
+fn btf_string(strings: &[u8], offset: u32) -> Result<&[u8], BtfScanError> {
+    let offset = offset as usize;
+    if offset >= strings.len() {
+        return Err(BtfScanError::BadString(offset as u32));
+    }
+    let tail = &strings[offset..];
+    let end = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(BtfScanError::BadString(offset as u32))?;
+    Ok(&tail[..end])
+}
+
+/// Extra bytes after a type's 12-byte header, by kind and vlen (uapi
+/// `struct btf_array` / `btf_member` / `btf_enum` / `btf_param` /
+/// `btf_var` / `btf_var_secinfo` / `btf_enum64`, plus the single-word
+/// tails of INT, VAR, and DECL_TAG).
+/// Unknown kinds fail: their records cannot be skipped soundly, so the
+/// blob cannot prove eligibility.
+///
+/// DECL_TAG counts 4, not 8: uapi's 8-byte `struct btf_decl_tag`
+/// overlays `type` on the common header's third word, leaving only
+/// `component_idx` as extra. (An 8-byte count desyncs the walk at the
+/// first `bpf_fastcall` tag of a real vmlinux blob — caught by the
+/// host-BTF test against an independent python walk.)
+fn btf_extra_len(kind: u32, vlen: usize) -> Result<usize, BtfScanError> {
+    let scaled = |size: usize| vlen.checked_mul(size).ok_or(BtfScanError::Truncated);
+    match kind {
+        0 | 2 | 7 | 8 | 9 | 10 | 11 | 12 | 16 | 18 => Ok(0),
+        1 | 14 | 17 => Ok(4),
+        3 => Ok(12),
+        4 | 5 => scaled(12),
+        6 => scaled(8),
+        13 => scaled(8),
+        15 => scaled(12),
+        19 => scaled(12),
+        unknown => Err(BtfScanError::UnknownKind(unknown)),
+    }
+}
+
+/// Walk every type in a raw blob. The visitor sees `(kind, name, record,
+/// strings)` and returns true to stop early with found.
+fn btf_each_type(
+    raw: &[u8],
+    mut visit: impl FnMut(u32, &[u8], &[u8], &[u8]) -> Result<bool, BtfScanError>,
+) -> Result<bool, BtfScanError> {
+    let (types, strings) = btf_sections(raw)?;
+    let mut at = 0usize;
+    while at < types.len() {
+        let rest = &types[at..];
+        if rest.len() < 12 {
+            return Err(BtfScanError::Truncated);
+        }
+        let name_off = btf_u32_at(rest, 0);
+        let info = btf_u32_at(rest, 4);
+        let kind = (info >> 24) & 0x1F;
+        let vlen = (info & 0xFFFF) as usize;
+        let record_len = 12usize
+            .checked_add(btf_extra_len(kind, vlen)?)
+            .ok_or(BtfScanError::Truncated)?;
+        if rest.len() < record_len {
+            return Err(BtfScanError::Truncated);
+        }
+        let name = btf_string(strings, name_off)?;
+        if visit(kind, name, &rest[..record_len], strings)? {
+            return Ok(true);
+        }
+        at += record_len;
+    }
+    Ok(false)
+}
+
+/// Whether any STRUCT `struct_name` in raw BTF carries `member`. True
+/// only when at least one same-named struct exists AND every same-named
+/// struct has the member: same-name distinct-layout types must not let
+/// an unpatched shape pass on a patched twin's evidence. (vmlinux BTF is
+/// deduplicated, so in practice exactly one struct answers.)
+pub fn btf_has_struct_member(
+    raw: &[u8],
+    struct_name: &str,
+    member: &str,
+) -> Result<bool, BtfScanError> {
+    let mut seen = false;
+    let mut missing = false;
+    btf_each_type(raw, |kind, name, record, strings| {
+        if kind != BTF_KIND_STRUCT || name != struct_name.as_bytes() {
+            return Ok(false);
+        }
+        seen = true;
+        let vlen = (btf_u32_at(record, 4) & 0xFFFF) as usize;
+        let mut found = false;
+        for index in 0..vlen {
+            let base = 12 + index * 12;
+            let member_name = btf_string(strings, btf_u32_at(record, base))?;
+            if member_name == member.as_bytes() {
+                found = true;
+                break;
+            }
+        }
+        missing |= !found;
+        Ok(false)
+    })?;
+    Ok(seen && !missing)
+}
+
+/// Whether any type of `kind` named `name` exists in raw BTF.
+pub fn btf_has_named_type(raw: &[u8], kind: u32, name: &str) -> Result<bool, BtfScanError> {
+    btf_each_type(raw, |found_kind, found_name, _, _| {
+        Ok(found_kind == kind && found_name == name.as_bytes())
+    })
+}
+
+/// Eligibility items 2–4 (§6.1) over raw BTF bytes: the `mm` fix must be
+/// present, plus one `pid_fd` witness. Gated on BTF fields only — never
+/// on release strings. An unscannable blob denies as fix-missing.
+pub fn check_kernel_identity_btf(raw: &[u8]) -> Result<(), KernelDeny> {
+    match btf_has_struct_member(raw, TASK_VMA_INFO_STRUCT, TASK_VMA_INFO_MM_MEMBER) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Err(KernelDeny::FixMissing),
+    }
+    let attach = btf_has_named_type(raw, BTF_KIND_FUNC, TASK_ITER_ATTACH_FUNC).unwrap_or(false);
+    let task_type = btf_has_named_type(raw, BTF_KIND_ENUM, TASK_ITER_TYPE_ENUM).unwrap_or(false);
+    if attach || task_type {
+        Ok(())
+    } else {
+        Err(KernelDeny::NoTaskIterPidfd)
+    }
+}
+
+/// Read the running kernel's raw BTF. Unreadable BTF denies as `no_btf`.
+pub fn read_vmlinux_btf() -> Result<Vec<u8>, KernelDeny> {
+    std::fs::read(VMLINUX_BTF_PATH)
+        .map_err(|error| KernelDeny::NoBtf(format!("{VMLINUX_BTF_PATH}: {error}")))
+}
+
+/// Deny before load: read vmlinux BTF and run the §6.1 items 2–4 checks.
+/// Callers must run this before any loader or BPF call and refuse on
+/// `Err` — the 5.15 guest cell proves the refusal happens with zero
+/// `bpf()` syscalls issued. Returns the scanned bytes on success.
+pub fn ensure_kernel_identity_btf() -> Result<Vec<u8>, KernelDeny> {
+    let raw = read_vmlinux_btf()?;
+    check_kernel_identity_btf(&raw)?;
+    Ok(raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5566,5 +5872,347 @@ mod tests {
         assert!(!scope_test_bit(&bitmap, 4_194_304));
         assert!(!scope_set_bit(&mut bitmap[..10], 4_194_303));
         assert!(!scope_test_bit(&bitmap[..10], 4_194_303));
+    }
+
+    // -- D2c BTF deny (RED-first) -------------------------------------------
+
+    /// Byte-constructed minimal BTF blob: types appended in id order
+    /// (1-based), strings NUL-terminated from offset 1 (offset 0 is the
+    /// anonymous empty name). Pure ASCII fixtures; no real kernel bytes.
+    struct BtfFixture {
+        types: Vec<u8>,
+        strings: Vec<u8>,
+    }
+
+    impl BtfFixture {
+        fn new() -> Self {
+            Self {
+                types: Vec::new(),
+                strings: vec![0],
+            }
+        }
+
+        fn intern(&mut self, text: &str) -> u32 {
+            let offset = self.strings.len() as u32;
+            self.strings.extend_from_slice(text.as_bytes());
+            self.strings.push(0);
+            offset
+        }
+
+        fn header(&mut self, name_off: u32, kind: u32, vlen: u32, size_or_type: u32) {
+            let info = (kind << 24) | (vlen & 0xFFFF);
+            self.types.extend_from_slice(&name_off.to_le_bytes());
+            self.types.extend_from_slice(&info.to_le_bytes());
+            self.types.extend_from_slice(&size_or_type.to_le_bytes());
+        }
+
+        fn int(&mut self, name: &str) {
+            let name_off = self.intern(name);
+            self.header(name_off, 1, 0, 4);
+            self.types.extend_from_slice(&0x0100_0020u32.to_le_bytes());
+        }
+
+        fn struct_with(&mut self, name: &str, members: &[(&str, u32, u32)]) {
+            let name_off = self.intern(name);
+            self.header(name_off, 4, members.len() as u32, 16);
+            for (member, type_id, offset) in members {
+                let member_off = self.intern(member);
+                self.types.extend_from_slice(&member_off.to_le_bytes());
+                self.types.extend_from_slice(&type_id.to_le_bytes());
+                self.types.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+
+        fn union_with(&mut self, name: &str, members: &[(&str, u32, u32)]) {
+            let name_off = self.intern(name);
+            self.header(name_off, 5, members.len() as u32, 8);
+            for (member, type_id, offset) in members {
+                let member_off = self.intern(member);
+                self.types.extend_from_slice(&member_off.to_le_bytes());
+                self.types.extend_from_slice(&type_id.to_le_bytes());
+                self.types.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+
+        fn func(&mut self, name: &str) {
+            let name_off = self.intern(name);
+            self.header(name_off, 12, 0, 1);
+        }
+
+        fn enum_with(&mut self, name: &str, values: &[(&str, u32)]) {
+            let name_off = self.intern(name);
+            self.header(name_off, 6, values.len() as u32, 4);
+            for (value, number) in values {
+                let value_off = self.intern(value);
+                self.types.extend_from_slice(&value_off.to_le_bytes());
+                self.types.extend_from_slice(&number.to_le_bytes());
+            }
+        }
+
+        fn decl_tag(&mut self, name: &str, target: u32) {
+            let name_off = self.intern(name);
+            self.header(name_off, 17, 0, target);
+            self.types.extend_from_slice(&0u32.to_le_bytes());
+        }
+
+        fn finish(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&0xE_B9Fu16.to_le_bytes());
+            out.push(0x01);
+            out.push(0x00);
+            out.extend_from_slice(&24u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(self.types.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(self.types.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(self.strings.len() as u32).to_le_bytes());
+            out.extend_from_slice(&self.types);
+            out.extend_from_slice(&self.strings);
+            out
+        }
+    }
+
+    /// A vmlinux-shaped fixture: an INT (id 1), the task_vma seq struct
+    /// (id 2, with or without `mm`), and the pid_fd witnesses.
+    fn seq_info_fixture(with_mm: bool, with_func: bool, with_enum: bool) -> Vec<u8> {
+        let mut fixture = BtfFixture::new();
+        fixture.int("unsigned int");
+        let mut members = vec![("task", 1, 0)];
+        if with_mm {
+            members.push(("mm", 1, 64));
+        }
+        fixture.struct_with(TASK_VMA_INFO_STRUCT, &members);
+        if with_func {
+            fixture.func(TASK_ITER_ATTACH_FUNC);
+        }
+        if with_enum {
+            fixture.enum_with(TASK_ITER_TYPE_ENUM, &[("PID", 0)]);
+        }
+        fixture.finish()
+    }
+
+    #[test]
+    fn btf_kind_consts_match_aya() {
+        assert_eq!(
+            BTF_KIND_STRUCT,
+            aya_obj::btf::BtfKind::Struct as u32,
+            "struct kind pins uapi"
+        );
+        assert_eq!(
+            BTF_KIND_UNION,
+            aya_obj::btf::BtfKind::Union as u32,
+            "union kind pins uapi"
+        );
+        assert_eq!(
+            BTF_KIND_ENUM,
+            aya_obj::btf::BtfKind::Enum as u32,
+            "enum kind pins uapi"
+        );
+        assert_eq!(
+            BTF_KIND_FUNC,
+            aya_obj::btf::BtfKind::Func as u32,
+            "func kind pins uapi"
+        );
+    }
+
+    #[test]
+    fn btf_struct_member_matches_exactly() {
+        let with = seq_info_fixture(true, true, false);
+        assert!(
+            btf_has_struct_member(&with, TASK_VMA_INFO_STRUCT, TASK_VMA_INFO_MM_MEMBER)
+                .expect("valid fixture scans"),
+            "the mm member must be found"
+        );
+        let without = seq_info_fixture(false, true, false);
+        assert!(
+            !btf_has_struct_member(&without, TASK_VMA_INFO_STRUCT, TASK_VMA_INFO_MM_MEMBER)
+                .expect("valid fixture scans"),
+            "a task-only struct must miss"
+        );
+        assert!(
+            !btf_has_struct_member(&with, TASK_VMA_INFO_STRUCT, "task_struct")
+                .expect("valid fixture scans"),
+            "a wrong member must miss"
+        );
+        assert!(
+            !btf_has_struct_member(&with, "bpf_iter_seq_task_info", TASK_VMA_INFO_MM_MEMBER)
+                .expect("valid fixture scans"),
+            "a wrong struct must miss"
+        );
+    }
+
+    #[test]
+    fn btf_struct_member_rejects_wrong_kind() {
+        let mut fixture = BtfFixture::new();
+        fixture.int("unsigned int");
+        fixture.union_with(TASK_VMA_INFO_STRUCT, &[("mm", 1, 0)]);
+        let blob = fixture.finish();
+        assert!(
+            !btf_has_struct_member(&blob, TASK_VMA_INFO_STRUCT, TASK_VMA_INFO_MM_MEMBER)
+                .expect("valid fixture scans"),
+            "a union is not the struct: deny direction"
+        );
+    }
+
+    #[test]
+    fn btf_walk_survives_decl_tag_records() {
+        // A DECL_TAG between the INT and the struct: only the 4-byte
+        // tail keeps the walk in sync (an 8-byte count desyncs here,
+        // exactly as on real vmlinux at the first `bpf_fastcall` tag).
+        let mut fixture = BtfFixture::new();
+        fixture.int("unsigned int");
+        fixture.decl_tag("bpf_fastcall", 1);
+        fixture.struct_with(TASK_VMA_INFO_STRUCT, &[("task", 1, 0), ("mm", 1, 64)]);
+        let blob = fixture.finish();
+        assert!(
+            btf_has_struct_member(&blob, TASK_VMA_INFO_STRUCT, TASK_VMA_INFO_MM_MEMBER)
+                .expect("valid fixture scans"),
+            "the struct past the tag must be found"
+        );
+    }
+
+    #[test]
+    fn btf_named_type_finds_func_and_enum() {
+        let blob = seq_info_fixture(true, true, true);
+        assert!(
+            btf_has_named_type(&blob, BTF_KIND_FUNC, TASK_ITER_ATTACH_FUNC)
+                .expect("valid fixture scans"),
+        );
+        assert!(
+            btf_has_named_type(&blob, BTF_KIND_ENUM, TASK_ITER_TYPE_ENUM)
+                .expect("valid fixture scans"),
+        );
+        assert!(
+            !btf_has_named_type(&blob, BTF_KIND_FUNC, TASK_ITER_TYPE_ENUM)
+                .expect("valid fixture scans"),
+            "kind is part of the match"
+        );
+        let bare = seq_info_fixture(true, false, false);
+        assert!(
+            !btf_has_named_type(&bare, BTF_KIND_FUNC, TASK_ITER_ATTACH_FUNC)
+                .expect("valid fixture scans"),
+        );
+    }
+
+    #[test]
+    fn btf_scan_rejects_malformed_blobs() {
+        let good = seq_info_fixture(true, true, false);
+        let mut bad_magic = good.clone();
+        bad_magic[0] = 0x00;
+        assert!(matches!(
+            btf_has_struct_member(&bad_magic, TASK_VMA_INFO_STRUCT, "mm"),
+            Err(BtfScanError::BadMagic)
+        ));
+        assert!(matches!(
+            btf_has_struct_member(&good[..10], TASK_VMA_INFO_STRUCT, "mm"),
+            Err(BtfScanError::TooShort)
+        ));
+        let mut bad_version = good.clone();
+        bad_version[2] = 0x09;
+        assert!(matches!(
+            btf_has_struct_member(&bad_version, TASK_VMA_INFO_STRUCT, "mm"),
+            Err(BtfScanError::BadHeader)
+        ));
+        let truncated = &good[..good.len() - 8];
+        assert!(matches!(
+            btf_has_struct_member(truncated, TASK_VMA_INFO_STRUCT, "mm"),
+            Err(BtfScanError::Truncated | BtfScanError::BadString(_))
+        ));
+        let mut bad_kind = good.clone();
+        // The struct header info word sits 4 bytes into the type
+        // section (after the INT's 16 bytes): force an unknown kind.
+        let info_at = 24 + 16 + 4;
+        bad_kind[info_at + 3] = 0x1F;
+        assert!(matches!(
+            btf_has_struct_member(&bad_kind, TASK_VMA_INFO_STRUCT, "mm"),
+            Err(BtfScanError::UnknownKind(31))
+        ));
+    }
+
+    #[test]
+    fn kernel_deny_labels_match_section_7() {
+        assert_eq!(KernelDeny::FixMissing.label(), "kernel_fix_missing");
+        assert_eq!(KernelDeny::NoTaskIterPidfd.label(), "no_task_iter_pidfd");
+        assert_eq!(KernelDeny::NoBtf("gone".to_owned()).label(), "no_btf");
+        let reason = KernelDeny::FixMissing.reason();
+        assert!(
+            reason.contains("kernel_fix_missing") && reason.contains("7ff94f276f8e"),
+            "the fix text names the upstream commit, got {reason:?}"
+        );
+        assert!(
+            !reason.contains("uname"),
+            "the deny vocabulary never mentions uname, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn kernel_deny_gate_matrix() {
+        assert!(
+            check_kernel_identity_btf(&seq_info_fixture(true, true, false)).is_ok(),
+            "mm + attach func allows"
+        );
+        assert!(
+            check_kernel_identity_btf(&seq_info_fixture(true, false, true)).is_ok(),
+            "mm + task-type enum allows (pid_fd fallback witness)"
+        );
+        assert!(
+            matches!(
+                check_kernel_identity_btf(&seq_info_fixture(false, true, false)),
+                Err(KernelDeny::FixMissing)
+            ),
+            "task-only struct denies even with the attach func"
+        );
+        assert!(
+            matches!(
+                check_kernel_identity_btf(&seq_info_fixture(true, false, false)),
+                Err(KernelDeny::NoTaskIterPidfd)
+            ),
+            "mm without any pid_fd witness denies"
+        );
+        assert!(
+            matches!(
+                check_kernel_identity_btf(&[0u8; 64]),
+                Err(KernelDeny::FixMissing)
+            ),
+            "an unscannable blob denies as fix-missing (fail closed)"
+        );
+    }
+
+    #[test]
+    fn kernel_deny_never_consults_uname() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(root.join("src/attach/identity_iter.rs"))
+            .expect("read own source");
+        // Split spellings: the token list itself must not contain the
+        // tokens it forbids.
+        let tokens = [
+            concat!("libc::", "uname"),
+            concat!("uts", "name"),
+            concat!("Uts", "Name"),
+            concat!("gethost", "name"),
+            concat!("/proc/", "version"),
+        ];
+        for token in tokens {
+            assert!(
+                !source.contains(token),
+                "the deny path must never consult {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_deny_host_btf_is_eligible() {
+        match std::fs::read(VMLINUX_BTF_PATH) {
+            Ok(bytes) => assert!(
+                check_kernel_identity_btf(&bytes).is_ok(),
+                "gate hosts (6.1.8+/6.2+) carry the mm fix; deny paths are pinned by fixtures and guest cells"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(
+                    matches!(read_vmlinux_btf(), Err(KernelDeny::NoBtf(_))),
+                    "missing BTF denies as no_btf"
+                );
+            }
+            Err(error) => panic!("host BTF unreadable: {error}"),
+        }
     }
 }

@@ -169,7 +169,7 @@ fn b3_missing_or_unknown_subcommand_names_problem_exit_2() {
 fn b4_version_prints_plain_version_exit_0() {
     let version = run(&["--version"]);
     assert_eq!(version.code, Some(0));
-    assert_eq!(version.stdout, "p11scope 0.2.0\n");
+    assert_eq!(version.stdout, "p11scope 0.3.0\n");
     assert!(version.stderr.is_empty());
 }
 

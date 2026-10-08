@@ -4887,10 +4887,7 @@ mod tests {
                 format!("impl Evil for{lrm}AnchorMaps {{}}"),
                 &[0xE2, 0x80, 0x8E],
             ),
-            (
-                format!("impl Evil for{nel}AnchorMaps {{}}"),
-                &[0xC2, 0x85],
-            ),
+            (format!("impl Evil for{nel}AnchorMaps {{}}"), &[0xC2, 0x85]),
         ];
         for (header, utf8) in non_ascii {
             assert!(

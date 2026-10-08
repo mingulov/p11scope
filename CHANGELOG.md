@@ -5,9 +5,13 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-08
 
-Work toward v0.3.0.
+Per-edge entry counts end to end (DR-02 closed): the native inventory lane
+publishes saturating lower-bound entry counts with first/last-seen
+timestamps across the JSON document, the event stream, and the dashboard;
+load-instance continuity with sharded discovery; a 2 MiB lifecycle ring
+with fill telemetry; and the stale-quiet label fix.
 
 ### Added
 
@@ -51,8 +55,10 @@ Work toward v0.3.0.
   ledger: P1/P2 edges read `counted` (even the unattested copy) with the
   exact attach-side count when the feed covers every in-window call, and
   must-fail fixtures cover above-ledger, published-0, absent-as-0 and
-  pre-admission-counted outputs. DR-02 stays open pending the M2 cost
-  gate. See [docs/known-limitations.md](docs/known-limitations.md).
+  pre-admission-counted outputs. DR-02 is closed by the M2 cost gate
+  (counting overhead immaterial on every cell over 250 ABBA samples; 0
+  count errors over 80 on-arm samples). See
+  [docs/known-limitations.md](docs/known-limitations.md).
 
 ### Changed
 

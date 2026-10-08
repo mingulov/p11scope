@@ -254,8 +254,13 @@ fn assert_frame_matches_presentation(presentation: &Presentation) {
     );
     let text = frame_text(&bytes);
     for edge in &presentation.edges {
-        let identity = format!("{} pid ", edge.caller.label());
-        assert!(text.contains(&identity), "edge identity: {identity}");
+        let caller = format!("[{}]", edge.caller.label());
+        let module = format!("[{}]", edge.module.label());
+        assert!(
+            text.lines()
+                .any(|line| line.contains(&caller) && line.contains(&module)),
+            "edge identity: {caller} -> {module}"
+        );
         assert!(
             text.contains(&format!("presence {}", edge.presence.label())),
             "presence for {}",
@@ -445,7 +450,7 @@ fn small_terminals_degrade_to_the_stated_minimal_layout() {
         assert!(lines.len() <= viewport.height, "{viewport:?}: {text}");
         for line in &lines {
             assert!(
-                line.chars().count() <= viewport.width,
+                unicode_width::UnicodeWidthStr::width(*line) <= viewport.width,
                 "{viewport:?}: line overflows: {line:?}"
             );
         }
@@ -456,6 +461,10 @@ fn small_terminals_degrade_to_the_stated_minimal_layout() {
         }
         assert!(text.contains("totals:"), "{viewport:?}: {text}");
         assert!(text.contains("coverage:"), "{viewport:?}: {text}");
+        if viewport.width >= 30 && viewport.height >= 8 {
+            assert!(text.contains("application "), "{viewport:?}: {text}");
+            assert!(text.contains("module "), "{viewport:?}: {text}");
+        }
     }
     // Boundary: 80×14 is full, with the edge table.
     let bytes = render_frame(
@@ -560,7 +569,7 @@ fn truncate_cell_never_splits_chars() {
     assert_eq!(truncate_cell("abc", 5), "abc");
     assert_eq!(truncate_cell("abc", 3), "abc");
     assert_eq!(truncate_cell("abcd", 3), "ab…");
-    assert_eq!(truncate_cell("日本語", 2), "日…");
+    assert_eq!(truncate_cell("日本語", 2), "…");
     assert_eq!(truncate_cell("a", 0), "");
     assert_eq!(truncate_cell("", 4), "");
 }
@@ -847,10 +856,12 @@ fn pty_frame_roundtrip_resize_and_layout() {
     pty.slave.flush().unwrap();
     // The whole minimal frame (its footer is its last row): its header
     // alone can arrive in a read before its coverage line does.
-    let seen = pty.read_until(b"enlarge the terminal", Duration::from_secs(5));
+    let seen = pty.read_until(b"q quit", Duration::from_secs(5));
     let text = String::from_utf8_lossy(&seen).replace("\r\n", "\n");
     assert!(text.contains("minimal"), "{text}");
     assert!(text.contains("coverage:"), "{text}");
+    assert!(text.contains("application "), "{text}");
+    assert!(text.contains("module "), "{text}");
 }
 
 #[test]
@@ -2384,7 +2395,10 @@ fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
         let lines: Vec<&str> = summary.lines().collect();
         let head = lines
             .iter()
-            .position(|line| line.contains(&format!("-> {} (", edge.module.label())))
+            .position(|line| {
+                line.contains(&format!("[{}]", edge.caller.label()))
+                    && line.contains(&format!("[{}]", edge.module.label()))
+            })
             .unwrap_or_else(|| panic!("{name} block: {summary}"));
         let block = lines[head..]
             .iter()
@@ -2449,4 +2463,267 @@ fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
     );
     assert_eq!(edges_json[2]["entries"]["coverage"]["since_ns"], at2);
     assert!(edges_json[2]["entries"]["coverage"]["until_ns"].is_null());
+}
+
+fn app_first_presentation() -> Presentation {
+    let mut presentation = varied_presentation();
+    for caller in &mut presentation.callers {
+        caller.exe.as_mut().unwrap().path = Some(format!(
+            "/very/long/{}/retained/application/path/python3",
+            "directory/".repeat(20)
+        ));
+    }
+    for module in &mut presentation.modules {
+        module.paths = vec!["/separate/physical/providers/provider.so".into()];
+    }
+    presentation
+}
+
+fn assert_bounded_frame(bytes: &[u8], viewport: Viewport) -> String {
+    assert_own_escapes_only(bytes);
+    let text = frame_text(bytes);
+    assert_eq!(text.split('\n').count(), viewport.height.max(1));
+    for line in text.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(line) <= viewport.width.max(1),
+            "{viewport:?}: overflow {line:?}"
+        );
+        assert!(
+            !line.chars().any(|ch| ch.is_control()),
+            "raw control: {line:?}"
+        );
+    }
+    text
+}
+
+#[test]
+fn app_first_dashboard_reserves_both_identity_labels() {
+    let presentation = app_first_presentation();
+    let frame = frame_for(&presentation);
+    for (width, height) in [(80, 24), (80, 14), (60, 20), (40, 10), (80, 10)] {
+        let viewport = Viewport { width, height };
+        let text = assert_bounded_frame(
+            &render_frame(&frame, viewport, &DashboardState::new()),
+            viewport,
+        );
+        assert!(text.contains("python3"), "{text}");
+        assert!(text.contains("provider.so"), "{text}");
+        let edge = &presentation.edges[0];
+        assert!(
+            text.contains(&format!("[{}]", edge.caller.label())),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("[{}]", edge.module.label())),
+            "{text}"
+        );
+    }
+    let viewport = Viewport {
+        width: 80,
+        height: 24,
+    };
+    for index in [0, 1, presentation.edges.len() - 1] {
+        let state = DashboardState {
+            scroll: index,
+            ..DashboardState::new()
+        };
+        let text = frame_text(&render_frame(&frame, viewport, &state));
+        let edge = &presentation.edges[index];
+        assert!(
+            text.lines()
+                .any(|line| line.contains(&format!("[{}]", edge.caller.label()))
+                    && line.contains(&format!("[{}]", edge.module.label()))),
+            "distinct pair {index}: {text}"
+        );
+    }
+    let edge = &presentation.edges[0];
+    let mut long = presentation.clone();
+    long.callers[0].exe.as_mut().unwrap().path = Some(format!("/{}", "日本語ＷＩＤＥ".repeat(40)));
+    long.modules[0].paths = vec![format!("/{}", "ＷＩＤＥ日本語".repeat(40))];
+    let line = edge_identity_line(&long, edge, 40);
+    assert!(
+        line.contains(&format!("[{}]", edge.caller.label())),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!("[{}]", edge.module.label())),
+        "{line}"
+    );
+    assert_eq!(
+        line.matches('…').count(),
+        2,
+        "each label independently truncates: {line}"
+    );
+}
+
+#[test]
+fn compact_inventory_keeps_associations_scrollable() {
+    let presentation = app_first_presentation();
+    let mut frame = frame_for(&presentation);
+    frame.log.dropped_lines = 7;
+    frame.log.dropped_bytes = 99;
+    let viewport = Viewport {
+        width: 40,
+        height: 10,
+    };
+    let mut state = DashboardState::new();
+    let top = assert_bounded_frame(&render_frame(&frame, viewport, &state), viewport);
+    for _ in 0..presentation.edges.len() {
+        state.scroll_down(presentation.edges.len());
+    }
+    let bottom = assert_bounded_frame(&render_frame(&frame, viewport, &state), viewport);
+    assert_eq!(
+        top.lines().nth(1),
+        bottom.lines().nth(1),
+        "full capture totals"
+    );
+    let edge = presentation.edges.last().unwrap();
+    assert!(
+        bottom.contains(&format!("[{}]", edge.caller.label())),
+        "{bottom}"
+    );
+    assert!(
+        bottom.contains(&format!("[{}]", edge.module.label())),
+        "{bottom}"
+    );
+    assert!(
+        bottom.contains("python3") && bottom.contains("provider.so"),
+        "{bottom}"
+    );
+    assert!(
+        bottom.contains("7") && bottom.contains("99"),
+        "log loss remains visible: {bottom}"
+    );
+    state.next_detail();
+    state.clamp_to_presentation(&presentation);
+    assert_eq!(state.scroll, presentation.edges.len() - 1);
+    state.next_detail();
+    state.clamp_to_presentation(&presentation);
+    assert_eq!(state.scroll, presentation.gaps.len().saturating_sub(1));
+    let large = Viewport {
+        width: 80,
+        height: 24,
+    };
+    let text = assert_bounded_frame(&render_frame(&frame, large, &state), large);
+    assert!(text.contains("[gaps]"), "{text}");
+    for (width, height) in [(10, 5), (0, 0), (1, 1), (0, 1), (1, 0)] {
+        let viewport = Viewport { width, height };
+        let text = assert_bounded_frame(&render_frame(&frame, viewport, &state), viewport);
+        assert!(
+            !text.contains("1-1"),
+            "tiny viewport claims no shown record: {text}"
+        );
+    }
+}
+
+#[test]
+fn dashboard_widths_count_cells_without_losing_gap_pages() {
+    assert_eq!(
+        truncate_cell("日本語", 4),
+        "日…",
+        "wide glyph overflow reproduced"
+    );
+    assert_eq!(truncate_cell("ＷＩＤＥ", 7), "ＷＩＤ…");
+    assert_eq!(truncate_cell("日本語", 0), "");
+    assert_eq!(truncate_cell("e\u{301}", 1), "e\u{301}");
+    let mut presentation = app_first_presentation();
+    for caller in &mut presentation.callers {
+        caller.exe.as_mut().unwrap().path = Some(format!(
+            "/日本語ＷＩＤＥe\u{301}😀\x1b[1m\x07{}",
+            "日本語".repeat(30)
+        ));
+    }
+    for module in &mut presentation.modules {
+        module.paths = vec![format!(
+            "/ＷＩＤＥ日本語e\u{301}😀\u{009b}\u{007f}{}",
+            "ＷＩＤＥ".repeat(30)
+        )];
+    }
+    presentation.gaps = observed_presentation().gaps;
+    let reason = format!(
+        "{} final-reason-ends-here",
+        "日本語ＷＩＤＥe\u{301}😀\x1b[1m\x07 ".repeat(30)
+    );
+    presentation.gaps[0].reason = reason;
+    let frame = frame_for(&presentation);
+    for (width, height) in [
+        (80, 24),
+        (80, 14),
+        (60, 20),
+        (40, 10),
+        (80, 10),
+        (10, 5),
+        (1, 1),
+    ] {
+        let viewport = Viewport { width, height };
+        assert_bounded_frame(
+            &render_frame(&frame, viewport, &DashboardState::new()),
+            viewport,
+        );
+    }
+    let viewport = Viewport {
+        width: 40,
+        height: 10,
+    };
+    let mut state = DashboardState {
+        detail: DetailPage::Gaps,
+        ..DashboardState::new()
+    };
+    let expected = gap_block_lines(&presentation.gaps[0], 0, presentation.gaps.len(), 40);
+    // Splitting overlong Unicode words must retain every non-whitespace
+    // character; matching renderer-generated chunks alone would miss loss.
+    let retained: String = expected
+        .iter()
+        .skip(1)
+        .flat_map(|line| line.chars())
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    let original: String = gap_item(&presentation.gaps[0])
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert_eq!(
+        retained, original,
+        "full escaped gap text survives wrapping"
+    );
+    let mut exposed = BTreeSet::new();
+    for _ in 0..expected.len() {
+        let text = assert_bounded_frame(&render_frame(&frame, viewport, &state), viewport);
+        for line in text.lines().filter(|line| line.starts_with("  ")) {
+            exposed.insert(line.to_owned());
+        }
+        state.scroll_gaps_down(&presentation, 40);
+    }
+    for line in expected.iter().skip(1) {
+        assert!(
+            exposed.contains(line),
+            "gap reason chunk unreachable: {line:?}"
+        );
+        assert!(
+            !line.contains('…'),
+            "retained reason must not truncate: {line:?}"
+        );
+    }
+    assert!(
+        exposed
+            .iter()
+            .any(|line| line.contains("final-reason-ends-here"))
+    );
+    state.gap_line = usize::MAX;
+    let large = Viewport {
+        width: 80,
+        height: 24,
+    };
+    let text = assert_bounded_frame(&render_frame(&frame, large, &state), large);
+    let offset = effective_gap_line(
+        &presentation.gaps[state.scroll],
+        state.scroll,
+        presentation.gaps.len(),
+        80,
+        usize::MAX,
+    );
+    assert!(
+        text.contains(&format!("line +{offset}")),
+        "resize clamps the displayed offset: {text}"
+    );
 }

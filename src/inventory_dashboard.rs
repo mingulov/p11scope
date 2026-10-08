@@ -15,12 +15,11 @@
 //! diagnostics with explicit truncation accounting (bytes/lines
 //! dropped shown, never silent). Small terminals degrade to a stated
 //! minimal layout (never crash, never corrupt); Unicode/control
-//! input renders safely via control-escaping plus char-boundary
+//! input renders safely via control-escaping plus display-cell
 //! truncation.
 //!
-//! No new dependencies: the widget needs (scroll/resize/degrade) are
-//! modest and hand-rolled ANSI suffices; the locked workspace
-//! qualifies without Ratatui.
+//! Hand-rolled ANSI handles scrolling and resize; unicode-width measures
+//! display cells without adding a terminal widget framework.
 
 use crate::inventory_present::Presentation;
 use crate::render::escape_controls;
@@ -30,6 +29,7 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use unicode_width::UnicodeWidthStr;
 
 /// Coalesced redraw cadence: ~3 Hz inside the plan's 2–4 Hz band.
 pub(crate) const REDRAW_INTERVAL: Duration = Duration::from_millis(333);
@@ -51,20 +51,26 @@ pub(crate) const LOG_LINE_MAX_CHARS: usize = 1024;
 /// In-cell truncation marker.
 pub(crate) const TRUNCATION_MARK: &str = "…";
 
-/// Truncate to `width` chars on a char boundary, marking with `…`.
-/// Never panics (zero width yields empty); never splits a char or an
-/// escape (callers escape before truncating, and markers carry no
-/// ANSI).
+/// Truncate to `width` display cells on a character boundary, marking
+/// omitted content with `…`. Callers escape controls before layout.
 pub(crate) fn truncate_cell(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
-        return text.to_string();
-    }
     if width == 0 {
         return String::new();
     }
-    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
-    format!("{kept}{TRUNCATION_MARK}")
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut kept = String::new();
+    for ch in text.chars() {
+        let previous = kept.len();
+        kept.push(ch);
+        if kept.width() > width - 1 {
+            kept.truncate(previous);
+            break;
+        }
+    }
+    kept.push_str(TRUNCATION_MARK);
+    kept
 }
 
 /// Producer-side bounded observer-log tail. Every push sanitizes
@@ -426,8 +432,7 @@ impl Default for DashboardState {
 /// edge blocks, a bounded log tail, and a footer naming the view
 /// window. Scrolling narrows only the visible window; every total
 /// still covers the whole capture. Small terminals get the stated
-/// minimal summary instead (totals, coverage, log tail, no edge
-/// table) — never a crash, never corruption.
+/// compact window instead (totals, coverage and scrollable associations) — never a crash, never corruption.
 pub(crate) fn render_frame(
     frame: &DisplayFrame,
     viewport: Viewport,
@@ -436,7 +441,7 @@ pub(crate) fn render_frame(
     let width = viewport.width.max(1);
     let height = viewport.height.max(1);
     let mut lines = if width < MIN_FULL_WIDTH || height < MIN_FULL_HEIGHT {
-        render_minimal(frame, width, height)
+        render_minimal(frame, width, height, state)
     } else {
         render_full(frame, width, height, state)
     };
@@ -458,95 +463,150 @@ pub(crate) fn render_frame(
     out
 }
 
-/// Stated minimal layout for small terminals: totals, coverage, and
-/// the log tail fit; the edge table does not and says so honestly.
-fn render_minimal(frame: &DisplayFrame, width: usize, height: usize) -> Vec<String> {
+/// Compact terminals prioritize identifiable associations over observer logs.
+/// Below the useful window size, only bounded totals and coverage remain.
+fn render_minimal(
+    frame: &DisplayFrame,
+    width: usize,
+    height: usize,
+    state: &DashboardState,
+) -> Vec<String> {
     let presentation = frame.presentation.as_ref();
     let budgets = &presentation.budgets;
+    let coverage = if frame.log.dropped_lines > 0 || frame.log.dropped_bytes > 0 {
+        format!(
+            "coverage: {}g {}r {}s; dropped {}L {}B",
+            presentation.gaps.len(),
+            budgets.refusals(),
+            presentation.gaps_suppressed,
+            frame.log.dropped_lines,
+            frame.log.dropped_bytes,
+        )
+    } else {
+        format!(
+            "coverage: {} gaps {} refusals {} suppressed",
+            presentation.gaps.len(),
+            budgets.refusals(),
+            presentation.gaps_suppressed,
+        )
+    };
     let mut lines = vec![
         truncate_cell(
-            &format!(
-                "p11scope inventory {} (minimal: terminal {}x{}, full dashboard needs {}x{})",
-                presentation.scope_label, width, height, MIN_FULL_WIDTH, MIN_FULL_HEIGHT,
-            ),
+            &format!("p11scope inventory {} (minimal)", presentation.scope_label),
             width,
         ),
         truncate_cell(
             &format!(
-                "totals: {} callers {} modules {} edges | {} passes",
+                "totals: {} callers {} modules {} edges",
                 presentation.callers.len(),
                 presentation.modules.len(),
-                presentation.edges.len(),
-                presentation.passes,
-            ),
-            width,
-        ),
-        truncate_cell(
-            &format!(
-                "coverage: {} gaps {} refusals {} suppressed | endpoints {}/{} | attach {}/{}",
-                presentation.gaps.len(),
-                budgets.refusals(),
-                presentation.gaps_suppressed,
-                budgets.endpoints_occupied,
-                budgets.endpoints_limit,
-                budgets.inventory_endpoints_occupied,
-                budgets.inventory_endpoints_limit,
-            ),
-            width,
-        ),
-        truncate_cell(
-            &format!(
-                "semantic: {} ({} held, {} unknown, {} refused) | retained {}/{}",
-                crate::inventory_present::semantic_status(budgets),
-                budgets.semantic_occupied,
-                budgets.semantic_unknown_edges,
-                budgets.semantic_refused,
-                budgets.retained,
-                budgets.retained_limit,
-            ),
-            width,
-        ),
-    ];
-    if !presentation.edges.is_empty() {
-        lines.push(truncate_cell(
-            &format!(
-                "{} edges hidden; enlarge the terminal for the edge table",
                 presentation.edges.len()
             ),
             width,
+        ),
+        truncate_cell(&coverage, width),
+    ];
+    if width >= 30 && height >= 8 {
+        let total = state.items_total(presentation);
+        let scroll = state.scroll.min(total.saturating_sub(1));
+        let room = height.saturating_sub(4);
+        let (mut window, shown) = match state.detail {
+            DetailPage::Summary => render_compact_edge_window(presentation, width, room, scroll),
+            DetailPage::Evidence => render_edge_window(presentation, width, room, scroll, true),
+            DetailPage::Gaps => {
+                render_gap_window(presentation, width, room, scroll, state.gap_line)
+            }
+        };
+        let (first, last) = visible_item_range(shown, total, scroll);
+        lines.append(&mut window);
+        while lines.len() < height - 1 {
+            lines.push(String::new());
+        }
+        let offset = if state.detail == DetailPage::Gaps {
+            presentation.gaps.get(scroll).map_or(0, |gap| {
+                effective_gap_line(gap, scroll, total, width, state.gap_line)
+            })
+        } else {
+            0
+        };
+        let continuation = if offset > 0 {
+            format!(" +{offset}")
+        } else {
+            String::new()
+        };
+        lines.push(truncate_cell(
+            &format!(
+                "{} {first}-{last}/{total}{continuation} | j/k tab q quit",
+                state.detail.label()
+            ),
+            width,
+        ));
+    } else {
+        lines.push(truncate_cell(
+            "enlarge terminal for associations | q quit",
+            width,
         ));
     }
-    let log_header = if frame.log.dropped_lines > 0 || frame.log.dropped_bytes > 0 {
-        format!(
-            "--- observer log ({} lines; +{} dropped lines, +{} dropped bytes) ---",
-            frame.log.lines.len(),
-            frame.log.dropped_lines,
-            frame.log.dropped_bytes
-        )
-    } else {
-        format!("--- observer log ({} lines) ---", frame.log.lines.len())
-    };
-    lines.push(truncate_cell(&log_header, width));
-    // The log tail fills what the terminal has left after the footer.
-    let room = height.saturating_sub(lines.len() + 1);
-    let tail: Vec<String> = frame
-        .log
-        .lines
-        .iter()
-        .rev()
-        .take(room)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|line| truncate_cell(line, width))
-        .collect();
-    lines.extend(tail);
-    lines.push(truncate_cell(
-        "enlarge the terminal for details | q quit",
-        width,
-    ));
     lines.truncate(height);
     lines
+}
+
+/// Three lines per complete association, with directional markers when room
+/// permits. Visible ranges derive from emitted blocks, never from total rows.
+fn render_compact_edge_window(
+    presentation: &Presentation,
+    width: usize,
+    room: usize,
+    scroll: usize,
+) -> (Vec<String>, usize) {
+    let total = presentation.edges.len();
+    if total == 0 {
+        return (vec![truncate_cell("(no edges captured)", width)], 0);
+    }
+    let scroll = scroll.min(total - 1);
+    let mut lines = Vec::new();
+    // At height 8, an above marker takes the one spare line. Markers must
+    // never displace the first complete association.
+    if scroll > 0 && room >= 4 {
+        lines.push(truncate_cell(&format!("^ +{scroll} more above"), width));
+    }
+    let mut shown = 0;
+    for edge in presentation.edges.iter().skip(scroll) {
+        if room.saturating_sub(lines.len()) < 3 {
+            break;
+        }
+        lines.push(identity_cell(
+            "application ",
+            &crate::inventory_present::application_label(presentation, edge.caller),
+            &edge.caller.label(),
+            width,
+        ));
+        lines.push(identity_cell(
+            "module ",
+            &crate::inventory_present::module_label(presentation, edge.module),
+            &edge.module.label(),
+            width,
+        ));
+        lines.push(truncate_cell(
+            &crate::inventory_present::observation_label(edge),
+            width,
+        ));
+        shown += 1;
+        let below = total - scroll - shown;
+        if below > 0 && room.saturating_sub(lines.len()) < 4 {
+            if lines.len() < room {
+                lines.push(truncate_cell(&format!("v +{below} more below"), width));
+            }
+            break;
+        }
+    }
+    if shown == 0 {
+        return (
+            vec![truncate_cell("(no edges fit; enlarge terminal)", width)],
+            0,
+        );
+    }
+    (lines, shown)
 }
 
 fn render_full(
@@ -733,6 +793,9 @@ struct BlockBudget {
     /// Whether riding gap rows render (else a `gaps +N hidden`
     /// marker counts them).
     show_gaps: bool,
+    /// Secondary retained PID/incarnation/lifecycle; the evidence page always
+    /// carries these when a tight summary yields their rows.
+    show_identity: bool,
 }
 
 /// Render the visible edge window as whole edge blocks: `^ +K more
@@ -893,7 +956,8 @@ fn render_gap_window(
 /// Render one edge's block within `budget` rows, shaving expandable
 /// detail until it fits: mechanism rows shrink 8→0 first (the longest,
 /// least dense rows), then evidence hides, then gaps hide — each
-/// stage with explicit markers. `None` when even the minimal block
+/// stage with explicit markers. Secondary identity yields last to the
+/// evidence page. `None` when even the established minimal block
 /// (identity, states, counts, operations, markers) exceeds the budget;
 /// the window then stops honestly instead of cropping a block.
 /// The full-detail stage renders first, so roomy viewports pay
@@ -908,6 +972,7 @@ fn fit_edge_block(
         mech_rows: DASHBOARD_MAX_MECHS,
         show_evidence: true,
         show_gaps: true,
+        show_identity: true,
     };
     let block = render_edge_block(presentation, edge, width, full);
     if block.len() <= budget {
@@ -918,6 +983,7 @@ fn fit_edge_block(
             mech_rows,
             show_evidence: true,
             show_gaps: true,
+            show_identity: true,
         };
         let block = render_edge_block(presentation, edge, width, stage);
         if block.len() <= budget {
@@ -929,13 +995,23 @@ fn fit_edge_block(
             mech_rows: 0,
             show_evidence,
             show_gaps,
+            show_identity: true,
         };
         let block = render_edge_block(presentation, edge, width, stage);
         if block.len() <= budget {
             return Some(block);
         }
     }
-    None
+    // New secondary identity details must not increase the established
+    // minimum whole-edge summary block. They remain on the evidence page.
+    let compact = BlockBudget {
+        mech_rows: 0,
+        show_evidence: false,
+        show_gaps: false,
+        show_identity: false,
+    };
+    let block = render_edge_block(presentation, edge, width, compact);
+    (block.len() <= budget).then_some(block)
 }
 
 /// Dashboard mechanism facts: the count plus one item per mechanism
@@ -1050,43 +1126,59 @@ fn gap_item(gap: &crate::inventory_present::GapView) -> String {
     }
 }
 
-/// One edge's column-0 identity line, shared by the summary and
-/// evidence pages so blocks attribute identically on both.
+/// Reserve the physical reference before truncating its independent label.
+fn identity_cell(prefix: &str, label: &str, id: &str, width: usize) -> String {
+    let suffix = format!(" [{id}]");
+    let label_width = width.saturating_sub(suffix.width());
+    let text = truncate_cell(&format!("{prefix}{label}"), label_width);
+    truncate_cell(&format!("{text}{suffix}"), width)
+}
+
+/// Independently budget the application and module around the arrow.
 fn edge_identity_line(
     presentation: &Presentation,
     edge: &crate::inventory_present::EdgeView,
     width: usize,
 ) -> String {
-    let caller_exe = presentation
+    let separator = " -> ";
+    let available = width.saturating_sub(separator.width());
+    let app_width = available / 2;
+    let module_width = available - app_width;
+    let app = identity_cell(
+        "",
+        &crate::inventory_present::application_label(presentation, edge.caller),
+        &edge.caller.label(),
+        app_width,
+    );
+    let module = identity_cell(
+        "",
+        &crate::inventory_present::module_label(presentation, edge.module),
+        &edge.module.label(),
+        module_width,
+    );
+    truncate_cell(&format!("{app}{separator}{module}"), width)
+}
+
+/// Retained identity details only; a dangling ID never borrows a current PID.
+fn secondary_identity_items(
+    presentation: &Presentation,
+    edge: &crate::inventory_present::EdgeView,
+) -> Vec<String> {
+    let Ok(index) = presentation
         .callers
-        .iter()
-        .find(|caller| caller.id == edge.caller)
-        .and_then(|caller| caller.exe.as_ref())
-        .and_then(|exe| exe.path.as_deref())
-        .unwrap_or("?");
-    let module_path = presentation
-        .modules
-        .iter()
-        .find(|module| module.id == edge.module)
-        .and_then(|module| module.paths.first())
-        .map(String::as_str)
-        .unwrap_or("?");
-    truncate_cell(
-        &format!(
-            "{} pid {} ({}) -> {} ({})",
-            edge.caller.label(),
-            presentation
-                .callers
-                .iter()
-                .find(|caller| caller.id == edge.caller)
-                .map(|caller| caller.pid)
-                .unwrap_or(0),
-            escape_controls(caller_exe),
-            edge.module.label(),
-            escape_controls(module_path),
-        ),
-        width,
-    )
+        .binary_search_by_key(&edge.caller, |caller| caller.id)
+    else {
+        return Vec::new();
+    };
+    let caller = &presentation.callers[index];
+    let mut items = vec![format!(
+        "pid {} incarnation {}",
+        caller.pid, caller.incarnation
+    )];
+    if let Some(lifecycle) = crate::inventory_present::caller_lifecycle_label(caller) {
+        items.push(lifecycle.into());
+    }
+    items
 }
 
 /// Greedy wrap on item boundaries; no item is split mid-label.
@@ -1101,14 +1193,14 @@ fn wrap_items(width: usize, items: &[String]) -> Vec<String> {
         } else {
             item.clone()
         };
-        if current.len() + piece.len() <= width {
+        if current.width() + piece.width() <= width {
             current.push_str(&piece);
         } else {
             if current.len() > 2 {
                 lines.push(truncate_cell(&current, width));
             }
             current = format!("  {item}");
-            if current.len() > width {
+            if current.width() > width {
                 lines.push(truncate_cell(&current, width));
                 current = String::from("  ");
             }
@@ -1195,6 +1287,9 @@ fn render_edge_block(
         };
         items.push(active);
     }
+    if budget.show_identity {
+        items.extend(secondary_identity_items(presentation, edge));
+    }
     lines.extend(wrap_items(width, &items));
     lines
 }
@@ -1217,6 +1312,7 @@ fn render_evidence_block(
         Some(operations) => items.extend(evidence_items(operations)),
         None => items.push(format!("semantics {}", edge.semantics.label)),
     }
+    items.extend(secondary_identity_items(presentation, edge));
     lines.extend(wrap_items(width, &items));
     lines
 }
@@ -1243,9 +1339,8 @@ fn fit_evidence_block(
     (block.len() <= budget).then_some(block)
 }
 
-/// Greedy word-wrap for gap text: words pack to `width` chars,
-/// overlong words split on char boundaries. Always returns at
-/// least one line; every line fits `width` chars.
+/// Greedy word-wrap for gap text in display cells; overlong words split
+/// on character boundaries. A glyph too wide for the viewport is marked.
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -1255,7 +1350,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
             current.push_str(word);
             return;
         }
-        if current.chars().count() + 1 + word.chars().count() <= width {
+        if current.width() + 1 + word.width() <= width {
             current.push(' ');
             current.push_str(word);
             return;
@@ -1264,7 +1359,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
         current.push_str(word);
     };
     for word in text.split_whitespace() {
-        if word.chars().count() <= width {
+        if word.width() <= width {
             push_word(&mut lines, &mut current, word);
             continue;
         }
@@ -1275,8 +1370,17 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
         }
         let mut chunk = String::new();
         for ch in word.chars() {
-            if chunk.chars().count() >= width {
-                lines.push(std::mem::take(&mut chunk));
+            let mut candidate = chunk.clone();
+            candidate.push(ch);
+            if candidate.width() > width {
+                if !chunk.is_empty() {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                if ch.to_string().width() > width {
+                    // A single glyph cannot fit this degenerate viewport.
+                    lines.push(TRUNCATION_MARK.into());
+                    continue;
+                }
             }
             chunk.push(ch);
         }

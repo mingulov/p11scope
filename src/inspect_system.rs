@@ -119,11 +119,13 @@ pub(crate) fn set_progress_lines(on: bool) -> bool {
     PROGRESS_LINES.swap(on, std::sync::atomic::Ordering::SeqCst)
 }
 
-/// `eprintln!` for a scan progress line (see [`set_progress_lines`]).
+/// Best-effort bounded stderr for a scan progress line. Formatting and
+/// argument evaluation stay inside the enabled branch (see [`set_progress_lines`]).
 macro_rules! progress {
     ($($arg:tt)*) => {
         if PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst) {
-            eprintln!($($arg)*);
+            let line = format!($($arg)*);
+            let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&line));
         }
     };
 }

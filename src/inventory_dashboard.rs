@@ -1877,14 +1877,15 @@ fn read_key_byte(fd: std::os::fd::RawFd, into: &mut [u8], wait: Duration) -> boo
 }
 
 /// Cooperative stop flag for the inventory loop (classic or dashboard):
-/// SIGINT/SIGTERM/SIGHUP set it (signal-safe atomics only, like the
-/// capture loops); the loop polls it every tick and exits through its
+/// SIGINT/SIGTERM/SIGHUP increment a delivered-handler count up to two
+/// (signal-safe atomics only, like the capture loops); the loop polls it
+/// every tick and exits through its
 /// stop path, so the terminal restores on operator stops and supervisor
 /// kills alike.
 /// SIGKILL cannot be caught — its terminal needs `reset(1)`.
 pub(crate) struct StopFlag {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    /// Armed once the report is written (R-C51-4): a further stop signal
+    signals: Arc<std::sync::atomic::AtomicUsize>,
+    /// Armed once output attempts finish (R-C51-4): a further stop signal
     /// then ends the process at once (`_exit(128 + signal)`); the kernel
     /// releases whatever the drop was still detaching.
     exit_on_next: Arc<std::sync::atomic::AtomicBool>,
@@ -1895,21 +1896,23 @@ pub(crate) struct StopFlag {
 // runs once per process, so the hooks live for the run.
 impl StopFlag {
     pub(crate) fn install() -> Self {
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let exit_on_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut hooks = Vec::new();
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            let flag = Arc::clone(&stop);
+            let count = Arc::clone(&signals);
             let armed = Arc::clone(&exit_on_next);
-            // The callback is the signal-safe minimum: atomic loads and a
-            // store, or `_exit` (async-signal-safe); no allocation, no
+            // The callback uses lock-free atomics on supported x86-64, or
+            // `_exit` (async-signal-safe); no allocation, no
             // I/O, no locks.
             let hook = unsafe {
                 signal_hook::low_level::register(signal, move || {
                     if armed.load(Ordering::SeqCst) {
                         libc::_exit(128 + signal);
                     }
-                    flag.store(true, Ordering::SeqCst);
+                    let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
+                        (seen < 2).then_some(seen + 1)
+                    });
                 })
             };
             if let Ok(id) = hook {
@@ -1917,18 +1920,22 @@ impl StopFlag {
             }
         }
         Self {
-            stop,
+            signals,
             exit_on_next,
             _hooks: hooks,
         }
     }
 
     pub(crate) fn stopped(&self) -> bool {
-        self.stop.load(Ordering::SeqCst)
+        self.signal_count() > 0
+    }
+
+    pub(crate) fn signal_count(&self) -> usize {
+        self.signals.load(Ordering::SeqCst)
     }
 
     /// From now on a stop signal exits the process at once (R-C51-4: the
-    /// report is written; only the blocking probe detach may remain).
+    /// output attempts finished; only the blocking probe detach may remain).
     pub(crate) fn exit_on_next_signal(&self) {
         self.exit_on_next.store(true, Ordering::SeqCst);
     }
@@ -2589,7 +2596,7 @@ impl Display {
 
     /// After a restore the terminal did not take whole (one still stalled
     /// at the stop, e.g. Ctrl-S then `q`): one more attempt, bounded by
-    /// `budget`, once the report is written. Says how it went (on the
+    /// `budget`, after output attempts. Says how it went (on the
     /// closing lines) when it was needed; true when the terminal is
     /// restored.
     pub(crate) fn retry_restore(&mut self, budget: Duration) -> bool {

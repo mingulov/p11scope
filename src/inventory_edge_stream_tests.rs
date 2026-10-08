@@ -221,7 +221,7 @@ fn the_final_sweep_makes_the_replayed_edges_equal_the_snapshot() {
         &last,
         false,
         false,
-        &mut text,
+        &mut crate::inventory_output::WriterStdout(&mut text),
         None,
     );
     assert_eq!(outcome.exit_code(), 0);
@@ -912,7 +912,16 @@ fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
         (&mut classic, &mut classic_state),
     ] {
         let mut sink = Vec::new();
-        let outcome = finish_output(None, writer, state, &last, false, true, &mut sink, None);
+        let outcome = finish_output(
+            None,
+            writer,
+            state,
+            &last,
+            false,
+            true,
+            &mut crate::inventory_output::WriterStdout(&mut sink),
+            None,
+        );
         assert_eq!(outcome.exit_code(), 0);
         assert_eq!(outcome.event_log_confirmed, Some(true));
     }

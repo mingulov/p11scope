@@ -758,8 +758,9 @@ Limits that matter in pods:
   shed so far` once frames are drawn again. On exit the screen is
   restored (waiting at most 1 s for the terminal; a restore the
   terminal did not take, e.g. after Ctrl-S then `q`, is tried once
-  more for up to 5 s after final output attempts, and a second signal
-  ends that wait), and stderr ends with
+  more for up to 5 s after final output attempts; deliberate stdout
+  cancellation gives that retry zero wait budget, and a further delivered
+  signal after output attempts ends the process), and stderr ends with
   `p11scope: dashboard terminal: W frames written, S shed by a terminal
   that did not keep up (C cut short, B bytes, T ms waited); screen
   restored; service ticks N, longest gap G ms (P ms across a pass)` and
@@ -787,8 +788,23 @@ Limits that matter in pods:
   may contain a partial line, and `ended` is never fabricated or retried.
   A readable `ended` alone does not confirm successful sync. A failed
   `-o` commit preserves the destination under the atomic-file policy;
-  failed stdout may contain only a prefix. These guarantees cover calls
-  that return; final stdout on a stalled terminal can still block.
+  failed stdout may contain only a prefix. Final JSON and text stdout keep
+  writing while bytes are accepted, with no total-document deadline. On
+  ordinary Linux pipes/FIFOs and TTYs/PTYs, five seconds without a positive
+  write fails stdout with exit 1. A reader pausing at least five seconds can
+  lose the remaining suffix; a truncated JSON prefix is not a usable report.
+  A signal already used to stop capture permits healthy final output; a
+  later delivered SIGINT, SIGTERM or SIGHUP cancels it, including a first
+  delivery after a duration/key stop starts finalization. The bounded
+  diagnostic names the reason and exact local accepted/total/remaining
+  bytes; a stopped stderr may shed it. Accepted bytes do not prove that a
+  reader parsed them or a screen displayed them. `-o` and event completion
+  remain independent and their failures remain explicit. Saved termios is
+  restored before dashboard JSON, but a permanently stopped screen may
+  still need `reset` after output resumes. These bounds cover eligible
+  stdout backpressure waits: filesystem publication/sync, regular-file or
+  arbitrary device writes already in the kernel, scheduling and unsettled
+  native detach retain their separate limits.
   Entry columns read unknown
   unless a usage feed observed them, mappings are never reported as
   observed calls, and every coverage loss is an explicit gap.

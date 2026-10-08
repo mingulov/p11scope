@@ -35,6 +35,9 @@ use crate::inventory_events::{
     EdgeEmitter, EventWriter, GapEmitter, caller_event_payload, ended_payload, pass_payload,
     started_payload,
 };
+#[cfg(test)]
+use crate::inventory_output::WriterStdout;
+use crate::inventory_output::{FdStdout, FinalStdout, StdoutFailureReason, StdoutResult};
 use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, render_snapshot};
 use crate::output::AtomicFile;
 use crate::process::PidPin;
@@ -48,6 +51,25 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Inventory-local diagnostics must not wait on an aliased stopped terminal.
+fn inventory_diagnostic(line: &str) {
+    let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(line));
+}
+
+/// Shared by the real classic/dashboard Retiring callbacks and scripted lane
+/// controls. The boundary must precede the action that restores/notifies.
+pub(crate) fn retiring_stdout(stdout: &mut dyn FinalStdout, action: impl FnOnce()) {
+    stdout.begin_finalization();
+    action();
+}
+
+/// Scan has no Retiring callback; native retains its earlier boundary.
+pub(crate) fn begin_scan_stdout(stdout: &mut dyn FinalStdout, native_stopped: bool) {
+    if !native_stopped {
+        stdout.begin_finalization();
+    }
+}
 
 /// An event transport failure does not invalidate captured facts. Retire
 /// the writer once and keep the first error through ordinary finalization.
@@ -89,13 +111,23 @@ impl EventLogState {
 pub(crate) struct FinalOutputOutcome {
     event_log_confirmed: Option<bool>,
     report_committed: Option<bool>,
-    stdout_complete: Option<bool>,
+    stdout_result: Option<StdoutResult>,
     failures: Vec<String>,
 }
 
 impl FinalOutputOutcome {
     pub(crate) fn exit_code(&self) -> i32 {
         i32::from(!self.failures.is_empty())
+    }
+
+    pub(crate) fn stdout_cancelled(&self) -> bool {
+        matches!(
+            self.stdout_result,
+            Some(Err(crate::inventory_output::StdoutFailure {
+                reason: StdoutFailureReason::Cancelled,
+                ..
+            }))
+        )
     }
 
     fn notices(&self, previously_reported: Option<&str>, notice: &mut dyn FnMut(&str)) {
@@ -122,8 +154,8 @@ impl FinalOutputOutcome {
                 "-o report commit failed"
             });
         }
-        if let Some(complete) = self.stdout_complete {
-            statuses.push(if complete {
+        if let Some(result) = &self.stdout_result {
+            statuses.push(if result.is_ok() {
                 "stdout complete"
             } else {
                 "stdout incomplete (may contain a prefix)"
@@ -176,6 +208,8 @@ pub fn run(
     // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
     // its stop path (the final sinks are still written).
     let stop = StopFlag::install();
+    let signals = || stop.signal_count();
+    let mut stdout = FdStdout::new(1, &signals);
     run_with_writer(
         scope,
         modules,
@@ -194,7 +228,7 @@ pub fn run(
         &|| stop.stopped(),
         &|| stop.exit_on_next_signal(),
         stdout_tty,
-        &mut std::io::stdout().lock(),
+        &mut stdout,
     )
 }
 
@@ -217,7 +251,7 @@ fn run_with_writer(
     stop: &dyn Fn() -> bool,
     outputs_attempted: &dyn Fn(),
     stdout_tty: bool,
-    stdout: &mut dyn std::io::Write,
+    stdout: &mut dyn FinalStdout,
 ) -> Result<i32> {
     run_with_terminal(
         scope,
@@ -264,7 +298,7 @@ fn run_with_terminal(
     stop: &dyn Fn() -> bool,
     outputs_attempted: &dyn Fn(),
     stdout_tty: bool,
-    stdout: &mut dyn std::io::Write,
+    stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
 ) -> Result<i32> {
     run_with_terminal_inner(
@@ -311,7 +345,7 @@ fn run_with_terminal_inner(
     stop: &dyn Fn() -> bool,
     outputs_attempted: &dyn Fn(),
     stdout_tty: bool,
-    stdout: &mut dyn std::io::Write,
+    stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
     #[cfg(test)] event_fault: Option<crate::inventory_events::EventFault>,
 ) -> Result<i32> {
@@ -325,7 +359,7 @@ fn run_with_terminal_inner(
         }
         InspectScope::System => {
             if let Some(warning) = crate::pidns::nested_warning(numbering) {
-                let _ = writeln!(std::io::stderr(), "{warning}");
+                inventory_diagnostic(&warning);
             }
             // Resolve the proof-stat and shard diagnostic knobs now: their
             // one stderr note each then lands before a dashboard can take the terminal,
@@ -422,14 +456,14 @@ fn run_with_terminal_inner(
         }
     }
     if let Some(why) = degraded {
-        eprintln!(
+        inventory_diagnostic(&format!(
             "p11scope: --dashboard {why}; degraded to {} (no ANSI emitted)",
             if json {
                 "the JSON document"
             } else {
                 "pager snapshots"
             }
-        );
+        ));
     }
     if let Some(writer) = stream.writer.as_mut() {
         let prologue = Presentation::capture(&coordinator, &scope_label, started_ns, started_ns, 0);
@@ -468,7 +502,7 @@ fn run_with_terminal_inner(
             match point {
                 Publish::Pass { report, now_ns } => {
                     for line in progress_lines(coordinator, report) {
-                        eprintln!("{line}");
+                        inventory_diagnostic(&line);
                     }
                     if let Some(error) = stream.attempt("pass publication", |writer| {
                         let presentation =
@@ -483,11 +517,13 @@ fn run_with_terminal_inner(
                     attached,
                     links,
                     budget,
-                } => eprintln!(
-                    "p11scope: stopping: detaching the native probes of {attached} endpoints \
+                } => retiring_stdout(stdout, || {
+                    inventory_diagnostic(&format!(
+                        "p11scope: stopping: detaching the native probes of {attached} endpoints \
                      in {links} links (up to {} s)",
-                    budget.as_secs()
-                ),
+                        budget.as_secs()
+                    ))
+                }),
                 Publish::Stop { events, now_ns } => {
                     if let Some(error) = stream.attempt("stop publication", |writer| {
                         let presentation =
@@ -509,15 +545,16 @@ fn run_with_terminal_inner(
             Ok(())
         },
     )?;
+    begin_scan_stdout(stdout, stopped.is_some());
     if let Some(stopped) = &stopped {
-        eprintln!("{}", stop_line(&stopped.summary));
+        inventory_diagnostic(&stop_line(&stopped.summary));
     }
     let ended_ns = now_ns();
     let passes = coordinator.passes();
     let presentation =
         Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
-    // The report first; only then may an unsettled retirement's drop
-    // block (invariant 5), and a second signal then exits at once
+    // Output attempts first; only then may an unsettled retirement's drop
+    // block (invariant 5), and a further signal then exits at once
     // (R-C51-4).
     let previously_reported = stream.first_error().map(str::to_string);
     let outcome = crate::inventory_capture::finish_native(
@@ -565,7 +602,7 @@ impl ClassicDriver<'_> {
     fn warn(&mut self, warning: &str) {
         match self.display.as_mut() {
             Some(display) => display.warn(warning),
-            None => eprintln!("{warning}"),
+            None => inventory_diagnostic(warning),
         }
     }
 }
@@ -635,10 +672,10 @@ fn open_native_lane(
                 "--capture native: the native usage lane cannot run: {reason}"
             )),
             _ => {
-                eprintln!(
+                inventory_diagnostic(&format!(
                     "p11scope: native usage feed unavailable, continuing with the scan lane: {}",
                     crate::render::escape_controls(&reason)
-                );
+                ));
                 coordinator.note_scope_gap("native usage feed unavailable".into(), reason);
                 Ok(None)
             }
@@ -674,7 +711,7 @@ fn open_native_lane(
     });
     match NativeLane::start(capture, coordinator, LaneWindows::PROVISIONAL, lossy) {
         Ok(lane) => {
-            eprintln!("{}", lane_active_line(&backend));
+            inventory_diagnostic(&lane_active_line(&backend));
             Ok(Some(lane))
         }
         Err((mut capture, reason)) => {
@@ -760,7 +797,7 @@ pub(crate) fn finish_output(
     presentation: &Presentation,
     json: bool,
     silent_text: bool,
-    stdout: &mut dyn std::io::Write,
+    stdout: &mut dyn FinalStdout,
     native: Option<&LaneSummary>,
 ) -> FinalOutputOutcome {
     let mut document = render_json_from_presentation(presentation);
@@ -809,7 +846,7 @@ pub(crate) fn finish_output(
     let mut outcome = FinalOutputOutcome {
         event_log_confirmed: event_requested.then(|| stream.first_error().is_none()),
         report_committed: None,
-        stdout_complete: None,
+        stdout_result: None,
         failures: stream
             .first_error()
             .map(str::to_string)
@@ -837,13 +874,19 @@ pub(crate) fn finish_output(
             text = render_snapshot(presentation);
             text.as_bytes()
         };
-        let result = stdout.write_all(bytes).and_then(|()| stdout.flush());
-        outcome.stdout_complete = Some(result.is_ok());
-        if let Err(error) = result {
+        let result = stdout.write_document(bytes);
+        if let Err(error) = &result {
+            let reason = match &error.reason {
+                StdoutFailureReason::NoProgress => "no progress for 5 seconds".to_string(),
+                StdoutFailureReason::Cancelled => "cancelled by a later signal".to_string(),
+                StdoutFailureReason::Io(error) => format!("I/O error: {error}"),
+            };
             outcome
                 .failures
-                .push(format!("p11scope: inventory stdout failed: {error}"));
+                .push(format!("p11scope: inventory stdout failed: {reason}; accepted {} of {} bytes; remaining {} not written",
+                    error.accepted, error.total, error.total - error.accepted));
         }
+        outcome.stdout_result = Some(result);
     }
     outcome
 }
@@ -1208,7 +1251,7 @@ fn run_dashboard(
     mut stream: EventLogState,
     stop: &dyn Fn() -> bool,
     outputs_attempted: &dyn Fn(),
-    stdout: &mut dyn std::io::Write,
+    stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
 ) -> Result<i32> {
     let DashboardRun {
@@ -1289,16 +1332,17 @@ fn run_dashboard(
                     links,
                     budget,
                 } => {
-                    // The terminal back first: the stop's notices (and a
-                    // detach past the report) are then readable.
-                    if let Some(display) = driver.display.as_mut() {
-                        display.restore();
-                        display.notice(&format!(
-                            "p11scope: stopping: detaching the native probes of {attached} \
+                    retiring_stdout(stdout, || {
+                        // Termios and the bounded screen restore precede JSON.
+                        if let Some(display) = driver.display.as_mut() {
+                            display.restore();
+                            display.notice(&format!(
+                                "p11scope: stopping: detaching the native probes of {attached} \
                              endpoints in {links} links (up to {} s)",
-                            budget.as_secs()
-                        ));
-                    }
+                                budget.as_secs()
+                            ));
+                        }
+                    });
                 }
                 Publish::Stop { events, now_ns } => {
                     let coordinator = &*driver.coordinator;
@@ -1322,6 +1366,7 @@ fn run_dashboard(
             Ok(())
         },
     )?;
+    begin_scan_stdout(stdout, stopped.is_some());
     let mut display = driver
         .display
         .take()
@@ -1335,7 +1380,7 @@ fn run_dashboard(
     let ended_ns = now_ns();
     let presentation =
         Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
-    // The report first (R-C51-4), silent text: the live view showed it.
+    // Output attempts first (R-C51-4), silent text: the live view showed it.
     let previously_reported = stream.first_error().map(str::to_string);
     let outcome = crate::inventory_capture::finish_native(
         stopped,
@@ -1356,7 +1401,11 @@ fn run_dashboard(
     );
     // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
     // the alternate screen: after output attempts, it can wait longer.
-    display.retry_restore(RESTORE_RETRY_BUDGET);
+    display.retry_restore(if outcome.stdout_cancelled() {
+        Duration::ZERO
+    } else {
+        RESTORE_RETRY_BUDGET
+    });
     outcome.notices(previously_reported.as_deref(), &mut |line| {
         display.notice(line)
     });
@@ -2065,7 +2114,7 @@ mod tests {
                 &|| false,
                 &|| finalized.set(true),
                 false,
-                &mut stdout,
+                &mut WriterStdout(&mut stdout),
                 &DashboardIo::stdio(),
                 Some(fault),
             );
@@ -2116,7 +2165,7 @@ mod tests {
             &|| false,
             &|| {},
             false,
-            &mut stdout,
+            &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
             None,
         )
@@ -2170,7 +2219,7 @@ mod tests {
             &|| false,
             &|| finalized.set(true),
             false,
-            &mut stdout,
+            &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
             Some(fault),
         );
@@ -2184,6 +2233,680 @@ mod tests {
         assert!(stdout.is_empty());
         assert_eq!(std::fs::read_to_string(&report).unwrap(), "old report");
         assert_eq!(attempts.borrow().as_slice(), ["started"]);
+    }
+
+    /// A partial final write must disclose the exact local prefix, including
+    /// when the event sink has independently failed.
+    #[test]
+    fn incomplete_stdout_discloses_exact_accepted_bytes() {
+        struct Prefix {
+            accepted: usize,
+            total: usize,
+        }
+        impl std::io::Write for Prefix {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.accepted == 0 {
+                    self.total = bytes.len();
+                    let n = bytes.len().min(7);
+                    self.accepted = n;
+                    Ok(n)
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let view = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let mut out = Prefix {
+            accepted: 0,
+            total: 0,
+        };
+        let result = finish_output(
+            None,
+            &mut EventLogState::new(None),
+            &mut StreamState::new(),
+            &view,
+            true,
+            false,
+            &mut WriterStdout(&mut out),
+            None,
+        );
+        assert_eq!(result.exit_code(), 1);
+        let total = out.total;
+        let mut notices = Vec::new();
+        result.notices(None, &mut |s| notices.push(s.to_string()));
+        assert!(
+            notices.iter().any(|s| s.contains(&format!(
+                "accepted 7 of {total} bytes; remaining {} not written",
+                total - 7
+            ))),
+            "missing exact prefix account: {notices:?}"
+        );
+        assert!(!notices.iter().any(|s| s.contains("stdout complete")));
+    }
+
+    #[test]
+    fn scan_finalization_captures_after_loop_once() {
+        use std::os::fd::AsRawFd;
+        struct Recorded<'a> {
+            inner: FdStdout<'a>,
+            begins: usize,
+        }
+        impl FinalStdout for Recorded<'_> {
+            fn begin_finalization(&mut self) {
+                self.begins += 1;
+                self.inner.begin_finalization();
+            }
+            fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+                assert_eq!(
+                    self.begins, 1,
+                    "scan stdout began before/after the wrong boundary"
+                );
+                self.inner.write_document(bytes)
+            }
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut stdout = Recorded {
+            inner: FdStdout::new(file.as_raw_fd(), &|| 0),
+            begins: 0,
+        };
+        let code = run_with_writer(
+            InspectScope::System,
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            Some(1),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            &|| false,
+            &|| {},
+            false,
+            &mut stdout,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(stdout.begins, 1);
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        assert_eq!(document["schema"], DOC_ID);
+        assert!(document["observation"].get("lane").is_none());
+    }
+
+    #[test]
+    fn retired_event_failure_and_incomplete_stdout_remain_independent() {
+        use crate::inventory_output::StdoutFailure;
+        struct Incomplete {
+            cancelled: bool,
+            called: bool,
+            total: usize,
+        }
+        impl FinalStdout for Incomplete {
+            fn begin_finalization(&mut self) {}
+            fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+                self.called = true;
+                self.total = bytes.len();
+                Err(StdoutFailure {
+                    accepted: 3,
+                    total: bytes.len(),
+                    reason: if self.cancelled {
+                        StdoutFailureReason::Cancelled
+                    } else {
+                        StdoutFailureReason::NoProgress
+                    },
+                })
+            }
+        }
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let view = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        for cancelled in [false, true] {
+            for (json, silent_text) in [(true, false), (false, false), (false, true)] {
+                let mut stdout = Incomplete {
+                    cancelled,
+                    called: false,
+                    total: 0,
+                };
+                let mut stream = EventLogState {
+                    writer: None,
+                    first_error: Some(
+                        "p11scope: inventory event log pass publication failed: injected".into(),
+                    ),
+                };
+                let result = finish_output(
+                    None,
+                    &mut stream,
+                    &mut StreamState::new(),
+                    &view,
+                    json,
+                    silent_text,
+                    &mut stdout,
+                    None,
+                );
+                let requested = json || !silent_text;
+                assert_eq!(result.exit_code(), 1);
+                assert_eq!(result.event_log_confirmed, Some(false));
+                assert_eq!(result.report_committed, None);
+                assert_eq!(stdout.called, requested);
+                assert_eq!(result.stdout_cancelled(), requested && cancelled);
+                let mut notices = Vec::new();
+                result.notices(None, &mut |line| notices.push(line.to_string()));
+                assert!(
+                    !notices
+                        .iter()
+                        .any(|line| line.contains("stdout complete")
+                            || line.contains("report saved"))
+                );
+                if requested {
+                    assert!(notices.iter().any(|line| line.contains(&format!(
+                        "accepted 3 of {} bytes; remaining {} not written",
+                        stdout.total,
+                        stdout.total - 3
+                    ))));
+                    assert_eq!(result.failures.len(), 2);
+                    assert_eq!(
+                        result
+                            .stdout_result
+                            .as_ref()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap_err()
+                            .accepted,
+                        3
+                    );
+                } else {
+                    assert!(result.stdout_result.is_none());
+                    assert_eq!(result.failures.len(), 1);
+                }
+            }
+        }
+    }
+
+    /// Requested sinks settle before stdout is allowed to acquire or cancel.
+    /// This remains a strict normal-host gate; output ancestor trust is intact.
+    #[test]
+    fn requested_sinks_precede_incomplete_stdout() {
+        use crate::inventory_events::EventFault;
+        use crate::inventory_output::StdoutFailure;
+        struct Check<'a> {
+            cancelled: bool,
+            verify: &'a dyn Fn(&[u8]),
+            called: bool,
+        }
+        impl FinalStdout for Check<'_> {
+            fn begin_finalization(&mut self) {}
+            fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+                self.called = true;
+                (self.verify)(bytes);
+                Err(StdoutFailure {
+                    accepted: 3,
+                    total: bytes.len(),
+                    reason: if self.cancelled {
+                        StdoutFailureReason::Cancelled
+                    } else {
+                        StdoutFailureReason::NoProgress
+                    },
+                })
+            }
+        }
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let view = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        for event_failed in [false, true] {
+            for report_failed in [false, true] {
+                for cancelled in [false, true] {
+                    for (json, silent) in [(true, false), (false, false), (false, true)] {
+                        let dir = private_tempdir();
+                        let report = dir.path().join("report.json");
+                        let old = dir.path().join("old.json");
+                        std::fs::write(&old, b"prior report").unwrap();
+                        let sink = AtomicFile::create(&report).unwrap();
+                        if report_failed {
+                            std::os::unix::fs::symlink(&old, &report).unwrap();
+                        }
+                        let events = dir.path().join("events.jsonl");
+                        let attempts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                        let mut writer = EventWriter::create(&events, 1 << 20, 2).unwrap();
+                        writer.fault = Some(EventFault {
+                            kind: if event_failed { "ended" } else { "never" },
+                            final_pass_only: false,
+                            after_ended: false,
+                            attempts: attempts.clone(),
+                        });
+                        let verify = |bytes: &[u8]| {
+                            assert!(
+                                attempts.borrow().iter().any(|kind| kind == "ended"),
+                                "stdout started before the requested event completion attempt"
+                            );
+                            if report_failed {
+                                assert_eq!(std::fs::read(&old).unwrap(), b"prior report");
+                                assert!(
+                                    std::fs::symlink_metadata(&report)
+                                        .unwrap()
+                                        .file_type()
+                                        .is_symlink()
+                                );
+                            } else {
+                                let committed = std::fs::read(&report).unwrap();
+                                let document: serde_json::Value =
+                                    serde_json::from_slice(&committed).unwrap();
+                                assert_eq!(document["schema"], DOC_ID);
+                                if json {
+                                    assert_eq!(committed, bytes);
+                                }
+                            }
+                            assert!(
+                                !std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
+                                    .unwrap()
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with(".p11scope.")),
+                                "stdout started before the report attempt disposed its temp file"
+                            );
+                        };
+                        let mut stdout = Check {
+                            cancelled,
+                            verify: &verify,
+                            called: false,
+                        };
+                        let result = finish_output(
+                            Some(sink),
+                            &mut EventLogState::new(Some(writer)),
+                            &mut StreamState::new(),
+                            &view,
+                            json,
+                            silent,
+                            &mut stdout,
+                            None,
+                        );
+                        let requested = json || !silent;
+                        assert_eq!(stdout.called, requested);
+                        assert_eq!(result.event_log_confirmed, Some(!event_failed));
+                        assert_eq!(result.report_committed, Some(!report_failed));
+                        assert_eq!(result.stdout_cancelled(), cancelled && requested);
+                        assert_eq!(
+                            result.exit_code(),
+                            i32::from(requested || event_failed || report_failed)
+                        );
+                        let mut notices = Vec::new();
+                        result.notices(None, &mut |line| notices.push(line.to_string()));
+                        assert!(!notices.iter().any(|line| line.contains("stdout complete")));
+                        assert_eq!(
+                            notices.iter().any(|line| line.contains("report saved")),
+                            !report_failed && result.exit_code() != 0
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A cancelled final stdout must not add five seconds of screen retry.
+    /// Only the owned child uses the PTY; the parent watchdog never resumes it.
+    #[test]
+    fn dashboard_cancelled_stdout_skips_restore_wait() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::process::{Command, Stdio};
+        if let Some(dir) = std::env::var_os("P11SCOPE_DASHBOARD_CANCEL_CHILD") {
+            let dir = PathBuf::from(dir);
+            struct Cancelled {
+                begins: usize,
+            }
+            impl FinalStdout for Cancelled {
+                fn begin_finalization(&mut self) {
+                    self.begins += 1;
+                }
+                fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+                    assert_eq!(self.begins, 1);
+                    Err(crate::inventory_output::StdoutFailure {
+                        accepted: 0,
+                        total: bytes.len(),
+                        reason: StdoutFailureReason::Cancelled,
+                    })
+                }
+            }
+            let notices = std::fs::File::create(dir.join("notices")).unwrap();
+            let account = std::rc::Rc::new(std::cell::Cell::new(None));
+            let terminal = DashboardIo {
+                output: 0,
+                input: Some(0),
+                account: Some(account.clone()),
+                stderr_fd: notices.as_raw_fd(),
+                stderr: StderrRoute::Leave,
+            };
+            let stop = || {
+                assert_eq!(unsafe { libc::tcflow(0, libc::TCOOFF) }, 0);
+                true
+            };
+            let result = run_with_terminal(
+                InspectScope::System,
+                &[],
+                &HookRegistry::builtin(),
+                true,
+                Some(1),
+                None,
+                None,
+                None,
+                true,
+                None,
+                None,
+                None,
+                CaptureMode::Scan,
+                crate::attach::BackendSelection::Auto,
+                &stop,
+                &|| {},
+                true,
+                &mut Cancelled { begins: 0 },
+                &terminal,
+            )
+            .unwrap();
+            assert_eq!(result, 1);
+            let terminal = account.take().unwrap().terminal;
+            assert!(terminal.restore_retried && !terminal.restored);
+            std::fs::write(dir.join("finished"), b"cancelled; restore retry shed\n").unwrap();
+            std::process::exit(0);
+        }
+        let deadline = Instant::now() + Duration::from_millis(4500);
+        let dir = private_tempdir();
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let _master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut saved = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), saved.as_mut_ptr()) },
+            0
+        );
+        let saved = unsafe { saved.assume_init() };
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Owned(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "inventory::tests::dashboard_cancelled_stdout_skips_restore_wait",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("P11SCOPE_DASHBOARD_CANCEL_CHILD", dir.path())
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled stdout waited for the five-second screen retry"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "dashboard cancellation child failed: {status}"
+        );
+        assert!(dir.path().join("finished").exists());
+        let mut actual = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), actual.as_mut_ptr()) },
+            0
+        );
+        let actual = unsafe { actual.assume_init() };
+        assert_eq!(
+            actual.c_lflag, saved.c_lflag,
+            "saved input termios was not restored"
+        );
+        assert_eq!(actual.c_cc, saved.c_cc);
+        // The cell has finished while output is stopped. Resume only in owned cleanup.
+        assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOON) }, 0);
+    }
+
+    /// Only this owned subprocess aliases stdout/stderr onto its own PTY.
+    /// A blocked warning must fail the parent watchdog, never be rescued into
+    /// a passing final-output control.
+    #[test]
+    fn namespace_warning_on_stopped_shared_pty_reaches_finalization() {
+        namespace_warning_output_control(true, false);
+    }
+
+    #[test]
+    fn namespace_warning_on_stopped_shared_pty_without_report_reaches_finalization() {
+        namespace_warning_output_control(false, false);
+    }
+
+    #[test]
+    fn namespace_warning_only_on_stopped_shared_pty_without_report_reaches_finalization() {
+        namespace_warning_output_control(false, true);
+    }
+
+    fn namespace_warning_output_control(with_report: bool, isolate_progress: bool) {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::process::{Command, Stdio};
+        if let Some(dir) = std::env::var_os("P11SCOPE_NAMESPACE_OUTPUT_CHILD") {
+            let dir = PathBuf::from(dir);
+            // A separate warning-only control isolates default scan progress.
+            // The default-path control retains the progress diagnostics.
+            if isolate_progress {
+                crate::inspect_system::set_progress_lines(false);
+            }
+            // stdin is the owned inherited slave. The libtest banner was sent
+            // to /dev/null before this child-only descriptor redirection.
+            assert_eq!(unsafe { libc::dup2(0, 1) }, 1);
+            assert_eq!(unsafe { libc::dup2(0, 2) }, 2);
+            std::fs::write(dir.join("ready"), b"warning-path\n").unwrap();
+            let report = dir.join("report.json");
+            let finalized = dir.join("finalized");
+            let code =
+                crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), || {
+                    run_with_writer(
+                        InspectScope::System,
+                        &[],
+                        &HookRegistry::builtin(),
+                        true,
+                        Some(1),
+                        None,
+                        None,
+                        with_report.then_some(report.as_path()),
+                        false,
+                        None,
+                        None,
+                        None,
+                        CaptureMode::Scan,
+                        crate::attach::BackendSelection::Auto,
+                        &|| false,
+                        &|| {
+                            std::fs::write(&finalized, b"output-attempts\n").unwrap();
+                        },
+                        false,
+                        &mut FdStdout::new(1, &|| 0),
+                    )
+                });
+            let code = match code {
+                Ok(code) => code,
+                Err(error) => {
+                    std::fs::write(dir.join("error.txt"), format!("{error:#}")).unwrap();
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        for stopped in [true, false] {
+            let dir = private_tempdir();
+            let deadline = Instant::now() + Duration::from_secs(9);
+            let mut master_fd = -1;
+            let mut slave_fd = -1;
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master_fd,
+                        &mut slave_fd,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+            let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+            let mut attrs = unsafe { std::mem::zeroed::<libc::termios>() };
+            assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut attrs) }, 0);
+            attrs.c_oflag &= !(libc::OPOST | libc::ONLCR);
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attrs) },
+                0
+            );
+            if stopped {
+                assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
+            }
+            let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(
+                unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            let mut bytes = Vec::new();
+            let mut buf = [0; 4096];
+            use std::io::Read;
+            let mut child = OwnedChild(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", if with_report { "inventory::tests::namespace_warning_on_stopped_shared_pty_reaches_finalization" }
+                    else if isolate_progress { "inventory::tests::namespace_warning_only_on_stopped_shared_pty_without_report_reaches_finalization" }
+                    else { "inventory::tests::namespace_warning_on_stopped_shared_pty_without_report_reaches_finalization" },
+                    "--nocapture", "--test-threads=1"])
+                .env("P11SCOPE_NAMESPACE_OUTPUT_CHILD", dir.path())
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+            let status = loop {
+                if !stopped {
+                    while let Ok(n) = master.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                    }
+                }
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "namespace warning watchdog: stopped={stopped}; owned child killed/reaped on failure"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                dir.path().join("ready").exists(),
+                "child never reached warning path"
+            );
+            assert_eq!(
+                status.code(),
+                Some(i32::from(stopped)),
+                "child failure: {}",
+                std::fs::read_to_string(dir.path().join("error.txt")).unwrap_or_default()
+            );
+            assert!(
+                dir.path().join("finalized").is_file(),
+                "warning path skipped output finalization"
+            );
+            if with_report {
+                let document: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(dir.path().join("report.json")).unwrap())
+                        .unwrap();
+                assert!(
+                    document["gaps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|gap| gap["subject"] == "pid namespace"),
+                    "{document}"
+                );
+            }
+            // Output resumes only after the observer exited. Drain the healthy
+            // companion to retain the warning text; stalled success never
+            // depends on this cleanup.
+            if stopped {
+                assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOON) }, 0);
+            }
+            drop(slave);
+            while let Ok(n) = master.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            if !stopped {
+                if !isolate_progress {
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(
+                        text.contains("p11scope: enumerating processes..."),
+                        "default progress disabled: {text}"
+                    );
+                    assert!(
+                        text.contains("p11scope: lowering scan-only admission and rendering..."),
+                        "default lowering progress lost: {text}"
+                    );
+                }
+                assert!(
+                    String::from_utf8_lossy(&bytes).contains("PID namespace"),
+                    "namespace warning missing: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                if !with_report {
+                    let start = bytes.windows(2).position(|bytes| bytes == b"{\n").unwrap();
+                    let document: serde_json::Value =
+                        serde_json::from_slice(&bytes[start..]).unwrap();
+                    assert!(
+                        document["gaps"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|gap| gap["subject"] == "pid namespace")
+                    );
+                }
+            }
+            eprintln!(
+                "namespace-output: stopped={stopped}, report_requested={with_report}, watchdog=false, exit={status}, output attempts finished"
+            );
+        }
     }
 
     #[test]
@@ -2207,13 +2930,13 @@ mod tests {
                 &presentation,
                 true,
                 false,
-                &mut stdout,
+                &mut WriterStdout(&mut stdout),
                 None,
             );
             assert_eq!(result.exit_code(), 1);
             assert_eq!(result.event_log_confirmed, Some(false));
             assert_eq!(result.report_committed, Some(true));
-            assert_eq!(result.stdout_complete, Some(true));
+            assert_eq!(result.stdout_result.as_ref().map(Result::is_ok), Some(true));
             assert_eq!(result.failures.len(), 1);
             assert!(result.failures[0].contains("event log completion"));
             assert!(
@@ -2276,13 +2999,13 @@ mod tests {
             &presentation,
             true,
             false,
-            &mut stdout,
+            &mut WriterStdout(&mut stdout),
             None,
         );
         assert_eq!(result.exit_code(), 1);
         assert_eq!(result.event_log_confirmed, Some(true));
         assert_eq!(result.report_committed, Some(false));
-        assert_eq!(result.stdout_complete, Some(true));
+        assert_eq!(result.stdout_result.as_ref().map(Result::is_ok), Some(true));
         let mut notices = Vec::new();
         result.notices(None, &mut |line| notices.push(line.to_string()));
         assert!(notices.iter().any(|line| line.contains("-o report failed")));
@@ -2326,13 +3049,16 @@ mod tests {
             &presentation,
             true,
             false,
-            &mut stdout,
+            &mut WriterStdout(&mut stdout),
             None,
         );
         assert_eq!(result.exit_code(), 1);
         assert_eq!(result.event_log_confirmed, Some(false));
         assert_eq!(result.report_committed, Some(true));
-        assert_eq!(result.stdout_complete, Some(false));
+        assert_eq!(
+            result.stdout_result.as_ref().map(Result::is_ok),
+            Some(false)
+        );
         assert_eq!(result.failures.len(), 2);
         assert!(result.failures[0].contains("event log completion"));
         assert!(result.failures[1].contains("stdout failed"));
@@ -2371,7 +3097,7 @@ mod tests {
             &|| false,
             &|| finalized.set(true),
             false,
-            &mut stdout,
+            &mut WriterStdout(&mut stdout),
             &DashboardIo::stdio(),
         );
         assert_eq!(result.unwrap(), 1);
@@ -2448,7 +3174,7 @@ mod tests {
             &|| true,
             &|| {},
             true,
-            &mut ResumeThenFail(slave.as_raw_fd()),
+            &mut WriterStdout(&mut ResumeThenFail(slave.as_raw_fd())),
             &terminal,
         );
         let account = account
@@ -2551,7 +3277,7 @@ mod tests {
                 &|| false,
                 &|| {},
                 false,
-                out,
+                &mut WriterStdout(out),
             )
         };
         let mut out = Vec::new();
@@ -2771,7 +3497,7 @@ mod tests {
                     &presentation,
                     true,
                     false,
-                    &mut stdout,
+                    &mut WriterStdout(&mut stdout),
                     Some(&summary),
                 )
                 .exit_code(),
@@ -2824,7 +3550,7 @@ mod tests {
                     &presentation,
                     true,
                     false,
-                    &mut stdout,
+                    &mut WriterStdout(&mut stdout),
                     Some(&summary),
                 )
                 .exit_code(),
@@ -2857,7 +3583,7 @@ mod tests {
                 &presentation,
                 true,
                 false,
-                &mut stdout,
+                &mut WriterStdout(&mut stdout),
                 None,
             )
             .exit_code(),
@@ -3129,7 +3855,7 @@ mod tests {
                 &last,
                 false,
                 true,
-                &mut sink,
+                &mut WriterStdout(&mut sink),
                 None,
             )
             .exit_code(),
@@ -3262,7 +3988,7 @@ mod tests {
             &|| false,
             &|| {},
             true,
-            &mut stdout,
+            &mut WriterStdout(&mut stdout),
             &terminal,
         )
         .unwrap();
@@ -3348,7 +4074,7 @@ mod tests {
                     view,
                     false,
                     true,
-                    &mut sink,
+                    &mut WriterStdout(&mut sink),
                     None,
                 )
                 .exit_code(),

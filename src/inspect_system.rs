@@ -26,7 +26,7 @@
 use crate::attach::Scope;
 use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
-use crate::discovery::confirm_shards::attribute_unselected_sharded;
+use crate::discovery::confirm_shards::attribute_unselected_with_policy;
 use crate::discovery::engine::{
     MAX_SCAN_PIDS, scope_pids, select_deep_scan_candidates, sweep_process_maps,
     unreadable_member_skip,
@@ -43,10 +43,11 @@ use crate::discovery::scan::{
     scan_process_view_examined, scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
-    AttributionLoss, KnownKeyIndex, MatchedObject, MemberProbe, ObjectChecks, OsConfirmIo,
-    OsMemberProbe, RefusedObject, SweepAttribution, SweptMember, attribute_unselected,
-    is_caller_range, retain_unchanged,
+    AttributionLoss, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo, ProofPools,
+    RefusedObject, ReservationOwner, SegmentPolicy, SweepAttribution, SweptMember, is_caller_range,
+    retain_unchanged,
 };
+use crate::discovery::sweep_attribution::{MemberProbe, OsMemberProbe, attribute_unselected};
 use crate::discovery::sweep_shards::{shard_count, shard_threads};
 use crate::inspect_identity::{
     InspectApplicationResult, InspectIdentityUnknown, InspectImageReader, ProcessViewImageReader,
@@ -969,39 +970,56 @@ pub(crate) fn collect(
     // for this confirmation stage only (DR-C1b-3); the shards never nest
     // that pool.
     let shards = shard_count(collection.sweep.len(), shard_threads());
-    let attributed = if shards > 1 {
+    let segment_policy = SegmentPolicy::snapshot(shard_threads(), collection.sweep.len());
+    let reservations = ReservationOwner::new(segment_policy);
+    let attribute = |pools: ProofPools<'_>| {
         attribute_sweep_with(
             &mut collection,
             &bound,
             &bound.aggregate,
             |sweep, unavailable, selected, index, budget| {
-                attribute_unselected_sharded(
+                attribute_unselected_with_policy(
                     sweep,
                     unavailable,
                     selected,
                     index,
                     budget,
+                    segment_policy,
+                    &reservations,
                     shards,
-                    &OsConfirmIo::default,
+                    &|| OsConfirmIo::with_pools(pools),
                 )
             },
         )
-    } else {
-        ProofStatPool::scoped(proof_stat_threads(), |pool| {
-            attribute_sweep(
-                &mut collection,
-                &bound,
-                &mut OsMemberProbe { pool },
-                &bound.aggregate,
-            )
-        })
     };
+    let attributed =
+        with_confirmation_pools(shards, segment_policy, proof_stat_threads(), attribute);
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(collection, bound, attributed, policy);
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
     Ok(catalog)
+}
+
+/// Immediate work keeps its FD-free proof pool even when the population
+/// selected shards. Parallel batch workers avoid nested range workers.
+fn with_confirmation_pools<R>(
+    shards: usize,
+    policy: SegmentPolicy,
+    threads: usize,
+    body: impl FnOnce(ProofPools<'_>) -> R,
+) -> R {
+    ProofStatPool::scoped(threads, |pool| {
+        body(ProofPools {
+            batch: if shards > 1 && policy.workers > 1 {
+                None
+            } else {
+                pool
+            },
+            immediate: pool,
+        })
+    })
 }
 
 /// Collect one pid through the same member scan and the same assembly:
@@ -2915,7 +2933,9 @@ mod tests {
         use super::super::*;
         use crate::discovery::identity::test_fixture::{PATH, SHA, module, view_pin};
         use crate::discovery::identity::{FileIdentity, MappedFile};
-        use crate::discovery::sweep_attribution::{Confirmation, ConfirmedRead, MappedIdentities};
+        use crate::discovery::sweep_attribution::{
+            Confirmation, ConfirmedRead, MappedIdentities, RangeProof,
+        };
         use p11scope_manifest::maps::{Device, ObjectKey};
         use std::collections::HashMap;
 
@@ -2991,7 +3011,12 @@ mod tests {
                 let entries = self.0.get(&pid).cloned().unwrap_or_default();
                 let mapped = entries
                     .iter()
-                    .map(|entry| ((entry.start, entry.end), Ok(vm_file(entry))))
+                    .map(|entry| {
+                        (
+                            (entry.start, entry.end),
+                            RangeProof::MapFiles(vm_file(entry)),
+                        )
+                    })
                     .collect();
                 Confirmation::Confirmed(ConfirmedRead {
                     start_time: 9_000 + u64::from(pid),
@@ -3014,7 +3039,7 @@ mod tests {
                         entries
                             .iter()
                             .find(|entry| (entry.start, entry.end) == *range)
-                            .map(|entry| (*range, Ok(vm_file(entry))))
+                            .map(|entry| (*range, RangeProof::MapFiles(vm_file(entry))))
                     })
                     .collect()
             }
@@ -4280,5 +4305,266 @@ pub(crate) mod demotion_retirement_producer_tests {
             positive_budget.stopped_reason(),
             positive_budget.refusal_counts(),
         );
+    }
+}
+
+#[cfg(test)]
+mod d3a_adapter_tests {
+    use super::with_confirmation_pools;
+    use crate::discovery::caller_registry::ExeIdentity;
+    use crate::discovery::confirm_shards::{ShardableIo, attribute_unselected_with_policy};
+    use crate::discovery::identity::{FileIdentity, MappedFile, PinnedObjectId};
+    use crate::discovery::proof_stats::MIN_PARALLEL_BATCH;
+    use crate::discovery::scan::{CaptureWorkBudget, read_maps_or_refuse};
+    use crate::discovery::sweep_attribution::{
+        AttributionLoss, ConfirmIo, FdLease, KnownKeyIndex, ObjectChecks, OsConfirmIo, ProofTrace,
+        ReservationOwner, SegmentPolicy,
+    };
+    use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::sync::{Arc, Mutex};
+
+    struct AdapterIo<'p> {
+        os: OsConfirmIo<'p>,
+        text: Arc<Vec<u8>>,
+        trace: Arc<Mutex<ProofTrace>>,
+        owner: ReservationOwner,
+    }
+
+    impl ConfirmIo for AdapterIo<'_> {
+        type Pin = std::fs::File;
+        fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+            self.os.mapped_file(pid, start, end)
+        }
+        fn mapped_files_reserved(
+            &mut self,
+            pid: u32,
+            ranges: &[(u64, u64)],
+            lease: Option<FdLease>,
+        ) -> Vec<Result<FileIdentity, String>> {
+            let results = self.os.mapped_files_reserved(pid, ranges, lease);
+            // The actual OS directory has closed and returned its immediate
+            // transient lease before final checks or the next PID can reuse it.
+            assert_eq!(self.owner.state_for_test().0[3], 0);
+            let trace = self.trace.lock().unwrap();
+            assert_eq!(trace.opened, trace.closed);
+            results
+        }
+        fn open(&mut self, _pid: u32) -> Result<Self::Pin, String> {
+            std::fs::File::open("/dev/null").map_err(|error| error.to_string())
+        }
+        fn start_time(&self, _pin: &Self::Pin) -> Option<u64> {
+            Some(1)
+        }
+        fn still_the_same(&self, _pin: &Self::Pin) -> bool {
+            true
+        }
+        fn exe(&self, _pid: u32) -> Option<ExeIdentity> {
+            Some(ExeIdentity {
+                dev: 1,
+                ino: 2,
+                mtime_secs: 3,
+                mtime_nanos: 0,
+                path: None,
+            })
+        }
+        fn maps(
+            &mut self,
+            pid: u32,
+            budget: &mut CaptureWorkBudget,
+        ) -> Result<Vec<MapEntry>, String> {
+            read_maps_or_refuse(self.open_maps(pid).unwrap(), budget, || self.maps_now())
+        }
+        fn gone(&self, _pid: u32) -> bool {
+            false
+        }
+    }
+
+    impl ShardableIo for AdapterIo<'_> {
+        type Maps = std::io::Cursor<Vec<u8>>;
+        fn open_maps(&mut self, _pid: u32) -> std::io::Result<Self::Maps> {
+            Ok(std::io::Cursor::new(self.text.as_ref().clone()))
+        }
+        fn maps_now(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    struct Held;
+    impl ObjectChecks for Held {
+        fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
+            Ok(None)
+        }
+        fn unchanged(&self, _: PinnedObjectId) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
+            Ok(MappedFile {
+                identity: FileIdentity { dev: 37, ino: 7001 },
+                fs_magic: None,
+            })
+        }
+    }
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn d3a_r2_immediate_adapter_preserves_proof_pool() {
+        let child = Child(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let mut pids = [std::process::id(), child.0.id()];
+        pids.sort_unstable();
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 7001,
+        };
+        let object = PinnedObjectId(1);
+        let (index, refused) = KnownKeyIndex::build(
+            [(key, Some(object))],
+            &BTreeMap::from([(key, object)]),
+            [],
+            &Held,
+        );
+        assert!(refused.is_empty());
+        for (headroom, oversized) in [(3, false), (4, false), (5, false), (9, true)] {
+            for count in [
+                MIN_PARALLEL_BATCH - 1,
+                MIN_PARALLEL_BATCH,
+                MIN_PARALLEL_BATCH + 1,
+            ] {
+                // Odd range ends cannot name a Linux VMA. The production OS
+                // proof reads therefore return exact ENOENT negatives without
+                // privilege or reliance on any provider's installed behavior.
+                let text: Vec<u8> = (0..count)
+                    .map(|i| {
+                        let start = 0x6000_0000_0000u64 + (i as u64) * 0x2000;
+                        format!(
+                            "{start:x}-{:x} r-xp 00000000 08:01 7001 /usr/lib/provider.so\n",
+                            start + 0x1001
+                        )
+                    })
+                    .collect::<String>()
+                    .into_bytes();
+                let text = Arc::new(text);
+                let entries = p11scope_manifest::maps::parse_maps(text.as_slice()).unwrap();
+                let sweep: Vec<_> = pids.iter().map(|&pid| (pid, entries.clone())).collect();
+                let mut policy = SegmentPolicy::from_headroom(headroom, 4, sweep.len());
+                if oversized {
+                    assert_eq!((policy.workers, policy.retained), (2, 2));
+                    policy.max_ranges = 0;
+                } else {
+                    assert_eq!((policy.workers, policy.retained), (0, 0));
+                }
+                let mut oracle = None;
+                for proof_threads in [1, 4] {
+                    let owner = ReservationOwner::new(policy);
+                    let trace = Arc::new(Mutex::new(ProofTrace::default()));
+                    let mut budget = CaptureWorkBudget::default();
+                    let out = with_confirmation_pools(4, policy, proof_threads, |pools| {
+                        if oversized {
+                            assert!(
+                                pools.batch.is_none(),
+                                "parallel batch must not nest a range pool"
+                            );
+                        }
+                        let make_io = || {
+                            assert_eq!(
+                                owner.state_for_test().0,
+                                [0; 4],
+                                "previous immediate envelope still held"
+                            );
+                            let trace_state = trace.lock().unwrap();
+                            assert_eq!(trace_state.opened, trace_state.closed);
+                            drop(trace_state);
+                            AdapterIo {
+                                os: OsConfirmIo::with_pools(pools).observing(trace.clone()),
+                                text: text.clone(),
+                                trace: trace.clone(),
+                                owner: owner.clone(),
+                            }
+                        };
+                        // Serial preparation makes the rejected oversized
+                        // record's destruction fence directly observable.
+                        attribute_unselected_with_policy(
+                            &sweep,
+                            &BTreeSet::new(),
+                            &BTreeSet::new(),
+                            &index,
+                            &mut budget,
+                            policy,
+                            &owner,
+                            if oversized { 1 } else { 4 },
+                            &make_io,
+                        )
+                    });
+                    assert!(out.members.is_empty());
+                    assert_eq!(out.probed, 2);
+                    assert_eq!(out.member_losses.keys().copied().collect::<Vec<_>>(), pids);
+                    assert!(
+                        out.member_losses
+                            .values()
+                            .all(|(loss, _)| *loss == AttributionLoss::MappingChanged)
+                    );
+                    assert!(out.unexamined_objects.is_empty());
+                    let state = budget.confirm_state_for_test();
+                    assert_eq!(state.1, (2 * count) as u64);
+                    assert_eq!(state.0.attempted_io_bytes, (2 * text.len()) as u64);
+                    assert_eq!(state.0.stop, None);
+                    assert!(!state.0.stop_reported);
+                    if let Some((expected, expected_state)) = &oracle {
+                        assert_eq!(&out, expected);
+                        assert_eq!(&state, expected_state);
+                    } else {
+                        oracle = Some((out, state));
+                    }
+                    let trace = trace.lock().unwrap();
+                    assert_eq!(trace.opened, 2);
+                    assert_eq!(trace.closed, 2);
+                    let mut requests: Vec<_> = trace
+                        .reads
+                        .iter()
+                        .map(|&(pid, start, end, _, _)| (pid, start, end))
+                        .collect();
+                    requests.sort_unstable();
+                    let expected: Vec<_> = pids
+                        .iter()
+                        .flat_map(|&pid| {
+                            entries
+                                .iter()
+                                .map(move |entry| (pid, entry.start, entry.end))
+                        })
+                        .collect();
+                    assert_eq!(requests, expected);
+                    let threads: HashSet<_> = trace.reads.iter().map(|read| read.3).collect();
+                    if proof_threads > 1 && count >= MIN_PARALLEL_BATCH {
+                        assert!(
+                            threads.len() > 1,
+                            "H={headroom}: population shards discarded the immediate proof pool"
+                        );
+                        assert!(trace.reads.iter().any(|read| {
+                            read.4
+                                .as_deref()
+                                .is_some_and(|name| name.starts_with("p11scope-proof-"))
+                        }));
+                    } else {
+                        assert_eq!(threads, HashSet::from([std::thread::current().id()]));
+                    }
+                    assert_eq!(owner.state_for_test().0, [0; 4]);
+                    assert_eq!(owner.state_for_test().1[2], 1);
+                    assert_eq!(owner.state_for_test().1[3], 2);
+                    assert_eq!(owner.state_for_test().2, 3);
+                }
+            }
+        }
     }
 }

@@ -39,7 +39,8 @@
 # Per-sample gates (any failure fails the campaign immediately; nothing is
 # excluded silently): quiet-host load gate (load1 < MAX_LOAD1 AND load5 <
 # MAX_LOAD5, defaults 4/4 per the M2 discipline, no cargo/rustc; bounded
-# COOLDOWN, default 300 s, else the campaign is refused), workload READY,
+# COOLDOWN, default 300 s, else the campaign is refused; plus a
+# load1 < 2.0 settle at cell boundaries), workload READY,
 # observer lane-active line with a recorded attach mechanism, two
 # per-pass progress lines before the gate opens (extend precedes commit in
 # a pass, so endpoint probes are attached), exact workload op count +
@@ -277,6 +278,21 @@ host_hot() {
 wait_cool() {
     waited=0
     while host_hot "$MAX_LOAD1" "$MAX_LOAD5" || [ "$(build_processes)" != 0 ]; do
+        if [ "$waited" -ge "$COOLDOWN" ]; then
+            return 1
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    return 0
+}
+
+# wait_settle: deeper quiet wait at cell boundaries (a hot cell's heat must
+# not step into the next cell's first round: the smoke showed a t12-hot
+# first unrelated sample). False when the host never settles: refused.
+wait_settle() {
+    waited=0
+    while awk '{exit !($1 >= 2.0)}' /proc/loadavg || [ "$(build_processes)" != 0 ]; do
         if [ "$waited" -ge "$COOLDOWN" ]; then
             return 1
         fi
@@ -745,7 +761,14 @@ EOF
     say "SAMPLE cell=$rs_cell arm=$rs_arm round=$rs_round threads=1 ops=$rs_ops wall_ns=$rs_wall pad=0 mode=mmap parallel=1 lane=$rs_lane edge_count=$rs_edge_count edge_expected=$rs_expected edge_state=$rs_edge_state bpf_ns=$rs_bpf_ns bpf_cnt=$rs_bpf_cnt"
 }
 
+first_cell=1
 for cell in $CELLS; do
+    if [ "$first_cell" = 1 ]; then
+        first_cell=0
+    else
+        echo "--- settling before cell $cell ---"
+        wait_settle || refuse "host never settled below load1 2.0 ($COOLDOWN s)"
+    fi
     round=1
     while [ "$round" -le "$ROUNDS" ]; do
         if [ $((round % 2)) -eq 1 ]; then

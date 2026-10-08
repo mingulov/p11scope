@@ -362,7 +362,7 @@ except Exception:
 for prog in sorted(progs, key=lambda p: p.get("id", 0)):
     name = prog.get("name", "")
     if name.startswith("p11_usage_entry"):
-        print(f"{prog['id']} {name}")
+        print(prog.get("id"), name)
 '
 }
 

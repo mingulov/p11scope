@@ -170,71 +170,58 @@ fn identity_core_relocations_resolve_against_host_btf() {
     drop(pristine);
 }
 
-/// D2a byte-identity gate: the three default objects are unchanged by the new
-/// flavor. Digests pinned at BASE `cd6ad51` in this toolchain; small-ring and
-/// diagnostic features legitimately change the objects, so the pin applies
-/// only to the default build.
-#[test]
-fn default_objects_byte_identical_to_base() {
-    if cfg!(feature = "unsafe-unvalidated-metadata")
-        || cfg!(feature = "wide-detailed-2112")
-        || cfg!(p11scope_small_discovery_ring)
-        || std::env::var("P11SCOPE_SMALL_RING").is_ok_and(|v| v == "1" || v == "true")
-        || std::env::var("P11SCOPE_SMALL_STATE_MAPS").is_ok_and(|v| v == "1" || v == "true")
-        || std::env::var("P11SCOPE_SMALL_DISCOVERY_RING").is_ok_and(|v| v == "1" || v == "true")
-    {
-        eprintln!("byte-identity pin applies to default builds only; skipping");
-        return;
-    }
+/// Reviewed native source inputs, independent of compiler-produced debug bytes.
+/// Source/flag changes need review and affected behavior/ABI tests; this
+/// tripwire alone is not semantic equivalence or runtime qualification.
+const IDENTITY_INPUTS: [(&str, &[u8], &str); 3] = [
+    (
+        "vma_identity.c",
+        include_bytes!("../crates/ebpf/native/vma_identity.c"),
+        "c1197dd1e616f1be4bcbf8abf651fd5254e5683f2d652f650187058a7fe31256",
+    ),
+    (
+        "vma_identity.h",
+        include_bytes!("../crates/ebpf/native/vma_identity.h"),
+        "f7832cc4aef629f38a03530412377b902d1a70bd7bcb0c601e8c9f9478f17aba",
+    ),
+    (
+        "uapi_check.c",
+        include_bytes!("../crates/ebpf/native/uapi_check.c"),
+        "69b17fde1f8755865dee1f79286d0378a6c6431a09a91b565a9ef674e248a963",
+    ),
+];
+
+fn check_identity_input(name: &str, bytes: &[u8], expected: &str) -> Result<(), String> {
     use sha2::Digest as _;
-    // The identity object has no feature variants: its pin (below) applies
-    // to every build, while these three skip under small-ring/diagnostic
-    // features.
-    for (name, bytes, pinned) in [
-        (
-            "p11scope-ebpf",
-            p11scope::EBPF_OBJECT,
-            "b62b40541cad83d211cbd80031c4e2bbea60edd20f5a040af35f1f890efb9f08",
-        ),
-        (
-            "p11scope-ebpf-inventory",
-            p11scope::EBPF_INVENTORY_OBJECT,
-            "a8b93b30813b666ef63a868f0615cfa2b7da8822d0bfa297f35b6f680759bc77",
-        ),
-        (
-            "p11scope-ebpf-inventory-callers",
-            p11scope::EBPF_INVENTORY_CALLERS_OBJECT,
-            "bc77210dbd74ecf2ec8dbac9bb73553c37f0939512e7d1a71c65df35300be480",
-        ),
-    ] {
-        let digest = sha2::Sha256::digest(bytes);
-        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(hex, pinned, "{name} must stay byte-identical to BASE");
+    let digest = sha2::Sha256::digest(bytes);
+    let actual: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} source input changed: expected {expected}, got {actual}"
+        ))
     }
 }
 
-/// Digest pin for the identity object itself (F-build): any source or
-/// toolchain drift changes these bytes, and the pin fails loudly. Pinned
-/// at the arena-containment commit in this toolchain (round 1:
-/// `000caca5…`; round 2 adds the fifth map plus the end-containment
-/// check; round 3 re-pins comment-only — the observed-map doc comment
-/// was rewritten with identical line numbers, so code/maps/BTF are
-/// byte-identical and only the DWARF `.debug_line` source MD5 moved;
-/// round 4 re-pins comment-only again — the marker-outcome phrase was
-/// narrowed to the explicit triple with identical line numbers, so
-/// `iter/task_vma`, `.maps`, `license`, `.BTF`, and `.BTF.ext` are
-/// byte-identical and only `.debug_line` moved); the build-info test
-/// below binds the pin to the compiler digest and CPU baseline it was
-/// recorded with.
+/// The existing receipt test below pins the complete compile/UAPI argv,
+/// endian target and CPU baseline. Together these contracts work in a
+/// source recipient without Git history or an old development-host ELF.
 #[test]
-fn identity_object_digest_pinned() {
-    use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(OBJECT);
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    assert_eq!(
-        hex, "e948001ed065c7f731ae3753a3bc59c4923d38e4fffb64bfb789527e9c4a5420",
-        "p11scope-ebpf-identity must stay byte-identical to the round-4 pin"
-    );
+fn identity_source_and_compile_contract_pinned() {
+    for (name, bytes, expected) in IDENTITY_INPUTS {
+        check_identity_input(name, bytes, expected).unwrap();
+    }
+}
+
+#[test]
+fn identity_source_contract_rejects_changed_byte_in_each_input() {
+    for (name, bytes, expected) in IDENTITY_INPUTS {
+        let mut changed = bytes.to_vec();
+        changed[0] ^= 1;
+        let error = check_identity_input(name, &changed, expected).unwrap_err();
+        assert!(error.contains(name), "mutation must name the changed input");
+    }
 }
 
 /// Qualification binding (F-build): the build records the resolved
@@ -244,8 +231,8 @@ fn identity_object_digest_pinned() {
 /// must exist, be executable, and re-hash to the recorded digest), the
 /// complete argument record, and its agreement with the object under
 /// test. Ordinary builds still trust their tool environment (PATH
-/// `clang-18`, system headers) — the record makes qualification
-/// reproducible, not the build hermetic.
+/// `clang-18`, system headers) — the record binds this
+/// executed build, not a historical compiler or cross-environment equality.
 #[test]
 fn identity_build_info_binds_compiler_and_baseline() {
     let info = std::fs::read_to_string(concat!(

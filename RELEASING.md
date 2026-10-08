@@ -71,20 +71,49 @@ dependency upgrade that needs the full checks and qualification again.
 
 Push the frozen commit to a branch and let `ci` run. Every job of the push
 run must pass on that exact SHA: `dedupe`; the check jobs `lint`, `audit`,
-`tests`, every `contracts-N` shard and `scripts`; every `coverage` shard and
+`tests`, `bpf-noninterference`, every `contracts-N` shard and `scripts`; every `coverage` shard and
 `coverage-report`; and `archive-log`. `quarantine` runs only when a check
 job failed, so a green run skips it.
 
 `ci` runs the full matrix once per commit. When the same commit is pushed
 again under another ref (the release branch, then `main`, then the tag),
 the later push run's `dedupe` job finds the earlier push or dispatch run that
-already passed `lint` and `coverage-report` on that SHA, skips its own check
+already passed `lint`, `coverage-report` and `bpf-noninterference` on that SHA, skips its own check
 and coverage jobs, and names the covering run in its summary. If the earlier
 run is still going, `dedupe` waits for it, and runs the full matrix itself
 when that run fails, is cancelled or is still unfinished after 75 minutes.
 Record the URL of the run that executed the matrix, not of a deduplicated
 one; a deduplicated run on the tag is green only because that covering run
 passed. A manual dispatch always runs the full matrix.
+
+`bpf-noninterference` follows `tests`, including when tests fail. It first
+builds released `792530713348f3a74e9100140226a51aea65a666` twice, then compares
+that release with the exact candidate commit in fresh sequential snapshots.
+All bytes of the three default BPF objects must match in the same pinned
+tool/header environment. Its separate artifact retains commands, source and
+tool receipts, object digests and section summaries on success or failure.
+After root/BPF acquisition, it fetches the selected pinned nightly's installed
+`library/sysroot/Cargo.toml` with `--locked` before the offline build. Receipts
+bind that manifest and `library/Cargo.lock` before/after and between snapshots;
+the toolchain source inputs must stay unchanged.
+The checker's command runner applies timeouts; later text parsing rejects stdout
+over 64 MiB. Captured
+stdout/stderr files have no byte cap and can consume disk until a command exits
+or times out, including a failed build whose output is retained without parsing.
+This gate does not qualify the separate identity object on a live kernel.
+
+For a restricted network environment, pass both `--baseline-offline-payload ABS`
+and `--candidate-offline-payload ABS` to the checker. Each snapshot admits its
+payload against its own committed offline recipe using the existing complete
+validator. The checker copies validated inputs into owned scratch, generates
+only the exact source replacement config, and uses locked offline fetches and
+offline nested Cargo in a fresh private home for each build. Receipts bind the
+supplied and copied payloads, config and coordinator helpers before and after
+execution. Use the released payload for both sides of the R/R diagnostic.
+The ordinary acquisition path also fetches nightly sysroot dependencies;
+root/BPF fetches alone do not provide that closure. Payload mode does not
+establish hosted online/network qualification, which still needs real CI
+evidence.
 
 Then dispatch `ci` manually on the same ref (Actions → ci → Run workflow,
 `release_preview` selected). Keep the `release-preview-public-assets` artifact

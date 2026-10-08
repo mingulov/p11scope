@@ -37,11 +37,13 @@ SUITE_DIR = "tests/python"
 
 # (file, extra args). A file may appear more than once with different args.
 RUN = [
+    ("test_bpf_noninterference.py", []),
     ("test_cargo_wrapper.py", []),
     ("test_e16_oracle.py", []),
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),
     ("test_ci_dependency_selection.py", []),
+    ("test_dashboard_pty_cleanup.py", []),
     ("test_help_usage_drift.py", []),
     ("test_loader.py", []),
     ("test_measure_e03.py", []),

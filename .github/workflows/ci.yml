@@ -66,8 +66,8 @@ jobs:
   # minutes at most), so a cancelled or failed earlier run never leaves the
   # commit without a result: the matrix then runs here. Pull requests (which
   # test a merge commit) and manual dispatches always run it, and any API
-  # error runs it too. A covering run must itself have run lint and
-  # coverage-report, so a run that only deduplicated never covers another.
+  # error runs it too. A covering run must itself have run lint,
+  # coverage-report and bpf-noninterference successfully.
   dedupe:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -107,9 +107,9 @@ jobs:
                 active="$active $id"
               elif [ "$conclusion" = success ]; then
                 ran=$(gh api "$api/runs/$id/jobs?per_page=100" \
-                  --jq '[.jobs[] | select((.name == "lint" or .name == "coverage-report") and .conclusion == "success")] | length') \
+                  --jq '[.jobs[] | select((.name == "lint" or .name == "coverage-report" or .name == "bpf-noninterference") and .conclusion == "success")] | unique_by(.name) | length') \
                   || ran=0
-                if [ "$ran" = 2 ]; then
+                if [ "$ran" = 3 ]; then
                   decide false "commit $GITHUB_SHA already passed the full check matrix in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id; this run skips it"
                 fi
               fi
@@ -338,6 +338,52 @@ jobs:
       - run: cargo +"$(cat .release-rust-version)" test --locked --offline --manifest-path third-party/src/aya-obj-0.3.0-p2/Cargo.toml --target-dir target/aya-obj-tests --lib
       - name: Prove the prepared dependency trees are unchanged
         run: python3 -I scripts/prepare-dependencies.py --check
+  # Reuse the tests runner slot. Failure of tests still permits this independent
+  # diagnostic, while cancellation and a deduplicated run suppress it.
+  bpf-noninterference:
+    needs: [dedupe, tests]
+    if: ${{ !cancelled() && needs.dedupe.outputs.run == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
+      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      # The checker reconstructs and explicitly fetches each immutable snapshot,
+      # then builds it offline (including nested nightly Cargo). No target cache.
+      - name: Compare complete default objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASELINE=792530713348f3a74e9100140226a51aea65a666
+          comparison_root="$RUNNER_TEMP/bpf-noninterference"
+          mkdir -m 700 "$comparison_root"
+          python3 -I scripts/check-bpf-noninterference.py \
+            --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$BASELINE" \
+            --work "$comparison_root/repeat-baseline" --repeat-baseline
+          python3 -I scripts/check-bpf-noninterference.py \
+            --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$GITHUB_SHA" \
+            --work "$comparison_root/integration"
+          test -s "$comparison_root/repeat-baseline/comparison.json"
+          test -s "$comparison_root/integration/comparison.json"
+      - name: Retain available comparison evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpf-noninterference
+          path: |
+            ${{ runner.temp }}/bpf-noninterference/*/*.json
+            ${{ runner.temp }}/bpf-noninterference/*/*.jsonl
+            ${{ runner.temp }}/bpf-noninterference/*/*.stdout
+            ${{ runner.temp }}/bpf-noninterference/*/*.stderr
+            ${{ runner.temp }}/bpf-noninterference/*/baseline/
+            ${{ runner.temp }}/bpf-noninterference/*/candidate/
+          if-no-files-found: error
+          retention-days: 90
   # The same workspace test gate, narrowed to artifact_contracts and split
   # into shards. Each shard computes the same longest-first plan from the
   # binary's own test list and the checked-in scripts/ci-test-weights.json,
@@ -596,7 +642,7 @@ jobs:
   # token gets actions: read and nothing else; upload-artifact uses the runtime
   # token, not GITHUB_TOKEN. It neither restores nor saves a cache.
   archive-log:
-    needs: [lint, audit, tests, contracts, scripts]
+    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]
     # Not always(): a cancelled run's log is truncated by definition, and
     # publishing it produces an artifact that looks like evidence of a
     # completed job and is not. Failures still archive. A run the dedupe job
@@ -607,7 +653,7 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
-      CHECK_JOBS: lint audit tests contracts-1 contracts-2 contracts-3 contracts-4 contracts-5 contracts-6 contracts-7 contracts-8 scripts
+      CHECK_JOBS: lint audit tests bpf-noninterference contracts-1 contracts-2 contracts-3 contracts-4 contracts-5 contracts-6 contracts-7 contracts-8 scripts
     steps:
       - run: |
           mkdir "$RUNNER_TEMP/checks-logs"
@@ -1084,7 +1130,7 @@ jobs:
   # when any check job fails, each ledgered flake re-runs exactly once,
   # serially, in isolation. A green quarantine run never greens the workflow.
   quarantine:
-    needs: [lint, audit, tests, contracts, scripts]
+    needs: [lint, audit, tests, bpf-noninterference, contracts, scripts]
     if: failure()
     runs-on: ubuntu-24.04
     steps:

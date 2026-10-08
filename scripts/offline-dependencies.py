@@ -1011,18 +1011,18 @@ def assemble(root: Path, options, preparer, checker) -> None:
                                            "inputs": inputs, "outcome": outcome})
 
 
-def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
-    _external_target(root, options.prefix, "evidence prefix")
-    _absolute_directory(options.payload, "offline dependency payload")
+def _verify_payload_contents(root: Path, payload: Path, nightly_rustc: Path,
+                             preparer, *, reconstruct: bool = True) -> tuple[dict, dict]:
+    """Validate all payload content against maintained inputs, without source-origin evidence."""
+    _absolute_directory(payload, "offline dependency payload")
     recipe_path = root / RECIPE_RELATIVE
     if not recipe_path.is_file():
         raise OfflineDependencyError(f"fixed recipe is missing: {recipe_path}")
     manifest = _strict_manifest(root, preparer)
-    project_source = _project_source_identity(root)
     recipe_bytes = recipe_path.read_bytes()
     recipe = _validate_recipe(_read_json(recipe_path, "fixed recipe"), manifest, preparer, root)
-    tool = _tool_identity(options.nightly_rustc, "nightly rustc")
-    rust, nightly = _rust_source(options.nightly_rustc)
+    tool = _tool_identity(nightly_rustc, "nightly rustc")
+    rust, nightly = _rust_source(nightly_rustc)
     inputs = _check_current_inputs(
         root, recipe, manifest, preparer, nightly, recipe["shared_git"]
     )
@@ -1031,8 +1031,8 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
     shared, expected_vendor = _locked_dependencies(lock_paths)
     if shared != recipe["shared_git"]:
         raise OfflineDependencyError("shared Git revision in dependency locks changed")
-    _entry_inventory(options.payload, payload_modes=True)
-    shared_dir = options.payload / "provenance/shared"
+    _entry_inventory(payload, payload_modes=True)
+    shared_dir = payload / "provenance/shared"
     try:
         shared_names = {path.name for path in shared_dir.iterdir()}
     except OSError as error:
@@ -1048,12 +1048,12 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
         "licenses": _shared_license_digests(shared_dir),
         "packages": [],
     }
-    _payload_structure(options.payload, manifest, expected_vendor, expected_shared)
-    _verify_nightly_provenance(options.payload, nightly)
+    _payload_structure(payload, manifest, expected_vendor, expected_shared)
+    _verify_nightly_provenance(payload, nightly)
     try:
         if reconstruct:
             preparer.run(root, check=False, offline=True,
-                         archive_dir=options.payload / "archives")
+                         archive_dir=payload / "archives")
         else:
             with _existing_preparation_lock(root):
                 preparer.run(root, check=True, offline=False, archive_dir=None)
@@ -1061,7 +1061,7 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
         action = "original archives cannot reconstruct prepared trees" if reconstruct \
             else "existing prepared outputs failed read-only verification"
         raise OfflineDependencyError(f"{action}: {error}") from error
-    final_rust, final_nightly = _rust_source(options.nightly_rustc)
+    final_rust, final_nightly = _rust_source(nightly_rustc)
     if final_rust != rust or final_nightly != nightly:
         raise OfflineDependencyError("nightly source input changed during verification")
     final_shared, final_vendor = _locked_dependencies(lock_paths)
@@ -1071,14 +1071,30 @@ def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
         raise OfflineDependencyError("recipe inputs changed during verification")
     if recipe_path.read_bytes() != recipe_bytes:
         raise OfflineDependencyError("fixed recipe changed during verification")
-    actual_digest = tree_content_digest(options.payload)
+    actual_digest = tree_content_digest(payload)
     if actual_digest != recipe["payload_tree_sha256"]:
         raise OfflineDependencyError(
             f"payload tree digest mismatch: expected {recipe['payload_tree_sha256']}, got {actual_digest}"
         )
     receipt = {"schema_version": 1, "recipe_sha256": _sha256_bytes(recipe_bytes),
-               "observed_inputs": inputs, "payload": str(options.payload),
-               "payload_tree_sha256": actual_digest, "project_source": project_source}
+               "observed_inputs": inputs, "payload": str(payload),
+               "payload_tree_sha256": actual_digest}
+    return receipt, tool
+
+
+def verify(root: Path, options, preparer, *, reconstruct: bool = True) -> dict:
+    _external_target(root, options.prefix, "evidence prefix")
+    _absolute_directory(options.payload, "offline dependency payload")
+    if not (root / RECIPE_RELATIVE).is_file():
+        raise OfflineDependencyError(f"fixed recipe is missing: {root / RECIPE_RELATIVE}")
+    _strict_manifest(root, preparer)
+    project_source = _project_source_identity(root)
+    receipt, tool = _verify_payload_contents(
+        root, options.payload, options.nightly_rustc, preparer, reconstruct=reconstruct
+    )
+    receipt["project_source"] = project_source
+    inputs = receipt["observed_inputs"]
+    actual_digest = receipt["payload_tree_sha256"]
     values = {
         "command": {"operation": "verify", "payload": str(options.payload),
                     "nightly_rustc": str(options.nightly_rustc), "root": str(root)},

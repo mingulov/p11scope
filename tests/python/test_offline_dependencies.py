@@ -913,6 +913,39 @@ class OfflineDependenciesTests(unittest.TestCase):
         self.assertEqual(receipt["project_source"]["revision"], "1" * 40)
         self.assertEqual(receipt["payload_tree_sha256"], association["payload_tree_sha256"])
 
+    def test_internal_content_validation_accepts_raw_snapshot_without_public_origin_bypass(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        self.fixture.export_manifest.unlink()
+        helper = load_module(self.root_helper, "offline_raw_snapshot")
+        receipt, tool = helper._verify_payload_contents(
+            self.fixture.root, self.fixture.output,
+            self.fixture.tools / "nightly rustc", self.fixture.preparer
+        )
+        self.assertNotIn("project_source", receipt)
+        self.assertEqual(receipt["payload_tree_sha256"],
+                         json.loads(self.fixture.candidate.read_text())["payload_tree_sha256"])
+        self.assertEqual(tool["path"], str(self.fixture.tools / "nightly rustc"))
+        self.assert_refused(self.fixture.run("verify"), "source identity")
+        self.assertFalse(Path(f"{self.fixture.prefix}.verify.receipt.json").exists())
+
+    def test_internal_content_validation_still_rejects_corruption_and_checks_prepared_read_only(self):
+        self.fixture.assemble()
+        self.fixture.approve()
+        self.fixture.export_manifest.unlink()
+        helper = load_module(self.root_helper, "offline_raw_corruption")
+        arguments = (self.fixture.root, self.fixture.output,
+                     self.fixture.tools / "nightly rustc", self.fixture.preparer)
+        receipt, _ = helper._verify_payload_contents(*arguments)
+        target = self.fixture.root / "third-party/src/demo-1.0.0-p1/value.txt"
+        before = (target.read_bytes(), target.stat().st_mtime_ns)
+        self.assertEqual(helper._verify_payload_contents(*arguments, reconstruct=False)[0], receipt)
+        self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
+        delivered = self.fixture.output / "vendor/registry-1.2.3/src.rs"
+        delivered.write_text("corrupt delivered file\n")
+        with self.assertRaisesRegex(helper.OfflineDependencyError, "checksum"):
+            helper._verify_payload_contents(*arguments, reconstruct=False)
+
     def test_v2_source_identity_refuses_open_or_malformed_association_and_unknown_schema(self):
         self.fixture.assemble()
         self.fixture.approve()

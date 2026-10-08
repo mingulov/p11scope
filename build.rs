@@ -475,8 +475,9 @@ fn sha256_file_hex(path: &std::path::Path) -> String {
 /// and records that same path, its realpath, its binary digest, the
 /// full compile and UAPI argv, the explicit CPU baseline, the `PATH`
 /// directories watched, the candidate permission bits, and the object
-/// digest in `p11scope-identity-build-info.txt`; the harness pins the
-/// object digest plus that record, including the compiler's identity.
+/// digest in `p11scope-identity-build-info.txt`; the harness checks the
+/// executed compiler and object against that record. Reviewed source/argv
+/// contracts are independent of compiler-produced object metadata.
 /// Every existing `PATH` directory is watched (a brand-new shadowing
 /// file bumps its directory and re-runs the build), every candidate
 /// file is watched (content changes re-run), and `PATH` itself is
@@ -486,16 +487,16 @@ fn sha256_file_hex(path: &std::path::Path) -> String {
 /// are caught instead by the recorded-vs-live permission comparison
 /// in the harness, which fails loudly on a stale receipt. All of this
 /// acts AT REBUILD TIME: a skipped rebuild leaves a stale-but-
-/// consistent object+receipt pair where the pins pass by design — the
+/// consistent object+receipt pair where receipt checks pass by design — the
 /// record binds the compiler that ran, not custody across invocations.
 /// Remaining envelope (three shapes): concurrent mid-build compiler
 /// replacement (standard build-time trust); nonexistent `PATH`
 /// directories (listed in the receipt, unwatched until they exist);
 /// and executability-only changes — a named-user ACL grant or a
 /// noexec remount flips executability with no mtime/mode change, so
-/// no rebuild fires and the pins pass (the receipt stays true; any
-/// rebuild re-records, and the digest pin fails loudly on a byte
-/// change). No test re-resolves the winner: the recorded-vs-live
+/// no rebuild fires and receipt checks can pass (the receipt stays true;
+/// any rebuild re-records the executed compiler and current object). No test
+/// re-resolves the winner: the recorded-vs-live
 /// comparison covers `mode & 0o7777` bits only.
 fn build_identity_object() {
     let manifest_dir =
@@ -572,8 +573,8 @@ fn build_identity_object() {
     // Qualification record: resolved compiler identity, full argv, CPU
     // baseline, watch set, candidate bits, and the object digest. A
     // compiler upgrade re-runs this build (via the rerun lines below)
-    // and re-records; the digest pin in the harness then either still
-    // matches (same bytes) or fails loudly.
+    // and re-records. The harness verifies current receipt/object agreement;
+    // it does not compare with an old development-host object digest.
     let path_env = env::var_os("PATH").unwrap_or_default();
     let build_cwd = env::current_dir().expect("build cwd");
     println!("cargo:rerun-if-changed={}", compiler_path.display());

@@ -506,7 +506,115 @@ fn assert_lane14_selected_python_isolated(source: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
+fn assert_bpf_snapshot_dependency_preparation(driver: &str) -> Result<(), String> {
+    let prepare = r#"run_command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
+    let root_fetch = r#""fetch", "--locked", "--manifest-path", "Cargo.toml""#;
+    let bpf_fetch = r#""fetch", "--locked", "--manifest-path", "crates/ebpf/Cargo.toml""#;
+    let sysroot_fetch = r#""fetch", "--locked", "--manifest-path", nightly["manifest"]"#;
+    let offline = r#"env["CARGO_NET_OFFLINE"] = "true""#;
+    let metadata = r#""metadata", "--locked", "--offline""#;
+    let build = r#""build", "--locked", "--offline", "--lib""#;
+    for marker in [
+        "--baseline-offline-payload",
+        "--candidate-offline-payload",
+        "helper._verify_payload_contents(",
+        "helper.replacement_config(",
+        "verify_home_configuration(",
+        r#""fetch", "--locked", "--offline", "--manifest-path", "Cargo.toml""#,
+        r#""fetch", "--locked", "--offline", "--manifest-path", "crates/ebpf/Cargo.toml""#,
+        r#""fetch", "--locked", "--offline", "--manifest-path", nightly["manifest"]"#,
+        "nightly-source-before",
+        "nightly-source-after",
+    ] {
+        require_contract_marker(driver, marker, "verified snapshot payload admission")?;
+    }
+    for (first, second) in [
+        (prepare, root_fetch),
+        (root_fetch, bpf_fetch),
+        (bpf_fetch, sysroot_fetch),
+        (sysroot_fetch, offline),
+        (offline, metadata),
+        (metadata, build),
+    ] {
+        require_before(
+            driver,
+            first,
+            second,
+            "fresh BPF snapshot dependency preparation",
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
+    let block = job_block(ci, "bpf-noninterference");
+    let condition = "    needs: [dedupe, tests]\n    if: ${{ !cancelled() && needs.dedupe.outputs.run == 'true' }}\n";
+    if !block.starts_with(condition) {
+        return Err("BPF comparison must follow tests, including failed tests, unless cancelled/deduplicated".into());
+    }
+    for marker in [
+        "    runs-on: ubuntu-24.04\n",
+        "          fetch-depth: 0\n",
+        "rustup toolchain install \"$(cat .release-rust-version)\" --profile minimal",
+        "rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src",
+        "apt-get install -y clang-18 gcc libseccomp-dev llvm python3",
+        "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
+        "set -euo pipefail",
+        "BASELINE=792530713348f3a74e9100140226a51aea65a666",
+        "python3 -I scripts/check-bpf-noninterference.py \\",
+        "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
+        "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
+        "test -s \"$comparison_root/repeat-baseline/comparison.json\"",
+        "test -s \"$comparison_root/integration/comparison.json\"",
+        "        if: ${{ !cancelled() }}\n        uses: actions/upload-artifact@",
+        "          if-no-files-found: error\n",
+        "${{ runner.temp }}/bpf-noninterference/*/baseline/",
+        "${{ runner.temp }}/bpf-noninterference/*/candidate/",
+    ] {
+        require_contract_marker(block, marker, "required default BPF comparison")?;
+    }
+    require_before(
+        block,
+        "--work \"$comparison_root/repeat-baseline\" --repeat-baseline",
+        "--work \"$comparison_root/integration\"",
+        "R/R control before exact R/C comparison",
+    )?;
+    if block
+        .matches("python3 -I scripts/check-bpf-noninterference.py \\")
+        .count()
+        != 2
+    {
+        return Err(
+            "BPF comparison must execute exactly the control and integration driver".into(),
+        );
+    }
+    Ok(())
+}
+
+fn assert_hosted_bpf_external_lane_calls(ci: &str) -> Result<(), String> {
+    assert_hosted_bpf_noninterference(ci)?;
+    for line in job_block(ci, "bpf-noninterference").lines().map(str::trim) {
+        let line = line
+            .split_once(" #")
+            .map_or(line, |(code, _)| code.trim_end());
+        if line.starts_with('#') {
+            continue;
+        }
+        let names_script = line
+            .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
+            .any(|token| {
+                token.contains("scripts/") && (token.ends_with(".sh") || token.ends_with(".py"))
+            });
+        if names_script && line != r#"python3 -I scripts/check-bpf-noninterference.py \"# {
+            return Err(format!(
+                "unreviewed comparison-job lane invocation: {line:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_hosted_dependency_preparation(ci: &str, bpf_driver: &str) -> Result<(), String> {
     // The prepared-selection proof runs once, in the lint job; every job that
     // runs project Cargo reconstructs the pinned sources before its first
     // project operation.
@@ -541,6 +649,11 @@ fn assert_hosted_dependency_preparation(ci: &str) -> Result<(), String> {
         require_contract_marker(checks, marker, contract)?;
     }
     for job in CARGO_JOBS {
+        if job == "bpf-noninterference" {
+            assert_hosted_bpf_noninterference(ci)?;
+            assert_bpf_snapshot_dependency_preparation(bpf_driver)?;
+            continue;
+        }
         require_before(
             job_block(ci, job),
             prepare,
@@ -7722,22 +7835,96 @@ fn block_under<'a>(source: &'a str, header: &str) -> &'a str {
 }
 
 /// The hosted check jobs that together replaced the single `checks-and-e2e`
-/// job. They run on every push and pull request, in parallel, and every one of
-/// them gates the run: `archive-log` keeps each one's log and `quarantine`
+/// job. They run on every push and pull request; the BPF comparison follows
+/// tests. Every one gates the run: `archive-log` keeps each one's log and `quarantine`
 /// fires when any one fails.
-const CHECK_JOBS: [&str; 5] = ["lint", "audit", "tests", "contracts", "scripts"];
-
-/// Every job that runs project Cargo after reconstructing the pinned
-/// dependency sources: the check jobs plus the coverage shards and report.
-const CARGO_JOBS: [&str; 7] = [
+const CHECK_JOBS: [&str; 6] = [
     "lint",
     "audit",
     "tests",
+    "bpf-noninterference",
+    "contracts",
+    "scripts",
+];
+
+/// Every job that runs project Cargo after reconstructing the pinned
+/// dependency sources: the check jobs plus the coverage shards and report.
+const CARGO_JOBS: [&str; 8] = [
+    "lint",
+    "audit",
+    "tests",
+    "bpf-noninterference",
     "contracts",
     "scripts",
     "coverage",
     "coverage-report",
 ];
+
+#[test]
+fn hosted_pipeline_requires_exact_default_bpf_comparison() {
+    let ci = read(".github/workflows/ci.yml");
+    let driver = read("scripts/check-bpf-noninterference.py");
+    assert_hosted_bpf_noninterference(&ci).unwrap();
+    assert_bpf_snapshot_dependency_preparation(&driver).unwrap();
+    assert_hosted_bpf_external_lane_calls(&ci).unwrap();
+    let comparison = job_block(&ci, "bpf-noninterference");
+    let call = r#"python3 -I scripts/check-bpf-noninterference.py \"#;
+    for changed in [
+        comparison.replacen(
+            "set -euo pipefail",
+            "set -euo pipefail\n          scripts/verify-inspect-doctor.sh",
+            1,
+        ),
+        comparison.replacen(call, &format!("sudo {call}"), 1),
+        comparison.replacen(
+            call,
+            &format!("{call} && scripts/verify-inspect-doctor.sh"),
+            1,
+        ),
+    ] {
+        let changed = ci.replacen(comparison, &changed, 1);
+        assert!(
+            assert_hosted_bpf_external_lane_calls(&changed).is_err(),
+            "an additional or altered external comparison lane must be rejected"
+        );
+    }
+    for marker in [
+        "needs: [dedupe, tests]",
+        "!cancelled() && needs.dedupe.outputs.run == 'true'",
+        "fetch-depth: 0",
+        "BASELINE=792530713348f3a74e9100140226a51aea65a666",
+        "--repeat-baseline",
+        "--candidate \"$GITHUB_SHA\"",
+        "test -s \"$comparison_root/integration/comparison.json\"",
+        "${{ runner.temp }}/bpf-noninterference/*/candidate/",
+    ] {
+        let block = job_block(&ci, "bpf-noninterference");
+        let changed = ci.replacen(block, &block.replacen(marker, "", 1), 1);
+        assert!(
+            assert_hosted_bpf_noninterference(&changed).is_err(),
+            "removing {marker:?} must reject the comparison job"
+        );
+    }
+    let prepare = r#"run_command(["python3", "-I", "scripts/prepare-dependencies.py"]"#;
+    let fetch = r#""fetch", "--locked", "--manifest-path", "Cargo.toml""#;
+    for marker in [
+        prepare,
+        fetch,
+        r#""fetch", "--locked", "--manifest-path", "crates/ebpf/Cargo.toml""#,
+        r#""fetch", "--locked", "--manifest-path", nightly["manifest"]"#,
+        r#"env["CARGO_NET_OFFLINE"] = "true""#,
+        r#""build", "--locked", "--offline", "--lib""#,
+    ] {
+        assert!(
+            assert_bpf_snapshot_dependency_preparation(&driver.replacen(marker, "", 1)).is_err(),
+            "removing {marker:?} must reject snapshot preparation"
+        );
+    }
+    let moved = driver
+        .replacen(prepare, "", 1)
+        .replacen(fetch, &format!("{fetch}\n{prepare}"), 1);
+    assert!(assert_bpf_snapshot_dependency_preparation(&moved).is_err());
+}
 
 /// The `scripts` check job: it prints the UNRUN block and runs every
 /// validator `--self-test` and every lane this pipeline runs in full, so the
@@ -8398,8 +8585,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // with its gate pinned. None runs on the push/PR success path (manual
     // dispatch or post-failure evidence only), so the checks job's UNRUN and
     // scope: claims keep their exact meaning. A new script in any of these
-    // jobs, or a fourth script-naming job, fails here until this table is
-    // taught about it first.
+    // jobs fails here until this table is taught about it first. The required
+    // unprivileged comparison job is admitted separately below.
     let manual_jobs: [(&str, &str, &[&str]); 3] = [
         (
             "privileged-e2e",
@@ -8459,6 +8646,12 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         }
         outside = outside.replacen(block, "", 1);
     }
+    // This required job runs an unprivileged build comparison outside checks.
+    // Admit only its reviewed gates and two exact driver call lines; do not
+    // credit it to this checks job's hosted_full or UNRUN/scope claims.
+    assert_hosted_bpf_external_lane_calls(&ci).unwrap();
+    let comparison = block_under(&ci, "  bpf-noninterference:");
+    outside = outside.replacen(comparison, "", 1);
     // The other check jobs and the coverage jobs name two kinds of script and
     // no lane: the dependency helpers, and the test-gate partition helper,
     // which only narrows the workspace test gate's `--all-targets` (every call
@@ -8466,17 +8659,30 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // `hosted_pipeline_partitions_the_workspace_test_gate`; its own
     // `--self-test` is an ordinary step of the checks job).
     let partition_helper = "scripts/ci-test-partition.py";
-    for line in outside.lines().map(str::trim) {
-        let line = line
-            .split_once(" #")
-            .map_or(line, |(code, _)| code.trim_end());
+    let outside_line_admitted = |line: &str| {
         let scripts = named_scripts(line);
         let dependency_only = !scripts.is_empty()
             && scripts.iter().all(|script| {
                 dependency_helpers.contains(&script.as_str()) || script == partition_helper
             });
+        line.starts_with('#') || !names_lane(line) || dependency_only
+    };
+    for rejected in [
+        "python3 -I scripts/check-bpf-noninterference.py \\",
+        "run: scripts/verify-inspect-doctor.sh",
+        "run: python3 -I scripts/prepare-dependencies.py && scripts/verify-inspect-doctor.sh",
+    ] {
         assert!(
-            line.starts_with('#') || !names_lane(line) || dependency_only,
+            !outside_line_admitted(rejected),
+            "a known comparison or arbitrary lane outside its admitted job must be rejected"
+        );
+    }
+    for line in outside.lines().map(str::trim) {
+        let line = line
+            .split_once(" #")
+            .map_or(line, |(code, _)| code.trim_end());
+        assert!(
+            outside_line_admitted(line),
             "a lane is named outside the checks job: {line:?}. The UNRUN and scope \
              claims are about that job alone; running a lane elsewhere needs the \
              derivation taught about it first"
@@ -8608,14 +8814,15 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // Full strings: "test --locked" alone was also matched by the diagnostic
     // step, so deleting the workspace test gate left this claim standing.
     assert_hosted_offline_gates(&ci).unwrap();
-    assert_hosted_dependency_preparation(&ci).unwrap();
+    let bpf_driver = read("scripts/check-bpf-noninterference.py");
+    assert_hosted_dependency_preparation(&ci, &bpf_driver).unwrap();
     for marker in [
         "--metadata \"Cargo.toml=$RUNNER_TEMP/root-metadata.json\"",
         "--metadata \"crates/ebpf/Cargo.toml=$RUNNER_TEMP/bpf-metadata.json\" --ledger",
     ] {
         let missing = ci.replacen(marker, "", 1);
         assert!(
-            assert_hosted_dependency_preparation(&missing).is_err(),
+            assert_hosted_dependency_preparation(&missing, &bpf_driver).is_err(),
             "removing either metadata context must fail preparation activation"
         );
     }
@@ -8628,7 +8835,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         1,
     );
     assert!(
-        assert_hosted_dependency_preparation(&moved).is_err(),
+        assert_hosted_dependency_preparation(&moved, &bpf_driver).is_err(),
         "dependency reconstruction after the first project operation must fail"
     );
     for gate in ["check", "test", "clippy"] {
@@ -8745,7 +8952,7 @@ fn hosted_pipeline_retains_the_job_log() {
     // shard. A shard added to the matrix without a log, or a check job added
     // without one, fails here.
     let shards = contracts_shard_count(&ci).unwrap();
-    for job in ["lint", "audit", "tests", "scripts"] {
+    for job in ["lint", "audit", "tests", "bpf-noninterference", "scripts"] {
         assert!(
             !job_block(&ci, job).contains("\n    name:"),
             "{job} must keep its job id as its name: archive-log finds its log by that name"
@@ -9110,6 +9317,8 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
             assert!(block.starts_with(&format!(
                 "    name: contracts-${{{{ matrix.shard }}}}\n{gate}"
             )));
+        } else if job == "bpf-noninterference" {
+            assert_hosted_bpf_noninterference(&ci).unwrap();
         } else {
             assert!(
                 block.starts_with(gate),
@@ -9134,8 +9343,9 @@ fn hosted_pipeline_runs_one_full_matrix_per_commit() {
         "/runs?head_sha=$GITHUB_SHA&per_page=100",
         "select(.id < $GITHUB_RUN_ID and (.event == \\\"push\\\" or .event == \\\"workflow_dispatch\\\"))",
         // A covering run ran the matrix itself.
-        "select((.name == \"lint\" or .name == \"coverage-report\") and .conclusion == \"success\")",
-        "if [ \"$ran\" = 2 ]; then",
+        "select((.name == \"lint\" or .name == \"coverage-report\" or .name == \"bpf-noninterference\") and .conclusion == \"success\")",
+        "unique_by(.name) | length",
+        "if [ \"$ran\" = 3 ]; then",
         // An unfinished earlier run is waited for, never trusted.
         "sleep 60",
     ] {

@@ -1845,10 +1845,9 @@ pub fn spawn_exec_mapping_child(paths: &[PathBuf]) -> io::Result<MappedChild> {
                     libc::close(pipe[0]);
                     libc::waitpid(pid, &mut status, 0);
                 }
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("probe child {pid} died before reporting (status {status})"),
-                ));
+                return Err(io::Error::other(format!(
+                    "probe child {pid} died before reporting (status {status})"
+                )));
             }
             if got < 0 {
                 let error = io::Error::last_os_error();

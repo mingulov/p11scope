@@ -4713,7 +4713,7 @@ mod tests {
         // byte-asserted.
         let lrm = char::from_u32(0x200E).expect("U+200E exists");
         let nel = char::from_u32(0x0085).expect("U+0085 exists");
-        let unicode: [(String, &[u8]); 3] = [
+        let unicode: [(String, &[u8]); 4] = [
             (
                 format!("    pub{lrm}(crate) fn smuggled_unicode_vis(&self) -> i32 {{ 0 }}\n"),
                 &[0xE2, 0x80, 0x8E],
@@ -4724,6 +4724,12 @@ mod tests {
             ),
             (
                 format!("    pub{nel}(crate) fn smuggled_unicode_nel(&self) -> i32 {{ 0 }}\n"),
+                &[0xC2, 0x85],
+            ),
+            (
+                format!(
+                    "    #{nel}[inline] pub fn smuggled_unicode_attr_nel(&self) -> i32 {{ 0 }}\n"
+                ),
                 &[0xC2, 0x85],
             ),
         ];
@@ -4829,6 +4835,7 @@ mod tests {
             "impl Evil for self :: AnchorMaps {}",
             "impl AsRef<OwnedFd> for self /*gap*/ :: AnchorMaps {}",
             "impl Evil for :: AnchorMaps {}",
+            "impl Evil for crate :: AnchorMaps {}",
         ] {
             let mutated = format!("{code}\n{header}\n");
             assert!(
@@ -4869,24 +4876,33 @@ mod tests {
             (1, false),
             "`impl Wrapper<AnchorMaps>` must not count as an AnchorMaps block"
         );
-        // Non-ASCII in an impl header (fix round 5): a U+200E gap
-        // between `for` and the subject must fail the scan loudly.
-        // Byte-built (`char::from_u32`, never literal non-ASCII) and
-        // byte-asserted.
+        // Non-ASCII in an impl header (fix round 5): a U+200E or
+        // U+0085 gap between `for` and the subject must fail the
+        // scan loudly. Byte-built (`char::from_u32`, never literal
+        // non-ASCII) and byte-asserted.
         let lrm = char::from_u32(0x200E).expect("U+200E exists");
-        let header = format!("impl Evil for{lrm}AnchorMaps {{}}");
-        assert!(
-            header
-                .as_bytes()
-                .windows(3)
-                .any(|w| w == [0xE2, 0x80, 0x8E]),
-            "fixture must carry the U+200E bytes"
-        );
-        let mutated = format!("{code}\n{header}\n");
-        assert!(
-            scan_anchor_impls(&blank_rust_noise(&mutated)).is_err(),
-            "scan must fail loudly on non-ASCII: {header:?}"
-        );
+        let nel = char::from_u32(0x0085).expect("U+0085 exists");
+        let non_ascii: [(String, &[u8]); 2] = [
+            (
+                format!("impl Evil for{lrm}AnchorMaps {{}}"),
+                &[0xE2, 0x80, 0x8E],
+            ),
+            (
+                format!("impl Evil for{nel}AnchorMaps {{}}"),
+                &[0xC2, 0x85],
+            ),
+        ];
+        for (header, utf8) in non_ascii {
+            assert!(
+                header.as_bytes().windows(utf8.len()).any(|w| w == utf8),
+                "fixture must carry the {utf8:02X?} bytes"
+            );
+            let mutated = format!("{code}\n{header}\n");
+            assert!(
+                scan_anchor_impls(&blank_rust_noise(&mutated)).is_err(),
+                "scan must fail loudly on non-ASCII: {header:?}"
+            );
+        }
     }
 
     /// Macros cannot smuggle handle methods (astra N5, design decision

@@ -4242,6 +4242,24 @@ fn task4_record_registration(
             && !lifecycle.contains_key(&return_program)
             && !lifecycle.contains_key(&entry_program)
     );
+    // Stage A continuity hooks live in every Detailed object. They attach
+    // optionally (`InstanceTracking::start`); the census classifies their
+    // links as an `instance` role and cross-checks the kernel-observed
+    // count against the userspace-retained hook count, so a leaked or
+    // missing hook trips the census in either direction.
+    let instance: BTreeMap<_, _> = crate::attach::INSTANCE_PROGRAMS
+        .into_iter()
+        .map(|(name, _)| -> Result<_> {
+            Ok((session.ebpf.program(name).context(name)?.info()?.id(), name))
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        instance.len() == 3
+            && !instance.contains_key(&return_program)
+            && !instance.contains_key(&entry_program)
+            && instance.keys().all(|id| !lifecycle.contains_key(id))
+    );
+    let instance_expected = session.instance.hook_link_count();
     let mut pin_facts = BTreeMap::new();
     for target in slots {
         if pin_facts.contains_key(&target.object) {
@@ -4314,7 +4332,8 @@ fn task4_record_registration(
     }
     let infos = owned_link_info_snapshot(&ids.programs)?;
     ensure!(infos.len() == ids.links.len());
-    let mut role_counts = [0usize; 2];
+    let mut role_counts = [0usize; 3];
+    let mut instance_names = BTreeSet::new();
     for (position, (id, info)) in infos.iter().enumerate() {
         ensure!(ids.links.contains(id) && info.raw.id == *id);
         let (role, program) = if info.raw.prog_id == return_program {
@@ -4323,6 +4342,10 @@ fn task4_record_registration(
         } else if info.raw.prog_id == entry_program {
             role_counts[1] += 1;
             ("entry", "p11_entry")
+        } else if let Some(name) = instance.get(&info.raw.prog_id) {
+            role_counts[2] += 1;
+            instance_names.insert(*name);
+            ("instance", *name)
         } else {
             (
                 "other",
@@ -4331,7 +4354,14 @@ fn task4_record_registration(
                     .context("unexpected non-static program in Detailed link census")?,
             )
         };
-        if role != "other" {
+        if role == "instance" {
+            // fentry/fexit hooks attach through bpf_tracing_prog_attach and
+            // report a TRACING link (see the lifecycle comment below).
+            ensure!(
+                info.raw.type_ == bpf_link_type::BPF_LINK_TYPE_TRACING as u32,
+                "Detailed instance hook link type differs from TRACING"
+            );
+        } else if role != "other" {
             ensure!(info.raw.type_ == bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32);
         } else {
             // All three lifecycle hooks report a raw-tracepoint link. The
@@ -4356,9 +4386,18 @@ fn task4_record_registration(
             "pid_filter_token":witness.pid_filter_token
         }))?;
     }
+    // Hook attach is all-or-nothing (`InstanceTracking::start` detaches
+    // every hook when any attach fails), so an attached session shows all
+    // three instance programs exactly once; a refused session shows none.
+    let expected_instance: BTreeSet<_> = crate::attach::INSTANCE_PROGRAMS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
     ensure!(
-        role_counts == [n, n] && infos.len() == 2 * n + 3,
-        "Detailed kernel per-program link census omitted a side or lifecycle role"
+        role_counts == [n, n, instance_expected]
+            && infos.len() == 2 * n + 3 + instance_expected
+            && (instance_expected == 0 || instance_names == expected_instance),
+        "Detailed kernel per-program link census omitted a side, lifecycle or instance role"
     );
     Ok(())
 }
@@ -4369,12 +4408,20 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
     let n = offsets.len();
     ensure!(n > 0);
     let identity = phase == "second_attached";
-    ensure!(rows.len() == if identity { 22 } else { 4 * n + 3 });
+    // Stage A continuity hooks add zero or three `instance` kernel rows per
+    // group (all-or-nothing attach), so group sizes are data-dependent:
+    // identity groups split on the recorded session generation, and every
+    // group below proves its exact static + kernel + instance shape.
     let groups: Vec<_> = if identity {
         ensure!(n == 2);
+        let split = rows
+            .iter()
+            .position(|row| row["session_generation"] == 2)
+            .context("identity registration has no second generation")?;
+        ensure!(split > 0 && split < rows.len());
         vec![
-            (&rows[..11], "first_attached", 1_u64),
-            (&rows[11..], "second_attached", 2_u64),
+            (&rows[..split], "first_attached", 1_u64),
+            (&rows[split..], "second_attached", 2_u64),
         ]
     } else {
         vec![(&rows[..], phase, 1_u64)]
@@ -4384,7 +4431,12 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
     let mut all_programs = BTreeSet::new();
     let mut all_links = BTreeSet::new();
     for (group, expected_phase, generation) in groups {
-        ensure!(group.len() == 4 * n + 3);
+        // Kernel-row exactness is proven after classification below (the
+        // instance tail is data-dependent); here only guard the split.
+        ensure!(
+            group.len() > 2 * n,
+            "registration group shorter than its static rows"
+        );
         let static_rows = &group[..2 * n];
         let kernel_rows = &group[2 * n..];
         let anchor = group[0]["stats_map_id"].as_u64().context("STATS map ID")?;
@@ -4453,8 +4505,13 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
         }
         ensure!(program_ids.len() == 2 && program_ids["return"] != program_ids["entry"]);
         let mut link_ids = BTreeSet::new();
-        let mut role_counts = [0usize; 2];
+        let mut role_counts = [0usize; 3];
         let mut lifecycle = BTreeMap::new();
+        let mut instance = BTreeMap::new();
+        let instance_names: BTreeSet<_> = crate::attach::INSTANCE_PROGRAMS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         for (position, row) in kernel_rows.iter().enumerate() {
             let id = row["link_id"].as_u64().context("kernel link ID")?;
             let program_id = row["program_id"].as_u64().context("kernel program ID")?;
@@ -4465,13 +4522,20 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
                 role_counts[1] += 1;
                 ("entry", "p11_entry")
             } else {
-                let name = row["program"].as_str().context("lifecycle program")?;
-                ensure!(lifecycle.insert(name, program_id).is_none());
-                ("other", name)
+                let name = row["program"].as_str().context("non-static program")?;
+                if instance_names.contains(name) {
+                    ensure!(instance.insert(name, program_id).is_none());
+                    role_counts[2] += 1;
+                    ("instance", name)
+                } else {
+                    ensure!(lifecycle.insert(name, program_id).is_none());
+                    ("other", name)
+                }
             };
             let kind = match role {
                 "return" | "entry" => bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u64,
                 "other" => bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u64,
+                "instance" => bpf_link_type::BPF_LINK_TYPE_TRACING as u64,
                 _ => unreachable!(),
             };
             ensure!(
@@ -4493,18 +4557,28 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
                 "Detailed borrowed-FD kernel link census changed"
             );
         }
+        // Hook attach is all-or-nothing, so a group carries zero or three
+        // instance rows naming the full hook set exactly once; the kernel
+        // tail length is exact, never a lower bound.
+        let instance_count = role_counts[2];
         ensure!(
-            role_counts == [n, n]
+            role_counts[0] == n
+                && role_counts[1] == n
+                && kernel_rows.len() == 2 * n + 3 + instance_count
                 && lifecycle.keys().copied().collect::<BTreeSet<_>>()
                     == BTreeSet::from(["sched_process_exec", "sched_process_exit", "task_newtask"])
+                && (instance_count == 0 || instance_count == 3)
+                && (instance_count == 0
+                    || instance.keys().copied().collect::<BTreeSet<_>>() == instance_names)
         );
         let group_programs: BTreeSet<_> = program_ids
             .values()
             .copied()
             .chain(lifecycle.values().copied())
+            .chain(instance.values().copied())
             .collect();
         ensure!(
-            group_programs.len() == 5
+            group_programs.len() == 5 + instance_count
                 && all_programs.is_disjoint(&group_programs)
                 && all_links.is_disjoint(&link_ids)
         );
@@ -4596,6 +4670,173 @@ fn task4_detailed_registration_rejects_missing_tail_entry_and_kernel_link() -> R
             "registration accepted a changed {key}"
         );
     }
+    Ok(())
+}
+
+/// Synthetic n=2 `attached`-shaped registration rows: 4 static + 4
+/// return/entry + 3 lifecycle kernel rows, plus the 3 Stage A `instance`
+/// kernel rows when `instance` is set. Row shapes mirror
+/// `task4_record_registration`; `id_shift` keeps program/link IDs disjoint
+/// across identity groups.
+fn task4_synthetic_attached_rows(
+    phase: &str,
+    generation: u64,
+    anchor: u64,
+    scope: u64,
+    id_shift: u64,
+    instance: bool,
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for slot in 0..2_u64 {
+        for (role, program, program_id) in
+            [("return", "p11_return", 10), ("entry", "p11_entry", 11)]
+        {
+            rows.push(serde_json::json!({
+                "kind":"static","phase":phase,"position":rows.len(),
+                "slot":slot,"role":role,"program":program,"program_id":program_id + id_shift,
+                "object":0,"dev":1,"ino":2,"offset":100+100*slot,"pin_unchanged":true,
+                "session_generation":generation,"stats_map_id":anchor,"scope_pid":scope,
+                "pid_filter_token":1,"descriptor_index":0,
+                "requested_attach_cookie":slot,"cookie_provenance":"userspace_requested",
+                "pin_id":0,"pin_key":{"device_major":0,"device_minor":1,"inode":2},
+                "pin_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "fresh_pin_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "abi":"Lp64"
+            }));
+        }
+    }
+    let mut kernel = vec![
+        (
+            10,
+            "return",
+            "p11_return",
+            bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32,
+        ),
+        (
+            10,
+            "return",
+            "p11_return",
+            bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32,
+        ),
+        (
+            11,
+            "entry",
+            "p11_entry",
+            bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32,
+        ),
+        (
+            11,
+            "entry",
+            "p11_entry",
+            bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32,
+        ),
+        (
+            20,
+            "other",
+            "sched_process_exec",
+            bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32,
+        ),
+        (
+            21,
+            "other",
+            "sched_process_exit",
+            bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32,
+        ),
+        (
+            22,
+            "other",
+            "task_newtask",
+            bpf_link_type::BPF_LINK_TYPE_RAW_TRACEPOINT as u32,
+        ),
+    ];
+    if instance {
+        kernel.extend([
+            (
+                30,
+                "instance",
+                "p11_inst_vma_map",
+                bpf_link_type::BPF_LINK_TYPE_TRACING as u32,
+            ),
+            (
+                31,
+                "instance",
+                "p11_inst_vma_unmap",
+                bpf_link_type::BPF_LINK_TYPE_TRACING as u32,
+            ),
+            (
+                32,
+                "instance",
+                "p11_inst_vma_copy",
+                bpf_link_type::BPF_LINK_TYPE_TRACING as u32,
+            ),
+        ]);
+    }
+    for (position, (program_id, role, program, kind)) in kernel.into_iter().enumerate() {
+        rows.push(serde_json::json!({
+            "kind":"kernel_link","phase":phase,"position":position,
+            "link_id":position as u64 + 100 + id_shift,
+            "program_id":program_id + id_shift,
+            "type":kind,"info_len":32,
+            "role":role,"program":program,
+            "session_generation":generation,"stats_map_id":anchor,"scope_pid":scope,
+            "pid_filter_token":1
+        }));
+    }
+    rows
+}
+
+#[test]
+fn task4_detailed_registration_accepts_instance_tail_and_rejects_mistakes() -> Result<()> {
+    let offsets = serde_json::to_vec(&vec![
+        serde_json::json!({"object":0,"dev":1,"ino":2,"offset":100}),
+        serde_json::json!({"object":0,"dev":1,"ino":2,"offset":200}),
+    ])?;
+    let encode = |rows: &[serde_json::Value]| -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, row)?;
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    };
+    // Hook-free shape (k=0) still accepted.
+    let plain = task4_synthetic_attached_rows("attached", 1, 21, 77, 0, false);
+    task4_replay_registration(&encode(&plain)?, &offsets, "attached")?;
+    // Instance tail (k=3) accepted. Instance rows sit at global 11..14
+    // (4 static + 7 return/entry/lifecycle kernel rows first).
+    let hooked = task4_synthetic_attached_rows("attached", 1, 21, 77, 0, true);
+    task4_replay_registration(&encode(&hooked)?, &offsets, "attached")?;
+    // Partial tail (k=2): rejected.
+    let mut partial = hooked.clone();
+    partial.remove(12);
+    assert!(task4_replay_registration(&encode(&partial)?, &offsets, "attached").is_err());
+    // Wrong link type on an instance row: rejected.
+    let mut changed = hooked.clone();
+    changed[11]["type"] = serde_json::json!(bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32);
+    assert!(task4_replay_registration(&encode(&changed)?, &offsets, "attached").is_err());
+    // Unknown instance program: rejected.
+    let mut changed = hooked.clone();
+    changed[11]["program"] = serde_json::json!("p11_inst_evil");
+    assert!(task4_replay_registration(&encode(&changed)?, &offsets, "attached").is_err());
+    // Duplicated instance program name: rejected.
+    let mut changed = hooked.clone();
+    changed[12]["program"] = changed[11]["program"].clone();
+    assert!(task4_replay_registration(&encode(&changed)?, &offsets, "attached").is_err());
+    // Identity split with instance tails in both groups (28 rows): accepted.
+    let mut identity = task4_synthetic_attached_rows("first_attached", 1, 21, 77, 0, true);
+    identity.extend(task4_synthetic_attached_rows(
+        "second_attached",
+        2,
+        22,
+        78,
+        1000,
+        true,
+    ));
+    task4_replay_registration(&encode(&identity)?, &offsets, "second_attached")?;
+    // Tampered generation boundary: rejected.
+    let mut changed = identity.clone();
+    changed[14]["session_generation"] = serde_json::json!(1);
+    assert!(task4_replay_registration(&encode(&changed)?, &offsets, "second_attached").is_err());
     Ok(())
 }
 
@@ -7548,12 +7789,17 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     )?;
     ensure!(first.attach_failures().is_empty() && first.attached_probes() == 4);
     let first_ids = OwnedIds::detailed(&first)?;
+    // Canonical Detailed Allowlisted Singles inventory, measured
+    // 2026-10-08: 24 base maps + 8 Stage A continuity maps (G_EPOCH,
+    // INSTANCE_CALIB/COUNTERS/GEN/START, PROC_EPOCH, SLOT_FILE,
+    // WATCHED_FILES); 13 base programs + 3 instance hooks; 7 base links +
+    // 3 hook links.
     ensure!(
         (
             first_ids.maps.len(),
             first_ids.programs.len(),
             first_ids.links.len()
-        ) == (24, 13, 7)
+        ) == (32, 16, 10)
     );
     let first_witness = task4_session_witness(&first, &first_ids, 1, original.child.id())?;
     task4_record_registration(
@@ -7581,12 +7827,13 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     )?;
     ensure!(second.attach_failures().is_empty() && second.attached_probes() == 4);
     let second_ids = OwnedIds::detailed(&second)?;
+    // Same canonical inventory as the first session (see above).
     ensure!(
         (
             second_ids.maps.len(),
             second_ids.programs.len(),
             second_ids.links.len()
-        ) == (24, 13, 7)
+        ) == (32, 16, 10)
     );
     let second_witness = task4_session_witness(&second, &second_ids, 2, copy.child.id())?;
     ensure!(
@@ -7605,7 +7852,9 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
         "second_attached",
     )?;
     let ids = first_ids.union(&second_ids);
-    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (48, 26, 14));
+    // Twice the canonical per-session inventory: the two sessions are
+    // proven disjoint above, so the union is the exact sum 2*(32,16,10).
+    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (64, 32, 20));
     task4_ids_phase("second_attached", &ids);
     task4_session_ids("second_attached", second_witness, &second_ids);
     task4_ids_receipt(&ids);

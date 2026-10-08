@@ -286,6 +286,56 @@ the min..max of per-sample p95.
   attach the hooks only while Stage B routing is armed, or add a
   documented operator opt-out.
 
+### Per-edge counting overhead (M2) — immaterial on every cell; DR-02 closed
+
+- What the user sees (v0.3.0, unreleased): the native lane counts every
+  entry (V1 non-fetch atomic add in `CALLER_USE`, plus the per-pass
+  count-refresh reader and counted publish). Workload-side ABBA medians
+  on the measured host (below) show no resolvable tax: 1-thread call
+  churn -6.0 ns/call (-0.20%, range 2,992–3,064 vs 2,980–3,070 ns/call),
+  4-thread +34.4 ns/call (+0.27%, 12,371–13,084 vs 12,438–13,121),
+  12-thread -115.2 ns/call (-0.29%, 38,197–45,067 vs 37,994–40,733),
+  12-thread padded -76.0 ns/call (-0.19%, 36,633–40,417 vs
+  38,267–51,284), and unrelated mapping churn beside an idle capture
+  -21.6 ns/op (-0.61%, 3,420–4,022 vs 3,437–3,934 ns/op). Paired medians
+  (20 ABBA pairs per cell) read -0.09%, +0.01%, +0.17%, -0.02% and
+  -0.44% with bootstrap 95% CI uppers of +0.32%, +0.23%, +1.00%, +0.53%
+  and +1.87% — every cell far inside the M2 bar (paired median ≤5% of
+  the BASE observed call cost, CI upper ≤10%). BPF program time is
+  identical across arms (270/271, 468/466, 787/779 and 780/788 ns/event
+  on the four call cells; exactly 1.00 entry events per call): the +1
+  XADD sits far below the ~270 ns program body and below run-time
+  quantization, and the per-pass refresh adds no resolvable cost at one
+  row. Count exactness held on every counted sample: 0 errors over 80
+  on-arm samples, each edge exactly TOTAL+2*THREADS+1. For context, the
+  native entry path itself costs ~2.4 µs/call at t1 (observed ~3.0 µs
+  vs unobserved 0.62 µs: the uprobe trap plus the entry program, paid
+  with or without counting) and SoftHSM2 contention dominates t12
+  (~39 µs/call observed vs ~30 µs unobserved on either arm).
+- Kernels/conditions: any kernel where the native lane attaches.
+  Campaign: Linux 7.0.0-34-generic x86-64 on a VM (microsoft), AMD Ryzen
+  AI 9 HX PRO 370, 12 CPUs, commit cbd1c65 (candidate sha256
+  40615595c0521271700f1d2ab40f92576c495c639d3eba34de515753cda26196;
+  witness-only base c34b4d4 sha256
+  30e8db074de4b7df1338fe17a91b3e4ffce435a5e5eda9bf14b27bbda1d10a85),
+  2026-10-08, quiet host (load gates 4/4, kind paused, builds paused),
+  `scripts/bench-count-overhead.sh` defaults (5 cells, 250 valid
+  samples, ABBA within a round with the starting arm alternating per
+  round plus one unobserved sample per round; off-arm drift ≤1.11%;
+  lane multi on every observed sample; no exclusions). Reproduce:
+  build the base once (`git archive c34b4d4`, release build) to
+  BASE_BIN, then `flock /var/tmp/p11scope-ws-tmp/privileged.lock
+  scripts/bench-count-overhead.sh` on that commit, then
+  `scripts/bench-count-overhead-analyze.py` on the campaign log.
+- Disclosure: the counts are the feature (`entries.count` with
+  `coverage.state counted`); the overhead is disclosed here only.
+- Workaround: none needed (immaterial). `--capture scan` avoids the
+  native entry cost entirely but loses per-edge use.
+- Planned: none (gate PASS). DR-02 closed by C4 + C5 + this gate. Open
+  for the owner: per-guest counting-cost cells ride with the Stage 5
+  qualification windows (counting exactness on 5.15 is already proven
+  by the C34 campaign, 3/3 with identical finals).
+
 ### Harness validity (M0) — PASS
 
 - What the user sees: PASS: all 5 legs classified as expected (29 of 29
@@ -703,9 +753,10 @@ the min..max of per-sample p95.
   counted entries.
 - Workaround: `profile` for exact function-level counts (aggregate maps
   stay exact under event loss).
-- Planned: v0.3.0 (C7: V1 non-fetch atomic add in `CALLER_USE`, about
-  0–300 ns/call; C5 landed — the M2 cost gate closes DR-02, and M2 must
-  measure V1 directly).
+- Planned: v0.3.0 (C7: V1 non-fetch atomic add in `CALLER_USE`; C4
+  published, C5 oracle landed, M2 cost gate PASS — counting overhead
+  immaterial on every cell with 0 count errors — DR-02 closed; see the
+  per-edge counting-overhead row).
 
 ### `C_GetInterfaceList`/`C_GetInterface` export calls go uncounted (DR-51)
 

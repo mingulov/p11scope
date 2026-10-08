@@ -69,7 +69,9 @@
 //! Retained objects are shared clones of the attach set's open files (no
 //! new FDs). A witness read costs two syscalls per visited row, keeps a
 //! seen set bounded by the pair limit P, and rechecks at most
-//! [`PIN_RECHECK_PER_READ`] held object pins; a cookie query is one
+//! [`PIN_RECHECK_PER_READ`] held object pins; the count refresh then
+//! re-reads witnessed rows within the same window (one batch step where
+//! the kernel has it, else a per-key walk); a cookie query is one
 //! syscall plus two pidfd polls.
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -79,7 +81,7 @@ use super::activation::{
     RetiredInventory, RetiringInventory, attach_published_entry_with, require_live_pid_custody,
     service_inventory_discovery_with, validate_entry,
 };
-use super::callers::{CallerRowFault, CallerUseCursor};
+use super::callers::{CallerRowFault, CallerUseCursor, CallerUseIo};
 use super::{AttachBackend, PreparedInventory, Scope};
 use crate::capacity::{CallerBudget, InventoryBudget};
 use crate::discovery::identity::{PinnedObjectId, RetainedInventoryTarget};
@@ -360,7 +362,7 @@ pub(crate) struct DomainCookie {
 }
 
 impl DomainCookie {
-    fn new(domain: NativeDomainId, cookie: u64) -> Self {
+    pub(crate) fn new(domain: NativeDomainId, cookie: u64) -> Self {
         Self { domain, cookie }
     }
 
@@ -539,6 +541,9 @@ pub(crate) struct WitnessRow {
     pub host_tgid: u32,
     /// First association instant (CLOCK_MONOTONIC), not first-ever call.
     pub recorded_at_ns: u64,
+    /// The row's entry count at first sight (saturated): the baseline its
+    /// refresh advances from. A lower bound while producers run.
+    pub entry_count: u64,
 }
 
 impl WitnessRow {
@@ -553,7 +558,8 @@ impl WitnessRow {
         self.image.exec_id
     }
 
-    /// A scripted row for binder tests (never a host read).
+    /// A scripted row for binder tests (never a host read): first seen
+    /// with a count of one, like a fresh BPF insert.
     #[cfg(test)]
     pub(crate) fn scripted(
         domain: NativeDomainId,
@@ -574,6 +580,7 @@ impl WitnessRow {
             endpoint,
             host_tgid,
             recorded_at_ns,
+            entry_count: 1,
         }
     }
 }
@@ -584,6 +591,17 @@ pub(crate) struct WitnessIntegrity {
     pub key: CallerObjectKey,
     pub value: Option<CallerObjectUse>,
     pub reason: String,
+}
+
+/// One refreshed entry count: a witnessed row's image and object with the
+/// saturated count the refresh re-read for it, above every earlier read.
+/// A lower bound while producers run; the terminal read after stop is the
+/// final word. Joins its witness row on (`image`, `object`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallerCountUpdate {
+    pub image: ImageIdentity,
+    pub object: AttachObjectId,
+    pub count: u64,
 }
 
 /// The health counters a witness batch carries (sums over CPUs).
@@ -711,6 +729,29 @@ pub(crate) struct WitnessBatch {
     /// `sweep_completed`, but that sweep skipped rows (a lookup failure or
     /// the seen-set bound): it completed with gaps.
     pub sweep_gaps: bool,
+    /// Witnessed rows whose entry count advanced since the last read, with
+    /// the re-read saturated count. Lower bounds while producers run; the
+    /// terminal read after stop carries the final ones. A row whose count
+    /// never advanced past its first sight appears only on its witness
+    /// row's `entry_count`, never here.
+    pub counts: Vec<CallerCountUpdate>,
+    /// This read completed a count-refresh sweep: every witnessed row was
+    /// re-read (or skipped with `refresh_sweep_gaps`) since the sweep
+    /// began.
+    pub refresh_sweep_completed: bool,
+    /// `refresh_sweep_completed`, but that sweep skipped a tracked row (a
+    /// lookup failure): that row's count is stale, and the next sweep
+    /// retries it.
+    pub refresh_sweep_gaps: bool,
+    /// The refresh quantum hit the window deadline before completing
+    /// its sweep (F1): tracked rows went unvisited this pass, so
+    /// their counts may be stale. The witness and refresh share the
+    /// window's deadline and the witness runs first, so a witness
+    /// scan that consumes the window starves the refresh with no
+    /// failures or gaps. Discovery treats a starved refresh as
+    /// count-refresh loss (lossy, never quiet).
+    pub refresh_deadline_reached: bool,
+    pub refresh_sweeps_completed: u64,
     /// The userspace seen-set size: distinct CALLER_USE rows this capture
     /// has reported (bounded by `pair_limit`). Not the kernel map's
     /// occupancy, which a hash map does not expose without a full walk.
@@ -734,8 +775,17 @@ pub(crate) struct WitnessBatch {
     pub health_read_ns: u64,
     /// CLOCK_MONOTONIC after this read's rows were read: every row here was
     /// inserted before it (`u64::MAX` when the clock read failed, `0`
-    /// when nothing was read).
+    /// when nothing was read). Stamped after the count refresh too, so it
+    /// also bounds every count here.
     pub rows_read_ns: u64,
+    /// CLOCK_MONOTONIC when this read's count-refresh lookup began (round
+    /// 5, anchor skew): every count here was observed at or after it
+    /// (`u64::MAX` when the clock read failed, `0` when nothing was
+    /// read). Count anchors (base reads) stamp from here, never from
+    /// the post-quantum `rows_read_ns` — genuine growth between a
+    /// pair's lookup and the late batch stamp must land at or after
+    /// its own anchor, never strictly before it.
+    pub counts_read_ns: u64,
     /// Held objects whose retained pin no longer matches (modified in
     /// place) or could not be rechecked, first reported in this batch:
     /// their modules' coverage is unknown from now on.
@@ -761,6 +811,13 @@ pub(crate) struct WitnessBatch {
     /// never a settled terminal read (FD closure is not a
     /// callback-quiescence protocol, and unproven health proves nothing).
     pub unsettled: bool,
+}
+
+/// Whether one `WitnessBatch.read_failures` entry is a count-refresh
+/// failure (not a witness failure): the refresh stamps every transport
+/// error it hits with [`super::callers::REFRESH_FAILURE_PREFIX`].
+pub(crate) fn is_refresh_failure(failure: &str) -> bool {
+    failure.starts_with(super::callers::REFRESH_FAILURE_PREFIX)
 }
 
 /// What one `query_cookie` learned about a pinned process.
@@ -2090,9 +2147,13 @@ impl InventoryCapture {
     }
 
     /// Starts owned retirement. Reads stay available and are unsettled.
+    /// The count-refresh traversal restarts (baselines kept): the
+    /// terminal refresh is then a generation begun after this boundary,
+    /// never the tail of a pre-stop sweep with stale prefix rows.
     pub(crate) fn begin_stop(self) -> RetiringCapture {
         let Self { state, mut book } = self;
         book.stopping = true;
+        book.cursor.restart_refresh_traversal();
         let (inner, failure) = match state {
             // Never activated: no producer ever existed. The PID pin stays
             // held so a read after stop still polls custody.
@@ -2412,6 +2473,11 @@ fn read_witnesses_from(
         read_failures: Vec::new(),
         unrecorded_rows: 0,
         sweep_gaps: false,
+        counts: Vec::new(),
+        refresh_sweep_completed: false,
+        refresh_sweep_gaps: false,
+        refresh_deadline_reached: false,
+        refresh_sweeps_completed: book.cursor.refresh_sweeps_completed(),
         seen_rows: book.cursor.occupancy(),
         pair_limit: book.pair_limit,
         health: CaptureHealth::default(),
@@ -2420,6 +2486,7 @@ fn read_witnesses_from(
         health_baseline_ns: book.health_ns,
         health_read_ns: 0,
         rows_read_ns: 0,
+        counts_read_ns: 0,
         changed_objects: Vec::new(),
         custody: book.custody(),
         custody_proven_ns: book.scope.map(|_| book.held_ns),
@@ -2451,20 +2518,8 @@ fn read_witnesses_from(
     apply_health(&mut batch, assessed);
     batch.changed_objects = recheck_pins(state, book);
     let capacity = state.endpoint_capacity();
-    let published = &book.published;
-    let failed = &book.failed;
-    let scope_pid = book.scope_pid();
     let mut io: &Ebpf = state.ebpf();
-    let read = book.cursor.read_with(
-        &mut io,
-        window.max_rows,
-        window.deadline,
-        capacity,
-        |endpoint| published.get(&endpoint).map(|object| object.index()),
-        |_, value| witness_rejection(failed, scope_pid, value),
-    );
-    batch.rows_read_ns = monotonic_ns();
-    absorb_rows(book, &mut batch, read);
+    read_rows_from_with(&mut io, book, &mut batch, window, capacity);
     batch.custody = book.custody();
     batch.custody_proven_ns = book.scope.map(|_| book.held_ns);
     batch.lifecycle_proven_ns = book.drained_ns;
@@ -2526,6 +2581,42 @@ fn recheck_pins(state: &mut InventoryState, book: &mut CaptureBook) -> Vec<Attac
     changed
 }
 
+/// The row half of one witness read over any CALLER_USE IO (the real map
+/// in production, scripted rows in tests): the witness quantum first — new
+/// rows seed their count baselines as they report — then the count-refresh
+/// quantum over the witnessed rows within the same window bounds.
+fn read_rows_from_with<I: CallerUseIo>(
+    io: &mut I,
+    book: &mut CaptureBook,
+    batch: &mut WitnessBatch,
+    window: ReadWindow,
+    capacity: u32,
+) {
+    let published = &book.published;
+    let failed = &book.failed;
+    let scope_pid = book.scope_pid();
+    let read = book.cursor.read_with(
+        io,
+        window.max_rows,
+        window.deadline,
+        capacity,
+        |endpoint| published.get(&endpoint).map(|object| object.index()),
+        |_, value| witness_rejection(failed, scope_pid, value),
+    );
+    // The count-lookup stamp goes down before the refresh quantum
+    // (round 5, anchor skew): every refreshed count is observed at or
+    // after it, so a base read anchors at-or-before its own lookup.
+    // The batch stamp stays after the quantum — binding horizons
+    // prove their starts strictly after the rows' read finished.
+    batch.counts_read_ns = monotonic_ns();
+    let refreshed = book
+        .cursor
+        .refresh_with(io, window.max_rows, window.deadline);
+    batch.rows_read_ns = monotonic_ns();
+    absorb_rows(book, batch, read);
+    absorb_counts(book, batch, refreshed);
+}
+
 fn absorb_rows(
     book: &mut CaptureBook,
     batch: &mut WitnessBatch,
@@ -2540,26 +2631,11 @@ fn absorb_rows(
             endpoint: EndpointId(value.witness_endpoint),
             host_tgid: value.host_tgid,
             recorded_at_ns: value.recorded_at_ns,
+            entry_count: value.saturated_entry_count(),
         });
     }
     for (key, value, fault) in read.faults {
-        let reason = match fault {
-            CallerRowFault::InvalidKey => {
-                "CALLER_USE key is invalid (no image or reserved bits)".into()
-            }
-            CallerRowFault::InvalidValue => {
-                "CALLER_USE value is invalid for this capture's endpoint capacity".into()
-            }
-            CallerRowFault::Vanished => "CALLER_USE row vanished between key and lookup".into(),
-            CallerRowFault::UnpublishedEndpoint => {
-                "CALLER_USE witness endpoint was never published by this capture".into()
-            }
-            CallerRowFault::BindingMismatch { published } => format!(
-                "CALLER_USE row names object {} but its witness endpoint is bound to object {published}",
-                key.object_id
-            ),
-            CallerRowFault::Rejected(reason) => reason,
-        };
+        let reason = row_fault_reason(&key, fault);
         batch
             .integrity
             .push(WitnessIntegrity { key, value, reason });
@@ -2577,6 +2653,87 @@ fn absorb_rows(
     batch.unrecorded_rows = read.unrecorded;
     batch.sweep_gaps = read.sweep_gaps;
     batch.seen_rows = book.cursor.occupancy();
+}
+
+/// What one row fault means, for the witness and refresh absorbs alike.
+fn row_fault_reason(key: &CallerObjectKey, fault: CallerRowFault) -> String {
+    match fault {
+        CallerRowFault::InvalidKey => {
+            "CALLER_USE key is invalid (no image or reserved bits)".into()
+        }
+        CallerRowFault::InvalidValue => {
+            "CALLER_USE value is invalid for this capture's endpoint capacity".into()
+        }
+        CallerRowFault::Vanished => "CALLER_USE row vanished between key and lookup".into(),
+        CallerRowFault::UnpublishedEndpoint => {
+            "CALLER_USE witness endpoint was never published by this capture".into()
+        }
+        CallerRowFault::BindingMismatch { published } => format!(
+            "CALLER_USE row names object {} but its witness endpoint is bound to object {published}",
+            key.object_id
+        ),
+        CallerRowFault::Rejected(reason) => reason,
+        CallerRowFault::CountDecrease { before, after } => format!(
+            "CALLER_USE entry count decreased {before}->{after} for a tracked row (integrity gap; the published count stays {before})"
+        ),
+    }
+}
+
+/// Re-validates one refreshed row's endpoint binding (H-C3R2): the
+/// refresh re-reads without validating, so a corrupt re-read faults
+/// into integrity here instead of indexing `published`.
+fn refreshed_object(
+    book: &CaptureBook,
+    key: &CallerObjectKey,
+    value: &CallerObjectUse,
+) -> Result<AttachObjectId, super::callers::CallerRowFault> {
+    match book.published.get(&value.witness_endpoint).copied() {
+        Some(object) if object.index() == key.object_id => Ok(object),
+        Some(object) => Err(super::callers::CallerRowFault::BindingMismatch {
+            published: object.index(),
+        }),
+        None => Err(super::callers::CallerRowFault::UnpublishedEndpoint),
+    }
+}
+
+fn absorb_counts(
+    book: &mut CaptureBook,
+    batch: &mut WitnessBatch,
+    refreshed: super::callers::CallerCountsRead,
+) {
+    let integrity_before = batch.integrity.len();
+    for (key, value) in refreshed.updates {
+        match refreshed_object(book, &key, &value) {
+            Ok(object) => batch.counts.push(CallerCountUpdate {
+                image: key.image,
+                object,
+                count: value.saturated_entry_count(),
+            }),
+            Err(fault) => {
+                let reason = row_fault_reason(&key, fault);
+                batch.integrity.push(WitnessIntegrity {
+                    key,
+                    value: Some(value),
+                    reason,
+                });
+            }
+        }
+    }
+    for (key, value, fault) in refreshed.gaps {
+        let reason = row_fault_reason(&key, fault);
+        batch
+            .integrity
+            .push(WitnessIntegrity { key, value, reason });
+    }
+    book.integrity_total = book
+        .integrity_total
+        .saturating_add((batch.integrity.len() - integrity_before) as u64);
+    batch.integrity_total = book.integrity_total;
+    batch.refresh_sweep_completed = refreshed.sweep_completed;
+    batch.refresh_sweep_gaps = refreshed.sweep_gaps;
+    batch.refresh_deadline_reached = refreshed.deadline_reached;
+    batch.refresh_sweeps_completed = book.cursor.refresh_sweeps_completed();
+    batch.read_failures.extend(refreshed.read_failures);
 }
 
 /// A rise in any watch-relevant counter since the last readable health

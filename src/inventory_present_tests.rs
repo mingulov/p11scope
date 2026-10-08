@@ -96,15 +96,7 @@ fn capture_for(harness: &Harness, document: &serde_json::Value) -> Presentation 
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
     let passes = document["observation"]["passes"].as_u64().unwrap();
-    Presentation::capture(
-        harness.coordinator(),
-        "workload",
-        started,
-        ended,
-        passes,
-        ended,
-        ended.saturating_sub(started),
-    )
+    Presentation::capture(harness.coordinator(), "workload", started, ended, passes)
 }
 
 #[test]
@@ -392,8 +384,9 @@ fn activity_splits_in_flight_from_recent_from_quiet() {
     assert_eq!(activity(c0), Activity::RecentlyObserved);
     assert_eq!(activity(c1), Activity::InFlight);
     assert_eq!(activity(c2), Activity::Quiet);
-    // An old entry outside the window reads as quiet, not recent.
-    let stale = Presentation::capture(
+    // The dashboard display keeps its window: an old entry outside it
+    // reads as quiet, not recent.
+    let stale = Presentation::capture_dashboard(
         harness.coordinator(),
         "workload",
         0,
@@ -1141,16 +1134,11 @@ fn uncovered_edges_read_neither_idle_nor_armed() {
         registry.observe_entries(caller, &scale_key(2), 2, 20);
     }
     harness.commit();
+    // One more pass without counts: per-pass activity clears the rise,
+    // so the old counted edge reads quiet.
+    harness.commit();
     let document = harness.render();
-    let presentation = Presentation::capture(
-        harness.coordinator(),
-        "workload",
-        0,
-        now,
-        2,
-        now,
-        DASHBOARD_ACTIVITY_WINDOW_NS,
-    );
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 0, now, 3);
     let view = |key: &ModuleKey| {
         let id = harness.coordinator().registry().module_id_for(key).unwrap();
         presentation
@@ -1213,4 +1201,49 @@ fn uncovered_edges_read_neither_idle_nor_armed() {
         .find(|edge| edge["module"] == view(&scale_key(3)).module.label())
         .unwrap();
     assert_eq!(lossy_json["entries"]["coverage"]["lossy"], true);
+}
+
+// F3-06 doc-accuracy pin (round-2 F2-07): `docs/schema/inventory-events-v1.md`
+// states the per-pass `recently observed` precedence exception (an in-flight
+// edge, or one with active operations, reads `operation initialized /
+// in flight` over a rise — production `Activity::for_edge`) and the
+// `last_seen_ns` correction (records and the snapshot DO carry
+// `entries.last_seen_ns`, serialized by `edge_json` verbatim into
+// `edge_observed` payloads — only the dashboard's trailing 5 s window
+// over it is display-only). Either old sentence returning fails the pin.
+#[test]
+fn event_doc_pins_activity_precedence_and_last_seen_presence() {
+    const DOC: &str = include_str!("../docs/schema/inventory-events-v1.md");
+    let counted = UseCoverage::Counted {
+        since_ns: 7,
+        lossy: false,
+    };
+    assert_eq!(
+        Activity::for_edge(MappingState::Mapped, true, true, false, &counted),
+        Activity::InFlight,
+        "in-flight takes precedence over a rise"
+    );
+    assert_eq!(
+        Activity::for_edge(MappingState::Mapped, false, true, true, &counted),
+        Activity::InFlight,
+        "active operations take precedence over a rise"
+    );
+    assert_eq!(Activity::RecentlyObserved.label(), "recently observed");
+    assert!(
+        DOC.contains("take precedence") && DOC.contains("over a rise"),
+        "the precedence exception is stated"
+    );
+    assert!(
+        !DOC.contains("`recently observed` iff"),
+        "the old unconditional `iff` must not return"
+    );
+    assert!(
+        DOC.contains("do carry `entries.last_seen_ns`")
+            && DOC.contains("display-only, never the recorded signal"),
+        "the `last_seen_ns` display-only correction is stated"
+    );
+    assert!(
+        !DOC.contains("never appears in records or the snapshot"),
+        "the old `never appears` claim must not return"
+    );
 }

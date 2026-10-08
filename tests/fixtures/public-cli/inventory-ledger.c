@@ -18,6 +18,13 @@
  *   --gate FILE|-    wait for FILE to exist before the main phase (default -: no gate)
  *   --hold           after teardown, wait for SIGTERM/SIGINT before exiting
  *   --late           (mech) dlopen only after the gate opens: a late provider     [P7]
+ *   --late-from N    (mech) modules N.. load only after the gate; modules below N
+ *                    load eagerly (default: all eager; --late is --late-from 0) [AB]
+ *   --gate2 FILE     (mech) with --single-call M: after module M's C_Initialize,
+ *                    wait for FILE before the rest of setup                    [AB]
+ *   --single-call M  (mech) late module M performs only C_Initialize after the
+ *                    quarantine, flushes, waits --gate2, then finishes setup;
+ *                    needs a late module and --gate2                           [AB]
  *   --delay-ms N     sleep N ms after the gate (after a --late dlopen) before calling;
  *                    exec-chain also sleeps N ms before every exec
  *   --sleep-us N     sleep N us after every iteration (stretches a short CLI)
@@ -321,10 +328,15 @@ static void sleep_ms(long ms) {
     while (nanosleep(&t, &t) && errno == EINTR) {}
 }
 
-static CK_SESSION_HANDLE setup(int m) {
+/* The first setup call on its own, so a staged late module can publish
+ * exactly one counted call before the harness releases the rest. */
+static void initialize_module(int m) {
     CK_INIT_ARGS args = {0};
     args.flags = 2; /* CKF_OS_LOCKING_OK: leader-exit calls from a second thread */
     if (CALL(m, PH_SETUP, I_Initialize, NO_MECH, CK_RV (*)(void *), &args)) die("C_Initialize");
+}
+
+static CK_SESSION_HANDLE setup_after_init(int m) {
     CK_SLOT_ID slots[16];
     CK_ULONG ns = 16;
     if (CALL(m, PH_SETUP, I_GetSlotList, NO_MECH, CK_RV (*)(unsigned char, CK_SLOT_ID *, CK_ULONG *),
@@ -338,6 +350,11 @@ static CK_SESSION_HANDLE setup(int m) {
              s, 1, (unsigned char *)"1234", 4))
         die("C_Login");
     return s;
+}
+
+static CK_SESSION_HANDLE setup(int m) {
+    initialize_module(m);
+    return setup_after_init(m);
 }
 
 static void teardown(int m, CK_SESSION_HANDLE s) {
@@ -402,11 +419,11 @@ static void iteration(int m, CK_SESSION_HANDLE s) {
 }
 
 struct options {
-    const char *mode, *gate, *chain;
+    const char *mode, *gate, *gate2, *chain;
     long iters, delay_ms, sleep_us;
-    int hold, late;
+    int hold, late_from, single_call;
 };
-static struct options opt = {.gate = "-", .iters = 4};
+static struct options opt = {.gate = "-", .iters = 4, .late_from = -1, .single_call = -1};
 
 static void hold_if_asked(void) {
     if (!opt.hold) return;
@@ -421,20 +438,46 @@ static void done_ok(void) {
 /* The mech generation over every module: setup all, gate, main, teardown. */
 static void mech_generation(long iters, int gated) {
     CK_SESSION_HANDLE s[MAX_MODULES];
-    if (!opt.late)
-        for (int m = 0; m < module_count; m++) { load_module(m); bind_module(m); s[m] = setup(m); }
+    int split = opt.late_from < 0 ? module_count : opt.late_from;
+    if (split > module_count) split = module_count;
+    for (int m = 0; m < split; m++) { load_module(m); bind_module(m); s[m] = setup(m); }
     flush_ledger();
     if (gated) {
         printf("READY " HEAD "\n", HEAD_ARGS);
         fflush(stdout);
         wait_gate(opt.gate);
     }
-    if (opt.late) {
-        for (int m = 0; m < module_count; m++) load_module(m);
+    if (split == module_count) {
         sleep_ms(opt.delay_ms);
-        for (int m = 0; m < module_count; m++) { bind_module(m); s[m] = setup(m); }
     } else {
-        sleep_ms(opt.delay_ms);
+        if (opt.single_call >= module_count) die("--single-call module out of range");
+        if (opt.single_call >= 0 && opt.single_call < split) die("--single-call module is not late");
+        if (opt.single_call >= 0 && (!opt.gate2 || !strcmp(opt.gate2, "-")))
+            die("--single-call needs --gate2");
+        /* AB only: one eager call after the gate (post-capture, the
+         * capture started before gate1 opened) and before B maps, so
+         * the lane caches the caller through A first — P3's
+         * cached-caller sequence needs A counted before B is ever
+         * observed (round 2, F5). */
+        if (opt.single_call >= 0 && split > 0) {
+            iteration(0, s[0]);
+            flush_ledger();
+        }
+        for (int m = split; m < module_count; m++) load_module(m);
+        if (opt.single_call < 0) {
+            sleep_ms(opt.delay_ms);
+            for (int m = split; m < module_count; m++) { bind_module(m); s[m] = setup(m); }
+        } else {
+            /* Bind before the quarantine: the dlsym acquisition is
+             * pre-attach (uncounted) while C_Initialize lands post-attach. */
+            for (int m = split; m < module_count; m++) bind_module(m);
+            sleep_ms(opt.delay_ms);
+            initialize_module(opt.single_call);
+            flush_ledger();
+            wait_gate(opt.gate2);
+            for (int m = split; m < module_count; m++)
+                s[m] = (m == opt.single_call) ? setup_after_init(m) : setup(m);
+        }
     }
     for (int m = 0; m < module_count; m++)
         for (long i = 0; i < iters * (m + 1); i++) {
@@ -530,7 +573,8 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: inventory-ledger mech|map|exec-chain|held|leader-exit --cell LABEL "
                         "[--module P]... [--iters N] [--gate F|-] [--hold] [--late] [--delay-ms N] "
-                        "[--sleep-us N] [--chain HOW:EXE,...]\n");
+                        "[--sleep-us N] [--chain HOW:EXE,...] [--late-from N] [--gate2 F] "
+                        "[--single-call M]\n");
         return 2;
     }
     opt.mode = argv[1];
@@ -538,7 +582,7 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--hold")) { opt.hold = 1; continue; }
-        if (!strcmp(a, "--late")) { opt.late = 1; continue; }
+        if (!strcmp(a, "--late")) { opt.late_from = 0; continue; }
         if (!v) { fprintf(stderr, "missing value for %s\n", a); return 2; }
         i++;
         if (!strcmp(a, "--cell")) cell = v;
@@ -546,7 +590,14 @@ int main(int argc, char **argv) {
             if (module_count == MAX_MODULES) { fprintf(stderr, "too many --module\n"); return 2; }
             snprintf(modules[module_count++].path, PATH_MAX, "%s", v);
         } else if (!strcmp(a, "--iters")) opt.iters = atol(v);
-        else if (!strcmp(a, "--gate")) opt.gate = v;
+        else if (!strcmp(a, "--late-from")) {
+            if (atol(v) < 0) { fprintf(stderr, "--late-from must be >= 0\n"); return 2; }
+            opt.late_from = atoi(v);
+        } else if (!strcmp(a, "--single-call")) {
+            if (atol(v) < 0) { fprintf(stderr, "--single-call must be >= 0\n"); return 2; }
+            opt.single_call = atoi(v);
+        } else if (!strcmp(a, "--gate")) opt.gate = v;
+        else if (!strcmp(a, "--gate2")) opt.gate2 = v;
         else if (!strcmp(a, "--delay-ms")) opt.delay_ms = atol(v);
         else if (!strcmp(a, "--sleep-us")) opt.sleep_us = atol(v);
         else if (!strcmp(a, "--chain")) opt.chain = v;
@@ -582,7 +633,8 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(opt.mode, "exec-chain")) {
         if (module_count != 1) die("exec-chain needs exactly one --module");
-        if (opt.late) die("exec-chain does not take --late");
+        if (opt.late_from >= 0) die("exec-chain does not take --late");
+        if (opt.gate2 || opt.single_call >= 0) die("exec-chain does not take staged options");
         /* Generation k runs ITERS*(k+1) iterations, so every image's count is distinct. */
         mech_generation(opt.iters * (gen + 1), gen == 0);
         done_ok();

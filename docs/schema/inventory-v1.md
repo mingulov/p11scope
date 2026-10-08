@@ -280,22 +280,32 @@ non-null values needs a new allowlist row.
   observation is not a fact about usage; a caller with zero observed
   entries is "mapped, quiet", never "active". Recency ("active now")
   is last-seen plus in-flight state, never a sticky bit; last-seen
-  comes only from counted entries.
+  comes only from counted entries, at pass resolution: the instant of
+  the witness read that observed the rise, never a BPF timestamp, and
+  never per function, per thread, or per call time.
 - `edges[].entries.coverage` (additive within v1): what this edge's
   usage columns can claim, per edge — never a run-wide flag. Always
   the seven keys `{state, since_ns, until_ns, first_ns, lossy, reason, detail}`
   (`null` where a key does not apply: `lossy` is a boolean only for
   `counted`). In v0.2.0 the producer emits `witnessed`, `watched_no_use`
-  and `unknown` only; `counted` is a contract state reserved for a future
-  counting feed (C7) and never appears in v0.2.0 output. `state` is:
+  and `unknown` only; since v0.3.0 the native lane also emits `counted`
+  (C7). `state` is:
   - `counted`: a counting feed (actual call observations) covers the
     edge since `since_ns`; `count` and `last_seen_ns` are meaningful.
+    `count` is a saturating lower bound of entries on the module's
+    attached endpoints since the pair's first record, including calls
+    that returned errors; reads mid-capture are lower bounds, only the
+    post-stop read is final. An edge reads `counted` only when its row
+    is bound to an admitted caller incarnation and its count is ≥ 1.
     `lossy: true` means records were lost: a positive count is a lower
     bound and a zero reads `unknown (usage observation lossy)`.
   - `witnessed`: use was witnessed (first at `first_ns`) but nothing
     counts it — `count` stays 0 for old consumers, `observation` reads
     `unknown (count unavailable; use witnessed)`, and the dashboard
-    activity reads `used (recency unknown)`, never quiet. A native
+    activity reads `used (recency unknown)`, never quiet. Since v0.3.0
+    the native lane counts every bound row, so it emits `counted`
+    instead; `witnessed` remains for scan-lane and Detailed-subset
+    witnesses. A native
     `CALLER_USE` row witnesses an edge only when the binder binds it
     to this caller incarnation (see `observation.native_witnesses`);
     the row is use of the admitted module whose endpoint set holds
@@ -337,8 +347,13 @@ non-null values needs a new allowlist row.
     scan-only run), `not_admitted`, `not_attached`, `attach_failed`,
     `identity_unavailable`, `capacity_limited` (`detail` names the
     resource), `loss` (`detail` says what was lost),
-    `retired_before_coverage`, `use_before_admission`, or
-    `pending_first_use`.
+    `retired_before_coverage`, `use_before_admission`,
+    `pending_first_use`, or `uncounted` (since v0.3.0, C7: a
+    CALLER_USE pair insert failed, so some pair has use but no row
+    and absence proves nothing — `detail` names the
+    `PairInsertFailure` evidence, `observation` reads `unknown (usage
+    observation unavailable)` with a zero no consumer reads as fact,
+    and no watch starts again in the capture).
   - `use_before_admission` (native lane): a `CALLER_USE` row whose pid
     is this caller's pid was not bound to it — typically a use before
     the caller's admission (`before_admission`), or any other unbound
@@ -358,7 +373,9 @@ non-null values needs a new allowlist row.
     `witnessed`) is never downgraded. The reason names what first voided
     the watch: a watch a loss already demoted keeps `loss`, and a later
     loss leaves `use_before_admission` in place (a loss demotes watch
-    intervals only); no watch starts again either way.
+    intervals only); no watch starts again either way. The same
+    first-wins holds against `uncounted`, which demotes watch intervals
+    only and is itself never downgraded once read.
     A row that lifecycle loss left unbound (`lifecycle_loss`) downgrades
     the same way but reads `loss` (`detail`: the lost lifecycle
     evidence), since the loss, not an early use, is what it shows.
@@ -369,8 +386,9 @@ non-null values needs a new allowlist row.
     `unknown` (`activity unknown`, `entries ?`) on the dashboard and in
     mid-run `edge_observed` records, and the watch's proven-clean
     instant is not extended over it. Once the row binds the edge reads
-    `witnessed`, or the unbound reason when it does not; the staged
-    watch resumes when the row binds elsewhere. The finish flush
+    `counted` (since v0.3.0 the native lane counts every bound row), or
+    the unbound reason when it does not; the staged watch resumes when
+    the row binds elsewhere. The finish flush
     decides every row, so the `-o` snapshot and the final sweep never
     carry this reason.
   A zero reads `observed` only under `watched_no_use` or a loss-free

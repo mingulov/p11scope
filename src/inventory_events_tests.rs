@@ -59,15 +59,8 @@ fn presentation_for(harness: &Harness) -> (Presentation, serde_json::Value) {
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
     let passes = document["observation"]["passes"].as_u64().unwrap();
-    let presentation = Presentation::capture(
-        harness.coordinator(),
-        "workload",
-        started,
-        ended,
-        passes,
-        ended,
-        ended.saturating_sub(started),
-    );
+    let presentation =
+        Presentation::capture(harness.coordinator(), "workload", started, ended, passes);
     (presentation, document)
 }
 
@@ -374,15 +367,8 @@ fn incremental_pass_events_match_the_final_snapshot() {
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
     let passes = document["observation"]["passes"].as_u64().unwrap();
-    let presentation = Presentation::capture(
-        harness.coordinator(),
-        "workload",
-        started,
-        ended,
-        passes,
-        ended,
-        ended.saturating_sub(started),
-    );
+    let presentation =
+        Presentation::capture(harness.coordinator(), "workload", started, ended, passes);
     // Emit the pass the way production does (caller turnover, new
     // gaps, pass marker).
     for event in &events {

@@ -458,9 +458,9 @@ fn collect_keys(value: &serde_json::Value, forbidden: &mut Vec<String>) {
 
 #[test]
 fn d1_right_now_trichotomy_stays_three_distinct_facts() {
-    // Edge m0: recently observed entries, no operation. Edge m1: an
-    // initialized operation, quiet entries. Edge m2: an API call in
-    // flight. Three distinct states, never merged (B3).
+    // Edge m0: risen entries, no operation. Edge m1: an initialized
+    // operation, quiet entries. Edge m2: an API call in flight. Three
+    // distinct states, never merged (B3).
     let mut harness = harness();
     let spec = ScaleSpec {
         name: "s1-trichotomy",
@@ -488,7 +488,7 @@ fn d1_right_now_trichotomy_stays_three_distinct_facts() {
     let recent = edge_json(&document, "c0", "m0");
     let initialized = edge_json(&document, "c0", "m1");
     let in_flight = edge_json(&document, "c0", "m2");
-    // Recently observed call: entries recency, no operation.
+    // Risen call: a per-pass rise, no operation.
     assert_eq!(recent["entries"]["count"], 2);
     assert!(recent["operations"].is_null());
     assert!(!recent["entries"]["in_flight"].as_bool().unwrap());
@@ -504,7 +504,7 @@ fn d1_right_now_trichotomy_stays_three_distinct_facts() {
     assert_eq!(in_flight["entries"]["count"], 0);
     assert!(in_flight["operations"].is_null());
     // The dashboard activity wires genuine operation state (B4):
-    // initialized-op and in-flight edges read in-flight; the recent
+    // initialized-op and in-flight edges read in-flight; the risen
     // edge reads recently observed.
     let presentation = presentation_for(&harness, &document);
     let activity = |module: &str| {
@@ -527,15 +527,7 @@ fn presentation_for(harness: &Harness, document: &serde_json::Value) -> Presenta
     let started = document["observation"]["started_ns"].as_u64().unwrap();
     let ended = document["observation"]["ended_ns"].as_u64().unwrap();
     let passes = document["observation"]["passes"].as_u64().unwrap();
-    Presentation::capture(
-        harness.coordinator(),
-        "workload",
-        started,
-        ended,
-        passes,
-        ended,
-        ended.saturating_sub(started),
-    )
+    Presentation::capture(harness.coordinator(), "workload", started, ended, passes)
 }
 
 // ---------------------------------------------------------------------------

@@ -1489,6 +1489,7 @@ fn detailed_map_data(map: &Map) -> Result<&MapData> {
         Map::Array(data)
         | Map::CgroupArray(data)
         | Map::HashMap(data)
+        | Map::LruHashMap(data)
         | Map::PerCpuArray(data)
         | Map::PerCpuHashMap(data)
         | Map::ProgramArray(data)
@@ -9001,6 +9002,127 @@ fn caller_usage(ebpf: &Ebpf, endpoint: u32) -> Result<u64> {
     Ok(map.get(&endpoint, 0)?)
 }
 
+/// One caller/object identity row: the key plus the insert-immutable
+/// value fields. BPF publishes rows with BPF_NOEXIST and afterwards
+/// only advances `entry_count`, so identity compares across counting
+/// eras while counts are asserted separately, per era.
+fn caller_identity_row(
+    row: &(CallerObjectKey, CallerObjectUse),
+) -> (CallerObjectKey, CallerObjectUse) {
+    let (key, mut value) = *row;
+    value.entry_count = 0;
+    (key, value)
+}
+
+fn caller_identity_set(
+    rows: &[(CallerObjectKey, CallerObjectUse)],
+) -> Vec<(CallerObjectKey, CallerObjectUse)> {
+    rows.iter().map(caller_identity_row).collect()
+}
+
+/// The counting-era stability assertion: two era-fresh reads carry the
+/// same identity rows (keys + insert-immutable fields).
+fn ensure_identity_same(
+    before: &[(CallerObjectKey, CallerObjectUse)],
+    after: &[(CallerObjectKey, CallerObjectUse)],
+    era: &str,
+) -> Result<()> {
+    ensure!(
+        caller_identity_set(before) == caller_identity_set(after),
+        "{era}: identity rows changed: {before:?} vs {after:?}"
+    );
+    Ok(())
+}
+
+/// The counting-era growth assertion: `key`'s row advanced by exactly
+/// `delta` between two era-fresh reads, while every other row's count
+/// stood still.
+fn ensure_count_delta(
+    before: &[(CallerObjectKey, CallerObjectUse)],
+    after: &[(CallerObjectKey, CallerObjectUse)],
+    key: &CallerObjectKey,
+    delta: u64,
+    era: &str,
+) -> Result<()> {
+    let count_of = |rows: &[(CallerObjectKey, CallerObjectUse)]| {
+        rows.iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.entry_count)
+    };
+    let (before_count, after_count) = match (count_of(before), count_of(after)) {
+        (Some(before_count), Some(after_count)) => (before_count, after_count),
+        _ => bail!("{era}: row {key:?} missing from an era read"),
+    };
+    ensure!(
+        after_count == before_count + delta,
+        "{era}: row {key:?} grew {before_count}->{after_count}, want +{delta}"
+    );
+    for (candidate, value) in before {
+        if candidate == key {
+            continue;
+        }
+        let after_count = after
+            .iter()
+            .find(|(after_key, _)| after_key == candidate)
+            .map(|(_, after_value)| after_value.entry_count);
+        ensure!(
+            after_count == Some(value.entry_count),
+            "{era}: idle row {candidate:?} moved while {key:?} grew: {before:?} vs {after:?}"
+        );
+    }
+    for (candidate, _) in after {
+        ensure!(
+            before.iter().any(|(before_key, _)| before_key == candidate),
+            "{era}: row {candidate:?} is new, want only {key:?} active: {after:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The counting-era stillness assertion: two era-fresh reads carry
+/// identical counts on every row (no entries happened between them).
+fn ensure_counts_static(
+    before: &[(CallerObjectKey, CallerObjectUse)],
+    after: &[(CallerObjectKey, CallerObjectUse)],
+    era: &str,
+) -> Result<()> {
+    ensure!(
+        before.len() == after.len(),
+        "{era}: row count changed without entries: {before:?} vs {after:?}"
+    );
+    for (key, value) in before {
+        let after_count = after
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, after_value)| after_value.entry_count);
+        ensure!(
+            after_count == Some(value.entry_count),
+            "{era}: row {key:?} moved without entries: {before:?} vs {after:?}"
+        );
+    }
+    Ok(())
+}
+
+/// One idle row's stillness across eras with different row sets (a new
+/// row appeared elsewhere): `key`'s count is identical in both reads.
+fn ensure_row_static(
+    before: &[(CallerObjectKey, CallerObjectUse)],
+    after: &[(CallerObjectKey, CallerObjectUse)],
+    key: &CallerObjectKey,
+    era: &str,
+) -> Result<()> {
+    let count_of = |rows: &[(CallerObjectKey, CallerObjectUse)]| {
+        rows.iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.entry_count)
+    };
+    ensure!(
+        count_of(before) == count_of(after) && count_of(before).is_some(),
+        "{era}: idle row {key:?} moved: {before:?} vs {after:?}"
+    );
+    Ok(())
+}
+
 fn assert_retained_pin(targets: &InventoryTargets, object: PinnedObjectId) -> Result<()> {
     let target = targets
         .pins
@@ -9388,9 +9510,11 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
         first.len() == 1
             && first[0].0.object_id == object.0
             && first[0].1.host_tgid == a.child.id()
-            && first[0].1.witness_endpoint == 575,
+            && first[0].1.witness_endpoint == 575
+            && first[0].1.entry_count == 1,
         "A first leader call did not create exact endpoint-575 pair: {first:?}"
     );
+    let a_key = first[0].0;
     ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
     assert_caller_health(&active.usage_snapshot(window()), [0; 4])?;
     eprintln!(
@@ -9398,8 +9522,13 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
         fixture.expected_abi,
         a.child.id()
     );
+    // Counting eras: every read below is era-fresh (the live map keeps
+    // counting between reads, so only the previous era's read is a valid
+    // baseline). Identity rows compare exact; counts assert per era.
     a.calls(575, 2)?;
-    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)? == first);
+    let era_repeat = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure_identity_same(&first, &era_repeat, "A repeat leader calls")?;
+    ensure_count_delta(&first, &era_repeat, &a_key, 2, "A repeat leader calls")?;
     ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
     eprintln!(
         "I2C_CALLER_A_REPEAT abi={:?} rows=1 witness=575",
@@ -9407,7 +9536,15 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
     );
     let thread_1 = a.thread_calls(575, 1)?;
     ensure!(thread_1 != a.child.id(), "first A worker was the leader");
-    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)? == first);
+    let era_thread_1 = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure_identity_same(&era_repeat, &era_thread_1, "A first worker thread")?;
+    ensure_count_delta(
+        &era_repeat,
+        &era_thread_1,
+        &a_key,
+        1,
+        "A first worker thread",
+    )?;
     eprintln!(
         "I2C_CALLER_A_THREAD abi={:?} ordinal=1 tid={thread_1} rows=1",
         fixture.expected_abi
@@ -9417,7 +9554,15 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
         thread_1 != thread_2 && thread_1 != a.child.id() && thread_2 != a.child.id(),
         "two A physical thread identities were not proven"
     );
-    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)? == first);
+    let era_thread_2 = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure_identity_same(&era_thread_1, &era_thread_2, "A second worker thread")?;
+    ensure_count_delta(
+        &era_thread_1,
+        &era_thread_2,
+        &a_key,
+        2,
+        "A second worker thread",
+    )?;
     ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
     eprintln!(
         "I2C_CALLER_A_THREAD abi={:?} ordinal=2 tid={thread_2} rows=1",
@@ -9431,17 +9576,22 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
     b.finish()?;
     await_lifecycle(&mut active, b.child.id(), DISCOVERY_KIND_LEADER_EXIT)?;
     let after_b = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    let a_identity = caller_identity_row(&era_thread_2[0]);
+    let b_row = after_b.iter().find(|(key, value)| {
+        value.host_tgid == b.child.id()
+            && value.witness_endpoint == 575
+            && key.image.task_cookie != first[0].0.image.task_cookie
+            && key.object_id == object.0
+    });
     ensure!(
         after_b.len() == 2
-            && after_b.contains(&first[0])
-            && after_b.iter().any(|(key, value)| {
-                value.host_tgid == b.child.id()
-                    && value.witness_endpoint == 575
-                    && key.image.task_cookie != first[0].0.image.task_cookie
-                    && key.object_id == object.0
-            }),
+            && caller_identity_set(&after_b).contains(&a_identity)
+            && b_row.is_some_and(|(_, value)| value.entry_count == 3),
         "B after USAGE=1 or exit history absent: {after_b:?}"
     );
+    let b_key = b_row.map(|(key, _)| *key).expect("B row present");
+    // A made no entries while B ran: its row stands exactly still.
+    ensure_row_static(&era_thread_2, &after_b, &a_key, "B era")?;
     ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
     assert_caller_health(&active.usage_snapshot(window()), [0; 4])?;
     eprintln!(
@@ -9454,18 +9604,26 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
     await_lifecycle(&mut active, a.child.id(), DISCOVERY_KIND_EXEC)?;
     a.calls(575, 4)?;
     let after_exec = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    let after_b_identities = caller_identity_set(&after_b);
+    let exec_row = after_exec.iter().find(|(key, value)| {
+        value.host_tgid == a.child.id()
+            && value.witness_endpoint == 575
+            && key.object_id == object.0
+            && key.image.task_cookie == first[0].0.image.task_cookie
+            && key.image.exec_id != first[0].0.image.exec_id
+    });
     ensure!(
         after_exec.len() == 3
-            && after_b.iter().all(|row| after_exec.contains(row))
-            && after_exec.iter().any(|(key, value)| {
-                value.host_tgid == a.child.id()
-                    && value.witness_endpoint == 575
-                    && key.object_id == object.0
-                    && key.image.task_cookie == first[0].0.image.task_cookie
-                    && key.image.exec_id != first[0].0.image.exec_id
-            }),
+            && after_b_identities
+                .iter()
+                .all(|row| caller_identity_set(&after_exec).contains(row))
+            && exec_row.is_some_and(|(_, value)| value.entry_count == 4),
         "same-PID exec did not retain old pairs and create new image pair: {after_exec:?}"
     );
+    let exec_key = exec_row.map(|(key, _)| *key).expect("exec row present");
+    // Neither old row moved while the exec image ran its 4 calls.
+    ensure_row_static(&after_b, &after_exec, &a_key, "exec era")?;
+    ensure_row_static(&after_b, &after_exec, &b_key, "exec era")?;
     ensure!(caller_usage(&active.state.prepared.ebpf, 575)? == 1);
     assert_caller_health(&active.usage_snapshot(window()), [0; 4])?;
     eprintln!(
@@ -9499,10 +9657,11 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
             && evidence[3] == prior_evidence[3],
         "C did not raise only pair-insert failure: before={prior_evidence:?} after={evidence:?}"
     );
-    ensure!(
-        caller_pair_set(&active.state.prepared.ebpf, object)? == after_exec,
-        "P exhaustion replaced an existing pair"
-    );
+    // P exhaustion replaced no existing pair: identities and counts
+    // stand exactly still across C's failed inserts.
+    let era_exhausted = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure_identity_same(&after_exec, &era_exhausted, "P exhaustion")?;
+    ensure_counts_static(&after_exec, &era_exhausted, "P exhaustion")?;
     ensure!(
         !after_exec
             .iter()
@@ -9519,7 +9678,19 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
         fixture.expected_abi
     );
     a.calls(575, 6)?;
-    ensure!(caller_pair_set(&active.state.prepared.ebpf, object)? == after_exec);
+    let era_post_exec_repeat = caller_pair_set(&active.state.prepared.ebpf, object)?;
+    ensure_identity_same(
+        &era_exhausted,
+        &era_post_exec_repeat,
+        "post-exec repeat calls",
+    )?;
+    ensure_count_delta(
+        &era_exhausted,
+        &era_post_exec_repeat,
+        &exec_key,
+        6,
+        "post-exec repeat calls",
+    )?;
     let after_repeat = active.usage_snapshot(window());
     assert_caller_health(&after_repeat, evidence)?;
     a.finish()?;
@@ -9532,7 +9703,9 @@ fn caller_system_gate(ia32: bool) -> Result<()> {
     ensure!(retired.cleanup.closed == 578 && retired.cleanup.failures.is_empty());
     let last = retired.usage_snapshot(window());
     ensure!(last.terminal_unsettled && last.health.caller_evidence == Some(evidence));
-    ensure!(caller_pair_set(&retired.state.prepared.ebpf, object)? == after_exec);
+    let era_retired = caller_pair_set(&retired.state.prepared.ebpf, object)?;
+    ensure_identity_same(&era_post_exec_repeat, &era_retired, "retirement")?;
+    ensure_counts_static(&era_post_exec_repeat, &era_retired, "retirement")?;
     assert_retained_pin(&retired.state.targets, object)?;
     eprintln!(
         "I2C_CALLER_RETAINED abi={:?} rows=3 maps={}",

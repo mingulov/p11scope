@@ -88,6 +88,19 @@ MAPPING_LIVE = "mapped"
 MAPPING_ENDED = "ended"
 # A counted feed that lost records must say so in gaps[] (plan §3.5 note_capture_loss).
 LOSS_GAP = re.compile(r"\bloss\b|\blost\b|lossy", re.I)
+# O1 partial attach (fix round 1): failed endpoints make their module
+# undercount (PARTIAL_ATTACH_SUBJECT in
+# src/discovery/inventory_coordinator.rs) — counted uses are lower
+# bounds, so COUNT-EXACT over the module is explicitly nonqualifying
+# and the COUNT-WINDOW lower bound is clamped (saturation-shaped).
+PARTIAL_ATTACH = re.compile(r"endpoint attach fail", re.I)
+# Demoted edge (fix round 4, R4-N2): a demoted placement marks its edge
+# (DEMOTED_COUNT_PLACED in src/discovery/caller_registry.rs) — the
+# count is segment-relative growth from the base read, so the window
+# judges the upper bound only and COUNT-EXACT is explicitly
+# nonqualifying. Distinct from the rejected-demoted-count disclosure
+# subject ("rejected demoted count": no edge carries that growth).
+DEMOTED_PLACED = re.compile(r"demoted count placed", re.I)
 # Unbound positive (plan §3.3, "used by an unidentified caller image").
 UNBOUND_GAP = re.compile(r"unidentified caller|unbound (caller|witness)", re.I)
 # A gap field naming when the unbound use happened (first match wins).
@@ -107,6 +120,17 @@ USE_BEFORE_ADMISSION = "use_before_admission"
 # Transient: the finish flush decides every row, so the final snapshot
 # never carries it — only mid-run frames and edge_observed records do.
 PENDING_FIRST_USE_REASON = "pending_first_use"
+# C7 C4/C5: a CALLER_USE pair insert failed, so some pair has use but no
+# row and absence proves nothing. The edge reads unknown/`uncounted`
+# (never 0) with a zero no consumer reads as fact, and no watch starts
+# again in the capture. Choice 1 (controller-accepted): the trigger is
+# BPF PairInsertFailure evidence only, never the userspace pair
+# precondition — so the reason requires the gap below plus evidence
+# naming PairInsertFailure in its detail, while counted positives frozen
+# before the evidence stand (the exact-count exception).
+UNCOUNTED_REASON = "uncounted"
+PAIRS_UNCOUNTED_SUBJECT = "usage coverage pair insert failure"
+PAIR_INSERT_EVIDENCE = re.compile(r"PairInsertFailure")
 SCAN_ONLY_REASON = "scan_only"
 # The only unknown reasons a scan-lane document gives (an unadmitted module
 # reads not_admitted in either lane).
@@ -156,6 +180,11 @@ EVENT_KINDS = {
 }
 # caller_event sub-kind -> field naming the incarnation it mints.
 CALLER_EVENT_MINTS = {"admitted": "caller", "exec_retired": "new", "reused": "new"}
+# C7 C4/C5: a count change that is not a class change emits at most once
+# per edge per 10 s (EDGE_COUNT_EMIT_INTERVAL_NS); class changes —
+# including log2 bucket jumps (Choice 2, controller-accepted) — stay
+# immediate, and the final sweep stays exact.
+COUNT_EMIT_INTERVAL_NS = 10_000_000_000
 
 # --- presentation: dashboard frames and edge_observed derived states ---------
 ACTIVITY = {
@@ -173,9 +202,10 @@ CAPTURE = {
 }
 PRESENCE = {"mapped": "mapped", "unloaded": "unloaded", "exited": "process exited", "unknown": "unknown"}
 EDGE_STATES = ("presence", "capture", "activity")
-# inventory_present.rs DASHBOARD_ACTIVITY_WINDOW_NS: recency is judged against
-# the frame's now; a counted edge seen within this of the run end may read recent.
-DASHBOARD_RECENT_WINDOW_NS = 5_000_000_000
+# Choice 3 (ACT re-rule): the recorded activity signal is per-pass
+# ("rose since previous pass"), window-free. The dashboard display
+# keeps its own trailing window, but frames never reach this oracle
+# with a frame time, so DASH-EDGE-LABELS admits base-or-recent there.
 FRAME = {
     "repaint": b"\x1b[H",
     "alt_on": b"\x1b[?1049h",
@@ -192,6 +222,40 @@ FRAME = {
 # Frame item key -> how the oracle derives the expected value.
 FRAME_ITEMS = ("capture", "activity", "entries", "semantics")
 
+# O3: at_ns stamps are u64 CLOCK_MONOTONIC nanoseconds (the JSON writer
+# emits Rust u64s): exact int type within 0..u64::MAX. isinstance is
+# bool-blind and unbounded, so it must never gate a clock.
+U64_MAX = 2**64 - 1
+
+
+def is_u64_clock(value):
+    """Whether `value` is a well-formed u64 clock stamp."""
+    return type(value) is int and 0 <= value <= U64_MAX
+
+
+def saturation_coherent(count, saturated, cap):
+    """O7 coherence arithmetic: saturated holds exactly at the cap."""
+    return saturated == (count == cap)
+
+
+def count_window_ok(count, saturated, lo, hi):
+    """O7 window arithmetic: a saturated feed is clamped at the cap, so
+    the lower bound cannot hold it; the upper bound still can."""
+    return (saturated or lo <= count) and count <= hi
+
+
+def is_saturated_artifact(entries):
+    """Whether the edge's saturation triple earns the saturated
+    exemptions: production-shaped (fixed u64::MAX cap, u64 count,
+    Boolean flag) and actually saturated at the cap. Anything else —
+    a forged cap, a non-u64 count, a non-Boolean flag — earns no
+    exemption (COUNT-SATURATED fails it separately)."""
+    cap, count, saturated = entries.get("cap"), entries.get("count"), entries.get("saturated")
+    return (type(cap) is int and cap == U64_MAX
+            and type(count) is int and 0 <= count <= U64_MAX
+            and type(saturated) is bool
+            and saturated and count == cap)
+
 # --- CLI probe ----------------------------------------------------------------
 HELP_PROBE = {"usage": "p11scope inventory", "flags": {"capture": "--capture", "manifest": "--manifest"}}
 
@@ -203,13 +267,19 @@ class Role:
     native_states: frozenset  # coverage allowed on the role's in-window used edges
     require_counted_when_attested: bool
     what: str
+    # C7 C5: the role's used edges read counted unconditionally (the P1/P2
+    # ledger cells, Counted even for unattested B), whatever attested
+    # delivery says. Since v0.3.0 the native lane counts every bound row.
+    require_counted: bool = False
 
 
 USED = frozenset({"counted", "witnessed"})
 IDLE = frozenset({WATCH_STATE, UNKNOWN_STATE})
 ROLES = {
-    "P1": Role("required", "required", USED, True, "attested provider A with Digest/AES-GCM/HMAC"),
-    "P2": Role("required", "required", USED, False, "byte-identical copy B, distinct inode, unattested"),
+    "P1": Role("required", "required", USED, True, "attested provider A with Digest/AES-GCM/HMAC",
+               require_counted=True),
+    "P2": Role("required", "required", USED, False, "byte-identical copy B, distinct inode, unattested",
+               require_counted=True),
     "P3": Role("required", "required", IDLE, False, "maps A and C, never calls them"),
     "P4": Role("optional", "optional", USED, False, "~100 ms CLI calling A"),
     "P5": Role("optional", "optional", USED, False, "exec chain (bind per EXEC_HOW_BIND)"),
@@ -223,9 +293,15 @@ ROLES = {
 EXEC_HOW_BIND = {"initial": "required", "leader": "required", "thread": "optional"}
 # Optional-bind cells must still bind at least one image per run.
 OPTIONAL_CELL_MIN_BOUND = 1
-# Counted = a counting feed: only the Detailed subset for operator-attested
-# providers in this release. Flip if per-pair BPF counts (plan C7/D2) ship.
-COUNTED_NEEDS_ATTESTED = True
+# Counted = a counting feed. Before C7 C4 only the Detailed subset for
+# operator-attested providers counted; per-pair BPF counts shipped (C1
+# entry_count, C4 publish), so the native lane counts every bound row and
+# attestation no longer gates the state (flipped C7 C5).
+COUNTED_NEEDS_ATTESTED = False
+# C7 C5 (r1 T3.5): the P1/P2 ledger cells pin counted edges with exact
+# entry counts — including Counted for the unattested byte-copy B — via
+# Role.require_counted above, overriding COUNTED_NEEDS_ATTESTED for those
+# roles; other roles still accept the witnessed/count distinction.
 # Runs the qualification needs, and the roles each must cover.
 REQUIRED_RUNS = {
     "system": frozenset({"P1", "P2", "P3", "P4", "P5", "P7", "LX"}),
@@ -236,6 +312,18 @@ REQUIRED_RUNS = {
 SKIPPABLE_RUNS = frozenset({"dashboard"})
 
 # --- ledger -----------------------------------------------------------------------
+# C7 C5 ledger rule (binding): ledger `calls` counts ATTACH-side calls
+# only. BPF increments entry_count on entry-probe fire, so only calls
+# through attached function-table endpoints count; the dlsym C_GetFunctionList
+# entry — the call that receipts the table, not a call through it — is
+# excluded (Use.table_calls). Error-returning calls are included: entry,
+# not return, is what both the ledger and BPF count.
+# O8 receipt boundary: the exclusion is acquisition-only — the
+# setup-phase dlsym call, never made through an attached slot. A dlsym
+# name alone does not exempt a call made after the endpoint is armed:
+# through-table calls count whatever they are named. LEDGER-COUNTS pins
+# exactly one setup C_GetFunctionList per provider, so the fixture
+# never holds an ambiguous second setup one.
 SYMBOL_ENTRY_FUNCTIONS = frozenset({"C_GetFunctionList"})
 WITNESS_SLACK_NS = 20_000_000
 EXEC_GAP_MIN_NS = 4 * WITNESS_SLACK_NS
@@ -362,6 +450,61 @@ def parse_ledger(text, errors):
     return images
 
 
+def legacy_table_call(fn, phase):
+    """The phase-only classifier: every call through the function table
+    except the setup-phase acquisition dlsym. The acquisition's arming
+    question (below) is asked against this set — never against a set
+    that already assumes the answer."""
+    return fn not in SYMBOL_ENTRY_FUNCTIONS or phase != "setup"
+
+
+def legacy_end_before_since(entries, since_ns):
+    """The latest end stamp of a legacy attach-side line ending strictly
+    before since_ns — the workload-side evidence of which line may hold
+    the recording call. None when no legacy line ends before the first
+    row. Only lines that made calls (n > 0, the counted population)
+    qualify."""
+    ends = [e["t1"] for e in entries
+            if e["n"] > 0 and legacy_table_call(e["fn"], e.get("phase"))
+            and type(e.get("t1")) is int and e["t1"] < since_ns]
+    return max(ends) if ends else None
+
+
+def is_table_call(fn, phase, entry=None, arming=None):
+    """Whether the ledger line is a call through the function table (what
+    BPF counts). The setup-phase acquisition dlsym is a possible
+    recording call (round 2): it is excluded ONLY with evidence it
+    missed — a legacy attach-side line ending at/after its own end but
+    strictly before the edge's first BPF row, so that line (or a later
+    one), not the acquisition, holds the recording call. `arming` is
+    (since_ns, legacy_end_before): the edge's first BPF row and the
+    latest legacy line end before it. Without timing context the
+    legacy exclusion stands. The first-row time alone never proves
+    pre-arming: an already-armed acquisition can itself create the
+    first row ahead of the first ordinary table call (and then counts),
+    and a predating row proves the acquisition executed after the row
+    existed — through an armed endpoint (SoftHSM: export == table
+    slot) — so it counts too."""
+    if legacy_table_call(fn, phase):
+        return True
+    if entry is None or arming is None:
+        return False
+    since_ns, legacy_end_before = arming
+    if type(since_ns) is not int:
+        return False
+    t1 = entry.get("t1")
+    if type(t1) is not int:
+        return False
+    if t1 >= since_ns:
+        # Overlapping or later: it may have traversed an armed endpoint
+        # and counts.
+        return True
+    # Ended before the row: excluded only if a legacy line proves a
+    # later recording call — otherwise the acquisition itself may hold
+    # it and counts.
+    return not (legacy_end_before is not None and legacy_end_before >= t1)
+
+
 @dataclass
 class Use:
     """One image's ledgered use of one provider, clipped to a capture window."""
@@ -373,7 +516,7 @@ class Use:
 
     @property
     def table_calls(self):
-        return sum(e["n"] for e in self.lines if e["fn"] not in SYMBOL_ENTRY_FUNCTIONS)
+        return sum(e["n"] for e in self.lines if is_table_call(e["fn"], e.get("phase")))
 
 
 def use_in(image, provider_path, window):
@@ -388,20 +531,229 @@ def use_in(image, provider_path, window):
     for e in definite:
         if e["mech"] != "-" and e["fn"] in OP_CATEGORY:
             mechs.setdefault(int(e["mech"], 16), set()).add(OP_CATEGORY[e["fn"]])
-    return Use(lines, definite, max(start, min(e["t0"] for e in lines)), min(end, max(e["t1"] for e in lines)), mechs)
+    return Use(lines, definite, max(start, min(e["t0"] for e in lines)), min(end, max(e["t1"] for e in lines)),
+               mechs)
+
+
+def recording_before(use, since_ns):
+    """The recording line (Case A) or None.
+
+    since_ns is the first BPF row's insert stamp, taken during the
+    recording call's probe: the recording call entered strictly before
+    it, and every earlier call missed (no row existed yet). When no
+    attach-side line straddles since_ns, the recording call is the last
+    entry before it, i.e. it sits on the last attach-side line ending
+    strictly before since_ns — which then contributes exactly one
+    recorded call however many it ledgered. A straddling attach-side
+    line (or a same-tick boundary) leaves the recording call's line
+    ambiguous and there is no identified recording line."""
+    arming = (since_ns, legacy_end_before_since(use.lines, since_ns))
+    attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"), e, arming)]
+    if any(e["t0"] <= since_ns <= e["t1"] for e in attach):
+        return None
+    before = [e for e in attach if e["t1"] < since_ns]
+    return max(before, key=lambda e: (e["t1"], e["t0"])) if before else None
 
 
 def window_count(use, since_ns, window):
-    """(lo, hi) calls a counting feed covering [max(since, start), end] must report."""
+    """(lo, hi) calls a counting feed covering [max(since, start), end] must report.
+
+    Lines completed strictly before since_ns missed (no row existed
+    yet) — except the recording line itself (recording_before), whose
+    recording call is always included: +1 in lo when fully inside the
+    window (that call created the row, so it is counted), +n in hi.
+    Lines starting strictly after since_ns are recorded (the row
+    exists); same-tick boundaries are ambiguous (hi only). No entry
+    timing proves the recording call contributed zero: the workload
+    stamps t0/t1 before invocation, so admission or attachment may
+    have landed between the stamp and the recorded entry."""
     start, end = max(since_ns, window[0]), window[1]
     lo = hi = 0
+    arming = (since_ns, legacy_end_before_since(use.lines, since_ns))
     for e in use.lines:
         if e["t1"] < start or e["t0"] > end:
             continue
         hi += e["n"]
-        if e["t0"] >= start and e["t1"] <= end and e["fn"] not in SYMBOL_ENTRY_FUNCTIONS:
+        if e["t0"] > since_ns and e["t0"] >= window[0] and e["t1"] <= end \
+                and is_table_call(e["fn"], e.get("phase"), e, arming):
             lo += e["n"]
+    rec = recording_before(use, since_ns)
+    if rec is not None:
+        hi += rec["n"]
+        if rec["t0"] >= window[0] and rec["t1"] <= end:
+            lo += 1
     return lo, hi
+
+
+def endpoint_coverage_ok(lines, admission_endpoints):
+    """O1 pigeonhole: every distinctly-called endpoint needs an admitted
+    endpoint. The caller proves the count is an int first: a missing
+    or malformed admission count is explicitly nonqualifying (round
+    2), never silently assumed sufficient."""
+    return len({e["fn"] for e in lines}) <= admission_endpoints
+
+
+def has_partial_attach(view, edge):
+    """Whether a partial-attach gap clouds the edge's module (O1): a
+    module-scoped gap naming the edge's module, or a run-wide
+    (module-less) one — either voids endpoint coverage."""
+    for gap in view.doc.get("gaps", []):
+        if not PARTIAL_ATTACH.search(f"{gap.get('subject', '')} {gap.get('reason', '')}"):
+            continue
+        if gap.get("module") is None or gap.get("module") == edge.get("module"):
+            return True
+    return False
+
+
+def has_demoted_edge(view, edge):
+    """Whether a demotion marker clouds the edge (round 4, R4-N2): a
+    caller-AND-module-scoped gap naming exactly this edge — its count
+    is segment-relative growth from the base read, so the window
+    judges the upper bound only and exactness is explicitly
+    nonqualifying. Sibling edges keep full judgment (no run-wide or
+    module-wide poison). The marker matches the subject only (round
+    5, sol-N2): reasons embed provider paths, so an adversarial path
+    naming the marker must not demote an ordinary edge."""
+    for gap in view.doc.get("gaps", []):
+        if not DEMOTED_PLACED.search(gap.get("subject", "")):
+            continue
+        if gap.get("caller") == edge.get("caller") and gap.get("module") == edge.get("module"):
+            return True
+    return False
+
+
+def ledger_total_table_calls(image, provider_path, since_ns=None):
+    """Every attach-side call the image ledgered for the provider, any time:
+    the upper bound a count will never exceed (r1 T3.5 `count <= total`).
+    `since_ns` arms the acquisition rule (None: the legacy exclusion)."""
+    entries = [e for e in image.entries if e["module"] == provider_path]
+    arming = (since_ns, legacy_end_before_since(entries, since_ns)) if since_ns is not None else None
+    return sum(e["n"] for e in entries if is_table_call(e["fn"], e.get("phase"), e, arming))
+
+
+def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
+                       mapping_first_seen_ns=None, admission_endpoints=None,
+                       partial_attach=False):
+    """(verdict, expected, detail): whether the ledger pins the count.
+
+    Verdicts: "exact" (equality required over the proven covered
+    workload segment), "inexact" (window bounds judge — frozen, empty,
+    clipped, or unadmitted), "nonqualifying" (insufficient evidence to
+    judge either way — recorded explicitly, never a pass or fail).
+
+    The covered segment is BPF-side: lines completed strictly before
+    since_ns missed (no row existed — certain zero); lines starting
+    strictly after since_ns recorded (the row proves live probes). A
+    line spanning since_ns splits unknowably (aggregation) — explicit
+    nonqualifying. The recording line (last attach line ending before
+    since_ns) is always row-possible: entry stamps precede invocation,
+    so no entry timing proves it executed before attachment. It takes
+    the legacy Case A (first attach line, singleton, admitted before
+    it — full-sum equality, attachment-before-workload convention) or
+    is insufficient evidence. Equality additionally requires endpoint
+    coverage over the equated lines (every distinctly-called endpoint
+    admitted — pigeonhole; no partial-attach gap clouds the module)
+    and identity/mapping hold-safety (admission and mapping at or
+    before the segment start, so rows bind immediately instead of
+    risking hold eviction).
+
+    since_ns is the first BPF row's insert stamp, NOT the attach time:
+    entry.rs record_caller_use_with stamps recorded_at_ns = now()
+    immediately before the first map insert
+    (crates/ebpf-common/src/inventory_callers/entry.rs:90-91), which
+    capture.rs absorb_rows copies into the witness row
+    (src/attach/inventory/capture.rs:2598), which absorb_pair_counts
+    keeps as PairCount.first_ns
+    (src/discovery/inventory_coordinator.rs:1675,1680), which
+    stage_pair_count publishes as Counted.since_ns
+    (src/discovery/inventory_coordinator.rs:1727,1745). The workload
+    stamps t0/t1 BEFORE the call
+    (tests/fixtures/public-cli/inventory-ledger.c:229), so since_ns
+    lands strictly after the recording call's entry stamp on every
+    real run and since_ns <= t_first can never gate exactness.
+    Demoted edges are the exception (round 4, R4-N2): their since_ns
+    is the base-observing read (pass resolution, not a BPF insert)
+    and their count is post-base growth — judged upper-bound-only
+    with COUNT-EXACT explicitly nonqualifying (see has_demoted_edge),
+    never by this function."""
+    arming = (since_ns, legacy_end_before_since(use.lines, since_ns))
+    attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"), e, arming)]
+    # Structural, legacy-verbatim: frozen, empty, or unadmitted (a
+    # malformed admission stamp is unadmitted too — the shape checks
+    # fail it elsewhere; the oracle never crashes on it).
+    # NOTE (round 2): no entry timing proves the recording call
+    # contributed zero, so there is no pre-attachment exact arm: the
+    # workload stamps t0/t1 before invocation
+    # (tests/fixtures/public-cli/inventory-ledger.c:236), and
+    # admission/attachment may land between the stamp and the recorded
+    # entry. A row-possible recording line takes the legacy Case A
+    # below or is insufficient evidence.
+    if until_ns is not None:
+        return "inexact", 0, ""
+    if not attach:
+        return "inexact", 0, ""
+    if type(caller_first_seen_ns) is not int:
+        return "inexact", 0, ""
+    # Round 2: the coverage and hold evidence must be present and
+    # well-formed before it proves anything — a missing admission
+    # count or mapping first-seen is explicitly nonqualifying, never
+    # silently skipped or defaulted to admission alone.
+    if type(admission_endpoints) is not int:
+        return "nonqualifying", 0, "admission endpoint count missing or malformed: endpoint coverage unprovable"
+    if type(mapping_first_seen_ns) is not int:
+        return "nonqualifying", 0, "mapping first-seen missing or malformed: mapping-hold risk unprovable"
+    if any(e["t0"] <= since_ns <= e["t1"] for e in attach):
+        return "nonqualifying", 0, "an attach-side line spans the first row: recorded split unknowable"
+    if partial_attach:
+        return "nonqualifying", 0, "a partial-attach gap clouds the module: counted uses are lower bounds"
+    first_attach_t0 = min(e["t0"] for e in attach)
+    whole_in_window = not any(e["t0"] < window[0] or e["t1"] > window[1] for e in use.lines)
+    # Legacy predating branch (verbatim + evidenced overrides): the row
+    # predates every attach-side call (the synth counting convention —
+    # real rows stamp during their recording call): all recorded.
+    if since_ns < first_attach_t0:
+        if caller_first_seen_ns > first_attach_t0 or not whole_in_window:
+            return "inexact", 0, ""
+        if mapping_first_seen_ns > first_attach_t0:
+            return "nonqualifying", 0, "mapping first seen after the first call: mapping-hold risk"
+        if not endpoint_coverage_ok(attach, admission_endpoints):
+            return "nonqualifying", 0, "more distinct endpoints called than admitted"
+        return "exact", sum(e["n"] for e in attach), ""
+    # Segment branch: pre-since lines are known zero (no row); post-since
+    # lines recorded (the row proves live probes).
+    post = [e for e in attach if e["t0"] > since_ns]
+    if post:
+        first_post_t0 = min(e["t0"] for e in post)
+        if caller_first_seen_ns > first_post_t0:
+            return "nonqualifying", 0, "admission after the covered segment: hold/eviction risk"
+        if mapping_first_seen_ns > first_post_t0:
+            return "nonqualifying", 0, "mapping first seen after the covered segment: mapping-hold risk"
+        if not endpoint_coverage_ok(post, admission_endpoints):
+            return "nonqualifying", 0, "more distinct endpoints called than admitted"
+    if any(e["t0"] < window[0] or e["t1"] > window[1] for e in post):
+        return "inexact", 0, ""
+    rec = recording_before(use, since_ns)
+    if rec is None:
+        # Unreachable (a missing recording line with a non-predating row
+        # means the first line spans it — caught above), kept defensive:
+        # every attach line starts after the row, and the recording call
+        # sits ledgered inside the first one.
+        return "exact", sum(e["n"] for e in post), ""
+    # Row-possible recording line: legacy Case A verbatim (first attach
+    # line, singleton, admitted before it — full-sum equality) or
+    # insufficient evidence (held-then-bound or an aggregation split).
+    # A recording line ending before admission/mapping is NOT known
+    # zero: entry stamps precede invocation, so the recording call may
+    # have executed after attachment and been counted.
+    first_line = min(attach, key=lambda e: (e["t0"], e["t1"]))
+    if rec is not first_line or rec["n"] != 1 \
+            or caller_first_seen_ns > first_attach_t0 or not whole_in_window:
+        return "nonqualifying", 0, "recording line neither pre-attachment nor first-singleton"
+    if mapping_first_seen_ns > first_attach_t0:
+        return "nonqualifying", 0, "mapping first seen after the first call: mapping-hold risk"
+    if not endpoint_coverage_ok(attach, admission_endpoints):
+        return "nonqualifying", 0, "more distinct endpoints called than admitted"
+    return "exact", sum(e["n"] for e in attach), ""
 
 
 def reached_by(images, image):
@@ -526,16 +878,29 @@ def coverage(edge):
 
 
 def coverage_ok(edge):
-    """The documented seven keys, a known state, and an interval whose non-null
-    until_ns lies strictly after since_ns."""
+    """The documented seven keys, a known state, and fields valid for the
+    state (O5, grounded in inventory.rs coverage_json: until_ns only on
+    a watched interval — never on counted — since_ns on counted and
+    watched, first_ns on witnessed, lossy on counted; anything else is
+    an invented boundary)."""
     cov = edge.get("entries", {}).get("coverage")
     if not (isinstance(cov, dict) and set(cov) == COVERAGE_KEYS and cov.get("state") in COVERAGE_STATES):
         return False
+    state = cov.get("state")
     since, until = cov.get("since_ns"), cov.get("until_ns")
-    if until is not None:
-        if not isinstance(until, int) or (since is not None and until <= since):
-            return False
-    return True
+    first, lossy = cov.get("first_ns"), cov.get("lossy")
+    reason, detail = cov.get("reason"), cov.get("detail")
+    if state == "counted":
+        return (isinstance(since, int) and until is None and first is None
+                and isinstance(lossy, bool) and reason is None and detail is None)
+    if state == "witnessed":
+        return (since is None and until is None and isinstance(first, int)
+                and lossy is None and reason is None and detail is None)
+    if state == WATCH_STATE:
+        return (isinstance(since, int) and (until is None or (isinstance(until, int) and until > since))
+                and first is None and lossy is None and reason is None and detail is None)
+    # unknown: only the reason/detail carry meaning; no instant applies.
+    return since is None and until is None and first is None and lossy is None
 
 
 def doc_lane(doc):
@@ -614,32 +979,49 @@ def expected_presence(caller, module, edge):
     return PRESENCE["unknown"]
 
 
-def expected_activity(edge, end_ns):
-    """inventory-events-v1 `activity` from the snapshot; recency (counted only)
-    may additionally read recent when last_seen is within the dashboard window."""
-    entries = edge["entries"]
-    cov = coverage(edge)
-    if entries.get("in_flight") or (edge.get("operations") or {}).get("active"):
-        return {ACTIVITY["inflight"]}
+def expected_activity_base(payload):
+    """The activity base label for an edge-shaped payload (a snapshot
+    edge or an edge_observed record's event): everything except the
+    per-pass rise. `recent` is never the base — EDGE-ACTIVITY admits it
+    only where a rise allows it."""
+    entries = payload.get("entries") or {}
+    cov = coverage(payload)
+    if entries.get("in_flight") or (payload.get("operations") or {}).get("active"):
+        return ACTIVITY["inflight"]
     if cov.get("state") == "witnessed":
-        base = ACTIVITY["used"]
-    elif edge.get("mapping", {}).get("state") != MAPPING_LIVE or frozen_watch(edge):
-        base = ACTIVITY["unknown"]
-    elif cov.get("state") == UNKNOWN_STATE and cov.get("reason") == PENDING_FIRST_USE_REASON:
+        return ACTIVITY["used"]
+    if payload.get("mapping", {}).get("state") != MAPPING_LIVE or frozen_watch(payload):
+        return ACTIVITY["unknown"]
+    if cov.get("state") == UNKNOWN_STATE and cov.get("reason") == PENDING_FIRST_USE_REASON:
         # DR-LIVE-LABEL-LAG: the edge is watched, so "not covered" would
         # lie — a read-but-undecided first use reads unknown.
-        base = ACTIVITY["unknown"]
-    elif (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
-        base = ACTIVITY["quiet"]
-    elif cov.get("state") == "counted":
-        base = ACTIVITY["lossy"]
-    else:
-        base = ACTIVITY["uncovered"]
-    allowed = {base}
-    last = entries.get("last_seen_ns")
-    if cov.get("state") == "counted" and last is not None and end_ns - last <= DASHBOARD_RECENT_WINDOW_NS:
-        allowed.add(ACTIVITY["recent"])
-    return allowed
+        return ACTIVITY["unknown"]
+    if (cov.get("state") == "counted" and not cov.get("lossy")) or cov.get("state") == WATCH_STATE:
+        return ACTIVITY["quiet"]
+    if cov.get("state") == "counted":
+        return ACTIVITY["lossy"]
+    return ACTIVITY["uncovered"]
+
+
+def per_pass_recent_allowed(payload, prev_count):
+    """Whether `recent` is legal on this counted record, matching
+    production precedence (Activity::for_edge): a rise since the edge's
+    previous record allows it (the emission may lag the rising pass),
+    as does a first record (emission-cap deferral may delay it past
+    the rising pass) — even over lossy coverage (a fresh rise beats
+    lossy). An unchanged count forbids it — that is the Choice 3 pin —
+    and so does in-flight (production reads in-flight over a rise).
+    Non-counted payloads never allow it."""
+    cov = coverage(payload)
+    entries = payload.get("entries") or {}
+    if cov.get("state") != "counted":
+        return False
+    if entries.get("in_flight") or (payload.get("operations") or {}).get("active"):
+        return False
+    count = entries.get("count")
+    if prev_count is None or not isinstance(count, int) or not isinstance(prev_count, int):
+        return True
+    return count > prev_count
 
 
 def frozen_watch(edge):
@@ -657,6 +1039,25 @@ def expected_entries_display(edge):
             (cov.get("state") == WATCH_STATE and not frozen_watch(edge)):
         return str(count)
     return str(count) if count > 0 else "?"
+
+
+def count_bucket(count):
+    """The count's power-of-two bucket (EdgeClass): 0, 1, 2-3, 4-7, ..."""
+    return 0 if count == 0 else count.bit_length()
+
+
+def edge_class_key(record):
+    """An edge_observed record's emit class (inventory-events-v1): the
+    count bucket plus saturated/in_flight/observation, the full coverage,
+    and the three derived states. Choice 2 (controller-accepted): the
+    bucket stays in the class, so a bucket jump is an immediate class
+    change while other count drift waits out the 10 s channel."""
+    entries = record.get("entries", {})
+    cov = entries.get("coverage") or {}
+    return (count_bucket(entries.get("count", 0)), entries.get("saturated"), entries.get("in_flight"),
+            entries.get("observation"), cov.get("state"), cov.get("since_ns"), cov.get("until_ns"),
+            cov.get("first_ns"), cov.get("lossy"), cov.get("reason"), cov.get("detail"),
+            record.get("presence"), record.get("capture"), record.get("activity"))
 
 
 def settlement_verdict(doc):
@@ -681,6 +1082,28 @@ def settlement_verdict(doc):
         if pattern.search(text):
             return verdict, f"gap matching {pattern.pattern!r}"
     return None, "no settlement statement"
+
+
+def edge_payload_problems(view, key, ev):
+    """Problems ([]) when the edge_observed payload `ev` disagrees with the
+    decided snapshot edge for `key`: DR-C5-EDGE replay minus the three
+    derived states. Presence and capture must match the oracle's own
+    derivation here; activity is per-pass and judged record-by-record
+    (with its previous record) by EDGE-ACTIVITY instead."""
+    edge = view.edges.get(key)
+    if edge is None:
+        return [(key, "not in snapshot")]
+    caller, module = view.callers.get(key[0], {}), view.modules.get(key[1], {})
+    problems = []
+    replayed = {k: v for k, v in ev.items() if k not in EDGE_STATES}
+    if replayed != edge:
+        fields = sorted(k for k in set(replayed) | set(edge) if replayed.get(k) != edge.get(k))
+        problems.append((key, f"fields {fields}"))
+    if ev.get("presence") != expected_presence(caller, module, edge):
+        problems.append((key, f"presence {ev.get('presence')!r} != {expected_presence(caller, module, edge)!r}"))
+    if ev.get("capture") != expected_capture(caller, module, edge):
+        problems.append((key, f"capture {ev.get('capture')!r}"))
+    return problems
 
 
 class RunView:
@@ -719,6 +1142,13 @@ def check_streams(view, res):
     res.ok(run, "*", "COVERAGE-SHAPE", not malformed,
            f"{len(malformed)} edges lack the coverage keys {sorted(COVERAGE_KEYS)}, a known state, or "
            f"until_ns > since_ns: {malformed[:4]}")
+    # C7 C5 extends the C2 DR-LIVE-LABEL-LAG oracle (which judges mid-run
+    # frames and records): the finish flush decides every row, so the
+    # final snapshot itself never carries pending_first_use.
+    pending = [k for k, e in view.edges.items() if coverage(e).get("reason") == PENDING_FIRST_USE_REASON]
+    res.ok(run, "*", "PENDING-TRANSIENT", not pending,
+           f"{len(pending)} snapshot edges read {PENDING_FIRST_USE_REASON}: {pending[:4]} "
+           "(mid-run records and frames may; the decided snapshot never does)")
     if view.events is None:
         res.add(run, "*", "STREAM", "fail", "no --event-log JSONL to compare")
         return
@@ -805,21 +1235,7 @@ def check_streams(view, res):
         last[(ev.get("caller"), ev.get("module"))] = ev
     bad = []
     for key, ev in last.items():
-        edge = view.edges.get(key)
-        if edge is None:
-            bad.append((key, "not in snapshot"))
-            continue
-        caller, module = view.callers.get(key[0], {}), view.modules.get(key[1], {})
-        replayed = {k: v for k, v in ev.items() if k not in EDGE_STATES}
-        if replayed != edge:
-            fields = sorted(k for k in set(replayed) | set(edge) if replayed.get(k) != edge.get(k))
-            bad.append((key, f"fields {fields}"))
-        if ev.get("presence") != expected_presence(caller, module, edge):
-            bad.append((key, f"presence {ev.get('presence')!r} != {expected_presence(caller, module, edge)!r}"))
-        if ev.get("capture") != expected_capture(caller, module, edge):
-            bad.append((key, f"capture {ev.get('capture')!r}"))
-        if ev.get("activity") not in expected_activity(edge, view.window[1]):
-            bad.append((key, f"activity {ev.get('activity')!r}"))
+        bad.extend(edge_payload_problems(view, key, ev))
     missing = sorted(set(view.edges) - set(last))
     if missing:
         bad.append((missing[:4], f"{len(missing)} snapshot edges have no edge_observed"))
@@ -850,6 +1266,178 @@ def check_streams(view, res):
         bad.append(("*", f"ended.edges_unretained {ended.get('edges_unretained')!r} != 0"))
     res.ok(run, "*", "AGREE-EDGE-EVENTS", not bad, f"edge_observed disagrees with the snapshot: {bad[:4]}",
            f"{len(last)} edge_observed replays agree ({len(edge_events)} records)")
+    # C7 C5 (Choice 2): a mid-run record that follows its edge's previous
+    # record by less than the 10 s count channel must carry a class change
+    # (bucket jumps included) — anything else is a spurious fast emit.
+    # First records per edge and the exact final sweep (records after the
+    # last pass marker) are exempt. Rotated streams never reach here
+    # (STREAM-ROTATED returns early), so retention re-sends cannot fail it.
+    sweep_seq = max([e.get("seq", -1) for e in events if e.get("kind") == EVENT_KINDS["pass"]], default=-1)
+    by_edge = {}
+    for e in edge_events:
+        ev = e.get("event") if isinstance(e.get("event"), dict) else {}
+        by_edge.setdefault((ev.get("caller"), ev.get("module")), []).append(e)
+    rushed = []
+    for key in sorted(by_edge, key=str):
+        rows = sorted(by_edge[key], key=lambda e: e.get("seq", 0))
+        for prev, cur in zip(rows, rows[1:]):
+            if cur.get("seq", 0) > sweep_seq:
+                continue
+            prev_at, cur_at = prev.get("at_ns"), cur.get("at_ns")
+            prev_ev = prev.get("event") if isinstance(prev.get("event"), dict) else None
+            cur_ev = cur.get("event") if isinstance(cur.get("event"), dict) else None
+            if not isinstance(prev_at, int) or not isinstance(cur_at, int) or cur_at < prev_at \
+                    or prev_ev is None or cur_ev is None:
+                continue
+            if cur_at - prev_at < COUNT_EMIT_INTERVAL_NS and edge_class_key(prev_ev) == edge_class_key(cur_ev):
+                rushed.append((key, f"seq {prev.get('seq')}->{cur.get('seq')} dt {cur_at - prev_at} ns"))
+    res.ok(run, "*", "EDGE-CADENCE", not rushed,
+           f"{len(rushed)} edge_observed records re-emit an unchanged class within 10 s: {rushed[:4]}")
+    # O3: invalid clocks fail closed. A missing/non-integer/out-of-range
+    # at_ns, or a regressing per-edge stamp, makes its pair unjudgeable
+    # for cadence (which keeps skipping it above) — but the stream must
+    # fail here instead of passing silently. Monotonicity judges valid
+    # clocks only; anything else already failed above.
+    clock_bad = []
+    for key in sorted(by_edge, key=str):
+        rows = sorted(by_edge[key], key=lambda e: e.get("seq", 0))
+        for row in rows:
+            at = row.get("at_ns")
+            if not is_u64_clock(at):
+                clock_bad.append((key, f"seq {row.get('seq')} at_ns {at!r} is not a u64 clock"))
+        stamps = [(row.get("seq"), row.get("at_ns")) for row in rows]
+        for (pseq, prev_at), (cseq, cur_at) in zip(stamps, stamps[1:]):
+            if is_u64_clock(prev_at) and is_u64_clock(cur_at) and cur_at < prev_at:
+                clock_bad.append((key, f"seq {pseq}->{cseq} clock regresses {prev_at}->{cur_at}"))
+    # Round 2: cross-edge order. Per-edge monotonicity cannot see a
+    # reversal across edges, so edge records must also read
+    # nondecreasing in global sequence order. Equal stamps stay
+    # permitted (production reuses commit timestamps); invalid clocks
+    # already failed per-row above and are skipped here.
+    last_at = None
+    for row in sorted(edge_events, key=lambda e: e.get("seq", 0)):
+        at = row.get("at_ns")
+        if not is_u64_clock(at):
+            continue
+        if last_at is not None and at < last_at:
+            clock_bad.append(("*", f"seq {row.get('seq')} clock {at} regresses across edges "
+                                   f"(previous {last_at})"))
+        last_at = at
+    res.ok(run, "*", "EDGE-CLOCK", not clock_bad,
+           f"{len(clock_bad)} edge_observed records carry invalid or regressing clocks: {clock_bad[:4]}")
+    # ACT (Choice 3 pin): activity is per-pass. Every record (middle,
+    # last, and terminal — no sweep exemption: an unchanged terminal
+    # re-emission reads quiet too) is judged against its own coverage
+    # plus its edge's previous record: published counts never decrease
+    # (a strict product invariant), an unchanged counted record reads
+    # its base (a window echo fails), and a rise — or a first record,
+    # whose emission the per-pass cap may have deferred past the rising
+    # pass — admits recent-or-base. Non-counted records read base.
+    # Proven comparison (fix round 1): consecutive records in ADJACENT
+    # pass segments with zero deferred records on the proving markers
+    # show what each pass saw — a rise across them must read recent
+    # (or in-flight where recent is forbidden), never base. Non-adjacent
+    # records stay lenient: the rise may predate the latest pass.
+    markers = [e for e in events if e.get("kind") in (EVENT_KINDS["pass"], EVENT_KINDS["ended"])]
+    markers.sort(key=lambda e: e.get("seq", 0))
+    after = {}
+    for cur, nxt in zip(markers, markers[1:] + [None]):
+        after[cur.get("seq")] = nxt
+    before = {}
+    for prev, cur in zip([None] + markers, markers):
+        before[cur.get("seq")] = prev
+
+    def closing_marker(row_seq):
+        for marker in markers:
+            if marker.get("seq", 0) > row_seq:
+                return marker
+        return None
+
+    def deferred_is_zero(marker):
+        return type(marker.get("event", {}).get("edge_events_deferred")) is int \
+            and marker["event"]["edge_events_deferred"] == 0
+
+    def proven_rise(prev_row, row):
+        """Whether consecutive records prove a pass-to-pass rise: they
+        close in adjacent marker segments, the earlier record is fresh
+        (no wait past its previous marker — or the first marker, where
+        it is the edge's first record), the later one is fresh (no wait
+        past the earlier segment's marker — or a sweep record, which is
+        always exact-final), and the exact-int counts rise."""
+        if prev_row is None:
+            return False
+        m1, m2 = closing_marker(prev_row.get("seq", 0)), closing_marker(row.get("seq", 0))
+        if m1 is None or m2 is None or after.get(m1.get("seq")) is not m2:
+            return False
+        m0 = before.get(m1.get("seq"))
+        if m0 is not None and not deferred_is_zero(m0):
+            return False
+        if m2.get("kind") != EVENT_KINDS["ended"] and not deferred_is_zero(m1):
+            return False
+        prev_ev = prev_row.get("event") if isinstance(prev_row.get("event"), dict) else {}
+        cur_ev = row.get("event") if isinstance(row.get("event"), dict) else {}
+        prev_seen = (prev_ev.get("entries") or {}).get("count")
+        seen = (cur_ev.get("entries") or {}).get("count")
+        return type(prev_seen) is int and type(seen) is int and seen > prev_seen
+
+    activity_bad = []
+    for key in sorted(by_edge, key=str):
+        rows = sorted(by_edge[key], key=lambda e: e.get("seq", 0))
+        prev_count = None
+        prev_row = None
+        for row in rows:
+            ev = row.get("event") if isinstance(row.get("event"), dict) else None
+            if ev is None or not isinstance(ev.get("entries"), dict):
+                prev_count = None
+                prev_row = row
+                continue
+            count = ev["entries"].get("count")
+            base = expected_activity_base(ev)
+            if isinstance(count, int) and isinstance(prev_count, int) and count < prev_count:
+                activity_bad.append((key, f"seq {row.get('seq')} count decreases {prev_count}->{count}"))
+            elif proven_rise(prev_row, row):
+                want = ACTIVITY["recent"] if per_pass_recent_allowed(ev, prev_count) else base
+                if ev.get("activity") != want:
+                    activity_bad.append((key, f"seq {row.get('seq')} reads {ev.get('activity')!r}, "
+                                              f"want {want!r}: consecutive passes prove "
+                                              f"{prev_count}->{count}"))
+            elif ev.get("activity") != base and not per_pass_recent_allowed(ev, prev_count):
+                activity_bad.append((key, f"seq {row.get('seq')} reads {ev.get('activity')!r}, "
+                                          f"want {base!r} (count {prev_count}->{count})"))
+            elif ev.get("activity") not in {base, ACTIVITY["recent"]}:
+                activity_bad.append((key, f"seq {row.get('seq')} reads {ev.get('activity')!r}, "
+                                          f"want {base!r} or {ACTIVITY['recent']!r}"))
+            prev_count = count if isinstance(count, int) else None
+            prev_row = row
+    res.ok(run, "*", "EDGE-ACTIVITY", not activity_bad,
+           f"{len(activity_bad)} edge_observed records misread per-pass activity: {activity_bad[:4]}",
+           f"{sum(len(v) for v in by_edge.values())} edge_observed records read per-pass activity")
+    # O2: the final sweep is exact but not exempt from scrutiny. Past the
+    # last pass marker every edge carries at most one terminal record —
+    # production's sweep re-emits only uncarried edges (zero when the
+    # pre-marker record already carries the state), so duplicates are
+    # never legitimate in an unrotated stream — and every terminal
+    # payload must equal the decided snapshot. First records stay
+    # cadence-exempt; rotated streams never reach here (STREAM-ROTATED
+    # returns early); a stream with no pass marker is already failed by
+    # AGREE-TOTALS and has no sweep to judge.
+    if sweep_seq >= 0:
+        terminal = [e for e in edge_events if e.get("seq", 0) > sweep_seq]
+        by_terminal = {}
+        for e in terminal:
+            ev = e.get("event") if isinstance(e.get("event"), dict) else {}
+            by_terminal.setdefault((ev.get("caller"), ev.get("module")), []).append((e, ev))
+        sweep_bad = []
+        for key in sorted(by_terminal, key=str):
+            recs = by_terminal[key]
+            if len(recs) > 1:
+                sweep_bad.append((key, f"{len(recs)} terminal records past pass seq {sweep_seq} "
+                                      "(want at most 1)"))
+            for _, ev in recs:
+                sweep_bad.extend(edge_payload_problems(view, key, ev))
+        res.ok(run, "*", "TERMINAL-SWEEP", not sweep_bad,
+               f"{len(sweep_bad)} terminal sweep problems: {sweep_bad[:4]}",
+               f"{len(terminal)} terminal records agree ({len(by_terminal)} edges)")
 
 
 def resolve_providers(view, res, needed):
@@ -1053,6 +1641,9 @@ def check_cells(view, images_by_cell, res):
                 res.add(run, cell, "EXEC-SPLIT", "absent",
                         "same-binary re-exec and non-leader exec are invisible to exe-identity scan pins")
     check_positives(view, images_by_cell, mod, state, res)
+    check_counted_nonzero(view, res)
+    check_saturated(view, res)
+    check_uncounted(view, res)
 
 
 def check_image(view, cell, spec, role, images, image, mod, lane, attested_delivery, state, res):
@@ -1131,7 +1722,8 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
                 state.exec_bound.setdefault(cell, []).append(
                     (image.gen, how, e["caller"], view.callers[e["caller"]].get("first_seen_ns") or 0))
             res.add(run, cell, check, "pass", f"{ctag}: bound to {e['caller']} ({coverage(e).get('state')})")
-            check_bound_edge(view, cell, ctag, role, prov, e, use, attested_delivery, res)
+            check_bound_edge(view, cell, ctag, role, prov, e, use, image, attested_delivery, res)
+            check_no_preadmission_positive(view, cell, ctag, e, res)
             if not alive_at_end:
                 caller = view.callers[e["caller"]]
                 res.ok(run, cell, "RETIRED-LIFECYCLE",
@@ -1181,7 +1773,7 @@ def check_image(view, cell, spec, role, images, image, mod, lane, attested_deliv
                     f"({sorted(exe_ids)}) and no unbound gap naming this pid or this window")
 
 
-def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery, res):
+def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_delivery, res):
     run = view.name
     cov = coverage(edge)
     st = cov.get("state")
@@ -1191,13 +1783,20 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery,
         allowed.discard("counted")
     if role.require_counted_when_attested and attested:
         allowed = {"counted"}
+    if role.require_counted:
+        allowed = {"counted"}
     res.ok(run, cell, "COVERAGE-ALLOWED", st in allowed,
            f"{ctag}: coverage {st} not in {sorted(allowed)} (attested={attested})")
     if st == "counted":
         until = cov.get("until_ns")
         window = (view.window[0], min(view.window[1], until)) if until is not None else view.window
+        admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
+        mapping_first = edge.get("mapping", {}).get("first_seen_ns")
         lo, hi = window_count(use, cov.get("since_ns") or 0, window)
         count = edge["entries"].get("count", 0)
+        total = ledger_total_table_calls(image, prov["path"], cov.get("since_ns"))
+        res.ok(run, cell, "COUNT-TOTAL", count <= total,
+               f"{ctag}: count {count} above the ledger total {total} attach-side calls")
         if cov.get("lossy"):
             loss_gaps = [g for g in view.doc.get("gaps", [])
                          if LOSS_GAP.search(f"{g.get('subject', '')} {g.get('reason', '')}")]
@@ -1207,8 +1806,58 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery,
                    f"{ctag}: lossy count {count} (upper bound {hi}) needs a loss gap "
                    f"({len(loss_gaps)} found) and, at zero, observation {OBSERVATION_LOSSY_ZERO!r} (got {label!r})")
         else:
-            res.ok(run, cell, "COUNT-WINDOW", lo <= count <= hi,
-                   f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}")
+            # O7: only a production-shaped saturated triple (fixed
+            # u64::MAX cap, u64 count, Boolean flag, saturated at the
+            # cap) earns the clamped-bound exemption; a forged triple
+            # is judged unclamped (and fails COUNT-SATURATED). O1: a
+            # partial-attach gap clamps the lower bound the same way —
+            # missed endpoints void it; the upper bound still holds.
+            # Round 2 (S4): the gap list is bounded, so when any gap
+            # was suppressed a partial-attach gap may have been
+            # concealed — the lower bound clamps and exactness is
+            # explicitly nonqualifying rather than trusted or failed.
+            saturated = is_saturated_artifact(edge["entries"])
+            partial = has_partial_attach(view, edge)
+            demoted = has_demoted_edge(view, edge)
+            suppressed = view.doc.get("gaps_suppressed") or 0
+            # A malformed counter fails closed (F3-07, F2-08 style): a
+            # concealment may hide behind it — never raises.
+            concealed = suppressed > 0 if type(suppressed) is int else True
+            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated or partial or concealed or demoted, lo, hi),
+                   f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
+                   + (" (saturated: lower bound clamped at the cap)" if saturated else "")
+                   + (" (partial attach: lower bound clamped; counted uses are lower bounds)"
+                      if partial and not saturated else "")
+                   + (" (demoted: lower bound clamped; the edge carries post-base-read growth only)"
+                      if demoted and not saturated and not partial else "")
+                   + (f" ({suppressed} gaps suppressed: a partial-attach gap may be concealed; "
+                       "lower bound clamped)"
+                      if concealed and not saturated and not partial and not demoted else ""))
+            doc_module = view.modules.get(edge["module"], {})
+            verdict, expected, detail = exact_window_count(
+                use, cov.get("since_ns") or 0, window, until, admitted,
+                mapping_first, doc_module.get("admission", {}).get("endpoints"), partial)
+            if demoted and not saturated:
+                res.add(run, cell, "COUNT-EXACT", "nonqualifying",
+                        f"{ctag}: insufficient evidence for exactness: a demoted edge carries "
+                        f"post-base-read growth, so no whole-workload equality holds")
+            elif verdict == "exact" and not saturated and concealed:
+                res.add(run, cell, "COUNT-EXACT", "nonqualifying",
+                        f"{ctag}: insufficient evidence for exactness: {suppressed} gaps suppressed, "
+                        "a partial-attach gap may be concealed")
+            elif verdict == "exact" and not saturated:
+                # Ledger exactness = 0 error over the proven covered
+                # workload segment (pre-since lines missed for certain;
+                # post-since lines recorded; the recording line the
+                # legacy first-singleton): the count equals the segment
+                # sum — not a range. A saturated feed stays a lower
+                # bound (COUNT-TOTAL).
+                res.ok(run, cell, "COUNT-EXACT", count == expected,
+                       f"{ctag}: count {count} != ledger {expected} attach-side calls "
+                       f"(feed covers every in-window call since {cov.get('since_ns')})")
+            elif verdict == "nonqualifying" and not saturated:
+                res.add(run, cell, "COUNT-EXACT", "nonqualifying",
+                        f"{ctag}: insufficient evidence for exactness: {detail}")
     if st == "witnessed":
         res.ok(run, cell, "WITNESS-COUNT", edge["entries"].get("count", 0) == 0
                and edge["entries"].get("observation") != OBSERVATION_OBSERVED,
@@ -1220,6 +1869,28 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, attested_delivery,
         res.ok(run, cell, "SEMANTICS-ATTESTED",
                edge.get("semantics") == SEMANTICS_OBSERVED and not missing and not extra,
                f"{ctag}: semantics {edge.get('semantics')!r}; missing mechanism/ops {missing}; unledgered {extra}")
+
+
+def check_no_preadmission_positive(view, cell, ctag, edge, res):
+    """R-C51-1: a row recorded before its caller's admission never binds
+    (Rule 3, native_binding.rs:777: row.recorded_at_ns < first_seen_ns),
+    so the edge reads unknown/use_before_admission — never a positive.
+    The judged event is the ROW (the edge's first-seen: the earliest
+    insert stamp), not the ledger's first call: a table obtained before
+    the observer started (the acquisition dlsym) with use recorded
+    after admission and attachment binds legitimately. A counted (or
+    witnessed) positive over a row recorded before admission is the
+    DR-C51-PREADMIT upgrade, which v0.3.0 does not build (must-fail:
+    counted-on-preadmission). This only narrows failures: a true
+    pre-admission row implies a pre-admission ledger call (the entry
+    precedes the insert on the same clock)."""
+    row_ns = positive_first_ns(edge)
+    admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
+    if row_ns is None or admitted is None:
+        return
+    res.ok(view.name, cell, "PREADMISSION-POSITIVE", row_ns >= admitted,
+           f"{ctag}: edge {edge['caller']} reads {coverage(edge).get('state')} but its row was recorded "
+           f"({row_ns}) before its caller's admission ({admitted}): a pre-admission row never binds")
 
 
 def check_exec_split(view, cell, bound, images, man, mod, res, counted=frozenset()):
@@ -1242,6 +1913,79 @@ def check_exec_split(view, cell, bound, images, man, mod, res, counted=frozenset
            f"exec images must each bind to their own incarnation in order: required gens {required}, "
            f"unbound {missing}, bound (gen->caller) {dict((g, c) for g, (c, _f) in sorted(by_gen.items()))}",
            f"bound (gen->caller): {dict((g, c) for g, (c, _f) in sorted(by_gen.items()))}")
+
+
+def check_counted_nonzero(view, res):
+    """C7 C5: an edge reads `counted` only with a count >= 1 — a published
+    0 is never a positive fact (r1 T3.5 must-fail). A counted-0 edge never
+    binds, so this sweeps every edge rather than riding the bound path."""
+    for key in sorted(view.edges):
+        edge = view.edges[key]
+        if coverage(edge).get("state") != "counted":
+            continue
+        count = edge["entries"].get("count", 0)
+        res.ok(view.name, "*", "COUNTED-NONZERO", count >= 1,
+               f"edge {key[0]}->{key[1]} reads counted with count {count}: "
+               "a counted edge publishes its entry count, never 0")
+
+
+def check_saturated(view, res):
+    """O7: the saturation triple is production-shaped on every edge and
+    coherent — production always publishes the fixed cap u64::MAX
+    (MAX_EDGE_ENTRY_COUNT, src/inventory.rs edge_json), a u64 count,
+    and a Boolean saturated set exactly when the count reached the cap.
+    A forged cap, a non-u64 count, or a non-Boolean flag fails: the
+    document can never invent its own saturation exemption."""
+    for key in sorted(view.edges):
+        entries = view.edges[key]["entries"]
+        cap, count, saturated = entries.get("cap"), entries.get("count"), entries.get("saturated")
+        wellformed = (type(cap) is int and cap == U64_MAX
+                      and type(count) is int and 0 <= count <= U64_MAX
+                      and type(saturated) is bool)
+        ok = wellformed and saturation_coherent(count, saturated, cap)
+        res.ok(view.name, "*", "COUNT-SATURATED", ok,
+               f"edge {key[0]}->{key[1]} reads count {count!r} saturated {saturated!r} cap {cap!r}: "
+               "production publishes cap=u64::MAX, a u64 count, and saturated exactly at the cap")
+
+
+def check_uncounted(view, res):
+    """C7 C5 (Choice 1): every unknown/`uncounted` edge carries BPF
+    PairInsertFailure evidence — the gap plus the evidence name in its
+    detail — and publishes no count as fact (zero with the unavailable
+    observation). Userspace-only saturation withholds watches but never
+    reads uncounted, so an uncounted edge without the BPF evidence fails.
+    Counted positives are excepted (they stand beside the gap); only the
+    uncounted edges themselves are judged here. O6: the registry's
+    bounded output can suppress the gap (past --max-gaps) while the
+    edge keeps valid uncounted coverage plus its PairInsertFailure
+    detail (NotePairsUncounted demotes edges regardless) — that case
+    is explicitly nonqualifying, never a pass or a fail. The detail
+    itself is never suppressed, so a missing detail still fails."""
+    run = view.name
+    gaps = [g for g in view.doc.get("gaps", []) if g.get("subject") == PAIRS_UNCOUNTED_SUBJECT]
+    suppressed = view.doc.get("gaps_suppressed") or 0
+    for key in sorted(view.edges):
+        edge = view.edges[key]
+        cov = coverage(edge)
+        if cov.get("reason") != UNCOUNTED_REASON:
+            continue
+        entries = edge["entries"]
+        core = (cov.get("state") == UNKNOWN_STATE and entries.get("count", 0) == 0
+                and entries.get("observation") == "unknown (usage observation unavailable)"
+                and bool(PAIR_INSERT_EVIDENCE.search(cov.get("detail") or "")))
+        if core and gaps:
+            res.add(run, "*", "UNCOUNTED-EVIDENCE", "pass", "ok")
+        elif core and suppressed:
+            res.add(run, "*", "UNCOUNTED-EVIDENCE", "nonqualifying",
+                    f"edge {key[0]}->{key[1]} reads unknown/uncounted with the BPF PairInsertFailure detail "
+                    f"but the {PAIRS_UNCOUNTED_SUBJECT!r} gap is absent while gaps_suppressed={suppressed}: "
+                    "bounded output may have suppressed the gap, so the evidence can neither pass nor fail")
+        else:
+            res.ok(run, "*", "UNCOUNTED-EVIDENCE", False,
+                   f"edge {key[0]}->{key[1]} reads {cov.get('state')}/{cov.get('reason')} with count "
+                   f"{entries.get('count', 0)} {entries.get('observation')!r} detail {cov.get('detail')!r} "
+                   f"and {len(gaps)} {PAIRS_UNCOUNTED_SUBJECT!r} gaps: uncounted needs the BPF "
+                   "PairInsertFailure evidence and publishes no count as fact")
 
 
 def check_positives(view, images_by_cell, mod, state, res):
@@ -1405,10 +2149,17 @@ def check_dashboard(view, images_by_cell, res):
             mine[(image.pid, image.start)] = cell
 
     def want_for(caller, module, edge):
+        # Frames show the dashboard display (window recency at the frame's
+        # own time, which the oracle cannot see): a counted edge may
+        # legally read either its base or recent on screen.
+        activity = {expected_activity_base(edge)}
+        cov = coverage(edge)
+        if cov.get("state") == "counted" and not cov.get("lossy"):
+            activity.add(ACTIVITY["recent"])
         return {"capture": {expected_capture(caller, module, edge)},
                 "entries": {expected_entries_display(edge)},
                 "semantics": {edge.get("semantics")},
-                "activity": expected_activity(edge, view.window[1])}
+                "activity": activity}
 
     # DR-ORACLE-GATE: every frame is compared with the edge state at its
     # own pass from the event stream. A frame rendered before the stop
@@ -1715,7 +2466,7 @@ class Synth:
                     lines.append(f"LEDGER {head} module={path} fn={fn} mech={mech} n={n} bad=0 phase={phase} "
                                  f"t0={t0} t1={self.clock}")
                     self.clock += MS
-                    if fn not in SYMBOL_ENTRY_FUNCTIONS:
+                    if is_table_call(fn, phase):
                         table += n
                 uses[role] = (first, self.clock, table)
             lines.append(f"DONE {head} status=ok")
@@ -1799,19 +2550,25 @@ class Synth:
 
     def native_coverage(self, edge, role, use, since):
         cov = edge["entries"]["coverage"]
-        if use and self.providers[role]["attested"]:
+        if use:
+            # C7 C5: since v0.3.0 the native lane counts every bound row,
+            # attested or not (P2's unattested B reads Counted with the
+            # exact table sum). Semantic claims stay attested-only.
+            # Round 2: the synth's since always predates the workload,
+            # so the one setup acquisition provably executed after the
+            # first row existed — through an armed endpoint — and counts
+            # (LEDGER-COUNTS pins exactly one per provider).
             cov.update(state="counted", since_ns=since, lossy=False, reason=None)
-            edge["entries"].update(count=use[2], first_seen_ns=use[0] + MS, last_seen_ns=use[1], observation="observed")
-            edge["semantics"] = "observed"
-            edge["mechanisms"] = [
-                {"mechanism": m, "mechanism_hex": hex(m), "name": None, "operations": ops, "calls": 1, "errors": 0,
-                 "last_seen_ns": use[1], "evidence": {}}
-                for m, ops in [(0x250, ["digest"]), (0x251, ["sign"]), (0x350, ["generate_key"]),
-                               (0x1080, ["generate_key"]), (0x1087, ["encrypt"])]]
-            edge["operations"] = {"calls": 1, "active": []}
-        elif use:
-            cov.update(state="witnessed", first_ns=use[0] + MS, reason=None)
-            edge["entries"]["observation"] = "unknown (count unavailable; use witnessed)"
+            edge["entries"].update(count=use[2] + 1, first_seen_ns=use[0] + MS, last_seen_ns=use[1],
+                                   observation="observed")
+            if self.providers[role]["attested"]:
+                edge["semantics"] = "observed"
+                edge["mechanisms"] = [
+                    {"mechanism": m, "mechanism_hex": hex(m), "name": None, "operations": ops, "calls": 1, "errors": 0,
+                     "last_seen_ns": use[1], "evidence": {}}
+                    for m, ops in [(0x250, ["digest"]), (0x251, ["sign"]), (0x350, ["generate_key"]),
+                                   (0x1080, ["generate_key"]), (0x1087, ["encrypt"])]]
+                edge["operations"] = {"calls": 1, "active": []}
         else:
             cov.update(state=WATCH_STATE, since_ns=since, reason=None)
             edge["entries"]["observation"] = "observed"
@@ -1864,7 +2621,7 @@ class Synth:
             for e in doc["edges"]:
                 ev = dict(_deep(e), presence=expected_presence(callers[e["caller"]], modules[e["module"]], e),
                           capture=expected_capture(callers[e["caller"]], modules[e["module"]], e),
-                          activity=sorted(expected_activity(e, doc["observation"]["ended_ns"]))[0])
+                          activity=expected_activity_base(e))
                 rows.append(("edge_observed", ev))
                 edge_rows += 1
         rows += extra or []
@@ -1888,7 +2645,7 @@ class Synth:
                  "--- edges 1-2 of 2 [summary] ---"]
         for e in doc["edges"]:
             c, m = callers[e["caller"]], modules[e["module"]]
-            activity = sorted(expected_activity(e, doc["observation"]["ended_ns"]))[0]
+            activity = expected_activity_base(e)
             activity = (overrides or {}).get((e["caller"], e["module"]), activity)
             lines.append(f"{e['caller']} pid {c['pid']} ({c['image']['exe']['path']}) -> {e['module']} ({m['paths'][0]})")
             lines.append(f"  mapping {e['mapping']['state']} | presence mapped | capture {expected_capture(c, m, e)} | "
@@ -2005,7 +2762,7 @@ def self_test():
 
         def before_start(s, d, dash):
             e = _edge(d, cid(s, "P2"), s.mid["B"])
-            d["observation"]["started_ns"] = e["entries"]["coverage"]["first_ns"] + MS
+            d["observation"]["started_ns"] = positive_first_ns(e) + MS
         case("positive-before-capture-start", "POSITIVE-IN-WINDOW", before_start)
         # --- binding --------------------------------------------------------------
         def exec_merged(s, d, dash):
@@ -2101,7 +2858,8 @@ def self_test():
         # first call must bind; count coverage never excuses it.
         def admitted_live_counted(s, d, dash):
             e = _edge(d, cid(s, "P1"), s.mid["A"])
-            e["entries"]["coverage"].update(state="unknown", first_ns=None, since_ns=None, reason="not_attached")
+            e["entries"]["coverage"].update(state="unknown", first_ns=None, since_ns=None, reason="not_attached",
+                                                lossy=None)
             e["entries"]["observation"] = "unknown (usage observation unavailable)"
             caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
             first = min(u[0] for c, _p, _s, _g, _e, _sp, uses in s.images if c == "P1" for u in uses.values())
@@ -2144,7 +2902,7 @@ def self_test():
             def mutate(s, d, dash):
                 e = _edge(d, cid(s, "P1"), s.mid["A"])
                 e["entries"]["coverage"].update(state="unknown", first_ns=None, since_ns=None,
-                                                reason="use_before_admission")
+                                                reason="use_before_admission", lossy=None)
                 e["entries"]["observation"] = "unknown (usage observation unavailable)"
                 caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
                 first = min(u[0] for c, _p, _s, _g, _e, _sp, uses in s.images if c == "P1" for u in uses.values())
@@ -2193,6 +2951,7 @@ def self_test():
             return next((r for r in res.rows if r["run"] == "system" and r["check"] == "LANE"), {})
         for name, stated, reason, want in (("all-unknown-stated-native", "native", "not_admitted", "pass"),
                                            ("all-unknown-loss-unstated", None, "loss", "pass"),
+                                           ("all-unknown-uncounted-unstated", None, "uncounted", "pass"),
                                            ("all-unknown-scan-only-unstated", None, "scan_only", "fail"),
                                            ("stated-native-with-scan-only-edges", "native", "scan_only", "fail")):
             counter[0] += 1
@@ -2210,7 +2969,7 @@ def self_test():
             g1["entries"]["first_seen_ns"] = g0["entries"]["first_seen_ns"]
         case("exec-cross-attribution", "NO-CROSS-ATTRIBUTION", exec_cross)
         case("watched-on-used", "USED-NOT-WATCHED", lambda s, d, dash: _edge(d, cid(s, "P2"), s.mid["B"])["entries"]
-             ["coverage"].update(state=WATCH_STATE, since_ns=T0, first_ns=None))
+             ["coverage"].update(state=WATCH_STATE, since_ns=T0, first_ns=None, lossy=None))
 
         def cross(s, d, dash):
             e = _deep(_edge(d, cid(s, "P2"), s.mid["B"]))
@@ -2244,7 +3003,7 @@ def self_test():
         case("lossy-without-loss-gap", "COUNT-LOSSY", lossy)
         case("attested-only-witnessed", "COVERAGE-ALLOWED", lambda s, d, dash: _edge(d, cid(s, "P1"), s.mid["A"])
              ["entries"]["coverage"].update(state="witnessed", first_ns=_edge(d, cid(s, "P1"), s.mid["A"])
-                                            ["entries"]["first_seen_ns"], since_ns=None))
+                                            ["entries"]["first_seen_ns"], since_ns=None, lossy=None))
 
         def no_cov(s, d, dash):
             for e in d["edges"]:
@@ -2264,9 +3023,10 @@ def self_test():
         def watch_ending_before_use(until_offset):
             def mutate(s, d, dash):
                 e = _edge(d, cid(s, "P2"), s.mid["B"])
-                first = e["entries"]["coverage"]["first_ns"]
+                first = positive_first_ns(e)
                 until = None if until_offset is None else first + until_offset
-                e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=until, first_ns=None)
+                e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=until, first_ns=None,
+                                                lossy=None)
             return mutate
         # A frozen watch that ended before the ledgered use claims nothing about it ...
         res = case("watch-until-before-use", "USED-POSITIVE", watch_ending_before_use(-50 * MS))
@@ -2313,7 +3073,7 @@ def self_test():
                 edge = _edge(dash, s.dash_ids["P3"], s.mid["C"])
                 frames = s.frames(dash)
                 item, value = old_item
-                now = {"activity": sorted(expected_activity(edge, dash["observation"]["ended_ns"]))[0],
+                now = {"activity": expected_activity_base(edge),
                        "entries": expected_entries_display(edge)}
                 items = f"capture {expected_capture({}, {}, edge)} | activity {now['activity']} | " \
                         f"entries {now['entries']} |"
@@ -2323,6 +3083,18 @@ def self_test():
             return mutate
         case("frozen-watch-frame-quiet", "DASH-EDGE-LABELS", frozen_frame_claims(("activity", ACTIVITY["quiet"])))
         case("frozen-watch-frame-zero", "DASH-EDGE-LABELS", frozen_frame_claims(("entries", "0")))
+
+        def restamp_merged(out):
+            # Spliced sweep records carry their own stream's stamps;
+            # restamp them to the merged order so cross-edge clocks stay
+            # sane (round 2: EDGE-CLOCK judges global sequence order).
+            last = None
+            for r in out:
+                if r["kind"] != "edge_observed":
+                    continue
+                if last is not None and r["at_ns"] < last:
+                    r["at_ns"] = last
+                last = r["at_ns"]
 
         # A frame rendered before the stop that froze the watches: the
         # snapshot is frozen, the frame shows the then-ongoing watches as
@@ -2339,6 +3111,7 @@ def self_test():
             frozen = [r for r in s.events(dash) if r["kind"] == "edge_observed"]
             at = next(i for i, r in enumerate(ev) if r["kind"] == "ended")
             out = [dict(r, seq=i) for i, r in enumerate(ev[:at] + frozen + ev[at:])]
+            restamp_merged(out)
             next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(frozen)
             return {"frames": s.frames(live), "dash_events": out}
         case("dashboard-frame-before-freeze", None, dash_frame_before_freeze)
@@ -2359,6 +3132,7 @@ def self_test():
             decided = [r for r in s.events(dash) if r["kind"] == "edge_observed"]
             at = next(i for i, r in enumerate(ev) if r["kind"] == "ended")
             out = [dict(r, seq=i) for i, r in enumerate(ev[:at] + decided + ev[at:])]
+            restamp_merged(out)
             next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(decided)
             return {"frames": s.frames(live), "dash_events": out}
         case("dashboard-frame-pending-unknown", None, dash_frame_pending_unknown)
@@ -2374,7 +3148,7 @@ def self_test():
                 if row["kind"] == "edge_observed" and row["event"]["entries"]["coverage"].get("until_ns"):
                     row["event"]["activity"] = ACTIVITY["quiet"]
             return {"events": ev}
-        case("frozen-watch-event-quiet", "AGREE-EDGE-EVENTS", frozen_quiet_event)
+        case("frozen-watch-event-quiet", "EDGE-ACTIVITY", frozen_quiet_event)
 
         def empty(s, d, dash):
             d["callers"], d["edges"], d["modules"] = [], [], []
@@ -2503,6 +3277,32 @@ def self_test():
             if got != want:
                 failures.append(f"presence-{caller_lc}-{module_lc}-{edge['mapping']['state']}")
 
+        # Uncounted derivations (C4: they fall out of the Unknown mapping).
+        def _counted(last):
+            return {"mapping": {"state": MAPPING_LIVE}, "operations": None,
+                    "entries": {"count": 5, "last_seen_ns": last, "in_flight": False, "observation": "observed",
+                                "coverage": {"state": "counted", "since_ns": T0, "until_ns": None, "first_ns": None,
+                                             "lossy": False, "reason": None, "detail": None}}}
+
+        # (Choice 3 re-ruled: activity is per-pass; the window survives
+        # only in the dashboard display, which self-test frames cover.)
+        unc = _counted(None)
+        unc["entries"].update(count=0, observation="unknown (usage observation unavailable)")
+        unc["entries"]["coverage"].update(state=UNKNOWN_STATE, reason=UNCOUNTED_REASON,
+                                          detail="CALLER_EVIDENCE[2] PairInsertFailure showed 1 failed pair insert(s)")
+        endpoints = ({"retired": False, "lifecycle": "mapped"},
+                     {"admission": {"state": "admitted"}, "lifecycle": "mapped"})
+        if expected_capture(*endpoints, unc) != CAPTURE["lost"]:
+            failures.append("uncounted-capture-derivation")
+        if expected_activity_base(unc) != ACTIVITY["uncovered"]:
+            failures.append("uncounted-activity-derivation")
+        if expected_entries_display(unc) != "?":
+            failures.append("uncounted-entries-derivation")
+        # Bucket boundaries (EdgeClass): 0, 1, 2-3, 4-7, 8-15, ...
+        for count, want in ((0, 0), (1, 1), (2, 2), (3, 2), (4, 3), (7, 3), (8, 4), (37, 6)):
+            if count_bucket(count) != want:
+                failures.append(f"bucket-{count}")
+
         def edge_presence_wrong_label(s, d, dash):
             ev = s.events(d, True)
             row = ev[_edge_rows(ev)[0]]["event"]
@@ -2600,6 +3400,967 @@ def self_test():
         def dash_totals(s, d, dash):
             return {"frames": s.frames(dash).replace(b" callers ", b"0 callers ")}
         case("dashboard-totals", "DASH-TOTALS", dash_totals)
+        # --- C5: ledger exactness + Choice 1-2 pins ---------------------------------------
+        # r1 T3.5 must-fails: a count above the ledger, a published 0,
+        # absent-as-0 (P1), counted-on-preadmission (P2).
+        def above_ledger(s, d, dash):
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] += 1
+        res = case("count-above-ledger", "COUNT-EXACT", above_ledger)
+        failed = {r["check"] for r in res.failed()}
+        if "COUNT-TOTAL" not in failed:
+            failures.append("count-above-ledger-misses-total")
+        if "COUNT-WINDOW" not in failed:
+            # Round 2: no dlsym slack remains — the predating
+            # acquisition counts, so +1 above the ledger fails the
+            # now-tight window too.
+            failures.append("count-above-ledger-misses-window")
+
+        def zero_published(s, d, dash):
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] = 0
+        case("zero-count-published", "COUNTED-NONZERO", zero_published)
+
+        def absent_zero_p1(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"].update(state=WATCH_STATE, since_ns=T0, until_ns=None, first_ns=None,
+                                                lossy=None)
+            e["entries"].update(count=0, first_seen_ns=None, last_seen_ns=None, observation="observed")
+        case("absent-as-zero-p1", "USED-NOT-WATCHED", absent_zero_p1)
+
+        def preadmission_p2(s, d, dash):
+            # The ROW predates admission (admitted after the first
+            # attach-side entry, row stamped between the entry and the
+            # admission): a bound positive over it is the
+            # DR-C51-PREADMIT upgrade, which v0.3.0 does not build.
+            first = min(u[0] for c, _p, _st, _g, _e, _sp, uses in s.images if c == "P2" for u in uses.values())
+            attach_t0 = first + 3 * MS  # setup lines run 3 ms apart: dlsym, then C_Initialize
+            caller = next(c for c in d["callers"] if c["id"] == cid(s, "P2"))
+            caller["first_seen_ns"] = attach_t0 + MS
+            edge = _edge(d, cid(s, "P2"), s.mid["B"])
+            edge["entries"]["first_seen_ns"] = attach_t0 + MS // 2
+            edge["entries"]["coverage"]["since_ns"] = attach_t0 + MS // 2
+        case("counted-on-preadmission-p2", "PREADMISSION-POSITIVE", preadmission_p2)
+
+        # Counted for unattested B: a witnessed P2 edge fails like P1's.
+        def unattested_witnessed(s, d, dash):
+            e = _edge(d, cid(s, "P2"), s.mid["B"])
+            e["entries"]["coverage"].update(state="witnessed", first_ns=e["entries"]["first_seen_ns"],
+                                            since_ns=None, lossy=None)
+        case("unattested-witnessed", "COVERAGE-ALLOWED", unattested_witnessed)
+
+        # Choice 1: uncounted needs the BPF PairInsertFailure evidence.
+        def uncounted_edge(s, d):
+            e = _edge(d, cid(s, "P3"), s.mid["C"])
+            e["entries"]["coverage"].update(
+                state=UNKNOWN_STATE, since_ns=None, reason=UNCOUNTED_REASON,
+                detail="CALLER_EVIDENCE[2] PairInsertFailure showed 1 failed pair insert(s)")
+            e["entries"]["observation"] = "unknown (usage observation unavailable)"
+
+        def uncounted_no_gap(s, d, dash):
+            uncounted_edge(s, d)
+        case("uncounted-without-pair-evidence", "UNCOUNTED-EVIDENCE", uncounted_no_gap)
+
+        def uncounted_bad_detail(s, d, dash):
+            uncounted_edge(s, d)
+            _edge(d, cid(s, "P3"), s.mid["C"])["entries"]["coverage"]["detail"] = \
+                "userspace pair budget exhausted"
+            d["gaps"].append({"caller": None, "module": s.mid["C"], "pid": None,
+                              "subject": PAIRS_UNCOUNTED_SUBJECT, "reason": "synthetic", "budget": None,
+                              "repeats": 1})
+        case("uncounted-detail-without-bpf-name", "UNCOUNTED-EVIDENCE", uncounted_bad_detail)
+
+        def uncounted_count(s, d, dash):
+            uncounted_edge(s, d)
+            _edge(d, cid(s, "P3"), s.mid["C"])["entries"].update(count=3, observation="observed")
+            d["gaps"].append({"caller": None, "module": s.mid["C"], "pid": None,
+                              "subject": PAIRS_UNCOUNTED_SUBJECT, "reason": "synthetic", "budget": None,
+                              "repeats": 1})
+        case("uncounted-with-count", "UNCOUNTED-EVIDENCE", uncounted_count)
+
+        def uncounted_pass(s, d, dash):
+            uncounted_edge(s, d)
+            d["gaps"].append({"caller": None, "module": s.mid["C"], "pid": None,
+                              "subject": PAIRS_UNCOUNTED_SUBJECT, "reason": "synthetic", "budget": None,
+                              "repeats": 1})
+        res = case("uncounted-pass-with-counted-standing", None, uncounted_pass)
+        if not any(r["check"] == "UNCOUNTED-EVIDENCE" and r["status"] == "pass" for r in res.rows):
+            failures.append("uncounted-pass-exercises-evidence")
+
+        def uncounted_record(s, d):
+            uncounted_edge(s, d)
+            d["gaps"].append({"caller": None, "module": s.mid["C"], "pid": None,
+                              "subject": PAIRS_UNCOUNTED_SUBJECT, "reason": "synthetic", "budget": None,
+                              "repeats": 1})
+            ev = s.events(d)
+            return ev, next(e for e in ev if e["kind"] == "edge_observed"
+                            and e["event"]["caller"] == cid(s, "P3") and e["event"]["module"] == s.mid["C"])
+
+        def uncounted_activity(s, d, dash):
+            ev, row = uncounted_record(s, d)
+            assert row["event"]["activity"] == ACTIVITY["uncovered"], row["event"]
+            row["event"]["activity"] = ACTIVITY["unknown"]
+            return {"events": ev}
+        case("uncounted-activity-unknown", "EDGE-ACTIVITY", uncounted_activity)
+
+        def uncounted_capture(s, d, dash):
+            ev, row = uncounted_record(s, d)
+            assert row["event"]["capture"] == CAPTURE["lost"], row["event"]
+            row["event"]["capture"] = CAPTURE["armed"]
+            return {"events": ev}
+        case("uncounted-capture-armed", "AGREE-EDGE-EVENTS", uncounted_capture)
+
+        # Choice 2: bucket jumps are immediate class changes; other drift
+        # waits out the 10 s channel.
+        def drift_stages(s, d, cell, stages):
+            """Replace the cell's edge records with `stages` [(count,
+            at_ns)] before the pass marker; fix accounting + seq."""
+            cid_, mid = cid(s, cell), s.mid["A"]
+            ev = s.events(d)
+            template = [e for e in ev if e["kind"] == "edge_observed"
+                        and e["event"].get("caller") == cid_ and e["event"].get("module") == mid][-1]
+            keep = [e for e in ev if not (e["kind"] == "edge_observed"
+                                          and e["event"].get("caller") == cid_
+                                          and e["event"].get("module") == mid)]
+            at = next(i for i, e in enumerate(keep) if e["kind"] == "pass_committed")
+            new = []
+            for count, at_ns in stages:
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["at_ns"] = at_ns
+                new.append(rec)
+            out = keep[:at] + new + keep[at:]
+            next(e for e in out if e["kind"] == "pass_committed")["event"]["edge_events"] += len(new) - 1
+            return {"events": _renumber(out)}
+
+        def fast_drift(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            assert n >= 2 and count_bucket(n - 1) == count_bucket(n), n
+            return drift_stages(s, d, "P1", [(n - 1, T0 + 500), (n, T0 + 500 + 1_000_000_000)])
+        case("fast-drift-same-bucket", "EDGE-CADENCE", fast_drift)
+
+        def bucket_jump(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            prev = (1 << (count_bucket(n) - 1)) - 1
+            assert count_bucket(prev) != count_bucket(n), (prev, n)
+            return drift_stages(s, d, "P1", [(prev, T0 + 500), (n, T0 + 500 + 1_000_000_000)])
+        case("bucket-jump-fast-pass", None, bucket_jump)
+
+        # Choice 3 (ACT re-rule): activity is per-pass ("rose since
+        # previous pass"), never a recency window. An unchanged
+        # consecutive record must read quiet; a rise allows recent or
+        # quiet (the emission may lag the rising pass); counts never
+        # decrease.
+        def activity_stages(s, d, cell, stages):
+            """Like drift_stages, but each stage is (count, at_ns,
+            activity): the last stage must carry the snapshot count."""
+            cid_, mid = cid(s, cell), s.mid["A"]
+            ev = s.events(d)
+            template = [e for e in ev if e["kind"] == "edge_observed"
+                        and e["event"].get("caller") == cid_ and e["event"].get("module") == mid][-1]
+            keep = [e for e in ev if not (e["kind"] == "edge_observed"
+                                          and e["event"].get("caller") == cid_
+                                          and e["event"].get("module") == mid)]
+            at = next(i for i, e in enumerate(keep) if e["kind"] == "pass_committed")
+            new = []
+            for count, at_ns, activity in stages:
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["event"]["activity"] = activity
+                rec["at_ns"] = at_ns
+                new.append(rec)
+            out = keep[:at] + new + keep[at:]
+            next(e for e in out if e["kind"] == "pass_committed")["event"]["edge_events"] += len(new) - 1
+            return {"events": _renumber(out)}
+
+        def rise_then_quiet(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            assert n >= 2, n
+            # The rise flips quiet->recent (a class change, cadence-free);
+            # the cadence re-emission 10 s later reads quiet.
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["quiet"]),
+                                                (n, T0 + 600, ACTIVITY["recent"]),
+                                                (n, T0 + 700 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["quiet"])])
+        case("per-pass-rise-then-quiet", None, rise_then_quiet)
+
+        def fresh_last_seen(s, d):
+            # In-window at the run end, so the old window rule allows
+            # recent and only the per-pass pin can catch the echo.
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["last_seen_ns"] = \
+                d["observation"]["ended_ns"] - 1_000
+
+        def window_echo(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            assert n >= 2, n
+            fresh_last_seen(s, d)
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["quiet"]),
+                                                (n, T0 + 600, ACTIVITY["recent"]),
+                                                (n, T0 + 700 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["recent"])])
+        case("per-pass-window-echo-fails", "EDGE-ACTIVITY", window_echo)
+
+        def count_falls(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            assert n >= 2, n
+            # A decrease mid-stream (each pair 10 s apart, cadence-free);
+            # the last record still carries the snapshot count.
+            fresh_last_seen(s, d)
+            return activity_stages(s, d, "P1", [(n, T0 + 500, ACTIVITY["recent"]),
+                                                (n - 1, T0 + 600 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["quiet"]),
+                                                (n, T0 + 700 + 2 * COUNT_EMIT_INTERVAL_NS, ACTIVITY["recent"])])
+        case("per-pass-count-decreases-fails", "EDGE-ACTIVITY", count_falls)
+
+        # ACT precedence (fix round 1): production reads a fresh rise as
+        # recent even over lossy coverage (a rise beats lossy), while
+        # in-flight beats a rise (never recent over in_flight). The
+        # oracle must match both directions.
+        def make_lossy_p1(s, d):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"]["lossy"] = True
+            d["gaps"].append({"caller": None, "module": None, "pid": None,
+                              "subject": "native count refresh loss",
+                              "reason": "1 count-refresh read failure: scripted",
+                              "budget": None, "repeats": 1})
+
+        def lossy_rise_recent(s, d, dash):
+            make_lossy_p1(s, d)
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["lossy"]),
+                                                (n, T0 + 600, ACTIVITY["recent"])])
+        case("per-pass-lossy-rise-recent-pass", None, lossy_rise_recent)
+
+        def lossy_echo(s, d, dash):
+            make_lossy_p1(s, d)
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            return activity_stages(s, d, "P1", [(n, T0 + 500, ACTIVITY["lossy"]),
+                                                (n, T0 + 600 + COUNT_EMIT_INTERVAL_NS, ACTIVITY["recent"])])
+        case("per-pass-lossy-unchanged-recent-fails", "EDGE-ACTIVITY", lossy_echo)
+
+        def inflight_recent(s, d, dash):
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["in_flight"] = True
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["inflight"]),
+                                                (n, T0 + 600, ACTIVITY["recent"])])
+        case("per-pass-inflight-recent-fails", "EDGE-ACTIVITY", inflight_recent)
+
+        def inflight_over_rise(s, d, dash):
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["in_flight"] = True
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            # Same bucket, same activity: the re-emission rides the 10 s
+            # count channel, like production's within-bucket drift.
+            return activity_stages(s, d, "P1", [(n - 1, T0 + 500, ACTIVITY["inflight"]),
+                                                (n, T0 + 600 + COUNT_EMIT_INTERVAL_NS,
+                                                 ACTIVITY["inflight"])])
+        case("per-pass-inflight-over-rise-pass", None, inflight_over_rise)
+
+        # ACT proven comparison (fix round 1): consecutive pass segments
+        # with zero deferred records prove what each pass saw — a rise
+        # across them must read recent (the reviewer's 17 -> 37
+        # quiet-quiet instance). One segment per record; both markers
+        # carry deferred 0.
+        def two_pass_activity(s, d, cell, first, second):
+            """Adjacent single-record pass segments: `first`/`second`
+            are (count, at_ns, activity); the last stage must carry the
+            snapshot count."""
+            cid_, mid = cid(s, cell), s.mid["A"]
+            ev = s.events(d)
+            template = [e for e in ev if e["kind"] == "edge_observed"
+                        and e["event"].get("caller") == cid_ and e["event"].get("module") == mid][-1]
+            keep = [e for e in ev if not (e["kind"] == "edge_observed"
+                                          and e["event"].get("caller") == cid_
+                                          and e["event"].get("module") == mid)]
+            at = next(i for i, e in enumerate(keep) if e["kind"] == "pass_committed")
+            end = next(i for i, e in enumerate(keep) if e["kind"] == "ended")
+
+            def rec(stage):
+                count, at_ns, activity = stage
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["event"]["activity"] = activity
+                rec["at_ns"] = at_ns
+                return rec
+
+            first_marker = _deep(keep[at])
+            first_marker["event"]["pass"] -= 1
+            second_marker = _deep(keep[at])
+            second_marker["event"].update(edge_events=1, edge_events_deferred=0, new_gaps=0,
+                                          suppressed_delta=0)
+            out = keep[:at] + [rec(first)] + [first_marker] + [rec(second)] + [second_marker] + keep[end:]
+            return {"events": _renumber(out)}
+
+        def proven_quiet(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            prev = (1 << (count_bucket(n) - 1)) - 1
+            assert count_bucket(prev) != count_bucket(n), (prev, n)
+            return two_pass_activity(s, d, "P1", (prev, T0 + 500, ACTIVITY["quiet"]),
+                                     (n, T0 + 600, ACTIVITY["quiet"]))
+        case("per-pass-proven-rise-quiet-fails", "EDGE-ACTIVITY", proven_quiet)
+
+        def proven_recent(s, d, dash):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            prev = (1 << (count_bucket(n) - 1)) - 1
+            assert count_bucket(prev) != count_bucket(n), (prev, n)
+            return two_pass_activity(s, d, "P1", (prev, T0 + 500, ACTIVITY["quiet"]),
+                                     (n, T0 + 600, ACTIVITY["recent"]))
+        case("per-pass-proven-rise-recent-pass", None, proven_recent)
+
+        # C2 extension: the decided snapshot never carries pending_first_use.
+        def pending_snapshot(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"].update(state=UNKNOWN_STATE, since_ns=None, reason=PENDING_FIRST_USE_REASON,
+                                                lossy=None)
+            e["entries"]["observation"] = "unknown (usage observation unavailable)"
+        case("pending-in-snapshot", "PENDING-TRANSIENT", pending_snapshot)
+
+        # --- O1: realistic since timing (sol 1, astra B1) -------------------
+        # Native since_ns is the first BPF row's insert stamp, taken during
+        # the recording call's probe — strictly after the workload's
+        # pre-call ledger stamp — so since<=t_first never holds on real
+        # runs. The recording call's realistic singleton line [t,t] lands
+        # entirely before since; the old window drops it from lo AND hi
+        # ([36,36] vs the correct 37) while COUNT-EXACT never engages (an
+        # incorrect 36 passes everything).
+        def realistic_since_ledger(s, d):
+            """Collapse P1's first attach line (setup C_Initialize) to a
+            realistic singleton [t,t] and stamp the first BPF record 1500
+            ns (probe latency) after its entry."""
+            led = dict(s.ledgers)
+            pat = re.compile(r"(fn=C_Initialize mech=- n=1 bad=0 phase=setup t0=)(\d+)( t1=)\d+")
+            assert len(pat.findall(led["P1"])) == 1
+            match = pat.search(led["P1"])
+            tick = int(match.group(2))
+            led["P1"] = pat.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(2)}",
+                                led["P1"], count=1)
+            since = tick + 1500
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            # Mid-workload since: the setup acquisition missed (a legacy
+            # line ends after it but before the row), so the edge drops
+            # the synth's predating +1.
+            edge["entries"]["count"] -= 1
+            return {"ledgers": led}
+
+        def realistic_timing(s, d, dash):
+            return realistic_since_ledger(s, d)
+        res = case("count-exact-realistic-timing", None, realistic_timing)
+        if not any(r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"
+                   and r["status"] == "pass" for r in res.rows):
+            failures.append("count-exact-realistic-timing-misses-exact")
+
+        def realistic_timing_short(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] -= 1
+            return kw
+        case("count-below-ledger-realistic-timing", "COUNT-EXACT", realistic_timing_short)
+
+        # --- O1: covered-segment exactness (fix round 1, corrected round 2)
+        # Setup-before-attachment: four setup calls precede attachment;
+        # all 30 main + 3 teardown calls are captured. Admission lands
+        # in the setup->main gap with the first row after it. The
+        # recording call (on the last setup line) created the row, so
+        # the correct count is 34 = 33 post-since calls + the recording
+        # call; COUNT-EXACT is nonqualifying (entry stamps cannot prove
+        # the recording call executed before attachment), and 33 or
+        # fewer fails COUNT-WINDOW.
+        def setup_before_attachment(s, d, count):
+            login = re.search(r"fn=C_Login mech=- n=1 bad=0 phase=setup t0=\d+ t1=(\d+)",
+                              s.ledgers["P1"])
+            digest_init = re.search(r"fn=C_DigestInit mech=0x250 n=3 bad=0 phase=main t0=(\d+)",
+                                    s.ledgers["P1"])
+            setup_end, main_start = int(login.group(1)), int(digest_init.group(1))
+            assert setup_end < main_start, (setup_end, main_start)
+            admitted = setup_end + (main_start - setup_end) // 4
+            since = setup_end + (main_start - setup_end) // 2
+            caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
+            caller["first_seen_ns"] = admitted
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            edge["entries"]["count"] = count
+            return since
+
+        # The covered segment's correct count includes the recording
+        # call (34 = 33 post-since calls + the call that created the
+        # first row): the window keeps the recording-call bound, while
+        # COUNT-EXACT is explicitly nonqualifying — entry stamps cannot
+        # prove the recording call executed before attachment (round 2).
+        def covered_segment_correct(s, d, dash):
+            setup_before_attachment(s, d, 34)
+        res = case("o1-covered-segment-counts-recording-call", None, covered_segment_correct)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-covered-segment-not-nonqualifying")
+
+        # An undercount missing exactly the recording call (33) fails
+        # the window's lower bound — it no longer passes as exact.
+        def covered_segment_missing_recording(s, d, dash):
+            setup_before_attachment(s, d, 33)
+        case("o1-recording-call-missing-fails", "COUNT-WINDOW", covered_segment_missing_recording)
+
+        def covered_segment_short(s, d, dash):
+            setup_before_attachment(s, d, 32)
+        case("o1-covered-segment-short-fails", "COUNT-WINDOW", covered_segment_short)
+
+        # O1 partial attach: the module reports failed endpoints (verbatim
+        # production shape — PARTIAL_ATTACH_SUBJECT in
+        # src/discovery/inventory_coordinator.rs): counted uses are lower
+        # bounds, so COUNT-EXACT is explicitly nonqualifying.
+        def partial_attach_gap(s, d, dash):
+            setup_before_attachment(s, d, 33)
+            d["gaps"].append({"caller": None, "module": s.mid["A"], "pid": None,
+                              "subject": "native endpoint attach failed",
+                              "reason": "2 of 68 endpoints failed to attach (sticky, never retried); "
+                                        "counted uses are lower bounds",
+                              "budget": None, "repeats": 1})
+        res = case("o1-partial-attach-nonqualifying", None, partial_attach_gap)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-partial-attach-not-nonqualifying")
+
+        # F3-04: a module-scoped partial-attach gap voids only its own
+        # module's exactness — other modules' edges keep COUNT-EXACT
+        # (no run-wide poison). The B deferral below is the production
+        # shape a pre-publish deferral now stages (keyed attribution).
+        def scoped_partial_attach(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            d["gaps"].append({"caller": None, "module": s.mid["B"], "pid": None,
+                              "subject": "native endpoint attach failed",
+                              "reason": "1 endpoint(s) still deferred when the receipt closed; "
+                                        "counted uses are lower bounds",
+                              "budget": None, "repeats": 1})
+            return kw
+        res = case("o1-partial-attach-scoped-keeps-other-exact", None, scoped_partial_attach)
+        row_a = next((r for r in res.rows
+                      if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row_a is None or row_a["status"] != "pass":
+            failures.append("o1-partial-attach-scoped-other-not-exact")
+        row_b = next((r for r in res.rows
+                      if r["run"] == "system" and r["cell"] == "P2" and r["check"] == "COUNT-EXACT"), None)
+        if row_b is None or row_b["status"] != "nonqualifying" or "partial-attach" not in row_b["detail"]:
+            failures.append("o1-partial-attach-scoped-own-not-nonqualifying")
+
+        # Round 4 (R4-N2): a demoted edge carries segment-relative
+        # growth (post-base-read calls only) and marks itself with the
+        # production demotion gap (DEMOTED_COUNT_PLACED in
+        # src/discovery/caller_registry.rs). The ledger window judges
+        # the upper bound only (the lower bound cannot hold a
+        # segment), and COUNT-EXACT is explicitly nonqualifying (no
+        # segment equality to judge).
+        def demoted_segment_genuine(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            # The base call stays on the previous owner; the edge
+            # carries post-base growth only.
+            edge["entries"]["count"] -= 1
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                              "subject": "demoted count placed",
+                              "reason": "a demoted count placed post-demotion growth on this edge",
+                              "budget": None, "repeats": 1})
+            return kw
+        res = case("demoted-growth-window-passes-exact-nonqualifying", None, demoted_segment_genuine)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-WINDOW"), None)
+        if row is None or row["status"] != "pass":
+            failures.append("demoted-growth-window-not-passing")
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying" or "demot" not in row["detail"]:
+            failures.append("demoted-growth-exact-not-nonqualifying")
+
+        # Same co-design over the setup-before-attachment shape: the
+        # recording call belongs to the base, so genuine growth (33)
+        # sits below the unclamped lower bound (34).
+        def demoted_segment_setup_shape(s, d, dash):
+            setup_before_attachment(s, d, 33)
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                              "subject": "demoted count placed",
+                              "reason": "a demoted count placed post-demotion growth on this edge",
+                              "budget": None, "repeats": 1})
+        res = case("demoted-growth-setup-shape-window-passes", None, demoted_segment_setup_shape)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-WINDOW"), None)
+        if row is None or row["status"] != "pass":
+            failures.append("demoted-growth-setup-window-not-passing")
+
+        # The upper bound still judges demoted edges: an absolute
+        # count re-installed on a demoted edge (37 over a 34 window)
+        # fails COUNT-WINDOW — the clamp voids the lower bound only.
+        def demoted_segment_corrupt(s, d, dash):
+            setup_before_attachment(s, d, 37)
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                              "subject": "demoted count placed",
+                              "reason": "a demoted count placed post-demotion growth on this edge",
+                              "budget": None, "repeats": 1})
+        case("demoted-growth-absolute-fails-upper", "COUNT-WINDOW", demoted_segment_corrupt)
+
+        # Round 5 (sol-N2): the demotion marker matches the gap subject
+        # only — an ordinary "module admission changed" gap whose
+        # reason embeds an adversarial provider path naming "demoted
+        # count placed" marks nothing demoted: the edge keeps full
+        # judgment (COUNT-EXACT engaged).
+        def demoted_subject_only(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": 7,
+                              "subject": "module admission changed",
+                              "reason": "/lib/demoted count placed/provider.so: admission changed "
+                                        "from staged to admitted",
+                              "budget": None, "repeats": 1})
+            return kw
+        res = case("demoted-subject-only-ignores-adversarial-reason", None, demoted_subject_only)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "pass":
+            failures.append("demoted-subject-only-exact-not-engaged")
+
+        # O1 straddling first row (the reviewer's repro shape): the first
+        # row lands inside an aggregated ledger line, so the recorded
+        # split is unknowable — explicitly nonqualifying.
+        def straddling_first_row(s, d, dash):
+            login = re.search(r"fn=C_Login mech=- n=1 bad=0 phase=setup t0=\d+ t1=(\d+)",
+                              s.ledgers["P1"])
+            digest_init = re.search(
+                r"fn=C_DigestInit mech=0x250 n=3 bad=0 phase=main t0=(\d+) t1=(\d+)", s.ledgers["P1"])
+            setup_end = int(login.group(1))
+            dt0, dt1 = int(digest_init.group(1)), int(digest_init.group(2))
+            caller = next(c for c in d["callers"] if c["id"] == cid(s, "P1"))
+            caller["first_seen_ns"] = setup_end + (dt0 - setup_end) // 2
+            since = (dt0 + dt1) // 2
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            edge["entries"]["count"] = 33
+        res = case("o1-straddling-row-nonqualifying", None, straddling_first_row)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-straddling-row-not-nonqualifying")
+
+        # O1 admission coverage: eleven distinct endpoints called in the
+        # segment but only one admitted — some called endpoint missed, so
+        # COUNT-EXACT is explicitly nonqualifying.
+        def admitted_endpoints_short(s, d, dash):
+            setup_before_attachment(s, d, 34)
+            mod = next(m for m in d["modules"] if m["id"] == s.mid["A"])
+            mod["admission"]["endpoints"] = 1
+        res = case("o1-admission-coverage-nonqualifying", None, admitted_endpoints_short)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-admission-coverage-not-nonqualifying")
+
+        # O1 evidence validation (round 2): a missing admission
+        # endpoint count or mapping first-seen cannot prove endpoint
+        # coverage or mapping hold — COUNT-EXACT is explicitly
+        # nonqualifying, never exact on assumed evidence.
+        def admission_endpoints_missing(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            mod = next(m for m in d["modules"] if m["id"] == s.mid["A"])
+            mod["admission"]["endpoints"] = None
+            return kw
+        res = case("o1-admission-endpoints-missing-nonqualifying", None, admission_endpoints_missing)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-admission-endpoints-missing-not-nonqualifying")
+
+        def mapping_first_seen_missing(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            _edge(d, cid(s, "P1"), s.mid["A"])["mapping"]["first_seen_ns"] = None
+            return kw
+        res = case("o1-mapping-first-seen-missing-nonqualifying", None, mapping_first_seen_missing)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("o1-mapping-first-seen-missing-not-nonqualifying")
+
+        # O1 gap suppression (round 2, S4): production's gap list is
+        # bounded, so a partial-attach gap may have been suppressed —
+        # COUNT-EXACT is explicitly nonqualifying whenever any gap was
+        # suppressed, and the window clamps its lower bound rather than
+        # failing a true undercount.
+        def suppressed_exact(s, d, dash):
+            kw = realistic_since_ledger(s, d)
+            d["gaps_suppressed"] = 1
+            kw["events"] = s.events(d)
+            return kw
+        res = case("count-exact-suppressed-gaps-nonqualifying", None, suppressed_exact)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("count-exact-suppressed-gaps-not-nonqualifying")
+
+        def suppressed_undercount(s, d, dash):
+            setup_before_attachment(s, d, 33)
+            d["gaps_suppressed"] = 1
+            return {"events": s.events(d)}
+        res = case("count-window-suppressed-clamps-lower-bound", None, suppressed_undercount)
+        row = next((r for r in res.rows
+                    if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("count-window-suppressed-not-nonqualifying")
+
+        # F3-07: a malformed gaps_suppressed (truthy non-int —
+        # production always emits int) fails closed to nonqualifying,
+        # never raises TypeError. The stream stays well-formed
+        # (production ints — events render before the doc field is
+        # poisoned); only the snapshot field is malformed, so the
+        # AGREE-* mismatch failures are the structured verdict.
+        for malformed in ("1", [1], {"n": 1}):
+            def suppressed_malformed(s, d, dash, malformed=malformed):
+                kw = realistic_since_ledger(s, d)
+                kw["events"] = s.events(d)
+                d["gaps_suppressed"] = malformed
+                return kw
+            tag = type(malformed).__name__
+            res = case(f"count-exact-suppressed-malformed-{tag}-nonqualifying",
+                       "AGREE-GAP-ACCOUNTING", suppressed_malformed)
+            row = next((r for r in res.rows
+                        if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
+            if row is None or row["status"] != "nonqualifying":
+                failures.append(f"count-exact-suppressed-malformed-{tag}-not-nonqualifying")
+
+        # --- O2: terminal sweep hole (sol 2, astra B4) ----------------------
+        # Every record after the last pass marker skips EDGE-CADENCE while
+        # only the last record per edge must match the snapshot, so a tail
+        # disagreeing with the snapshot passes everything.
+        def tail_stages(s, d, cell, pre, post):
+            """Replace the cell's edge records with `pre` [(count, at_ns)]
+            records before the pass marker and `post` [(count, at_ns,
+            mutate)] records after it (the terminal sweep); fix
+            accounting + seq."""
+            cid_, mid = cid(s, cell), s.mid["A"]
+            ev = s.events(d)
+            template = [e for e in ev if e["kind"] == "edge_observed"
+                        and e["event"].get("caller") == cid_ and e["event"].get("module") == mid][-1]
+            keep = [e for e in ev if not (e["kind"] == "edge_observed"
+                                          and e["event"].get("caller") == cid_
+                                          and e["event"].get("module") == mid)]
+            at = next(i for i, e in enumerate(keep) if e["kind"] == "pass_committed")
+            new_pre = []
+            for count, at_ns in pre:
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["at_ns"] = at_ns
+                new_pre.append(rec)
+            new_post = []
+            for count, at_ns, mutate in post:
+                rec = _deep(template)
+                rec["event"]["entries"]["count"] = count
+                rec["at_ns"] = at_ns
+                if mutate:
+                    mutate(rec["event"])
+                new_post.append(rec)
+            end = next(i for i, e in enumerate(keep) if e["kind"] == "ended")
+            out = keep[:at] + new_pre + keep[at:end] + new_post + keep[end:]
+            next(e for e in out if e["kind"] == "pass_committed")["event"]["edge_events"] += len(new_pre) - 1
+            next(e for e in out if e["kind"] == "ended")["event"]["edge_events"] = len(new_post)
+            return {"events": _renumber(out)}
+
+        def sweep_tail_disagreeing(s, d, dash):
+            # sol probe: 35 before the marker, then 36->37 at the same
+            # timestamp afterward; the first tail record disagrees.
+            return tail_stages(s, d, "P1", [(35, T0 + 500)],
+                               [(36, T0 + 600, None), (37, T0 + 600, None)])
+        case("sweep-tail-disagreeing", "TERMINAL-SWEEP", sweep_tail_disagreeing)
+
+        def sweep_tail_pending(s, d, dash):
+            # astra probe: a terminal pending_first_use record followed by
+            # an exact record.
+            def make_pending(ev):
+                ev["entries"]["coverage"].update(state=UNKNOWN_STATE, since_ns=None,
+                                                reason=PENDING_FIRST_USE_REASON)
+                ev["entries"]["observation"] = "unknown (usage observation unavailable)"
+            return tail_stages(s, d, "P1", [(37, T0 + 500)],
+                               [(37, T0 + 600, make_pending), (37, T0 + 700, None)])
+        case("sweep-tail-pending-then-exact", "TERMINAL-SWEEP", sweep_tail_pending)
+
+        def sweep_single_terminal(s, d, dash):
+            # Legitimate sweep: the edge's only record is terminal and exact.
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            return tail_stages(s, d, "P1", [], [(n, T0 + 600, None)])
+        res = case("sweep-single-terminal-pass", None, sweep_single_terminal)
+        if not any(r["check"] == "TERMINAL-SWEEP" and r["status"] == "pass" for r in res.rows):
+            failures.append("sweep-single-terminal-not-compared")
+
+        # --- O3: invalid clocks fail open (sol 3) ---------------------------
+        # Missing/non-integer/backwards timestamps skip cadence silently
+        # with no other check failing. Each pair below is a bucket jump
+        # (a class change), so cadence itself stays quiet and only the
+        # clock verdict can fail.
+        def clock_stages(s, d, first_at, second_at):
+            n = _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"]
+            prev = (1 << (count_bucket(n) - 1)) - 1
+            assert count_bucket(prev) != count_bucket(n), (prev, n)
+            return drift_stages(s, d, "P1", [(prev, first_at), (n, second_at)])
+
+        def clock_null(s, d, dash):
+            return clock_stages(s, d, T0 + 500, None)
+        case("edge-clock-null", "EDGE-CLOCK", clock_null)
+
+        def clock_string(s, d, dash):
+            return clock_stages(s, d, T0 + 500, "not-a-clock")
+        case("edge-clock-string", "EDGE-CLOCK", clock_string)
+
+        def clock_backwards(s, d, dash):
+            return clock_stages(s, d, T0 + 1500, T0 + 500)
+        case("edge-clock-backwards", "EDGE-CLOCK", clock_backwards)
+
+        # O3 unsigned range (fix round 1): at_ns is a u64 CLOCK_MONOTONIC
+        # stamp — exact int type (never bool) within 0..u64::MAX. Each
+        # invalid stamp sits where monotonicity alone cannot catch it.
+        def clock_negative(s, d, dash):
+            return clock_stages(s, d, -1, T0 + 500)
+        case("edge-clock-negative", "EDGE-CLOCK", clock_negative)
+
+        def clock_bool(s, d, dash):
+            return clock_stages(s, d, True, T0 + 500)
+        case("edge-clock-bool", "EDGE-CLOCK", clock_bool)
+
+        def clock_above_u64(s, d, dash):
+            return clock_stages(s, d, T0 + 500, 2**64)
+        case("edge-clock-above-u64", "EDGE-CLOCK", clock_above_u64)
+
+        # O3 cross-edge order (round 2): per-edge monotonicity cannot
+        # see a reversal across edges — A@late followed by B@early in
+        # sequence order fails EDGE-CLOCK, while equal stamps stay
+        # permitted (production reuses commit timestamps).
+        def cross_edge_reversal(s, d, dash):
+            ev = s.events(d)
+            a = next(e for e in ev if e["kind"] == "edge_observed"
+                     and e["event"].get("caller") == cid(s, "P1") and e["event"].get("module") == s.mid["A"])
+            b = next(e for e in ev if e["kind"] == "edge_observed"
+                     and e["event"].get("caller") == cid(s, "P2") and e["event"].get("module") == s.mid["B"])
+            a["at_ns"], b["at_ns"] = b["at_ns"], a["at_ns"]
+            return {"events": ev}
+        case("edge-clock-cross-edge-reversal", "EDGE-CLOCK", cross_edge_reversal)
+
+        def cross_edge_equal(s, d, dash):
+            ev = s.events(d)
+            a = next(e for e in ev if e["kind"] == "edge_observed"
+                     and e["event"].get("caller") == cid(s, "P1") and e["event"].get("module") == s.mid["A"])
+            b = next(e for e in ev if e["kind"] == "edge_observed"
+                     and e["event"].get("caller") == cid(s, "P2") and e["event"].get("module") == s.mid["B"])
+            b["at_ns"] = a["at_ns"]
+            return {"events": ev}
+        case("edge-clock-cross-edge-equal-pass", None, cross_edge_equal)
+
+        # --- O4: preadmission checks the wrong event (astra B2) --------------
+        # The binder's Rule 3 rejects ROWS recorded before admission
+        # (native_binding.rs:777: row.recorded_at_ns < first_seen_ns),
+        # but the oracle compared the ledger's first call — including the
+        # excluded acquisition C_GetFunctionList — against admission, so a
+        # legitimate table-before-observer + use-after-admission edge
+        # fails. The rejection must rest on evidence that an attached
+        # entry produced a row before admission.
+        def preadmission_legit_held(s, d, dash):
+            sd = s.stop_doc()
+            first = min(u[0] for c, _p, _st, _g, _e, _sp, uses in s.images if c == "P6"
+                        for u in uses.values())
+            row = first + MS
+            sd["callers"][0]["first_seen_ns"] = first + MS // 2
+            sd["edges"][0]["entries"]["first_seen_ns"] = row
+            sd["edges"][0]["entries"]["coverage"]["since_ns"] = row
+            # Mid-workload since: the setup acquisition missed, so the
+            # edge drops the synth's predating +1 (round 2).
+            sd["edges"][0]["entries"]["count"] = 1
+            return {"stop_doc": sd}
+        case("preadmission-held-table-before-observer", None, preadmission_legit_held)
+
+        # --- O5: invented frozen-count bypass (astra B3) ---------------------
+        # Native Counted has no until_ns (frozen ends belong to
+        # WatchedNoUse), yet the oracle accepts a non-null counted end,
+        # clips COUNT-WINDOW to it and skips COUNT-EXACT — so an early
+        # until_ns with 37->1 calls passes everything.
+        def counted_until_bypass(s, d, dash):
+            match = re.search(r"fn=C_Initialize mech=- n=1 bad=0 phase=setup t0=\d+ t1=(\d+)",
+                              s.ledgers["P2"])
+            edge = _edge(d, cid(s, "P2"), s.mid["B"])
+            edge["entries"]["coverage"]["until_ns"] = int(match.group(1))
+            edge["entries"]["count"] = 1
+        case("counted-until-frozen-bypass", "COVERAGE-SHAPE", counted_until_bypass)
+
+        # --- O6: uncounted evidence vs gap suppression (astra A5) ------------
+        # caller_registry's bounded output can suppress the pair-insert gap
+        # while the edge retains valid uncounted coverage plus its
+        # PairInsertFailure detail — that legitimate case fails
+        # UNCOUNTED-EVIDENCE. Suppressed evidence is explicitly
+        # nonqualifying (neither pass nor fail).
+        def uncounted_suppressed(s, d, dash):
+            uncounted_edge(s, d)
+            d["gaps_suppressed"] = 1
+            return {"events": s.events(d)}
+        res = case("uncounted-gap-suppressed", None, uncounted_suppressed)
+        row = next((r for r in res.rows if r["run"] == "system" and r["check"] == "UNCOUNTED-EVIDENCE"),
+                   None)
+        if row is None or row["status"] != "nonqualifying":
+            failures.append("uncounted-gap-suppressed-not-nonqualifying")
+
+        # --- O7: saturation cap bounds (astra A6) ---------------------------
+        # Production's cap is fixed at u64::MAX (MAX_EDGE_ENTRY_COUNT,
+        # src/inventory.rs edge_json): the document can never invent its
+        # own saturation exemption. Small-cap arithmetic lives here as
+        # unit checks, separate from artifact qualification (which
+        # requires the fixed cap).
+        arith = [
+            saturation_coherent(7, True, 7),
+            count_window_ok(7, True, 36, 37),
+            not saturation_coherent(5, True, 7),
+            not saturation_coherent(7, False, 7),
+            count_window_ok(36, False, 36, 37),
+            not count_window_ok(5, False, 36, 37),
+        ]
+        if not all(arith):
+            failures.append("saturated-arithmetic-shape")
+
+        def forged_cap_one(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=1, saturated=True, cap=1)
+        case("saturated-forged-cap-one", "COUNT-SATURATED", forged_cap_one)
+
+        def cap_none(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(cap=None)
+        case("saturated-cap-none", "COUNT-SATURATED", cap_none)
+
+        def saturated_off_cap(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=5, saturated=True)
+        case("saturated-count-off-cap", "COUNT-SATURATED", saturated_off_cap)
+
+        def unsaturated_at_cap(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=U64_MAX, saturated=False)
+        case("unsaturated-count-at-cap", "COUNT-SATURATED", unsaturated_at_cap)
+
+        def flag_nonbool(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=U64_MAX, saturated=1)
+        case("saturated-flag-nonbool", "COUNT-SATURATED", flag_nonbool)
+
+        def count_bool(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"].update(count=True)
+        case("saturated-count-bool", "COUNT-SATURATED", count_bool)
+
+        # --- O8: receipt boundary proof (astra A7, corrected round 2) ----
+        # The C_GetFunctionList exclusion is acquisition-only AND
+        # missed-only: the setup-phase dlsym call that receipts the
+        # table counts unless a legacy attach-side line ending at/after
+        # its own end but strictly before the edge's first BPF row
+        # proves a later recording call. Phase, name, mechanism, and
+        # the first-row time alone never exempt it — an armed
+        # acquisition can itself create the first row (SoftHSM: export
+        # == table slot). LEDGER-COUNTS pins exactly one setup
+        # C_GetFunctionList per provider, so the fixture never holds an
+        # ambiguous second one.
+        def _line(fn, phase, n, t0, t1):
+            return {"module": "/prov/a/libsofthsm2.so", "fn": fn, "mech": "-", "n": n, "bad": 0,
+                    "phase": phase, "t0": t0, "t1": t1}
+        acq = _line("C_GetFunctionList", "setup", 1, T0 + 1, T0 + 2)
+        armed = _line("C_GetFunctionList", "main", 2, T0 + 3, T0 + 4)
+        digest = _line("C_Digest", "main", 3, T0 + 5, T0 + 6)
+        if Use([acq, armed, digest], [acq, armed, digest], T0 + 1, T0 + 6, {}).table_calls != 5:
+            failures.append("o8-armed-table-call-excluded")
+        if Use([acq], [acq], T0 + 1, T0 + 2, {}).table_calls != 0:
+            failures.append("o8-acquisition-not-excluded")
+        late = _line("C_GetFunctionList", "setup", 1, T0 + 5, T0 + 6)
+        # Armed (after the first row, realistic since): counts.
+        if not is_table_call("C_GetFunctionList", "setup", late, (T0 + 4, None)):
+            failures.append("o8-armed-acquisition-excluded")
+        # Missed: a legacy line ends after it but before the row, so
+        # that line (or a later one) holds the recording call.
+        if is_table_call("C_GetFunctionList", "setup", late, (T0 + 7, T0 + 6)):
+            failures.append("o8-missed-acquisition-counted")
+        # Predating row (synth convention: the row precedes every
+        # call): the acquisition provably executed after the row
+        # existed — through an armed endpoint — so it counts (round 2).
+        if not is_table_call("C_GetFunctionList", "setup", late, (T0, None)):
+            failures.append("o8-predating-acquisition-excluded")
+        # Natural order, acquisition as the recording call (round 2):
+        # no legacy line ends before the row, so it counts.
+        nat_acq = _line("C_GetFunctionList", "setup", 1, T0 + 10, T0 + 10)
+        if not is_table_call("C_GetFunctionList", "setup", nat_acq, (T0 + 15, None)):
+            failures.append("o8-natural-acquisition-recording-excluded")
+        # Natural order, acquisition missed (a legacy line ends after
+        # it but before the row): excluded.
+        if is_table_call("C_GetFunctionList", "setup", nat_acq, (T0 + 25, T0 + 20)):
+            failures.append("o8-natural-acquisition-missed-counted")
+
+        def armed_table_getfunctionlist(s, d, dash):
+            ident = next(l for l in s.ledgers["P1"].splitlines() if l.startswith("IDENT "))
+            main = re.search(r"phase=main t0=(\d+) t1=(\d+)", s.ledgers["P1"])
+            led = dict(s.ledgers)
+            led["P1"] += (f"LEDGER {ident.split(' ', 1)[1]} module=/prov/a/libsofthsm2.so "
+                          f"fn=C_GetFunctionList mech=- n=1 bad=0 phase=main "
+                          f"t0={main.group(1)} t1={main.group(2)}\n")
+            return {"ledgers": led}
+        case("armed-table-getfunctionlist", "LEDGER-COUNTS", armed_table_getfunctionlist)
+
+        # O8 post-arming acquisition (fix round 1): P7 loads the
+        # provider, waits, then invokes C_GetFunctionList through dlsym
+        # — after the first BPF row, so the acquisition provably
+        # traversed an armed endpoint (SoftHSM: export == table slot)
+        # and counts. 28 (27 table + the armed acquisition) qualifies;
+        # 27 (dropping it) fails.
+        def armed_acquisition_ledger(s, d, count):
+            led = dict(s.ledgers)
+            pat_acq = re.compile(r"(fn=C_GetFunctionList mech=- n=1 bad=0 phase=setup t0=)(\d+)( t1=)(\d+)")
+            pat_init = re.compile(r"(fn=C_Initialize mech=- n=1 bad=0 phase=setup t0=)(\d+)( t1=)(\d+)")
+            assert len(pat_acq.findall(led["P7"])) == 1
+            assert len(pat_init.findall(led["P7"])) == 1
+            acq = pat_acq.search(led["P7"])
+            init = pat_init.search(led["P7"])
+            # Swap the two setup lines' stamps wholesale, so the phase
+            # intervals (and LEDGER-COUNTS/PHASES) are unchanged but the
+            # acquisition dlsym lands after C_Initialize ...
+            led["P7"] = pat_acq.sub(
+                lambda m: f"{m.group(1)}{init.group(2)}{m.group(3)}{init.group(4)}", led["P7"], count=1)
+            led["P7"] = pat_init.sub(
+                lambda m: f"{m.group(1)}{acq.group(2)}{m.group(3)}{acq.group(4)}", led["P7"], count=1)
+            # ... with the first BPF row between them (mid-gap).
+            since = (int(acq.group(4)) + int(init.group(2))) // 2
+            edge = _edge(d, cid(s, "P7"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            edge["entries"]["count"] = count
+            return {"ledgers": led}
+
+        def armed_acquisition_correct(s, d, dash):
+            return armed_acquisition_ledger(s, d, 28)
+        case("armed-acquisition-counted-pass", None, armed_acquisition_correct)
+
+        def armed_acquisition_short(s, d, dash):
+            return armed_acquisition_ledger(s, d, 27)
+        case("armed-acquisition-missing-fails", "COUNT-EXACT", armed_acquisition_short)
+
+        # O8 acquisition as the recording call (round 2): P7's natural
+        # order (acquisition dlsym before C_Initialize — the fixture's
+        # own order) with the first BPF row between them. No legacy
+        # line ends before the row, so the acquisition holds the
+        # recording call and counts: 28 qualifies with COUNT-EXACT
+        # engaged; 27 fails it.
+        def natural_acquisition_ledger(s, d, count):
+            led = s.ledgers["P7"]
+            acq = re.search(r"fn=C_GetFunctionList mech=- n=1 bad=0 phase=setup t0=\d+ t1=(\d+)", led)
+            init = re.search(r"fn=C_Initialize mech=- n=1 bad=0 phase=setup t0=(\d+)", led)
+            acq_t1, init_t0 = int(acq.group(1)), int(init.group(1))
+            assert acq_t1 < init_t0, (acq_t1, init_t0)
+            since = (acq_t1 + init_t0) // 2
+            edge = _edge(d, cid(s, "P7"), s.mid["A"])
+            edge["entries"]["coverage"]["since_ns"] = since
+            edge["entries"]["first_seen_ns"] = since
+            edge["entries"]["count"] = count
+
+        def natural_acquisition_correct(s, d, dash):
+            natural_acquisition_ledger(s, d, 28)
+        res = case("acquisition-first-record-natural-pass", None, natural_acquisition_correct)
+        if not any(r["run"] == "system" and r["cell"] == "P7" and r["check"] == "COUNT-EXACT"
+                   and r["status"] == "pass" for r in res.rows):
+            failures.append("acquisition-first-record-natural-misses-exact")
+
+        def natural_acquisition_short(s, d, dash):
+            natural_acquisition_ledger(s, d, 27)
+        case("acquisition-first-record-natural-short-fails", "COUNT-EXACT", natural_acquisition_short)
         # --- ledger ------------------------------------------------------------------------------------
         case("ledger-bad-rv", "LEDGER-RV", lambda s, d, dash: {"ledgers": {"P1": s.ledgers["P1"].replace(
             "fn=C_Sign mech=0x251 n=3 bad=0", "fn=C_Sign mech=0x251 n=3 bad=1")}})

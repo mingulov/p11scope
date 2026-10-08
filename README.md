@@ -11,13 +11,14 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: v0.2.0**, the first release since v0.1.0, adds `inventory` (which module is used by whom:
-> scan and native lanes, JSON/JSONL/dashboard) and Kubernetes DaemonSet
-> manifests to `doctor`, `inspect` (now `--system`), `profile`
+> **Status: v0.3.0**, adds per-edge entry counts end to end to `inventory`
+> (which module is used by whom, counts included: scan and native lanes,
+> JSON/JSONL/dashboard), load-instance continuity, and sharded discovery
+> across `doctor`, `inspect` (now `--system`), `profile`
 > (including `--mode metrics`), `trace` and `run`. Read the
 > [known limitations](CHANGELOG.md#known-limitations) and
 > [docs/known-limitations.md](docs/known-limitations.md) before relying on
-> a capture; `--system` is a preview. The [v0.2.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.2.0)
+> a capture; `--system` is a preview. The [v0.3.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
 > identify tagged-artifact qualification and hosted CI;
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) preserves
 > revision-specific pre-release evidence.
@@ -39,7 +40,7 @@ known limitations, [Install](#install) to build and install it, and
 [docs/usage.md](docs/usage.md) for the full operator's guide (privileges,
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
-The v0.2.0 user-facing limits live in
+The v0.3.0 user-facing limits live in
 [docs/known-limitations.md](docs/known-limitations.md).
 
 ## Building from source
@@ -90,8 +91,8 @@ assets and local release-mode builds.
 
 ## Install
 
-p11scope v0.2.0 is distributed through the
-[GitHub release](https://github.com/mingulov/p11scope/releases/tag/v0.2.0)
+p11scope v0.3.0 is distributed through the
+[GitHub release](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
 as a static x86-64 Linux observer bundle, optional glibc and musl discovery
 helper bundles, and a source export. Download `SHA256SUMS` with the bundle you
 choose. The release also provides `RELEASE.json` with curated provenance;
@@ -99,9 +100,9 @@ each bundle contains its license notices and a copy of that record.
 
 | Bundle | Use |
 | --- | --- |
-| `p11scope-0.2.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
-| `p11scope-discover-0.2.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
-| `p11scope-discover-0.2.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
+| `p11scope-0.3.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
+| `p11scope-discover-0.3.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
+| `p11scope-discover-0.3.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
 
 For example, download the observer and `SHA256SUMS` into a private directory,
 then verify the archive before extraction:
@@ -109,11 +110,11 @@ then verify the archive before extraction:
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.2.0/p11scope-0.2.0-x86_64-linux-musl.tar.gz
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.2.0/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.3.0/p11scope-0.3.0-x86_64-linux-musl.tar.gz
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.3.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf p11scope-0.2.0-x86_64-linux-musl.tar.gz
-sudo install -m 0755 p11scope-0.2.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
+tar -xzf p11scope-0.3.0-x86_64-linux-musl.tar.gz
+sudo install -m 0755 p11scope-0.3.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
 p11scope --version
 sudo p11scope doctor
 ```
@@ -129,7 +130,7 @@ The observer needs Linux x86-64 and the kernel and privilege requirements
 below. The helper needs the matching provider ABI and libc; a 32-bit provider
 requires a separately built 32-bit helper.
 
-The release also includes `p11scope-0.2.0-source.tar.gz`. It contains the
+The release also includes `p11scope-0.3.0-source.tar.gz`. It contains the
 committed source and the two pinned Aya archives needed to reconstruct the
 local patches. Building it still needs network access for the remaining
 locked Cargo dependencies, plus the Rust/BPF and host build tools described
@@ -469,7 +470,7 @@ For now, the sudo path clears supplementary groups, so workloads needing an
 HSM/device group should use an already-running target until explicit run-as
 group selection is implemented.
 
-The [v0.2.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.2.0)
+The [v0.3.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
 identify final tagged-artifact qualification and hosted CI. The
 [changelog](CHANGELOG.md#qualification-of-this-release) and earlier campaign
 records in `docs/` retain revision-specific historical evidence.

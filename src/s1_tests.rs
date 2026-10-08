@@ -1962,23 +1962,23 @@ fn d3_refused_caller_gap_without_edge_matches_all_outputs() {
     }
 }
 
-/// Parse the dashboard's per-edge blocks: identity lines start at
-/// column 0 (`{caller} pid {pid} ({exe}) -> {module} ({path})`) while
-/// item lines are indented, so each block's facts attribute to exactly
-/// one edge (F6: no global substring can satisfy another edge).
+/// Parse the dashboard's per-edge blocks by the reserved physical references
+/// in `{app} [cN] -> {module} [mN]` headings. Item lines are indented, so
+/// each block's facts attribute to exactly one edge (F6).
 fn dashboard_edge_blocks(dashboard: &str) -> BTreeMap<(String, String), String> {
+    fn parse_reference(cell: &str, prefix: char) -> Option<String> {
+        let (_, reference) = cell.rsplit_once(" [")?;
+        let id = reference.strip_suffix(']')?;
+        let digits = id.strip_prefix(prefix)?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        Some(id.into())
+    }
     fn parse_identity(line: &str) -> Option<(String, String)> {
+        let line = line.strip_suffix("\x1b[K").unwrap_or(line);
         let (left, right) = line.rsplit_once(" -> ")?;
-        let mut left_tokens = left.split_whitespace();
-        let caller = left_tokens.next()?;
-        if left_tokens.next() != Some("pid") {
-            return None;
-        }
-        let module = right.split_whitespace().next()?;
-        if !caller.starts_with('c') || !module.starts_with('m') {
-            return None;
-        }
-        Some((caller.to_string(), module.to_string()))
+        Some((parse_reference(left, 'c')?, parse_reference(right, 'm')?))
     }
     let mut blocks: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut current: Option<((String, String), Vec<&str>)> = None;

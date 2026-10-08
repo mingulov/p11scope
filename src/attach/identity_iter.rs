@@ -11,7 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Record ABI (§5). Mirrors `vma_identity.h`; `c_header_records_match` pins it.
@@ -1491,6 +1492,761 @@ pub fn ensure_kernel_identity_btf() -> Result<Vec<u8>, KernelDeny> {
     let raw = read_vmlinux_btf()?;
     check_kernel_identity_btf(&raw)?;
     Ok(raw)
+}
+
+// ---------------------------------------------------------------------------
+// Anchor arena (§3.3) and functional probe (§6.5).
+// ---------------------------------------------------------------------------
+
+/// A slot arena: a `PROT_NONE` anonymous reservation of `slots *
+/// ANCHOR_STRIDE` bytes (8 MiB of address space at full cap, no RSS).
+/// Slot `i` is the page at `base + i * ANCHOR_STRIDE`, mapped
+/// `MAP_FIXED` `PROT_READ` from the held fd; its neighbours stay
+/// anonymous `PROT_NONE`, so the anchor VMA can never merge and
+/// `vm_start` identifies the slot exactly. `Drop` unmaps the reservation.
+pub struct AnchorArena {
+    base: u64,
+    slots: u32,
+}
+
+impl AnchorArena {
+    /// Reserve an arena for `slots` anchor pages. Rejects 0 and anything
+    /// past `ANCHOR_SLOTS` with `EINVAL` before any mapping.
+    pub fn reserve(slots: u32) -> io::Result<Self> {
+        if slots == 0 || slots > ANCHOR_SLOTS {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let len = u64::from(slots) * ANCHOR_STRIDE;
+        // SAFETY: anonymous reservation (`MAP_NORESERVE`, no fd); `len >
+        // 0` and page-aligned by construction.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            base: base.addr() as u64,
+            slots,
+        })
+    }
+
+    /// Reservation base address (page-aligned).
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Reservation length in bytes (`slots * ANCHOR_STRIDE`).
+    pub fn len(&self) -> u64 {
+        u64::from(self.slots) * ANCHOR_STRIDE
+    }
+
+    /// Whether the arena holds no slots. Always false: `reserve` rejects
+    /// 0, but the predicate keeps `len` honest for lints.
+    pub fn is_empty(&self) -> bool {
+        self.slots == 0
+    }
+
+    /// Slot `slot`'s page address, or `None` past the reservation.
+    pub fn slot_page(&self, slot: u32) -> Option<u64> {
+        if slot >= self.slots {
+            return None;
+        }
+        Some(self.base + u64::from(slot) * ANCHOR_STRIDE)
+    }
+
+    /// Map one page `PROT_READ` (never `PROT_EXEC`) at slot `slot` from
+    /// offset 0 of `file`, `MAP_FIXED` inside this reservation. Only the
+    /// slot page is replaced; the guard neighbours are untouched. The
+    /// caller must not assign slots to empty files (D3b policy): the
+    /// mapping itself is unopinionated.
+    pub fn map_slot(&self, slot: u32, file: BorrowedFd<'_>) -> io::Result<()> {
+        let page = self
+            .slot_page(slot)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: `MAP_FIXED` within our own reservation replaces exactly
+        // the slot page; the fd is borrowed live.
+        let at = unsafe {
+            libc::mmap(
+                page as *mut libc::c_void,
+                PAGE_GRANULE as usize,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Release slot `slot` back to anonymous `PROT_NONE`, rejoining the
+    /// reservation. Ordering rule (I1): call only after the last run
+    /// that used the slot has been read to END or abandoned.
+    pub fn release_slot(&self, slot: u32) -> io::Result<()> {
+        let page = self
+            .slot_page(slot)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: like `map_slot`, restoring the reservation's own shape.
+        let at = unsafe {
+            libc::mmap(
+                page as *mut libc::c_void,
+                PAGE_GRANULE as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The `config[0]` for a pass over this arena: `installed` slots of
+    /// this reservation, observed by `observer_tgid`. Validate with
+    /// [`validate_arena_config`] before writing (the probe does).
+    pub fn config(&self, generation: u64, installed: u32, observer_tgid: u32) -> IdentityConfig {
+        IdentityConfig {
+            generation,
+            arena_base: self.base,
+            arena_len: self.len(),
+            slots: installed,
+            observer_tgid,
+        }
+    }
+}
+
+impl Drop for AnchorArena {
+    fn drop(&mut self) {
+        // SAFETY: the exact reservation this arena owns. Errors are
+        // impossible here (a live private mapping) and ignored in `Drop`
+        // by convention.
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.len() as usize);
+        }
+    }
+}
+
+/// §6.5 probe files: two distinct files, a hard link to the first, and a
+/// byte-identical copy of the first. All paths are canonicalized (the
+/// child's maps text is matched against them verbatim).
+pub struct ProbeFixture {
+    /// First anchored file (slot 0).
+    pub a: PathBuf,
+    /// Second anchored file (slot 1).
+    pub b: PathBuf,
+    /// Hard link to `a`: must read back slot 0.
+    pub hardlink: PathBuf,
+    /// Byte-identical copy of `a` (distinct inode): must read NONE.
+    pub copy: PathBuf,
+}
+
+/// Write the §6.5 fixture into `dir` (one page per file, deterministic
+/// contents) and self-validate the discrimination the probe asserts:
+/// the link shares `a`'s inode, the copy shares its bytes but not its
+/// inode, and `b` differs in both. Stale `hardlink`/`copy` names from a
+/// previous run over a surviving dir are unlinked first, so a rerun can
+/// never see a previous run's inodes.
+pub fn write_probe_fixture(dir: &Path) -> io::Result<ProbeFixture> {
+    let dir = std::fs::canonicalize(dir)?;
+    let a_bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let b_bytes: Vec<u8> = (0..4096u32).map(|i| ((i % 241) as u8) ^ 0x5A).collect();
+    let a = dir.join("probe-a");
+    let b = dir.join("probe-b");
+    let hardlink = dir.join("probe-a-link");
+    let copy = dir.join("probe-a-copy");
+    std::fs::write(&a, &a_bytes)?;
+    std::fs::write(&b, &b_bytes)?;
+    for stale in [&hardlink, &copy] {
+        let _ = std::fs::remove_file(stale);
+    }
+    std::fs::hard_link(&a, &hardlink)?;
+    std::fs::write(&copy, &a_bytes)?;
+    use std::os::unix::fs::MetadataExt as _;
+    let ino = |path: &Path| std::fs::metadata(path).map(|meta| meta.ino());
+    let (ino_a, ino_b, ino_link, ino_copy) = (ino(&a)?, ino(&b)?, ino(&hardlink)?, ino(&copy)?);
+    let mismatch = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what);
+    if ino_a != ino_link {
+        return Err(mismatch("probe fixture: hard link left a's inode"));
+    }
+    if ino_a == ino_b || ino_a == ino_copy {
+        return Err(mismatch("probe fixture: distinct files share an inode"));
+    }
+    if std::fs::read(&copy)? != a_bytes {
+        return Err(mismatch("probe fixture: copy diverged from a"));
+    }
+    if a_bytes == b_bytes {
+        return Err(mismatch("probe fixture: a and b are byte-identical"));
+    }
+    Ok(ProbeFixture {
+        a,
+        b,
+        hardlink,
+        copy,
+    })
+}
+
+/// A forked child that maps each of its paths `PROT_READ|PROT_EXEC`
+/// `MAP_PRIVATE`, reports the mapping addresses over a pipe, then pauses
+/// until reaped. `Drop` kills (`SIGKILL`) and reaps, so a probe that
+/// bails early never leaks a child or a zombie.
+pub struct MappedChild {
+    pid: u32,
+    addrs: Vec<u64>,
+    reaped: bool,
+}
+
+impl MappedChild {
+    /// The child's pid (a group leader in the observer's namespace).
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// The reported mapping addresses, in path order.
+    pub fn addrs(&self) -> &[u64] {
+        &self.addrs
+    }
+
+    /// Kill (`SIGKILL`) and reap the child. Idempotent; `Drop` calls this
+    /// when a probe bails early.
+    pub fn reap(&mut self) {
+        if self.reaped {
+            return;
+        }
+        self.reaped = true;
+        // SAFETY: signal + `waitpid` on our own forked child; `waitpid`
+        // retries `EINTR`, and every outcome (including `ECHILD`) ends here.
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            let mut status = 0;
+            loop {
+                if libc::waitpid(self.pid as libc::pid_t, &mut status, 0) >= 0 {
+                    break;
+                }
+                if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for MappedChild {
+    fn drop(&mut self) {
+        self.reap();
+    }
+}
+
+/// Fork a child that maps `paths` executable and reports the addresses.
+///
+/// Fork-safety: the child touches only async-signal-safe calls (`open`,
+/// `mmap`, `close`, `write`, `pause`, `_exit`) and read-only inherited
+/// memory (the pre-fork `CString`s); it never allocates, never touches a
+/// Rust lock, and never returns into the test harness. Failure modes exit
+/// 11 (`open`), 12 (`mmap`), or 13 (report), which the parent reads back
+/// from the exit status on EOF. The parent reads exactly one address per
+/// path: the child either reports all of them or dies first, so the read
+/// cannot hang.
+pub fn spawn_exec_mapping_child(paths: &[PathBuf]) -> io::Result<MappedChild> {
+    if paths.is_empty() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let cpaths: Vec<std::ffi::CString> = paths
+        .iter()
+        .map(|path| {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut pipe = [0; 2];
+    // SAFETY: `pipe` writes two fresh fds on success.
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fork` in a multithreaded parent is sound when the child
+    // issues only async-signal-safe calls and `_exit`s (documented above).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        return Err(error);
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(pipe[0]);
+            for cpath in &cpaths {
+                // SAFETY: child-only, AS-safe (`open`, `mmap`, `close`).
+                let fd = libc::open(cpath.as_ptr(), libc::O_RDONLY);
+                if fd < 0 {
+                    libc::_exit(11);
+                }
+                let at = libc::mmap(
+                    std::ptr::null_mut(),
+                    PAGE_GRANULE as usize,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE,
+                    fd,
+                    0,
+                );
+                libc::close(fd);
+                if at == libc::MAP_FAILED {
+                    libc::_exit(12);
+                }
+                let bytes = (at.addr() as u64).to_le_bytes();
+                let mut wrote = 0;
+                while wrote < bytes.len() {
+                    // SAFETY: `write` of the live stack bytes.
+                    let got =
+                        libc::write(pipe[1], bytes[wrote..].as_ptr().cast(), bytes.len() - wrote);
+                    if got <= 0 {
+                        libc::_exit(13);
+                    }
+                    wrote += got as usize;
+                }
+            }
+            libc::close(pipe[1]);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    // SAFETY: parent: the write end belongs to the child now.
+    unsafe {
+        libc::close(pipe[1]);
+    }
+    let mut addrs = Vec::with_capacity(paths.len());
+    for _ in paths {
+        let mut word = [0u8; 8];
+        let mut have = 0;
+        while have < word.len() {
+            // SAFETY: `read` into the live stack buffer.
+            let got =
+                unsafe { libc::read(pipe[0], word[have..].as_mut_ptr().cast(), word.len() - have) };
+            if got == 0 {
+                // EOF: the child died before reporting; its exit code
+                // names the failed step (11/12/13).
+                let mut status = 0;
+                unsafe {
+                    libc::close(pipe[0]);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("probe child {pid} died before reporting (status {status})"),
+                ));
+            }
+            if got < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                unsafe {
+                    libc::close(pipe[0]);
+                    libc::kill(pid, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                return Err(error);
+            }
+            have += got as usize;
+        }
+        addrs.push(u64::from_le_bytes(word));
+    }
+    unsafe {
+        libc::close(pipe[0]);
+    }
+    Ok(MappedChild {
+        pid: pid as u32,
+        addrs,
+        reaped: false,
+    })
+}
+
+/// Why the functional probe failed: the stage plus the cause. Every stage
+/// fails the probe loudly; there is no fallback inside §6.5 (selection
+/// falls back to userspace on `probe_failed`, D3d's job).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeError {
+    /// Short stage tag (`fixture`, `child`, `arena-config`, `config-map`,
+    /// `scope-map`, `link`, `iter`, `read`, `parse-anchor`, `parse-target`,
+    /// `join`, ...).
+    pub stage: &'static str,
+    /// The underlying cause, rendered.
+    pub detail: String,
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "functional probe {}: {}",
+            self.stage, self.detail
+        )
+    }
+}
+
+impl std::error::Error for ProbeError {}
+
+fn probe_io(stage: &'static str, error: io::Error) -> ProbeError {
+    ProbeError {
+        stage,
+        detail: error.to_string(),
+    }
+}
+
+// SAFETY: `repr(C)`, `Copy`, all-primitive fields: every bit pattern is a
+// valid value, so aya may read and write it as map bytes.
+unsafe impl aya::Pod for IdentityConfig {}
+
+/// Write `config[0]` on a freshly loaded object.
+fn write_probe_config(ebpf: &mut aya::Ebpf, config: &IdentityConfig) -> Result<(), ProbeError> {
+    let map = ebpf.map_mut("config").ok_or_else(|| ProbeError {
+        stage: "config-map",
+        detail: "config map missing from the loaded object".to_owned(),
+    })?;
+    let mut array =
+        aya::maps::Array::<_, IdentityConfig>::try_from(map).map_err(|error| ProbeError {
+            stage: "config-cast",
+            detail: error.to_string(),
+        })?;
+    array.set(0, config, 0).map_err(|error| ProbeError {
+        stage: "config-write",
+        detail: error.to_string(),
+    })
+}
+
+/// Set exactly `tgids`' bits in the scope bitmap of a freshly loaded
+/// object (zero-init, so set == OR). An out-of-bitmap tgid fails loudly:
+/// silently dropping a target would forge a "no record" outcome.
+fn write_probe_scope(ebpf: &mut aya::Ebpf, tgids: &[u32]) -> Result<(), ProbeError> {
+    let mut words = BTreeMap::new();
+    for tgid in tgids {
+        let (word, bit) = scope_word_bit(*tgid).ok_or_else(|| ProbeError {
+            stage: "scope-bit",
+            detail: format!("tgid {tgid} past the scope bitmap"),
+        })?;
+        *words.entry(word as u32).or_insert(0u64) |= bit;
+    }
+    let map = ebpf.map_mut("scope_bitmap").ok_or_else(|| ProbeError {
+        stage: "scope-map",
+        detail: "scope_bitmap map missing from the loaded object".to_owned(),
+    })?;
+    let mut array = aya::maps::Array::<_, u64>::try_from(map).map_err(|error| ProbeError {
+        stage: "scope-cast",
+        detail: error.to_string(),
+    })?;
+    for (word, bits) in words {
+        array.set(word, bits, 0).map_err(|error| ProbeError {
+            stage: "scope-write",
+            detail: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Open a pidfd for `pid`. A descriptor numbered 0 is re-numbered to ≥1
+/// (`F_DUPFD_CLOEXEC`, restoring the closed-stdin state): the link
+/// encoder rejects fd 0 rather than risk a silent whole-system walk.
+pub fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
+    // SAFETY: `pidfd_open(pid, 0)` returns a new owned fd or -1.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the syscall returned a new owned fd.
+    let owned = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    if owned.as_raw_fd() != 0 {
+        return Ok(owned);
+    }
+    // SAFETY: `F_DUPFD_CLOEXEC` a live fd to ≥1; `owned` (fd 0) then
+    // drops, restoring the closed-stdin state.
+    let duped = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 1) };
+    if duped < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fcntl` returned a new owned fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(duped) })
+}
+
+/// Attach `prog_fd` (whole-system, or per-pid on `pid_fd`) and drain one
+/// run to EOF under `deadline` and `max_bytes`. The link and iter fds
+/// close on drop.
+fn attach_and_read_run(
+    prog_fd: BorrowedFd<'_>,
+    pid_fd: Option<BorrowedFd<'_>>,
+    deadline: Instant,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ProbeError> {
+    let link = link_create_task_vma(prog_fd, pid_fd).map_err(|error| probe_io("link", error))?;
+    let iter = iter_create(link.as_fd()).map_err(|error| probe_io("iter", error))?;
+    read_run(iter.as_fd(), deadline, max_bytes).map_err(|error| ProbeError {
+        stage: "read",
+        detail: format!("{error:?}"),
+    })
+}
+
+/// The single executable file range for `path` in a maps text. Exactly
+/// one must exist: zero means the mapping is gone (the child died),
+/// several means an unexpected merge or split.
+fn find_exec_range(maps: &str, path: &Path) -> Result<(u64, u64), ProbeError> {
+    let want = path.to_string_lossy();
+    let mut hits = Vec::new();
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let range = fields.next().unwrap_or("");
+        let perms = fields.next().unwrap_or("");
+        let tail: Vec<&str> = fields.collect();
+        if tail.last() == Some(&want.as_ref()) && perms.as_bytes().get(2) == Some(&b'x') {
+            let (start, end) = range.split_once('-').ok_or_else(|| ProbeError {
+                stage: "join",
+                detail: format!("unparsable maps range for {want}"),
+            })?;
+            let parse = |hex: &str| {
+                u64::from_str_radix(hex, 16).map_err(|_| ProbeError {
+                    stage: "join",
+                    detail: format!("unparsable maps range for {want}"),
+                })
+            };
+            hits.push((parse(start)?, parse(end)?));
+        }
+    }
+    if hits.len() != 1 {
+        return Err(ProbeError {
+            stage: "join",
+            detail: format!(
+                "expected exactly one exec VMA for {want}, found {}",
+                hits.len()
+            ),
+        });
+    }
+    Ok(hits[0])
+}
+
+/// The §6.5 verdicts, as data: callers assert (tests) or print (the
+/// `identity_probe` example) — this function never decides pass/fail
+/// itself beyond failing loudly on malformed runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionalProbeReport {
+    /// The probe child's pid (the only tgid that may emit).
+    pub child_pid: u32,
+    /// Anchor outcomes by slot, in slot order.
+    pub anchor_outcomes: Vec<(u32, AnchorOutcome)>,
+    /// Verdict at the hard link's range: `Slot(0)` on success.
+    pub hardlink_verdict: TargetVerdict,
+    /// Verdict at the second file's range: `Slot(1)` on success.
+    pub second_verdict: TargetVerdict,
+    /// Verdict at the byte-identical copy's range: `Unmatched` on success.
+    pub copy_verdict: TargetVerdict,
+    /// Records emitted for the child (3 probe + inherited exec VMAs).
+    pub child_record_count: usize,
+    /// Of those, the `Unmatched` ones (inherited VMAs + the copy).
+    pub child_unmatched_count: usize,
+    /// Tgids that emitted, sorted (must be exactly `[child_pid]`).
+    pub pids_seen: Vec<u32>,
+    /// Pids with conflicting exact-range duplicates (must be empty).
+    pub demoted_pids: Vec<u32>,
+    /// Whether the stale-generation phase read `Unmatched` at both
+    /// anchored ranges (the `gen`-check probe).
+    pub stale_unmatched: bool,
+}
+
+/// Run the §6.5 functional probe: fixture files, an executable-mapping
+/// child, a 2-slot arena (A→0, B→1), a per-pid anchor run on the
+/// observer, a whole-system target run over the child, and a
+/// stale-generation target phase. `loaded` must be freshly strict-loaded
+/// (zeroed maps); `generation` must be in `1..u32::MAX` (the stale phase
+/// uses `generation + 1`, and the parser compares low 32 bits). Slots
+/// release after the last run is consumed (I1 ordering).
+pub fn run_functional_probe(
+    dir: &Path,
+    loaded: &mut StrictIdentity,
+    generation: u64,
+) -> Result<FunctionalProbeReport, ProbeError> {
+    if generation == 0 || generation >= u64::from(u32::MAX) {
+        return Err(ProbeError {
+            stage: "generation",
+            detail: format!("generation {generation} outside 1..u32::MAX"),
+        });
+    }
+    let fixture = write_probe_fixture(dir).map_err(|error| probe_io("fixture", error))?;
+    let mut child = spawn_exec_mapping_child(&[
+        fixture.hardlink.clone(),
+        fixture.b.clone(),
+        fixture.copy.clone(),
+    ])
+    .map_err(|error| probe_io("child", error))?;
+    // Ground truth from the child's maps (robust to merge/split): the
+    // exact exec ranges the kernel must report for each probe file.
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", child.pid()))
+        .map_err(|error| probe_io("maps", error))?;
+    let hardlink_range = find_exec_range(&maps, &fixture.hardlink)?;
+    let second_range = find_exec_range(&maps, &fixture.b)?;
+    let copy_range = find_exec_range(&maps, &fixture.copy)?;
+    // The arena reserves AFTER the fork, so the child never inherits
+    // anchor VMAs (they are non-exec and out of scope anyway; this keeps
+    // the probe's VMA accounting exact).
+    let arena = AnchorArena::reserve(2).map_err(|error| probe_io("arena", error))?;
+    let file_a = std::fs::File::open(&fixture.a).map_err(|error| probe_io("anchor-open", error))?;
+    let file_b = std::fs::File::open(&fixture.b).map_err(|error| probe_io("anchor-open", error))?;
+    arena
+        .map_slot(0, file_a.as_fd())
+        .map_err(|error| probe_io("anchor-map", error))?;
+    arena
+        .map_slot(1, file_b.as_fd())
+        .map_err(|error| probe_io("anchor-map", error))?;
+    let observer = std::process::id();
+    let config = arena.config(generation, 2, observer);
+    validate_arena_config(&config).map_err(|error| ProbeError {
+        stage: "arena-config",
+        detail: format!("{error:?}"),
+    })?;
+    write_probe_config(&mut loaded.ebpf, &config)?;
+    write_probe_scope(&mut loaded.ebpf, &[child.pid()])?;
+    // Anchor run: ALWAYS per-pid on the observer.
+    let pidfd = open_pidfd(observer).map_err(|error| probe_io("pidfd", error))?;
+    let anchor_bytes = attach_and_read_run(
+        loaded.anchor_fd.as_fd(),
+        Some(pidfd.as_fd()),
+        Instant::now() + Duration::from_secs(5),
+        64 * 1024,
+    )?;
+    let anchor_run = parse(
+        &anchor_bytes,
+        &Expect {
+            generation,
+            slots: 2,
+            scope: &BTreeSet::from([observer]),
+            mode: RunMode::PerPid,
+            run: RunKind::Anchor,
+        },
+    )
+    .map_err(|error| ProbeError {
+        stage: "parse-anchor",
+        detail: format!("{error:?}"),
+    })?;
+    let mut anchor_outcomes: Vec<(u32, AnchorOutcome)> = anchor_run.anchors.into_iter().collect();
+    anchor_outcomes.sort_by_key(|(slot, _)| *slot);
+    // Target run: whole-system, only the child in scope.
+    let target_bytes = attach_and_read_run(
+        loaded.target_fd.as_fd(),
+        None,
+        Instant::now() + Duration::from_secs(5),
+        64 * 1024,
+    )?;
+    let target_run = parse(
+        &target_bytes,
+        &Expect {
+            generation,
+            slots: 2,
+            scope: &BTreeSet::from([child.pid()]),
+            mode: RunMode::WholeSystem,
+            run: RunKind::Target,
+        },
+    )
+    .map_err(|error| ProbeError {
+        stage: "parse-target",
+        detail: format!("{error:?}"),
+    })?;
+    let child_ranges = target_run
+        .by_pid
+        .get(&child.pid())
+        .ok_or_else(|| ProbeError {
+            stage: "join",
+            detail: format!("child {} emitted no records", child.pid()),
+        })?;
+    let verdict_at = |range: &(u64, u64)| {
+        child_ranges.get(range).copied().ok_or_else(|| ProbeError {
+            stage: "join",
+            detail: format!("no record at {}-{}", range.0, range.1),
+        })
+    };
+    let hardlink_verdict = verdict_at(&hardlink_range)?;
+    let second_verdict = verdict_at(&second_range)?;
+    let copy_verdict = verdict_at(&copy_range)?;
+    let child_record_count = child_ranges.len();
+    let child_unmatched_count = child_ranges
+        .values()
+        .filter(|verdict| **verdict == TargetVerdict::Unmatched)
+        .count();
+    let mut pids_seen: Vec<u32> = target_run.by_pid.keys().copied().collect();
+    pids_seen.sort();
+    let mut demoted_pids: Vec<u32> = target_run.demoted_pids.iter().copied().collect();
+    demoted_pids.sort();
+    // Stale phase: bump the generation without re-anchoring; every
+    // verdict must flip to NONE (the `gen`-check probe).
+    let stale_generation = generation + 1;
+    write_probe_config(
+        &mut loaded.ebpf,
+        &IdentityConfig {
+            generation: stale_generation,
+            ..config
+        },
+    )?;
+    let stale_bytes = attach_and_read_run(
+        loaded.target_fd.as_fd(),
+        None,
+        Instant::now() + Duration::from_secs(5),
+        64 * 1024,
+    )?;
+    let stale_run = parse(
+        &stale_bytes,
+        &Expect {
+            generation: stale_generation,
+            slots: 2,
+            scope: &BTreeSet::from([child.pid()]),
+            mode: RunMode::WholeSystem,
+            run: RunKind::Target,
+        },
+    )
+    .map_err(|error| ProbeError {
+        stage: "parse-stale",
+        detail: format!("{error:?}"),
+    })?;
+    let stale_ranges = stale_run
+        .by_pid
+        .get(&child.pid())
+        .ok_or_else(|| ProbeError {
+            stage: "join",
+            detail: format!("child {} emitted no stale records", child.pid()),
+        })?;
+    let stale_unmatched = [hardlink_range, second_range]
+        .iter()
+        .all(|range| stale_ranges.get(range) == Some(&TargetVerdict::Unmatched));
+    // Release AFTER the last run is consumed (I1 ordering rule).
+    arena
+        .release_slot(0)
+        .map_err(|error| probe_io("anchor-release", error))?;
+    arena
+        .release_slot(1)
+        .map_err(|error| probe_io("anchor-release", error))?;
+    child.reap();
+    Ok(FunctionalProbeReport {
+        child_pid: child.pid(),
+        anchor_outcomes,
+        hardlink_verdict,
+        second_verdict,
+        copy_verdict,
+        child_record_count,
+        child_unmatched_count,
+        pids_seen,
+        demoted_pids,
+        stale_unmatched,
+    })
 }
 
 #[cfg(test)]
@@ -6425,5 +7181,198 @@ mod tests {
         let filled = raw_map_lookup_batch(config, &mut batch_keys, &mut batch_values)
             .expect("readable-map batch lookup succeeds");
         assert_eq!(filled, 1, "the one config entry is returned");
+    }
+
+    // -- D2c arena + functional probe (RED-first) ------------------------------
+
+    #[cfg(test)]
+    fn probe_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("probe tempdir");
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod 0700");
+        dir
+    }
+
+    /// Own-VMA shapes overlapping `[base, base + len)`: `(start, end,
+    /// perms, path)` per line, in maps order.
+    #[cfg(test)]
+    fn own_reservation_shape(base: u64, len: u64) -> Vec<(u64, u64, String, String)> {
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("read own maps");
+        let mut shape = Vec::new();
+        for line in maps.lines() {
+            let mut fields = line.split_whitespace();
+            let range = fields.next().unwrap_or("");
+            let perms = fields.next().unwrap_or("").to_owned();
+            let (start, end) = range.split_once('-').unwrap_or(("0", "0"));
+            let start = u64::from_str_radix(start, 16).unwrap_or(0);
+            let end = u64::from_str_radix(end, 16).unwrap_or(0);
+            if start < base + len && end > base {
+                let path = fields.nth(3).unwrap_or("").to_owned();
+                shape.push((start, end, perms, path));
+            }
+        }
+        shape
+    }
+
+    #[test]
+    fn anchor_arena_maps_and_releases_slots() {
+        let dir = probe_tempdir();
+        let file = dir.path().join("anchor-a");
+        let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file, &content).expect("write anchor file");
+        let arena = AnchorArena::reserve(4).expect("reserve 4 slots");
+        assert_eq!(arena.base() & (PAGE_GRANULE - 1), 0, "page-aligned base");
+        assert_eq!(arena.len(), 4 * ANCHOR_STRIDE);
+        assert_eq!(arena.slot_page(1), Some(arena.base() + ANCHOR_STRIDE));
+        assert_eq!(arena.slot_page(4), None);
+        let opened = std::fs::File::open(&file).expect("open anchor file");
+        arena.map_slot(1, opened.as_fd()).expect("map slot 1");
+        // The mapped bytes are readable at the slot page.
+        let slot = arena.slot_page(1).expect("slot 1 page");
+        let bytes = unsafe { std::slice::from_raw_parts(slot as *const u8, 4096) };
+        assert_eq!(bytes, content.as_slice(), "the slot page shows the file");
+        // The no-merge shape: guard pair, file page, rest.
+        let shape = own_reservation_shape(arena.base(), arena.len());
+        assert_eq!(shape.len(), 3, "one split triple, got {shape:?}");
+        assert_eq!(
+            (shape[0].0, shape[0].1),
+            (arena.base(), arena.base() + 8192)
+        );
+        assert_eq!(shape[0].2, "---p");
+        assert_eq!(
+            (shape[1].0, shape[1].1),
+            (arena.base() + 8192, arena.base() + 12288)
+        );
+        assert_eq!(shape[1].2, "r--p");
+        assert_eq!(shape[1].3, file.to_string_lossy());
+        assert_eq!(
+            (shape[2].0, shape[2].1),
+            (arena.base() + 12288, arena.base() + 32768)
+        );
+        assert_eq!(shape[2].2, "---p");
+        // The arena's config validates for a 2-slot pass.
+        let config = arena.config(7, 2, 1234);
+        assert_eq!(config.generation, 7);
+        assert_eq!(config.arena_base, arena.base());
+        assert_eq!(config.slots, 2);
+        assert_eq!(config.observer_tgid, 1234);
+        validate_arena_config(&config).expect("arena config validates");
+        arena.release_slot(1).expect("release slot 1");
+        let merged = own_reservation_shape(arena.base(), arena.len());
+        assert_eq!(
+            merged.len(),
+            1,
+            "release rejoins the reservation, got {merged:?}"
+        );
+        assert_eq!(
+            (merged[0].0, merged[0].1),
+            (arena.base(), arena.base() + 32768)
+        );
+        assert_eq!(merged[0].2, "---p");
+    }
+
+    #[test]
+    fn anchor_arena_rejects_bad_shapes() {
+        assert!(AnchorArena::reserve(0).is_err(), "zero slots rejects");
+        assert!(
+            AnchorArena::reserve(ANCHOR_SLOTS + 1).is_err(),
+            "over-cap rejects"
+        );
+        let full = AnchorArena::reserve(ANCHOR_SLOTS).expect("full reserve");
+        assert!(full.slot_page(ANCHOR_SLOTS - 1).is_some());
+        assert_eq!(full.slot_page(ANCHOR_SLOTS), None);
+        let arena = AnchorArena::reserve(2).expect("reserve 2");
+        let dir = probe_tempdir();
+        let file = dir.path().join("f");
+        std::fs::write(&file, [7u8; 64]).expect("write");
+        let opened = std::fs::File::open(&file).expect("open");
+        assert!(
+            arena.map_slot(2, opened.as_fd()).is_err(),
+            "slot == slots rejects"
+        );
+        assert!(
+            arena.release_slot(2).is_err(),
+            "release past the end rejects"
+        );
+        assert_eq!(arena.slot_page(2), None);
+    }
+
+    /// The child's reported addresses must be the starts of its three
+    /// `r-xp` probe-file ranges (validates the address-report channel the
+    /// privileged probe joins on). Unprivileged.
+    #[test]
+    fn probe_child_maps_probe_files_executable() {
+        let dir = probe_tempdir();
+        let fixture = write_probe_fixture(dir.path()).expect("fixture");
+        let paths = [&fixture.hardlink, &fixture.b, &fixture.copy];
+        let mut child =
+            spawn_exec_mapping_child(&paths.map(std::path::PathBuf::from)).expect("spawn child");
+        assert_eq!(child.addrs().len(), 3, "one address per mapping");
+        let mut seen = std::collections::BTreeSet::new();
+        for addr in child.addrs() {
+            assert_eq!(addr & (PAGE_GRANULE - 1), 0, "page-aligned mapping");
+            assert!(seen.insert(addr), "distinct mappings");
+        }
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", child.pid()))
+            .expect("read child maps");
+        for (path, addr) in paths.iter().zip(child.addrs().iter()) {
+            let mut hits = 0;
+            for line in maps.lines() {
+                let mut fields = line.split_whitespace();
+                let range = fields.next().unwrap_or("");
+                let perms = fields.next().unwrap_or("");
+                let tail: Vec<&str> = fields.collect();
+                if tail.last() == Some(&path.to_string_lossy().as_ref()) && perms.contains('x') {
+                    let (start, _) = range.split_once('-').expect("maps range");
+                    let start = u64::from_str_radix(start, 16).expect("maps start");
+                    assert_eq!(&start, addr, "reported address starts the VMA");
+                    hits += 1;
+                }
+            }
+            assert_eq!(hits, 1, "exactly one exec VMA for {}", path.display());
+        }
+        child.reap();
+    }
+
+    /// §6.5 on the host: a hard link to an anchored file reads back its
+    /// slot, a byte-identical copy reads NONE, and a stale generation
+    /// reads NONE everywhere (the `gen`-check probe). Run as root with
+    /// `--ignored`.
+    #[test]
+    #[ignore = "privileged: functional probe proves hardlink-match vs copy-NONE"]
+    fn functional_probe_proves_hardlink_match_and_copy_none() {
+        ensure_kernel_identity_btf().expect("the probe needs an eligible kernel");
+        let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+        let mut loaded = load_identity_object_strict(&btf).expect("strict load");
+        let dir = probe_tempdir();
+        let report = run_functional_probe(dir.path(), &mut loaded, 1).expect("probe runs");
+        assert_eq!(
+            report.anchor_outcomes,
+            vec![(0, AnchorOutcome::Ok), (1, AnchorOutcome::Ok)],
+            "both slots install exactly once"
+        );
+        assert_eq!(report.hardlink_verdict, TargetVerdict::Slot(0));
+        assert_eq!(report.second_verdict, TargetVerdict::Slot(1));
+        assert_eq!(report.copy_verdict, TargetVerdict::Unmatched);
+        assert_eq!(
+            report.pids_seen,
+            vec![report.child_pid],
+            "only the child emits"
+        );
+        assert_eq!(
+            report.child_unmatched_count + 2,
+            report.child_record_count,
+            "only the two anchored ranges match; every inherited VMA is NONE"
+        );
+        assert!(report.demoted_pids.is_empty(), "no conflicting duplicates");
+        assert!(report.stale_unmatched, "the stale generation reads NONE");
+        eprintln!(
+            "W3-2 functional probe: child {} emitted {} records ({} NONE), \
+             hardlink=slot0 second=slot1 copy=NONE stale=all-NONE",
+            report.child_pid, report.child_record_count, report.child_unmatched_count,
+        );
     }
 }

@@ -2590,9 +2590,10 @@ fn compact_inventory_keeps_associations_scrollable() {
         bottom.contains("python3") && bottom.contains("provider.so"),
         "{bottom}"
     );
+    let loss_row = bottom.lines().nth(2).expect("compact coverage/loss row");
     assert!(
-        bottom.contains("7") && bottom.contains("99"),
-        "log loss remains visible: {bottom}"
+        loss_row.contains("dropped 7L 99B"),
+        "log loss remains visible on its row: {loss_row}"
     );
     state.next_detail();
     state.clamp_to_presentation(&presentation);
@@ -2725,5 +2726,110 @@ fn dashboard_widths_count_cells_without_losing_gap_pages() {
     assert!(
         text.contains(&format!("line +{offset}")),
         "resize clamps the displayed offset: {text}"
+    );
+}
+
+#[test]
+fn compact_log_drop_accounting_survives_large_coverage_counters_at_30_columns() {
+    assert_compact_log_drop_accounting_with_large_counters(30);
+}
+
+#[test]
+fn compact_log_drop_accounting_survives_large_coverage_counters_at_40_columns() {
+    assert_compact_log_drop_accounting_with_large_counters(40);
+}
+
+fn assert_compact_log_drop_accounting_with_large_counters(width: usize) {
+    let mut presentation = app_first_presentation();
+    presentation.gaps = vec![observed_presentation().gaps[0].clone(); 1024];
+    presentation.budgets.callers_refused = 10_000;
+    presentation.budgets.modules_refused = 0;
+    presentation.budgets.edges_refused = 0;
+    presentation.budgets.endpoints_refused = 0;
+    presentation.gaps_suppressed = 100_000;
+    let mut frame = frame_for(&presentation);
+    frame.log.dropped_lines = 7;
+    frame.log.dropped_bytes = 99;
+    let mut state = DashboardState::new();
+    state.scroll = presentation.edges.len() - 1;
+    for height in [8, 10] {
+        let viewport = Viewport { width, height };
+        let text = assert_bounded_frame(&render_frame(&frame, viewport, &state), viewport);
+        let loss_row = text.lines().nth(2).expect("compact coverage/loss row");
+        assert!(
+            loss_row.contains("dropped 7L 99B"),
+            "loss counters on their actual row at {width} columns: {loss_row:?}"
+        );
+        assert!(
+            loss_row.contains("coverage:"),
+            "coverage still identified: {loss_row:?}"
+        );
+        let edge = presentation.edges.last().unwrap();
+        assert!(
+            text.contains(&format!("application python3 [{}]", edge.caller.label())),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("module provider.so [{}]", edge.module.label())),
+            "{text}"
+        );
+        assert!(
+            text.contains(&truncate_cell(
+                &crate::inventory_present::observation_label(edge),
+                width
+            )),
+            "complete observation row: {text}"
+        );
+    }
+    // All full-capture coverage values remain reachable after enlargement,
+    // independently of the compact truncation and last-edge scroll.
+    let viewport = Viewport {
+        width: 200,
+        height: 24,
+    };
+    let text = assert_bounded_frame(&render_frame(&frame, viewport, &state), viewport);
+    let coverage_row = text
+        .lines()
+        .find(|line| line.starts_with("coverage:"))
+        .unwrap();
+    assert!(
+        coverage_row.contains("1024 gaps 10000 refusals 100000 suppressed"),
+        "{coverage_row}"
+    );
+    let loss_row = text
+        .lines()
+        .find(|line| line.starts_with("--- observer log"))
+        .unwrap();
+    assert!(
+        loss_row.contains("7 dropped lines") && loss_row.contains("99 dropped bytes"),
+        "{loss_row}"
+    );
+    // Counters too wide to fit remain explicitly identified as loss, with
+    // an omission marker; their complete values remain visible when enlarged.
+    frame.log.dropped_lines = u64::MAX - 1;
+    frame.log.dropped_bytes = u64::MAX;
+    let compact = Viewport { width, height: 8 };
+    let text = assert_bounded_frame(&render_frame(&frame, compact, &state), compact);
+    let loss_row = text.lines().nth(2).expect("compact coverage/loss row");
+    assert!(
+        loss_row.contains("dropped"),
+        "large log loss remains explicit: {loss_row}"
+    );
+    assert!(
+        loss_row.ends_with(TRUNCATION_MARK),
+        "oversized values visibly truncate: {loss_row}"
+    );
+    let text = assert_bounded_frame(&render_frame(&frame, viewport, &state), viewport);
+    let loss_row = text
+        .lines()
+        .find(|line| line.starts_with("--- observer log"))
+        .unwrap();
+    assert!(
+        loss_row.contains(&format!("{} dropped lines", u64::MAX - 1)),
+        "{loss_row}"
+    );
+    assert!(
+        loss_row.contains(&format!("{} dropped bytes", u64::MAX)),
+        "{loss_row}"
     );
 }

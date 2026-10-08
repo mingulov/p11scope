@@ -474,13 +474,22 @@ fn render_minimal(
     let presentation = frame.presentation.as_ref();
     let budgets = &presentation.budgets;
     let coverage = if frame.log.dropped_lines > 0 || frame.log.dropped_bytes > 0 {
-        format!(
-            "coverage: {}g {}r {}s; dropped {}L {}B",
+        let dropped = format!(
+            "; dropped {}L {}B",
+            frame.log.dropped_lines, frame.log.dropped_bytes,
+        );
+        let coverage = format!(
+            "coverage: {}g {}r {}s",
             presentation.gaps.len(),
             budgets.refusals(),
             presentation.gaps_suppressed,
-            frame.log.dropped_lines,
-            frame.log.dropped_bytes,
+        );
+        // Reserve log-loss accounting before truncating coverage. Large
+        // coverage counters must not silently hide observer-log loss.
+        format!(
+            "{}{}",
+            truncate_cell(&coverage, width.saturating_sub(dropped.width())),
+            dropped,
         )
     } else {
         format!(

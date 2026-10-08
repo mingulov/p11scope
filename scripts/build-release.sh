@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
-# v0.2.0 release build.
+# v0.3.0 release build.
 #
 # Produces the two artifact shapes the design calls for:
 #   - p11scope            fully static musl build (the observer never

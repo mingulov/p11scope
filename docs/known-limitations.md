@@ -1,17 +1,23 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Known limitations (v0.2.0)
+# Known limitations (v0.3.0)
 
-User-facing limits of p11scope v0.2.0, the first release since v0.1.0.
-It was qualified as a cut on 2026-10-04 (from merged and green
-`s2s3-semantics`); the released code adds the 128-range proof-stat pool
+User-facing limits of p11scope v0.3.0: per-edge entry counts end to end
+(DR-02 closed), load-instance continuity, and sharded discovery.
+The v0.2.0 cut was qualified on 2026-10-04 (from merged and green
+`s2s3-semantics`); the released v0.2.0 code adds the 128-range proof-stat pool
 threshold, the buffered `-o` JSON write and the retried discover self-maps
 read on top of that cut. The M1 and R4 rows below were re-measured on the
-released code in a quiet window on 2026-10-05; every other measured number
-is the cut's. The following move to v0.3.0: C6 (semantics, churn and
-capacity, 30-minute endurance), C5b (cgroup/pod scope, namespace-aware BPF
-filter), C7 (V1 call counts, 2 MiB inventory ring, kernel-side identity,
-allowlist-v3, BPF nightly bump), the full measurement set M2–M7, the full §7
-deferred closure, and the §8 Fable audit.
+released v0.2.0 code in a quiet window on 2026-10-05; every other
+v0.2.0-era measured number is the cut's. At the time, the following were
+planned to move to v0.3.0: C6 (semantics, churn and capacity, 30-minute
+endurance), C5b (cgroup/pod scope, namespace-aware BPF filter), C7 (V1 call
+counts, 2 MiB inventory ring, kernel-side identity, allowlist-v3, BPF
+nightly bump), the full measurement set M2–M7, the full §7 deferred
+closure, and the §8 Fable audit. Actual v0.3.0 contents are in
+CHANGELOG.md (per-edge counts with the M2 gate, load-instance continuity,
+sharded discovery, lifecycle ring, live-label fix, E16 checks);
+kernel-side identity and the remaining items move to v0.4.0 per the
+2026-10-08 release split.
 
 A short measurement tier (M0, M1 at 4,096 processes, M4 churn, and the C5.6
 pool) ran on the cut day (2026-10-04); its numbers are in the M0, M1, M4 and R4

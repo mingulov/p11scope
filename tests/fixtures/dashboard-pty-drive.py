@@ -31,6 +31,11 @@ first frame sends Ctrl-S (raw mode keeps IXON: the terminal stops taking
 output), then `q`; the restore is shed. Ctrl-Q comes 4 s later, once the
 report is written: the restore retried after the report must then reach
 the terminal (alternate screen left, cursor shown) and say so.
+
+Mode `app-first`: `BINARY PID DURATION BUDGET app-first`. The owned
+app-first-driver maps app-p1.so and app-p2.so. Verify both named associations
+at 80x24, resize to 40x10, scroll to the later module, enlarge, then quit and
+verify terminal restoration. This mode always uses the unprivileged scan lane.
 """
 
 import fcntl
@@ -54,6 +59,8 @@ def main() -> int:
         return stderr_mode()
     if len(sys.argv) > 5 and sys.argv[5] == "xoff":
         return xoff_mode()
+    if len(sys.argv) > 5 and sys.argv[5] == "app-first":
+        return app_first_mode()
     binary, pid, duration, budget = (
         sys.argv[1],
         sys.argv[2],
@@ -177,6 +184,152 @@ def main() -> int:
         print(output[-2000:].decode("utf-8", "replace"))
         return 1
     print("pty-dashboard: PASS (frame, scroll-key, q-quit, restoration, accounting)")
+    return 0
+
+
+def app_first_mode() -> int:
+    binary, pid, duration, budget = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+    argv = [
+        binary, "inventory", "--pid", pid, "--capture", "scan", "--dashboard",
+        "--duration", duration,
+    ]
+    launch_read, launch_write = os.pipe()
+    child, master = pty.fork()
+    if child == 0:
+        os.close(launch_write)
+        os.read(launch_read, 1)
+        os.close(launch_read)
+        os.execv(binary, argv)
+        os._exit(127)
+    os.close(launch_read)
+    output = bytearray()
+    start = time.monotonic()
+    status = None
+    excerpts = []
+
+    def resize(width: int, height: int) -> None:
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+
+    def complete_frame(mark: int, height: int, predicate) -> str:
+        """Require every row, including the footer, from a fresh full repaint."""
+        cursor = mark
+        while time.monotonic() - start < budget:
+            raw = bytes(output)
+            frame_start = raw.find(b"\x1b[H", cursor)
+            while frame_start >= 0:
+                next_start = raw.find(b"\x1b[H", frame_start + 3)
+                frame_end = next_start if next_start >= 0 else len(raw)
+                frame = raw[frame_start:frame_end]
+                # Each row ends with erase-to-end-of-line. The last row is
+                # the footer; a partial PTY read is never a complete frame.
+                if frame.count(b"\x1b[K") >= height:
+                    text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", frame).decode("utf-8")
+                    lines = text.replace("\r", "").split("\n")
+                    text = "\n".join(lines[:height])
+                    if predicate(text):
+                        return text
+                    cursor = frame_end
+                elif next_start >= 0:
+                    cursor = next_start
+                else:
+                    break
+                frame_start = raw.find(b"\x1b[H", cursor)
+            if not read_some(master, output, 0.1):
+                break
+        raise AssertionError("timed out waiting for a complete matching dashboard frame")
+
+    try:
+        # Record terminal settings before the observer can enter raw mode.
+        initial_termios = termios.tcgetattr(master)
+        resize(80, 24)
+        os.write(launch_write, b"1")
+        first = complete_frame(0, 24, lambda text: "scroll 0/1" in text
+                               and "app-p1.so" in text and "app-p2.so" in text)
+        associations = re.findall(r"app-first-driver \[(c\d+)\] -> (app-p[12]\.so) \[(m\d+)\]", first)
+        assert len(associations) == 2, f"two named initial associations: {first}"
+        caller_ids = {caller for caller, _, _ in associations}
+        assert len(caller_ids) == 1, f"one owned caller: {associations}"
+        caller_id = associations[0][0]
+        modules = {name: module for _, name, module in associations}
+        assert len(set(modules.values())) == 2, f"physical modules remain separate: {modules}"
+        # Navigation follows the rendered edge order, rather than assuming
+        # module IDs were assigned in the fixture's argument order.
+        first_name, first_id = associations[0][1:]
+        later_name, later_id = associations[1][1:]
+        assert f"pid {pid} incarnation 0" in first, first
+        excerpts.append(("80x24 initial", first))
+
+        mark = len(output)
+        resize(40, 10)
+        compact = complete_frame(mark, 10, lambda text: "(minimal)" in text
+                                 and "summary 1-1/2" in text and "tab q quit" in text)
+        assert f"application app-first-driver [{caller_id}]" in compact, compact
+        assert f"module {first_name} [{first_id}]" in compact, compact
+        assert "Module mapped; activity not captured" in compact, compact
+        assert "totals: 1 callers 2 modules 2 edges" in compact, compact
+        assert all(len(line) <= 40 for line in compact.splitlines()), compact
+        excerpts.append(("40x10 first association", compact))
+
+        mark = len(output)
+        os.write(master, b"j")
+        later = complete_frame(mark, 10, lambda text: "summary 2-2/2" in text and "tab q quit" in text)
+        assert f"application app-first-driver [{caller_id}]" in later, later
+        assert f"module {later_name} [{later_id}]" in later, later
+        assert f"module {first_name} [{first_id}]" not in later, later
+        assert "Module mapped; activity not captured" in later, later
+        assert "totals: 1 callers 2 modules 2 edges" in later, later
+        assert all(len(line) <= 40 for line in later.splitlines()), later
+        excerpts.append(("40x10 after j", later))
+
+        mark = len(output)
+        resize(80, 24)
+        enlarged = complete_frame(mark, 24, lambda text: "scroll 1/1" in text and "q quit" in text)
+        assert f"app-first-driver [{caller_id}] -> {later_name} [{later_id}]" in enlarged, enlarged
+        assert f"pid {pid} incarnation 0" in enlarged, enlarged
+        assert "presence mapped | capture scan only | activity not covered" in enlarged, enlarged
+        assert "entries ?" in enlarged, enlarged
+        excerpts.append(("80x24 enlarged after j", enlarged))
+        os.write(master, b"q")
+        eof = False
+        while time.monotonic() - start < budget:
+            done, code = os.waitpid(child, os.WNOHANG)
+            if done != 0:
+                status = code
+                break
+            if eof:
+                time.sleep(0.05)
+            else:
+                eof = not read_some(master, output, 0.1)
+        assert status is not None, "timed out waiting for q exit"
+        while read_some(master, output, 0.2) and select.select([master], [], [], 0)[0]:
+            pass
+        elapsed = time.monotonic() - start
+        assert os.waitstatus_to_exitcode(status) == 0, f"exit status {status}"
+        assert elapsed < float(duration) - 15, f"q did not quit early: {elapsed:.1f}s"
+        entered = output.find(b"\x1b[?1049h")
+        restored = output.rfind(b"\x1b[?1049l")
+        assert 0 <= entered < restored, "alternate-screen enter/exit did not bracket frames"
+        assert b"\x18\x1b[?25h\x1b[?1049l" in output[entered:], "cursor and screen restore sequence missing"
+        assert termios.tcgetattr(master) == initial_termios, "terminal settings not restored"
+        assert b"dashboard frames:" in output, "frame accounting missing"
+    except (AssertionError, OSError) as error:
+        return fail(str(error), output, child)
+    finally:
+        try:
+            os.kill(child, 9)
+        except OSError:
+            pass
+        try:
+            os.waitpid(child, 0)
+        except OSError:
+            pass
+        os.close(master)
+        os.close(launch_write)
+
+    for label, text in excerpts:
+        print(f"pty-dashboard-app-first frame ({label}):\n{text}")
+    print(f"pty-dashboard-app-first: {len(output)} bytes in {elapsed:.1f}s, exit=0")
+    print("pty-dashboard-app-first: PASS (names, IDs, compact resize, later module, enlargement, q, restoration)")
     return 0
 
 
@@ -431,7 +584,7 @@ def xoff_mode() -> int:
         ("exit 0", exit_code == 0, f"exit={exit_code}"),
         ("alternate screen left after Ctrl-Q", b"\x1b[?1049l" in after, ""),
         ("cursor shown after Ctrl-Q", b"\x1b[?25h" in after, ""),
-        ("retry said so", b"screen restored after the report" in after, ""),
+        ("retry said so", b"p11scope: dashboard screen restored (the terminal read again)" in after, ""),
     ]
     failed = [f"{name} ({detail})" for name, ok, detail in checks if not ok]
     print(f"pty-dashboard-xoff: exit={exit_code} {exit_secs:.2f}s after q")

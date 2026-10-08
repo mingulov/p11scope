@@ -169,6 +169,14 @@ fn dashboard_on_pipe_degrades_to_snapshots_never_ansi() {
     // The owned edges render with the full dashboard state columns.
     for soname in ["dg-p1.so", "dg-p2.so"] {
         assert!(stdout.contains(soname), "owned {soname} visible: {stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("application degrade-driver [c")
+                    && line.contains(&format!("-> module {soname} [m"))
+                    && line.contains("Module mapped; activity not captured")),
+            "joined overview for {soname}: {stdout}"
+        );
     }
     assert!(stdout.contains("presence mapped"), "{stdout}");
     // Scan only: nothing instruments the edge, so it is neither armed
@@ -372,6 +380,29 @@ fn unwritable_event_log_is_a_hard_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("event stream"), "{stderr}");
     assert!(output.stdout.is_empty(), "no report on hard error");
+}
+
+#[test]
+fn inventory_dashboard_compact_resize_retains_named_associations() {
+    let dir = tmp("inventory-dashboard-app-first");
+    let driver = Driver::spawn(&dir, "app-first", &["app-p1.so", "app-p2.so"]);
+    let output = Command::new("python3")
+        .arg(fixture_source("dashboard-pty-drive.py"))
+        .arg(env!("CARGO_BIN_EXE_p11scope"))
+        .arg(driver.pid.to_string())
+        .args(["60", "90", "app-first"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "app-first PTY failed:\n{stdout}\n{stderr}"
+    );
+    // Unknown optional modes used to fall through to the default journey.
+    // A generic PASS must not stand in for the resize/name assertions.
+    assert!(stdout.contains("pty-dashboard-app-first: PASS"), "{stdout}");
 }
 
 #[test]

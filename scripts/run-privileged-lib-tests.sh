@@ -72,6 +72,13 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # Default campaign: every ignored test except the long cells and the static
 # skips. Order is the binary's --list order; each runs in its own process.
 DEFAULT_TESTS=(
+# W3-2 kernel-identity gates: WRONLY EPERM, the section 6.5 functional
+# probe (hardlink-match vs copy-NONE plus the stale-generation phase),
+# the whole-system shape cell, and the anchor-handle validator.
+attach::identity_iter::tests::anchor_maps_validate_real_handles
+attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none
+attach::identity_iter::tests::whole_system_run_covers_all_children
+attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm
 attach::instance_tests::privileged_instance_attach_during_reload_loop_has_zero_false_joins
 attach::instance_tests::privileged_instance_exec_renews_the_instance
 attach::instance_tests::privileged_instance_fork_without_exec_stays_consistent

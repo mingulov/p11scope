@@ -1877,6 +1877,41 @@ pub fn spawn_exec_mapping_child(paths: &[PathBuf]) -> io::Result<MappedChild> {
     })
 }
 
+/// Fork `count` children that report nothing and pause until reaped: the
+/// lightweight whole-system population for cost runs. Each shares the
+/// observer's VMAs copy-on-write, so spawn is fast and RSS stays ~flat
+/// (every child still emits its inherited exec VMAs, which is exactly
+/// what the whole-system run must walk). Returns [`MappedChild`]s with
+/// empty [`MappedChild::addrs`] (reap-on-drop; a mid-spawn fork failure
+/// reaps the already-spawned prefix via the same path).
+pub fn spawn_pause_children(count: u32) -> io::Result<Vec<MappedChild>> {
+    if count == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let mut children = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        // SAFETY: like `spawn_exec_mapping_child`, but the child pauses
+        // immediately: no pipe, no report, no return.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pid == 0 {
+            unsafe {
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        children.push(MappedChild {
+            pid: pid as u32,
+            addrs: Vec::new(),
+            reaped: false,
+        });
+    }
+    Ok(children)
+}
+
 /// Why the functional probe failed: the stage plus the cause. Every stage
 /// fails the probe loudly; there is no fallback inside §6.5 (selection
 /// falls back to userspace on `probe_failed`, D3d's job).
@@ -1914,7 +1949,10 @@ fn probe_io(stage: &'static str, error: io::Error) -> ProbeError {
 unsafe impl aya::Pod for IdentityConfig {}
 
 /// Write `config[0]` on a freshly loaded object.
-fn write_probe_config(ebpf: &mut aya::Ebpf, config: &IdentityConfig) -> Result<(), ProbeError> {
+pub fn write_identity_config(
+    ebpf: &mut aya::Ebpf,
+    config: &IdentityConfig,
+) -> Result<(), ProbeError> {
     let map = ebpf.map_mut("config").ok_or_else(|| ProbeError {
         stage: "config-map",
         detail: "config map missing from the loaded object".to_owned(),
@@ -1933,7 +1971,7 @@ fn write_probe_config(ebpf: &mut aya::Ebpf, config: &IdentityConfig) -> Result<(
 /// Set exactly `tgids`' bits in the scope bitmap of a freshly loaded
 /// object (zero-init, so set == OR). An out-of-bitmap tgid fails loudly:
 /// silently dropping a target would forge a "no record" outcome.
-fn write_probe_scope(ebpf: &mut aya::Ebpf, tgids: &[u32]) -> Result<(), ProbeError> {
+pub fn write_scope_bitmap(ebpf: &mut aya::Ebpf, tgids: &[u32]) -> Result<(), ProbeError> {
     let mut words = BTreeMap::new();
     for tgid in tgids {
         let (word, bit) = scope_word_bit(*tgid).ok_or_else(|| ProbeError {
@@ -1986,7 +2024,7 @@ pub fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
 /// Attach `prog_fd` (whole-system, or per-pid on `pid_fd`) and drain one
 /// run to EOF under `deadline` and `max_bytes`. The link and iter fds
 /// close on drop.
-fn attach_and_read_run(
+pub fn attach_and_read_run(
     prog_fd: BorrowedFd<'_>,
     pid_fd: Option<BorrowedFd<'_>>,
     deadline: Instant,
@@ -2115,8 +2153,8 @@ pub fn run_functional_probe(
         stage: "arena-config",
         detail: format!("{error:?}"),
     })?;
-    write_probe_config(&mut loaded.ebpf, &config)?;
-    write_probe_scope(&mut loaded.ebpf, &[child.pid()])?;
+    write_identity_config(&mut loaded.ebpf, &config)?;
+    write_scope_bitmap(&mut loaded.ebpf, &[child.pid()])?;
     // Anchor run: ALWAYS per-pid on the observer.
     let pidfd = open_pidfd(observer).map_err(|error| probe_io("pidfd", error))?;
     let anchor_bytes = attach_and_read_run(
@@ -2190,7 +2228,7 @@ pub fn run_functional_probe(
     // Stale phase: bump the generation without re-anchoring; every
     // verdict must flip to NONE (the `gen`-check probe).
     let stale_generation = generation + 1;
-    write_probe_config(
+    write_identity_config(
         &mut loaded.ebpf,
         &IdentityConfig {
             generation: stale_generation,
@@ -7374,5 +7412,92 @@ mod tests {
              hardlink=slot0 second=slot1 copy=NONE stale=all-NONE",
             report.child_pid, report.child_record_count, report.child_unmatched_count,
         );
+    }
+
+    // -- D2c cost substrate (RED-first) ----------------------------------------
+
+    #[test]
+    fn pause_children_spawn_alive_and_reap() {
+        let mut children = spawn_pause_children(4).expect("spawn 4");
+        assert_eq!(children.len(), 4);
+        for child in &children {
+            assert!(child.addrs().is_empty(), "pause children report nothing");
+            // SAFETY: signal-0 existence probe on our own live child.
+            let alive = unsafe { libc::kill(child.pid() as libc::pid_t, 0) };
+            assert_eq!(alive, 0, "child {} is alive", child.pid());
+        }
+        for child in &mut children {
+            child.reap();
+        }
+        for child in &children {
+            // SAFETY: the reaped pid is gone (a reused pid here would
+            // need a fork in the microseconds since `waitpid`).
+            let gone = unsafe { libc::kill(child.pid() as libc::pid_t, 0) };
+            assert_ne!(gone, 0, "child {} is reaped", child.pid());
+        }
+    }
+
+    /// Small-scale whole-system shape (privileged): 32 pause children, 3
+    /// whole-system runs; every child emits, nothing demotes, every
+    /// verdict is NONE (no anchors installed). Timing is campaign
+    /// evidence (4096, scripted), not an assert here — except a generous
+    /// pathology bound. Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: small-scale whole-system run shape"]
+    fn whole_system_run_covers_all_children() {
+        ensure_kernel_identity_btf().expect("the shape cell needs an eligible kernel");
+        let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+        let mut loaded = load_identity_object_strict(&btf).expect("strict load");
+        let mut children = spawn_pause_children(32).expect("spawn 32");
+        let pids: Vec<u32> = children.iter().map(MappedChild::pid).collect();
+        let observer = std::process::id();
+        let arena = AnchorArena::reserve(1).expect("arena");
+        let config = arena.config(9, 0, observer);
+        validate_arena_config(&config).expect("empty-slot config validates");
+        write_identity_config(&mut loaded.ebpf, &config).expect("write config");
+        write_scope_bitmap(&mut loaded.ebpf, &pids).expect("write scope");
+        let scope: BTreeSet<u32> = pids.iter().copied().collect();
+        for round in 0..3 {
+            let start = Instant::now();
+            let bytes = attach_and_read_run(
+                loaded.target_fd.as_fd(),
+                None,
+                Instant::now() + Duration::from_secs(30),
+                8 * 1024 * 1024,
+            )
+            .unwrap_or_else(|error| panic!("round {round} runs: {error}"));
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(30),
+                "round {round} took {elapsed:?}"
+            );
+            let run = parse(
+                &bytes,
+                &Expect {
+                    generation: 9,
+                    slots: 0,
+                    scope: &scope,
+                    mode: RunMode::WholeSystem,
+                    run: RunKind::Target,
+                },
+            )
+            .unwrap_or_else(|error| panic!("round {round} parses: {error:?}"));
+            assert_eq!(run.by_pid.len(), 32, "round {round}: every child emits");
+            assert!(run.demoted_pids.is_empty(), "round {round}: no demotions");
+            for (pid, ranges) in &run.by_pid {
+                assert!(!ranges.is_empty(), "round {round}: child {pid} has records");
+                assert!(
+                    ranges.values().all(|v| *v == TargetVerdict::Unmatched),
+                    "round {round}: no anchors installed, all NONE"
+                );
+            }
+            eprintln!(
+                "W3-2 shape cell round {round}: {} records in {elapsed:?}",
+                run.by_pid.values().map(BTreeMap::len).sum::<usize>()
+            );
+        }
+        for child in &mut children {
+            child.reap();
+        }
     }
 }

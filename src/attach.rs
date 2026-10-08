@@ -56,6 +56,7 @@ pub(crate) use instance::{
     HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, LiveScan, WatchedFile,
 };
 mod cleanup_worker;
+pub mod identity_iter;
 pub use cleanup_worker::CleanupInterrupted;
 pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink, drive_cleanup};
 #[cfg(test)]

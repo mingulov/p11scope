@@ -7389,25 +7389,35 @@ mod tests {
         let slot = arena.slot_page(1).expect("slot 1 page");
         let bytes = unsafe { std::slice::from_raw_parts(slot as *const u8, 4096) };
         assert_eq!(bytes, content.as_slice(), "the slot page shows the file");
-        // The no-merge shape: guard pair, file page, rest.
+        // The no-merge shape: the slot page stands exactly alone. Its
+        // guard neighbours may merge OUTWARD with adjacent compatible
+        // VMAs (parallel tests mmap constantly, and the kernel is free
+        // to coalesce at the reservation edges), but neither the prot
+        // nor the file backing lets anything merge ACROSS the slot page:
+        // the lines beside it always end/start exactly at its bounds.
         let shape = own_reservation_shape(arena.base(), arena.len());
-        assert_eq!(shape.len(), 3, "one split triple, got {shape:?}");
-        assert_eq!(
-            (shape[0].0, shape[0].1),
-            (arena.base(), arena.base() + 8192)
-        );
-        assert_eq!(shape[0].2, "---p");
-        assert_eq!(
-            (shape[1].0, shape[1].1),
-            (arena.base() + 8192, arena.base() + 12288)
-        );
-        assert_eq!(shape[1].2, "r--p");
-        assert_eq!(shape[1].3, file.to_string_lossy());
-        assert_eq!(
-            (shape[2].0, shape[2].1),
-            (arena.base() + 12288, arena.base() + 32768)
-        );
-        assert_eq!(shape[2].2, "---p");
+        let slot_line = shape
+            .iter()
+            .find(|(start, end, _, _)| *start == slot && *end == slot + 4096)
+            .unwrap_or_else(|| panic!("the slot page stands alone, got {shape:?}"));
+        assert_eq!(slot_line.2, "r--p");
+        assert_eq!(slot_line.3, file.to_string_lossy());
+        let slot_at = shape
+            .iter()
+            .position(|line| line.0 == slot)
+            .expect("slot line position");
+        if slot_at > 0 {
+            assert_eq!(shape[slot_at - 1].1, slot, "the guard ends at the slot");
+            assert_eq!(shape[slot_at - 1].2, "---p");
+        }
+        if slot_at + 1 < shape.len() {
+            assert_eq!(
+                shape[slot_at + 1].0,
+                slot + 4096,
+                "the guard starts after the slot"
+            );
+            assert_eq!(shape[slot_at + 1].2, "---p");
+        }
         // The arena's config validates for a 2-slot pass.
         let config = arena.config(7, 2, 1234);
         assert_eq!(config.generation, 7);
@@ -7416,17 +7426,25 @@ mod tests {
         assert_eq!(config.observer_tgid, 1234);
         validate_arena_config(&config).expect("arena config validates");
         arena.release_slot(1).expect("release slot 1");
+        // Release rejoins the reservation: every overlapping line is an
+        // anonymous guard again, and together they cover the whole
+        // range. Outward merges are fine (see above); what matters is
+        // that no file page remains and no hole opens.
         let merged = own_reservation_shape(arena.base(), arena.len());
-        assert_eq!(
-            merged.len(),
-            1,
-            "release rejoins the reservation, got {merged:?}"
+        assert!(
+            !merged.is_empty(),
+            "the reservation is still mapped, got {merged:?}"
         );
-        assert_eq!(
-            (merged[0].0, merged[0].1),
-            (arena.base(), arena.base() + 32768)
+        let mut covered = arena.base();
+        for (start, end, perms, _) in &merged {
+            assert_eq!(perms, "---p", "release restores guards, got {merged:?}");
+            assert!(*start <= covered, "release leaves no hole, got {merged:?}");
+            covered = covered.max(*end);
+        }
+        assert!(
+            covered >= arena.base() + arena.len(),
+            "release covers the reservation, got {merged:?}"
         );
-        assert_eq!(merged[0].2, "---p");
     }
 
     #[test]

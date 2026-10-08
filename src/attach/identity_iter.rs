@@ -3,10 +3,10 @@
 //! parser, run reader, and raw iterator syscalls for the `vma_identity` BPF
 //! object (`crates/ebpf/native/vma_identity.c`).
 //!
-//! Standalone by construction: this file takes no `crate::` dependency, so
-//! the W3-1 harness can include it by path until W3-2 wires it into
-//! `attach.rs`. Every ABI constant mirrors `vma_identity.h`; the inline
-//! tests pin the shared layout against that header.
+//! Standalone by construction: this file takes no `crate::` dependency.
+//! Wired into `attach.rs` (W3-2). Every ABI constant mirrors
+//! `vma_identity.h`; the inline tests pin the shared layout against that
+//! header.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -882,6 +882,12 @@ pub fn iter_create(link_fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
 /// program's conflict guard reads); production teardown is W3-2's
 /// kernel-side slot/generation command. Inode addresses enter the kernel
 /// here and never come back.
+///
+/// The fields are intentionally never read (I6: no read API exists, and
+/// the kernel refuses reads through these fds). The `dead_code` allow is
+/// that invariant, not tidiness: any future read must go through a new
+/// audited API, which the I6 exact-API test will flag.
+#[allow(dead_code)]
 pub struct AnchorMaps {
     hash: OwnedFd,
     slots: OwnedFd,

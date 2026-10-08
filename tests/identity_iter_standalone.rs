@@ -2,22 +2,16 @@
 //! W3-1 (Stage 3 Wave D, D2a+b) standalone harness for the task_vma identity
 //! object and its loader/parser.
 //!
-//! TEMPORARY wiring (constraint: only `build.rs` may change among existing
-//! files, so `src/attach.rs` cannot declare the new module yet): the module
-//! under test is included by path. Its inline `#[cfg(test)]` unit tests
-//! (parser tables, byte-flip, reader, uapi offsets, I6 grep) therefore run
-//! inside this integration-test binary. W3-2 deletes the `#[path]` include
-//! below and switches these tests to `p11scope::attach::identity_iter` once
-//! the module is wired into `attach.rs`; the object-level tests in this file
-//! stay valid unchanged.
-
-#[path = "../src/attach/identity_iter.rs"]
-mod identity_iter;
+//! WIRING (W3-2): the module under test lives at
+//! `p11scope::attach::identity_iter`, and its inline `#[cfg(test)]` unit
+//! tests (parser tables, byte-flip, reader, uapi offsets, I6 grep) run
+//! inside the lib test binary. The object-level tests in this file stay
+//! valid unchanged.
 
 #[path = "../build_support/clang_resolve.rs"]
 mod clang_resolve;
 
-use identity_iter as ii;
+use p11scope::attach::identity_iter as ii;
 
 /// The clang-built identity object out of this package's `OUT_DIR`. This is
 /// the same artifact [`ii::IDENTITY_OBJECT`] embeds; reading it separately

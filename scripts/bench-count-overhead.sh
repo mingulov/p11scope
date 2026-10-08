@@ -41,7 +41,7 @@
 # MAX_LOAD5, defaults 4/4 per the M2 discipline, no cargo/rustc; bounded
 # COOLDOWN, default 300 s, else the campaign is refused), workload READY,
 # observer lane-active line with a recorded attach mechanism, two
-# pass_committed markers before the gate opens (extend precedes commit in
+# per-pass progress lines before the gate opens (extend precedes commit in
 # a pass, so endpoint probes are attached), exact workload op count +
 # shape, observer exit 0, no "attach failed", no "count refresh:"
 # failures, BPF entry-program set identical across the window with
@@ -326,13 +326,14 @@ wait_for_lane_active() {
     done
 }
 
-# wait_for_passes EVENTLOG N TIMEOUT: N pass_committed markers prove passes
-# are committing (extend precedes commit in a pass, so endpoint probes are
-# attached before the gate opens).
+# wait_for_passes STDERRLOG N TIMEOUT: N per-pass stderr progress lines prove
+# passes are committing (extend precedes commit in a pass, so endpoint
+# probes are attached before the gate opens). The event log is root-owned
+# while the observer runs, so readiness polls the user-readable stderr.
 wait_for_passes() {
     wfp_end=$(( $(date +%s) + $3 ))
     while :; do
-        wfp_n=$(grep -c '"kind"[ ]*:[ ]*"pass_committed"' "$1" 2>/dev/null || true)
+        wfp_n=$(grep -c '^p11scope: pass [0-9][0-9]*: .* scanned' "$1" 2>/dev/null || true)
         case $wfp_n in ''|*[!0-9]*) wfp_n=0 ;; esac
         if [ "$wfp_n" -ge "$2" ]; then
             return 0
@@ -506,7 +507,7 @@ start_observer() {
         cat "$so_dir/observer.stderr" >&2
         return 1
     fi
-    wait_for_passes "$so_dir/events.jsonl" "$PASSES_REQUIRED" "$ATTACH_TIMEOUT_S" || return 1
+    wait_for_passes "$so_dir/observer.stderr" "$PASSES_REQUIRED" "$ATTACH_TIMEOUT_S" || return 1
 }
 
 # stop_observer DIR: SIGINT the observer, require exit 0/130 and no
@@ -542,9 +543,12 @@ ops, threads = int(sys.argv[2]), int(sys.argv[3])
 lanes = doc.get("observation", {}).get("lane", None)
 if lanes != "native":
     sys.exit(f"lane is {lanes!r}, want native")
-edges = [e for e in doc.get("edges", [])
-         if "softhsm" in str(e.get("module", "")).lower()
-         or "libsofthsm2" in str(e.get("module", ""))]
+soft = [m.get("id") for m in doc.get("modules", [])
+        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
+               for p in m.get("paths", []))]
+if len(soft) != 1:
+    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
+edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
 if len(edges) != 1:
     sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
 entries = edges[0].get("entries", {})
@@ -569,9 +573,12 @@ doc = json.load(open(sys.argv[1]))
 lanes = doc.get("observation", {}).get("lane", None)
 if lanes != "native":
     sys.exit(f"lane is {lanes!r}, want native")
-edges = [e for e in doc.get("edges", [])
-         if "softhsm" in str(e.get("module", "")).lower()
-         or "libsofthsm2" in str(e.get("module", ""))]
+soft = [m.get("id") for m in doc.get("modules", [])
+        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
+               for p in m.get("paths", []))]
+if len(soft) != 1:
+    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
+edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
 if len(edges) != 1:
     sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
 state = edges[0].get("entries", {}).get("coverage", {}).get("state")

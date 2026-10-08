@@ -470,8 +470,8 @@ impl InstanceMaps<'_> {
     pub(crate) fn counters(&self) -> Result<InstanceCounters> {
         let map: Array<&MapData, InstanceCounters> = Array::try_from(
             self.ebpf
-                .map("INSTANCE_COUNTERS")
-                .context("INSTANCE_COUNTERS map")?,
+                .map("INSTANCE_COUNT")
+                .context("INSTANCE_COUNT map")?,
         )?;
         Ok(map.get(&0, 0)?)
     }

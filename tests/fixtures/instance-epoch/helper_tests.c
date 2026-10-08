@@ -119,7 +119,7 @@ static void *lookup(void *map, const void *key)
         return !gen_missing && index < INST_GEN_CELLS ? &gen[index] : 0;
     if (map == &INSTANCE_CALIB)
         return index == 0 ? &calib : 0;
-    if (map == &INSTANCE_COUNTERS)
+    if (map == &INSTANCE_COUNT)
         return index == 0 ? &counters : 0;
     if (map == &INSTANCE_START) {
         const struct instance_start_key *k = key;

@@ -114,7 +114,7 @@ struct {
     INST_UINT(max_entries, 1);
     INST_TYPE(key, u32);
     INST_TYPE(value, struct instance_counters);
-} INSTANCE_COUNTERS INST_SEC(".maps");
+} INSTANCE_COUNT INST_SEC(".maps");
 
 static void *(*inst_map_lookup)(void *map, const void *key) = (void *)1;
 static long (*inst_map_update)(void *map, const void *key, const void *value, u64 flags) = (void *)2;
@@ -145,7 +145,7 @@ static INST_INLINE void inst_add(u64 *cell)
 static INST_INLINE struct instance_counters *inst_counters(void)
 {
     u32 key = 0;
-    return inst_map_lookup(&INSTANCE_COUNTERS, &key);
+    return inst_map_lookup(&INSTANCE_COUNT, &key);
 }
 
 static INST_INLINE void inst_count(u64 *cell)

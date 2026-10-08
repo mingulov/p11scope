@@ -1445,7 +1445,7 @@ pub struct InstanceCalib {
     pub hits: u64,
 }
 
-/// `INSTANCE_COUNTERS[0]`: saturating-in-practice diagnostic counts.
+/// `INSTANCE_COUNT[0]`: saturating-in-practice diagnostic counts.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 pub struct InstanceCounters {

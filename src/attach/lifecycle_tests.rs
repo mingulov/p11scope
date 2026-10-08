@@ -675,8 +675,13 @@ impl OwnedIds {
             ensure!(ids.links.insert(id), "duplicate owned link FD");
         }
         ensure!(!ids.maps.is_empty() && !ids.programs.is_empty());
+        // Stage A continuity hooks are owned session links attached to the
+        // session's programs, but retained in `Session.instance`, not
+        // `Session.links`: the descriptor enumeration finds them, so the
+        // expected count includes both (0 hooks when refused).
+        let expected = session.links.len() + session.instance.hook_link_count();
         ensure!(
-            ids.links.len() == session.links.len(),
+            ids.links.len() == expected,
             "not every retained Detailed link has an owned descriptor receipt"
         );
         eprintln!("LIFECYCLE_IDS {ids:?}");

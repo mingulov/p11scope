@@ -3,7 +3,8 @@
 //! attribution and charge for charge, at every ceiling.
 
 use super::*;
-use crate::discovery::identity::{ExaminedObject, MappedFile, PinnedObjectId};
+use crate::discovery::caller_registry::ExeIdentity;
+use crate::discovery::identity::{ExaminedObject, FileIdentity, MappedFile, PinnedObjectId};
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, ScanLimits, WindowId,
     read_maps_or_refuse,
@@ -219,30 +220,6 @@ impl ShardableIo for FakeIo<'_> {
     }
 }
 
-/// The serial path's probe over the same scripted `/proc`.
-struct SerialProbe<'f, F> {
-    make_io: &'f F,
-}
-
-impl<'w, F: Fn() -> FakeIo<'w>> MemberProbe for SerialProbe<'_, F> {
-    fn confirm(
-        &mut self,
-        pid: u32,
-        prove: &BTreeSet<ObjectKey>,
-        budget: &mut CaptureWorkBudget,
-    ) -> Confirmation {
-        confirm_with(&mut (self.make_io)(), pid, prove, budget)
-    }
-    fn stat_ranges(
-        &mut self,
-        pid: u32,
-        ranges: &[(u64, u64)],
-        budget: &mut CaptureWorkBudget,
-    ) -> MappedIdentities {
-        stat_unpinned(&mut (self.make_io)(), pid, ranges, budget)
-    }
-}
-
 type State = (crate::discovery::scan::MapsSweepBudgetState, u64);
 
 struct Outcome {
@@ -280,26 +257,20 @@ fn run(
         .collect();
     let index = index();
     let mut budget = make_budget();
-    let attribution = if shards <= 1 {
-        attribute_unselected(
-            &sweep,
-            &unavailable,
-            &selected,
-            &index,
-            &mut SerialProbe { make_io: &make_io },
-            &mut budget,
-        )
-    } else {
-        attribute_unselected_sharded(
-            &sweep,
-            &unavailable,
-            &selected,
-            &index,
-            &mut budget,
-            shards,
-            &make_io,
-        )
-    };
+    let policy = SegmentPolicy::from_headroom(64, 4, sweep.len());
+    let owner = ReservationOwner::new(policy);
+    let attribution = attribute_unselected_with_policy(
+        &sweep,
+        &unavailable,
+        &selected,
+        &index,
+        &mut budget,
+        policy,
+        &owner,
+        shards,
+        &make_io,
+    );
+    assert_eq!(owner.state_for_test().0, [0; 4]);
     let threads = threads.lock().unwrap().len();
     Outcome {
         attribution,
@@ -657,4 +628,1398 @@ fn sharded_confirmation_equals_serial_when_a_replay_spends_less_than_its_shard()
             );
         }
     }
+}
+
+/// D3a catches end-to-end speculation: every accepted pin must survive until
+/// shared proof and the live final checks, after all segment preparations.
+#[derive(Default)]
+struct D3aEvents {
+    events: Vec<(u32, &'static str)>,
+    pins: BTreeSet<u32>,
+    requests: Vec<(u32, u64, u64)>,
+    peak_pins: usize,
+    prepare_threads: HashSet<std::thread::ThreadId>,
+    proof_threads: HashSet<std::thread::ThreadId>,
+}
+
+struct D3aPin {
+    pid: u32,
+    events: std::sync::Arc<Mutex<D3aEvents>>,
+    file: Option<std::fs::File>,
+}
+
+impl Drop for D3aPin {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let mut events = self.events.lock().unwrap();
+        assert!(events.pins.remove(&self.pid));
+        events.events.push((self.pid, "drop"));
+    }
+}
+
+struct D3aIo<'w> {
+    world: &'w BTreeMap<u32, Script>,
+    events: std::sync::Arc<Mutex<D3aEvents>>,
+    exe_reads: Cell<u32>,
+    stale_idle: Option<u32>,
+    bad_range: Option<u64>,
+    changed_generation: bool,
+    changed_exe: bool,
+    fail_at: Option<(u32, &'static str)>,
+    panic_at: Option<(u32, &'static str)>,
+}
+
+impl D3aIo<'_> {
+    fn fails(&self, pid: u32, stage: &'static str) -> bool {
+        assert_ne!(
+            self.panic_at,
+            Some((pid, stage)),
+            "injected D3a worker cancellation"
+        );
+        self.fail_at == Some((pid, stage))
+    }
+}
+
+impl ConfirmIo for D3aIo<'_> {
+    type Pin = D3aPin;
+
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        if self.fails(pid, "proof") {
+            return Err("scripted proof unavailable".into());
+        }
+        let mut events = self.events.lock().unwrap();
+        events.proof_threads.insert(std::thread::current().id());
+        events.events.push((pid, "proof"));
+        events.requests.push((pid, start, end));
+        if self.stale_idle == Some(pid) && start == 0x2000_1000 {
+            return Err(RANGE_NOT_MAPPED.into());
+        }
+        Ok(vm_file(if self.bad_range == Some(start) {
+            99
+        } else if start >> 28 == 1 {
+            PROVIDER
+        } else {
+            LIBC
+        }))
+    }
+
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        if self.fails(pid, "pin") {
+            return Err("scripted pin unavailable".into());
+        }
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let mut events = self.events.lock().unwrap();
+        assert!(events.pins.insert(pid), "a reread retained the old pin");
+        events.peak_pins = events.peak_pins.max(events.pins.len());
+        events.events.push((pid, "pin"));
+        Ok(D3aPin {
+            pid,
+            events: self.events.clone(),
+            file: Some(file),
+        })
+    }
+
+    fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
+        let fails = self.fails(pin.pid, "start");
+        let mut events = self.events.lock().unwrap();
+        assert!(events.pins.contains(&pin.pid));
+        events.events.push((pin.pid, "start"));
+        (!fails).then_some(u64::from(pin.pid))
+    }
+
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        let mut events = self.events.lock().unwrap();
+        assert!(events.pins.contains(&pin.pid));
+        events.events.push((pin.pid, "same"));
+        !self.changed_generation
+    }
+
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        let reads = self.exe_reads.get();
+        self.exe_reads.set(reads + 1);
+        if self.fails(pid, if reads == 0 { "before" } else { "after" }) {
+            return None;
+        }
+        self.events
+            .lock()
+            .unwrap()
+            .events
+            .push((pid, if reads == 0 { "before" } else { "after" }));
+        Some(ExeIdentity {
+            dev: 1,
+            ino: if self.changed_exe && reads > 0 {
+                101
+            } else {
+                100
+            },
+            mtime_secs: 10,
+            mtime_nanos: 0,
+            path: None,
+        })
+    }
+
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        let file = self.open_maps(pid).map_err(|error| error.to_string())?;
+        read_maps_or_refuse(file, budget, || self.maps_now())
+    }
+
+    fn gone(&self, _pid: u32) -> bool {
+        false
+    }
+}
+
+impl ShardableIo for D3aIo<'_> {
+    type Maps = std::io::Cursor<Vec<u8>>;
+
+    fn open_maps(&mut self, pid: u32) -> std::io::Result<Self::Maps> {
+        self.events
+            .lock()
+            .unwrap()
+            .prepare_threads
+            .insert(std::thread::current().id());
+        if self.fails(pid, "maps") {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
+        self.events.lock().unwrap().events.push((pid, "maps"));
+        self.world[&pid]
+            .confirm_maps
+            .as_ref()
+            .map(|text| std::io::Cursor::new(text.clone().into_bytes()))
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))
+    }
+
+    fn maps_now(&self) -> Option<u64> {
+        Some(T0)
+    }
+}
+
+fn d3a_caller_world(pids: &[u32]) -> BTreeMap<u32, Script> {
+    pids.iter()
+        .map(|&pid| {
+            let text = object_lines(0x1000_0000, PROVIDER, "/usr/lib/softhsm/libsofthsm2.so");
+            (
+                pid,
+                Script {
+                    phase_one: p11scope_manifest::maps::parse_maps(text.as_bytes()).unwrap(),
+                    confirm_maps: Some(text),
+                },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn d3a_prepare_prove_finish_order() {
+    let world = d3a_caller_world(&[1001, 1002]);
+    let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+    let make_io = || D3aIo {
+        world: &world,
+        events: events.clone(),
+        exe_reads: Cell::new(0),
+        stale_idle: None,
+        bad_range: None,
+        changed_generation: false,
+        changed_exe: false,
+        fail_at: None,
+        panic_at: None,
+    };
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, script)| (pid, script.phase_one.clone()))
+        .collect();
+    let out = attribute_unselected_sharded(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index(),
+        &mut legacy(u64::MAX, u64::MAX)(),
+        1,
+        &make_io,
+    );
+    assert_eq!(
+        out.members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [1001, 1002]
+    );
+    let events = events.lock().unwrap();
+    let first_proof = events
+        .events
+        .iter()
+        .position(|(_, event)| *event == "proof")
+        .unwrap();
+    for pid in [1001, 1002] {
+        assert!(
+            events.events[..first_proof].contains(&(pid, "maps")),
+            "proof preceded segment preparation: {:?}",
+            events.events
+        );
+        let proof = events
+            .events
+            .iter()
+            .position(|event| *event == (pid, "proof"))
+            .unwrap();
+        let after = events
+            .events
+            .iter()
+            .position(|event| *event == (pid, "after"))
+            .unwrap();
+        let same = events
+            .events
+            .iter()
+            .position(|event| *event == (pid, "same"))
+            .unwrap();
+        let start = events
+            .events
+            .iter()
+            .position(|event| *event == (pid, "start"))
+            .unwrap();
+        let drop = events
+            .events
+            .iter()
+            .position(|event| *event == (pid, "drop"))
+            .unwrap();
+        assert!(proof < after && after < same && same < start && start < drop);
+    }
+    assert!(events.pins.is_empty());
+    assert_eq!(
+        events.requests,
+        [
+            (1001, 0x1000_1000, 0x1000_2000),
+            (1002, 0x1000_1000, 0x1000_2000)
+        ]
+    );
+}
+
+#[test]
+fn d3a_promotions_charge_after_segment() {
+    let mut world = d3a_caller_world(&[1001, 1002]);
+    world.get_mut(&1001).unwrap().phase_one = p11scope_manifest::maps::parse_maps(
+        object_lines(0x2000_0000, LIBC, "/usr/lib/libc.so.6").as_bytes(),
+    )
+    .unwrap();
+    let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+    let make_io = || D3aIo {
+        world: &world,
+        events: events.clone(),
+        exe_reads: Cell::new(0),
+        stale_idle: Some(1001),
+        bad_range: None,
+        changed_generation: false,
+        changed_exe: false,
+        fail_at: None,
+        panic_at: None,
+    };
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, script)| (pid, script.phase_one.clone()))
+        .collect();
+    let mut budget = legacy(u64::MAX, 2)();
+    let out = attribute_unselected_sharded(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index(),
+        &mut budget,
+        1,
+        &make_io,
+    );
+    assert_eq!(
+        out.members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [1002],
+        "phase-D promotion stole a later segment charge: {out:?}"
+    );
+    assert_eq!(
+        out.member_losses[&1001].0,
+        crate::discovery::sweep_attribution::AttributionLoss::Budget
+    );
+    // A refused promotion leaves the original examined key unproven,
+    // exactly as the existing lost-confirmation policy specifies.
+    assert_eq!(out.unexamined_objects, BTreeSet::from([key(LIBC)]));
+    assert_eq!(out.unexamined, BTreeMap::from([(1001, 1)]));
+    assert_eq!(budget.confirm_state_for_test().1, 2);
+    let events = events.lock().unwrap();
+    let maps: Vec<_> = events
+        .events
+        .iter()
+        .filter(|(_, event)| *event == "maps")
+        .map(|(pid, _)| *pid)
+        .collect();
+    assert_eq!(maps, [1002, 1001]);
+    assert!(events.pins.is_empty());
+}
+
+/// Catches selecting a header/remnant or accepting only one proved text VMA.
+#[test]
+fn d3a_requested_ranges_and_every_range() {
+    use crate::discovery::sweep_attribution::AttributionLoss;
+    let mut world = d3a_caller_world(&[1001, 1002]);
+    let text = object_lines(0x1000_0000, PROVIDER, "/usr/lib/softhsm/libsofthsm2.so")
+        + &line(
+            0x1000_3000,
+            "r-xp",
+            PROVIDER,
+            "/usr/lib/softhsm/libsofthsm2.so",
+        )
+        + &line(
+            0x1000_4000,
+            "rw-p",
+            PROVIDER,
+            "/usr/lib/softhsm/libsofthsm2.so",
+        );
+    world.get_mut(&1001).unwrap().phase_one =
+        p11scope_manifest::maps::parse_maps(text.as_bytes()).unwrap();
+    world.get_mut(&1001).unwrap().confirm_maps = Some(text);
+    world.get_mut(&1002).unwrap().phase_one = p11scope_manifest::maps::parse_maps(
+        line(
+            0x1000_0000,
+            "r--p",
+            PROVIDER,
+            "/usr/lib/softhsm/libsofthsm2.so",
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, script)| (pid, script.phase_one.clone()))
+        .collect();
+    for shards in [1, 4] {
+        let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+        let make_io = || D3aIo {
+            world: &world,
+            events: events.clone(),
+            exe_reads: Cell::new(0),
+            stale_idle: None,
+            bad_range: Some(0x1000_3000),
+            changed_generation: false,
+            changed_exe: false,
+            fail_at: None,
+            panic_at: None,
+        };
+        let mut budget = legacy(u64::MAX, u64::MAX)();
+        let out = attribute_unselected_sharded(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index(),
+            &mut budget,
+            shards,
+            &make_io,
+        );
+        assert!(
+            out.members.is_empty(),
+            "one negative executable range cannot match: {out:?}"
+        );
+        assert_eq!(
+            out.member_losses.keys().copied().collect::<Vec<_>>(),
+            [1001]
+        );
+        assert_eq!(
+            out.member_losses[&1001].0,
+            AttributionLoss::IdentityMismatch
+        );
+        assert!(out.unexamined.is_empty());
+        assert_eq!(out.probed, 1);
+        assert_eq!(budget.confirm_state_for_test().1, 2);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.requests,
+            [
+                (1001, 0x1000_1000, 0x1000_2000),
+                (1001, 0x1000_3000, 0x1000_4000)
+            ]
+        );
+        assert!(!events.events.iter().any(|(pid, _)| *pid == 1002));
+        assert!(events.pins.is_empty());
+    }
+}
+
+/// Catches reusing speculative final identity answers after shared proof.
+#[test]
+fn d3a_live_final_checks_refuse_exec_and_generation_changes() {
+    use crate::discovery::sweep_attribution::AttributionLoss;
+    let world = d3a_caller_world(&[1001]);
+    let sweep = vec![(1001, world[&1001].phase_one.clone())];
+    for (generation, exe, want) in [
+        (true, false, AttributionLoss::GenerationChanged),
+        (false, true, AttributionLoss::ExecChanged),
+    ] {
+        let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+        let make_io = || D3aIo {
+            world: &world,
+            events: events.clone(),
+            exe_reads: Cell::new(0),
+            stale_idle: None,
+            bad_range: None,
+            changed_generation: generation,
+            changed_exe: exe,
+            fail_at: None,
+            panic_at: None,
+        };
+        let out = attribute_unselected_sharded(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index(),
+            &mut legacy(u64::MAX, u64::MAX)(),
+            2,
+            &make_io,
+        );
+        assert!(out.members.is_empty());
+        assert_eq!(out.member_losses[&1001].0, want);
+        let events = events.lock().unwrap();
+        assert_eq!(events.requests, [(1001, 0x1000_1000, 0x1000_2000)]);
+        assert!(events.pins.is_empty());
+    }
+}
+
+fn d3a_policy_run(
+    world: &BTreeMap<u32, Script>,
+    policy: SegmentPolicy,
+    threads: usize,
+    work: u64,
+    stale: Option<u32>,
+    failure: Option<(u32, &'static str)>,
+    panic: Option<(u32, &'static str)>,
+) -> (
+    SweepAttribution,
+    State,
+    std::sync::Arc<Mutex<D3aEvents>>,
+    ReservationOwner,
+) {
+    let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+    let make_io = || D3aIo {
+        world,
+        events: events.clone(),
+        exe_reads: Cell::new(0),
+        stale_idle: stale,
+        bad_range: None,
+        changed_generation: false,
+        changed_exe: false,
+        fail_at: failure,
+        panic_at: panic,
+    };
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, script)| (pid, script.phase_one.clone()))
+        .collect();
+    let owner = ReservationOwner::new(policy);
+    let mut budget = legacy(u64::MAX, work)();
+    let out = attribute_unselected_with_policy(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index(),
+        &mut budget,
+        policy,
+        &owner,
+        threads,
+        &make_io,
+    );
+    (out, budget.confirm_state_for_test(), events, owner)
+}
+
+/// Catches borrowing the 64-FD reserve, multiplying caps per shard and
+/// confusing an unavailable batch with an unavailable immediate operation.
+#[test]
+fn d3a_headroom_zero_one_and_multiple_workers() {
+    let mut world = d3a_caller_world(&[1001, 1002, 1003]);
+    world.get_mut(&1003).unwrap().phase_one = p11scope_manifest::maps::parse_maps(
+        line(
+            0x1000_0000,
+            "r--p",
+            PROVIDER,
+            "/usr/lib/softhsm/libsofthsm2.so",
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    for headroom in [0, 1, 2, 3, 4, 5, 6, 12, 64] {
+        let policy = SegmentPolicy::from_headroom(headroom, 4, world.len());
+        let (serial, state, events, owner) =
+            d3a_policy_run(&world, policy, 1, u64::MAX, None, None, None);
+        let events = events.lock().unwrap();
+        assert!(events.pins.is_empty());
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+        assert!(owner.state_for_test().2 <= headroom);
+        assert!(owner.state_for_test().3 <= headroom);
+        if headroom < 3 {
+            assert!(events.events.is_empty());
+            assert!(serial.members.is_empty());
+            assert_eq!(
+                serial.member_losses.keys().copied().collect::<Vec<_>>(),
+                [1001, 1002]
+            );
+            assert!(serial.member_losses.values().all(|(loss, _)| *loss
+                == crate::discovery::sweep_attribution::AttributionLoss::ConfirmUnreadable));
+            assert_eq!(state.1, 0);
+        } else {
+            assert_eq!(
+                serial
+                    .members
+                    .iter()
+                    .map(|member| member.pid)
+                    .collect::<Vec<_>>(),
+                [1001, 1002]
+            );
+            assert_eq!(state.1, 2);
+            assert!(events.peak_pins <= policy.retained.max(1));
+            if headroom <= 6 {
+                assert_eq!(events.peak_pins, 1);
+            }
+        }
+        drop(events);
+        let (parallel, parallel_state, _, owner) =
+            d3a_policy_run(&world, policy, 4, u64::MAX, None, None, None);
+        assert_eq!(parallel, serial, "H={headroom}");
+        assert_eq!(parallel_state, state, "H={headroom}");
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+    }
+    let world = d3a_caller_world(&[1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]);
+    let policy = SegmentPolicy::from_headroom(20, 4, world.len());
+    let (_, _, events, owner) = d3a_policy_run(&world, policy, 4, u64::MAX, None, None, None);
+    let events = events.lock().unwrap();
+    assert!(
+        events.proof_threads.len() > 1,
+        "normal headroom lost A5 parallelism"
+    );
+    assert!(events.peak_pins <= policy.retained);
+    assert!(events.pins.is_empty());
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    assert!(owner.state_for_test().1[0] <= policy.retained);
+    assert!(owner.state_for_test().1[1] <= 2 * policy.workers);
+}
+
+#[test]
+fn d3a_zero_headroom_preserves_settled_facts() {
+    use crate::discovery::sweep_attribution::AttributionLoss;
+    let mut world = d3a_caller_world(&[1001, 1002, 1003, 1004, 1005, 1006, 1007]);
+    for (pid, text) in [
+        (1003, line(0x3000_0000, "r-xp", 9001, "/usr/lib/unknown.so")),
+        (
+            1004,
+            line(
+                0x1000_0000,
+                "r-xp",
+                PROVIDER,
+                "/usr/lib/softhsm/libsofthsm2.so (deleted)",
+            ),
+        ),
+        (1005, object_lines(0x2000_0000, LIBC, "/usr/lib/libc.so.6")),
+        (
+            1007,
+            line(
+                0x1000_0000,
+                "r--p",
+                PROVIDER,
+                "/usr/lib/softhsm/libsofthsm2.so",
+            ),
+        ),
+    ] {
+        world.get_mut(&pid).unwrap().phase_one =
+            p11scope_manifest::maps::parse_maps(text.as_bytes()).unwrap();
+    }
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, script)| (pid, script.phase_one.clone()))
+        .collect();
+    let policy = SegmentPolicy::from_headroom(0, 4, world.len());
+    let owner = ReservationOwner::new(policy);
+    let mut budget = legacy(u64::MAX, u64::MAX)();
+    let make_io = || -> D3aIo<'_> { panic!("zero headroom must never construct an I/O adapter") };
+    let out = attribute_unselected_with_policy(
+        &sweep,
+        &BTreeSet::from([1002]),
+        &BTreeSet::from([1001]),
+        &index(),
+        &mut budget,
+        policy,
+        &owner,
+        4,
+        &make_io,
+    );
+    assert!(out.members.is_empty());
+    assert_eq!(out.unavailable, 1);
+    assert_eq!(out.probed, 1);
+    assert_eq!(
+        out.member_losses.keys().copied().collect::<Vec<_>>(),
+        [1004, 1006]
+    );
+    assert_eq!(out.member_losses[&1004].0, AttributionLoss::DeletedMapping);
+    assert_eq!(
+        out.member_losses[&1006].0,
+        AttributionLoss::ConfirmUnreadable
+    );
+    assert_eq!(out.unexamined, BTreeMap::from([(1003, 1), (1005, 1)]));
+    assert_eq!(
+        out.unexamined_objects,
+        BTreeSet::from([key(LIBC), key(9001)])
+    );
+    assert_eq!(budget.confirm_state_for_test().0.attempted_io_bytes, 0);
+    assert_eq!(budget.confirm_state_for_test().1, 1);
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    assert_eq!(owner.state_for_test().2, 0);
+}
+
+/// Catches committing a quota-rejected preview or retaining its pin during
+/// replacement. The capture pays one read per accepted PID despite rereads.
+#[test]
+fn d3a_segment_replay_preview_is_uncommitted() {
+    let world = d3a_caller_world(&[1001, 1002]);
+    let mut policy = SegmentPolicy::from_headroom(64, 4, world.len());
+    policy.max_ranges = 1;
+    let expected_io: u64 = world
+        .values()
+        .map(|script| script.confirm_maps.as_ref().unwrap().len() as u64)
+        .sum();
+    for threads in [1, 4] {
+        let (out, state, events, owner) =
+            d3a_policy_run(&world, policy, threads, u64::MAX, None, None, None);
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [1001, 1002]
+        );
+        assert!(out.losses.is_empty());
+        assert!(out.unexamined_objects.is_empty());
+        assert_eq!(state.0.attempted_io_bytes, expected_io);
+        assert_eq!(state.0.stop, None);
+        assert!(!state.0.stop_reported);
+        assert_eq!(state.1, 2);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.requests,
+            [
+                (1001, 0x1000_1000, 0x1000_2000),
+                (1002, 0x1000_1000, 0x1000_2000)
+            ]
+        );
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .filter(|event| **event == (1002, "maps"))
+                .count(),
+            2
+        );
+        assert!(events.pins.is_empty());
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+    }
+}
+
+#[test]
+fn d3a_idle_candidates_fix_the_pid_prefix_and_boundary_promotions() {
+    let mut world = d3a_caller_world(&[1001, 1002, 1003]);
+    world.get_mut(&1001).unwrap().phase_one.clear();
+    world.get_mut(&1002).unwrap().phase_one = p11scope_manifest::maps::parse_maps(
+        object_lines(0x2000_0000, LIBC, "/usr/lib/libc.so.6").as_bytes(),
+    )
+    .unwrap();
+    let policy = SegmentPolicy::from_headroom(7, 4, world.len()); // fixed prefix of two PIDs
+    for threads in [1, 4] {
+        let (out, state, events, owner) =
+            d3a_policy_run(&world, policy, threads, 2, Some(1002), None, None);
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [1002]
+        );
+        assert_eq!(
+            out.member_losses[&1003].0,
+            crate::discovery::sweep_attribution::AttributionLoss::Budget
+        );
+        assert!(out.unexamined_objects.is_empty());
+        assert_eq!(state.1, 2);
+        let events = events.lock().unwrap();
+        let maps: Vec<_> = events
+            .events
+            .iter()
+            .filter(|(_, event)| *event == "maps")
+            .map(|(pid, _)| *pid)
+            .collect();
+        assert_eq!(maps, [1002, 1003]);
+        assert_eq!(
+            events.requests,
+            [
+                (1002, 0x2000_1000, 0x2000_2000),
+                (1002, 0x1000_1000, 0x1000_2000)
+            ]
+        );
+        assert!(events.pins.is_empty());
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+    }
+}
+
+#[test]
+fn d3a_oversized_pid_is_one_immediate_segment() {
+    let mut world = d3a_caller_world(&[1001]);
+    let text = world[&1001].confirm_maps.as_ref().unwrap().clone()
+        + &line(
+            0x1000_3000,
+            "r-xp",
+            PROVIDER,
+            "/usr/lib/softhsm/libsofthsm2.so",
+        );
+    world.get_mut(&1001).unwrap().phase_one =
+        p11scope_manifest::maps::parse_maps(text.as_bytes()).unwrap();
+    world.get_mut(&1001).unwrap().confirm_maps = Some(text.clone());
+    let mut policy = SegmentPolicy::from_headroom(64, 4, world.len());
+    policy.max_ranges = 1;
+    let (out, state, events, owner) = d3a_policy_run(&world, policy, 4, u64::MAX, None, None, None);
+    assert_eq!(
+        out.members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [1001]
+    );
+    assert_eq!(state.1, 2);
+    assert_eq!(state.0.attempted_io_bytes, text.len() as u64);
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events.requests,
+        [
+            (1001, 0x1000_1000, 0x1000_2000),
+            (1001, 0x1000_3000, 0x1000_4000)
+        ]
+    );
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| **event == (1001, "maps"))
+            .count(),
+        2
+    );
+    assert!(events.pins.is_empty());
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    assert_eq!(owner.state_for_test().1[2], 1); // immediate pin was actually used
+}
+
+#[test]
+fn d3a_prepare_prove_finish_failures_release_every_handle() {
+    use crate::discovery::sweep_attribution::AttributionLoss;
+    let world = d3a_caller_world(&[1001]);
+    for headroom in [3, 6, 64] {
+        let policy = SegmentPolicy::from_headroom(headroom, 4, world.len());
+        for (stage, loss) in [
+            ("pin", AttributionLoss::ConfirmUnreadable),
+            ("before", AttributionLoss::ConfirmUnreadable),
+            ("maps", AttributionLoss::ConfirmUnreadable),
+            ("proof", AttributionLoss::MapFilesUnavailable),
+            ("after", AttributionLoss::ConfirmUnreadable),
+            ("start", AttributionLoss::ConfirmUnreadable),
+        ] {
+            let (out, _, events, owner) =
+                d3a_policy_run(&world, policy, 4, u64::MAX, None, Some((1001, stage)), None);
+            assert!(out.members.is_empty(), "H={headroom} stage={stage}");
+            assert_eq!(
+                out.member_losses[&1001].0, loss,
+                "H={headroom} stage={stage}"
+            );
+            assert!(events.lock().unwrap().pins.is_empty());
+            assert_eq!(owner.state_for_test().0, [0; 4]);
+        }
+    }
+}
+
+#[test]
+fn d3a_cancellation_joins_tail_and_stops_new_dispatch() {
+    use crate::discovery::sweep_attribution::AttributionLoss;
+    let world = d3a_caller_world(&[1001, 1002, 1003, 1004, 1005, 1006]);
+    let policy = SegmentPolicy::from_headroom(9, 4, world.len()); // W=P=2
+    for stage in ["maps", "proof"] {
+        let (out, _, events, owner) =
+            d3a_policy_run(&world, policy, 2, u64::MAX, None, None, Some((1001, stage)));
+        assert!(out.members.is_empty());
+        assert_eq!(
+            out.member_losses.keys().copied().collect::<Vec<_>>(),
+            [1001, 1002, 1003, 1004, 1005, 1006]
+        );
+        assert!(
+            out.member_losses
+                .values()
+                .all(|(loss, _)| *loss == AttributionLoss::ConfirmUnreadable)
+        );
+        let events = events.lock().unwrap();
+        assert!(events.pins.is_empty());
+        assert!(!events.events.iter().any(|(pid, _)| *pid >= 1003));
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+    }
+}
+
+/// Catches losing a failed spend's sticky/window/report mutation or replacing
+/// capture state with the shadow, including refusal paths that look pure.
+#[test]
+fn d3a_shadow_journal_budget_equivalence() {
+    for work in [0, 1, 2] {
+        for reported in [false, true] {
+            let mut budget = legacy(3, work)();
+            if reported {
+                let _ = budget.spend(work + 1);
+                let _ = budget.take_scan_stop_reason();
+            }
+            let before = budget.confirm_state_for_test();
+            let mut journal = BudgetJournal::new(&budget);
+            let mut expected = budget.shard_shadow();
+            for _ in 0..3 {
+                assert_eq!(journal.spend(), expected.spend(1));
+            }
+            assert_eq!(
+                journal.take_scan_stop_reason(),
+                expected.take_scan_stop_reason()
+            );
+            let wanted = 8;
+            let allowed = journal.allowed_capture_io(wanted);
+            assert_eq!(
+                allowed,
+                MapsReadBudget::allowed_capture_io(&mut expected, wanted)
+            );
+            journal.record_io(allowed);
+            expected.record_io(allowed);
+            assert_eq!(
+                journal.check_deadline(Some(T0)),
+                expected.check_deadline(Some(T0))
+            );
+            assert_eq!(
+                journal.take_scan_stop_reason(),
+                expected.take_scan_stop_reason()
+            );
+            assert_eq!(
+                budget.confirm_state_for_test(),
+                before,
+                "preview touched capture state"
+            );
+            journal.commit(&mut budget).unwrap();
+            assert_eq!(
+                budget.confirm_state_for_test(),
+                expected.confirm_state_for_test()
+            );
+        }
+    }
+    for (io, work, deadline, now) in [
+        (1, 1, u64::MAX, Some(T0)),
+        (8, 1, T0, Some(T0)),
+        (8, 1, T0 + 1, None),
+    ] {
+        let limits = InventoryDiscoveryLimits::new(
+            1,
+            InventoryWindowLimits::new(io, work, 64, 1 << 16, 64).unwrap(),
+            InventoryRetainedLimits::new(16, 16, 16, 4, 4, 64 * 1024).unwrap(),
+        )
+        .unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), deadline).unwrap();
+        budget.checkpoint(token).unwrap();
+        let mut expected = budget.shard_shadow();
+        let mut journal = BudgetJournal::new(&budget);
+        assert_eq!(journal.check_deadline(now), expected.check_deadline(now));
+        let allowed = journal.allowed_capture_io(8);
+        assert_eq!(
+            allowed,
+            MapsReadBudget::allowed_capture_io(&mut expected, 8)
+        );
+        journal.record_io(allowed);
+        expected.record_io(allowed);
+        assert_eq!(
+            journal.allowed_capture_io(8),
+            MapsReadBudget::allowed_capture_io(&mut expected, 8)
+        );
+        for _ in 0..2 {
+            assert_eq!(journal.spend(), expected.spend(1));
+        }
+        assert_eq!(
+            journal.take_scan_stop_reason(),
+            expected.take_scan_stop_reason()
+        );
+        journal.commit(&mut budget).unwrap();
+        assert_eq!(
+            budget.confirm_state_for_test(),
+            expected.confirm_state_for_test()
+        );
+        assert_eq!(budget.window_exhaustions(), 1);
+    }
+    let mut budget = legacy(u64::MAX, 3)();
+    let mut stale = BudgetJournal::new(&budget);
+    stale.spend().unwrap();
+    budget.spend(1).unwrap();
+    assert_eq!(stale.commit(&mut budget), Err(DIVERGED));
+    let mut budget = legacy(u64::MAX, 0)();
+    assert!(budget.spend(1).is_err());
+    let mut report = BudgetJournal::new(&budget);
+    assert!(report.take_scan_stop_reason().is_some());
+    assert!(budget.take_scan_stop_reason().is_some());
+    assert_eq!(
+        report.commit(&mut budget),
+        Err(DIVERGED),
+        "a consumed stop report must not be silently accepted"
+    );
+    let mut budget = legacy(u64::MAX, 0)();
+    assert!(budget.spend(1).is_err());
+    let empty = BudgetJournal::new(&budget);
+    assert!(budget.take_scan_stop_reason().is_some());
+    assert_eq!(
+        empty.commit(&mut budget),
+        Err(DIVERGED),
+        "even an empty journal must reject report-only drift"
+    );
+}
+
+/// Catches dropping only recorded answers while retaining a real speculative
+/// pin, and charging physical rereads as additional accepted logical work.
+#[test]
+fn d3a_replay_mark_rejection_releases_before_reread() {
+    let mut world = d3a_caller_world(&[1001, 1002, 1003, 1004]);
+    let anon: String = (0..300u64)
+        .map(|i| {
+            let start = 0x5000_0000 + i * 0x2000;
+            format!("{start:x}-{:x} rw-p 00000000 00:00 0 \n", start + 0x1000)
+        })
+        .collect();
+    let first = world[&1001].confirm_maps.as_ref().unwrap().clone() + &anon;
+    let heavy: String = (0..40u64)
+        .map(|i| {
+            line(
+                0x1000_0000 + i * 0x2000,
+                "r-xp",
+                PROVIDER,
+                "/usr/lib/softhsm/libsofthsm2.so",
+            )
+        })
+        .collect();
+    let idle = object_lines(0x2000_0000, LIBC, "/usr/lib/libc.so.6");
+    for (pid, text) in [(1001, first.clone()), (1002, heavy), (1003, idle)] {
+        world.get_mut(&pid).unwrap().phase_one =
+            p11scope_manifest::maps::parse_maps(text.as_bytes()).unwrap();
+        world.get_mut(&pid).unwrap().confirm_maps = Some(text);
+    }
+    let policy = SegmentPolicy::from_headroom(14, 2, world.len());
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, script)| (pid, script.phase_one.clone()))
+        .collect();
+    let mut oracle = None;
+    for threads in [1, 2] {
+        let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+        let make_io = || D3aIo {
+            world: &world,
+            events: events.clone(),
+            exe_reads: Cell::new(0),
+            stale_idle: None,
+            bad_range: None,
+            changed_generation: false,
+            changed_exe: false,
+            fail_at: None,
+            panic_at: None,
+        };
+        let owner = ReservationOwner::new(policy);
+        let ceiling = first.len() as u64 + 200;
+        let mut budget = legacy(ceiling, 25)();
+        let out = attribute_unselected_with_policy(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index(),
+            &mut budget,
+            policy,
+            &owner,
+            threads,
+            &make_io,
+        );
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [1001]
+        );
+        assert_eq!(
+            out.member_losses.keys().copied().collect::<Vec<_>>(),
+            [1002, 1004]
+        );
+        assert!(
+            out.member_losses
+                .values()
+                .all(|(loss, _)| *loss
+                    == crate::discovery::sweep_attribution::AttributionLoss::Budget)
+        );
+        assert!(out.unexamined_objects.is_empty());
+        let state = budget.confirm_state_for_test();
+        assert_eq!(state.0.attempted_io_bytes, ceiling);
+        assert_eq!(state.0.stop, None); // detailed I/O refusal is non-sticky
+        assert_eq!(state.1, 2);
+        if let Some((expected, expected_state)) = &oracle {
+            assert_eq!(&out, expected);
+            assert_eq!(&state, expected_state);
+        } else {
+            oracle = Some((out.clone(), state));
+        }
+        let events = events.lock().unwrap();
+        let opens = events
+            .events
+            .iter()
+            .filter(|event| **event == (1004, "pin"))
+            .count();
+        assert_eq!(
+            opens,
+            if threads == 2 { 2 } else { 1 },
+            "the cell must exercise uncovered replay"
+        );
+        assert!(events.pins.is_empty());
+        assert!(events.peak_pins <= policy.retained);
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+    }
+}
+
+/// Exercises the actual resource-aware one-PID helper used by phase D,
+/// including unwind after pin acquisition, rather than its legacy wrapper.
+#[test]
+fn d3a_phase_d_helper_releases_immediate_resources() {
+    use crate::discovery::sweep_attribution::AttributionLoss;
+    let world = d3a_caller_world(&[1001]);
+    let policy = SegmentPolicy::from_headroom(3, 4, world.len());
+    for (stage, loss) in [
+        ("pin", AttributionLoss::ConfirmUnreadable),
+        ("before", AttributionLoss::ConfirmUnreadable),
+        ("maps", AttributionLoss::ConfirmUnreadable),
+        ("proof", AttributionLoss::MapFilesUnavailable),
+        ("after", AttributionLoss::ConfirmUnreadable),
+        ("start", AttributionLoss::ConfirmUnreadable),
+    ] {
+        let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+        let owner = ReservationOwner::new(policy);
+        let mut io = D3aIo {
+            world: &world,
+            events: events.clone(),
+            exe_reads: Cell::new(0),
+            stale_idle: None,
+            bad_range: None,
+            changed_generation: false,
+            changed_exe: false,
+            fail_at: Some((1001, stage)),
+            panic_at: None,
+        };
+        let confirmation = confirm_with_resources(
+            &mut io,
+            1001,
+            &index().map_files_keys(),
+            &mut legacy(u64::MAX, u64::MAX)(),
+            Some(&owner.immediate()),
+        );
+        match confirmation {
+            Confirmation::Lost(actual, _) => assert_eq!(actual, loss, "{stage}"),
+            Confirmation::Confirmed(read) if stage == "proof" => {
+                assert_eq!(
+                    read.mapped[&(0x1000_1000, 0x1000_2000)],
+                    crate::discovery::sweep_attribution::RangeProof::Unavailable(
+                        "scripted proof unavailable".into()
+                    )
+                );
+            }
+            other => panic!("{stage}: {other:?}"),
+        }
+        assert!(events.lock().unwrap().pins.is_empty());
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+        assert!(owner.state_for_test().2 <= 3);
+    }
+    for stage in ["maps", "proof", "after"] {
+        let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+        let owner = ReservationOwner::new(policy);
+        let mut io = D3aIo {
+            world: &world,
+            events: events.clone(),
+            exe_reads: Cell::new(0),
+            stale_idle: None,
+            bad_range: None,
+            changed_generation: false,
+            changed_exe: false,
+            fail_at: None,
+            panic_at: Some((1001, stage)),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            confirm_with_resources(
+                &mut io,
+                1001,
+                &index().map_files_keys(),
+                &mut legacy(u64::MAX, u64::MAX)(),
+                Some(&owner.immediate()),
+            )
+        }));
+        assert!(result.is_err());
+        assert!(events.lock().unwrap().pins.is_empty());
+        assert_eq!(owner.state_for_test().0, [0; 4]);
+    }
+}
+
+#[test]
+fn d3a_r1_one_worker_stays_on_caller() {
+    let world = d3a_caller_world(&[1001, 1002, 1003]);
+    let policy = SegmentPolicy::from_headroom(6, 4, world.len());
+    let (out, state, events, owner) = d3a_policy_run(&world, policy, 4, u64::MAX, None, None, None);
+    assert_eq!(
+        out.members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [1001, 1002, 1003]
+    );
+    assert!(out.member_losses.is_empty());
+    assert!(out.unexamined_objects.is_empty());
+    assert_eq!(state.1, 3);
+    let events = events.lock().unwrap();
+    let caller = HashSet::from([std::thread::current().id()]);
+    assert_eq!(
+        events.prepare_threads, caller,
+        "one-worker preparation must not spawn per PID"
+    );
+    assert_eq!(
+        events.proof_threads, caller,
+        "one-worker proof must stay on the caller"
+    );
+    assert!(events.pins.is_empty());
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    assert_eq!(owner.state_for_test().1[0], 1);
+}
+
+#[test]
+fn d3a_r1_caller_queue_stops_after_later_record_panics() {
+    let world = d3a_caller_world(&[1001, 1002, 1003, 1004, 1005, 1006]);
+    let policy = SegmentPolicy::from_headroom(19, 4, world.len());
+    assert_eq!((policy.workers, policy.retained), (4, 6));
+    let owner = ReservationOwner::new(policy);
+    let resources = owner.batch();
+    let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+    let make_io = || D3aIo {
+        world: &world,
+        events: events.clone(),
+        exe_reads: Cell::new(0),
+        stale_idle: None,
+        bad_range: None,
+        changed_generation: false,
+        changed_exe: false,
+        fail_at: None,
+        panic_at: Some((1003, "maps")),
+    };
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, script)| (pid, script.phase_one.clone()))
+        .collect();
+    let index = index();
+    let none = BTreeSet::new();
+    let mut budget = legacy(u64::MAX, u64::MAX)();
+    // With two executors and W=4, the caller owns positions0/2. Accepting
+    // position0 queues position4; while waiting for the earlier worker's
+    // reply, position2 panics. Position4 must never start after that panic.
+    let (prepared, cancelled) = prepare_segment(
+        &sweep,
+        0..sweep.len(),
+        &none,
+        &none,
+        &index,
+        &index.map_files_keys(),
+        &mut budget,
+        policy,
+        &resources,
+        2,
+        &make_io,
+    );
+    assert!(cancelled);
+    assert_eq!(prepared.iter().map(|(at, _)| *at).collect::<Vec<_>>(), [0]);
+    assert_eq!(budget.confirm_state_for_test().1, 1);
+    assert_eq!(
+        budget.confirm_state_for_test().0.attempted_io_bytes,
+        world[&1001].confirm_maps.as_ref().unwrap().len() as u64
+    );
+    drop(prepared);
+    let events = events.lock().unwrap();
+    assert!(
+        !events.events.iter().any(|(pid, _)| *pid >= 1005),
+        "cancelled caller started another queued record"
+    );
+    assert!(events.requests.is_empty());
+    assert!(events.pins.is_empty());
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    assert!(owner.state_for_test().1[0] <= policy.retained);
+    assert!(owner.state_for_test().1[1] <= 2 * policy.workers);
+    assert!(owner.state_for_test().2 <= policy.headroom);
+}
+
+/// Run each phase independently so pthread calls2/3 refuse respectively its
+/// first/second worker. The reviewer injector is attached only to this test
+/// process, never the compiler; normal runs remain preservation controls.
+fn d3a_r1_spawn_refusal_phase(preparation: bool) {
+    let world = d3a_caller_world(&[1001, 1002, 1003]);
+    let policy = SegmentPolicy::from_headroom(12, 3, world.len());
+    let owner = ReservationOwner::new(policy);
+    let resources = owner.batch();
+    let events = std::sync::Arc::new(Mutex::new(D3aEvents::default()));
+    let make_io = || D3aIo {
+        world: &world,
+        events: events.clone(),
+        exe_reads: Cell::new(0),
+        stale_idle: None,
+        bad_range: None,
+        changed_generation: false,
+        changed_exe: false,
+        fail_at: None,
+        panic_at: None,
+    };
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, script)| (pid, script.phase_one.clone()))
+        .collect();
+    let index = index();
+    let prove = index.map_files_keys();
+    let none = BTreeSet::new();
+    let mut budget = legacy(u64::MAX, u64::MAX)();
+    let prepared = if preparation {
+        let (prepared, cancelled) = prepare_segment(
+            &sweep,
+            0..sweep.len(),
+            &none,
+            &none,
+            &index,
+            &prove,
+            &mut budget,
+            policy,
+            &resources,
+            3,
+            &make_io,
+        );
+        assert!(!cancelled, "spawn refusal must not cancel attribution");
+        prepared
+    } else {
+        sweep
+            .iter()
+            .enumerate()
+            .map(|(at, (pid, entries))| {
+                let recorded = record(
+                    *pid,
+                    entries,
+                    &none,
+                    &none,
+                    &index,
+                    &prove,
+                    &mut budget.shard_shadow(),
+                    &resources,
+                    &make_io,
+                );
+                let (prepared, journal) = preview(recorded, *pid, &prove, &budget, &resources);
+                journal.commit(&mut budget).unwrap();
+                (at, prepared)
+            })
+            .collect()
+    };
+    assert_eq!(prepared.len(), 3);
+    let proven = prove_segment(
+        prepared,
+        &sweep,
+        &resources,
+        if preparation { 1 } else { 3 },
+    )
+    .unwrap();
+    let mut out = SweepAttribution::default();
+    for (at, prepared) in proven {
+        let PreparedState::Confirm { io, plan } = prepared.state else {
+            panic!("caller preparation lost")
+        };
+        let confirmation = finish_confirmation(
+            &io,
+            sweep[at].0,
+            plan,
+            prepared.mapped,
+            Some(&resources),
+            &mut budget,
+        );
+        let mut probe = FinishedProbe {
+            confirmation: Some(confirmation),
+            mapped: MappedIdentities::new(),
+        };
+        attribute_one(
+            &mut out,
+            sweep[at].0,
+            &sweep[at].1,
+            &none,
+            &none,
+            &index,
+            &prove,
+            &mut probe,
+            &mut budget,
+        );
+    }
+    assert_eq!(
+        out.members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [1001, 1002, 1003]
+    );
+    assert!(out.losses.is_empty());
+    assert!(out.unexamined_objects.is_empty());
+    assert_eq!(out.probed, 3);
+    let state = budget.confirm_state_for_test();
+    assert_eq!(state.1, 3);
+    assert_eq!(
+        state.0.attempted_io_bytes,
+        world
+            .values()
+            .map(|script| script.confirm_maps.as_ref().unwrap().len() as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(state.0.stop, None);
+    assert!(!state.0.stop_reported);
+    let events = events.lock().unwrap();
+    let mut requests = events.requests.clone();
+    requests.sort_unstable();
+    assert_eq!(
+        requests,
+        [
+            (1001, 0x1000_1000, 0x1000_2000),
+            (1002, 0x1000_1000, 0x1000_2000),
+            (1003, 0x1000_1000, 0x1000_2000)
+        ]
+    );
+    assert!(events.pins.is_empty());
+    assert_eq!(events.peak_pins, 3);
+    let threads = if preparation {
+        &events.prepare_threads
+    } else {
+        &events.proof_threads
+    };
+    if let Ok(fail_at) = std::env::var("D3A_REVIEW_FAIL_PTHREAD_AT") {
+        let expected = match fail_at.as_str() {
+            "2" => 1,
+            "3" => 2,
+            _ => panic!("control requires refusal at first/second worker"),
+        };
+        assert_eq!(
+            threads.len(),
+            expected,
+            "partial pool must be used with caller fallback"
+        );
+        assert!(threads.contains(&std::thread::current().id()));
+    }
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    assert!(owner.state_for_test().1[0] <= policy.retained);
+    assert!(owner.state_for_test().1[1] <= 2 * policy.workers);
+    assert!(owner.state_for_test().2 <= policy.headroom);
+}
+
+#[test]
+fn d3a_r1_prepare_spawn_refusal_keeps_segment() {
+    d3a_r1_spawn_refusal_phase(true);
+}
+
+#[test]
+fn d3a_r1_proof_spawn_refusal_keeps_segment() {
+    d3a_r1_spawn_refusal_phase(false);
 }

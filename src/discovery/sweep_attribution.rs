@@ -58,7 +58,7 @@ use crate::discovery::scan::{
 };
 use p11scope_manifest::maps::{MapEntry, MappedPath, ObjectKey, mapped_path};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Why one unselected process mapping a known provider object was not
 /// attributed to it. Counted per category at scope level; the per-pid
@@ -199,6 +199,10 @@ pub(crate) struct KnownKeyIndex {
     /// allowlisted filesystem: any range under them is that file, so they
     /// skip the per-range `map_files` stat (DR-C1b-3).
     identity_keys: BTreeSet<ObjectKey>,
+    /// Optional per-pass anchor equivalence classes. Only validated anchor
+    /// aliases may be installed by a future proof adapter.
+    match_slots: BTreeMap<ObjectKey, BTreeSet<Slot>>,
+    examined_slots: BTreeMap<ObjectKey, BTreeSet<Slot>>,
 }
 
 impl KnownKeyIndex {
@@ -303,6 +307,27 @@ impl KnownKeyIndex {
             .collect()
     }
 
+    /// A backend installs only complete, validated per-pass anchor alias
+    /// classes. An empty class clears expectations and fails kernel proof.
+    #[allow(dead_code)] // D3a tests the seam; D3b/D3c install real anchors.
+    pub(crate) fn set_kernel_slots(
+        &mut self,
+        key: ObjectKey,
+        slots: BTreeSet<Slot>,
+    ) -> Result<(), &'static str> {
+        let target = match self.classify(key) {
+            KeyClass::Match(_) => &mut self.match_slots,
+            KeyClass::Examined => &mut self.examined_slots,
+            _ => return Err("the key has no comparable expected object"),
+        };
+        if slots.is_empty() {
+            target.remove(&key);
+        } else {
+            target.insert(key, slots);
+        }
+        Ok(())
+    }
+
     /// Whether any range under `key` is its file without a per-range stat.
     fn key_is_identity(&self, key: ObjectKey) -> bool {
         self.identity_keys.contains(&key)
@@ -319,7 +344,32 @@ impl KnownKeyIndex {
 
 /// `map_files` identities read for the mapped ranges that needed them,
 /// keyed by `(start, end)`.
-pub(crate) type MappedIdentities = BTreeMap<(u64, u64), Result<FileIdentity, String>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Slot(pub u32);
+
+/// Evidence answers a requested range only; keys, permissions and paths
+/// continue to come from the pinned maps snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // D3a is userspace-only; D3c supplies kernel evidence.
+pub(crate) enum RangeProof {
+    MapFiles(FileIdentity),
+    Kernel(Slot),
+    KernelNone,
+    NotMapped,
+    Unavailable(String),
+}
+
+impl From<Result<FileIdentity, String>> for RangeProof {
+    fn from(result: Result<FileIdentity, String>) -> Self {
+        match result {
+            Ok(identity) => Self::MapFiles(identity),
+            Err(error) if error == RANGE_NOT_MAPPED => Self::NotMapped,
+            Err(error) => Self::Unavailable(error),
+        }
+    }
+}
+
+pub(crate) type MappedIdentities = BTreeMap<(u64, u64), RangeProof>;
 
 /// A confirmation read that held: the generation the pin proved and the
 /// maps snapshot read while it held, between two equal exe reads.
@@ -477,12 +527,16 @@ impl Classified<'_> {
         for (key, group) in std::mem::take(&mut self.examined_pending) {
             let proven = index.key_is_identity(key)
                 || index.examined_identities(key).is_some_and(|files| {
-                    group.iter().all(|entry| {
-                        matches!(
-                            mapped.get(&(entry.start, entry.end)),
-                            Some(Ok(identity)) if files.contains(identity)
-                        )
-                    })
+                    group
+                        .iter()
+                        .all(|entry| match mapped.get(&(entry.start, entry.end)) {
+                            Some(RangeProof::MapFiles(identity)) => files.contains(identity),
+                            Some(RangeProof::Kernel(slot)) => index
+                                .examined_slots
+                                .get(&key)
+                                .is_some_and(|slots| slots.contains(slot)),
+                            _ => false,
+                        })
                 });
             if proven {
                 continue;
@@ -490,7 +544,7 @@ impl Classified<'_> {
             if group.iter().any(|entry| {
                 matches!(
                     mapped.get(&(entry.start, entry.end)),
-                    Some(Err(error)) if error == RANGE_NOT_MAPPED
+                    Some(RangeProof::NotMapped)
                 )
             }) {
                 changed.insert(key);
@@ -507,7 +561,7 @@ impl Classified<'_> {
             group.iter().any(|entry| {
                 matches!(
                     mapped.get(&(entry.start, entry.end)),
-                    Some(Err(error)) if error == RANGE_NOT_MAPPED
+                    Some(RangeProof::NotMapped)
                 )
             })
         })
@@ -533,13 +587,15 @@ fn classify_snapshot<'a>(index: &KnownKeyIndex, entries: &'a [MapEntry]) -> Clas
 /// [`is_caller_range`]) is the held object's file.
 fn prove_match(
     expected: FileIdentity,
+    slots: Option<&BTreeSet<Slot>>,
     group: &[&MapEntry],
     mapped: &MappedIdentities,
 ) -> Result<(), (AttributionLoss, String)> {
     for entry in group {
         match mapped.get(&(entry.start, entry.end)) {
-            Some(Ok(identity)) if *identity == expected => {}
-            Some(Ok(identity)) => {
+            Some(RangeProof::MapFiles(identity)) if *identity == expected => {}
+            Some(RangeProof::Kernel(slot)) if slots.is_some_and(|slots| slots.contains(slot)) => {}
+            Some(RangeProof::MapFiles(identity)) => {
                 return Err((
                     AttributionLoss::IdentityMismatch,
                     format!(
@@ -554,7 +610,7 @@ fn prove_match(
                     ),
                 ));
             }
-            Some(Err(error)) if error == RANGE_NOT_MAPPED => {
+            Some(RangeProof::NotMapped) => {
                 return Err((
                     AttributionLoss::MappingChanged,
                     format!(
@@ -564,7 +620,16 @@ fn prove_match(
                     ),
                 ));
             }
-            Some(Err(error)) => {
+            Some(RangeProof::Kernel(_)) | Some(RangeProof::KernelNone) => {
+                return Err((
+                    AttributionLoss::IdentityMismatch,
+                    format!(
+                        "the range {:x}-{:x} does not prove the held object's anchor",
+                        entry.start, entry.end
+                    ),
+                ));
+            }
+            Some(RangeProof::Unavailable(error)) => {
                 return Err((
                     AttributionLoss::MapFilesUnavailable,
                     format!(
@@ -746,7 +811,9 @@ pub(crate) fn attribute_one(
     for (key, object, group) in &confirmed.matches {
         let proven = match index.match_identity(*key) {
             Some(_) if index.key_is_identity(*key) => Ok(()),
-            Some(expected) => prove_match(expected, group, &read.mapped),
+            Some(expected) => {
+                prove_match(expected, index.match_slots.get(key), group, &read.mapped)
+            }
             None => Err((
                 AttributionLoss::KeyRejected,
                 "the key lost its proof".into(),
@@ -793,6 +860,49 @@ pub(crate) fn attribute_one(
         objects,
         unexamined: confirmed.unexamined.len(),
     });
+}
+
+/// The first snapshot decides preparation only; fresh confirmation maps
+/// remain the sole source of a matched caller's facts.
+pub(crate) enum PreparationKind {
+    Settled,
+    Idle(Vec<(u64, u64)>),
+    Confirm,
+}
+
+pub(crate) fn preparation_kind(
+    pid: u32,
+    phase_one: &[MapEntry],
+    unavailable: &BTreeSet<u32>,
+    selected: &BTreeSet<u32>,
+    index: &KnownKeyIndex,
+) -> PreparationKind {
+    if selected.contains(&pid) || unavailable.contains(&pid) {
+        return PreparationKind::Settled;
+    }
+    let first = classify_snapshot(index, phase_one);
+    if first
+        .matches
+        .iter()
+        .any(|(_, _, group)| usable_path(group).is_ok())
+    {
+        PreparationKind::Confirm
+    } else {
+        let ranges = first.pending_ranges(index);
+        if ranges.is_empty() {
+            PreparationKind::Settled
+        } else {
+            PreparationKind::Idle(ranges)
+        }
+    }
+}
+
+pub(crate) fn idle_needs_promotion(
+    index: &KnownKeyIndex,
+    phase_one: &[MapEntry],
+    mapped: &MappedIdentities,
+) -> bool {
+    classify_snapshot(index, phase_one).pending_changed(mapped)
 }
 
 /// Recheck every matched object once, after every confirmation read: a
@@ -931,6 +1041,244 @@ pub(crate) fn budget_refusal(reason: &str) -> bool {
     .contains(&reason)
 }
 
+/// Conservative FD allowance for one collection's attribution stage. The
+/// boundaries depend on this policy, never on actual executor concurrency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmentPolicy {
+    pub headroom: usize,
+    pub workers: usize,
+    pub retained: usize,
+    pub max_ranges: usize,
+}
+
+const FD_RESERVE: usize = 64;
+const IMMEDIATE_FDS: usize = 3;
+pub(crate) const FD_RESOURCE_REASON: &str = "confirmation file-descriptor headroom is unavailable";
+
+impl SegmentPolicy {
+    pub(crate) fn from_headroom(headroom: usize, max_workers: usize, candidates: usize) -> Self {
+        let workers = (headroom.saturating_sub(IMMEDIATE_FDS) / 3)
+            .min(max_workers.min(crate::discovery::sweep_shards::MAX_SHARD_THREADS))
+            .min(candidates);
+        let retained = if workers == 0 {
+            0
+        } else {
+            headroom
+                .saturating_sub(IMMEDIATE_FDS + 2 * workers)
+                .min(candidates)
+        };
+        Self {
+            headroom,
+            workers,
+            retained,
+            max_ranges: crate::discovery::scan::MapsReadLimits::LIVE.max_entries,
+        }
+    }
+
+    /// Census is taken at the quiescent attribution boundary. The census
+    /// directory counts itself; it is closed before that one FD is removed.
+    pub(crate) fn snapshot(max_workers: usize, candidates: usize) -> Self {
+        fn allowance() -> Option<usize> {
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            // SAFETY: getrlimit initializes the writable limit on success.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            // SAFETY: the successful getrlimit above initialized limit.
+            let soft = usize::try_from(unsafe { limit.assume_init() }.rlim_cur).ok()?;
+            let mut census = std::fs::read_dir("/proc/self/fd").ok()?;
+            let mut count = 0usize;
+            for entry in census.by_ref() {
+                entry.ok()?;
+                count = count.checked_add(1)?;
+            }
+            drop(census);
+            let open = count.checked_sub(1)?;
+            Some(
+                soft.checked_sub(open)
+                    .and_then(|left| left.checked_sub(FD_RESERVE))
+                    .unwrap_or(0),
+            )
+        }
+        match allowance() {
+            Some(headroom) => Self::from_headroom(headroom, max_workers, candidates),
+            // An unknown census authorizes one bounded immediate operation,
+            // whose real open failures remain fail-closed. Never a batch.
+            None => Self::from_headroom(IMMEDIATE_FDS, 0, candidates),
+        }
+    }
+
+    fn reserved(self) -> usize {
+        usize::from(self.headroom >= IMMEDIATE_FDS) * IMMEDIATE_FDS
+            + self.retained
+            + 2 * self.workers
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LeaseClass {
+    Retained,
+    Worker,
+    ImmediatePin,
+    ImmediateIo,
+}
+
+#[derive(Debug, Default)]
+struct ReservationState {
+    used: [usize; 4],
+    peak: [usize; 4],
+    peak_total: usize,
+}
+
+/// All speculative pins, accepted pins, rereads and phase-D operations use
+/// this same physical owner; work-budget shadows never clone its allowance.
+#[derive(Clone)]
+pub(crate) struct ReservationOwner {
+    policy: SegmentPolicy,
+    state: Arc<Mutex<ReservationState>>,
+}
+
+impl ReservationOwner {
+    pub(crate) fn new(policy: SegmentPolicy) -> Self {
+        assert!(policy.reserved() <= policy.headroom);
+        Self {
+            policy,
+            state: Arc::new(Mutex::new(ReservationState::default())),
+        }
+    }
+
+    fn reserve(&self, class: LeaseClass, count: usize) -> Result<FdLease, String> {
+        let (cell, limit) = match class {
+            LeaseClass::Retained => (0, self.policy.retained),
+            LeaseClass::Worker => (1, 2 * self.policy.workers),
+            LeaseClass::ImmediatePin => (2, usize::from(self.policy.headroom >= IMMEDIATE_FDS)),
+            LeaseClass::ImmediateIo => (3, usize::from(self.policy.headroom >= IMMEDIATE_FDS) * 2),
+        };
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let next = state.used[cell]
+            .checked_add(count)
+            .filter(|next| *next <= limit)
+            .ok_or_else(|| FD_RESOURCE_REASON.to_string())?;
+        state.used[cell] = next;
+        state.peak[cell] = state.peak[cell].max(next);
+        let total = state.used.iter().sum();
+        state.peak_total = state.peak_total.max(total);
+        assert!(total <= self.policy.reserved());
+        drop(state);
+        Ok(FdLease {
+            owner: self.clone(),
+            cell,
+            count,
+            immediate_io: matches!(class, LeaseClass::ImmediateIo),
+        })
+    }
+
+    pub(crate) fn batch(&self) -> IoResources {
+        IoResources {
+            owner: self.clone(),
+            immediate: false,
+        }
+    }
+    pub(crate) fn immediate(&self) -> IoResources {
+        IoResources {
+            owner: self.clone(),
+            immediate: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_for_test(&self) -> ([usize; 4], [usize; 4], usize, usize) {
+        let state = self.state.lock().unwrap();
+        (
+            state.used,
+            state.peak,
+            state.peak_total,
+            self.policy.reserved(),
+        )
+    }
+}
+
+/// A lease has no handle itself. Its actual owner drops the handle first.
+pub(crate) struct FdLease {
+    owner: ReservationOwner,
+    cell: usize,
+    count: usize,
+    immediate_io: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProofPools<'p> {
+    pub batch: Option<&'p ProofStatPool>,
+    pub immediate: Option<&'p ProofStatPool>,
+}
+
+impl<'p> ProofPools<'p> {
+    fn for_lease(self, lease: Option<&FdLease>) -> Option<&'p ProofStatPool> {
+        if lease.is_some_and(|lease| lease.immediate_io) {
+            self.immediate
+        } else {
+            self.batch
+        }
+    }
+}
+
+impl Drop for FdLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.used[self.cell] = state.used[self.cell]
+            .checked_sub(self.count)
+            .expect("a confirmation lease is returned once");
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IoResources {
+    owner: ReservationOwner,
+    immediate: bool,
+}
+
+impl IoResources {
+    pub(crate) fn pin(&self) -> Result<FdLease, String> {
+        self.owner.reserve(
+            if self.immediate {
+                LeaseClass::ImmediatePin
+            } else {
+                LeaseClass::Retained
+            },
+            1,
+        )
+    }
+    pub(crate) fn transient(&self) -> Result<FdLease, String> {
+        self.owner.reserve(
+            if self.immediate {
+                LeaseClass::ImmediateIo
+            } else {
+                LeaseClass::Worker
+            },
+            2,
+        )
+    }
+}
+
+/// Declaration order closes the real pin before its reservation returns.
+pub(crate) struct ReservedPin<P> {
+    pub pin: P,
+    pub _lease: Option<FdLease>,
+}
+
+/// An owned preparation has no references into its maps vector. It can move
+/// between workers and the caller while retaining the original live pin.
+pub(crate) struct PreparedConfirmation<P> {
+    pub pin: ReservedPin<P>,
+    pub before: ExeIdentity,
+    pub entries: Vec<MapEntry>,
+    pub ranges: Vec<(u64, u64)>,
+}
+
 /// The OS operations one confirmation needs, behind a seam so the
 /// decision order is unit-testable.
 pub(crate) trait ConfirmIo {
@@ -950,6 +1298,16 @@ pub(crate) trait ConfirmIo {
             .map(|&(start, end)| self.mapped_file(pid, start, end))
             .collect()
     }
+    fn mapped_files_reserved(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        lease: Option<FdLease>,
+    ) -> Vec<Result<FileIdentity, String>> {
+        let results = self.mapped_files(pid, ranges);
+        drop(lease);
+        results
+    }
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String>;
     fn start_time(&self, pin: &Self::Pin) -> Option<u64>;
     fn still_the_same(&self, pin: &Self::Pin) -> bool;
@@ -961,12 +1319,37 @@ pub(crate) trait ConfirmIo {
 /// The proof reads of `ranges` keyed by range. A range whose result is
 /// missing (never expected) is left out, which every consumer reads as
 /// unproven: fail closed.
-fn read_ranges<Io: ConfirmIo>(io: &mut Io, pid: u32, ranges: &[(u64, u64)]) -> MappedIdentities {
+pub(crate) fn read_ranges_reserved<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    ranges: &[(u64, u64)],
+    resources: Option<&IoResources>,
+) -> MappedIdentities {
+    if ranges.is_empty() {
+        return MappedIdentities::new();
+    }
+    let lease = match resources.map(IoResources::transient).transpose() {
+        Ok(lease) => lease,
+        Err(error) => {
+            return ranges
+                .iter()
+                .map(|&range| (range, RangeProof::Unavailable(error.clone())))
+                .collect();
+        }
+    };
     ranges
         .iter()
         .copied()
-        .zip(io.mapped_files(pid, ranges))
+        .zip(
+            io.mapped_files_reserved(pid, ranges, lease)
+                .into_iter()
+                .map(RangeProof::from),
+        )
         .collect()
+}
+
+fn read_ranges<Io: ConfirmIo>(io: &mut Io, pid: u32, ranges: &[(u64, u64)]) -> MappedIdentities {
+    read_ranges_reserved(io, pid, ranges, None)
 }
 
 /// The unpinned proof reads of `ranges` (each once): charged in order
@@ -987,7 +1370,10 @@ pub(crate) fn stat_unpinned<Io: ConfirmIo>(
             if budget.spend(1).is_err() {
                 break;
             }
-            answers.insert(range, io.mapped_file(pid, range.0, range.1));
+            answers.insert(
+                range,
+                RangeProof::from(io.mapped_file(pid, range.0, range.1)),
+            );
         }
         return answers;
     }
@@ -1007,95 +1393,125 @@ pub(crate) fn stat_unpinned<Io: ConfirmIo>(
 
 /// One confirmation: pin, exe, maps re-read, exe again, then the pin must
 /// still hold and both exe reads agree. Only then does the snapshot count.
-pub(crate) fn confirm_with<Io: ConfirmIo>(
+pub(crate) fn lost_with<Io: ConfirmIo>(
+    io: &Io,
+    pid: u32,
+    loss: AttributionLoss,
+    detail: String,
+) -> Confirmation {
+    if io.gone(pid) {
+        Confirmation::Exited
+    } else {
+        Confirmation::Lost(loss, detail)
+    }
+}
+
+fn stopped_confirmation() -> Confirmation {
+    Confirmation::Lost(
+        AttributionLoss::Budget,
+        "cgroup confirmation stopped or shared work allowance exhausted".into(),
+    )
+}
+
+pub(crate) fn prepare_confirmation<Io: ConfirmIo>(
     io: &mut Io,
     pid: u32,
     prove: &BTreeSet<ObjectKey>,
     budget: &mut CaptureWorkBudget,
-) -> Confirmation {
-    let lost = |io: &Io, loss: AttributionLoss, detail: String| {
-        if io.gone(pid) {
-            Confirmation::Exited
-        } else {
-            Confirmation::Lost(loss, detail)
-        }
-    };
+    resources: Option<&IoResources>,
+) -> Result<PreparedConfirmation<Io::Pin>, Confirmation> {
     let controlled = budget.has_collection_work();
-    let stopped = || {
-        Confirmation::Lost(
-            AttributionLoss::Budget,
-            "cgroup confirmation stopped or shared work allowance exhausted".into(),
-        )
-    };
     if controlled && !budget.poll_collection(1) {
-        return stopped();
+        return Err(stopped_confirmation());
     }
-    let pin = match io.open(pid) {
-        Ok(pin) => pin,
-        Err(error) => return lost(io, AttributionLoss::ConfirmUnreadable, error),
-    };
+    let transient = resources
+        .map(IoResources::transient)
+        .transpose()
+        .map_err(|error| Confirmation::Lost(AttributionLoss::ConfirmUnreadable, error))?;
+    let lease = resources
+        .map(IoResources::pin)
+        .transpose()
+        .map_err(|error| Confirmation::Lost(AttributionLoss::ConfirmUnreadable, error))?;
+    let pin = io
+        .open(pid)
+        .map(|pin| ReservedPin { pin, _lease: lease })
+        .map_err(|error| lost_with(io, pid, AttributionLoss::ConfirmUnreadable, error))?;
     if controlled && !budget.poll_collection(1) {
-        return stopped();
+        return Err(stopped_confirmation());
     }
-    let Some(before) = io.exe(pid) else {
-        return lost(
+    let before = io.exe(pid).ok_or_else(|| {
+        lost_with(
             io,
+            pid,
             AttributionLoss::ConfirmUnreadable,
             "the exe identity could not be read".into(),
-        );
-    };
+        )
+    })?;
     if controlled && !budget.poll_collection(1) {
-        return stopped();
+        return Err(stopped_confirmation());
     }
-    let entries = match io.maps(pid, budget) {
-        Ok(entries) => entries,
-        Err(reason) if budget_refusal(&reason) => {
-            return Confirmation::Lost(AttributionLoss::Budget, reason);
+    let read = io.maps(pid, budget);
+    let entries = read.map_err(|reason| {
+        if budget_refusal(&reason) {
+            Confirmation::Lost(AttributionLoss::Budget, reason)
+        } else {
+            lost_with(io, pid, AttributionLoss::ConfirmUnreadable, reason)
         }
-        Err(reason) => return lost(io, AttributionLoss::ConfirmUnreadable, reason),
-    };
-    // The map_files proof is read while the pin holds; `still_the_same`
-    // below proves it was this generation's mapping.
-    // Scoped work polls and charges between each normally returning proof
-    // read. Unscoped work retains its existing charged pooled batch. A partial
-    // proof never confirms the member's generation/image snapshot.
+    })?;
     if controlled && !budget.poll_collection(entries.len() as u64 + 1) {
-        return stopped();
+        return Err(stopped_confirmation());
     }
     let ranges = proof_ranges(&entries, prove);
-    let mapped = if controlled {
-        let mut mapped = MappedIdentities::new();
-        for &(start, end) in &ranges {
-            if let Err(reason) = budget.spend(1) {
-                return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
-            }
-            mapped.insert((start, end), io.mapped_file(pid, start, end));
-        }
-        mapped
-    } else {
+    // The scoped collector deliberately uses its immediate serial adapter:
+    // spend its shared allowance at each proof read, so a returning read can
+    // stop the suffix. Ordinary segments charge their full request set here.
+    if !controlled {
         for _ in &ranges {
-            if let Err(reason) = budget.spend(1) {
-                return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
-            }
+            budget
+                .spend(1)
+                .map_err(|reason| Confirmation::Lost(AttributionLoss::Budget, reason.into()))?;
         }
-        read_ranges(io, pid, &ranges)
-    };
-    if controlled && !budget.poll_collection(1) {
-        return stopped();
     }
+    drop(transient);
+    Ok(PreparedConfirmation {
+        pin,
+        before,
+        entries,
+        ranges,
+    })
+}
+
+/// Live final checks consume the original pin only after all segment proofs.
+pub(crate) fn finish_confirmation<Io: ConfirmIo>(
+    io: &Io,
+    pid: u32,
+    prepared: PreparedConfirmation<Io::Pin>,
+    mapped: MappedIdentities,
+    resources: Option<&IoResources>,
+    budget: &mut CaptureWorkBudget,
+) -> Confirmation {
+    let controlled = budget.has_collection_work();
+    if controlled && !budget.poll_collection(1) {
+        return stopped_confirmation();
+    }
+    let _transient = match resources.map(IoResources::transient).transpose() {
+        Ok(lease) => lease,
+        Err(error) => return Confirmation::Lost(AttributionLoss::ConfirmUnreadable, error),
+    };
     let after = io.exe(pid);
     if controlled && !budget.poll_collection(1) {
-        return stopped();
+        return stopped_confirmation();
     }
-    if !io.still_the_same(&pin) {
-        return lost(
+    if !io.still_the_same(&prepared.pin.pin) {
+        return lost_with(
             io,
+            pid,
             AttributionLoss::GenerationChanged,
             "the process generation changed during the confirmation read".into(),
         );
     }
     match after {
-        Some(after) if after == before => {}
+        Some(after) if after == prepared.before => {}
         Some(_) => {
             return Confirmation::Lost(
                 AttributionLoss::ExecChanged,
@@ -1103,17 +1519,18 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
             );
         }
         None => {
-            return lost(
+            return lost_with(
                 io,
+                pid,
                 AttributionLoss::ConfirmUnreadable,
                 "the exe identity could not be re-read".into(),
             );
         }
     }
     if controlled && !budget.poll_collection(1) {
-        return stopped();
+        return stopped_confirmation();
     }
-    let Some(start_time) = io.start_time(&pin) else {
+    let Some(start_time) = io.start_time(&prepared.pin.pin) else {
         return Confirmation::Lost(
             AttributionLoss::ConfirmUnreadable,
             "the start time is unreadable; the generation cannot be joined".into(),
@@ -1121,10 +1538,45 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
     };
     Confirmation::Confirmed(ConfirmedRead {
         start_time,
-        exe: before,
-        entries,
+        exe: prepared.before,
+        entries: prepared.entries,
         mapped,
     })
+}
+
+pub(crate) fn confirm_with_resources<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    prove: &BTreeSet<ObjectKey>,
+    budget: &mut CaptureWorkBudget,
+    resources: Option<&IoResources>,
+) -> Confirmation {
+    let prepared = match prepare_confirmation(io, pid, prove, budget, resources) {
+        Ok(prepared) => prepared,
+        Err(confirmation) => return confirmation,
+    };
+    let mapped = if budget.has_collection_work() {
+        let mut mapped = MappedIdentities::new();
+        for &range in &prepared.ranges {
+            if let Err(reason) = budget.spend(1) {
+                return Confirmation::Lost(AttributionLoss::Budget, reason.into());
+            }
+            mapped.extend(read_ranges_reserved(io, pid, &[range], resources));
+        }
+        mapped
+    } else {
+        read_ranges_reserved(io, pid, &prepared.ranges, resources)
+    };
+    finish_confirmation(io, pid, prepared, mapped, resources, budget)
+}
+
+pub(crate) fn confirm_with<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    prove: &BTreeSet<ObjectKey>,
+    budget: &mut CaptureWorkBudget,
+) -> Confirmation {
+    confirm_with_resources(io, pid, prove, budget, None)
 }
 
 /// The `map_files` error that means "no mapping is at this range now":
@@ -1151,25 +1603,105 @@ fn map_files_error(error: std::io::Error) -> String {
 pub(crate) struct OsConfirmIo<'p> {
     map_files: Option<(u32, Result<Arc<HeldMapFiles>, String>)>,
     /// The collection's proof-stat pool (`None`: read on this thread).
-    pool: Option<&'p ProofStatPool>,
+    pools: ProofPools<'p>,
+    #[cfg(test)]
+    observer: Option<Arc<Mutex<ProofTrace>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ProofTrace {
+    pub opened: usize,
+    pub closed: usize,
+    pub reads: Vec<(u32, u64, u64, std::thread::ThreadId, Option<String>)>,
 }
 
 /// A held `map_files` directory as a pool-shareable proof source, with
 /// `ENOENT` read as [`RANGE_NOT_MAPPED`].
-struct HeldMapFiles(MapFilesDir);
+#[derive(Clone, Default)]
+struct DropFence(Arc<(Mutex<bool>, Condvar)>);
+
+impl DropFence {
+    fn wait(&self) {
+        let (closed, changed) = &*self.0;
+        let mut closed = closed.lock().unwrap_or_else(|error| error.into_inner());
+        while !*closed {
+            closed = changed
+                .wait(closed)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+    fn complete(&self) {
+        let (closed, changed) = &*self.0;
+        *closed.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        changed.notify_all();
+    }
+}
+
+struct HeldMapFiles {
+    dir: Option<MapFilesDir>,
+    lease: Option<FdLease>,
+    closed: DropFence,
+    #[cfg(test)]
+    observer: Option<(u32, Arc<Mutex<ProofTrace>>)>,
+}
+
+impl Drop for HeldMapFiles {
+    fn drop(&mut self) {
+        // Result delivery does not establish final Arc destruction. Close
+        // the actual FD first, return its capacity, then signal observers.
+        drop(self.dir.take());
+        drop(self.lease.take());
+        #[cfg(test)]
+        if let Some((_, observer)) = &self.observer {
+            observer.lock().unwrap().closed += 1;
+        }
+        self.closed.complete();
+    }
+}
 
 impl RangeStat for HeldMapFiles {
     fn stat(&self, start: u64, end: u64) -> Result<FileIdentity, String> {
-        self.0.identity(start, end).map_err(map_files_error)
+        #[cfg(test)]
+        if let Some((pid, observer)) = &self.observer {
+            let thread = std::thread::current();
+            observer.lock().unwrap().reads.push((
+                *pid,
+                start,
+                end,
+                thread.id(),
+                thread.name().map(str::to_owned),
+            ));
+        }
+        self.dir
+            .as_ref()
+            .expect("the proof directory is live")
+            .identity(start, end)
+            .map_err(map_files_error)
     }
 }
 
 impl OsConfirmIo<'_> {
     /// The directory of `pid`, opened at its first range.
-    fn held(&mut self, pid: u32) -> Result<Arc<HeldMapFiles>, String> {
+    fn held(&mut self, pid: u32, lease: Option<FdLease>) -> Result<Arc<HeldMapFiles>, String> {
         if self.map_files.as_ref().is_none_or(|(held, _)| *held != pid) {
             let dir = MapFilesDir::open(pid)
-                .map(|dir| Arc::new(HeldMapFiles(dir)))
+                .map(|dir| {
+                    #[cfg(test)]
+                    if let Some(observer) = &self.observer {
+                        observer.lock().unwrap().opened += 1;
+                    }
+                    Arc::new(HeldMapFiles {
+                        dir: Some(dir),
+                        lease,
+                        closed: DropFence::default(),
+                        #[cfg(test)]
+                        observer: self
+                            .observer
+                            .as_ref()
+                            .map(|observer| (pid, observer.clone())),
+                    })
+                })
                 .map_err(map_files_error);
             self.map_files = Some((pid, dir));
         }
@@ -1180,11 +1712,49 @@ impl OsConfirmIo<'_> {
     }
 }
 
+impl OsConfirmIo<'_> {
+    fn release_directory(&mut self) {
+        let held = self.map_files.take();
+        let closed = held
+            .as_ref()
+            .and_then(|(_, dir)| dir.as_ref().ok())
+            .map(|dir| dir.closed.clone());
+        drop(held);
+        if let Some(closed) = closed {
+            closed.wait();
+        }
+    }
+
+    pub(crate) fn with_pool(pool: Option<&ProofStatPool>) -> OsConfirmIo<'_> {
+        Self::with_pools(ProofPools {
+            batch: pool,
+            immediate: pool,
+        })
+    }
+
+    pub(crate) fn with_pools(pools: ProofPools<'_>) -> OsConfirmIo<'_> {
+        OsConfirmIo {
+            map_files: None,
+            pools,
+            #[cfg(test)]
+            observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observing(mut self, observer: Arc<Mutex<ProofTrace>>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+}
+
 impl ConfirmIo for OsConfirmIo<'_> {
     type Pin = crate::process::PidPin;
 
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
-        self.held(pid)?.stat(start, end)
+        let result = self.held(pid, None).and_then(|dir| dir.stat(start, end));
+        self.release_directory();
+        result
     }
 
     fn mapped_files(
@@ -1192,10 +1762,25 @@ impl ConfirmIo for OsConfirmIo<'_> {
         pid: u32,
         ranges: &[(u64, u64)],
     ) -> Vec<Result<FileIdentity, String>> {
-        match self.held(pid) {
-            Ok(dir) => stat_batch(self.pool, dir, ranges),
-            Err(error) => vec![Err(error); ranges.len()],
+        self.mapped_files_reserved(pid, ranges, None)
+    }
+
+    fn mapped_files_reserved(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        lease: Option<FdLease>,
+    ) -> Vec<Result<FileIdentity, String>> {
+        if ranges.is_empty() {
+            return Vec::new();
         }
+        let pool = self.pools.for_lease(lease.as_ref());
+        let result = match self.held(pid, lease) {
+            Ok(dir) => stat_batch(pool, dir, ranges),
+            Err(error) => vec![Err(error); ranges.len()],
+        };
+        self.release_directory();
+        result
     }
 
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
@@ -1250,10 +1835,7 @@ impl MemberProbe for OsMemberProbe<'_> {
         prove: &BTreeSet<ObjectKey>,
         budget: &mut CaptureWorkBudget,
     ) -> Confirmation {
-        let mut io = OsConfirmIo {
-            map_files: None,
-            pool: self.pool,
-        };
+        let mut io = OsConfirmIo::with_pool(self.pool);
         confirm_with(&mut io, pid, prove, budget)
     }
 
@@ -1263,10 +1845,7 @@ impl MemberProbe for OsMemberProbe<'_> {
         ranges: &[(u64, u64)],
         budget: &mut CaptureWorkBudget,
     ) -> MappedIdentities {
-        let mut io = OsConfirmIo {
-            map_files: None,
-            pool: self.pool,
-        };
+        let mut io = OsConfirmIo::with_pool(self.pool);
         stat_unpinned(&mut io, pid, ranges, budget)
     }
 }

@@ -344,14 +344,15 @@ def report(headers, rows, rel_bar, ci_bar):
         if row["drift_pct"] is not None:
             lines.append(f"  off-arm drift {row['drift_pct']:+.2f}% (2nd vs 1st half)")
         lines.append(f"  verdict: {'MATERIAL' if row['material'] else 'immaterial'}")
-        exact += on["n"]
+        if row["mode"] == "call":
+            exact += on["n"]
     material = [row["cell"] for row in rows if row["material"]]
     if material:
         lines.append(f"OVERALL: MATERIAL ({', '.join(material)})")
     else:
         lines.append("OVERALL: immaterial on every cell")
     gate = "FAIL" if material else "PASS"
-    lines.append(f"M2 gate: {gate} (0 count errors across {exact} on-arm samples)")
+    lines.append(f"M2 gate: {gate} (0 count errors across {exact} counted on-arm samples)")
     return "\n".join(lines) + "\n"
 
 
@@ -483,7 +484,7 @@ def self_test():
         assert row["bare"]["median"] == 900.0
         text = report(headers, rows, 5.0, 10.0)
         assert "OVERALL: MATERIAL (relevant-call-t1)" in text, text
-        assert "M2 gate: FAIL (0 count errors across 4 on-arm samples)" in text, text
+        assert "M2 gate: FAIL (0 count errors across 4 counted on-arm samples)" in text, text
         # A quiet log (1% delta) reads immaterial with gate PASS.
         quiet = log.replace("wall_ns=1100000", "wall_ns=1010000").replace(
             "wall_ns=1120000", "wall_ns=1030000"

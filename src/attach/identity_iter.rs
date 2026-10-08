@@ -3154,6 +3154,12 @@ mod tests {
                     // the store vanishes. Wraps (`(` AT the cut),
                     // deref operands (`(` after `*`), and anything else
                     // keep their existing handling.
+                    // Whether the loop below cut a control-flow prefix:
+                    // a store under unbraced `if` may never execute, so
+                    // it propagates taint but never kills it (breaker
+                    // micro-fix B3b). Braced kills cut at `{`/`}` above
+                    // and never set this flag.
+                    let mut prefix_cut = false;
                     loop {
                         let rest = &lhs[cut..];
                         let stripped = rest.trim_start();
@@ -3199,6 +3205,7 @@ mod tests {
                             break;
                         }
                         cut = close + 1;
+                        prefix_cut = true;
                     }
                     let core = lhs[cut..].trim();
                     let mut unwrapped = strip_wrapping_parens(core);
@@ -3260,7 +3267,7 @@ mod tests {
                         }
                     } else if rhs_tainted {
                         tainted.insert(name.to_string());
-                    } else if !SOURCES.contains(&name) {
+                    } else if !SOURCES.contains(&name) && !prefix_cut {
                         tainted.remove(name);
                     }
                 }
@@ -3537,6 +3544,24 @@ mod tests {
                 "call-in-deref store must fail the audit: {stmt:?}"
             );
         }
+        // Conditional kills under unbraced `if` (breaker micro-fix
+        // B3b): `if (0) start = 0` may never execute, so the kill
+        // must not clear taint before the emit -- while a braced
+        // kill still clears (pre-existing flow-insensitivity,
+        // unchanged).
+        assert!(
+            audit_c_chunk(
+                "    start = addr;\n    if (0) start = 0;\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+                "chunk"
+            )
+            .is_err(),
+            "an unbraced-`if` kill must not clear taint"
+        );
+        audit_c_chunk(
+            "    start = addr;\n    if (c) { start = 0; }\n    emit(ctx, 1, 2, start, 0, 0, 0);\n",
+            "chunk",
+        )
+        .expect("a braced kill still clears taint");
         // No-regression control: a compound operator outside parens
         // (`(x) += ...`) still tracks taint on the unwrapped target.
         assert!(

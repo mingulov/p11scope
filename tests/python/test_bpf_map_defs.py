@@ -49,6 +49,30 @@ class MapDefsTests(unittest.TestCase):
         self.assertEqual(maps["LEGACY"], checker.map_def(1, 4, 8, 3))
         self.assertEqual(programs, {"probe"})
 
+    def test_frozen_map_names_survive_kernel_truncation(self):
+        """Frozen names must match the kernel-visible names bpftool reports.
+
+        BPF_OBJ_NAME_LEN truncates map names to 15 chars; the stopped
+        canary compares those truncated names against FROZEN_INVENTORY.
+        Only task_storage names have a canonical remap
+        (dump-owned-bpf-maps.canonical_map_name), so every other frozen
+        name must fit, and no two names in a flavor may share a prefix.
+        """
+        dumper = load_path(ROOT / "scripts/dump-owned-bpf-maps.py", "map_dumper")
+        for variant, (maps, _programs) in checker.FROZEN_INVENTORY.items():
+            with self.subTest(variant=variant):
+                prefixes = {}
+                for name in maps:
+                    if len(name) > 15:
+                        self.assertIn(name, dumper.TASK_STORAGE_NAMES,
+                                      f"{name} exceeds 15 chars without a canonical remap")
+                        # The remap only fires for task_storage rows.
+                        self.assertEqual(maps[name]["type"], 29, f"{name} remap needs task_storage type")
+                    truncated = name[:15]
+                    self.assertNotIn(truncated, prefixes,
+                                     f"{name} collides with {prefixes.get(truncated)}")
+                    prefixes[truncated] = name
+
 
     def test_elf_refusals(self):
         body, elf, _ = self.metadata()

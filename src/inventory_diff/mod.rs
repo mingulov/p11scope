@@ -5,5 +5,14 @@
 #[allow(dead_code)]
 mod input;
 
+// Consumed by the separately scoped offline rendering and command task.
+#[allow(dead_code)]
+mod compare;
+#[allow(dead_code)]
+mod model;
+
 #[cfg(test)]
 mod input_tests;
+
+#[cfg(test)]
+mod compare_tests;

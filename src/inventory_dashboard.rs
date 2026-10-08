@@ -2484,7 +2484,7 @@ impl Display {
         let restored = self.writer.retry_restore(budget);
         if !before.restored && self.writer.account().restore_retried {
             self.notice(if restored {
-                "p11scope: dashboard screen restored after the report (the terminal read again)"
+                "p11scope: dashboard screen restored (the terminal read again)"
             } else {
                 "p11scope: dashboard screen restore shed: the terminal did not read; run `reset`"
             });

@@ -76,6 +76,18 @@ pub(crate) struct EventWriter {
     evicted_bytes: u64,
     live_covered_events: u64,
     live_covered_bytes: u64,
+    #[cfg(test)]
+    pub(crate) fault: Option<EventFault>,
+}
+
+/// Failure injection belongs to one writer, never another parallel run.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct EventFault {
+    pub(crate) kind: &'static str,
+    pub(crate) final_pass_only: bool,
+    pub(crate) after_ended: bool,
+    pub(crate) attempts: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 }
 
 impl EventWriter {
@@ -121,6 +133,8 @@ impl EventWriter {
             evicted_bytes: 0,
             live_covered_events: 0,
             live_covered_bytes: 0,
+            #[cfg(test)]
+            fault: None,
         })
     }
 
@@ -142,6 +156,16 @@ impl EventWriter {
         payload: serde_json::Value,
         at_ns: u64,
     ) -> Result<u64, String> {
+        #[cfg(test)]
+        if let Some(fault) = &self.fault {
+            fault.attempts.borrow_mut().push(kind.to_string());
+            if !fault.after_ended
+                && fault.kind == kind
+                && (!fault.final_pass_only || payload["final"] == true)
+            {
+                return Err(format!("injected {kind} append failure"));
+            }
+        }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         let line = serde_json::json!({
@@ -227,6 +251,12 @@ impl EventWriter {
     /// Write the terminal `ended` event, flush, and sync the live file.
     pub(crate) fn finish(&mut self, payload: serde_json::Value, at_ns: u64) -> Result<(), String> {
         self.append("ended", payload, at_ns)?;
+        #[cfg(test)]
+        if let Some(fault) = &self.fault
+            && fault.after_ended
+        {
+            return Err("injected event stream sync failure".into());
+        }
         self.file.sync_all().map_err(|error| {
             format!(
                 "syncing event stream {} failed: {error}",

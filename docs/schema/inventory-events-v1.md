@@ -226,8 +226,14 @@ Retention keeps the live file plus `--event-max-files - 1` rotations
 `retention_evicted` record in the live file.
 
 Writes flush per event (SIGKILL-safe at the OS level) and sync on
-rotation and `ended`. A mid-run stream failure (full disk, lost file)
-is a hard run error, never a silent truncation.
+rotation and after appending `ended`. If a post-start append, rotation,
+flush or sync returns an error, inventory retires that writer, continues
+observation to its ordinary stop, and attempts its independent report and
+stdout. The command exits nonzero and identifies the failed sink. The
+stream may end with a partial line; a failed record and `ended` are never
+retried or fabricated. A visible `ended` does not prove successful sync:
+the append may have succeeded before sync returned an error. Event-file
+creation and the initial `started` append remain fail-fast.
 
 ## Privacy and loss accounting
 

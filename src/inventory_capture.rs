@@ -1415,23 +1415,23 @@ impl CaptureLane<PidPin> for FacadeLane {
     }
 }
 
-/// The run's end after the stop (R-C51-4): `write` writes the report
-/// (stream end, `-o`, stdout) first; then `report_written` arms the
+/// The run's end after the stop (R-C51-4): `write` attempts final outputs
+/// (stream end, `-o`, stdout) first; then `outputs_attempted` arms the
 /// immediate exit on a second signal; only then does an unsettled
 /// retirement finish its blocking detach, between two progress lines.
 pub(crate) fn finish_native<L, T>(
     stopped: Option<Stopped<L>>,
     write: impl FnOnce(Option<&LaneSummary>) -> T,
-    report_written: &dyn Fn(),
+    outputs_attempted: &dyn Fn(),
     progress: &mut dyn FnMut(String),
 ) -> T {
     let result = write(stopped.as_ref().map(|stopped| &stopped.summary));
-    report_written();
+    outputs_attempted();
     if let Some(stopped) = stopped
         && let Retirement::Unsettled(_) = stopped.summary.retirement
     {
         progress(format!(
-            "p11scope: report written; detaching the remaining native probes of {} \
+            "p11scope: output attempts finished; detaching the remaining native probes of {} \
              endpoints (a second SIGINT/SIGTERM exits at once)",
             stopped.summary.attached
         ));

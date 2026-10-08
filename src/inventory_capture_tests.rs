@@ -1442,6 +1442,164 @@ fn the_report_is_written_before_the_blocking_detach() {
     );
 }
 
+#[test]
+fn failed_output_attempt_arms_escape_before_detach() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    let (stopped, _) = run(&mut scene, lane, 1);
+    log.borrow_mut().clear();
+    let result = finish_native(
+        Some(stopped),
+        |_| {
+            log.borrow_mut().push("output:failed".into());
+            Err::<(), _>("sink failed")
+        },
+        &|| log.borrow_mut().push("armed".into()),
+        &mut |line| log.borrow_mut().push(line),
+    );
+    assert_eq!(result, Err("sink failed"));
+    let entries = entries(&log);
+    assert_eq!(&entries[..2], ["output:failed", "armed"]);
+    assert!(
+        !entries
+            .iter()
+            .any(|line| line.contains("report written") || line.contains("report saved")),
+        "{entries:?}"
+    );
+    assert!(entries[2].contains("detaching"));
+    assert_eq!(entries[3], "drop");
+    assert!(entries[4].contains("detached"));
+}
+
+/// Exercise the real native stop publication, then the shared output
+/// finalizer: a final-pass append failure retires only its event writer.
+#[test]
+fn stop_event_failure_keeps_native_cleanup_report_and_stdout() {
+    use crate::inventory::{EventLogState, StreamState, emit_stop_events, finish_output};
+    use crate::inventory_events::{EventFault, EventWriter, started_payload};
+    use crate::inventory_present::Presentation;
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = ScriptedLane::new(&log);
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let events = dir.path().join("events.jsonl");
+    let report = dir.path().join("report.json");
+    let mut writer = EventWriter::create(&events, 1 << 20, 2).unwrap();
+    let attempts = Rc::new(RefCell::new(Vec::new()));
+    writer.fault = Some(EventFault {
+        kind: "pass_committed",
+        final_pass_only: true,
+        after_ended: false,
+        attempts: attempts.clone(),
+    });
+    let now = now_ns();
+    let initial = Presentation::capture(&scene.coordinator, "system", now, now, 0);
+    writer
+        .append("started", started_payload("system", now, &initial), now)
+        .unwrap();
+    let mut stream = EventLogState::new(Some(writer));
+    let mut state = StreamState::new();
+    let scans = log.clone();
+    let stop = || scans.borrow().iter().any(|entry| entry == "scan");
+    let clock = LoopClock {
+        deadline: None,
+        stop: &stop,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let stopped = run_classic(
+        &mut scene,
+        Some(started),
+        &clock,
+        &mut |scene: &mut Scene, point| {
+            if let Publish::Stop { events, now_ns } = point {
+                scene.note("publish:stop");
+                let view = Presentation::capture(
+                    &scene.coordinator,
+                    "system",
+                    now,
+                    now_ns,
+                    scene.coordinator.passes(),
+                );
+                let error = stream.attempt("stop publication", |writer| {
+                    emit_stop_events(
+                        writer,
+                        &mut state,
+                        events,
+                        scene.coordinator.passes(),
+                        &view,
+                        now_ns,
+                    )
+                });
+                assert!(error.unwrap().contains("event log stop publication"));
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(stream.first_error().is_some());
+    assert!(
+        stream
+            .attempt("must stay retired", |_| panic!(
+                "retired event writer reused"
+            ))
+            .is_none()
+    );
+    let view = Presentation::capture(
+        &scene.coordinator,
+        "system",
+        now,
+        now_ns(),
+        scene.coordinator.passes(),
+    );
+    let mut stdout = Vec::new();
+    let outcome = finish_native(
+        stopped,
+        |summary| {
+            finish_output(
+                Some(crate::output::AtomicFile::create(&report).unwrap()),
+                &mut stream,
+                &mut state,
+                &view,
+                true,
+                false,
+                &mut stdout,
+                summary,
+            )
+        },
+        &|| log.borrow_mut().push("armed".into()),
+        &mut |_| {},
+    );
+    assert_eq!(outcome.exit_code(), 1);
+    assert_eq!(std::fs::read(report).unwrap(), stdout);
+    assert!(log.borrow().iter().any(|entry| entry == "publish:stop"));
+    let entries = entries(&log);
+    assert!(
+        entries.iter().position(|entry| entry == "armed").unwrap()
+            < entries.iter().position(|entry| entry == "drop").unwrap()
+    );
+    assert_eq!(
+        attempts
+            .borrow()
+            .iter()
+            .filter(|kind| *kind == "pass_committed")
+            .count(),
+        1
+    );
+    assert!(!attempts.borrow().iter().any(|kind| kind == "ended"));
+}
+
 /// A closed retirement has nothing left to detach: no progress lines.
 #[test]
 fn a_closed_retirement_reports_without_a_detach_phase() {

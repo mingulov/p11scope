@@ -647,16 +647,17 @@ the min..max of per-sample p95.
 - Workaround: redirect stdout to a file, or rely on `-o` for the report.
 - Planned: v0.3.0 (review follow-up; pre-existing).
 
-### Event-log write error loses the `-o` report (C5.4 I-4)
+### Returned event-log errors preserve independent reports (C5.4 I-4, fixed)
 
-- What the user sees: if the event stream (`--event-log`) fails while
-  writing the closing records (for example a full disk), `inventory`
-  aborts before writing the `-o` report, so the report is lost.
-- Kernels/conditions: all; event-log I/O errors (ENOSPC).
-- Disclosure: the returned I/O error; no partial report is written.
-- Workaround: keep the event log on a disk with free space (or omit
-  `--event-log` when only the `-o` report matters).
-- Planned: v0.3.0 (review follow-up; pre-existing).
+After the initial `started` record, a returned event-log error retires that
+writer and observation continues to its ordinary stop. Inventory attempts
+the independent atomic `-o` report and final stdout, identifies each failed
+sink, and exits nonzero. The event file may contain a partial record; no
+replacement `ended` is invented. An `ended` record may be visible after its
+subsequent sync failed, so the record alone does not confirm durable
+completion. Event creation and the initial `started` write remain fail-fast.
+This fixes returned errors only; stalled final stdout remains limited as
+described above.
 
 ## Scopes (cgroup and pod)
 

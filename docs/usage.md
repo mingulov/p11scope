@@ -731,7 +731,7 @@ Limits that matter in pods:
   shed so far` once frames are drawn again. On exit the screen is
   restored (waiting at most 1 s for the terminal; a restore the
   terminal did not take, e.g. after Ctrl-S then `q`, is tried once
-  more for up to 5 s after the report is written, and a second signal
+  more for up to 5 s after final output attempts, and a second signal
   ends that wait), and stderr ends with
   `p11scope: dashboard terminal: W frames written, S shed by a terminal
   that did not keep up (C cut short, B bytes, T ms waited); screen
@@ -752,7 +752,17 @@ Limits that matter in pods:
   `-o`'s hardening (a new file is 0600, a symlink or other non-regular
   target is refused and left as it was, the parent directory must be
   trusted) and is truncated when the stream opens; a rotation rename
-  never replaces an entry planted at its target. Entry columns read unknown
+  never replaces an entry planted at its target. After `started`, a returned
+  event write, rotation, flush or sync error disables that writer while
+  observation continues to its ordinary stop. Final event completion,
+  atomic `-o` commit and stdout are attempted independently; any returned
+  sink error gives exit 1 with sink-specific diagnostics. The event file
+  may contain a partial line, and `ended` is never fabricated or retried.
+  A readable `ended` alone does not confirm successful sync. A failed
+  `-o` commit preserves the destination under the atomic-file policy;
+  failed stdout may contain only a prefix. These guarantees cover calls
+  that return; final stdout on a stalled terminal can still block.
+  Entry columns read unknown
   unless a usage feed observed them, mappings are never reported as
   observed calls, and every coverage loss is an explicit gap.
   `--capture auto|scan|native` selects the usage lane. `scan` reads
@@ -774,12 +784,11 @@ Limits that matter in pods:
   protocol, so a call in flight at stop may still be unrecorded), and
   `observation.retirement` (`closed`, or `unsettled` when the probes did
   not detach within the stop budget — that also records a gap). The stop
-  waits at most 10 s for the probes before it writes the report (so a
-  supervisor's grace, such as Kubernetes' 30 s, always sees it); a
-  detach still running then finishes after the report, between the
-  stderr lines `p11scope: report written; detaching the remaining native
+  waits at most 10 s for the probes before attempting final outputs; a
+  detach still running then finishes after those attempts, between the
+  stderr lines `p11scope: output attempts finished; detaching the remaining native
   probes …` and `p11scope: native probes detached`, and a second
-  SIGINT, SIGTERM or SIGHUP once the report is written exits at once
+  SIGINT, SIGTERM or SIGHUP after output attempts return exits at once
   (status 128 + signal; the kernel releases the remaining probes).
   Every exec and process exit in scope sends a 920-byte record through
   the native lane's 2 MiB lifecycle ring (about 2,260 records). The lane
@@ -833,7 +842,8 @@ Limits that matter in pods:
   runs exactly as on the classic path; the dashboard gives the terminal
   back before the native stop, so its stderr notices are readable.
   Ctrl-C, SIGTERM or SIGHUP end a classic or dashboard run cleanly: the
-  stream's `ended`, the `-o` document and stdout are still written. Admission
+  stream's `ended`, the `-o` document and stdout are still attempted
+  independently, with returned sink failures reported as exit 1. Admission
   verdicts come only from the run's attach set; an object it did not
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in

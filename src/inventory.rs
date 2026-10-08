@@ -49,6 +49,93 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// An event transport failure does not invalidate captured facts. Retire
+/// the writer once and keep the first error through ordinary finalization.
+pub(crate) struct EventLogState {
+    writer: Option<EventWriter>,
+    first_error: Option<String>,
+}
+
+impl EventLogState {
+    pub(crate) fn new(writer: Option<EventWriter>) -> Self {
+        Self {
+            writer,
+            first_error: None,
+        }
+    }
+
+    pub(crate) fn attempt(
+        &mut self,
+        stage: &'static str,
+        action: impl FnOnce(&mut EventWriter) -> Result<(), String>,
+    ) -> Option<String> {
+        let writer = self.writer.as_mut()?;
+        if let Err(error) = action(writer) {
+            let error = format!("p11scope: inventory event log {stage} failed: {error}");
+            self.first_error = Some(error.clone());
+            self.writer = None;
+            return Some(error);
+        }
+        None
+    }
+
+    pub(crate) fn first_error(&self) -> Option<&str> {
+        self.first_error.as_deref()
+    }
+}
+
+/// None means not requested; false means failed or not sync-confirmed.
+#[derive(Debug)]
+pub(crate) struct FinalOutputOutcome {
+    event_log_confirmed: Option<bool>,
+    report_committed: Option<bool>,
+    stdout_complete: Option<bool>,
+    failures: Vec<String>,
+}
+
+impl FinalOutputOutcome {
+    pub(crate) fn exit_code(&self) -> i32 {
+        i32::from(!self.failures.is_empty())
+    }
+
+    fn notices(&self, previously_reported: Option<&str>, notice: &mut dyn FnMut(&str)) {
+        for error in &self.failures {
+            if Some(error.as_str()) != previously_reported {
+                notice(&crate::render::escape_controls(error));
+            }
+        }
+        if self.failures.is_empty() {
+            return;
+        }
+        let mut statuses = Vec::new();
+        if let Some(confirmed) = self.event_log_confirmed {
+            statuses.push(if confirmed {
+                "event log complete and synced"
+            } else {
+                "event log incomplete or sync unconfirmed"
+            });
+        }
+        if let Some(committed) = self.report_committed {
+            statuses.push(if committed {
+                "-o report saved"
+            } else {
+                "-o report commit failed"
+            });
+        }
+        if let Some(complete) = self.stdout_complete {
+            statuses.push(if complete {
+                "stdout complete"
+            } else {
+                "stdout incomplete (may contain a prefix)"
+            });
+        }
+        notice(&format!(
+            "p11scope: inventory outputs: {}",
+            statuses.join("; ")
+        ));
+    }
+}
+
 /// Resolve the registry gap bound: the `--max-gaps` override when the
 /// operator passed one, else the unchanged 1024 default. Every other
 /// limit stays at its default either way.
@@ -128,7 +215,7 @@ fn run_with_writer(
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
     stop: &dyn Fn() -> bool,
-    report_written: &dyn Fn(),
+    outputs_attempted: &dyn Fn(),
     stdout_tty: bool,
     stdout: &mut dyn std::io::Write,
 ) -> Result<i32> {
@@ -148,7 +235,7 @@ fn run_with_writer(
         capture,
         attach_backend,
         stop,
-        report_written,
+        outputs_attempted,
         stdout_tty,
         stdout,
         &DashboardIo::stdio(),
@@ -175,10 +262,58 @@ fn run_with_terminal(
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
     stop: &dyn Fn() -> bool,
-    report_written: &dyn Fn(),
+    outputs_attempted: &dyn Fn(),
     stdout_tty: bool,
     stdout: &mut dyn std::io::Write,
     terminal: &DashboardIo,
+) -> Result<i32> {
+    run_with_terminal_inner(
+        scope,
+        modules,
+        hooks,
+        json,
+        max_scan_pids,
+        max_gaps,
+        duration,
+        out,
+        dashboard,
+        event_log,
+        event_rotate_bytes,
+        event_max_files,
+        capture,
+        attach_backend,
+        stop,
+        outputs_attempted,
+        stdout_tty,
+        stdout,
+        terminal,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_terminal_inner(
+    scope: InspectScope,
+    modules: &[PathBuf],
+    hooks: &HookRegistry,
+    json: bool,
+    max_scan_pids: Option<usize>,
+    max_gaps: Option<usize>,
+    duration: Option<Duration>,
+    out: Option<&Path>,
+    dashboard: bool,
+    event_log: Option<&Path>,
+    event_rotate_bytes: Option<u64>,
+    event_max_files: Option<usize>,
+    capture: CaptureMode,
+    attach_backend: crate::attach::BackendSelection,
+    stop: &dyn Fn() -> bool,
+    outputs_attempted: &dyn Fn(),
+    stdout_tty: bool,
+    stdout: &mut dyn std::io::Write,
+    terminal: &DashboardIo,
+    #[cfg(test)] event_fault: Option<crate::inventory_events::EventFault>,
 ) -> Result<i32> {
     // DR-K8S-1: the kernel-side PID filter numbers tasks in the initial PID
     // namespace; a mismatched observer's --pid would match nothing, so it
@@ -209,7 +344,7 @@ fn run_with_terminal(
         ),
         None => None,
     };
-    let mut stream = match event_log {
+    let writer = match event_log {
         Some(path) => Some(
             crate::inventory_events::EventWriter::create(
                 path,
@@ -221,6 +356,11 @@ fn run_with_terminal(
         ),
         None => None,
     };
+    let mut stream = EventLogState::new(writer);
+    #[cfg(test)]
+    if let Some(writer) = stream.writer.as_mut() {
+        writer.fault = event_fault;
+    }
     let (inventory_scope, engine_scope, scope_label) = match scope {
         InspectScope::Pid(pid) => (
             InventoryScope::Pid(pid),
@@ -266,7 +406,7 @@ fn run_with_terminal(
                     sink,
                     stream,
                     stop,
-                    report_written,
+                    outputs_attempted,
                     stdout,
                     terminal,
                 );
@@ -291,7 +431,7 @@ fn run_with_terminal(
             }
         );
     }
-    if let Some(writer) = stream.as_mut() {
+    if let Some(writer) = stream.writer.as_mut() {
         let prologue = Presentation::capture(&coordinator, &scope_label, started_ns, started_ns, 0);
         writer
             .append(
@@ -330,11 +470,13 @@ fn run_with_terminal(
                     for line in progress_lines(coordinator, report) {
                         eprintln!("{line}");
                     }
-                    if let Some(writer) = stream.as_mut() {
+                    if let Some(error) = stream.attempt("pass publication", |writer| {
                         let presentation =
                             stream_presentation(coordinator, &scope_label, started_ns, now_ns);
                         emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
-                            .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    }) {
+                        let _ =
+                            crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
                     }
                 }
                 Publish::Retiring {
@@ -347,7 +489,7 @@ fn run_with_terminal(
                     budget.as_secs()
                 ),
                 Publish::Stop { events, now_ns } => {
-                    if let Some(writer) = stream.as_mut() {
+                    if let Some(error) = stream.attempt("stop publication", |writer| {
                         let presentation =
                             stream_presentation(coordinator, &scope_label, started_ns, now_ns);
                         emit_stop_events(
@@ -358,7 +500,9 @@ fn run_with_terminal(
                             &presentation,
                             now_ns,
                         )
-                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    }) {
+                        let _ =
+                            crate::sink::try_stderr_line(&crate::render::escape_controls(&error));
                     }
                 }
             }
@@ -375,12 +519,13 @@ fn run_with_terminal(
     // The report first; only then may an unsettled retirement's drop
     // block (invariant 5), and a second signal then exits at once
     // (R-C51-4).
-    crate::inventory_capture::finish_native(
+    let previously_reported = stream.first_error().map(str::to_string);
+    let outcome = crate::inventory_capture::finish_native(
         stopped,
         |summary| {
             finish_output(
                 sink,
-                stream.as_mut(),
+                &mut stream,
                 &mut stream_state,
                 &presentation,
                 json,
@@ -389,9 +534,15 @@ fn run_with_terminal(
                 summary,
             )
         },
-        report_written,
-        &mut |line| eprintln!("{line}"),
-    )
+        outputs_attempted,
+        &mut |line| {
+            let _ = crate::sink::try_stderr_line(&line);
+        },
+    );
+    outcome.notices(previously_reported.as_deref(), &mut |line| {
+        let _ = crate::sink::try_stderr_line(line);
+    });
+    Ok(outcome.exit_code())
 }
 
 /// The classic loop's pass side over the production coordinator.
@@ -602,45 +753,43 @@ fn stop_line(summary: &LaneSummary) -> String {
 /// JSON document under `--json`, the pager snapshot otherwise —
 /// silent in dashboard mode, whose live view already showed it).
 #[allow(clippy::too_many_arguments)]
-fn finish_output(
+pub(crate) fn finish_output(
     sink: Option<AtomicFile>,
-    stream: Option<&mut EventWriter>,
+    stream: &mut EventLogState,
     stream_state: &mut StreamState,
     presentation: &Presentation,
     json: bool,
     silent_text: bool,
     stdout: &mut dyn std::io::Write,
     native: Option<&LaneSummary>,
-) -> Result<i32> {
+) -> FinalOutputOutcome {
     let mut document = render_json_from_presentation(presentation);
     if let Some(summary) = native {
         note_native_observation(&mut document, summary);
     }
-    if let Some(writer) = stream {
-        // The exact repeat counts and the final edge sweep before `ended`,
-        // on every termination path, in the per-pass order (gaps, then
-        // edges): the last `gap_repeated` per index and the last
-        // `edge_observed` per edge then equal the snapshot. The sweep goes
-        // last so nothing but `ended` follows it (its retention bound).
+    // Render the immutable JSON payload once. Both destinations receive
+    // exactly these bytes; one transport cannot suppress the other's attempt.
+    let mut document_bytes = Vec::new();
+    if sink.is_some() || json {
+        document_bytes = serde_json::to_vec_pretty(&document)
+            .expect("an inventory document contains only serializable JSON values");
+        document_bytes.push(b'\n');
+    }
+    let event_requested = stream.writer.is_some() || stream.first_error().is_some();
+    stream.attempt("completion", |writer| {
+        // Exact repeat counts, then the final edge sweep, then ended:
+        // preserve healthy ordering and the sweep's retention reservation.
         stream_state
             .gaps
-            .emit(writer, &presentation.gaps, true, presentation.ended_ns)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        // The sweep reserves room for `ended` before it counts, so the
-        // `edges_unretained` it reports is final (review R-1).
+            .emit(writer, &presentation.gaps, true, presentation.ended_ns)?;
         let tail = ended_tail(presentation, writer);
-        let swept = stream_state
-            .edges
-            .sweep(
-                writer,
-                &presentation.edges,
-                presentation.budgets.edges_limit,
-                presentation.ended_ns,
-                tail,
-            )
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        // Recounted for the real `ended` line (review R2-1): the sweep's
-        // count was taken for the padded reservation.
+        let swept = stream_state.edges.sweep(
+            writer,
+            &presentation.edges,
+            presentation.budgets.edges_limit,
+            presentation.ended_ns,
+            tail,
+        )?;
         let (_, payload) = stream_state.edges.settle_ended(
             writer,
             &presentation.edges,
@@ -653,32 +802,50 @@ fn finish_output(
                 payload
             },
         );
-        writer
-            .finish(payload, presentation.ended_ns)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
+        // A sync error after append still retires the writer: a visible
+        // ended record is not proof that finish confirmed completion.
+        writer.finish(payload, presentation.ended_ns)
+    });
+    let mut outcome = FinalOutputOutcome {
+        event_log_confirmed: event_requested.then(|| stream.first_error().is_none()),
+        report_committed: None,
+        stdout_complete: None,
+        failures: stream
+            .first_error()
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+    };
     if let Some(mut sink) = sink {
-        // Buffered: serde_json writes a few bytes at a time (a 1.6 MB
-        // inventory was ~557k write syscalls unbuffered). Same bytes;
-        // the buffer is flushed to the temp file before commit.
-        {
-            let mut buffered =
-                std::io::BufWriter::with_capacity(crate::sink::SINK_BUFFER_BYTES, sink.file());
-            serde_json::to_writer_pretty(&mut buffered, &document)?;
-            // Same bytes stdout carries: the pretty document plus its
-            // trailing newline, so the two sinks agree byte for byte.
-            buffered.write_all(b"\n")?;
-            buffered.flush()?;
+        let result = sink
+            .file()
+            .write_all(&document_bytes)
+            .map_err(|error| format!("writing inventory report failed: {error}"))
+            .and_then(|()| sink.commit());
+        outcome.report_committed = Some(result.is_ok());
+        if let Err(error) = result {
+            outcome
+                .failures
+                .push(format!("p11scope: inventory -o report failed: {error}"));
         }
-        sink.commit().map_err(|error| anyhow::anyhow!("{error}"))?;
     }
-    if json {
-        let text = serde_json::to_string_pretty(&document)?;
-        writeln!(stdout, "{text}")?;
-    } else if !silent_text {
-        write!(stdout, "{}", render_snapshot(presentation))?;
+    if json || !silent_text {
+        let text;
+        let bytes = if json {
+            document_bytes.as_slice()
+        } else {
+            text = render_snapshot(presentation);
+            text.as_bytes()
+        };
+        let result = stdout.write_all(bytes).and_then(|()| stdout.flush());
+        outcome.stdout_complete = Some(result.is_ok());
+        if let Err(error) = result {
+            outcome
+                .failures
+                .push(format!("p11scope: inventory stdout failed: {error}"));
+        }
     }
-    Ok(0)
+    outcome
 }
 
 /// Bytes the `ended` line may take: its payload as measured now plus
@@ -738,7 +905,7 @@ fn apply_one_pass(
 /// so an index plus the suppressed counter replays exactly the new
 /// loss on every pass; edges keep one digest each (bounded by the edge
 /// limit) so only changes are streamed (DR-C5-EDGE).
-struct StreamState {
+pub(crate) struct StreamState {
     gaps: GapEmitter,
     edges: EdgeEmitter,
     emitted_suppressed: u64,
@@ -748,7 +915,7 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             gaps: GapEmitter::new(),
             edges: EdgeEmitter::new(),
@@ -871,7 +1038,7 @@ fn emit_commit(
 /// events and fresh gaps its final staging produced, then one
 /// `pass_committed` marked `final` (it commits after the last pass and
 /// scans nothing), so the stream's gap accounting stays exact.
-fn emit_stop_events(
+pub(crate) fn emit_stop_events(
     writer: &mut EventWriter,
     state: &mut StreamState,
     events: &[CallerEvent],
@@ -981,21 +1148,20 @@ fn dashboard_pass_views<S: ProcessSource>(
 /// then is the display view handed back for the screen.
 #[allow(clippy::too_many_arguments)]
 fn dashboard_stream_pass<S: ProcessSource>(
-    stream: Option<&mut EventWriter>,
+    stream: &mut EventLogState,
     state: &mut StreamState,
     report: &PassReport,
     coordinator: &InventoryCoordinator<S>,
     scope_label: &str,
     started_ns: u64,
     now_ns: u64,
-) -> Result<Presentation> {
+) -> (Presentation, Option<String>) {
     let (stream_view, display_view) =
         dashboard_pass_views(coordinator, scope_label, started_ns, now_ns);
-    if let Some(writer) = stream {
+    let error = stream.attempt("pass publication", |writer| {
         emit_pass_events(writer, state, report, &stream_view, now_ns)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
-    Ok(display_view)
+    });
+    (display_view, error)
 }
 
 /// With no `--duration` the dashboard runs until a key or a signal: its
@@ -1039,9 +1205,9 @@ fn run_dashboard(
     lane: Option<NativeLane<FacadeLane>>,
     display: Display,
     sink: Option<AtomicFile>,
-    mut stream: Option<EventWriter>,
+    mut stream: EventLogState,
     stop: &dyn Fn() -> bool,
-    report_written: &dyn Fn(),
+    outputs_attempted: &dyn Fn(),
     stdout: &mut dyn std::io::Write,
     terminal: &DashboardIo,
 ) -> Result<i32> {
@@ -1056,7 +1222,7 @@ fn run_dashboard(
     } = run;
     let quit = display.quit_flag();
     let mut stream_state = StreamState::new();
-    if let Some(writer) = stream.as_mut() {
+    if let Some(writer) = stream.writer.as_mut() {
         let prologue = Presentation::capture(&coordinator, &scope_label, started_ns, started_ns, 0);
         writer
             .append(
@@ -1092,16 +1258,19 @@ fn run_dashboard(
             match point {
                 Publish::Pass { report, now_ns } => {
                     let coordinator = &*driver.coordinator;
-                    let display_view = dashboard_stream_pass(
-                        stream.as_mut(),
+                    let (display_view, event_error) = dashboard_stream_pass(
+                        &mut stream,
                         &mut stream_state,
                         report,
                         coordinator,
                         &scope_label,
                         started_ns,
                         now_ns,
-                    )?;
+                    );
                     if let Some(display) = driver.display.as_mut() {
+                        if let Some(error) = event_error {
+                            display.notice(&crate::render::escape_controls(&error));
+                        }
                         // The pass line is progress; its events and gaps
                         // must outlive the screen.
                         for (index, line) in progress_lines(coordinator, report).iter().enumerate()
@@ -1132,8 +1301,8 @@ fn run_dashboard(
                     }
                 }
                 Publish::Stop { events, now_ns } => {
-                    if let Some(writer) = stream.as_mut() {
-                        let coordinator = &*driver.coordinator;
+                    let coordinator = &*driver.coordinator;
+                    if let Some(error) = stream.attempt("stop publication", |writer| {
                         let presentation =
                             stream_presentation(coordinator, &scope_label, started_ns, now_ns);
                         emit_stop_events(
@@ -1144,7 +1313,9 @@ fn run_dashboard(
                             &presentation,
                             now_ns,
                         )
-                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    }) && let Some(display) = driver.display.as_mut()
+                    {
+                        display.notice(&crate::render::escape_controls(&error));
                     }
                 }
             }
@@ -1161,19 +1332,17 @@ fn run_dashboard(
         display.notice(&stop_line(&stopped.summary));
     }
     let passes = coordinator.passes();
-    for line in dashboard_account_lines(passes, &display.account()) {
-        display.notice(&line);
-    }
     let ended_ns = now_ns();
     let presentation =
         Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
     // The report first (R-C51-4), silent text: the live view showed it.
-    let code = crate::inventory_capture::finish_native(
+    let previously_reported = stream.first_error().map(str::to_string);
+    let outcome = crate::inventory_capture::finish_native(
         stopped,
         |summary| {
             finish_output(
                 sink,
-                stream.as_mut(),
+                &mut stream,
                 &mut stream_state,
                 &presentation,
                 json,
@@ -1182,19 +1351,39 @@ fn run_dashboard(
                 summary,
             )
         },
-        report_written,
+        outputs_attempted,
         &mut |line| display.notice(&line),
-    )?;
+    );
     // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
-    // the alternate screen: with the report written, it can wait longer.
+    // the alternate screen: after output attempts, it can wait longer.
     display.retry_restore(RESTORE_RETRY_BUDGET);
+    outcome.notices(previously_reported.as_deref(), &mut |line| {
+        display.notice(line)
+    });
+    if outcome.exit_code() != 0
+        && let Some(error) = &failure
+    {
+        display.notice(&format!(
+            "p11scope: writing the dashboard terminal failed: {}",
+            crate::render::escape_controls(&error.to_string())
+        ));
+    }
+    // Closing accounting describes the final restore and output notices,
+    // including a retry that succeeds after the initial restore was shed.
+    for line in dashboard_account_lines(passes, &display.account()) {
+        display.notice(&line);
+    }
     if let Some(slot) = &terminal.account {
         slot.set(Some(display.account()));
     }
-    if let Some(error) = failure {
+    // Sink errors use the bounded notices above, including a simultaneous
+    // display error. Preserve the existing display-only error policy.
+    if outcome.exit_code() == 0
+        && let Some(error) = failure
+    {
         return Err(anyhow::anyhow!(error)).context("writing the dashboard terminal");
     }
-    Ok(code)
+    Ok(outcome.exit_code())
 }
 
 /// The stderr account a dashboard run ends with: its passes, the frame
@@ -1831,6 +2020,450 @@ mod tests {
         .unwrap()
     }
 
+    fn event_fault(kind: &'static str, after_ended: bool) -> crate::inventory_events::EventFault {
+        crate::inventory_events::EventFault {
+            kind,
+            final_pass_only: false,
+            after_ended,
+            attempts: Default::default(),
+        }
+    }
+
+    fn event_records(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn pass_event_failure_reaches_ordinary_finalization_with_and_without_report() {
+        for with_report in [true, false] {
+            let dir = private_tempdir();
+            let events = dir.path().join("events.jsonl");
+            let report = dir.path().join("report.json");
+            let fault = event_fault("pass_committed", false);
+            let attempts = fault.attempts.clone();
+            let finalized = std::cell::Cell::new(false);
+            let mut stdout = Vec::new();
+            let result = run_with_terminal_inner(
+                InspectScope::Pid(std::process::id()),
+                &[],
+                &HookRegistry::builtin(),
+                true,
+                None,
+                None,
+                Some(Duration::from_millis(1100)),
+                with_report.then_some(report.as_path()),
+                false,
+                Some(&events),
+                None,
+                None,
+                CaptureMode::Scan,
+                crate::attach::BackendSelection::Auto,
+                &|| false,
+                &|| finalized.set(true),
+                false,
+                &mut stdout,
+                &DashboardIo::stdio(),
+                Some(fault),
+            );
+            assert!(
+                finalized.get(),
+                "a returned event error skipped the finalizer: {result:?}"
+            );
+            assert_eq!(result.unwrap(), 1);
+            let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(document["observation"]["passes"], 2);
+            if with_report {
+                assert_eq!(std::fs::read(&report).unwrap(), stdout);
+            }
+            assert_eq!(
+                attempts
+                    .borrow()
+                    .iter()
+                    .filter(|kind| *kind == "pass_committed")
+                    .count(),
+                1
+            );
+            assert!(!attempts.borrow().iter().any(|kind| kind == "ended"));
+            assert_eq!(event_records(&events).first().unwrap()["kind"], "started");
+        }
+    }
+
+    #[test]
+    fn healthy_scan_outputs_agree_and_event_order_is_complete() {
+        let dir = private_tempdir();
+        let events = dir.path().join("events.jsonl");
+        let report = dir.path().join("report.json");
+        let mut stdout = Vec::new();
+        let result = run_with_terminal_inner(
+            InspectScope::Pid(std::process::id()),
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            Some(&report),
+            false,
+            Some(&events),
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            &|| false,
+            &|| {},
+            false,
+            &mut stdout,
+            &DashboardIo::stdio(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, 0);
+        assert_eq!(std::fs::read(&report).unwrap(), stdout);
+        let records = event_records(&events);
+        assert_eq!(records.first().unwrap()["kind"], "started");
+        assert_eq!(records.last().unwrap()["kind"], "ended");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["kind"] == "pass_committed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["kind"] == "ended")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn initial_event_failure_remains_fail_fast() {
+        let dir = private_tempdir();
+        let events = dir.path().join("events.jsonl");
+        let report = dir.path().join("report.json");
+        std::fs::write(&report, "old report").unwrap();
+        let finalized = std::cell::Cell::new(false);
+        let fault = event_fault("started", false);
+        let attempts = fault.attempts.clone();
+        let mut stdout = Vec::new();
+        let result = run_with_terminal_inner(
+            InspectScope::Pid(std::process::id()),
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            Some(&report),
+            false,
+            Some(&events),
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            &|| false,
+            &|| finalized.set(true),
+            false,
+            &mut stdout,
+            &DashboardIo::stdio(),
+            Some(fault),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("started append failure")
+        );
+        assert!(!finalized.get());
+        assert!(stdout.is_empty());
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "old report");
+        assert_eq!(attempts.borrow().as_slice(), ["started"]);
+    }
+
+    #[test]
+    fn final_event_append_or_sync_failure_preserves_report_and_stdout() {
+        for after_ended in [false, true] {
+            let mut coordinator = coordinator();
+            coordinator.commit_batch(false).unwrap();
+            let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+            let dir = private_tempdir();
+            let events = dir.path().join("events.jsonl");
+            let report = dir.path().join("report.json");
+            let mut writer = EventWriter::create(&events, 1 << 20, 2).unwrap();
+            let fault = event_fault("ended", after_ended);
+            let attempts = fault.attempts.clone();
+            writer.fault = Some(fault);
+            let mut stdout = Vec::new();
+            let result = finish_output(
+                Some(AtomicFile::create(&report).unwrap()),
+                &mut EventLogState::new(Some(writer)),
+                &mut StreamState::new(),
+                &presentation,
+                true,
+                false,
+                &mut stdout,
+                None,
+            );
+            assert_eq!(result.exit_code(), 1);
+            assert_eq!(result.event_log_confirmed, Some(false));
+            assert_eq!(result.report_committed, Some(true));
+            assert_eq!(result.stdout_complete, Some(true));
+            assert_eq!(result.failures.len(), 1);
+            assert!(result.failures[0].contains("event log completion"));
+            assert!(
+                report.exists(),
+                "closing event failure discarded -o: {result:?}"
+            );
+            assert_eq!(std::fs::read(report).unwrap(), stdout);
+            assert_eq!(
+                attempts
+                    .borrow()
+                    .iter()
+                    .filter(|kind| *kind == "ended")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                event_records(&events)
+                    .iter()
+                    .filter(|record| record["kind"] == "ended")
+                    .count(),
+                usize::from(after_ended)
+            );
+        }
+    }
+
+    struct BrokenStdout {
+        writes: usize,
+    }
+    impl std::io::Write for BrokenStdout {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected stdout failure",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn report_commit_failure_preserves_destination_and_completes_other_sinks() {
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let dir = private_tempdir();
+        let report = dir.path().join("report.json");
+        let old = dir.path().join("old.json");
+        std::fs::write(&old, "old report").unwrap();
+        let sink = AtomicFile::create(&report).unwrap();
+        std::os::unix::fs::symlink(&old, &report).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let writer = EventWriter::create(&events, 1 << 20, 2).unwrap();
+        let mut stdout = Vec::new();
+        let result = finish_output(
+            Some(sink),
+            &mut EventLogState::new(Some(writer)),
+            &mut StreamState::new(),
+            &presentation,
+            true,
+            false,
+            &mut stdout,
+            None,
+        );
+        assert_eq!(result.exit_code(), 1);
+        assert_eq!(result.event_log_confirmed, Some(true));
+        assert_eq!(result.report_committed, Some(false));
+        assert_eq!(result.stdout_complete, Some(true));
+        let mut notices = Vec::new();
+        result.notices(None, &mut |line| notices.push(line.to_string()));
+        assert!(notices.iter().any(|line| line.contains("-o report failed")));
+        assert!(!notices.iter().any(|line| line.contains("report saved")));
+        assert!(
+            !stdout.is_empty(),
+            "report failure suppressed stdout: {result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "old report");
+        assert!(
+            std::fs::symlink_metadata(&report)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(event_records(&events).last().unwrap()["kind"], "ended");
+        assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".p11scope.")
+        }));
+    }
+
+    #[test]
+    fn event_and_stdout_failures_still_commit_the_report() {
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let dir = private_tempdir();
+        let report = dir.path().join("report.json");
+        let events = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&events, 1 << 20, 2).unwrap();
+        writer.fault = Some(event_fault("ended", false));
+        let mut stdout = BrokenStdout { writes: 0 };
+        let result = finish_output(
+            Some(AtomicFile::create(&report).unwrap()),
+            &mut EventLogState::new(Some(writer)),
+            &mut StreamState::new(),
+            &presentation,
+            true,
+            false,
+            &mut stdout,
+            None,
+        );
+        assert_eq!(result.exit_code(), 1);
+        assert_eq!(result.event_log_confirmed, Some(false));
+        assert_eq!(result.report_committed, Some(true));
+        assert_eq!(result.stdout_complete, Some(false));
+        assert_eq!(result.failures.len(), 2);
+        assert!(result.failures[0].contains("event log completion"));
+        assert!(result.failures[1].contains("stdout failed"));
+        let mut notices = Vec::new();
+        result.notices(None, &mut |line| notices.push(line.to_string()));
+        assert!(notices.iter().any(|line| line.contains("report saved")));
+        assert!(
+            report.exists(),
+            "two sink errors suppressed the report: {result:?}"
+        );
+        assert!(stdout.writes > 0);
+    }
+
+    #[test]
+    fn returned_stdout_failure_exits_nonzero_with_healthy_event_and_report() {
+        let dir = private_tempdir();
+        let events = dir.path().join("events.jsonl");
+        let report = dir.path().join("report.json");
+        let finalized = std::cell::Cell::new(false);
+        let mut stdout = BrokenStdout { writes: 0 };
+        let result = run_with_terminal(
+            InspectScope::Pid(std::process::id()),
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            Some(&report),
+            false,
+            Some(&events),
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            &|| false,
+            &|| finalized.set(true),
+            false,
+            &mut stdout,
+            &DashboardIo::stdio(),
+        );
+        assert_eq!(result.unwrap(), 1);
+        assert!(finalized.get());
+        assert!(stdout.writes > 0);
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        assert_eq!(document["schema"], DOC_ID);
+        assert_eq!(event_records(&events).last().unwrap()["kind"], "ended");
+    }
+
+    #[test]
+    fn dashboard_retries_restore_after_output_failure() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: valid output pointers; defaults create an owned PTY pair.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned two distinct owned descriptors.
+        let _master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        // SAFETY: the PTY is owned by this test; only its flow is stopped.
+        assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
+        struct ResumeThenFail(i32);
+        impl std::io::Write for ResumeThenFail {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                // SAFETY: this is the owned PTY, kept live through the run.
+                assert_eq!(unsafe { libc::tcflow(self.0, libc::TCOON) }, 0);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected stdout failure",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let account = std::rc::Rc::new(std::cell::Cell::new(None));
+        let dir = private_tempdir();
+        let notices = std::fs::File::create(dir.path().join("notices")).unwrap();
+        let terminal = DashboardIo {
+            output: slave.as_raw_fd(),
+            input: None,
+            account: Some(account.clone()),
+            stderr_fd: notices.as_raw_fd(),
+            stderr: StderrRoute::Leave,
+        };
+        let result = run_with_terminal(
+            InspectScope::Pid(std::process::id()),
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            &|| true,
+            &|| {},
+            true,
+            &mut ResumeThenFail(slave.as_raw_fd()),
+            &terminal,
+        );
+        let account = account
+            .take()
+            .expect("output failure skipped dashboard cleanup accounting");
+        assert_eq!(result.unwrap(), 1);
+        assert!(account.terminal.restore_retried);
+        assert!(account.terminal.restored);
+        let notices = std::fs::read_to_string(dir.path().join("notices")).unwrap();
+        assert!(
+            notices.contains("; screen restored; service ticks"),
+            "final accounting preceded output/restore: {notices}"
+        );
+    }
+
     /// B2: the observation deadline never panics. A window that
     /// overflows the clock degrades to no deadline (the classic wait's
     /// `checked_add` shape in `run.rs`); a plain `Instant::now() +
@@ -2130,17 +2763,20 @@ mod tests {
             let mut summary = lane_summary(Retirement::Closed(Default::default()));
             summary.backend = backend.clone();
             let mut stdout = Vec::new();
-            finish_output(
-                None,
-                None,
-                &mut StreamState::new(),
-                &presentation,
-                true,
-                false,
-                &mut stdout,
-                Some(&summary),
-            )
-            .unwrap();
+            assert_eq!(
+                finish_output(
+                    None,
+                    &mut EventLogState::new(None),
+                    &mut StreamState::new(),
+                    &presentation,
+                    true,
+                    false,
+                    &mut stdout,
+                    Some(&summary),
+                )
+                .exit_code(),
+                0
+            );
             let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
             let attach = &document["observation"]["attach"];
             assert_eq!(attach["selection"], "auto");
@@ -2180,17 +2816,20 @@ mod tests {
             let out = dir.path().join("doc.json");
             let sink = AtomicFile::create(&out).unwrap();
             let mut stdout = Vec::new();
-            finish_output(
-                Some(sink),
-                None,
-                &mut StreamState::new(),
-                &presentation,
-                true,
-                false,
-                &mut stdout,
-                Some(&summary),
-            )
-            .unwrap();
+            assert_eq!(
+                finish_output(
+                    Some(sink),
+                    &mut EventLogState::new(None),
+                    &mut StreamState::new(),
+                    &presentation,
+                    true,
+                    false,
+                    &mut stdout,
+                    Some(&summary),
+                )
+                .exit_code(),
+                0
+            );
             let file = std::fs::read(&out).unwrap();
             assert_eq!(file, stdout, "-o and stdout agree");
             let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
@@ -2210,17 +2849,20 @@ mod tests {
             );
         }
         let mut stdout = Vec::new();
-        finish_output(
-            None,
-            None,
-            &mut StreamState::new(),
-            &presentation,
-            true,
-            false,
-            &mut stdout,
-            None,
-        )
-        .unwrap();
+        assert_eq!(
+            finish_output(
+                None,
+                &mut EventLogState::new(None),
+                &mut StreamState::new(),
+                &presentation,
+                true,
+                false,
+                &mut stdout,
+                None,
+            )
+            .exit_code(),
+            0
+        );
         let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         for key in ["lane", "settlement", "retirement", "lifecycle"] {
             assert!(document["observation"].get(key).is_none(), "{key}");
@@ -2479,18 +3121,20 @@ mod tests {
         let last = Presentation::capture(&coordinator, "pid", 0, 3, 3);
         // Through the real terminal path: flush, then `ended`.
         let mut sink = Vec::new();
-        finish_output(
-            None,
-            Some(&mut writer),
-            &mut state,
-            &last,
-            false,
-            true,
-            &mut sink,
-            None,
-        )
-        .unwrap();
-        drop(writer);
+        assert_eq!(
+            finish_output(
+                None,
+                &mut EventLogState::new(Some(writer)),
+                &mut state,
+                &last,
+                false,
+                true,
+                &mut sink,
+                None,
+            )
+            .exit_code(),
+            0
+        );
         let document = render_json(&coordinator, "pid", 0, 3, 3);
         let snapshot = document["gaps"].as_array().unwrap();
         let mut replayed: Vec<serde_json::Value> = Vec::new();
@@ -2696,18 +3340,20 @@ mod tests {
             let mut state = StreamState::new();
             emit_pass_events(&mut writer, &mut state, &report, view, now).unwrap();
             let mut sink = Vec::new();
-            finish_output(
-                None,
-                Some(&mut writer),
-                &mut state,
-                view,
-                false,
-                true,
-                &mut sink,
-                None,
-            )
-            .unwrap();
-            drop(writer);
+            assert_eq!(
+                finish_output(
+                    None,
+                    &mut EventLogState::new(Some(writer)),
+                    &mut state,
+                    view,
+                    false,
+                    true,
+                    &mut sink,
+                    None,
+                )
+                .exit_code(),
+                0
+            );
             std::fs::read(&path).unwrap()
         };
         assert_eq!(

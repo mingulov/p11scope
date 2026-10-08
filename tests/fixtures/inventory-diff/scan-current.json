@@ -1,0 +1,186 @@
+{
+  "schema": "p11scope/inventory/v1",
+  "scope": "pid:4242",
+  "clock": {
+    "basis": "CLOCK_MONOTONIC",
+    "unit": "ns"
+  },
+  "observation": {
+    "started_ns": 100,
+    "ended_ns": 200,
+    "passes": 1,
+    "usage_feed": false,
+    "native_witnesses": {
+      "rows": 0,
+      "bound": 0,
+      "unbound": 0,
+      "pending": 0,
+      "integrity": 0,
+      "unbound_reasons": {},
+      "placement": {
+        "edge": 0,
+        "module": 0,
+        "ambiguous": 0,
+        "unresolved": 0
+      }
+    }
+  },
+  "budgets": {
+    "callers": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "modules": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "edges": {
+      "limit": 32768,
+      "occupied": 1,
+      "refused": 0
+    },
+    "endpoints": {
+      "limit": 1048576,
+      "occupied": 4,
+      "refused": 0
+    },
+    "inventory_endpoints": {
+      "limit": 4096,
+      "occupied": 4,
+      "refused": 0
+    },
+    "inventory_attach_modules": {
+      "limit": 4096,
+      "occupied": 1,
+      "refused": 0
+    },
+    "counters": {
+      "cap": 18446744073709551615,
+      "observed_edges": 0,
+      "saturated_edges": 0
+    },
+    "semantic_state": {
+      "limit": 32768,
+      "occupied": 0,
+      "status": "withheld",
+      "unknown_edges": 1,
+      "refused": 0
+    },
+    "retained_history": {
+      "limit": 1024,
+      "retained": 1,
+      "suppressed": 0
+    },
+    "native_preadmission": null
+  },
+  "callers": [
+    {
+      "id": "c0",
+      "pid": 4242,
+      "start_time": 1000,
+      "start_time_unit": "clock_ticks_since_boot",
+      "incarnation": 0,
+      "image": {
+        "authority": "scan_pinned",
+        "task_cookie": null,
+        "exec_id": null,
+        "exe": {
+          "dev": 1,
+          "ino": 100,
+          "mtime_secs": 10,
+          "mtime_nanos": 0,
+          "path": "/bin/driver"
+        },
+        "exec_observed": true
+      },
+      "lifecycle": "mapped",
+      "lifecycle_reason": null,
+      "first_seen_ns": 110,
+      "last_seen_ns": 190,
+      "retired": false
+    }
+  ],
+  "modules": [
+    {
+      "id": "m0",
+      "paths": [
+        "/scale/m0.so"
+      ],
+      "identity": {
+        "device": {
+          "major": 8,
+          "minor": 1
+        },
+        "inode": 100000,
+        "sha256": "d392738570eaab6fcc9aa561001275faf4c774e2bba7f47745b15a388f17f0a2",
+        "build_id": null,
+        "source": "workload"
+      },
+      "admission": {
+        "state": "admitted",
+        "class": "exact",
+        "endpoints": 4,
+        "reasons": [],
+        "note": "scan-only admission: manifest corroboration was not consulted",
+        "history": []
+      },
+      "lifecycle": "mapped",
+      "unloaded_observed": false,
+      "unbound_use": null
+    }
+  ],
+  "edges": [
+    {
+      "caller": "c0",
+      "module": "m0",
+      "mapping": {
+        "state": "mapped",
+        "evidence": "deep_scan",
+        "reason": null,
+        "first_seen_ns": 110,
+        "last_seen_ns": 190,
+        "interruptions": 0
+      },
+      "entries": {
+        "count": 0,
+        "saturated": false,
+        "cap": 18446744073709551615,
+        "first_seen_ns": null,
+        "last_seen_ns": null,
+        "in_flight": false,
+        "observation": "unknown (usage observation unavailable)",
+        "coverage": {
+          "state": "unknown",
+          "since_ns": null,
+          "until_ns": null,
+          "first_ns": null,
+          "lossy": null,
+          "reason": "scan_only",
+          "detail": null
+        }
+      },
+      "semantics": "unknown (semantic capture withheld)",
+      "mechanisms": null,
+      "operations": null
+    }
+  ],
+  "gaps": [
+    {
+      "caller": "c0",
+      "module": "m0",
+      "pid": 4242,
+      "subject": "fixture coverage unknown",
+      "reason": "scan fixture has no usage producer",
+      "budget": null,
+      "repeats": 1
+    }
+  ],
+  "gaps_suppressed": 0,
+  "pid_namespace": {
+    "observer": "initial",
+    "kernel_pids": "initial",
+    "proc_pids": "observer"
+  }
+}

@@ -3191,6 +3191,13 @@ mod tests {
                             }
                         }
                         let Some(close) = close else { break };
+                        // A call-in-deref target (`*f() = addr`) ends at
+                        // the close: only a control-flow prefix has a
+                        // target after it, so cut only when non-whitespace
+                        // follows (breaker micro-fix B1).
+                        if lhs[close + 1..].trim_start().is_empty() {
+                            break;
+                        }
                         cut = close + 1;
                     }
                     let core = lhs[cut..].trim();
@@ -3518,6 +3525,16 @@ mod tests {
             assert!(
                 audit_c_chunk(stmt, "chunk").is_err(),
                 "control-flow-prefixed deref store must fail: {stmt:?}"
+            );
+        }
+        // Call-in-deref targets (breaker micro-fix B1): in `*f() =
+        // addr` the trailing `(` is a call suffix, not a
+        // control-flow prefix, so the through-deref store must fail
+        // loudly. Both spellings are clang-18-valid C.
+        for stmt in ["    *getp() = addr;\n", "    *target() = addr;\n"] {
+            assert!(
+                audit_c_chunk(stmt, "chunk").is_err(),
+                "call-in-deref store must fail the audit: {stmt:?}"
             );
         }
         // No-regression control: a compound operator outside parens

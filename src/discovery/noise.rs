@@ -247,10 +247,11 @@ impl DiscoveryNoiseAggregator {
             .collect()
     }
 
-    /// Emit the summaries to stderr, one line per class.
+    /// Best-effort stderr summaries through the backpressure-aware sink, one
+    /// line per class. Diagnostic delivery must not change recorded losses.
     pub fn report(&self) {
         for line in self.lines() {
-            eprintln!("{line}");
+            let _ = crate::sink::try_stderr_line(&line);
         }
     }
 
@@ -267,6 +268,135 @@ mod tests {
     const ESRCH_REASON: &str = "open failed: No such process (os error 3)";
     const MAPS_REASON: &str = "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot";
     const ENOENT_REASON: &str = "open failed: No such file or directory (os error 2)";
+
+    #[test]
+    fn aggregate_report_does_not_wait_on_stopped_stderr() {
+        use std::fs::{File, OpenOptions};
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "P11SCOPE_DISCOVERY_NOISE_REPORT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut noise = DiscoveryNoiseAggregator::default();
+            noise.note_skip("process view", ENOENT_REASON);
+            noise.note_skip("process view", ESRCH_REASON);
+            noise.report();
+            assert_eq!(
+                noise.total(),
+                2,
+                "diagnostic delivery must not change losses"
+            );
+            println!("discovery noise report returned");
+            std::process::exit(0);
+        }
+
+        struct OwnedPty {
+            _master: File,
+            slave: File,
+        }
+        impl Drop for OwnedPty {
+            fn drop(&mut self) {
+                // SAFETY: resume only our still-owned PTY, after the child reaps.
+                let _ = unsafe { libc::tcflow(self.slave.as_raw_fd(), libc::TCOON) };
+            }
+        }
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty initializes two fresh descriptors with default termios.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: each successfully opened descriptor is owned exactly once.
+        let pty = OwnedPty {
+            _master: unsafe { File::from_raw_fd(master) },
+            slave: unsafe { File::from_raw_fd(slave) },
+        };
+        for fd in [master, slave] {
+            // SAFETY: keep our fixture descriptors out of the exec'd child.
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        // SAFETY: query and stop only this owned PTY.
+        let original_flags = unsafe { libc::fcntl(slave, libc::F_GETFL) };
+        assert!(original_flags >= 0 && original_flags & libc::O_NONBLOCK == 0);
+        assert_eq!(unsafe { libc::tcflow(slave, libc::TCOOFF) }, 0);
+        let mut probe = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(format!("/proc/self/fd/{slave}"))
+            .unwrap();
+        assert_eq!(
+            probe.write(b"backpressure probe").unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the owned stderr must have real backpressure"
+        );
+        drop(probe);
+
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut child = OwnedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "discovery::noise::tests::aggregate_report_does_not_wait_on_stopped_stderr",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::from(pty.slave.try_clone().unwrap()))
+                .spawn()
+                .unwrap(),
+        );
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "discovery summary blocked on stopped stderr; owned child killed/reaped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            status.success(),
+            "discovery reporter child failed: {status}"
+        );
+        let mut output = String::new();
+        child
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert!(
+            output.contains("discovery noise report returned"),
+            "reporter did not run: {output}"
+        );
+        // SAFETY: our inherited description remains open, stopped and unmodified.
+        assert_eq!(unsafe { libc::fcntl(slave, libc::F_GETFL) }, original_flags);
+    }
 
     #[test]
     fn aggregates_live_reference_classes_with_exact_counts() {

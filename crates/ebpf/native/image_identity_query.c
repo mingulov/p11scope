@@ -279,7 +279,10 @@ int p11_image_query(struct image_iter_task *ctx)
     row.sequence = 0;
     row.slot = 0;
     row.status = IMG_ROW_END;
-    if (!ctx->task) {
+    /* Keep this checked callback value across helpers: a context reload is
+     * nullable again to the verifier. Fields below are still read afresh. */
+    struct task_struct___p11image *task = ctx->task;
+    if (!task) {
         if (ctl->emitted != ctl->count || !image_allowed()) {
             IMG_STORE(ctl->failed, 1);
             return 1;
@@ -291,7 +294,7 @@ int p11_image_query(struct image_iter_task *ctx)
             IMG_STORE(ctl->failed, 1);
         return 0;
     }
-    u64 *cell = image_storage_get(&TASK_COOKIE, ctx->task, 0, 0);
+    u64 *cell = image_storage_get(&TASK_COOKIE, task, 0, 0);
     if (!cell)
         return 0;
     u64 cookie = IMG_READ(*cell);
@@ -305,15 +308,15 @@ int p11_image_query(struct image_iter_task *ctx)
     row.slot = (u32)request->slot;
     row.status = IMG_ROW_UNKNOWN;
     /* Selected-task reads follow immutable request/cookie matching. */
-    struct task_struct___p11image *leader = ctx->task->group_leader;
-    u64 exec_id = IMG_READ(ctx->task->self_exec_id);
+    struct task_struct___p11image *leader = task->group_leader;
+    u64 exec_id = IMG_READ(task->self_exec_id);
     struct image_continuity *record = image_lookup(&IMAGE_CONTINUITY, &cookie);
-    if (leader == ctx->task && !(ctx->task->flags & 0x00200000U) && record &&
+    if (leader == task && !(task->flags & 0x00200000U) && record &&
         image_snapshot(record, exec_id, &row.sequence)) {
         IMG_BARRIER();
-        u64 *fresh = image_storage_get(&TASK_COOKIE, ctx->task, 0, 0);
+        u64 *fresh = image_storage_get(&TASK_COOKIE, task, 0, 0);
         if (fresh && IMG_READ(*fresh) == cookie &&
-            ctx->task->group_leader == leader && IMG_READ(ctx->task->self_exec_id) == exec_id &&
+            task->group_leader == leader && IMG_READ(task->self_exec_id) == exec_id &&
             IMG_READ(record->seq) == row.sequence && image_allowed()) {
             row.exec_id = exec_id;
             row.status = IMG_ROW_READY;

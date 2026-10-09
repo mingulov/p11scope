@@ -903,7 +903,18 @@ Limits that matter in pods:
   verdicts come only from the run's attach set; an object it did not
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in
-  `gaps_suppressed`, never silently. A target no scan inventoried is a
+  `gaps_suppressed`, never silently. Inventory-only `--max-endpoints <n>`
+  selects the capture-lifetime physical endpoint budget (1..=8192; 4096
+  when absent), before output files or native maps are opened. The same
+  limit applies to scan, native and auto fallback, including the dashboard.
+  IDs are append-only: unloading a provider does not refund capacity, and
+  whole-module growth that does not fit is refused while retained endpoints
+  and historical observations remain. The JSON row `budgets.inventory_endpoints`
+  reports this physical limit; `budgets.endpoints` is the separate summed
+  per-module census limit. Pair and discovery-work limits stay independent.
+  The 8192 upper bound is a candidate policy limit, not a measured native
+  release envelope; see [known limitations](known-limitations.md).
+  A target no scan inventoried is a
   hard error (one stderr line, exit 1), never an empty-success report.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
   target that confines syscalls instead of refusing to attach. The default

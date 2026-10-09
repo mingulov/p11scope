@@ -9385,7 +9385,7 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "report_trace_loss(",
         ),
     ] {
-        let tick = between(source, "let tick = {", "let mut finish_context =");
+        let tick = between(source, "let tick = ", "let mut finish_context =");
         for marker in [
             "capture_tick_with(",
             "drain_discovery_tick(",

@@ -100,7 +100,7 @@ fn replay(lines: &[serde_json::Value]) -> BTreeMap<(String, String), serde_json:
 
 fn without_states(event: &serde_json::Value) -> serde_json::Value {
     let mut edge = event.clone();
-    for state in ["presence", "capture", "activity"] {
+    for state in ["presence", "capture", "activity", "identity_context"] {
         edge.as_object_mut().unwrap().remove(state);
     }
     edge
@@ -273,7 +273,14 @@ fn the_final_sweep_makes_the_replayed_edges_equal_the_snapshot() {
     assert_eq!(
         state
             .edges
-            .sweep(&mut writer, &last.edges, last.budgets.edges_limit, 1, 0)
+            .sweep(
+                &mut writer,
+                &last.edges,
+                &IdentityIndex::new(&last),
+                last.budgets.edges_limit,
+                1,
+                0
+            )
             .unwrap()
             .emitted,
         0
@@ -305,17 +312,26 @@ fn edge_records(path: &std::path::Path) -> Vec<String> {
 /// deferred and written on the next pass.
 #[test]
 fn a_pass_writes_at_most_4096_edge_records_and_defers_the_rest() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     assert_eq!(EDGE_EVENTS_PER_PASS, 4096);
     let edges = synthetic_edges(5000);
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 30, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
-    let first = emitter.emit(&mut writer, &edges, 32_768, 1).unwrap();
+    let first = emitter
+        .emit(&mut writer, &edges, &identities, 32_768, 1)
+        .unwrap();
     assert_eq!((first.emitted, first.deferred), (4096, 904));
-    let second = emitter.emit(&mut writer, &edges, 32_768, 2).unwrap();
+    let second = emitter
+        .emit(&mut writer, &edges, &identities, 32_768, 2)
+        .unwrap();
     assert_eq!((second.emitted, second.deferred), (904, 0));
-    let third = emitter.emit(&mut writer, &edges, 32_768, 3).unwrap();
+    let third = emitter
+        .emit(&mut writer, &edges, &identities, 32_768, 3)
+        .unwrap();
     assert_eq!((third.emitted, third.deferred), (0, 0));
     drop(writer);
     let records = edge_records(&path);
@@ -329,29 +345,40 @@ fn a_pass_writes_at_most_4096_edge_records_and_defers_the_rest() {
 /// emission time, and the sweep drains whatever is still waiting.
 #[test]
 fn deferred_edges_carry_to_the_next_pass_in_arrival_order() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     let mut edges = synthetic_edges(5);
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::with_cap(2);
-    let pass = emitter.emit(&mut writer, &edges, 64, 1).unwrap();
+    let pass = emitter
+        .emit(&mut writer, &edges, &identities, 64, 1)
+        .unwrap();
     assert_eq!((pass.emitted, pass.deferred), (2, 3));
     // c0 changes class while c2..c4 wait; c3 changes too.
     edges[0].entry_count = 1;
     edges[3].entry_count = 1;
-    let pass = emitter.emit(&mut writer, &edges, 64, 2).unwrap();
+    let pass = emitter
+        .emit(&mut writer, &edges, &identities, 64, 2)
+        .unwrap();
     assert_eq!((pass.emitted, pass.deferred), (2, 2));
-    let pass = emitter.emit(&mut writer, &edges, 64, 3).unwrap();
+    let pass = emitter
+        .emit(&mut writer, &edges, &identities, 64, 3)
+        .unwrap();
     assert_eq!((pass.emitted, pass.deferred), (2, 0));
     // One more deferral, then the sweep drains it.
     edges[1].entry_count = 1;
     edges[2].entry_count = 1;
     edges[4].entry_count = 1;
-    let pass = emitter.emit(&mut writer, &edges, 64, 4).unwrap();
+    let pass = emitter
+        .emit(&mut writer, &edges, &identities, 64, 4)
+        .unwrap();
     assert_eq!((pass.emitted, pass.deferred), (2, 1));
     assert_eq!(
         emitter
-            .sweep(&mut writer, &edges, 64, 5, 0)
+            .sweep(&mut writer, &edges, &identities, 64, 5, 0)
             .unwrap()
             .emitted,
         1
@@ -376,17 +403,25 @@ fn deferred_edges_carry_to_the_next_pass_in_arrival_order() {
 /// bound is treated as always changed (over-emits, never under-emits).
 #[test]
 fn edge_digests_are_bounded_by_the_edge_limit() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     let edges = synthetic_edges(3);
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
     for pass in 1..=3 {
-        emitter.emit(&mut writer, &edges, 2, pass).unwrap();
+        emitter
+            .emit(&mut writer, &edges, &identities, 2, pass)
+            .unwrap();
         assert_eq!(emitter.tracked(), 2, "bounded by the limit");
     }
     assert_eq!(
-        emitter.sweep(&mut writer, &edges, 2, 4, 0).unwrap().emitted,
+        emitter
+            .sweep(&mut writer, &edges, &identities, 2, 4, 0)
+            .unwrap()
+            .emitted,
         1
     );
     assert_eq!(emitter.tracked(), 2);
@@ -408,22 +443,31 @@ fn edge_digests_are_bounded_by_the_edge_limit() {
 /// stream carries: its turn writes nothing and costs no record.
 #[test]
 fn a_deferred_change_that_reverts_is_not_written() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     let mut edges = synthetic_edges(2);
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::with_cap(1);
-    let pass = emitter.emit(&mut writer, &edges, 64, 1).unwrap();
+    let pass = emitter
+        .emit(&mut writer, &edges, &identities, 64, 1)
+        .unwrap();
     assert_eq!((pass.emitted, pass.deferred), (1, 1));
     edges[0].entry_count = 1;
-    let pass = emitter.emit(&mut writer, &edges, 64, 2).unwrap();
+    let pass = emitter
+        .emit(&mut writer, &edges, &identities, 64, 2)
+        .unwrap();
     assert_eq!((pass.emitted, pass.deferred), (1, 1), "c1 first, c0 waits");
     edges[0].entry_count = 0;
-    let pass = emitter.emit(&mut writer, &edges, 64, 3).unwrap();
+    let pass = emitter
+        .emit(&mut writer, &edges, &identities, 64, 3)
+        .unwrap();
     assert_eq!((pass.emitted, pass.deferred), (0, 0));
     assert_eq!(
         emitter
-            .sweep(&mut writer, &edges, 64, 4, 0)
+            .sweep(&mut writer, &edges, &identities, 64, 4, 0)
             .unwrap()
             .emitted,
         0
@@ -467,26 +511,38 @@ fn retained_edges(path: &std::path::Path) -> BTreeMap<String, serde_json::Value>
 /// used to read "swept 0; retained c1").
 #[test]
 fn the_sweep_resends_an_unchanged_edge_whose_record_was_evicted() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     let mut edges = synthetic_edges(2);
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 4096, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
-    emitter.emit(&mut writer, &edges, 64, 1).unwrap();
+    emitter
+        .emit(&mut writer, &edges, &identities, 64, 1)
+        .unwrap();
     for pass in 2..200u64 {
         edges[1].entry_count = pass % 2;
-        emitter.emit(&mut writer, &edges, 64, pass).unwrap();
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, pass)
+            .unwrap();
     }
     assert!(writer.oldest_generation() > 0, "c0's record was evicted");
     assert!(!retained_edges(&path).contains_key("c0"));
-    let sweep = emitter.sweep(&mut writer, &edges, 64, 200, 0).unwrap();
+    let sweep = emitter
+        .sweep(&mut writer, &edges, &identities, 64, 200, 0)
+        .unwrap();
     assert!(sweep.emitted >= 1, "{sweep:?}");
     assert_eq!(sweep.unretained, 0);
     drop(writer);
     let retained = retained_edges(&path);
     assert_eq!(retained.keys().collect::<Vec<_>>(), ["c0", "c1"]);
     for edge in &edges {
-        assert_eq!(retained[&edge.caller.label()], edge_payload(edge));
+        assert_eq!(
+            retained[&edge.caller.label()],
+            edge_payload(edge, &identities)
+        );
     }
 }
 
@@ -496,12 +552,17 @@ fn the_sweep_resends_an_unchanged_edge_whose_record_was_evicted() {
 /// retained record (it used to claim nothing: 200 sent, 29 kept).
 #[test]
 fn a_sweep_larger_than_the_retention_reports_its_unretained_edges() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     let edges = synthetic_edges(200);
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 8192, 3).unwrap();
     let mut emitter = EdgeEmitter::new();
-    let sweep = emitter.sweep(&mut writer, &edges, 64_000, 1, 0).unwrap();
+    let sweep = emitter
+        .sweep(&mut writer, &edges, &identities, 64_000, 1, 0)
+        .unwrap();
     drop(writer);
     let kept = retained_edges(&path).len();
     assert_eq!(sweep.emitted, 200, "one record per edge, no futile dump");
@@ -514,12 +575,17 @@ fn a_sweep_larger_than_the_retention_reports_its_unretained_edges() {
 /// dump: every edge keeps a retained record equal to its state.
 #[test]
 fn a_sweep_that_rotates_out_a_needed_record_dumps_every_edge_when_it_fits() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     let mut edges = synthetic_edges(10);
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 16 * 1024, 4).unwrap();
     let mut emitter = EdgeEmitter::new();
-    emitter.emit(&mut writer, &edges, 64, 1).unwrap();
+    emitter
+        .emit(&mut writer, &edges, &identities, 64, 1)
+        .unwrap();
     let pad = serde_json::json!({"pad": "x".repeat(64)});
     while writer.rotations() < 3 {
         writer.append("probe", pad.clone(), 2).unwrap();
@@ -531,7 +597,9 @@ fn a_sweep_that_rotates_out_a_needed_record_dumps_every_edge_when_it_fits() {
     for edge in edges.iter_mut().skip(1) {
         edge.entry_count = 1;
     }
-    let sweep = emitter.sweep(&mut writer, &edges, 64, 3, 0).unwrap();
+    let sweep = emitter
+        .sweep(&mut writer, &edges, &identities, 64, 3, 0)
+        .unwrap();
     assert!(
         writer.oldest_generation() > 0,
         "the sweep rotated gen 0 out"
@@ -548,7 +616,10 @@ fn a_sweep_that_rotates_out_a_needed_record_dumps_every_edge_when_it_fits() {
     let retained = retained_edges(&path);
     assert_eq!(retained.len(), 10);
     for edge in &edges {
-        assert_eq!(retained[&edge.caller.label()], edge_payload(edge));
+        assert_eq!(
+            retained[&edge.caller.label()],
+            edge_payload(edge, &identities)
+        );
     }
 }
 
@@ -558,20 +629,29 @@ fn a_sweep_that_rotates_out_a_needed_record_dumps_every_edge_when_it_fits() {
 /// is left to account for it.
 #[test]
 fn evicted_edges_are_refreshed_mid_run_only_when_the_records_fit() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     for (max_bytes, files, refreshed) in [(16 * 1024, 4, 3), (4096, 2, 0)] {
         let edges = synthetic_edges(3);
         let dir = private_tempdir();
         let path = dir.path().join("events.jsonl");
         let mut writer = EventWriter::create(&path, max_bytes, files).unwrap();
         let mut emitter = EdgeEmitter::new();
-        emitter.emit(&mut writer, &edges, 64, 1).unwrap();
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 1)
+            .unwrap();
         let pad = serde_json::json!({"pad": "x".repeat(64)});
         while writer.oldest_generation() == 0 {
             writer.append("probe", pad.clone(), 2).unwrap();
         }
-        let pass = emitter.emit(&mut writer, &edges, 64, 3).unwrap();
+        let pass = emitter
+            .emit(&mut writer, &edges, &identities, 64, 3)
+            .unwrap();
         assert_eq!(pass.emitted, refreshed, "{max_bytes} x {files}");
-        let pass = emitter.emit(&mut writer, &edges, 64, 4).unwrap();
+        let pass = emitter
+            .emit(&mut writer, &edges, &identities, 64, 4)
+            .unwrap();
         assert_eq!(pass.emitted, 0, "{max_bytes} x {files}: refreshed once");
     }
 }
@@ -581,6 +661,9 @@ fn evicted_edges_are_refreshed_mid_run_only_when_the_records_fit() {
 /// the 14 s command-level test.
 #[test]
 fn presence_capture_and_activity_each_trigger_a_record_alone() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     use crate::inventory_present::{Activity, Capture, Presence};
     let mut edges = synthetic_edges(1);
     edges[0].presence = Presence::Mapped;
@@ -590,15 +673,41 @@ fn presence_capture_and_activity_each_trigger_a_record_alone() {
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
-    assert_eq!(emitter.emit(&mut writer, &edges, 64, 1).unwrap().emitted, 1);
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 1)
+            .unwrap()
+            .emitted,
+        1
+    );
     let mut emitted = Vec::new();
     edges[0].presence = Presence::Unloaded;
-    emitted.push(emitter.emit(&mut writer, &edges, 64, 2).unwrap().emitted);
+    emitted.push(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 2)
+            .unwrap()
+            .emitted,
+    );
     edges[0].capture = Capture::Retired;
-    emitted.push(emitter.emit(&mut writer, &edges, 64, 3).unwrap().emitted);
+    emitted.push(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 3)
+            .unwrap()
+            .emitted,
+    );
     edges[0].activity = Activity::Unknown;
-    emitted.push(emitter.emit(&mut writer, &edges, 64, 4).unwrap().emitted);
-    emitted.push(emitter.emit(&mut writer, &edges, 64, 5).unwrap().emitted);
+    emitted.push(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 4)
+            .unwrap()
+            .emitted,
+    );
+    emitted.push(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 5)
+            .unwrap()
+            .emitted,
+    );
     assert_eq!(emitted, [1, 1, 1, 0], "presence, capture, activity, quiet");
     drop(writer);
     let last = lines(&path).pop().unwrap();
@@ -634,19 +743,26 @@ struct Outcome {
 }
 
 fn run_shape(shape: &Shape, mut edges: Vec<EdgeView>, changed: &[usize]) -> Outcome {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, shape.max_bytes, shape.files).unwrap();
     let mut emitter = EdgeEmitter::new();
     let pad = serde_json::json!({"pad": "p".repeat(40)});
-    emitter.emit(&mut writer, &edges, 64, 1).unwrap();
+    emitter
+        .emit(&mut writer, &edges, &identities, 64, 1)
+        .unwrap();
     for pass in 2..=shape.passes {
         let index = pass as usize % edges.len();
         edges[index].entry_count += 1;
         for _ in 0..3 {
             writer.append("probe", pad.clone(), pass).unwrap();
         }
-        emitter.emit(&mut writer, &edges, 64, pass).unwrap();
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, pass)
+            .unwrap();
     }
     while writer.rotations() < shape.rotations {
         writer.append("probe", pad.clone(), 2).unwrap();
@@ -661,7 +777,9 @@ fn run_shape(shape: &Shape, mut edges: Vec<EdgeView>, changed: &[usize]) -> Outc
     let ended = |unretained: usize| serde_json::json!({"pad": "e".repeat(shape.ended_pad), "edges_unretained": unretained});
     let tail =
         ended(usize::MAX).to_string().len() as u64 + crate::inventory_events::ENDED_TAIL_SLACK;
-    let sweep = emitter.sweep(&mut writer, &edges, 64, 3, tail).unwrap();
+    let sweep = emitter
+        .sweep(&mut writer, &edges, &identities, 64, 3, tail)
+        .unwrap();
     let (settled, payload) = emitter.settle_ended(&writer, &edges, sweep.unretained, 4, ended);
     assert!(
         settled <= sweep.unretained,
@@ -677,7 +795,11 @@ fn run_shape(shape: &Shape, mut edges: Vec<EdgeView>, changed: &[usize]) -> Outc
     let retained = retained_edges(&path);
     for edge in &edges {
         if let Some(record) = retained.get(&edge.caller.label()) {
-            assert_eq!(*record, edge_payload(edge), "a retained record is exact");
+            assert_eq!(
+                *record,
+                edge_payload(edge, &identities),
+                "a retained record is exact"
+            );
         }
     }
     assert_eq!(
@@ -944,6 +1066,9 @@ fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
 /// drift waits; the 10 s record carries every rise since the last one.
 #[test]
 fn count_drift_emits_at_most_once_per_edge_per_ten_seconds() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     use crate::discovery::caller_registry::UseCoverage;
     use crate::inventory_events::EDGE_COUNT_EMIT_INTERVAL_NS;
     use crate::inventory_present::Activity;
@@ -960,14 +1085,26 @@ fn count_drift_emits_at_most_once_per_edge_per_ten_seconds() {
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
-    assert_eq!(emitter.emit(&mut writer, &edges, 64, 1).unwrap().emitted, 1);
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 1)
+            .unwrap()
+            .emitted,
+        1
+    );
     // Same power-of-two bucket (4-7): drift, never a class change.
     edges[0].entry_count = 5;
-    assert_eq!(emitter.emit(&mut writer, &edges, 64, 2).unwrap().emitted, 0);
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 2)
+            .unwrap()
+            .emitted,
+        0
+    );
     edges[0].entry_count = 6;
     assert_eq!(
         emitter
-            .emit(&mut writer, &edges, 64, 5_000_000_000)
+            .emit(&mut writer, &edges, &identities, 64, 5_000_000_000)
             .unwrap()
             .emitted,
         0
@@ -975,7 +1112,7 @@ fn count_drift_emits_at_most_once_per_edge_per_ten_seconds() {
     edges[0].entry_count = 7;
     assert_eq!(
         emitter
-            .emit(&mut writer, &edges, 64, 10_000_000_001)
+            .emit(&mut writer, &edges, &identities, 64, 10_000_000_001)
             .unwrap()
             .emitted,
         1,
@@ -984,7 +1121,7 @@ fn count_drift_emits_at_most_once_per_edge_per_ten_seconds() {
     // No new drift since the 10 s record: nothing goes out.
     assert_eq!(
         emitter
-            .emit(&mut writer, &edges, 64, 11_000_000_000)
+            .emit(&mut writer, &edges, &identities, 64, 11_000_000_000)
             .unwrap()
             .emitted,
         0
@@ -999,6 +1136,9 @@ fn count_drift_emits_at_most_once_per_edge_per_ten_seconds() {
 /// once, never waiting for the cadence.
 #[test]
 fn class_emissions_reset_the_count_cadence_and_buckets_stay_immediate() {
+    // Synthetic edge fixtures have no retained caller/module records.
+    let identity_revision = presentation(&harness(0, 0));
+    let identities = IdentityIndex::new(&identity_revision);
     use crate::discovery::caller_registry::UseCoverage;
     use crate::inventory_present::Activity;
     let mut edges = synthetic_edges(1);
@@ -1013,21 +1153,42 @@ fn class_emissions_reset_the_count_cadence_and_buckets_stay_immediate() {
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
-    assert_eq!(emitter.emit(&mut writer, &edges, 64, 1).unwrap().emitted, 1);
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 1)
+            .unwrap()
+            .emitted,
+        1
+    );
     edges[0].entry_count = 5;
-    assert_eq!(emitter.emit(&mut writer, &edges, 64, 2).unwrap().emitted, 0);
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 2)
+            .unwrap()
+            .emitted,
+        0
+    );
     // A class change goes out at once, carrying the drifted count.
     edges[0].activity = Activity::RecentlyObserved;
-    assert_eq!(emitter.emit(&mut writer, &edges, 64, 3).unwrap().emitted, 1);
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 3)
+            .unwrap()
+            .emitted,
+        1
+    );
     edges[0].entry_count = 6;
     assert_eq!(
-        emitter.emit(&mut writer, &edges, 64, 4).unwrap().emitted,
+        emitter
+            .emit(&mut writer, &edges, &identities, 64, 4)
+            .unwrap()
+            .emitted,
         0,
         "the class record carried 5, so 6 waits a fresh ten seconds"
     );
     assert_eq!(
         emitter
-            .emit(&mut writer, &edges, 64, 10_000_000_004)
+            .emit(&mut writer, &edges, &identities, 64, 10_000_000_004)
             .unwrap()
             .emitted,
         1
@@ -1036,7 +1197,7 @@ fn class_emissions_reset_the_count_cadence_and_buckets_stay_immediate() {
     edges[0].entry_count = 8;
     assert_eq!(
         emitter
-            .emit(&mut writer, &edges, 64, 10_000_000_005)
+            .emit(&mut writer, &edges, &identities, 64, 10_000_000_005)
             .unwrap()
             .emitted,
         1

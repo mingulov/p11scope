@@ -31,6 +31,7 @@ use crate::inventory_dashboard::{
     DashboardIo, Display, DisplayAccount, RESCAN_INTERVAL, RESTORE_RETRY_BUDGET, StderrRoute,
     StopFlag,
 };
+use crate::inventory_event_identity::IdentityIndex;
 use crate::inventory_events::{
     EdgeEmitter, EventWriter, GapEmitter, caller_event_payload, ended_payload, pass_payload,
     started_payload,
@@ -820,9 +821,11 @@ pub(crate) fn finish_output(
             .gaps
             .emit(writer, &presentation.gaps, true, presentation.ended_ns)?;
         let tail = ended_tail(presentation, writer);
+        let identities = IdentityIndex::new(presentation);
         let swept = stream_state.edges.sweep(
             writer,
             &presentation.edges,
+            &identities,
             presentation.budgets.edges_limit,
             presentation.ended_ns,
             tail,
@@ -1053,13 +1056,19 @@ fn emit_commit(
     stop: bool,
     now_ns: u64,
 ) -> Result<(), String> {
+    let identities = IdentityIndex::new(presentation);
     for event in &report.events {
-        writer.append("caller_event", caller_event_payload(event), now_ns)?;
+        writer.append(
+            "caller_event",
+            caller_event_payload(event, &identities),
+            now_ns,
+        )?;
     }
     let fresh = state.gaps.emit(writer, &presentation.gaps, false, now_ns)?;
     let edges = state.edges.emit(
         writer,
         &presentation.edges,
+        &identities,
         presentation.budgets.edges_limit,
         now_ns,
     )?;
@@ -1586,7 +1595,7 @@ fn progress_lines<Source: ProcessSource>(
                     .adapter()
                     .record(*id)
                     .map(|record| record.pid)
-                    .unwrap_or(0);
+                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string());
                 format!("caller {} admitted (pid {pid})", id.label())
             }
             CallerEvent::Exited { id, reason } => {
@@ -3702,6 +3711,534 @@ mod tests {
             .map(|line| line["event"]["new_gaps"].as_u64().unwrap())
             .sum();
         assert_eq!(streamed_new, 2);
+    }
+
+    fn stream_identity_fixture(callers: usize) -> (Presentation, Vec<CallerEvent>) {
+        use crate::discovery::inventory_workload::{Harness, ScaleSpec};
+        let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+        let events = harness.stage_scale(&ScaleSpec {
+            name: "inline-identity",
+            callers,
+            modules: 1,
+            edges_per_caller: 1,
+            endpoints_per_module: 4,
+            first_pid: 91_000,
+        });
+        harness.commit();
+        (
+            Presentation::capture(harness.coordinator(), "workload", 1, 2, 1),
+            events,
+        )
+    }
+
+    fn stream_identity_sink() -> (EventWriter, std::fs::File) {
+        let file = tempfile::tempfile().expect("private disk TMPDIR is writable");
+        let reader = file.try_clone().unwrap();
+        (EventWriter::anonymous_test_sink(file), reader)
+    }
+
+    fn stream_sink_records(reader: &mut std::fs::File) -> Vec<serde_json::Value> {
+        use std::io::{Read as _, Seek as _};
+        reader.rewind().unwrap();
+        let mut bytes = String::new();
+        reader.read_to_string(&mut bytes).unwrap();
+        bytes
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn stream_identity_report(events: Vec<CallerEvent>) -> PassReport {
+        PassReport {
+            pass: 0,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events,
+            timings: crate::timing::StageTimings::new(),
+        }
+    }
+
+    fn stream_edge_records(records: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        records
+            .iter()
+            .filter(|record| record["kind"] == "edge_observed")
+            .map(|record| &record["event"])
+            .collect()
+    }
+
+    fn stream_inline_keys_are_allowed(context: &serde_json::Value) -> bool {
+        fn keys(value: &serde_json::Value, expected: &[&str]) -> bool {
+            value.as_object().is_some_and(|object| {
+                object.len() == expected.len()
+                    && expected.iter().all(|key| object.contains_key(*key))
+            })
+        }
+        let caller_keys = [
+            "id",
+            "pid",
+            "incarnation",
+            "start_time",
+            "authority",
+            "lifecycle",
+            "executable",
+            "status",
+        ];
+        if !keys(context, &["version", "caller", "module"])
+            || context["version"] != 1
+            || !keys(&context["caller"], &caller_keys)
+            || !keys(
+                &context["module"],
+                &[
+                    "id",
+                    "device_major",
+                    "device_minor",
+                    "inode",
+                    "path",
+                    "status",
+                ],
+            )
+        {
+            return false;
+        }
+        context["caller"]["executable"].is_null()
+            || keys(
+                &context["caller"]["executable"],
+                &["dev", "ino", "mtime_secs", "mtime_nanos", "path"],
+            )
+    }
+
+    // Catches a contextless production commit and forbidden adjacent identity
+    // fields; the positive expected paths are independent fixture literals.
+    #[test]
+    fn stream_inline_identity_exact_privacy_keys() {
+        let (mut view, events) = stream_identity_fixture(1);
+        view.callers[0].authority = ImageAuthority::NativeExact {
+            task_cookie: 0xfedc_ba98_7654_3210,
+            exec_id: 0xabcd_ef01_2345_6789,
+        };
+        view.callers[0].lifecycle_reason = Some("FORBIDDEN_ARGV_ENV_COMM".into());
+        view.modules[0].admission_reasons = vec!["FORBIDDEN_MODULE_REASON".into()];
+        view.modules[0].sha256 = Some("FORBIDDEN_HASH".into());
+        let (mut writer, mut reader) = stream_identity_sink();
+        let mut state = StreamState::new();
+        emit_commit(
+            &mut writer,
+            &mut state,
+            &stream_identity_report(events),
+            &view,
+            false,
+            2,
+        )
+        .unwrap();
+        view.callers[0].lifecycle = crate::discovery::caller_registry::CallerLifecycle::Exited;
+        emit_stop_events(
+            &mut writer,
+            &mut state,
+            &[CallerEvent::Exited {
+                id: view.callers[0].id,
+                reason: "exited".into(),
+            }],
+            1,
+            &view,
+            3,
+        )
+        .unwrap();
+        let mut stream = EventLogState::new(Some(writer));
+        assert_eq!(
+            finish_output(
+                None,
+                &mut stream,
+                &mut state,
+                &view,
+                false,
+                true,
+                &mut WriterStdout(&mut Vec::new()),
+                None
+            )
+            .exit_code(),
+            0
+        );
+        let records = stream_sink_records(&mut reader);
+        let edge = stream_edge_records(&records)[0];
+        let context = &edge["identity_context"];
+        assert!(stream_inline_keys_are_allowed(context), "{context}");
+        for edge in stream_edge_records(&records) {
+            assert!(stream_inline_keys_are_allowed(&edge["identity_context"]));
+            assert_eq!(
+                edge["identity_context"]["caller"]["executable"]["path"],
+                "/bin/driver"
+            );
+        }
+        for event in records
+            .iter()
+            .filter(|record| record["kind"] == "caller_event")
+        {
+            let caller_context = &event["event"]["identity_context"];
+            assert_eq!(caller_context.as_object().unwrap().len(), 2);
+            assert_eq!(caller_context["version"], 1);
+            assert_eq!(
+                caller_context["caller"]["executable"]["path"],
+                "/bin/driver"
+            );
+            assert!(stream_inline_keys_are_allowed(&serde_json::json!({
+                "version": 1, "caller": caller_context["caller"], "module": context["module"],
+            })));
+        }
+        assert_eq!(context["caller"]["executable"]["path"], "/bin/driver");
+        assert_eq!(context["module"]["path"], "/scale/m0.so");
+        assert_eq!(context["caller"]["authority"], "native_exact");
+        let encoded = context.to_string();
+        for forbidden in [
+            "FORBIDDEN_",
+            "task_cookie",
+            "exec_id",
+            "tgid",
+            "comm",
+            "argv",
+            "environ",
+        ] {
+            assert!(!encoded.contains(forbidden), "{encoded}");
+        }
+        // The checker must detect an otherwise-valid adjacent-field leak.
+        for forbidden in ["argv", "environ", "comm", "tgid", "task_cookie", "exec_id"] {
+            let mut leaked = context.clone();
+            leaked["caller"][forbidden] = "MUST_DETECT_SENTINEL".into();
+            assert!(!stream_inline_keys_are_allowed(&leaked));
+        }
+        for forbidden in [
+            "sha256",
+            "build_id",
+            "admission_reasons",
+            "admission_history",
+            "paths",
+        ] {
+            let mut leaked = context.clone();
+            leaked["module"][forbidden] = "MUST_DETECT_MODULE_NEIGHBOR".into();
+            assert!(!stream_inline_keys_are_allowed(&leaked));
+        }
+    }
+
+    // Catches borrowed-index implementations that serialize or clone a shared
+    // multi-MiB module record for each edge. Total allocation is a conservative
+    // upper bound on peak owned allocations within this real production commit.
+    #[test]
+    fn stream_compact_context_ignores_large_shared_metadata() {
+        let (mut view, _) = stream_identity_fixture(4000);
+        view.modules[0].admission_reasons = vec!["FORBIDDEN_SHARED_METADATA".repeat(350_000)];
+        let (mut writer, mut reader) = stream_identity_sink();
+        let mut state = StreamState::new();
+        let (_, _, allocated) = crate::test_alloc::count_allocs_during(|| {
+            emit_commit(
+                &mut writer,
+                &mut state,
+                &stream_identity_report(Vec::new()),
+                &view,
+                false,
+                2,
+            )
+            .unwrap();
+        });
+        assert!(
+            allocated < 256 * 1024 * 1024,
+            "commit allocated {allocated} bytes"
+        );
+        let records = stream_sink_records(&mut reader);
+        let edges = stream_edge_records(&records);
+        assert_eq!(edges.len(), 4000);
+        let mut additional_bytes = 0;
+        for edge in edges {
+            let context = &edge["identity_context"];
+            assert_eq!(context["module"]["path"], "/scale/m0.so");
+            let bytes = context.to_string().len();
+            assert!(bytes <= 65536);
+            additional_bytes += bytes;
+            assert!(!context.to_string().contains("FORBIDDEN_SHARED_METADATA"));
+        }
+        eprintln!(
+            "compact shared-module: additional bytes={additional_bytes}, allocation upper bound={allocated}"
+        );
+    }
+
+    // Catches identity-only changes omitted by ordinary due detection and
+    // queued reversion, while proving that such changes obey the existing cap.
+    #[test]
+    fn stream_metadata_only_change_and_reversion_obey_cap() {
+        let (mut view, _) = stream_identity_fixture(3);
+        let (mut writer, mut reader) = stream_identity_sink();
+        let mut state = StreamState::new();
+        state.edges = EdgeEmitter::with_cap(1);
+        let report = stream_identity_report(Vec::new());
+        for now in 2..=4 {
+            emit_commit(&mut writer, &mut state, &report, &view, false, now).unwrap();
+        }
+        for caller in &mut view.callers {
+            caller.exe.as_mut().unwrap().path = Some("/bin/renamed".into());
+        }
+        emit_commit(&mut writer, &mut state, &report, &view, false, 5).unwrap();
+        view.callers[1].exe.as_mut().unwrap().path = Some("/bin/driver".into());
+        emit_commit(&mut writer, &mut state, &report, &view, false, 6).unwrap();
+        emit_commit(&mut writer, &mut state, &report, &view, false, 7).unwrap();
+        let records = stream_sink_records(&mut reader);
+        let edges = stream_edge_records(&records);
+        assert_eq!(
+            edges.len(),
+            5,
+            "three originals, two metadata changes; reverted queued edge is omitted"
+        );
+        assert_eq!(
+            edges[3]["identity_context"]["caller"]["executable"]["path"],
+            "/bin/renamed"
+        );
+        assert_eq!(edges[4]["caller"], "c2");
+        let markers: Vec<_> = records
+            .iter()
+            .filter(|record| record["kind"] == "pass_committed")
+            .collect();
+        assert_eq!(markers[3]["event"]["edge_events"], 1);
+        assert_eq!(markers[3]["event"]["edge_events_deferred"], 2);
+        assert_eq!(markers[4]["event"]["edge_events"], 1);
+        assert_eq!(markers[4]["event"]["edge_events_deferred"], 0);
+        assert_eq!(markers[5]["event"]["edge_events"], 0);
+    }
+
+    // Catches turnover contexts read from a later live PID instead of the
+    // exact old/new publication records, and a contextless native stop path.
+    #[test]
+    fn stream_exec_and_reuse_preserve_old_names() {
+        let (mut view, _) = stream_identity_fixture(2);
+        view.callers[0].exe.as_mut().unwrap().path = Some("/bin/old".into());
+        view.callers[0].lifecycle = crate::discovery::caller_registry::CallerLifecycle::ExecRetired;
+        view.callers[1].exe.as_mut().unwrap().path = Some("/bin/new".into());
+        let old = view.callers[0].id;
+        let new = view.callers[1].id;
+        let (mut writer, mut reader) = stream_identity_sink();
+        let mut state = StreamState::new();
+        emit_commit(
+            &mut writer,
+            &mut state,
+            &stream_identity_report(vec![CallerEvent::ExecRetired { old, new }]),
+            &view,
+            false,
+            2,
+        )
+        .unwrap();
+        emit_stop_events(
+            &mut writer,
+            &mut state,
+            &[CallerEvent::Reused { old, new }],
+            1,
+            &view,
+            3,
+        )
+        .unwrap();
+        let records = stream_sink_records(&mut reader);
+        let turnovers: Vec<_> = records
+            .iter()
+            .filter(|record| record["kind"] == "caller_event")
+            .collect();
+        assert_eq!(turnovers.len(), 2);
+        for turnover in turnovers {
+            let context = &turnover["event"]["identity_context"];
+            assert_eq!(context.as_object().map(|object| object.len()), Some(3));
+            assert_eq!(context["version"], 1);
+            for reference in ["old", "new"] {
+                let edge_context = serde_json::json!({
+                    "version": 1,
+                    "caller": context[reference],
+                    "module": {
+                        "id": "m0", "device_major": 8, "device_minor": 1,
+                        "inode": 100000, "path": "/scale/m0.so", "status": "observed",
+                    },
+                });
+                assert!(stream_inline_keys_are_allowed(&edge_context));
+            }
+            assert_eq!(
+                turnover["event"]["identity_context"]["old"]["executable"]["path"],
+                "/bin/old"
+            );
+            assert_eq!(
+                turnover["event"]["identity_context"]["new"]["executable"]["path"],
+                "/bin/new"
+            );
+            assert_eq!(
+                turnover["event"]["identity_context"]["old"]["lifecycle"],
+                "exec_retired"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_identity_bytes_count_toward_retention() {
+        let (mut view, _) = stream_identity_fixture(1);
+        view.callers[0].exe.as_mut().unwrap().path = Some("\u{1}".repeat(4096));
+        view.modules[0].paths = vec!["\u{2}".repeat(4096)];
+        let (mut writer, mut reader) = stream_identity_sink();
+        let mut state = StreamState::new();
+        emit_commit(
+            &mut writer,
+            &mut state,
+            &stream_identity_report(Vec::new()),
+            &view,
+            false,
+            9,
+        )
+        .unwrap();
+        let records = stream_sink_records(&mut reader);
+        let edge = stream_edge_records(&records)[0];
+        let context_bytes = edge["identity_context"].to_string().len();
+        assert!((49152..=65536).contains(&context_bytes), "{context_bytes}");
+        assert_eq!(writer.live_bytes(), reader.metadata().unwrap().len());
+        assert!(writer.live_bytes() > context_bytes as u64);
+        // Real finalization emits a metadata-only final change at wider clock
+        // and sequence digits, through the same sweep and ended reservation.
+        view.callers[0].lifecycle = crate::discovery::caller_registry::CallerLifecycle::Exited;
+        view.ended_ns = 10_000_000_000;
+        let mut stream = EventLogState::new(Some(writer));
+        let outcome = finish_output(
+            None,
+            &mut stream,
+            &mut state,
+            &view,
+            false,
+            true,
+            &mut WriterStdout(&mut Vec::new()),
+            None,
+        );
+        assert_eq!(outcome.exit_code(), 0);
+        let records = stream_sink_records(&mut reader);
+        let edges = stream_edge_records(&records);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(
+            edges[1]["identity_context"]["caller"]["lifecycle"],
+            "exited"
+        );
+        assert!(stream_inline_keys_are_allowed(
+            &edges[1]["identity_context"]
+        ));
+        assert_eq!(records.last().unwrap()["kind"], "ended");
+        assert_eq!(records.last().unwrap()["event"]["edges_unretained"], 0);
+    }
+
+    // This is an actual protected filesystem/rotation gate. An environment
+    // refusal stays a failed gate, independent of anonymous-sink controls.
+    #[test]
+    fn stream_edge_names_survive_dictionary_eviction() {
+        let (mut view, events) = stream_identity_fixture(1);
+        let dir = private_tempdir();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 8192, 1).unwrap();
+        writer
+            .append("started", started_payload("workload", 1, &view), 1)
+            .unwrap();
+        let mut state = StreamState::new();
+        emit_commit(
+            &mut writer,
+            &mut state,
+            &stream_identity_report(events),
+            &view,
+            false,
+            2,
+        )
+        .unwrap();
+        writer
+            .append("probe", serde_json::json!({"pad": "x".repeat(9000)}), 3)
+            .unwrap();
+        view.callers[0].exe.as_mut().unwrap().path = Some("/bin/retained".into());
+        emit_stop_events(&mut writer, &mut state, &[], 1, &view, 4).unwrap();
+        let mut stream = EventLogState::new(Some(writer));
+        assert_eq!(
+            finish_output(
+                None,
+                &mut stream,
+                &mut state,
+                &view,
+                false,
+                true,
+                &mut WriterStdout(&mut Vec::new()),
+                None
+            )
+            .exit_code(),
+            0
+        );
+        let records = event_records(&path);
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["kind"] == "started" || record["kind"] == "caller_event")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record["kind"] == "retention_evicted")
+        );
+        let edges = stream_edge_records(&records);
+        assert!(!edges.is_empty());
+        for edge in edges {
+            assert_eq!(
+                edge["identity_context"]["caller"]["executable"]["path"],
+                "/bin/retained"
+            );
+            assert_eq!(edge["identity_context"]["module"]["path"], "/scale/m0.so");
+            assert!(stream_inline_keys_are_allowed(&edge["identity_context"]));
+        }
+        assert_eq!(records.last().unwrap()["event"]["edges_unretained"], 0);
+    }
+
+    #[test]
+    fn stream_ended_rotation_counts_unretained_edges() {
+        let (mut view, _) = stream_identity_fixture(12);
+        for caller in &mut view.callers {
+            caller.exe.as_mut().unwrap().path = Some("\u{1}".repeat(4096));
+        }
+        view.ended_ns = 10_000_000_000;
+        let dir = private_tempdir();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 1, 1).unwrap();
+        let mut state = StreamState::new();
+        emit_commit(
+            &mut writer,
+            &mut state,
+            &stream_identity_report(Vec::new()),
+            &view,
+            false,
+            9,
+        )
+        .unwrap();
+        let mut stream = EventLogState::new(Some(writer));
+        assert_eq!(
+            finish_output(
+                None,
+                &mut stream,
+                &mut state,
+                &view,
+                false,
+                true,
+                &mut WriterStdout(&mut Vec::new()),
+                None
+            )
+            .exit_code(),
+            0
+        );
+        let records = event_records(&path);
+        assert!(stream_edge_records(&records).is_empty());
+        let ended = records.last().unwrap();
+        assert_eq!(ended["kind"], "ended");
+        assert_eq!(ended["event"]["edges_unretained"], 12);
+    }
+
+    #[test]
+    fn stream_progress_missing_admission_is_unknown() {
+        let coordinator = coordinator();
+        let report = stream_identity_report(vec![CallerEvent::Admitted {
+            id: crate::discovery::caller_registry::CallerId(999),
+        }]);
+        let lines = progress_lines(&coordinator, &report).join("\n");
+        assert!(lines.contains("unknown"), "{lines}");
+        assert!(!lines.contains("pid 0"), "{lines}");
     }
 
     #[test]

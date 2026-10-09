@@ -4070,6 +4070,73 @@ mod tests {
 mod demotion_retirement_producer_tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    struct OwnedStoppedChild(Option<Child>);
+
+    impl OwnedStoppedChild {
+        fn new() -> Self {
+            // The shell reaches its own code only after dynamic startup.
+            // A confirmed SIGSTOP then holds its maps stable during the scan.
+            let mut owned = Self(Some(
+                Command::new("/bin/sh")
+                    .args(["-c", "kill -STOP $$; exit 99"])
+                    .spawn()
+                    .unwrap(),
+            ));
+            let pid = owned.id() as libc::pid_t;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned positive-control child did not stop after startup"
+                );
+                let mut status = 0;
+                // SAFETY: pid names only this retained owned child; WNOHANG
+                // prevents a blocking wait and WUNTRACED reports its stop.
+                let waited =
+                    unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+                if waited == pid {
+                    if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                        // waitpid already reaped it: never kill that pid again.
+                        owned.0 = None;
+                    }
+                    assert!(
+                        libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP,
+                        "owned positive-control child ended before readiness: {status}"
+                    );
+                    return owned;
+                }
+                if waited < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        // Another wait has already consumed this child.
+                        owned.0 = None;
+                    }
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted,
+                        "cannot observe owned positive-control child readiness: {error}"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn id(&self) -> u32 {
+            self.0.as_ref().expect("retained owned child").id()
+        }
+    }
+
+    impl Drop for OwnedStoppedChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     // The scanner must expose each real unusable mapping before pinning.
     #[test]
@@ -4184,23 +4251,28 @@ mod demotion_retirement_producer_tests {
             member.complete_scan.is_none(),
             "hint absence supplies no physical absence authority"
         );
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let child = OwnedStoppedChild::new();
+        let mut positive_budget = CaptureWorkBudget::default();
         let member = scan_member(
             child.id(),
             ProcessViewId(0),
             &[],
             &HookRegistry::builtin(),
-            &mut CaptureWorkBudget::default(),
+            &mut positive_budget,
             &mut noise,
         );
-        let _ = child.kill();
-        child.wait().unwrap();
+        drop(child);
         assert!(
             member.complete_scan.is_some(),
-            "unrestricted complete scan is the positive control"
+            "unrestricted complete scan is the positive control: status={:?}, \
+             generation={:?}, mapping_scan_completed={}, gaps={:?}, \
+             budget_stop={:?}, refusals={:?}",
+            member.status,
+            member.generation,
+            member.mapping_scan_completed,
+            member.gaps,
+            positive_budget.stopped_reason(),
+            positive_budget.refusal_counts(),
         );
     }
 }

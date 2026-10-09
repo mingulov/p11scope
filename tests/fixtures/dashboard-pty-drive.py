@@ -36,6 +36,8 @@ Mode `app-first`: `BINARY PID DURATION BUDGET app-first`. The owned
 app-first-driver maps app-p1.so and app-p2.so. Verify both named associations
 at 80x24, resize to 40x10, scroll to the later module, enlarge, then quit and
 verify terminal restoration. This mode always uses the unprivileged scan lane.
+Optional trailing `48 12` selects the U6 compact dimensions and checks the
+evidence/gaps navigation without changing the default 40x10 journey.
 """
 
 import fcntl
@@ -223,6 +225,10 @@ def main() -> int:
 
 def app_first_mode() -> int:
     binary, pid, duration, budget = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+    compact_width, compact_height = (40, 10)
+    if len(sys.argv) > 6:
+        assert sys.argv[6:] == ["48", "12"], "app-first accepts only optional 48 12"
+        compact_width, compact_height = (48, 12)
     argv = [
         binary, "inventory", "--pid", pid, "--capture", "scan", "--dashboard",
         "--duration", duration,
@@ -294,27 +300,69 @@ def app_first_mode() -> int:
         assert f"pid {pid} incarnation 0" in first, first
         excerpts.append(("80x24 initial", first))
 
+        if compact_width == 48:
+            mark = len(output)
+            os.write(master, b"\t")
+            evidence = complete_frame(mark, 24, lambda text: "[evidence]" in text)
+            assert "coverage unknown (scan only)" in evidence, evidence
+            excerpts.append(("80x24 scan coverage evidence", evidence))
+            mark = len(output)
+            os.write(master, b"\t")
+            gaps = complete_frame(mark, 24, lambda text: "showing gaps" in text)
+            assert "exact image authority unavailable" in gaps, gaps
+            excerpts.append(("80x24 recorded gap ledger", gaps))
+            mark = len(output)
+            os.write(master, b"\t")
+            complete_frame(mark, 24, lambda text: "[summary]" in text)
+
         mark = len(output)
-        resize(40, 10)
-        compact = complete_frame(mark, 10, lambda text: "(minimal)" in text
-                                 and "summary 1-1/2" in text and "tab q quit" in text)
+        resize(compact_width, compact_height)
+        initial_range = "summary 1-2/2" if compact_width == 48 else "summary 1-1/2"
+        compact = complete_frame(mark, compact_height, lambda text: "(minimal)" in text
+                                 and initial_range in text and "tab q quit" in text)
         assert f"application app-first-driver [{caller_id}]" in compact, compact
         assert f"module {first_name} [{first_id}]" in compact, compact
         assert "Module mapped; activity not captured" in compact, compact
         assert "totals: 1 callers 2 modules 2 edges" in compact, compact
-        assert all(len(line) <= 40 for line in compact.splitlines()), compact
-        excerpts.append(("40x10 first association", compact))
+        assert all(len(line) <= compact_width for line in compact.splitlines()), compact
+        excerpts.append((f"{compact_width}x{compact_height} first association", compact))
 
         mark = len(output)
         os.write(master, b"j")
-        later = complete_frame(mark, 10, lambda text: "summary 2-2/2" in text and "tab q quit" in text)
+        later = complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab q quit" in text)
         assert f"application app-first-driver [{caller_id}]" in later, later
         assert f"module {later_name} [{later_id}]" in later, later
         assert f"module {first_name} [{first_id}]" not in later, later
         assert "Module mapped; activity not captured" in later, later
         assert "totals: 1 callers 2 modules 2 edges" in later, later
-        assert all(len(line) <= 40 for line in later.splitlines()), later
-        excerpts.append(("40x10 after j", later))
+        assert all(len(line) <= compact_width for line in later.splitlines()), later
+        excerpts.append((f"{compact_width}x{compact_height} after j", later))
+
+        if compact_width == 48:
+            # The scan coverage limit remains visible in each named summary;
+            # the gaps page also makes the lack of exact image authority reachable.
+            mark = len(output)
+            os.write(master, b"\t")
+            evidence = complete_frame(mark, compact_height, lambda text: text.splitlines()[-1].startswith("evidence "))
+            assert "coverage unknown (scan only)" in evidence, evidence
+            excerpts.append(("48x12 scan coverage evidence", evidence))
+            mark = len(output)
+            os.write(master, b"\t")
+            complete_frame(mark, compact_height, lambda text: text.splitlines()[-1].startswith("gaps "))
+            # Page switching retains the selected index. Return to the first
+            # recorded gap so host-specific later gaps cannot replace this one.
+            mark = len(output)
+            os.write(master, b"k")
+            gaps = complete_frame(mark, compact_height, lambda text: text.splitlines()[-1].startswith("gaps 1-"))
+            assert "exact image authority unavailable" in gaps, gaps
+            assert all(len(line) <= compact_width for line in gaps.splitlines()), gaps
+            excerpts.append(("48x12 recorded gap ledger", gaps))
+            mark = len(output)
+            os.write(master, b"\t")
+            complete_frame(mark, compact_height, lambda text: initial_range in text and "tab q quit" in text)
+            mark = len(output)
+            os.write(master, b"j")
+            complete_frame(mark, compact_height, lambda text: "summary 2-2/2" in text and "tab q quit" in text)
 
         mark = len(output)
         resize(80, 24)

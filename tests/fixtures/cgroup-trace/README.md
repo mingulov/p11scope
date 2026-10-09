@@ -73,7 +73,7 @@ before this command runs. Substitute its candidate path/revision and a new
 private output directory; output is temporary debugging material, not an archive.
 
 ```sh
-sudo -n timeout 300 python3 -I scripts/qualify-cgroup-trace.py \
+sudo -n timeout --kill-after=20s 300s python3 -I scripts/qualify-cgroup-trace.py \
   --binary /absolute/root-pinned/p11scope \
   --source-revision EXACT_40_HEX_COMMIT \
   --provider /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
@@ -90,6 +90,14 @@ directory identity and cgroup2 filesystem. Wrong-parent/birth and filesystem
 controls refuse operations. It enables no controllers, changes no ambient
 scope/sysctl and touches no existing kind/container workload. Cleanup signals
 only held owned processes and removes only verified empty owned directories.
+Scoped TERM/INT handling enters those cleanup paths, defers signals until newly
+created directories/direct Popen children are enrolled, and prevents a second
+termination from interrupting bounded cleanup. A failed Cgroup open still has
+the actual created directory identity; a failed process validation still has
+the actual unreaped direct Popen child. Replacement directories and arbitrary
+descendants receive no cleanup authority. Previous signal handlers are restored.
+The outer timeout allows a 20-second cleanup grace before its last-resort KILL;
+a forced kill is a failed run and cannot establish cleanup or naming qualification.
 The run route drops the caller to the ordinary supplied uid/gid through its
 public SUDO invocation credentials. Caller/provider setup and each cell are
 bounded; cgroup observer stop uses SIGINT with a five-second limit. The run

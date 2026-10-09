@@ -2234,6 +2234,30 @@ fn merge(
             // refuses; were that ever broken, the module is refused whole
             // rather than retried.
             debug_assert!(!kept_only, "kept endpoints alone need no new slot");
+            // A whole-union policy refuses the group's complete fresh demand,
+            // even when its manifest or strongest table failed first. Scan
+            // targets without a valid table never enter that admission union.
+            let refused = if whole {
+                group
+                    .iter()
+                    .flat_map(|module| {
+                        module.targets.iter().filter(move |target| {
+                            module.scan_evidence.as_ref().is_none_or(|evidence| {
+                                target
+                                    .table
+                                    .is_some_and(|index| evidence.tables.get(index).is_some())
+                            })
+                        })
+                    })
+                    .map(|target| AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    })
+                    .filter(|key| !claimed.contains(key) && !existing_slots.contains_key(key))
+                    .collect()
+            } else {
+                refused
+            };
             if !kept_only && !kept.is_empty() {
                 refused_growth = Some(refused);
                 uncorroborated_candidates = spill_baseline;
@@ -6988,6 +7012,284 @@ mod tests {
         plan.modules_skipped
             .iter()
             .find(|skipped| skipped.subject == path)
+    }
+
+    fn replace_table_targets(
+        module: &mut ReconciledModule,
+        table: usize,
+        targets: &[(&'static str, u32, u64)],
+    ) {
+        module.scanned.tables[table].entries = targets
+            .iter()
+            .map(
+                |&(name, object, file_offset)| crate::discovery::scan::ScannedEntry {
+                    name,
+                    object: scanned_key(PinnedObjectId(object)),
+                    object_path: if PinnedObjectId(object) == module.object {
+                        module.scanned.path.clone()
+                    } else {
+                        format!("/opt/obj{object}.so")
+                    },
+                    file_offset,
+                },
+            )
+            .collect();
+        module.entry_objects[table] = targets
+            .iter()
+            .map(|&(_, object, _)| PinnedObjectId(object))
+            .collect();
+    }
+
+    /// The first table's three fresh keys already fail, but the whole group
+    /// wants five: aliases/views/overlap dedup, equal offsets on distinct
+    /// objects stay distinct, and another admitted module's key costs no slot.
+    #[test]
+    fn whole_module_demand_unions_later_tables_views_aliases_and_shared_targets() {
+        let existing =
+            provider_with_tables(201, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, true);
+        let mut refused = provider_with_tables(202, "/opt/refused.so", 2, 4, true);
+        replace_table_targets(
+            &mut refused,
+            0,
+            &[
+                ("C_Sign", 202, 0x10),
+                ("C_Sign", 202, 0x20),
+                ("C_Sign", 202, 0x30),
+                ("C_Sign", 201, 0),
+            ],
+        );
+        replace_table_targets(
+            &mut refused,
+            1,
+            &[
+                ("C_Sign", 202, 0x30),
+                ("C_Sign", 202, 0x40),
+                ("C_Verify", 202, 0x40),
+                ("C_Sign", 203, 0x40),
+            ],
+        );
+        let mut repeated_view = refused.clone();
+        repeated_view.scanned.view = ProcessViewId(99);
+        let plan = scoped_plan(&[refused, repeated_view, existing], AdmissionScope::Shared);
+
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize - 2);
+        assert_eq!(plan.modules.len(), 1, "no refused prefix or duplicate view");
+        assert_eq!(plan.modules_skipped.len(), 1);
+        let refusal = refusal_of(&plan, "/opt/refused.so").unwrap();
+        assert!(
+            refusal.reason.starts_with("module needs 5 more;"),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn whole_module_demand_preserves_the_shared_reserve() {
+        let reserve = shared_scope_reserve(MAX_SLOTS as usize);
+        let open = MAX_SLOTS as usize - reserve;
+        let existing = provider_with_tables(211, "/opt/existing.so", 1, open - 2, false);
+        let refused = provider_with_tables(212, "/opt/refused.so", 2, 3, false);
+        let plan = scoped_plan(&[existing, refused], AdmissionScope::Shared);
+
+        assert_eq!(plan.slots.len(), open - 2);
+        let refusal = refusal_of(&plan, "/opt/refused.so").unwrap();
+        assert!(
+            refusal.reason.starts_with("module needs 6 more;"),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal.reason.contains(&format!("{reserve} are reserved")),
+            "{refusal:?}"
+        );
+    }
+
+    /// Broad admission requires the scan union too, even when a manifest
+    /// subset has already failed before any scan-table demand is considered.
+    #[test]
+    fn whole_module_demand_unions_scan_after_an_early_manifest_refusal() {
+        let mut scan = provider_with_tables(42, "/opt/p11.so", 2, 3, false);
+        replace_table_targets(
+            &mut scan,
+            0,
+            &[
+                ("C_Sign", 42, 0),
+                ("C_Sign", 42, 0x100000),
+                ("C_Verify", 42, 0x100008),
+            ],
+        );
+        replace_table_targets(
+            &mut scan,
+            1,
+            &[
+                ("C_Sign", 42, 0x100008),
+                ("C_Sign", 42, 0x100010),
+                ("C_Verify", 42, 0),
+            ],
+        );
+        let manifest = manifest_with(
+            (0..=MAX_SLOTS)
+                .map(|index| resolved("C_Sign", u64::from(index) * 8))
+                .collect(),
+        );
+        let plan = build_from_sources_with(
+            &[scan],
+            &[manifest],
+            |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+            |_, _| true,
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
+            },
+            true,
+            AdmissionPolicy::detailed(),
+            AdmissionScope::Named,
+        );
+
+        assert!(plan.slots.is_empty() && plan.modules.is_empty());
+        assert_eq!(plan.modules_skipped.len(), 1);
+        assert!(
+            plan.modules_skipped[0]
+                .reason
+                .starts_with(&format!("module needs {} more;", MAX_SLOTS + 4)),
+            "{:?}",
+            plan.modules_skipped
+        );
+    }
+
+    #[test]
+    fn whole_module_demand_excludes_scan_targets_without_a_valid_table() {
+        let existing =
+            provider_with_tables(221, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, true);
+        let refused = provider_with_tables(222, "/opt/refused.so", 2, 3, true);
+        let mut lowered = lower_scanned(&refused);
+        for (table, offset) in [(None, 0x9000), (Some(2), 0xa000)] {
+            let mut stray = lower_scanned(&refused).targets.remove(0);
+            stray.table = table;
+            stray.file_offset = offset;
+            lowered.targets.push(stray);
+        }
+        lowered.entries_seen = lowered.targets.len();
+        let plan = merge(
+            vec![lower_scanned(&existing), lowered],
+            0,
+            "absent".into(),
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
+            },
+            false,
+            AdmissionPolicy::detailed(),
+            AdmissionScope::Shared,
+        );
+
+        let refusal = refusal_of(&plan, "/opt/refused.so").unwrap();
+        assert!(
+            refusal.reason.starts_with("module needs 6 more;"),
+            "{refusal:?}"
+        );
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize - 2);
+    }
+
+    #[test]
+    fn whole_module_demand_keeps_named_heuristic_subset_reporting() {
+        let existing =
+            provider_with_tables(231, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, false);
+        let refused = provider_with_tables(232, "/opt/refused.so", 5, 3, false);
+        let named = scoped_plan(&[existing, refused.clone()], AdmissionScope::Named);
+        let refusal = refusal_of(&named, "/opt/refused.so").unwrap();
+        assert!(
+            refusal.reason.starts_with("module needs 3 more;"),
+            "{refusal:?}"
+        );
+        assert_eq!(named.slots.len(), MAX_SLOTS as usize - 2);
+
+        let prefix = scoped_plan(&[refused], AdmissionScope::Named);
+        assert_eq!(
+            prefix.slots.len(),
+            12,
+            "K4 admits its strongest four tables"
+        );
+        assert_eq!(prefix.uncorroborated_candidates, 1);
+        assert!(prefix.modules_skipped.is_empty());
+    }
+
+    /// Retired keys cost fresh lifetime slots if they reappear. A failed
+    /// growth keeps all old physical IDs and reports its nine-key union once.
+    #[test]
+    fn whole_module_demand_preserves_growth_and_retired_occupancy() {
+        let existing =
+            provider_with_tables(241, "/opt/existing.so", 1, MAX_SLOTS as usize - 12, true);
+        let owner = provider_with_tables(242, "/opt/grown.so", 2, 2, true);
+        let ended = provider_with_tables(243, "/opt/ended.so", 1, 4, true);
+        let mut plan = scoped_plan(
+            &[existing.clone(), owner.clone(), ended],
+            AdmissionScope::Shared,
+        );
+        let without_ended = plan.rebuild_from_sources(
+            &[existing.clone(), owner.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(plan.extend_exact(without_ended).unwrap().retire.len(), 4);
+        let previous = plan.slots.clone();
+        let mut grown = owner;
+        replace_table_targets(
+            &mut grown,
+            0,
+            &[
+                ("C_Sign", 242, 0),
+                ("C_Sign", 242, 8),
+                ("C_Sign", 242, 0x10000),
+                ("C_Sign", 242, 0x10008),
+                ("C_Sign", 242, 0x10010),
+                ("C_Sign", 242, 0x10018),
+                ("C_Sign", 242, 0x10020),
+            ],
+        );
+        replace_table_targets(
+            &mut grown,
+            1,
+            &[
+                ("C_Sign", 242, 16),
+                ("C_Sign", 242, 24),
+                ("C_Sign", 242, 0x10020),
+                ("C_Sign", 242, 0x20000),
+                ("C_Verify", 242, 0x20000),
+                ("C_Sign", 242, 0x20008),
+                ("C_Sign", 242, 0x20010),
+                ("C_Sign", 241, 0),
+                ("C_Sign", 243, 0),
+            ],
+        );
+
+        for _ in 0..2 {
+            let rebuilt = plan.rebuild_from_sources(
+                &[existing.clone(), grown.clone()],
+                &[],
+                &PinnedObjects::empty(),
+            );
+            assert_eq!(rebuilt.modules_skipped.len(), 1);
+            let omission = refusal_of(&rebuilt, "/opt/grown.so").unwrap();
+            assert!(
+                omission.reason.starts_with("admitted module needs 9 more;"),
+                "{omission:?}"
+            );
+            assert!(omission.reason.contains("4 retired"), "{omission:?}");
+            assert!(
+                omission.reason.contains("kept its 4 attached endpoints"),
+                "{omission:?}"
+            );
+            let delta = plan.extend_exact(rebuilt).unwrap();
+            assert!(delta.new.is_empty() && delta.replace.is_empty() && delta.retire.is_empty());
+            assert_eq!(plan.slots, previous, "no old identity or decoder changes");
+            assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 8);
+            assert_eq!(
+                plan.refused_modules().count(),
+                1,
+                "one omission across retries"
+            );
+        }
     }
 
     const P11_KIT: &str = "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8";

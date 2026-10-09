@@ -428,6 +428,10 @@ pub struct Engine {
     /// The revision whose complete facts were successfully projected publicly.
     /// A staged merge is private and cannot advance this marker.
     published_facts_revision: u64,
+    /// One stationary full loader transaction's exact pre-projection plan.
+    /// Historical public surfaces can differ, so the projected plan is not
+    /// a substitute for the next unchanged planner result.
+    loader_plan_cache: Option<LoaderPlanCache>,
     /// Batch-tail publications executed (counter, not timing: the B1 proof).
     tail_publishes: u64,
     /// Batch-tail publications skipped as provably redundant (same proof).
@@ -2771,6 +2775,21 @@ struct LiveCandidate {
     selection_admission: Option<PendingSelectionAdmission>,
     manifest_selection_admissions: Vec<ManifestSelectionAdmission>,
     manifest_inventory_slots: BTreeMap<plan::AttachKey, plan::Slot>,
+    loader_plan_proof: Option<LoaderPlanProof>,
+}
+
+struct LoaderPlanCache {
+    revision: u64,
+    broad_admit: bool,
+    plan: plan::AttachPlan,
+}
+
+/// Transient baseline for one loader transaction, never a second retained
+/// history cache. Only stationary accepted publication may seed/carry a plan.
+struct LoaderPlanProof {
+    revision: u64,
+    published_plan: plan::AttachPlan,
+    discovery: render::DiscoveryEvidence,
 }
 
 struct StartPublicationSnapshot {
@@ -5793,6 +5812,7 @@ fn fallback_proof_in_plan(proof: &BoundFallbackProof, plan: &plan::AttachPlan) -
 }
 
 fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
+    discovered.loader_plan_cache = None;
     let aggregate_start = crate::attach::monotonic_ns();
     let mut counters = discovered.base_counters.clone();
     let mut scan_modules = Vec::new();
@@ -7855,6 +7875,7 @@ impl Engine {
             // exactly like the un-gated tail it replaces.
             facts_revision: 1,
             published_facts_revision: 0,
+            loader_plan_cache: None,
             tail_publishes: 0,
             tail_skips: 0,
             discovery_truncated: 0,
@@ -9816,6 +9837,7 @@ impl Engine {
     /// it. Unconditional by design — a dedup-hit marker (an eviction message
     /// identical to an earlier one) still follows a real mutation.
     fn note_facts_mutated(&mut self) {
+        self.loader_plan_cache = None;
         self.facts_revision = self.facts_revision.saturating_add(1);
     }
 
@@ -9920,6 +9942,9 @@ impl Engine {
     }
 
     fn publish_current_capture_facts(&mut self) -> Result<()> {
+        // A failed or staged publication cannot keep an earlier planning
+        // proof alive. Successful stationary loader finalization may reseed.
+        self.loader_plan_cache = None;
         let skips_start = crate::attach::monotonic_ns();
         record_object_skips(&mut self.plan, &self.counters.object_skips);
         self.stage_timings.span(
@@ -9970,6 +9995,7 @@ impl Engine {
     }
 
     fn project_capture_facts(&mut self) {
+        self.loader_plan_cache = None;
         let project_start = crate::attach::monotonic_ns();
         self.capture_facts.apply_to_plan(&mut self.plan);
         self.discovery = self.capture_facts.discovery(&self.plan);
@@ -10103,6 +10129,7 @@ impl Engine {
         mut skipped: Vec<Skipped>,
         pending_selection: Option<&SelectionTableKey>,
     ) -> Result<LiveCandidate> {
+        self.loader_plan_cache = None;
         let merge_head_start = crate::attach::monotonic_ns();
         self.pending_rejected_keys
             .extend(pinned.newly_rejected_keys(&self.pinned));
@@ -10382,7 +10409,52 @@ impl Engine {
             selection_admission: None,
             manifest_selection_admissions,
             manifest_inventory_slots,
+            loader_plan_proof: None,
         })
+    }
+
+    /// Prove only the admitted loader's pin ownership may change. Existing
+    /// proof/table history is permitted; inputs requiring fresh admission or
+    /// retirement stay on the original planner path.
+    fn loader_inputs_are_stationary(
+        &self,
+        view: ProcessViewId,
+        loader_module: &ScannedModule,
+        pinned: &PinnedObjects,
+        loader: PinnedObjectId,
+    ) -> bool {
+        self.capture_facts.staged.is_none()
+            && self.facts_revision == self.published_facts_revision
+            && self.inventory.is_none()
+            && self.manifests.is_empty()
+            && self.manifest_ordinals.is_empty()
+            && self.manifest_inputs.is_empty()
+            && self.counters.manifest_fallbacks.is_empty()
+            && self.selection_claims.is_empty()
+            && self.pending_retirements.is_empty()
+            && self.retirement_intents.is_empty()
+            && self.pending_rejected_keys.is_empty()
+            && self.pending_leader_exit_views.is_empty()
+            && self.ready_expected_removals.is_empty()
+            && self.expected_target_exit_pending.is_none()
+            && self.plan.active_slot_count() == self.plan.slots.len()
+            && loader_module.view == view
+            && loader_module.tables.is_empty()
+            && loader_module.interfaces.is_empty()
+            && self.modules.iter().all(|module| {
+                module.object != loader
+                    && !module
+                        .entry_objects
+                        .iter()
+                        .flatten()
+                        .any(|id| *id == loader)
+            })
+            && pinned
+                .view_claims(view)
+                .is_some_and(|claims| claims.pins.contains(&loader))
+            && self
+                .pinned
+                .preserves_provider_inputs_for_loader(pinned, loader)
     }
 
     fn loader_candidate(
@@ -10400,12 +10472,79 @@ impl Engine {
             .is_some_and(|candidate_loader| {
                 loader_pins.exactly_matches(local_loader, &candidate_pins, candidate_loader)
             });
-        let raw_modules = self
-            .modules
-            .iter()
-            .map(|module| module.scanned.clone())
-            .collect();
-        let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        // Probe on a disposable clone: fallback retains the original exact
+        // loader restoration and global canonicalization path unchanged.
+        let stationary = if skipped.is_empty() && had_exact_loader {
+            let mut probe = candidate_pins.clone();
+            let (folds, lost) = canonicalize_scanned_overlays(&mut probe);
+            probe
+                .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
+                .is_some_and(|loader| {
+                    folds == 0
+                        && lost.is_empty()
+                        && self.loader_inputs_are_stationary(view, loader_module, &probe, loader)
+                })
+        } else {
+            false
+        };
+        let proof = stationary.then(|| LoaderPlanProof {
+            revision: self.facts_revision,
+            published_plan: self.plan.clone(),
+            discovery: self.discovery.clone(),
+        });
+        let cached_plan = stationary
+            .then_some(self.loader_plan_cache.as_ref())
+            .flatten()
+            .filter(|cache| {
+                cache.revision == self.published_facts_revision
+                    && cache.broad_admit == self.broad_admit
+            })
+            .map(|cache| cache.plan.clone());
+        let mut candidate = if let Some(plan) = cached_plan {
+            LiveCandidate {
+                pinned: candidate_pins,
+                modules: self.modules.clone(),
+                plan,
+                delta: plan::AttachDelta {
+                    new: Vec::new(),
+                    replace: Vec::new(),
+                    retire: Vec::new(),
+                },
+                views: self
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.view)
+                    .collect(),
+                corroboration: self.counters.corroboration.clone(),
+                manifest_fallbacks: Vec::new(),
+                selection_claims: BTreeMap::new(),
+                selection_tables: self.selection_tables.clone(),
+                selection_admission: None,
+                manifest_selection_admissions: Vec::new(),
+                // No manifest/selection admission can use rollback inventory.
+                manifest_inventory_slots: BTreeMap::new(),
+                loader_plan_proof: None,
+            }
+        } else {
+            self.loader_plan_cache = None;
+            let raw_modules = self
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect();
+            self.live_candidate(candidate_pins, raw_modules, skipped)?
+        };
+        if candidate.delta.new.is_empty()
+            && candidate.delta.replace.is_empty()
+            && candidate.delta.retire.is_empty()
+            && candidate.modules == self.modules
+            && candidate.corroboration == self.counters.corroboration
+            && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
+            && candidate.selection_claims == self.selection_claims
+            && candidate.selection_tables == self.selection_tables
+        {
+            candidate.loader_plan_proof = proof;
+        }
         candidate.views.insert(view);
         let loader = candidate
             .pinned
@@ -10924,6 +11063,10 @@ impl Engine {
         additions_allowed: &mut bool,
         outcome: &mut ApplyOutcome,
     ) {
+        let loader_plan = candidate
+            .loader_plan_proof
+            .take()
+            .map(|proof| (proof, candidate.plan.clone()));
         let selection_pending = candidate.selection_admission.take();
         outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
         let retired = !outcome.stale_views.is_empty();
@@ -11266,6 +11409,24 @@ impl Engine {
                 "live discovery evidence",
                 "the retired candidate's provider history could not be published",
             );
+        }
+        if let Some((proof, plan)) = loader_plan
+            && outcome.disposition == ApplyDisposition::Accepted
+            && new_targets_attached
+            && extra_views.is_empty()
+            && self.capture_facts.staged.is_none()
+            && self.facts_revision == self.published_facts_revision
+            && self.facts_revision == proof.revision.saturating_add(1)
+            && self.plan == proof.published_plan
+            && self.discovery == proof.discovery
+        {
+            // Publication invalidates first. Only this proved unchanged
+            // accepted transaction can carry the exact raw plan forward.
+            self.loader_plan_cache = Some(LoaderPlanCache {
+                revision: self.published_facts_revision,
+                broad_admit: self.broad_admit,
+                plan,
+            });
         }
         outcome.selection_authorized &= outcome.disposition == ApplyDisposition::Accepted;
     }

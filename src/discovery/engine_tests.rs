@@ -16228,6 +16228,998 @@ fn pin_test_module(view: &ProcessView, module: &ScannedModule) -> PinnedObjects 
     pins
 }
 
+/// Populated provider history over distinct real held files. The bytes and
+/// asserted digests agree across files; the opened identities remain distinct.
+struct LoaderPlanningFixture {
+    dir: tempfile::TempDir,
+    raw: Vec<ScannedModule>,
+    provider_pins: PinnedObjects,
+    loader: ScannedModule,
+    loader_pins: PinnedObjects,
+    local_loader: PinnedObjectId,
+    warm_loader: ScannedModule,
+    warm_loader_pins: PinnedObjects,
+    local_warm_loader: PinnedObjectId,
+}
+
+impl LoaderPlanningFixture {
+    fn new() -> Self {
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = Vec::new();
+        let mut provider_pins = PinnedObjects::empty();
+        for (minor, name, count) in [
+            (220, "provider.so", 3),
+            (222, "peer.so", 3),
+            (224, "refused.so", p11scope_ebpf_common::MAX_SLOTS + 1),
+        ] {
+            let path = dir.path().join(name);
+            let _file = overlay_backing_file(&dir, name);
+            let mut module = overlay_module(overlay_key(minor));
+            module.path = path.display().to_string();
+            module.tables[0].entries = overlay_entries(&module, first_offsets(count));
+            let pins = real_scan_pin(&path, Some(module.key), minor + 1, OVERLAY_SHA);
+            assert!(provider_pins.absorb(pins).is_empty());
+            raw.push(module);
+        }
+        let make_loader = |minor, name| {
+            let path = dir.path().join(name);
+            let _file = overlay_backing_file(&dir, name);
+            let mut loader = overlay_module(overlay_key(minor));
+            loader.path = path.display().to_string();
+            loader.tables.clear();
+            loader.exports.clear();
+            let mut pins = real_scan_pin(&path, Some(loader.key), minor + 1, OVERLAY_SHA);
+            let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader), &mut pins);
+            assert!(skips.is_empty());
+            let local = pins
+                .id_for_scanned(&loader, loader.key, &loader.path)
+                .unwrap();
+            (loader, pins, local)
+        };
+        let (loader, loader_pins, local_loader) = make_loader(221, "loader.so");
+        let (warm_loader, warm_loader_pins, local_warm_loader) =
+            make_loader(226, "initial-loader.so");
+        Self {
+            dir,
+            raw,
+            provider_pins,
+            loader,
+            loader_pins,
+            local_loader,
+            warm_loader,
+            warm_loader_pins,
+            local_warm_loader,
+        }
+    }
+
+    fn engine(&self) -> Engine {
+        let mut engine = self.cold_engine();
+        self.warm(&mut engine);
+        engine
+    }
+
+    fn warm(&self, engine: &mut Engine) {
+        if !engine
+            .views
+            .iter()
+            .any(|view| view.id() == self.warm_loader.view)
+        {
+            engine
+                .views
+                .push(ProcessView::open(self.warm_loader.view, std::process::id()).unwrap());
+        }
+        let before_plan = engine.plan.clone();
+        let before_discovery = engine.discovery.clone();
+        let (candidate, loader) = engine
+            .loader_candidate(
+                self.warm_loader.view,
+                &self.warm_loader,
+                &self.warm_loader_pins,
+                self.local_warm_loader,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(loader.is_some());
+        apply_loader_planning_candidate(engine, candidate);
+        assert_eq!(engine.plan, before_plan);
+        assert_eq!(engine.discovery, before_discovery);
+    }
+
+    fn cold_engine(&self) -> Engine {
+        let mut pins = self.provider_pins.clone();
+        let (modules, skips) = bind_scanned_modules(&self.raw, &mut pins);
+        assert!(skips.is_empty());
+        let mut engine = Engine::empty();
+        engine.scope = Scope::System;
+        engine.plan = plan::build_from_sources_scoped(
+            &modules,
+            &[],
+            &pins,
+            false,
+            plan::AdmissionScope::Shared,
+        );
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        for view in self
+            .raw
+            .iter()
+            .map(|module| module.view)
+            .chain([self.loader.view, self.warm_loader.view])
+        {
+            engine
+                .views
+                .push(ProcessView::open(view, std::process::id()).unwrap());
+        }
+        // A real consumed-EXEC loss is historical input to both paired engines.
+        let mut pending = PendingViewRetirements::new();
+        for offset in 0..=MAX_PENDING_REFRESH as u32 {
+            engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+        }
+        engine.refresh_requested.clear();
+        engine.publish_current_capture_facts().unwrap();
+        // Settle through the ordinary candidate transaction before measuring
+        // loader-only work; projection alone does not populate every planning
+        // input of this manually constructed initial provider plan.
+        let raw = engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .collect();
+        let candidate = engine
+            .live_candidate(engine.pinned.clone(), raw, Vec::new())
+            .unwrap();
+        apply_loader_planning_candidate(&mut engine, candidate);
+        assert_eq!(engine.plan.active_slot_count(), 6);
+        assert_eq!(engine.discovery.modules.len(), 2);
+        assert_eq!(engine.discovery.modules_skipped.len(), 1);
+        assert_eq!(engine.discovery_truncated, 1);
+        engine
+    }
+
+    fn candidate(&self, engine: &mut Engine, full: bool) -> (LiveCandidate, PinnedObjectId) {
+        let (candidate, loader) = if full {
+            let mut pins = engine.pinned.clone();
+            let skips = pins.absorb(self.loader_pins.clone());
+            assert!(skips.is_empty());
+            let raw = engine
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect();
+            let mut candidate = engine.live_candidate(pins, raw, skips).unwrap();
+            candidate.views.insert(self.loader.view);
+            let loader =
+                candidate
+                    .pinned
+                    .id_for_scanned(&self.loader, self.loader.key, &self.loader.path);
+            (candidate, loader)
+        } else {
+            engine
+                .loader_candidate(
+                    self.loader.view,
+                    &self.loader,
+                    &self.loader_pins,
+                    self.local_loader,
+                    Vec::new(),
+                )
+                .unwrap()
+        };
+        let loader = loader.expect("the exact loader pin survives");
+        assert!(
+            self.loader_pins
+                .exactly_matches(self.local_loader, &candidate.pinned, loader)
+        );
+        (candidate, loader)
+    }
+}
+
+fn loader_planning_operation_counts(engine: &Engine) -> (u64, u64) {
+    let count = |name| {
+        engine
+            .stage_timings()
+            .ops()
+            .iter()
+            .find(|(op, _, _)| *op == name)
+            .map_or(0, |(_, _, count)| *count)
+    };
+    (count("bind_live_modules"), count("rebuild_live_plan"))
+}
+
+fn apply_loader_planning_candidate(engine: &mut Engine, candidate: LiveCandidate) -> ApplyOutcome {
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            candidate,
+            &mut additions_allowed,
+            false,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert!(additions_allowed);
+    outcome
+}
+
+fn assert_loader_planning_evidence_equal(left: &Engine, right: &Engine) {
+    assert_eq!(left.plan, right.plan);
+    assert_eq!(
+        serde_json::to_value(&left.discovery).unwrap(),
+        serde_json::to_value(&right.discovery).unwrap()
+    );
+    assert_eq!(left.interface_selection(), right.interface_selection());
+    assert_eq!(left.counters.corroboration, right.counters.corroboration);
+    assert_eq!(
+        left.counters.manifest_fallbacks,
+        right.counters.manifest_fallbacks
+    );
+    assert_eq!(left.selection_claims, right.selection_claims);
+    assert_eq!(left.selection_tables, right.selection_tables);
+    assert_eq!(left.discovery_truncated, right.discovery_truncated);
+    assert_eq!(
+        left.newcomer_ages.dropped_unknown,
+        right.newcomer_ages.dropped_unknown
+    );
+    assert_eq!(
+        left.capture_facts.history.decoded,
+        right.capture_facts.history.decoded
+    );
+    assert_eq!(left.modules, right.modules);
+    assert_eq!(left.pinned.pinned().count(), right.pinned.pinned().count());
+    for pin in left.pinned.pinned() {
+        assert!(left.pinned.exactly_matches(pin.id, &right.pinned, pin.id));
+        assert_eq!(left.pinned.sources(pin.id), right.pinned.sources(pin.id));
+        assert!(std::ptr::eq(
+            left.pinned.file_for(pin.id).unwrap(),
+            right.pinned.file_for(pin.id).unwrap()
+        ));
+    }
+}
+
+#[test]
+fn loader_pin_reuse_uses_full_path_before_stationary_warmup() {
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.cold_engine();
+    let mut reference = fixture.cold_engine();
+    let old_plan = engine.plan.clone();
+    let before = loader_planning_operation_counts(&engine);
+    let (candidate, _) = fixture.candidate(&mut engine, false);
+    let (full, _) = fixture.candidate(&mut reference, true);
+    let outcome = apply_loader_planning_candidate(&mut engine, candidate);
+    let full_outcome = apply_loader_planning_candidate(&mut reference, full);
+    assert_eq!(outcome.changed, full_outcome.changed);
+    assert_eq!(engine.plan, old_plan);
+    assert_loader_planning_evidence_equal(&engine, &reference);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+}
+
+#[test]
+fn loader_pin_reuse_carries_one_stationary_snapshot_across_applies() {
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.engine();
+    let mut reference = fixture.engine();
+    let before = loader_planning_operation_counts(&engine);
+    for _ in 0..3 {
+        let (candidate, _) = fixture.candidate(&mut engine, false);
+        let (full, _) = fixture.candidate(&mut reference, true);
+        let outcome = apply_loader_planning_candidate(&mut engine, candidate);
+        let full_outcome = apply_loader_planning_candidate(&mut reference, full);
+        assert_eq!(outcome.changed, full_outcome.changed);
+        assert_loader_planning_evidence_equal(&engine, &reference);
+        let cache = engine.loader_plan_cache.as_ref().unwrap();
+        assert_eq!(cache.revision, engine.published_facts_revision);
+        assert_eq!(cache.plan.slots.len(), engine.plan.slots.len());
+        assert_eq!(cache.plan.surfaces.len(), 2);
+        assert_eq!(engine.plan.surfaces.len(), 3);
+        assert_eq!(loader_planning_operation_counts(&engine), before);
+    }
+}
+
+#[test]
+fn loader_pin_reuse_invalidates_on_standalone_projection_and_failed_publication() {
+    let fixture = LoaderPlanningFixture::new();
+    for failed_publication in [false, true] {
+        let mut engine = fixture.engine();
+        assert!(engine.loader_plan_cache.is_some());
+        let revision = engine.facts_revision;
+        if failed_publication {
+            // Reach the actual merge's manifest/ordinal preflight failure.
+            engine.manifest_ordinals.push(0);
+            assert!(engine.publish_current_capture_facts().is_err());
+            engine.manifest_ordinals.clear();
+        } else {
+            engine.project_capture_facts();
+        }
+        assert_eq!(engine.facts_revision, revision);
+        assert_eq!(engine.facts_revision, engine.published_facts_revision);
+        assert!(engine.loader_plan_cache.is_none());
+        let before = loader_planning_operation_counts(&engine);
+        let (candidate, _) = fixture.candidate(&mut engine, false);
+        apply_loader_planning_candidate(&mut engine, candidate);
+        assert_eq!(
+            loader_planning_operation_counts(&engine),
+            (before.0 + 1, before.1 + 1)
+        );
+        assert!(engine.loader_plan_cache.is_some());
+        assert_eq!(engine.plan.active_slot_count(), 6);
+        assert_eq!(engine.discovery_truncated, 1);
+    }
+}
+
+#[test]
+fn loader_pin_reuse_invalidates_on_full_planning_and_initial_rebuild() {
+    let fixture = LoaderPlanningFixture::new();
+    for initial_rebuild in [false, true] {
+        let mut engine = fixture.engine();
+        assert!(engine.loader_plan_cache.is_some());
+        if initial_rebuild {
+            // The initial inventory inputs are empty in this live fixture.
+            // Rebuilding replaces the provider input set before publication.
+            rebuild_discovered(&mut engine).unwrap();
+            assert!(engine.modules.is_empty());
+            assert_eq!(engine.plan.active_slot_count(), 0);
+        } else {
+            engine
+                .live_candidate(engine.pinned.clone(), fixture.raw.clone(), Vec::new())
+                .unwrap();
+        }
+        assert!(engine.loader_plan_cache.is_none());
+        let before = loader_planning_operation_counts(&engine);
+        let (candidate, _) = fixture.candidate(&mut engine, false);
+        assert!(candidate_identity_is_complete(
+            &candidate.plan,
+            &candidate.modules,
+            &candidate.pinned
+        ));
+        assert_eq!(
+            loader_planning_operation_counts(&engine),
+            (before.0 + 1, before.1 + 1)
+        );
+    }
+}
+
+#[test]
+fn loader_pin_reuse_does_not_carry_across_a_later_dirty_mutation() {
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.engine();
+    engine.mark_partial("loader cache control", "repeated dirty input");
+    engine.publish_current_capture_facts().unwrap();
+    fixture.warm(&mut engine);
+    assert!(engine.loader_plan_cache.is_some());
+    let published_plan = engine.plan.clone();
+    let discovery = engine.discovery.clone();
+    let before = loader_planning_operation_counts(&engine);
+    let (candidate, _) = fixture.candidate(&mut engine, false);
+    assert_eq!(loader_planning_operation_counts(&engine), before);
+
+    // A repeated marker preserves final public fields but still follows a
+    // genuine later mutation. Equality alone cannot carry the earlier proof.
+    engine.mark_partial("loader cache control", "repeated dirty input");
+    apply_loader_planning_candidate(&mut engine, candidate);
+    assert_eq!(engine.plan, published_plan);
+    assert_eq!(engine.discovery, discovery);
+    assert!(engine.loader_plan_cache.is_none());
+    let (candidate, _) = fixture.candidate(&mut engine, false);
+    apply_loader_planning_candidate(&mut engine, candidate);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+    assert!(engine.loader_plan_cache.is_some());
+}
+
+#[test]
+fn loader_only_pin_reuses_provider_plan() {
+    use std::os::unix::fs::MetadataExt as _;
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.engine();
+    let mut reference = fixture.engine();
+    let old_plan = engine.plan.clone();
+    let old_discovery = engine.discovery.clone();
+    let before = loader_planning_operation_counts(&engine);
+    let reference_before = loader_planning_operation_counts(&reference);
+    let (candidate, loader) = fixture.candidate(&mut engine, false);
+    assert!(
+        candidate.delta.new.is_empty()
+            && candidate.delta.replace.is_empty()
+            && candidate.delta.retire.is_empty()
+    );
+    let (full, reference_loader) = fixture.candidate(&mut reference, true);
+    assert_eq!(
+        loader_planning_operation_counts(&reference),
+        (reference_before.0 + 1, reference_before.1 + 1)
+    );
+    let outcome = apply_loader_planning_candidate(&mut engine, candidate);
+    let full_outcome = apply_loader_planning_candidate(&mut reference, full);
+    assert_eq!(outcome.changed, full_outcome.changed);
+    assert_eq!(engine.plan, old_plan);
+    assert_eq!(engine.discovery, old_discovery);
+    assert_eq!(loader, reference_loader);
+    assert_loader_planning_evidence_equal(&engine, &reference);
+    let claims = engine.pinned.view_claims(fixture.loader.view).unwrap();
+    assert!(claims.pins.contains(&loader));
+    assert!(claims.tables.is_empty() && claims.targets.is_empty());
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .all(|module| module.object != loader)
+    );
+    assert!(engine.plan.slots.iter().all(|slot| slot.object != loader));
+    let provider = engine.modules[0].object;
+    let peer = engine.modules[1].object;
+    assert_ne!(provider, peer);
+    assert_eq!(
+        engine.pinned.summary(provider).unwrap().sha256,
+        engine.pinned.summary(peer).unwrap().sha256
+    );
+    assert_ne!(
+        engine
+            .pinned
+            .file_for(provider)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .ino(),
+        engine
+            .pinned
+            .file_for(peer)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .ino()
+    );
+    assert_eq!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == provider)
+            .count(),
+        3
+    );
+    assert_eq!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == peer)
+            .count(),
+        3
+    );
+    assert_eq!(engine.discovery_truncated, 1);
+    assert_eq!(loader_planning_operation_counts(&engine), before);
+}
+
+fn add_published_loader_planning_state(engine: &mut Engine) {
+    let module = &engine.modules[0];
+    let object = module.object;
+    let provider = engine.pinned.owned_timing_key(object).unwrap();
+    engine
+        .counters
+        .corroboration
+        .push(([object].into_iter().collect(), "single_source"));
+    engine.selection_tables.insert(
+        SelectionTableKey {
+            view: module.scanned.view,
+            provider,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        },
+        SelectionTableFact {
+            object,
+            file_offset: 0,
+            targets: module.scanned.tables[0]
+                .entries
+                .iter()
+                .map(|entry| plan::SelectionTableTarget {
+                    object,
+                    object_path: entry.object_path.clone(),
+                    file_offset: entry.file_offset,
+                    name: entry.name,
+                })
+                .collect(),
+        },
+    );
+    let tuple = LiveSelectionTuple {
+        module: engine.plan.modules[0].id,
+        request: SelectionRequest {
+            name: SelectionNameClass::Null,
+            version: SelectionVersionClass::Null,
+            flags: 0,
+        },
+        rv: 1,
+        result: None,
+        inventory_matches: Vec::new(),
+        authority: SelectionAuthority::None,
+        count: 0,
+    };
+    engine.capture_facts.record_selection(tuple.clone(), false);
+    engine.capture_facts.record_selection(tuple, false);
+    engine.note_facts_mutated();
+    engine.publish_current_capture_facts().unwrap();
+}
+
+#[test]
+fn loader_pin_reuse_preserves_published_proof_and_selection_state() {
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.engine();
+    let mut reference = fixture.engine();
+    add_published_loader_planning_state(&mut engine);
+    add_published_loader_planning_state(&mut reference);
+    fixture.warm(&mut engine);
+    fixture.warm(&mut reference);
+    assert!(!engine.counters.corroboration.is_empty());
+    assert!(!engine.selection_tables.is_empty());
+    assert_eq!(engine.interface_selection().tuples[0].count, 2);
+    let before = loader_planning_operation_counts(&engine);
+    let (candidate, _) = fixture.candidate(&mut engine, false);
+    let (full, _) = fixture.candidate(&mut reference, true);
+    let outcome = apply_loader_planning_candidate(&mut engine, candidate);
+    let full_outcome = apply_loader_planning_candidate(&mut reference, full);
+    assert_eq!(outcome.changed, full_outcome.changed);
+    assert_loader_planning_evidence_equal(&engine, &reference);
+    assert_eq!(engine.interface_selection().tuples[0].count, 2);
+    assert_eq!(loader_planning_operation_counts(&engine), before);
+}
+
+#[test]
+fn loader_pin_reuse_adds_a_view_to_an_existing_exact_loader() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.engine();
+    let mut reference = fixture.engine();
+    let (initial, loader) = fixture.candidate(&mut engine, false);
+    let (initial_full, full_loader) = fixture.candidate(&mut reference, true);
+    assert_eq!(loader, full_loader);
+    apply_loader_planning_candidate(&mut engine, initial);
+    apply_loader_planning_candidate(&mut reference, initial_full);
+    add_published_loader_planning_state(&mut engine);
+    add_published_loader_planning_state(&mut reference);
+    fixture.warm(&mut engine);
+    fixture.warm(&mut reference);
+    let held_fd = engine.pinned.file_for(loader).unwrap().as_raw_fd();
+    let owned: Vec<_> = fixture
+        .raw
+        .iter()
+        .map(|module| {
+            (
+                module.view,
+                engine.pinned.view_claims(module.view).unwrap().clone(),
+            )
+        })
+        .collect();
+    let mut loader_module = fixture.loader.clone();
+    loader_module.view = ProcessViewId(225);
+    for paired in [&mut engine, &mut reference] {
+        paired
+            .views
+            .push(ProcessView::open(loader_module.view, std::process::id()).unwrap());
+    }
+    // A fresh opened FD names the same physical loader in another process view.
+    // Absorption must keep the original capture's retained File allocation.
+    let mut pins = real_scan_pin(
+        Path::new(&loader_module.path),
+        Some(loader_module.key),
+        222,
+        OVERLAY_SHA,
+    );
+    let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader_module), &mut pins);
+    assert!(skips.is_empty());
+    let local = pins
+        .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+        .unwrap();
+    assert!(pins.exactly_matches(local, &engine.pinned, loader));
+    assert!(!std::ptr::eq(
+        pins.file_for(local).unwrap(),
+        engine.pinned.file_for(loader).unwrap()
+    ));
+    let before = loader_planning_operation_counts(&engine);
+    let (candidate, retained_loader) = engine
+        .loader_candidate(loader_module.view, &loader_module, &pins, local, Vec::new())
+        .unwrap();
+    assert_eq!(retained_loader, Some(loader));
+    let mut full_pins = reference.pinned.clone();
+    assert!(full_pins.absorb(pins).is_empty());
+    let raw = reference
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let mut full = reference
+        .live_candidate(full_pins, raw, Vec::new())
+        .unwrap();
+    full.views.insert(loader_module.view);
+    let old_plan = engine.plan.clone();
+    let outcome = apply_loader_planning_candidate(&mut engine, candidate);
+    let full_outcome = apply_loader_planning_candidate(&mut reference, full);
+    assert_eq!(outcome.changed, full_outcome.changed);
+    assert_eq!(engine.plan, old_plan);
+    assert_loader_planning_evidence_equal(&engine, &reference);
+    assert_eq!(engine.pinned.file_for(loader).unwrap().as_raw_fd(), held_fd);
+    for view in [fixture.loader.view, loader_module.view] {
+        let claims = engine.pinned.view_claims(view).unwrap();
+        assert!(claims.pins.contains(&loader));
+        assert!(claims.tables.is_empty() && claims.targets.is_empty());
+    }
+    for (view, before) in &owned {
+        let after = engine.pinned.view_claims(*view).unwrap();
+        assert_eq!(after.tables, before.tables);
+        assert_eq!(after.targets, before.targets);
+        assert_eq!(
+            after.pins.iter().collect::<BTreeSet<_>>(),
+            before.pins.iter().collect::<BTreeSet<_>>()
+        );
+    }
+    assert_eq!(loader_planning_operation_counts(&engine), before);
+    // Without rebinding, even the private duplicate pin-claim multiplicity
+    // remains untouched; each provider view keeps precisely its old claims.
+    for (view, before) in owned {
+        assert_eq!(engine.pinned.view_claims(view), Some(&before));
+    }
+}
+
+#[test]
+fn loader_pin_reuse_preserves_owed_retired_slot_reattachment() {
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.engine();
+    let mut reference = fixture.engine();
+    let retired = engine.plan.slots[0].index;
+    let allocated = engine.plan.slots.len();
+    for paired in [&mut engine, &mut reference] {
+        paired.plan.deactivate(retired);
+        paired.note_facts_mutated();
+        paired.publish_current_capture_facts().unwrap();
+        assert_eq!(paired.plan.active_slot_count(), 5);
+    }
+    let before = loader_planning_operation_counts(&engine);
+    let (candidate, _) = fixture.candidate(&mut engine, false);
+    assert_eq!(candidate.delta.new.len(), 1);
+    assert!(!candidate.plan.is_active(retired));
+    assert_eq!(candidate.plan.slots.len(), allocated + 1);
+    let (full, _) = fixture.candidate(&mut reference, true);
+    apply_loader_planning_candidate(&mut engine, candidate);
+    apply_loader_planning_candidate(&mut reference, full);
+    assert_loader_planning_evidence_equal(&engine, &reference);
+    assert_eq!(engine.plan.active_slot_count(), 6);
+    assert!(!engine.plan.is_active(retired));
+    assert_eq!(engine.plan.slots.len(), allocated + 1);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+}
+
+#[test]
+fn loader_pin_reuse_falls_back_for_cross_overlay_canonicalization() {
+    let fixture = LoaderPlanningFixture::new();
+    let (mut engine, provider_module, provider, _) = engine_with_overlay(104);
+    engine
+        .views
+        .push(ProcessView::open(provider_module.view, std::process::id()).unwrap());
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    let settled = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            vec![provider_module.clone()],
+            Vec::new(),
+        )
+        .unwrap();
+    apply_loader_planning_candidate(&mut engine, settled);
+    fixture.warm(&mut engine);
+    assert_eq!(engine.facts_revision, engine.published_facts_revision);
+    assert!(!engine.pinned.has_overlay_uncertainty());
+    let mut loader_module = overlay_module(overlay_key(102));
+    loader_module.tables.clear();
+    loader_module.exports.clear();
+    engine
+        .views
+        .push(ProcessView::open(loader_module.view, std::process::id()).unwrap());
+    let mut loader_pins = overlay_view_pin(&loader_module, 999, OVERLAY_SHA, 1, true);
+    let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader_module), &mut loader_pins);
+    assert!(skips.is_empty());
+    let local_loader = loader_pins
+        .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+        .unwrap();
+    let before = loader_planning_operation_counts(&engine);
+    let (candidate, loader) = engine
+        .loader_candidate(
+            loader_module.view,
+            &loader_module,
+            &loader_pins,
+            local_loader,
+            Vec::new(),
+        )
+        .unwrap();
+    let loader = loader.expect("the original full path restores the exact loader pin");
+    assert_ne!(loader, provider);
+    assert!(loader_pins.exactly_matches(local_loader, &candidate.pinned, loader));
+    assert!(candidate.pinned.has_overlay_uncertainty());
+    assert_eq!(candidate.plan.modules.len(), 1);
+    assert_eq!(candidate.plan.modules[0].object, provider);
+    assert!(
+        candidate
+            .plan
+            .slots
+            .iter()
+            .all(|slot| slot.object != loader)
+    );
+    assert!(candidate_identity_is_complete(
+        &candidate.plan,
+        &candidate.modules,
+        &candidate.pinned
+    ));
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+}
+
+#[test]
+fn loader_pin_reuse_falls_back_when_old_pin_source_authority_changes() {
+    let fixture = LoaderPlanningFixture::new();
+    // Minor 6 shares this existing manifest fixture's mount identity 7.
+    let (mut engine, raw, provider, _) = engine_with_overlay(6);
+    for view in [raw.view, fixture.loader.view] {
+        engine
+            .views
+            .push(ProcessView::open(view, std::process::id()).unwrap());
+    }
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    let settled = engine
+        .live_candidate(engine.pinned.clone(), vec![raw.clone()], Vec::new())
+        .unwrap();
+    apply_loader_planning_candidate(&mut engine, settled);
+    fixture.warm(&mut engine);
+    let old_plan = engine.plan.clone();
+    let held_fd = engine.pinned.file_for(provider).unwrap().as_raw_fd();
+    assert_eq!(engine.pinned.sources(provider), ["scan"]);
+    let mut incoming = fixture.loader_pins.clone();
+    assert!(
+        incoming
+            .absorb(crate::discovery::identity::test_fixture::manifest_pin(
+                raw.key,
+                OVERLAY_SHA,
+                1,
+            ))
+            .is_empty()
+    );
+    let before = loader_planning_operation_counts(&engine);
+    let (candidate, loader) = engine
+        .loader_candidate(
+            fixture.loader.view,
+            &fixture.loader,
+            &incoming,
+            fixture.local_loader,
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(loader.is_some());
+    assert_eq!(candidate.plan, old_plan);
+    assert_eq!(candidate.pinned.sources(provider), ["scan", "manifest"]);
+    assert_eq!(
+        candidate.pinned.file_for(provider).unwrap().as_raw_fd(),
+        held_fd
+    );
+    apply_loader_planning_candidate(&mut engine, candidate);
+    assert_eq!(engine.plan, old_plan);
+    assert_eq!(
+        engine.discovery.modules[0].objects[0].sources,
+        ["scan", "manifest"]
+    );
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+}
+
+#[test]
+fn loader_pin_reuse_falls_back_for_unsettled_or_invalid_inputs() {
+    let fixture = LoaderPlanningFixture::new();
+    for input in [
+        "staged",
+        "partial",
+        "scan",
+        "corroboration",
+        "fallback",
+        "selection",
+    ] {
+        let mut engine = fixture.engine();
+        match input {
+            "staged" => engine.capture_facts.begin_stage().unwrap(),
+            "partial" => engine.mark_partial("loader reuse control", "unpublished later gap"),
+            "scan" => {
+                engine.absorb_scan_counters(DiscoveryCounters {
+                    scan_ms: 19,
+                    ..DiscoveryCounters::default()
+                });
+            }
+            "corroboration" => {
+                engine
+                    .counters
+                    .corroboration
+                    .push(([PinnedObjectId(u32::MAX)].into_iter().collect(), "agreed"));
+                engine.publish_current_capture_facts().unwrap();
+            }
+            "fallback" => {
+                engine.counters.manifest_fallbacks.push(ManifestFallback {
+                    manifest: 0,
+                    object: 0,
+                    reason: ManifestStaleReason::IdentityMismatch,
+                    replacement: engine.modules[0].object,
+                    proof: BoundFallbackProof {
+                        module: PinnedObjectId(u32::MAX),
+                        tables: Vec::new(),
+                        required_targets: BTreeMap::new(),
+                    },
+                });
+                engine.publish_current_capture_facts().unwrap();
+            }
+            "selection" => {
+                add_published_loader_planning_state(&mut engine);
+                let (mut key, table) = engine.selection_tables.pop_first().unwrap();
+                key.view = ProcessViewId(u32::MAX);
+                engine.selection_tables.insert(key, table);
+                engine.publish_current_capture_facts().unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = loader_planning_operation_counts(&engine);
+        let (candidate, _) = fixture.candidate(&mut engine, false);
+        assert_eq!(
+            loader_planning_operation_counts(&engine),
+            (before.0 + 1, before.1 + 1),
+            "{input}"
+        );
+        apply_loader_planning_candidate(&mut engine, candidate);
+        assert_eq!(engine.plan.active_slot_count(), 6);
+        assert_eq!(engine.discovery_truncated, 1);
+        match input {
+            "staged" => {
+                assert!(engine.capture_facts.staged.is_some());
+                assert!(engine.loader_plan_cache.is_none());
+                engine.capture_facts.rollback_stage();
+            }
+            "partial" => assert!(
+                engine
+                    .plan
+                    .skipped
+                    .iter()
+                    .any(|skip| skip.reason == "unpublished later gap")
+            ),
+            "scan" => assert_eq!(engine.discovery.scan_ms, 19),
+            "corroboration" => assert!(engine.counters.corroboration.is_empty()),
+            "fallback" => assert!(engine.counters.manifest_fallbacks.is_empty()),
+            "selection" => assert!(engine.selection_tables.is_empty()),
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn conflicting_loader_planning_fixture(mutated_original: bool) {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let fixture = LoaderPlanningFixture::new();
+    let mut engine = fixture.engine();
+    let provider = engine.modules[0].object;
+    let mut loader = fixture.raw[0].clone();
+    loader.tables.clear();
+    let sha = if mutated_original {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&loader.path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(!engine.pinned.check_unchanged().unwrap());
+        assert!(engine.pinned.provider_changed());
+        // This control starts after the existing metadata check detects the
+        // original held file's mutation; it does not model an undetected write.
+        "changed-provider-digest"
+    } else {
+        let _file = overlay_backing_file(&fixture.dir, "conflicting-loader.so");
+        loader.path = fixture
+            .dir
+            .path()
+            .join("conflicting-loader.so")
+            .display()
+            .to_string();
+        assert_eq!(
+            std::fs::read(&fixture.raw[0].path).unwrap(),
+            std::fs::read(&loader.path).unwrap()
+        );
+        OVERLAY_SHA
+    };
+    let pins = real_scan_pin(Path::new(&loader.path), Some(loader.key), 221, sha);
+    let local = pins
+        .id_for_scanned(&loader, loader.key, &loader.path)
+        .unwrap();
+    assert!(!engine.pinned.exactly_matches(provider, &pins, local));
+    let before = loader_planning_operation_counts(&engine);
+    let (candidate, canonical_loader) = engine
+        .loader_candidate(loader.view, &loader, &pins, local, Vec::new())
+        .unwrap();
+    assert!(canonical_loader.is_none());
+    assert_eq!(candidate.delta.retire.len(), 3);
+    assert!(candidate.pinned.summary(provider).is_none());
+    assert!(candidate_identity_is_complete(
+        &candidate.plan,
+        &candidate.modules,
+        &candidate.pinned
+    ));
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+}
+
+#[test]
+fn loader_pin_reuse_rejects_equal_hash_conflicting_opened_file() {
+    conflicting_loader_planning_fixture(false);
+}
+
+#[test]
+fn loader_pin_reuse_rejects_changed_original_held_file() {
+    conflicting_loader_planning_fixture(true);
+}
+
+#[test]
+fn loader_pin_reuse_keeps_generation_checks_at_apply() {
+    let fixture = LoaderPlanningFixture::new();
+    for during_attach in [false, true] {
+        let children = e06_spawn_sleeps(1);
+        let pid = children[0].pid();
+        let mut engine = fixture.engine();
+        engine.views.retain(|view| view.id() != fixture.loader.view);
+        engine
+            .views
+            .push(ProcessView::open(fixture.loader.view, pid).unwrap());
+        let (candidate, loader) = fixture.candidate(&mut engine, false);
+        let old_plan = engine.plan.clone();
+        let mut session = ScriptedSession::default();
+        if during_attach {
+            session.lose_generation_at_attach(pid);
+        } else {
+            session.lose_generations_at_preflight([Some(pid)]);
+        }
+        let mut additions_allowed = true;
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+            .unwrap();
+        assert_eq!(
+            outcome.disposition,
+            if during_attach {
+                ApplyDisposition::ConservativeRetirement
+            } else {
+                ApplyDisposition::Refused
+            }
+        );
+        assert!(outcome.stale_views.contains(&fixture.loader.view));
+        assert!(!additions_allowed);
+        assert!(engine.loader_plan_cache.is_none());
+        assert!(engine.pinned.summary(loader).is_none());
+        assert_eq!(engine.plan.slots, old_plan.slots);
+        assert_eq!(engine.plan.active_slot_count(), 6);
+        assert_eq!(engine.discovery_truncated, 1);
+    }
+}
+
 #[test]
 fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
@@ -16851,6 +17843,7 @@ fn post_attach_generation_loss_detaches_and_cannot_commit_stale_candidate() {
         selection_admission: None,
         manifest_selection_admissions: Vec::new(),
         manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
     };
     commit_cleaned_candidate_identity(
         &mut candidate,

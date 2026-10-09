@@ -27800,14 +27800,14 @@ pub(crate) mod detailed_proof_driver {
     use p11scope_ebpf_common::{Event, ImageIdentity};
     use std::ops::ControlFlow;
 
-    struct Io {
-        proof: ProofSession,
+    pub(crate) struct Io {
+        pub(crate) proof: ProofSession,
         link: Vec<u8>,
-        cookie: Cell<Option<u64>>,
+        pub(crate) cookie: Cell<Option<u64>>,
         loss: Cell<Result<u64, TraceProofUnknown>>,
-        cookie_reads: Cell<usize>,
-        health_reads: Cell<usize>,
-        samples: Cell<usize>,
+        pub(crate) cookie_reads: Cell<usize>,
+        pub(crate) health_reads: Cell<usize>,
+        pub(crate) samples: Cell<usize>,
         expire_on_sample: Cell<Option<usize>>,
         slow_sample: Cell<Option<ProcessViewId>>,
         slow_cookie_pid: Cell<Option<u32>>,
@@ -27864,7 +27864,7 @@ pub(crate) mod detailed_proof_driver {
             result
         }
     }
-    fn fixture() -> (Engine, Io) {
+    pub(crate) fn fixture() -> (Engine, Io) {
         let mut engine = Engine::empty();
         engine.scope = Scope::System;
         engine.frame_work_budget_ns = 100_000_000;
@@ -27900,7 +27900,7 @@ pub(crate) mod detailed_proof_driver {
             .unwrap();
         accepted
     }
-    fn seed(engine: &mut Engine, io: &mut Io) {
+    pub(crate) fn seed(engine: &mut Engine, io: &mut Io) {
         assert!(service(engine, io).is_empty());
         assert_eq!(
             engine.trace_seeds.len(),
@@ -27913,7 +27913,7 @@ pub(crate) mod detailed_proof_driver {
             "no first CALL cookie is required at sampling"
         );
     }
-    fn calls(io: &Io, ts: u64, cookie: u64, exec: u64) -> usize {
+    pub(crate) fn calls(io: &Io, ts: u64, cookie: u64, exec: u64) -> usize {
         calls_pid(io, std::process::id(), ts, cookie, exec)
     }
     fn calls_pid(io: &Io, pid: u32, ts: u64, cookie: u64, exec: u64) -> usize {
@@ -27940,7 +27940,7 @@ pub(crate) mod detailed_proof_driver {
         });
         count
     }
-    fn empty(io: &Io) {
+    pub(crate) fn empty(io: &Io) {
         io.proof.test_set_time(io.proof.test_time().max(40));
         let mut drain = DiscoveryDrain::over_domain(
             ScriptedRecords::records([], 0),
@@ -27991,6 +27991,53 @@ pub(crate) mod detailed_proof_driver {
         seed(&mut engine, &mut io);
         let mut accepted = verify(&mut engine, &mut io);
         assert_eq!(accepted.len(), 1);
+        engine.views.clear();
+        assert!(service(&mut engine, &mut io).is_empty());
+        (io.proof.clone(), accepted.pop().unwrap())
+    }
+    pub(crate) fn exhaust_consumer_frame(engine: &mut Engine, io: &mut Io) {
+        engine
+            .with_trace_frame(io, |engine, io, work| {
+                assert!(work.state.is_some(), "the actual frame must own a ticket");
+                for _ in 0..100 {
+                    engine.service_trace_images(io, work, |_| panic!("no CALL witness yet"));
+                }
+                while work.external_read(&io.proof).is_ok() {}
+                let state = work.state.as_ref().unwrap().lock().unwrap();
+                assert_eq!((state.visits, state.reads), (0, 0));
+                assert!(state.health_attempted);
+                Ok(())
+            })
+            .unwrap();
+    }
+    pub(crate) fn verified_exited_fixture() -> (ProofSession, VerifiedTraceSeed) {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let (mut engine, mut io) = fixture();
+        engine.views.clear();
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), child.0.id()).unwrap());
+        seed(&mut engine, &mut io);
+        assert_eq!(calls_pid(&io, child.0.id(), 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        assert!(service(&mut engine, &mut io).is_empty());
+        empty(&io);
+        let mut accepted = service(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
         engine.views.clear();
         assert!(service(&mut engine, &mut io).is_empty());
         (io.proof.clone(), accepted.pop().unwrap())

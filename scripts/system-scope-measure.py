@@ -218,13 +218,16 @@ def resolve_ring_bytes(value):
         raise ValueError(f"unparseable ring_bytes: {value!r}")
 
 
+TRACE_JSON_STRING = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
 CALL_PREFIX_RE = re.compile(
     r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid \d+ tid \d+|"
-    r"Unknown executable \(PID [0-9]+, TID [0-9]+\)) (?P<body>.*)$")
+    r"Unknown executable \(PID [0-9]+, TID [0-9]+\)|"
+    rf"{TRACE_JSON_STRING} \(PID [0-9]+, TID [0-9]+\) exe={TRACE_JSON_STRING}) (?P<body>.*)$")
 CALL_LINE_RE = re.compile(r"^(\S+)(.*) \u2192 (\S+) (.+)$")
 TRACE_CONTEXT_LINES = frozenset((
     "Trace — completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
+    "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
 ))
 LOST_LINE_RE = re.compile(r"^LOST (\d+) events$")
 TRUNCATED_LINE_RE = re.compile(r"^TRUNCATED at \d+ events")
@@ -292,7 +295,7 @@ def parse_trace_stream(lines):
             session, separator, body = body.partition(" ")
             if not separator or not re.fullmatch(r"sess#[0-9]+", session):
                 raise ValueError(f"malformed trace session: {line!r}")
-        if body.startswith(("pid ", "Unknown executable ", "sess#")):
+        if body.startswith(("pid ", "Unknown executable ", "sess#", '"')) or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", body):
             raise ValueError(f"duplicate trace identity/session: {line!r}")
         call = CALL_LINE_RE.match(body) if prefix else None
         if call is not None:

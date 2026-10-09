@@ -7,6 +7,18 @@ use p11scope_ebpf_common::instance::{
     STAMP_LOCAL_FAULT, STAMP_NO_FILE, STAMP_NO_TASK, STAMP_OVERFLOW, STAMP_SHARED_MM, STAMP_VALID,
 };
 
+fn domain() -> NativeDomainId {
+    static DOMAIN: std::sync::OnceLock<NativeDomainId> = std::sync::OnceLock::new();
+    *DOMAIN.get_or_init(NativeDomainId::mint)
+}
+
+fn image(task_cookie: u64, exec_id: u64) -> ImageIdentity {
+    ImageIdentity {
+        task_cookie,
+        exec_id,
+    }
+}
+
 const COOKIE: u64 = 0x51;
 const FILE: u32 = 3;
 const BASE_A: u64 = 0x7f00_0000_0000;
@@ -65,7 +77,8 @@ fn stamp(local: u32, global: u32, fault: u32) -> InstanceStamp {
 fn call(token: u64, stamp: InstanceStamp, ip: u64) -> CallFacts {
     CallFacts {
         token,
-        cookie: COOKIE,
+        domain: domain(),
+        image: image(COOKIE, 0),
         entry: stamp,
         ret: stamp,
         ip: EntryIp::new(ip),
@@ -79,7 +92,7 @@ fn ip_in(base: u64) -> u64 {
 }
 
 fn router() -> InstanceRouter {
-    InstanceRouter::new(RouterLimits::default())
+    InstanceRouter::new(domain(), RouterLimits::default())
 }
 
 fn observation_for(cookie: u64, local: u64, ranges: Vec<MapRange>) -> StableObservation {
@@ -101,7 +114,8 @@ fn observation_for(cookie: u64, local: u64, ranges: Vec<MapRange>) -> StableObse
 fn call_for(token: u64, cookie: u64, stamp: InstanceStamp, ip: u64) -> CallFacts {
     CallFacts {
         token,
-        cookie,
+        domain: domain(),
+        image: image(cookie, 0),
         entry: stamp,
         ret: stamp,
         ip: EntryIp::new(ip),
@@ -116,11 +130,424 @@ fn joined(route: Route) -> InstanceId {
     }
 }
 
+/// These tests use the production proof consumer and the owning scan protocol,
+/// unlike the legacy scalar epoch fixtures below. The I/O script supplies
+/// stable reads; identity, range, epoch and original-fence checks remain real.
+mod full_image {
+    use super::*;
+    use crate::attach::image_query::{CompleteEpochs, ImageScanProof, acquire_test_scan};
+
+    fn seal(
+        owner: NativeDomainId,
+        identity: ImageIdentity,
+        local: u64,
+        fault: u64,
+        fence: u64,
+    ) -> ImageScanProof {
+        acquire_test_scan(
+            owner,
+            identity,
+            FILE,
+            CompleteEpochs {
+                local,
+                global: 0,
+                fault,
+                sticky: 0,
+                record_flags: 0,
+            },
+            load(BASE_A),
+            fence,
+        )
+        .expect("nonempty stable acquisition")
+    }
+
+    fn facts(
+        token: u64,
+        owner: NativeDomainId,
+        identity: ImageIdentity,
+        local: u32,
+        fault: u32,
+    ) -> CallFacts {
+        CallFacts {
+            token,
+            domain: owner,
+            image: identity,
+            entry: stamp(local, 0, fault),
+            ret: stamp(local, 0, fault),
+            ip: EntryIp::new(ip_in(BASE_A)),
+            attached_offset: Some(TEXT),
+        }
+    }
+
+    #[test]
+    fn stable_full_image_seal_joins_nonempty_supported_load() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, 0)).0,
+            ObserveOutcome::New
+        );
+        let first = joined(r.route(facts(1, domain(), identity, 1, 0)));
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, 0)).0,
+            ObserveOutcome::Continued
+        );
+        assert_eq!(joined(r.route(facts(2, domain(), identity, 1, 0))), first);
+        assert_eq!(r.instances_minted(), 1);
+        assert_eq!(r.ranges_retained(), 3);
+    }
+
+    #[test]
+    fn same_cookie_exec_images_never_share_instance() {
+        let mut r = router();
+        let old = image(COOKIE, 10);
+        let successor = image(COOKIE, 11);
+        r.observe(seal(domain(), old, 1, 0, 0));
+        let old_id = joined(r.route(facts(1, domain(), old, 1, 0)));
+        assert_eq!(
+            r.observe(seal(domain(), successor, 1, 0, 0)).0,
+            ObserveOutcome::New
+        );
+        let new_id = joined(r.route(facts(2, domain(), successor, 1, 0)));
+        assert_ne!(old_id, new_id);
+        assert_eq!(joined(r.route(facts(3, domain(), old, 1, 0))), old_id);
+    }
+
+    #[test]
+    fn retired_exec_allows_same_cookie_successor() {
+        let mut r = router();
+        let old = image(COOKIE, 10);
+        let successor = image(COOKIE, 11);
+        r.observe(seal(domain(), old, 1, 0, 0));
+        let old_id = joined(r.route(facts(1, domain(), old, 1, 0)));
+        assert_eq!(r.route(facts(2, domain(), old, 2, 0)), Route::Pending);
+        assert_eq!(r.route(facts(3, domain(), successor, 2, 0)), Route::Pending);
+        assert_eq!(
+            r.retire_image(old),
+            vec![(2, Route::Unknown(UnknownReason::Retired))],
+        );
+        assert_eq!(r.pending_len(), 1);
+        let (outcome, resolved) = r.observe(seal(domain(), successor, 2, 0, r.fence()));
+        assert_eq!(outcome, ObserveOutcome::New);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, 3);
+        let successor_id = joined(resolved[0].1);
+        assert_ne!(successor_id, old_id);
+        assert_eq!(
+            joined(r.route(facts(4, domain(), successor, 2, 0))),
+            successor_id
+        );
+    }
+
+    #[test]
+    fn old_scan_after_exec_never_revives() {
+        let mut r = router();
+        let old = image(COOKIE, 10);
+        let successor = image(COOKIE, 11);
+        r.observe(seal(domain(), old, 1, 0, 0));
+        let old_id = joined(r.route(facts(1, domain(), old, 1, 0)));
+        let cached = seal(domain(), old, 1, 0, r.fence());
+        r.retire_image(old);
+        assert_eq!(r.observe(cached).0, ObserveOutcome::Retired);
+        assert_eq!(
+            r.route(facts(2, domain(), old, 1, 0)),
+            Route::Unknown(UnknownReason::Retired)
+        );
+        assert_eq!(
+            r.observe(seal(domain(), successor, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        assert_ne!(joined(r.route(facts(3, domain(), successor, 1, 0))), old_id);
+        assert_eq!(
+            r.observe(seal(domain(), old, 1, 0, r.fence())).0,
+            ObserveOutcome::Retired
+        );
+    }
+
+    #[test]
+    fn equal_cookie_foreign_domain_refuses() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        r.observe(seal(domain(), identity, 1, 0, 0));
+        let own_id = joined(r.route(facts(1, domain(), identity, 1, 0)));
+        let before = (
+            r.instances_minted(),
+            r.ranges_retained(),
+            r.pending_len(),
+            r.counters().joined,
+        );
+        let foreign = NativeDomainId::mint();
+        assert_ne!(foreign, domain());
+        assert_eq!(
+            r.route(facts(2, foreign, identity, 1, 0)),
+            Route::Unknown(UnknownReason::ForeignDomain)
+        );
+        assert_eq!(
+            (
+                r.instances_minted(),
+                r.ranges_retained(),
+                r.pending_len(),
+                r.counters().joined
+            ),
+            before
+        );
+        assert_eq!(joined(r.route(facts(3, domain(), identity, 1, 0))), own_id);
+    }
+
+    #[test]
+    fn out_of_range_file_stamp_refuses_before_pending_capacity() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        r.observe(seal(domain(), identity, 1, 0, 0));
+        let own_id = joined(r.route(facts(1, domain(), identity, 1, 0)));
+        let mut invalid = facts(2, domain(), identity, 1, 0);
+        invalid.entry.file_slot_plus1 = (instance::FILE_SLOTS + 1) as u16;
+        invalid.ret = invalid.entry;
+        assert_eq!(r.route(invalid), Route::Unknown(UnknownReason::NoFile));
+        assert_eq!(r.pending_len(), 0);
+        assert_eq!(r.instances_minted(), 1);
+        assert_eq!(joined(r.route(facts(3, domain(), identity, 1, 0))), own_id);
+    }
+
+    #[test]
+    fn foreign_domain_seal_never_resolves_pending() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(r.route(facts(1, domain(), identity, 1, 0)), Route::Pending);
+        let foreign = NativeDomainId::mint();
+        let before = r.counters();
+        assert_eq!(
+            r.observe(seal(foreign, identity, 1, 0, r.fence())),
+            (ObserveOutcome::ForeignDomain, Vec::new()),
+        );
+        assert_eq!(r.instances_minted(), 0);
+        assert_eq!(r.ranges_retained(), 0);
+        assert_eq!(r.pending_len(), 1);
+        assert_eq!(r.counters(), before);
+        let (outcome, resolved) = r.observe(seal(domain(), identity, 1, 0, r.fence()));
+        assert_eq!(outcome, ObserveOutcome::New);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, 1);
+        assert_eq!(
+            joined(r.route(facts(2, domain(), identity, 1, 0))),
+            joined(resolved[0].1)
+        );
+    }
+
+    #[test]
+    fn retirement_eviction_cannot_reopen_ended_image() {
+        let mut r = InstanceRouter::new(
+            domain(),
+            RouterLimits {
+                retired_cookies: 1,
+                ..RouterLimits::default()
+            },
+        );
+        let ended = image(COOKIE, 10);
+        let successor = image(COOKIE, 11);
+        let other = image(COOKIE + 1, 3);
+        r.observe(seal(domain(), ended, 1, 0, 0));
+        r.observe(seal(domain(), other, 1, 0, 0));
+        joined(r.route(facts(1, domain(), other, 1, 0)));
+        // This old seal already reads the next kernel fault. Its original
+        // router fence still predates the audit and may never be restamped.
+        let cached = seal(domain(), ended, 1, 1, r.fence());
+        r.retire_image(ended);
+        r.retire_image(image(COOKIE + 2, 1));
+        r.audit(1, 0, 0);
+        assert_eq!(r.observe(cached).0, ObserveOutcome::StaleEra);
+        assert_eq!(
+            r.observe(seal(domain(), ended, 1, 1, r.fence())).0,
+            ObserveOutcome::Retired
+        );
+        assert_eq!(
+            r.route(facts(2, domain(), ended, 1, 1)),
+            Route::Unknown(UnknownReason::Retired)
+        );
+        assert_eq!(
+            r.observe(seal(domain(), successor, 1, 1, r.fence())).0,
+            ObserveOutcome::New
+        );
+        joined(r.route(facts(3, domain(), successor, 1, 1)));
+        assert_eq!(
+            r.observe(seal(domain(), other, 1, 1, r.fence())).0,
+            ObserveOutcome::New
+        );
+        joined(r.route(facts(4, domain(), other, 1, 1)));
+    }
+
+    #[test]
+    fn retirement_overflow_never_poisons_an_unrelated_fresh_cookie() {
+        let mut r = InstanceRouter::new(
+            domain(),
+            RouterLimits {
+                retired_cookies: 1,
+                ..RouterLimits::default()
+            },
+        );
+        let ended = image(COOKIE, 1_000_000);
+        let fresh = image(COOKIE + 1, 0);
+        r.observe(seal(domain(), ended, 1, 0, 0));
+        joined(r.route(facts(1, domain(), ended, 1, 0)));
+        r.retire_image(ended);
+        r.retire_image(image(COOKIE + 2, 2));
+        r.audit(1, 0, 0);
+        assert_eq!(
+            r.observe(seal(domain(), ended, 1, 1, r.fence())).0,
+            ObserveOutcome::Retired
+        );
+        assert_eq!(
+            r.observe(seal(domain(), fresh, 1, 1, r.fence())).0,
+            ObserveOutcome::New
+        );
+        joined(r.route(facts(2, domain(), fresh, 1, 1)));
+    }
+
+    #[test]
+    fn retirement_overflow_preserves_another_cookies_low_exec_successor() {
+        let mut r = InstanceRouter::new(
+            domain(),
+            RouterLimits {
+                retired_cookies: 1,
+                ..RouterLimits::default()
+            },
+        );
+        let high = image(COOKIE, 1_000_000);
+        let old = image(COOKIE + 1, 3);
+        let successor = image(COOKIE + 1, 4);
+        r.observe(seal(domain(), old, 1, 0, 0));
+        let old_id = joined(r.route(facts(1, domain(), old, 1, 0)));
+        r.retire_image(high);
+        r.retire_image(old);
+        r.audit(1, 0, 0);
+        assert_eq!(
+            r.observe(seal(domain(), high, 1, 1, r.fence())).0,
+            ObserveOutcome::Retired
+        );
+        assert_eq!(
+            r.observe(seal(domain(), old, 1, 1, r.fence())).0,
+            ObserveOutcome::Retired
+        );
+        assert_eq!(
+            r.observe(seal(domain(), successor, 1, 1, r.fence())).0,
+            ObserveOutcome::New
+        );
+        assert_ne!(joined(r.route(facts(2, domain(), successor, 1, 1))), old_id);
+    }
+
+    #[test]
+    fn pending_expiry_and_retirement_are_image_scoped() {
+        let mut r = router();
+        let old = image(COOKIE, 10);
+        let successor = image(COOKIE, 11);
+        let other = image(COOKIE + 1, 2);
+        for (token, identity) in [(1, old), (2, successor), (3, other)] {
+            assert_eq!(
+                r.route(facts(token, domain(), identity, 1, 0)),
+                Route::Pending
+            );
+        }
+        assert_eq!(
+            r.expire_image(old),
+            vec![(1, Route::Unknown(UnknownReason::Unobserved))]
+        );
+        assert!(r.expire_image(old).is_empty());
+        assert_eq!(r.pending_len(), 2);
+        let (_, successor_calls) = r.observe(seal(domain(), successor, 1, 0, 0));
+        assert_eq!(successor_calls.len(), 1);
+        assert_eq!(successor_calls[0].0, 2);
+        joined(successor_calls[0].1);
+        let (_, other_calls) = r.observe(seal(domain(), other, 1, 0, 0));
+        assert_eq!(other_calls.len(), 1);
+        assert_eq!(other_calls[0].0, 3);
+        joined(other_calls[0].1);
+        assert_eq!(r.pending_len(), 0);
+    }
+
+    #[test]
+    fn sealed_original_fence_cannot_be_restamped() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        r.observe(seal(domain(), identity, 1, 0, 0));
+        joined(r.route(facts(1, domain(), identity, 1, 0)));
+        let cached = seal(domain(), identity, 1, 1, r.fence());
+        r.audit(1, 0, 0);
+        assert_eq!(r.fence(), 1);
+        assert_eq!(r.observe(cached).0, ObserveOutcome::StaleEra);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 1, r.fence())).0,
+            ObserveOutcome::New
+        );
+        joined(r.route(facts(2, domain(), identity, 1, 1)));
+    }
+
+    #[test]
+    fn exhausted_fence_never_reuses_zero_authority() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        r.observe(seal(domain(), identity, 1, 0, 0));
+        joined(r.route(facts(1, domain(), identity, 1, 0)));
+        let cached_zero = seal(domain(), identity, 1, 1, 0);
+        r.fence = u64::MAX;
+        r.audit(1, 0, 0);
+        assert_eq!(
+            r.fence(),
+            u64::MAX,
+            "exhaustion must not wrap the retained authority"
+        );
+        assert_eq!(r.observe(cached_zero).0, ObserveOutcome::StaleEra);
+        assert_eq!(
+            r.route(facts(2, domain(), identity, 1, 1)),
+            Route::Unknown(UnknownReason::AuthorityExhausted)
+        );
+    }
+
+    #[test]
+    fn fault_outside_stamp_width_permanently_refuses() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        r.observe(seal(domain(), identity, 1, 0, 0));
+        joined(r.route(facts(1, domain(), identity, 1, 0)));
+        r.audit(u64::from(u32::MAX) + 1, 0, 0);
+        assert_eq!(
+            r.route(facts(2, domain(), identity, 1, 0)),
+            Route::Unknown(UnknownReason::AuthorityExhausted)
+        );
+        r.audit(0, 0, 0);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::StaleEra
+        );
+        assert_eq!(
+            r.route(facts(3, domain(), identity, 1, 0)),
+            Route::Unknown(UnknownReason::AuthorityExhausted)
+        );
+    }
+
+    #[test]
+    fn decreasing_fault_never_reopens_a_completed_era() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        r.audit(1, 0, 0);
+        r.observe(seal(domain(), identity, 1, 1, r.fence()));
+        joined(r.route(facts(1, domain(), identity, 1, 1)));
+        r.audit(0, 0, 0);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::StaleEra
+        );
+        assert_eq!(
+            r.route(facts(2, domain(), identity, 1, 0)),
+            Route::Unknown(UnknownReason::AuthorityExhausted)
+        );
+    }
+}
+
 #[test]
 fn same_epochs_under_unrelated_churn_keep_one_instance() {
     let mut r = router();
     assert_eq!(
-        r.observe(observation(2, 0, 0, load(BASE_A))).0,
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
         ObserveOutcome::New
     );
     let first = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
@@ -128,7 +555,7 @@ fn same_epochs_under_unrelated_churn_keep_one_instance() {
     // epochs and ranges, so continuity holds and no new ID is minted.
     for token in 2..50 {
         assert_eq!(
-            r.observe(observation(2, 0, 0, load(BASE_A))).0,
+            r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
             ObserveOutcome::Continued
         );
         assert_eq!(
@@ -143,9 +570,9 @@ fn same_epochs_under_unrelated_churn_keep_one_instance() {
 fn any_epoch_move_mints_a_new_instance_and_keeps_the_old_join() {
     for moved in [(3, 0, 0), (2, 1, 0)] {
         let mut r = router();
-        r.observe(observation(2, 0, 0, load(BASE_A)));
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
         let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
-        r.observe(observation(moved.0, moved.1, moved.2, load(BASE_A)));
+        r.observe_legacy(observation(moved.0, moved.1, moved.2, load(BASE_A)));
         let new = joined(r.route(call(
             2,
             stamp(moved.0 as u32, moved.1 as u32, moved.2 as u32),
@@ -161,11 +588,11 @@ fn any_epoch_move_mints_a_new_instance_and_keeps_the_old_join() {
 #[test]
 fn same_address_reload_never_revives_the_old_instance() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let before = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
     // dlclose (unmap: +k bumps) and dlopen at the same address (map: +m):
     // identical ranges, different epochs.
-    r.observe(observation(9, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(9, 0, 0, load(BASE_A)));
     let after = joined(r.route(call(2, stamp(9, 0, 0), ip_in(BASE_A))));
     assert_ne!(before, after);
     assert!(after > before, "IDs are monotonic, never reused");
@@ -176,7 +603,7 @@ fn dlmopen_siblings_route_to_separate_instances() {
     let mut r = router();
     let mut both = load(BASE_A);
     both.extend(load(BASE_B));
-    r.observe(observation(4, 0, 0, both));
+    r.observe_legacy(observation(4, 0, 0, both));
     let a = joined(r.route(call(1, stamp(4, 0, 0), ip_in(BASE_A))));
     let b = joined(r.route(call(2, stamp(4, 0, 0), ip_in(BASE_B))));
     assert_ne!(a, b);
@@ -187,7 +614,7 @@ fn dlmopen_siblings_route_to_separate_instances() {
 #[test]
 fn every_refusal_flag_and_straddle_is_unknown() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let cases = [
         (STAMP_SHARED_MM, UnknownReason::SharedMm),
         (STAMP_OVERFLOW, UnknownReason::Overflow),
@@ -216,7 +643,7 @@ fn every_refusal_flag_and_straddle_is_unknown() {
 #[test]
 fn unknown_reasons_follow_documented_precedence() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     // A refusal flag on the return stamp only surfaces as Straddle: entry
     // flags gate the flag reasons, and the halves differ.
     let mut ret_only = call(1, stamp(2, 0, 0), ip_in(BASE_A));
@@ -240,19 +667,16 @@ fn unknown_reasons_follow_documented_precedence() {
 }
 
 #[test]
-fn stamps_beyond_the_supersede_window_wait_rather_than_join() {
+fn representable_epochs_compare_without_a_wrapping_window() {
     let mut r = router();
-    r.observe(observation(0x8000_0001, 0, 0, load(BASE_A)));
-    // Exactly 2^31+1 behind: the wrapping window reads it as "future", so
-    // it waits; expiry keeps it unknown, never joined or evicted.
+    r.observe_legacy(observation(0x8000_0001, 0, 0, load(BASE_A)));
+    // More than 2^31 behind is still older: complete representable epochs
+    // compare directly, without truncation or a wrapping-window ambiguity.
     assert_eq!(
         r.route(call(1, stamp(0, 0, 0), ip_in(BASE_A))),
-        Route::Pending
+        Route::Unknown(UnknownReason::Unobserved)
     );
-    assert_eq!(
-        r.expire_pending(COOKIE),
-        vec![(1, Route::Unknown(UnknownReason::Unobserved))]
-    );
+    assert_eq!(r.pending_len(), 0);
     // Just behind the newest observation: older, unobservable, unknown.
     assert_eq!(
         r.route(call(2, stamp(0x8000_0000, 0, 0), ip_in(BASE_A))),
@@ -265,7 +689,7 @@ fn offset_arithmetic_overflow_cannot_join() {
     let mut r = router();
     let mut ranges = load(BASE_A);
     ranges.push(MapRange::new(u64::MAX - 0xfff, u64::MAX, u64::MAX, true));
-    r.observe(observation(2, 0, 0, ranges));
+    r.observe_legacy(observation(2, 0, 0, ranges));
     // `ip - start + file_offset` wraps; the wrapped value must refuse.
     let ip = u64::MAX - 0x100;
     let wrapped = ip.wrapping_sub(u64::MAX - 0xfff).wrapping_add(u64::MAX);
@@ -279,15 +703,18 @@ fn offset_arithmetic_overflow_cannot_join() {
 
 #[test]
 fn capacity_refusals_leave_no_zero_counts() {
-    let mut r = InstanceRouter::new(RouterLimits {
-        ranges: 6,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            ranges: 6,
+            ..RouterLimits::default()
+        },
+    );
     let mut both = load(BASE_A);
     both.extend(load(BASE_B));
-    r.observe(observation(2, 0, 0, both));
+    r.observe_legacy(observation(2, 0, 0, both));
     assert_eq!(
-        r.observe(observation(3, 0, 0, load(BASE_A))).0,
+        r.observe_legacy(observation(3, 0, 0, load(BASE_A))).0,
         ObserveOutcome::RangeCapacity
     );
     assert!(
@@ -295,12 +722,15 @@ fn capacity_refusals_leave_no_zero_counts() {
             .contains_key(&UnknownReason::RangeCapacity),
         "a refusal with no failed calls must not mint a zero count"
     );
-    let mut r = InstanceRouter::new(RouterLimits {
-        instances: 1,
-        ..RouterLimits::default()
-    });
-    r.observe(observation(2, 0, 0, load(BASE_A)));
-    r.observe(observation(3, 0, 0, load(BASE_A)));
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            instances: 1,
+            ..RouterLimits::default()
+        },
+    );
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(3, 0, 0, load(BASE_A)));
     assert!(
         !r.unknown_counts()
             .contains_key(&UnknownReason::InstanceCapacity),
@@ -310,30 +740,32 @@ fn capacity_refusals_leave_no_zero_counts() {
 
 #[test]
 fn router_debug_redacts_cookies_and_epochs() {
-    const COOKIE_BIG: u64 = 0x1234_5678_9abc_def0;
+    const COOKIE_BIG: u64 = 0x1234;
     const FAULT_BIG: u64 = 0xbeef;
     let mut r = router();
     assert!(r.audit(FAULT_BIG, 0, 0).is_empty());
     let mut reading = reading(2, 0, FAULT_BIG);
     reading.cookie = COOKIE_BIG;
-    r.observe(StableObservation {
-        file_slot: FILE,
-        reading,
-        ranges: load(BASE_A),
-        fence: r.fence(),
-    });
+    assert_eq!(
+        r.observe_legacy(StableObservation {
+            file_slot: FILE,
+            reading,
+            ranges: load(BASE_A),
+            fence: r.fence(),
+        })
+        .0,
+        ObserveOutcome::New
+    );
+    assert_eq!(
+        r.ranges_retained(),
+        3,
+        "redaction must cover retained state"
+    );
     r.route(call_for(1, COOKIE_BIG, stamp(3, 0, 0), ip_in(BASE_A)));
     r.retire_process(COOKIE_BIG + 1);
     let rendered = format!("{r:?}");
     assert!(rendered.contains("observed_keys"), "{rendered}");
-    for needle in [
-        "123456789abcdef0",
-        "1311768467463790320",
-        "beef",
-        "48879",
-        "123456789abcdef1",
-        "1311768467463790321",
-    ] {
+    for needle in ["0x1234", "4660", "beef", "48879", "0x1235", "4661"] {
         assert!(!rendered.contains(needle), "{rendered} leaks {needle}");
     }
 }
@@ -344,7 +776,7 @@ fn ip_must_lie_in_one_executable_partition_at_the_attached_offset() {
     // An orphan executable range before the first load base.
     let mut ranges = vec![MapRange::new(0x1000, 0x3000, 0x1000, true)];
     ranges.extend(load(BASE_A));
-    r.observe(observation(2, 0, 0, ranges));
+    r.observe_legacy(observation(2, 0, 0, ranges));
     let s = stamp(2, 0, 0);
     assert_eq!(
         r.route(call(1, s, 0x2000)),
@@ -376,11 +808,11 @@ fn ip_must_lie_in_one_executable_partition_at_the_attached_offset() {
 #[test]
 fn a_range_appearing_at_unchanged_epochs_is_a_sticky_coverage_fault() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let mut grown = load(BASE_A);
     grown.extend(load(BASE_B));
     assert_eq!(
-        r.observe(observation(2, 0, 0, grown)).0,
+        r.observe_legacy(observation(2, 0, 0, grown)).0,
         ObserveOutcome::CoverageFault
     );
     assert_eq!(
@@ -389,7 +821,7 @@ fn a_range_appearing_at_unchanged_epochs_is_a_sticky_coverage_fault() {
     );
     // Sticky: even a later, moved epoch does not re-enable this (P, F).
     assert_eq!(
-        r.observe(observation(5, 0, 0, load(BASE_A))).0,
+        r.observe_legacy(observation(5, 0, 0, load(BASE_A))).0,
         ObserveOutcome::CoverageFault
     );
     assert_eq!(
@@ -401,11 +833,11 @@ fn a_range_appearing_at_unchanged_epochs_is_a_sticky_coverage_fault() {
 #[test]
 fn a_range_disappearing_at_unchanged_epochs_keeps_its_instance_for_late_calls() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let id = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
     // Teardown (exec/exit) removes ranges without a bump.
     assert_eq!(
-        r.observe(observation(2, 0, 0, Vec::new())).0,
+        r.observe_legacy(observation(2, 0, 0, Vec::new())).0,
         ObserveOutcome::Continued
     );
     assert_eq!(joined(r.route(call(2, stamp(2, 0, 0), ip_in(BASE_A)))), id);
@@ -422,7 +854,7 @@ fn pending_calls_resolve_on_observation_or_become_unobserved() {
         r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))),
         Route::Pending
     );
-    let (_, resolved) = r.observe(observation(3, 0, 0, load(BASE_A)));
+    let (_, resolved) = r.observe_legacy(observation(3, 0, 0, load(BASE_A)));
     // Epoch 3 joins; epoch 2 can never be observed any more.
     assert_eq!(resolved.len(), 2);
     let by_token: BTreeMap<_, _> = resolved.into_iter().collect();
@@ -442,10 +874,13 @@ fn pending_calls_resolve_on_observation_or_become_unobserved() {
 
 #[test]
 fn pending_ceiling_refuses_at_n_plus_one() {
-    let mut r = InstanceRouter::new(RouterLimits {
-        pending: 3,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            pending: 3,
+            ..RouterLimits::default()
+        },
+    );
     for token in 0..3 {
         assert_eq!(
             r.route(call(token, stamp(2, 0, 0), ip_in(BASE_A))),
@@ -461,16 +896,19 @@ fn pending_ceiling_refuses_at_n_plus_one() {
 
 #[test]
 fn instance_ceiling_refuses_at_n_plus_one_and_never_reuses_ids() {
-    let mut r = InstanceRouter::new(RouterLimits {
-        instances: 2,
-        ..RouterLimits::default()
-    });
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            instances: 2,
+            ..RouterLimits::default()
+        },
+    );
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let first = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
-    r.observe(observation(3, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(3, 0, 0, load(BASE_A)));
     let second = joined(r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))));
     assert_eq!(r.instances_minted(), 2);
-    r.observe(observation(4, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(4, 0, 0, load(BASE_A)));
     assert_eq!(
         r.route(call(3, stamp(4, 0, 0), ip_in(BASE_A))),
         Route::Unknown(UnknownReason::InstanceCapacity)
@@ -481,16 +919,22 @@ fn instance_ceiling_refuses_at_n_plus_one_and_never_reuses_ids() {
 
 #[test]
 fn range_ceiling_refuses_at_n_plus_one() {
-    let mut r = InstanceRouter::new(RouterLimits {
-        ranges: 6,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            ranges: 6,
+            ..RouterLimits::default()
+        },
+    );
     let mut both = load(BASE_A);
     both.extend(load(BASE_B));
-    assert_eq!(r.observe(observation(2, 0, 0, both)).0, ObserveOutcome::New);
+    assert_eq!(
+        r.observe_legacy(observation(2, 0, 0, both)).0,
+        ObserveOutcome::New
+    );
     assert_eq!(r.ranges_retained(), 6);
     assert_eq!(
-        r.observe(observation(3, 0, 0, load(BASE_A))).0,
+        r.observe_legacy(observation(3, 0, 0, load(BASE_A))).0,
         ObserveOutcome::RangeCapacity
     );
     assert_eq!(r.ranges_retained(), 6);
@@ -505,7 +949,7 @@ fn range_ceiling_refuses_at_n_plus_one() {
 fn retained_keys_are_bounded_and_evicted_calls_are_unknown() {
     let mut r = router();
     for local in 1..=(KEYS_PER_PROCESS_FILE as u64 + 1) {
-        r.observe(observation(local, 0, 0, load(BASE_A)));
+        r.observe_legacy(observation(local, 0, 0, load(BASE_A)));
     }
     assert_eq!(r.ranges_retained(), KEYS_PER_PROCESS_FILE * 3);
     assert_eq!(
@@ -520,21 +964,24 @@ fn observed_registry_eviction_degrades_late_calls_to_unobserved() {
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
     const C: u64 = 0xA3;
-    let mut r = InstanceRouter::new(RouterLimits {
-        observed_keys: 2,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            observed_keys: 2,
+            ..RouterLimits::default()
+        },
+    );
     assert_eq!(
-        r.observe(observation_for(A, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(A, 2, load(BASE_A))).0,
         ObserveOutcome::New
     );
     assert_eq!(
-        r.observe(observation_for(B, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(B, 2, load(BASE_A))).0,
         ObserveOutcome::New
     );
     // The third key evicts the smallest (stalest) one, freeing its ranges.
     assert_eq!(
-        r.observe(observation_for(C, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(C, 2, load(BASE_A))).0,
         ObserveOutcome::New
     );
     assert_eq!(r.counters().observed_evictions, 1);
@@ -560,21 +1007,24 @@ fn faulted_registry_overflow_latches_coverage_refusal() {
     const B: u64 = 0xA2;
     const C: u64 = 0xA3;
     const D: u64 = 0xA4;
-    let mut r = InstanceRouter::new(RouterLimits {
-        faulted_keys: 1,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            faulted_keys: 1,
+            ..RouterLimits::default()
+        },
+    );
     let fault = |r: &mut InstanceRouter, cookie: u64| {
-        r.observe(observation_for(cookie, 2, load(BASE_A)));
+        r.observe_legacy(observation_for(cookie, 2, load(BASE_A)));
         let mut grown = load(BASE_A);
         grown.extend(load(BASE_B));
         assert_eq!(
-            r.observe(observation_for(cookie, 2, grown)).0,
+            r.observe_legacy(observation_for(cookie, 2, grown)).0,
             ObserveOutcome::CoverageFault
         );
     };
     assert_eq!(
-        r.observe(observation_for(D, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(D, 2, load(BASE_A))).0,
         ObserveOutcome::New
     );
     fault(&mut r, A);
@@ -590,7 +1040,7 @@ fn faulted_registry_overflow_latches_coverage_refusal() {
         Route::Unknown(UnknownReason::CoverageFault)
     );
     assert_eq!(
-        r.observe(observation_for(C, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(C, 2, load(BASE_A))).0,
         ObserveOutcome::CoverageFault
     );
     assert_eq!(
@@ -599,7 +1049,7 @@ fn faulted_registry_overflow_latches_coverage_refusal() {
     );
     // The retained key keeps continuity and still joins.
     assert_eq!(
-        r.observe(observation_for(D, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(D, 2, load(BASE_A))).0,
         ObserveOutcome::Continued
     );
     joined(r.route(call_for(4, D, stamp(2, 0, 0), ip_in(BASE_A))));
@@ -618,42 +1068,42 @@ fn latched_overflow_plus_era_change_refuses_everything_until_recreation() {
         faulted_keys: 1,
         ..RouterLimits::default()
     };
-    let mut r = InstanceRouter::new(limits);
+    let mut r = InstanceRouter::new(domain(), limits);
     assert_eq!(
-        r.observe(observation_for(D, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(D, 2, load(BASE_A))).0,
         ObserveOutcome::New
     );
     let fault = |r: &mut InstanceRouter, cookie: u64| {
-        r.observe(observation_for(cookie, 2, load(BASE_A)));
+        r.observe_legacy(observation_for(cookie, 2, load(BASE_A)));
         let mut grown = load(BASE_A);
         grown.extend(load(BASE_B));
         assert_eq!(
-            r.observe(observation_for(cookie, 2, grown)).0,
+            r.observe_legacy(observation_for(cookie, 2, grown)).0,
             ObserveOutcome::CoverageFault
         );
     };
     fault(&mut r, A);
     fault(&mut r, B);
     assert_eq!(
-        r.observe(observation_for(D, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(D, 2, load(BASE_A))).0,
         ObserveOutcome::Continued
     );
     assert!(r.audit(1, 0, 0).is_empty());
     let mut fresh = observation_for(D, 2, load(BASE_A));
     fresh.reading.fault = 1;
     fresh.fence = r.fence();
-    assert_eq!(r.observe(fresh).0, ObserveOutcome::CoverageFault);
+    assert_eq!(r.observe_legacy(fresh).0, ObserveOutcome::CoverageFault);
     assert_eq!(
         r.route(call_for(1, D, stamp(2, 0, 1), ip_in(BASE_A))),
         Route::Unknown(UnknownReason::CoverageFault)
     );
     // A recreated router accepts the same evidence again.
-    let mut recreated = InstanceRouter::new(limits);
+    let mut recreated = InstanceRouter::new(domain(), limits);
     assert!(recreated.audit(1, 0, 0).is_empty());
     let mut fresh = observation_for(D, 2, load(BASE_A));
     fresh.reading.fault = 1;
     fresh.fence = recreated.fence();
-    assert_eq!(recreated.observe(fresh).0, ObserveOutcome::New);
+    assert_eq!(recreated.observe_legacy(fresh).0, ObserveOutcome::New);
     joined(recreated.route(call_for(1, D, stamp(2, 0, 1), ip_in(BASE_A))));
 }
 
@@ -663,16 +1113,19 @@ fn fault_evict_reobserve_same_epoch_still_refuses_route() {
     // the same discredited epoch re-join on re-observation.
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
-    let mut r = InstanceRouter::new(RouterLimits {
-        faulted_keys: 1,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            faulted_keys: 1,
+            ..RouterLimits::default()
+        },
+    );
     let fault = |r: &mut InstanceRouter, cookie: u64| {
-        r.observe(observation_for(cookie, 2, load(BASE_A)));
+        r.observe_legacy(observation_for(cookie, 2, load(BASE_A)));
         let mut grown = load(BASE_A);
         grown.extend(load(BASE_B));
         assert_eq!(
-            r.observe(observation_for(cookie, 2, grown)).0,
+            r.observe_legacy(observation_for(cookie, 2, grown)).0,
             ObserveOutcome::CoverageFault
         );
     };
@@ -681,7 +1134,7 @@ fn fault_evict_reobserve_same_epoch_still_refuses_route() {
     assert_eq!(r.counters().faulted_evictions, 1);
     // Re-observing A's discredited epoch must still refuse: never New.
     assert_eq!(
-        r.observe(observation_for(A, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(A, 2, load(BASE_A))).0,
         ObserveOutcome::CoverageFault
     );
     // And no call at that epoch may join, directly or via pending.
@@ -698,24 +1151,27 @@ fn retired_cookie_eviction_still_refuses_delayed_observations() {
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
     const C: u64 = 0xA3;
-    let mut r = InstanceRouter::new(RouterLimits {
-        retired_cookies: 1,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            retired_cookies: 1,
+            ..RouterLimits::default()
+        },
+    );
     let saved = observation_for(A, 2, load(BASE_A));
-    assert_eq!(r.observe(saved.clone()).0, ObserveOutcome::New);
+    assert_eq!(r.observe_legacy(saved.clone()).0, ObserveOutcome::New);
     assert!(r.retire_process(A).is_empty());
     assert!(r.retire_process(B).is_empty());
     assert_eq!(r.counters().retired_evictions, 1);
     // The delayed observation is refused, never New; its calls never join.
-    assert_eq!(r.observe(saved).0, ObserveOutcome::Retired);
+    assert_eq!(r.observe_legacy(saved).0, ObserveOutcome::Retired);
     assert_eq!(
         r.route(call_for(9, A, stamp(2, 0, 0), ip_in(BASE_A))),
         Route::Unknown(UnknownReason::Retired)
     );
-    // A genuinely new cookie still joins: the watermark costs nothing new.
+    // A genuinely new cookie still joins: the ledger is per cookie.
     assert_eq!(
-        r.observe(observation_for(C, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(C, 2, load(BASE_A))).0,
         ObserveOutcome::New
     );
     joined(r.route(call_for(10, C, stamp(2, 0, 0), ip_in(BASE_A))));
@@ -723,18 +1179,19 @@ fn retired_cookie_eviction_still_refuses_delayed_observations() {
 
 #[test]
 fn delayed_new_era_observation_across_retirement_eviction_and_reset_is_refused() {
-    // Astra round-2 advisory (taken as blocking): the kernel fault
-    // advances to 1 while the router still knows 0; A's valid new-era
-    // observation is cached; A retires, then B at capacity 1, evicting
-    // A's tombstone; audit(1,0,0) resets the watermark. The delayed
-    // pre-reset observation must not become New, and matching late
-    // calls must never join on it.
+    // The kernel fault advances while the router still knows0. A cached
+    // seal predates the audit, while A's exact tombstone is evicted at N+1.
+    // Neither the cached scan nor a late call can revive the terminal task:
+    // the original fence refuses the scan and permanent death refuses calls.
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
-    let mut r = InstanceRouter::new(RouterLimits {
-        retired_cookies: 1,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            retired_cookies: 1,
+            ..RouterLimits::default()
+        },
+    );
     let mut cached = observation_for(A, 2, load(BASE_A));
     cached.reading.fault = 1;
     // Acquired before the router learns of the new era (fence 0).
@@ -743,25 +1200,25 @@ fn delayed_new_era_observation_across_retirement_eviction_and_reset_is_refused()
     assert!(r.retire_process(B).is_empty());
     assert_eq!(r.counters().retired_evictions, 1);
     assert!(r.audit(1, 0, 0).is_empty());
-    assert_eq!(r.observe(cached).0, ObserveOutcome::StaleEra);
+    assert_eq!(r.observe_legacy(cached).0, ObserveOutcome::StaleEra);
     assert_eq!(
         r.route(call_for(9, A, stamp(2, 0, 1), ip_in(BASE_A))),
-        Route::Pending
+        Route::Unknown(UnknownReason::Retired)
     );
-    assert_eq!(
-        r.expire_pending(A),
-        vec![(9, Route::Unknown(UnknownReason::Unobserved))]
-    );
+    assert!(r.expire_pending(A).is_empty());
 }
 
 #[test]
 fn retired_registry_eviction_preserves_retirement_refusal() {
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
-    let mut r = InstanceRouter::new(RouterLimits {
-        retired_cookies: 1,
-        ..RouterLimits::default()
-    });
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            retired_cookies: 1,
+            ..RouterLimits::default()
+        },
+    );
     assert!(r.retire_process(A).is_empty());
     assert_eq!(
         r.route(call_for(1, A, stamp(2, 0, 0), ip_in(BASE_A))),
@@ -769,8 +1226,7 @@ fn retired_registry_eviction_preserves_retirement_refusal() {
     );
     assert!(r.retire_process(B).is_empty());
     assert_eq!(r.counters().retired_evictions, 1);
-    // The evicted retirement still reports Retired: the per-era watermark
-    // preserves refusal for the evicted cookie.
+    // Permanent per-cookie death survives exact-cache eviction.
     assert_eq!(
         r.route(call_for(2, A, stamp(2, 0, 0), ip_in(BASE_A))),
         Route::Unknown(UnknownReason::Retired)
@@ -782,44 +1238,50 @@ fn retired_registry_eviction_preserves_retirement_refusal() {
 }
 
 #[test]
-fn retired_watermark_costs_retained_and_new_era_keys_nothing() {
+fn retirement_ledger_leaves_unrelated_live_keys_available_across_eras() {
     const LIVE: u64 = 0xA0;
     const A: u64 = 0xA1;
     const B: u64 = 0xA2;
-    let mut r = InstanceRouter::new(RouterLimits {
-        retired_cookies: 1,
-        ..RouterLimits::default()
-    });
-    // A live cookie below the coming watermark keeps continuity through its
-    // retained observation.
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            retired_cookies: 1,
+            ..RouterLimits::default()
+        },
+    );
+    // Other cookies' death cannot suppress this live cookie, even with a
+    // smaller ticket and after an ordinary fault era clears observations.
     assert_eq!(
-        r.observe(observation_for(LIVE, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(LIVE, 2, load(BASE_A))).0,
         ObserveOutcome::New
     );
     assert!(r.retire_process(A).is_empty());
     assert!(r.retire_process(B).is_empty());
     assert_eq!(r.counters().retired_evictions, 1);
     assert_eq!(
-        r.observe(observation_for(LIVE, 2, load(BASE_A))).0,
+        r.observe_legacy(observation_for(LIVE, 2, load(BASE_A))).0,
         ObserveOutcome::Continued
     );
     joined(r.route(call_for(1, LIVE, stamp(2, 0, 0), ip_in(BASE_A))));
-    // A fault-era advance resets the watermark: old-era evidence is stale
-    // anyway, and long-lived cookies re-observe freely in the new era.
+    // Ordinary era changes retain negative metadata, while this unrelated
+    // live cookie may acquire a fresh full observation.
     assert!(r.audit(1, 0, 0).is_empty());
     let mut old_era = observation_for(LIVE, 2, load(BASE_A));
     old_era.reading.fault = 0;
-    assert_eq!(r.observe(old_era).0, ObserveOutcome::StaleEra);
+    assert_eq!(r.observe_legacy(old_era).0, ObserveOutcome::StaleEra);
     let mut rescanned = observation_for(LIVE, 2, load(BASE_A));
     rescanned.reading.fault = 1;
-    assert_eq!(r.observe(fresh(&r, rescanned)).0, ObserveOutcome::New);
+    assert_eq!(
+        r.observe_legacy(fresh(&r, rescanned)).0,
+        ObserveOutcome::New
+    );
     joined(r.route(call_for(2, LIVE, stamp(2, 0, 1), ip_in(BASE_A))));
 }
 
 #[test]
 fn a_fault_era_change_ends_every_observation_and_pending_call() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
     assert_eq!(
         r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))),
@@ -835,10 +1297,10 @@ fn a_fault_era_change_ends_every_observation_and_pending_call() {
     );
     // An observation from the old era is refused; the new era mints anew.
     assert_eq!(
-        r.observe(observation(2, 0, 0, load(BASE_A))).0,
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
         ObserveOutcome::StaleEra
     );
-    r.observe(fresh(&r, observation(2, 0, 1, load(BASE_A))));
+    r.observe_legacy(fresh(&r, observation(2, 0, 1, load(BASE_A))));
     let new = joined(r.route(call(4, stamp(2, 0, 1), ip_in(BASE_A))));
     assert_ne!(old, new);
 }
@@ -846,7 +1308,7 @@ fn a_fault_era_change_ends_every_observation_and_pending_call() {
 #[test]
 fn a_recursion_miss_increase_without_a_raise_latches_the_era() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let old = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
     assert_eq!(
         r.route(call(2, stamp(3, 0, 0), ip_in(BASE_A))),
@@ -868,12 +1330,12 @@ fn a_recursion_miss_increase_without_a_raise_latches_the_era() {
         Route::Unknown(UnknownReason::FaultEra)
     );
     assert_eq!(
-        r.observe(observation(2, 0, 0, load(BASE_A))).0,
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
         ObserveOutcome::StaleEra
     );
     // A late raise re-coheres the era: the new fault is observable again.
     assert!(r.audit(1, 0, 1).is_empty());
-    r.observe(fresh(&r, observation(2, 0, 1, load(BASE_A))));
+    r.observe_legacy(fresh(&r, observation(2, 0, 1, load(BASE_A))));
     let new = joined(r.route(call(4, stamp(2, 0, 1), ip_in(BASE_A))));
     assert_ne!(old, new);
     assert_eq!(r.counters().miss_eras, 1);
@@ -896,14 +1358,15 @@ fn a_recursion_miss_increase_without_a_raise_latches_the_era() {
 #[test]
 fn a_raise_covering_the_miss_advances_a_single_era() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     // The normal capture-loop order (raise, then audit with both changed)
     // advances once and needs no latch: the kernel fault covers the misses.
     assert!(r.audit(1, 0, 1).is_empty());
     assert_eq!(r.counters().eras, 1);
     assert_eq!(r.counters().miss_eras, 0);
     assert_eq!(
-        r.observe(fresh(&r, observation(2, 0, 1, load(BASE_A)))).0,
+        r.observe_legacy(fresh(&r, observation(2, 0, 1, load(BASE_A))))
+            .0,
         ObserveOutcome::New
     );
     joined(r.route(call(1, stamp(2, 0, 1), ip_in(BASE_A))));
@@ -912,7 +1375,7 @@ fn a_raise_covering_the_miss_advances_a_single_era() {
 #[test]
 fn sticky_refusal_disables_routing_for_the_capture() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     assert_eq!(
         r.route(call(1, stamp(3, 0, 0), ip_in(BASE_A))),
         Route::Pending
@@ -930,7 +1393,7 @@ fn sticky_refusal_disables_routing_for_the_capture() {
 #[test]
 fn retired_processes_free_state_and_refuse_late_calls() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     assert_eq!(
         r.route(call(1, stamp(3, 0, 0), ip_in(BASE_A))),
         Route::Pending
@@ -945,7 +1408,7 @@ fn retired_processes_free_state_and_refuse_late_calls() {
         Route::Unknown(UnknownReason::Retired)
     );
     assert_eq!(
-        r.observe(observation(2, 0, 0, load(BASE_A))).0,
+        r.observe_legacy(observation(2, 0, 0, load(BASE_A))).0,
         ObserveOutcome::Retired
     );
 }
@@ -953,9 +1416,9 @@ fn retired_processes_free_state_and_refuse_late_calls() {
 #[test]
 fn other_processes_and_files_never_share_instances() {
     let mut r = router();
-    r.observe(observation(2, 0, 0, load(BASE_A)));
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
     let mut other = call(1, stamp(2, 0, 0), ip_in(BASE_A));
-    other.cookie = COOKIE + 1;
+    other.image.task_cookie = COOKIE + 1;
     assert_eq!(
         r.route(other),
         Route::Pending,
@@ -1128,10 +1591,10 @@ fn colliding_maps_keys_are_confirmed_by_map_files_identity() {
     // it joins a minted instance (the trap); confirmed ranges keep it out.
     let other_ip = 0x7f10_0000_0000 + TEXT;
     let mut keyed_only = router();
-    keyed_only.observe(observation(1, 0, 0, candidates.clone()));
+    keyed_only.observe_legacy(observation(1, 0, 0, candidates.clone()));
     joined(keyed_only.route(call(1, stamp(1, 0, 0), other_ip)));
     let mut exact = router();
-    exact.observe(observation(1, 0, 0, confirmed));
+    exact.observe_legacy(observation(1, 0, 0, confirmed));
     assert_eq!(
         exact.route(call(1, stamp(1, 0, 0), other_ip)),
         Route::Unknown(UnknownReason::IpOutside)

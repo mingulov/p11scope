@@ -819,6 +819,57 @@ fn scan_with(
     Err(ImageQueryRefusal::Unstable)
 }
 
+/// Script only the I/O beneath the owning acquisition protocol. Router
+/// regressions still obtain their seal through all of `scan_with`'s checks;
+/// they cannot construct a proof or replace its fence after acquisition.
+#[cfg(test)]
+pub(crate) fn acquire_test_scan(
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    file_slot: u32,
+    epochs: CompleteEpochs,
+    ranges: Vec<MapRange>,
+    fence: u64,
+) -> Result<ImageScanProof, ImageQueryRefusal> {
+    struct Reads {
+        image: ImageIdentity,
+        epochs: CompleteEpochs,
+        ranges: Vec<MapRange>,
+        fence: u64,
+    }
+    impl ScanSource for Reads {
+        fn budget(&self) -> Result<(), ImageQueryRefusal> {
+            Ok(())
+        }
+        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+            Ok(())
+        }
+        fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
+            Ok(self.image)
+        }
+        fn epochs(&mut self) -> Result<CompleteEpochs, ImageQueryRefusal> {
+            Ok(self.epochs)
+        }
+        fn ranges(&mut self) -> Result<Vec<MapRange>, ImageQueryRefusal> {
+            Ok(self.ranges.clone())
+        }
+        fn fence(&self, original: u64) -> bool {
+            original == self.fence
+        }
+    }
+    scan_with(
+        &mut Reads {
+            image,
+            epochs,
+            ranges,
+            fence,
+        },
+        domain,
+        file_slot,
+        fence,
+    )
+}
+
 fn parse_batch(
     domain: NativeDomainId,
     generation: u64,

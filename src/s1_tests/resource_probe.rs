@@ -12,6 +12,155 @@ use crate::semantics_edge::resource_tests::{Memory, measure, run_child};
 use std::mem::size_of;
 
 #[test]
+fn native_semantic_resource_legacy_and_instance_share_one_pool() {
+    use crate::semantics_edge::resources::{
+        ACTIVE_MACHINE_CHARGE, REDUCER_BASE_CHARGE, SEMANTIC_TRANSITION_SCRATCH,
+    };
+    let (mut h, caller, module) = single_edge();
+    let domain = NativeDomainId::mint();
+    let key = instance_key(domain, instance_router_ids(domain, 1)[0], &module);
+    h.coordinator_mut()
+        .registry_mut()
+        .reference_semantic_resource_limit(
+            SEMANTIC_TRANSITION_SCRATCH + 2 * REDUCER_BASE_CHARGE + 2 * ACTIVE_MACHINE_CHARGE,
+        );
+    let unknown = SemanticCall {
+        capture: capture::MECHANISM_UNREADABLE,
+        ..init("C_SignInit", 1, RSA_PSS, 100)
+    };
+    h.observe_semantic(caller, &module, unknown.clone());
+    instance_register(&mut h, &key, caller, 100);
+    instance_feed(&mut h, &key, caller, domain, 2, unknown);
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_entries(caller, &module, 17, 100);
+    h.commit();
+    let registry = h.coordinator().registry();
+    assert_eq!(
+        registry
+            .edges()
+            .next()
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap()
+            .started(),
+        1
+    );
+    assert_eq!(
+        registry
+            .instance_semantic_edges()
+            .next()
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap()
+            .started(),
+        1
+    );
+    assert_eq!(
+        registry.semantic_resource_snapshot().charged_bytes,
+        registry.semantic_resource_snapshot().limit_bytes
+    );
+    instance_feed(
+        &mut h,
+        &key,
+        caller,
+        domain,
+        4,
+        SemanticCall {
+            capture: capture::MECHANISM_UNREADABLE,
+            ..init("C_SignInit", 2, RSA_PSS, 110)
+        },
+    );
+    h.commit();
+    let registry = h.coordinator().registry();
+    let legacy = registry.edges().next().unwrap();
+    assert_eq!(legacy.entry_count, 17);
+    assert!(legacy.semantics.as_ref().unwrap().has_live_operations());
+    let instance = registry.instance_semantic_edges().next().unwrap();
+    assert_eq!(instance.api_returns, Some(2));
+    let state = instance.semantics.as_ref().unwrap();
+    assert_eq!((state.started(), state.unknown()), (1, 1));
+    assert!(!state.has_live_operations());
+    assert!(
+        instance
+            .reasons
+            .iter()
+            .any(|reason| reason.label() == "semantic_resource_capacity")
+    );
+    assert_eq!(registry.semantic_resource_snapshot().refused, 1);
+    assert!(
+        registry
+            .gaps()
+            .iter()
+            .any(|gap| gap.reason == "semantic_resource_capacity")
+    );
+    // A unique return minted before the refusal remains countable, but
+    // the persisted ordinal boundary prevents it from reopening authority.
+    instance_feed(
+        &mut h,
+        &key,
+        caller,
+        domain,
+        3,
+        SemanticCall {
+            capture: capture::MECHANISM_UNREADABLE,
+            ..init("C_SignInit", 3, RSA_PSS, 105)
+        },
+    );
+    h.commit();
+    let instance = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(
+        (instance.api_returns, instance.historical_only_returns),
+        (Some(3), 1)
+    );
+    assert_eq!(instance.semantics.as_ref().unwrap().started(), 1);
+    assert!(!instance.semantics.as_ref().unwrap().has_live_operations());
+    instance_feed(
+        &mut h,
+        &key,
+        caller,
+        domain,
+        5,
+        SemanticCall {
+            capture: capture::MECHANISM_UNREADABLE,
+            ..init("C_SignInit", 4, RSA_PSS, 120)
+        },
+    );
+    instance_feed(&mut h, &key, caller, domain, 6, op("C_Sign", 4, 130));
+    h.commit();
+    let registry = h.coordinator().registry();
+    let instance = registry.instance_semantic_edges().next().unwrap();
+    assert_eq!(
+        (instance.api_returns, instance.historical_only_returns),
+        (Some(5), 1)
+    );
+    let state = instance.semantics.as_ref().unwrap();
+    assert_eq!(
+        (state.started(), state.completed(), state.unknown()),
+        (2, 1, 1)
+    );
+    assert!(!state.has_live_operations());
+    assert_eq!(registry.edges().next().unwrap().entry_count, 17);
+    assert!(
+        registry
+            .edges()
+            .next()
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap()
+            .has_live_operations()
+    );
+}
+
+#[test]
 fn native_semantic_resource_registry_probe_child() {
     let Ok(profile) = std::env::var("P11SCOPE_S1_RESOURCE_PROFILE") else {
         return;

@@ -1805,6 +1805,7 @@ enum Mutation {
 /// one consistent snapshot per batch and the ordering test can pin that
 /// facts publish synchronously with the batch return.
 pub(crate) struct CallerRegistry {
+    semantic_resources: crate::semantics_edge::resources::SemanticResourcePool,
     instance_state: instance_input::InstanceState,
     limits: RegistryLimits,
     next_module: u32,
@@ -1868,8 +1869,32 @@ pub(crate) struct CallerRegistry {
 }
 
 impl CallerRegistry {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "aggregate projection follows Task4 registry review"
+        )
+    )]
+    pub(crate) fn semantic_resource_snapshot(
+        &self,
+    ) -> crate::semantics_edge::resources::SemanticResourceSnapshot {
+        self.semantic_resources.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_semantic_resource_limit(&mut self, limit: usize) {
+        assert_eq!(
+            self.semantic_occupied + self.instance_semantic_occupied(),
+            0
+        );
+        self.semantic_resources =
+            crate::semantics_edge::resources::SemanticResourcePool::reference_limit(limit);
+    }
+
     pub(crate) fn new(limits: RegistryLimits) -> Self {
         Self {
+            semantic_resources: crate::semantics_edge::resources::SemanticResourcePool::default(),
             instance_state: instance_input::InstanceState::default(),
             limits,
             next_module: 0,
@@ -3999,10 +4024,17 @@ impl CallerRegistry {
                 });
                 return;
             }
+            let reducer = match EdgeSemantics::with_resources(&self.semantic_resources) {
+                Ok(reducer) => reducer,
+                Err(refusal) => {
+                    self.refuse_semantic_resource(caller, id, refusal);
+                    return;
+                }
+            };
             self.edges
                 .get_mut(&(caller, id))
                 .expect("edge resolved above")
-                .semantics = Some(EdgeSemantics::default());
+                .semantics = Some(reducer);
             self.semantic_occupied = self.semantic_occupied.saturating_add(1);
         }
         let edge = self
@@ -4025,8 +4057,32 @@ impl CallerRegistry {
             .semantics
             .as_mut()
             .expect("semantic state materialized above")
-            .observe(call);
-        self.semantic_refused = self.semantic_refused.saturating_add(refused);
+            .observe_with_resources(call);
+        match refused {
+            Ok(refused) => self.semantic_refused = self.semantic_refused.saturating_add(refused),
+            Err(refusal) => self.refuse_semantic_resource(caller, id, refusal),
+        }
+    }
+
+    fn refuse_semantic_resource(
+        &mut self,
+        caller: CallerId,
+        module: ModuleId,
+        refusal: crate::semantics_edge::resources::SemanticResourceRefusal,
+    ) {
+        self.semantic_refused = self.semantic_refused.saturating_add(1);
+        self.push_gap(RegistryGap {
+            caller: Some(caller),
+            module: Some(module),
+            pid: None,
+            subject: "semantic resource capacity exhausted".into(),
+            reason: "semantic_resource_capacity".into(),
+            budget: Some(BudgetRefusal {
+                resource: "semantic_resource",
+                limit: refusal.limit_bytes,
+                requested: refusal.requested_bytes,
+            }),
+        });
     }
 
     fn apply_retire(&mut self, caller: CallerId, reason: String, at_ns: u64) {

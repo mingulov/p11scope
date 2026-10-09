@@ -83,6 +83,7 @@ pub(crate) enum InstanceReason {
     SemanticStateCapacity,
     AuthorityExhausted,
     NegativeStateCapacity,
+    SemanticResourceCapacity,
 }
 
 impl InstanceReason {
@@ -106,6 +107,7 @@ impl InstanceReason {
             Self::SemanticStateCapacity => "semantic_state_capacity",
             Self::AuthorityExhausted => "authority_exhausted",
             Self::NegativeStateCapacity => "negative_state_capacity",
+            Self::SemanticResourceCapacity => "semantic_resource_capacity",
         }
     }
 }
@@ -336,12 +338,13 @@ impl InstanceReason {
         Self::SemanticStateCapacity,
         Self::AuthorityExhausted,
         Self::NegativeStateCapacity,
+        Self::SemanticResourceCapacity,
     ];
     fn bit(self) -> u32 {
         1u32 << (self as u32)
     }
 }
-const _: () = assert!((InstanceReason::NegativeStateCapacity as u32) < 32);
+const _: () = assert!((InstanceReason::SemanticResourceCapacity as u32) < 32);
 
 const _: () = assert!(std::mem::size_of::<NegativeRecord>() <= 64);
 const _: () = assert!(!std::mem::needs_drop::<NegativeRecord>());
@@ -723,11 +726,18 @@ impl CallerRegistry {
             return;
         }
         if materialize {
+            let reducer = match EdgeSemantics::with_resources(&self.semantic_resources) {
+                Ok(reducer) => reducer,
+                Err(refusal) => {
+                    self.refuse_instance_resource(id, &input, module, refusal);
+                    return;
+                }
+            };
             self.instance_state
                 .semantics
                 .get_mut(&id)
                 .expect("retained edge")
-                .semantics = Some(EdgeSemantics::default());
+                .semantics = Some(reducer);
             self.instance_state.occupied += 1;
         }
         let state = self
@@ -739,7 +749,19 @@ impl CallerRegistry {
             .semantics
             .as_mut()
             .expect("materialized above")
-            .observe(&input.facts);
+            .observe_with_resources(&input.facts);
+        let refused = match refused {
+            Ok(refused) => refused,
+            Err(refusal) => {
+                self.refuse_instance_resource(id, &input, module, refusal);
+                return;
+            }
+        };
+        let state = self
+            .instance_state
+            .semantics
+            .get_mut(&id)
+            .expect("retained edge");
         state.last_reduced = Some(input.position.ordinal);
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(refused);
@@ -751,6 +773,33 @@ impl CallerRegistry {
         record.state = InstanceLifecycle::Observed;
         record.reason = None;
         record.last_seen_ns = record.last_seen_ns.max(input.facts.ts_ns);
+    }
+
+    fn refuse_instance_resource(
+        &mut self,
+        id: RegistryInstanceId,
+        input: &AdmittedInstanceCall,
+        module: ModuleId,
+        refusal: crate::semantics_edge::resources::SemanticResourceRefusal,
+    ) {
+        self.instance_state.semantic_refused =
+            self.instance_state.semantic_refused.saturating_add(1);
+        self.invalidate_instance(
+            id,
+            Some(input.position.ordinal),
+            InstanceReason::SemanticResourceCapacity,
+            false,
+        );
+        self.instance_gap(
+            Some(input.caller),
+            Some(module),
+            InstanceReason::SemanticResourceCapacity,
+            Some(BudgetRefusal {
+                resource: "semantic_resource",
+                limit: refusal.limit_bytes,
+                requested: refusal.requested_bytes,
+            }),
+        );
     }
 
     fn invalidate_instance(

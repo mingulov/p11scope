@@ -173,7 +173,14 @@ class BuildDriverTests(unittest.TestCase):
         module = load_path(ROOT / "tests/python/test_offline_dependencies.py")
         fixture_root = self.root / "offline-fixture"
         fixture_root.mkdir()
-        fixture = module.OfflineFixture(fixture_root)
+        # Validate a real bundle of this tiny fixture's history. Using the
+        # product HEAD makes repeated unbundle/fsck work grow with that repo.
+        product_repository = module.REPOSITORY
+        try:
+            module.REPOSITORY = self.repo
+            fixture = module.OfflineFixture(fixture_root)
+        finally:
+            module.REPOSITORY = product_repository
         fixture.testcase = self
         fixture.assemble()
         fixture.approve()
@@ -402,7 +409,9 @@ class BuildDriverTests(unittest.TestCase):
         self.assertFalse(any(call["tool"] == "cargo" and "fetch" in call["argv"] for call in self.calls()))
 
     def test_payload_mode_uses_full_validator_copied_inputs_fresh_home_and_offline_fetches(self):
+        shared_revision = self.candidate
         fixture = self.payload_fixture()
+        self.assertEqual(fixture.shared_revision, shared_revision)
         self.configure(sysroot=str(fixture.sysroot), require_sysroot=True)
         helper = load_path(ROOT / "scripts/offline-dependencies.py")
         original = helper.payload_inventory(fixture.output)

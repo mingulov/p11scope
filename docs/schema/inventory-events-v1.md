@@ -28,6 +28,19 @@ Every line carries the same envelope plus its `kind`-specific `event`:
 
 ## Event kinds
 
+- `instance_observed` (additive): the corresponding snapshot `instances[]`
+  row verbatim, keyed by capture-local `id` (`iN`).
+- `semantic_edge_observed` (additive): the corresponding snapshot
+  `semantic_edges[]` row verbatim, keyed by `instance`, referencing the same
+  caller/module IDs. `api_returns` and operation outcomes retain their separate
+  units; child `entries.count` is null and never copies a physical count.
+  No-call rows retain unknown labels and null details. Loss reasons and private
+  identity exclusions are defined in [inventory v1](inventory-v1.md#semantic-instances-additive-within-v1).
+  H2 provides shared serializers and the snapshot replay helper. H3 still must
+  connect bounded incremental emission and a retention-aware final sweep before
+  `ended`, with separate deferred/unretained counts. Snapshot replay equivalence
+  does not claim that the production live stream emits these new kinds yet.
+
 - `started`: `{scope, clock: {basis, unit}, started_ns, limits:
   {callers, modules, edges, endpoints, inventory_endpoints,
   inventory_attach_modules, semantic_state, retained_history}}`.

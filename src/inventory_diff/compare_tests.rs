@@ -1930,3 +1930,27 @@ fn module_path_source_population_changes_with_unchanged_global_facts() {
 fn module_lifecycle_source_population_changes_with_unchanged_global_facts() {
     module_source_population_change("lifecycle");
 }
+
+#[test]
+fn instance_s1_additive_details_do_not_change_physical_diff() {
+    let old = document();
+    let mut before = old.clone();
+    before["instances"] = json!([{"id":"i0","caller":"c0","module":"m0","state":"observed"}]);
+    before["semantic_edges"] = json!([{"instance":"i0","api_returns":{"unit":"api_returns","count":7},"operations":{"completed":1}}]);
+    let mut after = before.clone();
+    after["instances"][0]["state"] = json!("retired");
+    after["semantic_edges"][0]["api_returns"]["count"] = json!(99);
+    after["semantic_edges"][0]["operations"]["completed"] = json!(8);
+    let baseline = serde_json::to_value(compare(&snapshot(&old), &snapshot(&old))).unwrap();
+    for left in [&old, &before, &after] {
+        for right in [&old, &before, &after] {
+            let report = compare(&snapshot(left), &snapshot(right));
+            assert_eq!(serde_json::to_value(&report).unwrap(), baseline);
+            assert!(
+                report
+                    .limitations
+                    .contains(&"semantic_details_not_compared".into())
+            );
+        }
+    }
+}

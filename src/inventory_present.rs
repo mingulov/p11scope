@@ -21,6 +21,7 @@
 //! through [`coverage_label`] in snapshots and dashboard frames and as
 //! `entries.coverage` in JSON.
 
+use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, RegistryInstanceId};
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
     ExeIdentity, ImageAuthority, MappingState, ModuleId, ModuleLifecycle, ModuleRecord,
@@ -345,6 +346,34 @@ pub(crate) struct EdgeView {
     pub semantics: EdgeSemanticsView,
 }
 
+/// A public capture-local instance reference; private routing identity stays
+/// in the registry. All renderer references resolve in this snapshot.
+#[derive(Debug, Clone)]
+pub(crate) struct InstanceView {
+    pub id: RegistryInstanceId,
+    pub caller: CallerId,
+    pub module: ModuleId,
+    pub state: InstanceLifecycle,
+    pub reason: Option<&'static str>,
+    pub first_seen_ns: u64,
+    pub last_seen_ns: u64,
+}
+
+/// Return evidence and S1 aggregates for one instance. Inventory entry counts
+/// remain on the physical edge and are never apportioned to this child.
+#[derive(Debug, Clone)]
+pub(crate) struct InstanceSemanticView {
+    pub instance: RegistryInstanceId,
+    pub caller: CallerId,
+    pub module: ModuleId,
+    pub api_returns: Option<u64>,
+    pub saturated: bool,
+    pub historical_only_returns: u64,
+    pub semantics: EdgeSemanticsView,
+    pub lossy: bool,
+    pub reasons: Vec<&'static str>,
+}
+
 /// One coverage gap, owned for rendering.
 #[derive(Debug, Clone)]
 pub(crate) struct GapView {
@@ -391,6 +420,16 @@ pub(crate) struct BudgetView {
     pub semantic_occupied: usize,
     pub semantic_unknown_edges: usize,
     pub semantic_refused: u64,
+    pub instances_limit: usize,
+    pub instances_occupied: usize,
+    pub instances_refused: u64,
+    pub instance_semantic_occupied: usize,
+    pub instance_semantic_unknown_edges: usize,
+    pub instance_semantic_refused: u64,
+    pub instance_negative_limit: usize,
+    pub instance_negative_occupied: usize,
+    pub instance_negative_refused: u64,
+    pub instance_negative_exhausted: bool,
     pub retained_limit: usize,
     pub retained: usize,
     pub retained_suppressed: u64,
@@ -432,6 +471,8 @@ pub(crate) struct Presentation {
     pub callers: Vec<CallerView>,
     pub modules: Vec<ModuleView>,
     pub edges: Vec<EdgeView>,
+    pub instances: Vec<InstanceView>,
+    pub semantic_edges: Vec<InstanceSemanticView>,
     pub gaps: Vec<GapView>,
     pub gaps_suppressed: u64,
     pub budgets: BudgetView,
@@ -628,6 +669,45 @@ impl Presentation {
                 semantics,
             });
         }
+        let instances = registry
+            .instances()
+            .map(|r| InstanceView {
+                id: r.id,
+                caller: r.caller,
+                module: r.module,
+                state: r.state,
+                reason: r.reason.map(|reason| reason.label()),
+                first_seen_ns: r.first_seen_ns,
+                last_seen_ns: r.last_seen_ns,
+            })
+            .collect();
+        let semantic_edges = registry
+            .instance_semantic_edges()
+            .map(|r| {
+                let mut semantics = semantics_view(r.semantics.as_ref());
+                if r.semantics.is_none() {
+                    semantics.label = if r.api_returns.is_none() {
+                        "unknown (no calls observed)"
+                    } else {
+                        "unknown (no operation evidence)"
+                    };
+                }
+                let mut reasons: Vec<_> = r.reasons.iter().map(|reason| reason.label()).collect();
+                reasons.sort_unstable();
+                reasons.dedup();
+                InstanceSemanticView {
+                    instance: r.id,
+                    caller: r.caller,
+                    module: r.module,
+                    api_returns: r.api_returns,
+                    saturated: r.saturated,
+                    historical_only_returns: r.historical_only_returns,
+                    semantics,
+                    lossy: r.lossy,
+                    reasons,
+                }
+            })
+            .collect();
         let gaps = registry
             .gaps()
             .iter()
@@ -655,6 +735,8 @@ impl Presentation {
             callers,
             modules,
             edges,
+            instances,
+            semantic_edges,
             gaps,
             gaps_suppressed: registry.gaps_suppressed(),
             budgets: BudgetView {
@@ -691,6 +773,16 @@ impl Presentation {
                 semantic_occupied: registry.semantic_occupied(),
                 semantic_unknown_edges: registry.semantic_unknown_edges(),
                 semantic_refused: registry.semantic_refused(),
+                instances_limit: registry.instance_limit(),
+                instances_occupied: registry.instances().count(),
+                instances_refused: registry.instance_refused(),
+                instance_semantic_occupied: registry.instance_semantic_occupied(),
+                instance_semantic_unknown_edges: registry.instance_semantic_unknown_edges(),
+                instance_semantic_refused: registry.instance_semantic_refused(),
+                instance_negative_limit: registry.instance_negative_limit(),
+                instance_negative_occupied: registry.instance_negative_occupied(),
+                instance_negative_refused: registry.instance_negative_refused(),
+                instance_negative_exhausted: registry.instance_negative_exhausted(),
                 retained_limit: limits.max_gaps,
                 retained: registry.gaps().len(),
                 retained_suppressed: registry.gaps_suppressed(),
@@ -767,7 +859,10 @@ fn semantics_view(state: Option<&EdgeSemantics>) -> EdgeSemanticsView {
 /// categories, counts, recency, provenance) and the operation
 /// aggregates. Unknown edges render the bare label, exactly as U0.
 fn snapshot_semantics(edge: &EdgeView) -> String {
-    let semantics = &edge.semantics;
+    snapshot_semantics_view(&edge.semantics)
+}
+
+fn snapshot_semantics_view(semantics: &EdgeSemanticsView) -> String {
     let Some(operations) = semantics.operations.as_ref() else {
         return semantics.label.to_string();
     };
@@ -1177,6 +1272,31 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
             snapshot_semantics(edge),
             escape_controls(&coverage_label(&edge.coverage)),
         );
+        for child in presentation
+            .semantic_edges
+            .iter()
+            .filter(|child| child.caller == edge.caller && child.module == edge.module)
+        {
+            let instance = presentation
+                .instances
+                .iter()
+                .find(|r| r.id == child.instance)
+                .expect("semantic instance resolves in presentation");
+            let _ = writeln!(
+                out,
+                "  instance {} {} api_returns={}{} historical_only_returns={} semantics {} coverage lossy={} reasons=[{}]",
+                child.instance.label(),
+                instance.state.label(),
+                child
+                    .api_returns
+                    .map_or_else(|| "unknown".into(), |n| n.to_string()),
+                if child.saturated { " (saturated)" } else { "" },
+                child.historical_only_returns,
+                snapshot_semantics_view(&child.semantics),
+                child.lossy,
+                child.reasons.join(","),
+            );
+        }
     }
     for gap in &presentation.gaps {
         // Subjects and reasons carry target-controlled strings (paths,

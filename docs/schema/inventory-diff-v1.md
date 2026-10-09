@@ -151,6 +151,13 @@ Detailed mechanism/operation fields are validated as supported input when
 present but are not included in report pools or compared. Additive load-instance
 and semantic-edge records are likewise not analysed or distributed across
 physical edges. Each original edge's count remains separate.
+The additive `instances[]` and `semantic_edges[]` arrays, and their instance
+budgets, do not change this physical comparison or its
+`semantic_details_not_compared` disclosure. Inputs without these arrays remain
+compatible with inputs carrying them. The parser still charges their complete
+bytes, nesting depth and JSON values against input limits; ignoring their
+comparison meaning does not bypass resource limits. Capture-local `iN` values
+are never matched across captures.
 
 ## Comparison projections
 

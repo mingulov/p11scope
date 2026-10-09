@@ -796,6 +796,22 @@ pub(crate) fn emit_snapshot_as_events(
     for module in document["modules"].as_array().expect("modules array") {
         writer.append("module_observed", module.clone(), at_ns)?;
     }
+    // H2 snapshot equivalence only. H3 owns bounded incremental delivery and
+    // the retention-aware final sweep before ended.
+    for instance in &presentation.instances {
+        writer.append(
+            "instance_observed",
+            crate::inventory::instance_json(instance),
+            at_ns,
+        )?;
+    }
+    for edge in &presentation.semantic_edges {
+        writer.append(
+            "semantic_edge_observed",
+            crate::inventory::instance_semantic_json(edge),
+            at_ns,
+        )?;
+    }
     EdgeEmitter::new().sweep(
         writer,
         &presentation.edges,

@@ -2526,6 +2526,33 @@ pub(crate) fn edge_json(edge: &crate::inventory_present::EdgeView) -> serde_json
     })
 }
 
+pub(crate) fn instance_json(
+    instance: &crate::inventory_present::InstanceView,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": instance.id.label(), "caller": instance.caller.label(),
+        "module": instance.module.label(), "state": instance.state.label(),
+        "reason": instance.reason, "first_seen_ns": instance.first_seen_ns,
+        "last_seen_ns": instance.last_seen_ns,
+    })
+}
+
+pub(crate) fn instance_semantic_json(
+    edge: &crate::inventory_present::InstanceSemanticView,
+) -> serde_json::Value {
+    serde_json::json!({
+        "caller": edge.caller.label(), "module": edge.module.label(),
+        "instance": edge.instance.label(),
+        "entries": { "unit": "api_entries", "count": null, "observation": "unavailable" },
+        "api_returns": { "unit": "api_returns", "count": edge.api_returns,
+            "saturated": edge.saturated, "historical_only_returns": edge.historical_only_returns },
+        "semantics": edge.semantics.label,
+        "mechanisms": mechanisms_json(&edge.semantics.mechanisms),
+        "operations": operations_json(edge.semantics.operations.as_ref()),
+        "coverage": { "lossy": edge.lossy, "reasons": edge.reasons },
+    })
+}
+
 /// Additive (v1) per-edge usage coverage: the state, its instants
 /// (`since_ns` for counted and watched, `until_ns` for a watch that
 /// ended — the last proven-clean instant — and `first_ns` for
@@ -2713,6 +2740,8 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         "callers": presentation.callers.iter().map(caller_json).collect::<Vec<_>>(),
         "modules": presentation.modules.iter().map(module_json).collect::<Vec<_>>(),
         "edges": presentation.edges.iter().map(edge_json).collect::<Vec<_>>(),
+        "instances": presentation.instances.iter().map(instance_json).collect::<Vec<_>>(),
+        "semantic_edges": presentation.semantic_edges.iter().map(instance_semantic_json).collect::<Vec<_>>(),
         "gaps": gaps,
         "gaps_suppressed": presentation.gaps_suppressed,
         // Additive (v1, DR-K8S-2): caller PIDs are this observer's /proc
@@ -2799,6 +2828,22 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
             "status": crate::inventory_present::semantic_status(budgets),
             "unknown_edges": budgets.semantic_unknown_edges,
             "refused": budgets.semantic_refused,
+        },
+        "instances": {
+            "limit": budgets.instances_limit, "occupied": budgets.instances_occupied,
+            "refused": budgets.instances_refused,
+        },
+        "instance_semantic_state": {
+            "limit": budgets.semantic_limit.min(budgets.instances_limit),
+            "occupied": budgets.instance_semantic_occupied,
+            "unknown_edges": budgets.instance_semantic_unknown_edges,
+            "refused": budgets.instance_semantic_refused,
+            "shared_limit": budgets.semantic_limit,
+            "shared_occupied": budgets.semantic_occupied + budgets.instance_semantic_occupied,
+        },
+        "instance_negative_state": {
+            "limit": budgets.instance_negative_limit, "occupied": budgets.instance_negative_occupied,
+            "refused": budgets.instance_negative_refused, "exhausted": budgets.instance_negative_exhausted,
         },
         "retained_history": {
             "limit": budgets.retained_limit,

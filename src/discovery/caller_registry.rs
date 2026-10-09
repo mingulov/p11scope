@@ -1869,13 +1869,6 @@ pub(crate) struct CallerRegistry {
 }
 
 impl CallerRegistry {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "aggregate projection follows Task4 registry review"
-        )
-    )]
     pub(crate) fn semantic_resource_snapshot(
         &self,
     ) -> crate::semantics_edge::resources::SemanticResourceSnapshot {

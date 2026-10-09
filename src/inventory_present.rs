@@ -29,7 +29,8 @@ use crate::discovery::caller_registry::{
 };
 use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::render::escape_controls;
-use crate::semantics_edge::{EdgeEvidence, EdgeSemantics};
+use crate::semantics_edge::resources::SemanticResourceSnapshot;
+use crate::semantics_edge::{EdgeEvidence, EdgeSemantics, S1Occupancy};
 
 /// Trailing window for the dashboard display's "recently observed":
 /// an entry whose last-seen falls inside this window (of the frame's
@@ -387,6 +388,23 @@ pub(crate) struct GapView {
     pub repeats: u64,
 }
 
+/// Shared allocation charges and actual owned-state counts at publication.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SemanticResourceView {
+    pub charges: SemanticResourceSnapshot,
+    pub occupancy: S1Occupancy,
+}
+
+#[cfg(test)]
+impl Default for SemanticResourceView {
+    fn default() -> Self {
+        Self {
+            charges: crate::semantics_edge::resources::SemanticResourcePool::default().snapshot(),
+            occupancy: S1Occupancy::default(),
+        }
+    }
+}
+
 /// Every budgeted resource with limit, occupancy, and loss counter.
 #[derive(Debug, Clone)]
 pub(crate) struct BudgetView {
@@ -430,6 +448,7 @@ pub(crate) struct BudgetView {
     pub instance_negative_occupied: usize,
     pub instance_negative_refused: u64,
     pub instance_negative_exhausted: bool,
+    pub instance_semantic_resources: SemanticResourceView,
     pub retained_limit: usize,
     pub retained: usize,
     pub retained_suppressed: u64,
@@ -448,6 +467,34 @@ impl BudgetView {
             .saturating_add(self.edges_refused)
             .saturating_add(self.endpoints_refused)
     }
+}
+
+/// Compact charges first, followed by counts without private identifiers.
+pub(crate) fn semantic_resource_line(view: &SemanticResourceView) -> String {
+    let charge = view.charges;
+    let usage = view.occupancy;
+    format!(
+        "semantic {}/{}B peak={} refused={} | open={} active={} pending={} detached={} mechanisms={} categories={} functions={} function_bytes={} function_capacity={} returns={} async_bytes={} async_capacity={} origins={} origin_elements={} origin_capacity={}",
+        charge.charged_bytes,
+        charge.limit_bytes,
+        charge.peak_charged_bytes,
+        charge.refused,
+        usage.open_bindings,
+        usage.active_machines,
+        usage.pending_calls,
+        usage.detached_calls,
+        usage.mechanisms,
+        usage.operation_categories,
+        usage.provenance_functions,
+        usage.provenance_function_bytes,
+        usage.provenance_function_capacity_bytes,
+        usage.provenance_returns,
+        usage.async_function_bytes,
+        usage.async_function_capacity_bytes,
+        usage.origin_vectors,
+        usage.origin_elements,
+        usage.origin_capacity_elements,
+    )
 }
 
 /// The ONE presentation snapshot: immutable, owned, sorted. Built once
@@ -783,6 +830,10 @@ impl Presentation {
                 instance_negative_occupied: registry.instance_negative_occupied(),
                 instance_negative_refused: registry.instance_negative_refused(),
                 instance_negative_exhausted: registry.instance_negative_exhausted(),
+                instance_semantic_resources: SemanticResourceView {
+                    charges: registry.semantic_resource_snapshot(),
+                    occupancy: registry.semantic_resource_occupancy(),
+                },
                 retained_limit: limits.max_gaps,
                 retained: registry.gaps().len(),
                 retained_suppressed: registry.gaps_suppressed(),
@@ -1182,7 +1233,7 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
     );
     let _ = writeln!(
         out,
-        "budgets: callers {}/{} refused {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {}",
+        "budgets: callers {}/{} refused {} | modules {}/{} refused {} | edges {}/{} refused {} | endpoints {}/{} refused {} | counters observed {} saturated {} | semantic_state {} held {}/{} unknown {} refused {} | retained_history {}/{} suppressed {} | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {} | {}",
         budgets.callers_occupied,
         budgets.callers_limit,
         budgets.callers_refused,
@@ -1211,6 +1262,7 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
         budgets.inventory_modules_occupied,
         budgets.inventory_modules_limit,
         budgets.inventory_modules_refused,
+        semantic_resource_line(&budgets.instance_semantic_resources),
     );
     for caller in &presentation.callers {
         let exe = caller

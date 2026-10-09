@@ -732,11 +732,32 @@ Additive budgets are:
   scope past capacity permanently sets `exhausted`, invalidates current
   instance operations and refuses new registrations/reductions, preserving
   physical counts, history and admitted late API-return evidence.
+- `instance_semantic_resources`: `{limit_bytes, charged_bytes,
+  peak_charged_bytes, refused, occupancy}` for the single allocation-charge
+  pool shared by legacy physical-edge and instance S1 reducers. The default
+  limit is 64 MiB, including a permanently charged 1 MiB transition-scratch
+  reservation even when no reducer exists. Charges reserve conservative
+  allocation envelopes before growth; retained reducer bases and historical
+  provenance remain charged after live state is invalidated. `charged_bytes`
+  is current ownership, `peak_charged_bytes` includes temporary reservations,
+  and `refused` counts rejected reservations. These are not RSS measurements
+  or an allocator-independent process-memory guarantee.
+  `occupancy` contains current aggregate counts: `open_bindings`,
+  `active_machines`, `pending_calls`, `detached_calls`, `mechanisms`,
+  `operation_categories`, `provenance_functions`, `provenance_function_bytes`,
+  `provenance_function_capacity_bytes`, `provenance_returns`,
+  `async_function_bytes`, `async_function_capacity_bytes`, `origin_vectors`,
+  `origin_elements`, and `origin_capacity_elements`. Length and reserved
+  capacity are separate; no handles, function strings or return values are
+  exposed by this census. Counts are collected once into the immutable
+  presentation and reused by JSON, JSONL and terminal views. P6 physical
+  comparison does not compare these additive semantic resource fields.
 
 The H2 implementation supplies sealed consumers and this projection. Production
 activation remains H3: its sole proof-consuming adapter must establish the
 original input order and fresh continuity, fence unpublished calls after real
-physical uncertainty, and measure/admit aggregate S1 resources. A remapped
+physical uncertainty, and qualify the final unpublished-batch and emitter
+costs alongside the enforced reducer allocation pool. A remapped
 physical edge or a newer ordinal alone does not prove semantic recovery.
 Empty arrays in current production captures do not prove absence of instances
 or complete semantic coverage. No object authority is added.

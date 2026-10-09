@@ -896,8 +896,8 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
         );
     }
     assert!(
-        budgets.ends_with(&format!(
-            " | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {}",
+        budgets.contains(&format!(
+            " | inventory_endpoints {}/{} refused {} | inventory_attach_modules {}/{} refused {} | ",
             document["budgets"]["inventory_endpoints"]["occupied"],
             document["budgets"]["inventory_endpoints"]["limit"],
             document["budgets"]["inventory_endpoints"]["refused"],
@@ -906,6 +906,21 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
             document["budgets"]["inventory_attach_modules"]["refused"],
         )),
         "budgets inventory_endpoints: {budgets}"
+    );
+    let resources = &document["budgets"]["instance_semantic_resources"];
+    assert!(
+        budgets.contains(&format!(
+            " | semantic {}/{}B peak={} refused={} | open={} active={} pending={} detached={}",
+            resources["charged_bytes"],
+            resources["limit_bytes"],
+            resources["peak_charged_bytes"],
+            resources["refused"],
+            resources["occupancy"]["open_bindings"],
+            resources["occupancy"]["active_machines"],
+            resources["occupancy"]["pending_calls"],
+            resources["occupancy"]["detached_calls"],
+        )),
+        "shared semantic resource budget: {budgets}"
     );
     assert!(
         budgets.contains(&format!(
@@ -1465,11 +1480,18 @@ fn budgets_carry_the_inventory_attach_set_endpoints() {
         .find(|line| line.starts_with("budgets: "))
         .unwrap();
     assert!(
-        budgets.ends_with(
-            " | inventory_endpoints 0/4096 refused 0 | inventory_attach_modules 0/4096 refused 0"
+        budgets.contains(
+            " | inventory_endpoints 0/4096 refused 0 | inventory_attach_modules 0/4096 refused 0 | "
         ),
         "{budgets}"
     );
+    assert!(
+        budgets.contains(" | semantic 1048576/67108864B peak=1048576 refused=0 | "),
+        "{budgets}"
+    );
+    assert!(budgets.ends_with(
+        "open=0 active=0 pending=0 detached=0 mechanisms=0 categories=0 functions=0 function_bytes=0 function_capacity=0 returns=0 async_bytes=0 async_capacity=0 origins=0 origin_elements=0 origin_capacity=0"
+    ), "{budgets}");
 }
 
 #[test]

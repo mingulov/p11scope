@@ -65,14 +65,25 @@ Unchanged-image re-exec, including A-to-B-to-A between samples, is a documented
 snapshot limitation. This receipt cannot establish the image of a historical
 call event and grants no trace, profile or metrics executable-name authority.
 
-The corresponding approved additive inspect-system projection is per
-`processes[]` row in `p11scope/inspect-system/v1`, with the same fields and
-status vocabulary; process/object references retain their existing meanings.
-Scanned/MemoryUnavailable rows require the new receipt; confirmed MapsMatched
-rows use the separate retained confirmation adapter. Unreadable, Exited and
-NotSelected rows remain unknown. The PID helper slice and system producer
-implementation/qualification are tracked separately; the schema description
-alone does not prove the system path has been implemented or qualified.
+The system projection adds the same fields to every `processes[]` row in
+`p11scope/inspect-system/v1`; process/object references retain their existing
+meanings. Scanned/MemoryUnavailable rows require the completed deep-scan
+receipt. The sample encloses both mapping scans and provider pinning under the
+original ProcessView. Failed initial/final mapping validation or a rejected
+scan-generation check stays `not_examined`, even with a stable executable.
+Successfully empty scans and completed mapping scans with unavailable memory
+can retain an observed receipt. This presentation completion gate grants no
+absence authority and does not change the physical mapping result or gap.
+MapsMatched rows instead consume the separate retained SweptMember confirmation,
+which checks executable identity around maps and physical proof reads. A missing
+retained path still withholds the name. Unreadable, Exited and NotSelected rows
+remain visible with unknown application identity.
+
+System text uses the same retained receipts for mapped-by labels and the process
+table, which also shows full executable paths and physical identity detail.
+Rendering never repairs a missing identity using current process state. Host
+adapter tests and installed system-scope qualification remain distinct checks;
+the schema alone does not establish installed scope coverage.
 
 Field authority is the narrow
 [inspect presentation identity amendment](../privacy/allowlist-v3.md#inspect-presentation-identity-p5u-2026-10-09).

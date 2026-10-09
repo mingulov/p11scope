@@ -514,6 +514,9 @@ impl Scene {
             processes: members
                 .iter()
                 .map(|(pid, start)| crate::inspect_system::ProcessRecord {
+                    application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                        crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                    ),
                     complete_scan: None,
                     pid: *pid,
                     status: crate::inspect_system::MemberStatus::Scanned,

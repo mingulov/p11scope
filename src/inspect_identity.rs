@@ -119,6 +119,26 @@ pub(crate) fn begin_application(reader: &mut impl InspectImageReader) -> Pending
     }
 }
 
+/// Separate producer authority: the sweep confirmation already bracketed its
+/// maps and physical proof reads with matching executable samples and a held pin.
+/// Raw deep-scan generation metadata cannot enter this adapter.
+pub(crate) fn application_from_confirmed_member(
+    member: &crate::discovery::sweep_attribution::SweptMember,
+) -> InspectApplicationResult {
+    if !member
+        .exe
+        .path
+        .as_deref()
+        .is_some_and(|path| !path.is_empty())
+    {
+        return InspectApplicationResult::Unknown(InspectIdentityUnknown::Unavailable);
+    }
+    InspectApplicationResult::Observed(ValidatedInspectApplication {
+        exe: member.exe.clone(),
+        start_time: member.start_time,
+    })
+}
+
 pub(crate) fn finish_application(
     pending: PendingInspectApplication,
     reader: &mut impl InspectImageReader,

@@ -5896,6 +5896,9 @@ mod tests {
             cap: 1,
             scan_ms: 0,
             processes: vec![crate::inspect_system::ProcessRecord {
+                application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                    crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                ),
                 complete_scan: None,
                 pid,
                 status: crate::inspect_system::MemberStatus::Scanned,

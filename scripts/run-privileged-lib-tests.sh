@@ -59,8 +59,8 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation (102 ignored tests in the default-feature lib binary): 84 run by
-# default, 5 run only with --include-long, 13 are statically skipped with a
+# Curation: default tests run normally, long tests only with --include-long,
+# and static skips require their documented external prerequisites, with a
 # reason. Both modes verify the curation against the binary's own
 # `--list --ignored` output and refuse on drift, so a new ignored test can
 # never be silently dropped and a renamed one can never silently pass.
@@ -185,6 +185,9 @@ inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
 # caller publishes exactly one first count, holds it across idle passes,
 # then grows; ledger-exact finals. Prints C51_AB (about 20 s).
 inventory::privileged_tests::privileged_native_lane_system_ab_first_count_lp64
+# Owned provider retirement: A -> shared A/B -> A unload -> B recovery;
+# independent phased call ledger and production diagnostic decisions.
+inventory::privileged_tests::privileged_native_lane_pid_provider_retirement_diagnostics_lp64
 # Task 6 C5.11: --system over 544 endpoints (8 mapped copies of SoftHSM2)
 # retires closed under uprobe-multi (per-offset links may read unsettled);
 # under auto on a kernel whose functional probe links uprobe-multi it must

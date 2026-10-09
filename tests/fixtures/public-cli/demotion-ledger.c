@@ -5,6 +5,8 @@
  * cc ... -shared -fPIC -DDEMOTION_PROVIDER_A demotion-ledger.c \
  *    -LBUILD -ldemotion-common -Wl,-rpath,'$ORIGIN' -Wl,-z,defs -o provider-A.so
  * Repeat for DEMOTION_PROVIDER_B; workload: cc ... demotion-ledger.c -ldl -o workload.
+ * Add -DDEMOTION_PHASED_LEDGER for workload phase labels in the live regression;
+ * without it the existing checker-compatible call schema is unchanged.
  * usage: workload A B COMMON CONTROL_FIFO LEDGER NONCE DEADLINE_MS
  * CONTROL_FIFO must be an owned FIFO; keep its sole writer open until stop.
  * Newline commands, in order: ready, load-b, shared, unload-a, fence, proof, stop.
@@ -14,7 +16,7 @@
  * requires actual B admission, fence requires actual accepted original scan S,
  * proof requires actual selected fence/current proof. These commands establish
  * no observer facts and carry no observer clocks, counts or synthesized receipt.
- * The ledger contains only identity, actual selected call brackets, and terminal
+ * The ledger contains only identity, workload phase, actual call brackets, and terminal
  * acknowledgement. Every C_Initialize call, including errors, is one entry.
  * Provider tables contain only slot0 and their own slot3 root, with null holes.
  * Source-only execution proves topology, not discovery/attachment/count evidence.
@@ -241,7 +243,15 @@ static int wait_command(const char *expected) {
         token[used++]=byte;
     }
 }
-static int invoke(Initialize fn,unsigned count,unsigned alias,int error_last) {
+static int invoke(Initialize fn,unsigned count,unsigned alias,int error_last,const char *phase) {
+#ifdef DEMOTION_PHASED_LEDGER
+#define PHASE_FIELD "\"phase\":\"%s\","
+#define PHASE_VALUE phase,
+#else
+#define PHASE_FIELD ""
+#define PHASE_VALUE
+    (void)phase;
+#endif
     for(unsigned i=0;i<count;i++) {
         if(!alive()||calls>=64)return -1;
         /* No ledger writes, allocation, formatting or clock injection between
@@ -252,15 +262,17 @@ static int invoke(Initialize fn,unsigned count,unsigned alias,int error_last) {
         CK_RV rv=fn(arguments);
         if(clock_ns(&after)) {
             calls++;
-            (void)row("{\"kind\":\"call\",\"sequence\":%" PRIu64 ",\"caller_identity\":1,\"target_identity\":1,\"function\":\"C_Initialize\",\"alias\":%u,\"before_call_ns\":%" PRIu64 ",\"after_return_ns\":null,\"entered\":true,\"completed\":false,\"return_status\":null}",calls,alias,before);
+            (void)row("{\"kind\":\"call\",\"sequence\":%" PRIu64 ",\"caller_identity\":1,\"target_identity\":1,\"function\":\"C_Initialize\"," PHASE_FIELD "\"alias\":%u,\"before_call_ns\":%" PRIu64 ",\"after_return_ns\":null,\"entered\":true,\"completed\":false,\"return_status\":null}",calls,PHASE_VALUE alias,before);
             return -1;
         }
         calls++;
-        if(row("{\"kind\":\"call\",\"sequence\":%" PRIu64 ",\"caller_identity\":1,\"target_identity\":1,\"function\":\"C_Initialize\",\"alias\":%u,\"before_call_ns\":%" PRIu64 ",\"after_return_ns\":%" PRIu64 ",\"entered\":true,\"completed\":true,\"return_status\":%lu}",calls,alias,before,after,rv))return -1;
+        if(row("{\"kind\":\"call\",\"sequence\":%" PRIu64 ",\"caller_identity\":1,\"target_identity\":1,\"function\":\"C_Initialize\"," PHASE_FIELD "\"alias\":%u,\"before_call_ns\":%" PRIu64 ",\"after_return_ns\":%" PRIu64 ",\"entered\":true,\"completed\":true,\"return_status\":%lu}",calls,PHASE_VALUE alias,before,after,rv))return -1;
         if(after<=before||!alive())return -1;
     }
     return 0;
 }
+#undef PHASE_FIELD
+#undef PHASE_VALUE
 static int complete(int success) {
     if(!identity_written||terminal_written)return 0;
     uint64_t now;if(clock_ns(&now))return -1;
@@ -301,15 +313,15 @@ int main(int argc,char **argv) {
            argv[6],getpid(),start,exe_hash,(uint64_t)exe_stat.st_dev,(uint64_t)exe_stat.st_ino,(uint64_t)exe_stat.st_mtim.tv_sec,(uint64_t)exe_stat.st_mtim.tv_nsec,
            common_target.major,common_target.minor,common_target.ino,common_hash,common_target.offset,common_target.offset,namespace,now))goto cleanup;
     identity_written=1;
-    if(invoke(a.call,5,0,1)||ack("a-done")||wait_command("load-b")||acquire(argv[2],&b)||!same(a.target,b.target)||
+    if(invoke(a.call,5,0,1,"a")||ack("a-done")||wait_command("load-b")||acquire(argv[2],&b)||!same(a.target,b.target)||
        (a.root.major==b.root.major&&a.root.minor==b.root.minor&&a.root.ino==b.root.ino))goto cleanup;
     if(printf("{\"event\":\"b-ready\",\"same_target\":true,\"a_root_ino\":%" PRIu64 ",\"b_root_ino\":%" PRIu64 ",\"b_root_offset\":%" PRIu64 ",\"b_table_ino\":%" PRIu64 ",\"b_table_offset\":%" PRIu64 "}\n",a.root.ino,b.root.ino,b.root.offset,b.table_file.ino,b.table_file.offset)<0||fflush(stdout))goto cleanup;
-    if(wait_command("shared")||invoke(a.call,1,0,0)||invoke(b.call,1,1,1)||ack("shared-done")||wait_command("unload-a"))goto cleanup;
+    if(wait_command("shared")||invoke(a.call,1,0,0,"shared")||invoke(b.call,1,1,1,"shared")||ack("shared-done")||wait_command("unload-a"))goto cleanup;
     if(dlclose(a.handle))goto cleanup;
     a.handle=NULL;a.table=NULL;a.call=NULL;
     if(mapped(a.root)!=0||mapped(b.root)!=1||mapped(common_target)!=1)goto cleanup;
     if(printf("{\"event\":\"a-unmapped\",\"a_mapped\":false,\"b_mapped\":true,\"common_mapped\":true}\n")<0||fflush(stdout))goto cleanup;
-    if(wait_command("fence")||invoke(b.call,1,1,1)||ack("fence-done")||wait_command("proof")||invoke(b.call,2,1,1)||
+    if(wait_command("fence")||invoke(b.call,1,1,1,"fence")||ack("fence-done")||wait_command("proof")||invoke(b.call,2,1,1,"proof")||
        complete(1)||ack("final-calls")||wait_command("stop"))goto cleanup;
     result=0;
 cleanup:

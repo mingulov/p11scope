@@ -430,8 +430,9 @@ fn e2_unload_reload_observed_with_history() {
 /// DR-C5-EDGE through the real `run_with_writer` stream: one multi-pass
 /// reload run read by three consumers — the `-o` JSON document, the
 /// `--event-log` JSONL stream and the stdout text snapshot. The last
-/// `edge_observed` per edge equals the document's edge, every edge has
-/// one, the derived states equal the text snapshot's, the mid-run
+/// `edge_observed` per edge equals the document's edge after checking
+/// its compact identity context separately, every edge has one, the
+/// derived states equal the text snapshot's, the mid-run
 /// unload/reload streamed its own records, and the records are accounted
 /// by the pass markers plus `ended`.
 #[test]
@@ -503,6 +504,16 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
     let mut last: BTreeMap<(String, String), &Value> = BTreeMap::new();
     let mut per_edge: BTreeMap<(String, String), usize> = BTreeMap::new();
     for record in &records {
+        let context = &record["identity_context"];
+        assert_eq!(context["version"], 1);
+        assert_eq!(context["caller"]["id"], record["caller"]);
+        assert_eq!(context["caller"]["pid"], pid);
+        assert_eq!(
+            context["caller"]["executable"]["path"],
+            driver.to_str().unwrap()
+        );
+        assert_eq!(context["module"]["id"], record["module"]);
+        assert_eq!(context["module"]["path"], prov.to_str().unwrap());
         let key = (
             record["caller"].as_str().unwrap().to_string(),
             record["module"].as_str().unwrap().to_string(),
@@ -520,8 +531,8 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
         );
         let record = last[&key];
         let mut replayed = record.clone();
-        for state in ["presence", "capture", "activity"] {
-            replayed.as_object_mut().unwrap().remove(state);
+        for field in ["presence", "capture", "activity", "identity_context"] {
+            replayed.as_object_mut().unwrap().remove(field);
         }
         assert_eq!(&replayed, edge, "JSONL replay == JSON for {key:?}");
         let line = text

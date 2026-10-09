@@ -282,7 +282,10 @@ impl Engine {
         match &self.scope {
             Scope::Pid(expected) => pid == *expected,
             Scope::System => true,
-            Scope::Cgroup { .. } => scope_pids(&self.scope).0.contains(&pid),
+            // Native owner reads/refresh do not yet fit inside the cgroup
+            // transaction bracket. Only the scoped scan-pinned path may
+            // admit; never walk membership again here or inherit a PID.
+            Scope::Cgroup { .. } => false,
         }
     }
 

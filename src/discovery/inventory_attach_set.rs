@@ -501,10 +501,232 @@ impl InventoryAttachSet {
     }
 }
 
+// Private preparation ceilings. Existing state remains bounded by InventoryBudget.
+const PREPARED_INPUT_LIMIT: usize = 512;
+const PREPARED_COMPARISON_LIMIT: usize = 8192;
+
+#[derive(Clone, Copy, Default)]
+struct ProviderRelation {
+    same_object: bool,
+    same_kernel_file: bool,
+}
+struct PreparedProviderFacts {
+    inputs: BTreeMap<PinnedObjectId, RetainedInventoryTarget>,
+    existing: BTreeMap<(AttachObjectId, PinnedObjectId), ProviderRelation>,
+    incoming: BTreeMap<(PinnedObjectId, PinnedObjectId), ProviderRelation>,
+    origins: BTreeMap<AttachObjectId, PinnedObjectId>,
+    base_objects: usize,
+}
+impl PreparedProviderFacts {
+    fn relation(&self, object: AttachObjectId, input: PinnedObjectId) -> ProviderRelation {
+        if (object.0 as usize) < self.base_objects {
+            return self
+                .existing
+                .get(&(object, input))
+                .copied()
+                .unwrap_or_default();
+        }
+        let Some(origin) = self.origins.get(&object) else {
+            return ProviderRelation::default();
+        };
+        if *origin == input {
+            return ProviderRelation {
+                same_object: true,
+                same_kernel_file: true,
+            };
+        }
+        self.incoming
+            .get(&(*origin, input))
+            .copied()
+            .unwrap_or_default()
+    }
+    fn contains_exact(&self, pins: &PinnedObjects, input: PinnedObjectId) -> bool {
+        let Some(target) = self.inputs.get(&input) else {
+            return false;
+        };
+        let held = target.retirement_lease();
+        pins.file_for(input)
+            .is_some_and(|file| std::ptr::eq(file, held.as_ref()))
+            && pins
+                .summary(input)
+                .is_some_and(|summary| summary.key == target.object_key())
+            && pins
+                .content_key(input)
+                .is_some_and(|key| key == target.content_key())
+    }
+}
+/// Exclusive attach-set custody prevents its resolution state changing between
+/// read preparation and consumption. Every input retains the exact opened File.
+/// The final allowed-PID lowering may consume a subset; it never reruns stat.
+pub(crate) struct PreparedAbsorption<'a> {
+    set: &'a mut InventoryAttachSet,
+    facts: PreparedProviderFacts,
+}
+impl PreparedAbsorption<'_> {
+    pub(crate) fn absorb(
+        mut self,
+        plan: &AttachPlan,
+        pins: &PinnedObjects,
+        mut work: impl FnMut(usize) -> bool,
+    ) -> Result<AbsorbOutcome, String> {
+        if !work(
+            plan.slots
+                .len()
+                .saturating_mul(8)
+                .saturating_add(plan.modules.len().saturating_mul(8))
+                .saturating_add(1),
+        ) {
+            return Err("cgroup provider commit allowance exhausted".into());
+        }
+        for input in plan
+            .slots
+            .iter()
+            .filter(|slot| plan.is_active(slot.index))
+            .map(|slot| slot.object)
+            .chain(plan.modules.iter().map(|module| module.object))
+        {
+            if !work(2) || !self.facts.contains_exact(pins, input) {
+                return Err(
+                    "cgroup provider preparation no longer names the exact aggregate input".into(),
+                );
+            }
+        }
+        Ok(self.set.absorb_with(plan, pins, Some(&mut self.facts)))
+    }
+}
+
+impl InventoryAttachSet {
+    pub(crate) fn prepare_absorption(
+        &mut self,
+        pins: &PinnedObjects,
+        mut work: impl FnMut(usize) -> bool,
+    ) -> Result<PreparedAbsorption<'_>, String> {
+        let mut facts = PreparedProviderFacts {
+            inputs: BTreeMap::new(),
+            existing: BTreeMap::new(),
+            incoming: BTreeMap::new(),
+            origins: BTreeMap::new(),
+            base_objects: self.objects.len(),
+        };
+        for summary in pins.pinned() {
+            if facts.inputs.len() >= PREPARED_INPUT_LIMIT {
+                return Err("cgroup provider preparation input ceiling reached".into());
+            }
+            let bytes = summary
+                .path
+                .len()
+                .saturating_mul(2)
+                .saturating_add(summary.sha256.len())
+                .saturating_add(summary.build_id.map_or(0, str::len));
+            if !work(bytes.div_ceil(16).saturating_add(8)) {
+                return Err(
+                    "cgroup provider preparation interrupted or allowance exhausted".into(),
+                );
+            }
+            let target = pins.retain_inventory_target(summary.id);
+            #[cfg(test)]
+            provider_read_test::retention_returned();
+            let target = target?;
+            if !work(1) {
+                return Err("cgroup provider preparation interrupted after retention".into());
+            }
+            facts.inputs.insert(summary.id, target);
+        }
+        for (&input, target) in &facts.inputs {
+            if !work(2) {
+                return Err("cgroup provider resolution interrupted".into());
+            }
+            let mut candidates = BTreeSet::new();
+            if let Some(object) = self.by_raw.get(&target.object_key()) {
+                if !work(1) {
+                    return Err("cgroup provider resolution interrupted".into());
+                }
+                candidates.insert(*object);
+            }
+            if let Some(objects) = self.by_content.get(&target.content_key()) {
+                for &object in objects {
+                    if !work(1) {
+                        return Err("cgroup provider resolution interrupted".into());
+                    }
+                    candidates.insert(object);
+                }
+            }
+            for object in candidates {
+                if facts.existing.len() + facts.incoming.len() >= PREPARED_COMPARISON_LIMIT {
+                    return Err("cgroup provider preparation comparison ceiling reached".into());
+                }
+                if !work(6) {
+                    return Err("cgroup provider identity comparison interrupted".into());
+                }
+                let retained = &self.objects[object.0 as usize].target;
+                let same_object = retained.same_object_as(pins, input);
+                if !work(4) {
+                    return Err("cgroup provider identity comparison interrupted".into());
+                }
+                let same_kernel_file = retained.same_kernel_file_as(pins, input);
+                #[cfg(test)]
+                provider_read_test::comparison_returned();
+                facts.existing.insert(
+                    (object, input),
+                    ProviderRelation {
+                        same_object,
+                        same_kernel_file,
+                    },
+                );
+            }
+        }
+        for (&origin, target) in &facts.inputs {
+            for (&input, other) in &facts.inputs {
+                if !work(1) {
+                    return Err("cgroup provider input comparison interrupted".into());
+                }
+                if origin == input
+                    || (target.object_key() != other.object_key()
+                        && target.content_key() != other.content_key())
+                {
+                    continue;
+                }
+                if facts.existing.len() + facts.incoming.len() >= PREPARED_COMPARISON_LIMIT {
+                    return Err("cgroup provider preparation comparison ceiling reached".into());
+                }
+                if !work(6) {
+                    return Err("cgroup provider input comparison interrupted".into());
+                }
+                let same_object = target.same_object_as(pins, input);
+                if !work(4) {
+                    return Err("cgroup provider input comparison interrupted".into());
+                }
+                let same_kernel_file = target.same_kernel_file_as(pins, input);
+                #[cfg(test)]
+                provider_read_test::comparison_returned();
+                facts.incoming.insert(
+                    (origin, input),
+                    ProviderRelation {
+                        same_object,
+                        same_kernel_file,
+                    },
+                );
+            }
+        }
+        if !work(1) {
+            return Err("cgroup provider preparation interrupted before completion".into());
+        }
+        Ok(PreparedAbsorption { set: self, facts })
+    }
+}
+
 impl InventoryAttachSet {
     /// Absorbs one pass's Inventory lowering. `pins` must be the aggregate
     /// the plan was lowered from: plan object IDs index it and nothing else.
     pub(crate) fn absorb(&mut self, plan: &AttachPlan, pins: &PinnedObjects) -> AbsorbOutcome {
+        self.absorb_with(plan, pins, None)
+    }
+    fn absorb_with(
+        &mut self,
+        plan: &AttachPlan,
+        pins: &PinnedObjects,
+        mut prepared: Option<&mut PreparedProviderFacts>,
+    ) -> AbsorbOutcome {
         let mut outcome = AbsorbOutcome::default();
         let refused: BTreeMap<PinnedObjectId, String> = plan
             .refused_modules()
@@ -533,7 +755,12 @@ impl InventoryAttachSet {
         let mut resolved: BTreeMap<PinnedObjectId, Resolution> = BTreeMap::new();
         for slot in plan.slots.iter().filter(|slot| plan.is_active(slot.index)) {
             if let std::collections::btree_map::Entry::Vacant(entry) = resolved.entry(slot.object) {
-                entry.insert(self.resolve(pins, slot.object, &mut outcome.gaps));
+                entry.insert(self.resolve(
+                    pins,
+                    slot.object,
+                    &mut outcome.gaps,
+                    prepared.as_deref(),
+                ));
             }
         }
         // An object marked changed later in this same resolution loop
@@ -608,6 +835,7 @@ impl InventoryAttachSet {
                 &mut resolved,
                 pins,
                 &mut outcome,
+                prepared.as_deref_mut(),
             );
             outcome.verdicts.insert(key, verdict);
         }
@@ -622,6 +850,7 @@ impl InventoryAttachSet {
         pins: &PinnedObjects,
         id: PinnedObjectId,
         gaps: &mut Vec<AttachGap>,
+        prepared: Option<&PreparedProviderFacts>,
     ) -> Resolution {
         let Some(summary) = pins.summary(id) else {
             return Resolution::Blocked {
@@ -644,12 +873,18 @@ impl InventoryAttachSet {
             // pinned file is looked up by content like any unseen key.
             let alias = retained.target.object_key() != summary.key;
             if alias
-                && !retained.target.same_object_as(pins, id)
-                && !retained.target.same_kernel_file_as(pins, id)
+                && !prepared.map_or_else(
+                    || retained.target.same_object_as(pins, id),
+                    |facts| facts.relation(object, id).same_object,
+                )
+                && !prepared.map_or_else(
+                    || retained.target.same_kernel_file_as(pins, id),
+                    |facts| facts.relation(object, id).same_kernel_file,
+                )
             {
                 self.by_raw.remove(&summary.key);
                 self.aliases = self.aliases.saturating_sub(1);
-                return self.resolve_by_content(pins, id);
+                return self.resolve_by_content(pins, id, prepared);
             }
             if let Some(reason) = &retained.changed {
                 return Resolution::Blocked {
@@ -657,7 +892,10 @@ impl InventoryAttachSet {
                     recorded: true,
                 };
             }
-            if retained.target.same_object_as(pins, id) {
+            if prepared.map_or_else(
+                || retained.target.same_object_as(pins, id),
+                |facts| facts.relation(object, id).same_object,
+            ) {
                 return Resolution::Known(object);
             }
             let reason = format!(
@@ -678,12 +916,17 @@ impl InventoryAttachSet {
                 recorded: true,
             };
         }
-        self.resolve_by_content(pins, id)
+        self.resolve_by_content(pins, id, prepared)
     }
 
     /// The content fallback: the same file under another raw key or mount,
     /// proven by `same_object_as`, or a fresh object.
-    fn resolve_by_content(&mut self, pins: &PinnedObjects, id: PinnedObjectId) -> Resolution {
+    fn resolve_by_content(
+        &mut self,
+        pins: &PinnedObjects,
+        id: PinnedObjectId,
+        prepared: Option<&PreparedProviderFacts>,
+    ) -> Resolution {
         let Some(summary) = pins.summary(id) else {
             return Resolution::Blocked {
                 reason: format!(
@@ -702,7 +945,11 @@ impl InventoryAttachSet {
         let proven = self.by_content.get(&content).and_then(|candidates| {
             candidates.iter().copied().find(|object| {
                 let retained = &self.objects[object.0 as usize];
-                retained.changed.is_none() && retained.target.same_object_as(pins, id)
+                retained.changed.is_none()
+                    && prepared.map_or_else(
+                        || retained.target.same_object_as(pins, id),
+                        |facts| facts.relation(*object, id).same_object,
+                    )
             })
         });
         if let Some(object) = proven {
@@ -719,6 +966,7 @@ impl InventoryAttachSet {
     }
 
     /// Admits one module's demand whole, or refuses its growth whole.
+    #[allow(clippy::too_many_arguments)] // Optional prepared provider custody adds one internal argument.
     fn admit(
         &mut self,
         key: &AttachModuleKey,
@@ -727,6 +975,7 @@ impl InventoryAttachSet {
         resolved: &mut BTreeMap<PinnedObjectId, Resolution>,
         pins: &PinnedObjects,
         outcome: &mut AbsorbOutcome,
+        prepared: Option<&mut PreparedProviderFacts>,
     ) -> AttachVerdict {
         let mut kept = 0usize;
         let mut fresh: Vec<(PinnedObjectId, u64)> = Vec::new();
@@ -789,7 +1038,7 @@ impl InventoryAttachSet {
                 budget: Some((ENDPOINT_RESOURCE, limit, self.endpoints.len() + fresh.len())),
             })
         } else {
-            self.add(&fresh, resolved, pins, &mut outcome.delta)
+            self.add(&fresh, resolved, pins, &mut outcome.delta, prepared)
                 .err()
                 .map(|cause| Refusal {
                     cause,
@@ -903,18 +1152,33 @@ impl InventoryAttachSet {
         resolved: &mut BTreeMap<PinnedObjectId, Resolution>,
         pins: &PinnedObjects,
         delta: &mut TargetDelta,
+        mut prepared: Option<&mut PreparedProviderFacts>,
     ) -> Result<(), String> {
         let mut retained: Vec<(PinnedObjectId, RetainedInventoryTarget)> = Vec::new();
         for &(object, _) in fresh {
             if matches!(resolved.get(&object), Some(Resolution::Fresh))
                 && !retained.iter().any(|(id, _)| *id == object)
             {
-                let target = pins.retain_inventory_target(object)?;
+                let target = if let Some(facts) = prepared.as_deref() {
+                    facts
+                        .inputs
+                        .get(&object)
+                        .ok_or_else(|| "cgroup provider input was not prepared".to_string())?
+                        .share()
+                } else {
+                    let target = pins.retain_inventory_target(object);
+                    #[cfg(test)]
+                    provider_read_test::retention_returned();
+                    target?
+                };
                 retained.push((object, target));
             }
         }
         for (object, target) in retained {
             let id = AttachObjectId(self.objects.len() as u32);
+            if let Some(facts) = prepared.as_deref_mut() {
+                facts.origins.insert(id, object);
+            }
             self.by_raw.insert(target.object_key(), id);
             self.by_content
                 .entry(target.content_key())
@@ -1062,6 +1326,72 @@ fn module_key(pins: &PinnedObjects, object: PinnedObjectId) -> Option<AttachModu
 
 fn endpoint_noun(count: usize) -> &'static str {
     if count == 1 { "endpoint" } else { "endpoints" }
+}
+
+#[cfg(test)]
+pub(crate) mod provider_read_test {
+    use std::cell::RefCell;
+
+    type Observer = Box<dyn FnMut(bool)>;
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
+    }
+
+    struct Restore(Option<Observer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| *observer.borrow_mut() = self.0.take());
+        }
+    }
+    pub(crate) fn observe<T>(
+        mut observer: impl FnMut() + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        observe_kind(
+            move |retention| {
+                if retention {
+                    observer();
+                }
+            },
+            action,
+        )
+    }
+    pub(crate) fn observe_comparisons<T>(
+        mut observer: impl FnMut() + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        observe_kind(
+            move |retention| {
+                if !retention {
+                    observer();
+                }
+            },
+            action,
+        )
+    }
+    pub(crate) fn observe_all<T>(
+        mut observer: impl FnMut() + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        observe_kind(move |_| observer(), action)
+    }
+    fn observe_kind<T>(observer: impl FnMut(bool) + 'static, action: impl FnOnce() -> T) -> T {
+        let _restore = Restore(OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+        action()
+    }
+    pub(super) fn retention_returned() {
+        returned(true);
+    }
+    pub(super) fn comparison_returned() {
+        returned(false);
+    }
+    fn returned(retention: bool) {
+        OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(retention);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1248,6 +1578,84 @@ pub(crate) mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn cgroup_prepared_absorption_keeps_reads_before_no_read_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = provider(&dir, "prepared.so", "provider");
+        let pins = pass_pins(&[(&path, "sha-a")]);
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let plan = lower(
+            &[module(&pins, &path, &offsets(3))],
+            &pins,
+            AdmissionPolicy::Inventory(set.budget()),
+        );
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = reads.clone();
+        let prepared = provider_read_test::observe(
+            move || counter.set(counter.get() + 1),
+            || set.prepare_absorption(&pins, |_| true).unwrap(),
+        );
+        assert_eq!(reads.get(), 1);
+        assert_eq!(prepared.set.len(), 0, "preparation cannot grow endpoints");
+        assert_eq!(prepared.set.aliases, 0);
+        let result = provider_read_test::observe_all(
+            || panic!("no provider retention or identity read at consumption"),
+            || prepared.absorb(&plan, &pins, |_| true).unwrap(),
+        );
+        assert_eq!(result.delta.endpoints.len(), 3);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn cgroup_prepared_absorption_rejects_another_aggregate_with_equal_scalars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = provider(&dir, "prepared.so", "provider");
+        let pins = pass_pins(&[(&path, "sha-a")]);
+        let other = pass_pins(&[(&path, "sha-a")]);
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let plan = lower(
+            &[module(&other, &path, &offsets(3))],
+            &other,
+            AdmissionPolicy::Inventory(set.budget()),
+        );
+        let prepared = set.prepare_absorption(&pins, |_| true).unwrap();
+        assert!(prepared.absorb(&plan, &other, |_| true).is_err());
+        assert_eq!(set.len(), 0);
+        assert!(set.by_raw.is_empty());
+    }
+
+    #[test]
+    fn cgroup_prepared_alias_resolution_uses_held_read_facts_and_stable_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = provider(&dir, "alias.so", "provider");
+        let pins = pass_pins(&[(&path, "sha-a")]);
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let plan = lower(&[module(&pins, &path, &offsets(3))], &pins, policy);
+        set.absorb(&plan, &pins);
+        let before = ids_by_target(&set);
+        let view = view_pins(&path, 4242, 2, "sha-a");
+        let plan = lower(&[module(&view, &path, &offsets(3))], &view, policy);
+        let comparisons = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = comparisons.clone();
+        let prepared = provider_read_test::observe_comparisons(
+            move || counter.set(counter.get() + 1),
+            || set.prepare_absorption(&view, |_| true).unwrap(),
+        );
+        assert!(
+            comparisons.get() > 0,
+            "cross-mount preparation performed actual held-FD comparisons"
+        );
+        assert_eq!(prepared.set.aliases, 0);
+        let outcome = provider_read_test::observe_all(
+            || panic!("prepared consumption must not retain or stat again"),
+            || prepared.absorb(&plan, &view, |_| true).unwrap(),
+        );
+        assert!(outcome.delta.is_empty());
+        assert_eq!(ids_by_target(&set), before);
+        assert_eq!(set.aliases, 1);
     }
 
     #[test]

@@ -3024,8 +3024,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 5389);
-        assert_eq!(hash, 0x92bd792391ca56b0);
+        assert_eq!(USAGE.len(), 5433);
+        assert_eq!(hash, 0x034f63d3296300de);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

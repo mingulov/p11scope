@@ -87,11 +87,14 @@ one; a deduplicated run on the tag is green only because that covering run
 passed. A manual dispatch always runs the full matrix.
 
 `bpf-noninterference` follows `tests`, including when tests fail. It first
-builds released `792530713348f3a74e9100140226a51aea65a666` twice, then compares
-that release with the exact candidate commit in fresh sequential snapshots.
-All bytes of the three default BPF objects must match in the same pinned
-tool/header environment. Its separate artifact retains commands, source and
-tool receipts, object digests and section summaries on success or failure.
+builds reviewed full-image baseline `ca3a1814201e2fbc4d3dd747b577fde849320041`
+twice, then compares that baseline with the exact candidate commit in fresh
+sequential snapshots. This baseline includes the approved same-object
+continuity and fault-exhaustion changes; advance it only after reviewing
+intentional BPF changes, not to clear an arbitrary comparison failure. All bytes
+of the three default BPF objects must match in the same pinned tool/header environment. Its
+separate artifact retains commands, source and tool receipts, object digests
+and section summaries on success or failure.
 After root/BPF acquisition, it fetches the selected pinned nightly's installed
 `library/sysroot/Cargo.toml` with `--locked` before the offline build. Receipts
 bind that manifest and `library/Cargo.lock` before/after and between snapshots;

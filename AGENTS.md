@@ -121,7 +121,12 @@ unrelated browser, service, VM, container or another agent's capture.
   a follow-up `git worktree prune`).
 - Use the contributor's real configured Git identity; do not invent an
   automation identity or replace another contributor's attribution.
-  Add the sign-off required by [CONTRIBUTING.md](CONTRIBUTING.md).
+  The repository owner's development commits do not require sign-offs.
+  The sign-off policy in [CONTRIBUTING.md](CONTRIBUTING.md) applies to external
+  contributors; do not impose it on the owner or request approval over missing
+  owner trailers.
+- Keep development history flat. Integrate task changes with cherry-pick or
+  fast-forward, not merge commits. Preserve task branches and their source commits.
 - Follow `<area>: <imperative summary>` commit messages. History rewriting
   and pushing require explicit agreement. Never force-push as a routine
   way to resolve a diverged branch.

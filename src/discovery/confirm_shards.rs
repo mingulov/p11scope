@@ -20,8 +20,107 @@ use crate::discovery::sweep_shards::{Transcript, record_read, replay_one};
 use p11scope_manifest::maps::{MapEntry, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+
+/// Minted only after the shared preparation has committed its charges. The
+/// driver keeps the original Io/pin while these request views are borrowed.
+pub(crate) struct AcceptedRequest<'a> {
+    pid: u32,
+    ranges: &'a [(u64, u64)],
+    entries: &'a [MapEntry],
+    #[allow(dead_code)] // The D3c promotion packet uses this original fd.
+    pidfd: Option<std::os::fd::BorrowedFd<'a>>,
+    #[allow(dead_code)] // The central segment hook also includes idle plans.
+    kind: AcceptedKind,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AcceptedKind {
+    Confirm,
+    #[allow(dead_code)]
+    Idle,
+}
+
+impl AcceptedRequest<'_> {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+    pub(crate) fn ranges(&self) -> &[(u64, u64)] {
+        self.ranges
+    }
+    pub(crate) fn entries(&self) -> &[MapEntry] {
+        self.entries
+    }
+    #[allow(dead_code)]
+    pub(crate) fn pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.pidfd
+    }
+    #[allow(dead_code)]
+    pub(crate) fn kind(&self) -> AcceptedKind {
+        self.kind
+    }
+}
+
+pub(crate) struct AcceptedBatch<'a> {
+    requests: Vec<AcceptedRequest<'a>>,
+    token: Arc<()>,
+}
+
+impl AcceptedBatch<'_> {
+    pub(crate) fn requests(&self) -> &[AcceptedRequest<'_>] {
+        &self.requests
+    }
+    pub(crate) fn token(&self) -> &Arc<()> {
+        &self.token
+    }
+}
+
+pub(crate) trait SegmentProof {
+    fn prove<'r>(
+        &'r mut self,
+        batch: &AcceptedBatch<'_>,
+        budget: &mut CaptureWorkBudget,
+        resources: &IoResources,
+    ) -> crate::discovery::kernel_identity::ProofDecision<'r>;
+}
+
+/// The standalone adapter uses the same prepared ownership and batch minting
+/// seam as the later central segment hook; no scalar request constructor is
+/// exposed to the kernel owner.
+pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    prepared: PreparedConfirmation<Io::Pin>,
+    hook: &mut impl SegmentProof,
+    resources: &IoResources,
+    budget: &mut CaptureWorkBudget,
+) -> Confirmation {
+    let batch = AcceptedBatch {
+        requests: vec![AcceptedRequest {
+            pid,
+            ranges: &prepared.ranges,
+            entries: &prepared.entries,
+            pidfd: io.borrowed_pidfd(&prepared.pin.pin),
+            kind: AcceptedKind::Confirm,
+        }],
+        token: Arc::new(()),
+    };
+    let decision = hook.prove(&batch, budget, resources);
+    let answers = decision.answer(&batch, 0).cloned();
+    drop(batch);
+    if let Some(reason) = budget.check_deadline_now() {
+        return Confirmation::Lost(AttributionLoss::Budget, reason.into());
+    }
+    let mapped =
+        answers.unwrap_or_else(|| read_ranges_reserved(io, pid, &prepared.ranges, Some(resources)));
+    let result = finish_confirmation(io, pid, prepared, mapped, Some(resources), budget);
+    // Keep the guard-bound result through final live checks, and consume it
+    // before another target run can replace scope or reuse slot numbers.
+    drop(decision);
+    result
+}
 
 pub(crate) trait ShardableIo: ConfirmIo + Send {
     type Maps: Read;

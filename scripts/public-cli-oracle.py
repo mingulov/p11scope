@@ -3,7 +3,7 @@
 """Judge public-command evidence against independent fixture targets/counts.
 
 TARGET records bind actual mapped device/inode and function file offsets.
-The receipt supplies independently hashed provider identity before/after, launch
+The receipt supplies independently hashed and mapped provider identity before/after, launch
 identity, readiness, and process exits. Counts remain provider totals; this
 checker never claims system-wide per-caller attribution.
 """
@@ -74,6 +74,26 @@ def identity(value):
     require(isinstance(value.get("sha256"), str) and
             re.fullmatch(r"[0-9a-f]{64}", value["sha256"]), "missing provider hash")
     return (*dev, value["ino"], value["sha256"])
+
+
+def provider_pin(value):
+    physical = identity(value)
+    anchor = value.get("mapping")
+    require(isinstance(anchor, dict) and isinstance(anchor.get("dev"), list) and
+            all(integer(x) for x in anchor["dev"]) and anchor["dev"] == list(physical[:2]) and
+            type(anchor.get("ino")) is int and anchor["ino"] == physical[2] and
+            type(anchor.get("file_offset")) is int and anchor["file_offset"] == 0 and
+            integer(anchor.get("length")) and anchor["length"] > 0 and
+            anchor.get("permissions") == "r--p", "missing or invalid independent mapping anchor")
+    file = value.get("file_identity")
+    require(isinstance(file, dict), "missing private FD identity")
+    dev = file.get("dev")
+    require(isinstance(dev, list) and len(dev) == 2 and all(integer(x) for x in dev) and
+            type(file.get("ino")) is int and file["ino"] == physical[2] and
+            integer(file.get("size")) and file["size"] >= anchor["length"] and
+            all(type(file.get(key)) is int for key in ("mtime_ns", "ctime_ns")),
+            "invalid private FD identity")
+    return physical, (*dev, file["ino"], file["size"], file["mtime_ns"], file["ctime_ns"])
 
 
 def ownership(row):
@@ -208,7 +228,7 @@ def common(receipt, cell):
         require(integer(generation) and generation > 0 and
                 type(receipt.get("ready_generation")) is int and
                 receipt["ready_generation"] == generation, "workload generation changed")
-    require(identity(receipt.get("provider_before")) == identity(receipt.get("provider_after")),
+    require(provider_pin(receipt.get("provider_before")) == provider_pin(receipt.get("provider_after")),
             "provider physical identity or hash changed")
 
 

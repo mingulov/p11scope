@@ -2,19 +2,25 @@
 """Public CLI oracle entrypoint controls; all expectations are independent."""
 
 import copy
+import ctypes
+import hashlib
+import io
 import json
+import mmap
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import struct
 import sys
 import tempfile
-import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 ORACLE = ROOT / "scripts/public-cli-oracle.py"
 SHELL = ROOT / "scripts/qualify-public-cli.sh"
+PIN = ROOT / "scripts/mapped-provider-pin.py"
 NAMES = ("C_GenerateRandom", "C_DigestInit", "C_Digest",
          "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal")
 OWNED = {"dev": [8, 1], "ino": 71, "sha256": "a" * 64}
@@ -35,6 +41,31 @@ VERDICT_COUNTERS = (
     "module_unresolved_slots", "unprotected_live_windows", "pause_partial", "vendor_interfaces")
 PROFILE_FIELDS = ("interface_selection", "attach_mechanisms", "attach_backend",
                   "pid_descendant_gaps", "multi_rebuild_gaps")
+
+
+def provider_pin():
+    return dict(OWNED,
+                file_identity={"dev": [0, 38], "ino": 71, "size": 8192,
+                               "mtime_ns": 123, "ctime_ns": 456},
+                mapping={"dev": [8, 1], "ino": 71, "file_offset": 0,
+                         "length": 4096, "permissions": "r--p"})
+
+
+def independent_mapping_identity(path):
+    # A separate Python mmap API and parser derive expectations, never the
+    # production pin helper or the fixture/capture outputs under test.
+    with open(path, "rb") as stream:
+        with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_COPY) as view:
+            address = ctypes.addressof(ctypes.c_char.from_buffer(view))
+            matches = []
+            for line in Path("/proc/self/maps").read_text().splitlines():
+                fields = line.split()
+                low, high = [int(bound, 16) for bound in fields[0].split("-")]
+                if low <= address < high:
+                    matches.append(([int(part, 16) for part in fields[3].split(":")],
+                                    int(fields[4])))
+            assert len(matches) == 1, "independent mapping has no unique maps anchor"
+            return matches[0]
 
 
 def inputs(*, metrics=False):
@@ -96,7 +127,7 @@ def inputs(*, metrics=False):
                "ready_pid": 123, "ready_generation": 456,
                "workload_ready": True, "capture_ready": True, "gate_released": True,
                "observer_exit": 0, "workload_exit": 0, "ledger_complete": True,
-               "provider_before": dict(OWNED), "provider_after": dict(OWNED)}
+               "provider_before": provider_pin(), "provider_after": provider_pin()}
     return report, ledger, receipt
 
 
@@ -149,6 +180,39 @@ class OracleTests(unittest.TestCase):
 
     def test_path_reused_changed_identity_fails(self):
         self.run_case(lambda d, l, r: r.update(provider_after=FOREIGN), want=1)
+
+    def test_split_stat_maps_device_with_independent_anchor_passes(self):
+        self.run_case()
+
+    def test_same_inode_hash_wrong_mapped_device_fails(self):
+        def mutate(d, l, r):
+            for pin in (r["provider_before"], r["provider_after"]):
+                pin["dev"] = [0, 38]
+        self.run_case(mutate, want=1)
+
+    def test_changed_private_fd_identity_fails(self):
+        self.run_case(lambda d, l, r: r["provider_after"]["file_identity"].update(dev=[0, 39]), want=1)
+
+    def test_changed_provider_hash_fails(self):
+        self.run_case(lambda d, l, r: r["provider_after"].update(sha256="c" * 64), want=1)
+
+    def test_missing_mapping_anchor_fails(self):
+        self.run_case(lambda d, l, r: r["provider_before"].pop("mapping"), want=1)
+
+    def test_invalid_mapping_anchor_fails(self):
+        for key, value in (("dev", [0, 38]), ("ino", 72), ("file_offset", 4096),
+                           ("length", 0), ("permissions", "r-xp")):
+            with self.subTest(key=key):
+                self.run_case(lambda d, l, r: r["provider_before"]["mapping"].update({key: value}), want=1)
+
+    def test_missing_or_invalid_private_fd_identity_fails(self):
+        for value in (None, {}, {"dev": [0, 38], "ino": 72, "size": 8192,
+                                "mtime_ns": 123, "ctime_ns": 456}):
+            with self.subTest(value=value):
+                self.run_case(lambda d, l, r: r["provider_before"].update(file_identity=value), want=1)
+
+    def test_mapping_anchor_bool_device_fails(self):
+        self.run_case(lambda d, l, r: r["provider_before"]["mapping"].update(dev=[8, True]), want=1)
 
     def test_missing_first_call_fails(self):
         self.run_case(lambda d, l, r: d["functions"][0].update(calls=6), want=1)
@@ -431,8 +495,24 @@ class ProfileVerdictModeTests(unittest.TestCase):
                               cell="metrics-pid", want=1)
 
 
+# Test-only independent mapping code runs in both separate lifecycle children.
+FAKE_MAPPING = '''
+def mapped_identity(path):
+ import ctypes,mmap
+ with open(path,'rb') as stream:
+  with mmap.mmap(stream.fileno(),0,access=mmap.ACCESS_COPY) as view:
+   address=ctypes.addressof(ctypes.c_char.from_buffer(view))
+   found=[]
+   for line in pathlib.Path('/proc/self/maps').read_text().splitlines():
+    fields=line.split(); lo,hi=(int(v,16) for v in fields[0].split('-'))
+    if lo<=address<hi: found.append(([int(v,16) for v in fields[3].split(':')],int(fields[4])))
+   assert len(found)==1
+   return found[0]
+'''
+
 FAKE_FIXTURE = '''#!/usr/bin/python3
 import json, os, pathlib, signal, sys, time
+''' + FAKE_MAPPING + '''
 cell = os.environ.get('CONTROL_CELL', 'profile-pid')
 if cell == 'mt-exact':
  module, threads, secs, pre, gate = sys.argv[1:]; iters = '7'
@@ -442,9 +522,9 @@ root = pathlib.Path(gate).parent
 mode = os.environ['CONTROL_MODE']
 names = ['C_GenerateRandom','C_DigestInit','C_Digest','C_FindObjectsInit','C_FindObjects','C_FindObjectsFinal']
 if cell == 'mt-exact': names=names[:1]
-st = os.stat(module)
+dev,ino = mapped_identity(module)
 for i, name in enumerate(names):
- print('TARGET '+json.dumps({'name':name,'dev':[os.major(st.st_dev),os.minor(st.st_dev)],'ino':st.st_ino,'file_offset':4096+i*16}), flush=True)
+ print('TARGET '+json.dumps({'name':name,'dev':dev,'ino':ino,'file_offset':4096+i*16}), flush=True)
 print('READY pid=%d' % (123 if mode=='wrong-ready-pid' else os.getpid()), flush=True)
 while not pathlib.Path(gate).exists(): time.sleep(.02)
 (root / 'released').write_text('yes')
@@ -457,6 +537,7 @@ while True: time.sleep(.02)
 '''
 FAKE_OBSERVER = '''#!/usr/bin/python3
 import hashlib,json,os,pathlib,signal,sys,time
+''' + FAKE_MAPPING + '''
 out=pathlib.Path(sys.argv[sys.argv.index('-o')+1]); root=out.parent
 (root / 'observer.pid').write_text(str(os.getpid()))
 mode=os.environ['CONTROL_MODE']
@@ -467,8 +548,8 @@ if mode in ('never-ready','stale-output','ignore-term'):
 print('p11scope: capturing: controlled',file=sys.stderr,flush=True)
 while not (root/(out.stem+'.gate')).exists(): time.sleep(.02)
 time.sleep(.1)
-module=pathlib.Path(os.environ['MODULE']); st=module.stat()
-obj={'dev':[os.major(st.st_dev),os.minor(st.st_dev)],'ino':st.st_ino,'sha256':hashlib.sha256(module.read_bytes()).hexdigest()}
+module=pathlib.Path(os.environ['MODULE']); dev,ino=mapped_identity(module)
+obj={'dev':dev,'ino':ino,'sha256':hashlib.sha256(module.read_bytes()).hexdigest()}
 names=['C_GenerateRandom','C_DigestInit','C_Digest','C_FindObjectsInit','C_FindObjects','C_FindObjectsFinal']
 if out.stem == 'mt-exact': names=names[:1]
 report=json.loads(pathlib.Path(os.environ['CONTROL_REPORT']).read_text())
@@ -659,6 +740,115 @@ U C_GetFunctionList(void**out){*out=&list;return 0;}
 '''
 
 
+class MappedPinTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.helper = runpy.run_path(str(PIN))
+
+    def test_real_pin_matches_independent_mapping_and_hash(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "provider"
+            content = b"short nonempty held provider"
+            path.write_bytes(content)
+            want_dev, want_ino = independent_mapping_identity(path)
+            result = self.helper["pin"](path)
+            self.assertEqual(result["dev"], want_dev)
+            self.assertEqual(result["ino"], want_ino)
+            self.assertEqual(result["sha256"], hashlib.sha256(content).hexdigest())
+            self.assertEqual(result["mapping"]["permissions"], "r--p")
+            self.assertEqual(result["mapping"]["file_offset"], 0)
+            info = path.stat()
+            self.assertEqual(result["file_identity"], {
+                "dev": [os.major(info.st_dev), os.minor(info.st_dev)], "ino": info.st_ino,
+                "size": len(content), "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns})
+
+    def test_held_fd_rename_and_path_replacement_keeps_original(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "provider"
+            old = Path(raw) / "renamed"
+            original = b"original provider bytes"
+            path.write_bytes(original)
+            with path.open("rb") as stream:
+                path.rename(old)
+                path.write_bytes(b"replacement provider bytes")
+                want_dev, want_ino = independent_mapping_identity(old)
+                result = self.helper["pin_fd"](stream.fileno())
+                self.assertEqual((result["dev"], result["ino"]), (want_dev, want_ino))
+                self.assertEqual(result["sha256"], hashlib.sha256(original).hexdigest())
+                self.assertNotEqual(result["ino"], path.stat().st_ino)
+
+    def test_empty_and_nonregular_fd_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            empty = Path(raw) / "empty"
+            empty.touch()
+            for path in (empty, Path(raw)):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    self.helper["pin"](path)
+
+    def test_short_hash_read_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "provider"
+            path.write_bytes(b"provider bytes")
+            with patch("os.pread", side_effect=[b"short", b""]):
+                with self.assertRaisesRegex(ValueError, "short read"):
+                    self.helper["pin"](path)
+
+    def test_fd_metadata_change_during_pin_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "provider"
+            path.write_bytes(b"original")
+            probe = self.helper["mapping_from_fd"]
+
+            def replace_bytes(fd, size):
+                anchor = probe(fd, size)
+                path.write_bytes(b"modified")
+                os.utime(path, ns=(1, 2))
+                return anchor
+
+            with patch.dict(self.helper["pin_fd"].__globals__, mapping_from_fd=replace_bytes):
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    self.helper["pin"](path)
+
+    def test_unmappable_opath_fd_refused(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "provider"
+            path.write_bytes(b"provider bytes")
+            fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+            try:
+                with self.assertRaises(OSError):
+                    self.helper["pin_fd"](fd)
+            finally:
+                os.close(fd)
+
+    def test_self_maps_read_or_parse_failure_unmaps_probe(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "provider"
+            path.write_bytes(b"provider bytes")
+            with path.open("rb") as stream:
+                inode = str(os.fstat(stream.fileno()).st_ino)
+                for error in (OSError("maps unreadable"), None):
+                    with self.subTest(error=error):
+                        kwargs = {"side_effect": error} if error else {"return_value": io.StringIO("malformed\n")}
+                        with patch("builtins.open", **kwargs), self.assertRaises((OSError, ValueError)):
+                            self.helper["mapping_from_fd"](stream.fileno(), path.stat().st_size)
+                        rows = [line.split() for line in Path("/proc/self/maps").read_text().splitlines()]
+                        self.assertFalse([row for row in rows if row[4] == inode and str(path) in row])
+
+    def test_missing_duplicate_malformed_or_wrong_offset_maps_anchor_refused(self):
+        valid = "1000-2000 r--p 00000000 00:23 71 /provider\n"
+        bad = ("", valid + valid, "malformed\n", valid.replace("00000000", "00001000"),
+               valid.replace(" 71 ", " 72 "), valid.replace("r--p", "r-xp"),
+               valid.replace("2000", "1000"), valid.replace("2000", "1001"))
+        for text in bad:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.helper["maps_anchor"](text, 0x1000, 4096, 71)
+
+    def test_valid_maps_anchor_accepts_its_device_without_stat_guess(self):
+        anchor = self.helper["maps_anchor"]("1000-2000 r--p 00000000 00:23 71 /provider\n", 0x1000, 4096, 71)
+        self.assertEqual(anchor, {"dev": [0, 35], "ino": 71, "file_offset": 0,
+                                  "length": 4096, "permissions": "r--p"})
+
+
 class NativeFixtureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -683,7 +873,7 @@ class NativeFixtureTests(unittest.TestCase):
         self.assertEqual(len(ledgers), 1, proc.stdout)
         self.assertTrue(ledgers[0]["complete"])
         self.assertEqual({row["name"] for row in ledgers[0]["functions"]}, set(names))
-        st = self.module.stat()
+        mapped_dev, mapped_ino = independent_mapping_identity(self.module)
         symbols = subprocess.run(["nm", "-D", "--defined-only", str(self.module)],
                                  check=True, capture_output=True, text=True).stdout
         addresses = {line.split()[2]: int(line.split()[0], 16) for line in symbols.splitlines()}
@@ -694,8 +884,8 @@ class NativeFixtureTests(unittest.TestCase):
         segments = [struct.unpack_from("<IIQQQQQQ", data, phoff + i * entsize) for i in range(entries)]
         for row in targets:
             if identity_gate:
-                self.assertEqual(row["dev"], [os.major(st.st_dev), os.minor(st.st_dev)])
-                self.assertEqual(row["ino"], st.st_ino)
+                self.assertEqual(row["dev"], mapped_dev)
+                self.assertEqual(row["ino"], mapped_ino)
             address = addresses[row["name"]]
             offsets = [p[2] + address - p[3] for p in segments if p[0] == 1 and p[3] <= address < p[3] + p[5]]
             self.assertEqual(offsets, [row["file_offset"]])

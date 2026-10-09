@@ -37,6 +37,7 @@ must translate ledger times by the namespace offset before running this oracle.
 
 usage:
   inventory-native-oracle.py check RUNDIR        full oracle (exit codes above)
+  inventory-native-oracle.py demotion-segment DIR   private one-pair accounting proof
   inventory-native-oracle.py ledgers RUNDIR      ledger self-consistency only
   inventory-native-oracle.py count-kind JSONL KIND   events of KIND (EVENT_KINDS key) so far
   inventory-native-oracle.py probe-help          read `p11scope --help` on stdin, print FLAG=0|1
@@ -45,9 +46,12 @@ usage:
 """
 
 import json
+import hashlib
+import errno
 import os
 import re
 import sys
+import stat
 import tempfile
 from dataclasses import dataclass, field
 
@@ -2435,6 +2439,1688 @@ def _deep(value):
     return json.loads(json.dumps(value))
 
 
+DEMOTION_INPUT_CAPS = {"receipt.json": 1048576, "inventory.json": 8388608,
+                      "ledger.jsonl": 262144, "run-manifest.json": 1048576}
+DEMOTION_PLACED_REASON = (
+    "a demoted count placed post-demotion growth on this edge: the edge's count covers "
+    "a workload segment starting at the base read, never the whole workload, so "
+    "per-segment exactness is unverifiable and only the ledger window's upper bound applies")
+DEMOTION_HEALTH_KEYS = {"native", "read", "lifecycle", "clock", "recorder"}
+
+
+class DemotionFault(Exception):
+    """Closed reason codes only: private input bytes never enter diagnostics."""
+    def __init__(self, reason, status="fail", **values):
+        self.reason, self.status, self.values = reason, status, values
+
+
+def demotion_require(condition, reason="invalid_schema", status="fail", **values):
+    if not condition:
+        raise DemotionFault(reason, status, **values)
+
+
+def demotion_result(status, reason, **values):
+    return {"pass": 0, "fail": 1, "nonqualifying": 2}[status], {
+        "check": "DEMOTION-SEGMENT", "status": status,
+        "qualification": "controlled-one-pair-one-new-owner", "reason": reason, **values}
+
+
+def demotion_fields(obj, required, optional=()):
+    required, optional = set(required), set(optional)
+    demotion_require(type(obj) is dict and required <= obj.keys() and obj.keys() <= required | optional)
+
+
+def demotion_uint(value, maximum=U64_MAX, minimum=0):
+    demotion_require(type(value) is int and minimum <= value <= maximum)
+    return value
+
+
+def demotion_id(value):
+    return demotion_uint(value, 512, 1)
+
+
+def demotion_text(value, limit=256):
+    demotion_require(type(value) is str and 0 < len(value) <= limit)
+
+
+def demotion_bool(value):
+    demotion_require(type(value) is bool)
+
+
+def demotion_hex(value, size):
+    demotion_require(type(value) is str and re.fullmatch("[0-9a-f]{" + str(size) + "}", value) is not None)
+
+
+def demotion_pairs(pairs):
+    obj = {}
+    for key, value in pairs:
+        demotion_require(key not in obj, "duplicate_json_key")
+        obj[key] = value
+    return obj
+
+
+def demotion_number(token):
+    # Check the decimal token before conversion, including leading sign/zeros.
+    demotion_require(len(token) <= 20 and re.fullmatch(r"0|[1-9][0-9]*", token) is not None, "invalid_integer")
+    value = int(token)
+    demotion_require(value <= U64_MAX, "invalid_integer")
+    return value
+
+
+def demotion_bad_number(_token):
+    raise DemotionFault("invalid_integer")
+
+
+def demotion_parse(data):
+    try:
+        return json.loads(data, object_pairs_hook=demotion_pairs, parse_int=demotion_number,
+                          parse_float=demotion_bad_number, parse_constant=demotion_bad_number)
+    except (ValueError, UnicodeError, RecursionError):
+        raise DemotionFault("malformed_json") from None
+
+
+def demotion_open_regular(directory, relative):
+    """Open without blocking/following links, then validate that same FD.
+
+    Directory components use anchored FDs too: a path swap cannot turn a
+    successful preflight into a blocking FIFO open or an outside-file read.
+    """
+    demotion_text(relative, 255)
+    parts = relative.split("/")
+    demotion_require(not os.path.isabs(relative) and all(part not in ("", ".", "..") for part in parts), "artifact_binding_mismatch")
+    directory_fd, fd = None, None
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        directory_fd = os.open(directory, directory_flags)
+        for part in parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+        demotion_require(stat.S_ISREG(os.fstat(fd).st_mode), "unsupported_artifact_type")
+        result, fd = fd, None
+        return result
+    except FileNotFoundError:
+        raise DemotionFault("missing_artifact", "nonqualifying") from None
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENXIO, errno.EISDIR):
+            raise DemotionFault("unsupported_artifact_type") from None
+        raise DemotionFault("unreadable_artifact", "nonqualifying") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def demotion_file_bytes(path, cap):
+    try:
+        fd = demotion_open_regular(os.path.dirname(path), os.path.basename(path))
+        with os.fdopen(fd, "rb") as f:
+            before = os.fstat(f.fileno())
+            demotion_require(before.st_size <= cap, "input_limit_exceeded")
+            data = f.read(cap + 1)
+            after = os.fstat(f.fileno())
+    except OSError:
+        raise DemotionFault("unreadable_artifact", "nonqualifying") from None
+    demotion_require(len(data) <= cap, "input_limit_exceeded")
+    demotion_require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                     (after.st_size, after.st_mtime_ns, after.st_ctime_ns) and len(data) == before.st_size, "artifact_changed")
+    return data
+
+
+def demotion_file_hash(root, relative):
+    h = hashlib.sha256()
+    with os.fdopen(demotion_open_regular(root, relative), "rb") as f:
+        before = os.fstat(f.fileno())
+        remaining = before.st_size
+        # No arbitrary binary size ceiling: memory is 64 KiB and work is
+        # proportional to the opened regular file's initial finite size.
+        while remaining:
+            chunk = f.read(min(65536, remaining))
+            demotion_require(bool(chunk), "artifact_changed")
+            h.update(chunk)
+            remaining -= len(chunk)
+        demotion_require(not f.read(1), "artifact_changed")
+        after = os.fstat(f.fileno())
+        demotion_require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                         (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "artifact_changed")
+    return h.hexdigest()
+
+
+def demotion_bindings(receipt, manifest):
+    demotion_fields(receipt["run"], {"nonce", "source_commit", "source_tree", "hashes"})
+    run = receipt["run"]
+    for field, size in (("nonce", 32), ("source_commit", 40), ("source_tree", 40)):
+        demotion_hex(run[field], size)
+        demotion_require(run[field] == manifest[field], "artifact_binding_mismatch")
+    keys = {"observer_binary", "bpf_object", "fixture_source", "fixture_binaries", "checker"}
+    demotion_fields(manifest["artifacts"], keys)
+    demotion_fields(run["hashes"], keys | {"inventory", "ledger", "manifest"})
+    for key in keys - {"fixture_binaries"} | {"inventory", "ledger", "manifest"}:
+        demotion_hex(run["hashes"][key], 64)
+    binaries = manifest["artifacts"]["fixture_binaries"]
+    demotion_fields(binaries, {"workload", "provider_A", "provider_B", "common"})
+    demotion_require(type(run["hashes"]["fixture_binaries"]) is dict and run["hashes"]["fixture_binaries"].keys() == binaries.keys())
+    for key in binaries:
+        demotion_text(key, 32)
+        demotion_hex(run["hashes"]["fixture_binaries"][key], 64)
+
+
+def demotion_segment(directory):
+    """Bounded offline consumer. Hash the actual saved bytes before arithmetic."""
+    try:
+        raw = {name: demotion_file_bytes(os.path.join(directory, name), cap)
+               for name, cap in DEMOTION_INPUT_CAPS.items()}
+        lines = raw["ledger.jsonl"].splitlines(keepends=True)
+        demotion_require(len(lines) <= 256 and all(len(line) <= 1024 for line in lines), "ledger_limit_exceeded")
+        receipt, inventory, manifest = (demotion_parse(raw[name]) for name in
+                                       ("receipt.json", "inventory.json", "run-manifest.json"))
+        ledger = [demotion_parse(line) for line in lines]
+        demotion_require(sum(type(row) is dict and row.get("kind") == "call" for row in ledger) <= 64, "ledger_limit_exceeded")
+        demotion_require(type(receipt) is dict and type(manifest) is dict)
+        demotion_bindings(receipt, manifest)
+        hashes = receipt["run"]["hashes"]
+        for key, name in (("inventory", "inventory.json"), ("ledger", "ledger.jsonl"), ("manifest", "run-manifest.json")):
+            demotion_require(hashlib.sha256(raw[name]).hexdigest() == hashes[key], "artifact_binding_mismatch")
+        for key, relative in manifest["artifacts"].items():
+            if key == "fixture_binaries":
+                for mode, path in relative.items():
+                    demotion_require(demotion_file_hash(directory, path) == hashes[key][mode], "artifact_binding_mismatch")
+            else:
+                demotion_require(demotion_file_hash(directory, relative) == hashes[key], "artifact_binding_mismatch")
+        with open(__file__, "rb") as f:
+            demotion_require(hashlib.sha256(f.read()).hexdigest() == hashes["checker"], "artifact_binding_mismatch")
+        demotion_require(len(raw["receipt.json"]) <= receipt["limits"]["serialized_bytes"], "input_limit_exceeded")
+        return check_demotion_segment(receipt, inventory, ledger, manifest)
+    except DemotionFault as fault:
+        return demotion_result(fault.status, fault.reason, **fault.values)
+    except (KeyError, TypeError, IndexError, OSError, ValueError, RecursionError):
+        return demotion_result("fail", "invalid_schema")
+
+
+def demotion_table(values, fields, cap):
+    demotion_require(type(values) is list and len(values) <= cap)
+    out = {}
+    for value in values:
+        demotion_fields(value, fields)
+        ident = demotion_id(value["id"])
+        demotion_require(ident not in out, "duplicate_identity")
+        out[ident] = value
+    return out
+
+
+def demotion_union(ranges):
+    """Sort/sweep at most 512 endpoints; work never depends on counter size."""
+    merged = []
+    for lo, hi in sorted(ranges):
+        demotion_uint(lo)
+        demotion_uint(hi)
+        demotion_require(lo <= hi, "invalid_range")
+        if hi == lo:
+            continue
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+        else:
+            merged.append((lo, hi))
+    total = sum(hi - lo for lo, hi in merged)
+    demotion_require(total <= U64_MAX, "invalid_range")
+    return merged, total
+
+
+def demotion_public_health(inventory):
+    """Read the existing exporter's health counters, including absent evidence."""
+    obs, budgets = inventory.get("observation"), inventory.get("budgets")
+    required_obs = {"lane", "settlement", "retirement", "lifecycle", "native_witnesses"}
+    budget_tables = {"callers", "modules", "edges", "endpoints", "inventory_endpoints", "inventory_attach_modules",
+                     "counters", "semantic_state", "retained_history", "native_preadmission"}
+    if type(obs) is not dict or not required_obs <= obs.keys() or type(budgets) is not dict or not budget_tables <= budgets.keys():
+        return ["missing_public_health"]
+    problems = []
+    if obs["lane"] != "native" or obs["settlement"] != "unsettled" or obs["retirement"] != "closed" or obs.get("usage_feed") is not True:
+        problems.append("unhealthy_public_capture")
+    lifecycle, census = obs["lifecycle"], obs["native_witnesses"]
+    demotion_fields(lifecycle, {"records", "ring_loss", "malformed", "failed_quanta", "recovery_rescans"})
+    for key, value in lifecycle.items():
+        demotion_uint(value)
+        if key != "records" and value:
+            problems.append("unhealthy_public_capture")
+    demotion_fields(census, {"rows", "bound", "unbound", "pending", "integrity", "unbound_reasons", "placement"})
+    for key in ("rows", "bound", "unbound", "pending", "integrity"):
+        demotion_uint(census[key])
+    demotion_require(type(census["unbound_reasons"]) is dict)
+    for value in census["unbound_reasons"].values():
+        demotion_uint(value)
+    # inventory.rs exports unbound_total() and these very same reason counts;
+    # native_binding.rs accounts each offered row as decided or pending.
+    demotion_require(sum(census["unbound_reasons"].values()) == census["unbound"] and
+                     all(value > 0 for value in census["unbound_reasons"].values()) and
+                     census["rows"] == census["bound"] + census["unbound"] + census["pending"], "public_census_mismatch")
+    supported_reasons = {"no_live_caller", "caller_exited", "cookie_unavailable", "cookie_mismatch",
+                         "before_admission", "exec_after_admission", "lifecycle_loss", "exec_ambiguous",
+                         "exec_transition", "exec_coverage_gap", "evidence_incomplete", "capacity"}
+    if not census["unbound_reasons"].keys() <= supported_reasons:
+        problems.append("unsupported_public_health")
+    demotion_fields(census["placement"], {"edge", "module", "ambiguous", "unresolved"})
+    for value in census["placement"].values():
+        demotion_uint(value)
+    demotion_require(sum(census["placement"].values()) == census["bound"] + census["unbound"], "public_census_mismatch")
+    if any(census[key] for key in ("unbound", "pending", "integrity")) or any(census["placement"][key] for key in ("module", "ambiguous", "unresolved")):
+        problems.append("unhealthy_public_capture")
+    shapes = {key: {"limit", "occupied", "refused"} for key in budget_tables - {"counters", "semantic_state", "retained_history", "native_preadmission"}}
+    shapes.update(counters={"cap", "observed_edges", "saturated_edges"},
+                  semantic_state={"limit", "occupied", "status", "unknown_edges", "refused"},
+                  retained_history={"limit", "retained", "suppressed"},
+                  native_preadmission={"limit", "occupied", "refused", "pruned"})
+    for name, shape in shapes.items():
+        table = budgets[name]
+        if name == "native_preadmission" and table is None:
+            problems.append("missing_public_health")
+            continue
+        demotion_fields(table, shape)
+        for key, value in table.items():
+            if key == "status":
+                demotion_require(value in ("withheld", "observed"))
+            else:
+                demotion_uint(value)
+            if key in ("refused", "suppressed", "saturated_edges", "pruned") and value:
+                problems.append("unhealthy_public_capture")
+    demotion_require(budgets["counters"]["cap"] == U64_MAX)
+    if set(budgets) != budget_tables:
+        problems.append("missing_public_health")
+    return problems
+
+
+def check_demotion_segment(receipt, inventory, ledger, manifest):
+    """Private integer/range proof; ordinary public COUNT-EXACT is unchanged."""
+    try:
+        return _check_demotion_segment(receipt, inventory, ledger, manifest)
+    except DemotionFault as fault:
+        return demotion_result(fault.status, fault.reason, **fault.values)
+    except (KeyError, TypeError, IndexError, ValueError, RecursionError):
+        return demotion_result("fail", "invalid_schema")
+
+
+def _check_demotion_segment(receipt, inventory, ledger, manifest):
+    demotion_fields(receipt, {"schema", "run", "limits", "identities", "records", "terminal"})
+    demotion_require(receipt["schema"] == "p11scope/demotion-qualification/v1")
+    demotion_fields(manifest, {"schema", "nonce", "source_commit", "source_tree", "artifacts", "clock",
+                             "caller_id", "target_id", "observer", "command", "selector", "start_ns", "stop_ns",
+                             "ready_ns", "completed_ns", "observer_exit", "workload_exit", "kernel"})
+    demotion_require(manifest["schema"] == "p11scope/demotion-run/v1")
+    demotion_bindings(receipt, manifest)
+    demotion_fields(manifest["clock"], {"basis"}, {"time_namespace", "observer_time_namespace"})
+    demotion_fields(manifest["observer"], {"pid", "start_ticks"})
+    demotion_id(manifest["caller_id"])
+    demotion_id(manifest["target_id"])
+    for value in manifest["observer"].values():
+        demotion_uint(value, minimum=1)
+    demotion_fields(manifest["kernel"], {"release", "capability_evidence"})
+    for value in manifest["kernel"].values():
+        demotion_text(value, 1024)
+    demotion_text(manifest["selector"])
+    demotion_require(type(manifest["command"]) is list and 1 <= len(manifest["command"]) <= 32)
+    for arg in manifest["command"]:
+        demotion_text(arg, 1024)
+    for key in ("start_ns", "stop_ns", "ready_ns", "completed_ns", "observer_exit", "workload_exit"):
+        demotion_uint(manifest[key])
+    limits = receipt["limits"]
+    demotion_fields(limits, {"pairs", "records", "allocated_bytes", "serialized_bytes", "pairs_high_water",
+                            "records_high_water", "allocated_high_water"})
+    for key, cap in (("pairs", 64), ("records", 512), ("allocated_bytes", 262144), ("serialized_bytes", 1048576)):
+        demotion_uint(limits[key], cap, 1)
+    for used, configured in (("pairs_high_water", "pairs"), ("records_high_water", "records"), ("allocated_high_water", "allocated_bytes")):
+        demotion_uint(limits[used], limits[configured])
+    terminal = receipt["terminal"]
+    demotion_fields(terminal, {"sealed", "incomplete_reason", "record_count", "last_seq", "publication_id",
+                              "final_read_id", "observer_exit", "workload_exit", "history_complete", "health"})
+    demotion_bool(terminal["sealed"])
+    demotion_bool(terminal["history_complete"])
+    demotion_require(terminal["incomplete_reason"] in (None, "missing_origin", "missing_post", "capacity", "serialization", "ordinal_exhaustion", "unsupported_contributor"))
+    demotion_fields(terminal["health"], DEMOTION_HEALTH_KEYS)
+    for state in terminal["health"].values():
+        demotion_require(state in ("healthy", "loss", "unavailable", "saturated", "backwards"))
+    for key in ("record_count", "last_seq"):
+        demotion_uint(terminal[key], 512)
+    for key in ("publication_id", "final_read_id"):
+        if terminal[key] is not None:
+            demotion_id(terminal[key])
+    for key in ("observer_exit", "workload_exit"):
+        demotion_uint(terminal[key])
+        demotion_require(terminal[key] == manifest[key], "artifact_binding_mismatch")
+    ids = receipt["identities"]
+    demotion_fields(ids, {"callers", "targets", "modules", "edges", "pairs"})
+    callers = demotion_table(ids["callers"], {"id", "public_id", "pid", "start_ticks", "incarnation", "exe_sha256", "exe"}, 64)
+    targets = demotion_table(ids["targets"], {"id", "dev_major", "dev_minor", "ino", "sha256", "offset", "endpoints"}, 64)
+    modules = demotion_table(ids["modules"], {"id", "public_id", "dev_major", "dev_minor", "ino", "sha256"}, 128)
+    edges = demotion_table(ids["edges"], {"id", "caller_id", "module_id"}, 128)
+    pairs = demotion_table(ids["pairs"], {"id", "caller_id", "target_id", "domain_id", "object_id", "generation", "old_edge_id", "new_edge_id"}, 64)
+    for c in callers.values():
+        demotion_text(c["public_id"], 32)
+        for key in ("pid", "start_ticks", "incarnation"):
+            demotion_uint(c[key])
+        demotion_hex(c["exe_sha256"], 64)
+        demotion_fields(c["exe"], {"dev", "ino", "mtime_secs", "mtime_nanos"})
+        for value in c["exe"].values():
+            demotion_uint(value)
+        demotion_uint(c["exe"]["mtime_nanos"], 999999999)
+    for obj in list(targets.values()) + list(modules.values()):
+        for key in ("dev_major", "dev_minor", "ino"):
+            demotion_uint(obj[key])
+        demotion_hex(obj["sha256"], 64)
+    for t in targets.values():
+        demotion_uint(t["offset"])
+        demotion_require(type(t["endpoints"]) is list and len(t["endpoints"]) <= 512)
+        for endpoint in t["endpoints"]:
+            demotion_uint(endpoint)
+    for m in modules.values():
+        demotion_text(m["public_id"], 32)
+    for e in edges.values():
+        demotion_id(e["caller_id"])
+        demotion_id(e["module_id"])
+        demotion_require(e["caller_id"] in callers and e["module_id"] in modules, "identity_mismatch")
+    for p in pairs.values():
+        for key in ("caller_id", "target_id", "domain_id", "object_id", "old_edge_id", "new_edge_id"):
+            demotion_id(p[key])
+        demotion_uint(p["generation"])
+        demotion_require(p["caller_id"] in callers and p["target_id"] in targets and p["old_edge_id"] in edges and p["new_edge_id"] in edges, "identity_mismatch")
+    records = receipt["records"]
+    demotion_require(type(records) is list and len(records) <= limits["records"])
+    demotion_require(len(pairs) == limits["pairs_high_water"] and len(records) == limits["records_high_water"] and len(records) == terminal["record_count"] == terminal["last_seq"], "history_mismatch")
+    demotion_require(len(pairs) == len(callers) == len(targets) == 1 and len(modules) == len(edges) == 2, "unsupported_topology", "nonqualifying")
+    pair = next(iter(pairs.values()))
+    caller, target = callers[pair["caller_id"]], targets[pair["target_id"]]
+    demotion_require(target["endpoints"] == [target["offset"]], "unsupported_topology", "nonqualifying")
+    old, new = edges[pair["old_edge_id"]], edges[pair["new_edge_id"]]
+    demotion_require(old != new and old["caller_id"] == new["caller_id"] == caller["id"] and old["module_id"] != new["module_id"], "identity_mismatch")
+    demotion_require(manifest["caller_id"] == caller["id"] and manifest["target_id"] == target["id"], "identity_mismatch")
+    binary_hashes = receipt["run"]["hashes"]["fixture_binaries"]
+    demotion_require((caller["exe_sha256"], target["sha256"], modules[old["module_id"]]["sha256"], modules[new["module_id"]]["sha256"]) ==
+                     (binary_hashes["workload"], binary_hashes["common"], binary_hashes["provider_A"], binary_hashes["provider_B"]), "identity_mismatch")
+    # Match public identities by incarnation and physical content, never paths.
+    demotion_require(type(inventory) is dict and inventory.get("schema") == SCHEMAS["inventory"])
+    public_callers, public_modules = {}, {}
+    for table, dest in ((inventory["callers"], public_callers), (inventory["modules"], public_modules)):
+        demotion_require(type(table) is list)
+        for item in table:
+            demotion_require(type(item) is dict and item["id"] not in dest, "duplicate_identity")
+            dest[item["id"]] = item
+    pc = public_callers.get(caller["public_id"])
+    demotion_require(pc is not None, "identity_mismatch")
+    for key in ("pid", "start_time", "incarnation"):
+        demotion_uint(pc[key])
+    demotion_require((pc["pid"], pc["start_time"], pc["incarnation"]) ==
+                     (caller["pid"], caller["start_ticks"], caller["incarnation"]), "identity_mismatch")
+    demotion_fields(pc["image"]["exe"], {"dev", "ino", "mtime_secs", "mtime_nanos", "path"})
+    for key, value in caller["exe"].items():
+        demotion_uint(pc["image"]["exe"][key])
+        demotion_require(pc["image"]["exe"][key] == value, "identity_mismatch")
+    demotion_require(pc["start_time_unit"] == "clock_ticks_since_boot" and pc["image"]["authority"] == "native_exact", "identity_mismatch")
+    for m in modules.values():
+        pm = public_modules.get(m["public_id"])
+        demotion_require(pm is not None, "identity_mismatch")
+        mi = pm["identity"]
+        for value in (mi["device"]["major"], mi["device"]["minor"], mi["inode"]):
+            demotion_uint(value)
+        demotion_require((mi["device"]["major"], mi["device"]["minor"], mi["inode"], mi["sha256"]) ==
+                         (m["dev_major"], m["dev_minor"], m["ino"], m["sha256"]), "identity_mismatch")
+    public_edges = {}
+    for e in inventory["edges"]:
+        key = (e["caller"], e["module"])
+        demotion_require(key not in public_edges, "duplicate_identity")
+        public_edges[key] = e
+    selected = {name: public_edges.get((caller["public_id"], modules[e["module_id"]]["public_id"]))
+                for name, e in (("A", old), ("B", new))}
+    demotion_require(all(e is not None for e in selected.values()), "identity_mismatch")
+    demotion_require(len(public_edges) == 2, "unsupported_topology", "nonqualifying")
+    for e in selected.values():
+        ent = e["entries"]
+        demotion_uint(ent["count"])
+        demotion_uint(ent["cap"])
+        demotion_require(ent["cap"] == U64_MAX)
+        demotion_bool(ent["saturated"])
+        demotion_require(ent["count"] <= ent["cap"] and saturation_coherent(ent["count"], ent["saturated"], ent["cap"]), "invalid_schema")
+    reads, scans, stages, decisions, publications, withholds, record_by_seq = {}, {}, {}, {}, {}, [], {}
+    selected_fences, cancelled_fences, read_previous, pending_handles = [], [], {}, set()
+    max_count = 0
+    uncertainties = []
+    def remember(table, key, rec):
+        demotion_id(rec[key])
+        demotion_require(rec[key] not in table, "duplicate_record_id")
+        table[rec[key]] = rec
+    common = {"seq", "pair_id", "kind"}
+    payloads = {
+        "read": {"read_id", "origin", "count", "pre_ns", "post_ns", "health"},
+        "scan": {"scan_id", "generation", "domain_id", "caller_id", "target_id", "eligibility_epoch", "attach_revision", "pre_ns", "post_ns", "owners", "disposition"},
+        "fence": {"scan_id", "epoch", "read_id", "disposition"},
+        "stage": {"allocation_id", "base", "base_read_id", "absolute_read_id", "base_count", "absolute_count", "growth", "pending_handle", "destination", "epoch", "placement_generation"},
+        "decision": {"allocation_id", "pending_handle", "disposition", "destination", "reason", "publication_id"},
+        "withhold": {"base_count", "absolute_count", "read_id", "scan_id", "epoch", "reason", "allocation_id", "publication_id", "supersedes_seq"},
+        "publication": {"publication_id", "at_ns", "old_edge_id", "new_edge_id", "count_A", "count_B", "lifecycle_A", "lifecycle_B", "status", "diagnostics"}}
+    for seq, rec in enumerate(records, 1):
+        demotion_require(type(rec) is dict and rec.get("kind") in payloads)
+        kind = rec["kind"]
+        demotion_fields(rec, common | payloads[kind], {"supersedes_allocation_id"} if kind == "stage" else ())
+        demotion_uint(rec["seq"], 512, 1)
+        demotion_id(rec["pair_id"])
+        demotion_require(rec["seq"] == seq and rec["pair_id"] == pair["id"], "history_mismatch")
+        record_by_seq[seq] = rec
+        for key in payloads[kind]:
+            if key.endswith("_id") or key in ("epoch", "pending_handle", "supersedes_seq"):
+                if rec[key] is not None:
+                    demotion_id(rec[key])
+        if kind == "read":
+            for key in ("count", "pre_ns", "post_ns"):
+                demotion_uint(rec[key])
+            demotion_require(rec["origin"] in ("initial_row", "refresh") and rec["health"] in ("healthy", "stale", "backwards", "saturated", "unavailable"))
+            demotion_require(rec["pre_ns"] <= rec["post_ns"], "invalid_range")
+            remember(reads, "read_id", rec)
+            read_previous[rec["read_id"]] = max_count
+            if rec["health"] == "healthy":
+                demotion_require(rec["count"] >= max_count, "read_history_mismatch")
+                max_count = rec["count"]
+            else:
+                uncertainties.append("read_health_unavailable")
+        elif kind == "scan":
+            demotion_id(rec["eligibility_epoch"])
+            for key in ("generation", "attach_revision", "pre_ns", "post_ns"):
+                demotion_uint(rec[key])
+            demotion_require(rec["pre_ns"] <= rec["post_ns"], "invalid_range")
+            demotion_require(rec["disposition"] in ("accepted", "cancelled") and type(rec["owners"]) is list)
+            demotion_require((rec["generation"], rec["domain_id"], rec["caller_id"], rec["target_id"]) ==
+                             (pair["generation"], pair["domain_id"], caller["id"], target["id"]), "identity_mismatch")
+            for owner in rec["owners"]:
+                demotion_id(owner)
+                demotion_require(owner in modules, "identity_mismatch")
+            demotion_require(len(set(rec["owners"])) == len(rec["owners"]), "duplicate_identity")
+            remember(scans, "scan_id", rec)
+        elif kind == "fence":
+            demotion_require(rec["disposition"] in ("selected", "cancelled", "provisional"))
+            demotion_require(rec["scan_id"] in scans and rec["read_id"] in reads, "stale_baseline_identity")
+            demotion_require(rec["epoch"] == scans[rec["scan_id"]]["eligibility_epoch"], "stale_baseline_identity")
+            if rec["disposition"] == "cancelled":
+                cancelled_fences.append(rec)
+            if rec["disposition"] == "selected":
+                selected_fences.append(rec)
+                s, r = scans[rec["scan_id"]], reads[rec["read_id"]]
+                demotion_require(not any(c["epoch"] == rec["epoch"] for c in cancelled_fences), "invalid_retirement_fence")
+                epoch_scans = [x for x in scans.values() if x["eligibility_epoch"] == rec["epoch"]]
+                demotion_require(epoch_scans[0]["scan_id"] == s["scan_id"], "original_scan_mismatch")
+                demotion_require(not any(x["seq"] > s["seq"] and
+                    (x["disposition"] != "accepted" or x["eligibility_epoch"] != rec["epoch"] or
+                     x["attach_revision"] != s["attach_revision"] or x["owners"] != s["owners"])
+                    for x in scans.values()), "invalid_retirement_fence")
+                demotion_require(s["disposition"] == "accepted" and s["eligibility_epoch"] == rec["epoch"] and s["owners"] == [new["module_id"]] and
+                                 r["seq"] > s["seq"] and r["origin"] == "refresh" and r["health"] == "healthy" and r["pre_ns"] > s["post_ns"], "invalid_retirement_fence")
+                eligible = [x for x in reads.values() if s["seq"] < x["seq"] <= r["seq"] and x["origin"] == "refresh" and x["health"] == "healthy" and x["pre_ns"] > s["post_ns"] and x["count"] > read_previous[x["read_id"]]]
+                demotion_require(not eligible or eligible[0]["read_id"] == r["read_id"], "first_retirement_fence_mismatch")
+                demotion_require(r["count"] > read_previous[r["read_id"]], "non_advancing_retirement_fence")
+        elif kind == "stage":
+            for key in ("base_count", "absolute_count", "growth", "placement_generation"):
+                demotion_uint(rec[key])
+            demotion_require(rec["base_count"] <= rec["absolute_count"] and rec["growth"] == rec["absolute_count"] - rec["base_count"], "allocation_arithmetic_mismatch")
+            demotion_require(rec["absolute_read_id"] in reads and reads[rec["absolute_read_id"]]["count"] == rec["absolute_count"], "stale_baseline_identity")
+            demotion_require(rec["placement_generation"] == pair["generation"], "identity_mismatch")
+            demotion_require(rec["destination"] in (None, "A", "B") and rec["base"] in ("initial_zero", "read_id"))
+            demotion_require((rec["pending_handle"] is None) == (rec["destination"] is not None))
+            if rec["pending_handle"] is not None:
+                demotion_require(rec["pending_handle"] not in pending_handles, "duplicate_record_id")
+                pending_handles.add(rec["pending_handle"])
+            if rec["base"] != "initial_zero" and rec["epoch"] is not None:
+                demotion_require(any(s["eligibility_epoch"] == rec["epoch"] for s in scans.values()), "stale_baseline_identity")
+            if rec["base"] == "initial_zero":
+                demotion_require(rec["epoch"] is None)
+                demotion_require(rec["base_read_id"] is None and rec["base_count"] == 0 and rec["destination"] == "A" and reads[rec["absolute_read_id"]]["origin"] == "initial_row", "stale_baseline_identity")
+            else:
+                demotion_require(rec["base_read_id"] in reads and reads[rec["base_read_id"]]["count"] == rec["base_count"] and reads[rec["base_read_id"]]["seq"] < reads[rec["absolute_read_id"]]["seq"], "stale_baseline_identity")
+            if "supersedes_allocation_id" in rec:
+                demotion_id(rec["supersedes_allocation_id"])
+                demotion_require(rec["supersedes_allocation_id"] in stages, "decision_mismatch")
+            remember(stages, "allocation_id", rec)
+        elif kind == "decision":
+            demotion_require(rec["allocation_id"] in stages, "decision_mismatch")
+            stage = stages[rec["allocation_id"]]
+            demotion_require(stage["pending_handle"] == rec["pending_handle"], "decision_mismatch")
+            demotion_require(rec["disposition"] in ("placed", "rejected", "unadmitted", "stale") and rec["destination"] in (None, "A", "B") and rec["reason"] in (None, "shared", "no_edge", "stale", "unadmitted"))
+            if rec["disposition"] == "placed":
+                demotion_require(rec["destination"] in ("A", "B") and rec["reason"] is None and stage["destination"] in (None, rec["destination"]) and rec["publication_id"] is not None, "decision_mismatch")
+            else:
+                demotion_require(rec["destination"] is None and rec["reason"] is not None, "decision_mismatch")
+            # Validate the discriminator tuple before any retry/supersession
+            # can remove an unresolved attempt from qualification accounting.
+            reasons = {"placed": {None}, "rejected": {"shared", "no_edge"},
+                       "unadmitted": {"unadmitted"}, "stale": {"stale"}}
+            demotion_require(rec["reason"] in reasons[rec["disposition"]] and
+                             (rec["disposition"] not in ("placed", "rejected") or rec["publication_id"] is not None),
+                             "decision_mismatch")
+            remember(decisions, "allocation_id", rec)
+        elif kind == "withhold":
+            demotion_uint(rec["base_count"])
+            demotion_uint(rec["absolute_count"])
+            demotion_require(rec["base_count"] < rec["absolute_count"], "invalid_range")
+            demotion_require(rec["read_id"] in reads and reads[rec["read_id"]]["count"] == rec["absolute_count"], "stale_baseline_identity")
+            demotion_require(rec["reason"] in ("retirement_prefix", "shared"))
+            if rec["reason"] == "retirement_prefix":
+                demotion_require(rec["scan_id"] in scans and selected_fences and rec["read_id"] == selected_fences[0]["read_id"] and rec["scan_id"] == selected_fences[0]["scan_id"] and rec["epoch"] == selected_fences[0]["epoch"] and rec["allocation_id"] is None, "stale_baseline_identity")
+            else:
+                # Shared rejection is justified by its actual pending
+                # decision; scan/retirement authority is inapplicable here.
+                demotion_require(rec["scan_id"] is None and rec["epoch"] is None)
+                demotion_require(rec["allocation_id"] in decisions, "decision_mismatch")
+                d, a = decisions[rec["allocation_id"]], stages[rec["allocation_id"]]
+                demotion_require(rec["read_id"] == a["absolute_read_id"], "stale_baseline_identity")
+                demotion_require(d["disposition"] == "rejected" and d["reason"] == "shared" and
+                                 d["publication_id"] == rec["publication_id"] and
+                                 (a["base_count"], a["absolute_count"]) == (rec["base_count"], rec["absolute_count"]), "decision_mismatch")
+            if rec["supersedes_seq"] is not None:
+                earlier = record_by_seq.get(rec["supersedes_seq"])
+                demotion_require(earlier is not None and earlier["kind"] == "withhold" and earlier["seq"] < rec["seq"] and earlier["reason"] == rec["reason"] and rec["base_count"] <= earlier["base_count"] and earlier["absolute_count"] <= rec["absolute_count"], "decision_mismatch")
+            withholds.append(rec)
+        elif kind == "publication":
+            for key in ("at_ns", "count_A", "count_B"):
+                demotion_uint(rec[key])
+            demotion_require(rec["old_edge_id"] == old["id"] and rec["new_edge_id"] == new["id"], "identity_mismatch")
+            demotion_require(rec["lifecycle_A"] in ("mapped", "ended") and rec["lifecycle_B"] == "mapped" and rec["status"] in ("COMPLETE", "PARTIAL"))
+            demotion_require(type(rec["diagnostics"]) is list and len(rec["diagnostics"]) <= 512)
+            for diagnostic in rec["diagnostics"]:
+                demotion_fields(diagnostic, {"gap_index", "kind", "record_seq"})
+                demotion_uint(diagnostic["gap_index"], 511)
+                demotion_id(diagnostic["record_seq"])
+                demotion_require(diagnostic["kind"] in ("retirement_prefix", "shared", "demoted_placed"))
+            remember(publications, "publication_id", rec)
+    demotion_require(len(selected_fences) <= 1, "unsupported_topology", "nonqualifying")
+    if not terminal["history_complete"] or not terminal["sealed"] or terminal["incomplete_reason"] is not None:
+        uncertainties.append("incomplete_receipt")
+    if not selected_fences or terminal["final_read_id"] not in reads or terminal["publication_id"] not in publications:
+        raise DemotionFault("incomplete_receipt", "nonqualifying")
+    fence = selected_fences[0]
+    baseline, final_read = reads[fence["read_id"]], reads[terminal["final_read_id"]]
+    demotion_require(final_read["origin"] == "refresh" and final_read["seq"] > baseline["seq"] and final_read["count"] >= baseline["count"], "read_history_mismatch")
+    initial = [a for a in stages.values() if a["base"] == "initial_zero"]
+    demotion_require(len(initial) == 1, "history_mismatch")
+    initial_read = reads[initial[0]["absolute_read_id"]]
+    demotion_require(initial_read["seq"] < scans[fence["scan_id"]]["seq"], "history_mismatch")
+    if set(stages) != set(decisions):
+        uncertainties.append("unresolved_allocation")
+    # An unpublished pending attempt can be replaced by a later containing
+    # attempt with the same base/authority. A published rejection is final:
+    # its ordinals stay withheld and cannot be reassigned by a later retry.
+    superseded = set()
+    for a in stages.values():
+        previous_id = a.get("supersedes_allocation_id")
+        if previous_id is None:
+            continue
+        previous, prior_decision = stages[previous_id], decisions.get(previous_id)
+        demotion_require(previous_id not in superseded and previous["seq"] < a["seq"] and
+                         all(previous[k] == a[k] for k in ("base", "base_read_id", "base_count", "epoch", "placement_generation")) and
+                         previous["absolute_count"] <= a["absolute_count"], "decision_mismatch")
+        if prior_decision is None or prior_decision["publication_id"] is None:
+            demotion_require(prior_decision is None or prior_decision["disposition"] in ("stale", "unadmitted"), "decision_mismatch")
+            superseded.add(previous_id)
+        elif prior_decision["disposition"] == "unadmitted":
+            # PendingCountOutcome::Unadmitted publishes no count and keeps
+            # the pair pending. Only a later advance re-stages that same base.
+            demotion_require(prior_decision["reason"] == "unadmitted" and
+                             prior_decision["publication_id"] in publications and
+                             publications[prior_decision["publication_id"]]["seq"] < a["seq"] and
+                             previous["absolute_count"] < a["absolute_count"], "decision_mismatch")
+            superseded.add(previous_id)
+        else:
+            demotion_require(prior_decision["disposition"] == "placed", "conflicting_allocation")
+    for d in decisions.values():
+        if d["publication_id"] is None:
+            if d["allocation_id"] not in superseded:
+                uncertainties.append("unresolved_allocation")
+            continue
+        if d["disposition"] not in ("placed", "rejected") and d["allocation_id"] not in superseded:
+            uncertainties.append("unresolved_allocation")
+        demotion_require(d["publication_id"] in publications and d["seq"] < publications[d["publication_id"]]["seq"], "decision_mismatch")
+        a, p = stages[d["allocation_id"]], publications[d["publication_id"]]
+        demotion_require(p["at_ns"] >= reads[a["absolute_read_id"]]["post_ns"], "decision_mismatch")
+        if d["destination"] == "B":
+            demotion_require(not any(c["epoch"] == fence["epoch"] and c["seq"] < p["seq"] for c in cancelled_fences), "invalid_retirement_fence")
+            original_scan = scans[fence["scan_id"]]
+            demotion_require(not any(s["seq"] > original_scan["seq"] and s["seq"] < p["seq"] and
+                (s["disposition"] != "accepted" or s["eligibility_epoch"] != fence["epoch"] or
+                 s["attach_revision"] != original_scan["attach_revision"] or s["owners"] != original_scan["owners"]) for s in scans.values()), "invalid_retirement_fence")
+            demotion_require(a["epoch"] == fence["epoch"] and a["base_read_id"] is not None and reads[a["base_read_id"]]["seq"] >= baseline["seq"] and a["base_count"] >= baseline["count"], "stale_baseline_identity")
+            if a["base_count"] == baseline["count"]:
+                demotion_require(a["base_read_id"] == baseline["read_id"], "stale_baseline_identity")
+        if d["destination"] == "A":
+            demotion_require(a["seq"] < fence["seq"], "unsupported_topology", "nonqualifying")
+    original_scan = scans[fence["scan_id"]]
+    if any(s["seq"] > original_scan["seq"] and
+           (s["disposition"] != "accepted" or s["eligibility_epoch"] != fence["epoch"] or
+            s["attach_revision"] != original_scan["attach_revision"] or s["owners"] != original_scan["owners"])
+           for s in scans.values()) or any(c["epoch"] == fence["epoch"] for c in cancelled_fences):
+        uncertainties.append("unsupported_topology")
+    for w in withholds:
+        demotion_require(w["publication_id"] in publications and w["seq"] < publications[w["publication_id"]]["seq"], "decision_mismatch")
+        demotion_require(reads[w["read_id"]]["post_ns"] <= publications[w["publication_id"]]["at_ns"], "decision_mismatch")
+        for earlier in withholds:
+            if earlier["seq"] >= w["seq"]:
+                break
+            if max(earlier["base_count"], w["base_count"]) < min(earlier["absolute_count"], w["absolute_count"]):
+                demotion_require(earlier["reason"] == w["reason"] and
+                                 (earlier["publication_id"] == w["publication_id"] or w["supersedes_seq"] == earlier["seq"]), "conflicting_allocation")
+    previous_publication_time = manifest["start_ns"]
+    for pub in publications.values():
+        demotion_require(previous_publication_time <= pub["at_ns"] <= manifest["stop_ns"], "publication_history_mismatch")
+        previous_publication_time = pub["at_ns"]
+        demotion_require(bool(pub["diagnostics"]) == (pub["status"] == "PARTIAL"), "diagnostic_mismatch")
+        for diagnostic in pub["diagnostics"]:
+            evidence = record_by_seq.get(diagnostic["record_seq"])
+            demotion_require(evidence is not None and evidence["seq"] < pub["seq"], "diagnostic_mismatch")
+    # Reconstruct the watermark that existed before F, never a later maximum.
+    pre_ranges = [(a["base_count"], a["absolute_count"]) for a in stages.values()
+                  if a["allocation_id"] in decisions and decisions[a["allocation_id"]]["disposition"] == "placed" and
+                  decisions[a["allocation_id"]]["publication_id"] in publications and publications[decisions[a["allocation_id"]]["publication_id"]]["seq"] < baseline["seq"]]
+    pre_ranges += [(w["base_count"], w["absolute_count"]) for w in withholds if publications[w["publication_id"]]["seq"] < baseline["seq"]]
+    demotion_require(baseline["count"] > max((hi for _lo, hi in pre_ranges), default=0), "non_advancing_retirement_fence")
+    allocations = {"A": [], "B": []}
+    committed = []
+    for pub in publications.values():
+        for d in decisions.values():
+            if d["publication_id"] != pub["publication_id"] or d["disposition"] != "placed":
+                continue
+            a = stages[d["allocation_id"]]
+            lo, hi = a["base_count"], a["absolute_count"]
+            for previous, prev_d in committed:
+                if max(lo, previous["base_count"]) < min(hi, previous["absolute_count"]):
+                    demotion_require(prev_d["destination"] == d["destination"] and
+                                     (prev_d["publication_id"] == d["publication_id"] or a.get("supersedes_allocation_id") == previous["allocation_id"]), "conflicting_allocation")
+            committed.append((a, d))
+            allocations[d["destination"]].append((lo, hi))
+        totals = {name: demotion_union(ranges)[1] for name, ranges in allocations.items()}
+        if set(stages) == set(decisions):
+            demotion_require((pub["count_A"], pub["count_B"]) == (totals["A"], totals["B"]), "publication_allocation_mismatch")
+    ranges = {name: demotion_union(values)[0] for name, values in allocations.items()}
+    ranges["withheld"], withheld_total = demotion_union([(w["base_count"], w["absolute_count"]) for w in withholds])
+    totals = {"A": demotion_union(allocations["A"])[1], "B": demotion_union(allocations["B"])[1], "withheld": withheld_total}
+    terminal_pub = publications[terminal["publication_id"]]
+    demotion_require(terminal_pub is list(publications.values())[-1] and terminal_pub["seq"] > final_read["seq"], "history_mismatch")
+    # Public arithmetic contradictions take precedence over diagnostics/timing.
+    demotion_require((selected["A"]["entries"]["count"], selected["B"]["entries"]["count"]) ==
+                     (terminal_pub["count_A"], terminal_pub["count_B"]), "public_allocation_mismatch")
+    for name, edge in selected.items():
+        demotion_require(edge["mapping"]["state"] == terminal_pub["lifecycle_" + name], "public_allocation_mismatch")
+    # Every successful rejection is a terminal disposition too. A placement
+    # cannot hide it by covering the same ordinals in another stage.
+    rejected = [(stages[d["allocation_id"]], d) for d in decisions.values()
+                if d["disposition"] == "rejected" and d["publication_id"] is not None]
+    for a, d in rejected:
+        lo, hi = a["base_count"], a["absolute_count"]
+        for name in ("A", "B"):
+            values = ranges[name]
+            demotion_require(not any(max(lo, x) < min(hi, y) for x, y in values), "conflicting_allocation")
+        for w in withholds:
+            if max(lo, w["base_count"]) < min(hi, w["absolute_count"]):
+                demotion_require(w["reason"] == d["reason"], "conflicting_allocation")
+        matching = [w for w in withholds if w["allocation_id"] == a["allocation_id"] and
+                    w["publication_id"] == d["publication_id"] and w["reason"] == d["reason"]]
+        disclosed = demotion_union([(w["base_count"], w["absolute_count"]) for w in matching])[0]
+        if disclosed != demotion_union([(lo, hi)])[0]:
+            uncertainties.append("unresolved_rejected_range")
+        for previous, prev_d in rejected:
+            if previous["seq"] >= a["seq"]:
+                break
+            if max(lo, previous["base_count"]) < min(hi, previous["absolute_count"]):
+                supersedes = any(w["supersedes_seq"] is not None and
+                    record_by_seq[w["supersedes_seq"]]["allocation_id"] == previous["allocation_id"] for w in matching)
+                demotion_require(prev_d["reason"] == d["reason"] and
+                    (prev_d["publication_id"] == d["publication_id"] or supersedes), "conflicting_allocation")
+    ranges["withheld"], totals["withheld"] = demotion_union(
+        [(w["base_count"], w["absolute_count"]) for w in withholds] +
+        [(a["base_count"], a["absolute_count"]) for a, _d in rejected])
+    accepted_reads = [r for r in reads.values() if r["health"] == "healthy"]
+    if final_read["health"] != "healthy" or not accepted_reads or accepted_reads[-1]["read_id"] != final_read["read_id"] or terminal_pub["seq"] != len(records):
+        uncertainties.append("incomplete_terminal_observation")
+    partition = sorted((lo, hi, name) for name, values in ranges.items() for lo, hi in values)
+    end = 0
+    for lo, hi, _name in partition:
+        demotion_require(lo >= end, "conflicting_allocation")
+        if lo != end:
+            uncertainties.append("incomplete_partition")
+        end = hi
+    demotion_require(end <= final_read["count"], "allocation_arithmetic_mismatch")
+    if end != final_read["count"]:
+        uncertainties.append("incomplete_partition")
+    if len(ranges["B"]) != 1 or ranges["B"][0] != (baseline["count"], final_read["count"]):
+        uncertainties.append("unresolved_allocation")
+    # Ledger control records are independent identity/readiness authority.
+    demotion_require(type(ledger) is list and 2 <= len(ledger) <= 256)
+    head, tail = ledger[0], ledger[-1]
+    demotion_fields(head, {"kind", "nonce", "caller", "target", "domain_id", "clock", "ready_ns"}, {"time_namespace"})
+    demotion_fields(tail, {"kind", "completed_ns", "calls", "complete"})
+    demotion_require(head["kind"] == "identity" and tail["kind"] == "complete")
+    ledger_caller = {key: value for key, value in caller.items() if key != "public_id"}
+    demotion_fields(head["caller"], ledger_caller.keys())
+    demotion_id(head["caller"]["id"])
+    for key in ("pid", "start_ticks", "incarnation"):
+        demotion_uint(head["caller"][key])
+    demotion_hex(head["caller"]["exe_sha256"], 64)
+    demotion_fields(head["caller"]["exe"], {"dev", "ino", "mtime_secs", "mtime_nanos"})
+    for value in head["caller"]["exe"].values():
+        demotion_uint(value)
+    demotion_fields(head["target"], target.keys())
+    demotion_id(head["target"]["id"])
+    for key in ("dev_major", "dev_minor", "ino", "offset"):
+        demotion_uint(head["target"][key])
+    demotion_hex(head["target"]["sha256"], 64)
+    demotion_require(type(head["target"]["endpoints"]) is list and len(head["target"]["endpoints"]) <= 512)
+    for endpoint in head["target"]["endpoints"]:
+        demotion_uint(endpoint)
+    demotion_id(head["domain_id"])
+    demotion_require(head["nonce"] == receipt["run"]["nonce"] and head["caller"] == ledger_caller and head["target"] == target and head["domain_id"] == pair["domain_id"], "identity_mismatch")
+    for obj, key in ((head, "ready_ns"), (tail, "completed_ns"), (tail, "calls")):
+        demotion_uint(obj[key])
+    demotion_bool(tail["complete"])
+    demotion_require(head["ready_ns"] == manifest["ready_ns"] and tail["completed_ns"] == manifest["completed_ns"], "artifact_binding_mismatch")
+    calls = ledger[1:-1]
+    demotion_require(len(calls) <= 64 and tail["calls"] == len(calls), "ledger_limit_exceeded")
+    for sequence, call in enumerate(calls, 1):
+        demotion_fields(call, {"kind", "sequence", "caller_identity", "target_identity", "function", "alias", "before_call_ns", "after_return_ns", "entered", "completed", "return_status"})
+        for key in ("sequence", "caller_identity", "target_identity", "before_call_ns", "alias"):
+            demotion_uint(call[key], 64 if key == "alias" else U64_MAX)
+        demotion_text(call["function"], 64)
+        demotion_require(call["kind"] == "call" and call["sequence"] == sequence and call["caller_identity"] == caller["id"] and call["target_identity"] == target["id"], "identity_mismatch")
+        demotion_bool(call["entered"])
+        demotion_bool(call["completed"])
+        if call["completed"]:
+            demotion_uint(call["after_return_ns"])
+            demotion_uint(call["return_status"])
+            demotion_require(call["entered"] and call["before_call_ns"] <= call["after_return_ns"], "invalid_range")
+        else:
+            demotion_require(call["after_return_ns"] is None and call["return_status"] is None)
+            uncertainties.append("incomplete_ledger")
+        if not call["entered"] or call["before_call_ns"] == 0:
+            uncertainties.append("incomplete_ledger")
+    if not tail["complete"] or manifest["ready_ns"] == 0 or not calls or manifest["ready_ns"] >= min(c["before_call_ns"] for c in calls):
+        uncertainties.append("unproven_readiness")
+    if any(c["completed"] and c["after_return_ns"] >= manifest["completed_ns"] for c in calls) or manifest["completed_ns"] >= final_read["pre_ns"]:
+        uncertainties.append("incomplete_ledger")
+    clocks = manifest["clock"]
+    namespaces = [clocks.get("time_namespace"), clocks.get("observer_time_namespace"), head.get("time_namespace")]
+    for namespace in namespaces:
+        if namespace is None:
+            continue
+        demotion_text(namespace, 27)
+        match = re.fullmatch(r"time:\[([1-9][0-9]{0,19})\]", namespace)
+        demotion_require(match is not None)
+        demotion_uint(int(match[1]), minimum=1)
+    available_namespaces = [namespace for namespace in namespaces if namespace is not None]
+    demotion_require(len(set(available_namespaces)) <= 1, "clock_namespace_mismatch")
+    if len(available_namespaces) != 3 or clocks["basis"] != "CLOCK_MONOTONIC" or head["clock"] != "CLOCK_MONOTONIC" or inventory["clock"] != {"basis": "CLOCK_MONOTONIC", "unit": "ns"}:
+        uncertainties.append("unavailable_clock")
+    if any(state != "healthy" for state in terminal["health"].values()) or manifest["observer_exit"] != 0 or manifest["workload_exit"] != 0:
+        uncertainties.append("unhealthy_capture")
+    if any(e["entries"]["saturated"] or e["entries"]["coverage"].get("lossy") is not False or e["entries"]["coverage"].get("state") != "counted" for e in selected.values()) or any(r["count"] == U64_MAX for r in reads.values()):
+        uncertainties.append("unhealthy_capture")
+    uncertainties.extend(demotion_public_health(inventory))
+    # The exported interval comes from Presentation::capture. Manifest start
+    # and stop may bracket process execution more widely; the public interval
+    # must still enclose the actual reads, scans, commits and completed calls.
+    observation = inventory.get("observation", {})
+    public_start, public_stop = observation.get("started_ns"), observation.get("ended_ns")
+    for value in (public_start, public_stop):
+        if value is not None:
+            demotion_uint(value)
+    if public_start in (None, 0) or public_stop in (None, 0, U64_MAX):
+        uncertainties.append("unavailable_public_observation")
+    else:
+        demotion_require(public_start <= public_stop, "public_observation_mismatch")
+        if "unavailable_clock" not in uncertainties:
+            lower = [r["pre_ns"] for r in reads.values()] + [s["pre_ns"] for s in scans.values()]
+            upper = [r["post_ns"] for r in reads.values()] + [s["post_ns"] for s in scans.values()]
+            lower += [p["at_ns"] for p in publications.values()] + [manifest["ready_ns"]]
+            upper += [p["at_ns"] for p in publications.values()] + [manifest["completed_ns"]]
+            lower += [c["before_call_ns"] for c in calls]
+            upper += [c["after_return_ns"] for c in calls if c["completed"]]
+            demotion_require(manifest["start_ns"] <= public_start <= public_stop <= manifest["stop_ns"] and
+                             all(public_start <= value <= public_stop for value in lower + upper if value not in (0, U64_MAX)),
+                             "public_observation_mismatch")
+    for name, r in (("A", initial_read), ("B", baseline)):
+        demotion_require(selected[name]["entries"]["coverage"].get("since_ns") == r["pre_ns"], "public_baseline_mismatch")
+    # Only these exact source-bound disclosures can explain public PARTIAL.
+    gaps = inventory["gaps"]
+    demotion_require(type(gaps) is list)
+    demotion_uint(inventory["gaps_suppressed"])
+    for pub in publications.values():
+        seen_gaps, seen_diagnostics, explained_withholds, explained_placements = {}, set(), set(), set()
+        for diagnostic in pub["diagnostics"]:
+            index, kind, recseq = diagnostic["gap_index"], diagnostic["kind"], diagnostic["record_seq"]
+            demotion_require(index < len(gaps) and (index, kind, recseq) not in seen_diagnostics and recseq in record_by_seq, "diagnostic_mismatch")
+            seen_diagnostics.add((index, kind, recseq))
+            seen_gaps.setdefault(index, set()).add(recseq)
+            gap, record = gaps[index], record_by_seq[recseq]
+            demotion_require(type(gap) is dict and gap.get("pid") is None and gap.get("budget") is None and type(gap.get("repeats")) is int and 1 <= gap["repeats"] <= 512, "diagnostic_mismatch")
+            if kind == "demoted_placed":
+                demotion_require(record["kind"] == "stage" and record["allocation_id"] in decisions, "diagnostic_mismatch")
+                d = decisions[record["allocation_id"]]
+                demotion_require(d["disposition"] == "placed" and d["destination"] == "B" and
+                                 d["seq"] < pub["seq"] and publications[d["publication_id"]]["seq"] <= pub["seq"] and
+                                 fence["seq"] < record["seq"], "diagnostic_mismatch")
+                expected = (caller["public_id"], modules[new["module_id"]]["public_id"], "demoted count placed", DEMOTION_PLACED_REASON)
+                explained_placements.add(record["allocation_id"])
+            else:
+                demotion_require(record["kind"] == "withhold" and record["reason"] == kind and
+                                 record["publication_id"] in publications and
+                                 publications[record["publication_id"]]["seq"] <= pub["seq"], "diagnostic_mismatch")
+                lo, hi = record["base_count"], record["absolute_count"]
+                if kind == "retirement_prefix":
+                    reason = f"the current physical owner is not proven for absolute count range ({lo}, {hi}] ({hi - lo} unattributed calls); historical counts remain and no witness or module-level use is recorded"
+                    expected = (caller["public_id"], None, "rejected demoted count", reason)
+                else:
+                    reason = f"a native witness endpoint is shared by 2 admitted modules (re-resolved with {hi - lo} unattributed calls after sharing appeared): which module was used is ambiguous, so no edge and no module-level use is recorded"
+                    demotion_require(gap.get("module") in {m["public_id"] for m in modules.values()}, "diagnostic_mismatch")
+                    expected = (None, gap["module"], "rejected demoted count", reason)
+                explained_withholds.add((record["seq"], gap.get("module")))
+            demotion_require((gap.get("caller"), gap.get("module"), gap.get("subject"), gap.get("reason")) == expected, "diagnostic_mismatch")
+        for w in withholds:
+            if publications[w["publication_id"]]["seq"] > pub["seq"]:
+                continue
+            needed = {(w["seq"], None)} if w["reason"] == "retirement_prefix" else {(w["seq"], m["public_id"]) for m in modules.values()}
+            if not needed <= explained_withholds:
+                uncertainties.append("missing_public_disclosure")
+        placed_here = {d["allocation_id"] for d in decisions.values() if d["destination"] == "B" and d["publication_id"] == pub["publication_id"]}
+        if placed_here and not placed_here.intersection(explained_placements):
+            uncertainties.append("missing_public_disclosure")
+        demotion_require(all(len(refs) <= gaps[index]["repeats"] for index, refs in seen_gaps.items()), "diagnostic_mismatch")
+    if any(len(refs) != gaps[index]["repeats"] for index, refs in seen_gaps.items()):
+        uncertainties.append("missing_public_disclosure")
+    if len(seen_gaps) != len(gaps) or inventory["gaps_suppressed"] != 0:
+        uncertainties.append("unrelated_public_diagnostic")
+    if bool(gaps) != (terminal_pub["status"] == "PARTIAL"):
+        uncertainties.append("unrelated_public_diagnostic")
+    # Prefix equality is decidable only with complete independent clock/entry evidence.
+    prefix_uncertainties = {"unproven_readiness", "incomplete_ledger", "unavailable_clock"}
+    if not prefix_uncertainties.intersection(uncertainties):
+        required = {r["read_id"] for r in accepted_reads}
+        required.update((initial_read["read_id"], baseline["read_id"], final_read["read_id"]))
+        required.update(a["base_read_id"] for a in stages.values() if a["base_read_id"] is not None)
+        required.update(a["absolute_read_id"] for a in stages.values())
+        required.update(w["read_id"] for w in withholds)
+        for r in sorted((reads[ident] for ident in required), key=lambda r: r["seq"]):
+            if r["pre_ns"] == 0 or r["post_ns"] == U64_MAX:
+                uncertainties.append("unavailable_clock")
+                continue
+            ambiguous = any(c["after_return_ns"] >= r["pre_ns"] and c["before_call_ns"] <= r["post_ns"] for c in calls)
+            if ambiguous:
+                uncertainties.append("ambiguous_baseline_interval")
+                continue
+            prefix = sum(c["after_return_ns"] < r["pre_ns"] for c in calls)
+            demotion_require(prefix == r["count"], "independent_prefix_mismatch", observed_baseline=r["count"], independent_prefix=prefix)
+        if "ambiguous_baseline_interval" not in uncertainties:
+            growth = sum(c["before_call_ns"] > baseline["post_ns"] and c["after_return_ns"] < final_read["pre_ns"] for c in calls)
+            demotion_require(growth == final_read["count"] - baseline["count"], "independent_growth_mismatch")
+            if "unresolved_allocation" not in uncertainties:
+                demotion_require(growth == totals["B"], "independent_growth_mismatch")
+    if uncertainties:
+        return demotion_result("nonqualifying", uncertainties[0], **totals)
+    return demotion_result("pass", "qualified", **totals)
+
+
+def demotion_self_test():
+    """Literal producer histories and independently authored completed calls.
+
+    A restored historical B entry must fail even below the workload total.
+    Missing prefix verification, count enumeration, and a held-max fence each
+    break a different whole-directory control below. No receipt uses the ledger
+    to calculate a count, bracket, decision or allocation.
+    """
+    failures = []
+    fixture_hashes = {"workload": "4dec82fd065310341f89b3db580be1f834c358f79bd0a3dd2415452336da0a2c",
+                      "provider_A": "a0319a311e558d5f2f69e31bf129f43f767759029c1a62a111290f40756c890e",
+                      "provider_B": "90c9cebe9b79c07c6d0be78aa1fa8d286df749c6a229a8d0ece4d934ea6550cb",
+                      "common": "1da368043ab9a602df84187b9820f09e0494eeea281da6aee7932602b7d89568"}
+    caller = {"id": 1, "public_id": "c0", "pid": 1234, "start_ticks": 55,
+              "incarnation": 0, "exe_sha256": fixture_hashes["workload"],
+              "exe": {"dev": 35, "ino": 51, "mtime_secs": 1000, "mtime_nanos": 0}}
+    target = {"id": 1, "dev_major": 0, "dev_minor": 35, "ino": 99,
+              "sha256": fixture_hashes["common"], "offset": 4096, "endpoints": [4096]}
+    modules = [{"id": 1, "public_id": "mA", "dev_major": 0, "dev_minor": 35,
+                "ino": 101, "sha256": fixture_hashes["provider_A"]},
+               {"id": 2, "public_id": "mB", "dev_major": 0, "dev_minor": 35,
+                "ino": 102, "sha256": fixture_hashes["provider_B"]}]
+    identity = {"callers": [caller], "targets": [target], "modules": modules,
+                "edges": [{"id": 1, "caller_id": 1, "module_id": 1},
+                          {"id": 2, "caller_id": 1, "module_id": 2}],
+                "pairs": [{"id": 1, "caller_id": 1, "target_id": 1, "domain_id": 1,
+                           "object_id": 1, "generation": 1, "old_edge_id": 1, "new_edge_id": 2}]}
+    records = [
+        {"seq": 1, "pair_id": 1, "kind": "read", "read_id": 1, "origin": "initial_row",
+         "count": 1, "pre_ns": 82, "post_ns": 86, "health": "healthy"},
+        {"seq": 2, "pair_id": 1, "kind": "stage", "allocation_id": 1, "base": "initial_zero",
+         "base_read_id": None, "absolute_read_id": 1, "base_count": 0, "absolute_count": 1,
+         "growth": 1, "pending_handle": None, "destination": "A", "epoch": None,
+         "placement_generation": 1},
+        {"seq": 3, "pair_id": 1, "kind": "decision", "allocation_id": 1, "pending_handle": None,
+         "disposition": "placed", "destination": "A", "reason": None, "publication_id": 1},
+        {"seq": 4, "pair_id": 1, "kind": "publication", "publication_id": 1, "at_ns": 87,
+         "old_edge_id": 1, "new_edge_id": 2, "count_A": 1, "count_B": 0,
+         "lifecycle_A": "mapped", "lifecycle_B": "mapped", "status": "COMPLETE", "diagnostics": []},
+        {"seq": 5, "pair_id": 1, "kind": "scan", "scan_id": 1, "generation": 1,
+         "domain_id": 1, "caller_id": 1, "target_id": 1, "eligibility_epoch": 1,
+         "attach_revision": 1, "pre_ns": 92, "post_ns": 96, "owners": [2], "disposition": "accepted"},
+        {"seq": 6, "pair_id": 1, "kind": "read", "read_id": 2, "origin": "refresh",
+         "count": 2, "pre_ns": 100, "post_ns": 106, "health": "healthy"},
+        {"seq": 7, "pair_id": 1, "kind": "fence", "scan_id": 1, "epoch": 1,
+         "read_id": 2, "disposition": "selected"},
+        {"seq": 8, "pair_id": 1, "kind": "withhold", "base_count": 1, "absolute_count": 2,
+         "read_id": 2, "scan_id": 1, "epoch": 1, "reason": "retirement_prefix",
+         "allocation_id": None, "publication_id": 2, "supersedes_seq": None},
+        {"seq": 9, "pair_id": 1, "kind": "read", "read_id": 3, "origin": "refresh",
+         "count": 4, "pre_ns": 160, "post_ns": 166, "health": "healthy"},
+        {"seq": 10, "pair_id": 1, "kind": "stage", "allocation_id": 2, "base": "read_id",
+         "base_read_id": 2, "absolute_read_id": 3, "base_count": 2, "absolute_count": 4,
+         "growth": 2, "pending_handle": 1, "destination": None, "epoch": 1,
+         "placement_generation": 1},
+        {"seq": 11, "pair_id": 1, "kind": "decision", "allocation_id": 2, "pending_handle": 1,
+         "disposition": "placed", "destination": "B", "reason": None, "publication_id": 2},
+        {"seq": 12, "pair_id": 1, "kind": "publication", "publication_id": 2, "at_ns": 170,
+         "old_edge_id": 1, "new_edge_id": 2, "count_A": 1, "count_B": 2,
+         "lifecycle_A": "ended", "lifecycle_B": "mapped", "status": "PARTIAL",
+         "diagnostics": [{"gap_index": 0, "kind": "retirement_prefix", "record_seq": 8},
+                         {"gap_index": 1, "kind": "demoted_placed", "record_seq": 10}]},
+    ]
+    receipt = {"schema": "p11scope/demotion-qualification/v1", "run": {},
+               "limits": {"pairs": 64, "records": 512, "allocated_bytes": 262144,
+                          "serialized_bytes": 1048576, "pairs_high_water": 1,
+                          "records_high_water": 12, "allocated_high_water": 16384},
+               "identities": identity, "records": records,
+               "terminal": {"sealed": True, "incomplete_reason": None, "record_count": 12,
+                            "last_seq": 12, "publication_id": 2, "final_read_id": 3,
+                            "observer_exit": 0, "workload_exit": 0,
+                            "history_complete": True, "health": {"native": "healthy", "read": "healthy",
+                            "lifecycle": "healthy", "clock": "healthy", "recorder": "healthy"}}}
+    inventory = {"schema": SCHEMAS["inventory"], "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+                 "observation": {"started_ns": 60, "ended_ns": 180, "usage_feed": True},
+                 "callers": [{"id": "c0", "pid": 1234, "start_time": 55,
+                              "start_time_unit": "clock_ticks_since_boot", "incarnation": 0,
+                              "image": {"authority": "native_exact", "task_cookie": None, "exec_id": None,
+                                        "exe": dict(caller["exe"], path="/private/workload"), "exec_observed": True},
+                              "lifecycle": "mapped", "retired": False}],
+                 "modules": [{"id": "mA", "identity": {"device": {"major": 0, "minor": 35},
+                              "inode": 101, "sha256": fixture_hashes["provider_A"]}},
+                             {"id": "mB", "identity": {"device": {"major": 0, "minor": 35},
+                              "inode": 102, "sha256": fixture_hashes["provider_B"]}}],
+                 "edges": [], "gaps": [], "gaps_suppressed": 0}
+    for mid, count, pre, mapping in (("mA", 1, 82, "ended"), ("mB", 2, 100, "mapped")):
+        edge = Synth.edge("c0", mid, mapping == "mapped", pre, 180)
+        edge["entries"].update(count=count, observation="observed")
+        edge["entries"]["coverage"].update(state="counted", since_ns=pre, until_ns=None, lossy=False, reason=None)
+        inventory["edges"].append(edge)
+    placed_reason = ("a demoted count placed post-demotion growth on this edge: the edge's count covers "
+                     "a workload segment starting at the base read, never the whole workload, so "
+                     "per-segment exactness is unverifiable and only the ledger window's upper bound applies")
+    inventory["gaps"] = [
+        {"caller": "c0", "module": None, "pid": None, "subject": "rejected demoted count",
+         "reason": "the current physical owner is not proven for absolute count range (1, 2] (1 unattributed calls); historical counts remain and no witness or module-level use is recorded",
+         "budget": None, "repeats": 1},
+        {"caller": "c0", "module": "mB", "pid": None, "subject": "demoted count placed",
+         "reason": placed_reason, "budget": None, "repeats": 1}]
+    ledger = [
+        {"kind": "identity", "nonce": "01" * 16, "caller": {key: value for key, value in caller.items() if key != "public_id"}, "target": target,
+         "domain_id": 1, "clock": "CLOCK_MONOTONIC", "time_namespace": "time:[1]", "ready_ns": 70},
+        {"kind": "call", "sequence": 1, "caller_identity": 1, "target_identity": 1,
+         "function": "C_GetInfo", "alias": 0, "before_call_ns": 79, "after_return_ns": 81,
+         "entered": True, "completed": True, "return_status": 0},
+        {"kind": "call", "sequence": 2, "caller_identity": 1, "target_identity": 1,
+         "function": "C_GetInfo", "alias": 0, "before_call_ns": 89, "after_return_ns": 91,
+         "entered": True, "completed": True, "return_status": 0},
+        {"kind": "call", "sequence": 3, "caller_identity": 1, "target_identity": 1,
+         "function": "C_GetInfo", "alias": 1, "before_call_ns": 109, "after_return_ns": 111,
+         "entered": True, "completed": True, "return_status": 5},
+        {"kind": "call", "sequence": 4, "caller_identity": 1, "target_identity": 1,
+         "function": "C_GetInfo", "alias": 0, "before_call_ns": 149, "after_return_ns": 151,
+         "entered": True, "completed": True, "return_status": 0},
+        {"kind": "complete", "completed_ns": 152, "calls": 4, "complete": True}]
+    manifest = {"schema": "p11scope/demotion-run/v1", "nonce": "01" * 16,
+                "source_commit": "6175d196084d01e1534b2ca63c8c64796c2356e9",
+                "source_tree": "3d409c492864c68601656a7e8af1bc9e8cdab16c", "artifacts": {},
+                "clock": {"basis": "CLOCK_MONOTONIC", "time_namespace": "time:[1]",
+                          "observer_time_namespace": "time:[1]"}, "caller_id": 1, "target_id": 1,
+                "observer": {"pid": 4321, "start_ticks": 66}, "command": ["owned-test", "--exact"],
+                "selector": "checker-fixture", "start_ns": 60, "stop_ns": 180, "ready_ns": 70,
+                "completed_ns": 152, "observer_exit": 0, "workload_exit": 0,
+                "kernel": {"release": "checker-fixture", "capability_evidence": "unprivileged checker only"}}
+
+    def public_health(r, i, l, m):
+        i["observation"].update(lane="native", settlement="unsettled", retirement="closed",
+            lifecycle={"records": 1, "ring_loss": 0, "malformed": 0, "failed_quanta": 0, "recovery_rescans": 0},
+            native_witnesses={"rows": 1, "bound": 1, "unbound": 0, "pending": 0, "integrity": 0,
+                "unbound_reasons": {}, "placement": {"edge": 1, "module": 0, "ambiguous": 0, "unresolved": 0}})
+        i["budgets"] = {key: {"limit": 64, "occupied": 1, "refused": 0} for key in (
+            "callers", "modules", "edges", "endpoints", "inventory_endpoints", "inventory_attach_modules")}
+        i["budgets"].update(counters={"cap": U64_MAX, "observed_edges": 2, "saturated_edges": 0},
+            semantic_state={"limit": 64, "occupied": 0, "status": "withheld", "unknown_edges": 2, "refused": 0},
+            retained_history={"limit": 64, "retained": 2, "suppressed": 0},
+            native_preadmission={"limit": 64, "occupied": 0, "refused": 0, "pruned": 0})
+    public_health(receipt, inventory, ledger, manifest)
+
+    def wider(r, inv, lines, m, pre=100, post=116, public=True):
+        r["records"][5].update(count=3, pre_ns=pre, post_ns=post)
+        r["records"][7]["absolute_count"] = 3
+        r["records"][9].update(base_count=3, growth=1)
+        r["records"][11]["count_B"] = 1
+        if public:
+            inv["edges"][1]["entries"]["count"] = 1
+            inv["edges"][1]["entries"]["coverage"]["since_ns"] = pre
+            inv["gaps"][0]["reason"] = "the current physical owner is not proven for absolute count range (1, 3] (2 unattributed calls); historical counts remain and no witness or module-level use is recorded"
+
+    with tempfile.TemporaryDirectory(prefix="demotion-oracle-") as tmp:
+        def case(name, status, reason, mutate=None, values=None, raw=None, bind=True):
+            r, inv, lines, m = map(_deep, (receipt, inventory, ledger, manifest))
+            if mutate:
+                mutate(r, inv, lines, m)
+            root = os.path.join(tmp, name)
+            os.mkdir(root)
+            # These stand-ins bind real bytes, without executing any native code.
+            for key, data in (("observer_binary", b"literal observer artifact"),
+                              ("bpf_object", b"literal BPF artifact"), ("fixture_source", b"literal fixture source")):
+                m["artifacts"][key] = key + ".bin"
+                with open(os.path.join(root, key + ".bin"), "wb") as f:
+                    f.write(data)
+            m["artifacts"]["fixture_binaries"] = {}
+            for mode, data in (("workload", b"literal fixture workload"), ("provider_A", b"literal provider A"),
+                               ("provider_B", b"literal provider B"), ("common", b"literal common body")):
+                m["artifacts"]["fixture_binaries"][mode] = mode + ".bin"
+                with open(os.path.join(root, mode + ".bin"), "wb") as f:
+                    f.write(data)
+            m["artifacts"]["checker"] = "checker.py"
+            with open(__file__, "rb") as f:
+                checker_bytes = f.read()
+            with open(os.path.join(root, "checker.py"), "wb") as f:
+                f.write(checker_bytes)
+            for filename, data in (("inventory.json", json.dumps(inv).encode()),
+                                   ("ledger.jsonl", b"".join(json.dumps(x).encode() + b"\n" for x in lines)),
+                                   ("run-manifest.json", json.dumps(m).encode())):
+                with open(os.path.join(root, filename), "wb") as f:
+                    f.write(data)
+            hashes = {key: hashlib.sha256(open(os.path.join(root, path), "rb").read()).hexdigest()
+                      for key, path in m["artifacts"].items() if key != "fixture_binaries"}
+            hashes["fixture_binaries"] = {mode: hashlib.sha256(open(os.path.join(root, path), "rb").read()).hexdigest()
+                                           for mode, path in m["artifacts"]["fixture_binaries"].items()}
+            for key, filename in (("inventory", "inventory.json"), ("ledger", "ledger.jsonl"), ("manifest", "run-manifest.json")):
+                with open(os.path.join(root, filename), "rb") as f:
+                    hashes[key] = hashlib.sha256(f.read()).hexdigest()
+            r["run"] = {"nonce": m["nonce"], "source_commit": m["source_commit"],
+                        "source_tree": m["source_tree"], "hashes": hashes}
+            if not bind:
+                r["run"]["hashes"]["inventory"] = "ff" * 32
+            r["limits"]["records_high_water"] = len(r["records"])
+            r["limits"]["pairs_high_water"] = len(r["identities"]["pairs"])
+            r["terminal"]["record_count"] = len(r["records"])
+            r["terminal"]["last_seq"] = len(r["records"])
+            with open(os.path.join(root, "receipt.json"), "wb") as f:
+                f.write(json.dumps(r).encode())
+            if raw:
+                raw(root)
+            rc, result = demotion_segment(root)
+            ok = rc == {"pass": 0, "fail": 1, "nonqualifying": 2}[status] and result.get("status") == status and result.get("reason") == reason
+            if values:
+                ok = ok and all(result.get(k) == v for k, v in values.items())
+            ok = ok and "SECRET-NATIVE-COOKIE" not in json.dumps(result)
+            print(f"self-test {'ok  ' if ok else 'FAIL'} demotion-{name}" + ("" if ok else f": got {rc} {result}; wanted {status}/{reason}"))
+            if not ok:
+                failures.append("demotion-" + name)
+            return root
+
+        first = case("C1-strict-fence2", "pass", "qualified", values={"A": 1, "withheld": 1, "B": 2})
+        second = case("C2-identical-public-wider-private", "fail", "public_allocation_mismatch",
+                      lambda r, i, l, m: wider(r, i, l, m, public=False))
+        for filename in ("inventory.json", "ledger.jsonl"):
+            with open(os.path.join(first, filename), "rb") as a, open(os.path.join(second, filename), "rb") as b:
+                if a.read() != b.read():
+                    failures.append("demotion-identical-" + filename)
+        case("C3-wider-ambiguous", "nonqualifying", "ambiguous_baseline_interval", wider)
+        case("C4-separated-fence3", "pass", "qualified", lambda r, i, l, m: wider(r, i, l, m, pre=112),
+             values={"A": 1, "withheld": 2, "B": 1})
+        case("C5-coherent-false-prefix", "fail", "independent_prefix_mismatch",
+             lambda r, i, l, m: wider(r, i, l, m, post=106), values={"observed_baseline": 3, "independent_prefix": 2})
+        case("C6-restored-history", "fail", "public_allocation_mismatch",
+             lambda r, i, l, m: i["edges"][1]["entries"].update(count=3))
+
+        def equal_fence(r, i, l, m):
+            r["records"][0].update(count=2, pre_ns=92, post_ns=94)
+            r["records"][1].update(absolute_count=2, growth=2)
+            r["records"][3].update(count_A=2, at_ns=95)
+            r["records"][4].update(pre_ns=96, post_ns=98)
+            r["records"].pop(7)
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["records"][-1].update(count_A=2, diagnostics=[{"gap_index": 0, "kind": "demoted_placed", "record_seq": 9}])
+            i["edges"][0]["entries"].update(count=2)
+            i["edges"][0]["entries"]["coverage"]["since_ns"] = 92
+            i["gaps"].pop(0)
+        case("C7-equal-fence", "fail", "non_advancing_retirement_fence", equal_fence)
+        case("initial-row-fence", "fail", "invalid_retirement_fence",
+             lambda r, i, l, m: r["records"][5].update(origin="initial_row"))
+        case("wrong-artifact", "fail", "artifact_binding_mismatch", bind=False)
+        case("wrong-pending-handle", "fail", "decision_mismatch",
+             lambda r, i, l, m: r["records"][10].update(pending_handle=2))
+        def unresolved(r, i, l, m):
+            r["records"][10].update(disposition="stale", destination=None, reason="stale")
+            r["records"][-1].update(count_B=0, diagnostics=r["records"][-1]["diagnostics"][:1])
+            i["edges"][1]["entries"]["count"] = 0
+            i["gaps"].pop(1)
+        case("unresolved-decision", "nonqualifying", "unresolved_allocation", unresolved)
+        case("incomplete-history", "nonqualifying", "incomplete_receipt",
+             lambda r, i, l, m: r["terminal"].update(history_complete=False, incomplete_reason="missing_origin"))
+        case("unrelated-public-gap", "nonqualifying", "unrelated_public_diagnostic",
+             lambda r, i, l, m: i["gaps"].append({"subject": "native loss", "reason": "lost", "caller": "c0", "module": "mB"}))
+        case("bool-count", "fail", "invalid_schema", lambda r, i, l, m: r["records"][5].update(count=True))
+        case("extra-pair", "nonqualifying", "unsupported_topology",
+             lambda r, i, l, m: r["identities"]["pairs"].append(dict(r["identities"]["pairs"][0], id=2)))
+        case("raw-native-key", "fail", "invalid_schema",
+             lambda r, i, l, m: r["identities"]["pairs"][0].update(native_cookie="SECRET-NATIVE-COOKIE"))
+        def huge(r, i, l, m):
+            r["records"][0]["count"] = 2**63 - 2
+            r["records"][1].update(absolute_count=2**63 - 2, growth=2**63 - 2)
+            r["records"][3]["count_A"] = 2**63 - 2
+            r["records"][5]["count"] = 2**63
+            r["records"][7].update(base_count=2**63 - 2, absolute_count=2**63)
+            r["records"][8]["count"] = 2**63 + 2
+            r["records"][9].update(base_count=2**63, absolute_count=2**63 + 2)
+            r["records"][11]["count_A"] = 2**63 - 2
+            i["edges"][0]["entries"]["count"] = 2**63 - 2
+            i["gaps"][0]["reason"] = "the current physical owner is not proven for absolute count range (9223372036854775806, 9223372036854775808] (2 unattributed calls); historical counts remain and no witness or module-level use is recorded"
+        case("huge-bounded-prefix", "fail", "independent_prefix_mismatch", huge)
+
+        def repeated(r, i, l, m):
+            stage = dict(r["records"][9], allocation_id=3, pending_handle=2)
+            decision = dict(r["records"][10], allocation_id=3, pending_handle=2)
+            r["records"][11:11] = [stage, decision]
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+        case("same-publication-repeat-union", "pass", "qualified", repeated,
+             values={"A": 1, "withheld": 1, "B": 2})
+        def huge_repeated(r, i, l, m):
+            huge(r, i, l, m)
+            repeated(r, i, l, m)
+        case("huge-repeat-union-bounded", "fail", "independent_prefix_mismatch", huge_repeated)
+
+        def shared_history(r, i, l, m):
+            # Independently written A5, shared(5,7], retired(7,8], B(8,10].
+            a_read, a_stage, a_decision, a_pub, scan, f_read, fence, hold, t_read, b_stage, b_decision, terminal_pub = map(_deep, r["records"])
+            a_read["count"] = 5
+            a_stage.update(absolute_count=5, growth=5)
+            a_pub["count_A"] = 5
+            shared_read = dict(f_read, read_id=4, count=7, pre_ns=100, post_ns=106)
+            shared_stage = dict(b_stage, allocation_id=3, base_read_id=1, absolute_read_id=4,
+                                base_count=5, absolute_count=7, growth=2, pending_handle=2, epoch=None)
+            shared_decision = dict(b_decision, allocation_id=3, pending_handle=2, disposition="rejected",
+                                   destination=None, reason="shared", publication_id=2)
+            shared_hold = dict(hold, base_count=5, absolute_count=7, read_id=4, scan_id=None,
+                              epoch=None, reason="shared", allocation_id=3, publication_id=2)
+            shared_pub = dict(a_pub, publication_id=2, at_ns=110, status="PARTIAL", diagnostics=[
+                {"gap_index": 0, "kind": "shared", "record_seq": 8},
+                {"gap_index": 1, "kind": "shared", "record_seq": 8}])
+            scan.update(pre_ns=120, post_ns=126)
+            f_read.update(count=8, pre_ns=130, post_ns=136)
+            hold.update(base_count=7, absolute_count=8, publication_id=3)
+            t_read["count"] = 10
+            b_stage.update(base_count=8, absolute_count=10)
+            b_decision["publication_id"] = 3
+            terminal_pub.update(publication_id=3, count_A=5, diagnostics=[
+                {"gap_index": 0, "kind": "shared", "record_seq": 8},
+                {"gap_index": 1, "kind": "shared", "record_seq": 8},
+                {"gap_index": 2, "kind": "retirement_prefix", "record_seq": 13},
+                {"gap_index": 3, "kind": "demoted_placed", "record_seq": 15}])
+            r["records"] = [a_read, a_stage, a_decision, a_pub, shared_read, shared_stage,
+                            shared_decision, shared_hold, shared_pub, scan, f_read, fence, hold,
+                            t_read, b_stage, b_decision, terminal_pub]
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["terminal"]["publication_id"] = 3
+            i["edges"][0]["entries"]["count"] = 5
+            i["edges"][1]["entries"]["coverage"]["since_ns"] = 130
+            shared_reason = "a native witness endpoint is shared by 2 admitted modules (re-resolved with 2 unattributed calls after sharing appeared): which module was used is ambiguous, so no edge and no module-level use is recorded"
+            i["gaps"] = [{"caller": None, "module": mid, "pid": None,
+                          "subject": "rejected demoted count", "reason": shared_reason,
+                          "budget": None, "repeats": 1} for mid in ("mA", "mB")] + [
+                          {"caller": "c0", "module": None, "pid": None, "subject": "rejected demoted count",
+                           "reason": "the current physical owner is not proven for absolute count range (7, 8] (1 unattributed calls); historical counts remain and no witness or module-level use is recorded",
+                           "budget": None, "repeats": 1}, dict(i["gaps"][1])]
+            calls = [dict(l[1], sequence=n, before_call_ns=pre, after_return_ns=post)
+                     for n, (pre, post) in enumerate([(11, 13), (21, 23), (31, 33), (41, 43), (79, 81),
+                                                    (89, 91), (93, 95), (109, 111), (149, 151), (154, 156)], 1)]
+            l[:] = [dict(l[0], ready_ns=10)] + calls + [dict(l[-1], completed_ns=157, calls=10)]
+            m.update(ready_ns=10, completed_ns=157, start_ns=1)
+            i["observation"]["started_ns"] = 1
+        case("R1-A5-withheld3-B2", "pass", "qualified", shared_history,
+             values={"A": 5, "withheld": 3, "B": 2})
+
+        def earlier_strict(r, i, l, m):
+            # Earlier count2 strict refresh must keep first fence identity.
+            r["records"].insert(5, dict(r["records"][5], read_id=4, count=2, pre_ns=97, post_ns=98))
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["records"][-1]["diagnostics"] = [
+                {"gap_index": 0, "kind": "retirement_prefix", "record_seq": 9},
+                {"gap_index": 1, "kind": "demoted_placed", "record_seq": 11}]
+        case("earlier-strict-fence-not-replaced", "fail", "first_retirement_fence_mismatch", earlier_strict)
+        def later_equal_scan(r, i, l, m):
+            r["records"].insert(5, dict(r["records"][4], scan_id=2, pre_ns=97, post_ns=98))
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["records"][7]["scan_id"] = 2
+            r["records"][8]["scan_id"] = 2
+            r["records"][-1]["diagnostics"] = [
+                {"gap_index": 0, "kind": "retirement_prefix", "record_seq": 9},
+                {"gap_index": 1, "kind": "demoted_placed", "record_seq": 11}]
+        case("original-equivalent-S-preserved", "fail", "original_scan_mismatch", later_equal_scan)
+        case("cancelled-S", "fail", "invalid_retirement_fence",
+             lambda r, i, l, m: r["records"][4].update(disposition="cancelled"))
+        case("cancelled-selected-epoch", "fail", "stale_baseline_identity",
+             lambda r, i, l, m: r["records"][6].update(disposition="cancelled"))
+        case("changed-domain", "fail", "identity_mismatch",
+             lambda r, i, l, m: r["identities"]["pairs"][0].update(domain_id=2))
+        case("changed-offset", "fail", "identity_mismatch",
+             lambda r, i, l, m: r["identities"]["targets"][0].update(offset=8192, endpoints=[8192]))
+        case("changed-executable", "fail", "identity_mismatch",
+             lambda r, i, l, m: r["identities"]["callers"][0].update(exe_sha256="99" * 32))
+        case("bool-public-incarnation", "fail", "invalid_schema",
+             lambda r, i, l, m: i["callers"][0].update(incarnation=False))
+        case("bool-eligibility-epoch", "fail", "invalid_schema",
+             lambda r, i, l, m: r["records"][4].update(eligibility_epoch=True))
+        case("bool-manifest-caller", "fail", "invalid_schema",
+             lambda r, i, l, m: m.update(caller_id=True))
+        case("unknown-diagnostic-reason", "fail", "diagnostic_mismatch",
+             lambda r, i, l, m: i["gaps"][1].update(reason="unrelated PARTIAL"))
+        case("unrelated-health", "nonqualifying", "unhealthy_capture",
+             lambda r, i, l, m: r["terminal"]["health"].update(native="loss"))
+        case("missing-return", "nonqualifying", "incomplete_ledger",
+             lambda r, i, l, m: l[3].update(completed=False, after_return_ns=None, return_status=None))
+        case("equal-clock-boundary", "nonqualifying", "ambiguous_baseline_interval",
+             lambda r, i, l, m: l[2].update(after_return_ns=100))
+        case("unready-prefix", "nonqualifying", "unproven_readiness",
+             lambda r, i, l, m: (l[0].update(ready_ns=79), m.update(ready_ns=79)))
+        case("time-namespace-mismatch", "fail", "clock_namespace_mismatch",
+             lambda r, i, l, m: m["clock"].update(observer_time_namespace="time:[2]"))
+        case("multiple-endpoints", "nonqualifying", "unsupported_topology",
+             lambda r, i, l, m: r["identities"]["targets"][0].update(endpoints=[4096, 8192]))
+        case("invalid-arithmetic", "fail", "allocation_arithmetic_mismatch",
+             lambda r, i, l, m: r["records"][9].update(growth=3))
+        case("bad-publication-count", "fail", "publication_allocation_mismatch",
+             lambda r, i, l, m: r["records"][-1].update(count_B=3))
+        case("saturation-refusal", "nonqualifying", "unhealthy_capture",
+             lambda r, i, l, m: r["terminal"]["health"].update(read="saturated"))
+        case("configured-cap-overflow", "fail", "invalid_schema",
+             lambda r, i, l, m: r["limits"].update(records=513))
+        def receipt_raw(root, transform):
+            path = os.path.join(root, "receipt.json")
+            with open(path, "rb") as f:
+                data = f.read()
+            with open(path, "wb") as f:
+                f.write(transform(data))
+        case("duplicate-json-key", "fail", "duplicate_json_key",
+             raw=lambda root: receipt_raw(root, lambda b: b.replace(b'{"schema":', b'{"schema": "duplicate", "schema":', 1)))
+        case("truncated-json", "fail", "malformed_json", raw=lambda root: receipt_raw(root, lambda b: b[:-1]))
+        for token in (b"-1", b"1.5", b"1e0", b"18446744073709551616", b"9" * 1000):
+            case("integer-token-" + str(len(token)) + "-" + token[:3].decode(), "fail", "invalid_integer",
+                 raw=lambda root, token=token: receipt_raw(root, lambda b: b.replace(b'"count": 2', b'"count": ' + token, 1)))
+        case("receipt-exact-cap", "pass", "qualified",
+             raw=lambda root: receipt_raw(root, lambda b: b + b" " * (1048576 - len(b))))
+        for filename, cap in DEMOTION_INPUT_CAPS.items():
+            def excessive(root, filename=filename, cap=cap):
+                with open(os.path.join(root, filename), "wb") as f:
+                    f.write(b" " * (cap + 1))
+            case("cap-plus-one-" + filename, "fail", "input_limit_exceeded", raw=excessive)
+        def long_line(root):
+            with open(os.path.join(root, "ledger.jsonl"), "wb") as f:
+                f.write(b" " * 1024 + b"\n")
+        case("ledger-line-cap", "fail", "ledger_limit_exceeded", raw=long_line)
+        case("missing-receipt", "nonqualifying", "missing_artifact", raw=lambda root: os.unlink(os.path.join(root, "receipt.json")))
+
+        def false_target_hash(r, i, l, m):
+            r["identities"]["targets"][0]["sha256"] = "ff" * 32
+            l[0]["target"]["sha256"] = "ff" * 32
+        case("physical-target-artifact-binding", "fail", "identity_mismatch", false_target_hash)
+        def false_module_hash(r, i, l, m):
+            r["identities"]["modules"][1]["sha256"] = "ff" * 32
+            i["modules"][1]["identity"]["sha256"] = "ff" * 32
+        case("provider-artifact-binding", "fail", "identity_mismatch", false_module_hash)
+        def false_workload_hash(r, i, l, m):
+            r["identities"]["callers"][0]["exe_sha256"] = "ff" * 32
+            l[0]["caller"]["exe_sha256"] = "ff" * 32
+        case("workload-artifact-binding", "fail", "identity_mismatch", false_workload_hash)
+        case("bool-edge-caller-id", "fail", "invalid_schema",
+             lambda r, i, l, m: r["identities"]["edges"][0].update(caller_id=True))
+        case("private-publication-clock-order", "fail", "publication_history_mismatch",
+             lambda r, i, l, m: r["records"][3].update(at_ns=1000))
+        case("private-initial-PARTIAL-unexplained", "fail", "diagnostic_mismatch",
+             lambda r, i, l, m: r["records"][3].update(status="PARTIAL"))
+        def cancellation_after_fence(r, i, l, m):
+            r["records"].insert(7, dict(r["records"][6], disposition="cancelled"))
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["records"][-1]["diagnostics"] = [
+                {"gap_index": 0, "kind": "retirement_prefix", "record_seq": 9},
+                {"gap_index": 1, "kind": "demoted_placed", "record_seq": 11}]
+        case("cancelled-epoch-cannot-place", "fail", "invalid_retirement_fence", cancellation_after_fence)
+        def withholding_overlap(r, i, l, m):
+            shared_history(r, i, l, m)
+            r["records"][12]["base_count"] = 6
+            i["gaps"][2]["reason"] = "the current physical owner is not proven for absolute count range (6, 8] (2 unattributed calls); historical counts remain and no witness or module-level use is recorded"
+        case("opposite-withheld-decisions-overlap", "fail", "conflicting_allocation", withholding_overlap)
+        case("non-u64-native-cap", "fail", "invalid_schema",
+             lambda r, i, l, m: i["edges"][1]["entries"].update(cap=100))
+        def genuine_exe_shape(r, i, l, m):
+            exe = {"dev": 35, "ino": 51, "mtime_secs": 1000, "mtime_nanos": 0}
+            r["identities"]["callers"][0]["exe"] = dict(exe)
+            l[0]["caller"]["exe"] = dict(exe)
+            i["callers"][0]["image"]["exe"] = dict(exe, path="/private/workload")
+        case("existing-public-executable-identity", "pass", "qualified", genuine_exe_shape)
+        def lifecycle_counter(r, i, l, m):
+            public_health(r, i, l, m)
+            i["observation"]["lifecycle"]["ring_loss"] = 1
+        case("public-lifecycle-counter-without-gap", "nonqualifying", "unhealthy_public_capture", lifecycle_counter)
+        def integrity_counter(r, i, l, m):
+            public_health(r, i, l, m)
+            i["observation"]["native_witnesses"]["integrity"] = 1
+        case("public-integrity-counter-without-gap", "nonqualifying", "unhealthy_public_capture", integrity_counter)
+        def refused_counter(r, i, l, m):
+            public_health(r, i, l, m)
+            i["budgets"]["inventory_endpoints"]["refused"] = 1
+        case("public-budget-refusal-without-gap", "nonqualifying", "unhealthy_public_capture", refused_counter)
+        def repeated_withhold(r, i, l, m):
+            r["records"].insert(8, dict(r["records"][7], supersedes_seq=8))
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["records"][-1]["diagnostics"] = [
+                {"gap_index": 0, "kind": "retirement_prefix", "record_seq": 8},
+                {"gap_index": 0, "kind": "retirement_prefix", "record_seq": 9},
+                {"gap_index": 1, "kind": "demoted_placed", "record_seq": 11}]
+            i["gaps"][0]["repeats"] = 2
+        case("repeated-withheld-range-union", "pass", "qualified", repeated_withhold,
+             values={"A": 1, "withheld": 1, "B": 2})
+        case("unexplained-withheld-repeat", "nonqualifying", "missing_public_disclosure",
+             lambda r, i, l, m: i["gaps"][0].update(repeats=2))
+        def growth_stages(r, i, l, m):
+            read = dict(r["records"][8], read_id=4, count=3, pre_ns=112, post_ns=116)
+            stage = dict(r["records"][9], allocation_id=3, absolute_read_id=4, absolute_count=3,
+                         growth=1, pending_handle=2)
+            decision = dict(r["records"][10], allocation_id=3, pending_handle=2)
+            r["records"][8:8] = [read, stage, decision]
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["records"][-1]["diagnostics"][1]["record_seq"] = 10
+        case("overlapping-growth-stages-union", "pass", "qualified", growth_stages,
+             values={"A": 1, "withheld": 1, "B": 2})
+        def placed_withheld(r, i, l, m):
+            r["records"][7]["base_count"] = 0
+        case("placed-and-withheld-overlap", "fail", "conflicting_allocation", placed_withheld)
+        def duplicate_decision(r, i, l, m):
+            r["records"].insert(11, dict(r["records"][10]))
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+        case("duplicate-terminal-decision", "fail", "duplicate_record_id", duplicate_decision)
+        def stale_baseline_id(r, i, l, m):
+            r["records"].insert(8, dict(r["records"][5], read_id=4, pre_ns=112, post_ns=116))
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["records"][10]["base_read_id"] = 4
+            r["records"][-1]["diagnostics"][1]["record_seq"] = 11
+        case("later-equal-base-ID-refused", "fail", "stale_baseline_identity", stale_baseline_id)
+        case("complete-limit-exhaustion", "nonqualifying", "incomplete_receipt",
+             lambda r, i, l, m: r["terminal"].update(incomplete_reason="capacity", sealed=False))
+        case("missing-public-health", "nonqualifying", "missing_public_health",
+             lambda r, i, l, m: i["observation"].pop("lifecycle"))
+        def false_intermediate(r, i, l, m):
+            growth_stages(r, i, l, m)
+            r["records"][8]["count"] = 4
+            r["records"][9].update(absolute_count=4, growth=2)
+        case("false-intermediate-absolute-prefix", "fail", "independent_prefix_mismatch", false_intermediate,
+             values={"observed_baseline": 4, "independent_prefix": 3})
+        def changed_attach_revision(r, i, l, m):
+            r["records"].insert(8, dict(r["records"][4], scan_id=2, pre_ns=112, post_ns=116, attach_revision=2))
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            r["records"][-1]["diagnostics"][1]["record_seq"] = 11
+        case("changed-relevant-membership-revision", "fail", "invalid_retirement_fence", changed_attach_revision)
+        case("bool-ledger-domain", "fail", "invalid_schema",
+             lambda r, i, l, m: l[0].update(domain_id=True))
+        case("bool-ledger-incarnation", "fail", "invalid_schema",
+             lambda r, i, l, m: l[0]["caller"].update(incarnation=False))
+        case("bool-public-suppressed", "fail", "invalid_schema",
+             lambda r, i, l, m: i.update(gaps_suppressed=False))
+        # Closure regressions: each omitting history/evidence validator below
+        # used to qualify a complete, rebound contradictory directory.
+        def renumber(r):
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+            pub = r["records"][-1]
+            pub["diagnostics"][0]["record_seq"] = next(x["seq"] for x in r["records"] if x["kind"] == "withhold")
+            pub["diagnostics"][1]["record_seq"] = next(x["seq"] for x in r["records"] if x["kind"] == "stage" and x["allocation_id"] == 2)
+        def cancel_before(r, i, l, m):
+            r["records"].insert(6, dict(r["records"][6], disposition="cancelled"))
+            renumber(r)
+        case("closure-cancel-before-selection", "fail", "invalid_retirement_fence", cancel_before)
+        def replacement(r, i, l, m, owners=(1,), epoch=2, at=8):
+            r["records"].insert(at, dict(r["records"][4], scan_id=2, eligibility_epoch=epoch,
+                                        owners=list(owners), pre_ns=112, post_ns=116))
+            renumber(r)
+        case("closure-superseding-owner-epoch", "fail", "invalid_retirement_fence", replacement)
+        case("closure-equivalent-owner-scan", "pass", "qualified",
+             lambda r, i, l, m: replacement(r, i, l, m, owners=(2,), epoch=1))
+        case("closure-replacement-before-selection", "fail", "invalid_retirement_fence",
+             lambda r, i, l, m: replacement(r, i, l, m, at=6))
+        def cancel_before_commit(r, i, l, m):
+            r["records"].insert(-1, dict(r["records"][6], disposition="cancelled"))
+            renumber(r)
+        case("closure-cancel-after-decision-before-commit", "fail", "invalid_retirement_fence", cancel_before_commit)
+        def later_read(r, i, l, m, count=5, terminal=False):
+            r["records"].insert(-1, dict(r["records"][8], read_id=4, count=count, pre_ns=167, post_ns=168))
+            if terminal:
+                r["terminal"]["final_read_id"] = 4
+            renumber(r)
+        case("closure-unreferenced-later-count", "fail", "independent_prefix_mismatch", later_read,
+             values={"observed_baseline": 5, "independent_prefix": 4})
+        case("closure-stale-terminal-read-ID", "nonqualifying", "incomplete_terminal_observation",
+             lambda r, i, l, m: later_read(r, i, l, m, count=4))
+        case("closure-latest-terminal-equal-count", "pass", "qualified",
+             lambda r, i, l, m: later_read(r, i, l, m, count=4, terminal=True))
+        def rejected_overlap(r, i, l, m, reason="shared"):
+            stage = dict(r["records"][9], allocation_id=3, pending_handle=2)
+            decision = dict(r["records"][10], allocation_id=3, pending_handle=2,
+                            disposition="rejected", destination=None, reason=reason)
+            r["records"][10:10] = [stage, decision]
+            renumber(r)
+        case("closure-rejected-shared-and-placed", "fail", "conflicting_allocation", rejected_overlap)
+        case("closure-rejected-no-edge-and-placed", "fail", "conflicting_allocation",
+             lambda r, i, l, m: rejected_overlap(r, i, l, m, "no_edge"))
+        def retry(r, i, l, m):
+            stage = dict(r["records"][9], allocation_id=3, pending_handle=2)
+            decision = dict(r["records"][10], allocation_id=3, pending_handle=2,
+                            disposition="stale", destination=None, reason="stale", publication_id=None)
+            r["records"][9]["supersedes_allocation_id"] = 3
+            r["records"][9:9] = [stage, decision]
+            renumber(r)
+        case("closure-explicit-pending-retry", "pass", "qualified", retry)
+        def admission_retry(r, i, l, m):
+            read = dict(r["records"][8], read_id=4, count=3, pre_ns=112, post_ns=116)
+            stage = dict(r["records"][9], allocation_id=3, absolute_read_id=4,
+                         absolute_count=3, growth=1, pending_handle=2)
+            decision = dict(r["records"][10], allocation_id=3, pending_handle=2,
+                            disposition="unadmitted", destination=None, reason="unadmitted")
+            publication = dict(r["records"][11], at_ns=117, count_B=0,
+                               diagnostics=[dict(r["records"][11]["diagnostics"][0])])
+            r["records"][9]["supersedes_allocation_id"] = 3
+            r["records"][10]["publication_id"] = 3
+            r["records"][11]["publication_id"] = 3
+            r["terminal"]["publication_id"] = 3
+            r["records"][8:8] = [read, stage, decision, publication]
+            renumber(r)
+        case("closure-published-unadmitted-retry", "pass", "qualified", admission_retry)
+        def terminal_rejection_retry(r, i, l, m):
+            admission_retry(r, i, l, m)
+            next(d for d in r["records"] if d["kind"] == "decision" and d["allocation_id"] == 3).update(
+                disposition="rejected", reason="shared")
+        case("closure-terminal-rejection-cannot-retry", "fail", "conflicting_allocation", terminal_rejection_retry)
+        def no_edge_terminal(r, i, l, m):
+            unresolved(r, i, l, m)
+            r["records"][10].update(disposition="rejected", reason="no_edge")
+        case("closure-undisclosed-terminal-no-edge", "nonqualifying", "unresolved_rejected_range", no_edge_terminal,
+             values={"A": 1, "withheld": 3, "B": 0})
+        def namespace(r, i, l, m, value):
+            m["clock"].update(time_namespace=value, observer_time_namespace=value)
+            l[0]["time_namespace"] = value
+        case("closure-unavailable-namespaces", "nonqualifying", "unavailable_clock",
+             lambda r, i, l, m: namespace(r, i, l, m, None))
+        for name, value in (("numeric", 1), ("empty", ""), ("wrong-shape", "same"), ("overlong", "time:[" + "1" * 30 + "]")):
+            case("closure-" + name + "-namespace", "fail", "invalid_schema",
+                 lambda r, i, l, m, value=value: namespace(r, i, l, m, value))
+        case("closure-conflicting-namespaces", "fail", "clock_namespace_mismatch",
+             lambda r, i, l, m: m["clock"].update(observer_time_namespace="time:[2]"))
+        case("closure-absent-manifest-namespace", "nonqualifying", "unavailable_clock",
+             lambda r, i, l, m: m["clock"].pop("time_namespace"))
+        case("closure-absent-ledger-namespace", "nonqualifying", "unavailable_clock",
+             lambda r, i, l, m: l[0].pop("time_namespace"))
+        def fake_diagnostic(r, i, l, m):
+            r["records"][3].update(status="PARTIAL", diagnostics=[
+                {"gap_index": 1, "kind": "demoted_placed", "record_seq": 1}])
+        case("closure-early-fake-diagnostic", "fail", "diagnostic_mismatch", fake_diagnostic)
+        def early_shared_bad_reference(r, i, l, m):
+            shared_history(r, i, l, m)
+            r["records"][8]["diagnostics"][0]["record_seq"] = 5
+        case("closure-intermediate-shared-diagnostic", "fail", "diagnostic_mismatch", early_shared_bad_reference)
+        for reason in ("lifecycle_loss", "process_gone"):
+            case("closure-false-census-" + reason, "fail", "public_census_mismatch",
+                 lambda r, i, l, m, reason=reason: i["observation"]["native_witnesses"].update(unbound_reasons={reason: 1}))
+        def coherent_loss(r, i, l, m):
+            census = i["observation"]["native_witnesses"]
+            census.update(rows=2, unbound=1, unbound_reasons={"lifecycle_loss": 1})
+            census["placement"]["unresolved"] = 1
+        case("closure-coherent-native-loss", "nonqualifying", "unhealthy_public_capture", coherent_loss)
+        case("closure-false-public-capture-time", "fail", "public_observation_mismatch",
+             lambda r, i, l, m: i["observation"].update(started_ns=200, ended_ns=201))
+        case("closure-public-window-before-ledger", "fail", "public_observation_mismatch",
+             lambda r, i, l, m: i["observation"].update(started_ns=80))
+        case("closure-public-window-before-terminal", "fail", "public_observation_mismatch",
+             lambda r, i, l, m: i["observation"].update(ended_ns=165))
+        case("closure-unavailable-public-window", "nonqualifying", "unavailable_public_observation",
+             lambda r, i, l, m: i["observation"].update(started_ns=0))
+        case("closure-malformed-public-window", "fail", "invalid_schema",
+             lambda r, i, l, m: i["observation"].update(ended_ns=True))
+        # Round-2 contract controls exercise discriminator branches and
+        # references, including branches unused by the selected B decision.
+        def renumber_all(r):
+            positions = {rec["seq"]: n for n, rec in enumerate(r["records"], 1) if rec["seq"]}
+            for rec in r["records"]:
+                if rec["kind"] == "publication":
+                    for diagnostic in rec["diagnostics"]:
+                        diagnostic["record_seq"] = positions[diagnostic["record_seq"]]
+            for n, rec in enumerate(r["records"], 1):
+                rec["seq"] = n
+        def shared_refs(r, i, l, m, scan_id, epoch):
+            shared_history(r, i, l, m)
+            r["records"][7].update(scan_id=scan_id, epoch=epoch)
+        for name, scan_id, epoch in (("dangling", 512, 512), ("scan-only", 512, None),
+                                     ("epoch-only", None, 512), ("future", 1, 1), ("contradictory", 1, 2)):
+            case("contract-shared-" + name + "-authority", "fail", "invalid_schema",
+                 lambda r, i, l, m, sid=scan_id, epoch=epoch: shared_refs(r, i, l, m, sid, epoch))
+        def retry_reason(r, i, l, m, disposition, reason):
+            retry(r, i, l, m)
+            next(x for x in r["records"] if x["kind"] == "decision" and x["allocation_id"] == 3).update(
+                disposition=disposition, reason=reason)
+        for disposition, reason in (("stale", "shared"), ("stale", "no_edge"), ("stale", "unadmitted"),
+                                     ("unadmitted", "shared"), ("unadmitted", "no_edge"), ("unadmitted", "stale")):
+            case("contract-retry-" + disposition + "-" + reason, "fail", "decision_mismatch",
+                 lambda r, i, l, m, d=disposition, why=reason: retry_reason(r, i, l, m, d, why))
+        case("contract-unpublished-unadmitted-retry", "pass", "qualified",
+             lambda r, i, l, m: retry_reason(r, i, l, m, "unadmitted", "unadmitted"))
+        for reason in ("stale", "unadmitted"):
+            case("contract-terminal-rejected-" + reason, "fail", "decision_mismatch",
+                 lambda r, i, l, m, reason=reason: rejected_overlap(r, i, l, m, reason))
+        def unpublished_rejection(r, i, l, m):
+            rejected_overlap(r, i, l, m)
+            next(x for x in r["records"] if x["kind"] == "decision" and x["allocation_id"] == 3)["publication_id"] = None
+        case("contract-terminal-rejection-needs-publication", "fail", "decision_mismatch", unpublished_rejection)
+        def nonselected_fence(r, i, l, m, disposition, epoch):
+            r["records"].insert(6, dict(r["records"][6], seq=0, disposition=disposition, epoch=epoch))
+            renumber_all(r)
+        for disposition in ("cancelled", "provisional"):
+            case("contract-" + disposition + "-fence-epoch", "fail", "stale_baseline_identity",
+                 lambda r, i, l, m, d=disposition: nonselected_fence(r, i, l, m, d, 512))
+        case("contract-valid-provisional-fence", "pass", "qualified",
+             lambda r, i, l, m: nonselected_fence(r, i, l, m, "provisional", 1))
+        def earlier_owners(r, i, l, m, owners):
+            r["records"].insert(4, dict(r["records"][4], seq=0, scan_id=2,
+                                        eligibility_epoch=2, owners=owners, pre_ns=88, post_ns=89))
+            renumber_all(r)
+        case("contract-unknown-prior-scan-owner", "fail", "identity_mismatch",
+             lambda r, i, l, m: earlier_owners(r, i, l, m, [512]))
+        case("contract-duplicate-prior-scan-owner", "fail", "duplicate_identity",
+             lambda r, i, l, m: earlier_owners(r, i, l, m, [1, 1]))
+        case("contract-valid-prior-scan-owner", "pass", "qualified",
+             lambda r, i, l, m: earlier_owners(r, i, l, m, [1]))
+        case("contract-initial-stage-epoch", "fail", "invalid_schema",
+             lambda r, i, l, m: r["records"][1].update(epoch=512))
+        def direct_with_handle(r, i, l, m):
+            r["records"][1]["pending_handle"] = 2
+            r["records"][2]["pending_handle"] = 2
+        case("contract-direct-stage-pending-handle", "fail", "invalid_schema", direct_with_handle)
+        def missing_pending_handle(r, i, l, m):
+            r["records"][9]["pending_handle"] = None
+            r["records"][10]["pending_handle"] = None
+        case("contract-pending-stage-needs-handle", "fail", "invalid_schema", missing_pending_handle)
+        case("contract-pending-stage-direct-destination", "fail", "invalid_schema",
+             lambda r, i, l, m: r["records"][9].update(destination="B"))
+        def duplicate_pending_handle(r, i, l, m):
+            repeated(r, i, l, m)
+            r["records"][11]["pending_handle"] = 1
+            r["records"][12]["pending_handle"] = 1
+        case("contract-duplicate-pending-handle", "fail", "duplicate_record_id", duplicate_pending_handle)
+        def bad_supersession_id(r, i, l, m):
+            retry(r, i, l, m)
+            next(x for x in r["records"] if x["kind"] == "stage" and x["allocation_id"] == 2)["supersedes_allocation_id"] = True
+        case("contract-bool-optional-supersession-ID", "fail", "invalid_schema", bad_supersession_id)
+        def shared_read_alias(r, i, l, m):
+            shared_history(r, i, l, m)
+            r["records"].insert(7, dict(r["records"][4], seq=0, read_id=5, pre_ns=107, post_ns=108))
+            r["records"][8]["read_id"] = 5
+            renumber_all(r)
+        case("contract-shared-withhold-original-read-ID", "fail", "stale_baseline_identity", shared_read_alias)
+        def shared_stage_epoch(r, i, l, m):
+            shared_history(r, i, l, m)
+            r["records"][5]["epoch"] = 512
+        case("contract-shared-stage-dangling-epoch", "fail", "stale_baseline_identity", shared_stage_epoch)
+        def direct_B(r, i, l, m):
+            r["records"][9].update(destination="B", pending_handle=None)
+            r["records"][10]["pending_handle"] = None
+        case("contract-valid-confirmed-direct-B", "pass", "qualified", direct_B)
+        # Full CLI inputs, with automatic timeout kill+wait owned by run().
+        # A FIFO open must never defeat the cap+1 reader's bound.
+        import subprocess
+        for filename in list(DEMOTION_INPUT_CAPS) + ["observer_binary.bin"]:
+            for special in ("fifo", "symlink", "directory"):
+                name = "CLI-" + special + "-" + filename
+                root = case(name + "-setup", "pass", "qualified")
+                path = os.path.join(root, filename)
+                os.rename(path, path + ".saved")
+                if special == "fifo":
+                    os.mkfifo(path, 0o600)
+                elif special == "symlink":
+                    os.symlink(filename + ".saved", path)
+                else:
+                    os.mkdir(path)
+                try:
+                    proc = subprocess.run([sys.executable, "-I", __file__, "demotion-segment", root],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
+                    result = json.loads(proc.stdout)
+                    ok = proc.returncode == 1 and result.get("reason") == "unsupported_artifact_type"
+                    detail = f"exit={proc.returncode}, reason={result.get('reason')}"
+                except subprocess.TimeoutExpired:
+                    ok, detail = False, "owned CLI timed out (killed and reaped)"
+                except (ValueError, OSError):
+                    ok, detail = False, "invalid CLI result"
+                print(f"self-test {'ok  ' if ok else 'FAIL'} demotion-{name}" + ("" if ok else ": " + detail))
+                if not ok:
+                    failures.append("demotion-" + name)
+    return failures
+
+
 class Synth:
     """A consistent synthetic qualification: system, dashboard and stop runs.
     Cases mutate one document (or the manifest) and expect one check to fail."""
@@ -4556,6 +6242,7 @@ def self_test():
             "LX": s.ledgers["LX"].replace("state=Z", "state=S")}})
         case("ledger-unflushed", "LEDGER-PARSE", lambda s, d, dash: {"ledgers": {
             "P1": s.ledgers["P1"] + "LEDGER_UNFLUSHED cell=P1 pid=1 reason=lock-held\n"}})
+    failures.extend(demotion_self_test())
     if failures:
         print(f"{ORACLE_ID} self-test FAILED: {failures}")
         return 1
@@ -4566,6 +6253,10 @@ def self_test():
 def main(argv):
     if argv[:1] == ["--self-test"]:
         return self_test()
+    if len(argv) == 2 and argv[0] == "demotion-segment":
+        code, result = demotion_segment(argv[1])
+        print(json.dumps(result, sort_keys=True))
+        return code
     if len(argv) == 2 and argv[0] in ("check", "ledgers"):
         res = oracle(argv[1], ledgers_only=argv[0] == "ledgers")
         return report(res, os.path.join(argv[1], f"oracle-{argv[0]}.jsonl"), argv[0] == "ledgers")

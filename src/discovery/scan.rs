@@ -1198,6 +1198,17 @@ impl CaptureWorkBudget {
         self.deadline_ns
     }
 
+    /// The existing deadline, without renewing a window or hiding the
+    /// absence of one. Callers retain the normal stop/clock checks.
+    pub(crate) fn effective_deadline_ns(&self) -> Option<u64> {
+        let window = self.active_window.as_ref().map(|window| window.deadline_ns);
+        match (window, self.deadline_ns) {
+            (Some(window), Some(transaction)) => Some(window.min(transaction)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
+    }
+
     fn check_deadline(&mut self, now: Option<u64>) -> Option<&'static str> {
         self.collection_checkpoint(0);
         if let Some(reason) = self.scan_stop_reason {

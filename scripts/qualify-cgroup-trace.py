@@ -28,11 +28,15 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 CGROUP2_MAGIC = 0x63677270
-CELLS = ('stable', 'onecall', 'burst', 'migrate', 'exec', 'run')
+INITIAL_CELLS = ('stable', 'onecall', 'burst', 'migrate', 'exec', 'run')
+SPARSE = {'sparse1': (5, 1000), 'sparse10': (4, 10000),
+          'sparse59': (3, 59000), 'sparse61': (3, 61000)}
+MATRIX_CELLS = (*SPARSE, 'short', 'reexec', 'nonleader')
+CELLS = (*INITIAL_CELLS, *MATRIX_CELLS)
 CANARIES = ('N3_PRIVATE_BUFFER_91b947', 'N3_PRIVATE_ENV_a279d2', 'N3_PRIVATE_ARG_248abc')
-REMAINING = ('sparse calls at 1s, 10s, 59s and >60s', 'short-lived caller',
+REMAINING = ('actual fixed registration/sample deadline and equality proof',
              'unchanged leave while the allowed identity sample actually runs, then reenter',
-             'same-path exec', 'nonleader exec', 'PID reuse', 'PID/time/mount namespaces and domains',
+             'PID reuse', 'PID/time/mount namespaces and domains',
              'event/discovery loss', 'entry/path/interest capacity and fairness',
              'long resource/read plateau and isolated-host performance qualification')
 
@@ -43,6 +47,15 @@ class CleanupError(RuntimeError):
         self.errors = tuple(errors)
         details = '; '.join(f'{type(error).__name__}: {error}' for error in self.errors)
         super().__init__(f'{message}: {details}')
+
+
+def cell_timing(name):
+    if name in SPARSE:
+        count, gap = SPARSE[name]
+        span = (count - 1) * gap / 1000
+        return dict(duration_seconds=int(span + 30), acknowledgement_seconds=span + 10)
+    return dict(duration_seconds=30 if name in ('reexec', 'nonleader') else 20,
+                acknowledgement_seconds=10)
 
 
 class TerminationRequested(BaseException):
@@ -453,10 +466,10 @@ class Reader:
             except queue.Empty:
                 pass
 
-    def record(self, kind, image=0, phase=None):
+    def record(self, kind, image=0, phase=None, seconds=10):
         return self.wait(lambda reader: next((row for row in reader.records
             if row.get('kind') == kind and row.get('image') == image
-            and (phase is None or row.get('phase') == phase)), None))
+            and (phase is None or row.get('phase') == phase)), None), seconds)
 
     def finish(self):
         self.thread.join(timeout=3)
@@ -533,7 +546,8 @@ class Resources:
                     limitation='aggregate /proc/io reads; not identity-reader counts or a capacity plateau')
 
 
-def command(caller, reader, fn, count, delay, phase, scope, image=0, group=None, phases=None):
+def command(caller, reader, fn, count, delay, phase, scope, image=0, group=None, phases=None,
+            spaced=False, acknowledgement_seconds=10):
     caller.verify()
     expected_group = None
     if group is not None:
@@ -542,9 +556,10 @@ def command(caller, reader, fn, count, delay, phase, scope, image=0, group=None,
         if cgroup_of(caller.pid) != expected_group:
             raise ValueError('workload phase starts outside its independently expected membership')
     begin = time.monotonic_ns()
-    caller.popen.stdin.write(f'calls {fn} {count} {delay} {phase} {scope}\n')
+    instruction = 'spaced' if spaced else 'calls'
+    caller.popen.stdin.write(f'{instruction} {fn} {count} {delay} {phase} {scope}\n')
     caller.popen.stdin.flush()
-    acknowledgement = reader.record('ack', image, phase)
+    acknowledgement = reader.record('ack', image, phase, seconds=acknowledgement_seconds)
     finish = time.monotonic_ns()
     caller.verify()
     if expected_group is not None and cgroup_of(caller.pid) != expected_group:
@@ -552,7 +567,45 @@ def command(caller, reader, fn, count, delay, phase, scope, image=0, group=None,
     if phases is not None:
         phases.append(dict(image=image, fn=fn, count=count, phase=phase, scope=scope,
                            t0=begin, t1=finish, actual_cgroup=expected_group))
+        if spaced:
+            phases[-1]['gap_ms'] = delay
     return acknowledgement
+
+
+def short_workload(args, directory, env, provider, caller_pin, selected, owners, readers, images):
+    gate = directory / 'short-start-gate'
+    started = time.monotonic_ns()
+    def remaining():
+        seconds = 1 - (time.monotonic_ns() - started) / 1e9
+        if seconds <= 0:
+            raise TimeoutError('short child exceeded the actual one-second lifetime limit')
+        return seconds
+    child = spawn_owned(owners, [str(caller_pin.path), str(provider.path), '1', 'selected',
+        '--start-gate', str(gate), '--auto-gate', str(gate), '--auto-count', '1', '--auto-delay-ms', '0',
+        '--canary', CANARIES[2]], uid=args.uid, user=args.uid, group=args.gid, extra_groups=[],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, start_new_session=True)
+    # This is our direct child, so retain spawn_owned's continuous enrollment.
+    # Its parent remains alive throughout cleanup regardless of observer order.
+    stdout = Reader(child.popen.stdout, directory / 'short.ledger.jsonl')
+    stderr = Reader(child.popen.stderr, directory / 'short.stderr.txt')
+    readers.extend((stdout, stderr))
+    image = stdout.record('image', 1, seconds=remaining())
+    images.append(caller_pin.image_receipt(image, child))
+    selected.move(child)
+    begin = time.monotonic_ns()
+    remaining()
+    gate.touch(mode=0o644, exist_ok=False)
+    stdout.record('ack', 1, 'done', seconds=remaining())
+    phase_end = time.monotonic_ns()
+    if not child.wait_exit(remaining()):
+        raise TimeoutError('short child failed to exit within its actual lifetime limit')
+    exited = time.monotonic_ns()
+    return dict(reader=stdout, caller_rc=child.popen.wait(timeout=3),
+                lifetime=dict(image=1, spawn_started_ns=started, exit_observed_ns=exited, limit_seconds=1),
+                phase=dict(image=1, fn='C_GenerateRandom', count=1, phase='main', scope='selected',
+                           t0=begin, t1=phase_end,
+                           actual_cgroup='/' + str(selected.path.relative_to('/sys/fs/cgroup'))))
 
 
 def terminate(owner):
@@ -598,15 +651,21 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
     selected, outside = cgroups
     owners, readers, images, sampler = [], [], [], None
     observer = caller = None
-    receipt = dict(cell=name, require_named=name in ('stable', 'migrate', 'exec', 'run'),
+    budget = cell_timing(name)
+    receipt = dict(cell=name, require_named=name in ('stable', 'migrate', 'exec', 'run',
+                                                   'sparse1', 'sparse10', 'reexec', 'nonleader'),
                    fresh_observer=True, scope_created_ns=scope_created_ns,
                    pid_namespace=process_identity(os.getpid())['pid_namespace'],
                    time_namespace=process_identity(os.getpid())['time_namespace'],
-                   privacy_canaries=list(CANARIES), images=images, stop_limit_seconds=5)
-    if name in ('stable', 'migrate', 'run'):
+                   privacy_canaries=list(CANARIES), images=images, stop_limit_seconds=5,
+                   timing_budget=budget)
+    if name in ('stable', 'migrate', 'run', 'sparse1', 'sparse10'):
         receipt['require_named_images'] = [0]
-    elif name == 'exec':
+    elif name in ('exec', 'reexec', 'nonleader'):
         receipt['require_named_images'] = [0, 1]
+    if name in ('reexec', 'nonleader', 'short'):
+        receipt['first_unknown_images'] = [1]
+    ledger_readers = []
     phases = []
     if name != 'run':
         receipt['phases'] = phases
@@ -635,7 +694,7 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
             if receipt['selected_initial_pids'] != [caller.pid]:
                 raise ValueError('selected cgroup contains a process other than the owned caller')
             argv = [str(binary.path), 'trace', '--cgroup', str(selected.path), '--module', str(provider.path),
-                    '--duration', '20s', '-o', str(trace_path)]
+                    '--duration', f"{budget['duration_seconds']}s", '-o', str(trace_path)]
         else:
             gate = directory / 'run-gate'
             argv = [str(binary.path), 'run', '--trace', '--module', str(provider.path), '--pause', 'auto',
@@ -672,7 +731,7 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
             receipt['fixture_done_ns'] = done['t']
             receipt['observer_rc'] = proc.wait(timeout=5)
             receipt['caller_rc'] = receipt['observer_rc']
-            ledger_reader = capture
+            ledger_readers = [capture]
         else:
             if name == 'stable':
                 workload('C_GenerateRandom', 20, 200, 'main', 'selected')
@@ -680,21 +739,41 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
                 workload('C_GenerateRandom', 1, 0, 'main', 'selected')
             elif name == 'burst':
                 workload('C_GenerateRandom', 256, 0, 'main', 'selected')
+            elif name in SPARSE:
+                count, gap = SPARSE[name]
+                command(caller, stdout, 'C_GenerateRandom', count, gap, 'sparse', 'selected',
+                        group=selected, phases=phases, spaced=True,
+                        acknowledgement_seconds=budget['acknowledgement_seconds'])
+            elif name == 'short':
+                short = short_workload(args, directory, env, provider, callers[0], selected,
+                                       owners, readers, images)
+                receipt['short_lifetime'] = short['lifetime']
+                receipt['short_caller_rc'] = short['caller_rc']
+                phases.append(short['phase'])
+                ledger_readers.append(short['reader'])
             else:
                 workload('C_GenerateRandom', 20, 200, 'a', 'selected')
                 outside.move(caller)
                 workload('C_GetInfo', 3, 50, 'outside-a', 'outside')
                 image_id = 0
-                if name == 'exec':
-                    caller.popen.stdin.write(f'exec {callers[1].path}\n')
+                if name in ('exec', 'reexec', 'nonleader'):
+                    next_pin = callers[0] if name == 'reexec' else callers[1]
+                    instruction = 'thread-exec' if name == 'nonleader' else 'exec'
+                    transition_start = time.monotonic_ns()
+                    caller.popen.stdin.write(f'{instruction} {next_pin.path}\n')
                     caller.popen.stdin.flush()
                     stdout.record('ready', 1)
                     image = stdout.record('image', 1)
-                    images.append(callers[1].image_receipt(image, caller))
+                    images.append(next_pin.image_receipt(image, caller))
+                    if name in ('reexec', 'nonleader'):
+                        request = stdout.record('exec')
+                        receipt['exec_transitions'] = [dict(from_image=0, to_image=1,
+                            mode='nonleader' if name == 'nonleader' else 'leader', same_path=name == 'reexec',
+                            t0=transition_start, t1=time.monotonic_ns(), request=dict(request))]
                     image_id = 1
                     workload('C_GetInfo', 3, 50, 'outside-b', 'outside', 1)
                 selected.move(caller)
-                workload('C_GetSessionInfo' if name == 'exec' else 'C_GenerateRandom',
+                workload('C_GetSessionInfo' if name in ('exec', 'reexec', 'nonleader') else 'C_GenerateRandom',
                          20, 200, 'reenter', 'selected', image_id)
             stop_started = time.monotonic_ns()
             receipt['stop_kind'] = 'SIGINT'
@@ -704,9 +783,11 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
             outside.move(caller)
             caller.popen.stdin.write('stop\n')
             caller.popen.stdin.flush()
-            stdout.record('ack', 1 if name == 'exec' else 0, 'done')
+            stdout.record('ack', 1 if name in ('exec', 'reexec', 'nonleader') else 0, 'done')
             receipt['caller_rc'] = caller.popen.wait(timeout=3)
-            ledger_reader = stdout
+            if receipt.get('short_caller_rc'):
+                receipt['caller_rc'] = receipt['short_caller_rc']
+            ledger_readers.append(stdout)
         if 'observer_stopped_ns' not in receipt:
             receipt['observer_stopped_ns'] = time.monotonic_ns()
         # Measure observer stop only; workload teardown/cleanup is separate.
@@ -721,7 +802,7 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
             reader.finish()
         trace = ''.join(capture.lines)
         receipt['observer_stderr'] = ''.join(errors.lines)
-        ledger = ledger_reader.records
+        ledger = [record for reader in ledger_readers for record in reader.records]
         (directory / 'ledger.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in ledger))
         (directory / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
         oracle = runpy.run_path(str(ROOT / 'scripts/cgroup-trace-oracle.py'))['evaluate']
@@ -748,7 +829,7 @@ def _main():
     parser.add_argument('--source-revision', required=True)
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)
-    parser.add_argument('--cells', default=','.join(CELLS))
+    parser.add_argument('--cells', default=','.join(INITIAL_CELLS))
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     names = args.cells.split(',')
@@ -801,7 +882,8 @@ def _main():
                               ('cell', 'pass', 'calls', 'named', 'unknown', 'false_names', 'errors')}), flush=True)
         summary = dict(source_revision=args.source_revision, candidate=binary.metadata(),
                        provider=provider.metadata(), abi='Linux x86-64 LP64', kernel=os.uname().release,
-                       cells=results, remaining=list(REMAINING),
+                       cells=results, remaining=list(REMAINING) +
+                       [f'unexecuted prepared cell: {name}' for name in MATRIX_CELLS if name not in names],
                        resource_qualification='exploratory shared loaded build host')
         (args.out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         return 0 if all(result['pass'] for result in results) else 1

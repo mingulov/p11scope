@@ -1,12 +1,14 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Native Linux x86-64 LP64 caller. Real SoftHSM calls; no simulated provider.
  * Every provider call, including setup/teardown, has an independent ledger.
- * Interactive: calls FUNCTION COUNT DELAY_MS PHASE SCOPE | exec PATH | stop
- * Auto: MODULE IMAGE SCOPE --auto-gate PATH [--canary PRIVATE_VALUE]. */
+ * Interactive: calls|spaced FUNCTION COUNT DELAY_MS PHASE SCOPE;
+ * exec|thread-exec PATH; stop. Auto: --start-gate PATH --auto-gate PATH
+ * [--auto-count N --auto-delay-ms N --canary PRIVATE_VALUE]. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,9 +129,12 @@ static void teardown(void) {
   call("C_CloseSession", rv, "teardown", t);
   t = now_ns(); rv = F(1, CK_RV (*)(void *))(NULL); call("C_Finalize", rv, "teardown", t);
 }
-static void calls(const char *fn, unsigned long n, unsigned long ms, const char *phase) {
-  if (n > 10000 || ms > 10000 || (strcmp(fn, "C_GenerateRandom") && strcmp(fn, "C_GetSessionInfo") && strcmp(fn, "C_GetInfo"))) exit(2);
+static void calls(const char *fn, unsigned long n, unsigned long ms, const char *phase, int spaced) {
+  if (n > 10000 || ms > (spaced ? 61000UL : 10000UL) ||
+      (spaced && (!n || (n - 1) * ms > 125000UL)) ||
+      (strcmp(fn, "C_GenerateRandom") && strcmp(fn, "C_GetSessionInfo") && strcmp(fn, "C_GetInfo"))) exit(2);
   for (unsigned long i = 0; i < n; i++) {
+    if (spaced && i && ms) delay_ms(ms);
     CK_RV rv; unsigned long long t = now_ns();
     if (!strcmp(fn, "C_GenerateRandom")) {
       unsigned char bytes[64];
@@ -141,38 +146,64 @@ static void calls(const char *fn, unsigned long n, unsigned long ms, const char 
       CK_ULONG info[32]; rv = F(2, CK_RV (*)(void *))(info);
     }
     call(fn, rv, phase, t);
-    if (ms) delay_ms(ms);
+    if (!spaced && ms) delay_ms(ms);
   }
   ack(phase);
 }
+static void wait_gate(const char *gate, unsigned long long limit_ns) {
+  unsigned long long end = now_ns() + limit_ns;
+  while (access(gate, F_OK)) { if (now_ns() >= end) exit(1); delay_ms(1); }
+}
+static void exec_image(const char *path, const char *mode) {
+  header("exec"); printf(",\"pid\":%d,\"tid\":%ld,\"start_time\":%llu,\"mode\":",
+                        getpid(), syscall(SYS_gettid), birth()); quoted(mode);
+  printf(",\"path\":"); quoted(path); printf(",\"scope\":"); quoted(scope);
+  printf(",\"t\":%llu}\n", now_ns()); fflush(stdout);
+  char next_image[32]; snprintf(next_image, sizeof next_image, "%lu", image + 1);
+  execl(path, path, module, next_image, "outside", (char *)NULL); perror("exec"); exit(1);
+}
+static void *thread_exec(void *path) { exec_image(path, "nonleader"); return NULL; }
 int main(int argc, char **argv) {
   if (sizeof(void *) != 8 || sizeof(unsigned long) != 8 || argc < 4) return 2;
   module = argv[1]; image = strtoul(argv[2], NULL, 10); scope = argv[3];
-  const char *gate = NULL;
+  const char *gate = NULL, *start_gate = NULL;
+  unsigned long auto_count = 20, auto_delay = 200;
   for (int i = 4; i < argc; i += 2) {
     if (i + 1 >= argc) return 2;
     if (!strcmp(argv[i], "--auto-gate")) gate = argv[i + 1];
+    else if (!strcmp(argv[i], "--start-gate")) start_gate = argv[i + 1];
+    else if (!strcmp(argv[i], "--auto-count")) auto_count = strtoul(argv[i + 1], NULL, 10);
+    else if (!strcmp(argv[i], "--auto-delay-ms")) auto_delay = strtoul(argv[i + 1], NULL, 10);
     else if (!strcmp(argv[i], "--canary")) { private_buffer[63] ^= (unsigned char)argv[i + 1][0]; }
     else return 2;
   }
   const char *env = getenv("N3_PRIVATE_ENV");
   if (env) private_buffer[62] ^= (unsigned char)env[0];
-  observed_image(); setup();
+  if (!auto_count || auto_count > 10000 || auto_delay > 10000 || auto_count * auto_delay > 125000UL) return 2;
+  observed_image();
+  if (start_gate) wait_gate(start_gate, 5000000000ULL);
+  setup();
   if (gate) {
-    unsigned long long end = now_ns() + 30000000000ULL;
-    while (access(gate, F_OK)) { if (now_ns() >= end) return 1; delay_ms(10); }
-    calls("C_GenerateRandom", 20, 200, "main"); teardown(); ack("done"); return 0;
+    wait_gate(gate, 30000000000ULL);
+    calls("C_GenerateRandom", auto_count, auto_delay, "main", 0); teardown(); ack("done"); return 0;
   }
   char line[8192], fn[64], phase[64], next_scope[64], path[4096];
   unsigned long n, ms;
   while (fgets(line, sizeof line, stdin)) {
     if (!strcmp(line, "stop\n")) { teardown(); ack("done"); return 0; }
     if (sscanf(line, "calls %63s %lu %lu %63s %63s", fn, &n, &ms, phase, next_scope) == 5) {
-      scope = next_scope; calls(fn, n, ms, phase); continue;
+      scope = next_scope; calls(fn, n, ms, phase, 0); continue;
+    }
+    if (sscanf(line, "spaced %63s %lu %lu %63s %63s", fn, &n, &ms, phase, next_scope) == 5) {
+      scope = next_scope; calls(fn, n, ms, phase, 1); continue;
+    }
+    if (sscanf(line, "thread-exec %4095s", path) == 1) {
+      pthread_t thread;
+      if (pthread_create(&thread, NULL, thread_exec, path) || pthread_join(thread, NULL)) return 1;
+      return 1;
     }
     if (sscanf(line, "exec %4095s", path) == 1) {
-      char next_image[32]; snprintf(next_image, sizeof next_image, "%lu", image + 1);
-      execl(path, path, module, next_image, "outside", (char *)NULL); perror("exec"); return 1;
+      exec_image(path, "leader"); return 1;
     }
     return 2;
   }

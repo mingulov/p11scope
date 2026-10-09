@@ -7,7 +7,7 @@ assigns a unique executable to each (PID, TID, function); ambiguous keys refuse.
 """
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import json
 from pathlib import Path
 import re
@@ -125,6 +125,29 @@ def _evaluate(trace, ledger, receipt, file_trace):
             errors.append('incomplete caller image identity')
     targets = {(row['image'], row['fn']): row for row in ledger if row['kind'] == 'target'}
     calls = [row for row in ledger if row['kind'] == 'call']
+    transitions = {}
+    for transition in receipt.get('exec_transitions', []):
+        previous, successor = images[transition['from_image']], images[transition['to_image']]
+        requests = [row for row in ledger if row['kind'] == 'exec'
+                    and row['image'] == previous['image']]
+        if len(requests) != 1 or requests[0] != transition['request']:
+            errors.append('exec request disagrees with independently controlled transition')
+            continue
+        request = requests[0]
+        mode = transition['mode']
+        if (mode not in ('leader', 'nonleader') or request['mode'] != mode
+                or request['pid'] != previous['pid'] or request['start_time'] != previous['start_time']
+                or request['tid'] <= 0 or (request['tid'] == request['pid']) != (mode == 'leader')
+                or request['scope'] != 'outside' or request['path'] != successor['path']
+                or not transition['t0'] <= request['t'] < successor['t'] <= transition['t1']
+                or previous['pid'] != successor['pid'] or previous['start_time'] != successor['start_time']
+                or (previous['path'] == successor['path']) != transition['same_path']
+                or any(call['scope'] == 'selected' and call['t0'] < successor['t']
+                       for call in calls if call['image'] == successor['image'])):
+            errors.append('exec transition lacks authentic generation/leader/birth/scope evidence')
+        else:
+            transitions[successor['image']] = transition
+    phase_gaps = {}
     if 'phases' in receipt:
         phase_calls = [call for call in calls if call['phase'] not in ('setup', 'teardown')]
         phase_keys = set()
@@ -139,13 +162,32 @@ def _evaluate(trace, ledger, receipt, file_trace):
                     call['scope'] != phase['scope'] or not phase['t0'] <= call['t0'] <= call['t1'] <= phase['t1']
                     for call in population):
                 errors.append('fixture phase disagrees with independently issued command/membership interval')
+            if 'gap_ms' in phase:
+                ordered = sorted(population, key=lambda call: call['t0'])
+                gap = phase['gap_ms'] * 1_000_000
+                phase_gaps[phase['phase']] = [(later['t0'] - earlier['t1']) / 1e9
+                                             for earlier, later in zip(ordered, ordered[1:])]
+                if not 0 <= phase['gap_ms'] <= 61000 or any(
+                        later['t0'] - earlier['t1'] < gap
+                        for earlier, later in zip(ordered, ordered[1:])):
+                    errors.append('real spaced-call gap is shorter than the independent command')
         if any((call['image'], call['fn'], call['phase']) not in phase_keys for call in phase_calls):
             errors.append('fixture call has no independently issued workload phase')
     start, ready, stop = (receipt[field] for field in
                           ('observer_started_ns', 'observer_ready_ns', 'observer_stopped_ns'))
     if not receipt['scope_created_ns'] < start <= ready < stop:
         errors.append('invalid independent observer interval')
+    if receipt['cell'] == 'short':
+        lifetime = receipt['short_lifetime']
+        image = images[lifetime['image']]
+        short_calls = [call for call in calls if call['image'] == image['image']]
+        if (not short_calls or not start <= lifetime['spawn_started_ns'] <= image['t']
+                or not max(call['t1'] for call in short_calls) <= lifetime['exit_observed_ns'] <= stop
+                or not 0 < (lifetime['exit_observed_ns'] - lifetime['spawn_started_ns']) / 1e9
+                   <= lifetime['limit_seconds'] <= 1):
+            errors.append('short child lacks the actual bounded spawn-to-pidfd-exit lifetime')
     mandatory, possible, expected_images = Counter(), Counter(), defaultdict(set)
+    expected_calls = defaultdict(deque)
     selected_interval = []
     for call in calls:
         image = images[call['image']]
@@ -161,7 +203,7 @@ def _evaluate(trace, ledger, receipt, file_trace):
             continue
         selected_interval.append(call)
         key = (call['pid'], call['tid'], call['fn'])
-        expected_images[key].add(image['path'])
+        expected_images[key].add(image['image'])
         if call['t0'] >= ready and call['t1'] < stop:
             mandatory[key] += 1
         elif receipt['cell'] == 'run' and call['phase'] == 'setup' and call['t1'] < ready:
@@ -173,13 +215,17 @@ def _evaluate(trace, ledger, receipt, file_trace):
     if not mandatory:
         errors.append('no independently ledgered calls after capture readiness')
     if any(len(paths) != 1 for paths in expected_images.values()):
-        errors.append('ambiguous executable for a PID/TID/function; a stronger oracle is required')
+        errors.append('ambiguous image generation for a PID/TID/function; a stronger oracle is required')
+    for call in sorted(selected_interval, key=lambda call: call['t0']):
+        expected_calls[call['pid'], call['tid'], call['fn']].append(call)
     actual = Counter((row['pid'], row['tid'], row['fn']) for row in rows)
     for key in actual.keys() | mandatory.keys():
         if not mandatory[key] <= actual[key] <= mandatory[key] + possible[key]:
             errors.append(f'captured provider-call population disagrees with ledger: {key}')
     named = unknown = false_names = 0
     populations = {image['path']: {'named': 0, 'unknown': 0} for image in images.values()}
+    generations = {image_id: {'named': 0, 'unknown': 0} for image_id in images}
+    phase_populations, first_rows = defaultdict(Counter), {}
     for row in rows:
         key = row['pid'], row['tid'], row['fn']
         if row['rv'] != 'CKR_OK':
@@ -188,19 +234,42 @@ def _evaluate(trace, ledger, receipt, file_trace):
             unknown += 1
         else:
             named += 1
-            paths = expected_images.get(key, set())
-            if len(paths) != 1 or row['path'] not in paths or row['label'] != Path(row['path']).name:
+            ids = expected_images.get(key, set())
+            if (len(ids) != 1 or row['path'] != images[next(iter(ids))]['path']
+                    or row['label'] != Path(row['path']).name):
                 false_names += 1
-        paths = expected_images.get(key, set())
-        if len(paths) == 1:
-            populations[next(iter(paths))]['named' if row['path'] else 'unknown'] += 1
+        ids = expected_images.get(key, set())
+        if len(ids) == 1:
+            image_id = next(iter(ids))
+            field = 'named' if row['path'] else 'unknown'
+            populations[images[image_id]['path']][field] += 1
+            generations[image_id][field] += 1
+            first_rows.setdefault(image_id, row)
+            if expected_calls[key]:
+                call = expected_calls[key].popleft()
+                phase_populations[call['phase']][field] += 1
     if false_names:
         errors.append('capture published an executable other than the independently observed image')
     if receipt['require_named'] and not named:
         errors.append('required stable positive contains no named event')
     for image_id in receipt.get('require_named_images', []):
-        if not populations[images[image_id]['path']]['named']:
+        if not generations[image_id]['named']:
             errors.append('required image contains no independently correct named event')
+    for image_id in receipt.get('first_unknown_images', []):
+        image_calls = [call for call in selected_interval if call['image'] == image_id]
+        new_child = (receipt['cell'] == 'short' and receipt['short_lifetime']['image'] == image_id
+                     and images[image_id]['t'] >= receipt['short_lifetime']['spawn_started_ns'] >= ready)
+        if (not image_calls or (image_id not in transitions and not new_child)
+                or any(call['scope'] == 'selected' and call['t0'] < ready
+                       for call in calls if call['image'] == image_id)):
+            errors.append('first image CALL lacks independently proved fresh scoped generation')
+        else:
+            first = min(image_calls, key=lambda call: call['t0'])
+            row = first_rows.get(image_id)
+            if row is None or (row['pid'], row['tid'], row['fn']) != (first['pid'], first['tid'], first['fn']):
+                errors.append('first image event disagrees with the earliest independent scoped call')
+            elif row['path'] is not None:
+                errors.append('fresh image first scoped CALL was named without a possible upper witness')
     if counts and any(counts[0].get(field) != len(rows) for field in
                       ('stats_entered', 'stats_returned', 'raw_calls')):
         errors.append('terminal counts disagree with independently accounted completed events')
@@ -237,6 +306,13 @@ def _evaluate(trace, ledger, receipt, file_trace):
             'named_share': named / len(rows) if rows else None,
             'unknown_share': unknown / len(rows) if rows else None,
             'image_populations': populations,
+            'image_generation_populations': generations, 'phase_populations': dict(phase_populations),
+            'phase_gap_seconds': phase_gaps,
+            'short_lifetime_seconds': ((receipt['short_lifetime']['exit_observed_ns'] -
+                                        receipt['short_lifetime']['spawn_started_ns']) / 1e9
+                                       if receipt['cell'] == 'short' else None),
+            'deadline_boundary_proof': ('not_exposed_by_public_output'
+                                        if receipt['cell'] in ('sparse59', 'sparse61') else None),
             'mandatory_calls': sum(mandatory.values()), 'possible_setup_calls': sum(possible.values()),
             'first_call_receipt_impossible': first_proved,
             'cold_receipt_impossible': cold_proved, 'counts': counts,

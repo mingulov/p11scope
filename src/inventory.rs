@@ -3959,7 +3959,7 @@ mod tests {
             assert!(!context.to_string().contains("FORBIDDEN_SHARED_METADATA"));
         }
         eprintln!(
-            "compact shared-module: additional bytes={additional_bytes}, allocation upper bound={allocated}"
+            "compact shared-module: context value bytes={additional_bytes}, allocation upper bound={allocated}"
         );
     }
 
@@ -4093,8 +4093,9 @@ mod tests {
         assert!((49152..=65536).contains(&context_bytes), "{context_bytes}");
         assert_eq!(writer.live_bytes(), reader.metadata().unwrap().len());
         assert!(writer.live_bytes() > context_bytes as u64);
-        // Real finalization emits a metadata-only final change at wider clock
-        // and sequence digits, through the same sweep and ended reservation.
+        // Real finalization emits a metadata-only final change with wider clock
+        // digits through the same sweep and ended reservation. Sequence-width
+        // and actual rotation boundaries remain separate normal-host gates.
         view.callers[0].lifecycle = crate::discovery::caller_registry::CallerLifecycle::Exited;
         view.ended_ns = 10_000_000_000;
         let mut stream = EventLogState::new(Some(writer));

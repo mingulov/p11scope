@@ -12,6 +12,7 @@
 //! witnesses. Mappings are never reported as observed calls.
 
 use crate::attach::Scope;
+use crate::capacity::{InventoryBudget, inventory_endpoint_budget};
 use crate::cli::{CaptureMode, InspectScope};
 use crate::discovery::caller_registry::{
     CallerEvent, ImageAuthority, ModuleId, OsProcessSource, ProcessSource, RegistryLimits,
@@ -422,6 +423,7 @@ pub fn run(
     json: bool,
     max_scan_pids: Option<usize>,
     max_gaps: Option<usize>,
+    max_endpoints: Option<u64>,
     duration: Option<Duration>,
     out: Option<&Path>,
     dashboard: bool,
@@ -433,19 +435,21 @@ pub fn run(
     diagnostics: Option<&Path>,
     diagnostics_pid: Option<u32>,
 ) -> Result<i32> {
+    let endpoint_budget = inventory_endpoint_budget(max_endpoints).map_err(anyhow::Error::msg)?;
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
     // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
     // its stop path (the final sinks are still written).
     let stop = StopFlag::install();
     let signals = || stop.signal_count();
     let mut stdout = FdStdout::new(1, &signals);
-    run_with_terminal_diagnostics(
+    run_with_terminal_budget(
         scope,
         modules,
         hooks,
         json,
         max_scan_pids,
         max_gaps,
+        endpoint_budget,
         duration,
         out,
         dashboard,
@@ -614,6 +618,7 @@ fn run_with_terminal_inner(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_with_terminal_diagnostics(
     scope: InspectScope,
@@ -622,6 +627,57 @@ fn run_with_terminal_diagnostics(
     json: bool,
     max_scan_pids: Option<usize>,
     max_gaps: Option<usize>,
+    duration: Option<Duration>,
+    out: Option<&Path>,
+    dashboard: bool,
+    event_log: Option<&Path>,
+    event_rotate_bytes: Option<u64>,
+    event_max_files: Option<usize>,
+    capture: CaptureMode,
+    attach_backend: crate::attach::BackendSelection,
+    stop: &dyn Fn() -> bool,
+    outputs_attempted: &dyn Fn(),
+    stdout_tty: bool,
+    stdout: &mut dyn FinalStdout,
+    terminal: &DashboardIo,
+    request: DiagnosticRequest<'_>,
+    event_fault: Option<crate::inventory_events::EventFault>,
+) -> Result<i32> {
+    run_with_terminal_budget(
+        scope,
+        modules,
+        hooks,
+        json,
+        max_scan_pids,
+        max_gaps,
+        inventory_endpoint_budget(None).map_err(anyhow::Error::msg)?,
+        duration,
+        out,
+        dashboard,
+        event_log,
+        event_rotate_bytes,
+        event_max_files,
+        capture,
+        attach_backend,
+        stop,
+        outputs_attempted,
+        stdout_tty,
+        stdout,
+        terminal,
+        request,
+        event_fault,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_terminal_budget(
+    scope: InspectScope,
+    modules: &[PathBuf],
+    hooks: &HookRegistry,
+    json: bool,
+    max_scan_pids: Option<usize>,
+    max_gaps: Option<usize>,
+    endpoint_budget: InventoryBudget,
     duration: Option<Duration>,
     out: Option<&Path>,
     dashboard: bool,
@@ -700,12 +756,13 @@ fn run_with_terminal_diagnostics(
         InspectScope::System => (InventoryScope::System, Scope::System, "system".to_string()),
     };
     let started_ns = now_ns();
-    let mut coordinator = InventoryCoordinator::new(
+    let mut coordinator = InventoryCoordinator::new_with_budget(
         engine_scope,
         hooks.clone(),
         modules.to_vec(),
         OsProcessSource,
         registry_limits(max_gaps),
+        endpoint_budget,
     )?;
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
@@ -1066,6 +1123,28 @@ fn open_native_lane(
     scope: InspectScope,
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
 ) -> Result<Option<NativeLane<FacadeLane>>> {
+    open_native_lane_with(
+        mode,
+        attach_backend,
+        scope,
+        coordinator,
+        FacadeLane::prepare,
+    )
+}
+
+/// The preparation boundary permits testing its actual arguments and startup
+/// refusal without loading BPF. An active lane's later refusals stay native.
+fn open_native_lane_with(
+    mode: CaptureMode,
+    attach_backend: crate::attach::BackendSelection,
+    scope: InspectScope,
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    prepare: impl FnOnce(
+        crate::attach::capture::CaptureScope,
+        InventoryBudget,
+        crate::attach::BackendSelection,
+    ) -> Result<FacadeLane>,
+) -> Result<Option<NativeLane<FacadeLane>>> {
     let unavailable =
         |coordinator: &mut InventoryCoordinator<OsProcessSource>, reason: String| match mode {
             CaptureMode::Native => Err(anyhow::anyhow!(
@@ -1090,7 +1169,7 @@ fn open_native_lane(
         },
         InspectScope::System => crate::attach::capture::CaptureScope::System,
     };
-    let capture = match FacadeLane::prepare(
+    let capture = match prepare(
         capture_scope,
         coordinator.attach_set().budget(),
         attach_backend,
@@ -2528,6 +2607,101 @@ mod tests {
             RegistryLimits::default_limits(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn inventory_selected_budget_reaches_native_preparation_and_fallback() {
+        use crate::attach::BackendSelection;
+        for n in [1, 4097, 6531, 8192] {
+            let budget = inventory_endpoint_budget(Some(n)).unwrap();
+            for mode in [CaptureMode::Scan, CaptureMode::Auto, CaptureMode::Native] {
+                for backend in [
+                    BackendSelection::Auto,
+                    BackendSelection::Multi,
+                    BackendSelection::Singles,
+                ] {
+                    let mut coordinator = InventoryCoordinator::new_with_budget(
+                        Scope::System,
+                        HookRegistry::builtin(),
+                        Vec::new(),
+                        OsProcessSource,
+                        RegistryLimits::default_limits(),
+                        budget,
+                    )
+                    .unwrap();
+                    let prepared = std::cell::Cell::new(None);
+                    let result = open_native_lane_with(
+                        mode,
+                        backend,
+                        InspectScope::System,
+                        &mut coordinator,
+                        |scope, actual_budget, actual_backend| {
+                            assert!(matches!(
+                                scope,
+                                crate::attach::capture::CaptureScope::System
+                            ));
+                            assert_eq!(actual_backend, backend);
+                            prepared.set(Some(actual_budget));
+                            anyhow::bail!("controlled native preparation refusal")
+                        },
+                    );
+                    assert_eq!(
+                        prepared.get(),
+                        (mode != CaptureMode::Scan).then_some(budget)
+                    );
+                    if mode == CaptureMode::Native {
+                        let error = result
+                            .err()
+                            .expect("forced native must refuse preparation failure");
+                        assert!(error.to_string().contains("--capture native"));
+                    } else {
+                        assert!(result.unwrap().is_none());
+                    }
+                    assert_eq!(coordinator.attach_set().budget(), budget);
+                    coordinator.commit_batch(false).unwrap();
+                    let document = render_json(&coordinator, "system", 1, 2, 0);
+                    assert_eq!(document["budgets"]["inventory_endpoints"]["limit"], n);
+                    assert_eq!(document["budgets"]["endpoints"]["limit"], 1_048_576);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_inventory_endpoint_budget_precedes_runtime_sinks() {
+        let dir = private_tempdir();
+        let report = dir.path().join("report.json");
+        let event_log = dir.path().join("events.jsonl");
+        let diagnostics = dir.path().join("diagnostics.jsonl");
+        for capture in [CaptureMode::Scan, CaptureMode::Auto, CaptureMode::Native] {
+            for dashboard in [false, true] {
+                let error = run(
+                    InspectScope::System,
+                    &[],
+                    &HookRegistry::builtin(),
+                    true,
+                    None,
+                    None,
+                    Some(8193),
+                    None,
+                    Some(&report),
+                    dashboard,
+                    Some(&event_log),
+                    None,
+                    None,
+                    capture,
+                    crate::attach::BackendSelection::Auto,
+                    Some(&diagnostics),
+                    None,
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("--max-endpoints")
+                        && error.to_string().contains("1..=8192")
+                );
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+            }
+        }
     }
 
     fn event_fault(kind: &'static str, after_ended: bool) -> crate::inventory_events::EventFault {

@@ -141,6 +141,8 @@ pub struct InventoryArgs {
     pub max_scan_pids: Option<usize>,
     /// `--max-gaps`: retained gap history bound; None ⇒ 1024 default.
     pub max_gaps: Option<usize>,
+    /// `--max-endpoints`: capture-lifetime physical endpoint IDs; None ⇒ 4096.
+    pub max_endpoints: Option<u64>,
     /// `--duration`: keep observing (rescanning) until the deadline;
     /// None ⇒ a single snapshot pass (or, with `--dashboard`, until quit).
     pub duration: Option<Duration>,
@@ -307,8 +309,8 @@ usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
@@ -434,8 +436,8 @@ Without --pid or --cgroup, target readiness is unassessed.
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
@@ -445,6 +447,7 @@ example (4242 is an example PID, not a detected target):
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
+--max-endpoints selects capture-lifetime physical endpoint IDs: 1..=8192, default 4096; unloading does not refund IDs.
 --capture scan uses no BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
 --json and -o contain the same inventory facts; --event-log appends bounded JSONL history with rotation.
 --diagnostics writes bounded native count decisions after capture stops; requires auto or native and a separate regular file.
@@ -911,6 +914,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut json = false;
     let mut max_scan_pids: Option<usize> = None;
     let mut max_gaps: Option<usize> = None;
+    let mut max_endpoints: Option<u64> = None;
     let mut duration: Option<Duration> = None;
     let mut out: Option<PathBuf> = None;
     let mut dashboard = false;
@@ -1037,6 +1041,19 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                 }
                 max_gaps = Some(value);
             }
+            "--max-endpoints" => {
+                if max_endpoints.is_some() {
+                    return Err(usage_err("--max-endpoints given twice"));
+                }
+                let value = require_value(&mut args, "--max-endpoints")?;
+                let endpoints = value
+                    .parse::<u64>()
+                    .map_err(|_| usage_err(format!("--max-endpoints: invalid number {value:?}")))?;
+                // Validate usage here; the runtime retains the one resolved
+                // budget before it opens any output or capture resources.
+                crate::capacity::inventory_endpoint_budget(Some(endpoints)).map_err(usage_err)?;
+                max_endpoints = Some(endpoints);
+            }
             "--duration" => {
                 if duration.is_some() {
                     return Err(usage_err("--duration given twice"));
@@ -1099,6 +1116,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         json,
         max_scan_pids,
         max_gaps,
+        max_endpoints,
         duration,
         out,
         dashboard,
@@ -1734,6 +1752,82 @@ mod tests {
             ])),
             Err(CliError::Usage { message: m, .. }) if m.contains("--max-scan-pids given twice")
         ));
+    }
+
+    #[test]
+    fn inventory_endpoint_policy_checks_range_and_exact_payload() {
+        let Ok(Command::Inventory(default)) = parse(args(&["inventory", "--system"])) else {
+            panic!("expected inventory default");
+        };
+        assert_eq!(default.max_endpoints, None);
+        for endpoints in [1_u64, 4097, 6531, 8192] {
+            for capture in ["scan", "auto", "native"] {
+                let value = endpoints.to_string();
+                let parsed = parse(args(&[
+                    "inventory",
+                    "--pid",
+                    "7",
+                    "--max-endpoints",
+                    &value,
+                    "--capture",
+                    capture,
+                ]));
+                let Ok(Command::Inventory(parsed)) = parsed else {
+                    panic!("selected endpoint budget {endpoints} in {capture}: {parsed:?}");
+                };
+                assert_eq!(parsed.max_endpoints, Some(endpoints));
+                let budget =
+                    crate::capacity::inventory_endpoint_budget(parsed.max_endpoints).unwrap();
+                assert_eq!(budget.endpoint_limit(), endpoints);
+                assert_eq!(budget.payload_bytes(), endpoints * 8);
+            }
+        }
+    }
+
+    #[test]
+    fn inventory_endpoint_policy_refuses_invalid_and_duplicate_values() {
+        for value in ["0", "8193", "4294967296", "18446744073709551615"] {
+            assert!(
+                matches!(
+                    parse(args(&["inventory", "--system", "--max-endpoints", value])),
+                    Err(CliError::Usage { message, .. })
+                        if message.contains("--max-endpoints") && message.contains("1..=8192")
+                ),
+                "out-of-policy endpoint budget {value} names the accepted range"
+            );
+        }
+        for value in ["oops", "1.5", "18446744073709551616"] {
+            assert!(
+                matches!(
+                    parse(args(&["inventory", "--system", "--max-endpoints", value])),
+                    Err(CliError::Usage { message, .. })
+                        if message.contains("--max-endpoints") && message.contains("invalid number")
+                ),
+                "malformed endpoint budget {value} names the numeric error"
+            );
+        }
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--system", "--max-endpoints", "4097", "--max-endpoints", "8192"
+            ])),
+            Err(CliError::Usage { message, .. }) if message.contains("--max-endpoints given twice")
+        ));
+    }
+
+    #[test]
+    fn max_endpoints_is_inventory_only_and_its_help_names_the_policy() {
+        for command in ["inspect", "profile", "trace"] {
+            assert!(matches!(
+                parse(args(&[command, "--system", "--max-endpoints", "8192"])),
+                Err(CliError::Usage { message, .. }) if message.contains("--max-endpoints")
+            ));
+        }
+        assert!(matches!(
+            parse(args(&["run", "--max-endpoints", "8192", "--", "/bin/true"])),
+            Err(CliError::Usage { message, .. }) if message.contains("--max-endpoints")
+        ));
+        assert!(INVENTORY_HELP.contains("[--max-endpoints <n>]"));
+        assert!(INVENTORY_HELP.contains("1..=8192") && INVENTORY_HELP.contains("4096"));
     }
 
     #[test]

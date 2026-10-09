@@ -7,6 +7,8 @@
 
 use p11scope::discovery::inventory_workload::{FdScope, assert_settled, assert_subset_ledger};
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -148,6 +150,266 @@ fn assert_settled_consistent(doc: &Value) {
             1024,
             "suppression means the 1024 retention cap engaged"
         );
+    }
+}
+
+#[test]
+fn invalid_inventory_endpoint_budget_precedes_every_sink() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-invalid-endpoint-budget");
+    let report = dir.join("report.json");
+    let events = dir.join("events.jsonl");
+    let diagnostics = dir.join("diagnostics");
+    let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(["inventory", "--system", "--max-endpoints", "8193"])
+        .arg("-o")
+        .arg(&report)
+        .arg("--event-log")
+        .arg(&events)
+        .arg("--diagnostics")
+        .arg(&diagnostics)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--max-endpoints") && stderr.contains("1..=8192"),
+        "a policy error names the selected endpoint range: {stderr}"
+    );
+    assert!(output.stdout.is_empty());
+    assert!(
+        !report.exists(),
+        "invalid selection must not create a report"
+    );
+    assert!(
+        !events.exists(),
+        "invalid selection must not create an event log"
+    );
+    assert!(
+        !diagnostics.exists(),
+        "invalid selection must not create diagnostic output"
+    );
+}
+
+/// Independently enumerate the owned fixture's published 3.0 table. The
+/// observer never executes this code: this is the test application calling
+/// its own provider, then translating its function addresses through its
+/// own executable mappings. No attach plan or observer result supplies the
+/// population count.
+fn fixture_endpoint_offsets(provider: &Path) -> BTreeSet<u64> {
+    #[repr(C)]
+    struct Table {
+        version: [u8; 2],
+        functions: [*mut libc::c_void; 92],
+    }
+    struct Library(*mut libc::c_void);
+    impl Drop for Library {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::dlclose(self.0) }, 0);
+        }
+    }
+
+    let path = std::ffi::CString::new(provider.as_os_str().as_encoded_bytes()).unwrap();
+    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    assert!(
+        !handle.is_null(),
+        "load owned fixture {}",
+        provider.display()
+    );
+    let library = Library(handle);
+    let symbol = unsafe { libc::dlsym(library.0, c"C_GetFunctionList".as_ptr()) };
+    assert!(!symbol.is_null());
+    let get_list: unsafe extern "C" fn(*mut *mut Table) -> libc::c_ulong =
+        unsafe { std::mem::transmute(symbol) };
+    let mut table = std::ptr::null_mut();
+    assert_eq!(unsafe { get_list(&mut table) }, 0);
+    let table = unsafe { table.as_ref() }.unwrap();
+    assert_eq!(table.version, [3, 0]);
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    table
+        .functions
+        .iter()
+        .map(|function| {
+            assert!(!function.is_null());
+            let address = *function as u64;
+            maps.lines()
+                .find_map(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    let (start, end) = fields[0].split_once('-').unwrap();
+                    let start = u64::from_str_radix(start, 16).unwrap();
+                    let end = u64::from_str_radix(end, 16).unwrap();
+                    (start <= address && address < end).then(|| {
+                        assert!(fields[1].contains('x'), "fixture target must be executable");
+                        assert_eq!(fields[5], provider.to_str().unwrap());
+                        u64::from_str_radix(fields[2], 16).unwrap() + address - start
+                    })
+                })
+                .expect("each published fixture endpoint has a file-backed executable mapping")
+        })
+        .collect()
+}
+
+#[test]
+fn inventory_capacity_default_refuses_and_override_admits() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-selected-endpoint-capacity");
+    let driver = gcc(
+        &dir,
+        "driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    // A synthetic, test-local copy selects the matrix's anchored3.0 table
+    // as the actual surface returned to the unchanged driver. The shared
+    // fixture returns2.40; counting its separately exposed3.2 table would
+    // overstate this target. Keep one getter address, with no wrapper alias.
+    let provider_source = dir.join("provider.c");
+    let matrix = std::fs::read_to_string(matrix_source()).unwrap();
+    let original = "*out = SHORT_LEGACY ? short_legacy : (void *)&legacy;";
+    assert_eq!(matrix.matches(original).count(), 1);
+    std::fs::write(
+        &provider_source,
+        matrix.replace(original, "*out = (void *)&t30;"),
+    )
+    .unwrap();
+    let template = gcc(
+        &dir,
+        "template.so",
+        &provider_source,
+        &["-shared", "-fPIC"],
+        &[],
+    );
+    let offsets = fixture_endpoint_offsets(&template);
+    assert_eq!(
+        offsets.len(),
+        92,
+        "distinct published physical function offsets"
+    );
+    let mut providers = Vec::new();
+    let mut physical_union = BTreeSet::new();
+    for index in 0..45 {
+        let provider = dir.join(format!("capacity-{index:02}.so"));
+        std::fs::copy(&template, &provider).unwrap();
+        let metadata = std::fs::metadata(&provider).unwrap();
+        for offset in &offsets {
+            physical_union.insert((metadata.dev(), metadata.ino(), *offset));
+        }
+        providers.push(provider);
+    }
+    assert_eq!(
+        physical_union.len(),
+        4140,
+        "same bytes at distinct inodes stay distinct"
+    );
+    assert!(physical_union.len() > 4096);
+    let provider_list = providers
+        .iter()
+        .map(|path| path.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (label, selected, dashboard) in [
+        ("default", None, false),
+        ("selected", Some(8192), false),
+        ("dashboard", Some(8192), true),
+    ] {
+        let ready = dir.join(format!("ready-{label}"));
+        let out = dir.join(format!("{label}.json"));
+        let stderr_log = dir.join(format!("{label}.stderr"));
+        let mut command = Command::new("sh");
+        command
+            .arg(fixture_source("inventory-scale-observe.sh"))
+            .args([
+                "--system",
+                "--json",
+                "--capture",
+                "scan",
+                "--max-scan-pids",
+                "64",
+            ]);
+        for provider in &providers {
+            command.arg("--module").arg(provider);
+        }
+        if let Some(selected) = selected {
+            command.arg("--max-endpoints").arg(selected.to_string());
+        }
+        if dashboard {
+            command.arg("--dashboard");
+        }
+        command
+            .env("INV_DRIVER", &driver)
+            .env("INV_COUNT", "1")
+            .env("INV_PROVIDERS", &provider_list)
+            .env("INV_READY", &ready)
+            .env("INV_OUT", &out)
+            .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        let (output, peak) = spawn_with_peak(&mut command, &stderr_log);
+        let fixture = FixtureGuard {
+            pids: vec![ready_pid(&ready.join("S001.ready"))],
+        };
+        let stderr = std::fs::read_to_string(&stderr_log).unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: {:?}: {stderr}",
+            output.status
+        );
+        assert!(
+            peak < OBSERVER_RSS_BOUND_BYTES,
+            "{label}: observer peak RSS {peak}"
+        );
+        let document: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        let budget = &document["budgets"]["inventory_endpoints"];
+        assert_eq!(budget["limit"], selected.unwrap_or(4096));
+        assert_eq!(document["budgets"]["endpoints"]["limit"], 1_048_576);
+        if selected.is_some() {
+            assert_eq!(budget["occupied"], physical_union.len());
+            assert_eq!(budget["refused"], 0);
+            assert_eq!(
+                document["modules"].as_array().unwrap().len(),
+                providers.len()
+            );
+            for provider in &providers {
+                let matching: Vec<_> = document["modules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|module| {
+                        module["paths"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|path| path.as_str() == provider.to_str())
+                    })
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "one physical module for {}",
+                    provider.display()
+                );
+                let module = matching[0];
+                assert_eq!(
+                    module["identity"]["inode"],
+                    std::fs::metadata(provider).unwrap().ino()
+                );
+                assert_eq!(module["admission"]["state"], "admitted");
+                assert_eq!(module["admission"]["endpoints"], offsets.len());
+            }
+        } else {
+            assert!(budget["occupied"].as_u64().unwrap() <= 4096);
+            assert!(
+                document["modules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|module| module["admission"]["state"] == "refused"
+                        && module["admission"]["reasons"].to_string().contains("4096")),
+                "the default lowering refuses owned demand and names its physical endpoint capacity"
+            );
+        }
+        drop(fixture);
     }
 }
 

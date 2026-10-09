@@ -131,6 +131,7 @@ EXITS = {"version.log": "version", "doctor.log": "doctor", "qual.log": "qual",
 RUNTIME_SOURCES = ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c")
 SOURCE_FILES = ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
                 "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
+                "scripts/mapped-provider-pin.py",
                 "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                 "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                 "tests/fixtures/public-cli/inventory-ledger.c")

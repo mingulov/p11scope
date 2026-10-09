@@ -26470,6 +26470,154 @@ fn a_polling_rescan_of_provider_free_processes_is_not_a_loss() {
     );
 }
 
+/// A full lifecycle queue leaves an optional poll for a later round. No
+/// producer record was lost: these retained views are still provider-free,
+/// so the delay belongs to scheduling evidence, not discovery truncation.
+#[test]
+fn optional_polling_defers_at_a_full_refresh_queue_without_record_loss() {
+    let (_children, mut engine, pids) = polling_engine_with_full_exec_queue(2);
+    let requested = engine.refresh_requested.clone();
+
+    engine.queue_polling_rescans(&pids);
+
+    assert_eq!(
+        engine.refresh_requested, requested,
+        "EXEC work stays queued"
+    );
+    assert!(engine.polled_pids.is_empty(), "no poll was admitted");
+    assert_eq!(engine.polling_rescans_queued, 0);
+    assert_eq!(engine.discovery_truncated, 0, "optional work was deferred");
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
+    assert_eq!(engine.frame_deferrals, 1, "the delay stays explicit");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| skip.subject != "live discovery refresh"),
+        "an unadmitted optional poll is not a dropped producer record"
+    );
+}
+
+/// Checking capacity only before a polling round is insufficient: the
+/// first poll can use the last free entry. Stop there instead of treating
+/// every later eligible view as overflow beyond the eight-poll bound.
+#[test]
+fn optional_polling_stops_when_the_last_refresh_entry_is_taken() {
+    let (_children, mut engine, pids) =
+        polling_engine_with_full_exec_queue(MAX_POLLING_RESCANS + 3);
+    engine.refresh_requested.remove(&4_000_000);
+    let requested = engine.refresh_requested.clone();
+
+    engine.queue_polling_rescans(&pids);
+
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert!(requested.iter().all(|(pid, queued)| {
+        engine
+            .refresh_requested
+            .get(pid)
+            .is_some_and(|now| now == queued)
+    }));
+    assert_eq!(engine.polled_pids, BTreeSet::from([pids[0]]));
+    assert_eq!(engine.polling_rescans_queued, 1);
+    assert_eq!(engine.discovery_truncated, 0, "the tail waits, never drops");
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
+    assert_eq!(engine.frame_deferrals, 1, "the waiting tail stays explicit");
+}
+
+/// Saturated rounds cannot consume the cursor's next candidate. As one
+/// entry becomes available each time, every retained exploratory view gets
+/// its turn even though genuine EXEC work keeps the rest of the queue full.
+#[test]
+fn optional_polling_resumes_fairly_after_refresh_capacity_reopens() {
+    let (_children, mut engine, pids) = polling_engine_with_full_exec_queue(3);
+    engine.queue_polling_rescans(&pids);
+    assert_eq!(engine.scheduler.poll_order(&pids), pids);
+    engine.refresh_requested.remove(&4_000_000);
+
+    for (index, pid) in pids.iter().copied().enumerate() {
+        engine.queue_polling_rescans(&pids);
+        assert_eq!(engine.polled_pids, BTreeSet::from([pid]));
+        assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+
+        // A saturated round must leave the next eligible view in place.
+        let next = pids[(index + 1) % pids.len()];
+        engine.queue_polling_rescans(&pids);
+        assert_eq!(engine.scheduler.poll_order(&pids)[0], next);
+
+        let view = engine
+            .views
+            .iter()
+            .find(|view| view.pid() == pid)
+            .unwrap()
+            .id();
+        engine.settle_polling_rescans(
+            &[(view, Vec::new(), PinnedObjects::empty())],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        engine.refresh_requested.remove(&pid);
+    }
+
+    assert_eq!(engine.polling_rescans_queued, 3);
+    assert!(engine.polled_pids.is_empty());
+    assert_eq!(engine.discovery_truncated, 0);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 0);
+}
+
+/// Optional-poll backpressure must not excuse genuine lifecycle overflow.
+/// An EXEC for an unretained generation still needs discovery work, and a
+/// full queue must retain its explicit dropped-record evidence.
+#[test]
+fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let mut pending = PendingViewRetirements::new();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+    }
+    let requested = engine.refresh_requested.clone();
+
+    engine.dispatch_lifecycle_record(&exec_record_for(4_001_000), &mut pending);
+
+    assert_eq!(engine.refresh_requested, requested);
+    assert_eq!(engine.discovery_truncated, 1);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery refresh"
+                && skip.reason.contains("exceeded the bounded pending queue")),
+        "a real EXEC request was dropped and must remain visible"
+    );
+    engine.dispatch_lifecycle_record(&exec_record_for(4_000_000), &mut pending);
+    assert_eq!(engine.discovery_truncated, 1, "already-queued EXEC is free");
+}
+
+fn polling_engine_with_full_exec_queue(
+    count: usize,
+) -> (Vec<SystemScopeChildGuard>, Engine, Vec<u32>) {
+    let children = e06_spawn_sleeps(count);
+    let mut pids: Vec<_> = children.iter().map(SystemScopeChildGuard::pid).collect();
+    pids.sort_unstable();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    for (index, pid) in pids.iter().copied().enumerate() {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(index as u32), pid).unwrap());
+    }
+    let mut pending = PendingViewRetirements::new();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.discovery_truncated, 0);
+    (children, engine, pids)
+}
+
 /// F1: a polled view whose rescan fails is already published by the
 /// refresh-failure path, so the settle forgets its poll instead of
 /// publishing `POLLED_PROVIDER_LOSS` on top of the failure. A sibling poll

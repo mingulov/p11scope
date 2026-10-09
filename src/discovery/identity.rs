@@ -862,6 +862,102 @@ impl PinnedObjects {
         self.overlay_uncertain
     }
 
+    /// A loader-only absorption may add its pin and scan ownership, but every
+    /// retained provider input must still name the same held File and facts.
+    /// This compares stored state only; attachment keeps its ordinary metadata
+    /// and generation revalidation, rather than replacing them with this proof.
+    pub(crate) fn preserves_provider_inputs_for_loader(
+        &self,
+        candidate: &Self,
+        loader: PinnedObjectId,
+    ) -> bool {
+        if self.changed.get()
+            || candidate.changed.get()
+            || self.overlay_uncertain
+            || candidate.overlay_uncertain
+            || self.rejected_keys != candidate.rejected_keys
+            || self.ambiguous_keys != candidate.ambiguous_keys
+            || self.ambiguity_published != candidate.ambiguity_published
+            || !candidate.by_id.contains_key(&loader)
+            || candidate
+                .by_id
+                .keys()
+                .any(|id| !self.by_id.contains_key(id) && *id != loader)
+        {
+            return false;
+        }
+        for (id, old) in &self.by_id {
+            let Some(new) = candidate.by_id.get(id) else {
+                return false;
+            };
+            if !Arc::ptr_eq(&old.file, &new.file)
+                || old.raw != new.raw
+                || old.mapping != new.mapping
+                || old.pin != new.pin
+                || old.path != new.path
+                || old.sha256 != new.sha256
+                || old.build_id != new.build_id
+                || old.abi != new.abi
+                || old.exports != new.exports
+                || old.overlay != new.overlay
+                || old.collapsed != new.collapsed
+            {
+                return false;
+            }
+        }
+        if self
+            .raw_to_id
+            .iter()
+            .any(|(raw, id)| candidate.raw_to_id.get(raw) != Some(id))
+            || candidate.raw_to_id.iter().any(|(raw, id)| {
+                !self.raw_to_id.contains_key(raw)
+                    && (*id != loader || raw.mount_namespace.is_none())
+            })
+            || (self.by_id.contains_key(&loader)
+                && self.sources(loader) != candidate.sources(loader))
+        {
+            return false;
+        }
+        for (view, old) in &self.ownership {
+            let Some(new) = candidate.ownership.get(view) else {
+                return false;
+            };
+            if old.tables != new.tables
+                || old.targets != new.targets
+                || !new.pins.starts_with(&old.pins)
+                || new.pins[old.pins.len()..].iter().any(|id| *id != loader)
+            {
+                return false;
+            }
+        }
+        if candidate.ownership.iter().any(|(view, claims)| {
+            !self.ownership.contains_key(view)
+                && (!claims.tables.is_empty()
+                    || !claims.targets.is_empty()
+                    || claims.pins.iter().any(|id| *id != loader))
+        }) {
+            return false;
+        }
+        for (view, old) in &self.raw_ownership {
+            if candidate
+                .raw_ownership
+                .get(view)
+                .is_none_or(|new| !old.is_subset(new))
+            {
+                return false;
+            }
+        }
+        candidate.raw_ownership.iter().all(|(view, raws)| {
+            raws.iter().all(|raw| {
+                self.raw_ownership
+                    .get(view)
+                    .is_some_and(|old| old.contains(raw))
+                    || (raw.mount_namespace.is_some()
+                        && candidate.raw_to_id.get(raw) == Some(&loader))
+            })
+        })
+    }
+
     pub(crate) fn newly_rejected_keys(&self, committed: &Self) -> BTreeSet<ObjectKey> {
         self.rejected_keys
             .difference(&committed.rejected_keys)

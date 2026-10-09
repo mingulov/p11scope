@@ -402,11 +402,10 @@ pub struct Engine {
     module_hints: Vec<PathBuf>,
     counter_snapshot: CounterSnapshot,
     malformed_discovery: u64,
-    /// Pending lifecycle/loader refresh requests: pid to its first-seen
-    /// monotonic-nanosecond arrival mark (`None` when the clock read failed).
-    /// Re-requesting an already-queued pid keeps the earliest mark. Bounded
-    /// by `MAX_PENDING_REFRESH`.
-    refresh_requested: BTreeMap<u32, Option<u64>>,
+    /// Requests retain their original age; each consumed-record renewal gets
+    /// a unique serial so an older inventory pass cannot complete newer work.
+    refresh_requested: BTreeMap<u32, RefreshRequest>,
+    last_refresh_serial: u64,
     scheduler: DiscoveryScheduler,
     loader_records_accepted: u64,
     timings: CausalTimings,
@@ -2457,6 +2456,13 @@ type DiscoveryCollector<'a> =
 /// injected clock can expire mid-path; the poll count and order match the
 /// direct reads it replaces exactly.
 type TickClock<'a> = dyn FnMut() -> Option<u64> + 'a;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RefreshRequest {
+    first_seen_ns: Option<u64>,
+    serial: u64,
+    owner: Option<ProcessViewId>,
+}
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 
@@ -7864,6 +7870,7 @@ impl Engine {
             counter_snapshot: CounterSnapshot::default(),
             malformed_discovery: 0,
             refresh_requested: BTreeMap::new(),
+            last_refresh_serial: 0,
             scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
             timings: CausalTimings::default(),
@@ -9773,31 +9780,118 @@ impl Engine {
         })
     }
 
-    /// Enqueues one lifecycle/loader refresh request on the bounded pending
-    /// queue (Task 3.1b). Past the cap the excess request is dropped with
-    /// explicit truncation evidence — the queue never grows unbounded.
-    /// Re-requesting an already-queued pid is free and keeps the earliest
-    /// arrival mark. `now_ns` is the caller's clock poll (scheduler style);
-    /// `None` marks the arrival clock-unknown.
-    fn request_refresh(&mut self, pid: u32, now_ns: Option<u64>) {
-        if self.refresh_requested.contains_key(&pid) {
-            return;
+    /// Ensure retry/setup work is queued without renewing a later consumed
+    /// request or counting an unperformed retry as another dropped record.
+    /// `None` keeps the original arrival clock-unknown.
+    fn request_refresh(&mut self, pid: u32, now_ns: Option<u64>) -> bool {
+        let accepted = self.request_refresh_with(pid, now_ns, false);
+        if !accepted {
+            // A retained owner's skipped setup/replacement must remain owed
+            // when the PID queue cannot accept it. The existing bounded
+            // retirement-intent replay waits for capacity before finishing
+            // ExecRefresh. Stronger existing retirement causes still win.
+            for view in self.views.iter().filter(|view| view.pid() == pid) {
+                self.retirement_intents
+                    .entry(view.id())
+                    .and_modify(|cause| *cause = cause.merge(RetirementCause::ExecRefresh))
+                    .or_insert(RetirementCause::ExecRefresh);
+            }
         }
-        if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
-            self.discovery_truncated = self.discovery_truncated.saturating_add(1);
-            // The drop keeps its loss marker and reports the dropped age:
-            // a diff-discovered newcomer carries its first-seen mark, so a
-            // drop then still says how long the newcomer had waited.
-            let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
-            self.newcomer_ages
-                .note_dropped(newcomer_age_ms(seen, now_ns));
-            self.mark_live_loss(
-                "live discovery refresh",
-                "refresh requests exceeded the bounded pending queue; excess requests were dropped",
-            );
-            return;
+        accepted
+    }
+
+    /// Each consumed record renews pending intent while keeping its first
+    /// arrival mark. Refusing that record preserves explicit loss evidence.
+    fn request_refresh_consumed(&mut self, pid: u32, now_ns: Option<u64>) -> bool {
+        self.request_refresh_with(pid, now_ns, true)
+    }
+
+    fn request_refresh_with(&mut self, pid: u32, now_ns: Option<u64>, consumed: bool) -> bool {
+        let existing = self.refresh_requested.get(&pid).copied();
+        if existing.is_some() && !consumed {
+            return true;
         }
-        self.refresh_requested.insert(pid, now_ns);
+        if existing.is_none() && self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+            if consumed {
+                self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+                // Diff-first arrivals retain their known dropped age.
+                let seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+                self.newcomer_ages
+                    .note_dropped(newcomer_age_ms(seen, now_ns));
+                self.mark_live_loss(
+                    "live discovery refresh",
+                    "refresh requests exceeded the bounded pending queue; excess requests were dropped",
+                );
+            } else {
+                self.mark_partial(
+                    "live discovery refresh",
+                    "refresh retry exceeded the bounded pending queue; work remains unfinished",
+                );
+            }
+            return false;
+        }
+        let Some(serial) = self.last_refresh_serial.checked_add(1) else {
+            if consumed {
+                self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+                let refresh_seen = existing.and_then(|request| request.first_seen_ns);
+                let diff_seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+                let seen = match (refresh_seen, diff_seen) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                self.newcomer_ages
+                    .note_dropped(newcomer_age_ms(seen, now_ns));
+                self.mark_live_loss(
+                    "live discovery refresh",
+                    "refresh request serials were exhausted; a consumed request was refused",
+                );
+            } else {
+                self.mark_partial(
+                    "live discovery refresh",
+                    "refresh request serials were exhausted; retry work remains unfinished",
+                );
+            }
+            return false;
+        };
+        self.last_refresh_serial = serial;
+        let owner = self
+            .views
+            .iter()
+            .find(|view| view.pid() == pid && view.still_the_same())
+            .map(ProcessView::id);
+        self.refresh_requested.insert(
+            pid,
+            RefreshRequest {
+                first_seen_ns: existing.map_or(now_ns, |request| request.first_seen_ns),
+                serial,
+                owner,
+            },
+        );
+        true
+    }
+
+    fn clear_refresh_for_view(&mut self, view: ProcessViewId, pid: u32) {
+        if self
+            .refresh_requested
+            .get(&pid)
+            .is_some_and(|request| request.owner == Some(view))
+        {
+            self.refresh_requested.remove(&pid);
+        }
+    }
+
+    fn refresh_request_snapshot(&self) -> BTreeMap<u32, u64> {
+        self.refresh_requested
+            .iter()
+            .map(|(pid, request)| (*pid, request.serial))
+            .collect()
+    }
+
+    fn complete_refresh_requests(&mut self, serviced: &BTreeMap<u32, u64>, failed: &BTreeSet<u32>) {
+        self.refresh_requested.retain(|pid, request| {
+            failed.contains(pid) || serviced.get(pid) != Some(&request.serial)
+        });
     }
 
     /// Marks one diff-discovered newcomer's arrival (first diff wins; later
@@ -9819,7 +9913,10 @@ impl Engine {
     /// mark (a loader event can queue a refresh before the diff finds the
     /// pid, or after — either order keeps the earlier observation).
     fn sample_newcomer_admission(&mut self, pid: u32, now_ns: Option<u64>) {
-        let refresh_seen = self.refresh_requested.get(&pid).copied().flatten();
+        let refresh_seen = self
+            .refresh_requested
+            .get(&pid)
+            .and_then(|request| request.first_seen_ns);
         let diff_seen = self.newcomer_first_seen.get(&pid).copied().flatten();
         let seen = match (refresh_seen, diff_seen) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -11637,7 +11734,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.request_refresh(pid, crate::attach::monotonic_ns());
+            self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             self.mark_live_loss(
                 "live export discovery",
                 "an export record had no retained process generation",
@@ -11769,7 +11866,7 @@ impl Engine {
         let Some(position) = self.views.iter().position(|view| {
             view.id() == binding_view && view.pid() == pid && view.still_the_same()
         }) else {
-            self.request_refresh(pid, crate::attach::monotonic_ns());
+            self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             self.mark_live_loss(
                 "live interface selection",
                 "a selection result had no retained process generation when its table was validated",
@@ -12181,7 +12278,7 @@ impl Engine {
         }
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
-            self.request_refresh(pid, crate::attach::monotonic_ns());
+            self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             self.reject_loader_record("a loader hit had no retained process generation");
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::LoaderNoRetainedView,
@@ -14985,7 +15082,7 @@ impl Engine {
         {
             match cause {
                 RetirementCause::ExpectedRemoval => {
-                    self.refresh_requested.remove(&pid);
+                    self.clear_refresh_for_view(view, pid);
                     // The view is leaving, so its pending poll dies with it:
                     // no rescan will settle it, and the removal evidence is
                     // its publication (F1).
@@ -15234,13 +15331,14 @@ impl Engine {
                 if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {
                     admission.closed_ns = None;
                 }
+                self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
                 self.queue_retirement(view, cause, pending_views);
             }
             (cause == RetirementCause::ExecRefresh).then_some(view)
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
         {
-            self.request_refresh(pid, crate::attach::monotonic_ns());
+            self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             None
         } else {
             if record.kind == DISCOVERY_KIND_LEADER_EXIT {
@@ -15342,7 +15440,7 @@ impl Engine {
                         .find(|candidate| candidate.id() == *view)
                         .map(ProcessView::pid)
                     {
-                        self.refresh_requested.remove(&pid);
+                        self.clear_refresh_for_view(*view, pid);
                         // No rescan will settle this view's pending poll, and
                         // the link loss is counted separately — forget the
                         // poll rather than publishing it twice (F1).
@@ -15661,7 +15759,9 @@ impl Engine {
                     if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
                         continue;
                     }
-                    self.request_refresh(retained_pid, crate::attach::monotonic_ns());
+                    if !self.request_refresh(retained_pid, crate::attach::monotonic_ns()) {
+                        continue;
+                    }
                 }
                 // The conservative replay this queues drops every pin the view
                 // owns. That is right for a generation that is gone, and wrong
@@ -15710,7 +15810,13 @@ impl Engine {
         let mut failed_pids = BTreeSet::new();
         let mut deferred_pids = BTreeSet::new();
         let mut skipped = Vec::new();
-        let ordered: Vec<ProcessViewId> = views.iter().copied().collect();
+        let ids: Vec<u32> = views.iter().map(|view| view.0).collect();
+        let ordered: Vec<ProcessViewId> = self
+            .scheduler
+            .retained_view_order(&ids)
+            .into_iter()
+            .map(ProcessViewId)
+            .collect();
         for (index, view_id) in ordered.iter().enumerate() {
             // The tick's deep-scan quantum stops the phase before another
             // scan: the current and remaining views defer to the next tick
@@ -15746,6 +15852,7 @@ impl Engine {
                 skipped.push(skip);
                 continue;
             };
+            self.scheduler.note_retained_view_attempt(view_id.0);
             let broad_admit = self.broad_admit;
             let (scan_result, counters) = Self::scan_retained_view(
                 &self.views[position],
@@ -16016,8 +16123,7 @@ impl Engine {
                 self.note_frame_deferral();
                 break;
             }
-            self.request_refresh(pid, crate::attach::monotonic_ns());
-            if self.refresh_requested.contains_key(&pid) {
+            if self.request_refresh(pid, crate::attach::monotonic_ns()) {
                 polling += 1;
                 last_queued = Some(pid);
                 self.polled_pids.insert(pid);
@@ -16623,6 +16729,7 @@ impl Engine {
         // view whose pid is absent has departed. Over the cap or with skips,
         // neither scope claims authority.
         let membership_authoritative = membership_complete && self.admits_generations();
+        let serviced_requests = self.refresh_request_snapshot();
         let retirement_causes: BTreeMap<_, _> = self
             .views
             .iter()
@@ -16669,7 +16776,7 @@ impl Engine {
             crate::attach::monotonic_ns(),
         );
         if removed.is_empty() && refreshed.is_empty() && new_pids.is_empty() {
-            self.refresh_requested.clear();
+            self.complete_refresh_requests(&serviced_requests, &BTreeSet::new());
             // No tick queued anything (a queued poll would have made a
             // retirement cause), so any pending poll is stale: forget it
             // with the requests rather than leaking it into a later tick.
@@ -16684,17 +16791,6 @@ impl Engine {
         // new-view admissions share one wall-time quantum and one admission
         // count bound. Direct scan calls outside this tick stay unbounded.
         self.scheduler.begin_deep_scan_tick(tick_now());
-        let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) = self
-            .scan_inventory_views(
-                &refreshed,
-                "a requested inventory refresh failed",
-                &mut *tick_now,
-            );
-        let mut failed_refresh_pids = failed_scan_pids.clone();
-        failed_refresh_pids.extend(deferred_scan_pids);
-        skipped.extend(refresh_skips);
-        self.settle_polling_rescans(&refreshed_scans, &failed_scan_pids, &removed);
-
         // Per-tick admission bound: rotate past the last attempted newcomer
         // before selecting this tick's window. Failed opens/scans must not
         // consume the same first window forever and starve later processes.
@@ -16709,8 +16805,8 @@ impl Engine {
         for pid in admitted.iter().chain(deferred.iter()) {
             self.mark_newcomer_arrival(*pid, arrival_now);
         }
+        let mut failed_refresh_pids: BTreeSet<u32> = deferred.iter().copied().collect();
         if !deferred.is_empty() {
-            failed_refresh_pids.extend(deferred.iter().copied());
             let pending = admitted.len() + deferred.len();
             let noun = if pending == 1 { "process" } else { "processes" };
             skipped.push(Skipped {
@@ -16721,8 +16817,33 @@ impl Engine {
                 ),
             });
         }
-        let (admitted_views, failed_admission_pids, admission_skips) =
-            self.admit_inventory_new_views(admitted, max_scan_pids, &mut *tick_now);
+        let newcomers_first = self
+            .scheduler
+            .newcomers_first(!refreshed.is_empty(), !admitted.is_empty());
+        let (refresh_outcome, admission_outcome) = if newcomers_first {
+            let admission = self.admit_inventory_new_views(admitted, max_scan_pids, &mut *tick_now);
+            let refresh = self.scan_inventory_views(
+                &refreshed,
+                "a requested inventory refresh failed",
+                &mut *tick_now,
+            );
+            (refresh, admission)
+        } else {
+            let refresh = self.scan_inventory_views(
+                &refreshed,
+                "a requested inventory refresh failed",
+                &mut *tick_now,
+            );
+            let admission = self.admit_inventory_new_views(admitted, max_scan_pids, &mut *tick_now);
+            (refresh, admission)
+        };
+        let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) =
+            refresh_outcome;
+        failed_refresh_pids.extend(failed_scan_pids.iter().copied());
+        failed_refresh_pids.extend(deferred_scan_pids);
+        skipped.extend(refresh_skips);
+        self.settle_polling_rescans(&refreshed_scans, &failed_scan_pids, &removed);
+        let (admitted_views, failed_admission_pids, admission_skips) = admission_outcome;
         new_views.extend(admitted_views);
         failed_refresh_pids.extend(failed_admission_pids);
         skipped.extend(admission_skips);
@@ -17053,8 +17174,6 @@ impl Engine {
             }));
             failed_refresh_pids.extend(new_view_pids);
         }
-        self.refresh_requested
-            .retain(|pid, _| failed_refresh_pids.contains(pid));
         self.close_cgroup_admissions_at_removal(&removed);
         self.settle_leader_exits_at_removal(removed.iter().copied());
         let released: Vec<_> = self
@@ -17086,6 +17205,7 @@ impl Engine {
                 if self.frame_work_exhausted() {
                     self.note_frame_deferral();
                     let pid = self.views[position].pid();
+                    failed_refresh_pids.insert(pid);
                     self.request_refresh(pid, crate::attach::monotonic_ns());
                     return Ok(false);
                 }
@@ -17123,13 +17243,11 @@ impl Engine {
         };
         // A closed tick skips arming: the whole phase when the closure came
         // after the apply, and every view after the one that raised it inside
-        // the phase. A newly admitted newcomer has no refresh request that
-        // the retain above could keep, and a refreshed view's request was
-        // dropped there whenever the tick was still open. Without one, its
-        // loader would never be armed and its dynamic exports never attached
-        // (U-07). Once it owns modules polling never rescans it either.
-        // Request each owned view the closed tick left unarmed; the next open
-        // tick rescans and arms it.
+        // the phase. Keep a serviced request until that setup finishes, and
+        // request any newly admitted owner the closed tick left unarmed.
+        // Without that intent its loader would never be armed and its
+        // dynamic exports never attached (U-07): once it owns modules polling
+        // never rescans it. The next open tick rescans and arms it.
         if !*additions_allowed {
             let unarmed: Vec<_> = self
                 .views
@@ -17143,6 +17261,7 @@ impl Engine {
                 .map(ProcessView::pid)
                 .collect();
             for pid in unarmed {
+                failed_refresh_pids.insert(pid);
                 self.request_refresh(pid, crate::attach::monotonic_ns());
             }
             // The unarmed filter above cannot see an armed view whose export
@@ -17153,6 +17272,11 @@ impl Engine {
         if *additions_allowed && self.frame_deferred {
             self.request_skipped_export_views(&export_incomplete);
         }
+        failed_refresh_pids.extend(
+            self.views
+                .iter()
+                .filter_map(|view| export_incomplete.contains(&view.id()).then_some(view.pid())),
+        );
         let cleanup = self.process_discovery_records(
             session,
             records,
@@ -17165,6 +17289,7 @@ impl Engine {
             return Err(error);
         }
         changed |= cleanup?;
+        self.complete_refresh_requests(&serviced_requests, &failed_refresh_pids);
         Ok(changed)
     }
 
@@ -17186,6 +17311,7 @@ impl Engine {
         !matches!(self.scope, Scope::Pid(_))
             && self.pending_discovery_records.is_empty()
             && self.pending_loader_scans.is_empty()
+            && self.retirement_intents.is_empty()
             && self.pending_retirements.is_empty()
             && self.pending_rejected_keys.is_empty()
             && self.ready_expected_removals.is_empty()
@@ -17706,10 +17832,11 @@ impl Engine {
         for seen in self
             .refresh_requested
             .values()
-            .chain(self.newcomer_first_seen.values())
+            .map(|request| request.first_seen_ns)
+            .chain(self.newcomer_first_seen.values().copied())
             .flatten()
         {
-            let age = newcomer_age_ms(Some(*seen), now_ns);
+            let age = newcomer_age_ms(Some(seen), now_ns);
             oldest = match (oldest, age) {
                 (Some(known), Some(age)) => Some(known.max(age)),
                 (None, age) => age,

@@ -31916,16 +31916,39 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
 
     // Expected-exit/link-loss cleanup is owned by its exact retained view,
     // and cannot clear an unmatched replacement request for the same PID.
-    let mut children = e06_spawn_sleeps(1);
-    let pid = children[0].pid();
-    let view = ProcessViewId(0);
-    engine.views.push(ProcessView::open(view, pid).unwrap());
+    let (selection_fixture, mut engine, mut session, binding) = attached_selection_route();
+    let pid = selection_fixture.child.id();
+    let view = binding.view;
+    assert!(binding.attached);
+    assert_eq!(binding.abi, HookAbi::Interface);
+    assert!(!engine.modules.is_empty());
     assert!(engine.request_refresh_consumed(pid, Some(30)));
     assert_eq!(engine.refresh_requested[&pid].owner, Some(view));
     engine.clear_refresh_for_view(view, pid);
     assert!(!engine.refresh_requested.contains_key(&pid));
-    children[0].reap().unwrap();
-    engine.dispatch_lifecycle_record(&exec_record_for(pid), &mut PendingViewRetirements::new());
+    // The actual lowering route refuses to join the fresh record to the
+    // retained old generation. A later timestamp alone cannot establish
+    // this distinction for an EXEC already matched by lifecycle_retirement.
+    engine.views = vec![crate::process::reused_process_view_for_test(view, pid).unwrap()];
+    assert_eq!(
+        engine.views[0].original_generation_state(),
+        Ok(crate::process::OriginalGenerationState::Reused),
+    );
+    let mut selection = successful_selection_record(pid, binding.id, 0);
+    selection.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+    assert!(selection.hook_ts_ns >= engine.views[0].admitted_ns());
+    let outcome = engine
+        .process_selection_lowering(
+            &selection,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
+    ));
     let replacement = engine.refresh_requested[&pid];
     assert_eq!(replacement.owner, None);
     engine.queue_retirement(
@@ -31934,6 +31957,13 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
         &mut PendingViewRetirements::new(),
     );
     assert_eq!(engine.refresh_requested[&pid], replacement);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live interface selection"
+                && skip.reason.contains("no retained process generation")
+        }),
+        "the unprovable selection still publishes its original loss"
+    );
 
     // Exercise the actual empty inventory path on a populated provider plan.
     let mut fixture = RefreshFairnessFixture::new();
@@ -31957,6 +31987,44 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
     assert!(fixture.engine.refresh_requested.is_empty());
     assert_eq!(fixture.engine.deep_scans, scans);
     assert!(!fixture.engine.plan.slots.is_empty());
+}
+
+#[test]
+fn matched_lifecycle_refresh_keeps_owner_for_proven_exit() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let pid = fixture.children[0].pid();
+    let view = fixture.engine.views[0].id();
+    fixture.engine.scope = Scope::Pid(pid);
+    assert!(!fixture.engine.plan.slots.is_empty());
+    assert!(fixture.engine.request_refresh(pid, Some(10_000_000)));
+    let first = fixture.engine.refresh_requested[&pid];
+    let mut pending = PendingViewRetirements::new();
+    fixture
+        .engine
+        .dispatch_lifecycle_record(&exec_record_for(pid), &mut pending);
+    let renewed = fixture.engine.refresh_requested[&pid];
+    assert_eq!(renewed.owner, Some(view));
+    assert!(renewed.serial > first.serial);
+    assert_eq!(renewed.first_seen_ns, first.first_seen_ns);
+    fixture.children[0].reap().unwrap();
+    assert_eq!(fixture.engine.views[0].original_exited(), Ok(true));
+    fixture
+        .engine
+        .dispatch_lifecycle_record(&exec_record_for(pid), &mut pending);
+    fixture.engine.promote_stale_execs(&mut pending);
+    assert_eq!(pending.get(&view), Some(&RetirementCause::ExpectedRemoval));
+    assert!(
+        !fixture.engine.refresh_requested.contains_key(&pid),
+        "a matched late EXEC belongs to the proven-ended retained group"
+    );
+    assert!(
+        fixture
+            .engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| { skip.subject != "live discovery generation" })
+    );
 }
 
 #[test]

@@ -2206,6 +2206,337 @@ fn engine_admitting_overlay(minor: u64, admitted: u32) -> (Engine, ScannedModule
     (engine, raw)
 }
 
+fn publication_operation_counts(engine: &Engine) -> (u64, u64) {
+    let count = |name| {
+        engine
+            .stage_timings()
+            .ops()
+            .iter()
+            .find(|(op, _, _)| *op == name)
+            .map_or(0, |(_, _, count)| *count)
+    };
+    (count("merge_facts"), count("project_facts"))
+}
+
+fn retained_publication_engine(minor: u64, admitted: u32) -> (Engine, ScannedModule) {
+    let (mut engine, raw) = engine_admitting_overlay(minor, admitted);
+    engine
+        .views
+        .push(ProcessView::open(raw.view, std::process::id()).unwrap());
+    (engine, raw)
+}
+
+fn apply_publication_candidate(engine: &mut Engine, raw: &ScannedModule) -> ApplyOutcome {
+    let candidate = engine
+        .live_candidate(engine.pinned.clone(), vec![raw.clone()], Vec::new())
+        .unwrap();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            candidate,
+            &mut additions_allowed,
+            false,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert!(additions_allowed);
+    outcome
+}
+
+#[test]
+fn candidate_publication_is_not_repeated_by_unchanged_batch_tail() {
+    let (mut engine, mut raw) = retained_publication_engine(210, 1);
+    engine.mark_partial("publication control", "an earlier observed discovery gap");
+    raw.tables[0].entries = overlay_entries(&raw, first_offsets(2));
+    let before = publication_operation_counts(&engine);
+
+    let outcome = apply_publication_candidate(&mut engine, &raw);
+
+    assert!(
+        outcome.changed,
+        "consumers still resynchronize after growth"
+    );
+    assert_eq!(engine.discovery.modules.len(), 1);
+    assert_eq!(engine.plan.active_slot_count(), 2);
+    assert_eq!(engine.plan.entries_seen, 2);
+    assert_eq!(engine.capture_facts.history.decoded.len(), 2);
+    assert!(engine.plan.skipped.iter().any(|skip| {
+        skip.subject == "publication control" && skip.reason == "an earlier observed discovery gap"
+    }));
+    let published = publication_operation_counts(&engine);
+    assert_eq!(published, (before.0 + 1, before.1 + 1));
+    let discovery = serde_json::to_value(&engine.discovery).unwrap();
+    let plan = engine.plan.clone();
+
+    engine.publish_batch_tail(outcome.changed).unwrap();
+
+    assert_eq!(publication_operation_counts(&engine), published);
+    assert_eq!(serde_json::to_value(&engine.discovery).unwrap(), discovery);
+    assert_eq!(engine.plan, plan);
+    assert!(outcome.changed);
+    assert_eq!(engine.published_facts_revision, engine.facts_revision);
+}
+
+#[test]
+fn publication_reuse_preserves_later_dirty_inputs() {
+    // This existing overlay fixture's mount ID is minor + 1. Minor 6
+    // therefore shares the manifest fixture's exact mount ID 7.
+    let (mut engine, raw) = retained_publication_engine(6, 1);
+    apply_publication_candidate(&mut engine, &raw);
+    engine.publish_batch_tail(false).unwrap();
+
+    let before = publication_operation_counts(&engine);
+    engine.mark_partial("later publication gap", "later evidence must survive reuse");
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(
+        publication_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+    assert!(engine.plan.skipped.iter().any(|skip| {
+        skip.subject == "later publication gap"
+            && skip.reason == "later evidence must survive reuse"
+    }));
+
+    let before = publication_operation_counts(&engine);
+    let prior_scan_ms = engine.discovery.scan_ms;
+    engine.absorb_scan_counters(DiscoveryCounters {
+        scan_ms: 17,
+        scan_unavailable: Some("later scan unavailable"),
+        ..DiscoveryCounters::default()
+    });
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(
+        publication_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+    assert_eq!(engine.discovery.scan_ms, prior_scan_ms + 17);
+    assert_eq!(
+        engine.discovery.scan_unavailable.as_deref(),
+        Some("later scan unavailable")
+    );
+
+    // An exact additional pin source changes public object evidence while
+    // leaving all provider plan fields and physical target keys identical.
+    let object = engine.modules[0].object;
+    assert_eq!(engine.pinned.sources(object), ["scan"]);
+    let mut pins = engine.pinned.clone();
+    let skips = pins.absorb(crate::discovery::identity::test_fixture::manifest_pin(
+        raw.key,
+        OVERLAY_SHA,
+        1,
+    ));
+    assert!(skips.is_empty(), "{skips:?}");
+    assert_eq!(pins.sources(object), ["scan", "manifest"]);
+    let candidate = engine
+        .live_candidate(pins, vec![raw.clone()], Vec::new())
+        .unwrap();
+    assert_eq!(candidate.plan, engine.plan);
+    let before = publication_operation_counts(&engine);
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            candidate,
+            &mut additions_allowed,
+            false,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert!(!outcome.changed, "pin source evidence is not plan equality");
+    assert_eq!(
+        publication_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+    assert_eq!(
+        engine.discovery.modules[0].objects[0].sources,
+        ["scan", "manifest"]
+    );
+    let published = publication_operation_counts(&engine);
+    engine.publish_batch_tail(outcome.changed).unwrap();
+    assert_eq!(publication_operation_counts(&engine), published);
+}
+
+#[test]
+fn publication_reuse_preserves_refusal_and_overflow_history() {
+    let admitted = p11scope_ebpf_common::MAX_SLOTS - 1;
+    let (mut engine, raw) = retained_publication_engine(211, admitted);
+    engine.scope = Scope::System;
+    engine.broad_admit = true;
+    let mut pending = PendingViewRetirements::new();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+    }
+    engine.dispatch_lifecycle_record(&exec_record_for(4_001_000), &mut pending);
+    assert_eq!(engine.discovery_truncated, 1);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+    // The next successful provider transaction models recovery, after the
+    // earlier queued work has completed. It must not clear the consumed loss.
+    engine.refresh_requested.clear();
+    let mut grown = raw.clone();
+    grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 2));
+    let mut later = raw.tables[0].clone();
+    later.file_offset = Some(8);
+    later.address += 8;
+    for (fresh_later, high_water) in [(3, 5), (5, 7), (1, 7)] {
+        later.entries = overlay_entries(
+            &raw,
+            first_offsets(admitted + 2 + fresh_later).skip((admitted + 2) as usize),
+        );
+        grown.tables = vec![grown.tables[0].clone(), later.clone()];
+        let outcome = apply_publication_candidate(&mut engine, &grown);
+        assert_eq!(engine.plan.active_slot_count(), admitted as usize);
+        assert_eq!(engine.plan.slots.len(), admitted as usize);
+        assert_eq!(engine.discovery.modules_skipped.len(), 1);
+        assert!(
+            engine.discovery.modules_skipped[0]
+                .reason
+                .starts_with(&format!("admitted module needs {high_water} more;")),
+            "{:?}",
+            engine.discovery.modules_skipped
+        );
+        assert_eq!(engine.capture_facts().discovery_truncated, 1);
+        assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+        assert!(engine.plan.skipped.iter().any(|skip| {
+            skip.subject == "live discovery refresh"
+                && skip.reason.contains("exceeded the bounded pending queue")
+        }));
+        let published = publication_operation_counts(&engine);
+        let discovery = serde_json::to_value(&engine.discovery).unwrap();
+        let plan = engine.plan.clone();
+        engine.publish_batch_tail(outcome.changed).unwrap();
+        assert_eq!(publication_operation_counts(&engine), published);
+        assert_eq!(serde_json::to_value(&engine.discovery).unwrap(), discovery);
+        assert_eq!(engine.plan, plan);
+    }
+}
+
+#[test]
+fn staged_publication_does_not_complete_the_public_revision() {
+    let (mut engine, raw) = retained_publication_engine(212, 1);
+    engine.publish_batch_tail(false).unwrap();
+    let public_revision = engine.published_facts_revision;
+    let public_discovery = serde_json::to_value(&engine.discovery).unwrap();
+    let before = publication_operation_counts(&engine);
+    let snapshot = engine.begin_start_capture_attempt().unwrap();
+    engine.mark_partial(&raw.path, "staged acquisition gap");
+    engine.publish_batch_tail(true).unwrap();
+
+    assert_eq!(engine.published_facts_revision, public_revision);
+    assert_ne!(engine.facts_revision, public_revision);
+    assert_eq!(
+        serde_json::to_value(&engine.discovery).unwrap(),
+        public_discovery
+    );
+    assert_eq!(
+        publication_operation_counts(&engine),
+        (before.0 + 2, before.1)
+    );
+    engine
+        .finish_start_capture_attempt(snapshot, Ok(()))
+        .unwrap();
+    assert_eq!(engine.published_facts_revision, engine.facts_revision);
+    assert!(
+        engine
+            .plan
+            .skipped
+            .iter()
+            .any(|skip| skip.reason == "staged acquisition gap")
+    );
+    let published = publication_operation_counts(&engine);
+    engine.publish_batch_tail(true).unwrap();
+    assert_eq!(publication_operation_counts(&engine), published);
+}
+
+#[test]
+fn failed_publication_keeps_the_revision_dirty() {
+    let (mut engine, _) = retained_publication_engine(213, 1);
+    engine.publish_batch_tail(false).unwrap();
+    let public_revision = engine.published_facts_revision;
+    let discovery = serde_json::to_value(&engine.discovery).unwrap();
+    engine.mark_partial("publication failure control", "unpublished later input");
+    engine.manifest_ordinals.push(0); // No parallel manifest: the real merge refuses.
+    let before = publication_operation_counts(&engine);
+
+    assert!(engine.publish_batch_tail(false).is_err());
+
+    assert_eq!(engine.published_facts_revision, public_revision);
+    assert_ne!(engine.facts_revision, public_revision);
+    assert_eq!(serde_json::to_value(&engine.discovery).unwrap(), discovery);
+    assert_eq!(
+        publication_operation_counts(&engine),
+        (before.0 + 1, before.1)
+    );
+    engine.manifest_ordinals.clear();
+    engine.note_facts_mutated();
+    engine.publish_batch_tail(false).unwrap();
+    assert_eq!(engine.published_facts_revision, engine.facts_revision);
+    assert!(
+        engine
+            .plan
+            .skipped
+            .iter()
+            .any(|skip| skip.reason == "unpublished later input")
+    );
+    let published = publication_operation_counts(&engine);
+    engine.publish_batch_tail(true).unwrap();
+    assert_eq!(publication_operation_counts(&engine), published);
+}
+
+#[test]
+fn failed_start_does_not_leave_unpublished_state_clean() {
+    let (mut engine, _) = retained_publication_engine(214, 1);
+    engine.publish_batch_tail(false).unwrap();
+    let discovery = serde_json::to_value(&engine.discovery).unwrap();
+    let public_revision = engine.published_facts_revision;
+    let snapshot = engine.begin_start_capture_attempt().unwrap();
+    engine.mark_partial("failed start control", "failure remains public evidence");
+    engine.publish_current_capture_facts().unwrap();
+    assert_eq!(engine.published_facts_revision, public_revision);
+    let failure: Result<()> =
+        engine.finish_start_capture_attempt(snapshot, Err(anyhow!("startup control failure")));
+    assert_eq!(failure.unwrap_err().to_string(), "startup control failure");
+    assert!(engine.capture_facts.staged.is_none());
+    assert_ne!(engine.published_facts_revision, engine.facts_revision);
+    assert_eq!(serde_json::to_value(&engine.discovery).unwrap(), discovery);
+
+    engine.publish_batch_tail(false).unwrap();
+
+    assert_eq!(engine.published_facts_revision, engine.facts_revision);
+    assert!(
+        engine
+            .plan
+            .skipped
+            .iter()
+            .any(|skip| skip.reason == "failure remains public evidence")
+    );
+}
+
+#[test]
+fn publication_reuse_preserves_later_ambiguity() {
+    let (mut engine, raw) = retained_publication_engine(215, 1);
+    apply_publication_candidate(&mut engine, &raw);
+    engine.publish_batch_tail(false).unwrap();
+    let mut shared = engine.plan.slots[0].clone();
+    shared.module_ids.push(plan::ModuleId(99));
+    let candidate = plan::AttachPlan::from_slots(vec![shared]);
+    let changed = engine.latch_candidate_ambiguity(&candidate);
+    assert!(changed);
+    let before = publication_operation_counts(&engine);
+
+    engine.publish_batch_tail(changed).unwrap();
+
+    assert_eq!(
+        publication_operation_counts(&engine),
+        (before.0 + 1, before.1 + 1)
+    );
+    assert_eq!(engine.discovery.module_ambiguous, 1);
+    assert_eq!(engine.plan.module_of_slot(0), None);
+    assert_eq!(engine.published_facts_revision, engine.facts_revision);
+}
+
 /// One live rebuild of `raw`, committed and published the way an accepted
 /// candidate is; returns its link delta.
 fn commit_live_rebuild(engine: &mut Engine, raw: &ScannedModule) -> plan::AttachDelta {
@@ -27644,8 +27975,7 @@ fn maps_sweep_refusal_does_not_retire_a_retained_generation() {
     assert_eq!(engine.counters.object_skips.len(), 1);
 }
 
-/// B1: a batch tail that changed nothing and dirtied no publication input
-/// republishes byte-identical facts — the skip removes repeated work only.
+/// A batch tail with no unpublished input reuses byte-identical facts.
 /// Proved by counter (publishes vs skips), not timing; the published
 /// `discovery` JSON, the attach plan, the pin revision, and the retained
 /// generation are identical across the skip.
@@ -27659,16 +27989,16 @@ fn batch_tail_skip_republishes_byte_identical_facts() {
     refresh_inventory_once(&mut engine);
     engine.publish_current_capture_facts().unwrap();
 
-    // The first tail call publishes: the revision gate starts dirty.
+    // The explicit successful publication already completed this revision.
     engine.publish_batch_tail(false).unwrap();
-    assert_eq!(engine.tail_stats(), (1, 0));
+    assert_eq!(engine.tail_stats(), (0, 1));
     let facts = serde_json::to_value(&engine.discovery).unwrap();
     let plan = engine.plan.clone();
     let pinned_revision = engine.pinned.revision();
 
     // A quiet tail skips the recompute — observable only in the counter.
     engine.publish_batch_tail(false).unwrap();
-    assert_eq!(engine.tail_stats(), (1, 1));
+    assert_eq!(engine.tail_stats(), (0, 2));
     assert_eq!(serde_json::to_value(&engine.discovery).unwrap(), facts);
     assert_eq!(engine.plan, plan);
     assert_eq!(engine.pinned.revision(), pinned_revision);
@@ -27678,20 +28008,23 @@ fn batch_tail_skip_republishes_byte_identical_facts() {
     // forces the tail to run, so the skip can never hide a mutation.
     engine.absorb_scan_counters(DiscoveryCounters::default());
     engine.publish_batch_tail(false).unwrap();
-    assert_eq!(engine.tail_stats(), (2, 1));
+    assert_eq!(engine.tail_stats(), (1, 2));
 
-    // An explicit change always republishes, whatever the revision says.
+    // Consumer resynchronization still sees the change, while the completed
+    // publication needs no additional merge or projection.
+    let published = publication_operation_counts(&engine);
     engine.publish_batch_tail(true).unwrap();
-    assert_eq!(engine.tail_stats(), (3, 1));
+    assert_eq!(engine.tail_stats(), (1, 3));
+    assert_eq!(publication_operation_counts(&engine), published);
 
     // The same skip fires on real idle batches, not just direct tail
     // calls: each refresh finds nothing to do and its tail skips, leaving
     // the published discovery JSON byte-identical.
     let facts = serde_json::to_value(&engine.discovery).unwrap();
-    for skips in [2u64, 3] {
+    for skips in [4u64, 5] {
         refresh_inventory_once(&mut engine);
         engine.publish_batch_tail(false).unwrap();
-        assert_eq!(engine.tail_stats(), (3, skips));
+        assert_eq!(engine.tail_stats(), (1, skips));
         assert_eq!(serde_json::to_value(&engine.discovery).unwrap(), facts);
     }
 
@@ -27699,7 +28032,7 @@ fn batch_tail_skip_republishes_byte_identical_facts() {
     // time forces the tail to run again.
     engine.absorb_scan_counters(DiscoveryCounters::default());
     engine.publish_batch_tail(false).unwrap();
-    assert_eq!(engine.tail_stats(), (4, 3));
+    assert_eq!(engine.tail_stats(), (2, 5));
 }
 
 /// C2: the tick deep-scan quantum is honored on the refreshed-rescan path.

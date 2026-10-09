@@ -422,12 +422,11 @@ pub struct Engine {
     /// Cumulative newcomer queue-age evidence (admissions and drops sample
     /// here; pending counts fill in at snapshot time).
     newcomer_ages: crate::timing::NewcomerStats,
-    /// Publication-input revision (B1): bumped on every live-batch mutation
-    /// of the batch-tail merge inputs (plan, pins, modules, corroboration,
-    /// fallback, skips, scan time). The tail skips its publication work only
-    /// when the batch changed nothing AND this equals the last published
-    /// revision — a quiet batch republishes byte-identical facts otherwise.
+    /// Publication-input revision: bumped on every live-batch mutation of
+    /// plan, pins, modules, corroboration, fallback, skips or scan time.
     facts_revision: u64,
+    /// The revision whose complete facts were successfully projected publicly.
+    /// A staged merge is private and cannot advance this marker.
     published_facts_revision: u64,
     /// Batch-tail publications executed (counter, not timing: the B1 proof).
     tail_publishes: u64,
@@ -9921,6 +9920,14 @@ impl Engine {
     }
 
     fn publish_current_capture_facts(&mut self) -> Result<()> {
+        let skips_start = crate::attach::monotonic_ns();
+        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        self.stage_timings.span(
+            crate::timing::StageKind::Projection,
+            "record_publication_skips",
+            skips_start,
+            crate::attach::monotonic_ns(),
+        );
         let merge_start = crate::attach::monotonic_ns();
         let merged = self.capture_facts.merge_current(
             &self.plan,
@@ -9941,28 +9948,20 @@ impl Engine {
             return Ok(());
         }
         self.project_capture_facts();
+        self.published_facts_revision = self.facts_revision;
         Ok(())
     }
 
-    /// One batch tail's publication work, gated (B1). A batch that changed
-    /// nothing and dirtied no publication input republishes byte-identical
-    /// facts: skip the skip-recompute, the evidence rebuild, and the
-    /// consumer resync. The revision gate (not `changed` alone) is what
-    /// makes this sound: scan time, loss markers, and plan-equal pin commits
-    /// all bump the revision without setting `changed`, and any of them
-    /// forces the tail to run.
-    fn publish_batch_tail(&mut self, changed: bool) -> Result<()> {
-        if changed || self.facts_revision != self.published_facts_revision {
-            let skips_start = crate::attach::monotonic_ns();
-            record_object_skips(&mut self.plan, &self.counters.object_skips);
-            self.stage_timings.span(
-                crate::timing::StageKind::Projection,
-                "record_tail_skips",
-                skips_start,
-                crate::attach::monotonic_ns(),
-            );
+    /// Reuse a candidate's completed publication when no later input changed.
+    /// The batch's `changed` flag still tells consumers to resynchronize; it
+    /// does not require publishing the same revision twice. Scan time, loss
+    /// markers and plan-equal pin commits dirty the revision independently.
+    /// Startup staging remains ineligible for public-publication reuse.
+    fn publish_batch_tail(&mut self, _changed: bool) -> Result<()> {
+        if self.facts_revision != self.published_facts_revision
+            || self.capture_facts.staged.is_some()
+        {
             self.publish_current_capture_facts()?;
-            self.published_facts_revision = self.facts_revision;
             self.tail_publishes = self.tail_publishes.saturating_add(1);
         } else {
             self.tail_skips = self.tail_skips.saturating_add(1);
@@ -10072,6 +10071,7 @@ impl Engine {
             Ok(value) => {
                 self.capture_facts.commit_stage()?;
                 self.project_capture_facts();
+                self.published_facts_revision = self.facts_revision;
                 Ok(value)
             }
             Err(error) => {
@@ -11411,6 +11411,7 @@ impl Engine {
         if !self.plan.latch_ambiguity_from(candidate) {
             return false;
         }
+        self.note_facts_mutated();
         self.discovery.module_ambiguous = self.plan.module_ambiguous as u64;
         true
     }

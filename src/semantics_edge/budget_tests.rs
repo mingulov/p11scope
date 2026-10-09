@@ -27,6 +27,234 @@ fn native_semantic_resource_compiler_metadata_guard() {
     assert!(semantic_rustc::validate_metadata(&(valid + "release: 1.98.1\n")).is_err());
 }
 
+fn direct_charge(name: &str) -> usize {
+    MECHANISM_CHARGE
+        + CATEGORY_CHARGE
+        + FUNCTION_CHARGE
+        + name.len()
+        + OWNED_ALLOCATION_PADDING
+        + RETURN_CHARGE
+}
+
+#[test]
+fn native_semantic_resource_mechanism_boundary() {
+    let resources =
+        pool(2 * REDUCER_BASE_CHARGE + 3 * direct_charge("C_GenerateKey") + ACTIVE_MACHINE_CHARGE);
+    let mut edge = EdgeSemantics::with_resources(&resources).unwrap();
+    let mut sibling = EdgeSemantics::with_resources(&resources).unwrap();
+    sibling.observe_with_resources(&unknown_init(99)).unwrap();
+    for mechanism in 1..=3 {
+        edge.observe_with_resources(&SemanticCall {
+            mechanism,
+            ..facts("C_GenerateKey", 1)
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        (edge.started(), edge.completed(), edge.mechanisms().len()),
+        (3, 3, 3)
+    );
+    assert_eq!(
+        resources.snapshot().charged_bytes,
+        resources.snapshot().limit_bytes
+    );
+    assert!(
+        edge.observe_with_resources(&SemanticCall {
+            mechanism: 4,
+            ..facts("C_GenerateKey", 1)
+        })
+        .is_err()
+    );
+    assert_eq!(
+        (edge.started(), edge.completed(), edge.mechanisms().len()),
+        (3, 3, 3)
+    );
+    assert_eq!(resources.snapshot().refused, 1);
+    assert!(sibling.has_live_operations());
+    // Known retained keys still accept genuine observed facts without growth.
+    edge.observe_with_resources(&SemanticCall {
+        mechanism: 1,
+        ..facts("C_GenerateKey", 1)
+    })
+    .unwrap();
+    assert_eq!(edge.mechanisms()[&1].calls, 2);
+    assert_eq!(
+        resources.snapshot().charged_bytes,
+        resources.snapshot().limit_bytes
+    );
+}
+
+#[test]
+fn native_semantic_resource_category_boundary() {
+    let names = ["C_GenerateKey", "C_DeriveKey"];
+    let functions: usize = names
+        .iter()
+        .map(|name| FUNCTION_CHARGE + name.len() + OWNED_ALLOCATION_PADDING)
+        .sum();
+    let resources = pool(
+        2 * REDUCER_BASE_CHARGE
+            + MECHANISM_CHARGE
+            + 2 * CATEGORY_CHARGE
+            + functions
+            + RETURN_CHARGE
+            + ACTIVE_MACHINE_CHARGE,
+    );
+    let mut edge = EdgeSemantics::with_resources(&resources).unwrap();
+    let mut sibling = EdgeSemantics::with_resources(&resources).unwrap();
+    sibling.observe_with_resources(&unknown_init(99)).unwrap();
+    for name in names {
+        edge.observe_with_resources(&facts(name, 1)).unwrap();
+    }
+    assert_eq!((edge.started(), edge.completed()), (2, 2));
+    assert_eq!(edge.mechanisms()[&0x1087].ops.len(), 2);
+    assert_eq!(
+        resources.snapshot().charged_bytes,
+        resources.snapshot().limit_bytes
+    );
+    assert!(edge.observe_with_resources(&facts("C_WrapKey", 1)).is_err());
+    let stat = &edge.mechanisms()[&0x1087];
+    assert_eq!(
+        (stat.calls, stat.ops.len(), stat.functions.len()),
+        (2, 2, 2)
+    );
+    assert!(sibling.has_live_operations());
+    edge.observe_with_resources(&facts("C_DeriveKey", 1))
+        .unwrap();
+    assert_eq!(edge.mechanisms()[&0x1087].calls, 3);
+    assert_eq!(resources.snapshot().refused, 1);
+}
+
+#[test]
+fn native_semantic_resource_return_boundary() {
+    let update = FUNCTION_CHARGE + "C_SignUpdate".len() + OWNED_ALLOCATION_PADDING;
+    let resources = pool(
+        2 * REDUCER_BASE_CHARGE
+            + sign_history_charge()
+            + update
+            + 2 * RETURN_CHARGE
+            + 2 * ACTIVE_MACHINE_CHARGE,
+    );
+    let mut edge = EdgeSemantics::with_resources(&resources).unwrap();
+    let mut sibling = EdgeSemantics::with_resources(&resources).unwrap();
+    sibling.observe_with_resources(&unknown_init(99)).unwrap();
+    for error in 1..=2 {
+        edge.observe_with_resources(&facts("C_SignInit", 1))
+            .unwrap();
+        edge.observe_with_resources(&SemanticCall {
+            rv: 0x8000_0000 + error,
+            ..facts("C_SignUpdate", 1)
+        })
+        .unwrap();
+    }
+    edge.observe_with_resources(&facts("C_SignInit", 1))
+        .unwrap();
+    assert_eq!(edge.mechanisms()[&0x1087].returns.len(), 3);
+    assert_eq!(
+        resources.snapshot().charged_bytes,
+        resources.snapshot().limit_bytes
+    );
+    assert!(
+        edge.observe_with_resources(&SemanticCall {
+            rv: 0x8000_0003,
+            ..facts("C_SignUpdate", 1)
+        })
+        .is_err()
+    );
+    let stat = &edge.mechanisms()[&0x1087];
+    assert_eq!((stat.calls, stat.errors, stat.returns.len()), (5, 2, 3));
+    assert_eq!((edge.started(), edge.failed(), edge.unknown()), (3, 2, 1));
+    assert!(sibling.has_live_operations());
+    // A retained RV/function can reuse the released live allocation.
+    edge.observe_with_resources(&facts("C_SignInit", 2))
+        .unwrap();
+    edge.observe_with_resources(&SemanticCall {
+        rv: 0x8000_0001,
+        ..facts("C_SignUpdate", 2)
+    })
+    .unwrap();
+    assert_eq!(edge.mechanisms()[&0x1087].returns.len(), 3);
+    assert_eq!(resources.snapshot().refused, 1);
+}
+
+#[test]
+fn native_semantic_resource_new_async_boundary() {
+    let pending = SemanticCall {
+        rv: CkRv::PENDING.0,
+        ..facts("C_SignInit", 1)
+    };
+    let descriptor = crate::kinds::descriptor(&pending.function).unwrap();
+    let asynchronous = EdgeSemantics::async_charge(&pending, &descriptor);
+    let history =
+        sign_history_charge() + FUNCTION_CHARGE + "C_Sign".len() + OWNED_ALLOCATION_PADDING;
+    let resources =
+        pool(2 * REDUCER_BASE_CHARGE + history + 2 * asynchronous + ACTIVE_MACHINE_CHARGE);
+    let mut edge = EdgeSemantics::with_resources(&resources).unwrap();
+    let mut sibling = EdgeSemantics::with_resources(&resources).unwrap();
+    sibling.observe_with_resources(&unknown_init(99)).unwrap();
+    edge.observe_with_resources(&facts("C_SignInit", 10))
+        .unwrap();
+    edge.observe_with_resources(&facts("C_Sign", 10)).unwrap();
+    for session in 1..=2 {
+        edge.observe_with_resources(&SemanticCall {
+            session,
+            ..pending.clone()
+        })
+        .unwrap();
+    }
+    let before = edge.resource_usage();
+    assert_eq!(
+        (
+            before.pending_calls,
+            before.origin_vectors,
+            before.origin_capacity_elements
+        ),
+        (2, 2, 8)
+    );
+    assert_eq!(
+        resources.snapshot().charged_bytes,
+        resources.snapshot().limit_bytes
+    );
+    assert!(
+        edge.observe_with_resources(&SemanticCall {
+            session: 3,
+            ..pending.clone()
+        })
+        .is_err()
+    );
+    assert_eq!(
+        (
+            edge.resource_usage().pending_calls,
+            edge.resource_usage().detached_calls
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        (
+            edge.started(),
+            edge.completed(),
+            edge.mechanisms()[&0x1087].calls
+        ),
+        (1, 1, 2)
+    );
+    assert_eq!(edge.resource_usage().provenance_functions, 2);
+    assert!(sibling.has_live_operations());
+    assert_eq!(resources.snapshot().refused, 1);
+    edge.observe_with_resources(&SemanticCall {
+        session: 4,
+        ..pending
+    })
+    .unwrap();
+    assert_eq!(edge.resource_usage().pending_calls, 1);
+    assert_eq!(
+        resources.snapshot().charged_bytes,
+        SEMANTIC_TRANSITION_SCRATCH
+            + 2 * REDUCER_BASE_CHARGE
+            + history
+            + ACTIVE_MACHINE_CHARGE
+            + asynchronous
+    );
+}
+
 fn pool(persistent: usize) -> SemanticResourcePool {
     SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH + persistent)
 }

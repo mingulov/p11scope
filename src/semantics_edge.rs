@@ -592,10 +592,6 @@ impl EdgeSemantics {
         bytes
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 4 measurement precedes aggregate admission")
-    )]
     pub(crate) fn resource_usage(&self) -> S1Occupancy {
         let mut usage = S1Occupancy {
             open_bindings: self.open.len(),

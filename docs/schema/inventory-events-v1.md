@@ -43,11 +43,14 @@ Every line carries the same envelope plus its `kind`-specific `event`:
 
 - `started`: `{scope, clock: {basis, unit}, started_ns, limits:
   {callers, modules, edges, endpoints, inventory_endpoints,
-  inventory_attach_modules, semantic_state, retained_history}}`.
+  inventory_attach_modules, semantic_state, instance_semantic_resources,
+  retained_history}}`.
   First event of every run. `inventory_endpoints` and
   `inventory_attach_modules` (additive within v1) are the run's
   Inventory attach-set limits (`budgets.inventory_endpoints.limit`,
   `budgets.inventory_attach_modules.limit`).
+  `instance_semantic_resources` (additive) is the shared semantic allocation
+  pool's byte limit, `budgets.instance_semantic_resources.limit_bytes`.
 - `caller_event`: one caller-incarnation turnover —
   `{event: admitted, caller}`, `{event: exited, caller, reason}`,
   `{event: retired, caller, reason}` (old incarnation only, no authorized successor),
@@ -267,6 +270,9 @@ never sum successive cumulative records for an edge.
   `caller_event` instead).
 - `snapshot`: `{scope, passes, budgets, gaps_suppressed}` (test/sync
   emission marker).
+  Its additive `budgets.instance_semantic_resources` is the same immutable
+  charge-and-occupancy object as the JSON snapshot, defined in
+  [inventory v1](inventory-v1.md#semantic-instances-additive-within-v1).
 - `rotated`: `{prior_file, prior_events, prior_bytes, rotation_seq}` —
   the new file's first line after every rotation. The boundary is
   explicit: the named prior file exists with exactly `prior_events`
@@ -285,6 +291,9 @@ never sum successive cumulative records for an edge.
   `edges_unretained` the edges whose last record retention deleted (0
   unless the retention cannot hold one record per edge; see
   `edge_observed`).
+  The semantic resource budget uses this terminal presentation's current
+  charges, peak charges, refusals and occupancy; it never recomputes live
+  registry state while serializing the event.
 
 ## Transport and rotation
 

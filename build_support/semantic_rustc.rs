@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 // These charges depend on the pinned alloc implementation. A stable compiler
 // bump requires semantic-budget remeasurement and source-proof revalidation.
 

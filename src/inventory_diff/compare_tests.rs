@@ -1954,3 +1954,30 @@ fn instance_s1_additive_details_do_not_change_physical_diff() {
         }
     }
 }
+
+#[test]
+fn native_semantic_resource_budgets_do_not_change_physical_diff() {
+    let old = document();
+    let mut charged = old.clone();
+    charged["budgets"]["instance_semantic_resources"] = json!({
+        "limit_bytes": 67108864, "charged_bytes": 1074691,
+        "peak_charged_bytes": 1074691, "refused": 0,
+        "occupancy": {"active_machines": 1, "detached_calls": 1, "mechanisms": 1}
+    });
+    let mut refused = charged.clone();
+    refused["budgets"]["instance_semantic_resources"]["charged_bytes"] = json!(1068880);
+    refused["budgets"]["instance_semantic_resources"]["refused"] = json!(7);
+    refused["budgets"]["instance_semantic_resources"]["occupancy"]["active_machines"] = json!(0);
+    let baseline = serde_json::to_value(compare(&snapshot(&old), &snapshot(&old))).unwrap();
+    for left in [&old, &charged, &refused] {
+        for right in [&old, &charged, &refused] {
+            let report = compare(&snapshot(left), &snapshot(right));
+            assert_eq!(serde_json::to_value(&report).unwrap(), baseline);
+            assert!(
+                report
+                    .limitations
+                    .contains(&"semantic_details_not_compared".into())
+            );
+        }
+    }
+}

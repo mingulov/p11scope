@@ -2580,9 +2580,29 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
         )),
         "dashboard coverage"
     );
+    let budget_dashboard = String::from_utf8(render_frame(
+        &frame,
+        Viewport {
+            width: 1400,
+            height: 20,
+        },
+        &DashboardState::new(),
+    ))
+    .unwrap();
+    let resources = &budgets["instance_semantic_resources"];
     assert!(
-        dashboard.contains(&format!(
-            "budgets: callers {} | modules {} | edges {} | counters observed {} saturated {} | retained {}/{} suppressed {}",
+        budget_dashboard.contains(&format!(
+            "budgets: semantic {}/{}B peak={} refused={}",
+            resources["charged_bytes"],
+            resources["limit_bytes"],
+            resources["peak_charged_bytes"],
+            resources["refused"],
+        )),
+        "dashboard resource charges"
+    );
+    assert!(
+        budget_dashboard.contains(&format!(
+            " | callers {} | modules {} | edges {} | counters observed {} saturated {} | retained {}/{} suppressed {}",
             row("callers"),
             row("modules"),
             row("edges"),

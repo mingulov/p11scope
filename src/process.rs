@@ -482,10 +482,24 @@ fn run_while_same_with<T>(
     Ok(result)
 }
 
+/// Allocation identity of one admitted view; carries no descriptor.
+#[derive(Clone)]
+pub(crate) struct ViewAdmission(std::sync::Arc<()>);
+impl ViewAdmission {
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+    #[cfg(test)]
+    pub(crate) fn test_new() -> Self {
+        Self(std::sync::Arc::new(()))
+    }
+}
+
 /// One accepted process generation and its filesystem view. Task 4 uses the pin
 /// through scan/open/hash; the later lifecycle task can retain this value and recheck
 /// it before subtracting this view's claims.
 pub struct ProcessView {
+    admission: ViewAdmission,
     id: ProcessViewId,
     mount_namespace: MountNamespaceId,
     pin: PidPin,
@@ -518,11 +532,19 @@ impl ProcessView {
             crate::attach::monotonic_ns,
         )?;
         Ok(Self {
+            admission: ViewAdmission(std::sync::Arc::new(())),
             id,
             mount_namespace,
             pin,
             admitted_ns,
         })
+    }
+
+    pub(crate) fn retained_pin(&self) -> &PidPin {
+        &self.pin
+    }
+    pub(crate) fn view_admission(&self) -> ViewAdmission {
+        self.admission.clone()
     }
 
     pub fn id(&self) -> ProcessViewId {

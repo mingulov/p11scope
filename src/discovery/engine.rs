@@ -67,12 +67,178 @@ pub(crate) mod inventory;
 #[path = "inventory_coordinator.rs"]
 pub(crate) mod inventory_coordinator;
 
+use crate::attach::detailed_identity::{
+    ProofSession, SeedId, TraceIo, TraceSeed, TraceServiceProgress, TraceWorkError,
+    VerifiedTraceSeed,
+};
+/// Constructors remain inside this scheduling owner; copies share allowance.
+#[derive(Clone, Default)]
+pub(crate) struct TraceWorkTicket {
+    state: Option<std::sync::Arc<std::sync::Mutex<TraceWorkState>>>,
+}
+struct TraceWorkState {
+    proof: ProofSession,
+    deadline: u64,
+    last_clock: u64,
+    visits: u32,
+    reads: u32,
+    health_attempted: bool,
+    closed: bool,
+    terminal: bool,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+impl TraceWorkTicket {
+    fn new(
+        proof: ProofSession,
+        start: u64,
+        deadline: u64,
+        terminal: bool,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        Self {
+            state: Some(std::sync::Arc::new(std::sync::Mutex::new(TraceWorkState {
+                proof,
+                deadline,
+                last_clock: start,
+                visits: 32,
+                reads: 32,
+                health_attempted: false,
+                closed: false,
+                terminal,
+                cancel,
+            }))),
+        }
+    }
+    fn same_allocation(&self, other: &Self) -> bool {
+        match (&self.state, &other.state) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+    pub(crate) fn check(&self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(TraceWorkError::Deferred)?
+            .lock()
+            .map_err(|_| TraceWorkError::Deferred)?;
+        if state.closed
+            || !state.proof.same_allocation(proof)
+            || state
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(TraceWorkError::Deferred);
+        }
+        let Some(now) = proof.now() else {
+            state.closed = true;
+            return Err(TraceWorkError::Deferred);
+        };
+        if now < state.last_clock || now >= state.deadline {
+            state.closed = true;
+            return Err(TraceWorkError::Deferred);
+        }
+        state.last_clock = now;
+        Ok(())
+    }
+    pub(crate) fn external_read(&mut self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        self.check(proof)?;
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(TraceWorkError::Deferred)?
+            .lock()
+            .map_err(|_| TraceWorkError::Deferred)?;
+        if state.reads == 0 {
+            return Err(TraceWorkError::Deferred);
+        }
+        state.reads -= 1;
+        Ok(())
+    }
+    pub(crate) fn claim_health(&mut self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        self.check(proof)?;
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(TraceWorkError::Deferred)?
+            .lock()
+            .map_err(|_| TraceWorkError::Deferred)?;
+        if state.health_attempted {
+            return Err(TraceWorkError::Deferred);
+        }
+        state.health_attempted = true;
+        Ok(())
+    }
+    fn health_attempted(&self) -> bool {
+        self.state
+            .as_ref()
+            .and_then(|s| s.lock().ok())
+            .is_none_or(|s| s.health_attempted)
+    }
+    fn visit(&mut self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        self.check(proof)?;
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(TraceWorkError::Deferred)?
+            .lock()
+            .map_err(|_| TraceWorkError::Deferred)?;
+        if state.visits == 0 {
+            return Err(TraceWorkError::Deferred);
+        }
+        state.visits -= 1;
+        Ok(())
+    }
+    fn terminal(&self) -> bool {
+        self.state
+            .as_ref()
+            .and_then(|s| s.lock().ok())
+            .is_some_and(|s| s.terminal)
+    }
+    fn close(&self) {
+        if let Some(state) = &self.state
+            && let Ok(mut state) = state.lock()
+        {
+            state.closed = true;
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_new(proof: ProofSession, start: u64, deadline: u64) -> Self {
+        Self::new(proof, start, deadline, false, None)
+    }
+}
+struct TraceCandidate {
+    seed: TraceSeed,
+    position: usize,
+}
+#[derive(Clone, Copy)]
+enum TracePhase {
+    Arming,
+    Health,
+    Settlement,
+    Seeding,
+}
+
 pub struct Engine {
     plan: plan::AttachPlan,
     pinned: PinnedObjects,
     discovery: render::DiscoveryEvidence,
     capture_facts: CaptureFacts,
     views: Vec<ProcessView>,
+    trace_seeds: BTreeMap<SeedId, TraceCandidate>,
+    trace_by_view: BTreeMap<ProcessViewId, SeedId>,
+    trace_owner: Option<ProofSession>,
+    trace_active: Option<TraceWorkTicket>,
+    /// Inherited frame limit; only with_live_frame activates ordinary deferral.
+    trace_frame_deadline_ns: Option<u64>,
+    trace_terminal: Option<TraceWorkTicket>,
+    trace_phase: TracePhase,
+    trace_phase_visits: u32,
+    trace_arm_cursor: Option<SeedId>,
+    trace_settle_cursor: Option<SeedId>,
+    trace_view_cursor: usize,
+    trace_needs_health: bool,
     modules: Vec<ReconciledModule>,
     manifests: Vec<Manifest>,
     manifest_ordinals: Vec<u32>,
@@ -7522,6 +7688,18 @@ impl Engine {
             discovery: render::DiscoveryEvidence::default(),
             capture_facts: CaptureFacts::default(),
             views: Vec::new(),
+            trace_seeds: BTreeMap::new(),
+            trace_by_view: BTreeMap::new(),
+            trace_owner: None,
+            trace_active: None,
+            trace_frame_deadline_ns: None,
+            trace_terminal: None,
+            trace_phase: TracePhase::Arming,
+            trace_phase_visits: 0,
+            trace_arm_cursor: None,
+            trace_settle_cursor: None,
+            trace_view_cursor: 0,
+            trace_needs_health: false,
             modules: Vec::new(),
             manifests: Vec::new(),
             manifest_ordinals: Vec::new(),
@@ -7752,16 +7930,339 @@ impl Engine {
         }
     }
 
+    pub(crate) fn with_trace_frame<S: TraceIo, T>(
+        &mut self,
+        session: &mut S,
+        run: impl FnOnce(&mut Self, &mut S, &mut TraceWorkTicket) -> Result<T>,
+    ) -> Result<T> {
+        let Some(proof) = session.proof().cloned() else {
+            return run(self, session, &mut TraceWorkTicket::default());
+        };
+        if self
+            .trace_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.same_allocation(&proof))
+        {
+            return run(self, session, &mut TraceWorkTicket::default());
+        }
+        if let Some(active) = &self.trace_active {
+            return run(self, session, &mut active.clone());
+        }
+        self.trace_owner = Some(proof.clone());
+        let prior_deadline = self.trace_frame_deadline_ns;
+        let mut work = TraceWorkTicket::default();
+        if let Some(start) = proof.now()
+            && let Some(frame) = start.checked_add(self.frame_work_budget_ns)
+            && let Some(proof_end) = start.checked_add(5_000_000)
+        {
+            let frame = prior_deadline.map_or(frame, |prior| prior.min(frame));
+            let frame = self
+                .frame_deadline_ns
+                .map_or(frame, |prior| prior.min(frame));
+            self.trace_frame_deadline_ns = Some(frame);
+            work = TraceWorkTicket::new(
+                proof,
+                start,
+                frame.min(proof_end),
+                false,
+                self.cancel_flag.clone(),
+            );
+        }
+        self.trace_active = Some(work.clone());
+        let result = run(self, session, &mut work);
+        work.close();
+        self.trace_active = None;
+        self.trace_frame_deadline_ns = prior_deadline;
+        result
+    }
+    fn drop_trace_seed(&mut self, id: SeedId) {
+        if let Some(candidate) = self.trace_seeds.remove(&id) {
+            if self.trace_by_view.get(&candidate.seed.view_id()) == Some(&id) {
+                self.trace_by_view.remove(&candidate.seed.view_id());
+            }
+            // No ledger guard is held while dropping the sole reservation.
+            drop(candidate);
+        }
+    }
+    fn next_trace_seed(&self, cursor: Option<SeedId>) -> Option<SeedId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match cursor {
+            Some(id) => self
+                .trace_seeds
+                .range((Excluded(id), Unbounded))
+                .next()
+                .map(|(id, _)| *id),
+            None => self.trace_seeds.keys().next().copied(),
+        }
+    }
+    fn advance_trace_phase(&mut self) {
+        self.trace_phase = match self.trace_phase {
+            TracePhase::Arming => TracePhase::Health,
+            TracePhase::Health => TracePhase::Settlement,
+            TracePhase::Settlement => TracePhase::Seeding,
+            TracePhase::Seeding => TracePhase::Arming,
+        };
+        self.trace_phase_visits = 0;
+    }
+    pub(crate) fn service_trace_images(
+        &mut self,
+        session: &impl TraceIo,
+        work: &mut TraceWorkTicket,
+        mut accept: impl FnMut(VerifiedTraceSeed),
+    ) -> TraceServiceProgress {
+        let mut progress = TraceServiceProgress::default();
+        let Some(proof) = session.proof() else {
+            progress.deferred = 1;
+            return progress;
+        };
+        let owned = self
+            .trace_active
+            .as_ref()
+            .is_some_and(|active| active.same_allocation(work))
+            || self
+                .trace_terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.same_allocation(work));
+        if !owned || work.check(proof).is_err() {
+            progress.deferred = 1;
+            return progress;
+        }
+        loop {
+            if work.check(proof).is_err() {
+                progress.deferred += 1;
+                break;
+            }
+            match self.trace_phase {
+                TracePhase::Arming => {
+                    if self.trace_phase_visits >= 8 {
+                        self.advance_trace_phase();
+                        continue;
+                    }
+                    let Some(id) = self.next_trace_seed(self.trace_arm_cursor) else {
+                        self.trace_arm_cursor = None;
+                        self.advance_trace_phase();
+                        continue;
+                    };
+                    if work.visit(proof).is_err() {
+                        progress.deferred += 1;
+                        break;
+                    }
+                    progress.visited += 1;
+                    // An attempted confirmation consumes its fair phase turn,
+                    // including when the original-pin read later defers.
+                    self.trace_arm_cursor = Some(id);
+                    self.trace_phase_visits += 1;
+                    let candidate = &self.trace_seeds[&id];
+                    let status = self
+                        .views
+                        .get(candidate.position)
+                        .ok_or(crate::attach::detailed_identity::TraceProofUnknown::TargetGone)
+                        .and_then(|view| proof.seed_status(&candidate.seed, view));
+                    let result = match status {
+                        Ok((true, _)) => {
+                            let view = &self.views[candidate.position];
+                            session
+                                .cookie(view.retained_pin(), work)
+                                .and_then(|cookie| {
+                                    proof
+                                        .confirm(&candidate.seed, view, cookie)
+                                        .map_err(Into::into)
+                                })
+                        }
+                        Ok((false, needs_health)) => {
+                            self.trace_needs_health |= needs_health;
+                            Ok(())
+                        }
+                        Err(reason) => Err(reason.into()),
+                    };
+                    match result {
+                        Err(TraceWorkError::Deferred) => {
+                            progress.deferred += 1;
+                            break;
+                        }
+                        Err(TraceWorkError::Unknown(_)) => self.drop_trace_seed(id),
+                        Ok(()) => {
+                            if let Some(candidate) = self.trace_seeds.get(&id)
+                                && let Some(view) = self.views.get(candidate.position)
+                                && let Ok((_, needs)) = proof.seed_status(&candidate.seed, view)
+                            {
+                                self.trace_needs_health |= needs;
+                            }
+                        }
+                    }
+                }
+                TracePhase::Health => {
+                    let mut baseline_needed = false;
+                    if !work.terminal() && !proof.has_baseline() && !self.views.is_empty() {
+                        if work.visit(proof).is_err() {
+                            progress.deferred += 1;
+                            break;
+                        }
+                        progress.visited += 1;
+                        self.trace_view_cursor %= self.views.len();
+                        baseline_needed =
+                            proof.can_seed(&self.views[self.trace_view_cursor]).is_ok();
+                    }
+                    if (self.trace_needs_health || baseline_needed) && !work.health_attempted() {
+                        match session.refresh_health(work) {
+                            Err(TraceWorkError::Deferred) => {
+                                progress.deferred += 1;
+                                break;
+                            }
+                            _ => self.trace_needs_health = false,
+                        }
+                    }
+                    self.advance_trace_phase();
+                }
+                TracePhase::Settlement => {
+                    if self.trace_phase_visits >= 8 {
+                        self.advance_trace_phase();
+                        continue;
+                    }
+                    let Some(id) = self.next_trace_seed(self.trace_settle_cursor) else {
+                        self.trace_settle_cursor = None;
+                        self.advance_trace_phase();
+                        continue;
+                    };
+                    if work.visit(proof).is_err() {
+                        progress.deferred += 1;
+                        break;
+                    }
+                    progress.visited += 1;
+                    let candidate = &self.trace_seeds[&id];
+                    let result = self
+                        .views
+                        .get(candidate.position)
+                        .ok_or(crate::attach::detailed_identity::TraceProofUnknown::TargetGone)
+                        .and_then(|view| {
+                            proof.seed_status(&candidate.seed, view)?;
+                            proof.ready_to_transfer(&candidate.seed)
+                        });
+                    match result {
+                        Ok(true) => {
+                            let candidate = self
+                                .trace_seeds
+                                .remove(&id)
+                                .expect("visited retained candidate");
+                            if self.trace_by_view.get(&candidate.seed.view_id()) == Some(&id) {
+                                self.trace_by_view.remove(&candidate.seed.view_id());
+                            }
+                            if let Ok(verified) =
+                                proof.verified(candidate.seed, &self.views[candidate.position])
+                            {
+                                progress.transferred += 1;
+                                accept(verified);
+                            }
+                        }
+                        Err(_) => self.drop_trace_seed(id),
+                        Ok(false) => {}
+                    }
+                    self.trace_settle_cursor = Some(id);
+                    self.trace_phase_visits += 1;
+                }
+                TracePhase::Seeding => {
+                    if work.terminal() || self.views.is_empty() || self.trace_phase_visits >= 8 {
+                        self.advance_trace_phase();
+                        break;
+                    }
+                    if work.visit(proof).is_err() {
+                        progress.deferred += 1;
+                        break;
+                    }
+                    progress.visited += 1;
+                    self.trace_view_cursor %= self.views.len();
+                    let position = self.trace_view_cursor;
+                    let view = &self.views[position];
+                    let eligible = !self.trace_by_view.contains_key(&view.id())
+                        && proof.can_seed(view).is_ok();
+                    if eligible && !proof.has_baseline() {
+                        // The baseline read retains this eligible view for its
+                        // capacity recheck; no sample attempt has begun yet.
+                        self.trace_phase = TracePhase::Health;
+                        self.trace_phase_visits = 0;
+                        progress.deferred += 1;
+                        break;
+                    }
+                    // Charge the fair slot before a sample can overrun. Partial
+                    // samples roll back; this view is retried on a later pass.
+                    self.trace_view_cursor = (position + 1) % self.views.len();
+                    self.trace_phase_visits += 1;
+                    if eligible {
+                        match session.sample(view, work) {
+                            Ok(seed) => {
+                                let id = seed.id();
+                                self.trace_by_view.insert(view.id(), id);
+                                self.trace_seeds
+                                    .insert(id, TraceCandidate { seed, position });
+                                progress.seeded += 1;
+                            }
+                            Err(TraceWorkError::Deferred) => {
+                                if self.trace_phase_visits as usize >= self.views.len()
+                                    || self.trace_phase_visits >= 8
+                                {
+                                    self.advance_trace_phase();
+                                }
+                                progress.deferred += 1;
+                                break;
+                            }
+                            Err(TraceWorkError::Unknown(_)) => {}
+                        }
+                    }
+                    // One complete bounded view pass need not revisit a short list.
+                    if self.trace_phase_visits as usize >= self.views.len() {
+                        self.advance_trace_phase();
+                        break;
+                    }
+                }
+            }
+        }
+        progress
+    }
+    pub(crate) fn begin_trace_terminal_work(
+        &mut self,
+        remaining: std::time::Duration,
+    ) -> TraceWorkTicket {
+        if let Some(ticket) = &self.trace_terminal {
+            return ticket.clone();
+        }
+        let mut ticket = TraceWorkTicket::default();
+        if let Some(proof) = &self.trace_owner
+            && let Some(now) = proof.now()
+            && let Ok(ns) = u64::try_from(remaining.as_nanos())
+            && let Some(stop) = now.checked_add(ns)
+            && let Some(end) = now.checked_add(5_000_000)
+        {
+            ticket = TraceWorkTicket::new(
+                proof.clone(),
+                now,
+                stop.min(end),
+                true,
+                self.cancel_flag.clone(),
+            );
+        }
+        self.trace_terminal = Some(ticket.clone());
+        ticket
+    }
+
     /// Runs one live discovery frame under its work budget (H-1).
     fn with_live_frame<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        // An unreadable clock bounds nothing rather than deferring forever.
-        self.frame_deadline_ns = Some(crate::attach::monotonic_ns().map_or(u64::MAX, |now| {
-            now.saturating_add(self.frame_work_budget_ns)
+        // A nested actual live scope reuses its existing allowance. The trace
+        // wrapper alone never activates ordinary discovery or pause deferral.
+        if self.trace_active.is_some() && self.frame_deadline_ns.is_some() {
+            return work(self);
+        }
+        let prior_deadline = self.frame_deadline_ns;
+        let prior_deferred = self.frame_deferred;
+        // Preserve the ordinary disabled clock-failure policy.
+        self.frame_deadline_ns = Some(self.trace_frame_deadline_ns.unwrap_or_else(|| {
+            crate::attach::monotonic_ns().map_or(u64::MAX, |now| {
+                now.saturating_add(self.frame_work_budget_ns)
+            })
         }));
         self.frame_deferred = false;
         let result = work(self);
-        self.frame_deadline_ns = None;
-        self.frame_deferred = false;
+        self.frame_deadline_ns = prior_deadline;
+        self.frame_deferred = prior_deferred;
         result
     }
 
@@ -8291,6 +8792,9 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
+        if let Some(seed) = self.trace_by_view.get(&id).copied() {
+            self.drop_trace_seed(seed);
+        }
         if let Some(inventory) = &mut self.inventory {
             inventory.release_reservation(id);
             return;

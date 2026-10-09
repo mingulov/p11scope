@@ -41,7 +41,7 @@ use crate::discovery::caller_registry::{
     UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
-    AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
+    AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
     InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::native_binding::{
@@ -52,11 +52,15 @@ use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
+use crate::inspect_system::inventory_cgroup::{
+    CgroupCollectRequest, CgroupCollection, CgroupFence, ScopedCollectionOutcome,
+};
 use crate::inventory_diagnostics::{
     Decision as DiagnosticDecision, DiagnosticConfig, DiagnosticKind, DiagnosticOutcome,
     DiagnosticReason, DiagnosticRecord, Eligibility, FinishedDiagnostics, InitError, NativePairKey,
     ReadOrigin, Recorder,
 };
+use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, CollectionControl};
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -104,6 +108,16 @@ pub(crate) struct BatchReceipt {
     pub registry_facts: u64,
     pub registry_published: u64,
     pub registry_applied: usize,
+}
+
+/// Delivered after the actual publication boundary. Cg4 must service its
+/// newly available target delta and emit these delayed admission events.
+#[cfg_attr(not(test), allow(dead_code))] // Cg4 consumes completion after commit.
+pub(crate) struct CgroupCompletion {
+    pub(crate) state: CgroupWalkState,
+    pub(crate) outcome: ScopedCollectionOutcome,
+    pub(crate) events: Vec<CallerEvent>,
+    pub(crate) admitted: usize,
 }
 
 /// Static reason carried when a scan defers past its deadline. The
@@ -203,6 +217,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
+    cgroup_fence: CgroupFence,
+    pending_cgroup: Option<(CgroupCollection, u64)>,
+    completed_cgroup: Option<CgroupCompletion>,
     scanned_owners: BTreeSet<ProcessViewId>,
     churned_owners: BTreeSet<ProcessViewId>,
     next_window: u64,
@@ -286,6 +303,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
+            cgroup_fence: CgroupFence::default(),
+            pending_cgroup: None,
+            completed_cgroup: None,
             scanned_owners: BTreeSet::new(),
             churned_owners: BTreeSet::new(),
             next_window: 0,
@@ -1586,17 +1606,116 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // The catalog lowers its admission under the Inventory policy and
         // budget the attach set enforces, never the Detailed slot ceiling
         // `inspect` reports.
+        let cgroup_requires_transaction = matches!(self.engine.scope, Scope::Cgroup { .. });
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
-        move || match scope {
-            InventoryScope::Pid(pid) => {
-                crate::inspect_system::collect_pid(pid, &hints, &hooks, policy)
+        move || {
+            if cgroup_requires_transaction {
+                bail!("cgroup inventory requires the bounded scoped collection job");
             }
-            InventoryScope::System => {
-                crate::inspect_system::collect(&hints, &hooks, max_scan_pids, policy)
+            match scope {
+                InventoryScope::Pid(pid) => {
+                    crate::inspect_system::collect_pid(pid, &hints, &hooks, policy)
+                }
+                InventoryScope::System => {
+                    crate::inspect_system::collect(&hints, &hooks, max_scan_pids, policy)
+                }
             }
         }
+    }
+
+    /// Prepare one bounded cgroup job over exactly the root retained by the
+    /// engine. A legacy System/PID job can never stand in for this request.
+    #[cfg_attr(not(test), allow(dead_code))] // Cg4 supplies the runtime owner.
+    pub(crate) fn cgroup_collector(
+        &self,
+        state: CgroupWalkState,
+        limits: CgroupWalkLimits,
+        control: CollectionControl,
+        max_scan_pids: Option<usize>,
+    ) -> Result<impl FnOnce() -> CgroupCollection + Send + 'static> {
+        let Scope::Cgroup { dir, .. } = &self.engine.scope else {
+            bail!("scoped cgroup collection requires a retained cgroup root");
+        };
+        let crate::discovery::scan::DiscoveryPolicy::Inventory(work) = self.engine.budget.policy()
+        else {
+            bail!("cgroup inventory collection requires the immutable Inventory work policy");
+        };
+        let request = CgroupCollectRequest {
+            root: Arc::clone(dir),
+            fence: self.cgroup_fence.issue(),
+            state,
+            limits,
+            control,
+            max_scan_pids,
+            scan_budget: crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+        };
+        let hints = self.engine.module_hints.clone();
+        let hooks = self.engine.hooks.clone();
+        let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
+        Ok(move || {
+            crate::inspect_system::inventory_cgroup::collect(request, &hints, &hooks, policy)
+        })
+    }
+
+    /// Store custody until commit, reconcile old lifecycle only, and withhold
+    /// all new facts. The final grouped sample runs inside commit_batch.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn apply_cgroup_collection(
+        &mut self,
+        collection: CgroupCollection,
+        now_ns: u64,
+    ) -> Result<PassReport> {
+        let Scope::Cgroup { dir, .. } = &self.engine.scope else {
+            bail!("scoped cgroup collection cannot apply to a PID/System coordinator");
+        };
+        if !collection.issued_by(&self.cgroup_fence) {
+            bail!("cgroup collection was not issued by this coordinator");
+        }
+        if !Arc::ptr_eq(dir, collection.root()) {
+            bail!("cgroup collection retained a different root from the coordinator");
+        }
+        if self.pending_cgroup.is_some() || self.completed_cgroup.is_some() {
+            bail!(
+                "previous cgroup transaction must be committed and its continuation consumed first"
+            );
+        }
+        let work = collection.work();
+        let events = self
+            .adapter
+            .reconcile_scoped(now_ns, &mut || work.charge(5));
+        self.apply_reconcile_events(&events, now_ns);
+        // Any history absent from this bounded pass stays live and uncertain;
+        // a partial census is never an exit or physical-unmap proof.
+        for record in self.adapter.records() {
+            if !work.charge(1) {
+                break;
+            }
+            if !record.retired {
+                self.registry.note_member_unscanned(record.id);
+            }
+        }
+        let scanned = collection.member_pids().count();
+        self.pending_cgroup = Some((collection, now_ns));
+        let pass = self.passes;
+        self.passes += 1;
+        Ok(PassReport {
+            pass,
+            scanned,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events,
+            timings: crate::timing::StageTimings::new(),
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_cgroup_completion(&mut self) -> Option<CgroupCompletion> {
+        self.completed_cgroup.take()
     }
 
     /// The pass after collection: absorb the lowering into the attach set,
@@ -1612,6 +1731,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         deadline_ns: u64,
         now_ns: u64,
     ) -> PassReport {
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            return self.observe_empty_pass(
+                guard,
+                identity,
+                "catalog without retained cgroup transaction authority was withheld",
+                now_ns,
+            );
+        }
         let mut timings = std::mem::take(&mut catalog.stage_timings);
         // Absorb at once: the aggregate pins and their fds drop here, never
         // living across reconcile or the native owner scans below.
@@ -1782,9 +1909,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             native_failures: Vec::new(),
             scan_pinned: 0,
         };
-        let mut events =
+        let mut events = if matches!(resolver.engine.scope, Scope::Cgroup { .. }) {
+            self.adapter.reconcile_scoped(now_ns, &mut || true)
+        } else {
             self.adapter
-                .reconcile(&BTreeSet::new(), &mut |pid| resolver.resolve(pid), now_ns);
+                .reconcile(&BTreeSet::new(), &mut |pid| resolver.resolve(pid), now_ns)
+        };
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
         self.record_authority_gaps(native_failures, scan_pinned);
@@ -1837,7 +1967,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 CallerEvent::Admitted { id }
                 | CallerEvent::ExecRetired { new: id, .. }
                 | CallerEvent::Reused { new: id, .. } => *id,
-                CallerEvent::Exited { id, .. } => {
+                CallerEvent::Exited { id, .. } | CallerEvent::Retired { id, .. } => {
                     self.retire_caller_in_registry(*id, now_ns);
                     continue;
                 }
@@ -2137,6 +2267,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         let absorbed = self.attach_set.absorb(&lowering.plan, &lowering.pins);
         drop(lowering);
+        self.record_absorbed(absorbed)
+    }
+
+    fn record_absorbed(
+        &mut self,
+        absorbed: AbsorbOutcome,
+    ) -> BTreeMap<AttachModuleKey, AttachVerdict> {
         self.pending_targets.append(absorbed.delta);
         for gap in absorbed.gaps {
             self.registry.record_gap(RegistryGap {
@@ -4320,6 +4457,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         now_ns: u64,
     ) -> Vec<CallerEvent> {
         let caller = transition.caller();
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            self.cgroup_fence.invalidate();
+        }
+        if let Some((collection, _)) = &mut self.pending_cgroup {
+            collection.invalidate(transition.pid());
+        }
         // The binder emits a transition only for the live incarnation that
         // held the row's tgid, so the pid matches by construction; whether
         // that incarnation is still live is what may have changed since.
@@ -4353,9 +4496,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             native_failures: Vec::new(),
             scan_pinned: 0,
         };
-        let events = self
-            .adapter
-            .exec_transition(caller, &mut |pid| resolver.resolve(pid), now_ns);
+        let events = if matches!(resolver.engine.scope, Scope::Cgroup { .. }) {
+            self.adapter.exec_transition_scoped(caller, now_ns)
+        } else {
+            self.adapter
+                .exec_transition(caller, &mut |pid| resolver.resolve(pid), now_ns)
+        };
         let (native_failures, scan_pinned) = resolver.finish();
         self.record_authority_gaps(native_failures, scan_pinned);
         events
@@ -4366,7 +4512,145 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// invisible before this returns and visible after — the ordering
     /// the Phase 2 test pins, extended to caller/edge facts.
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {
+        // Original cgroup custody is still in self during the fallible engine
+        // tail. Scoped preparation/staging then has no later fallible tail.
         self.engine.publish_batch_tail(engine_changed)?;
+        let mut publishing_cgroup = self.pending_cgroup.take();
+        let mut scoped_events = Vec::new();
+        let mut scoped_admitted = 0;
+        if let Some((collection, now_ns)) = &mut publishing_cgroup {
+            let work = collection.work();
+            let pids: Vec<u32> = if work.charge(
+                collection
+                    .member_pids()
+                    .count()
+                    .saturating_mul(2)
+                    .saturating_add(1),
+            ) {
+                collection.member_pids().collect() // private cap128; charged before allocation
+            } else {
+                Vec::new()
+            };
+            let mut prepared = BTreeMap::new();
+            for pid in pids {
+                if !work.charge(6) {
+                    break;
+                }
+                let Some(preparation) = collection.preparation(pid) else {
+                    continue;
+                };
+                match self.adapter.prepare_scoped_caller(&preparation) {
+                    Ok(pin) => {
+                        prepared.insert(pid, pin);
+                    }
+                    Err(failure) => {
+                        collection.preparation_failed();
+                        scoped_events.push(CallerEvent::AdmitFailed {
+                            pid,
+                            reason: failure.reason,
+                            budget: failure.budget,
+                        });
+                    }
+                }
+            }
+            // Prepare every provider read while retaining exclusive attach-set
+            // custody. No aliases/endpoints/memberships are published here.
+            let provider = if collection.reserve_projection(self.registry.edge_count()) {
+                match self
+                    .attach_set
+                    .prepare_absorption(collection.provider_inputs(), |units| work.charge(units))
+                {
+                    Ok(provider) => Some(provider),
+                    Err(reason) => {
+                        collection.preparation_incomplete();
+                        self.registry.record_gap(RegistryGap {
+                            caller: None,
+                            module: None,
+                            pid: None,
+                            subject: "cgroup provider preparation incomplete".into(),
+                            reason,
+                            budget: None,
+                        });
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let requested = if provider.is_some()
+                && work.charge(prepared.len().saturating_mul(8).saturating_add(1))
+            {
+                prepared.keys().copied().collect()
+            } else {
+                BTreeSet::new()
+            };
+            collection.sample_end(&requested);
+            let mut allowed = BTreeSet::new();
+            for (pid, pin) in prepared {
+                let Some(permit) = collection.permit(pid) else {
+                    continue;
+                };
+                match self.adapter.commit_scoped_caller(pin, permit, *now_ns) {
+                    Ok((id, admitted)) => {
+                        allowed.insert(pid);
+                        if admitted {
+                            scoped_admitted += 1;
+                            scoped_events.push(CallerEvent::Admitted { id });
+                        }
+                    }
+                    Err(failure) => scoped_events.push(CallerEvent::AdmitFailed {
+                        pid,
+                        reason: failure.reason,
+                        budget: failure.budget,
+                    }),
+                }
+            }
+            let mut catalog = collection.catalog(&allowed);
+            let absorbed = match (provider, catalog.lowering.take()) {
+                (Some(provider), Some(lowering)) => {
+                    match provider
+                        .absorb(&lowering.plan, &lowering.pins, |units| work.charge(units))
+                    {
+                        Ok(absorbed) => Some(absorbed),
+                        Err(reason) => {
+                            collection.preparation_incomplete();
+                            self.registry.record_gap(RegistryGap {
+                                caller: None,
+                                module: None,
+                                pid: None,
+                                subject: "cgroup provider consumption incomplete".into(),
+                                reason,
+                                budget: None,
+                            });
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            // The prepared guard has been consumed/dropped, so ordinary staging
+            // can borrow the coordinator again. It performed no provider reads.
+            self.apply_reconcile_events(&scoped_events, *now_ns);
+            let verdicts =
+                absorbed.map_or_else(BTreeMap::new, |absorbed| self.record_absorbed(absorbed));
+            self.project_catalog(&catalog, &verdicts, *now_ns);
+            self.registry.record_gap(RegistryGap { caller: None, module: None, pid: None,
+                subject: "scoped native owner admission deferred".into(),
+                reason: "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; sampled scan-pinned callers and retained native totals remain available".into(), budget: None });
+            let outcome = collection.outcome(); // final cancellation/deadline poll
+            if outcome != ScopedCollectionOutcome::Complete {
+                self.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: "cgroup scope transaction incomplete".into(),
+                    reason: outcome.reason().into(),
+                    budget: None,
+                });
+            }
+        }
+        // Pure projection performs no additional generation/admission reads.
+        // Keep the original handles through this actual publication call.
         let registry_applied = if let Some(recorder) = &mut self.diagnostics {
             let adapter = &self.adapter;
             self.registry
@@ -4390,6 +4674,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.registry.publish()
         };
         self.finalize_pending_counts();
+        if let Some((collection, _)) = publishing_cgroup {
+            let (state, outcome) = collection.finish();
+            self.completed_cgroup = Some(CgroupCompletion {
+                state,
+                outcome,
+                events: scoped_events,
+                admitted: scoped_admitted,
+            });
+        }
         Ok(BatchReceipt {
             engine_facts: self.engine.facts_revision,
             engine_published: self.engine.published_facts_revision,
@@ -6883,6 +7176,1137 @@ mod tests {
             .find(|edge| edge.caller == caller)
             .unwrap();
         assert_eq!(edge.entry_count, 7);
+    }
+
+    fn cgroup_retained_history_scene() -> (NativeScene, CallerId) {
+        let (mut native, caller) = NativeScene::new();
+        std::fs::write(native.scene._dir.path().join("cgroup.procs"), b"").unwrap();
+        native.scene.coordinator.engine.scope =
+            crate::scope::cgroup(native.scene._dir.path()).unwrap();
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        native.scene.attach_all(100, ScopeCustody::CgroupHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        let first = native.row(41, 1, 7, 100, 0);
+        let cgroup_read = |native: &NativeScene, rows| {
+            let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, rows) else {
+                unreachable!("the scripted read constructs a witness batch")
+            };
+            batch.custody = ScopeCustody::CgroupHeld;
+            batch
+        };
+        native.stage(NativeBatch::Witness(cgroup_read(&native, vec![first])));
+        native.drain();
+        native.stage(NativeBatch::Witness(cgroup_read(&native, Vec::new())));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let mut refreshed = cgroup_read(&native, Vec::new());
+        refreshed.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: native.scene.delta.endpoints[0].object,
+            count: 7,
+        }];
+        native.stage(NativeBatch::Witness(refreshed));
+        native.scene.project(7, 2_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false,
+            }
+        );
+        (native, caller)
+    }
+
+    fn assert_cgroup_old_history_only(native: &NativeScene, caller: CallerId) {
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(
+            adapter.live_id(7),
+            None,
+            "a tracked PID cannot authorize an outside or unproven successor"
+        );
+        assert_eq!(
+            adapter.len(),
+            1,
+            "never mint a successor just to retire old"
+        );
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the old history stays retained");
+        assert_eq!(edge.entry_count, 7);
+        assert_eq!(
+            edge.mapping,
+            crate::discovery::caller_registry::MappingState::Ended,
+            "registry retirement must be consumed"
+        );
+    }
+
+    #[test]
+    fn cgroup_reconcile_empty_scope_never_admits_outside_exec_successor() {
+        let (mut native, caller) = cgroup_retained_history_scene();
+        native.scene.source.exec(7, 200, "/bin/outside");
+        native.scene.coordinator.observe_empty_pass(
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            "scoped collection has no positive member transaction",
+            2_000,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_cgroup_old_history_only(&native, caller);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .lifecycle,
+            crate::discovery::caller_registry::CallerLifecycle::ExecRetired
+        );
+    }
+
+    #[test]
+    fn cgroup_reconcile_partial_scope_never_admits_unknown_reused_successor() {
+        let (mut native, caller) = cgroup_retained_history_scene();
+        native.scene.source.spawn(7, 700);
+        native.scene.source.blind(7);
+        native.scene.coordinator.observe_empty_pass(
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            "scoped membership sampling was interrupted",
+            2_000,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_cgroup_old_history_only(&native, caller);
+    }
+
+    #[test]
+    fn cgroup_exec_transition_never_admits_successor_without_current_scope_transaction() {
+        let (mut native, caller) = cgroup_retained_history_scene();
+        let later = native.row(41, 2, 7, 200, 1);
+        native.witness(vec![later]);
+        assert_cgroup_old_history_only(&native, caller);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .lifecycle,
+            crate::discovery::caller_registry::CallerLifecycle::ExecRetired
+        );
+    }
+
+    fn cgroup_os_scene() -> (
+        tempfile::TempDir,
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+    ) {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("cgroup.procs"),
+            format!("{}\n", child.id()),
+        )
+        .unwrap();
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(fixture.path()).unwrap(),
+            HookRegistry::builtin(),
+            Vec::new(),
+            crate::discovery::caller_registry::OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        (fixture, child, coordinator)
+    }
+
+    fn cgroup_provider_scene() -> (
+        tempfile::TempDir,
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        InventoryCoordinator<OsProcessSource>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            dir.path(),
+            "scoped-provider.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        gcc(
+            dir.path(),
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let child = spawn_cgroup_provider_child(dir.path(), &provider, "ready");
+        std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(dir.path()).unwrap(),
+            HookRegistry::builtin(),
+            vec![provider],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        (dir, child, coordinator)
+    }
+
+    fn spawn_cgroup_provider_child(
+        dir: &std::path::Path,
+        provider: &std::path::Path,
+        ready_name: &str,
+    ) -> crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let ready = dir.join(ready_name);
+        OwnedStoppedChild::spawn_stopped(
+            std::process::Command::new(dir.join("scoped-driver"))
+                .arg("--ready")
+                .arg(&ready)
+                .arg("--call")
+                .arg(provider)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            |pid| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned provider child did not finish startup"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // SAFETY: pid names the child retained by spawn_stopped.
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+            },
+        )
+    }
+
+    struct ReturningLivenessSource {
+        control: CollectionControl,
+        armed: std::rc::Rc<std::cell::Cell<bool>>,
+        returned: std::rc::Rc<std::cell::Cell<usize>>,
+        successful: std::rc::Rc<std::cell::Cell<usize>>,
+        stop_on_return: bool,
+        proc_fallback: bool,
+    }
+
+    impl crate::discovery::caller_registry::ProcessSource for ReturningLivenessSource {
+        type Pin = crate::process::PidPin;
+
+        fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+            OsProcessSource.open(pid)
+        }
+        fn still_the_same(&self, pin: &Self::Pin) -> bool {
+            // The fallback branch performs the same actual /proc start-time
+            // operation as PidPin's documented fallback, without changing the
+            // ordinary source or forcing the host's pidfd capability off.
+            let same = if self.proc_fallback {
+                crate::process::process_start_time(pin.pid()).ok() == pin.start_time()
+            } else {
+                OsProcessSource.still_the_same(pin)
+            };
+            if self.armed.get() {
+                self.returned.set(self.returned.get() + 1);
+                if same {
+                    self.successful.set(self.successful.get() + 1);
+                }
+                if self.stop_on_return {
+                    self.control.cancel();
+                }
+            }
+            same
+        }
+        fn start_time(&self, pid: u32) -> Option<u64> {
+            OsProcessSource.start_time(pid)
+        }
+        fn exe_identity(&self, pid: u32) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+            OsProcessSource.exe_identity(pid)
+        }
+        fn gone(&self, pid: u32) -> bool {
+            OsProcessSource.gone(pid)
+        }
+    }
+
+    fn cgroup_returning_liveness_control(stop_on_return: bool, proc_fallback: bool) {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (fixture, child, old_coordinator) = cgroup_provider_scene();
+        drop(old_coordinator);
+        let control = CollectionControl::new(None);
+        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let returned = std::rc::Rc::new(std::cell::Cell::new(0));
+        let successful = std::rc::Rc::new(std::cell::Cell::new(0));
+        let source = ReturningLivenessSource {
+            control: control.clone(),
+            armed: armed.clone(),
+            returned: returned.clone(),
+            successful: successful.clone(),
+            stop_on_return,
+            proc_fallback,
+        };
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(fixture.path()).unwrap(),
+            HookRegistry::builtin(),
+            vec![fixture.path().join("scoped-provider.so")],
+            source,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control,
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check()),
+            "the real provider child supplies attributable facts before preparation"
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        provider_read_test::observe(
+            move || armed.set(true), // after actual provider retention, before final sampling
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert_eq!(
+            returned.get(),
+            1,
+            "exactly the final source liveness operation returned"
+        );
+        assert_eq!(
+            successful.get(),
+            1,
+            "the retained child remained the same generation"
+        );
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        if stop_on_return {
+            assert_eq!(
+                completion.admitted, 0,
+                "stop during returning liveness must precede ID mint"
+            );
+            assert_eq!(coordinator.adapter.live_id(child.id()), None);
+            assert_eq!(coordinator.adapter.records().count(), 0);
+            assert_eq!(coordinator.attach_set.len(), 0);
+            assert_eq!(coordinator.registry.caller_count(), 0);
+            assert_eq!(
+                completion.outcome,
+                ScopedCollectionOutcome::Cancelled(
+                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+                )
+            );
+        } else {
+            assert_eq!(completion.admitted, 1);
+            assert!(coordinator.adapter.live_id(child.id()).is_some());
+            assert!(coordinator.attach_set.len() > 0);
+            assert!(coordinator.registry.edges().next().is_some());
+        }
+    }
+
+    #[test]
+    fn cgroup_returning_liveness_stop_prevents_caller_mint() {
+        cgroup_returning_liveness_control(true, false);
+    }
+
+    #[test]
+    fn cgroup_returning_liveness_proc_fallback_stop_prevents_caller_mint() {
+        cgroup_returning_liveness_control(true, true);
+    }
+
+    #[test]
+    fn cgroup_returning_liveness_healthy_child_keeps_admission() {
+        cgroup_returning_liveness_control(false, false);
+    }
+
+    #[test]
+    fn cgroup_review_provider_transaction_admits_after_retention_and_final_sample() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check()),
+            "a real provider scan produced attributable facts for the held child"
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let read_counter = reads.clone();
+        provider_read_test::observe(
+            move || read_counter.set(read_counter.get() + 1),
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            reads.get() > 0,
+            "real provider retention metadata reads ran"
+        );
+        assert!(
+            coordinator.attach_set.len() > 0,
+            "provider endpoints actually admitted"
+        );
+        assert!(coordinator.registry.edges().count() > 0);
+        assert_eq!(coordinator.take_cgroup_completion().unwrap().admitted, 1);
+    }
+
+    #[test]
+    fn cgroup_review_movement_during_retention_prevents_admission_and_targets() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (fixture, child, mut coordinator) = cgroup_provider_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check())
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let membership = fixture.path().join("cgroup.procs");
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let read_counter = reads.clone();
+        provider_read_test::observe(
+            move || {
+                read_counter.set(read_counter.get() + 1);
+                std::fs::write(&membership, b"").unwrap();
+            },
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            reads.get() > 0,
+            "movement occurred after actual provider retention read"
+        );
+        assert_eq!(
+            coordinator.adapter.len(),
+            0,
+            "the final sample must enclose provider reads"
+        );
+        assert_eq!(coordinator.attach_set.len(), 0);
+        assert_eq!(coordinator.registry.edges().count(), 0);
+        assert!(coordinator.take_target_delta().is_empty());
+        assert_ne!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn cgroup_review_mixed_retention_move_keeps_the_other_valid_member() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (fixture, moved, mut coordinator) = cgroup_provider_scene();
+        let provider = &coordinator.engine.module_hints[0];
+        let kept = spawn_cgroup_provider_child(fixture.path(), provider, "ready-second");
+        let membership = fixture.path().join("cgroup.procs");
+        std::fs::write(&membership, format!("{}\n{}\n", moved.id(), kept.id())).unwrap();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(moved.id())
+                .is_some_and(|preparation| preparation.check())
+        );
+        assert!(
+            collection
+                .preparation(kept.id())
+                .is_some_and(|preparation| preparation.check())
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let retained_member = format!("{}\n", kept.id());
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let read_counter = reads.clone();
+        provider_read_test::observe(
+            move || {
+                read_counter.set(read_counter.get() + 1);
+                std::fs::write(&membership, &retained_member).unwrap();
+            },
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            reads.get() > 0,
+            "movement occurred at actual retention metadata read"
+        );
+        assert_eq!(
+            coordinator.adapter.live_id(moved.id()),
+            None,
+            "the member removed before the final sample is withheld"
+        );
+        let kept_id = coordinator
+            .adapter
+            .live_id(kept.id())
+            .expect("valid member remains useful");
+        assert_eq!(coordinator.adapter.len(), 1);
+        assert!(coordinator.attach_set.len() > 0);
+        assert!(
+            coordinator
+                .registry
+                .edges()
+                .any(|edge| edge.caller == kept_id)
+        );
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(completion.admitted, 1);
+        assert_ne!(completion.outcome, ScopedCollectionOutcome::Complete);
+    }
+
+    #[test]
+    fn cgroup_review_stop_during_retention_prevents_admission_and_targets() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let control = CollectionControl::new(None);
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control.clone(),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check())
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let read_counter = reads.clone();
+        provider_read_test::observe(
+            move || {
+                read_counter.set(read_counter.get() + 1);
+                control.cancel();
+            },
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            reads.get() > 0,
+            "stop was requested after actual provider retention read"
+        );
+        assert_eq!(
+            coordinator.adapter.len(),
+            0,
+            "stop cannot authorize a caller before provider reads end"
+        );
+        assert_eq!(coordinator.attach_set.len(), 0);
+        assert_eq!(coordinator.registry.edges().count(), 0);
+        assert!(coordinator.take_target_delta().is_empty());
+        assert_eq!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Cancelled(
+                crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+            )
+        );
+    }
+
+    #[test]
+    fn cgroup_tiny_remaining_budget_stops_before_provider_preparation() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let limits = CgroupWalkLimits::default();
+        let maximum = limits.work_units;
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                limits,
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(collection.preparation(child.id()).is_some());
+        let remaining = maximum - collection.used_work();
+        assert!(remaining > 1);
+        assert!(collection.work().charge(remaining - 1));
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = reads.clone();
+        provider_read_test::observe(
+            move || counter.set(counter.get() + 1),
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert_eq!(
+            reads.get(),
+            0,
+            "no next provider identity read after allowance exhaustion"
+        );
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(coordinator.attach_set.len(), 0);
+        assert_ne!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn cgroup_exhausted_exec_fence_never_wraps_or_reads_provider_inputs() {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let old = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(old.preparation(child.id()).is_some());
+        coordinator.cgroup_fence.exhaust();
+        coordinator.cgroup_fence.invalidate();
+        let stale_work = old.work();
+        assert!(!stale_work.charge(0));
+        coordinator.apply_cgroup_collection(old, 1_000).unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = reads.clone();
+        provider_read_test::observe(
+            move || counter.set(counter.get() + 1),
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        let stale = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(
+            stale.outcome,
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::GenerationChanged
+            )
+        );
+        assert_eq!(reads.get(), 0);
+        assert_eq!(coordinator.adapter.len(), 0);
+        let fresh = coordinator
+            .cgroup_collector(
+                stale.state,
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(fresh.member_pids().count(), 0);
+        coordinator.apply_cgroup_collection(fresh, 2_000).unwrap();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(coordinator.attach_set.len(), 0);
+        assert_ne!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn cgroup_admission_waits_for_true_commit_and_releases_original_after_publish() {
+        let (_fixture, child, mut coordinator) = cgroup_os_scene();
+        let pid = child.id();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        let original = collection
+            .original_weak(pid)
+            .expect("fresh begin retained the original child");
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        assert_eq!(
+            coordinator.adapter.len(),
+            0,
+            "preparation cannot mint an ID"
+        );
+        assert!(
+            original.upgrade().is_some(),
+            "pending state retains original custody"
+        );
+        assert!(coordinator.take_cgroup_completion().is_none());
+        coordinator.commit_batch(false).unwrap();
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(completion.admitted, 1);
+        let id = coordinator
+            .adapter
+            .live_id(pid)
+            .expect("both fresh samples authorize the held generation");
+        assert_eq!(completion.events, vec![CallerEvent::Admitted { id }]);
+        assert!(
+            original.upgrade().is_none(),
+            "custody drops only after actual publication"
+        );
+        assert_eq!(
+            coordinator.adapter.record(id).unwrap().authority,
+            ImageAuthority::ScanPinned
+        );
+    }
+
+    #[test]
+    fn cgroup_final_sample_occurs_after_apply_and_prevents_moved_member_admission() {
+        let (fixture, child, mut coordinator) = cgroup_os_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(
+            collection.member_pids().collect::<Vec<_>>(),
+            vec![child.id()]
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        std::fs::write(fixture.path().join("cgroup.procs"), b"").unwrap();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(coordinator.registry.edges().count(), 0);
+        assert!(coordinator.take_target_delta().endpoints.is_empty());
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(completion.admitted, 0);
+        assert_ne!(completion.outcome, ScopedCollectionOutcome::Complete);
+    }
+
+    #[test]
+    fn cgroup_stop_after_apply_never_admits_or_publishes_complete_scope_receipt() {
+        let (_fixture, child, mut coordinator) = cgroup_os_scene();
+        let control = CollectionControl::new(None);
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control.clone(),
+                None,
+            )
+            .unwrap()();
+        let original = collection.original_weak(child.id()).unwrap();
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        control.cancel();
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert!(original.upgrade().is_none());
+        assert_eq!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Cancelled(
+                crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+            )
+        );
+    }
+
+    #[test]
+    fn cgroup_generation_exit_after_preparation_never_mints_a_caller() {
+        let (_fixture, child, mut coordinator) = cgroup_os_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert_eq!(
+            collection.member_pids().collect::<Vec<_>>(),
+            vec![child.id()]
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        drop(child); // RAII kills and reaps only the owned process.
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_ne!(
+            coordinator.take_cgroup_completion().unwrap().outcome,
+            ScopedCollectionOutcome::Complete
+        );
+    }
+
+    #[test]
+    fn cgroup_same_image_reentry_keeps_the_original_caller_id() {
+        let (fixture, child, mut coordinator) = cgroup_os_scene();
+        let pid = child.id();
+        let mut state = CgroupWalkState::default();
+        let mut admitted = None;
+        for (pass, members) in [format!("{pid}\n"), String::new(), format!("{pid}\n")]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(fixture.path().join("cgroup.procs"), members).unwrap();
+            let collection = coordinator
+                .cgroup_collector(
+                    state,
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(collection, 1_000 + pass as u64)
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            state = completion.state;
+            let current = coordinator.adapter.live_id(pid).unwrap();
+            if pass == 0 {
+                admitted = Some(current);
+                assert_eq!(completion.admitted, 1);
+            } else {
+                assert_eq!(Some(current), admitted);
+                assert_eq!(completion.admitted, 0);
+            }
+            assert!(
+                !coordinator.adapter.record(current).unwrap().retired,
+                "mere scope movement does not prove exit"
+            );
+        }
+        assert_eq!(coordinator.adapter.len(), 1);
+    }
+
+    #[test]
+    fn cgroup_partial_candidate_passes_eventually_admit_a_later_member() {
+        let (fixture, child, mut coordinator) = cgroup_os_scene();
+        let pid = child.id();
+        std::fs::write(
+            fixture.path().join("cgroup.procs"),
+            format!("4000000000\n4000000001\n4000000002\n{pid}\n"),
+        )
+        .unwrap();
+        let mut state = CgroupWalkState::default();
+        let mut reached = false;
+        for pass in 0..6 {
+            let limits = CgroupWalkLimits {
+                members: 1,
+                ..CgroupWalkLimits::default()
+            };
+            let collection = coordinator
+                .cgroup_collector(state, limits, CollectionControl::new(None), Some(1))
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(collection, 1_000 + pass)
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            assert_ne!(
+                completion.outcome,
+                ScopedCollectionOutcome::Complete,
+                "partial passes never union into complete scope absence"
+            );
+            state = completion.state;
+            if coordinator.adapter.live_id(pid).is_some() {
+                reached = true;
+                break;
+            }
+        }
+        assert!(
+            reached,
+            "later candidate can be admitted when both fresh samples and scan fit"
+        );
+        assert_eq!(coordinator.adapter.len(), 1);
+    }
+
+    #[test]
+    fn cgroup_wrong_root_and_legacy_catalog_jobs_cannot_supply_authority() {
+        let (_fixture, _child, mut coordinator) = cgroup_os_scene();
+        assert!(coordinator.collector(InventoryScope::System, None)().is_err());
+        let (_other_fixture, _, other) = cgroup_os_scene();
+        let collection = other
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            coordinator
+                .apply_cgroup_collection(collection, 1_000)
+                .is_err()
+        );
+        assert_eq!(coordinator.adapter.len(), 0);
+    }
+
+    #[test]
+    fn cgroup_catalog_without_transaction_cannot_admit_a_fresh_outside_caller() {
+        let (_fixture, child, mut coordinator) = cgroup_os_scene();
+        let catalog = crate::inspect_system::collect_pid(
+            child.id(),
+            &[],
+            &HookRegistry::builtin(),
+            crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget()),
+        )
+        .unwrap();
+        assert!(
+            catalog
+                .processes
+                .iter()
+                .any(|process| process.pid == child.id() && process.status.attributable()),
+            "the unscoped catalog actually observed the positive child"
+        );
+        coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut ScanOnlyIdentity,
+            u64::MAX,
+            1_000,
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(coordinator.adapter.len(), 0);
+        assert_eq!(coordinator.registry.edges().count(), 0);
+    }
+
+    #[test]
+    fn cgroup_native_exec_invalidates_pending_transaction_even_with_unchanged_scalars() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn_matching_process(pid);
+        let birth = scene.source.start_time(pid).unwrap();
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.project(pid, 60);
+        scene.coordinator.commit_batch(false).unwrap();
+        std::fs::write(scene._dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        scene.coordinator.engine.scope = crate::scope::cgroup(scene._dir.path()).unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        scene.attach_all(100, ScopeCustody::CgroupHeld);
+        let mut native = NativeScene::over(scene, 0);
+        native.answer(pid, birth, 41);
+        native.witness(vec![native.row(41, 1, pid, 100, 0)]);
+        let collection = native
+            .scene
+            .coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(pid)
+                .is_some_and(|preparation| preparation.check()),
+            "the pending scan transaction is usable before EXEC invalidation"
+        );
+        let before = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .unwrap()
+            .exe
+            .clone();
+        native
+            .scene
+            .coordinator
+            .apply_cgroup_collection(collection, 2_000)
+            .unwrap();
+        native.witness(vec![native.row(41, 2, pid, 200, 1)]);
+        assert_eq!(
+            native.scene.source.exe_identity(pid),
+            before,
+            "same scalar executable identity cannot reconstruct the invalidated proof"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        assert_eq!(native.scene.coordinator.adapter.live_id(pid), None);
+        assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .unwrap()
+                .mapping,
+            MappingState::Ended
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .take_cgroup_completion()
+                .unwrap()
+                .admitted,
+            0
+        );
+    }
+
+    #[test]
+    fn cgroup_review_exec_between_collect_and_apply_invalidates_stale_job() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn_matching_process(pid);
+        let birth = scene.source.start_time(pid).unwrap();
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.project(pid, 60);
+        scene.coordinator.commit_batch(false).unwrap();
+        std::fs::write(scene._dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        scene.coordinator.engine.scope = crate::scope::cgroup(scene._dir.path()).unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        scene.attach_all(100, ScopeCustody::CgroupHeld);
+        let mut native = NativeScene::over(scene, 0);
+        native.answer(pid, birth, 41);
+        native.witness(vec![native.row(41, 1, pid, 100, 0)]);
+        let collection = native
+            .scene
+            .coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(pid)
+                .is_some_and(|preparation| preparation.check()),
+            "the collected transaction is usable before EXEC invalidation"
+        );
+        let before = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .unwrap()
+            .exe
+            .clone();
+        native.witness(vec![native.row(41, 2, pid, 200, 1)]);
+        native
+            .scene
+            .coordinator
+            .apply_cgroup_collection(collection, 2_000)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.source.exe_identity(pid),
+            before,
+            "same scalar executable identity cannot reconstruct the invalidated proof"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+        assert_eq!(native.scene.coordinator.adapter.live_id(pid), None);
+        assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .unwrap()
+                .mapping,
+            MappingState::Ended
+        );
+        let stale = native.scene.coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(stale.admitted, 0);
+        assert_ne!(stale.outcome, ScopedCollectionOutcome::Complete);
+        let fresh = native
+            .scene
+            .coordinator
+            .cgroup_collector(
+                stale.state,
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        native
+            .scene
+            .coordinator
+            .apply_cgroup_collection(fresh, 4_000)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let fresh = native.scene.coordinator.take_cgroup_completion().unwrap();
+        assert_eq!(
+            fresh.admitted, 1,
+            "a fresh next job can authorize the current image"
+        );
+        assert_ne!(native.scene.coordinator.adapter.live_id(pid), Some(caller));
+        assert_eq!(native.scene.coordinator.adapter.len(), 2);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .retired
+        );
     }
 
     #[test]

@@ -2136,6 +2136,13 @@ fn progress_lines<Source: ProcessSource>(
                     crate::render::escape_controls(reason)
                 )
             }
+            CallerEvent::Retired { id, reason } => {
+                format!(
+                    "caller {} retired: {}",
+                    id.label(),
+                    crate::render::escape_controls(reason)
+                )
+            }
             CallerEvent::ExecRetired { old, new } => {
                 format!("caller {} exec-retired, now {}", old.label(), new.label())
             }

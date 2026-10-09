@@ -609,6 +609,9 @@ pub(crate) fn attribute_unselected(
     let mut out = SweepAttribution::default();
     let prove = index.map_files_keys();
     for (pid, phase_one) in sweep {
+        if budget.has_collection_work() && !budget.poll_collection(2) {
+            break;
+        }
         attribute_one(
             &mut out,
             *pid,
@@ -641,6 +644,9 @@ pub(crate) fn attribute_one(
     probe: &mut dyn MemberProbe,
     budget: &mut CaptureWorkBudget,
 ) {
+    if budget.has_collection_work() && !budget.poll_collection(phase_one.len() as u64 + 1) {
+        return;
+    }
     if selected.contains(&pid) {
         return;
     }
@@ -972,6 +978,19 @@ pub(crate) fn stat_unpinned<Io: ConfirmIo>(
     ranges: &[(u64, u64)],
     budget: &mut CaptureWorkBudget,
 ) -> MappedIdentities {
+    if budget.has_collection_work() {
+        let mut answers = MappedIdentities::new();
+        for &range in ranges {
+            if answers.contains_key(&range) {
+                continue;
+            }
+            if budget.spend(1).is_err() {
+                break;
+            }
+            answers.insert(range, io.mapped_file(pid, range.0, range.1));
+        }
+        return answers;
+    }
     let mut charged = Vec::new();
     let mut seen = BTreeSet::new();
     for &range in ranges {
@@ -1001,10 +1020,23 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
             Confirmation::Lost(loss, detail)
         }
     };
+    let controlled = budget.has_collection_work();
+    let stopped = || {
+        Confirmation::Lost(
+            AttributionLoss::Budget,
+            "cgroup confirmation stopped or shared work allowance exhausted".into(),
+        )
+    };
+    if controlled && !budget.poll_collection(1) {
+        return stopped();
+    }
     let pin = match io.open(pid) {
         Ok(pin) => pin,
         Err(error) => return lost(io, AttributionLoss::ConfirmUnreadable, error),
     };
+    if controlled && !budget.poll_collection(1) {
+        return stopped();
+    }
     let Some(before) = io.exe(pid) else {
         return lost(
             io,
@@ -1012,6 +1044,9 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
             "the exe identity could not be read".into(),
         );
     };
+    if controlled && !budget.poll_collection(1) {
+        return stopped();
+    }
     let entries = match io.maps(pid, budget) {
         Ok(entries) => entries,
         Err(reason) if budget_refusal(&reason) => {
@@ -1021,18 +1056,37 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
     };
     // The map_files proof is read while the pin holds; `still_the_same`
     // below proves it was this generation's mapping.
-    // Every range is charged first, in order, exactly as one read at a
-    // time would charge it; only then are the charged ranges read (on the
-    // proof-stat pool when there is one), so a ceiling stops at the same
-    // range and never yields a partial proof.
-    let ranges = proof_ranges(&entries, prove);
-    for _ in &ranges {
-        if let Err(reason) = budget.spend(1) {
-            return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
-        }
+    // Scoped work polls and charges between each normally returning proof
+    // read. Unscoped work retains its existing charged pooled batch. A partial
+    // proof never confirms the member's generation/image snapshot.
+    if controlled && !budget.poll_collection(entries.len() as u64 + 1) {
+        return stopped();
     }
-    let mapped = read_ranges(io, pid, &ranges);
+    let ranges = proof_ranges(&entries, prove);
+    let mapped = if controlled {
+        let mut mapped = MappedIdentities::new();
+        for &(start, end) in &ranges {
+            if let Err(reason) = budget.spend(1) {
+                return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
+            }
+            mapped.insert((start, end), io.mapped_file(pid, start, end));
+        }
+        mapped
+    } else {
+        for _ in &ranges {
+            if let Err(reason) = budget.spend(1) {
+                return Confirmation::Lost(AttributionLoss::Budget, reason.to_string());
+            }
+        }
+        read_ranges(io, pid, &ranges)
+    };
+    if controlled && !budget.poll_collection(1) {
+        return stopped();
+    }
     let after = io.exe(pid);
+    if controlled && !budget.poll_collection(1) {
+        return stopped();
+    }
     if !io.still_the_same(&pin) {
         return lost(
             io,
@@ -1055,6 +1109,9 @@ pub(crate) fn confirm_with<Io: ConfirmIo>(
                 "the exe identity could not be re-read".into(),
             );
         }
+    }
+    if controlled && !budget.poll_collection(1) {
+        return stopped();
     }
     let Some(start_time) = io.start_time(&pin) else {
         return Confirmation::Lost(

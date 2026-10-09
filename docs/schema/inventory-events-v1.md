@@ -37,12 +37,13 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `budgets.inventory_attach_modules.limit`).
 - `caller_event`: one caller-incarnation turnover —
   `{event: admitted, caller}`, `{event: exited, caller, reason}`,
+  `{event: retired, caller, reason}` (old incarnation only, no authorized successor),
   `{event: exec_retired, old, new}`, `{event: reused, old, new}`, or
   `{event: admit_failed, pid, reason, budget}` where `budget` is
   `{resource, limit, requested}` or null (the same budget shape
   snapshot gaps carry).
   The additive `identity_context` has `version: 1` and `caller` for
-  admitted/exited, or `old` and `new` for exec-retired/reused. Each subject
+  admitted/exited/retired, or `old` and `new` for exec-retired/reused. Each subject
   uses the compact caller projection below from the same publication revision.
   `admit_failed` has no identity context or invented incarnation.
 - `gap_recorded`: `{index, caller, module, pid, subject, reason,

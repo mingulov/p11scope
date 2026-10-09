@@ -210,6 +210,11 @@ pub(crate) enum CallerEvent {
         id: CallerId,
         reason: String,
     },
+    /// The old incarnation ended; no successor was authorized.
+    Retired {
+        id: CallerId,
+        reason: String,
+    },
     ExecRetired {
         old: CallerId,
         new: CallerId,
@@ -224,6 +229,12 @@ pub(crate) enum CallerEvent {
         /// `Some` exactly when admission refused on the caller budget.
         budget: Option<BudgetRefusal>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum SuccessorAdmission {
+    Unrestricted,
+    ScopedDenied,
 }
 
 struct TrackedCaller<Pin> {
@@ -242,13 +253,23 @@ pub(crate) struct CallerAdapter<Source: ProcessSource> {
     live_by_pid: BTreeMap<u32, CallerId>,
     max_callers: usize,
     admit_refused: u64,
+    scoped_retire_cursor: Option<u32>,
 }
 
 /// Why one admission attempt failed: an honest pin failure, or a budget
 /// refusal carrying the resource, limit, and requested occupancy.
-struct AdmitFailure {
-    reason: String,
-    budget: Option<BudgetRefusal>,
+pub(crate) struct AdmitFailure {
+    pub(crate) reason: String,
+    pub(crate) budget: Option<BudgetRefusal>,
+}
+
+/// A fresh source pin and identity reads, still without an admitted ID.
+/// Only a borrowed cgroup transaction permit can commit it.
+pub(crate) struct PreparedScopedCaller<Pin> {
+    pid: u32,
+    pin: Pin,
+    generation: crate::inspect_system::MemberGeneration,
+    existing: Option<CallerId>,
 }
 
 impl<Source: ProcessSource> CallerAdapter<Source> {
@@ -261,6 +282,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             live_by_pid: BTreeMap::new(),
             max_callers: DEFAULT_MAX_CALLERS,
             admit_refused: 0,
+            scoped_retire_cursor: None,
         }
     }
 
@@ -406,6 +428,131 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         Ok(id)
     }
 
+    pub(crate) fn prepare_scoped_caller(
+        &mut self,
+        preparation: &crate::inspect_system::inventory_cgroup::CgroupPreparation<'_>,
+    ) -> Result<PreparedScopedCaller<Source::Pin>, AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        if !preparation.check() {
+            return Err(failed(
+                "original cgroup transaction custody could not be revalidated",
+            ));
+        }
+        let pid = preparation.pid();
+        let pin = self
+            .source
+            .open(pid)
+            .map_err(|_| failed("cgroup caller source pin unavailable"))?;
+        let generation = crate::inspect_system::MemberGeneration {
+            start_time: self.source.start_time(pid),
+            exe: self.source.exe_identity(pid),
+        };
+        if self.source.gone(pid)
+            || !self.source.still_the_same(&pin)
+            || generation != *preparation.generation()
+        {
+            return Err(failed(
+                "cgroup caller source generation or image changed before final sampling",
+            ));
+        }
+        let existing = self.live_id(pid);
+        if let Some(id) = existing {
+            let record = self.record(id).expect("live caller retains its record");
+            if record.start_time != generation.start_time || record.exe != generation.exe {
+                return Err(failed(
+                    "retained caller is a different image from the scoped transaction",
+                ));
+            }
+        }
+        Ok(PreparedScopedCaller {
+            pid,
+            pin,
+            generation,
+            existing,
+        })
+    }
+
+    pub(crate) fn commit_scoped_caller(
+        &mut self,
+        prepared: PreparedScopedCaller<Source::Pin>,
+        permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
+        now_ns: u64,
+    ) -> Result<(CallerId, bool), AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        if prepared.pid != permit.pid()
+            || prepared.generation != *permit.generation()
+            || !permit.check()
+            || !self.source.still_the_same(&prepared.pin)
+            || !permit.finish_check()
+            || self.live_id(prepared.pid) != prepared.existing
+        {
+            return Err(failed(
+                "cgroup transaction was interrupted or changed at admission commit",
+            ));
+        }
+        if let Some(id) = prepared.existing {
+            let record = self
+                .record(id)
+                .ok_or_else(|| failed("retained cgroup caller disappeared"))?;
+            if record.retired
+                || record.start_time != prepared.generation.start_time
+                || record.exe != prepared.generation.exe
+            {
+                return Err(failed(
+                    "retained cgroup caller changed before admission commit",
+                ));
+            }
+            self.callers.get_mut(&id).unwrap().record.last_seen_ns = now_ns;
+            return Ok((id, false));
+        }
+        if self.callers.len() >= self.max_callers {
+            self.admit_refused = self.admit_refused.saturating_add(1);
+            let budget = BudgetRefusal {
+                resource: "callers",
+                limit: self.max_callers,
+                requested: self.callers.len().saturating_add(1),
+            };
+            return Err(AdmitFailure {
+                reason: "cgroup caller admission refused on the retained caller budget".into(),
+                budget: Some(budget),
+            });
+        }
+        let id = self
+            .mint()
+            .map_err(|_| failed("caller ID space exhausted"))?;
+        let incarnation = self.incarnations.get(&prepared.pid).copied().unwrap_or(0);
+        self.incarnations
+            .insert(prepared.pid, incarnation.saturating_add(1));
+        self.callers.insert(
+            id,
+            TrackedCaller {
+                record: CallerRecord {
+                    id,
+                    pid: prepared.pid,
+                    start_time: prepared.generation.start_time,
+                    exe: prepared.generation.exe,
+                    incarnation,
+                    exec_observed: true,
+                    authority: ImageAuthority::ScanPinned,
+                    lifecycle: CallerLifecycle::Mapped,
+                    lifecycle_reason: None,
+                    first_seen_ns: now_ns,
+                    last_seen_ns: now_ns,
+                    retired: false,
+                },
+                pin: Some(prepared.pin),
+            },
+        );
+        self.live_by_pid.insert(prepared.pid, id);
+        Ok((id, true))
+    }
+
     /// Reconcile's admission: the budget refusal carries its
     /// resource/limit/requested structurally; pin failures stay bare.
     fn try_admit(
@@ -469,6 +616,27 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
     ) -> Vec<CallerEvent> {
+        self.exec_transition_inner(id, authority_for, now_ns, SuccessorAdmission::Unrestricted)
+    }
+
+    /// A scope-independent EXEC proof retires the old image. Membership of
+    /// its successor is a separate transaction, never inherited from its PID.
+    pub(crate) fn exec_transition_scoped(&mut self, id: CallerId, now_ns: u64) -> Vec<CallerEvent> {
+        self.exec_transition_inner(
+            id,
+            &mut |_| ImageAuthority::ScanPinned,
+            now_ns,
+            SuccessorAdmission::ScopedDenied,
+        )
+    }
+
+    fn exec_transition_inner(
+        &mut self,
+        id: CallerId,
+        authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
+        now_ns: u64,
+        admission: SuccessorAdmission,
+    ) -> Vec<CallerEvent> {
         let Some(pid) = self
             .callers
             .get(&id)
@@ -485,6 +653,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 .into(),
             now_ns,
         );
+        if matches!(admission, SuccessorAdmission::ScopedDenied) {
+            return vec![self.retired_event(id)];
+        }
         vec![match self.try_admit(pid, authority_for(pid), now_ns) {
             Ok(new) => CallerEvent::ExecRetired { old: id, new },
             Err(failure) => CallerEvent::AdmitFailed {
@@ -507,13 +678,83 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
     ) -> Vec<CallerEvent> {
+        self.reconcile_inner(
+            observed,
+            authority_for,
+            now_ns,
+            SuccessorAdmission::Unrestricted,
+            &mut || true,
+        )
+    }
+
+    /// Retire independently proven old generations without authorizing any
+    /// successor. The explicit work callback bounds these lifecycle checks.
+    pub(crate) fn reconcile_scoped(
+        &mut self,
+        now_ns: u64,
+        work: &mut dyn FnMut() -> bool,
+    ) -> Vec<CallerEvent> {
+        self.reconcile_inner(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            now_ns,
+            SuccessorAdmission::ScopedDenied,
+            work,
+        )
+    }
+
+    fn retired_event(&self, id: CallerId) -> CallerEvent {
+        CallerEvent::Retired {
+            id,
+            reason: self
+                .record(id)
+                .and_then(|record| record.lifecycle_reason.clone())
+                .unwrap_or_else(|| "caller retired".into()),
+        }
+    }
+
+    fn reconcile_inner(
+        &mut self,
+        observed: &BTreeSet<u32>,
+        authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
+        now_ns: u64,
+        admission: SuccessorAdmission,
+        work: &mut dyn FnMut() -> bool,
+    ) -> Vec<CallerEvent> {
         let mut events = Vec::new();
-        let live: Vec<(u32, CallerId)> = self
-            .live_by_pid
-            .iter()
-            .map(|(pid, id)| (*pid, *id))
-            .collect();
+        let live: Vec<(u32, CallerId)> = match admission {
+            SuccessorAdmission::Unrestricted => self
+                .live_by_pid
+                .iter()
+                .map(|(pid, id)| (*pid, *id))
+                .collect(),
+            SuccessorAdmission::ScopedDenied => {
+                // Bounded lifecycle work leaves room for fresh final sampling.
+                // Its cursor has no membership authority; it only schedules
+                // later retained callers fairly across partial collections.
+                use std::ops::Bound::{Excluded, Included, Unbounded};
+                let start = self.scoped_retire_cursor.map_or(Unbounded, Excluded);
+                let end = self.scoped_retire_cursor.map_or(Unbounded, Included);
+                self.live_by_pid
+                    .range((start, Unbounded))
+                    .chain(
+                        self.live_by_pid
+                            .range((Unbounded, end))
+                            .filter(|_| self.scoped_retire_cursor.is_some()),
+                    )
+                    .take(128)
+                    .map(|(pid, id)| (*pid, *id))
+                    .take_while(|_| work())
+                    .collect()
+            }
+        };
         for (pid, id) in live {
+            if !work() {
+                break;
+            }
+            if matches!(admission, SuccessorAdmission::ScopedDenied) {
+                self.scoped_retire_cursor = Some(pid);
+            }
             let same = self
                 .callers
                 .get(&id)
@@ -539,6 +780,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                         "executable image changed while the generation pin held (exec)".into(),
                         now_ns,
                     );
+                    if matches!(admission, SuccessorAdmission::ScopedDenied) {
+                        events.push(self.retired_event(id));
+                        continue;
+                    }
                     match self.try_admit(pid, authority_for(pid), now_ns) {
                         Ok(new) => events.push(CallerEvent::ExecRetired { old: id, new }),
                         Err(failure) => events.push(CallerEvent::AdmitFailed {
@@ -595,6 +840,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     ),
                 };
                 self.retire(id, lifecycle, reason, now_ns);
+                if matches!(admission, SuccessorAdmission::ScopedDenied) {
+                    events.push(self.retired_event(id));
+                    continue;
+                }
                 match self.try_admit(pid, authority_for(pid), now_ns) {
                     Ok(new) => events.push(CallerEvent::Reused { old: id, new }),
                     Err(failure) => events.push(CallerEvent::AdmitFailed {
@@ -3927,6 +4176,18 @@ pub(crate) mod tests {
             );
         }
 
+        pub(crate) fn spawn_matching_process(&self, pid: u32) {
+            self.set(
+                pid,
+                ScriptedProcess {
+                    alive: true,
+                    start_time: process_start_time(pid).unwrap(),
+                    exe: read_exe_identity(pid),
+                    readable: true,
+                },
+            );
+        }
+
         pub(crate) fn blind(&self, pid: u32) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.readable = false;
@@ -4166,6 +4427,27 @@ pub(crate) mod tests {
         assert_eq!(
             adapter.record(first).unwrap().lifecycle,
             CallerLifecycle::Unknown
+        );
+    }
+
+    #[test]
+    fn scoped_retirement_pages_eventually_check_later_live_callers() {
+        let (source, mut adapter) = adapter();
+        for pid in 1..=257 {
+            source.spawn(pid, 500);
+            adapter.admit(pid, AUTHORITY, 50).unwrap();
+        }
+        let later = adapter.live_id(257).unwrap();
+        source.exec(257, 200, "/bin/later-image");
+        for _ in 0..3 {
+            adapter.reconcile_scoped(100, &mut || true);
+        }
+        assert!(adapter.record(later).unwrap().retired);
+        assert_eq!(adapter.live_id(257), None);
+        assert_eq!(
+            adapter.len(),
+            257,
+            "no successor inherited scope membership"
         );
     }
 

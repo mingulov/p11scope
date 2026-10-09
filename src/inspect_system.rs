@@ -62,6 +62,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+pub(crate) mod inventory_cgroup;
+
 const DOC_ID: &str = "p11scope/inspect-system/v1";
 
 /// The controller ruling, carried on every admission verdict and on the
@@ -4067,24 +4069,28 @@ mod tests {
 }
 
 #[cfg(test)]
-mod demotion_retirement_producer_tests {
+pub(crate) mod demotion_retirement_producer_tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
     use std::process::{Child, Command};
     use std::time::{Duration, Instant};
 
-    struct OwnedStoppedChild(Option<Child>);
+    pub(crate) struct OwnedStoppedChild(Option<Child>);
 
     impl OwnedStoppedChild {
-        fn new() -> Self {
-            // The shell reaches its own code only after dynamic startup.
+        pub(crate) fn new() -> Self {
+            Self::with_command("kill -STOP $$; exit 99")
+        }
+
+        pub(crate) fn with_command(command: &str) -> Self {
+            Self::spawn_stopped(Command::new("/bin/sh").args(["-c", command]), |_| {})
+        }
+
+        pub(crate) fn spawn_stopped(command: &mut Command, after_spawn: impl FnOnce(u32)) -> Self {
+            // The child reaches its readiness handshake after dynamic startup.
             // A confirmed SIGSTOP then holds its maps stable during the scan.
-            let mut owned = Self(Some(
-                Command::new("/bin/sh")
-                    .args(["-c", "kill -STOP $$; exit 99"])
-                    .spawn()
-                    .unwrap(),
-            ));
+            let mut owned = Self(Some(command.spawn().unwrap()));
+            after_spawn(owned.id());
             let pid = owned.id() as libc::pid_t;
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -4124,7 +4130,7 @@ mod demotion_retirement_producer_tests {
             }
         }
 
-        fn id(&self) -> u32 {
+        pub(crate) fn id(&self) -> u32 {
             self.0.as_ref().expect("retained owned child").id()
         }
     }

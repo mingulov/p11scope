@@ -2027,8 +2027,8 @@ mod tests {
     }
 
     /// The C8 harness probes `--capture` on a usage line that names
-    /// `p11scope inventory` (`inventory-native-oracle.py probe-help`): both
-    /// inventory usage lines carry it, in the global and scoped help alike.
+    /// `p11scope inventory` (`inventory-native-oracle.py probe-help`): every
+    /// inventory scope usage line carries it, in global and scoped help alike.
     #[test]
     fn inventory_usage_lines_carry_the_capture_flag() {
         for text in [USAGE, INVENTORY_HELP] {
@@ -2036,9 +2036,26 @@ mod tests {
                 .lines()
                 .filter(|line| line.contains("p11scope inventory --") && line.contains("[--"))
                 .collect();
-            assert_eq!(lines.len(), 2, "{text}");
-            for line in lines {
-                assert!(line.contains("[--capture auto|scan|native]"), "{line}");
+            assert_eq!(lines.len(), 3, "{text}");
+            for prefix in [
+                "  p11scope inventory --pid ",
+                "  p11scope inventory --cgroup ",
+                "  p11scope inventory --system ",
+            ] {
+                let scoped_lines: Vec<&&str> = lines
+                    .iter()
+                    .filter(|line| line.starts_with(prefix))
+                    .collect();
+                assert_eq!(
+                    scoped_lines.len(),
+                    1,
+                    "missing or duplicate {prefix:?} line"
+                );
+                assert!(
+                    scoped_lines[0].contains("[--capture auto|scan|native]"),
+                    "{}",
+                    scoped_lines[0]
+                );
             }
         }
     }
@@ -2109,12 +2126,27 @@ mod tests {
                 .lines()
                 .filter(|line| line.contains("p11scope inventory --") && line.contains("[--"))
                 .collect();
-            assert_eq!(lines.len(), 2);
-            assert!(
-                lines
+            assert_eq!(lines.len(), 3);
+            for prefix in [
+                "  p11scope inventory --pid ",
+                "  p11scope inventory --cgroup ",
+                "  p11scope inventory --system ",
+            ] {
+                let scoped_lines: Vec<&&str> = lines
                     .iter()
-                    .all(|line| line.contains("[--attach-backend auto|multi|singles]"))
-            );
+                    .filter(|line| line.starts_with(prefix))
+                    .collect();
+                assert_eq!(
+                    scoped_lines.len(),
+                    1,
+                    "missing or duplicate {prefix:?} line"
+                );
+                assert!(
+                    scoped_lines[0].contains("[--attach-backend auto|multi|singles]"),
+                    "{}",
+                    scoped_lines[0]
+                );
+            }
         }
     }
 
@@ -3130,8 +3162,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 5433);
-        assert_eq!(hash, 0x034f63d3296300de);
+        assert_eq!(USAGE.len(), 5839);
+        assert_eq!(hash, 0x1d28c23e32d64b60);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

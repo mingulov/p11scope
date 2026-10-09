@@ -353,13 +353,15 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      # Reviewed full-image continuity and fault exhaustion change Detailed;
+      # both Inventory objects remain byte-identical to v0.3.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
       - name: Compare complete default objects
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=792530713348f3a74e9100140226a51aea65a666
+          BASELINE=ca3a1814201e2fbc4d3dd747b577fde849320041
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

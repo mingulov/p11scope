@@ -181,6 +181,35 @@ impl<Source: ProcessSource> CallerLookup<Source::Pin> for CallerAdapter<Source> 
     }
 }
 
+/// A current-image query for an already historically bound image.
+#[derive(Clone, Copy)]
+pub(crate) struct CurrentBindingRequest {
+    pub caller: CallerId,
+    pub pid: u32,
+    pub image: DomainCookie,
+    pub exec_id: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CurrentBindingSighting {
+    request: CurrentBindingRequest,
+    first_seen_ns: u64,
+    sighted_ns: u64,
+}
+
+impl CurrentBindingSighting {
+    pub(crate) fn sighted_ns(&self) -> u64 {
+        self.sighted_ns
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CurrentBindingCheck {
+    Pending,
+    Proven,
+    Rejected(UnboundReason),
+}
+
 /// Why one witness row stays unbound. The order is the census order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum UnboundReason {
@@ -377,6 +406,7 @@ fn stamp(ns: u64) -> Option<u64> {
 /// One native domain's binding state.
 struct DomainState {
     domain: NativeDomainId,
+    finished: bool,
     /// Start of the latest complete lifecycle drain.
     lifecycle_ns: Option<u64>,
     /// Start of the latest readable health read.
@@ -413,6 +443,7 @@ impl DomainState {
     fn new(domain: NativeDomainId) -> Self {
         Self {
             domain,
+            finished: false,
             lifecycle_ns: None,
             health_ns: None,
             coverage_ns: None,
@@ -463,9 +494,12 @@ impl DomainState {
 pub(crate) struct NativeBinder {
     limits: BinderLimits,
     domains: Vec<DomainState>,
+    domain_indices: HashMap<NativeDomainId, usize>,
     decided: Vec<Decision>,
     transitions: Vec<ExecTransition>,
     census: BindingCensus,
+    #[cfg(test)]
+    current_binding_clock: Option<fn() -> Option<u64>>,
 }
 
 impl NativeBinder {
@@ -473,9 +507,12 @@ impl NativeBinder {
         Self {
             limits,
             domains: Vec::new(),
+            domain_indices: HashMap::new(),
             decided: Vec::new(),
             transitions: Vec::new(),
             census: BindingCensus::default(),
+            #[cfg(test)]
+            current_binding_clock: None,
         }
     }
 
@@ -517,11 +554,13 @@ impl NativeBinder {
     }
 
     fn domain_index(&mut self, domain: NativeDomainId) -> usize {
-        match self.domains.iter().position(|state| state.domain == domain) {
+        match self.domain_indices.get(&domain).copied() {
             Some(index) => index,
             None => {
+                let index = self.domains.len();
                 self.domains.push(DomainState::new(domain));
-                self.domains.len() - 1
+                self.domain_indices.insert(domain, index);
+                index
             }
         }
     }
@@ -678,13 +717,147 @@ impl NativeBinder {
         self.decide_ready(index);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_current_binding_clock(&mut self, clock: fn() -> Option<u64>) {
+        self.current_binding_clock = Some(clock);
+    }
+
+    pub(crate) fn domain_active(&self, domain: NativeDomainId) -> bool {
+        self.domain_indices
+            .get(&domain)
+            .is_some_and(|index| !self.domains[*index].finished)
+    }
+
+    pub(crate) fn sight_current_binding<Pin>(
+        &self,
+        request: CurrentBindingRequest,
+        lookup: &dyn CallerLookup<Pin>,
+        identity: &mut dyn NativeIdentity<Pin>,
+    ) -> Result<CurrentBindingSighting, UnboundReason> {
+        #[cfg(test)]
+        let clock = self
+            .current_binding_clock
+            .unwrap_or(crate::attach::monotonic_ns);
+        #[cfg(not(test))]
+        let clock = crate::attach::monotonic_ns;
+        self.sight_current_binding_at(request, lookup, identity, || clock().and_then(stamp))
+    }
+
+    fn sight_current_binding_at<Pin>(
+        &self,
+        request: CurrentBindingRequest,
+        lookup: &dyn CallerLookup<Pin>,
+        identity: &mut dyn NativeIdentity<Pin>,
+        clock: impl FnOnce() -> Option<u64>,
+    ) -> Result<CurrentBindingSighting, UnboundReason> {
+        let state = self
+            .domain_indices
+            .get(&request.image.domain())
+            .map(|index| &self.domains[*index])
+            .ok_or(UnboundReason::EvidenceIncomplete)?;
+        if state.finished {
+            return Err(UnboundReason::EvidenceIncomplete);
+        }
+        if state.ended.contains(&request.caller) {
+            return Err(UnboundReason::ExecTransition);
+        }
+        if state.callers.get(&request.caller) != Some(&(request.image, request.exec_id)) {
+            return Err(UnboundReason::ExecAmbiguous);
+        }
+        let caller = lookup
+            .live_caller(request.pid)
+            .filter(|caller| caller.id == request.caller)
+            .ok_or(UnboundReason::NoLiveCaller)?;
+        let query = identity.query_cookie(request.image.domain(), caller.pin);
+        // Query completion, never the caller's pass-start or an old witness stamp.
+        let sighted_ns = clock()
+            .filter(|ns| *ns > 0)
+            .ok_or(UnboundReason::EvidenceIncomplete)?;
+        match query {
+            CookieQuery::Cookie(answered) if answered == request.image => {}
+            CookieQuery::Cookie(_) | CookieQuery::NoCookie => {
+                return Err(UnboundReason::CookieMismatch);
+            }
+            CookieQuery::Exited => return Err(UnboundReason::CallerExited),
+            CookieQuery::Unavailable(_) => return Err(UnboundReason::CookieUnavailable),
+        }
+        if sighted_ns < caller.first_seen_ns {
+            return Err(UnboundReason::BeforeAdmission);
+        }
+        let sighting = CurrentBindingSighting {
+            request,
+            first_seen_ns: caller.first_seen_ns,
+            sighted_ns,
+        };
+        if let CurrentBindingCheck::Rejected(reason) = self.check_current_binding(&sighting) {
+            return Err(reason);
+        }
+        Ok(sighting)
+    }
+
+    pub(crate) fn check_current_binding(
+        &self,
+        sighting: &CurrentBindingSighting,
+    ) -> CurrentBindingCheck {
+        let request = sighting.request;
+        let Some(state) = self
+            .domain_indices
+            .get(&request.image.domain())
+            .map(|index| &self.domains[*index])
+        else {
+            return CurrentBindingCheck::Rejected(UnboundReason::EvidenceIncomplete);
+        };
+        let rejected = if state.finished {
+            Some(UnboundReason::EvidenceIncomplete)
+        } else if state.ended.contains(&request.caller) {
+            Some(UnboundReason::ExecTransition)
+        } else if state.callers.get(&request.caller) != Some(&(request.image, request.exec_id)) {
+            Some(UnboundReason::ExecAmbiguous)
+        } else if state
+            .exec_ns
+            .get(&request.pid)
+            .is_some_and(|ns| *ns >= sighting.first_seen_ns)
+        {
+            Some(UnboundReason::ExecAfterAdmission)
+        } else if state.loss_ns.is_some_and(|ns| ns >= sighting.first_seen_ns) {
+            Some(UnboundReason::LifecycleLoss)
+        } else if state.predates_coverage(sighting.first_seen_ns)
+            && state
+                .revalidated
+                .as_ref()
+                .is_none_or(|ids| !ids.contains(&request.caller))
+        {
+            Some(UnboundReason::ExecCoverageGap)
+        } else if state.cookies.get(&request.image).is_none_or(|execs| {
+            execs
+                .keys()
+                .next_back()
+                .is_none_or(|exec| *exec != request.exec_id)
+        }) {
+            Some(UnboundReason::ExecAmbiguous)
+        } else {
+            None
+        };
+        if let Some(reason) = rejected {
+            return CurrentBindingCheck::Rejected(reason);
+        }
+        if state
+            .lifecycle_ns
+            .is_some_and(|ns| ns > sighting.sighted_ns)
+            && state.health_ns.is_some_and(|ns| ns > sighting.sighted_ns)
+        {
+            CurrentBindingCheck::Proven
+        } else {
+            CurrentBindingCheck::Pending
+        }
+    }
+
     /// No later evidence will arrive for `domain` (its capture retired):
     /// every row of that domain still waiting is unbound. Other domains
     /// are untouched.
     pub(crate) fn finish(&mut self, domain: NativeDomainId) {
-        let Some(index) = self.domains.iter().position(|state| state.domain == domain) else {
-            return;
-        };
+        let index = self.domain_index(domain);
+        self.domains[index].finished = true;
         while let Some(pending) = self.domains[index].pending.pop_front() {
             self.census.pending -= 1;
             let reason = if self.domains[index].awaits_revalidation(&pending) {

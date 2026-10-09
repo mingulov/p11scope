@@ -42,6 +42,13 @@ is never required merely because a workload is short. For `run`, every setup
 call is ledgered; setup completed before observed capture readiness is an
 explicitly uncertain attachment prefix, bounded by the independent ledger.
 Calls after readiness are mandatory. No captured setup row is omitted.
+The public run route may initially announce zero provider probes while the
+caller is still loading its provider. That banner alone never opens the native
+workload gate: the harness also validates the actual owned child image and held
+provider target, then waits at most ten seconds for a completed successful
+`C_OpenSession` event matching its independently recorded setup PID/TID/function.
+Only then does it record gate-release readiness and start main work. Cgroup
+cells still require a positive initial provider-probe count.
 
 The observer's event wall clock is anchored when rendering begins. The oracle
 does not use it to assign exec phases. It compares actual function populations,

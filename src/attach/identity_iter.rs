@@ -1996,6 +1996,86 @@ pub fn write_scope_bitmap(ebpf: &mut aya::Ebpf, tgids: &[u32]) -> Result<(), Pro
     Ok(())
 }
 
+/// Tracks the words written on one fresh strict-loaded identity object.
+/// A failed replacement cannot authorize an iterator run.
+#[derive(Default)]
+pub(crate) struct ScopeBitmap {
+    words: BTreeSet<u32>,
+    ready: bool,
+}
+
+impl ScopeBitmap {
+    #[cfg(test)]
+    pub(crate) fn fixture_replace(&mut self, tgids: &[u32]) -> Result<(), &'static str> {
+        self.replace_with(tgids, |_, _| Ok(()), || "invalid fixture scope")
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        self.ready
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.ready = false;
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        ebpf: &mut aya::Ebpf,
+        tgids: &[u32],
+    ) -> Result<(), ProbeError> {
+        self.ready = false;
+        let map = ebpf.map_mut("scope_bitmap").ok_or_else(|| ProbeError {
+            stage: "scope-map",
+            detail: "scope_bitmap map missing from the loaded object".into(),
+        })?;
+        let mut array = aya::maps::Array::<_, u64>::try_from(map).map_err(|error| ProbeError {
+            stage: "scope-cast",
+            detail: error.to_string(),
+        })?;
+        self.replace_with(
+            tgids,
+            |word, bits| {
+                array.set(word, bits, 0).map_err(|error| ProbeError {
+                    stage: "scope-write",
+                    detail: error.to_string(),
+                })
+            },
+            || ProbeError {
+                stage: "scope-bit",
+                detail: "tgid outside the scope bitmap".into(),
+            },
+        )
+    }
+
+    fn replace_with<E>(
+        &mut self,
+        tgids: &[u32],
+        mut write: impl FnMut(u32, u64) -> Result<(), E>,
+        invalid: impl FnOnce() -> E,
+    ) -> Result<(), E> {
+        self.ready = false;
+        let mut words = BTreeMap::new();
+        for &tgid in tgids {
+            let Some((word, bit)) = scope_word_bit(tgid) else {
+                return Err(invalid());
+            };
+            *words.entry(word as u32).or_insert(0u64) |= bit;
+        }
+        for &word in &self.words {
+            write(word, 0)?;
+        }
+        self.words.clear();
+        for (word, bits) in words {
+            // Track attempts too: a writer may have applied the update before
+            // reporting failure. A later replacement must clear that cell.
+            self.words.insert(word);
+            write(word, bits)?;
+        }
+        self.ready = true;
+        Ok(())
+    }
+}
+
 /// Open a pidfd for `pid`. A descriptor numbered 0 is re-numbered to ≥1
 /// (`F_DUPFD_CLOEXEC`, restoring the closed-stdin state): the link
 /// encoder rejects fd 0 rather than risk a silent whole-system walk.
@@ -2031,10 +2111,24 @@ pub fn attach_and_read_run(
 ) -> Result<Vec<u8>, ProbeError> {
     let link = link_create_task_vma(prog_fd, pid_fd).map_err(|error| probe_io("link", error))?;
     let iter = iter_create(link.as_fd()).map_err(|error| probe_io("iter", error))?;
-    read_run(iter.as_fd(), deadline, max_bytes).map_err(|error| ProbeError {
+    consume_owned_run(iter, link, deadline, max_bytes).map_err(|error| ProbeError {
         stage: "read",
         detail: format!("{error:?}"),
     })
+}
+
+/// Return only completed bytes or failure after both concrete run descriptors
+/// close. No reference or callback can detach an iterator from its arena owner.
+pub(crate) fn consume_owned_run(
+    iter: OwnedFd,
+    link: OwnedFd,
+    deadline: Instant,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ReadError> {
+    let result = read_run(iter.as_fd(), deadline, max_bytes);
+    drop(iter);
+    drop(link);
+    result
 }
 
 /// The single executable file range for `path` in a maps text. Exactly
@@ -2288,6 +2382,82 @@ pub fn run_functional_probe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn d3b_scope_replacement_clears_shrinking_and_disjoint_sets() {
+        let mut state = ScopeBitmap::default();
+        let mut bitmap = vec![0u64; SCOPE_WORDS];
+        for scope in [vec![1, 2, 65], vec![2], vec![128], vec![]] {
+            state
+                .replace_with(
+                    &scope,
+                    |word, bits| {
+                        bitmap[word as usize] = bits;
+                        Ok::<_, ()>(())
+                    },
+                    || (),
+                )
+                .unwrap();
+            assert!(state.ready());
+            let actual: BTreeSet<_> = (0..192)
+                .filter(|pid| scope_test_bit(&bitmap, *pid))
+                .collect();
+            assert_eq!(
+                actual,
+                scope.into_iter().collect(),
+                "scope retained an earlier pass"
+            );
+        }
+    }
+
+    #[test]
+    fn d3b_failed_scope_replacement_disables_runs_and_can_clear_partial_writes() {
+        let mut state = ScopeBitmap::default();
+        let mut bitmap = vec![0u64; SCOPE_WORDS];
+        state
+            .replace_with(
+                &[1],
+                |word, bits| {
+                    bitmap[word as usize] = bits;
+                    Ok::<_, ()>(())
+                },
+                || (),
+            )
+            .unwrap();
+        assert!(
+            state
+                .replace_with(
+                    &[65, 128],
+                    |word, bits| {
+                        bitmap[word as usize] = bits;
+                        if word == 2 { Err(()) } else { Ok(()) }
+                    },
+                    || ()
+                )
+                .is_err()
+        );
+        assert!(!state.ready(), "partially replaced scope authorized a run");
+        state
+            .replace_with(
+                &[192],
+                |word, bits| {
+                    bitmap[word as usize] = bits;
+                    Ok::<_, ()>(())
+                },
+                || (),
+            )
+            .unwrap();
+        assert_eq!(bitmap[..4], [0, 0, 0, 1]);
+        assert!(
+            state
+                .replace_with(&[u32::MAX], |_, _| Ok::<_, ()>(()), || ())
+                .is_err()
+        );
+        assert!(
+            !state.ready(),
+            "invalid scope retained earlier authorization"
+        );
+    }
+
     use super::*;
     use std::time::Duration;
 

@@ -3282,6 +3282,103 @@ fn d3a_global_reservations_enforce_each_envelope() {
     assert_eq!(ReservationOwner::new(policy).state_for_test().3, 9);
 }
 
+#[test]
+fn d3b_examined_holds_use_one_global_allowance() {
+    let policy = SegmentPolicy::from_headroom(10, 0, 0);
+    let owner = ReservationOwner::for_examined(policy, 2);
+    assert_eq!(owner.examined_capacity(), 2);
+    let first = owner.examined().unwrap();
+    let first_file = std::fs::File::open("/dev/null").unwrap();
+    let sibling = owner.clone();
+    let second = sibling.examined().unwrap();
+    let second_file = std::fs::File::open("/dev/null").unwrap();
+    assert!(owner.examined().is_err(), "cap multiplied by owner clones");
+    let immediate = owner.immediate();
+    let pin = immediate.pin().unwrap();
+    let io = immediate.transient().unwrap();
+    assert_eq!(owner.examined_for_test(), (2, 2));
+    assert!(owner.state_for_test().2 <= policy.headroom);
+    drop((first_file, second_file));
+    drop((first, second, pin, io));
+    assert_eq!(owner.examined_for_test().0, 0);
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+}
+
+#[test]
+fn d3b_strict_census_never_accepts_a_partial_count() {
+    let entries = || [Ok::<_, ()>(()), Ok(()), Ok(())].into_iter();
+    // Three FDs include the census itself; held/admitted/current scan FDs
+    // would be among the other two, never subtracted a second time.
+    assert_eq!(census_allowance(100, entries(), 4, || true).unwrap(), 34);
+    assert_eq!(census_allowance(64, entries(), 4, || true).unwrap(), 0);
+    assert_eq!(
+        census_allowance(100, entries(), 3, || true).unwrap_err(),
+        FD_CENSUS_REASON
+    );
+    assert_eq!(
+        census_allowance(100, [Ok(()), Err(())].into_iter(), 4, || true).unwrap_err(),
+        FD_CENSUS_REASON
+    );
+    let polls = std::cell::Cell::new(0);
+    assert!(
+        census_allowance(100, entries(), 4, || {
+            polls.set(polls.get() + 1);
+            polls.get() < 4
+        })
+        .is_err(),
+        "late census accepted its partial count"
+    );
+    assert!(
+        census_allowance(100, entries(), 4, || false).is_err(),
+        "clock refusal was ignored"
+    );
+    assert!(census_allowance(100, std::iter::empty::<Result<(), ()>>(), 4, || true).is_err());
+    // Exercise the real unprivileged directory/syscall path too. Headroom
+    // is environment dependent, so its numeric value is not an oracle.
+    match SegmentPolicy::try_snapshot(0, 0) {
+        Ok(live) => assert_eq!((live.workers, live.retained), (0, 0)),
+        Err(reason) => assert_eq!(reason, FD_CENSUS_REASON),
+    }
+}
+
+#[test]
+fn d3b_census_reconciliation_requires_quiescence_and_counts_holds_once() {
+    let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(10, 0, 0), 2);
+    let hold = owner.examined().unwrap();
+    let held_file = std::fs::File::open("/dev/null").unwrap();
+    let immediate = owner.immediate();
+    let pin = immediate.pin().unwrap();
+    let fresh = SegmentPolicy::from_headroom(6, 1, 1);
+    assert!(
+        owner.reconcile(fresh).is_err(),
+        "live confirmation pin rebased"
+    );
+    drop(pin);
+    let worker = immediate.transient().unwrap();
+    assert!(
+        owner.reconcile(fresh).is_err(),
+        "live transient worker rebased"
+    );
+    drop(worker);
+    owner.reconcile(fresh).unwrap();
+    assert!(
+        owner.examined().is_err(),
+        "new custody after the census boundary"
+    );
+    let batch = owner.batch();
+    let pin = batch.pin().unwrap();
+    let transient = batch.transient().unwrap();
+    let immediate_pin = immediate.pin().unwrap();
+    let immediate_io = immediate.transient().unwrap();
+    assert_eq!(owner.state_for_test().0, [1, 2, 1, 2]);
+    assert_eq!(owner.examined_for_test().0, 1);
+    drop((pin, transient, immediate_pin, immediate_io));
+    drop(held_file);
+    drop(hold);
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    assert_eq!(owner.examined_for_test().0, 0);
+}
+
 /// A delivered reply does not release the worker's source Arc. The observer
 /// owns no source, and the next immediate operation awaits real destruction.
 #[test]

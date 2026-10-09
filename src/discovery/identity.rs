@@ -360,6 +360,16 @@ pub(crate) struct ExaminedObject {
     pub key_is_identity: bool,
 }
 
+/// The actual scanner-opened file; its physical lease returns after the file
+/// closes. Equal metadata never makes two instances of this type one file.
+pub(crate) struct HeldExaminedObject {
+    pub scan: u64,
+    pub ordinal: u64,
+    pub examined: ExaminedObject,
+    pub file: std::fs::File,
+    pub _lease: crate::discovery::sweep_attribution::FdLease,
+}
+
 /// Filesystems on which a maps key is one file: one superblock renders one
 /// device in maps and `stat` alike, and no two simultaneously live inodes
 /// of the superblock share an inode number. A positive allowlist; the

@@ -27790,7 +27790,7 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
     assert_eq!(stats.dropped_unknown, 1);
 }
 
-mod detailed_proof_driver {
+pub(crate) mod detailed_proof_driver {
     use super::*;
     use crate::attach::detailed_identity::{
         ProofSession, TraceIo, TraceProofUnknown, TraceSeed, TraceWorkError, TraceWorkTicket,
@@ -27802,6 +27802,7 @@ mod detailed_proof_driver {
 
     struct Io {
         proof: ProofSession,
+        link: Vec<u8>,
         cookie: Cell<Option<u64>>,
         loss: Cell<Result<u64, TraceProofUnknown>>,
         cookie_reads: Cell<usize>,
@@ -27854,7 +27855,8 @@ mod detailed_proof_driver {
                     self.proof.test_set_time(self.proof.test_time() + 5_000_000);
                 })
             } else {
-                self.proof.test_sample_view(view, work)
+                self.proof
+                    .test_sample_view_with_link(view, work, &self.link)
             };
             if self.expire_on_sample.get() == Some(n) {
                 self.proof.test_set_time(self.proof.test_time() + 5_000_000);
@@ -27875,6 +27877,7 @@ mod detailed_proof_driver {
             engine,
             Io {
                 proof,
+                link: b"/owned/fixture".to_vec(),
                 cookie: Cell::new(None),
                 loss: Cell::new(Ok(0)),
                 cookie_reads: Cell::new(0),
@@ -27978,6 +27981,63 @@ mod detailed_proof_driver {
         );
         empty(io);
         service(engine, io)
+    }
+    pub(crate) fn verified_fixture() -> (ProofSession, VerifiedTraceSeed) {
+        verified_fixture_with_link(b"/owned/fixture")
+    }
+    pub(crate) fn verified_fixture_with_link(link: &[u8]) -> (ProofSession, VerifiedTraceSeed) {
+        let (mut engine, mut io) = fixture();
+        io.link = link.to_vec();
+        seed(&mut engine, &mut io);
+        let mut accepted = verify(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        engine.views.clear();
+        assert!(service(&mut engine, &mut io).is_empty());
+        (io.proof.clone(), accepted.pop().unwrap())
+    }
+    pub(crate) fn verified_duplicate_fixture()
+    -> (ProofSession, VerifiedTraceSeed, VerifiedTraceSeed) {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        let mut accepted = verify(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        let first = accepted.pop().unwrap();
+        if engine.trace_seeds.is_empty() {
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+        assert_eq!(engine.trace_seeds.len(), 1);
+        assert_eq!(calls(&io, io.proof.test_time() + 1, 11, 0), 1);
+        assert!(service(&mut engine, &mut io).is_empty());
+        empty(&io);
+        let mut accepted = service(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        engine.views.clear();
+        assert!(service(&mut engine, &mut io).is_empty());
+        (io.proof.clone(), first, accepted.pop().unwrap())
+    }
+    pub(crate) fn verified_conflicting_fixture()
+    -> (ProofSession, VerifiedTraceSeed, VerifiedTraceSeed) {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        let mut accepted = verify(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        let first = accepted.pop().unwrap();
+        // Cancel any automatic prior-link candidate before sampling the renamed
+        // link. The same original admitted ProcessView/pidfd remains in custody.
+        for id in engine.trace_seeds.keys().copied().collect::<Vec<_>>() {
+            engine.drop_trace_seed(id);
+        }
+        io.link = b"/renamed/fixture".to_vec();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(engine.trace_seeds.len(), 1);
+        assert_eq!(calls(&io, io.proof.test_time() + 1, 11, 0), 1);
+        assert!(service(&mut engine, &mut io).is_empty());
+        empty(&io);
+        let mut accepted = service(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        engine.views.clear();
+        assert!(service(&mut engine, &mut io).is_empty());
+        (io.proof.clone(), first, accepted.pop().unwrap())
     }
     #[test]
     fn detailed_proof_seed_precedes_first_cookie() {

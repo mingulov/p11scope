@@ -93,8 +93,90 @@ impl<'a> TraceExecutableView<'a> {
 mod tests {
     use super::*;
     use crate::discovery::engine::tests::detailed_proof_driver::{
-        verified_conflicting_fixture, verified_duplicate_fixture, verified_fixture,
+        cgroup_verified_fixture, verified_conflicting_fixture, verified_duplicate_fixture,
+        verified_fixture,
     };
+
+    // Catches using either warm-up witness as the immutable event-time boundary,
+    // PID-only lookup, and moving that boundary after delayed event delivery.
+    #[test]
+    fn cgroup_trace_bracket_store_uses_strict_sample_boundary_and_exact_key() {
+        let (proof, receipt) = cgroup_verified_fixture();
+        let key = receipt.key();
+        assert!(proof.is_cgroup());
+        assert_eq!(receipt.eligible_after_ns(), 106);
+        let mut store = TraceIdentityStore::new(proof.clone());
+        assert_eq!(store.lookup(key, 115).path(), None);
+        assert_eq!(store.admit(receipt), Ok(()));
+        for ts in [0, 101, 105, 106] {
+            assert_eq!(
+                store.lookup(key, ts).result,
+                Err(TraceIdentityUnknown::AfterEvent)
+            );
+        }
+        for ts in [107, 114, 1_000] {
+            assert_eq!(store.lookup(key, ts).path(), Some("/owned/fixture"));
+        }
+        assert_eq!(
+            store.lookup(key, u64::MAX).result,
+            Err(TraceIdentityUnknown::Unreadable)
+        );
+        for foreign in [
+            ProcessKey { exec_id: 1, ..key },
+            ProcessKey {
+                generation: 12,
+                ..key
+            },
+            ProcessKey { domain: 8, ..key },
+            ProcessKey::from_pid(key.pid),
+        ] {
+            assert_eq!(
+                store.lookup(foreign, 115).result,
+                Err(TraceIdentityUnknown::NotSeeded)
+            );
+        }
+        assert_eq!(
+            store
+                .lookup(
+                    ProcessKey {
+                        pid: key.pid + 1,
+                        ..key
+                    },
+                    115
+                )
+                .path(),
+            Some("/owned/fixture")
+        );
+        assert_eq!(
+            store.lookup(key, 106).result,
+            Err(TraceIdentityUnknown::AfterEvent)
+        );
+        assert_eq!(proof.usage(), (1, 14));
+        drop(store);
+        assert_eq!(proof.usage(), (0, 0));
+    }
+
+    // Catches treating numeric key equality as receipt authority, or retaining
+    // the foreign receipt's accepted-key metadata and reservation on refusal.
+    #[test]
+    fn cgroup_trace_bracket_store_rejects_foreign_receipt_and_releases_charge() {
+        let (owner, first) = cgroup_verified_fixture();
+        let (foreign, receipt) = cgroup_verified_fixture();
+        let key = first.key();
+        assert_eq!(receipt.key(), key);
+        assert!(!owner.same_allocation(&foreign));
+        let mut store = TraceIdentityStore::new(owner.clone());
+        store.admit(first).unwrap();
+        assert_eq!(
+            store.admit(receipt),
+            Err(TraceIdentityUnknown::DomainMismatch)
+        );
+        assert_eq!(foreign.usage(), (0, 0));
+        assert_eq!(owner.usage(), (1, 14));
+        assert_eq!(store.lookup(key, 115).path(), Some("/owned/fixture"));
+        drop(store);
+        assert_eq!(owner.usage(), (0, 0));
+    }
 
     // Catches PID-indexed/successor lookup and failure to retain a real receipt.
     #[test]

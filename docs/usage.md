@@ -157,6 +157,17 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
   -o observed-profile.json --pause auto -- /opt/application/bin/workload
 ```
 
+Trace rows show an executable label when p11scope can establish which process
+image made that call. Otherwise they say `Unknown executable` and retain the
+PID/TID. The label comes from the observed executable path: an interpreter may
+therefore appear as `python` or `sh`, rather than the script or service name.
+For cgroup traces, naming needs calls on both sides of a validated executable
+sample. Early calls and short-lived or infrequent callers can stay unknown;
+their count and admission rules are unchanged. Previously printed rows are
+not renamed later. See the [trace privacy contract](privacy/allowlist-v3.md#trace-executable-labels-p5u-2026-10-09)
+for the sampling and retention limits. Installed cgroup naming checks for v0.4
+are still in progress.
+
 > **`run` safety boundary:** `sudo p11scope run` requires valid non-root
 > `SUDO_UID` and `SUDO_GID` values naming one existing non-root account and
 > drops the child to that identity before releasing its private barrier. Root

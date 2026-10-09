@@ -27952,7 +27952,7 @@ pub(crate) mod detailed_proof_driver {
             },
         )
     }
-    fn service(engine: &mut Engine, io: &mut Io) -> Vec<VerifiedTraceSeed> {
+    pub(crate) fn service(engine: &mut Engine, io: &mut Io) -> Vec<VerifiedTraceSeed> {
         let mut accepted = Vec::new();
         engine
             .with_trace_frame(io, |engine, io, work| {
@@ -28871,7 +28871,7 @@ pub(crate) mod detailed_proof_driver {
         assert!(io.proof.usage().0 <= 16384 && io.proof.usage().1 <= 8 * 1024 * 1024);
     }
 
-    fn cgroup_fixture() -> (Engine, Io) {
+    pub(crate) fn cgroup_fixture() -> (Engine, Io) {
         let (mut engine, mut io) = fixture();
         let scope = Scope::Cgroup {
             id: 1,
@@ -28883,7 +28883,7 @@ pub(crate) mod detailed_proof_driver {
         engine.scope = scope;
         (engine, io)
     }
-    fn cgroup_sampled() -> (Engine, Io, SeedId) {
+    pub(crate) fn cgroup_sampled() -> (Engine, Io, SeedId) {
         let (mut engine, mut io) = cgroup_fixture();
         service(&mut engine, &mut io);
         calls(&io, 101, 11, 0);
@@ -28902,7 +28902,7 @@ pub(crate) mod detailed_proof_driver {
         );
         (engine, io, id)
     }
-    fn cgroup_verified_engine() -> (Engine, Io, VerifiedTraceSeed) {
+    pub(crate) fn cgroup_verified_engine() -> (Engine, Io, VerifiedTraceSeed) {
         let (mut engine, mut io, _) = cgroup_sampled();
         calls(&io, io.proof.test_time() + 10, 11, 0);
         assert!(service(&mut engine, &mut io).is_empty());
@@ -28916,6 +28916,16 @@ pub(crate) mod detailed_proof_driver {
         let (engine, io, receipt) = cgroup_verified_engine();
         drop(engine);
         (io.proof, receipt)
+    }
+    pub(crate) fn retire_original_view(engine: &mut Engine) {
+        engine.views.clear();
+        engine.release_view_id(ProcessViewId(0));
+    }
+    pub(crate) fn reopen_original_view(engine: &mut Engine) {
+        assert!(engine.views.is_empty());
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), std::process::id()).unwrap());
     }
     fn no_cgroup_io(io: &Io) {
         assert_eq!(

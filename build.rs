@@ -30,6 +30,8 @@ use std::{
 mod bpf_tools;
 #[path = "build_support/clang_resolve.rs"]
 mod clang_resolve;
+#[path = "build_support/semantic_rustc.rs"]
+mod semantic_rustc;
 
 #[derive(Clone, Copy)]
 enum BpfFlavor {
@@ -83,6 +85,7 @@ fn strip_coverage_flags(encoded: &str) -> String {
 }
 
 fn main() {
+    semantic_rustc::emit_proof();
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");

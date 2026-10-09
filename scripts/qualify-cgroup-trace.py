@@ -37,6 +37,14 @@ REMAINING = ('sparse calls at 1s, 10s, 59s and >60s', 'short-lived caller',
              'long resource/read plateau and isolated-host performance qualification')
 
 
+class CleanupError(RuntimeError):
+    """Retain all failures after every bounded owned cleanup attempt."""
+    def __init__(self, message, errors):
+        self.errors = tuple(errors)
+        details = '; '.join(f'{type(error).__name__}: {error}' for error in self.errors)
+        super().__init__(f'{message}: {details}')
+
+
 class TerminationRequested(BaseException):
     def __init__(self, signum):
         self.signum = signum
@@ -192,7 +200,7 @@ def cleanup_processes(owners):
             finally:
                 owner.close()
         if errors:
-            raise ExceptionGroup('owned process cleanup failed', errors)
+            raise CleanupError('owned process cleanup failed', errors)
 
 
 def cleanup_cgroups(groups):
@@ -204,7 +212,7 @@ def cleanup_cgroups(groups):
             except (OSError, ValueError) as error:
                 errors.append(error)
         if errors:
-            raise ExceptionGroup('owned cgroup cleanup failed', errors)
+            raise CleanupError('owned cgroup cleanup failed', errors)
 
 
 def assert_process_identity(expected, actual):

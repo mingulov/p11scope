@@ -6241,6 +6241,106 @@ print('actual seq_write127 binary row ABI passes; three mutations refuse')
 }
 
 #[test]
+fn image_query_iterator_retains_one_checked_callback_task() {
+    let directory = tempfile::tempdir().expect("temporary image iterator task contract");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded BPF object");
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+from pathlib import Path
+import struct, sys
+sys.path.insert(0, str(Path('scripts').resolve()))
+from _loader import load_path
+checker = load_path(Path('scripts/check-bpf-map-defs.py'), 'image_query_task_checker')
+
+def verify(data):
+    elf = checker.Elf(data)
+    symbols = [s for s in elf.symbols if s[0] == 'p11_image_query']
+    assert len(symbols) == 1, 'missing/duplicate image query program'
+    symbol = symbols[0]
+    row, body = elf.sections['iter/task']
+    assert symbol[3] == elf.indices['iter/task'], 'wrong query section'
+    insns = [struct.unpack_from('<BBhi', body, at)
+             for at in range(symbol[4], symbol[4] + symbol[5], 8)]
+    first_call = next(i for i, insn in enumerate(insns) if insn[0] == 0x85)
+    contexts = {reg & 15 for op, reg, offset, immediate in insns[:first_call]
+                if op == 0xbf and reg >> 4 == 1 and 6 <= reg & 15 <= 9
+                and offset == immediate == 0}
+    loads = [i for i, (op, reg, offset, immediate) in enumerate(insns)
+             if op == 0x79 and reg >> 4 in contexts and offset == 8 and immediate == 0]
+    assert len(loads) == 1, f'callback task must be loaded once, saw {len(loads)}'
+    load = loads[0]
+    guard = load + 1
+    op, reg, offset, immediate = insns[guard]
+    assert (op in (0x15, 0x55) and reg == insns[load][1] & 15
+            and immediate == 0), 'callback task needs its own zero check'
+    start = guard + 1 if op == 0x15 else guard + 1 + offset
+    calls = [i for i, insn in enumerate(insns) if insn == (0x85, 0, 0, 156)]
+    assert len(calls) == 2 and start <= calls[0], 'missing two selected-task storage reads'
+    end = next(i for i in range(calls[-1] + 1, len(insns))
+               if insns[i] == (0x85, 0, 0, 127))
+    # A bounded LLVM lowering guard, not a verifier: follow the retained task
+    # through moves/own-stack spills along the selected task's read window.
+    aliases, spills, reads = {insns[load][1] & 15}, set(), []
+    for i in range(start, end):
+        op, reg, offset, immediate = insns[i]
+        dst, src = reg & 15, reg >> 4
+        if op == 0x85:
+            if i in calls:
+                assert 2 in aliases, 'storage read lost the checked callback task'
+            aliases -= set(range(6))
+        elif op == 0xbf:
+            aliases.discard(dst)
+            if src in aliases: aliases.add(dst)
+        elif op == 0x7b and dst == 10:
+            spills.discard(offset)
+            if src in aliases: spills.add(offset)
+        elif op & 7 == 1:
+            if src in aliases: reads.append(i)
+            aliases.discard(dst)
+            if op == 0x79 and src == 10 and offset in spills: aliases.add(dst)
+        elif op & 7 in (4, 7):
+            aliases.discard(dst)
+    assert reads and any(i > calls[-1] for i in reads), 'missing fresh retained-task field reads'
+    return row[4] + symbol[4], insns, load, guard, calls, reads, contexts
+
+data = Path(sys.argv[1]).read_bytes()
+base, insns, load, guard, calls, reads, contexts = verify(data)
+bad = bytearray(data)
+struct.pack_into('<i', bad, base + guard * 8 + 4, 1)
+mutations = [bad]
+bad = bytearray(data)
+at = next(i for i in range(calls[-1] - 1, calls[0], -1)
+          if insns[i][0] in (0xbf, 0x79) and insns[i][1] & 15 == 2)
+bad[base + at * 8 + 1] = 0xa2
+mutations.append(bad)
+bad = bytearray(data)
+at = next(i for i in reads if i > calls[-1])
+struct.pack_into('<BBhi', bad, base + at * 8, 0x79,
+                 (next(iter(contexts)) << 4) | (insns[at][1] & 15), 8, 0)
+mutations.append(bad)
+for bad in mutations:
+    try: verify(bad)
+    except AssertionError: pass
+    else: raise AssertionError('unchecked/reloaded/wrong storage task accepted')
+print('one checked callback task survives helper calls; three mutations refuse')
+"#,
+        ])
+        .arg(&object)
+        .output()
+        .expect("inspect actual task iterator callback pointer retention");
+    assert!(
+        output.status.success(),
+        "compiled image callback task contract failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn image_entry_native_frame_fits_the_compiled_caller_budget() {
     let directory = tempfile::tempdir().expect("temporary image entry stack contract");
     let object = directory.path().join("p11scope-ebpf");

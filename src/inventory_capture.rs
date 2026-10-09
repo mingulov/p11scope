@@ -796,12 +796,22 @@ impl<L> NativeLane<L> {
 
     /// The bounded stop (invariant 4). Needs one full pass after
     /// activation: the loop guarantees it before calling.
-    pub(crate) fn stop<Pin, H>(mut self, host: &mut H) -> Stopped<L>
+    pub(crate) fn stop<Pin, H>(self, host: &mut H) -> Stopped<L>
     where
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
         debug_assert!(self.passes > 0, "stop before any pass after activation");
+        self.stop_after_error(host)
+    }
+
+    /// An ordinary failure can precede the first completed pass. Retire
+    /// through the same bounded terminal reads without repeating that pass.
+    fn stop_after_error<Pin, H>(mut self, host: &mut H) -> Stopped<L>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
         let mut events = std::mem::take(&mut self.pending_events);
         // Nothing is held after a pass; staged first all the same.
         events.extend(self.stage_held(host));
@@ -1124,9 +1134,18 @@ pub(crate) enum Publish<'a> {
 /// before one full pass after activation), service ticks between them, and
 /// — for the native lane — the bounded stop and its commit. The final
 /// sinks are the caller's.
+/// The loop outcome keeps stopped native ownership even when capture or
+/// publication failed, so terminal sinks precede an unsettled blocking drop.
+pub(crate) struct ClassicOutcome<L> {
+    pub(crate) stopped: Option<Stopped<L>>,
+    pub(crate) error: Option<anyhow::Error>,
+}
+
+/// Compatibility adapter for existing scripted successful-loop controls.
+#[cfg(test)]
 pub(crate) fn run_classic<Pin, D, L>(
     driver: &mut D,
-    mut lane: Option<NativeLane<L>>,
+    lane: Option<NativeLane<L>>,
     clock: &LoopClock<'_>,
     publish: &mut dyn FnMut(&mut D, Publish<'_>) -> Result<()>,
 ) -> Result<Option<Stopped<L>>>
@@ -1134,94 +1153,149 @@ where
     D: PassDriver<Pin>,
     L: CaptureLane<Pin>,
 {
-    let mut passes: u64 = 0;
-    let mut rescan = false;
-    loop {
-        // At least one full pass after activation: a stop that arrived
-        // during startup (activation included) still gets one.
-        if passes > 0 && clock.ending() {
-            break;
-        }
-        // A granted recovery rescan counts once its pass really starts.
-        if std::mem::take(&mut rescan)
-            && let Some(lane) = lane.as_mut()
-        {
-            lane.begin_recovery_rescan();
-        }
-        let now = now_ns();
-        let job = driver.collector();
-        // The ring first, then the display (C5.3): on a fixed-rate schedule,
-        // so the draw never delays the next ring service.
-        let collected = collect_off_thread(job, clock.collection_tick, &mut || {
-            if let Some(lane) = lane.as_mut() {
-                lane.collecting_tick();
+    let outcome = run_classic_finalizing(driver, lane, clock, None, publish);
+    match outcome.error {
+        Some(error) => Err(error),
+        None => Ok(outcome.stopped),
+    }
+}
+
+pub(crate) fn run_classic_finalizing<Pin, D, L>(
+    driver: &mut D,
+    mut lane: Option<NativeLane<L>>,
+    clock: &LoopClock<'_>,
+    initial_error: Option<anyhow::Error>,
+    publish: &mut dyn FnMut(&mut D, Publish<'_>) -> Result<()>,
+) -> ClassicOutcome<L>
+where
+    D: PassDriver<Pin>,
+    L: CaptureLane<Pin>,
+{
+    let running = match initial_error {
+        Some(error) => Err(error),
+        None => (|| -> Result<()> {
+            let mut passes: u64 = 0;
+            let mut rescan = false;
+            loop {
+                // At least one full pass after activation: a stop that arrived
+                // during startup (activation included) still gets one.
+                if passes > 0 && clock.ending() {
+                    break;
+                }
+                // A granted recovery rescan counts once its pass really starts.
+                if std::mem::take(&mut rescan)
+                    && let Some(lane) = lane.as_mut()
+                {
+                    lane.begin_recovery_rescan();
+                }
+                let now = now_ns();
+                let job = driver.collector();
+                // The ring first, then the display (C5.3): on a fixed-rate schedule,
+                // so the draw never delays the next ring service.
+                let collected = collect_off_thread(job, clock.collection_tick, &mut || {
+                    if let Some(lane) = lane.as_mut() {
+                        lane.collecting_tick();
+                    }
+                    driver.on_tick();
+                });
+                let mut report = match lane.as_mut() {
+                    Some(lane) => driver.apply(collected, lane.identity(), now)?,
+                    None => driver.apply(collected, &mut ScanOnlyIdentity, now)?,
+                };
+                if let Some(lane) = lane.as_mut() {
+                    report.events.extend(lane.after_pass(driver.host()));
+                }
+                driver.commit(report.engine_changed)?;
+                passes += 1;
+                // Publication time is sampled AFTER collection, refresh, and
+                // commit: rows this pass stamped (rows_read_ns) must not read as
+                // the future to the presentation clock, or a rising count reads
+                // Quiet live. Scan semantics keep the pass-start `now`.
+                let published_ns = now_ns();
+                publish(
+                    driver,
+                    Publish::Pass {
+                        report: &report,
+                        now_ns: published_ns,
+                    },
+                )?;
+                rescan = lane.as_mut().is_some_and(NativeLane::take_recovery_rescan);
+                let next = if rescan {
+                    Instant::now()
+                } else {
+                    Instant::now() + clock.interval
+                };
+                let mut schedule = TickSchedule::starting(Instant::now(), clock.tick);
+                loop {
+                    let now = Instant::now();
+                    if clock.ending() || now >= next {
+                        break;
+                    }
+                    std::thread::sleep(schedule.wait(now).min(next - now));
+                    // The ring first, then the display; the schedule is fixed-rate,
+                    // so the draw never delays the next ring service.
+                    if let Some(lane) = lane.as_mut() {
+                        lane.tick(driver.host());
+                    }
+                    driver.on_tick();
+                    schedule.advance(Instant::now());
+                }
             }
-            driver.on_tick();
-        });
-        let mut report = match lane.as_mut() {
-            Some(lane) => driver.apply(collected, lane.identity(), now)?,
-            None => driver.apply(collected, &mut ScanOnlyIdentity, now)?,
-        };
-        if let Some(lane) = lane.as_mut() {
-            report.events.extend(lane.after_pass(driver.host()));
-        }
-        driver.commit(report.engine_changed)?;
-        passes += 1;
-        // Publication time is sampled AFTER collection, refresh, and
-        // commit: rows this pass stamped (rows_read_ns) must not read as
-        // the future to the presentation clock, or a rising count reads
-        // Quiet live. Scan semantics keep the pass-start `now`.
-        let published_ns = now_ns();
-        publish(
-            driver,
-            Publish::Pass {
-                report: &report,
-                now_ns: published_ns,
-            },
-        )?;
-        rescan = lane.as_mut().is_some_and(NativeLane::take_recovery_rescan);
-        let next = if rescan {
-            Instant::now()
-        } else {
-            Instant::now() + clock.interval
-        };
-        let mut schedule = TickSchedule::starting(Instant::now(), clock.tick);
-        loop {
-            let now = Instant::now();
-            if clock.ending() || now >= next {
-                break;
-            }
-            std::thread::sleep(schedule.wait(now).min(next - now));
-            // The ring first, then the display; the schedule is fixed-rate,
-            // so the draw never delays the next ring service.
-            if let Some(lane) = lane.as_mut() {
-                lane.tick(driver.host());
-            }
-            driver.on_tick();
-            schedule.advance(Instant::now());
-        }
+            Ok(())
+        })(),
+    };
+    let mut error = running.err();
+    if let Some(error) = &error {
+        driver
+            .host()
+            .note_scope_gap("inventory capture failed".into(), format!("{error:#}"));
     }
     let Some(lane) = lane else {
-        return Ok(None);
+        // Publish the failure gap without repeating the failed scan/pass.
+        if error.is_some() {
+            let _ = driver.commit(false);
+        }
+        return ClassicOutcome {
+            stopped: None,
+            error,
+        };
     };
-    publish(
+    if let Err(next) = publish(
         driver,
         Publish::Retiring {
             attached: lane.attached,
             links: lane.retirement_load().links,
             budget: lane.windows.retirement_budget(lane.retirement_load()),
         },
-    )?;
-    let stopped = lane.stop(driver.host());
-    driver.commit(false)?;
-    publish(
+    ) {
+        if error.is_none() {
+            driver
+                .host()
+                .note_scope_gap("inventory capture failed".into(), format!("{next:#}"));
+        }
+        error.get_or_insert(next);
+    }
+    let stopped = if error.is_some() {
+        lane.stop_after_error(driver.host())
+    } else {
+        lane.stop(driver.host())
+    };
+    if let Err(next) = driver.commit(false) {
+        error.get_or_insert(next);
+    }
+    if let Err(next) = publish(
         driver,
         Publish::Stop {
             events: &stopped.events,
             now_ns: now_ns(),
         },
-    )?;
-    Ok(Some(stopped))
+    ) {
+        error.get_or_insert(next);
+    }
+    ClassicOutcome {
+        stopped: Some(stopped),
+        error,
+    }
 }
 
 /// The production lane: the owned facade across its typestates.

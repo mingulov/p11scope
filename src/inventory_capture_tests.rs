@@ -1444,6 +1444,200 @@ fn the_report_is_written_before_the_blocking_detach() {
     );
 }
 
+/// A pass callback failure still gets one bounded native stop and terminal
+/// read. Later stop-publication failures cannot replace the first error or
+/// drop the unsettled capture before the caller's final sinks.
+#[test]
+fn failed_pass_publication_retains_native_stop_for_final_sinks() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.retire_after = None;
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let clock = LoopClock {
+        deadline: None,
+        stop: &|| false,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut publications = Vec::new();
+    let outcome =
+        run_classic_finalizing(&mut scene, Some(started), &clock, None, &mut |_, point| {
+            let stage = match point {
+                Publish::Pass { .. } => "pass",
+                Publish::Retiring { .. } => "retiring",
+                Publish::Stop { .. } => "stop",
+            };
+            publications.push(stage);
+            Err(anyhow!("{stage} publication failed"))
+        });
+    assert_eq!(
+        outcome.error.unwrap().to_string(),
+        "pass publication failed"
+    );
+    assert_eq!(publications, ["pass", "retiring", "stop"]);
+    let captured = entries(&log);
+    assert_eq!(captured.iter().filter(|entry| *entry == "scan").count(), 1);
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|entry| *entry == "begin_stop")
+            .count(),
+        1
+    );
+    assert!(captured.iter().any(|entry| entry == "stage:finish"));
+    assert!(!captured.iter().any(|entry| entry == "drop"));
+    let stopped = outcome
+        .stopped
+        .expect("native ownership survives the error");
+    log.borrow_mut().clear();
+    finish_native(
+        Some(stopped),
+        |_| {
+            log.borrow_mut().push("report".into());
+            log.borrow_mut().push("diagnostics".into());
+        },
+        &|| log.borrow_mut().push("armed".into()),
+        &mut |_| {},
+    );
+    assert_eq!(entries(&log), ["report", "diagnostics", "armed", "drop"]);
+}
+
+#[test]
+fn failed_pass_application_still_reads_terminal_state_and_keeps_first_error() {
+    struct FailedDriver<'a>(&'a mut Scene);
+    impl PassDriver<Pin> for FailedDriver<'_> {
+        type Host = Scene;
+        fn host(&mut self) -> &mut Scene {
+            self.0
+        }
+        fn collector(&mut self) -> CollectJob {
+            self.0.collector()
+        }
+        fn apply(
+            &mut self,
+            _: Result<crate::inspect_system::Catalog>,
+            _: &mut dyn NativeIdentity<Pin>,
+            _: u64,
+        ) -> Result<PassReport> {
+            self.0.note("apply:failed");
+            Err(anyhow!("first application error"))
+        }
+        fn commit(&mut self, _: bool) -> Result<()> {
+            self.0.note("commit:failed");
+            Err(anyhow!("later terminal commit error"))
+        }
+        fn on_tick(&mut self) {}
+    }
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = ScriptedLane::new(&log);
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let clock = LoopClock {
+        deadline: None,
+        stop: &|| false,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let outcome = run_classic_finalizing(
+        &mut FailedDriver(&mut scene),
+        Some(started),
+        &clock,
+        None,
+        &mut |_, _| Ok(()),
+    );
+    assert_eq!(
+        outcome.error.unwrap().to_string(),
+        "first application error"
+    );
+    assert!(outcome.stopped.is_some());
+    let captured = entries(&log);
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|entry| *entry == "apply:failed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|entry| *entry == "commit:failed")
+            .count(),
+        1
+    );
+    assert!(captured.iter().any(|entry| entry == "stage:finish"));
+    assert!(!captured.iter().any(|entry| entry == "drop"));
+}
+
+#[test]
+#[should_panic(expected = "stop before any pass after activation")]
+fn zero_pass_successful_stop_keeps_the_full_pass_guard() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let started = NativeLane::start(ScriptedLane::new(&log), &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.stop(&mut scene);
+}
+
+#[test]
+fn zero_pass_prologue_failure_still_finishes_terminal_reads() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let started = NativeLane::start(ScriptedLane::new(&log), &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let clock = LoopClock {
+        deadline: None,
+        stop: &|| false,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut publications = Vec::new();
+    let outcome = run_classic_finalizing(
+        &mut scene,
+        Some(started),
+        &clock,
+        Some(anyhow!("started append failure")),
+        &mut |_, point| {
+            publications.push(match point {
+                Publish::Retiring { .. } => "retiring",
+                Publish::Stop { .. } => "stop",
+                Publish::Pass { .. } => "pass",
+            });
+            Ok(())
+        },
+    );
+    assert_eq!(outcome.error.unwrap().to_string(), "started append failure");
+    assert_eq!(publications, ["retiring", "stop"]);
+    let stopped = outcome.stopped.unwrap();
+    assert_eq!(stopped.summary.passes, 0);
+    let captured = entries(&log);
+    assert!(
+        !captured
+            .iter()
+            .any(|entry| entry == "collect" || entry == "scan")
+    );
+    assert!(captured.iter().any(|entry| entry == "stage:finish"));
+    assert!(!captured.iter().any(|entry| entry == "drop"));
+    log.borrow_mut().clear();
+    finish_native(
+        Some(stopped),
+        |_| log.borrow_mut().push("outputs".into()),
+        &|| log.borrow_mut().push("armed".into()),
+        &mut |_| {},
+    );
+    assert_eq!(entries(&log), ["outputs", "armed", "drop"]);
+}
+
 #[test]
 fn failed_output_attempt_arms_escape_before_detach() {
     let log = Log::default();

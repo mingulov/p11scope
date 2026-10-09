@@ -34,8 +34,9 @@ use crate::attach::capture::{
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
     AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
-    CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleId, ModuleInfo, ModuleKey,
-    PendingCountOutcome, ProcessSource, RegistryGap, RegistryLimits, UnknownReason, UseCoverage,
+    CountPublication, CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleId, ModuleInfo,
+    ModuleKey, PendingCountOutcome, PendingRejection, ProcessSource, RegistryGap, RegistryLimits,
+    UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
@@ -49,6 +50,11 @@ use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
+use crate::inventory_diagnostics::{
+    Decision as DiagnosticDecision, DiagnosticConfig, DiagnosticKind, DiagnosticOutcome,
+    DiagnosticReason, DiagnosticRecord, Eligibility, FinishedDiagnostics, InitError, NativePairKey,
+    ReadOrigin, Recorder,
+};
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -176,7 +182,7 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// and refresh counts merge here (the maximum wins, with its
     /// observing read) and stage to the edge once the pair binds. One
     /// entry per CALLER_USE row at most.
-    pair_counts: HashMap<PairKey, PairCount>,
+    pair_counts: HashMap<PairKey, HeldPairCount>,
     /// Decided pairs (C7 C4): bound pairs stage their counts to one
     /// edge, dropped pairs (binder-unbound, ambiguous, or edgeless)
     /// never publish — DR-C51-PREADMIT stays out. One entry per
@@ -204,6 +210,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// drain reported. Timings telemetry only (the stage-timings pass
     /// lines), never schema.
     lifecycle_high_water_bytes: Option<u64>,
+    diagnostics: Option<Recorder>,
+    diagnostic_health: Option<u16>,
+    diagnostic_refresh_loss: bool,
+    diagnostic_native_unavailable: bool,
 }
 
 /// The capture-lifetime Inventory endpoint budget: the engine's admission
@@ -263,6 +273,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             passes: 0,
             authority_gap_recorded: false,
             lifecycle_high_water_bytes: None,
+            diagnostics: None,
+            diagnostic_health: None,
+            diagnostic_refresh_loss: false,
+            diagnostic_native_unavailable: false,
         })
     }
 
@@ -270,6 +284,493 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// pass lines. `None` until a native drain stages (the scan lane).
     pub(crate) fn lifecycle_high_water_bytes(&self) -> Option<u64> {
         self.lifecycle_high_water_bytes
+    }
+
+    pub(crate) fn enable_diagnostics(&mut self, config: DiagnosticConfig) -> Result<(), InitError> {
+        self.diagnostics = Some(Recorder::try_new(config)?);
+        Ok(())
+    }
+
+    pub(crate) fn take_diagnostics(
+        &mut self,
+        outcome: DiagnosticOutcome,
+    ) -> Option<FinishedDiagnostics> {
+        self.diagnostics
+            .take()
+            .map(|recorder| recorder.finish(outcome))
+    }
+
+    pub(crate) fn note_diagnostics_native_unavailable(&mut self) {
+        if let Some(recorder) = &mut self.diagnostics
+            && !self.diagnostic_native_unavailable
+        {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+            record.reason = Some(DiagnosticReason::NativeUnavailable);
+            recorder.record(record);
+            self.diagnostic_native_unavailable = true;
+        }
+    }
+
+    fn diagnostic_identity(&self, record: &mut DiagnosticRecord, caller: CallerId) {
+        record.caller = Some(caller.0);
+        if let Some(caller) = self.adapter.record(caller) {
+            record.pid = Some(caller.pid);
+            record.incarnation = Some(u64::from(caller.incarnation));
+        } else {
+            record.context_unavailable = true;
+        }
+    }
+
+    fn diagnostic_count_record(
+        &self,
+        key: PairKey,
+        caller: CallerId,
+        observation: PairCount,
+        base: u64,
+        staged: u64,
+        since: u64,
+    ) -> DiagnosticRecord {
+        let recovery = self.recoveries.get(&key);
+        let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
+            .with_pair(key.diagnostic_key())
+            .with_private_ids(
+                None,
+                recovery.and_then(|recovery| recovery.epoch.map(|epoch| epoch.0)),
+                None,
+            );
+        self.diagnostic_identity(&mut record, caller);
+        record.absolute = Some(observation.count);
+        record.base = Some(base);
+        record.staged = Some(staged);
+        record.after = Some(base);
+        record.through = Some(observation.count);
+        record.pre = Some(observation.anchor_ns);
+        record.post = Some(observation.last_ns);
+        record.baseline_pre = (base != 0).then_some(since);
+        record.fence = recovery.and_then(|recovery| recovery.fence.map(|read| read.count));
+        record.observation_ref = nonzero_ref(observation.diagnostic_observation);
+        record.transition_ref = recovery
+            .and_then(|recovery| nonzero_ref(recovery.diagnostic.transition_ref))
+            .or_else(|| nonzero_ref(observation.diagnostic_transition));
+        // Ordinary targets retain PRE only; a matching immutable recovery fence
+        // also retains the genuine read POST. Never infer it from newer counts.
+        if let Some(fence) = recovery.and_then(|recovery| recovery.fence)
+            && fence.count == base
+            && fence.anchor_ns == since
+        {
+            record.baseline_pre = Some(fence.anchor_ns);
+            record.baseline_post = Some(fence.last_ns);
+        }
+        record.context_unavailable = record.pid.is_none()
+            || record.observation_ref.is_none()
+            || base != 0 && record.baseline_post.is_none();
+        record
+    }
+
+    fn diagnostic_raw_count(
+        &mut self,
+        key: PairKey,
+        pid: Option<u32>,
+        origin: ReadOrigin,
+        count: u64,
+        interval: (u64, u64),
+        valid: bool,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let previous = self.pair_counts.get(&key).copied();
+        let reason = if previous.is_some_and(|held| count < held.count) {
+            Some(DiagnosticReason::StaleObservation)
+        } else if !valid {
+            Some(DiagnosticReason::CountInvalid)
+        } else {
+            None
+        };
+        if previous.is_some_and(|held| held.diagnostic_last_raw == Some(count)) {
+            if let Some(reason) = reason {
+                self.diagnostics
+                    .as_mut()
+                    .expect("enabled recorder")
+                    .note_reason(reason);
+            }
+            return;
+        }
+        let caller = match self.pair_targets.get(&key) {
+            Some(
+                PairTarget::Bound { caller, .. }
+                | PairTarget::Pending { caller, .. }
+                | PairTarget::Suspended { caller, .. },
+            ) => Some(*caller),
+            _ => None,
+        };
+        let mut record =
+            DiagnosticRecord::new(DiagnosticKind::CountObservation).with_pair(key.diagnostic_key());
+        record.pid = pid;
+        if let Some(caller) = caller {
+            self.diagnostic_identity(&mut record, caller);
+        }
+        record.origin = Some(origin);
+        record.absolute = Some(count);
+        let (pre, post) = interval;
+        record.pre = Some(pre);
+        record.post = Some(post);
+        record.reason = reason;
+        let seq = self
+            .diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record_changed(previous.and_then(|held| held.diagnostic_last_raw), record)
+            .unwrap_or(0);
+        if let Some(held) = self.pair_counts.get_mut(&key) {
+            held.diagnostic_last_raw = Some(count);
+            if count > held.count {
+                held.diagnostic_observation = seq;
+            }
+        }
+    }
+
+    fn diagnostic_recovery_decision(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        reason: DiagnosticReason,
+        held: Option<PairCount>,
+        decision: DiagnosticDecision,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let state = (
+            reason,
+            decision,
+            held.map_or(0, |held| held.diagnostic_observation),
+            recovery.watermark,
+            recovery.fence.map_or(0, |read| read.count),
+        );
+        if recovery.diagnostic.wait == Some(state) {
+            self.diagnostics
+                .as_mut()
+                .expect("enabled recorder")
+                .note_reason(reason);
+            return;
+        }
+        let mut record = if let Some(held) = held {
+            self.diagnostic_count_record(
+                key,
+                recovery.caller,
+                held,
+                recovery.watermark,
+                recovery.watermark,
+                recovery.fence.map_or(0, |read| read.anchor_ns),
+            )
+        } else {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
+                .with_pair(key.diagnostic_key());
+            self.diagnostic_identity(&mut record, recovery.caller);
+            record.context_unavailable = true;
+            record
+        };
+        record = record.with_private_ids(None, recovery.epoch.map(|epoch| epoch.0), None);
+        record.fence = recovery.fence.map(|read| read.count);
+        record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+        record.decision = Some(decision);
+        record.reason = Some(reason);
+        self.diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record);
+        recovery.diagnostic.wait = Some(state);
+    }
+
+    fn diagnostic_recovery_wait(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        reason: DiagnosticReason,
+        held: Option<PairCount>,
+    ) {
+        self.diagnostic_recovery_decision(key, recovery, reason, held, DiagnosticDecision::Pending);
+    }
+
+    fn diagnostic_ownership(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        candidate: &CurrentCandidates,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let (eligibility, module, epoch, interval, reason) = match candidate {
+            CurrentCandidates::Unknown => (
+                Eligibility::Unknown,
+                None,
+                None,
+                None,
+                DiagnosticReason::OwnershipUnknown,
+            ),
+            CurrentCandidates::Shared => (
+                Eligibility::SharedOwner,
+                None,
+                None,
+                None,
+                DiagnosticReason::SharedOwner,
+            ),
+            CurrentCandidates::Sole {
+                module,
+                epoch,
+                scan,
+            } => (
+                Eligibility::SoleOwner,
+                self.registry.module_id_for(module),
+                Some(epoch.0),
+                Some((scan.started_ns(), scan.finished_ns())),
+                DiagnosticReason::SoleOwner,
+            ),
+        };
+        let state = (eligibility, module, epoch);
+        if recovery.diagnostic.ownership == Some(state) {
+            return;
+        }
+        let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition)
+            .with_pair(key.diagnostic_key())
+            .with_private_ids(None, epoch, None);
+        self.diagnostic_identity(&mut record, recovery.caller);
+        record.reason = Some(reason);
+        record.prior_eligibility = recovery.diagnostic.ownership.map(|state| state.0);
+        record.new_eligibility = Some(eligibility);
+        record.module = module.map(|module| module.0);
+        record.base = Some(recovery.watermark);
+        record.fence = recovery.fence.map(|read| read.count);
+        if recovery.epoch.map(|epoch| epoch.0) != epoch {
+            record.fence = None;
+            record.context_unavailable = true;
+        }
+        if let Some((pre, post)) = interval {
+            record.baseline_pre = Some(pre);
+            record.baseline_post = Some(post);
+        }
+        record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+        recovery.diagnostic.transition_ref = self
+            .diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record)
+            .unwrap_or(0);
+        recovery.diagnostic.ownership = Some(state);
+        recovery.diagnostic.wait = None;
+    }
+
+    fn diagnostic_recovery_selection(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        proven: bool,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let state = (
+            recovery.epoch.map(|epoch| epoch.0),
+            recovery.fence.map_or(0, |read| read.count),
+            proven,
+        );
+        if recovery.diagnostic.selection == Some(state) {
+            return;
+        }
+        let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition)
+            .with_pair(key.diagnostic_key())
+            .with_private_ids(None, state.0, None);
+        self.diagnostic_identity(&mut record, recovery.caller);
+        record.reason = Some(if proven {
+            DiagnosticReason::SoleOwner
+        } else {
+            DiagnosticReason::OwnershipTransition
+        });
+        record.prior_eligibility = recovery.diagnostic.selection.map(|state| {
+            if state.2 {
+                Eligibility::SoleOwner
+            } else {
+                Eligibility::Unproven
+            }
+        });
+        record.new_eligibility = Some(if proven {
+            Eligibility::SoleOwner
+        } else {
+            Eligibility::Unproven
+        });
+        record.base = Some(recovery.watermark);
+        record.fence = nonzero_ref(state.1);
+        record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+        if let Some(scan) = &recovery.scan {
+            record.baseline_pre = Some(scan.started_ns());
+            record.baseline_post = Some(scan.finished_ns());
+        }
+        if let Some(read) = recovery.fence {
+            record.absolute = Some(read.count);
+            record.pre = Some(read.anchor_ns);
+            record.post = Some(read.last_ns);
+            record.observation_ref = nonzero_ref(read.diagnostic_observation);
+        } else {
+            record.context_unavailable = true;
+        }
+        recovery.diagnostic.transition_ref = self
+            .diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record)
+            .unwrap_or(0);
+        recovery.diagnostic.selection = Some(state);
+    }
+
+    fn diagnostic_pending_refusal(
+        &mut self,
+        key: PairKey,
+        caller: CallerId,
+        observation: PairCount,
+        base: u64,
+        since: u64,
+        reason: DiagnosticReason,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let state = (reason, observation.count, base);
+        if self
+            .pair_counts
+            .get(&key)
+            .is_some_and(|held| held.diagnostic_refusal == Some(state))
+        {
+            self.diagnostics
+                .as_mut()
+                .expect("enabled recorder")
+                .note_reason(reason);
+            return;
+        }
+        let mut record = self.diagnostic_count_record(key, caller, observation, base, base, since);
+        record.decision = Some(DiagnosticDecision::Rejected);
+        record.reason = Some(reason);
+        self.diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record);
+        if let Some(held) = self.pair_counts.get_mut(&key) {
+            held.diagnostic_refusal = Some(state);
+        }
+    }
+
+    fn diagnostic_pending_result(
+        &mut self,
+        pending_id: u64,
+        pending: &PendingCountObservation,
+        outcome: Option<&PendingCountOutcome>,
+    ) {
+        if self.diagnostics.is_none() {
+            return;
+        }
+        let mut record = self
+            .diagnostic_count_record(
+                pending.key,
+                pending.caller,
+                pending.observation,
+                pending.diagnostic.map_or(0, |diagnostic| diagnostic.base),
+                pending.diagnostic.map_or(0, |diagnostic| diagnostic.staged),
+                pending.diagnostic.map_or(0, |diagnostic| diagnostic.since),
+            )
+            .with_private_ids(
+                None,
+                match pending.origin {
+                    PendingCountOrigin::Recovered(epoch) => Some(epoch.0),
+                    _ => None,
+                },
+                Some(pending_id),
+            );
+        if let Some(diagnostic) = pending.diagnostic {
+            record.fence = nonzero_ref(diagnostic.fence);
+            record.baseline_post = nonzero_ref(diagnostic.baseline_post);
+            record.transition_ref = nonzero_ref(diagnostic.transition_ref);
+            record.context_unavailable = record.pid.is_none()
+                || record.observation_ref.is_none()
+                || diagnostic.base != 0 && record.baseline_post.is_none();
+        } else {
+            record.base = None;
+            record.staged = None;
+            record.after = None;
+            record.baseline_pre = None;
+            record.fence = None;
+            record.transition_ref = None;
+            record.context_unavailable = true;
+        }
+        match outcome {
+            Some(PendingCountOutcome::Placed { module }) => {
+                record.kind = DiagnosticKind::Publication;
+                record.decision = Some(DiagnosticDecision::Placed);
+                record.reason = Some(DiagnosticReason::SoleOwner);
+                record.module = self.registry.module_id_for(module).map(|module| module.0);
+                record.edge_total = self
+                    .registry
+                    .module_id_for(module)
+                    .and_then(|module| self.registry.edge(pending.caller, module))
+                    .map(|edge| edge.entry_count);
+            }
+            Some(PendingCountOutcome::Rejected { reason }) => {
+                record.decision = Some(DiagnosticDecision::Rejected);
+                record.reason = Some(match reason {
+                    PendingRejection::Ambiguous => DiagnosticReason::SharedOwner,
+                    PendingRejection::NoEdge => DiagnosticReason::OwnershipUnknown,
+                });
+            }
+            Some(PendingCountOutcome::Unadmitted { module }) => {
+                record.decision = Some(DiagnosticDecision::Pending);
+                record.reason = Some(DiagnosticReason::NotAdmitted);
+                record.module = self.registry.module_id_for(module).map(|module| module.0);
+            }
+            None => {
+                record.decision = Some(DiagnosticDecision::Rejected);
+                record.reason = Some(DiagnosticReason::StaleDecision);
+            }
+        }
+        self.diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record);
+    }
+
+    fn diagnostic_withheld(
+        &mut self,
+        key: PairKey,
+        recovery: &PairRecovery,
+        after: u64,
+        through: u64,
+        reason: DiagnosticReason,
+        read: Option<PairCount>,
+    ) {
+        if self.diagnostics.is_none() || through <= after {
+            return;
+        }
+        let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
+            .with_pair(key.diagnostic_key())
+            .with_private_ids(None, recovery.epoch.map(|epoch| epoch.0), None);
+        self.diagnostic_identity(&mut record, recovery.caller);
+        record.decision = Some(DiagnosticDecision::Withheld);
+        record.reason = Some(reason);
+        record.base = Some(after);
+        record.after = Some(after);
+        record.through = Some(through);
+        record.fence = recovery.fence.map(|read| read.count);
+        record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+        if let Some(read) = read {
+            record.absolute = Some(read.count);
+            record.pre = Some(read.anchor_ns);
+            record.post = Some(read.last_ns);
+            record.observation_ref = nonzero_ref(read.diagnostic_observation);
+        }
+        record.context_unavailable = true;
+        self.diagnostics
+            .as_mut()
+            .expect("enabled recorder")
+            .record(record);
     }
 
     pub(crate) fn adapter(&self) -> &CallerAdapter<Source> {
@@ -309,6 +810,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// failed live read — a scope gap alone would leave them
     /// loss-free. The loss is a gap too, never silent loss.
     pub(crate) fn note_refresh_loss(&mut self, reason: String) {
+        if let Some(recorder) = &mut self.diagnostics {
+            if !self.diagnostic_refresh_loss {
+                let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+                record.reason = Some(DiagnosticReason::CaptureLoss);
+                recorder.record(record);
+                self.diagnostic_refresh_loss = true;
+            } else {
+                recorder.note_reason(DiagnosticReason::CaptureLoss);
+            }
+        }
         self.registry.note_refresh_loss(reason);
     }
 
@@ -591,6 +1102,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// counts exactly like a live one (P1-5 terminal-first).
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards batches.
     pub(crate) fn note_witness_batch(&mut self, batch: &WitnessBatch) {
+        if let Some(recorder) = &mut self.diagnostics {
+            let health = u16::from(batch.health_unproven.is_some())
+                | (u16::from(batch.health_regression.is_some()) << 1)
+                | (u16::from(!batch.read_failures.is_empty()) << 2)
+                | (u16::from(batch.refresh_sweep_gaps) << 3)
+                | (u16::from(batch.refresh_deadline_reached) << 4)
+                | (u16::from(batch.lifecycle_loss.is_some()) << 5)
+                | (u16::from(!batch.changed_objects.is_empty()) << 6)
+                | (u16::from(!batch.health.failures.is_empty()) << 7)
+                | (u16::from(batch.health.malformed_discovery != 0) << 8)
+                | (u16::from(batch.health.pin_check_failures != 0) << 9)
+                | (u16::from(batch.health.caller_evidence.is_some_and(|counters| {
+                    counters[CallerEvidence::PairInsertFailure.counter_index() as usize] != 0
+                })) << 10)
+                | (u16::from(batch.sweep_gaps) << 11);
+            if self.diagnostic_health != Some(health) {
+                let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+                record.reason = (health != 0).then_some(DiagnosticReason::CaptureLoss);
+                record.pre = Some(batch.health_baseline_ns);
+                record.post = Some(batch.health_read_ns);
+                recorder.record(record);
+                self.diagnostic_health = Some(health);
+            } else if health != 0 {
+                recorder.note_reason(DiagnosticReason::CaptureLoss);
+            }
+        }
         self.note_count_freshness(batch);
         let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
             return;
@@ -724,6 +1261,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         capture.unproven = Some(loss.reason.clone());
+        if let Some(recorder) = &mut self.diagnostics {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+            record.reason = Some(DiagnosticReason::CaptureLoss);
+            record.post = Some(loss.at_ns);
+            recorder.record(record);
+        }
         self.registry.note_watch_demotion(
             "native capture lifecycle evidence lost",
             loss.reason.clone(),
@@ -746,6 +1289,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         capture.stopped = true;
+        if let Some(recorder) = &mut self.diagnostics {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
+            record.reason = Some(DiagnosticReason::CaptureStopped);
+            record.post = Some(at_ns);
+            recorder.record(record);
+        }
         let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
         self.registry.note_watch_end(
             "native capture stopped before a clean health read proved the watch",
@@ -1934,13 +2483,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ) {
                 continue;
             }
-            let held = self.pair_counts.entry(key).or_insert(PairCount {
-                count: 0,
-                first_ns: row.recorded_at_ns,
-                anchor_ns: batch.rows_anchor_ns,
-                last_ns: batch.rows_read_ns,
-                retirement_usable: false,
-            });
+            self.pair_counts
+                .entry(key)
+                .or_insert(HeldPairCount::new(PairCount {
+                    count: 0,
+                    first_ns: row.recorded_at_ns,
+                    anchor_ns: batch.rows_anchor_ns,
+                    last_ns: batch.rows_read_ns,
+                    retirement_usable: false,
+                    diagnostic_observation: 0,
+                    diagnostic_transition: 0,
+                }));
+            if self.diagnostics.is_some() {
+                self.diagnostic_raw_count(
+                    key,
+                    Some(row.host_tgid),
+                    ReadOrigin::Initial,
+                    row.entry_count,
+                    (batch.rows_anchor_ns, batch.rows_read_ns),
+                    row.entry_count > 0,
+                );
+            }
+            let held = self.pair_counts.get_mut(&key).expect("inserted row count");
             // The row sets its first record whatever arrived before: a
             // refresh can only precede it in a scripted batch.
             held.first_ns = row.recorded_at_ns;
@@ -1964,14 +2528,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Keep the refresh PRE bound for future base coverage and
             // the common POST bound for this count's observation. Neither
             // claims exactly when this particular pair was looked up.
-            let (held, advanced) = {
-                let held = self.pair_counts.entry(key).or_insert(PairCount {
+            self.pair_counts
+                .entry(key)
+                .or_insert(HeldPairCount::new(PairCount {
                     count: 0,
                     first_ns: batch.rows_read_ns,
                     anchor_ns: batch.counts_read_ns,
                     last_ns: batch.rows_read_ns,
                     retirement_usable: false,
-                });
+                    diagnostic_observation: 0,
+                    diagnostic_transition: 0,
+                }));
+            if self.diagnostics.is_some() {
+                self.diagnostic_raw_count(
+                    key,
+                    None,
+                    ReadOrigin::Refresh,
+                    update.count,
+                    (batch.counts_read_ns, batch.rows_read_ns),
+                    valid_retirement_refresh(batch, update.count),
+                );
+            }
+            let (held, advanced) = {
+                let held = self
+                    .pair_counts
+                    .get_mut(&key)
+                    .expect("inserted refresh count");
                 let advanced = update.count > held.count;
                 if advanced {
                     held.count = update.count;
@@ -1979,7 +2561,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     held.last_ns = batch.rows_read_ns;
                     held.retirement_usable = valid_retirement_refresh(batch, update.count);
                 }
-                (*held, advanced)
+                (held.read, advanced)
             };
             // The rotating proof service may not visit this pair before the next
             // read. Preserve its first eligible actual advance at this accounting
@@ -2098,7 +2680,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // later publish, growth the edge already holds.
                 if count.count > staged_abs {
                     let growth = rebased_count(count, staged_abs);
-                    self.stage_pair_count(caller, &module, growth, staged_ns, staged_abs);
+                    self.stage_pair_count(
+                        caller,
+                        &module,
+                        growth,
+                        staged_ns,
+                        staged_abs,
+                        Some((key, count.count)),
+                    );
                     if let Some(recovery) = self.recoveries.get_mut(&key) {
                         recovery.watermark = recovery.watermark.max(count.count);
                     }
@@ -2131,6 +2720,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // metadata. It keeps counting while confirmed above; a changed
                 // carrier cannot recover without that bounded state.
                 self.note_retirement_metadata_refusal(caller);
+                if self.diagnostics.is_some() {
+                    let mut record = self.diagnostic_count_record(
+                        key, caller, count, new_base, staged_abs, staged_ns,
+                    );
+                    record.decision = Some(DiagnosticDecision::Withheld);
+                    record.reason = Some(DiagnosticReason::BudgetRefused);
+                    if let Some(recorder) = &mut self.diagnostics {
+                        recorder.record(record);
+                    }
+                }
                 self.registry
                     .note_retirement_count_gap(caller, new_base, count.count);
                 self.pair_targets.insert(
@@ -2215,6 +2814,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let was_refused = recovery.receipt_refused;
         recovery.normalize_reads(&view, continuing || ordinary, &mut work);
         if !was_refused && recovery.receipt_refused {
+            if let Some(recorder) = &mut self.diagnostics {
+                record_recovery_refusal(
+                    recorder,
+                    &self.adapter,
+                    key,
+                    recovery,
+                    DiagnosticReason::CountInvalid,
+                );
+            }
             self.registry.record_gap(RegistryGap {
                 caller: Some(recovery.caller), module: None, pid: None,
                 subject: "count retirement earlier read invariant refused".into(),
@@ -2261,6 +2869,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             recovery.epoch = None;
             recovery.scan = None;
             recovery.sighting = None;
+            if let Some(recorder) = &mut self.diagnostics {
+                record_recovery_refusal(
+                    recorder,
+                    &self.adapter,
+                    key,
+                    recovery,
+                    DiagnosticReason::BudgetRefused,
+                );
+            }
             self.registry.record_gap(RegistryGap {
                 caller: Some(recovery.caller), module: None, pid: None,
                 subject: "count retirement receipt invariant refused".into(),
@@ -2271,6 +2888,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     fn note_retirement_metadata_refusal(&mut self, caller: CallerId) {
+        if self.diagnostics.is_some() {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition);
+            self.diagnostic_identity(&mut record, caller);
+            record.reason = Some(DiagnosticReason::BudgetRefused);
+            record.context_unavailable = true;
+            if let Some(recorder) = &mut self.diagnostics {
+                recorder.record(record);
+            }
+        }
         let limit = self.registry.limits().max_edges;
         self.registry.record_gap(RegistryGap {
             caller: Some(caller),
@@ -2319,6 +2945,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         count: PairCount,
         since_ns: u64,
         base: u64,
+        diagnostic_source: Option<(PairKey, u64)>,
     ) {
         if count.count == 0 {
             return;
@@ -2328,6 +2955,42 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .module_id_for(module)
             .and_then(|id| self.registry.module(id))
             .is_some_and(|record| record.admission == AdmissionState::Admitted);
+        if let Some(recorder) = &mut self.diagnostics {
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision);
+            record.caller = Some(caller.0);
+            if let Some(caller) = self.adapter.record(caller) {
+                record.pid = Some(caller.pid);
+                record.incarnation = Some(u64::from(caller.incarnation));
+            }
+            record.module = self.registry.module_id_for(module).map(|module| module.0);
+            record.base = Some(base);
+            record.staged = Some(count.count);
+            record.pre = Some(count.anchor_ns);
+            record.post = Some(count.last_ns);
+            record.baseline_pre = (base != 0).then_some(since_ns);
+            record.observation_ref = nonzero_ref(count.diagnostic_observation);
+            record.transition_ref = nonzero_ref(count.diagnostic_transition);
+            record.context_unavailable = base != 0 || record.observation_ref.is_none();
+            if let Some((key, absolute)) = diagnostic_source {
+                record = record.with_pair(key.diagnostic_key());
+                record.absolute = Some(absolute);
+                record.after = Some(base);
+                record.through = Some(absolute);
+            } else {
+                record.context_unavailable = true;
+            }
+            record.decision = Some(if admitted {
+                DiagnosticDecision::Staged
+            } else {
+                DiagnosticDecision::Rejected
+            });
+            record.reason = Some(if admitted {
+                DiagnosticReason::SoleOwner
+            } else {
+                DiagnosticReason::NotAdmitted
+            });
+            recorder.record(record);
+        }
         if !admitted {
             return;
         }
@@ -2385,6 +3048,43 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ) => (*base, *base, *base_since, *base_since),
             None => (0, 0, 0, held_first),
         };
+        if self.diagnostics.is_some() {
+            let mut record = if let Some(count) = self.pair_counts.get(&key).map(|held| held.read) {
+                self.diagnostic_count_record(key, caller, count, base, staged, base_since)
+            } else {
+                let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition)
+                    .with_pair(key.diagnostic_key());
+                self.diagnostic_identity(&mut record, caller);
+                record.context_unavailable = true;
+                record
+            };
+            record.kind = DiagnosticKind::OwnershipTransition;
+            record.prior_eligibility = self.pair_targets.get(&key).map(|target| match target {
+                PairTarget::Bound { .. } => Eligibility::SoleOwner,
+                PairTarget::Pending { .. } => Eligibility::Unproven,
+                _ => Eligibility::Unknown,
+            });
+            record.new_eligibility = Some(Eligibility::Unproven);
+            record.reason = Some(DiagnosticReason::PendingPublication);
+            record.module = (modules.len() == 1)
+                .then(|| {
+                    self.registry
+                        .module_id_for(&modules[0])
+                        .map(|module| module.0)
+                })
+                .flatten();
+            let seq = self
+                .diagnostics
+                .as_mut()
+                .and_then(|recorder| recorder.record(record))
+                .unwrap_or(0);
+            if let Some(count) = self.pair_counts.get_mut(&key) {
+                count.diagnostic_transition = seq;
+            }
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.diagnostic.transition_ref = seq;
+            }
+        }
         // A new, generically bound witness still owns its ordinary publication
         // placement. It does not borrow or discharge an armed retirement proof.
         if modules.len() == 1
@@ -2408,7 +3108,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base_since,
             },
         );
-        if let Some(count) = self.pair_counts.get(&key).copied()
+        if let Some(count) = self.pair_counts.get(&key).map(|held| held.read)
             && count.count > staged
         {
             self.stage_pending_count(key, caller, modules, count, base_since, base);
@@ -2448,6 +3148,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let generation = *self.placement_generations.entry(key).or_insert(Some(0));
         let Some(next) = self.next_pending_id.checked_add(1) else {
+            self.diagnostic_pending_refusal(
+                key,
+                caller,
+                observation,
+                base,
+                since_ns,
+                DiagnosticReason::BudgetRefused,
+            );
             self.registry
                 .note_retirement_count_gap(caller, base, observation.count);
             if let Some(recovery) = self.recoveries.get_mut(&key) {
@@ -2457,6 +3165,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return false;
         };
         if generation.is_none() || self.pending_ids.len() >= self.registry.limits().max_edges {
+            self.diagnostic_pending_refusal(
+                key,
+                caller,
+                observation,
+                base,
+                since_ns,
+                DiagnosticReason::BudgetRefused,
+            );
             self.registry
                 .note_retirement_count_gap(caller, base, observation.count);
             if let Some(recovery) = self.recoveries.get_mut(&key) {
@@ -2482,7 +3198,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ..
                 },
             ) if *bound == caller => *endpoint,
-            _ => return false,
+            _ => {
+                self.diagnostic_pending_refusal(
+                    key,
+                    caller,
+                    observation,
+                    base,
+                    since_ns,
+                    DiagnosticReason::BindingUnproven,
+                );
+                return false;
+            }
         };
         let mut work = ReceiptWork::new();
         let origin = if let Some(recovery) = self.recoveries.get(&key) {
@@ -2511,6 +3237,44 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         let pending_id = self.next_pending_id;
         self.next_pending_id = next;
+        let diagnostic = if self.diagnostics.is_some() {
+            // This is the exact rebased value queued below, not the prior
+            // absolute watermark retained by PairTarget.
+            let staged = count.count;
+            let mut record = self
+                .diagnostic_count_record(key, caller, observation, base, staged, since_ns)
+                .with_private_ids(
+                    None,
+                    match origin {
+                        PendingCountOrigin::Recovered(epoch) => Some(epoch.0),
+                        _ => None,
+                    },
+                    Some(pending_id),
+                );
+            record.decision = Some(DiagnosticDecision::Staged);
+            record.reason = Some(DiagnosticReason::PendingPublication);
+            record.module = (modules.len() == 1)
+                .then(|| {
+                    self.registry
+                        .module_id_for(&modules[0])
+                        .map(|module| module.0)
+                })
+                .flatten();
+            let diagnostic = PendingDiagnostics {
+                base,
+                staged,
+                since: since_ns,
+                baseline_post: record.baseline_post.unwrap_or(0),
+                fence: record.fence.unwrap_or(0),
+                transition_ref: record.transition_ref.unwrap_or(0),
+            };
+            if let Some(recorder) = &mut self.diagnostics {
+                recorder.record(record);
+            }
+            Some(diagnostic)
+        } else {
+            None
+        };
         self.pending_ids.insert(
             pending_id,
             PendingCountObservation {
@@ -2520,6 +3284,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 observation,
                 generation,
                 origin,
+                diagnostic,
             },
         );
         self.registry.note_pending_count(
@@ -2548,14 +3313,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 continue;
             };
             let key = pending.key;
+            self.diagnostic_pending_result(decision.pending_id, &pending, Some(&decision.outcome));
             if pending.generation.is_none()
                 || self.placement_generations.get(&key).copied().flatten() != pending.generation
             {
+                self.diagnostic_pending_result(decision.pending_id, &pending, None);
                 continue;
             }
             if let PendingCountOrigin::Recovered(epoch) = pending.origin {
                 let valid = self.recovery_is_current(key, epoch);
                 if !valid {
+                    self.diagnostic_pending_result(decision.pending_id, &pending, None);
                     continue;
                 }
             }
@@ -2565,9 +3333,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     | PairTarget::Suspended { base, .. }
                     | PairTarget::Pending { base, .. },
                 ) => *base,
-                _ => continue,
+                _ => {
+                    self.diagnostic_pending_result(decision.pending_id, &pending, None);
+                    continue;
+                }
             };
             if pending.observation.count < accounted {
+                self.diagnostic_pending_result(decision.pending_id, &pending, None);
                 continue;
             }
             match decision.outcome {
@@ -2602,6 +3374,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                     deferred_count: false,
                                     receipt_refused: false,
                                     epoch_pending: false,
+                                    diagnostic: RecoveryDiagnostics::default(),
                                 },
                             );
                             self.recovery_order.push(key);
@@ -2766,6 +3539,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             rebased_count(count, staged),
             staged_ns,
             staged,
+            Some((key, count.count)),
         );
         recovery.watermark = recovery.watermark.max(count.count);
         if let Some(PairTarget::Bound {
@@ -2785,7 +3559,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Only a classified contiguous unknown prefix is disclosed here. Callers
     /// first resolve historical generic decisions and continuing ownership.
-    fn flush_withheld_prefix(&mut self, recovery: &mut PairRecovery) {
+    fn flush_withheld_prefix(&mut self, key: PairKey, recovery: &mut PairRecovery) {
+        self.diagnostic_withheld(
+            key,
+            recovery,
+            recovery.watermark,
+            recovery.withheld_through,
+            DiagnosticReason::OwnershipTransition,
+            None,
+        );
         self.registry.note_retirement_count_gap(
             recovery.caller,
             recovery.watermark,
@@ -2805,7 +3587,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         key: PairKey,
         recovery: &mut PairRecovery,
         held: Option<PairCount>,
+        reason: DiagnosticReason,
     ) {
+        self.diagnostic_recovery_decision(
+            key,
+            recovery,
+            reason,
+            held,
+            DiagnosticDecision::Rejected,
+        );
         let predecessor = self.generic_predecessor(key, recovery);
         let protected = recovery.deferred_count
             || recovery.epoch.is_some()
@@ -2824,8 +3614,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // No surviving allocation candidate remains after genuine revocation.
             recovery.withheld_through = recovery.withheld_through.max(recovery.discarded_through);
             recovery.discarded_through = recovery.watermark;
-            self.flush_withheld_prefix(recovery);
+            self.flush_withheld_prefix(key, recovery);
             if let Some(held) = held {
+                self.diagnostic_withheld(
+                    key,
+                    recovery,
+                    recovery.watermark,
+                    held.count,
+                    reason,
+                    Some(held),
+                );
                 self.registry.note_retirement_count_gap(
                     recovery.caller,
                     recovery.watermark,
@@ -2861,7 +3659,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let Some(mut recovery) = self.recoveries.remove(&key) else {
                 continue;
             };
-            let held = self.pair_counts.get(&key).copied();
+            let held = self.pair_counts.get(&key).map(|held| held.read);
             let ownership = self
                 .count_ownership
                 .ordinary_view(recovery.caller, key.object);
@@ -2876,6 +3674,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     && (recovery.epoch.is_none() || recovery.epoch_pending && continuing)
                     && recovery.ordinary_checkpoint != 0
                     && recovery.ordinary_checkpoint == ownership.sequence);
+            self.diagnostic_ownership(key, &mut recovery, &candidate);
             let mut work = ReceiptWork::new();
             work.spend(3); // ordinary source/checkpoint guards within the fixed reservation
             let was_refused = recovery.receipt_refused;
@@ -2885,6 +3684,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 &mut work,
             );
             if !was_refused && recovery.receipt_refused {
+                if let Some(recorder) = &mut self.diagnostics {
+                    record_recovery_refusal(
+                        recorder,
+                        &self.adapter,
+                        key,
+                        &mut recovery,
+                        DiagnosticReason::CountInvalid,
+                    );
+                }
                 self.registry.record_gap(RegistryGap {
                     caller: Some(recovery.caller), module: None, pid: None,
                     subject: "count retirement earlier read invariant refused".into(),
@@ -2918,7 +3726,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             })
                 });
             if canceled {
-                self.cancel_retirement_candidate(key, &mut recovery, held);
+                let reason = if recovery.receipt_refused {
+                    DiagnosticReason::CountInvalid
+                } else if self.capture.as_ref().is_some_and(|capture| capture.stopped) {
+                    DiagnosticReason::CaptureStopped
+                } else if self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.unproven.is_some())
+                {
+                    DiagnosticReason::CaptureLoss
+                } else {
+                    DiagnosticReason::IdentityChanged
+                };
+                self.cancel_retirement_candidate(key, &mut recovery, held, reason);
                 self.recoveries.insert(key, recovery);
                 continue;
             }
@@ -2929,10 +3750,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 scan,
             } = candidate
             else {
+                let deferred = self.count_ownership.deferred(recovery.caller, key.object);
+                let reason = if deferred {
+                    DiagnosticReason::ScanIncomplete
+                } else if matches!(candidate, CurrentCandidates::Shared) {
+                    DiagnosticReason::SharedOwner
+                } else {
+                    DiagnosticReason::OwnershipUnknown
+                };
                 if !self.count_ownership.deferred(recovery.caller, key.object)
                     && (recovery.blocked || recovery.deferred_count || recovery.epoch.is_some())
                 {
-                    self.cancel_retirement_candidate(key, &mut recovery, held);
+                    self.cancel_retirement_candidate(key, &mut recovery, held, reason);
+                } else {
+                    self.diagnostic_recovery_wait(key, &mut recovery, reason, held);
                 }
                 self.recoveries.insert(key, recovery);
                 continue;
@@ -2982,6 +3813,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Ownership selection above may coexist with old generic handles.
             // It changes neither their generation/target nor any H/D disposition.
             if predecessor {
+                self.diagnostic_recovery_wait(
+                    key,
+                    &mut recovery,
+                    DiagnosticReason::PendingPublication,
+                    held,
+                );
+                self.diagnostic_recovery_selection(key, &mut recovery, false);
                 self.recoveries.insert(key, recovery);
                 continue;
             }
@@ -3027,7 +3865,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     recovery.withheld_through.max(recovery.discarded_through);
                 recovery.discarded_through = recovery.watermark;
             }
-            self.flush_withheld_prefix(&mut recovery);
+            self.flush_withheld_prefix(key, &mut recovery);
             let scan = recovery
                 .scan
                 .as_ref()
@@ -3038,7 +3876,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 || record.exe != scan.generation().exe
                 || record.first_seen_ns > scan.started_ns()
             {
-                self.cancel_retirement_candidate(key, &mut recovery, held);
+                self.cancel_retirement_candidate(
+                    key,
+                    &mut recovery,
+                    held,
+                    DiagnosticReason::IdentityChanged,
+                );
                 self.recoveries.insert(key, recovery);
                 continue;
             }
@@ -3062,9 +3905,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             recovery.sighting = Some(sighting);
                         }
                     }
-                    Err(UnboundReason::CookieUnavailable) => {}
+                    Err(UnboundReason::CookieUnavailable) => {
+                        self.diagnostic_recovery_wait(
+                            key,
+                            &mut recovery,
+                            DiagnosticReason::BindingUnproven,
+                            held,
+                        );
+                    }
                     Err(
-                        UnboundReason::NoLiveCaller
+                        reason @ (UnboundReason::NoLiveCaller
                         | UnboundReason::CallerExited
                         | UnboundReason::CookieMismatch
                         | UnboundReason::BeforeAdmission
@@ -3074,12 +3924,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         | UnboundReason::ExecTransition
                         | UnboundReason::ExecCoverageGap
                         | UnboundReason::EvidenceIncomplete
-                        | UnboundReason::Capacity,
+                        | UnboundReason::Capacity),
                     ) => {
                         // A failed completion clock also supplies no authority.
                         // Preserve history, but never retry a rejected read as
                         // though its original identity proof merely waited.
-                        self.cancel_retirement_candidate(key, &mut recovery, held);
+                        self.cancel_retirement_candidate(
+                            key,
+                            &mut recovery,
+                            held,
+                            diagnostic_binding_reason(reason),
+                        );
                         self.recoveries.insert(key, recovery);
                         continue;
                     }
@@ -3095,7 +3950,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         && read.anchor_ns > scan.finished_ns()
                 })
             {
-                self.flush_withheld_prefix(&mut recovery);
+                self.flush_withheld_prefix(key, &mut recovery);
+                self.diagnostic_withheld(
+                    key,
+                    &recovery,
+                    recovery.watermark,
+                    read.count,
+                    DiagnosticReason::AwaitingFence,
+                    Some(read),
+                );
                 self.registry.note_retirement_count_gap(
                     recovery.caller,
                     recovery.watermark,
@@ -3109,13 +3972,35 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .sighting
                 .as_ref()
                 .map(|sighting| self.binder.check_current_binding(sighting));
-            if matches!(proof, Some(CurrentBindingCheck::Rejected(_))) {
-                self.cancel_retirement_candidate(key, &mut recovery, held);
+            self.diagnostic_recovery_selection(
+                key,
+                &mut recovery,
+                matches!(proof, Some(CurrentBindingCheck::Proven)),
+            );
+            if let Some(CurrentBindingCheck::Rejected(reason)) = proof {
+                self.cancel_retirement_candidate(
+                    key,
+                    &mut recovery,
+                    held,
+                    diagnostic_binding_reason(reason),
+                );
             }
             let stage = matches!(proof, Some(CurrentBindingCheck::Proven))
                 && recovery.fence.is_some()
                 && held
                     .is_some_and(|held| held.count > recovery.watermark && held.retirement_usable);
+            if !stage && !matches!(proof, Some(CurrentBindingCheck::Rejected(_))) {
+                let reason = if recovery.fence.is_none() {
+                    DiagnosticReason::AwaitingFence
+                } else if !matches!(proof, Some(CurrentBindingCheck::Proven)) {
+                    DiagnosticReason::BindingUnproven
+                } else if held.is_some_and(|held| !held.retirement_usable) {
+                    DiagnosticReason::CountInvalid
+                } else {
+                    DiagnosticReason::AwaitingFence
+                };
+                self.diagnostic_recovery_wait(key, &mut recovery, reason, held);
+            }
             self.recoveries.insert(key, recovery);
             if stage && self.recovery_is_current(key, epoch) {
                 let held = held.expect("stage has held observation");
@@ -3145,13 +4030,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// remembers the held absolute, so a later row rebinds past it
     /// instead of attributing pre-drop calls to a new owner (round 4,
     /// rebind).
-    fn drop_pair_count(&mut self, row: &WitnessRow) {
+    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) {
         let key = PairKey::of(row);
         let (base, base_since) = self
             .pair_counts
             .get(&key)
             .map(|count| (count.count, count.anchor_ns))
             .unwrap_or((0, 0));
+        if let Some(recorder) = &mut self.diagnostics {
+            let held = self.pair_counts.get(&key).map(|held| held.read);
+            let mut record = DiagnosticRecord::new(DiagnosticKind::CountDecision)
+                .with_pair(key.diagnostic_key());
+            record.pid = Some(row.host_tgid);
+            record.decision = Some(DiagnosticDecision::Rejected);
+            record.reason = Some(reason);
+            record.absolute = Some(base);
+            record.through = Some(base);
+            record.context_unavailable = true;
+            if let Some(held) = held {
+                record.pre = Some(held.anchor_ns);
+                record.post = Some(held.last_ns);
+                record.observation_ref = nonzero_ref(held.diagnostic_observation);
+                record.transition_ref = nonzero_ref(held.diagnostic_transition);
+            }
+            recorder.record(record);
+        }
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
         self.pair_counts.remove(&key);
@@ -3165,7 +4068,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let modules = match self.witness_modules(&row) {
             Ok(modules) => modules,
             Err(reason) => {
-                self.drop_pair_count(&row);
+                self.drop_pair_count(&row, DiagnosticReason::NotAdmitted);
                 if let Binding::Unbound(unbound) = binding {
                     self.note_preadmission(row.host_tgid, &[None], unbound);
                 }
@@ -3179,7 +4082,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .note_bound_witness(caller, modules, row.recorded_at_ns)
             }
             Binding::Unbound(reason) => {
-                self.drop_pair_count(&row);
+                self.drop_pair_count(&row, diagnostic_binding_reason(reason));
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
                 self.note_preadmission(row.host_tgid, &keys, reason);
                 self.registry
@@ -3437,7 +4340,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// the Phase 2 test pins, extended to caller/edge facts.
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {
         self.engine.publish_batch_tail(engine_changed)?;
-        let registry_applied = self.registry.publish();
+        let registry_applied = if let Some(recorder) = &mut self.diagnostics {
+            let adapter = &self.adapter;
+            self.registry
+                .publish_with_count_observer(Some(&mut |count: CountPublication| {
+                    let mut record = DiagnosticRecord::new(DiagnosticKind::Publication);
+                    record.caller = Some(count.caller.0);
+                    if let Some(caller) = adapter.record(count.caller) {
+                        record.pid = Some(caller.pid);
+                        record.incarnation = Some(u64::from(caller.incarnation));
+                    }
+                    record.module = count.module.map(|module| module.0);
+                    record.staged = Some(count.staged);
+                    record.base = Some(count.base);
+                    record.edge_total = count.edge_total;
+                    // The registry mutation has no genuine raw pair/read reference.
+                    record.reason = Some(DiagnosticReason::ContextUnavailable);
+                    record.context_unavailable = true;
+                    recorder.record(record);
+                }))
+        } else {
+            self.registry.publish()
+        };
         self.finalize_pending_counts();
         Ok(BatchReceipt {
             engine_facts: self.engine.facts_revision,
@@ -3497,6 +4421,10 @@ impl PairKey {
         }
     }
 
+    fn diagnostic_key(self) -> NativePairKey {
+        NativePairKey::new(self.image, self.exec, self.object)
+    }
+
     fn of_update(domain: NativeDomainId, update: &CallerCountUpdate) -> Self {
         Self {
             image: DomainCookie::new(domain, update.image.task_cookie),
@@ -3520,6 +4448,36 @@ struct PairCount {
     last_ns: u64,
     /// The original strict advance had a valid, healthy observation bracket.
     retirement_usable: bool,
+    diagnostic_observation: u64,
+    diagnostic_transition: u64,
+}
+
+/// Poll suppression belongs only to the mutable held entry, not immutable reads.
+#[derive(Debug, Clone, Copy)]
+struct HeldPairCount {
+    read: PairCount,
+    diagnostic_last_raw: Option<u64>,
+    diagnostic_refusal: Option<(DiagnosticReason, u64, u64)>,
+}
+impl HeldPairCount {
+    fn new(read: PairCount) -> Self {
+        Self {
+            read,
+            diagnostic_last_raw: None,
+            diagnostic_refusal: None,
+        }
+    }
+}
+impl std::ops::Deref for HeldPairCount {
+    type Target = PairCount;
+    fn deref(&self) -> &Self::Target {
+        &self.read
+    }
+}
+impl std::ops::DerefMut for HeldPairCount {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.read
+    }
 }
 
 /// Rebase one held absolute count past `base` (F3-03): what stages is
@@ -3538,6 +4496,8 @@ fn rebased_count(count: PairCount, base: u64) -> PairCount {
         anchor_ns: count.anchor_ns,
         last_ns: count.last_ns,
         retirement_usable: count.retirement_usable,
+        diagnostic_observation: count.diagnostic_observation,
+        diagnostic_transition: count.diagnostic_transition,
     }
 }
 
@@ -3634,6 +4594,7 @@ struct PendingCountObservation {
     observation: PairCount,
     generation: Option<u64>,
     origin: PendingCountOrigin,
+    diagnostic: Option<PendingDiagnostics>,
 }
 
 #[derive(Clone, Copy)]
@@ -3676,6 +4637,63 @@ struct PairRecovery {
     /// Selected ownership may wait for original generic publication handles.
     /// Its placement generation and target are untouched until those finish.
     epoch_pending: bool,
+    diagnostic: RecoveryDiagnostics,
+}
+
+#[derive(Clone, Copy)]
+struct PendingDiagnostics {
+    base: u64,
+    staged: u64,
+    since: u64,
+    baseline_post: u64,
+    fence: u64,
+    transition_ref: u64,
+}
+
+#[derive(Default)]
+struct RecoveryDiagnostics {
+    ownership: Option<(Eligibility, Option<ModuleId>, Option<u64>)>,
+    transition_ref: u64,
+    wait: Option<(DiagnosticReason, DiagnosticDecision, u64, u64, u64)>,
+    selection: Option<(Option<u64>, u64, bool)>,
+}
+
+fn record_recovery_refusal<Source: ProcessSource>(
+    recorder: &mut Recorder,
+    adapter: &CallerAdapter<Source>,
+    key: PairKey,
+    recovery: &mut PairRecovery,
+    reason: DiagnosticReason,
+) {
+    let mut record = DiagnosticRecord::new(DiagnosticKind::OwnershipTransition)
+        .with_pair(key.diagnostic_key())
+        .with_private_ids(None, recovery.epoch.map(|epoch| epoch.0), None);
+    record.caller = Some(recovery.caller.0);
+    if let Some(caller) = adapter.record(recovery.caller) {
+        record.pid = Some(caller.pid);
+        record.incarnation = Some(u64::from(caller.incarnation));
+    }
+    record.reason = Some(reason);
+    record.new_eligibility = Some(Eligibility::Unknown);
+    record.base = Some(recovery.watermark);
+    record.transition_ref = nonzero_ref(recovery.diagnostic.transition_ref);
+    record.context_unavailable = true;
+    recovery.diagnostic.transition_ref = recorder.record(record).unwrap_or(0);
+}
+
+fn diagnostic_binding_reason(reason: UnboundReason) -> DiagnosticReason {
+    match reason {
+        UnboundReason::CookieUnavailable
+        | UnboundReason::ExecCoverageGap
+        | UnboundReason::EvidenceIncomplete => DiagnosticReason::BindingUnproven,
+        UnboundReason::LifecycleLoss => DiagnosticReason::CaptureLoss,
+        UnboundReason::Capacity => DiagnosticReason::BudgetRefused,
+        _ => DiagnosticReason::IdentityChanged,
+    }
+}
+
+fn nonzero_ref(seq: u64) -> Option<u64> {
+    (seq != 0).then_some(seq)
 }
 
 struct TaggedCountRead {
@@ -6817,9 +7835,12 @@ mod tests {
                 anchor_ns: 100,
                 last_ns: 200,
                 retirement_usable: false,
+                diagnostic_observation: 0,
+                diagnostic_transition: 0,
             },
             100,
             0,
+            None,
         );
         native.scene.coordinator.commit_batch(false).unwrap();
         let registry = &native.scene.coordinator.registry;
@@ -10755,3 +11776,7 @@ mod tests {
 #[cfg(test)]
 #[path = "demotion_retirement_tests.rs"]
 mod demotion_retirement_tests;
+
+#[cfg(test)]
+#[path = "inventory_diagnostics_tests.rs"]
+mod inventory_diagnostics_tests;

@@ -158,6 +158,10 @@ pub struct InventoryArgs {
     /// `--event-max-files`: live file plus retained rotations;
     /// None ⇒ 5 default.
     pub event_max_files: Option<usize>,
+    /// `--diagnostics`: write bounded native count decisions as JSONL after stop.
+    pub diagnostics: Option<PathBuf>,
+    /// `--diagnostics-pid`: select one PID's diagnostics without narrowing capture.
+    pub diagnostics_pid: Option<u32>,
     /// `--capture`: which usage lane runs; `auto` by default.
     pub capture: CaptureMode,
     /// `--attach-backend`: how the native lane attaches its usage entries
@@ -303,8 +307,8 @@ usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
@@ -430,18 +434,21 @@ Without --pid or --cgroup, target readiness is unassessed.
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
   p11scope inventory --pid 4242 --capture scan --json -o inventory.json
+  p11scope inventory --system --capture native --duration 30s --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 --capture scan uses no BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
 --json and -o contain the same inventory facts; --event-log appends bounded JSONL history with rotation.
+--diagnostics writes bounded native count decisions after capture stops; requires auto or native and a separate regular file.
+--diagnostics-pid selects that PID's diagnostics without changing capture scope; global health records remain included.
 A missing observation or incomplete retained history does not establish zero activity.
 Compare saved files offline with inventory diff; see docs/usage.md.
 ";
@@ -910,6 +917,8 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut event_log: Option<PathBuf> = None;
     let mut event_rotate_bytes: Option<u64> = None;
     let mut event_max_files: Option<usize> = None;
+    let mut diagnostics: Option<PathBuf> = None;
+    let mut diagnostics_pid: Option<u32> = None;
     let mut capture: Option<CaptureMode> = None;
     let mut attach_backend: Option<BackendSelection> = None;
     while let Some(a) = args.next() {
@@ -955,6 +964,25 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                     return Err(usage_err("--event-log given twice"));
                 }
                 event_log = Some(require_path(&mut args, "--event-log")?);
+            }
+            "--diagnostics" => {
+                if diagnostics.is_some() {
+                    return Err(usage_err("--diagnostics given twice"));
+                }
+                diagnostics = Some(require_path(&mut args, "--diagnostics")?);
+            }
+            "--diagnostics-pid" => {
+                if diagnostics_pid.is_some() {
+                    return Err(usage_err("--diagnostics-pid given twice"));
+                }
+                let value = require_value(&mut args, "--diagnostics-pid")?;
+                let pid = value.parse::<u32>().map_err(|_| {
+                    usage_err(format!("--diagnostics-pid: invalid number {value:?}"))
+                })?;
+                if pid == 0 {
+                    return Err(usage_err("--diagnostics-pid must be greater than zero"));
+                }
+                diagnostics_pid = Some(pid);
             }
             "--event-rotate-bytes" => {
                 if event_rotate_bytes.is_some() {
@@ -1051,6 +1079,19 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             "--event-rotate-bytes/--event-max-files require --event-log <f.jsonl>",
         ));
     }
+    if diagnostics.is_none() && diagnostics_pid.is_some() {
+        return Err(usage_err(
+            "--diagnostics-pid requires --diagnostics <f.jsonl>",
+        ));
+    }
+    if diagnostics.as_deref() == Some(std::path::Path::new("-")) {
+        return Err(usage_err(
+            "--diagnostics does not support stdout; pass a regular file path",
+        ));
+    }
+    if diagnostics.is_some() && capture == Some(CaptureMode::Scan) {
+        return Err(usage_err("--diagnostics requires --capture auto or native"));
+    }
     Ok(InventoryArgs {
         scope,
         modules,
@@ -1064,6 +1105,8 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         event_log,
         event_rotate_bytes,
         event_max_files,
+        diagnostics,
+        diagnostics_pid,
         capture: capture.unwrap_or(CaptureMode::Auto),
         attach_backend: attach_backend.unwrap_or_default(),
     })
@@ -1956,6 +1999,199 @@ mod tests {
     }
 
     #[test]
+    fn inventory_diagnostics_accepts_native_and_auto() {
+        for mode in ["auto", "native"] {
+            let Command::Inventory(parsed) = parse(args(&[
+                "inventory",
+                "--system",
+                "--capture",
+                mode,
+                "--diagnostics",
+                "inventory-debug.jsonl",
+                "--diagnostics-pid",
+                "42",
+            ]))
+            .unwrap() else {
+                panic!("expected inventory")
+            };
+            assert_eq!(parsed.scope, InspectScope::System);
+            assert_eq!(parsed.capture.label(), mode);
+            assert_eq!(
+                parsed.diagnostics,
+                Some(PathBuf::from("inventory-debug.jsonl"))
+            );
+            assert_eq!(parsed.diagnostics_pid, Some(42));
+        }
+    }
+
+    #[test]
+    fn inventory_diagnostics_defaults_and_filter_preserve_capture_scope() {
+        let Command::Inventory(plain) = parse(args(&["inventory", "--pid", "7"])).unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(plain.diagnostics, None);
+        assert_eq!(plain.diagnostics_pid, None);
+        let Command::Inventory(parsed) = parse(args(&[
+            "inventory",
+            "--pid",
+            "7",
+            "--diagnostics",
+            "debug.jsonl",
+            "--diagnostics-pid",
+            "4294967295",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(parsed.scope, InspectScope::Pid(7));
+        assert_eq!(parsed.capture, CaptureMode::Auto);
+        assert_eq!(parsed.diagnostics_pid, Some(u32::MAX));
+        let Command::Inventory(unfiltered) = parse(args(&[
+            "inventory",
+            "--system",
+            "--diagnostics",
+            "debug.jsonl",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(unfiltered.diagnostics_pid, None);
+    }
+
+    #[test]
+    fn inventory_diagnostics_preserves_path_bytes_and_rejects_non_utf8_pid() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let path = OsString::from_vec(b"debug-\xff.jsonl".to_vec());
+        let Command::Inventory(parsed) = parse([
+            OsString::from("inventory"),
+            OsString::from("--system"),
+            OsString::from("--diagnostics"),
+            path.clone(),
+        ])
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(
+            parsed.diagnostics.unwrap().as_os_str().as_bytes(),
+            path.as_bytes()
+        );
+        assert!(matches!(
+            parse([
+                OsString::from("inventory"),
+                OsString::from("--system"),
+                OsString::from("--diagnostics-pid"),
+                OsString::from_vec(b"42\xff".to_vec()),
+            ]),
+            Err(CliError::Usage { message, topic: HelpTopic::Inventory })
+                if message.contains("--diagnostics-pid") && message.contains("not valid UTF-8")
+        ));
+    }
+
+    #[test]
+    fn inventory_diagnostics_refuses_invalid_combinations_and_values() {
+        for (options, expected) in [
+            (vec!["--diagnostics-pid", "42"], "requires --diagnostics"),
+            (vec!["--diagnostics", "-"], "does not support stdout"),
+            (
+                vec!["--diagnostics", "debug.jsonl", "--capture", "scan"],
+                "requires --capture auto or native",
+            ),
+            (
+                vec!["--capture", "scan", "--diagnostics", "debug.jsonl"],
+                "requires --capture auto or native",
+            ),
+            (vec!["--diagnostics", ""], "requires a non-empty value"),
+            (vec!["--diagnostics"], "--diagnostics requires a value"),
+            (
+                vec!["--diagnostics", "a", "--diagnostics", "b"],
+                "--diagnostics given twice",
+            ),
+            (
+                vec!["--diagnostics-pid", "42", "--diagnostics-pid", "43"],
+                "--diagnostics-pid given twice",
+            ),
+            (
+                vec!["--diagnostics-pid"],
+                "--diagnostics-pid requires a value",
+            ),
+            (
+                vec!["--diagnostics-pid", "0"],
+                "--diagnostics-pid must be greater than zero",
+            ),
+            (
+                vec!["--diagnostics-pid", "-1"],
+                "--diagnostics-pid: invalid number",
+            ),
+            (
+                vec!["--diagnostics-pid", "4294967296"],
+                "--diagnostics-pid: invalid number",
+            ),
+            (
+                vec!["--diagnostics-pid", "many"],
+                "--diagnostics-pid: invalid number",
+            ),
+        ] {
+            let mut argv = vec!["inventory", "--system"];
+            argv.extend(options);
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
+                    if message.contains(expected)),
+                "{argv:?} should report {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_diagnostics_options_are_capture_only() {
+        for (argv, expected) in [
+            (
+                vec!["profile", "--pid", "7", "--diagnostics", "debug.jsonl"],
+                "unknown argument: --diagnostics",
+            ),
+            (
+                vec!["trace", "--pid", "7", "--diagnostics-pid", "42"],
+                "unknown argument: --diagnostics-pid",
+            ),
+            (
+                vec![
+                    "inventory",
+                    "diff",
+                    "before.json",
+                    "after.json",
+                    "--diagnostics",
+                    "debug.jsonl",
+                ],
+                "unknown inventory diff option",
+            ),
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message, .. })
+                    if message.contains(expected)),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_diagnostics_help_names_options_and_limits_scope() {
+        for text in [USAGE, INVENTORY_HELP] {
+            for line in text
+                .lines()
+                .filter(|line| line.contains("p11scope inventory --") && line.contains("[--"))
+            {
+                assert!(
+                    line.contains("[--diagnostics <f.jsonl> [--diagnostics-pid <n>]]"),
+                    "{line}"
+                );
+            }
+        }
+        assert!(INVENTORY_HELP.contains("without changing capture scope"));
+        assert!(INVENTORY_HELP.contains("auto or native"));
+        assert!(INVENTORY_HELP.contains("after capture stops"));
+        assert!(!INVENTORY_DIFF_HELP.contains("--diagnostics"));
+    }
+
+    #[test]
     fn inventory_parses_dashboard_and_event_stream_options() {
         let Command::Inventory(i) = parse(args(&[
             "inventory",
@@ -2694,8 +2930,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 5289);
-        assert_eq!(hash, 0x8bce676b37fea12c);
+        assert_eq!(USAGE.len(), 5389);
+        assert_eq!(hash, 0x92bd792391ca56b0);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

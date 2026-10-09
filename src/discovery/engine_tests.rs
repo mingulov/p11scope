@@ -27789,3 +27789,917 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
     assert_eq!(stats.dropped, 0);
     assert_eq!(stats.dropped_unknown, 1);
 }
+
+mod detailed_proof_driver {
+    use super::*;
+    use crate::attach::detailed_identity::{
+        ProofSession, TraceIo, TraceProofUnknown, TraceSeed, TraceWorkError, TraceWorkTicket,
+        VerifiedTraceSeed,
+    };
+    use crate::events::{DiscoveryDrain, EventDrain, ScriptedRecords};
+    use p11scope_ebpf_common::{Event, ImageIdentity};
+    use std::ops::ControlFlow;
+
+    struct Io {
+        proof: ProofSession,
+        cookie: Cell<Option<u64>>,
+        loss: Cell<Result<u64, TraceProofUnknown>>,
+        cookie_reads: Cell<usize>,
+        health_reads: Cell<usize>,
+        samples: Cell<usize>,
+        expire_on_sample: Cell<Option<usize>>,
+        slow_sample: Cell<Option<ProcessViewId>>,
+        slow_cookie_pid: Cell<Option<u32>>,
+        expire_health: Cell<bool>,
+    }
+    impl TraceIo for Io {
+        fn proof(&self) -> Option<&ProofSession> {
+            Some(&self.proof)
+        }
+        fn cookie(
+            &self,
+            pin: &crate::process::PidPin,
+            work: &mut TraceWorkTicket,
+        ) -> Result<u64, TraceWorkError> {
+            self.cookie_reads.set(self.cookie_reads.get() + 1);
+            if self.slow_cookie_pid.get() == Some(pin.pid()) {
+                self.proof
+                    .test_cookie_read_after(pin, work, self.cookie.get(), || {
+                        self.proof.test_set_time(self.proof.test_time() + 5_000_000);
+                    })
+            } else {
+                self.proof.test_cookie_read(pin, work, self.cookie.get())
+            }
+        }
+        fn refresh_health(&self, work: &mut TraceWorkTicket) -> Result<(), TraceWorkError> {
+            self.health_reads.set(self.health_reads.get() + 1);
+            if self.expire_health.get() {
+                self.proof
+                    .test_refresh_read_after(work, self.loss.get(), || {
+                        self.proof.test_set_time(self.proof.test_time() + 5_000_000);
+                    })
+            } else {
+                self.proof.test_refresh_read(work, self.loss.get())
+            }
+        }
+        fn sample(
+            &self,
+            view: &ProcessView,
+            work: &mut TraceWorkTicket,
+        ) -> Result<TraceSeed, TraceWorkError> {
+            let n = self.samples.get() + 1;
+            self.samples.set(n);
+            let result = if self.slow_sample.get() == Some(view.id()) {
+                self.proof.test_sample_view_after_link(view, work, &mut || {
+                    self.proof.test_set_time(self.proof.test_time() + 5_000_000);
+                })
+            } else {
+                self.proof.test_sample_view(view, work)
+            };
+            if self.expire_on_sample.get() == Some(n) {
+                self.proof.test_set_time(self.proof.test_time() + 5_000_000);
+            }
+            result
+        }
+    }
+    fn fixture() -> (Engine, Io) {
+        let mut engine = Engine::empty();
+        engine.scope = Scope::System;
+        engine.frame_work_budget_ns = 100_000_000;
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), std::process::id()).unwrap());
+        let proof = ProofSession::test_session();
+        proof.test_set_time(6);
+        (
+            engine,
+            Io {
+                proof,
+                cookie: Cell::new(None),
+                loss: Cell::new(Ok(0)),
+                cookie_reads: Cell::new(0),
+                health_reads: Cell::new(0),
+                samples: Cell::new(0),
+                expire_on_sample: Cell::new(None),
+                slow_sample: Cell::new(None),
+                slow_cookie_pid: Cell::new(None),
+                expire_health: Cell::new(false),
+            },
+        )
+    }
+    fn service(engine: &mut Engine, io: &mut Io) -> Vec<VerifiedTraceSeed> {
+        let mut accepted = Vec::new();
+        engine
+            .with_trace_frame(io, |engine, io, work| {
+                engine.service_trace_images(io, work, |seed| accepted.push(seed));
+                Ok(())
+            })
+            .unwrap();
+        accepted
+    }
+    fn seed(engine: &mut Engine, io: &mut Io) {
+        assert!(service(engine, io).is_empty());
+        assert_eq!(
+            engine.trace_seeds.len(),
+            1,
+            "production service must preseed an original admitted view"
+        );
+        assert_eq!(
+            io.cookie_reads.get(),
+            0,
+            "no first CALL cookie is required at sampling"
+        );
+    }
+    fn calls(io: &Io, ts: u64, cookie: u64, exec: u64) -> usize {
+        calls_pid(io, std::process::id(), ts, cookie, exec)
+    }
+    fn calls_pid(io: &Io, pid: u32, ts: u64, cookie: u64, exec: u64) -> usize {
+        io.proof
+            .test_set_time(io.proof.test_time().max(ts.max(20)) + 1);
+        let event = Event {
+            pid_tgid: u64::from(pid) << 32,
+            ts_ns: ts,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: exec,
+            },
+            ..Event::default()
+        };
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::events([event], 1),
+            io.proof.test_events_domain(),
+        );
+        drain.attach_trace_tap(io.proof.test_events_tap()).unwrap();
+        let mut count = 0;
+        drain.poll(Some(2), |_| {
+            count += 1;
+            ControlFlow::Continue(())
+        });
+        count
+    }
+    fn empty(io: &Io) {
+        io.proof.test_set_time(io.proof.test_time().max(40));
+        let mut drain = DiscoveryDrain::over_domain(
+            ScriptedRecords::records([], 0),
+            io.proof.test_discovery_domain(),
+        );
+        drain
+            .attach_trace_tap(io.proof.test_discovery_tap())
+            .unwrap();
+        assert!(drain.dequeue().is_none());
+    }
+    fn exec(io: &Io, ts: u64, tid: u32) {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.pid_tgid = (u64::from(std::process::id()) << 32) | u64::from(tid);
+        record.hook_ts_ns = ts;
+        record.kind = DISCOVERY_KIND_EXEC;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&record as *const DiscoveryRecord).cast::<u8>(),
+                std::mem::size_of::<DiscoveryRecord>(),
+            )
+        }
+        .to_vec();
+        let mut drain = DiscoveryDrain::over_domain(
+            ScriptedRecords::records([bytes], 1),
+            io.proof.test_discovery_domain(),
+        );
+        drain
+            .attach_trace_tap(io.proof.test_discovery_tap())
+            .unwrap();
+        assert!(drain.dequeue().is_some());
+    }
+    fn verify(engine: &mut Engine, io: &mut Io) -> Vec<VerifiedTraceSeed> {
+        assert_eq!(calls(io, 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        assert!(
+            service(engine, io).is_empty(),
+            "later health alone cannot replace complete lifecycle drain"
+        );
+        empty(io);
+        service(engine, io)
+    }
+    #[test]
+    fn detailed_proof_seed_precedes_first_cookie() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        let accepted = verify(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path(), "/owned/fixture");
+        assert_eq!(accepted[0].key().generation, 11);
+        assert_eq!(accepted[0].eligible_after_ns(), 10);
+    }
+    #[test]
+    fn detailed_proof_driver_requires_later_health_and_empty_drain() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        assert_eq!(calls(&io, 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        let mut accepted = Vec::new();
+        engine
+            .with_trace_frame(&mut io, |engine, io, work| {
+                assert!(accepted.is_empty());
+                engine.service_trace_images(io, work, |seed| accepted.push(seed));
+                assert!(accepted.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            io.health_reads.get() >= 2,
+            "production service must refresh after confirmation"
+        );
+        empty(&io);
+        accepted.extend(service(&mut engine, &mut io));
+        assert_eq!(accepted.len(), 1);
+        assert!(!accepted[0].path().is_empty());
+        assert_eq!(accepted[0].eligible_after_ns(), 10);
+    }
+    #[test]
+    fn detailed_proof_same_executable_and_nonleader_exec_refuse() {
+        for tid in [std::process::id(), std::process::id() + 1] {
+            let (mut engine, mut io) = fixture();
+            seed(&mut engine, &mut io);
+            exec(&io, 9, tid);
+            assert!(verify(&mut engine, &mut io).is_empty());
+        }
+    }
+    #[test]
+    fn detailed_proof_owned_initial_exec_requires_new_seed() {
+        let (_, mut io) = fixture();
+        let (mut engine, context) = Engine::retiring_loader_context(std::process::id());
+        engine.frame_work_budget_ns = 100_000_000;
+        seed(&mut engine, &mut io);
+        engine.owned_initial_exec = Some(OwnedInitialExec {
+            view: ProcessViewId(0),
+            context,
+            revalidated: true,
+        });
+        exec(&io, 9, std::process::id());
+        assert!(
+            engine.acknowledge_owned_initial_exec(ProcessViewId(0)),
+            "ordinary owned handoff is accepted independently"
+        );
+        assert!(verify(&mut engine, &mut io).is_empty());
+        io.proof.test_set_time(50);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert!(
+            !engine.trace_seeds.is_empty(),
+            "a successor requires a genuinely new sample"
+        );
+    }
+    #[test]
+    fn detailed_proof_view_id_reuse_cannot_borrow_successor() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        let id = engine.views[0].id();
+        engine.views[0] = ProcessView::open(id, std::process::id()).unwrap();
+        assert!(verify(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            io.cookie_reads.get(),
+            0,
+            "compare original allocation before borrowing successor pin"
+        );
+    }
+    #[test]
+    fn detailed_proof_view_removal_cancels_pending() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        engine.views.clear();
+        service(&mut engine, &mut io);
+        assert!(engine.trace_seeds.is_empty());
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+    #[test]
+    fn detailed_proof_terminal_ticket_never_renews() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        assert_eq!(calls(&io, 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        let mut ticket = engine.begin_trace_terminal_work(std::time::Duration::from_millis(1));
+        io.proof.test_set_time(2_000_021);
+        let before = (io.cookie_reads.get(), io.health_reads.get());
+        engine.service_trace_images(&io, &mut ticket, |_| panic!("expired proof cannot settle"));
+        let mut retry = engine.begin_trace_terminal_work(std::time::Duration::from_secs(100));
+        engine.service_trace_images(&io, &mut retry, |_| panic!("terminal allowance renewed"));
+        assert_eq!(before, (io.cookie_reads.get(), io.health_reads.get()));
+        assert_eq!(calls(&io, 30, 11, 0), 1, "ordinary reduction remains live");
+    }
+    #[test]
+    fn detailed_proof_service_deadline_is_shared_and_resumes() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        engine
+            .with_trace_frame(&mut io, |engine, io, work| {
+                let outer = engine
+                    .trace_frame_deadline_ns
+                    .expect("trace must establish existing frame deadline");
+                engine.with_live_frame(|inner| {
+                    assert_eq!(inner.frame_deadline_ns, Some(outer));
+                    Ok(())
+                })?;
+                io.proof.test_set_time(6_000_000);
+                let before = io.health_reads.get();
+                engine.service_trace_images(io, work, |_| panic!("expired ticket"));
+                assert_eq!(io.health_reads.get(), before);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(engine.frame_deadline_ns, None);
+    }
+    #[test]
+    fn detailed_proof_full_pool_skips_unneeded_health_reads() {
+        let (mut engine, mut io) = fixture();
+        let held: Vec<_> = (0..16384).map(|_| io.proof.reserve(0).unwrap()).collect();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(io.health_reads.get(), 0);
+        drop(held);
+        io.proof.test_set_time(6);
+        seed(&mut engine, &mut io);
+    }
+    #[test]
+    fn detailed_proof_transferred_labels_share_pending_budget() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        let accepted = verify(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        assert!(io.proof.usage().0 >= 1);
+        assert!(io.proof.usage().1 >= 14);
+        engine.views.clear();
+        service(&mut engine, &mut io);
+        assert_eq!(io.proof.usage(), (1, 14));
+        drop(accepted);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+    #[test]
+    fn detailed_proof_busy_head_plateaus() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        for _ in 0..16385 {
+            assert_eq!(calls(&io, 20, 11, 0), 1);
+            io.cookie.set(Some(11));
+            assert!(service(&mut engine, &mut io).is_empty());
+            assert_eq!(engine.trace_seeds.len(), 1);
+            assert_eq!(io.proof.usage(), (1, 14));
+        }
+    }
+    #[test]
+    fn detailed_proof_later_health_failure_never_heals_old_candidate() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        assert_eq!(calls(&io, 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        io.loss.set(Err(TraceProofUnknown::Unreadable));
+        assert!(service(&mut engine, &mut io).is_empty());
+        io.loss.set(Ok(0));
+        empty(&io);
+        assert!(
+            service(&mut engine, &mut io).is_empty(),
+            "a later finite baseline cannot repair old sample"
+        );
+    }
+    #[test]
+    fn detailed_proof_namespace_and_cgroup_gap_refuse() {
+        for scope in [
+            Scope::System,
+            Scope::Pid(std::process::id() + 1),
+            Scope::Cgroup {
+                id: 1,
+                path: "/unproved".into(),
+                dir: std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            },
+        ] {
+            let (mut engine, mut io) = fixture();
+            let agreeing = !matches!(&scope, Scope::System);
+            io.proof = ProofSession::test_scope(&scope, agreeing);
+            io.proof.test_set_time(6);
+            assert!(service(&mut engine, &mut io).is_empty());
+            assert!(engine.trace_seeds.is_empty());
+            assert_eq!(io.proof.usage(), (0, 0));
+            assert_eq!(
+                io.health_reads.get(),
+                0,
+                "cheap scope/namespace refusal precedes I/O"
+            );
+        }
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        assert_eq!(verify(&mut engine, &mut io).len(), 1);
+    }
+    #[test]
+    fn detailed_proof_missing_zero_and_wrong_cookie_refuse() {
+        for cookie in [None, Some(0), Some(12)] {
+            let (mut engine, mut io) = fixture();
+            seed(&mut engine, &mut io);
+            assert_eq!(calls(&io, 20, 11, 0), 1);
+            io.cookie.set(cookie);
+            assert!(service(&mut engine, &mut io).is_empty());
+            empty(&io);
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        assert_eq!(verify(&mut engine, &mut io).len(), 1);
+    }
+
+    struct Children(Vec<std::process::Child>);
+    impl Drop for Children {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    #[test]
+    fn detailed_proof_multiview_expiry_resumes_saved_seeding_phase() {
+        let (mut engine, mut io) = fixture();
+        let mut children = Children(Vec::new());
+        for id in 1..=2 {
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            engine
+                .views
+                .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
+            children.0.push(child);
+        }
+        io.expire_on_sample.set(Some(1));
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(io.samples.get(), 1);
+        assert_eq!(engine.trace_seeds.len(), 1);
+        assert_eq!(engine.trace_view_cursor, 1);
+        assert!(
+            matches!(engine.trace_phase, TracePhase::Seeding),
+            "expiry retains the next phase opportunity"
+        );
+        assert_eq!(
+            calls(&io, 20, 11, 0),
+            1,
+            "ordinary delivery proceeds after expiry"
+        );
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(engine.trace_seeds.len(), 3);
+        assert_eq!(io.samples.get(), 3);
+        assert_eq!(
+            io.health_reads.get(),
+            1,
+            "a valid baseline survives a scheduler deferral"
+        );
+    }
+    #[test]
+    fn detailed_proof_nested_and_duplicate_service_share_counters() {
+        let (mut engine, mut io) = fixture();
+        let mut leaked = None;
+        engine
+            .with_trace_frame(&mut io, |engine, io, work| {
+                let deadline = engine.frame_deadline_ns;
+                let allocation = work.clone();
+                engine.with_trace_frame(io, |inner, io, nested| {
+                    assert!(nested.same_allocation(&allocation));
+                    assert_eq!(inner.frame_deadline_ns, deadline);
+                    inner.service_trace_images(io, nested, |_| {});
+                    Ok(())
+                })?;
+                let state = work.state.as_ref().unwrap().clone();
+                assert!(state.lock().unwrap().health_attempted);
+                for _ in 0..100 {
+                    engine.service_trace_images(io, work, |_| {});
+                }
+                assert_eq!(state.lock().unwrap().visits, 0);
+                assert_eq!(io.health_reads.get(), 1);
+                while work.external_read(&io.proof).is_ok() {}
+                assert_eq!(state.lock().unwrap().reads, 0);
+                assert_eq!(work.external_read(&io.proof), Err(TraceWorkError::Deferred));
+                leaked = Some(work.clone());
+                Ok(())
+            })
+            .unwrap();
+        let before = (
+            io.samples.get(),
+            io.cookie_reads.get(),
+            io.health_reads.get(),
+        );
+        engine.service_trace_images(&io, &mut leaked.unwrap(), |_| panic!("closed ticket"));
+        assert_eq!(
+            before,
+            (
+                io.samples.get(),
+                io.cookie_reads.get(),
+                io.health_reads.get()
+            )
+        );
+    }
+    #[test]
+    fn detailed_proof_foreign_ticket_and_cancelled_scope_do_no_io() {
+        let (mut engine, mut io) = fixture();
+        let mut foreign = TraceWorkTicket::test_new(ProofSession::test_session(), 6, 5_000_006);
+        engine
+            .with_trace_frame(&mut io, |engine, io, _work| {
+                engine.service_trace_images(io, &mut foreign, |_| panic!("foreign ticket"));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                io.samples.get(),
+                io.cookie_reads.get(),
+                io.health_reads.get()
+            ),
+            (0, 0, 0)
+        );
+        engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )));
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!((io.samples.get(), io.health_reads.get()), (0, 0));
+    }
+    #[test]
+    fn detailed_proof_terminal_positive_uses_one_ticket_and_no_new_seed() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        calls(&io, 20, 11, 0);
+        io.cookie.set(Some(11));
+        let mut terminal = engine.begin_trace_terminal_work(std::time::Duration::from_secs(1));
+        let mut accepted = Vec::new();
+        engine.service_trace_images(&io, &mut terminal, |seed| accepted.push(seed));
+        assert!(accepted.is_empty());
+        empty(&io);
+        engine.service_trace_images(&io, &mut terminal, |seed| accepted.push(seed));
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(io.samples.get(), 1);
+        assert!(engine.trace_seeds.is_empty());
+        assert!(
+            terminal.same_allocation(
+                &engine.begin_trace_terminal_work(std::time::Duration::from_secs(5))
+            )
+        );
+        assert_eq!(io.health_reads.get(), 2);
+        assert_eq!(accepted[0].key().generation, 11);
+        assert_eq!(accepted[0].path(), "/owned/fixture");
+    }
+    #[test]
+    fn detailed_proof_old_receipt_is_immutable_after_finite_loss_and_reseed() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        let accepted = verify(&mut engine, &mut io);
+        let old_key = accepted[0].key();
+        let old_boundary = accepted[0].eligible_after_ns();
+        io.loss.set(Ok(1));
+        io.proof.test_set_time(100);
+        calls(&io, 120, 12, 1);
+        io.cookie.set(Some(12));
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert!(service(&mut engine, &mut io).is_empty());
+        io.proof.test_set_time(200);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(calls(&io, 220, 12, 1), 1);
+        assert!(service(&mut engine, &mut io).is_empty());
+        empty(&io);
+        let newer = service(&mut engine, &mut io);
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].key().generation, 12);
+        assert!(newer[0].eligible_after_ns() > old_boundary);
+        assert_eq!(accepted[0].key(), old_key);
+        assert_eq!(accepted[0].eligible_after_ns(), old_boundary);
+        assert_eq!(accepted[0].path(), "/owned/fixture");
+    }
+    #[test]
+    fn detailed_proof_equal_drain_and_preseed_events_remain_pending() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        assert_eq!(calls(&io, 5, 11, 0), 1);
+        assert_eq!(calls(&io, 10, 11, 0), 1);
+        io.cookie.set(Some(11));
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(io.cookie_reads.get(), 0);
+        calls(&io, 20, 11, 0);
+        assert!(service(&mut engine, &mut io).is_empty());
+        // Cookie completes at22; the health driver is later, while drain equality refuses.
+        let mut drain = DiscoveryDrain::over_domain(
+            ScriptedRecords::records([], 0),
+            io.proof.test_discovery_domain(),
+        );
+        drain
+            .attach_trace_tap(io.proof.test_discovery_tap())
+            .unwrap();
+        io.proof.test_set_time(22);
+        assert!(drain.dequeue().is_none());
+        io.proof.test_set_time(25);
+        assert!(service(&mut engine, &mut io).is_empty());
+        empty(&io);
+        let accepted = service(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].eligible_after_ns(), 10);
+    }
+    #[test]
+    fn detailed_proof_baseline_request_rechecks_capacity_before_health() {
+        let (mut engine, mut io) = fixture();
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let children = Children(vec![child]);
+        let view = ProcessView::open(ProcessViewId(1), children.0[0].id()).unwrap();
+        engine.views.insert(0, view);
+        io.proof = ProofSession::test_scope(&Scope::Pid(std::process::id()), true);
+        io.proof.test_set_time(6);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(io.health_reads.get(), 0);
+        let held: Vec<_> = (0..16384).map(|_| io.proof.reserve(0).unwrap()).collect();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            io.health_reads.get(),
+            0,
+            "a deferred baseline request cannot bypass capacity refusal"
+        );
+        drop(held);
+        for _ in 0..6 {
+            service(&mut engine, &mut io);
+            if !engine.trace_seeds.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(engine.trace_seeds.len(), 1);
+        assert_eq!(io.health_reads.get(), 1);
+    }
+    #[test]
+    fn detailed_proof_transferred_reservation_prevents_extra_admission() {
+        let (mut engine, mut io) = fixture();
+        seed(&mut engine, &mut io);
+        let accepted = verify(&mut engine, &mut io);
+        engine.views.clear();
+        service(&mut engine, &mut io);
+        assert_eq!(io.proof.usage(), (1, 14));
+        let held: Vec<_> = (0..16383).map(|_| io.proof.reserve(0).unwrap()).collect();
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), std::process::id()).unwrap());
+        let before = io.health_reads.get();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert!(engine.trace_seeds.is_empty());
+        assert_eq!(io.health_reads.get(), before);
+        assert_eq!(io.proof.usage(), (16384, 14));
+        drop(accepted);
+        service(&mut engine, &mut io);
+        assert_eq!(engine.trace_seeds.len(), 1);
+        drop(held);
+    }
+    fn changed_loss_overrun(prior: u64, changed: u64) {
+        let (mut engine, mut io) = fixture();
+        io.loss.set(Ok(prior));
+        seed(&mut engine, &mut io);
+        calls(&io, 20, 11, 0);
+        io.cookie.set(Some(11));
+        service(&mut engine, &mut io);
+        empty(&io);
+        let id = *engine.trace_seeds.keys().next().unwrap();
+        assert!(io.proof.test_health_interval().is_some());
+        let epoch = io.proof.test_epoch();
+        io.loss.set(Ok(changed));
+        io.expire_health.set(true);
+        engine
+            .with_trace_frame(&mut io, |_engine, io, work| {
+                assert_eq!(io.refresh_health(work), Err(TraceWorkError::Deferred));
+                assert_eq!(work.external_read(&io.proof), Err(TraceWorkError::Deferred));
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            io.proof.test_epoch() > epoch,
+            "an observed finite change must invalidate even after the read overruns"
+        );
+        assert_eq!(
+            io.proof.test_health_interval(),
+            None,
+            "overrun cannot publish a successful health horizon"
+        );
+        assert_eq!(
+            io.proof.test_problem(id),
+            Some(TraceProofUnknown::LifecycleLoss)
+        );
+        io.expire_health.set(false);
+        io.loss.set(Ok(prior));
+        engine
+            .with_trace_frame(&mut io, |_engine, io, work| {
+                let _ = io.refresh_health(work);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            io.proof.test_problem(id),
+            Some(TraceProofUnknown::LifecycleLoss),
+            "returning to the old finite baseline never heals the old sample"
+        );
+        engine.drop_trace_seed(id);
+        for _ in 0..8 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(
+            engine.trace_seeds.len(),
+            1,
+            "a fresh post-loss sample may be admitted"
+        );
+        calls(&io, io.proof.test_time() + 1, 11, 0);
+        let mut accepted = Vec::new();
+        for _ in 0..8 {
+            empty(&io);
+            accepted.extend(service(&mut engine, &mut io));
+            if !accepted.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(accepted.len(), 1, "fresh post-loss proof can settle");
+    }
+    #[test]
+    fn detailed_proof_fix_finite_loss_increase_after_read_expiry() {
+        changed_loss_overrun(0, 1);
+    }
+    #[test]
+    fn detailed_proof_fix_finite_loss_regression_after_read_expiry() {
+        changed_loss_overrun(1, 0);
+    }
+    fn trace_batch(engine: &mut Engine, required_rejection: bool) -> DiscoveryBatchOutcome {
+        let mut record = exec_record_for(4_000_001);
+        if required_rejection {
+            record.kind = u8::MAX;
+        }
+        let mut session = ScriptedSession::default();
+        let mut collect = |_session: &mut dyn EngineSession| Ok((Vec::new(), 0));
+        let deadline = crate::attach::monotonic_ns().unwrap() + 500_000_000;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                vec![record],
+                0,
+                true,
+                false,
+                &mut collect,
+                Some(deadline),
+            )
+            .unwrap()
+    }
+    #[test]
+    fn detailed_proof_fix_expired_trace_frame_cannot_false_complete_pause_batch() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let (_, mut io) = fixture();
+        engine.frame_work_budget_ns = 0;
+        engine
+            .with_trace_frame(&mut io, |engine, _io, _work| {
+                engine.set_pause_owned_batch(true);
+                let outcome = trace_batch(engine, true);
+                engine.set_pause_owned_batch(false);
+                assert!(
+                    !outcome.required_complete,
+                    "a rejected required record cannot be queued while the pause reports complete"
+                );
+                assert!(
+                    engine.pending_discovery_records.is_empty(),
+                    "pause dispatch is independent of the expired outer live frame"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(engine.frame_deadline_ns, None);
+    }
+    #[test]
+    fn detailed_proof_fix_pause_applies_accepted_record_after_trace_expiry() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let (_, mut io) = fixture();
+        engine.frame_work_budget_ns = 0;
+        engine
+            .with_trace_frame(&mut io, |engine, _io, _work| {
+                let outcome = trace_batch(engine, false);
+                assert!(outcome.required_complete);
+                assert!(
+                    engine.pending_discovery_records.is_empty(),
+                    "accepted required work is dispatched inside the valid pause deadline"
+                );
+                assert!(!engine.frame_deferred);
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn detailed_proof_fix_live_batch_inherits_expired_trace_deadline_and_restores_pause() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let (_, mut io) = fixture();
+        engine.frame_work_budget_ns = 0;
+        engine.with_trace_frame(&mut io, |engine, io, work| {
+            let deadline = Some(work.state.as_ref().unwrap().lock().unwrap().deadline);
+            engine.with_trace_frame(io, |engine, _io, _nested| {
+                engine.with_live_frame(|engine| {
+                    assert_eq!(engine.frame_deadline_ns, deadline);
+                    assert!(trace_batch(engine, true).required_complete);
+                    assert_eq!(engine.pending_discovery_records.len(), 1);
+                    Err::<(), _>(anyhow::anyhow!("scope restoration fixture"))
+                }).unwrap_err();
+                assert!(!trace_batch(engine, true).required_complete,
+                    "after leaving live scope the real pause batch must dispatch its required work");
+                assert!(engine.pending_discovery_records.is_empty());
+                Ok(())
+            })
+        }).unwrap();
+        assert_eq!(engine.frame_deadline_ns, None);
+        assert!(!engine.frame_deferred);
+    }
+    fn add_child_view(engine: &mut Engine, id: u32) -> Children {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
+        Children(vec![child])
+    }
+    #[test]
+    fn detailed_proof_fix_persistent_partial_sample_serves_other_view_and_phases() {
+        let (mut engine, mut io) = fixture();
+        let children = add_child_view(&mut engine, 1);
+        let good_pid = children.0[0].id();
+        io.slow_sample.set(Some(ProcessViewId(0)));
+        for _ in 0..16 {
+            service(&mut engine, &mut io);
+            assert_eq!(
+                io.proof.usage().1,
+                engine.trace_seeds.len() * 14,
+                "every partial sample frees its entire charged scratch"
+            );
+            assert!(!engine.trace_by_view.contains_key(&ProcessViewId(0)));
+        }
+        assert!(
+            engine.trace_by_view.contains_key(&ProcessViewId(1)),
+            "persistent mid-read deferral cannot pin the first sampling slot"
+        );
+        calls_pid(&io, good_pid, io.proof.test_time() + 1, 11, 0);
+        io.cookie.set(Some(11));
+        let mut accepted = Vec::new();
+        for _ in 0..24 {
+            empty(&io);
+            accepted.extend(service(&mut engine, &mut io));
+            if !accepted.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            accepted.len(),
+            1,
+            "arming, later health and settlement remain fair"
+        );
+        assert_eq!(accepted[0].key().pid, good_pid);
+        assert!(!engine.trace_by_view.contains_key(&ProcessViewId(0)));
+        io.slow_sample.set(None);
+        for _ in 0..16 {
+            service(&mut engine, &mut io);
+        }
+        assert!(
+            engine.trace_by_view.contains_key(&ProcessViewId(0)),
+            "a deferred view gets a later complete retry"
+        );
+        assert!(io.proof.usage().0 <= 16384 && io.proof.usage().1 <= 8 * 1024 * 1024);
+    }
+    #[test]
+    fn detailed_proof_fix_persistent_cookie_deferral_serves_other_candidate() {
+        let (mut engine, mut io) = fixture();
+        let children = add_child_view(&mut engine, 1);
+        let good_pid = children.0[0].id();
+        for _ in 0..4 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(engine.trace_seeds.len(), 2);
+        calls(&io, io.proof.test_time() + 1, 11, 0);
+        calls_pid(&io, good_pid, io.proof.test_time() + 1, 11, 0);
+        io.cookie.set(Some(11));
+        io.slow_cookie_pid.set(Some(std::process::id()));
+        let mut accepted = Vec::new();
+        for _ in 0..24 {
+            empty(&io);
+            accepted.extend(service(&mut engine, &mut io));
+            if !accepted.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            accepted.len(),
+            1,
+            "an original-pin cookie read that always overruns cannot starve a healthy candidate"
+        );
+        assert_eq!(accepted[0].key().pid, good_pid);
+        assert!(engine.trace_by_view.contains_key(&ProcessViewId(0)));
+        io.slow_cookie_pid.set(None);
+        for _ in 0..16 {
+            empty(&io);
+            accepted.extend(service(&mut engine, &mut io));
+            if accepted.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            accepted.len(),
+            2,
+            "the partial confirmation candidate is retained for retry"
+        );
+        assert!(io.proof.usage().0 <= 16384 && io.proof.usage().1 <= 8 * 1024 * 1024);
+    }
+}

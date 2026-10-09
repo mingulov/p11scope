@@ -38,6 +38,8 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub(crate) mod detailed_identity;
+
 // I3 will consume this preparation capability; I2b installs no callers or links.
 #[allow(dead_code)]
 mod inventory;
@@ -1199,6 +1201,8 @@ pub struct Session {
     /// metrics-mode sessions (which never drain) free of reader setup.
     events_consumer: Option<events::OwnedDrain>,
     discovery_domain: events::DiscoveryDomain,
+    trace_coverage: Option<detailed_identity::TraceCoverage>,
+    trace_proof: Option<detailed_identity::ProofSession>,
     /// One cursor over DISCOVERY for all dequeues. The owned mapping is
     /// created lazily and then lives until this Session is dropped.
     discovery_consumer: Option<events::OwnedDiscoveryDrain>,
@@ -3231,6 +3235,8 @@ impl Session {
         // (ordering I1). A failure refuses instance routing, not capture.
         // Metrics sessions skip the hooks (Task 1d overhead gate): they
         // never join per-call records, so their slots stay unmapped.
+        let trace_coverage =
+            detailed_identity::TraceCoverage::after_activation(scope, monotonic_ns());
         let instance = InstanceTracking::start(&mut ebpf, &btf, policy);
 
         Ok(Self {
@@ -3239,6 +3245,8 @@ impl Session {
             events_domain,
             events_consumer: None,
             discovery_domain,
+            trace_coverage,
+            trace_proof: None,
             discovery_consumer: None,
             discovery_staged: DiscoveryStage::default(),
             root_seed,
@@ -4044,6 +4052,8 @@ impl Session {
         if self.events_consumer.is_none() {
             let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
             self.events_consumer = Some(consumer);
+            self.wire_trace_consumers()
+                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
         }
         self.events_consumer
             .as_mut()
@@ -4099,6 +4109,8 @@ impl Session {
             let consumer =
                 events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
             self.discovery_consumer = Some(consumer);
+            self.wire_trace_consumers()
+                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
         }
         Ok(self
             .discovery_consumer
@@ -4111,6 +4123,8 @@ impl Session {
         if self.events_consumer.is_none() {
             let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
             self.events_consumer = Some(consumer);
+            self.wire_trace_consumers()
+                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
         }
         Ok(())
     }
@@ -4120,6 +4134,8 @@ impl Session {
             let consumer =
                 events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
             self.discovery_consumer = Some(consumer);
+            self.wire_trace_consumers()
+                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
         }
         Ok(())
     }

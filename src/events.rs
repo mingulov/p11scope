@@ -37,6 +37,9 @@ impl EventsDomain {
             .context("retaining EVENTS map descriptor")?;
         Ok(Self(Arc::new(RetainedEvents { id, _fd: fd })))
     }
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub(crate) fn id(&self) -> u64 {
         self.0.id.get()
     }
@@ -63,8 +66,21 @@ impl DiscoveryDomain {
             .context("retaining DISCOVERY map descriptor")?;
         Ok(Self(Arc::new(RetainedDiscovery { id, _fd: fd })))
     }
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub(crate) fn id(&self) -> u64 {
         self.0.id.get()
+    }
+}
+
+#[cfg(test)]
+impl DiscoveryDomain {
+    pub(crate) fn test_standin(id: u64) -> Self {
+        Self(Arc::new(RetainedDiscovery {
+            id: NonZeroU64::new(id).unwrap(),
+            _fd: std::fs::File::open("/dev/null").unwrap().into(),
+        }))
     }
 }
 
@@ -386,8 +402,18 @@ impl<S: RecordSource> EventDrain<S> {
                 let progress = match self.source.bounded_record(p.producer)? {
                     BoundedRecord::Item(item) => {
                         match decode(&item) {
-                            Some(event) => reduce(event)?,
-                            None => self.malformed += 1,
+                            Some(event) => {
+                                if let Some(tap) = &self.trace_tap {
+                                    tap.observe_call(&event);
+                                }
+                                reduce(event)?;
+                            }
+                            None => {
+                                self.malformed += 1;
+                                if let Some(tap) = &self.trace_tap {
+                                    tap.observe_failure();
+                                }
+                            }
                         }
                         drop(item);
                         RootTailProgress::Yielded
@@ -423,6 +449,9 @@ impl<S: RecordSource> EventDrain<S> {
         })();
         if result.is_err() {
             tail.failed = true;
+            if let Some(tap) = &self.trace_tap {
+                tap.observe_failure();
+            }
         }
         result.context("root_tail_incomplete: bounded reduction")
     }
@@ -435,6 +464,7 @@ pub struct EventDrain<S> {
     malformed: u64,
     malformed_reported: u64,
     domain: Option<EventsDomain>,
+    trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
 }
 
 impl OwnedDrain {
@@ -468,11 +498,26 @@ impl OwnedDrain {
             malformed: 0,
             malformed_reported: 0,
             domain: Some(domain.clone()),
+            trace_tap: None,
         })
     }
 }
 
 impl<S: RecordSource> EventDrain<S> {
+    pub(crate) fn attach_trace_tap(
+        &mut self,
+        tap: crate::attach::detailed_identity::ProofTap,
+    ) -> Result<(), crate::attach::detailed_identity::TraceProofUnknown> {
+        if !self
+            .domain
+            .as_ref()
+            .is_some_and(|domain| tap.matches_events(domain))
+        {
+            return Err(crate::attach::detailed_identity::TraceProofUnknown::DomainMismatch);
+        }
+        self.trace_tap = Some(tap);
+        Ok(())
+    }
     #[cfg(test)]
     pub(crate) fn over(source: S) -> Self {
         Self {
@@ -480,6 +525,7 @@ impl<S: RecordSource> EventDrain<S> {
             malformed: 0,
             malformed_reported: 0,
             domain: None,
+            trace_tap: None,
         }
     }
 
@@ -495,6 +541,7 @@ impl<S: RecordSource> EventDrain<S> {
             malformed: 0,
             malformed_reported: 0,
             domain: Some(domain),
+            trace_tap: None,
         }
     }
     #[cfg(test)]
@@ -533,11 +580,19 @@ impl<S: RecordSource> EventDrain<S> {
             }
             match decode(&item) {
                 Some(event) => {
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_call(&event);
+                    }
                     if f(event).is_break() {
                         return true;
                     }
                 }
-                None => self.malformed = self.malformed.saturating_add(1),
+                None => {
+                    self.malformed = self.malformed.saturating_add(1);
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_failure();
+                    }
+                }
             }
         }
     }
@@ -564,11 +619,19 @@ impl<S: RecordSource> EventDrain<S> {
             }
             match decode_record(&item) {
                 Some(record) => {
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_call(&record.event);
+                    }
                     if f(record).is_break() {
                         return true;
                     }
                 }
-                None => self.malformed = self.malformed.saturating_add(1),
+                None => {
+                    self.malformed = self.malformed.saturating_add(1);
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_failure();
+                    }
+                }
             }
         }
     }
@@ -639,7 +702,12 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
                 BoundedRecord::Reached => BoundedRecord::Reached,
                 BoundedRecord::Pending => BoundedRecord::Pending,
             },
-            Err(error) => return Ok((map_bounded_error(error)?, false)),
+            Err(error) => {
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_failure();
+                }
+                return Ok((map_bounded_error(error)?, false));
+            }
         };
         match record {
             BoundedRecord::Item(event) => {
@@ -648,11 +716,19 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
                 }
                 match event {
                     Some(event) => {
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_call(&event);
+                        }
                         if f(event).is_break() {
                             return Ok((false, true));
                         }
                     }
-                    None => drain.malformed = drain.malformed.saturating_add(1),
+                    None => {
+                        drain.malformed = drain.malformed.saturating_add(1);
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_failure();
+                        }
+                    }
                 }
             }
             BoundedRecord::Reached => {
@@ -795,6 +871,7 @@ pub(crate) type OwnedDiscoveryDrain = DiscoveryDrain<aya::maps::RingBuf<MapData>
 pub(crate) struct DiscoveryDrain<S> {
     source: S,
     _domain: Option<DiscoveryDomain>,
+    trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
 }
 
 impl OwnedDiscoveryDrain {
@@ -819,16 +896,41 @@ impl OwnedDiscoveryDrain {
         Ok(Self {
             source: ring,
             _domain: Some(domain.clone()),
+            trace_tap: None,
         })
     }
 }
 
 impl<S: RecordSource> DiscoveryDrain<S> {
+    pub(crate) fn attach_trace_tap(
+        &mut self,
+        tap: crate::attach::detailed_identity::ProofTap,
+    ) -> Result<(), crate::attach::detailed_identity::TraceProofUnknown> {
+        if !self
+            ._domain
+            .as_ref()
+            .is_some_and(|domain| tap.matches_discovery(domain))
+        {
+            return Err(crate::attach::detailed_identity::TraceProofUnknown::DomainMismatch);
+        }
+        self.trace_tap = Some(tap);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn over_domain(source: S, domain: DiscoveryDomain) -> Self {
+        Self {
+            source,
+            _domain: Some(domain),
+            trace_tap: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn over(source: S) -> Self {
         Self {
             source,
             _domain: None,
+            trace_tap: None,
         }
     }
 
@@ -842,12 +944,29 @@ impl<S: RecordSource> DiscoveryDrain<S> {
         self._domain.as_ref().map_or(0, DiscoveryDomain::id)
     }
 
-    pub(crate) fn dequeue(&mut self) -> Option<DiscoveryItem> {
-        let item = self.source.next_record()?;
-        match decode_discovery(&item) {
-            Some(record) => Some(DiscoveryItem::Record(record)),
-            None => Some(DiscoveryItem::Malformed),
+    pub(crate) fn dequeue(&mut self) -> Option<DiscoveryItem>
+    where
+        S: BoundedRecordSource,
+    {
+        let started = self.trace_tap.as_ref().and_then(|tap| tap.read_started());
+        let decoded = self
+            .source
+            .next_record()
+            .map(|item| match decode_discovery(&item) {
+                Some(record) => DiscoveryItem::Record(record),
+                None => DiscoveryItem::Malformed,
+            });
+        if let Some(tap) = &self.trace_tap {
+            match &decoded {
+                Some(DiscoveryItem::Record(record)) => tap.observe_discovery(record),
+                Some(DiscoveryItem::Malformed) => tap.observe_failure(),
+                None => {
+                    let positions = self.source.positions();
+                    tap.observe_empty(started, positions.producer == positions.consumer);
+                }
+            }
         }
+        decoded
     }
 }
 
@@ -895,6 +1014,7 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
         // Decode to an owned item first: matching the borrowed item
         // directly keeps the source borrow alive across the match,
         // blocking the post-Reached positions read below.
+        let started = drain.trace_tap.as_ref().and_then(|tap| tap.read_started());
         let record: BoundedRecord<DiscoveryItem> = match drain.source.bounded_record(stop) {
             Ok(bounded) => match bounded {
                 BoundedRecord::Item(item) => BoundedRecord::Item(match decode_discovery(&item) {
@@ -904,19 +1024,37 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
                 BoundedRecord::Reached => BoundedRecord::Reached,
                 BoundedRecord::Pending => BoundedRecord::Pending,
             },
-            Err(error) => return Ok((map_bounded_error(error)?, false)),
+            Err(error) => {
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_failure();
+                }
+                return Ok((map_bounded_error(error)?, false));
+            }
         };
         match record {
             BoundedRecord::Item(item) => {
                 if let Some(left) = left.as_mut() {
                     *left -= 1;
                 }
+                if let Some(tap) = &drain.trace_tap {
+                    match &item {
+                        DiscoveryItem::Record(record) => tap.observe_discovery(record),
+                        DiscoveryItem::Malformed => tap.observe_failure(),
+                    }
+                }
                 if f(item).is_break() {
                     return Ok((false, true));
                 }
             }
             BoundedRecord::Reached => {
-                let post_q_record = drain.source.positions().producer != stop;
+                let positions = drain.source.positions();
+                let post_q_record = positions.producer != stop;
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_empty(
+                        started,
+                        !post_q_record && positions.producer == positions.consumer,
+                    );
+                }
                 return Ok((post_q_record, false));
             }
             BoundedRecord::Pending => {
@@ -927,6 +1065,9 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
                 // boundary is reached and clean.
                 let consumer = drain.source.consumer();
                 if consumer != stop {
+                    if let Some(tap) = &drain.trace_tap {
+                        tap.observe_failure();
+                    }
                     return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
                 }
                 return Ok((false, false));
@@ -1007,7 +1148,8 @@ mod tests {
             weak.upgrade().is_some(),
             "State retains the map after Tracker and Session"
         );
-        assert!(peer.write(&[1]).is_ok());
+        let written = peer.write(&[1]);
+        assert!(written.is_ok(), "retained socket write: {written:?}");
         drop(state);
         assert!(weak.upgrade().is_none());
         // Closing the last descriptor is visible at its actual peer.
@@ -1089,6 +1231,7 @@ mod tests {
     /// snapshots it, and the terminal poll observes it — exactly the
     /// one-cursor sequence the retained production consumer must keep.
     struct CursorScript {
+        positions_reads: std::cell::Cell<usize>,
         cursor: std::rc::Rc<std::cell::Cell<usize>>,
         producer: usize,
         capacity: usize,
@@ -1117,6 +1260,7 @@ mod tests {
         fn scripted(records: impl IntoIterator<Item = Vec<u8>>) -> Self {
             let queue: std::collections::VecDeque<_> = records.into_iter().collect();
             Self {
+                positions_reads: std::cell::Cell::new(0),
                 cursor: std::rc::Rc::new(std::cell::Cell::new(0)),
                 producer: queue.len() * 8,
                 capacity: 4096,
@@ -1140,6 +1284,7 @@ mod tests {
 
     impl BoundedRecordSource for CursorScript {
         fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+            self.positions_reads.set(self.positions_reads.get() + 1);
             aya::maps::ring_buf::RingBufPositions {
                 consumer: self.cursor.get(),
                 producer: self.producer,
@@ -1432,6 +1577,276 @@ mod tests {
         assert!(decode(&[]).is_none());
     }
 
+    use crate::attach::detailed_identity::{ProofSession, TraceProofUnknown};
+    use p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+    use std::time::{Duration, Instant};
+    fn proof_call(pid: u32, ts: u64, cookie: u64, exec: u64) -> Event {
+        Event {
+            pid_tgid: u64::from(pid) << 32,
+            ts_ns: ts,
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: cookie,
+                exec_id: exec,
+            },
+            ..Event::default()
+        }
+    }
+    fn proof_lifecycle(pid: u32, ts: u64, kind: u8) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.pid_tgid = u64::from(pid) << 32;
+        record.hook_ts_ns = ts;
+        record.kind = kind;
+        record
+    }
+    // Preparation only: intended insertion into leased events.rs after shared core RED.
+    // Every test calls retained production decoder entrypoints; pure decode cannot witness.
+    #[test]
+    fn detailed_proof_all_event_decoders_stamp_witness() {
+        for route in 0..4 {
+            let proof = ProofSession::test_session();
+            let pending = proof.test_pending(7, 9, 10);
+            let event = proof_call(7, 20, 11, 0);
+            let mut drain = EventDrain::over_domain(
+                ScriptedRecords::events([event], 1),
+                proof.test_events_domain(),
+            );
+            drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            let mut seen = 0;
+            match route {
+                0 => {
+                    drain.poll(Some(2), |_| {
+                        seen += 1;
+                        ControlFlow::Continue(())
+                    });
+                }
+                1 => {
+                    drain.poll_records(Some(2), |_| {
+                        seen += 1;
+                        ControlFlow::Continue(())
+                    });
+                }
+                2 => {
+                    poll_events_to_position(&mut drain, 8, Some(2), |_| {
+                        seen += 1;
+                        ControlFlow::Continue(())
+                    })
+                    .unwrap();
+                }
+                _ => {
+                    let mut tail = OwnedRootTail::new(
+                        crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
+                        Instant::now() + Duration::from_secs(1),
+                    );
+                    drain.begin_root_tail(&mut tail).unwrap();
+                    drain
+                        .poll_root_tail(&mut tail, 2, |_| {
+                            seen += 1;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }
+            assert_eq!(seen, 1);
+            assert_eq!(proof.test_witness(pending.id()), Some((11, 0, 20)));
+        }
+    }
+
+    #[test]
+    fn detailed_proof_busy_head_is_not_empty() {
+        let proof = ProofSession::test_session();
+        let _pending = proof.test_pending(7, 9, 10);
+        let mut source = CursorScript::scripted([]);
+        source.producer = 8;
+        let mut drain = DiscoveryDrain::over_domain(source, proof.test_discovery_domain());
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        assert!(drain.dequeue().is_none());
+        assert!(discovery_head_pending(&drain));
+        assert_eq!(proof.test_horizon(), None);
+        drain.source.producer = 0;
+        assert!(drain.dequeue().is_none());
+        assert_eq!(proof.test_horizon(), Some(100));
+    }
+
+    #[test]
+    fn detailed_proof_quantum_and_q_boundary_do_not_grant_horizon() {
+        for post_q in [false, true] {
+            let proof = ProofSession::test_session();
+            let _pending = proof.test_pending(7, 9, 10);
+            let record = proof_lifecycle(8, 20, DISCOVERY_KIND_EXEC);
+            let mut drain = DiscoveryDrain::over_domain(
+                CursorScript::scripted([discovery_bytes(&record)]),
+                proof.test_discovery_domain(),
+            );
+            drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+            assert_eq!(
+                poll_discovery_to_position(&mut drain, 8, Some(1), |_| ControlFlow::Continue(()))
+                    .unwrap(),
+                (false, true)
+            );
+            assert_eq!(proof.test_horizon(), None);
+            if post_q {
+                drain.source.producer = 16;
+            }
+            assert_eq!(
+                poll_discovery_to_position(&mut drain, 8, Some(1), |_| ControlFlow::Continue(()))
+                    .unwrap(),
+                (post_q, false)
+            );
+            assert_eq!(proof.test_horizon(), if post_q { None } else { Some(100) });
+        }
+    }
+
+    #[test]
+    fn detailed_proof_quiesce_direct_dequeue_invalidates() {
+        let proof = ProofSession::test_session();
+        let pending = proof.test_pending(7, 9, 10);
+        let record = proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC);
+        let mut drain = DiscoveryDrain::over_domain(
+            ScriptedRecords::records([discovery_bytes(&record)], 1),
+            proof.test_discovery_domain(),
+        );
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Record(_))));
+        assert_eq!(
+            proof.test_problem(pending.id()),
+            Some(TraceProofUnknown::ExecChanged)
+        );
+        assert!(drain.dequeue().is_none());
+        assert_eq!(proof.test_horizon(), Some(100));
+    }
+
+    #[test]
+    fn detailed_proof_stage_and_replay_observe_lifecycle_once() {
+        let proof = ProofSession::test_session();
+        let _pending = proof.test_pending(7, 9, 10);
+        let mut drain = DiscoveryDrain::over_domain(
+            ScriptedRecords::records([vec![0]], 1),
+            proof.test_discovery_domain(),
+        );
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        let mut fifo = ProofSession::test_stage_once(&mut drain);
+        assert_eq!(proof.test_epoch(), 1);
+        assert!(matches!(fifo.pop(), Some(DiscoveryItem::Malformed)));
+        assert_eq!(
+            proof.test_epoch(),
+            1,
+            "replay cannot apply malformed loss twice"
+        );
+        assert!(drain.dequeue().is_none());
+        assert_eq!(proof.test_horizon(), Some(100));
+    }
+
+    #[test]
+    fn detailed_proof_disabled_tap_has_no_extra_operations() {
+        let source = CursorScript::scripted([event_bytes(&Event::default())]);
+        let cursor = source.cursor.clone();
+        let mut drain = EventDrain::over(source);
+        let mut seen = 0;
+        drain.poll(Some(2), |_| {
+            assert_eq!(cursor.get(), 0);
+            seen += 1;
+            ControlFlow::Continue(())
+        });
+        assert_eq!(seen, 1);
+        assert_eq!(drain.malformed(), 0);
+        // A counting proof clock/source is never installed and performs zero new operations.
+    }
+    #[test]
+    fn detailed_proof_enabled_root_tail_preserves_callback_cursor_and_error() {
+        for failed_clock in [false, true] {
+            let proof = ProofSession::test_session();
+            let pending = proof.test_pending(7, 9, 10);
+            if failed_clock {
+                proof.test_set_time(u64::MAX);
+            }
+            let source = CursorScript::scripted([event_bytes(&proof_call(7, 20, 11, 0))]);
+            let cursor = source.cursor.clone();
+            let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+            drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            let mut tail = OwnedRootTail::new(
+                crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
+                Instant::now() + Duration::from_secs(1),
+            );
+            drain.begin_root_tail(&mut tail).unwrap();
+            assert!(
+                drain
+                    .poll_root_tail(&mut tail, 1, |_| {
+                        assert_eq!(cursor.get(), 0);
+                        anyhow::bail!("ordinary callback error")
+                    })
+                    .is_err()
+            );
+            assert_eq!(cursor.get(), 8);
+            assert_eq!(proof.test_horizon(), None);
+            assert_eq!(
+                proof.test_problem(pending.id()),
+                Some(TraceProofUnknown::LifecycleLoss)
+            );
+        }
+    }
+    #[test]
+    fn detailed_proof_disabled_discovery_does_no_new_clock_or_positions() {
+        let proof = ProofSession::test_session();
+        let before = proof.test_clock_calls();
+        let mut drain = DiscoveryDrain::over(CursorScript::scripted([vec![0]]));
+        assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Malformed)));
+        assert!(drain.dequeue().is_none());
+        assert_eq!(proof.test_clock_calls(), before);
+        assert_eq!(drain.source.positions_reads.get(), 0);
+        let mut enabled = DiscoveryDrain::over_domain(
+            CursorScript::scripted([vec![0]]),
+            proof.test_discovery_domain(),
+        );
+        enabled
+            .attach_trace_tap(proof.test_discovery_tap())
+            .unwrap();
+        assert!(matches!(enabled.dequeue(), Some(DiscoveryItem::Malformed)));
+        assert!(enabled.dequeue().is_none());
+        assert_eq!(proof.test_clock_calls(), before + 2);
+        assert_eq!(enabled.source.positions_reads.get(), 1);
+    }
+    #[test]
+    fn detailed_proof_bounded_discovery_break_and_busy_never_complete() {
+        let proof = ProofSession::test_session();
+        let seed = proof.test_pending(7, 9, 10);
+        let mut drain = DiscoveryDrain::over_domain(
+            CursorScript::scripted([discovery_bytes(&proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC))]),
+            proof.test_discovery_domain(),
+        );
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        let mut callbacks = 0;
+        assert_eq!(
+            poll_discovery_to_position(&mut drain, 8, None, |_| {
+                callbacks += 1;
+                assert_eq!(
+                    proof.test_problem(seed.id()),
+                    Some(TraceProofUnknown::ExecChanged)
+                );
+                ControlFlow::Break(())
+            })
+            .unwrap(),
+            (false, true)
+        );
+        assert_eq!(callbacks, 1);
+        assert_eq!(proof.test_horizon(), None);
+        assert_eq!(
+            poll_discovery_to_position(&mut drain, 8, None, |_| panic!("already consumed"))
+                .unwrap(),
+            (false, false)
+        );
+        assert_eq!(proof.test_horizon(), Some(100));
+        let other = ProofSession::test_session();
+        let _seed = other.test_pending(7, 9, 10);
+        let mut source = CursorScript::scripted([]);
+        source.producer = 8;
+        let mut busy = DiscoveryDrain::over_domain(source, other.test_discovery_domain());
+        busy.attach_trace_tap(other.test_discovery_tap()).unwrap();
+        assert!(
+            poll_discovery_to_position(&mut busy, 8, None, |_| panic!("reserved head")).is_err()
+        );
+        assert_eq!(other.test_horizon(), None);
+        assert_eq!(other.test_epoch(), 1);
+    }
     fn discovery_bytes(record: &DiscoveryRecord) -> Vec<u8> {
         // SAFETY: the shared repr(C) record is transported as these exact raw
         // bytes by the kernel ring buffer.

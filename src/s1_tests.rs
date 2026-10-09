@@ -19,6 +19,10 @@ use p11scope_ebpf_common::{SESSION_NONE, capture};
 use pkcs11_types::CkRv;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[path = "s1_tests/resource_probe.rs"]
+mod resource_probe;
+
 const AES_GCM: u64 = 0x1087;
 const RSA_PSS: u64 = 0x000d;
 const ECDSA: u64 = 0x1041;

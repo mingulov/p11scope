@@ -321,6 +321,71 @@ impl std::fmt::Debug for EdgeSemantics {
     }
 }
 
+/// Counts of owned S1 state. B-tree nodes have no public capacity accessor;
+/// their actual allocation costs are measured by the isolated host probe.
+/// These counts contain no handles, function names, or return-code values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct S1Occupancy {
+    pub open_bindings: usize,
+    pub active_machines: usize,
+    pub pending_calls: usize,
+    pub detached_calls: usize,
+    pub mechanisms: usize,
+    pub operation_categories: usize,
+    pub provenance_functions: usize,
+    pub provenance_function_bytes: usize,
+    pub provenance_function_capacity_bytes: usize,
+    pub provenance_returns: usize,
+    pub async_function_bytes: usize,
+    pub async_function_capacity_bytes: usize,
+    pub origin_vectors: usize,
+    pub origin_elements: usize,
+    pub origin_capacity_elements: usize,
+}
+
+impl EdgeSemantics {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 4 measurement precedes aggregate admission")
+    )]
+    pub(crate) fn resource_usage(&self) -> S1Occupancy {
+        let mut usage = S1Occupancy {
+            open_bindings: self.open.len(),
+            active_machines: self.active.len(),
+            pending_calls: self.pending.len(),
+            detached_calls: self.detached.len(),
+            mechanisms: self.mechs.len(),
+            ..S1Occupancy::default()
+        };
+        for stat in self.mechs.values() {
+            usage.operation_categories += stat.ops.len();
+            usage.provenance_functions += stat.functions.len();
+            usage.provenance_returns += stat.returns.len();
+            for function in &stat.functions {
+                usage.provenance_function_bytes += function.len();
+                usage.provenance_function_capacity_bytes += function.capacity();
+            }
+        }
+        for (call, origin) in self
+            .pending
+            .values()
+            .map(|p| (&p.call, &p.origin))
+            .chain(self.detached.values().map(|id| (&id.call, &id.origin)))
+        {
+            usage.async_function_bytes += call.function.len();
+            usage.async_function_capacity_bytes += call.function.capacity();
+            usage.origin_vectors += 1;
+            usage.origin_elements += origin.bits.len();
+            usage.origin_capacity_elements += origin.bits.capacity();
+        }
+        usage
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+#[path = "semantics_edge/resource_tests.rs"]
+pub(crate) mod resource_tests;
+
 /// Published per-edge semantic labels. `observed` iff the edge holds
 /// at least one mechanism or operation claim AND no double-load
 /// detection stands; otherwise the reason no claim exists — or the

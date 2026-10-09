@@ -37,6 +37,19 @@ fn run(args: &[&str]) -> Outcome {
     }
 }
 
+fn assert_scoped_hint(stderr: &str, command: &str) {
+    let hint = match command {
+        "profile" => "Try 'p11scope profile --help'.",
+        "trace" => "Try 'p11scope trace --help'.",
+        "run" => "Try 'p11scope run --help'.",
+        "inspect" => "Try 'p11scope inspect --help'.",
+        "doctor" => "Try 'p11scope doctor --help'.",
+        "inventory" => "Try 'p11scope inventory --help'.",
+        other => panic!("no scoped-help contract for {other}"),
+    };
+    assert_eq!(stderr.lines().last(), Some(hint), "{stderr}");
+}
+
 /// Whether this host and these privileges allow the capture lane at all —
 /// asked with the observer's own doctor rather than a second copy of the rule.
 fn capture_available() -> bool {
@@ -105,8 +118,7 @@ fn b2_subcommand_help_is_scoped_to_that_subcommand() {
     for subcommand in ["profile", "trace", "run", "inspect", "doctor"] {
         let scoped = run(&[subcommand, "--help"]);
         assert_eq!(scoped.code, Some(0), "{subcommand} --help");
-        // F1 fixed (Task 2): scoped help carries only that subcommand's
-        // section plus the shared notes footer — never another subcommand.
+        // Scoped help has one usage section plus command-specific guidance.
         assert!(
             scoped.stderr.is_empty(),
             "{subcommand} --help: {:?}",
@@ -128,11 +140,25 @@ fn b2_subcommand_help_is_scoped_to_that_subcommand() {
             }
         }
         assert_ne!(scoped.stdout, global.stdout, "{subcommand} --help");
-        assert!(
-            scoped.stdout.contains("notes: discovery scans"),
-            "{subcommand} --help: {}",
-            scoped.stdout
-        );
+        if subcommand == "doctor" {
+            for guidance in [
+                "Check host and requested-target capability before capture.",
+                "Without --pid or --cgroup, target readiness is unassessed.",
+                "--extra-strict also treats warnings as failure",
+            ] {
+                assert!(
+                    scoped.stdout.contains(guidance),
+                    "{subcommand} --help missing {guidance:?}: {}",
+                    scoped.stdout
+                );
+            }
+        } else {
+            assert!(
+                scoped.stdout.contains("notes: discovery scans"),
+                "{subcommand} --help: {}",
+                scoped.stdout
+            );
+        }
     }
 }
 
@@ -419,7 +445,7 @@ fn j4_bad_flag_values_name_flag_exit_2() {
             "{flag} {value}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{flag} {value}");
+        assert_scoped_hint(&usage.stderr, "profile");
     }
     // F5 fixed (Task 3): like --ring-bytes (whose error line prints its
     // 4K..64M range) and --pause, the --mode error line lists its valid
@@ -960,7 +986,7 @@ fn se08_dash_output_never_creates_a_file_named_dash() {
     let stderr = String::from_utf8(refused.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains("-o -"), "{stderr}");
     assert!(stderr.contains("omit -o"), "{stderr}");
-    assert!(stderr.contains("usage:"), "{stderr}");
+    assert_scoped_hint(&stderr, "profile");
     // Trace accepts `-o -` as stdout: never exit 2, never a file.
     let target = SleepTarget::spawn();
     let pid = target.pid();
@@ -1031,7 +1057,7 @@ fn se07_repeated_scalar_flag_is_a_usage_error_exit_2() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
 }
 
@@ -1067,7 +1093,7 @@ fn se06_empty_option_values_are_usage_errors_exit_2() {
         let usage = run(&refs);
         assert_eq!(usage.code, Some(2), "{argv:?}: {}", usage.stderr);
         assert!(usage.stderr.contains(flag), "{argv:?}: {}", usage.stderr);
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
 }
 
@@ -1087,7 +1113,7 @@ fn se05_pid_zero_is_a_usage_error_exit_2() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
 }
 
@@ -1118,7 +1144,7 @@ fn se04_zero_duration_is_a_usage_error_exit_2() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
 }
 
@@ -1167,6 +1193,6 @@ fn b2_huge_duration_is_a_usage_error_not_a_panic() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert!(usage.stderr.contains("usage:"), "{argv:?}");
+        assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
 }

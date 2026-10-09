@@ -12569,7 +12569,16 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         "src/attach/instance_tests.rs",
         "src/events.rs",
         "src/run/capture_loop_tests.rs",
+        // H0's retained evidence adapter owns private CALL routing/continuity;
+        // this grants no renderer or public projection a raw-field consumer.
+        "src/semantic_capture.rs",
+        // Test-only assertions that the public projection omits private fields.
+        "src/s1_tests.rs",
     ];
+    assert!(
+        read("src/lib.rs").contains("#[cfg(test)]\nmod s1_tests;"),
+        "the public projection privacy sentinel must remain test-only"
+    );
     // `decode_record`/`poll_records` hand the whole record only to the
     // router; every other consumer gets the bare `Event` from `decode`.
     let events = read("src/events.rs");

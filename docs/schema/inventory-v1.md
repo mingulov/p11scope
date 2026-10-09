@@ -251,8 +251,8 @@ non-null values needs a new allowlist row.
   double-load detected` gap names it; without that evidence the
   merge carries no marking. For `dlopen` in one namespace the merge
   is correct (same file → same loaded object → one session
-  namespace); per-instance separation for `dlmopen` is S2 scope
-  (instance authority — see `docs/notes/s2-instance-authority.md`).
+  namespace). The additive instance projection below separates proven
+  semantic instances; physical module and entry meanings stay the same.
 - `edges[]`: one record per (caller incarnation, module instance)
   pair. `mapping` is scan evidence (state `mapped`, `ended`, or
   `uncertain`, with first/last seen and an interruption count of
@@ -676,6 +676,70 @@ non-null values needs a new allowlist row.
   watched caller's scope). Refusal never erases
   retained evidence: over-budget members are dropped with a named
   gap while catalog entries and previously observed use stay.
+
+## Semantic instances (additive within v1)
+
+`instances[]` contains `{id, caller, module, state, reason, first_seen_ns,
+last_seen_ns}`. Capture-local IDs are `iN`, referencing this document's `cN`
+and `mN`. `state` is `observed`, `uncertain` or `retired`; `reason` is null or
+a finite code below. Rows are sorted by instance ID, retained after retirement,
+and IDs are never reused. These references disclose no router ID, native
+domain, task cookie, exec ID, address, session, slot or async handle.
+
+`semantic_edges[]` has one row per registered instance, including instances
+with no calls, sorted by instance ID:
+
+- `caller`, `module`, `instance`: references resolving in this snapshot.
+- `entries`: exactly `{unit:"api_entries", count:null,
+  observation:"unavailable"}`. Only physical `edges[].entries` counts
+  Inventory entries; no count is copied, divided or rolled up into a child.
+- `api_returns`: `{unit:"api_returns", count:null|u64, saturated:bool,
+  historical_only_returns:u64}`. The count is null before the first admitted
+  return, then an observed lower bound, including proven late returns.
+  It does not count successful operations. Saturation is explicit.
+- `semantics`, `mechanisms`, `operations`: the existing S1 shapes above.
+  No-call rows have an unknown label and null mechanism/operation details,
+  rather than observed zeroes. `operations.calls` counts reducer-admitted
+  API observations; outcomes count operations. Historical-only returns do not
+  update the current operation machine. A retry, Update or pending return does
+  not imply completion.
+- `coverage`: `{lossy:bool, reasons:[finite_code,...]}`, with sorted,
+  duplicate-free reasons. Historical positive aggregates survive loss with
+  this sticky disclosure. The new semantic loss path does not alter physical
+  entry totals or their coverage.
+
+Finite reasons are `no_calls`, `instance_unproven`,
+`provider_instance_unproven`, `caller_unbound`, `unauthorized`,
+`ambiguous_descriptor`, `count_only`, `semantic_loss`,
+`before_semantic_boundary`, `out_of_order_return`, `instance_retired`,
+`image_retired`, `task_retired`, `capture_stopped`, `instance_capacity`,
+`semantic_state_capacity`, `negative_state_capacity`, `authority_exhausted`.
+
+Additive budgets are:
+
+- `instances`: `{limit, occupied, refused}` for lifetime retained records,
+  including retired records (default limit 4096).
+- `instance_semantic_state`: `{limit, occupied, unknown_edges, refused,
+  shared_limit, shared_occupied}`. No-call registration allocates no reducer.
+  `limit` is the lesser of the instance and existing semantic-state limits;
+  `shared_*` accounts for legacy plus instance reducers under the existing
+  `max_semantic_states`. Existing `semantic_state` keeps its physical-edge
+  meaning. `unknown_edges` here counts only new semantic edges.
+- `instance_negative_state`: `{limit, occupied, refused, exhausted}` for one
+  bounded ledger shared by domain/task/image/module/exact loss and retirement
+  scopes (default limit 4096). Existing scopes coalesce without eviction.
+  `refused` counts unretained inputs, not distinct keys. The first distinct
+  scope past capacity permanently sets `exhausted`, invalidates current
+  instance operations and refuses new registrations/reductions, preserving
+  physical counts, history and admitted late API-return evidence.
+
+The H2 implementation supplies sealed consumers and this projection. Production
+activation remains H3: its sole proof-consuming adapter must establish the
+original input order and fresh continuity, fence unpublished calls after real
+physical uncertainty, and measure/admit aggregate S1 resources. A remapped
+physical edge or a newer ordinal alone does not prove semantic recovery.
+Empty arrays in current production captures do not prove absence of instances
+or complete semantic coverage. No object authority is added.
 
 ## Example (abridged)
 

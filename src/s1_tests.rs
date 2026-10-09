@@ -2873,3 +2873,1845 @@ fn json_entries_display(edge_json: &serde_json::Value) -> String {
         _ => "?".to_string(),
     }
 }
+
+// H2 reference inputs exercise the sealed registry consumer. They supply no
+// evidence that a production adapter can mint these capabilities.
+use crate::attach::capture::NativeDomainId;
+use crate::discovery::caller_registry::instance_input::{
+    self as instance, InstanceKey, InstanceLifecycle, InstanceReason,
+};
+use crate::discovery::instances::{
+    CallFacts, EntryIp, EpochReading, InstanceId, InstanceRouter, MapRange, Route, RouterLimits,
+    StableObservation,
+};
+use p11scope_ebpf_common::{ImageIdentity, InstanceStamp};
+
+fn instance_router_ids(domain: NativeDomainId, count: usize) -> Vec<InstanceId> {
+    let mut router = InstanceRouter::new(domain, RouterLimits::default());
+    let ranges = (0..count)
+        .map(|n| {
+            let base = 0x7000_0000 + n as u64 * 0x10000;
+            MapRange::new(base, base + 0x3000, 0, true)
+        })
+        .collect();
+    router.observe_legacy(StableObservation {
+        file_slot: 0,
+        reading: EpochReading {
+            cookie: 71,
+            local: 1,
+            global: 0,
+            fault: 0,
+            record_flags: 0,
+            sticky: 0,
+        },
+        ranges,
+        fence: 0,
+    });
+    (0..count)
+        .map(|n| {
+            let stamp = InstanceStamp {
+                epoch: 1,
+                file_slot_plus1: 1,
+                flags: p11scope_ebpf_common::instance::STAMP_VALID,
+                ..InstanceStamp::default()
+            };
+            match router.route(CallFacts {
+                token: n as u64 + 1,
+                domain,
+                image: ImageIdentity {
+                    task_cookie: 71,
+                    exec_id: 0,
+                },
+                entry: stamp,
+                ret: stamp,
+                ip: EntryIp::new(0x7000_0000 + n as u64 * 0x10000 + 0x1000),
+                attached_offset: Some(0x1000),
+            }) {
+                Route::Joined(id) => id,
+                other => panic!("fixture must route a real instance: {other:?}"),
+            }
+        })
+        .collect()
+}
+
+fn instance_key(domain: NativeDomainId, router: InstanceId, module: &ModuleKey) -> InstanceKey {
+    instance::key(
+        domain,
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        },
+        router,
+        module.clone(),
+    )
+}
+
+fn instance_register(h: &mut Harness, key: &InstanceKey, caller: CallerId, ts: u64) {
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance(instance::registration(key.clone(), caller, ts, None));
+}
+
+fn instance_feed(
+    h: &mut Harness,
+    key: &InstanceKey,
+    caller: CallerId,
+    domain: NativeDomainId,
+    ordinal: u64,
+    facts: SemanticCall,
+) {
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(instance::call(
+            key.clone(),
+            caller,
+            instance::position(domain, ordinal),
+            facts,
+            None,
+        ));
+}
+
+#[test]
+fn instance_s1_full_identity_separates_equal_router_ids() {
+    let mut h = harness();
+    h.stage_scale(&ScaleSpec {
+        name: "instance-identity",
+        callers: 2,
+        modules: 2,
+        edges_per_caller: 2,
+        endpoints_per_module: 1,
+        first_pid: 9100,
+    });
+    h.commit();
+    let a = caller_of(&h, 9100);
+    let b = caller_of(&h, 9101);
+    let d = NativeDomainId::mint();
+    let other = NativeDomainId::mint();
+    let r = instance_router_ids(d, 1)[0];
+    let r_other = instance_router_ids(other, 1)[0];
+    assert_eq!(r.get(), r_other.get());
+    let keys = [
+        instance_key(d, r, &scale_key(0)),
+        instance_key(other, r_other, &scale_key(0)),
+        instance::key(
+            d,
+            ImageIdentity {
+                task_cookie: 71,
+                exec_id: 1,
+            },
+            r,
+            scale_key(0),
+        ),
+        instance::key(
+            d,
+            ImageIdentity {
+                task_cookie: 72,
+                exec_id: 0,
+            },
+            r,
+            scale_key(0),
+        ),
+        instance_key(d, r, &scale_key(1)),
+    ];
+    for (n, k) in keys.iter().enumerate() {
+        instance_register(&mut h, k, if n == 3 { b } else { a }, 100);
+    }
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 5);
+    let labels: BTreeSet<_> = h
+        .coordinator()
+        .registry()
+        .instances()
+        .map(|i| i.id.label())
+        .collect();
+    assert_eq!(labels.len(), 5);
+    instance_register(&mut h, &keys[0], b, 200);
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 5);
+    assert!(
+        h.coordinator()
+            .registry()
+            .gaps()
+            .iter()
+            .any(|g| g.reason == "caller_unbound")
+    );
+}
+
+#[test]
+fn instance_s1_same_file_sessions_and_async_ids_do_not_join() {
+    let (mut h, c, m) = single_edge();
+    h.coordinator_mut().registry_mut().note_mapping(
+        c,
+        9000,
+        ModuleInfo {
+            path: "/scale/m0.so".into(),
+            key: m.clone(),
+            double_loaded: true,
+            build_id: None,
+            identity_source: Some("workload".into()),
+            admission: crate::discovery::caller_registry::AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        },
+        100,
+    );
+    h.commit();
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 2);
+    let keys = [instance_key(d, ids[0], &m), instance_key(d, ids[1], &m)];
+    for k in &keys {
+        instance_register(&mut h, k, c, 100);
+    }
+    for (n, k) in keys.iter().enumerate() {
+        instance_feed(
+            &mut h,
+            k,
+            c,
+            d,
+            1 + n as u64 * 5,
+            init("C_SignInit", 7, if n == 0 { RSA_PSS } else { ECDSA }, 100),
+        );
+        let mut pending = op("C_Sign", 7, 110);
+        pending.rv = CkRv::PENDING.0;
+        instance_feed(&mut h, k, c, d, 2 + n as u64 * 5, pending);
+        let mut get = call("C_AsyncGetID", 7, CkRv::OK.0, 120);
+        get.target_function = crate::kinds::function_id("C_Sign").unwrap();
+        get.async_value = 88;
+        instance_feed(&mut h, k, c, d, 3 + n as u64 * 5, get);
+        let mut complete = call(
+            "C_AsyncComplete",
+            7,
+            if n == 0 {
+                CkRv::OK.0
+            } else {
+                CkRv::GENERAL_ERROR.0
+            },
+            130,
+        );
+        complete.target_function = crate::kinds::function_id("C_Sign").unwrap();
+        instance_feed(&mut h, k, c, d, 4 + n as u64 * 5, complete);
+    }
+    h.commit();
+    let rows: Vec<_> = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .collect();
+    assert_eq!(rows.len(), 2);
+    for (n, row) in rows.iter().enumerate() {
+        let s = row.semantics.as_ref().unwrap();
+        assert_eq!(row.api_returns, Some(4));
+        assert_eq!(s.started(), 1);
+        assert_eq!(s.completed(), u64::from(n == 0));
+        assert_eq!(s.failed(), u64::from(n == 1));
+        assert_eq!(
+            s.mechanisms().keys().copied().collect::<Vec<_>>(),
+            vec![if n == 0 { RSA_PSS } else { ECDSA }]
+        );
+    }
+    assert_eq!(h.coordinator().registry().semantic_occupied(), 0);
+}
+
+#[test]
+fn instance_s1_registration_is_idempotent_and_staged() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    assert_eq!(h.coordinator().registry().instances().count(), 0);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.commit();
+    let id = h.coordinator().registry().instances().next().unwrap().id;
+    instance_register(&mut h, &k, c, 200);
+    h.commit();
+    let rows: Vec<_> = h.coordinator().registry().instances().collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].first_seen_ns, 100);
+    assert_eq!(rows[0].last_seen_ns, 200);
+    assert_eq!(
+        h.coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap()
+            .started(),
+        1
+    );
+}
+
+#[test]
+fn instance_s1_no_call_and_unrouted_stay_unknown() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 2);
+    let k = instance_key(d, ids[0], &m);
+    let missing = instance_key(d, ids[1], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(
+        &mut h,
+        &missing,
+        c,
+        d,
+        1,
+        init("C_SignInit", 7, RSA_PSS, 100),
+    );
+    h.commit();
+    let rows: Vec<_> = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].api_returns, None);
+    assert!(rows[0].semantics.is_none());
+    assert!(
+        h.coordinator()
+            .registry()
+            .gaps()
+            .iter()
+            .any(|g| g.reason == "instance_unproven")
+    );
+    assert_eq!(h.coordinator().registry().instance_semantic_occupied(), 0);
+}
+
+#[test]
+fn instance_s1_does_not_change_physical_totals() {
+    let (mut h, c, m) = single_edge();
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_entries(c, &m, 12, 90);
+    h.commit();
+    let before = crate::inventory::render_json_from_presentation(&Presentation::capture(
+        h.coordinator(),
+        "system",
+        0,
+        100,
+        1,
+    ))["edges"]
+        .clone();
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 2);
+    for (n, id) in ids.into_iter().enumerate() {
+        let k = instance_key(d, id, &m);
+        instance_register(&mut h, &k, c, 100);
+        instance_feed(
+            &mut h,
+            &k,
+            c,
+            d,
+            1 + n as u64 * 2,
+            init("C_SignInit", 7, RSA_PSS, 100),
+        );
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance_semantic_loss(instance::loss(
+                instance::Scope::Exact(k.clone()),
+                instance::position(d, 2 + n as u64 * 2),
+                InstanceReason::SemanticLoss,
+            ));
+        h.coordinator_mut()
+            .registry_mut()
+            .retire_instance(instance::retirement(
+                instance::Retirement::Exact(k),
+                instance::position(d, 3 + n as u64 * 2),
+                InstanceReason::InstanceRetired,
+            ));
+    }
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 2);
+    let after = crate::inventory::render_json_from_presentation(&Presentation::capture(
+        h.coordinator(),
+        "system",
+        0,
+        100,
+        1,
+    ))["edges"]
+        .clone();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn instance_s1_capacity_refuses_without_reuse() {
+    let mut limits = RegistryLimits::default_limits();
+    limits.max_semantic_states = 1;
+    let mut h = Harness::new(limits).unwrap();
+    h.stage_scale(&ScaleSpec {
+        name: "instance-cap",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 9000,
+    });
+    h.commit();
+    let c = caller_of(&h, 9000);
+    let m = scale_key(0);
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 3);
+    h.coordinator_mut()
+        .registry_mut()
+        .reference_instance_limit(2);
+    for (n, id) in ids.iter().enumerate() {
+        let k = instance_key(d, *id, &m);
+        instance_register(&mut h, &k, c, 100);
+        instance_feed(
+            &mut h,
+            &k,
+            c,
+            d,
+            n as u64 + 1,
+            init("C_SignInit", 7, RSA_PSS, 100),
+        );
+    }
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 2);
+    assert_eq!(h.coordinator().registry().instance_semantic_occupied(), 1);
+    assert_eq!(h.coordinator().registry().instance_semantic_refused(), 1);
+    assert_eq!(h.coordinator().registry().instance_refused(), 1);
+    let k = instance_key(d, ids[0], &m);
+    h.coordinator_mut()
+        .registry_mut()
+        .retire_instance(instance::retirement(
+            instance::Retirement::Exact(k),
+            instance::position(d, 4),
+            InstanceReason::InstanceRetired,
+        ));
+    let third = instance_key(d, ids[2], &m);
+    instance_register(&mut h, &third, c, 200);
+    h.commit();
+    assert_eq!(
+        h.coordinator()
+            .registry()
+            .instances()
+            .map(|r| r.id.label())
+            .collect::<Vec<_>>(),
+        vec!["i0", "i1"]
+    );
+    assert_eq!(h.coordinator().registry().instance_refused(), 2);
+    h.observe_semantic(c, &m, init("C_SignInit", 8, ECDSA, 200));
+    h.commit();
+    assert_eq!(
+        h.coordinator().registry().semantic_occupied(),
+        0,
+        "legacy and instance reducers share one cap"
+    );
+}
+
+#[test]
+fn instance_s1_loss_is_scoped_and_preserves_counts() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let other = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 2);
+    let keys = [
+        instance_key(d, ids[0], &m),
+        instance_key(d, ids[1], &m),
+        instance_key(other, instance_router_ids(other, 1)[0], &m),
+    ];
+    for (n, k) in keys.iter().enumerate() {
+        instance_register(&mut h, k, c, 100);
+        instance_feed(
+            &mut h,
+            k,
+            c,
+            if n < 2 { d } else { other },
+            n as u64 + 1,
+            init("C_SignInit", 7, RSA_PSS, 100),
+        );
+    }
+    h.commit();
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Exact(keys[0].clone()),
+            instance::position(d, 10),
+            InstanceReason::SemanticLoss,
+        ));
+    h.commit();
+    let rows: Vec<_> = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].semantics.as_ref().unwrap().unknown(), 1);
+    assert!(rows[0].lossy);
+    assert!(!rows[0].semantics.as_ref().unwrap().has_live_operations());
+    for row in &rows[1..] {
+        assert!(row.semantics.as_ref().unwrap().has_live_operations());
+        assert!(!row.lossy);
+    }
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Module(
+                d,
+                ImageIdentity {
+                    task_cookie: 71,
+                    exec_id: 0,
+                },
+                m.clone(),
+            ),
+            instance::position(d, 11),
+            InstanceReason::SemanticLoss,
+        ));
+    h.commit();
+    let rows: Vec<_> = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .collect();
+    assert_eq!(rows[1].semantics.as_ref().unwrap().unknown(), 1);
+    assert!(!rows[2].lossy);
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Domain(other),
+            instance::position(other, 12),
+            InstanceReason::SemanticLoss,
+        ));
+    h.commit();
+    assert!(
+        h.coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .all(|r| r.lossy)
+    );
+    assert!(h.coordinator().registry().edges().all(|e| !matches!(
+        h.coordinator().registry().coverage(e),
+        crate::discovery::caller_registry::UseCoverage::Counted { lossy: true, .. }
+    )));
+}
+
+#[test]
+fn instance_s1_late_return_after_boundary_is_history_only() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.commit();
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Image(
+                d,
+                ImageIdentity {
+                    task_cookie: 71,
+                    exec_id: 0,
+                },
+            ),
+            instance::position(d, 3),
+            InstanceReason::SemanticLoss,
+        ));
+    instance_feed(&mut h, &k, c, d, 2, op("C_Sign", 7, 110));
+    h.commit();
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(2));
+    assert_eq!(row.historical_only_returns, 1);
+    let s = row.semantics.as_ref().unwrap();
+    assert_eq!(s.calls(), 1);
+    assert_eq!(s.completed(), 0);
+    assert_eq!(s.unknown(), 1);
+}
+
+#[test]
+fn instance_s1_late_init_after_final_cannot_restart() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    instance_feed(&mut h, &k, c, d, 3, op("C_SignFinal", 7, 120));
+    instance_feed(&mut h, &k, c, d, 2, init("C_SignInit", 7, ECDSA, 110));
+    h.commit();
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(3));
+    assert_eq!(row.historical_only_returns, 1);
+    let s = row.semantics.as_ref().unwrap();
+    assert_eq!(s.completed(), 1);
+    assert_eq!(s.started(), 1);
+    assert!(!s.has_live_operations());
+    assert!(row.reasons.contains(&InstanceReason::OutOfOrderReturn));
+}
+
+fn instance_buffered_first_scan(with_loss: bool) {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    let init = instance::call(
+        k.clone(),
+        c,
+        instance::position(d, 1),
+        init("C_SignInit", 7, RSA_PSS, 100),
+        None,
+    );
+    let sign = instance::call(
+        k.clone(),
+        c,
+        instance::position(d, 2),
+        op("C_Sign", 7, 110),
+        None,
+    );
+    // Calls retained before the first stable scan preserve their positions.
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance(instance::registration(
+            k,
+            c,
+            120,
+            with_loss.then(|| instance::position(d, 3)),
+        ));
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(init);
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(sign);
+    h.commit();
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(2));
+    assert_eq!(row.historical_only_returns, if with_loss { 2 } else { 0 });
+    if with_loss {
+        assert!(row.semantics.is_none());
+        assert!(row.lossy);
+    } else {
+        let s = row.semantics.as_ref().unwrap();
+        assert_eq!(s.calls(), 2);
+        assert_eq!(s.started(), 1);
+        assert_eq!(s.completed(), 1);
+    }
+}
+
+#[test]
+fn instance_s1_first_scan_reduces_buffered_init_and_sign() {
+    instance_buffered_first_scan(false);
+}
+#[test]
+fn instance_s1_first_scan_post_collection_loss_is_history_only() {
+    instance_buffered_first_scan(true);
+}
+
+#[test]
+fn instance_s1_delayed_in_order_returns_reduce() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    h.commit();
+    let a = instance::call(
+        k.clone(),
+        c,
+        instance::position(d, 1),
+        init("C_SignInit", 7, RSA_PSS, 100),
+        None,
+    );
+    let b = instance::call(
+        k.clone(),
+        c,
+        instance::position(d, 2),
+        op("C_Sign", 7, 110),
+        None,
+    );
+    h.commit();
+    h.commit(); // Quiet ticks are not loss.
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(a);
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(b);
+    h.commit();
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(2));
+    assert_eq!(row.historical_only_returns, 0);
+    assert_eq!(row.semantics.as_ref().unwrap().completed(), 1);
+    assert!(!row.lossy);
+}
+
+#[test]
+fn instance_s1_new_partition_is_not_old_partition_loss() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 2);
+    let first = instance_key(d, ids[0], &m);
+    let new = instance_key(d, ids[1], &m);
+    instance_register(&mut h, &first, c, 100);
+    instance_feed(&mut h, &first, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.commit();
+    instance_register(&mut h, &new, c, 110);
+    h.commit();
+    let rows: Vec<_> = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].semantics.as_ref().unwrap().has_live_operations());
+    assert!(!rows[0].lossy);
+    assert!(rows[1].semantics.is_none());
+    instance_feed(&mut h, &first, c, d, 2, op("C_Sign", 7, 120));
+    h.commit();
+    assert_eq!(
+        h.coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap()
+            .completed(),
+        1
+    );
+}
+
+#[test]
+fn instance_s1_retired_key_never_revives_but_successor_is_independent() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 2);
+    let k = instance_key(d, ids[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    let mut pending = op("C_Sign", 7, 110);
+    pending.rv = CkRv::PENDING.0;
+    instance_feed(&mut h, &k, c, d, 2, pending);
+    h.commit();
+    h.coordinator_mut()
+        .registry_mut()
+        .retire_instance(instance::retirement(
+            instance::Retirement::Image(
+                d,
+                ImageIdentity {
+                    task_cookie: 71,
+                    exec_id: 0,
+                },
+            ),
+            instance::position(d, 3),
+            InstanceReason::ImageRetired,
+        ));
+    instance_register(&mut h, &k, c, 200);
+    let mut complete = call("C_AsyncComplete", 7, CkRv::OK.0, 210);
+    complete.target_function = crate::kinds::function_id("C_Sign").unwrap();
+    instance_feed(&mut h, &k, c, d, 4, complete);
+    let successor = instance::key(
+        d,
+        ImageIdentity {
+            task_cookie: 71,
+            exec_id: 1,
+        },
+        ids[1],
+        m,
+    );
+    instance_register(&mut h, &successor, c, 220);
+    instance_feed(
+        &mut h,
+        &successor,
+        c,
+        d,
+        5,
+        init("C_SignInit", 7, ECDSA, 220),
+    );
+    instance_feed(&mut h, &successor, c, d, 6, op("C_Sign", 7, 230));
+    h.commit();
+    let rows: Vec<_> = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].api_returns, Some(3));
+    assert_eq!(rows[0].historical_only_returns, 1);
+    assert_eq!(rows[0].semantics.as_ref().unwrap().completed(), 0);
+    assert_eq!(rows[1].semantics.as_ref().unwrap().completed(), 1);
+    assert_eq!(
+        h.coordinator().registry().instances().next().unwrap().state,
+        InstanceLifecycle::Retired
+    );
+}
+
+#[test]
+fn instance_s1_private_debug_and_projection_are_redacted() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let id = instance_router_ids(d, 1)[0];
+    let k = instance::key(
+        d,
+        ImageIdentity {
+            task_cookie: 0xdead_beef_1212,
+            exec_id: 0xcafe_1234,
+        },
+        id,
+        m,
+    );
+    let mut facts = init("C_SignInit", 0xfeed_1234, RSA_PSS, 100);
+    facts.async_value = 0xbead_1234;
+    facts.slot_id = 0xabcd_1234;
+    let call_debug = format!("{facts:?}");
+    let envelope = instance::call(
+        k.clone(),
+        c,
+        instance::position(d, 0xffff_1234),
+        facts,
+        None,
+    );
+    let registration = instance::registration(k.clone(), c, 100, None);
+    let loss = instance::loss(
+        instance::Scope::Image(
+            d,
+            ImageIdentity {
+                task_cookie: 0xdead_beef_1212,
+                exec_id: 0xcafe_1234,
+            },
+        ),
+        instance::position(d, 2),
+        InstanceReason::SemanticLoss,
+    );
+    let retirement = instance::retirement(
+        instance::Retirement::Task(d, 0xdead_beef_1212),
+        instance::position(d, 3),
+        InstanceReason::TaskRetired,
+    );
+    let debug = format!("{k:?} {envelope:?} {registration:?} {loss:?} {retirement:?} {call_debug}");
+    assert!(!debug.contains("NativeDomainId("));
+    for private in [
+        0xdead_beef_1212u64,
+        0xcafe_1234,
+        0xfeed_1234,
+        0xbead_1234,
+        0xabcd_1234,
+        0xffff_1234,
+    ] {
+        assert!(
+            !debug.contains(&private.to_string()),
+            "private identity or handle escaped debug: {debug}"
+        );
+    }
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance(registration);
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(envelope);
+    h.commit();
+    let debug = format!(
+        "{:?} {:?}",
+        h.coordinator().registry().instances().collect::<Vec<_>>(),
+        h.coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .collect::<Vec<_>>()
+    );
+    for private in [
+        0xdead_beef_1212u64,
+        0xcafe_1234,
+        0xfeed_1234,
+        0xbead_1234,
+        0xabcd_1234,
+    ] {
+        assert!(!debug.contains(&private.to_string()));
+    }
+    let p = Presentation::capture(h.coordinator(), "system", 0, 200, 1);
+    let document = crate::inventory::render_json_from_presentation(&p);
+    assert_eq!(document["instances"].as_array().map(Vec::len), Some(1));
+    let frame = crate::inventory_dashboard::DisplayFrame {
+        presentation: std::sync::Arc::new(p.clone()),
+        log: crate::inventory_dashboard::LogTail::bounded().snapshot(),
+    };
+    let public = format!(
+        "{p:?} {} {} {}",
+        document,
+        render_snapshot(&p),
+        String::from_utf8(render_frame(
+            &frame,
+            Viewport {
+                width: 200,
+                height: 120
+            },
+            &DashboardState::new()
+        ))
+        .unwrap(),
+    );
+    assert!(!public.contains("NativeDomainId("));
+    for private in [
+        0xdead_beef_1212u64,
+        0xcafe_1234,
+        0xfeed_1234,
+        0xbead_1234,
+        0xabcd_1234,
+        0xffff_1234,
+    ] {
+        assert!(!public.contains(&private.to_string()));
+        assert!(!public.contains(&format!("0x{private:x}")));
+    }
+}
+
+#[test]
+fn instance_s1_mapping_and_caller_retirement_bound_current_authority() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.commit();
+    let module = h.coordinator().registry().module_id_for(&m).unwrap();
+    h.coordinator_mut()
+        .registry_mut()
+        .note_module_absent(c, module, false, 110);
+    h.commit();
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.semantics.as_ref().unwrap().unknown(), 1);
+    assert!(row.lossy);
+    assert_eq!(
+        h.coordinator().registry().instances().next().unwrap().state,
+        InstanceLifecycle::Uncertain
+    );
+    h.coordinator_mut()
+        .registry_mut()
+        .note_module_absent(c, module, true, 120);
+    h.commit();
+    assert_eq!(
+        h.coordinator().registry().instances().next().unwrap().state,
+        InstanceLifecycle::Retired
+    );
+    instance_feed(&mut h, &k, c, d, 2, op("C_Sign", 7, 130));
+    h.commit();
+    assert_eq!(
+        h.coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .unwrap()
+            .historical_only_returns,
+        1
+    );
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.commit();
+    h.coordinator_mut()
+        .registry_mut()
+        .retire_caller(c, "process exited".into(), 110);
+    instance_feed(&mut h, &k, c, d, 2, op("C_Sign", 7, 120));
+    h.commit();
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.historical_only_returns, 1);
+    assert_eq!(row.semantics.as_ref().unwrap().unknown(), 1);
+    assert_eq!(
+        h.coordinator().registry().instances().next().unwrap().state,
+        InstanceLifecycle::Retired
+    );
+}
+
+#[test]
+fn instance_s1_staged_mapping_is_required_and_unidentified_refuses() {
+    let mut h = harness();
+    h.stage_scale(&ScaleSpec {
+        name: "staged-instance",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 9200,
+    });
+    let c = caller_of(&h, 9200);
+    let d = NativeDomainId::mint();
+    let id = instance_router_ids(d, 1)[0];
+    let k = instance_key(d, id, &scale_key(0));
+    instance_register(&mut h, &k, c, 100);
+    assert_eq!(h.coordinator().registry().instances().count(), 0);
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 1);
+    let missing = instance_key(d, id, &scale_key(1));
+    instance_register(&mut h, &missing, c, 100);
+    let unidentified = instance_key(
+        d,
+        id,
+        &ModuleKey::Unidentified {
+            path: "private-test-sentinel".into(),
+        },
+    );
+    instance_register(&mut h, &unidentified, c, 100);
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 1);
+    assert!(
+        h.coordinator()
+            .registry()
+            .gaps()
+            .iter()
+            .any(|g| g.reason == "provider_instance_unproven")
+    );
+    assert!(
+        h.coordinator()
+            .registry()
+            .gaps()
+            .iter()
+            .any(|g| g.reason == "caller_unbound")
+    );
+}
+
+#[test]
+fn instance_s1_pre_registration_negatives_are_inherited() {
+    for scope_kind in 0..5 {
+        let (mut h, c, m) = single_edge();
+        let d = NativeDomainId::mint();
+        let ids = instance_router_ids(d, 2);
+        let old = instance_key(d, ids[0], &m);
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance_semantic_loss(instance::loss(
+                match scope_kind {
+                    0 => instance::Scope::Domain(d),
+                    1 => instance::Scope::Image(
+                        d,
+                        ImageIdentity {
+                            task_cookie: 71,
+                            exec_id: 0,
+                        },
+                    ),
+                    2 => instance::Scope::Module(
+                        d,
+                        ImageIdentity {
+                            task_cookie: 71,
+                            exec_id: 0,
+                        },
+                        m.clone(),
+                    ),
+                    3 => instance::Scope::Exact(old.clone()),
+                    _ => instance::Scope::Module(
+                        d,
+                        ImageIdentity {
+                            task_cookie: 71,
+                            exec_id: 0,
+                        },
+                        scale_key(99),
+                    ),
+                },
+                instance::position(d, 3),
+                InstanceReason::SemanticLoss,
+            ));
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance(instance::registration(
+                old.clone(),
+                c,
+                120,
+                if scope_kind == 4 {
+                    Some(instance::position(d, 1))
+                } else {
+                    None
+                },
+            ));
+        instance_feed(&mut h, &old, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+        instance_feed(&mut h, &old, c, d, 2, op("C_Sign", 7, 110));
+        let safe_domain = if scope_kind == 0 {
+            NativeDomainId::mint()
+        } else {
+            d
+        };
+        let new = instance::key(
+            safe_domain,
+            ImageIdentity {
+                task_cookie: 71,
+                exec_id: 1,
+            },
+            ids[0],
+            m.clone(),
+        );
+        instance_register(&mut h, &new, c, 120);
+        instance_feed(
+            &mut h,
+            &new,
+            c,
+            safe_domain,
+            4,
+            init("C_SignInit", 7, ECDSA, 120),
+        );
+        instance_feed(&mut h, &new, c, safe_domain, 5, op("C_Sign", 7, 130));
+        h.commit();
+        let rows: Vec<_> = h
+            .coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].api_returns, Some(2));
+        assert_eq!(rows[0].historical_only_returns, 2);
+        assert!(rows[0].semantics.is_none());
+        assert_eq!(rows[1].semantics.as_ref().unwrap().completed(), 1);
+        assert!(!rows[1].lossy);
+        assert_eq!(h.coordinator().registry().module_count(), 1);
+        instance_feed(&mut h, &old, c, d, 8, init("C_SignInit", 7, RSA_PSS, 140));
+        instance_feed(&mut h, &old, c, d, 9, op("C_Sign", 7, 150));
+        h.commit();
+        let row = h
+            .coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .unwrap();
+        assert_eq!(row.api_returns, Some(4));
+        assert_eq!(row.historical_only_returns, 2);
+        assert_eq!(row.semantics.as_ref().unwrap().completed(), 1);
+
+        h.coordinator_mut()
+            .registry_mut()
+            .retire_instance(instance::retirement(
+                instance::Retirement::Image(
+                    d,
+                    ImageIdentity {
+                        task_cookie: 71,
+                        exec_id: 0,
+                    },
+                ),
+                instance::position(d, 10),
+                InstanceReason::ImageRetired,
+            ));
+        let another_old = instance_key(d, ids[1], &m);
+        instance_register(&mut h, &another_old, c, 140);
+        h.commit();
+        assert_eq!(h.coordinator().registry().instances().count(), 2);
+        assert!(
+            h.coordinator()
+                .registry()
+                .gaps()
+                .iter()
+                .any(|g| g.reason == "image_retired")
+        );
+    }
+}
+
+#[test]
+fn instance_s1_negative_scope_n_and_n_plus_one() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 2);
+    let k = instance_key(d, ids[0], &m);
+    h.coordinator_mut()
+        .registry_mut()
+        .reference_negative_limit(1);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Domain(d),
+            instance::position(d, 3),
+            InstanceReason::SemanticLoss,
+        ));
+    // Same scope coalesces; it cannot consume a second negative record.
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Domain(d),
+            instance::position(d, 2),
+            InstanceReason::SemanticLoss,
+        ));
+    instance_feed(&mut h, &k, c, d, 4, init("C_SignInit", 7, ECDSA, 120));
+    h.commit();
+    assert_eq!(h.coordinator().registry().reference_negative_occupied(), 1);
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Image(
+                d,
+                ImageIdentity {
+                    task_cookie: 71,
+                    exec_id: 0,
+                },
+            ),
+            instance::position(d, 5),
+            InstanceReason::SemanticLoss,
+        ));
+    instance_feed(&mut h, &k, c, d, 6, op("C_Sign", 7, 130));
+    let new = instance_key(d, ids[1], &m);
+    instance_register(&mut h, &new, c, 140);
+    h.commit();
+    assert_eq!(h.coordinator().registry().reference_negative_occupied(), 1);
+    assert_eq!(h.coordinator().registry().instances().count(), 1);
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(3));
+    assert_eq!(row.historical_only_returns, 1);
+    let s = row.semantics.as_ref().unwrap();
+    assert_eq!(s.started(), 2);
+    assert_eq!(s.unknown(), 2);
+    assert!(!s.has_live_operations());
+    assert!(row.reasons.contains(&InstanceReason::NegativeStateCapacity));
+    assert!(
+        h.coordinator()
+            .registry()
+            .gaps()
+            .iter()
+            .any(|g| g.reason == "negative_state_capacity")
+    );
+    // The production bound itself, including updates at exactly N.
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 2);
+    for n in 0..instance::MAX_INSTANCE_NEGATIVE_SCOPES {
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance_semantic_loss(instance::loss(
+                instance::Scope::Image(
+                    d,
+                    ImageIdentity {
+                        task_cookie: 100_000 + n as u64,
+                        exec_id: 0,
+                    },
+                ),
+                instance::position(d, 1),
+                InstanceReason::SemanticLoss,
+            ));
+    }
+    h.commit();
+    assert_eq!(
+        h.coordinator().registry().reference_negative_occupied(),
+        4096
+    );
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Image(
+                d,
+                ImageIdentity {
+                    task_cookie: 100_000,
+                    exec_id: 0,
+                },
+            ),
+            instance::position(d, 3),
+            InstanceReason::SemanticLoss,
+        ));
+    let k = instance_key(d, ids[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 4, init("C_SignInit", 7, RSA_PSS, 100));
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_entries(c, &m, 17, 100);
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), 1);
+    let physical = h.coordinator().registry().edges().next().unwrap();
+    let physical_count = physical.entry_count;
+    let physical_coverage = h.coordinator().registry().coverage(physical);
+    for _ in 0..2 {
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance_semantic_loss(instance::loss(
+                instance::Scope::Image(
+                    d,
+                    ImageIdentity {
+                        task_cookie: 999_999,
+                        exec_id: 0,
+                    },
+                ),
+                instance::position(d, 5),
+                InstanceReason::SemanticLoss,
+            ));
+    }
+    instance_feed(&mut h, &k, c, d, 6, op("C_Sign", 7, 110));
+    let another = instance_key(d, ids[1], &m);
+    instance_register(&mut h, &another, c, 120);
+    h.commit();
+    h.commit();
+    assert_eq!(
+        h.coordinator().registry().reference_negative_occupied(),
+        4096
+    );
+    assert_eq!(h.coordinator().registry().instances().count(), 1);
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(2));
+    assert_eq!(row.historical_only_returns, 1);
+    assert_eq!(row.semantics.as_ref().unwrap().unknown(), 1);
+    assert!(!row.semantics.as_ref().unwrap().has_live_operations());
+    let physical = h.coordinator().registry().edges().next().unwrap();
+    assert_eq!(physical.entry_count, physical_count);
+    assert_eq!(
+        h.coordinator().registry().coverage(physical),
+        physical_coverage
+    );
+}
+
+#[test]
+fn instance_s1_pre_registration_retirement_never_reopens() {
+    for kind in 0..5 {
+        let (mut h, c, m) = single_edge();
+        let d = NativeDomainId::mint();
+        let other = NativeDomainId::mint();
+        let ids = instance_router_ids(d, 2);
+        let old = instance_key(d, ids[0], &m);
+        if kind == 4 {
+            h.coordinator_mut()
+                .registry_mut()
+                .note_instance_semantic_loss(instance::exhausted_domain(d));
+        } else {
+            let scope = match kind {
+                0 => instance::Retirement::Domain(d),
+                1 => instance::Retirement::Image(
+                    d,
+                    ImageIdentity {
+                        task_cookie: 71,
+                        exec_id: 0,
+                    },
+                ),
+                2 => instance::Retirement::Exact(old.clone()),
+                _ => instance::Retirement::Task(d, 71),
+            };
+            h.coordinator_mut()
+                .registry_mut()
+                .retire_instance(instance::retirement(
+                    scope,
+                    instance::position(d, 3),
+                    if kind == 1 {
+                        InstanceReason::ImageRetired
+                    } else {
+                        InstanceReason::TaskRetired
+                    },
+                ));
+        }
+        instance_register(&mut h, &old, c, 100);
+        h.commit();
+        assert_eq!(
+            h.coordinator().registry().instances().count(),
+            0,
+            "pre-registration retirement kind {kind}"
+        );
+        let (safe_domain, safe_image) = if kind == 0 || kind == 4 {
+            (
+                other,
+                ImageIdentity {
+                    task_cookie: 71,
+                    exec_id: 0,
+                },
+            )
+        } else {
+            (
+                d,
+                ImageIdentity {
+                    task_cookie: if kind == 3 { 72 } else { 71 },
+                    exec_id: 1,
+                },
+            )
+        };
+        let safe = instance::key(safe_domain, safe_image, ids[1], m.clone());
+        instance_register(&mut h, &safe, c, 110);
+        instance_feed(
+            &mut h,
+            &safe,
+            c,
+            safe_domain,
+            4,
+            init("C_SignInit", 7, RSA_PSS, 110),
+        );
+        instance_feed(&mut h, &safe, c, safe_domain, 5, op("C_Sign", 7, 120));
+        h.commit();
+        assert_eq!(h.coordinator().registry().instances().count(), 1);
+        assert_eq!(
+            h.coordinator()
+                .registry()
+                .instance_semantic_edges()
+                .next()
+                .unwrap()
+                .semantics
+                .as_ref()
+                .unwrap()
+                .completed(),
+            1
+        );
+        if kind == 3 {
+            let forbidden = instance::key(
+                d,
+                ImageIdentity {
+                    task_cookie: 71,
+                    exec_id: 1,
+                },
+                ids[1],
+                m,
+            );
+            instance_register(&mut h, &forbidden, c, 130);
+            h.commit();
+            assert_eq!(
+                h.coordinator().registry().instances().count(),
+                1,
+                "terminal task cannot mint successor exec"
+            );
+        }
+    }
+}
+
+#[test]
+fn instance_s1_negative_record_payload_is_bounded_and_private() {
+    assert_eq!(instance::MAX_INSTANCE_NEGATIVE_SCOPES, 4096);
+    let domain = NativeDomainId::mint();
+    let image = ImageIdentity {
+        task_cookie: 0xdead_beef_1313,
+        exec_id: 0xcafe_1313,
+    };
+    let (size, needs_drop, debug) = instance::negative_payload_debug(domain, image);
+    assert!(size <= 64);
+    assert!(!needs_drop);
+    assert!(size * instance::MAX_INSTANCE_NEGATIVE_SCOPES <= 256 * 1024);
+    assert!(!debug.contains(&image.task_cookie.to_string()));
+    assert!(!debug.contains(&image.exec_id.to_string()));
+    assert!(!debug.contains("NativeDomainId("));
+}
+
+#[test]
+fn instance_s1_shared_capacity_reports_total_requested() {
+    let mut limits = RegistryLimits::default_limits();
+    limits.max_semantic_states = 1;
+    let mut h = Harness::new(limits).unwrap();
+    h.stage_scale(&ScaleSpec {
+        name: "shared-instance-cap",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 9300,
+    });
+    h.commit();
+    let c = caller_of(&h, 9300);
+    let m = scale_key(0);
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.commit();
+    h.observe_semantic(c, &m, init("C_SignInit", 8, ECDSA, 110));
+    h.commit();
+    let budget = h
+        .coordinator()
+        .registry()
+        .gaps()
+        .iter()
+        .find_map(|g| g.budget.as_ref().filter(|b| b.resource == "semantic_state"))
+        .unwrap();
+    assert_eq!(budget.limit, 1);
+    assert_eq!(budget.requested, 2);
+}
+
+#[test]
+fn instance_s1_repeated_negative_preserves_post_boundary_operations() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Exact(k.clone()),
+            instance::position(d, 2),
+            InstanceReason::SemanticLoss,
+        ));
+    instance_feed(&mut h, &k, c, d, 3, init("C_SignInit", 7, ECDSA, 120));
+    h.commit();
+    for ordinal in [2, 1] {
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance_semantic_loss(instance::loss(
+                instance::Scope::Exact(k.clone()),
+                instance::position(d, ordinal),
+                InstanceReason::SemanticLoss,
+            ));
+        instance_register(&mut h, &k, c, 130);
+        h.commit();
+        let row = h
+            .coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .unwrap();
+        let s = row.semantics.as_ref().unwrap();
+        assert!(s.has_live_operations());
+        assert_eq!(s.unknown(), 1);
+        assert_eq!(row.api_returns, Some(2));
+    }
+    instance_feed(&mut h, &k, c, d, 4, op("C_Sign", 7, 140));
+    h.commit();
+    assert_eq!(
+        h.coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap()
+            .completed(),
+        1
+    );
+}
+
+#[test]
+fn instance_s1_projection_agrees_across_consumers() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let ids = instance_router_ids(d, 3);
+    let keys: Vec<_> = ids.into_iter().map(|id| instance_key(d, id, &m)).collect();
+    for k in &keys {
+        instance_register(&mut h, k, c, 100);
+    }
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_entries(c, &m, 100, 100);
+    instance_feed(
+        &mut h,
+        &keys[0],
+        c,
+        d,
+        1,
+        init("C_SignInit", 7, RSA_PSS, 100),
+    );
+    instance_feed(&mut h, &keys[1], c, d, 2, init("C_SignInit", 7, ECDSA, 105));
+    instance_feed(&mut h, &keys[0], c, d, 4, op("C_Sign", 7, 110));
+    let mut fail = op("C_Sign", 7, 115);
+    fail.rv = CkRv::GENERAL_ERROR.0;
+    instance_feed(&mut h, &keys[1], c, d, 5, fail);
+    h.coordinator_mut()
+        .registry_mut()
+        .note_instance_semantic_loss(instance::loss(
+            instance::Scope::Exact(keys[0].clone()),
+            instance::position(d, 7),
+            InstanceReason::SemanticLoss,
+        ));
+    h.coordinator_mut()
+        .registry_mut()
+        .retire_instance(instance::retirement(
+            instance::Retirement::Exact(keys[0].clone()),
+            instance::position(d, 8),
+            InstanceReason::InstanceRetired,
+        ));
+    instance_feed(&mut h, &keys[0], c, d, 3, op("C_SignUpdate", 7, 108));
+    h.commit();
+    let p = Presentation::capture(h.coordinator(), "system", 0, 200, 1);
+    let document = crate::inventory::render_json_from_presentation(&p);
+    assert_eq!(document["instances"].as_array().map(Vec::len), Some(3));
+    assert_eq!(document["semantic_edges"].as_array().map(Vec::len), Some(3));
+    assert_eq!(document["edges"][0]["entries"]["count"], 100);
+    let rows = document["semantic_edges"].as_array().unwrap();
+    assert_eq!(rows[0]["api_returns"]["count"], 3);
+    assert_eq!(rows[0]["api_returns"]["historical_only_returns"], 1);
+    assert_eq!(rows[0]["operations"]["completed"], 1);
+    assert_eq!(rows[0]["operations"]["calls"], 2);
+    assert_eq!(rows[0]["coverage"]["lossy"], true);
+    assert_eq!(document["instances"][0]["state"], "retired");
+    assert_eq!(rows[1]["api_returns"]["count"], 2);
+    assert_eq!(rows[1]["operations"]["failed"], 1);
+    assert!(rows[2]["api_returns"]["count"].is_null());
+    assert!(rows[2]["mechanisms"].is_null());
+    assert!(rows[2]["operations"].is_null());
+    assert!(
+        rows[2]["semantics"]
+            .as_str()
+            .unwrap()
+            .starts_with("unknown")
+    );
+    for (n, row) in rows.iter().enumerate() {
+        assert_eq!(row["instance"], format!("i{n}"));
+        assert_eq!(row["caller"], "c0");
+        assert_eq!(row["module"], "m0");
+        assert_eq!(
+            row["entries"],
+            serde_json::json!({"unit":"api_entries","count":null,"observation":"unavailable"})
+        );
+        assert_eq!(row["api_returns"]["unit"], "api_returns");
+        let reasons: Vec<_> = row["coverage"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert!(reasons.windows(2).all(|p| p[0] < p[1]));
+        for private in [
+            "task_cookie",
+            "exec_id",
+            "domain",
+            "session",
+            "slot_id",
+            "async_value",
+            "entry_ip",
+            "router",
+        ] {
+            assert!(row.get(private).is_none());
+            assert!(document["instances"][n].get(private).is_none());
+        }
+    }
+    assert_eq!(document["budgets"]["instances"]["occupied"], 3);
+    assert_eq!(
+        document["budgets"]["instance_semantic_state"]["occupied"],
+        2
+    );
+    assert_eq!(
+        document["budgets"]["instance_semantic_state"]["unknown_edges"],
+        1
+    );
+    assert_eq!(
+        document["budgets"]["instance_semantic_state"]["shared_occupied"],
+        2
+    );
+    assert_eq!(document["budgets"]["semantic_state"]["occupied"], 0);
+    assert_eq!(
+        document["budgets"]["instance_negative_state"]["occupied"],
+        1
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let path = dir.path().join("instance-events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 30, 5).unwrap();
+    emit_snapshot_as_events(&mut writer, &p, 200).unwrap();
+    writer.finish(serde_json::json!({}), 200).unwrap();
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for (array, kind, key) in [
+        ("instances", "instance_observed", "id"),
+        ("semantic_edges", "semantic_edge_observed", "instance"),
+    ] {
+        let streamed: Vec<_> = events.iter().filter(|e| e["kind"] == kind).collect();
+        assert_eq!(streamed.len(), 3);
+        for row in document[array].as_array().unwrap() {
+            let event = streamed
+                .iter()
+                .find(|e| e["event"][key] == row[key])
+                .unwrap();
+            assert_eq!(event["event"], *row);
+        }
+    }
+    let snapshot = render_snapshot(&p);
+    let frame = crate::inventory_dashboard::DisplayFrame {
+        presentation: std::sync::Arc::new(p),
+        log: crate::inventory_dashboard::LogTail::bounded().snapshot(),
+    };
+    let wide = String::from_utf8(render_frame(
+        &frame,
+        Viewport {
+            width: 200,
+            height: 120,
+        },
+        &DashboardState::new(),
+    ))
+    .unwrap();
+    for text in [&snapshot, &wide] {
+        for id in ["i0", "i1", "i2"] {
+            assert!(text.contains(&format!("instance {id}")));
+        }
+        assert!(text.contains("api_returns=3"));
+        assert!(text.contains("historical_only_returns=1"));
+        assert!(text.contains("completed=1"));
+        assert!(text.contains("failed=1"));
+    }
+    assert_eq!(
+        wide.matches("entries 100").count(),
+        1,
+        "physical entry total appears once"
+    );
+    let narrow = String::from_utf8(render_frame(
+        &frame,
+        Viewport {
+            width: 80,
+            height: 14,
+        },
+        &DashboardState::new(),
+    ))
+    .unwrap();
+    assert!(narrow.contains("instances +3 hidden"), "{narrow}");
+}
+
+#[test]
+fn instance_s1_unscanned_member_invalidates_current_operations() {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_entries(c, &m, 12, 100);
+    h.commit();
+    h.coordinator_mut().registry_mut().note_member_unscanned(c);
+    h.commit();
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    let state = row.semantics.as_ref().unwrap();
+    assert!(!state.has_live_operations());
+    assert_eq!(state.unknown(), 1);
+    assert_eq!(row.api_returns, Some(1));
+    assert!(row.lossy);
+    assert_eq!(
+        h.coordinator().registry().instances().next().unwrap().state,
+        InstanceLifecycle::Uncertain
+    );
+    let document = crate::inventory::render_json_from_presentation(&Presentation::capture(
+        h.coordinator(),
+        "system",
+        0,
+        200,
+        1,
+    ));
+    assert_eq!(document["edges"][0]["entries"]["count"], 12);
+}
+
+fn instance_physical_gap_trace(recover: bool) {
+    let (mut h, c, m) = single_edge();
+    let d = NativeDomainId::mint();
+    let k = instance_key(d, instance_router_ids(d, 1)[0], &m);
+    instance_register(&mut h, &k, c, 100);
+    instance_feed(&mut h, &k, c, d, 1, init("C_SignInit", 7, RSA_PSS, 100));
+    instance_feed(&mut h, &k, c, d, 2, op("C_Sign", 7, 105));
+    h.commit();
+    // This test-only factory can fabricate continuity authority. In H3 held
+    // envelopes still need the finalization barrier before publication.
+    let held_init = instance::call(
+        k.clone(),
+        c,
+        instance::position(d, 3),
+        init("C_SignInit", 7, ECDSA, 108),
+        None,
+    );
+    let held_sign = instance::call(
+        k.clone(),
+        c,
+        instance::position(d, 4),
+        op("C_Sign", 7, 109),
+        None,
+    );
+    {
+        h.coordinator_mut()
+            .registry_mut()
+            .note_instance_semantic_loss(instance::loss(
+                instance::Scope::Module(
+                    d,
+                    ImageIdentity {
+                        task_cookie: 71,
+                        exec_id: 0,
+                    },
+                    m.clone(),
+                ),
+                instance::position(d, 5),
+                InstanceReason::SemanticLoss,
+            ));
+    }
+    let module = h.coordinator().registry().module_id_for(&m).unwrap();
+    h.coordinator_mut()
+        .registry_mut()
+        .note_module_absent(c, module, false, 110);
+    h.coordinator_mut().registry_mut().note_mapping(
+        c,
+        9000,
+        ModuleInfo {
+            path: "/scale/m0.so".into(),
+            key: m,
+            double_loaded: false,
+            build_id: None,
+            identity_source: Some("workload".into()),
+            admission: crate::discovery::caller_registry::AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        },
+        120,
+    );
+    instance_register(&mut h, &k, c, 120);
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(held_init);
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_instance_semantic(held_sign);
+    h.commit();
+    let row = h
+        .coordinator()
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(4));
+    assert_eq!(row.historical_only_returns, 2);
+    assert_eq!(row.semantics.as_ref().unwrap().started(), 1);
+    assert_eq!(row.semantics.as_ref().unwrap().completed(), 1);
+    assert!(!row.semantics.as_ref().unwrap().has_live_operations());
+    if recover {
+        // A separately fresh recovery receipt authorizes these original records.
+        instance_feed(&mut h, &k, c, d, 6, init("C_SignInit", 7, ECDSA, 130));
+        instance_feed(&mut h, &k, c, d, 7, op("C_Sign", 7, 140));
+        h.commit();
+        let row = h
+            .coordinator()
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .unwrap();
+        assert_eq!(row.api_returns, Some(6));
+        assert_eq!(row.historical_only_returns, 2);
+        assert_eq!(row.semantics.as_ref().unwrap().completed(), 2);
+        assert_eq!(row.semantics.as_ref().unwrap().started(), 2);
+        assert!(row.lossy);
+    }
+}
+
+#[test]
+fn instance_s1_physical_gap_barrier_blocks_preminted_returns_after_remap() {
+    instance_physical_gap_trace(false);
+}
+
+#[test]
+fn instance_s1_physical_gap_recovery_reduces_fresh_pair() {
+    instance_physical_gap_trace(true);
+}

@@ -793,6 +793,8 @@ fn detail_room(height: usize) -> usize {
 /// explicitly counted by a marker, never silently dropped.
 #[derive(Debug, Clone, Copy)]
 struct BlockBudget {
+    /// Instance children shown; hidden children retain an explicit count.
+    instance_rows: usize,
     /// Mechanism rows shown (of the edge's total; the rest collapse
     /// into the `+N more mechs` marker).
     mech_rows: usize,
@@ -978,6 +980,7 @@ fn fit_edge_block(
     budget: usize,
 ) -> Option<Vec<String>> {
     let full = BlockBudget {
+        instance_rows: DASHBOARD_MAX_INSTANCES,
         mech_rows: DASHBOARD_MAX_MECHS,
         show_evidence: true,
         show_gaps: true,
@@ -989,6 +992,7 @@ fn fit_edge_block(
     }
     for mech_rows in (0..DASHBOARD_MAX_MECHS).rev() {
         let stage = BlockBudget {
+            instance_rows: DASHBOARD_MAX_INSTANCES,
             mech_rows,
             show_evidence: true,
             show_gaps: true,
@@ -1001,6 +1005,7 @@ fn fit_edge_block(
     }
     for (show_evidence, show_gaps) in [(false, true), (false, false)] {
         let stage = BlockBudget {
+            instance_rows: DASHBOARD_MAX_INSTANCES,
             mech_rows: 0,
             show_evidence,
             show_gaps,
@@ -1013,14 +1018,20 @@ fn fit_edge_block(
     }
     // New secondary identity details must not increase the established
     // minimum whole-edge summary block. They remain on the evidence page.
-    let compact = BlockBudget {
-        mech_rows: 0,
-        show_evidence: false,
-        show_gaps: false,
-        show_identity: false,
-    };
-    let block = render_edge_block(presentation, edge, width, compact);
-    (block.len() <= budget).then_some(block)
+    for instance_rows in (0..=DASHBOARD_MAX_INSTANCES).rev() {
+        let compact = BlockBudget {
+            instance_rows,
+            mech_rows: 0,
+            show_evidence: false,
+            show_gaps: false,
+            show_identity: false,
+        };
+        let block = render_edge_block(presentation, edge, width, compact);
+        if block.len() <= budget {
+            return Some(block);
+        }
+    }
+    None
 }
 
 /// Dashboard mechanism facts: the count plus one item per mechanism
@@ -1032,6 +1043,7 @@ fn fit_edge_block(
 /// provenance — so every dashboard edge's facts compare against its
 /// JSON edge (F6/C1).
 pub(crate) const DASHBOARD_MAX_MECHS: usize = 8;
+const DASHBOARD_MAX_INSTANCES: usize = 8;
 
 fn semantic_mech_items(
     mechanisms: &[crate::inventory_present::MechanismView],
@@ -1300,6 +1312,77 @@ fn render_edge_block(
         items.extend(secondary_identity_items(presentation, edge));
     }
     lines.extend(wrap_items(width, &items));
+    let children: Vec<_> = presentation
+        .semantic_edges
+        .iter()
+        .filter(|child| child.caller == edge.caller && child.module == edge.module)
+        .collect();
+    for child in children.iter().take(budget.instance_rows) {
+        let instance = presentation
+            .instances
+            .iter()
+            .find(|r| r.id == child.instance)
+            .expect("semantic instance resolves in presentation");
+        let mut items = vec![
+            format!(
+                "instance {} {}",
+                child.instance.label(),
+                instance.state.label()
+            ),
+            format!(
+                "api_returns={}{}",
+                child
+                    .api_returns
+                    .map_or_else(|| "unknown".into(), |n| n.to_string()),
+                if child.saturated { " (saturated)" } else { "" }
+            ),
+            format!("historical_only_returns={}", child.historical_only_returns),
+            format!("semantics {}", child.semantics.label),
+            format!("coverage lossy={}", child.lossy),
+        ];
+        items.extend(
+            child
+                .reasons
+                .iter()
+                .map(|reason| format!("reason {reason}")),
+        );
+        if let Some(ops) = &child.semantics.operations {
+            items.extend(semantic_mech_items(
+                &child.semantics.mechanisms,
+                budget.mech_rows,
+            ));
+            items.push(format!(
+                "ops calls={} started={} completed={} cancelled={}",
+                ops.calls, ops.started, ops.completed, ops.cancelled
+            ));
+            items.push(format!(
+                "ops failed={} unknown={} orphans={} dropped={}",
+                ops.failed, ops.unknown, ops.orphans, ops.dropped
+            ));
+            items.push(format!(
+                "active {}",
+                if ops.active.is_empty() {
+                    "none".into()
+                } else {
+                    ops.active
+                        .iter()
+                        .map(|op| format!("{}:{}x{}", op.category, op.state, op.count))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            ));
+            if budget.show_evidence {
+                items.extend(evidence_items(ops));
+            } else {
+                items.push(format!("evidence +{} hidden", evidence_items(ops).len()));
+            }
+        }
+        lines.extend(wrap_items(width, &items));
+    }
+    let hidden = children.len().saturating_sub(budget.instance_rows);
+    if hidden > 0 {
+        lines.extend(wrap_items(width, &[format!("instances +{hidden} hidden")]));
+    }
     lines
 }
 

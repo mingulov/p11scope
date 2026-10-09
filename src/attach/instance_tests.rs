@@ -547,6 +547,72 @@ fn spawn_cmd_target() -> Result<CmdSetup> {
     })
 }
 
+/// Timeout-only reads of the owned fixture's actual capture path.
+fn native_image_call_diagnostics(session: &Session, target: &Target) -> Result<String> {
+    use p11scope_ebpf_common::{CallStart, EVIDENCE_CELLS, SlotStats, StartKey};
+
+    let stats: PerCpuArray<_, SlotStats> =
+        PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS")?)?;
+    let (entered, returned, errors) =
+        stats
+            .get(&0, 0)?
+            .iter()
+            .fold((0u64, 0u64, 0u64), |(entered, returned, errors), value| {
+                (
+                    entered.saturating_add(value.entered),
+                    returned.saturating_add(value.returned),
+                    errors.saturating_add(value.errors),
+                )
+            });
+    let evidence: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE")?)?;
+    let evidence = (0..EVIDENCE_CELLS)
+        .map(|index| {
+            Ok(evidence
+                .get(&index, 0)?
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let cookie: Array<_, ImageIdentityControl> =
+        Array::try_from(session.ebpf.map("COOKIE_CTL").context("COOKIE_CTL")?)?;
+    let owner: Array<_, ThreadOwnerControl> =
+        Array::try_from(session.ebpf.map("OWNER_CTL").context("OWNER_CTL")?)?;
+    let pid_filter: HashMap<_, u32, u64> =
+        HashMap::try_from(session.ebpf.map("PID_FILTER").context("PID_FILTER")?)?;
+    let start: HashMap<_, StartKey, CallStart> =
+        HashMap::try_from(session.ebpf.map("START").context("START")?)?;
+    let key = StartKey {
+        pid_tgid: (u64::from(target.pid()) << 32) | u64::from(target.pid()),
+        slot: 0,
+        _pad: 0,
+    };
+    let start_present = match start.get(&key, 0) {
+        Ok(_) => true,
+        Err(MapError::KeyNotFound) => false,
+        Err(error) => return Err(error).context("diagnostic START lookup"),
+    };
+    let array = |name: &str, index: u32| -> Result<u64> {
+        let map: Array<_, u64> =
+            Array::try_from(session.ebpf.map(name).with_context(|| name.to_string())?)?;
+        Ok(map.get(&index, 0)?)
+    };
+    let maps = session.instance_maps();
+    Ok(format!(
+        "slot0 entered={entered} returned={returned} errors={errors} START={start_present}; \
+         EVIDENCE[ring,start,unmatched,rv,cgroup,semantic,template,mechanism,abi]={evidence:?}; \
+         cookie={:?}; owner={:?}; pid_filter={:?}; CONFIG={} STOP_GATE={}; fault={} sticky={}",
+        cookie.get(&0, 0)?,
+        owner.get(&0, 0)?,
+        pid_filter.get(&target.pid(), 0),
+        array("CONFIG", 0)?,
+        array("STOP_GATE", 0)?,
+        maps.fault()?,
+        maps.sticky()?,
+    ))
+}
+
 /// A real endpoint call and its private continuity record, collected without
 /// the legacy cookie-only router harness.
 fn native_image_call(session: &mut Session, target: &mut Target) -> Result<EventRecord> {
@@ -571,16 +637,51 @@ fn native_image_call(session: &mut Session, target: &mut Target) -> Result<Event
             ensure!(record.continuity.return_stamp.flags == instance::STAMP_VALID);
             return Ok(record);
         }
-        ensure!(
-            Instant::now() < deadline,
-            "owned native call record timed out"
-        );
+        if Instant::now() >= deadline {
+            let diagnostics = native_image_call_diagnostics(session, target)
+                .unwrap_or_else(|error| format!("diagnostic read failed: {error:#}"));
+            bail!("owned native call record timed out; {diagnostics}");
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-// Explicit PID-scoped Multi supplies genuine entries after de_thread. Classic
-// Singles detach on the old leader's death; its separate refusal gate remains.
+fn native_image_retained_kernel_ids(session: &Session) -> Result<BTreeMap<String, u32>> {
+    let mut ids = BTreeMap::new();
+    for (name, map) in session.ebpf.maps() {
+        let data = match map {
+            Map::Array(data)
+            | Map::CgroupArray(data)
+            | Map::HashMap(data)
+            | Map::LruHashMap(data)
+            | Map::PerCpuArray(data)
+            | Map::PerCpuHashMap(data)
+            | Map::ProgramArray(data)
+            | Map::RingBuf(data)
+            | Map::Unsupported(data) => data,
+            _ => bail!("unexpected full-image fixture map {name}"),
+        };
+        let id = data.info()?.id();
+        ensure!(id != 0);
+        ids.insert(format!("map:{name}"), id);
+    }
+    for (name, program) in session.ebpf.programs() {
+        match program.info() {
+            Ok(info) => {
+                ensure!(info.id() != 0);
+                ids.insert(format!("program:{name}"), info.id());
+            }
+            Err(aya::programs::ProgramError::NotLoaded) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(ids)
+}
+
+// Fixed PID-scoped Multi links retain the original leader task/mm and do not
+// follow de_thread. Rebind only the endpoints for the successor positive;
+// the same Session/domain/maps/four hooks stay retained throughout. Classic
+// Singles' separate detachment/refusal gate remains unchanged.
 fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let provider = compile_for_abi(directory.path(), true, abi)?;
@@ -615,8 +716,16 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
         session.query_images(&[&target.pin], window()?),
         Err(image_query::ImageQueryRefusal::Unknown)
     ));
-    let first = native_image_call(&mut session, &mut target)?;
+    eprintln!("full-image {abi:?}: native startup and initial Unknown query verified");
+    let first = native_image_call(&mut session, &mut target).context("first owned native call")?;
     let domain = session.native_domain().context("retained native domain")?;
+    let retained_ids = native_image_retained_kernel_ids(&session)?;
+    let hook_ids = session
+        .instance_hook_stats()?
+        .into_iter()
+        .map(|(name, stats)| (name, stats.program_id))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(hook_ids.len() == 4 && session.instance_tracking().hook_link_count() == 4);
     let router = InstanceRouter::new(RouterLimits::default());
     let fence = router.fence();
     let scan = session
@@ -631,6 +740,7 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
     );
     ensure!(scan.file_slot() + 1 == u32::from(first.continuity.entry_stamp.file_slot_plus1));
     ensure!(scan.fence() == router.fence());
+    eprintln!("full-image {abi:?}: first owned call and nonempty full-image scan verified");
     let ready = target.command(b'e')?;
     ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
     // Poison is not repaired by a query. The real post-exec entry must renew.
@@ -638,7 +748,8 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
         session.query_images(&[&target.pin], window()?),
         Err(image_query::ImageQueryRefusal::Unknown)
     ));
-    let renewed = native_image_call(&mut session, &mut target)?;
+    let renewed = native_image_call(&mut session, &mut target)
+        .context("owned native call after leader exec")?;
     ensure!(renewed.event.image.task_cookie == first.event.image.task_cookie);
     ensure!(renewed.event.image.exec_id > first.event.image.exec_id);
     let scan = session
@@ -648,6 +759,7 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
         .map_err(|refusal| anyhow::anyhow!("renewed full-image scan refused: {refusal:?}"))?;
     ensure!(scan.domain() == domain && scan.image() == renewed.event.image);
     ensure!(!scan.ranges().is_empty());
+    eprintln!("full-image {abi:?}: leader exec, renewed call and nonempty scan verified");
     let original_birth = target.pin.start_time();
     let original_pid = target.pid();
     let ready = target.command(b'E')?;
@@ -659,7 +771,67 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
         session.query_images(&[&target.pin], window()?),
         Err(image_query::ImageQueryRefusal::Unknown)
     ));
-    let successor = native_image_call(&mut session, &mut target)?;
+    eprintln!("full-image {abi:?}: nonleader exec custody and pre-entry Unknown verified");
+    // The original fixed PID-Multi link cannot install a breakpoint in the
+    // successor mm. This fixture rebinds endpoint links, without restarting
+    // the proof owner or manufacturing continuity through a fresh Session.
+    session
+        .audit_image_continuity()
+        .map_err(|refusal| anyhow::anyhow!("pre-rebind full-image audit refused: {refusal:?}"))?;
+    session.detach_slots(&plan.slots)?;
+    ensure!(session.detach_failures().is_empty() && !session.has_slot_link(plan.slots[0].index));
+    let (failed, completed) = session.attach_targets(&plan.slots, &pins)?;
+    ensure!(failed.is_empty() && session.attach_failures().is_empty());
+    ensure!(completed.len() == 1 && completed[0].0 == plan.slots[0].index);
+    let owned_sides: Vec<_> = session
+        .links
+        .iter()
+        .filter(|link| link.slots().contains(&plan.slots[0].index))
+        .map(|link| match link {
+            RegisteredLink::MultiUProbe {
+                program,
+                slots,
+                fds,
+            } => {
+                ensure!(slots == &[plan.slots[0].index] && fds.len() == 1);
+                Ok(*program)
+            }
+            _ => bail!("successor fixture endpoint is not owned Multi"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected_entry = entry_program(
+        &plan.slots[0].semantics,
+        CapturePolicy::Allowlisted,
+        false,
+        abi,
+    );
+    ensure!(
+        owned_sides.len() == 2
+            && BTreeSet::from_iter(owned_sides) == BTreeSet::from([expected_entry, "p11_return"])
+    );
+    ensure!(session.backend_fallback().is_none() && session.native_domain() == Some(domain));
+    ensure!(native_image_retained_kernel_ids(&session)? == retained_ids);
+    ensure!(session.instance_tracking().hook_link_count() == 4);
+    ensure!(
+        session
+            .instance_hook_stats()?
+            .into_iter()
+            .map(|(name, stats)| (name, stats.program_id))
+            .collect::<BTreeMap<_, _>>()
+            == hook_ids
+    );
+    session
+        .audit_image_continuity()
+        .map_err(|refusal| anyhow::anyhow!("post-rebind full-image audit refused: {refusal:?}"))?;
+    ensure!(matches!(
+        session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    eprintln!(
+        "full-image {abi:?}: successor endpoints rebound; same domain/maps/programs/hooks and Unknown verified"
+    );
+    let successor = native_image_call(&mut session, &mut target)
+        .context("owned native call after nonleader exec")?;
     ensure!(successor.event.image.task_cookie != renewed.event.image.task_cookie);
     let scan = session
         .scan_image(&target.pin, plan.slots[0].object, window()?, fence, || {
@@ -670,6 +842,7 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
         })?;
     ensure!(scan.domain() == domain && scan.image() == successor.event.image);
     ensure!(!scan.ranges().is_empty());
+    eprintln!("full-image {abi:?}: nonleader successor call and nonempty scan verified");
     session
         .audit_image_continuity()
         .map_err(|refusal| anyhow::anyhow!("final full-image audit refused: {refusal:?}"))?;

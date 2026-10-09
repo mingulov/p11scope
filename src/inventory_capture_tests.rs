@@ -34,6 +34,108 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// return at once.
 const NO_COLLECTION_TICK: Duration = Duration::from_secs(3600);
 
+/// The existing scripted capture through the real PID-pin runtime seam.
+/// It supplies no kernel identity or privileged capture evidence.
+pub(crate) fn cgroup_runtime_lane() -> (
+    impl CaptureLane<crate::process::PidPin>,
+    Rc<RefCell<Vec<String>>>,
+) {
+    cgroup_runtime_lane_with_exec(None)
+}
+
+pub(crate) fn cgroup_runtime_exec_lane(
+    pid: u32,
+) -> (
+    impl CaptureLane<crate::process::PidPin>,
+    Rc<RefCell<Vec<String>>>,
+) {
+    cgroup_runtime_lane_with_exec(Some(pid))
+}
+
+fn cgroup_runtime_lane_with_exec(
+    pid: Option<u32>,
+) -> (
+    impl CaptureLane<crate::process::PidPin>,
+    Rc<RefCell<Vec<String>>>,
+) {
+    struct OsLane(ScriptedLane, Option<u32>, u64);
+    impl NativeIdentity<crate::process::PidPin> for OsLane {
+        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+            None
+        }
+        fn query_cookie(
+            &mut self,
+            domain: NativeDomainId,
+            pin: &crate::process::PidPin,
+        ) -> CookieQuery {
+            if domain == self.0.domain && self.1 == Some(pin.pid()) {
+                CookieQuery::Cookie(DomainCookie::scripted(domain, TICKET))
+            } else {
+                CookieQuery::NoCookie
+            }
+        }
+    }
+    impl CaptureLane<crate::process::PidPin> for OsLane {
+        fn domain(&self) -> NativeDomainId {
+            self.0.domain()
+        }
+        fn scope_coverage(&self) -> CaptureScopeCoverage {
+            self.0.scope_coverage()
+        }
+        fn extend(
+            &mut self,
+            delta: TargetDelta,
+            targets: &dyn CaptureTargets,
+            window: ExtendWindow,
+        ) -> ExtendReceipt {
+            self.0.extend(delta, targets, window)
+        }
+        fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
+            self.0.service_discovery(window)
+        }
+        fn read_witnesses(&mut self, window: ReadWindow) -> WitnessBatch {
+            let mut batch = self.0.read_witnesses(window);
+            if let Some(pid) = self.1
+                && let Some(endpoint) = self.0.attached.first()
+            {
+                self.2 = self.2.saturating_add(1);
+                // Each new image row needs a later empty read's health
+                // horizon, alongside a later lifecycle drain, before binding.
+                let exec = match self.2 {
+                    1 => Some(1),
+                    3 => Some(2),
+                    _ => None,
+                };
+                if let Some(exec) = exec {
+                    batch.rows.push(WitnessRow::scripted(
+                        self.0.domain,
+                        TICKET,
+                        exec,
+                        endpoint.object,
+                        endpoint.id,
+                        pid,
+                        batch.rows_read_ns,
+                    ));
+                }
+            }
+            batch
+        }
+        fn begin_stop(&mut self) {
+            self.0.begin_stop();
+        }
+        fn poll_retirement(&mut self, deadline: Instant) -> Result<bool> {
+            self.0.poll_retirement(deadline)
+        }
+        fn cleanup(&self) -> Option<CleanupSummary> {
+            self.0.cleanup()
+        }
+    }
+    let log = Log::default();
+    let mut lane = ScriptedLane::new(&log);
+    lane.scope_coverage = CaptureScopeCoverage::Cgroup;
+    (OsLane(lane, pid, 0), log)
+}
+
 /// Strictly increasing CLOCK_MONOTONIC stamps: each facade batch follows
 /// the one before it, and every stamp follows the real clock.
 #[derive(Default)]
@@ -679,7 +781,7 @@ impl PassDriver<Pin> for Scene {
         self.scans += 1;
         let catalog = self.catalog();
         let gate = self.collect_gate.take();
-        Box::new(move || {
+        CollectJob::Legacy(Box::new(move || {
             if let Some((serviced, wanted)) = gate {
                 for _ in 0..wanted {
                     serviced
@@ -688,18 +790,18 @@ impl PassDriver<Pin> for Scene {
                 }
             }
             Ok(catalog)
-        })
+        }))
     }
 
     fn apply(
         &mut self,
-        collected: Result<crate::inspect_system::Catalog>,
+        collected: CollectedPass,
         identity: &mut dyn NativeIdentity<Pin>,
         now_ns: u64,
     ) -> Result<PassReport> {
         self.note("scan");
         Ok(self.coordinator.apply_catalog(
-            collected?,
+            collected.legacy()?,
             &mut UnavailableImageGuard,
             identity,
             u64::MAX,
@@ -1550,7 +1652,7 @@ fn failed_pass_application_still_reads_terminal_state_and_keeps_first_error() {
         }
         fn apply(
             &mut self,
-            _: Result<crate::inspect_system::Catalog>,
+            _: CollectedPass,
             _: &mut dyn NativeIdentity<Pin>,
             _: u64,
         ) -> Result<PassReport> {

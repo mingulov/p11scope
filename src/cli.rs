@@ -107,6 +107,15 @@ pub enum InspectScope {
     System,
 }
 
+impl From<InspectScope> for ScopeArg {
+    fn from(scope: InspectScope) -> Self {
+        match scope {
+            InspectScope::Pid(pid) => Self::Pid(pid),
+            InspectScope::System => Self::System,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectArgs {
     pub scope: InspectScope,
@@ -125,19 +134,19 @@ pub struct DoctorArgs {
     pub extra_strict: bool,
 }
 
-/// What `p11scope inventory` observes: one named process, or every
-/// process on the machine, for one snapshot or across `--duration`.
+/// What `p11scope inventory` observes: one process, a retained cgroup and
+/// its descendants, or every process, for one snapshot or across `--duration`.
 /// The scan lane reads `/proc` only; the native usage lane (`--capture`)
 /// adds the Inventory BPF object's witnesses. Usage columns read unknown
 /// unless a feed observed them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryArgs {
-    pub scope: InspectScope,
+    pub scope: ScopeArg,
     pub modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     pub json: bool,
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
-    /// Only `--system` scans more than one member, so only it reads this.
+    /// System and cgroup scopes may scan multiple members; this is not a tree cap.
     pub max_scan_pids: Option<usize>,
     /// `--max-gaps`: retained gap history bound; None ⇒ 1024 default.
     pub max_gaps: Option<usize>,
@@ -310,6 +319,7 @@ usage:
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
   p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
@@ -437,14 +447,19 @@ Without --pid or --cgroup, target readiness is unassessed.
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
   p11scope inventory --pid 4242 --capture scan --json -o inventory.json
+  p11scope inventory --cgroup <path> --capture native --duration 30s --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
   p11scope inventory --system --capture native --duration 30s --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
+Choose exactly one of --pid, --cgroup, or --system; --cgroup includes descendants.
+Quiet cgroup usage remains unknown: endpoint samples do not prove continuous membership.
+Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, not the cgroup tree.
 --module narrows the scan to named providers.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 --max-endpoints selects capture-lifetime physical endpoint IDs: 1..=8192, default 4096; unloading does not refund IDs.
@@ -908,6 +923,7 @@ fn parse_inventory_diff(
 /// saved JSON report. Diff parsing above never changes this capture path.
 fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<InventoryArgs, CliError> {
     let mut pid: Option<u32> = None;
+    let mut cgroup: Option<PathBuf> = None;
     let mut system = false;
     let mut modules = Vec::new();
     let mut hooks = HookRegistry::builtin();
@@ -957,6 +973,12 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                     return Err(usage_err("--pid given twice"));
                 }
                 pid = Some(require_pid(&mut args)?);
+            }
+            "--cgroup" => {
+                if cgroup.is_some() {
+                    return Err(usage_err("--cgroup given twice"));
+                }
+                cgroup = Some(require_path(&mut args, "--cgroup")?);
             }
             "--system" => system = true,
             "--module" => modules.push(require_path(&mut args, "--module")?),
@@ -1075,14 +1097,22 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             other => return Err(unknown_arg(other)),
         }
     }
-    if system && pid.is_some() {
-        return Err(usage_err("--pid and --system are mutually exclusive"));
+    let selected = usize::from(pid.is_some()) + usize::from(cgroup.is_some()) + usize::from(system);
+    if selected > 1 {
+        return Err(usage_err(
+            "--pid, --cgroup, and --system are mutually exclusive",
+        ));
     }
-    let scope = match (pid, system) {
-        (Some(pid), false) => InspectScope::Pid(pid),
-        (None, true) => InspectScope::System,
-        (None, false) => return Err(usage_err("inventory requires --pid <n> or --system")),
-        (Some(_), true) => unreachable!("mutual exclusion returns above"),
+    let scope = match (pid, cgroup, system) {
+        (Some(pid), None, false) => ScopeArg::Pid(pid),
+        (None, Some(path), false) => ScopeArg::Cgroup(path),
+        (None, None, true) => ScopeArg::System,
+        (None, None, false) => {
+            return Err(usage_err(
+                "inventory requires --pid <n>, --cgroup <path>, or --system",
+            ));
+        }
+        _ => unreachable!("mutual exclusion returns above"),
     };
     if out.as_deref() == Some(std::path::Path::new("-")) {
         return Err(usage_err(
@@ -1461,6 +1491,82 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn inventory_cgroup_accepts_capture_modes_and_output_forms() {
+        let outputs: &[&[&str]] = &[
+            &[],
+            &["--json"],
+            &["--dashboard"],
+            &["-o", "inventory.json"],
+        ];
+        for capture in ["scan", "auto", "native"] {
+            for output in outputs {
+                let mut argv = vec![
+                    "inventory",
+                    "--cgroup",
+                    "/sys/fs/cgroup/owned.scope",
+                    "--capture",
+                    capture,
+                    "--max-scan-pids",
+                    "2",
+                ];
+                argv.extend_from_slice(output);
+                let result = parse(args(&argv));
+                let Ok(Command::Inventory(parsed)) = result else {
+                    panic!("cgroup {capture} with {output:?} must parse: {result:?}");
+                };
+                assert_eq!(
+                    parsed.scope,
+                    ScopeArg::Cgroup(PathBuf::from("/sys/fs/cgroup/owned.scope"))
+                );
+                assert_eq!(parsed.max_scan_pids, Some(2));
+                assert_eq!(parsed.json, output.contains(&"--json"));
+                assert_eq!(parsed.dashboard, output.contains(&"--dashboard"));
+                assert_eq!(
+                    parsed.capture,
+                    match capture {
+                        "scan" => CaptureMode::Scan,
+                        "auto" => CaptureMode::Auto,
+                        "native" => CaptureMode::Native,
+                        _ => unreachable!(),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inventory_cgroup_accepts_non_utf8_operator_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let result = parse(vec![
+            OsString::from("inventory"),
+            OsString::from("--cgroup"),
+            OsString::from_vec(b"/sys/fs/cgroup/owned-\xff.scope".to_vec()),
+            OsString::from("--capture"),
+            OsString::from("scan"),
+        ]);
+        let Ok(Command::Inventory(parsed)) = result else {
+            panic!("the byte path must parse: {result:?}");
+        };
+        assert_eq!(
+            parsed.scope,
+            ScopeArg::Cgroup(PathBuf::from(OsString::from_vec(
+                b"/sys/fs/cgroup/owned-\xff.scope".to_vec()
+            )))
+        );
+    }
+
+    #[test]
+    fn inventory_cgroup_help_names_scope_and_coverage_limit() {
+        let help = HelpTopic::Inventory.text();
+        assert!(help.contains("--cgroup <path>"), "{help}");
+        assert!(help.contains("descendants"), "{help}");
+        assert!(
+            help.contains("Quiet cgroup usage remains unknown"),
+            "{help}"
+        );
     }
 
     #[test]
@@ -1844,7 +1950,7 @@ mod tests {
         .unwrap() else {
             panic!("expected inventory")
         };
-        assert_eq!(i.scope, InspectScope::Pid(7));
+        assert_eq!(i.scope, ScopeArg::Pid(7));
         assert_eq!(i.duration, Some(Duration::from_secs(60)));
         assert_eq!(i.out, Some(PathBuf::from("inventory.json")));
         assert!(!i.json);
@@ -1860,7 +1966,7 @@ mod tests {
         .unwrap() else {
             panic!("expected inventory")
         };
-        assert_eq!(i.scope, InspectScope::System);
+        assert_eq!(i.scope, ScopeArg::System);
         assert!(i.json);
         assert_eq!(i.max_scan_pids, Some(8));
         assert_eq!(i.duration, Some(Duration::from_secs(300)));
@@ -2108,7 +2214,7 @@ mod tests {
             .unwrap() else {
                 panic!("expected inventory")
             };
-            assert_eq!(parsed.scope, InspectScope::System);
+            assert_eq!(parsed.scope, ScopeArg::System);
             assert_eq!(parsed.capture.label(), mode);
             assert_eq!(
                 parsed.diagnostics,
@@ -2137,7 +2243,7 @@ mod tests {
         .unwrap() else {
             panic!("expected inventory")
         };
-        assert_eq!(parsed.scope, InspectScope::Pid(7));
+        assert_eq!(parsed.scope, ScopeArg::Pid(7));
         assert_eq!(parsed.capture, CaptureMode::Auto);
         assert_eq!(parsed.diagnostics_pid, Some(u32::MAX));
         let Command::Inventory(unfiltered) = parse(args(&[

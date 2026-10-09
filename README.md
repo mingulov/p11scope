@@ -50,6 +50,14 @@ observations by recorded application path and module content; `--json` and
 Counts describe independent windows, and absence does not prove removal.
 See [offline comparison examples](docs/usage.md#offline-inventory-comparison).
 
+Development inventory also accepts `--cgroup /sys/fs/cgroup/owned.scope`, including
+descendants, across scan/auto/native and the existing output modes. Discovery
+retains the selected root, requires initial PID numbering with matching procfs,
+and reports bounded partial work explicitly. Quiet cgroup usage remains unknown;
+endpoint membership samples do not prove continuous residency. Scoped native
+owner admission is still deferred; useful scan-pinned facts remain available.
+Public live cgroup qualification remains a development gate.
+
 ## Building from source
 
 The root manifest selects two patched crates reconstructed from

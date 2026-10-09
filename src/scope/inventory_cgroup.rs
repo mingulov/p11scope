@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
 const CHUNK: usize = 4096;
@@ -30,6 +30,7 @@ pub(crate) enum CollectionStop {
 pub(crate) struct CollectionControl {
     deadline: Option<Instant>,
     stop: Arc<AtomicU8>,
+    operator_stop_source: Option<Arc<AtomicUsize>>,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 impl CollectionControl {
@@ -43,8 +44,13 @@ impl CollectionControl {
         Self {
             deadline,
             stop: Arc::new(AtomicU8::new(0)),
+            operator_stop_source: None,
             clock: Arc::new(clock),
         }
+    }
+    pub(crate) fn with_operator_stop_source(mut self, source: Arc<AtomicUsize>) -> Self {
+        self.operator_stop_source = Some(source);
+        self
     }
     pub(crate) fn cancel(&self) {
         let _ = self
@@ -52,6 +58,14 @@ impl CollectionControl {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
     }
     pub(crate) fn check(&self) -> Result<(), CollectionStop> {
+        if self.stop.load(Ordering::Acquire) == 0
+            && self
+                .operator_stop_source
+                .as_ref()
+                .is_some_and(|source| source.load(Ordering::Acquire) != 0)
+        {
+            self.cancel();
+        }
         if self.stop.load(Ordering::Acquire) == 0
             && self
                 .deadline

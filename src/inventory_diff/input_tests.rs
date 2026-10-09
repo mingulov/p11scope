@@ -608,3 +608,61 @@ fn oversized_regular_file_and_directory_are_errors() {
             .contains("regular file")
     );
 }
+
+#[test]
+fn cgroup_native_filter_is_a_known_label_with_nonempty_evidence() {
+    let mut document = fixture();
+    document["scope"] = json!("cgroup:/sys/fs/cgroup/owned.scope");
+    document["observation"]["lane"] = json!("native");
+    document["observation"]["attach"] = json!({
+        "selection": "auto", "mechanism": "uprobe-multi",
+        "fallback": null, "scope_filter": "bpf-cgroup"
+    });
+    let snapshot = parse_snapshot(&bytes(&document)).unwrap();
+    assert_eq!(
+        (
+            snapshot.callers.len(),
+            snapshot.modules.len(),
+            snapshot.edges.len()
+        ),
+        (1, 1, 1)
+    );
+    let filter = snapshot
+        .observation
+        .attach
+        .as_ref()
+        .unwrap()
+        .scope_filter
+        .as_ref()
+        .unwrap();
+    assert_eq!(filter.raw, "bpf-cgroup");
+    assert!(
+        filter.known,
+        "the current producer's cgroup filter must be recognized"
+    );
+}
+
+#[test]
+fn cgroup_membership_uncertainty_is_a_known_label_with_nonempty_evidence() {
+    let mut document = fixture();
+    document["scope"] = json!("cgroup:/sys/fs/cgroup/owned.scope");
+    document["edges"][0]["entries"]["coverage"]["state"] = json!("unknown");
+    document["edges"][0]["entries"]["coverage"]["reason"] = json!("scope_membership_unproven");
+    let snapshot = parse_snapshot(&bytes(&document)).unwrap();
+    assert_eq!(
+        (
+            snapshot.callers.len(),
+            snapshot.modules.len(),
+            snapshot.edges.len()
+        ),
+        (1, 1, 1)
+    );
+    let coverage = snapshot.edges[0].coverage.as_ref().unwrap();
+    let reason = coverage.reason.as_ref().unwrap();
+    assert_eq!(coverage.state.raw, "unknown");
+    assert_eq!(reason.raw, "scope_membership_unproven");
+    assert!(
+        reason.known,
+        "the current producer's finite cgroup uncertainty must be recognized"
+    );
+}

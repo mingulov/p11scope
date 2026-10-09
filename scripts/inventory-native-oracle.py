@@ -6466,9 +6466,9 @@ def capacity_prepare(directory, population, demand=8192, custody=None):
                                       "offsets": trust_offsets, "implementation": "p11-kit-trust"})
         compile_fixture("ledger", "tests/fixtures/public-cli/inventory-ledger.c", ["-O1", "-ldl", "-lpthread"])
     else:
-        if population == "boundary" and demand not in (4097, 6531, 8192):
+        if population in ("boundary", "refusal") and demand not in (4097, 6531, 8192):
             raise ValueError("boundary demand must be4097,6531,8192")
-        if population not in ("boundary", "growth", "owners"):
+        if population not in ("boundary", "growth", "owners", "refusal"):
             raise ValueError("unknown capacity population")
         full_unique = 1 if population == "owners" else 68
         template = compile_fixture("full.so", "crates/discover/tests/fixture/version_matrix.c",
@@ -6500,6 +6500,10 @@ def capacity_prepare(directory, population, demand=8192, custody=None):
                               for provider in manifest["providers"] for offset in provider["offsets"]})
     if population == "boundary" and manifest["demand"] != demand:
         raise ValueError("independent mapped object/offset union does not equal requested boundary")
+    if population == "refusal":
+        if manifest["demand"] != demand:
+            raise ValueError("independent mapped object/offset union does not equal requested refusal demand")
+        manifest["refusal_limit"] = demand - 1
     with open(output / "capacity.json", "w", encoding="utf-8") as stream:
         json.dump(manifest, stream)
     return manifest
@@ -6620,16 +6624,19 @@ def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, 
 
     custody.checkpoint()
     keys = list(providers)
-    if manifest["demand"] > limit:
-        raise ValueError("positive population exceeds selected budget; N+1 is a separate Task3 refusal cell")
+    if population == "refusal":
+        if manifest["demand"] != limit + 1 or limit != manifest.get("refusal_limit"):
+            raise ValueError("refusal cell needs demand exactly one above the selected budget")
+    elif manifest["demand"] > limit:
+        raise ValueError("positive population exceeds selected budget")
     if population == "owners":
         for index, key in enumerate(keys):
             catalog(f"owner-{index:03d}", [key])
     elif population == "growth":
         growth, owner = catalog("growth", keys[:32])
         owner["providers"] = keys
-    elif population == "boundary":
-        catalog("boundary", keys)
+    elif population in ("boundary", "refusal"):
+        catalog(population, keys)
     else:
         # The already installed trust provider has a valid read-only
         # Initialize/GetInfo/Finalize protocol; no hardware token login.
@@ -6780,6 +6787,25 @@ def capacity_object(pin):
     return (*device, pin["ino"])
 
 
+def capacity_lowering_refusal(reason, needed, limit):
+    """Whole-module lowering wording, observed on a real N+1 run: names its
+    needed count and the selected limit, and refuses to attach a prefix."""
+    return (f"module needs {needed} more;" in reason
+            and f"only {limit} attach slots are available;" in reason
+            and "are in use" in reason
+            and "refusing to attach a prefix" in reason)
+
+
+def capacity_lifetime_refusal(reason, path, needed, limit):
+    """Run-lifetime attach-set wording (production unit-pinned): names the
+    module path, its needed count and the lifetime occupancy/limit."""
+    noun = "endpoint" if needed == 1 else "endpoints"
+    return (path in reason
+            and f"needs {needed} more {noun}" in reason
+            and f"of {limit} capture-lifetime endpoints" in reason
+            and "refusing to add a prefix" in reason)
+
+
 def capacity_stream_view(path, until_ns, final):
     """Production streams publish compact identity and lower-bound counts.
 
@@ -6811,6 +6837,164 @@ def capacity_stream_view(path, until_ns, final):
             "observation": final.get("observation", {})}
 
 
+def capacity_refusal_judgment(directory, manifest, providers, owners, calls, all_calls, result, lane, limit, union):
+    """Single-shot N+1 refusal: demand exactly one past the selected budget.
+
+    Judges the terminal snapshot only, never an event stream. The lowering
+    refuses whole modules before the attach set sees them (no gap, the
+    per-pass `refused` counter untouched); run-lifetime exhaustion refuses
+    with the attach-set wording plus a budget gap. Either wording names its
+    needed count and limit, every owned provider is admitted whole or
+    refused whole, and admitted endpoints plus refused whole-module
+    surfaces sum to the independent demand. Late over-budget growth is a
+    separate cell with its own multi-snapshot judgment.
+    """
+    phases = manifest["phases"]
+    names = [phase["name"] for phase in phases]
+    single = len(phases) == 1 and len(set(names)) == 1 and "snapshot" in phases[0] and "stream" not in phases[0]
+    result.ok("capacity", "*", "CAPACITY-REFUSAL-SINGLE-SNAPSHOT", single,
+              "refusal cells judge one terminal snapshot; late over-budget growth is a separate cell")
+    if not single:
+        return
+    phase = phases[0]
+    name = phase["name"]
+    result.ok(name, "*", "CAPACITY-REFUSAL-COVERAGE", set(phase["providers"]) == set(providers),
+              "single-shot refusal must judge every owned provider")
+    doc = load_json(os.path.join(directory, phase["snapshot"]))
+    result.ok(name, "*", "CAPACITY-SCHEMA", doc.get("schema") == SCHEMAS["inventory"], "wrong inventory schema")
+    started = doc.get("observation", {}).get("started_ns")
+    ended = doc.get("observation", {}).get("ended_ns")
+    clock_valid = doc.get("clock") == {"basis": "CLOCK_MONOTONIC", "unit": "ns"} and \
+        type(started) is int and type(ended) is int and 0 < started < ended
+    result.ok(name, "*", "CAPACITY-WINDOW", clock_valid,
+              "terminal report has no valid monotonic capture window")
+    if clock_valid:
+        result.ok(name, "*", "CAPACITY-WINDOW", all(
+            call["t1"] < started if call["phase"] == "pre_admission" else started <= call["t0"] <= call["t1"] <= ended
+            for call in all_calls), "disclosed pre-admission or claimed captured calls overlap the wrong window")
+    admitted, refused, reasons = {}, {}, {}
+    for key in phase["providers"]:
+        provider, identity, offsets = providers[key]
+        matching = [module for module in doc.get("modules", [])
+                    if (module.get("identity", {}).get("device", {}).get("major"),
+                        module.get("identity", {}).get("device", {}).get("minor"),
+                        module.get("identity", {}).get("inode")) == identity]
+        if not result.ok(name, key, "CAPACITY-PROVIDER", len(matching) == 1,
+                         f"expected exactly one module for independently pinned {identity}; got {len(matching)}"):
+            continue
+        module = matching[0]
+        result.ok(name, key, "CAPACITY-PROVIDER", provider["path"] in module.get("paths", []) and
+                  module["identity"].get("sha256") == provider["pin"]["sha256"], "provider path/hash mismatch")
+        admission = module.get("admission", {})
+        state = admission.get("state")
+        if state == "admitted":
+            if result.ok(name, key, "CAPACITY-REFUSAL-VERDICT",
+                         admission.get("endpoints") == len(offsets) and admission.get("reasons") == [],
+                         f"admitted provider is truncated or partial: {admission}"):
+                admitted[key] = module
+        elif state == "refused":
+            stated = admission.get("reasons", [])
+            named = (admission.get("endpoints") is None and isinstance(stated, list) and 1 <= len(stated) <= 8
+                     and any(capacity_lowering_refusal(reason, len(offsets), limit)
+                             or capacity_lifetime_refusal(reason, provider["path"], len(offsets), limit)
+                             for reason in stated if isinstance(reason, str)))
+            if result.ok(name, key, "CAPACITY-REFUSAL-VERDICT", named,
+                         f"refusal is partial or unnamed: {admission}"):
+                refused[key] = module
+                reasons[key] = stated
+        else:
+            result.ok(name, key, "CAPACITY-REFUSAL-VERDICT", False,
+                      f"owned provider is neither admitted nor refused: {admission}")
+    admitted_endpoints = sum(len(providers[key][2]) for key in admitted)
+    refused_endpoints = sum(len(providers[key][2]) for key in refused)
+    budget = doc.get("budgets", {}).get("inventory_endpoints", {})
+    result.ok(name, "*", "CAPACITY-REFUSAL-BUDGET",
+              budget.get("limit") == limit and budget.get("occupied") == admitted_endpoints
+              and type(budget.get("occupied")) is int and budget["occupied"] <= limit and bool(refused)
+              and admitted_endpoints + refused_endpoints == len(union),
+              f"refusal budget/exact demand mismatch: {budget}; "
+              f"admitted={admitted_endpoints} refused={refused_endpoints} demand={len(union)}")
+    records = doc.get("budgets", {}).get("inventory_attach_modules", {})
+    result.ok(name, "*", "CAPACITY-REFUSAL-RECORDS",
+              records.get("limit") == limit and records.get("occupied") == len(admitted),
+              f"module records must be exactly the admitted modules: {records}")
+    census = doc.get("budgets", {}).get("endpoints", {})
+    result.ok(name, "*", "CAPACITY-REFUSAL-CENSUS", census.get("occupied") == admitted_endpoints,
+              f"retained endpoint census must equal admitted endpoints: {census}")
+    owned_paths = {provider[0]["path"] for provider in providers.values()}
+    expected = [gap for gap in doc.get("gaps", []) if gap.get("subject") == "inventory attach set refused module"]
+    for gap in expected:
+        stated = gap.get("budget") or {}
+        result.ok(name, "*", "CAPACITY-REFUSAL-GAP",
+                  stated.get("resource") == "inventory_endpoints" and stated.get("limit") == limit
+                  and type(stated.get("requested")) is int and limit < stated["requested"] <= len(union)
+                  and any(providers[key][0]["path"] in str(gap.get("reason", "")) for key in refused),
+                  f"refusal gap must name its resource/limit/requested owned module: {gap}")
+    for key in refused:
+        if any(isinstance(reason, str) and capacity_lifetime_refusal(reason, providers[key][0]["path"],
+               len(providers[key][2]), limit) for reason in reasons[key]):
+            result.ok(name, key, "CAPACITY-REFUSAL-GAP",
+                      any(providers[key][0]["path"] in str(gap.get("reason", "")) for gap in expected),
+                      "lifetime-worded refusal has no recorded budget gap")
+    rest = [gap for gap in doc.get("gaps", []) if gap.get("subject") != "inventory attach set refused module"]
+    harmful = [gap for gap in rest if LOSS_GAP.search(str(gap.get("reason", "")))
+               or LOSS_GAP.search(str(gap.get("subject", ""))) or
+               ((any(path in str(gap) for path in owned_paths) or gap.get("budget")) and
+                re.search(r"refus|fail|partial|unavailable", str(gap), re.I))]
+    result.ok(name, "*", "CAPACITY-LOSS", not harmful and doc.get("gaps_suppressed", 0) == 0,
+              f"controlled capacity population has harmful/suppressed gaps: {harmful[:3]}")
+    module_keys = {module["id"]: key for key, module in {**admitted, **refused}.items()}
+    caller_keys = {caller["id"]: (caller.get("pid"), caller.get("start_time")) for caller in doc.get("callers", [])}
+    caller_authorities = {caller["id"]: caller.get("image", {}).get("authority") for caller in doc.get("callers", [])}
+    edges = {}
+    for edge in doc.get("edges", []):
+        key = (caller_keys.get(edge.get("caller")), module_keys.get(edge.get("module")))
+        entries = edge.get("entries", {})
+        if entries.get("count", 0) > 0:
+            result.ok(name, "*", "CAPACITY-FOREIGN", key[0] in owners and key[1] in owners[key[0]]["providers"],
+                      f"positive on an unexpected caller/provider pair: {key}")
+            if lane == "native":
+                result.ok(name, str(key), "CAPACITY-AUTHORITY", caller_authorities.get(edge.get("caller")) == "native_exact",
+                          "native positive has no exact caller authority")
+        if key in edges:
+            result.add(name, "*", "CAPACITY-PAIR", "fail", f"duplicate edge: {key}")
+        edges[key] = edge
+    expected_counts = {}
+    called_union = set()
+    for owner_identity, key, call in calls:
+        if call["phase"] in names:
+            pair = (owner_identity, key)
+            expected_counts[pair] = expected_counts.get(pair, 0) + call["n"]
+            called_union.add((*providers[key][1], call["offset"]))
+    result.ok(name, "*", "CAPACITY-NONEMPTY", bool(expected_counts), "no independent post-admission calls")
+    result.ok(name, "*", "CAPACITY-CALL-POPULATION", {pair[1] for pair in expected_counts} >= set(phase["providers"]),
+              "some demanded physical providers have no independent post-admission activity")
+    for pair, count in expected_counts.items():
+        edge = edges.get(pair)
+        if lane == "native":
+            entries = edge.get("entries", {}) if edge else {}
+            actual = entries.get("count", 0)
+            if pair[1] in refused:
+                result.ok(name, str(pair), "CAPACITY-REFUSAL-NO-COUNT", actual == 0,
+                          f"refused demand must never count positives: {entries.get('count')}")
+            else:
+                result.ok(name, str(pair), "CAPACITY-COUNT", actual == count and
+                          entries.get("observation") == "observed" and
+                          entries.get("coverage", {}).get("state") == "counted" and
+                          entries.get("coverage", {}).get("lossy") is False,
+                          f"exact cumulative count expected {count}, got {entries.get('count')}")
+    if lane == "native":
+        observation = doc.get("observation", {})
+        result.ok(name, "*", "CAPACITY-LANE", observation.get("lane") == "native", "required native lane absent")
+        if manifest.get("require_retirement"):
+            result.ok(name, "*", "CAPACITY-RETIREMENT", observation.get("retirement") == manifest["require_retirement"]
+                      and observation.get("settlement") == "unsettled",
+                      "required retirement gate or current semantic-settlement contract changed")
+    result.add(name, "*", "CAPACITY-DENOMINATORS", "pass",
+               f"attached physical endpoints={admitted_endpoints}; refused physical endpoints={refused_endpoints}; "
+               f"actually called physical endpoints={len(called_union)}")
+
+
 def capacity_oracle(directory):
     """Private workload facts establish demand; output only supplies observations.
 
@@ -6827,7 +7011,7 @@ def capacity_oracle(directory):
     if lane not in ("scan", "native") or type(limit) is not int or not 1 <= limit <= 8192:
         raise ValueError("invalid capacity lane or selected limit")
     population = manifest["population"]
-    if population not in ("boundary", "growth", "owners", "real"):
+    if population not in ("boundary", "growth", "owners", "real", "refusal"):
         raise ValueError("unknown capacity population")
     result = Results(lane)
     providers = {}
@@ -6844,14 +7028,20 @@ def capacity_oracle(directory):
         union.update((*identity, offset) for offset in offsets)
     result.ok("capacity", "*", "CAPACITY-UNION", len(union) == manifest["demand"],
               f"independent physical union={len(union)}, declared={manifest['demand']}")
-    if population == "boundary":
-        result.ok("capacity", "*", "CAPACITY-BOUNDARY", len(union) in (4097, 6531, 8192),
-                  f"exact boundary must be4097,6531,8192; got{len(union)}")
-    elif population in ("growth", "real"):
-        result.ok("capacity", "*", "CAPACITY-WIDE", len(union) > 6530,
-                  f"wide workload has only{len(union)} physical endpoints")
-    result.ok("capacity", "*", "CAPACITY-ENVELOPE", len(union) <= limit,
-              f"positive population{len(union)} exceeds selected limit{limit}")
+    if population == "refusal":
+        result.ok("capacity", "*", "CAPACITY-REFUSAL-PAIR",
+                  len(union) in (4097, 6531, 8192) and len(union) == manifest["demand"] == limit + 1,
+                  f"refusal demand must be exactly one past the selected limit: "
+                  f"union={len(union)} demand={manifest['demand']} limit={limit}")
+    else:
+        if population == "boundary":
+            result.ok("capacity", "*", "CAPACITY-BOUNDARY", len(union) in (4097, 6531, 8192),
+                      f"exact boundary must be4097,6531,8192; got{len(union)}")
+        elif population in ("growth", "real"):
+            result.ok("capacity", "*", "CAPACITY-WIDE", len(union) > 6530,
+                      f"wide workload has only{len(union)} physical endpoints")
+        result.ok("capacity", "*", "CAPACITY-ENVELOPE", len(union) <= limit,
+                  f"positive population{len(union)} exceeds selected limit{limit}")
     owners = {}
     calls = []
     all_calls = []
@@ -6904,6 +7094,12 @@ def capacity_oracle(directory):
         implementations = {providers[key][0].get("implementation") for _owner, key, _call in calls}
         result.ok("capacity", "*", "CAPACITY-IMPLEMENTATIONS", None not in implementations and len(implementations) >= 2,
                   f"actual calls require two declared provider implementations; got{implementations}")
+    if population == "refusal":
+        capacity_refusal_judgment(directory, manifest, providers, owners, calls, all_calls,
+                                  result, lane, limit, union)
+        if lane == "scan":
+            result.add("capacity", "*", "CAPACITY-NATIVE", "nonqualifying", "scan proves discovery/admission only")
+        return result
     phase_names = [phase["name"] for phase in manifest["phases"]]
     if len(set(phase_names)) != len(phase_names) or not phase_names:
         raise ValueError("capacity phases must be unique and nonempty")

@@ -173,6 +173,134 @@ class TraceIdentityConsumerTests(unittest.TestCase):
                 extract(prefix)
 
 
+class NamedTraceIdentityConsumerTests(unittest.TestCase):
+    @staticmethod
+    def prefix(basename="duplicate", path="/first/duplicate", *, pid=111, tid=112):
+        return f"{json.dumps(basename)} (PID {pid}, TID {tid}) exe={json.dumps(path)}"
+
+    @staticmethod
+    def pidns_extract(prefix):
+        source = (ROOT / "scripts/matrix/verify-pidns.sh").read_text()
+        block = source.split('  d=$(python3 - "$OUT" "$ITERS" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            line = f"00:00:00.000000 {prefix} C_Sign → CKR_OK 12.0µs\n"
+            evidence = {"pid_namespace": {"observer": "nested", "kernel_pids": "initial"}}
+            (tmp / "nested-trace.txt").write_text(line * 6 + "EVIDENCE " + json.dumps(evidence) + "\n")
+            (tmp / "nested-trace.wl").write_text("READY pid=7\n")
+            (tmp / "nested-trace.rc").write_text("0\n")
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", ["fixture", str(tmp), "1"]), contextlib.redirect_stdout(output):
+                exec(compile(block, str(ROOT / "scripts/matrix/verify-pidns.sh"), "exec"), {})
+            return json.loads(output.getvalue())
+
+    def test_measurement_named_mixed_and_quoted_atoms_keep_exact_counts(self):
+        prefixes = [self.prefix(), self.prefix(path="/second/duplicate"),
+                    self.prefix('q"u\\ote\\n\\u{85} (deleted)', '/owned/q"u\\ote\\n\\u{85} (deleted)'),
+                    self.prefix('(PID 9, TID 8) exe="fake" sess#4', '/owned/escaped identity'),
+                    "Unknown executable (PID 111, TID 112)", "pid 111 tid 112"]
+        text = trace_fixture(functions=["C_Sign"] * len(prefixes))
+        for prefix in prefixes:
+            text = text.replace("pid 111 tid 111", prefix + " sess#7", 1)
+        text = text.replace("CAPTURE privacy=allowlisted\n", "CAPTURE privacy=allowlisted\n"
+            "Trace — completed call events in arrival order\n"
+            "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.\n")
+        result = MEASURE["parse_trace_stream"](text.splitlines())
+        self.assertEqual(result["call_lines_total"], len(prefixes))
+        self.assertEqual(result["per_function"], {"C_Sign": len(prefixes)})
+        self.assertEqual(result["mechanism_lines"], 0, "parentheses in executable atoms are not mechanisms")
+
+    def test_privacy_named_atoms_are_retained_raw_and_decoded(self):
+        checker = runpy.run_path(str(ROOT / "scripts/check-canary-evidence.py"))
+        # Whitespace/quotes/fake prefix words inside JSON strings are data.
+        prefix = self.prefix('name "pid 999"', '/owned/(PID 1, TID 2) sess#9 (deleted)')
+        line = f"00:00:00.000000 {prefix} sess#7 C_Sign → CKR_OK 12.0µs"
+        rest = checker["trace_scannable"]("fixture", line)
+        self.assertIn('name "pid 999"', rest)
+        self.assertIn('/owned/(PID 1, TID 2) sess#9 (deleted)', rest)
+        self.assertIn(json.dumps('name "pid 999"'), rest)
+        self.assertIn("sess#7 C_Sign → CKR_OK 12.0µs", rest)
+        self.assertNotIn("PID 111", rest)
+        sentinel = next(iter(checker["LOADER_PAUSE_IDENTITIES"].values()))
+        encoded = '"' + ''.join(f"\\u{ord(c):04x}" for c in str(sentinel)) + '"'
+        for position in ["basename", "path", "suffix"]:
+            bad_prefix = (f'{encoded} (PID 111, TID 112) exe="/owned/clean"' if position == "basename"
+                          else f'"clean" (PID 111, TID 112) exe={encoded}' if position == "path"
+                          else self.prefix())
+            bad = f"00:00:00.000000 {bad_prefix} C_Sign → CKR_OK 12.0µs"
+            if position == "suffix":
+                bad += " " + str(sentinel)
+            with self.subTest(position=position), self.assertRaises(AssertionError):
+                checker["assert_no_loader_pause_identity"]("fixture", checker["trace_scannable"]("fixture", bad))
+
+    def test_kind_named_rows_keep_ledger_and_diagnostic_pid_extraction(self):
+        with mock.patch.object(sys, "argv", ["kind-e2e-oracle.py", "--self-test"]):
+            oracle = runpy.run_path(str(ROOT / "scripts/kind-e2e-oracle.py"))
+        legacy = oracle["good_trace"](2)
+        named = legacy.replace("pid 77 tid 77", self.prefix(pid=77, tid=77))
+        named = named.replace(self.prefix(pid=77, tid=77), "Unknown executable (PID 77, TID 77)", 1)
+        named = named.replace(self.prefix(pid=77, tid=77), "pid 77 tid 77", 1)
+        result = oracle["trace_exact"](named, 2)
+        self.assertEqual(result["trace_pids"], [77])
+        self.assertEqual(result["calls"], 2 * len(oracle["LEDGER_FUNCTIONS"]))
+
+    def test_pidns_actual_heredoc_accepts_quoted_named_rows(self):
+        for prefix in [self.prefix(), self.prefix('(PID 9, TID 8) sess#4', '/owned/q"u\\ote (deleted)')]:
+            for session in ["", " sess#7"]:
+                with self.subTest(prefix=prefix + session):
+                    result = self.pidns_extract(prefix + session)
+                    self.assertEqual(result["printed_pids"], [111])
+                    self.assertEqual(result["call_lines"], 6)
+
+    def test_all_four_parsers_refuse_malformed_or_duplicate_named_identity(self):
+        checker = runpy.run_path(str(ROOT / "scripts/check-canary-evidence.py"))
+        with mock.patch.object(sys, "argv", ["kind-e2e-oracle.py", "--self-test"]):
+            oracle = runpy.run_path(str(ROOT / "scripts/kind-e2e-oracle.py"))
+        good = self.prefix()
+        bad_prefixes = [
+            '"unterminated (PID 111, TID 112) exe="/owned/name"',
+            '"bad\\q" (PID 111, TID 112) exe="/owned/name"',
+            '"name" (PID 111, TID 112)',
+            '"name" (PID -1, TID 112) exe="/owned/name"',
+            good + ' exe="/second/name"', good + " sess#1 sess#2", good + " pid 111 tid 112",
+            good + " Unknown executable (PID 111, TID 112)",
+            good + ' "second" (PID 111, TID 112) exe="/owned/second"',
+            good + ' owner="private"', "unquoted (PID 111, TID 112) exe=\"/owned/name\"",
+        ]
+        for prefix in bad_prefixes:
+            text = trace_fixture(functions=["C_Sign"]).replace("pid 111 tid 111", prefix)
+            line = text.splitlines()[1]
+            with self.subTest(prefix=prefix, parser="measurement"), self.assertRaises(ValueError):
+                MEASURE["parse_trace_stream"](text.splitlines())
+            with self.subTest(prefix=prefix, parser="privacy"), self.assertRaises(AssertionError):
+                checker["trace_scannable"]("fixture", line)
+            with self.subTest(prefix=prefix, parser="kind"), self.assertRaises(AssertionError):
+                oracle["trace_exact"](oracle["good_trace"](2).replace("pid 77 tid 77", prefix), 2)
+            with self.subTest(prefix=prefix, parser="pidns"), self.assertRaises(AssertionError):
+                self.pidns_extract(prefix)
+
+    def test_final_artifact_canaries_cannot_hide_in_json_escaped_atoms(self):
+        checker = runpy.run_path(str(ROOT / "scripts/check-canary-evidence.py"))
+        checker["initialize"](64)
+        sentinels = checker["fixture_sentinels"]()
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "trace.output"
+            def write(prefix, suffix=""):
+                path.write_text(f"00:00:00.000000 {prefix} C_Sign → CKR_OK 12.0µs{suffix}\n")
+            write(self.prefix())
+            checker["assert_final_artifact_privacy"]([path])
+            for family in ["KEY", "PIN"]:
+                secret = sentinels[family].decode()
+                for position in ["basename", "path", "suffix"]:
+                    for encoded in [json.dumps(secret), '"' + ''.join(f"\\u{ord(c):04x}" for c in secret) + '"']:
+                        prefix = (f'{encoded} (PID 111, TID 112) exe="/owned/clean"' if position == "basename"
+                                  else f'"clean" (PID 111, TID 112) exe={encoded}' if position == "path"
+                                  else self.prefix())
+                        write(prefix, " " + secret if position == "suffix" else "")
+                        with self.subTest(family=family, position=position, encoded=encoded), self.assertRaises(AssertionError):
+                            checker["assert_final_artifact_privacy"]([path])
+
+
 class TraceStreamTests(unittest.TestCase):
     def parse(self, text):
         return MEASURE["parse_trace_stream"](text.splitlines(keepends=True))

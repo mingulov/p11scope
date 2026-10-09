@@ -1598,6 +1598,164 @@ mod tests {
         record.kind = kind;
         record
     }
+    fn cgroup_proof_cursor_fixture() -> (
+        ProofSession,
+        crate::process::ProcessView,
+        crate::attach::detailed_identity::CgroupCandidate,
+    ) {
+        let scope = crate::attach::Scope::Cgroup {
+            id: 1,
+            path: "/retained-only".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()),
+        };
+        let proof = ProofSession::test_scope(&scope, true);
+        proof.test_set_time(100);
+        let view =
+            crate::process::ProcessView::open(crate::process::ProcessViewId(0), std::process::id())
+                .unwrap();
+        let mut work = crate::attach::detailed_identity::TraceWorkTicket::test_new(
+            proof.clone(),
+            100,
+            5_000_100,
+        );
+        let candidate = proof.register_cgroup(&view, &mut work).unwrap();
+        proof.test_set_time(200);
+        (proof, view, candidate)
+    }
+    #[test]
+    fn cgroup_trace_bracket_all_actual_event_routes_preserve_delivery() {
+        for route in 0..4 {
+            let (proof, view, pending) = cgroup_proof_cursor_fixture();
+            let source = CursorScript::scripted([event_bytes(&proof_call(view.pid(), 101, 11, 0))]);
+            let cursor = source.cursor.clone();
+            let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+            drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            let mut seen = 0;
+            let mut callback = || {
+                seen += 1;
+                assert_eq!(
+                    cursor.get(),
+                    if route == 2 { 8 } else { 0 },
+                    "retain each route's existing item release boundary"
+                );
+                assert_eq!(proof.test_witness(pending.id()), Some((11, 0, 101)));
+                assert_eq!(proof.usage(), (1, 0), "tap only mutates charged metadata");
+            };
+            match route {
+                0 => {
+                    drain.poll(Some(2), |_| {
+                        callback();
+                        ControlFlow::Continue(())
+                    });
+                }
+                1 => {
+                    drain.poll_records(Some(2), |_| {
+                        callback();
+                        ControlFlow::Continue(())
+                    });
+                }
+                2 => {
+                    poll_events_to_position(&mut drain, 8, Some(2), |_| {
+                        callback();
+                        ControlFlow::Continue(())
+                    })
+                    .unwrap();
+                }
+                _ => {
+                    let mut tail = OwnedRootTail::new(
+                        crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
+                        Instant::now() + Duration::from_secs(1),
+                    );
+                    drain.begin_root_tail(&mut tail).unwrap();
+                    drain
+                        .poll_root_tail(&mut tail, 2, |_| {
+                            callback();
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }
+            assert_eq!(seen, 1);
+            assert_eq!(cursor.get(), 8);
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_actual_discovery_routes_apply_once() {
+        for route in 0..3 {
+            let (proof, view, pending) = cgroup_proof_cursor_fixture();
+            let mut events = EventDrain::over_domain(
+                ScriptedRecords::events([proof_call(view.pid(), 101, 11, 0)], 1),
+                proof.test_events_domain(),
+            );
+            events.attach_trace_tap(proof.test_events_tap()).unwrap();
+            events.poll(None, |_| ControlFlow::Continue(()));
+            let source = CursorScript::scripted([discovery_bytes(&proof_lifecycle(
+                view.pid(),
+                150,
+                DISCOVERY_KIND_EXEC,
+            ))]);
+            let mut drain = DiscoveryDrain::over_domain(source, proof.test_discovery_domain());
+            drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+            match route {
+                0 => assert!(matches!(drain.dequeue(), Some(DiscoveryItem::Record(_)))),
+                1 => {
+                    let mut staged = ProofSession::test_stage_once(&mut drain);
+                    let stamps = proof.test_clock_calls();
+                    assert!(matches!(staged.pop(), Some(DiscoveryItem::Record(_))));
+                    assert_eq!(
+                        proof.test_clock_calls(),
+                        stamps,
+                        "FIFO replay is not a second observation"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        poll_discovery_to_position(&mut drain, 8, Some(1), |_| {
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap(),
+                        (false, true)
+                    );
+                }
+            }
+            assert_eq!(
+                proof
+                    .test_cgroup_snapshot(pending.id())
+                    .unwrap()
+                    .contradiction,
+                Some(150)
+            );
+            assert_eq!(proof.test_horizon(), None);
+            assert!(drain.dequeue().is_none());
+            assert_eq!(proof.test_horizon(), Some(200));
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_root_tail_error_releases_and_invalidates() {
+        let (proof, view, pending) = cgroup_proof_cursor_fixture();
+        let source = CursorScript::scripted([event_bytes(&proof_call(view.pid(), 101, 11, 0))]);
+        let cursor = source.cursor.clone();
+        let mut drain = EventDrain::over_domain(source, proof.test_events_domain());
+        drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+        let mut tail = OwnedRootTail::new(
+            crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
+            Instant::now() + Duration::from_secs(1),
+        );
+        drain.begin_root_tail(&mut tail).unwrap();
+        assert!(
+            drain
+                .poll_root_tail(&mut tail, 1, |_| {
+                    assert_eq!(cursor.get(), 0);
+                    anyhow::bail!("ordinary callback error")
+                })
+                .is_err()
+        );
+        assert_eq!(cursor.get(), 8);
+        assert_eq!(
+            proof.test_problem(pending.id()),
+            Some(TraceProofUnknown::LifecycleLoss)
+        );
+    }
     // Preparation only: intended insertion into leased events.rs after shared core RED.
     // Every test calls retained production decoder entrypoints; pure decode cannot witness.
     #[test]

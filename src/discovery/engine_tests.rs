@@ -27793,17 +27793,19 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
 pub(crate) mod detailed_proof_driver {
     use super::*;
     use crate::attach::detailed_identity::{
-        ProofSession, TraceIo, TraceProofUnknown, TraceSeed, TraceWorkError, TraceWorkTicket,
-        VerifiedTraceSeed,
+        CgroupCandidate, ProofSession, TraceIo, TraceProofUnknown, TraceSeed, TraceWorkError,
+        TraceWorkTicket, VerifiedTraceSeed,
     };
     use crate::events::{DiscoveryDrain, EventDrain, ScriptedRecords};
     use p11scope_ebpf_common::{Event, ImageIdentity};
+    use std::cell::RefCell;
     use std::ops::ControlFlow;
 
     pub(crate) struct Io {
         pub(crate) proof: ProofSession,
         link: Vec<u8>,
         pub(crate) cookie: Cell<Option<u64>>,
+        cookie_by_pid: RefCell<BTreeMap<u32, u64>>,
         loss: Cell<Result<u64, TraceProofUnknown>>,
         pub(crate) cookie_reads: Cell<usize>,
         pub(crate) health_reads: Cell<usize>,
@@ -27863,6 +27865,65 @@ pub(crate) mod detailed_proof_driver {
             }
             result
         }
+        fn sample_cgroup(
+            &self,
+            candidate: &mut CgroupCandidate,
+            view: &ProcessView,
+            work: &mut TraceWorkTicket,
+        ) -> Result<(), TraceWorkError> {
+            let starts = self
+                .proof
+                .test_cgroup_snapshot(candidate.id())
+                .unwrap()
+                .starts;
+            let mut after = || self.proof.test_set_time(self.proof.test_time() + 5_000_000);
+            let result = self.proof.test_sample_cgroup(
+                candidate,
+                view,
+                work,
+                (
+                    &self.link,
+                    (self.slow_sample.get() == Some(view.id())).then_some(&mut after),
+                ),
+                || {
+                    self.cookie_reads.set(self.cookie_reads.get() + 1);
+                    Ok(self
+                        .cookie_by_pid
+                        .borrow()
+                        .get(&view.pid())
+                        .copied()
+                        .or(self.cookie.get()))
+                },
+                |work| self.refresh_health(work),
+            );
+            let after = self
+                .proof
+                .test_cgroup_snapshot(candidate.id())
+                .unwrap()
+                .starts;
+            self.samples
+                .set(self.samples.get() + usize::from(after - starts));
+            result
+        }
+        fn confirm_cgroup(
+            &self,
+            candidate: &mut CgroupCandidate,
+            view: &ProcessView,
+            work: &mut TraceWorkTicket,
+        ) -> Result<(), TraceWorkError> {
+            self.proof.test_confirm_cgroup(candidate, view, work, || {
+                self.cookie_reads.set(self.cookie_reads.get() + 1);
+                if self.slow_cookie_pid.get() == Some(view.pid()) {
+                    self.proof.test_set_time(self.proof.test_time() + 5_000_000);
+                }
+                Ok(self
+                    .cookie_by_pid
+                    .borrow()
+                    .get(&view.pid())
+                    .copied()
+                    .or(self.cookie.get()))
+            })
+        }
     }
     pub(crate) fn fixture() -> (Engine, Io) {
         let mut engine = Engine::empty();
@@ -27879,6 +27940,7 @@ pub(crate) mod detailed_proof_driver {
                 proof,
                 link: b"/owned/fixture".to_vec(),
                 cookie: Cell::new(None),
+                cookie_by_pid: RefCell::new(BTreeMap::new()),
                 loss: Cell::new(Ok(0)),
                 cookie_reads: Cell::new(0),
                 health_reads: Cell::new(0),
@@ -28821,6 +28883,40 @@ pub(crate) mod detailed_proof_driver {
         engine.scope = scope;
         (engine, io)
     }
+    fn cgroup_sampled() -> (Engine, Io, SeedId) {
+        let (mut engine, mut io) = cgroup_fixture();
+        service(&mut engine, &mut io);
+        calls(&io, 101, 11, 0);
+        io.cookie.set(Some(11));
+        for _ in 0..3 {
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+        assert_eq!(io.samples.get(), 1);
+        let id = *engine.trace_by_view.get(&ProcessViewId(0)).unwrap();
+        assert!(
+            io.proof
+                .test_cgroup_snapshot(id)
+                .unwrap()
+                .completed
+                .is_some()
+        );
+        (engine, io, id)
+    }
+    fn cgroup_verified_engine() -> (Engine, Io, VerifiedTraceSeed) {
+        let (mut engine, mut io, _) = cgroup_sampled();
+        calls(&io, io.proof.test_time() + 10, 11, 0);
+        assert!(service(&mut engine, &mut io).is_empty());
+        io.proof.test_tick();
+        empty(&io);
+        let mut accepted = service(&mut engine, &mut io);
+        assert_eq!(accepted.len(), 1);
+        (engine, io, accepted.pop().unwrap())
+    }
+    pub(crate) fn cgroup_verified_fixture() -> (ProofSession, VerifiedTraceSeed) {
+        let (engine, io, receipt) = cgroup_verified_engine();
+        drop(engine);
+        (io.proof, receipt)
+    }
     fn no_cgroup_io(io: &Io) {
         assert_eq!(
             (
@@ -28831,6 +28927,690 @@ pub(crate) mod detailed_proof_driver {
             (0, 0, 0),
             "registration and CALL metadata must perform no external read"
         );
+    }
+    #[test]
+    fn cgroup_trace_bracket_zero_exec_id_positive_and_zero_cookie_refusal() {
+        for cookie in [0, 11] {
+            let (mut engine, mut io) = cgroup_fixture();
+            assert!(service(&mut engine, &mut io).is_empty());
+            calls(&io, 101, cookie, 0);
+            io.cookie.set(Some(cookie));
+            for _ in 0..3 {
+                assert!(service(&mut engine, &mut io).is_empty());
+            }
+            if cookie == 0 {
+                assert_eq!(io.samples.get(), 0);
+                continue;
+            }
+            assert_eq!(io.samples.get(), 1, "fresh CALL must drive the real sample");
+            let upper = io.proof.test_time() + 1;
+            calls(&io, upper, cookie, 0);
+            assert!(service(&mut engine, &mut io).is_empty());
+            io.proof.test_tick();
+            empty(&io);
+            let accepted = service(&mut engine, &mut io);
+            assert_eq!(
+                accepted.len(),
+                1,
+                "both independent later horizons prove a bracket"
+            );
+            assert_eq!(accepted[0].key().exec_id, 0);
+            assert_eq!(accepted[0].path(), "/owned/fixture");
+            assert!(accepted[0].eligible_after_ns() < upper);
+            assert_eq!(io.proof.usage(), (1, 14));
+            drop(accepted);
+            assert_eq!(io.proof.usage(), (0, 0));
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_full_sample_and_upper_producer_time() {
+        let (mut engine, mut io) = cgroup_fixture();
+        service(&mut engine, &mut io);
+        calls(&io, 101, 11, 0);
+        io.cookie.set(Some(11));
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(io.samples.get(), 1);
+        // A record copied late but produced before S1 is not upper evidence.
+        calls(&io, 102, 11, 0);
+        service(&mut engine, &mut io);
+        empty(&io);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(io.samples.get(), 1, "completed sample is never restarted");
+        calls(&io, io.proof.test_time() + 1, 11, 0);
+        service(&mut engine, &mut io);
+        io.proof.test_tick();
+        empty(&io);
+        assert_eq!(service(&mut engine, &mut io).len(), 1);
+    }
+    #[test]
+    fn cgroup_trace_bracket_single_budget_restart_keeps_first_deadline() {
+        let (mut engine, mut io) = cgroup_fixture();
+        service(&mut engine, &mut io);
+        calls(&io, 101, 11, 0);
+        io.cookie.set(Some(11));
+        io.slow_sample.set(Some(ProcessViewId(0)));
+        for _ in 0..4 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(io.samples.get(), 2, "only one budget restart is permitted");
+        assert_eq!(
+            io.proof.usage(),
+            (1, 0),
+            "parked failure retains only its cooldown entry"
+        );
+        let deadline = io.proof.test_pending_times(std::process::id()).unwrap().2;
+        let id = *engine.trace_by_view.get(&ProcessViewId(0)).unwrap();
+        let state = io.proof.test_cgroup_snapshot(id).unwrap();
+        assert_eq!(state.starts, 2);
+        assert!(state.parked && state.completed.is_none());
+        assert_eq!(deadline, state.first_start.unwrap() + 60_000_000_000);
+        for _ in 0..4 {
+            calls(&io, io.proof.test_time() + 1, 11, 0);
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(io.samples.get(), 2);
+        assert_eq!(
+            io.proof.test_pending_times(std::process::id()).unwrap().2,
+            deadline
+        );
+    }
+    #[test]
+    fn cgroup_trace_bracket_one_budget_restart_can_complete_without_renewing_deadline() {
+        let (mut engine, mut io) = cgroup_fixture();
+        service(&mut engine, &mut io);
+        calls(&io, 101, 11, 0);
+        io.cookie.set(Some(11));
+        io.slow_sample.set(Some(ProcessViewId(0)));
+        service(&mut engine, &mut io);
+        let id = *engine.trace_by_view.get(&ProcessViewId(0)).unwrap();
+        let first = io.proof.test_cgroup_snapshot(id).unwrap().first_start;
+        let deadline = io.proof.test_pending_times(std::process::id()).unwrap().2;
+        assert_eq!(io.proof.usage(), (1, 0));
+        io.slow_sample.set(None);
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        let state = io.proof.test_cgroup_snapshot(id).unwrap();
+        assert_eq!(state.starts, 2);
+        assert_eq!(state.first_start, first);
+        assert!(state.completed.is_some());
+        assert_eq!(
+            io.proof.test_pending_times(std::process::id()).unwrap().2,
+            deadline
+        );
+        calls(&io, io.proof.test_time() + 1, 11, 0);
+        service(&mut engine, &mut io);
+        io.proof.test_tick();
+        empty(&io);
+        assert_eq!(service(&mut engine, &mut io).len(), 1);
+    }
+    #[test]
+    fn cgroup_trace_bracket_invalid_frame_cannot_restore_a_budget_restart() {
+        for fault in 0..3 {
+            let (mut engine, mut io) = cgroup_fixture();
+            service(&mut engine, &mut io);
+            calls(&io, 101, 11, 0);
+            io.cookie.set(Some(11));
+            io.slow_sample.set(Some(ProcessViewId(0)));
+            service(&mut engine, &mut io);
+            assert_eq!(io.samples.get(), 1);
+            let restore = io.proof.test_time() + 1;
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(fault == 0));
+            engine.cancel_flag = Some(cancel.clone());
+            if fault == 1 {
+                io.proof.test_set_time(u64::MAX);
+            }
+            if fault == 2 {
+                io.proof.test_set_time(restore - 2);
+            }
+            service(&mut engine, &mut io);
+            io.proof.test_set_time(restore);
+            cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+            io.slow_sample.set(None);
+            for _ in 0..3 {
+                service(&mut engine, &mut io);
+            }
+            assert_eq!(
+                io.samples.get(),
+                1,
+                "invalid clock/cancellation is sticky, not budget-only deferral"
+            );
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_later_exec_and_out_of_order_conflict() {
+        for early in [false, true] {
+            for before_upper in [false, true] {
+                let (mut engine, mut io) = cgroup_fixture();
+                service(&mut engine, &mut io);
+                calls(&io, 101, 11, 0);
+                io.cookie.set(Some(11));
+                for _ in 0..3 {
+                    service(&mut engine, &mut io);
+                }
+                assert_eq!(io.samples.get(), 1);
+                let upper = io.proof.test_time() + 10;
+                let change = if early { upper - 1 } else { upper + 1 };
+                if before_upper {
+                    exec(&io, change, 19);
+                }
+                calls(&io, upper, 11, 0);
+                if !before_upper {
+                    exec(&io, change, 19);
+                }
+                service(&mut engine, &mut io);
+                io.proof.test_tick();
+                empty(&io);
+                assert_eq!(
+                    service(&mut engine, &mut io).len(),
+                    usize::from(!early),
+                    "minimum producer-time contradiction is independent of ring arrival order"
+                );
+            }
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_accepted_interest_drop_and_full_capacity_request() {
+        let (mut engine, mut io, receipt) = cgroup_verified_engine();
+        let first_boundary = receipt.eligible_after_ns();
+        for _ in 0..4 {
+            calls(&io, io.proof.test_time() + 1, 11, 0);
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "accepted-key repeats do no executable reads"
+        );
+        let full: Vec<_> = (0..16_383).map(|_| io.proof.reserve(0).unwrap()).collect();
+        let reads = (io.cookie_reads.get(), io.health_reads.get());
+        calls(&io, io.proof.test_time() + 1, 11, 1);
+        for _ in 0..3 {
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+        assert_eq!(io.samples.get(), 1);
+        assert_eq!((io.cookie_reads.get(), io.health_reads.get()), reads);
+        assert_eq!(io.proof.usage(), (16_384, 14));
+        drop(full);
+        io.proof.test_tick();
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "requesting CALL cannot also witness a new registration"
+        );
+        calls(&io, io.proof.test_time() + 1, 11, 1);
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(io.samples.get(), 2);
+        assert_eq!(receipt.eligible_after_ns(), first_boundary);
+        drop(receipt);
+        assert_eq!(
+            io.proof.usage(),
+            (1, 14),
+            "old receipt drop preserves successor alias/path"
+        );
+        engine.views.clear();
+        engine.release_view_id(ProcessViewId(0));
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+    #[test]
+    fn cgroup_trace_bracket_accepted_interest_authenticates_admission_and_session_rewire() {
+        let (mut engine, mut io, receipt) = cgroup_verified_engine();
+        let id = *engine.trace_by_view.get(&ProcessViewId(0)).unwrap();
+        let TraceCandidateBody::Accepted(interest) = &engine.trace_seeds[&id].body else {
+            panic!("real accepted interest");
+        };
+        assert_eq!(
+            io.proof.cgroup_interest_status(interest, &engine.views[0]),
+            Ok(false)
+        );
+        let foreign = ProofSession::test_scope(&engine.scope, true);
+        assert_eq!(
+            foreign.cgroup_interest_status(interest, &engine.views[0]),
+            Err(TraceProofUnknown::TargetGone)
+        );
+        let reused = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        assert_eq!(
+            io.proof.cgroup_interest_status(interest, &reused),
+            Err(TraceProofUnknown::TargetGone)
+        );
+        let original = io.proof.clone();
+        io.proof = foreign;
+        io.proof.test_set_time(1_000);
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(
+            original.usage(),
+            (1, 14),
+            "foreign session cannot operate the original receipt or interest"
+        );
+        assert_eq!(io.proof.usage(), (0, 0));
+        let TraceCandidateBody::Accepted(interest) = &engine.trace_seeds[&id].body else {
+            panic!("original alias survives foreign service");
+        };
+        assert_eq!(
+            original.cgroup_interest_status(interest, &engine.views[0]),
+            Ok(false)
+        );
+        assert_eq!(receipt.path(), "/owned/fixture");
+        drop(receipt);
+        assert_eq!(original.usage(), (0, 0));
+        drop(engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+        let (proof, receipt) = cgroup_verified_fixture();
+        assert_eq!(proof.usage(), (1, 14));
+        drop(receipt);
+        assert_eq!(proof.usage(), (0, 0));
+    }
+    #[test]
+    fn cgroup_trace_bracket_full_accepted_pool_refuses_without_new_reads() {
+        let (mut engine, mut io, receipt) = cgroup_verified_engine();
+        let mut receipts = vec![receipt];
+        // Fill the actual accepted-key/index shape through production transitions,
+        // rather than substituting anonymous reservations for accepted receipts.
+        for image in 1..16_384 {
+            calls(&io, io.proof.test_time() + 1, 11, image);
+            io.proof.test_tick();
+            for _ in 0..3 {
+                assert!(service(&mut engine, &mut io).is_empty());
+            }
+            calls(&io, io.proof.test_time() + 1, 11, image);
+            for _ in 0..3 {
+                assert!(service(&mut engine, &mut io).is_empty());
+            }
+            calls(&io, io.proof.test_time() + 1, 11, image);
+            assert!(service(&mut engine, &mut io).is_empty());
+            io.proof.test_tick();
+            empty(&io);
+            let accepted = service(&mut engine, &mut io);
+            assert_eq!(
+                accepted.len(),
+                1,
+                "each retained key has a real independently settled bracket"
+            );
+            receipts.extend(accepted);
+        }
+        assert_eq!(io.proof.usage(), (16_384, 16_384 * 14));
+        let before = (
+            io.samples.get(),
+            io.cookie_reads.get(),
+            io.health_reads.get(),
+        );
+        calls(&io, io.proof.test_time() + 1, 11, 16_384);
+        io.proof.test_tick();
+        for _ in 0..3 {
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+        assert_eq!(
+            (
+                io.samples.get(),
+                io.cookie_reads.get(),
+                io.health_reads.get()
+            ),
+            before
+        );
+        drop(receipts);
+        assert_eq!(io.proof.usage(), (0, 0));
+        drop(engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+    #[test]
+    fn cgroup_trace_bracket_saved_phases_share_visit_read_and_time_allowance() {
+        let (mut engine, mut io) = cgroup_fixture();
+        let mut children = Children(Vec::new());
+        for id in 1..=9 {
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            engine
+                .views
+                .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
+            children.0.push(child);
+        }
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(engine.trace_seeds.len(), 10);
+        for view in &engine.views {
+            let cookie = u64::from(view.pid()) + 11;
+            io.cookie_by_pid.borrow_mut().insert(view.pid(), cookie);
+            calls_pid(&io, view.pid(), io.proof.test_time() + 1, cookie, 0);
+        }
+        io.slow_sample.set(Some(ProcessViewId(0)));
+        for _ in 0..12 {
+            engine
+                .with_trace_frame(&mut io, |engine, io, work| {
+                    let progress =
+                        engine.service_trace_images(io, work, |_| panic!("no upper CALL yet"));
+                    assert!(progress.visited <= 32);
+                    assert!(engine.trace_phase_visits <= 8);
+                    let state = work.state.as_ref().unwrap().lock().unwrap();
+                    assert!(state.reads <= 32 && state.visits <= 32);
+                    assert!(state.deadline - state.last_clock.min(state.deadline) <= 5_000_000);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let complete = engine
+            .trace_seeds
+            .values()
+            .filter(|candidate| {
+                io.proof
+                    .test_cgroup_snapshot(candidate.body.id())
+                    .is_some_and(|s| s.completed.is_some())
+            })
+            .count();
+        assert!(
+            complete >= 2,
+            "an always slow early view cannot starve the later views"
+        );
+        for candidate in engine.trace_seeds.values() {
+            if let Some(state) = io.proof.test_cgroup_snapshot(candidate.body.id()) {
+                assert!(state.starts <= 2);
+            }
+        }
+        for view in &engine.views {
+            calls_pid(
+                &io,
+                view.pid(),
+                io.proof.test_time() + 1,
+                u64::from(view.pid()) + 11,
+                0,
+            );
+        }
+        let mut accepted = Vec::new();
+        for _ in 0..12 {
+            accepted.extend(service(&mut engine, &mut io));
+            io.proof.test_tick();
+            empty(&io);
+        }
+        assert_eq!(
+            accepted.len(),
+            complete,
+            "health and settlement phases reach every complete later candidate"
+        );
+        drop(accepted);
+        drop(engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+    #[test]
+    fn cgroup_trace_bracket_admission_retirement_cancels_pending_and_detaches_history() {
+        let (mut engine, mut io, _) = cgroup_sampled();
+        calls(&io, io.proof.test_time() + 1, 11, 0);
+        service(&mut engine, &mut io);
+        engine.views.clear();
+        engine.release_view_id(ProcessViewId(0));
+        assert_eq!(io.proof.usage(), (0, 0));
+        let reads = (
+            io.samples.get(),
+            io.cookie_reads.get(),
+            io.health_reads.get(),
+        );
+        empty(&io);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            (
+                io.samples.get(),
+                io.cookie_reads.get(),
+                io.health_reads.get()
+            ),
+            reads
+        );
+
+        let (mut engine, mut io, receipt) = cgroup_verified_engine();
+        let key = receipt.key();
+        engine.views.clear();
+        engine.release_view_id(ProcessViewId(0));
+        assert_eq!(io.proof.usage(), (1, 14));
+        let reads = (
+            io.samples.get(),
+            io.cookie_reads.get(),
+            io.health_reads.get(),
+        );
+        calls(&io, io.proof.test_time() + 1, 11, 1);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            (
+                io.samples.get(),
+                io.cookie_reads.get(),
+                io.health_reads.get()
+            ),
+            reads
+        );
+        assert_eq!(receipt.key(), key);
+        drop(receipt);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+    #[test]
+    fn cgroup_trace_bracket_stale_health_demand_performs_no_read_after_contradiction() {
+        let (mut engine, mut io, id) = cgroup_sampled();
+        let upper = io.proof.test_time() + 1;
+        calls(&io, upper, 11, 0);
+        io.expire_health.set(true);
+        service(&mut engine, &mut io);
+        assert!(io.proof.test_cgroup_snapshot(id).unwrap().arm.is_some());
+        assert!(engine.trace_needs_health);
+        let reads = io.health_reads.get();
+        exec(&io, upper, 19);
+        io.expire_health.set(false);
+        for _ in 0..3 {
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+        assert_eq!(
+            io.health_reads.get(),
+            reads,
+            "parked contradiction cannot consume a saved health demand"
+        );
+        assert_eq!(io.proof.usage(), (1, 0));
+    }
+    #[test]
+    fn cgroup_trace_bracket_sample_deadline_is_fixed_and_expires_at_equality() {
+        let (mut engine, mut io, id) = cgroup_sampled();
+        let state = io.proof.test_cgroup_snapshot(id).unwrap();
+        let (_, g, deadline, _) = io.proof.test_pending_times(std::process::id()).unwrap();
+        assert!(state.first_start.unwrap() > g);
+        assert_eq!(deadline, state.first_start.unwrap() + 60_000_000_000);
+        io.proof.test_set_time(deadline - 2);
+        calls(&io, deadline - 2, 11, 0);
+        let reads = io.cookie_reads.get();
+        io.proof.test_set_time(deadline);
+        for _ in 0..3 {
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+        assert!(!engine.trace_seeds.contains_key(&id));
+        assert_eq!(
+            io.cookie_reads.get(),
+            reads,
+            "equality prevents confirmation before cleanup traversal"
+        );
+        assert!(io.proof.usage().0 <= 1);
+    }
+    #[test]
+    fn cgroup_trace_bracket_redundant_key_preserves_original_receipt_and_interest() {
+        let (mut engine, mut io, receipt) = cgroup_verified_engine();
+        let original = *engine.trace_by_view.get(&ProcessViewId(0)).unwrap();
+        calls(&io, io.proof.test_time() + 1, 11, 1);
+        io.proof.test_tick();
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_ne!(
+            *engine.trace_by_view.get(&ProcessViewId(0)).unwrap(),
+            original
+        );
+        calls(&io, io.proof.test_time() + 1, 11, 0);
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(
+            *engine.trace_by_view.get(&ProcessViewId(0)).unwrap(),
+            original
+        );
+        assert_eq!(io.samples.get(), 1);
+        assert_eq!(io.proof.usage(), (1, 14));
+        let TraceCandidateBody::Accepted(interest) = &engine.trace_seeds[&original].body else {
+            panic!("redirected accepted alias");
+        };
+        assert_eq!(
+            io.proof.cgroup_interest_status(interest, &engine.views[0]),
+            Ok(false)
+        );
+        drop(receipt);
+        assert_eq!(io.proof.usage(), (0, 0));
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert!(
+            io.proof.usage().0 <= 1,
+            "dropped receipt cannot leave an uncharged accepted-key alias"
+        );
+    }
+    #[test]
+    fn cgroup_trace_bracket_terminal_settles_complete_but_never_starts_or_restarts() {
+        for sampled in [false, true] {
+            let (mut engine, mut io) = cgroup_fixture();
+            service(&mut engine, &mut io);
+            calls(&io, 101, 11, 0);
+            io.cookie.set(Some(11));
+            if sampled {
+                for _ in 0..3 {
+                    service(&mut engine, &mut io);
+                }
+                calls(&io, io.proof.test_time() + 10, 11, 0);
+            }
+            let samples = io.samples.get();
+            let mut terminal = engine.begin_trace_terminal_work(std::time::Duration::from_secs(1));
+            let mut receipts = Vec::new();
+            engine.service_trace_images(&io, &mut terminal, |receipt| receipts.push(receipt));
+            io.proof.test_tick();
+            empty(&io);
+            engine.service_trace_images(&io, &mut terminal, |receipt| receipts.push(receipt));
+            assert_eq!(receipts.len(), usize::from(sampled));
+            assert_eq!(io.samples.get(), samples);
+            let same = engine.begin_trace_terminal_work(std::time::Duration::from_secs(5));
+            assert!(terminal.same_allocation(&same));
+        }
+        let (mut engine, mut io) = cgroup_fixture();
+        service(&mut engine, &mut io);
+        calls(&io, 101, 11, 0);
+        io.cookie.set(Some(11));
+        io.slow_sample.set(Some(ProcessViewId(0)));
+        service(&mut engine, &mut io);
+        assert_eq!(io.samples.get(), 1);
+        io.slow_sample.set(None);
+        let mut terminal = engine.begin_trace_terminal_work(std::time::Duration::from_secs(1));
+        engine.service_trace_images(&io, &mut terminal, |_| {
+            panic!("incomplete sample cannot settle")
+        });
+        assert_eq!(io.samples.get(), 1);
+    }
+    #[test]
+    fn cgroup_trace_bracket_same_path_reexec_and_turnover_refuse() {
+        for changed_cookie in [false, true] {
+            let (mut engine, mut io, _) = cgroup_sampled();
+            calls(
+                &io,
+                io.proof.test_time() + 1,
+                if changed_cookie { 12 } else { 11 },
+                1,
+            );
+            for _ in 0..3 {
+                service(&mut engine, &mut io);
+            }
+            // Even without a scoped lifecycle record, a different image key
+            // cannot serve as the second witness for an identical path.
+            empty(&io);
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_horizons_health_and_first_arm_are_independent() {
+        let (mut engine, mut io, id) = cgroup_sampled();
+        calls(&io, io.proof.test_time() + 10, 11, 0);
+        engine
+            .with_trace_frame(&mut io, |engine, io, work| {
+                io.refresh_health(work).unwrap();
+                engine
+                    .service_trace_images(io, work, |_| panic!("pre-arm health cannot cover arm"));
+                Ok(())
+            })
+            .unwrap();
+        let arm = io.proof.test_cgroup_snapshot(id).unwrap().arm.unwrap();
+        let state = io.proof.test_cgroup_snapshot(id).unwrap();
+        assert!(state.upper.unwrap() > state.completed.unwrap());
+        assert!(state.contradiction.is_none());
+        io.proof.test_set_time(arm);
+        empty(&io);
+        assert!(
+            service(&mut engine, &mut io).is_empty(),
+            "equal discovery start is not a covering horizon"
+        );
+        calls(&io, io.proof.test_time() + 10, 11, 0);
+        service(&mut engine, &mut io);
+        assert_eq!(io.proof.test_cgroup_snapshot(id).unwrap().arm, Some(arm));
+        io.proof.test_tick();
+        empty(&io);
+        assert_eq!(service(&mut engine, &mut io).len(), 1);
+        for loss in [Err(TraceProofUnknown::Unreadable), Ok(1), Ok(u64::MAX)] {
+            let (mut engine, mut io, _) = cgroup_sampled();
+            calls(&io, io.proof.test_time() + 10, 11, 0);
+            io.loss.set(loss);
+            service(&mut engine, &mut io);
+            empty(&io);
+            assert!(service(&mut engine, &mut io).is_empty());
+        }
+    }
+    #[test]
+    fn cgroup_trace_bracket_failure_cooldown_and_new_registration() {
+        let (mut engine, mut io) = cgroup_fixture();
+        service(&mut engine, &mut io);
+        calls(&io, 101, 11, 0);
+        io.cookie.set(Some(11));
+        io.link.clear();
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "invalid metadata is checked inside the transaction"
+        );
+        assert_eq!(io.proof.usage(), (1, 0));
+        let deadline = io.proof.test_pending_times(std::process::id()).unwrap().2;
+        io.link = b"/owned/fixture".to_vec();
+        for _ in 0..3 {
+            calls(&io, io.proof.test_time() + 1, 11, 0);
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "validation failure cannot consume the budget-only restart"
+        );
+        io.proof.test_set_time(deadline);
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        calls(&io, deadline - 1, 11, 0);
+        service(&mut engine, &mut io);
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "old replay cannot arm the new registration"
+        );
+        calls(&io, io.proof.test_time() + 1, 11, 0);
+        for _ in 0..3 {
+            service(&mut engine, &mut io);
+        }
+        assert_eq!(io.samples.get(), 2);
     }
     fn cgroup_work_reason(
         work: &TraceWorkTicket,
@@ -28859,6 +29639,7 @@ pub(crate) mod detailed_proof_driver {
         );
         assert_eq!(io.proof.usage(), (1, 0));
         no_cgroup_io(&io);
+        let full_path = io.proof.reserve(8_388_608).unwrap();
         let pid = std::process::id();
         let (id, g, deadline, first) = io.proof.test_pending_times(pid).unwrap();
         assert_eq!((g, deadline, first), (1_000, 60_000_001_000, None));
@@ -28879,6 +29660,7 @@ pub(crate) mod detailed_proof_driver {
             Some((id, g, deadline, Some(witness)))
         );
         no_cgroup_io(&io);
+        drop(full_path);
         engine.views[0] = ProcessView::open(ProcessViewId(0), pid).unwrap();
         assert!(service(&mut engine, &mut io).is_empty());
         assert!(
@@ -28903,6 +29685,7 @@ pub(crate) mod detailed_proof_driver {
             (1, 0),
             "unsampled registration must own one slot"
         );
+        let full_path = io.proof.reserve(8_388_608).unwrap();
         let pid = std::process::id();
         let (id, g, deadline, _) = io.proof.test_pending_times(pid).unwrap();
         assert_eq!((g, deadline), (100, 60_000_000_100));
@@ -28918,8 +29701,8 @@ pub(crate) mod detailed_proof_driver {
             "registration lease expires at equality"
         );
         no_cgroup_io(&io);
-        // C1 has no sample transaction. The lease therefore remains G+60s even
-        // after its first witness; C2 will install first-S0's separate deadline.
+        // No scratch capacity means no sample transaction or deadline renewal.
+        drop(full_path);
         let (mut engine, mut io) = cgroup_fixture();
         io.proof.test_set_time(u64::MAX - 59_000_000_000);
         assert!(service(&mut engine, &mut io).is_empty());

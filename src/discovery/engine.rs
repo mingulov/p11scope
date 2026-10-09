@@ -68,8 +68,8 @@ pub(crate) mod inventory;
 pub(crate) mod inventory_coordinator;
 
 use crate::attach::detailed_identity::{
-    ProofSession, SeedId, TraceCandidateBody, TraceIo, TraceProofUnknown, TraceServiceProgress,
-    TraceWorkError, VerifiedTraceSeed,
+    CgroupAction, ProofSession, SeedId, TraceCandidateBody, TraceIo, TraceProofUnknown,
+    TraceServiceProgress, TraceWorkError, VerifiedTraceSeed,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CgroupWorkRefusal {
@@ -88,6 +88,8 @@ impl From<CgroupWorkRefusal> for TraceWorkError {
 #[derive(Clone, Default)]
 pub(crate) struct TraceWorkTicket {
     state: Option<std::sync::Arc<std::sync::Mutex<TraceWorkState>>>,
+    cgroup_deadline: Option<u64>,
+    cgroup_pending: Option<SeedId>,
 }
 struct TraceWorkState {
     proof: ProofSession,
@@ -109,6 +111,8 @@ impl TraceWorkTicket {
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Self {
         Self {
+            cgroup_deadline: None,
+            cgroup_pending: None,
             state: Some(std::sync::Arc::new(std::sync::Mutex::new(TraceWorkState {
                 proof,
                 deadline,
@@ -129,6 +133,13 @@ impl TraceWorkTicket {
         }
     }
     pub(crate) fn check(&self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        if let Some(deadline) = self.cgroup_deadline {
+            self.cgroup_check(proof, deadline)?;
+            if let Some(id) = self.cgroup_pending {
+                proof.cgroup_read_status(id)?;
+            }
+            return Ok(());
+        }
         self.checked(proof, None)
             .map(|_| ())
             .map_err(|_| TraceWorkError::Deferred)
@@ -158,7 +169,11 @@ impl TraceWorkTicket {
         if let Some(reason @ Refused(_)) = state.closed {
             return Err(reason);
         }
-        let Some(now) = proof.now() else {
+        let Some(now) = (if candidate_deadline.is_some() && proof.is_cgroup() {
+            proof.cgroup_now()
+        } else {
+            proof.now()
+        }) else {
             state.closed = Some(Refused(TraceProofUnknown::Unreadable));
             return Err(Refused(TraceProofUnknown::Unreadable));
         };
@@ -186,8 +201,44 @@ impl TraceWorkTicket {
         self.checked(proof, Some(candidate_deadline))
     }
     pub(crate) fn external_read(&mut self, proof: &ProofSession) -> Result<(), TraceWorkError> {
+        if let Some(deadline) = self.cgroup_deadline {
+            return self
+                .cgroup_external_read(proof, deadline)
+                .map(|_| ())
+                .map_err(Into::into);
+        }
         self.external_read_checked(proof)
             .map_err(|_| TraceWorkError::Deferred)
+    }
+    pub(crate) fn cgroup_reader(&self, deadline: u64, pending: Option<SeedId>) -> Self {
+        Self {
+            state: self.state.clone(),
+            cgroup_deadline: Some(deadline),
+            cgroup_pending: pending,
+        }
+    }
+    pub(crate) fn cgroup_external_read(
+        &mut self,
+        proof: &ProofSession,
+        deadline: u64,
+    ) -> Result<u64, CgroupWorkRefusal> {
+        let now = self.cgroup_check(proof, deadline)?;
+        if let Some(id) = self.cgroup_pending {
+            proof
+                .cgroup_read_status(id)
+                .map_err(CgroupWorkRefusal::Refused)?;
+        }
+        let mut state = self
+            .state
+            .as_ref()
+            .ok_or(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))?
+            .lock()
+            .map_err(|_| CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))?;
+        if state.reads == 0 {
+            return Err(CgroupWorkRefusal::BudgetDeferred);
+        }
+        state.reads -= 1;
+        Ok(now)
     }
     fn external_read_checked(&mut self, proof: &ProofSession) -> Result<(), CgroupWorkRefusal> {
         self.checked(proof, None)?;
@@ -290,6 +341,7 @@ pub struct Engine {
     trace_settle_cursor: Option<SeedId>,
     trace_view_cursor: usize,
     trace_needs_health: bool,
+    trace_health_seed: Option<SeedId>,
     modules: Vec<ReconciledModule>,
     manifests: Vec<Manifest>,
     manifest_ordinals: Vec<u32>,
@@ -7751,6 +7803,7 @@ impl Engine {
             trace_settle_cursor: None,
             trace_view_cursor: 0,
             trace_needs_health: false,
+            trace_health_seed: None,
             modules: Vec::new(),
             manifests: Vec::new(),
             manifest_ordinals: Vec::new(),
@@ -8012,12 +8065,14 @@ impl Engine {
                 .map_or(frame, |prior| prior.min(frame));
             self.trace_frame_deadline_ns = Some(frame);
             work = TraceWorkTicket::new(
-                proof,
+                proof.clone(),
                 start,
                 frame.min(proof_end),
                 false,
                 self.cancel_flag.clone(),
             );
+        } else {
+            proof.invalidate_cgroup_work();
         }
         self.trace_active = Some(work.clone());
         let result = run(self, session, &mut work);
@@ -8074,12 +8129,22 @@ impl Engine {
                 .trace_terminal
                 .as_ref()
                 .is_some_and(|terminal| terminal.same_allocation(work));
-        if !owned || work.check(proof).is_err() {
+        if !owned {
             progress.deferred = 1;
             return progress;
         }
         loop {
-            if work.check(proof).is_err() {
+            let checked = if proof.is_cgroup() {
+                work.cgroup_check(proof, u64::MAX)
+                    .map(|_| ())
+                    .map_err(Into::into)
+            } else {
+                work.check(proof)
+            };
+            if let Err(error) = checked {
+                if matches!(error, TraceWorkError::Unknown(_)) {
+                    proof.invalidate_cgroup_work();
+                }
                 progress.deferred += 1;
                 break;
             }
@@ -8103,15 +8168,42 @@ impl Engine {
                     // including when the original-pin read later defers.
                     self.trace_arm_cursor = Some(id);
                     self.trace_phase_visits += 1;
-                    let candidate = &self.trace_seeds[&id];
-                    let result = match &candidate.body {
+                    let candidate = self.trace_seeds.get_mut(&id).expect("visited candidate");
+                    let result = match &mut candidate.body {
                         TraceCandidateBody::Cgroup(registration) => self
                             .views
                             .get(candidate.position)
                             .ok_or(TraceWorkError::Unknown(TraceProofUnknown::TargetGone))
                             .and_then(|view| {
-                                proof.cgroup_registration_status(registration, view, work)
+                                let status = proof.cgroup_status(registration, view, work)?;
+                                self.trace_needs_health |= status.needs_health;
+                                if status.needs_health {
+                                    self.trace_health_seed = Some(id);
+                                }
+                                match status.action {
+                                    CgroupAction::Sample => {
+                                        session.sample_cgroup(registration, view, work)
+                                    }
+                                    CgroupAction::Confirm => {
+                                        session.confirm_cgroup(registration, view, work)
+                                    }
+                                    CgroupAction::Parked => {
+                                        proof.park_cgroup(
+                                            registration,
+                                            TraceProofUnknown::ProofPending,
+                                        );
+                                        Ok(())
+                                    }
+                                    CgroupAction::Idle => Ok(()),
+                                }
                             }),
+                        TraceCandidateBody::Accepted(interest) => self
+                            .views
+                            .get(candidate.position)
+                            .ok_or(TraceProofUnknown::TargetGone)
+                            .and_then(|view| proof.cgroup_interest_status(interest, view))
+                            .map(|_| ())
+                            .map_err(Into::into),
                         TraceCandidateBody::PidSystem(seed) => {
                             let status = self
                                 .views
@@ -8140,14 +8232,67 @@ impl Engine {
                             progress.deferred += 1;
                             break;
                         }
-                        Err(TraceWorkError::Unknown(_)) => self.drop_trace_seed(id),
+                        Err(TraceWorkError::Unknown(reason)) => {
+                            let redirect = self.trace_seeds.get(&id).and_then(|candidate| {
+                                if let TraceCandidateBody::Cgroup(registration) = &candidate.body {
+                                    self.views.get(candidate.position).and_then(|view| {
+                                        proof
+                                            .redirect_cgroup(registration, view)
+                                            .map(|interest| (interest, candidate.position))
+                                    })
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some((interest, position)) = redirect {
+                                self.drop_trace_seed(id);
+                                let body = TraceCandidateBody::Accepted(interest);
+                                let target = body.id();
+                                // Drop an old handle before installing the replacement:
+                                // its detach cannot erase a newly installed alias.
+                                self.drop_trace_seed(target);
+                                self.trace_by_view.insert(body.view_id(), target);
+                                self.trace_seeds
+                                    .insert(target, TraceCandidate { body, position });
+                                continue;
+                            }
+                            if let Some(candidate) = self.trace_seeds.get_mut(&id)
+                                && let TraceCandidateBody::Cgroup(registration) =
+                                    &mut candidate.body
+                                && !matches!(
+                                    reason,
+                                    TraceProofUnknown::TargetGone
+                                        | TraceProofUnknown::AfterEvent
+                                        | TraceProofUnknown::NotSeeded
+                                )
+                            {
+                                proof.park_cgroup(registration, reason);
+                            } else {
+                                self.drop_trace_seed(id);
+                            }
+                        }
                         Ok(()) => {
                             if let Some(candidate) = self.trace_seeds.get(&id)
                                 && let Some(view) = self.views.get(candidate.position)
-                                && let TraceCandidateBody::PidSystem(seed) = &candidate.body
-                                && let Ok((_, needs)) = proof.seed_status(seed, view)
                             {
-                                self.trace_needs_health |= needs;
+                                match &candidate.body {
+                                    TraceCandidateBody::PidSystem(seed) => {
+                                        if let Ok((_, needs)) = proof.seed_status(seed, view) {
+                                            self.trace_needs_health |= needs;
+                                        }
+                                    }
+                                    TraceCandidateBody::Cgroup(registration) => {
+                                        if let Ok(status) =
+                                            proof.cgroup_status(registration, view, work)
+                                        {
+                                            self.trace_needs_health |= status.needs_health;
+                                            if status.needs_health {
+                                                self.trace_health_seed = Some(id);
+                                            }
+                                        }
+                                    }
+                                    TraceCandidateBody::Accepted(_) => {}
+                                }
                             }
                         }
                     }
@@ -8169,12 +8314,52 @@ impl Engine {
                             proof.can_seed(&self.views[self.trace_view_cursor]).is_ok();
                     }
                     if (self.trace_needs_health || baseline_needed) && !work.health_attempted() {
-                        match session.refresh_health(work) {
+                        let result = if proof.is_cgroup() {
+                            if work.visit(proof).is_err() {
+                                progress.deferred += 1;
+                                break;
+                            }
+                            progress.visited += 1;
+                            // A saved demand is only a cursor into charged state.
+                            // Revalidate it before any shared health syscall.
+                            let demand = self.trace_health_seed.and_then(|id| {
+                                self.trace_seeds.get(&id).and_then(|candidate| {
+                                    self.views.get(candidate.position).and_then(|view| {
+                                        if let TraceCandidateBody::Cgroup(registration) =
+                                            &candidate.body
+                                        {
+                                            Some((
+                                                id,
+                                                proof.cgroup_status(registration, view, work),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                            });
+                            match demand {
+                                Some((id, Ok(status))) if status.needs_health => session
+                                    .refresh_health(
+                                        &mut work.cgroup_reader(status.deadline, Some(id)),
+                                    ),
+                                Some((_, Err(TraceWorkError::Deferred))) => {
+                                    Err(TraceWorkError::Deferred)
+                                }
+                                _ => Ok(()),
+                            }
+                        } else {
+                            session.refresh_health(work)
+                        };
+                        match result {
                             Err(TraceWorkError::Deferred) => {
                                 progress.deferred += 1;
                                 break;
                             }
-                            _ => self.trace_needs_health = false,
+                            _ => {
+                                self.trace_needs_health = false;
+                                self.trace_health_seed = None;
+                            }
                         }
                     }
                     self.advance_trace_phase();
@@ -8204,11 +8389,10 @@ impl Engine {
                                 proof.seed_status(seed, view)?;
                                 proof.ready_to_transfer(seed).map_err(Into::into)
                             }
-                            TraceCandidateBody::Cgroup(registration) => {
-                                proof.cgroup_registration_status(registration, view, work)?;
-                                // C1 has no complete sample, and cannot publish a receipt.
-                                Ok(false)
-                            }
+                            TraceCandidateBody::Cgroup(registration) => proof
+                                .cgroup_status(registration, view, work)
+                                .map(|status| status.ready_to_transfer),
+                            TraceCandidateBody::Accepted(_) => Ok(false),
                         });
                     match result {
                         Ok(true) => {
@@ -8216,15 +8400,53 @@ impl Engine {
                                 .trace_seeds
                                 .remove(&id)
                                 .expect("visited retained candidate");
-                            if self.trace_by_view.get(&candidate.body.view_id()) == Some(&id) {
-                                self.trace_by_view.remove(&candidate.body.view_id());
-                            }
-                            if let TraceCandidateBody::PidSystem(seed) = candidate.body
-                                && let Ok(verified) =
-                                    proof.verified(seed, &self.views[candidate.position])
-                            {
-                                progress.transferred += 1;
-                                accept(verified);
+                            let position = candidate.position;
+                            match candidate.body {
+                                TraceCandidateBody::PidSystem(seed) => {
+                                    if self.trace_by_view.get(&seed.view_id()) == Some(&id) {
+                                        self.trace_by_view.remove(&seed.view_id());
+                                    }
+                                    if let Ok(verified) =
+                                        proof.verified(seed, &self.views[position])
+                                    {
+                                        progress.transferred += 1;
+                                        accept(verified);
+                                    }
+                                }
+                                TraceCandidateBody::Cgroup(registration) => {
+                                    match proof.verify_cgroup(
+                                        registration,
+                                        &self.views[position],
+                                        work,
+                                    ) {
+                                        Ok((verified, interest)) => {
+                                            self.trace_seeds.insert(
+                                                id,
+                                                TraceCandidate {
+                                                    body: TraceCandidateBody::Accepted(interest),
+                                                    position,
+                                                },
+                                            );
+                                            progress.transferred += 1;
+                                            accept(verified);
+                                        }
+                                        Err((mut registration, error)) => {
+                                            if let TraceWorkError::Unknown(reason) = error {
+                                                proof.park_cgroup(&mut registration, reason);
+                                            }
+                                            self.trace_seeds.insert(
+                                                id,
+                                                TraceCandidate {
+                                                    body: TraceCandidateBody::Cgroup(registration),
+                                                    position,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                TraceCandidateBody::Accepted(_) => {
+                                    unreachable!("accepted aliases cannot transfer")
+                                }
                             }
                         }
                         Err(TraceWorkError::Deferred) => {
@@ -8250,8 +8472,19 @@ impl Engine {
                     self.trace_view_cursor %= self.views.len();
                     let position = self.trace_view_cursor;
                     let view = &self.views[position];
-                    let eligible = !self.trace_by_view.contains_key(&view.id())
-                        && (proof.is_cgroup() || proof.can_seed(view).is_ok());
+                    let eligible = if proof.is_cgroup() {
+                        self.trace_by_view
+                            .get(&view.id())
+                            .and_then(|id| self.trace_seeds.get(id))
+                            .is_none_or(|candidate| match &candidate.body {
+                                TraceCandidateBody::Accepted(interest) => proof
+                                    .cgroup_interest_status(interest, view)
+                                    .unwrap_or(false),
+                                _ => false,
+                            })
+                    } else {
+                        !self.trace_by_view.contains_key(&view.id()) && proof.can_seed(view).is_ok()
+                    };
                     if eligible && !proof.is_cgroup() && !proof.has_baseline() {
                         // The baseline read retains this eligible view for its
                         // capacity recheck; no sample attempt has begun yet.

@@ -3,14 +3,17 @@
 
 from collections import Counter
 import os
+import json
 from pathlib import Path
 import runpy
+import select
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-cgroup-trace.py'))
@@ -95,6 +98,167 @@ class OwnershipTests(unittest.TestCase):
                 child.wait(timeout=3)
             owner.close()
             child.stdout.close()
+
+
+class AcquisitionTests(unittest.TestCase):
+    def test_failed_cgroup_open_removes_the_actual_created_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, groups = Path(directory) / 'new', []
+            namespace = HARNESS['create_cgroup'].__globals__
+            with mock.patch.dict(namespace, fs_magic=lambda _: 0x63677270,
+                                 Cgroup=mock.Mock(side_effect=OSError('open refused'))):
+                with self.assertRaises(OSError):
+                    HARNESS['create_cgroup'](path, groups)
+                HARNESS['cleanup_cgroups'](groups)
+            self.assertFalse(path.exists(), 'created directory was never enrolled')
+
+    def test_failed_acquisition_never_removes_a_replacement_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, groups = Path(directory) / 'new', []
+            original = Path(directory) / 'original'
+            namespace = HARNESS['create_cgroup'].__globals__
+            with mock.patch.dict(namespace, fs_magic=lambda _: 0x63677270,
+                                 Cgroup=mock.Mock(side_effect=OSError('open refused'))):
+                with self.assertRaises(OSError):
+                    HARNESS['create_cgroup'](path, groups)
+                path.rename(original)
+                path.mkdir()
+                with self.assertRaises(ExceptionGroup):
+                    HARNESS['cleanup_cgroups'](groups)
+                self.assertTrue(path.is_dir())
+                self.assertTrue(original.is_dir())
+
+    def test_wrong_filesystem_refuses_creation_before_mkdir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, groups = Path(directory) / 'new', []
+            with self.assertRaises(ValueError):
+                HARNESS['create_cgroup'](path, groups)
+            self.assertFalse(path.exists())
+            HARNESS['cleanup_cgroups'](groups)
+
+    def test_failed_process_ownership_still_reaps_the_actual_popen_child(self):
+        owners, children = [], []
+        original_popen = subprocess.Popen
+        def capture(*args, **options):
+            child = original_popen(*args, **options)
+            children.append(child)
+            return child
+        namespace = HARNESS['spawn_owned'].__globals__
+        try:
+            with mock.patch.object(subprocess, 'Popen', capture), mock.patch.dict(namespace,
+                    OwnedProcess=mock.Mock(side_effect=ValueError('identity refused'))):
+                with self.assertRaises(ValueError):
+                    HARNESS['spawn_owned'](owners, [sys.executable, '-c', 'import time; time.sleep(10)'],
+                                          os.getuid(), start_new_session=True)
+            HARNESS['cleanup_processes'](owners)
+            self.assertIsNotNone(children[0].poll(), 'actual Popen child was never enrolled')
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=3)
+
+    def test_late_ownership_refusal_closes_pidfd_and_reaps_the_direct_child(self):
+        owners, children, pidfds = [], [], []
+        original_popen, original_pidfd = subprocess.Popen, os.pidfd_open
+        def capture(*args, **options):
+            child = original_popen(*args, **options)
+            children.append(child)
+            return child
+        def open_pidfd(*args):
+            fd = original_pidfd(*args)
+            pidfds.append(fd)
+            return fd
+        try:
+            with mock.patch.object(subprocess, 'Popen', capture), mock.patch.object(os, 'pidfd_open', open_pidfd), \
+                    mock.patch.object(HARNESS['OwnedProcess'], 'verify', side_effect=ValueError('late refusal')):
+                with self.assertRaises(ValueError):
+                    HARNESS['spawn_owned'](owners, [sys.executable, '-c', 'import time; time.sleep(10)'], os.getuid())
+            with self.assertRaises(OSError):
+                os.fstat(pidfds[0])
+            HARNESS['cleanup_processes'](owners)
+            self.assertIsNotNone(children[0].poll())
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=3)
+
+    def test_sigterm_during_acquisition_is_delivered_after_directory_enrollment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, groups = Path(directory) / 'new', []
+            namespace = HARNESS['create_cgroup'].__globals__
+            def interrupted_open(_path):
+                os.kill(os.getpid(), signal.SIGTERM)
+                raise OSError('open refused after TERM')
+            with HARNESS['signal_cleanup']():
+                try:
+                    with mock.patch.dict(namespace, fs_magic=lambda _: 0x63677270, Cgroup=interrupted_open):
+                        with self.assertRaises(HARNESS['TerminationRequested']):
+                            HARNESS['create_cgroup'](path, groups)
+                        HARNESS['cleanup_cgroups'](groups)
+                finally:
+                    self.assertFalse(path.exists())
+
+
+class TerminationTests(unittest.TestCase):
+    def test_actual_sigterm_unwinds_and_second_term_cannot_abort_cleanup(self):
+        # Children retire themselves if the deliberately broken RED controller
+        # dies; the test never abandons descendants or guesses replacement PIDs.
+        child_program = ('import os,signal,time; p=os.getppid(); '
+                         'signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+                         'print("ready",flush=True); '
+                         'exec("while os.getppid()==p: time.sleep(0.01)")')
+        program = """
+import json,os,runpy,signal,sys,time
+h=runpy.run_path(sys.argv[1]); owners=[]
+try:
+    with h['signal_cleanup']():
+        try:
+            for _ in range(2):
+                owner=h['spawn_owned'](owners,[sys.executable,'-c',sys.argv[2]],os.getuid(),
+                    stdout=-1,text=True,start_new_session=True)
+                assert owner.popen.stdout.readline().strip()=='ready'
+            print('READY '+json.dumps([owner.pid for owner in owners]),flush=True)
+            while True: time.sleep(0.1)
+        finally:
+            print('CLEANING',flush=True)
+            h['cleanup_processes'](owners)
+            print('CLEANED',flush=True)
+except h['TerminationRequested'] as error:
+    sys.exit(128+error.signum)
+"""
+        controller = subprocess.Popen([sys.executable, '-I', '-c', program,
+            str(ROOT / 'scripts/qualify-cgroup-trace.py'), child_program],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        pidfds = []
+        try:
+            ready = controller.stdout.readline()
+            self.assertTrue(ready.startswith('READY '), ready)
+            for pid in json.loads(ready[6:]):
+                identity = HARNESS['process_identity'](pid)
+                self.assertEqual(identity['ppid'], controller.pid)
+                self.assertEqual(identity['uid'], os.getuid())
+                pidfds.append(os.pidfd_open(pid))
+            controller.send_signal(signal.SIGTERM)
+            cleaning = controller.stdout.readline()
+            if cleaning.strip() == 'CLEANING':
+                controller.send_signal(signal.SIGTERM)
+            output, errors = controller.communicate(timeout=8)
+            self.assertEqual(controller.returncode, 128 + signal.SIGTERM, errors)
+            self.assertEqual(cleaning.strip(), 'CLEANING')
+            self.assertIn('CLEANED', output)
+        finally:
+            if controller.poll() is None:
+                controller.kill()
+                controller.wait(timeout=3)
+            for fd in pidfds:
+                poll = select.poll()
+                poll.register(fd, select.POLLIN)
+                self.assertTrue(poll.poll(1000), 'owned fixture descendant failed to retire')
+                os.close(fd)
+            controller.stdout.close()
+            controller.stderr.close()
 
 
 class NativeFixtureTests(unittest.TestCase):

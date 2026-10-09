@@ -7,6 +7,7 @@ Resource samples on the shared build host are exploratory, not performance gates
 """
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import ctypes
 import hashlib
 import json
@@ -34,6 +35,176 @@ REMAINING = ('sparse calls at 1s, 10s, 59s and >60s', 'short-lived caller',
              'same-path exec', 'nonleader exec', 'PID reuse', 'PID/time/mount namespaces and domains',
              'event/discovery loss', 'entry/path/interest capacity and fairness',
              'long resource/read plateau and isolated-host performance qualification')
+
+
+class TerminationRequested(BaseException):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+_active_signals = None
+
+
+class TerminationGuard:
+    def __init__(self):
+        self.pending, self.raised, self.depth = None, False, 0
+        self.previous = {}
+
+    def deliver(self):
+        if self.pending is not None and not self.raised and self.depth == 0:
+            self.raised = True
+            raise TerminationRequested(self.pending)
+
+    def handle(self, signum, _frame):
+        if self.pending is None:
+            self.pending = signum
+        # Once unwinding starts, another TERM/INT cannot abort cleanup.
+        self.deliver()
+
+    @contextmanager
+    def defer(self):
+        self.depth += 1
+        try:
+            yield
+        finally:
+            self.depth -= 1
+            self.deliver()
+
+
+@contextmanager
+def signal_cleanup():
+    global _active_signals
+    guard, previous_guard = TerminationGuard(), _active_signals
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            guard.previous[signum] = signal.signal(signum, guard.handle)
+        _active_signals = guard
+        yield
+    finally:
+        _active_signals = previous_guard
+        for signum, previous_handler in guard.previous.items():
+            signal.signal(signum, previous_handler)
+
+
+def cleanup_section():
+    return _active_signals.defer() if _active_signals else nullcontext()
+
+
+class DirectChild:
+    """Only the actual direct Popen fork, before richer validation succeeds.
+
+    This child remains unreaped, so its PID cannot identify a replacement.
+    No arbitrary PID or independently supplied descendant gets this fallback.
+    """
+    def __init__(self, popen):
+        self.popen, self.pid = popen, popen.pid
+
+    def send(self, signum):
+        self.popen.send_signal(signum)
+
+    def close(self):
+        for stream in (self.popen.stdin, self.popen.stdout, self.popen.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def spawn_owned(owners, argv, uid, **options):
+    with cleanup_section():
+        proc = subprocess.Popen(argv, **options)
+        pending = DirectChild(proc)
+        owners.append(pending)  # before proc reads, pidfd open or validation
+        owner = OwnedProcess(proc.pid, os.getpid(), uid, proc)
+        owners[owners.index(pending)] = owner
+    return owner
+
+
+class CreatedDirectory:
+    """Enroll mkdir before attempting the higher-level Cgroup acquisition."""
+    def __init__(self, path):
+        self.path, self.created, self.identity, self.group = path, False, None, None
+        self.parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(self.parent_fd)
+            self.parent_identity = info.st_dev, info.st_ino
+            self.verify_parent()
+        except BaseException:
+            os.close(self.parent_fd)
+            raise
+
+    def verify_parent(self):
+        held = os.fstat(self.parent_fd)
+        current = self.path.parent.stat(follow_symlinks=False)
+        assert_directory_identity(self.parent_identity, (held.st_dev, held.st_ino), fs_magic(self.parent_fd))
+        assert_directory_identity(self.parent_identity, (current.st_dev, current.st_ino), fs_magic(self.parent_fd))
+        if not stat.S_ISDIR(current.st_mode):
+            raise ValueError('created cgroup parent was replaced')
+
+    def create(self):
+        os.mkdir(self.path.name, 0o755, dir_fd=self.parent_fd)
+        self.created = True
+        info = os.stat(self.path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError('new cgroup directory was replaced before enrollment')
+        self.identity = info.st_dev, info.st_ino
+
+    def remove(self):
+        try:
+            if not self.created:
+                return  # mkdir failed; never remove an existing directory
+            self.verify_parent()
+            current = os.stat(self.path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            if self.identity is None or not stat.S_ISDIR(current.st_mode):
+                raise ValueError('created cgroup has no verifiable original directory identity')
+            assert_directory_identity(self.identity, (current.st_dev, current.st_ino), fs_magic(self.parent_fd))
+            if self.group is not None:
+                self.group.verify()
+                if self.group.members():
+                    raise ValueError('refusing to remove a populated owned cgroup')
+            # For failed acquisition the kernel rmdir emptiness check also
+            # refuses live tasks/children; no cgroup.kill or foreign cleanup.
+            os.rmdir(self.path.name, dir_fd=self.parent_fd)
+        finally:
+            if self.group is not None:
+                self.group.close()
+            os.close(self.parent_fd)
+
+
+def create_cgroup(path, groups):
+    with cleanup_section():
+        pending = CreatedDirectory(path)
+        groups.append(pending)  # includes failed mkdir, before higher-level open
+        pending.create()
+        group = Cgroup(path)
+        pending.group = group
+        if group.identity != pending.identity:
+            raise ValueError('opened cgroup differs from the actual created directory')
+    return group
+
+
+def cleanup_processes(owners):
+    with cleanup_section():
+        errors = []
+        for owner in owners:
+            try:
+                terminate(owner)
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                errors.append(error)
+            finally:
+                owner.close()
+        if errors:
+            raise ExceptionGroup('owned process cleanup failed', errors)
+
+
+def cleanup_cgroups(groups):
+    with cleanup_section():
+        errors = []
+        for group in reversed(groups):
+            try:
+                group.remove()
+            except (OSError, ValueError) as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup('owned cgroup cleanup failed', errors)
 
 
 def assert_process_identity(expected, actual):
@@ -87,8 +258,8 @@ class Cgroup:
         self.identity = info.st_dev, info.st_ino
         try:
             self.verify()
-        except Exception:
-            os.close(self.fd)
+        except BaseException:
+            self.close()
             raise
 
     def verify(self):
@@ -131,17 +302,27 @@ class Cgroup:
         finally:
             os.close(fd)
         os.rmdir(self.path)
-        os.close(self.fd)
+        self.close()
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 
 class OwnedProcess:
     def __init__(self, pid, parent, uid, popen=None):
         self.pid, self.popen = pid, popen
-        self.identity = process_identity(pid)
-        if self.identity['ppid'] != parent or self.identity['uid'] != uid:
-            raise ValueError('not a child of the expected owned parent/uid')
-        self.pidfd = os.pidfd_open(pid)
-        self.verify()
+        self.pidfd = None
+        try:
+            self.identity = process_identity(pid)
+            if self.identity['ppid'] != parent or self.identity['uid'] != uid:
+                raise ValueError('not a child of the expected owned parent/uid')
+            self.pidfd = os.pidfd_open(pid)
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
 
     def verify(self):
         assert_process_identity(self.identity, process_identity(self.pid))
@@ -159,17 +340,23 @@ class OwnedProcess:
         return any(mask & (select.POLLIN | select.POLLHUP) for _, mask in events)
 
     def close(self):
-        os.close(self.pidfd)
+        if self.pidfd is not None:
+            os.close(self.pidfd)
+            self.pidfd = None
 
 
 class FilePin:
     def __init__(self, path):
         self.path = path.resolve(strict=True)
         self.fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        self.initial = os.fstat(self.fd)
-        if not stat.S_ISREG(self.initial.st_mode):
-            raise ValueError('expected a regular executable/provider')
-        self.digest = self.hash()
+        try:
+            self.initial = os.fstat(self.fd)
+            if not stat.S_ISREG(self.initial.st_mode):
+                raise ValueError('expected a regular executable/provider')
+            self.digest = self.hash()
+        except BaseException:
+            os.close(self.fd)
+            raise
 
     def hash(self):
         digest, offset = hashlib.sha256(), 0
@@ -385,12 +572,12 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
     try:
         trace_path = directory / 'trace.file.txt'
         if name != 'run':
-            proc = subprocess.Popen([str(callers[0].path), str(provider.path), '0', 'selected',
+            caller = spawn_owned(owners, [str(callers[0].path), str(provider.path), '0', 'selected',
                                      '--canary', CANARIES[2]], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                    env=env, user=args.uid, group=args.gid, extra_groups=[], start_new_session=True)
-            caller = OwnedProcess(proc.pid, os.getpid(), args.uid, proc)
-            owners.append(caller)
+                                    env=env, uid=args.uid, user=args.uid, group=args.gid,
+                                    extra_groups=[], start_new_session=True)
+            proc = caller.popen
             stdout = Reader(proc.stdout, directory / 'caller.ledger.jsonl')
             stderr = Reader(proc.stderr, directory / 'caller.stderr.txt')
             readers.extend((stdout, stderr))
@@ -409,10 +596,10 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
                     '--duration', '20s', '-o', str(trace_path), '--', str(callers[0].path),
                     str(provider.path), '0', 'selected', '--auto-gate', str(gate), '--canary', CANARIES[2]]
         receipt['observer_started_ns'] = time.monotonic_ns()
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
-        observer = OwnedProcess(proc.pid, os.getpid(), 0, proc)
-        owners.append(observer)
+        observer = spawn_owned(owners, argv, uid=0, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env=env, start_new_session=True)
+        proc = observer.popen
         binary.image_receipt(dict(image=0), observer)
         capture = Reader(proc.stdout, directory / 'trace.stdout.txt')
         errors = Reader(proc.stderr, directory / 'observer.stderr.txt')
@@ -425,8 +612,9 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
         if name == 'run':
             capture.record('ready')
             image = capture.record('image')
-            caller = OwnedProcess(image['pid'], observer.pid, args.uid)
-            owners.insert(0, caller)
+            with cleanup_section():
+                caller = OwnedProcess(image['pid'], observer.pid, args.uid)
+                owners.insert(0, caller)
             images.append(callers[0].image_receipt(image, caller))
             gate.touch(mode=0o644)
             done = capture.record('ack', 0, 'done')
@@ -493,23 +681,18 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
         (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         return result
     finally:
-        if sampler:
-            sampler.finish()
-        cleanup_errors = []
-        for owner in owners:  # caller first, before losing its expected parent
+        with cleanup_section():
+            if sampler:
+                sampler.finish()
             try:
-                terminate(owner)
-            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-                cleanup_errors.append(error)
+                # Caller first, before losing its independently expected parent.
+                cleanup_processes(owners)
             finally:
-                owner.close()
-        for reader in readers:
-            reader.thread.join(timeout=1)
-        if cleanup_errors:
-            raise ExceptionGroup('owned process cleanup failed', cleanup_errors)
+                for reader in readers:
+                    reader.thread.join(timeout=1)
 
 
-def main():
+def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--provider', type=Path, required=True)
@@ -538,31 +721,33 @@ def main():
         # run's public contract drops its owned child to these ordinary
         # invocation credentials; never run the provider workload as root.
         env['SUDO_UID'], env['SUDO_GID'] = str(args.uid), str(args.gid)
-        binary, provider = FilePin(args.binary), FilePin(args.provider)
-        pins.extend((binary, provider))
+        with cleanup_section():
+            binary = FilePin(args.binary)
+            pins.append(binary)
+            provider = FilePin(args.provider)
+            pins.append(provider)
         callers = []
         for name in ('trace-a', 'trace-b'):
             path = args.out / name
             shutil.copyfile(args.caller, path)
             path.chmod(0o755)
-            pin = FilePin(path)
-            pins.append(pin)
+            with cleanup_section():
+                pin = FilePin(path)
+                pins.append(pin)
             callers.append(pin)
         # Only mkdir under the unified root; no controllers are enabled.
-        os.mkdir(owned_root, 0o755)
-        root_group = Cgroup(owned_root)
-        groups.append(root_group)
+        create_cgroup(owned_root, groups)
+        cgroups = []
         for name in ('selected', 'outside'):
             path = owned_root / name
-            os.mkdir(path, 0o755)
-            groups.append(Cgroup(path))
+            cgroups.append(create_cgroup(path, groups))
         created = time.monotonic_ns()
         if cgroup_of(os.getpid()).startswith('/' + owned_root.name):
             raise ValueError('controller unexpectedly belongs to the selected scope')
         for name in names:
             directory = args.out / name
             directory.mkdir(mode=0o755)
-            result = run_cell(args, name, directory, env, provider, binary, callers, groups[1:], created)
+            result = run_cell(args, name, directory, env, provider, binary, callers, cgroups, created)
             results.append(result)
             print(json.dumps({key: result.get(key) for key in
                               ('cell', 'pass', 'calls', 'named', 'unknown', 'false_names', 'errors')}), flush=True)
@@ -573,16 +758,21 @@ def main():
         (args.out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         return 0 if all(result['pass'] for result in results) else 1
     finally:
-        cleanup_errors = []
-        for group in reversed(groups):
+        with cleanup_section():
             try:
-                group.remove()
-            except (OSError, ValueError) as error:
-                cleanup_errors.append(error)
-        for pin in reversed(pins):
-            pin.close()
-        if cleanup_errors:
-            raise ExceptionGroup('owned cgroup cleanup failed', cleanup_errors)
+                cleanup_cgroups(groups)
+            finally:
+                for pin in reversed(pins):
+                    pin.close()
+
+
+def main():
+    try:
+        with signal_cleanup():
+            return _main()
+    except TerminationRequested as error:
+        print(f'qualification interrupted by signal {error.signum}', file=sys.stderr)
+        return 128 + error.signum
 
 
 if __name__ == '__main__':

@@ -195,7 +195,7 @@ static IMG_INLINE int image_write(struct image_continuity *record, u64 exec_id,
         image_fail();
     return 0;
 }
-__attribute__((noinline)) u32 p11_image_entry(u64 tgid, u64 cookie, u64 exec_id)
+__attribute__((always_inline)) u32 p11_image_entry(u64 tgid, u64 cookie, u64 exec_id)
 {
     if (!image_allowed())
         return 0;

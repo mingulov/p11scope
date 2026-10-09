@@ -5,8 +5,8 @@
 
 use crate::attach::Session;
 use crate::attach::capture::{NativeDomainId, ReadWindow};
-use crate::attach::image_query::{ImageQueryRefusal, ImageScanProof};
-use crate::discovery::identity::PinnedObjectId;
+use crate::attach::image_query::{CompleteEpochs, ImageQueryRefusal, ImageScanProof};
+use crate::discovery::identity::{PinnedObjectId, RetainedInventoryTarget};
 use crate::discovery::instances::{
     CallFacts, EntryIp, InstanceId, InstanceRouter, MAX_INSTANCES, MAX_PENDING, ObserveOutcome,
     Route, RouterLimits, UnknownReason,
@@ -17,13 +17,112 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Endpoint {
     pub(crate) object: PinnedObjectId,
     pub(crate) file_slot: u32,
     pub(crate) offset: u64,
+}
+
+/// Current registration authority is separate from historical Joined calls.
+/// Only the synchronous accepted scan path may mint this move-only receipt.
+pub(crate) struct CurrentPartitionReceipt {
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    pin: Arc<PidPin>,
+    endpoint: Endpoint,
+    attachment_slot: u32,
+    watched: RetainedInventoryTarget,
+    epochs: CompleteEpochs,
+    fence: u64,
+    deadline: Instant,
+    ids: Vec<InstanceId>,
+}
+impl CurrentPartitionReceipt {
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+    pub(crate) fn image(&self) -> ImageIdentity {
+        self.image
+    }
+    pub(crate) fn endpoint(&self) -> Endpoint {
+        self.endpoint
+    }
+    pub(crate) fn instances(&self) -> &[InstanceId] {
+        &self.ids
+    }
+    pub(crate) fn original_pin(&self) -> &Arc<PidPin> {
+        &self.pin
+    }
+}
+impl fmt::Debug for CurrentPartitionReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CurrentPartitionReceipt(<private>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentReceiptRefusal {
+    Domain,
+    Custody,
+    Attachment,
+    Epoch,
+    Partition,
+    Deadline,
+    Audit,
+    Stopped,
+}
+
+/// I/O observations only. The capture owner applies all receipt decisions.
+struct ReceiptState {
+    image: ImageIdentity,
+    epochs: CompleteEpochs,
+    watched: RetainedInventoryTarget,
+}
+
+/// One latch belongs to one retained physical-authority episode, within the
+/// coordinator's existing record budgets. H0 scans cannot reopen an episode.
+struct PhysicalGapEpisode {
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    pin: Arc<PidPin>,
+    applied: AtomicBool,
+}
+
+/// Task3's completed physical adjudicator alone gains the production factory.
+/// A provisional scan marker or scalar caller fact cannot construct a gap.
+/// This slice requires an already accepted H0 cookie-to-original-Arc binding;
+/// handling a genuine gap before that first scan remains a Task3 prerequisite.
+pub(crate) struct PhysicalSemanticGap {
+    episode: Arc<PhysicalGapEpisode>,
+}
+impl fmt::Debug for PhysicalSemanticGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PhysicalSemanticGap(<private>)")
+    }
+}
+impl PhysicalSemanticGap {
+    #[cfg(test)]
+    fn test_episode(domain: NativeDomainId, image: ImageIdentity, pin: Arc<PidPin>) -> Self {
+        Self {
+            episode: Arc::new(PhysicalGapEpisode {
+                domain,
+                image,
+                pin,
+                applied: AtomicBool::new(false),
+            }),
+        }
+    }
+    #[cfg(test)]
+    fn test_repeat(&self) -> Self {
+        Self {
+            episode: self.episode.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +263,7 @@ pub(crate) enum TickOutcome {
 #[derive(Default, Debug)]
 pub(crate) struct TickReport {
     outcomes: Vec<TickOutcome>,
+    current: Vec<CurrentPartitionReceipt>,
     pub(crate) collected_calls: usize,
     pub(crate) scans: usize,
     pub(crate) observations: Vec<ObserveOutcome>,
@@ -175,6 +275,12 @@ impl TickReport {
     }
     pub(crate) fn outcomes(&self) -> &[TickOutcome] {
         &self.outcomes
+    }
+    pub(crate) fn current(&self) -> &[CurrentPartitionReceipt] {
+        &self.current
+    }
+    pub(crate) fn into_parts(self) -> (Vec<TickOutcome>, Vec<CurrentPartitionReceipt>) {
+        (self.outcomes, self.current)
     }
     pub(crate) fn calls(&self) -> impl Iterator<Item = &RoutedCall> {
         self.outcomes.iter().filter_map(|item| match item {
@@ -204,6 +310,7 @@ struct Collection {
 struct ScanJob {
     image: ImageIdentity,
     endpoint: Endpoint,
+    slot: u32,
     pin: Arc<PidPin>,
     deadline: Instant,
 }
@@ -223,7 +330,19 @@ trait CaptureIo {
     fn now(&self) -> Instant;
     fn collect(&mut self, limit: usize) -> Collection;
     fn health(&mut self) -> Result<Health, ()>;
-    fn raise_fault(&mut self) -> Result<(), ()>;
+    fn raise_fault(&mut self) -> Result<u64, ()>;
+    fn retained_attachment(
+        &self,
+        slot: u32,
+    ) -> Result<RetainedInventoryTarget, CurrentReceiptRefusal>;
+    fn receipt_state(
+        &mut self,
+        pin: &Arc<PidPin>,
+        image: ImageIdentity,
+        endpoint: Endpoint,
+        slot: u32,
+        deadline: Instant,
+    ) -> Result<ReceiptState, CurrentReceiptRefusal>;
     fn endpoint(&self, slot: u32) -> Option<Endpoint>;
     fn target(&self, pid: u32) -> Option<Arc<PidPin>>;
     fn scan(
@@ -282,12 +401,31 @@ impl CaptureIo for SessionIo<'_> {
             sticky: maps.sticky().map_err(|_| ())?,
         })
     }
-    fn raise_fault(&mut self) -> Result<(), ()> {
-        self.session
-            .instance_maps()
-            .raise_fault()
-            .map(|_| ())
-            .map_err(|_| ())
+    fn raise_fault(&mut self) -> Result<u64, ()> {
+        self.session.instance_maps().raise_fault().map_err(|_| ())
+    }
+    fn retained_attachment(
+        &self,
+        slot: u32,
+    ) -> Result<RetainedInventoryTarget, CurrentReceiptRefusal> {
+        self.session.semantic_receipt_target(slot)
+    }
+    fn receipt_state(
+        &mut self,
+        pin: &Arc<PidPin>,
+        image: ImageIdentity,
+        endpoint: Endpoint,
+        slot: u32,
+        deadline: Instant,
+    ) -> Result<ReceiptState, CurrentReceiptRefusal> {
+        let (image, epochs, watched) = self
+            .session
+            .semantic_receipt_state(pin, image, endpoint, slot, deadline)?;
+        Ok(ReceiptState {
+            image,
+            epochs,
+            watched,
+        })
     }
     fn endpoint(&self, slot: u32) -> Option<Endpoint> {
         self.session.instance_endpoint(slot)
@@ -360,6 +498,7 @@ pub(crate) struct SemanticCapture {
     image_failed: bool,
     exhausted: bool,
     stopped: bool,
+    continuity_cuts: u64,
 }
 impl SemanticCapture {
     pub(crate) fn new(session: &Session, limits: TickLimits) -> anyhow::Result<Self> {
@@ -395,10 +534,223 @@ impl SemanticCapture {
             image_failed: false,
             exhausted: false,
             stopped: false,
+            continuity_cuts: 0,
         })
     }
     pub(crate) fn router(&self) -> &InstanceRouter {
         &self.router
+    }
+    pub(crate) fn continuity_cuts(&self) -> u64 {
+        self.continuity_cuts
+    }
+    #[expect(
+        dead_code,
+        reason = "H3 final adjudication wiring consumes this actual-owner validator"
+    )]
+    pub(crate) fn validate_current(
+        &mut self,
+        session: &mut Session,
+        receipt: &CurrentPartitionReceipt,
+        report: &mut TickReport,
+    ) -> Result<(), CurrentReceiptRefusal> {
+        self.validate_current_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            receipt,
+            report,
+        )
+    }
+    fn validate_current_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        receipt: &CurrentPartitionReceipt,
+        report: &mut TickReport,
+    ) -> Result<(), CurrentReceiptRefusal> {
+        use CurrentReceiptRefusal as Refusal;
+        if io.domain() != Some(self.router.domain()) || receipt.domain != self.router.domain() {
+            return Err(Refusal::Domain);
+        }
+        if self.stopped {
+            return Err(Refusal::Stopped);
+        }
+        let binding = self
+            .bindings
+            .get(&receipt.image.task_cookie)
+            .ok_or(Refusal::Custody)?;
+        if !binding.current
+            || binding.domain != receipt.domain
+            || binding.image != receipt.image
+            || !Arc::ptr_eq(&binding.pin, &receipt.pin)
+            || receipt.pin.pidfd().is_err()
+        {
+            return Err(Refusal::Custody);
+        }
+        if io.now() >= receipt.deadline {
+            return Err(Refusal::Deadline);
+        }
+        if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint) {
+            return Err(Refusal::Attachment);
+        }
+        let target = io.retained_attachment(receipt.attachment_slot)?;
+        if !Arc::ptr_eq(
+            &target.retirement_lease(),
+            &receipt.watched.retirement_lease(),
+        ) || target.check_unchanged() != Ok(true)
+            || receipt.watched.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::Attachment);
+        }
+        if !self.audit(io, report) {
+            return Err(Refusal::Audit);
+        }
+        if !self.receipt_partition_matches(receipt) {
+            return Err(Refusal::Partition);
+        }
+        let Some(slice_end) = io.now().checked_add(self.limits.scan_slice) else {
+            self.exhaust(report);
+            return Err(Refusal::Deadline);
+        };
+        let deadline = slice_end.min(receipt.deadline);
+        let state = io.receipt_state(
+            &receipt.pin,
+            receipt.image,
+            receipt.endpoint,
+            receipt.attachment_slot,
+            deadline,
+        );
+        if !self.audit(io, report) {
+            return Err(Refusal::Audit);
+        }
+        // A failed native read is permanent even when the later audit itself
+        // succeeded. Ordinary epoch/attachment refusals do not restamp proof.
+        let state = match state {
+            Err(Refusal::Audit) => {
+                self.fail_coverage(io, report);
+                return Err(Refusal::Audit);
+            }
+            result => result?,
+        };
+        if io.now() >= deadline {
+            return Err(Refusal::Deadline);
+        }
+        if state.image != receipt.image || state.epochs != receipt.epochs {
+            return Err(Refusal::Epoch);
+        }
+        if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint)
+            || !Arc::ptr_eq(
+                &state.watched.retirement_lease(),
+                &receipt.watched.retirement_lease(),
+            )
+            || state.watched.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::Attachment);
+        }
+        if !self.receipt_partition_matches(receipt) {
+            return Err(Refusal::Partition);
+        }
+        Ok(())
+    }
+    fn receipt_partition_matches(&self, receipt: &CurrentPartitionReceipt) -> bool {
+        self.router.current_partition_matches(
+            receipt.domain,
+            receipt.image,
+            receipt.endpoint.file_slot,
+            receipt.epochs,
+            receipt.fence,
+            &receipt.ids,
+        )
+    }
+    #[expect(
+        dead_code,
+        reason = "H3 final physical adjudicator supplies the staged opaque gap factory"
+    )]
+    pub(crate) fn apply_physical_gaps(
+        &mut self,
+        session: &mut Session,
+        gaps: Vec<PhysicalSemanticGap>,
+    ) -> anyhow::Result<TickReport> {
+        self.apply_physical_gaps_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            gaps,
+        )
+    }
+    fn apply_physical_gaps_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        gaps: Vec<PhysicalSemanticGap>,
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(
+            io.domain() == Some(self.router.domain()),
+            "foreign semantic Session"
+        );
+        anyhow::ensure!(
+            !self.stopped && gaps.len() <= MAX_INSTANCES,
+            "invalid physical gap publication"
+        );
+        // Validate the whole bounded publication before audit, CAS or state
+        // mutation. Equal numeric PID or a duplicated fd is not this Arc.
+        for gap in &gaps {
+            let episode = &gap.episode;
+            let binding = self
+                .bindings
+                .get(&episode.image.task_cookie)
+                .ok_or_else(|| anyhow::anyhow!("physical gap custody unavailable"))?;
+            anyhow::ensure!(
+                episode.domain == self.router.domain()
+                    && binding.domain == episode.domain
+                    && Arc::ptr_eq(&episode.pin, &binding.pin)
+                    && (episode.applied.load(Ordering::SeqCst) || binding.image == episode.image),
+                "foreign physical gap authority"
+            );
+        }
+        let mut report = TickReport::default();
+        if gaps
+            .iter()
+            .all(|gap| gap.episode.applied.load(Ordering::SeqCst))
+            || self.image_failed
+            || self.exhausted
+        {
+            return Ok(report);
+        }
+        if !self.audit(io, &mut report) {
+            return Ok(report);
+        }
+        let Some(cuts) = self.continuity_cuts.checked_add(1) else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        let Ok(raised) = io.raise_fault() else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        self.continuity_cuts = cuts; // Count actual successful userspace advances.
+        let Ok(health) = io.health() else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        if raised <= self.fault
+            || raised > u64::from(u32::MAX)
+            || health.fault < raised
+            || health.fault > u64::from(u32::MAX)
+            || health.sticky != 0
+        {
+            self.exhaust(&mut report);
+            return Ok(report);
+        }
+        // This shared audited path clears old observations, resolves old
+        // pending calls and allocates one position after all issued records.
+        if !self.audit_health(health, &mut report) {
+            return Ok(report);
+        }
+        for gap in gaps {
+            gap.episode.applied.store(true, Ordering::SeqCst);
+        }
+        Ok(report)
     }
     pub(crate) fn tick(
         &mut self,
@@ -460,10 +812,11 @@ impl SemanticCapture {
                     let job = ScanJob {
                         image: proof.image(),
                         endpoint,
+                        slot,
                         pin,
                         deadline,
                     };
-                    self.accept_scan(proof, &job, fence, &mut report);
+                    self.accept_scan(io, proof, &job, fence, &mut report);
                 }
                 Err(refusal) => report.scan_refusals.push(refusal),
             }
@@ -550,6 +903,9 @@ impl SemanticCapture {
             self.fail_coverage(io, report);
             return false;
         };
+        self.audit_health(health, report)
+    }
+    fn audit_health(&mut self, health: Health, report: &mut TickReport) -> bool {
         if health.fault > u64::from(u32::MAX) || health.fault < self.fault {
             self.exhaust(report);
             return false;
@@ -637,6 +993,7 @@ impl SemanticCapture {
 
     fn accept_scan(
         &mut self,
+        io: &mut impl CaptureIo,
         proof: ImageScanProof,
         job: &ScanJob,
         fence: u64,
@@ -651,6 +1008,10 @@ impl SemanticCapture {
             || fence != self.router.fence()
         {
             report.scan_refusals.push(ImageQueryRefusal::Fence);
+            return;
+        }
+        if io.endpoint(job.slot) != Some(job.endpoint) {
+            report.scan_refusals.push(ImageQueryRefusal::Custody);
             return;
         }
         if let Some(existing) = self.bindings.get(&job.image.task_cookie) {
@@ -669,6 +1030,8 @@ impl SemanticCapture {
         let prior_ids =
             self.router
                 .current_instances(self.router.domain(), job.image, job.endpoint.file_slot);
+        let epochs = proof.epochs();
+        let watched = io.retained_attachment(job.slot).ok();
         let (outcome, resolved) = self.router.observe(proof);
         let accepted = matches!(outcome, ObserveOutcome::New | ObserveOutcome::Continued);
         // These losses come from the actual eviction, not a counter inference.
@@ -730,6 +1093,34 @@ impl SemanticCapture {
                     current: true,
                 },
             );
+            let ids = self.router.current_instances(
+                self.router.domain(),
+                job.image,
+                job.endpoint.file_slot,
+            );
+            if self.router.current_partition_matches(
+                self.router.domain(),
+                job.image,
+                job.endpoint.file_slot,
+                epochs,
+                fence,
+                &ids,
+            ) && let Some(watched) = watched
+                && watched.check_unchanged() == Ok(true)
+            {
+                report.current.push(CurrentPartitionReceipt {
+                    domain: self.router.domain(),
+                    image: job.image,
+                    pin: job.pin.clone(),
+                    endpoint: job.endpoint,
+                    attachment_slot: job.slot,
+                    watched,
+                    epochs,
+                    fence,
+                    deadline: job.deadline,
+                    ids,
+                });
+            }
         }
         report.observations.push(outcome);
         // Invalidation exhaustion cannot leak a previously computed join.
@@ -846,6 +1237,7 @@ impl SemanticCapture {
                 self.jobs.push_back(ScanJob {
                     image,
                     endpoint,
+                    slot: record.event.slot,
                     pin,
                     deadline,
                 });
@@ -886,7 +1278,7 @@ impl SemanticCapture {
             } else if healthy && io.now() < attempt_deadline {
                 match result {
                     Ok(proof) => {
-                        self.accept_scan(proof, &job, fence, &mut report);
+                        self.accept_scan(io, proof, &job, fence, &mut report);
                     }
                     Err(refusal) => report.scan_refusals.push(refusal),
                 }
@@ -928,6 +1320,709 @@ mod tests {
     use crate::discovery::instances::MapRange;
     use p11scope_ebpf_common::{InstanceStamp, instance};
 
+    mod current_receipts_tests {
+        //! SPDX-License-Identifier: GPL-3.0-or-later
+        //! Shared production orchestration with substituted I/O, never proof decisions.
+        use super::*;
+
+        fn initial_pair(capture: &mut SemanticCapture, io: &mut ScriptIo) -> TickReport {
+            io.semantic_call("C_SignInit", 0, 0);
+            io.semantic_call("C_Sign", 0, 0);
+            let report = capture.tick_with(io).unwrap();
+            assert_eq!(report.calls().count(), 2);
+            assert!(
+                report
+                    .calls()
+                    .all(|call| matches!(call.route(), Route::Joined(_)))
+            );
+            assert!(
+                report
+                    .outcomes()
+                    .iter()
+                    .all(|item| !matches!(item, TickOutcome::Invalidation(_)))
+            );
+            assert_eq!(capture.router.ranges_retained(), 2);
+            report
+        }
+
+        fn id(route: Route) -> InstanceId {
+            let Route::Joined(id) = route else {
+                panic!("nonempty supported join required")
+            };
+            id
+        }
+
+        fn gap(capture: &SemanticCapture) -> PhysicalSemanticGap {
+            let binding = &capture.bindings[&1];
+            PhysicalSemanticGap::test_episode(binding.domain, binding.image, binding.pin.clone())
+        }
+
+        fn barrier(report: &TickReport) -> &Invalidation {
+            report
+                .outcomes()
+                .iter()
+                .find_map(|outcome| match outcome {
+                    TickOutcome::Invalidation(value)
+                        if matches!(value.scope(), InvalidationScope::FaultEra) =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .expect("one producer-visible fault barrier")
+        }
+
+        #[test]
+        fn native_semantic_current_receipt_requires_original_pin_and_accepted_scan() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            let mut report = initial_pair(&mut capture, &mut io);
+            let joined = id(report.calls().next().unwrap().route());
+            assert_eq!(
+                report.current.len(),
+                1,
+                "accepted complete first scan must yield registration authority"
+            );
+            let mut receipt = report.current.pop().unwrap();
+            assert_eq!(receipt.domain(), io.domain);
+            assert_eq!(receipt.image(), io.current_image);
+            assert_eq!(receipt.instances(), &[joined]);
+            assert!(receipt.endpoint() == io.endpoint(0).unwrap());
+            assert!(Arc::ptr_eq(receipt.original_pin(), &io.pin));
+            assert!(Arc::ptr_eq(
+                &receipt.watched.retirement_lease(),
+                &io.watched[0].retirement_lease()
+            ));
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Ok(())
+            );
+
+            io.semantic_call("C_Sign", 0, 0);
+            let cached = capture.tick_with(&mut io).unwrap();
+            assert_eq!(
+                cached.calls().next().unwrap().route(),
+                Route::Joined(joined)
+            );
+            assert!(
+                cached.current().is_empty(),
+                "historical cached Joined is not a scan receipt"
+            );
+            let (owned_cached, no_receipts) = cached.into_parts();
+            assert_eq!(owned_cached.len(), 1);
+            assert!(no_receipts.is_empty());
+            let refresh = capture
+                .refresh_with(&mut io, receipt.pin.clone(), 0)
+                .unwrap();
+            assert_eq!(refresh.collected_calls, 0);
+            assert_eq!(refresh.current.len(), 1, "fresh no-call scan can register");
+
+            let original_domain = receipt.domain;
+            receipt.domain = NativeDomainId::mint();
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Domain)
+            );
+            receipt.domain = original_domain;
+            let original_pin = receipt.pin.clone();
+            receipt.pin = Arc::new(PidPin::open(original_pin.pid()).unwrap());
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Custody)
+            );
+            receipt.pin = original_pin;
+            receipt.image.exec_id += 1;
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Custody)
+            );
+            receipt.image.exec_id -= 1;
+            receipt.endpoint.file_slot = 1;
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Attachment)
+            );
+            assert_eq!(capture.router.instances_minted(), 1);
+            assert_eq!(io.raises, 0);
+            receipt.endpoint.file_slot = 0;
+            capture.stop();
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Stopped)
+            );
+        }
+
+        #[test]
+        fn native_semantic_receipt_expires_before_finalization() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            let mut report = initial_pair(&mut capture, &mut io);
+            let held_route = report.calls().next().unwrap().route();
+            let receipt = report.current.pop().expect("accepted original receipt");
+            let now = io.now;
+            io.now = receipt.deadline;
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Deadline)
+            );
+            io.now = now;
+            io.local = 1; // Actual epoch I/O changes before any subsequent observation.
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Epoch)
+            );
+            let original_pin = io.pin.clone();
+            let mut newer = capture.refresh_with(&mut io, original_pin, 0).unwrap();
+            assert_eq!(newer.current.len(), 1);
+            let new_receipt = newer.current.pop().unwrap();
+            assert_ne!(new_receipt.instances(), receipt.instances());
+            assert_eq!(
+                capture.validate_current_with(&mut io, &new_receipt, &mut newer),
+                Ok(())
+            );
+            assert_eq!(
+                report.calls().next().unwrap().route(),
+                held_route,
+                "owned history is not restamped"
+            );
+            assert!(newer.outcomes().iter().any(|item| matches!(item,
+                TickOutcome::Invalidation(value) if matches!(value.scope(), InvalidationScope::InstancesRetired { ids, .. } if ids == receipt.instances()))));
+
+            io.local = 0;
+            let original_pin = io.pin.clone();
+            let historical = capture.refresh_with(&mut io, original_pin, 0).unwrap();
+            assert_eq!(historical.observations, vec![ObserveOutcome::Continued]);
+            assert!(
+                historical.current.is_empty(),
+                "a retained historical epoch cannot mint current authority"
+            );
+            io.semantic_call("C_Sign", 0, 0);
+            let late = capture.tick_with(&mut io).unwrap();
+            assert_eq!(late.calls().next().unwrap().route(), held_route);
+            assert!(late.current.is_empty());
+            for epoch in 2..=5 {
+                io.local = epoch;
+                let pin = io.pin.clone();
+                assert_eq!(
+                    capture.refresh_with(&mut io, pin, 0).unwrap().current.len(),
+                    1
+                );
+            }
+            io.local = 0;
+            io.semantic_call("C_Sign", 0, 0);
+            assert_eq!(
+                capture
+                    .tick_with(&mut io)
+                    .unwrap()
+                    .calls()
+                    .next()
+                    .unwrap()
+                    .route(),
+                Route::Unknown(UnknownReason::Evicted)
+            );
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Partition)
+            );
+            capture.router.retire_image(receipt.image);
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Partition)
+            );
+        }
+
+        #[test]
+        fn native_semantic_receipt_revalidates_readback_and_postscan_health() {
+            // Exercise the actual Session readback decision, alongside the shared
+            // capture's I/O-failure paths; no injected boolean may seal a receipt.
+            use crate::attach::{CapturePolicy, semantic_receipt_readback_test};
+            let descriptors = crate::kinds::DESCRIPTORS.to_vec();
+            assert_eq!(
+                semantic_receipt_readback_test(CapturePolicy::Allowlisted, Ok(descriptors.clone())),
+                Ok(())
+            );
+            assert_eq!(
+                semantic_receipt_readback_test(
+                    CapturePolicy::AggregateOnly,
+                    Ok(descriptors.clone())
+                ),
+                Err(CurrentReceiptRefusal::Attachment)
+            );
+            assert_eq!(
+                semantic_receipt_readback_test(
+                    CapturePolicy::Allowlisted,
+                    Err(anyhow::anyhow!("readback I/O"))
+                ),
+                Err(CurrentReceiptRefusal::Attachment)
+            );
+            let mut truncated = descriptors.clone();
+            truncated.pop();
+            assert_eq!(
+                semantic_receipt_readback_test(CapturePolicy::Allowlisted, Ok(truncated)),
+                Err(CurrentReceiptRefusal::Attachment)
+            );
+            let mut changed = descriptors;
+            let positive = changed
+                .iter()
+                .position(|descriptor| {
+                    *descriptor != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+                })
+                .expect("nonempty non-count descriptor inventory");
+            changed[positive] = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+            assert_eq!(
+                semantic_receipt_readback_test(CapturePolicy::Allowlisted, Ok(changed)),
+                Err(CurrentReceiptRefusal::Attachment)
+            );
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            let mut report = initial_pair(&mut capture, &mut io);
+            let receipt = report.current.pop().expect("accepted original receipt");
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Ok(())
+            );
+            for (query_refusal, refusal) in [
+                (ImageQueryRefusal::Unknown, CurrentReceiptRefusal::Epoch),
+                (ImageQueryRefusal::Unstable, CurrentReceiptRefusal::Epoch),
+                (ImageQueryRefusal::Deadline, CurrentReceiptRefusal::Deadline),
+                (ImageQueryRefusal::Custody, CurrentReceiptRefusal::Custody),
+            ] {
+                let classified = crate::attach::semantic_receipt_query_refusal_test(query_refusal);
+                assert_eq!(
+                    classified, refusal,
+                    "temporary current-proof refusal is not missed coverage"
+                );
+                io.receipt_refusal = Some(classified);
+                io.health.extend([Ok(io.last_health), Ok(io.last_health)]);
+                assert_eq!(
+                    capture.validate_current_with(&mut io, &receipt, &mut report),
+                    Err(refusal)
+                );
+                assert!(
+                    io.health.is_empty(),
+                    "post-read audit still runs after finite refusal"
+                );
+                assert!(!capture.image_failed && !capture.exhausted);
+                io.receipt_refusal = None;
+                assert_eq!(
+                    capture.validate_current_with(&mut io, &receipt, &mut report),
+                    Ok(())
+                );
+            }
+            for query_refusal in [ImageQueryRefusal::Coverage, ImageQueryRefusal::Stream] {
+                let classified = crate::attach::semantic_receipt_query_refusal_test(query_refusal);
+                assert_eq!(classified, CurrentReceiptRefusal::Audit);
+                let mut failed_io = ScriptIo::new(NativeDomainId::mint());
+                let mut failed_capture = super::capture(&failed_io);
+                let mut failed_report = initial_pair(&mut failed_capture, &mut failed_io);
+                let failed_receipt = failed_report.current.pop().unwrap();
+                failed_io.receipt_refusal = Some(classified);
+                failed_io
+                    .health
+                    .extend([Ok(failed_io.last_health), Ok(failed_io.last_health)]);
+                assert_eq!(
+                    failed_capture.validate_current_with(
+                        &mut failed_io,
+                        &failed_receipt,
+                        &mut failed_report
+                    ),
+                    Err(CurrentReceiptRefusal::Audit)
+                );
+                assert!(
+                    failed_io.health.is_empty(),
+                    "both surrounding audits succeed"
+                );
+                assert!(
+                    failed_capture.image_failed,
+                    "actual receipt read failure stays permanent"
+                );
+                failed_io.receipt_refusal = None;
+                assert_eq!(
+                    failed_capture.validate_current_with(
+                        &mut failed_io,
+                        &failed_receipt,
+                        &mut failed_report
+                    ),
+                    Err(CurrentReceiptRefusal::Audit)
+                );
+                let fault = u32::try_from(failed_io.last_health.fault).unwrap();
+                failed_io.semantic_call("C_SignInit", 0, fault);
+                let retry = failed_capture.tick_with(&mut failed_io).unwrap();
+                assert!(retry.current.is_empty());
+                assert_eq!(
+                    retry.calls().next().unwrap().route(),
+                    Route::Unknown(UnknownReason::CoverageFault)
+                );
+                assert_eq!(failed_capture.router.instances_minted(), 1);
+            }
+            io.current_image.exec_id += 1;
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Epoch)
+            );
+            io.current_image.exec_id -= 1;
+            for epochs in [
+                CompleteEpochs {
+                    local: 1,
+                    ..receipt.epochs
+                },
+                CompleteEpochs {
+                    global: 1,
+                    ..receipt.epochs
+                },
+                CompleteEpochs {
+                    fault: 1,
+                    ..receipt.epochs
+                },
+                CompleteEpochs {
+                    sticky: 1,
+                    ..receipt.epochs
+                },
+                CompleteEpochs {
+                    record_flags: 1,
+                    ..receipt.epochs
+                },
+            ] {
+                io.receipt_epochs = Some(epochs);
+                assert_eq!(
+                    capture.validate_current_with(&mut io, &receipt, &mut report),
+                    Err(CurrentReceiptRefusal::Epoch)
+                );
+            }
+            io.receipt_epochs = None;
+            io.attachment_refusal = Some(CurrentReceiptRefusal::Attachment);
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Attachment)
+            );
+            io.attachment_refusal = None;
+            io.receipt_refusal = Some(CurrentReceiptRefusal::Epoch);
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Epoch)
+            );
+            io.receipt_refusal = None;
+            io.health.extend([Ok(io.last_health), Err(())]);
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut report),
+                Err(CurrentReceiptRefusal::Audit)
+            );
+            assert!(capture.image_failed, "post-read health loss is permanent");
+            io.last_health.fault += 1;
+            let original_pin = io.pin.clone();
+            let retry = capture.refresh_with(&mut io, original_pin, 0).unwrap();
+            assert!(retry.current.is_empty());
+            assert_eq!(capture.router.instances_minted(), 1);
+
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            io.health.extend([Ok(io.last_health), Err(())]);
+            io.semantic_call("C_SignInit", 0, 0);
+            let failed = capture.tick_with(&mut io).unwrap();
+            assert!(failed.current.is_empty());
+            assert_eq!(
+                failed.calls().next().unwrap().route(),
+                Route::Unknown(UnknownReason::CoverageFault)
+            );
+            assert_eq!(capture.router.instances_minted(), 0);
+        }
+
+        #[test]
+        fn native_semantic_physical_cut_fences_unread_and_inflight() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            let history = initial_pair(&mut capture, &mut io);
+            let old_id = id(history.calls().next().unwrap().route());
+            let last_position = history
+                .calls()
+                .filter_map(RoutedCall::position)
+                .max()
+                .unwrap();
+            io.semantic_call("C_SignInit", 0, 0); // Completed, still unread EVENTS record.
+            io.semantic_call("C_SignInit", 0, 0); // Entry was before the cut, return after it.
+            io.records.back_mut().unwrap().continuity.return_stamp.fault = 1;
+            let queued = io.records.len();
+            let episode = gap(&capture);
+            let cut = capture
+                .apply_physical_gaps_with(&mut io, vec![episode])
+                .unwrap();
+            assert_eq!(
+                io.raises, 1,
+                "genuine physical gap must reach producer fault cell"
+            );
+            assert_eq!(capture.continuity_cuts(), 1);
+            assert_eq!(barrier(&cut).domain(), io.domain);
+            assert!(barrier(&cut).position().unwrap() > last_position);
+            assert_eq!(cut.calls().count(), 0);
+            assert_eq!(
+                io.records.len(),
+                queued,
+                "cut neither drains EVENTS nor changes completed physical records"
+            );
+            assert_eq!(
+                history.calls().next().unwrap().route(),
+                Route::Joined(old_id)
+            );
+            let old = capture.tick_with(&mut io).unwrap();
+            let routes: Vec<_> = old.calls().map(RoutedCall::route).collect();
+            assert_eq!(
+                routes,
+                vec![
+                    Route::Unknown(UnknownReason::FaultEra),
+                    Route::Unknown(UnknownReason::Straddle)
+                ]
+            );
+            assert_eq!(capture.router.instances_minted(), 1);
+            io.semantic_call("C_SignInit", 0, 1);
+            io.semantic_call("C_Sign", 0, 1);
+            let fresh = capture.tick_with(&mut io).unwrap();
+            assert_eq!(fresh.calls().count(), 2);
+            assert!(
+                fresh
+                    .calls()
+                    .all(|call| matches!(call.route(), Route::Joined(new) if new != old_id))
+            );
+            assert_eq!(capture.router.instances_minted(), 2);
+        }
+
+        #[test]
+        fn native_semantic_physical_cut_coalesces_and_exhausts() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            initial_pair(&mut capture, &mut io);
+            let first = gap(&capture);
+            let repeat = first.test_repeat();
+            let another_episode = gap(&capture);
+            let other_repeat = another_episode.test_repeat();
+            let cut = capture
+                .apply_physical_gaps_with(&mut io, vec![first, another_episode])
+                .unwrap();
+            assert_eq!(
+                io.raises, 1,
+                "distinct new gaps in one publication coalesce"
+            );
+            assert_eq!(
+                cut.outcomes()
+                    .iter()
+                    .filter(|item| matches!(item, TickOutcome::Invalidation(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(capture.continuity_cuts(), 1);
+            let repeated = capture
+                .apply_physical_gaps_with(&mut io, vec![repeat.test_repeat(), other_repeat])
+                .unwrap();
+            assert!(repeated.outcomes().is_empty());
+            assert_eq!(io.raises, 1);
+            io.semantic_call("C_SignInit", 0, 1);
+            let healthy = capture.tick_with(&mut io).unwrap();
+            assert!(matches!(
+                healthy.calls().next().unwrap().route(),
+                Route::Joined(_)
+            ));
+            capture
+                .apply_physical_gaps_with(&mut io, vec![repeat])
+                .unwrap();
+            assert_eq!(
+                io.raises, 1,
+                "H0 scan alone cannot reset physical uncertainty"
+            );
+            // Only Task3's completed physical recovery can mint this successor episode.
+            let successor = gap(&capture);
+            capture
+                .apply_physical_gaps_with(&mut io, vec![successor])
+                .unwrap();
+            assert_eq!(io.raises, 2);
+            assert_eq!(capture.continuity_cuts(), 2);
+        }
+
+        #[test]
+        fn native_semantic_physical_cut_requires_returned_token_readback_and_preserves_cas() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            initial_pair(&mut capture, &mut io);
+            io.concurrent_raise = true;
+            let episode = gap(&capture);
+            let cut = capture
+                .apply_physical_gaps_with(&mut io, vec![episode])
+                .unwrap();
+            assert_eq!(capture.continuity_cuts(), 1);
+            assert_eq!(io.fault_cell.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(
+                capture.fault, 2,
+                "readback newer than returned userspace token is another loss"
+            );
+            assert!(barrier(&cut).position().is_some());
+            io.semantic_call("C_SignInit", 0, 2);
+            assert!(matches!(
+                capture
+                    .tick_with(&mut io)
+                    .unwrap()
+                    .calls()
+                    .next()
+                    .unwrap()
+                    .route(),
+                Route::Joined(_)
+            ));
+
+            for refusal in 0..3 {
+                let mut io = ScriptIo::new(NativeDomainId::mint());
+                let mut capture = super::capture(&io);
+                initial_pair(&mut capture, &mut io);
+                let episode = gap(&capture);
+                let repeat = episode.test_repeat();
+                match refusal {
+                    0 => io.raise_fails = true,
+                    1 => io.health.extend([Ok(io.last_health), Err(())]),
+                    2 => io.health.extend([Ok(io.last_health), Ok(io.last_health)]), // stale readback below CAS result
+                    _ => unreachable!(),
+                }
+                capture
+                    .apply_physical_gaps_with(&mut io, vec![episode])
+                    .unwrap();
+                assert!(
+                    capture.image_failed || capture.exhausted,
+                    "write/read/token failure permanently refuses"
+                );
+                let raises = io.raises;
+                io.raise_fails = false;
+                io.last_health.fault = 3;
+                capture
+                    .apply_physical_gaps_with(&mut io, vec![repeat])
+                    .unwrap();
+                assert_eq!(io.raises, raises, "permanent failure never retries the CAS");
+                io.semantic_call("C_SignInit", 0, 3);
+                let failed = capture.tick_with(&mut io).unwrap();
+                assert!(failed.calls().all(|call| matches!(
+                    call.route(),
+                    Route::Unknown(
+                        UnknownReason::CoverageFault | UnknownReason::AuthorityExhausted
+                    )
+                )));
+                assert_eq!(capture.router.instances_minted(), 1);
+            }
+        }
+
+        #[test]
+        fn native_semantic_physical_cut_counter_and_position_exhaustion_never_reopen() {
+            for ordinal in [false, true] {
+                let mut io = ScriptIo::new(NativeDomainId::mint());
+                let mut capture = super::capture(&io);
+                initial_pair(&mut capture, &mut io);
+                let episode = gap(&capture);
+                if ordinal {
+                    capture.next_token = u64::MAX;
+                } else {
+                    io.last_health.fault = u64::from(u32::MAX);
+                }
+                let failed = capture
+                    .apply_physical_gaps_with(&mut io, vec![episode])
+                    .unwrap();
+                assert!(
+                    capture.exhausted,
+                    "unrepresentable cut or negative position is permanent"
+                );
+                assert!(
+                    failed
+                        .outcomes()
+                        .iter()
+                        .any(|item| matches!(item, TickOutcome::Invalidation(value)
+                    if matches!(value.scope(), InvalidationScope::AuthorityExhausted)))
+                );
+                if !ordinal {
+                    assert_eq!(
+                        io.fault_cell.load(std::sync::atomic::Ordering::SeqCst),
+                        u64::from(u32::MAX) + 1
+                    );
+                    assert_eq!(capture.continuity_cuts(), 0);
+                }
+                let minted = capture.router.instances_minted();
+                io.last_health.fault = u64::from(u32::MAX);
+                io.semantic_call("C_SignInit", 0, u32::MAX);
+                assert_eq!(
+                    capture
+                        .tick_with(&mut io)
+                        .unwrap()
+                        .calls()
+                        .next()
+                        .unwrap()
+                        .route(),
+                    Route::Unknown(UnknownReason::AuthorityExhausted)
+                );
+                assert_eq!(capture.router.instances_minted(), minted);
+            }
+        }
+
+        #[test]
+        fn native_semantic_physical_cut_prevalidates_all_gaps_and_costs_healthy_sibling() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            let first = initial_pair(&mut capture, &mut io);
+            let first_id = id(first.calls().next().unwrap().route());
+            io.semantic_call("C_SignInit", 1, 0);
+            io.semantic_call("C_Sign", 1, 0);
+            let sibling = capture.tick_with(&mut io).unwrap();
+            let sibling_id = id(sibling.calls().next().unwrap().route());
+            assert_ne!(first_id, sibling_id);
+            assert_eq!(capture.router.ranges_retained(), 4);
+            let valid = gap(&capture);
+            let foreign = PhysicalSemanticGap::test_episode(
+                NativeDomainId::mint(),
+                io.current_image,
+                io.pin.clone(),
+            );
+            assert!(
+                capture
+                    .apply_physical_gaps_with(&mut io, vec![valid, foreign])
+                    .is_err()
+            );
+            assert_eq!(
+                io.raises, 0,
+                "validate entire publication before any mutation"
+            );
+            let rival = PhysicalSemanticGap::test_episode(
+                io.domain,
+                io.current_image,
+                Arc::new(PidPin::open(io.pin.pid()).unwrap()),
+            );
+            let valid = gap(&capture);
+            assert!(
+                capture
+                    .apply_physical_gaps_with(&mut io, vec![valid, rival])
+                    .is_err()
+            );
+            assert_eq!(capture.router.ranges_retained(), 4);
+            assert_eq!(capture.router.instances_minted(), 2);
+            let episode = gap(&capture);
+            let cut = capture
+                .apply_physical_gaps_with(&mut io, vec![episode])
+                .unwrap();
+            assert_eq!(io.raises, 1);
+            assert_eq!(barrier(&cut).domain(), io.domain);
+            io.semantic_call("C_Sign", 1, 0);
+            assert_eq!(
+                capture
+                    .tick_with(&mut io)
+                    .unwrap()
+                    .calls()
+                    .next()
+                    .unwrap()
+                    .route(),
+                Route::Unknown(UnknownReason::FaultEra)
+            );
+            io.semantic_call("C_SignInit", 0, 1);
+            io.semantic_call("C_Sign", 0, 1);
+            io.semantic_call("C_SignInit", 1, 1);
+            io.semantic_call("C_Sign", 1, 1);
+            let recovery = capture.tick_with(&mut io).unwrap();
+            assert_eq!(recovery.calls().count(), 4);
+            assert!(recovery.calls().all(
+                |call| matches!(call.route(), Route::Joined(new) if new != first_id && new != sibling_id)
+            ));
+            assert_eq!(capture.router.instances_minted(), 4);
+        }
+    }
+
     struct ScriptIo {
         domain: NativeDomainId,
         now: Instant,
@@ -945,9 +2040,37 @@ mod tests {
         scan_advance: Duration,
         collection_status: CollectionStatus,
         extra_range: bool,
+        watched: [RetainedInventoryTarget; 2],
+        attachment_refusal: Option<CurrentReceiptRefusal>,
+        receipt_refusal: Option<CurrentReceiptRefusal>,
+        receipt_epochs: Option<CompleteEpochs>,
+        current_image: ImageIdentity,
+        fault_cell: Arc<std::sync::atomic::AtomicU64>,
+        concurrent_raise: bool,
     }
     impl ScriptIo {
         fn new(domain: NativeDomainId) -> Self {
+            let path = std::env::current_exe().unwrap();
+            let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+                &path,
+                None,
+                1,
+                "held-test-image",
+            );
+            let watched = pins.retain_inventory_target(PinnedObjectId(0)).unwrap();
+            let sibling = crate::discovery::identity::test_fixture::real_scan_pin(
+                std::path::Path::new("/usr/bin/true"),
+                None,
+                2,
+                "held-sibling-image",
+            )
+            .retain_inventory_target(PinnedObjectId(0))
+            .unwrap();
+            assert_ne!(
+                watched.object_key(),
+                sibling.object_key(),
+                "sibling must be a distinct physical file"
+            );
             Self {
                 domain,
                 now: Instant::now(),
@@ -968,6 +2091,16 @@ mod tests {
                 scan_advance: Duration::ZERO,
                 collection_status: CollectionStatus::Complete,
                 extra_range: false,
+                watched: [watched, sibling],
+                attachment_refusal: None,
+                receipt_refusal: None,
+                receipt_epochs: None,
+                current_image: ImageIdentity {
+                    task_cookie: 1,
+                    exec_id: 1,
+                },
+                fault_cell: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                concurrent_raise: false,
             }
         }
         fn call_image(&mut self, cookie: u64, exec_id: u64, fault: u32) {
@@ -999,6 +2132,22 @@ mod tests {
                 },
             });
         }
+        fn semantic_call(&mut self, name: &str, file: u32, fault: u32) {
+            self.call(1, fault);
+            let record = self.records.back_mut().unwrap();
+            // Native function selection belongs to the retained attach slot;
+            // target_function is a different, captured API argument.
+            let function_slot = match name {
+                "C_SignInit" => 0,
+                "C_Sign" => 1,
+                _ => panic!("fixture endpoint not retained"),
+            };
+            record.event.slot = file * 2 + function_slot;
+            record.continuity.entry_stamp.file_slot_plus1 = (file + 1) as u16;
+            record.continuity.return_stamp.file_slot_plus1 = (file + 1) as u16;
+            record.continuity.entry_ip +=
+                u64::from(file) * 0x4000 + u64::from(function_slot) * 0x100;
+        }
     }
     impl CaptureIo for ScriptIo {
         fn domain(&self) -> Option<NativeDomainId> {
@@ -1022,15 +2171,64 @@ mod tests {
             }
             result
         }
-        fn raise_fault(&mut self) -> Result<(), ()> {
+        fn raise_fault(&mut self) -> Result<u64, ()> {
             self.raises += 1;
-            if self.raise_fails { Err(()) } else { Ok(()) }
+            if self.raise_fails {
+                return Err(());
+            }
+            use std::sync::atomic::Ordering;
+            self.fault_cell
+                .store(self.last_health.fault, Ordering::SeqCst);
+            let raised = crate::attach::raise_fault_test_cell(&self.fault_cell).map_err(|_| ())?;
+            if self.concurrent_raise {
+                let cell = self.fault_cell.clone();
+                std::thread::spawn(move || crate::attach::raise_fault_test_cell(&cell).unwrap())
+                    .join()
+                    .unwrap();
+            }
+            self.last_health.fault = self.fault_cell.load(Ordering::SeqCst);
+            Ok(raised)
+        }
+        fn retained_attachment(
+            &self,
+            slot: u32,
+        ) -> Result<RetainedInventoryTarget, CurrentReceiptRefusal> {
+            if let Some(refusal) = self.attachment_refusal {
+                return Err(refusal);
+            }
+            self.watched
+                .get((slot / 2) as usize)
+                .map(RetainedInventoryTarget::share)
+                .ok_or(CurrentReceiptRefusal::Attachment)
+        }
+        fn receipt_state(
+            &mut self,
+            _: &Arc<PidPin>,
+            _: ImageIdentity,
+            endpoint: Endpoint,
+            _: u32,
+            _: Instant,
+        ) -> Result<ReceiptState, CurrentReceiptRefusal> {
+            if let Some(refusal) = self.receipt_refusal {
+                return Err(refusal);
+            }
+            Ok(ReceiptState {
+                image: self.current_image,
+                epochs: self.receipt_epochs.unwrap_or(CompleteEpochs {
+                    local: u64::from(self.local),
+                    global: 0,
+                    fault: self.last_health.fault,
+                    sticky: self.last_health.sticky,
+                    record_flags: 0,
+                }),
+                watched: self.watched[endpoint.file_slot as usize].share(),
+            })
         }
         fn endpoint(&self, slot: u32) -> Option<Endpoint> {
-            (slot == 0).then_some(Endpoint {
-                object: PinnedObjectId(0),
-                file_slot: 0,
-                offset: 0x1200,
+            (slot < 4).then_some(Endpoint {
+                object: PinnedObjectId(slot / 2),
+                file_slot: slot / 2,
+                offset: 0x1200 + u64::from(slot % 2) * 0x100,
             })
         }
         fn target(&self, _: u32) -> Option<Arc<PidPin>> {
@@ -1048,17 +2246,19 @@ mod tests {
             if self.fail_cookie == Some(job.image.task_cookie) {
                 return Err(ImageQueryRefusal::Unstable);
             }
+            let base = u64::from(job.endpoint.file_slot) * 0x4000;
             let mut ranges = vec![
-                MapRange::new(0x1000, 0x2000, 0, false),
-                MapRange::new(0x2000, 0x3000, 0x1000, true),
+                MapRange::new(base + 0x1000, base + 0x2000, 0, false),
+                MapRange::new(base + 0x2000, base + 0x3000, 0x1000, true),
             ];
             if self.extra_range {
                 ranges.push(MapRange::new(0x4000, 0x5000, 0, false));
             }
+            self.current_image = self.output_image.unwrap_or(job.image);
             acquire_test_scan(
                 self.domain,
                 self.output_image.unwrap_or(job.image),
-                self.output_file.unwrap_or(0),
+                self.output_file.unwrap_or(job.endpoint.file_slot),
                 CompleteEpochs {
                     local: u64::from(self.local),
                     global: 0,
@@ -1084,6 +2284,7 @@ mod tests {
                     exec_id: 1,
                 }),
                 endpoint,
+                slot: endpoint.file_slot * 2,
                 pin: pin.clone(),
                 deadline,
             };

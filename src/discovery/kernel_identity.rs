@@ -2,7 +2,9 @@
 //! Pass-local scanner custody and anchor installation. Runtime proof selection
 //! is a later slice; these owners never change default userspace collection.
 
-use super::confirm_shards::{AcceptedBatch, SegmentProof, prove_and_finish_prepared};
+use super::confirm_shards::{
+    AcceptedBatch, AcceptedKind, AcceptedRequest, SegmentProof, prove_and_finish_prepared,
+};
 use super::identity::{ExaminedObject, HeldExaminedObject, PinnedObjectId, PinnedObjects};
 use super::scan::CaptureWorkBudget;
 use super::sweep_attribution::{
@@ -22,6 +24,17 @@ use std::sync::Arc;
 
 pub(crate) const EXAMINED_ANCHOR_CAP: usize = 512;
 pub(crate) const TOTAL_ANCHOR_CAP: usize = 1024;
+
+/// One shared per-pass count of actual proof target runs: whole-system
+/// segment batches and per-PID promotion packets, including failed runs.
+/// Anchor setup and the one-time eligibility probe are not target attempts.
+pub(crate) const MAX_TARGET_ATTEMPTS_PER_PASS: u32 = 3;
+
+/// Provisional automatic whole-system threshold: proof-needing PIDs inside
+/// one resource-bounded segment. Named and internal, with deterministic
+/// injection for tests, never a public tuning option. Neither this value
+/// nor any latency is a validated production crossover.
+pub(crate) const AUTO_KERNEL_PROOF_PID_THRESHOLD: usize = 2_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnchorDeny {
@@ -268,9 +281,12 @@ pub(crate) struct InstalledAnchorPass<'s, 'p> {
     pass: Option<AnchorPass<'p>>,
     session: &'s mut IdentitySession,
     failed_target: Option<RunFailure>,
+    target_attempts: u32,
 }
 
 impl InstalledAnchorPass<'_, '_> {
+    /// A raw target read without a charged batch: custody probing only, not
+    /// a proof attempt, so it never consumes the per-pass attempt budget.
     pub(crate) fn read_target(
         &mut self,
         pid: Option<std::os::fd::BorrowedFd<'_>>,
@@ -337,6 +353,190 @@ pub(crate) enum RunFailure {
     Clock,
     StreamInvalid,
     AttachOrRead,
+    BelowThreshold,
+    TargetLimit,
+}
+
+/// Finite userspace-fallback cause for one proof request. Labels and details
+/// are fixed strings: they never carry PIDs, paths, verdicts or low-level
+/// error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KernelFallbackReason {
+    BelowThreshold,
+    FdHeadroom,
+    TargetLimit,
+    AnchorNotInstalled,
+    Scope,
+    Deadline,
+    Clock,
+    StreamInvalid,
+    TargetUnavailable,
+    Unvisited,
+    ConflictingDuplicate,
+}
+
+impl KernelFallbackReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::BelowThreshold => "below_threshold",
+            Self::FdHeadroom | Self::TargetLimit => "fd_headroom",
+            Self::AnchorNotInstalled => "anchor_not_installed",
+            Self::Scope => "scope_unavailable",
+            Self::Deadline => "deadline",
+            Self::Clock => "clock_unavailable",
+            Self::StreamInvalid => "stream_invalid",
+            Self::TargetUnavailable => "target_unavailable",
+            Self::Unvisited => "unvisited",
+            Self::ConflictingDuplicate => "conflicting_duplicate",
+        }
+    }
+
+    pub(crate) fn detail(self) -> Option<&'static str> {
+        match self {
+            Self::TargetLimit => Some("target_run_limit"),
+            _ => None,
+        }
+    }
+}
+
+impl From<RunFailure> for KernelFallbackReason {
+    fn from(reason: RunFailure) -> Self {
+        match reason {
+            RunFailure::Scope => Self::Scope,
+            RunFailure::AnchorNotInstalled => Self::AnchorNotInstalled,
+            RunFailure::FdHeadroom => Self::FdHeadroom,
+            RunFailure::Deadline => Self::Deadline,
+            RunFailure::Clock => Self::Clock,
+            RunFailure::StreamInvalid => Self::StreamInvalid,
+            RunFailure::AttachOrRead => Self::TargetUnavailable,
+            RunFailure::BelowThreshold => Self::BelowThreshold,
+            RunFailure::TargetLimit => Self::TargetLimit,
+        }
+    }
+}
+
+/// Capture-level fallback disclosure input: a pass counts once if any
+/// requested proof fell back, distinct affected PIDs/keys once per pass,
+/// summed across the capture, with the first finite reason preserved.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct KernelFallbackTotals {
+    pub(crate) passes: u64,
+    pub(crate) pids: u64,
+    pub(crate) keys: u64,
+    pub(crate) first_reason: Option<KernelFallbackReason>,
+}
+
+#[derive(Debug, Default)]
+struct PassFallback {
+    pids: BTreeSet<u32>,
+    keys: BTreeSet<ObjectKey>,
+    reason: Option<KernelFallbackReason>,
+}
+
+/// Session-owned fallback accounting. The current pass opens at anchor
+/// installation and rolls up when its guard drops; a pass with no fallback
+/// requests adds zero at every unit.
+#[derive(Debug, Default)]
+pub(crate) struct KernelFallbackLedger {
+    totals: KernelFallbackTotals,
+    current: Option<PassFallback>,
+}
+
+impl KernelFallbackLedger {
+    pub(crate) fn begin_pass(&mut self) {
+        self.end_pass();
+        self.current = Some(PassFallback::default());
+    }
+
+    pub(crate) fn end_pass(&mut self) {
+        let Some(pass) = self.current.take() else {
+            return;
+        };
+        if pass.pids.is_empty() {
+            return;
+        }
+        self.totals.passes = self.totals.passes.saturating_add(1);
+        self.totals.pids = self.totals.pids.saturating_add(pass.pids.len() as u64);
+        self.totals.keys = self.totals.keys.saturating_add(pass.keys.len() as u64);
+        if self.totals.first_reason.is_none() {
+            self.totals.first_reason = pass.reason;
+        }
+    }
+
+    pub(crate) fn note_fallback(
+        &mut self,
+        pid: u32,
+        keys: impl IntoIterator<Item = ObjectKey>,
+        reason: KernelFallbackReason,
+    ) {
+        let Some(current) = self.current.as_mut() else {
+            return;
+        };
+        current.pids.insert(pid);
+        current.keys.extend(keys);
+        if current.reason.is_none() {
+            current.reason = Some(reason);
+        }
+    }
+
+    pub(crate) fn note_batch(&mut self, batch: &AcceptedBatch<'_>, reason: KernelFallbackReason) {
+        for request in batch.requests() {
+            self.note_fallback(request.pid(), request_keys(request), reason);
+        }
+    }
+
+    pub(crate) fn totals(&self) -> KernelFallbackTotals {
+        self.totals.clone()
+    }
+}
+
+fn request_keys(request: &AcceptedRequest<'_>) -> BTreeSet<ObjectKey> {
+    let wanted: BTreeSet<(u64, u64)> = request.ranges().iter().copied().collect();
+    request
+        .entries()
+        .iter()
+        .filter(|entry| wanted.contains(&(entry.start, entry.end)))
+        .map(ObjectKey::of)
+        .collect()
+}
+
+/// Session-level failure that persists through subsequent passes: an invalid
+/// target stream, or three consecutive attempted overdue runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelSticky {
+    StreamInvalid,
+    Deadlines,
+}
+
+impl KernelSticky {
+    fn reason(self) -> RunFailure {
+        match self {
+            Self::StreamInvalid => RunFailure::StreamInvalid,
+            Self::Deadlines => RunFailure::Deadline,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentSelection {
+    Kernel,
+    Userspace(KernelFallbackReason),
+}
+
+/// The automatic cost gate for one resource-bounded segment: `proof_pids`
+/// counts the segment's charged requests, never the whole sweep. `None` is
+/// forced kernel, which bypasses this cost threshold only: resource, guard,
+/// attempt-cap and run-failure policy still apply where the run is attempted.
+pub(crate) fn select_proof_run(
+    proof_pids: usize,
+    auto_threshold: Option<usize>,
+) -> SegmentSelection {
+    match auto_threshold {
+        Some(threshold) if proof_pids < threshold => {
+            SegmentSelection::Userspace(KernelFallbackReason::BelowThreshold)
+        }
+        _ => SegmentSelection::Kernel,
+    }
 }
 
 impl From<crate::attach::identity_iter::ReadError> for RunFailure {
@@ -381,6 +581,7 @@ impl ProofDecision<'_> {
 
 impl Drop for InstalledAnchorPass<'_, '_> {
     fn drop(&mut self) {
+        self.session.fallback.end_pass();
         self.session.binding = None;
         self.session.scope.invalidate();
         // Explicit Drop keeps the exclusive session borrow alive through
@@ -401,6 +602,7 @@ struct KernelPassProof<'g, 's, 'p> {
     installed: &'g mut InstalledAnchorPass<'s, 'p>,
     deadline: std::time::Instant,
     eligible_keys: BTreeSet<ObjectKey>,
+    auto_threshold: Option<usize>,
 }
 
 struct TargetWorkDeadline {
@@ -450,6 +652,40 @@ fn bounded_target_deadline(
     Ok(deadline)
 }
 
+impl KernelPassProof<'_, '_, '_> {
+    fn userspace(&mut self, batch: &AcceptedBatch<'_>, reason: RunFailure) -> ProofDecision<'_> {
+        self.installed
+            .session
+            .fallback
+            .note_batch(batch, reason.into());
+        ProofDecision::Userspace(reason)
+    }
+
+    /// Session bookkeeping for one attempted target run's terminal outcome.
+    /// An overdue run advances the consecutive streak (sticky at three); an
+    /// invalid stream sticks immediately; any other attempted outcome breaks
+    /// the deadline streak without clearing stickiness. No-attempt refusals
+    /// never reach this function.
+    fn note_attempted_outcome(&mut self, reason: RunFailure) {
+        let session = &mut self.installed.session;
+        match reason {
+            RunFailure::Deadline => {
+                session.consecutive_deadlines = session.consecutive_deadlines.saturating_add(1);
+                if session.consecutive_deadlines >= 3 {
+                    session.sticky = Some(KernelSticky::Deadlines);
+                }
+            }
+            RunFailure::StreamInvalid => {
+                session.sticky = Some(KernelSticky::StreamInvalid);
+                session.consecutive_deadlines = 0;
+            }
+            _ => {
+                session.consecutive_deadlines = 0;
+            }
+        }
+    }
+}
+
 impl SegmentProof for KernelPassProof<'_, '_, '_> {
     fn prove<'r>(
         &'r mut self,
@@ -457,23 +693,44 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         budget: &mut CaptureWorkBudget,
         resources: &IoResources,
     ) -> ProofDecision<'r> {
-        let pass = self
-            .installed
-            .pass
-            .as_ref()
-            .expect("installed guard owns its pass");
-        if !pass.owns_installation(self.installed.session) {
-            return ProofDecision::Userspace(RunFailure::Scope);
+        let (owns, same_owner, failed_target, sticky, attempts) = {
+            let pass = self
+                .installed
+                .pass
+                .as_ref()
+                .expect("installed guard owns its pass");
+            (
+                pass.owns_installation(self.installed.session),
+                resources.same_owner(&pass.reservations),
+                self.installed.failed_target,
+                self.installed.session.sticky,
+                self.installed.target_attempts,
+            )
+        };
+        if !owns {
+            return self.userspace(batch, RunFailure::Scope);
         }
-        if !resources.same_owner(&pass.reservations) {
-            return ProofDecision::Userspace(RunFailure::FdHeadroom);
+        if !same_owner {
+            return self.userspace(batch, RunFailure::FdHeadroom);
         }
-        if let Some(reason) = self.installed.failed_target {
-            return ProofDecision::Userspace(reason);
+        if let Some(sticky) = sticky {
+            return self.userspace(batch, sticky.reason());
+        }
+        if let Some(reason) = failed_target {
+            return self.userspace(batch, reason);
+        }
+        if attempts >= MAX_TARGET_ATTEMPTS_PER_PASS {
+            return self.userspace(batch, RunFailure::TargetLimit);
+        }
+        if matches!(
+            select_proof_run(batch.requests().len(), self.auto_threshold),
+            SegmentSelection::Userspace(_)
+        ) {
+            return self.userspace(batch, RunFailure::BelowThreshold);
         }
         let deadline = match bounded_target_deadline(budget, self.deadline) {
             Ok(deadline) => deadline,
-            Err(reason) => return ProofDecision::Userspace(reason),
+            Err(reason) => return self.userspace(batch, reason),
         };
         let mut work = TargetWorkDeadline { deadline, steps: 0 };
         // Exclude a PID before running if any required whole-key expectation
@@ -485,15 +742,15 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         let mut maps = 0usize;
         for request in batch.requests() {
             if let Err(reason) = work.check(budget) {
-                return ProofDecision::Userspace(reason);
+                return self.userspace(batch, reason);
             }
             examined_entries = match examined_entries.checked_add(request.entries().len()) {
                 Some(total) if total <= super::scan::MapsReadLimits::LIVE.max_entries => total,
-                _ => return ProofDecision::Userspace(RunFailure::FdHeadroom),
+                _ => return self.userspace(batch, RunFailure::FdHeadroom),
             };
             requested_ranges = match requested_ranges.checked_add(request.ranges().len()) {
                 Some(total) if total <= super::scan::MapsReadLimits::LIVE.max_entries => total,
-                _ => return ProofDecision::Userspace(RunFailure::FdHeadroom),
+                _ => return self.userspace(batch, RunFailure::FdHeadroom),
             };
             // Exact-range lookup is built once from the original prepared maps.
             // Duplicate ranges cannot supply an unambiguous kernel request.
@@ -502,10 +759,10 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                 #[cfg(test)]
                 tests::note_eligibility_visit(budget);
                 if let Err(reason) = work.step(budget) {
-                    return ProofDecision::Userspace(reason);
+                    return self.userspace(batch, reason);
                 }
                 if by_range.insert((entry.start, entry.end), entry).is_some() {
-                    return ProofDecision::Userspace(RunFailure::StreamInvalid);
+                    return self.userspace(batch, RunFailure::StreamInvalid);
                 }
             }
             let mut complete = !request.ranges().is_empty();
@@ -516,7 +773,7 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     tests::note_eligibility_visit(budget);
                 }
                 if let Err(reason) = work.step(budget) {
-                    return ProofDecision::Userspace(reason);
+                    return self.userspace(batch, reason);
                 }
                 if !entry.is_some_and(|entry| self.eligible_keys.contains(&ObjectKey::of(entry))) {
                     complete = false;
@@ -530,47 +787,71 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             eligible.push(complete);
         }
         if let Err(reason) = work.check(budget) {
-            return ProofDecision::Userspace(reason);
+            return self.userspace(batch, reason);
         }
         if scope.is_empty() {
-            return ProofDecision::Userspace(RunFailure::AnchorNotInstalled);
+            return self.userspace(batch, RunFailure::AnchorNotInstalled);
         }
-        let binding = pass
-            .binding
-            .as_ref()
-            .expect("owned installation has a binding");
-        let generation = binding.generation;
-        let slots = (binding.arena_len / crate::attach::identity_iter::ANCHOR_STRIDE) as u32;
+        let (generation, slots) = {
+            let pass = self
+                .installed
+                .pass
+                .as_ref()
+                .expect("installed guard owns its pass");
+            let binding = pass
+                .binding
+                .as_ref()
+                .expect("owned installation has a binding");
+            (
+                binding.generation,
+                (binding.arena_len / crate::attach::identity_iter::ANCHOR_STRIDE) as u32,
+            )
+        };
         let max_bytes = maps
             .checked_add(slots as usize + 1)
             .and_then(|records| records.checked_mul(crate::attach::identity_iter::RECORD_LEN));
         let Some(max_bytes) = max_bytes else {
-            return ProofDecision::Userspace(RunFailure::FdHeadroom);
+            return self.userspace(batch, RunFailure::FdHeadroom);
         };
         if let Err(reason) = self
             .installed
             .replace_target_scope(&scope.iter().copied().collect::<Vec<_>>())
         {
-            return ProofDecision::Userspace(reason);
+            return self.userspace(batch, reason);
         }
         if let Err(reason) = work.check(budget) {
-            return ProofDecision::Userspace(reason);
+            return self.userspace(batch, reason);
         }
-        let bytes = match self.installed.read_target_typed(None, deadline, max_bytes) {
-            Ok(bytes) => bytes,
+        // One confirmed request on its original retained pidfd is a per-PID
+        // promotion walk; anything else runs whole-system without a pidfd.
+        // The fd is only ever borrowed from the charged preparation: a
+        // missing pidfd runs whole-system, never a numeric reopen.
+        let promotion = match batch.requests() {
+            [only] => matches!(only.kind(), AcceptedKind::Confirm)
+                .then(|| only.pidfd())
+                .flatten(),
+            _ => None,
+        };
+        let (mode, pid) = match promotion {
+            Some(pidfd) => (RunMode::PerPid, Some(pidfd)),
+            None => (RunMode::WholeSystem, None),
+        };
+        let bytes = match self.installed.read_target_typed(pid, deadline, max_bytes) {
+            Ok(bytes) => {
+                self.installed.target_attempts = self.installed.target_attempts.saturating_add(1);
+                bytes
+            }
             Err(reason) => {
-                // Reservation/installation refusals precede target I/O.
-                // Only an attempted run's failure demotes later segments.
-                if matches!(
-                    reason,
-                    RunFailure::Deadline
-                        | RunFailure::Clock
-                        | RunFailure::StreamInvalid
-                        | RunFailure::AttachOrRead
-                ) {
-                    self.installed.failed_target = Some(reason);
+                // Reservation/installation refusals precede target I/O and
+                // are not attempts. Only an attempted run's failure demotes
+                // later segments and moves the session streak.
+                if matches!(reason, RunFailure::FdHeadroom | RunFailure::Scope) {
+                    return self.userspace(batch, reason);
                 }
-                return ProofDecision::Userspace(reason);
+                self.installed.target_attempts = self.installed.target_attempts.saturating_add(1);
+                self.note_attempted_outcome(reason);
+                self.installed.failed_target = Some(reason);
+                return self.userspace(batch, reason);
             }
         };
         let run = match parse(
@@ -579,39 +860,58 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                 generation,
                 slots,
                 scope: &scope,
-                mode: RunMode::WholeSystem,
+                mode,
                 run: RunKind::Target,
             },
         ) {
             Ok(run) => run,
             Err(_) => {
+                self.note_attempted_outcome(RunFailure::StreamInvalid);
                 self.installed.failed_target = Some(RunFailure::StreamInvalid);
-                return ProofDecision::Userspace(RunFailure::StreamInvalid);
+                return self.userspace(batch, RunFailure::StreamInvalid);
             }
         };
+        #[cfg(test)]
+        tests::maybe_cross_work_deadline(&mut work);
         if let Err(reason) = work.check(budget) {
+            self.note_attempted_outcome(reason);
             self.installed.failed_target = Some(reason);
-            return ProofDecision::Userspace(reason);
+            return self.userspace(batch, reason);
         }
         let mut answers = Vec::with_capacity(batch.requests().len());
         for (request, eligible) in batch.requests().iter().zip(eligible) {
             if let Err(reason) = work.step(budget) {
+                self.note_attempted_outcome(reason);
                 self.installed.failed_target = Some(reason);
-                return ProofDecision::Userspace(reason);
+                return self.userspace(batch, reason);
             }
+            let demoted = run.demoted_pids.contains(&request.pid());
             let records = eligible
                 .then(|| run.by_pid.get(&request.pid()))
                 .flatten()
-                .filter(|_| !run.demoted_pids.contains(&request.pid()));
+                .filter(|_| !demoted);
             let Some(records) = records else {
+                let reason = if !eligible {
+                    KernelFallbackReason::AnchorNotInstalled
+                } else if demoted {
+                    KernelFallbackReason::ConflictingDuplicate
+                } else {
+                    KernelFallbackReason::Unvisited
+                };
+                self.installed.session.fallback.note_fallback(
+                    request.pid(),
+                    request_keys(request),
+                    reason,
+                );
                 answers.push(None);
                 continue;
             };
             let mut mapped = MappedIdentities::new();
             for &range in request.ranges() {
                 if let Err(reason) = work.step(budget) {
+                    self.note_attempted_outcome(reason);
                     self.installed.failed_target = Some(reason);
-                    return ProofDecision::Userspace(reason);
+                    return self.userspace(batch, reason);
                 }
                 let proof = match records.get(&range) {
                     Some(crate::attach::identity_iter::TargetVerdict::Slot(slot)) => {
@@ -627,9 +927,12 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             answers.push(Some(mapped));
         }
         if let Err(reason) = work.check(budget) {
+            self.note_attempted_outcome(reason);
             self.installed.failed_target = Some(reason);
-            return ProofDecision::Userspace(reason);
+            return self.userspace(batch, reason);
         }
+        // A completed run breaks any deadline streak; stickiness never clears.
+        self.installed.session.consecutive_deadlines = 0;
         let binding = self
             .installed
             .pass
@@ -667,10 +970,19 @@ impl<'g, 's, 'p, Io: ConfirmIo> KernelMemberProbe<'g, 's, 'p, Io> {
                 installed,
                 deadline,
                 eligible_keys: BTreeSet::new(),
+                auto_threshold: None,
             },
             io,
             resources,
         }
+    }
+
+    /// The automatic cost gate for this probe's segments: batches with fewer
+    /// charged requests fall back with `below_threshold` and never attempt a
+    /// target run. Absent, the probe runs every accepted batch (forced shape).
+    pub(crate) fn with_auto_threshold(mut self, threshold: usize) -> Self {
+        self.proof.auto_threshold = Some(threshold);
+        self
     }
 
     pub(crate) fn install_expectations(
@@ -1001,6 +1313,9 @@ pub(crate) struct IdentitySession {
     generation: u64,
     token: Arc<()>,
     binding: Option<PassBinding>,
+    sticky: Option<KernelSticky>,
+    consecutive_deadlines: u32,
+    fallback: KernelFallbackLedger,
 }
 
 enum SessionObject {
@@ -1032,6 +1347,7 @@ struct FixtureRunTrace {
     scopes: Vec<BTreeSet<u32>>,
     closed: Vec<(tests::FdToken, tests::FdToken)>,
     outcomes: Vec<Result<(), RunFailure>>,
+    pidfds: Vec<Option<i32>>,
 }
 
 fn probe_succeeded(report: &crate::attach::identity_iter::FunctionalProbeReport) -> bool {
@@ -1081,6 +1397,9 @@ impl IdentitySession {
             generation: 0,
             token: Arc::new(()),
             binding: None,
+            sticky: None,
+            consecutive_deadlines: 0,
+            fallback: KernelFallbackLedger::default(),
         })
     }
 
@@ -1175,7 +1494,11 @@ impl IdentitySession {
                     })
                     .collect();
                 if run == RunKind::Target {
-                    target_trace.lock().unwrap().scopes.push(scope);
+                    let mut trace = target_trace.lock().unwrap();
+                    trace.scopes.push(scope);
+                    trace
+                        .pidfds
+                        .push(pid.map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd)));
                 }
                 if let Some(FixtureTarget::Failure(reason)) = step {
                     target_trace.lock().unwrap().outcomes.push(Err(reason));
@@ -1229,6 +1552,7 @@ impl IdentitySession {
             pass: Some(pass),
             session: self,
             failed_target: None,
+            target_attempts: 0,
         })
     }
 
@@ -1240,6 +1564,7 @@ impl IdentitySession {
     ) -> Result<AnchorPass<'p>, &'static str> {
         self.binding = None;
         self.scope.invalidate();
+        self.fallback.begin_pass();
         let result = self.install_pass_inner(pass, generation, deadline);
         if result.is_err() {
             self.binding = None;

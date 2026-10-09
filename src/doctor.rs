@@ -1400,12 +1400,135 @@ fn verdict_line(checks: &[Check]) -> String {
     format!("verdict: {}", parts.join("; "))
 }
 
-/// Pads `name` to 34 columns with dots and prints `ok` / `warn` / `FAIL` /
-/// `n/a` followed by the detail (when there is one), then a final
-/// `verdict:` line naming what is available. Pure: takes the probe result,
-/// returns the text, so the layout is testable without any probe running.
+fn is_requested_lane(name: &str) -> bool {
+    is_capture_row(name)
+        || is_target_row(name)
+        || is_scan_row(name)
+        || is_cgroup_row(name)
+        || is_run_capture_row(name)
+        || is_pid_namespace_row(name)
+}
+
+/// Explain the existing requested-lane verdict and capability tier before the
+/// diagnostic rows. This is pure over probe results; missing rows cannot prove
+/// a target or scope ready, and copy does not change qualification or exits.
+pub fn summary(checks: &[Check], extra_strict: bool) -> String {
+    let assessed = checks.iter().any(|check| {
+        is_requested_lane(&check.name) && !matches!(check.status, Status::NotApplicable(_))
+    });
+    let conclusion = if extra_strict && verdict_extra_strict(checks) != 0 {
+        "extra-strict qualification refused"
+    } else if !assessed {
+        "no requested lanes assessed"
+    } else if extra_strict {
+        "extra-strict qualification passed"
+    } else if verdict(checks) == 0 {
+        "requested-lane checks passed"
+    } else {
+        "requested lane unavailable"
+    };
+    let mut out = format!("Doctor: {conclusion}.\n");
+    let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
+    let assessment = |name: &str| match checks
+        .iter()
+        .find(|check| check.name == name)
+        .map(|check| &check.status)
+    {
+        Some(Status::Ok(_)) => "available",
+        Some(Status::Warn(_) | Status::Fail(_)) => "unavailable",
+        Some(Status::NotApplicable(_)) | None => "unassessed",
+    };
+    let target = assessment("target readability");
+    let scope = if checks
+        .iter()
+        .any(|check| is_pid_namespace_row(&check.name) && matches!(check.status, Status::Fail(_)))
+    {
+        "unavailable"
+    } else {
+        match assessment("cgroup path") {
+            "unavailable" => "unavailable",
+            _ => assessment("scope preflight"),
+        }
+    };
+    let _ = writeln!(out, "Target: {target}.\nScope: {scope}.");
+    let problem = if extra_strict {
+        extra_strict_violations(checks).first().copied()
+    } else {
+        checks
+            .iter()
+            .find(|check| is_requested_lane(&check.name) && matches!(check.status, Status::Fail(_)))
+            .or_else(|| {
+                checks
+                    .iter()
+                    .find(|check| matches!(check.status, Status::Warn(_)) && !is_build_limit(check))
+            })
+    };
+    let next = match problem {
+        Some(check) => next_step(check),
+        None if scope == "unassessed" =>
+            "choose --pid <PID> or --cgroup <PATH> to assess a target scope".into(),
+        None => "choose a capture mode with p11scope profile --help; these checks do not prove provider activity".into(),
+    };
+    let _ = writeln!(out, "Next: {}.", crate::render::escape_controls(&next));
+    out
+}
+
+fn next_step(check: &Check) -> String {
+    let detail = status_detail(&check.status);
+    // These suffixes come from the existing independent EPERM classifier.
+    // Seccomp mode or CapEff alone must never select a causal recommendation.
+    if detail.ends_with("(origin: controlled seccomp denial)") {
+        return "review the specific denied operation in the launcher seccomp policy".into();
+    }
+    if detail.ends_with("(origin: missing required capability)") {
+        return "review the required capabilities for the failed operation".into();
+    }
+    if is_pid_namespace_row(&check.name) {
+        return "use an observer in the initial PID namespace with a matching /proc view".into();
+    }
+    if is_cgroup_row(&check.name) || check.name == "cgroup version" {
+        return "choose a cgroup v2 directory with cgroup.procs and check access to it".into();
+    }
+    if is_target_row(&check.name) || is_scan_row(&check.name) {
+        if detail == "generation unavailable" {
+            return "verify the target is live and readable, then rerun p11scope doctor --pid <PID>".into();
+        }
+        if ["generation changed", "ESRCH", "ENOENT"]
+            .iter()
+            .any(|cause| detail.contains(cause))
+        {
+            return "select a live target and rerun p11scope doctor --pid <PID>".into();
+        }
+        return "check access to the target's maps, memory, root and provider files; rerun p11scope doctor --pid <PID>".into();
+    }
+    if detail.contains("EPERM") || detail.contains("Operation not permitted") {
+        return "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges".into();
+    }
+    if is_capture_row(&check.name)
+        && ["unsupported", "not supported", "ENOSYS", "EOPNOTSUPP"]
+            .iter()
+            .any(|cause| detail.contains(cause))
+    {
+        return "use a host with the required BPF/uprobe support; check the failed feature below"
+            .into();
+    }
+    if detail.contains("verifier:") {
+        return "review the verifier diagnostic and use a build supported by this kernel".into();
+    }
+    format!(
+        "review {} in the checks below before retrying qualification or capture",
+        check.name
+    )
+}
+
+/// Summary first, then every diagnostic row and the unchanged lane verdict.
+/// Pure: no probe or lookup runs while formatting.
 pub fn render(checks: &[Check]) -> String {
-    let mut out = String::new();
+    render_with_mode(checks, false)
+}
+
+fn render_with_mode(checks: &[Check], extra_strict: bool) -> String {
+    let mut out = summary(checks, extra_strict);
     for check in checks {
         let dots = NAME_WIDTH.saturating_sub(check.name.chars().count());
         let word = status_word(&check.status);
@@ -1422,7 +1545,6 @@ pub fn render(checks: &[Check]) -> String {
         }
         out.push('\n');
     }
-    let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
     let _ = writeln!(out, "{}", verdict_line(checks));
     out
 }
@@ -1494,7 +1616,7 @@ pub fn verdict_extra_strict(checks: &[Check]) -> i32 {
 /// labels, never target-controlled bytes, so the refusal line cannot be
 /// forged the way a detail could (F-59).
 pub fn render_extra_strict(checks: &[Check]) -> String {
-    let mut out = render(checks);
+    let mut out = render_with_mode(checks, true);
     let violations = extra_strict_violations(checks);
     let exempt: Vec<&str> = checks
         .iter()
@@ -1530,7 +1652,7 @@ pub fn render_extra_strict(checks: &[Check]) -> String {
 /// `p11scope doctor`: probes, prints the table, returns the exit code.
 /// With `extra_strict`, any `Warn`/`Fail` row refuses (exit 1) and the
 /// render names every violating row; otherwise the default gated verdict
-/// applies and the render is unchanged.
+/// applies. Both modes put the matching conclusion before the checks.
 ///
 /// The table is written without `print!`: a reader that went away
 /// (`p11scope doctor | head`, EPIPE) must not turn the verdict into a panic
@@ -2909,8 +3031,8 @@ mod tests {
             "detail must survive escaped on its own row: {out:?}"
         );
         assert!(
-            out.lines().count() == 3,
-            "one check must render exactly one row + tier + verdict: {out:?}"
+            out.lines().count() == 7,
+            "one check must render five summary lines + one row + verdict: {out:?}"
         );
     }
 }

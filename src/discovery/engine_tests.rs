@@ -28266,15 +28266,7 @@ pub(crate) mod detailed_proof_driver {
     }
     #[test]
     fn detailed_proof_namespace_and_cgroup_gap_refuse() {
-        for scope in [
-            Scope::System,
-            Scope::Pid(std::process::id() + 1),
-            Scope::Cgroup {
-                id: 1,
-                path: "/unproved".into(),
-                dir: std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()),
-            },
-        ] {
+        for scope in [Scope::System, Scope::Pid(std::process::id() + 1)] {
             let (mut engine, mut io) = fixture();
             let agreeing = !matches!(&scope, Scope::System);
             io.proof = ProofSession::test_scope(&scope, agreeing);
@@ -28288,6 +28280,13 @@ pub(crate) mod detailed_proof_driver {
                 "cheap scope/namespace refusal precedes I/O"
             );
         }
+        // C1 supersedes only cgroup's zero-entry expectation: registration is
+        // charged, unsampled and unpublishable until the later C2 protocol.
+        let (mut engine, mut io) = cgroup_fixture();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(engine.trace_seeds.len(), 1);
+        assert_eq!(io.proof.usage(), (1, 0));
+        no_cgroup_io(&io);
         let (mut engine, mut io) = fixture();
         seed(&mut engine, &mut io);
         assert_eq!(verify(&mut engine, &mut io).len(), 1);
@@ -28808,5 +28807,407 @@ pub(crate) mod detailed_proof_driver {
             "the partial confirmation candidate is retained for retry"
         );
         assert!(io.proof.usage().0 <= 16384 && io.proof.usage().1 <= 8 * 1024 * 1024);
+    }
+
+    fn cgroup_fixture() -> (Engine, Io) {
+        let (mut engine, mut io) = fixture();
+        let scope = Scope::Cgroup {
+            id: 1,
+            path: "/retained-only".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()),
+        };
+        io.proof = ProofSession::test_scope(&scope, true);
+        io.proof.test_set_time(100);
+        engine.scope = scope;
+        (engine, io)
+    }
+    fn no_cgroup_io(io: &Io) {
+        assert_eq!(
+            (
+                io.samples.get(),
+                io.cookie_reads.get(),
+                io.health_reads.get()
+            ),
+            (0, 0, 0),
+            "registration and CALL metadata must perform no external read"
+        );
+    }
+    fn cgroup_work_reason(
+        work: &TraceWorkTicket,
+        proof: &ProofSession,
+    ) -> Result<(), TraceProofUnknown> {
+        work.cgroup_check(proof, u64::MAX)
+            .map(|_| ())
+            .map_err(|error| match error {
+                CgroupWorkRefusal::BudgetDeferred => TraceProofUnknown::Budget,
+                CgroupWorkRefusal::Refused(reason) => reason,
+            })
+    }
+    // Catches event-created registration, delayed old witness admission, sliding G,
+    // and numeric ViewId reuse borrowing the original opaque admission.
+    #[test]
+    fn cgroup_trace_bracket_registration_requires_admission_capacity_and_fresh_call() {
+        let (mut engine, mut io) = cgroup_fixture();
+        assert_eq!(calls(&io, 101, 11, 0), 1);
+        assert_eq!(io.proof.usage(), (0, 0), "CALL cannot allocate an entry");
+        io.proof.test_set_time(1_000);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            engine.trace_seeds.len(),
+            1,
+            "fair service must register the admitted view"
+        );
+        assert_eq!(io.proof.usage(), (1, 0));
+        no_cgroup_io(&io);
+        let pid = std::process::id();
+        let (id, g, deadline, first) = io.proof.test_pending_times(pid).unwrap();
+        assert_eq!((g, deadline, first), (1_000, 60_000_001_000, None));
+        assert_eq!(calls(&io, 999, 11, 0), 1);
+        assert_eq!(calls(&io, 1_000, 11, 0), 1);
+        assert_eq!(io.proof.test_pending_times(pid).unwrap().3, None);
+        assert_eq!(calls(&io, 1_001, 11, 0), 1);
+        let witness = io.proof.test_pending_times(pid).unwrap().3.unwrap();
+        assert_eq!(
+            (witness.0.generation, witness.0.exec_id, witness.1),
+            (11, 0, 1_001)
+        );
+        assert!(witness.2 >= witness.1);
+        assert_eq!(calls(&io, 1_002, 11, 0), 1);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            io.proof.test_pending_times(pid),
+            Some((id, g, deadline, Some(witness)))
+        );
+        no_cgroup_io(&io);
+        engine.views[0] = ProcessView::open(ProcessViewId(0), pid).unwrap();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert!(
+            !engine.trace_seeds.contains_key(&id),
+            "reused numeric ID cannot retain old authority"
+        );
+        assert!(io.proof.usage().0 <= 1);
+        no_cgroup_io(&io);
+        engine.views.clear();
+        engine.release_view_id(ProcessViewId(0));
+        assert_eq!(io.proof.usage(), (0, 0));
+        assert_eq!(io.proof.test_pending_times(pid), None);
+    }
+    // Catches lease renewal by a fresh first witness or repeated service, equality
+    // admission, and overflowing registration arithmetic before any actual read.
+    #[test]
+    fn cgroup_trace_bracket_registration_lease_is_separate_from_sample_deadline() {
+        let (mut engine, mut io) = cgroup_fixture();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            io.proof.usage(),
+            (1, 0),
+            "unsampled registration must own one slot"
+        );
+        let pid = std::process::id();
+        let (id, g, deadline, _) = io.proof.test_pending_times(pid).unwrap();
+        assert_eq!((g, deadline), (100, 60_000_000_100));
+        io.proof.test_set_time(deadline - 2);
+        assert_eq!(calls(&io, deadline - 2, 11, 0), 1);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(io.proof.test_pending_times(pid).unwrap().2, deadline);
+        assert!(engine.trace_seeds.contains_key(&id));
+        io.proof.test_set_time(deadline);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert!(
+            !engine.trace_seeds.contains_key(&id),
+            "registration lease expires at equality"
+        );
+        no_cgroup_io(&io);
+        // C1 has no sample transaction. The lease therefore remains G+60s even
+        // after its first witness; C2 will install first-S0's separate deadline.
+        let (mut engine, mut io) = cgroup_fixture();
+        io.proof.test_set_time(u64::MAX - 59_000_000_000);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            io.proof.usage(),
+            (0, 0),
+            "checked G+60s must refuse overflow"
+        );
+        no_cgroup_io(&io);
+    }
+    // Catches a second pool/uncharged alias, path-cap speculative I/O, lost drop
+    // charge, and a seeding traversal that starts every ticket at the first view.
+    #[test]
+    fn cgroup_trace_bracket_shared_slots_paths_interest_and_fairness() {
+        let (mut engine, mut io) = cgroup_fixture();
+        let mut held: Vec<_> = (0..16_384).map(|_| io.proof.reserve(0).unwrap()).collect();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert!(engine.trace_seeds.is_empty());
+        assert_eq!(calls(&io, 101, 11, 0), 1);
+        assert_eq!(io.proof.usage(), (16_384, 0));
+        no_cgroup_io(&io);
+        drop(held.pop());
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            engine.trace_seeds.len(),
+            1,
+            "registration must use the released shared slot"
+        );
+        assert_eq!(io.proof.usage(), (16_384, 0));
+        drop(engine);
+        assert_eq!(io.proof.usage(), (16_383, 0));
+        drop(held);
+        assert_eq!(io.proof.usage(), (0, 0));
+
+        let (mut engine, mut io) = cgroup_fixture();
+        let full_path = io.proof.reserve(8_388_608).unwrap();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            io.proof.usage(),
+            (2, 8_388_608),
+            "AwaitFirst owns zero work/path bytes"
+        );
+        calls(&io, 101, 11, 0);
+        assert!(service(&mut engine, &mut io).is_empty());
+        no_cgroup_io(&io);
+        engine.release_view_id(ProcessViewId(0));
+        assert_eq!(io.proof.usage(), (1, 8_388_608));
+        drop(full_path);
+        assert_eq!(io.proof.usage(), (0, 0));
+
+        // Existing genuine PID/system receipt owns the same shared reservation
+        // through B-style retention; no fabricated verified-token constructor.
+        let (proof, receipt) = verified_fixture();
+        let held: Vec<_> = (0..16_383).map(|_| proof.reserve(0).unwrap()).collect();
+        assert_eq!(proof.usage(), (16_384, 14));
+        assert!(matches!(proof.reserve(0), Err(TraceProofUnknown::Budget)));
+        drop(receipt);
+        let last = proof.reserve(0).unwrap();
+        drop(last);
+        drop(held);
+        assert_eq!(proof.usage(), (0, 0));
+
+        let (mut engine, mut io) = cgroup_fixture();
+        let mut children = Children(Vec::new());
+        for id in 1..=9 {
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            engine
+                .views
+                .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
+            children.0.push(child);
+        }
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            engine.trace_seeds.len(),
+            8,
+            "registration phase visits at most eight views"
+        );
+        assert_eq!(engine.trace_view_cursor, 8);
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            engine.trace_seeds.len(),
+            10,
+            "saved cursor reaches later admitted views"
+        );
+        no_cgroup_io(&io);
+        drop(engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+    // Catches registration after allowance exhaustion. This is the real C1
+    // registration boundary, with no synthetic future sample/start counter.
+    #[test]
+    fn cgroup_trace_bracket_deferred_before_first_read_is_not_a_start() {
+        let (mut engine, mut io) = cgroup_fixture();
+        engine
+            .with_trace_frame(&mut io, |engine, io, work| {
+                for _ in 0..32 {
+                    work.visit(&io.proof).unwrap();
+                }
+                engine.service_trace_images(io, work, |_| panic!("C1 cannot publish"));
+                assert_eq!(
+                    io.proof.usage(),
+                    (0, 0),
+                    "spent visit allowance cannot register"
+                );
+                no_cgroup_io(io);
+                Ok(())
+            })
+            .unwrap();
+        assert!(service(&mut engine, &mut io).is_empty());
+        assert_eq!(
+            io.proof.usage(),
+            (1, 0),
+            "new ticket can register without starting reads"
+        );
+        no_cgroup_io(&io);
+        let mut terminal = engine.begin_trace_terminal_work(std::time::Duration::from_secs(1));
+        let before = io.proof.usage();
+        engine.service_trace_images(&io, &mut terminal, |_| panic!("C1 cannot publish"));
+        assert_eq!(io.proof.usage(), before);
+        no_cgroup_io(&io);
+        let (mut empty_engine, mut empty_io) = cgroup_fixture();
+        empty_engine
+            .with_trace_frame(&mut empty_io, |engine, io, work| {
+                for _ in 0..32 {
+                    work.visit(&io.proof).unwrap();
+                }
+                engine.service_trace_images(io, work, |_| panic!("C1 cannot publish"));
+                Ok(())
+            })
+            .unwrap();
+        let mut terminal =
+            empty_engine.begin_trace_terminal_work(std::time::Duration::from_secs(1));
+        empty_engine
+            .service_trace_images(&empty_io, &mut terminal, |_| panic!("C1 cannot publish"));
+        assert_eq!(
+            empty_io.proof.usage(),
+            (0, 0),
+            "terminal work cannot register an empty view"
+        );
+        no_cgroup_io(&empty_io);
+    }
+    // Catches invalid/cancelled/foreign/closed authority being reclassified as
+    // retryable budget, including a poisoned clock followed by frame expiry.
+    #[test]
+    fn cgroup_trace_bracket_ticket_refusals_preserve_nonbudget_causes() {
+        let proof = ProofSession::test_session();
+        proof.test_set_time(100);
+        let budget = TraceWorkTicket::test_new(proof.clone(), 100, 101);
+        proof.test_set_time(101);
+        let budget_reason = cgroup_work_reason(&budget, &proof);
+        proof.test_set_time(100);
+        let missing = TraceWorkTicket::default();
+        let foreign = TraceWorkTicket::test_new(ProofSession::test_session(), 100, 1_000);
+        let cancelled = TraceWorkTicket::new(
+            proof.clone(),
+            100,
+            1_000,
+            false,
+            Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            ))),
+        );
+        let closed = TraceWorkTicket::test_new(proof.clone(), 100, 1_000);
+        closed.close();
+        let results = [
+            budget_reason,
+            cgroup_work_reason(&missing, &proof),
+            cgroup_work_reason(&foreign, &proof),
+            cgroup_work_reason(&cancelled, &proof),
+            cgroup_work_reason(&closed, &proof),
+        ];
+        assert_eq!(
+            results,
+            [
+                Err(TraceProofUnknown::Budget),
+                Err(TraceProofUnknown::Unreadable),
+                Err(TraceProofUnknown::DomainMismatch),
+                Err(TraceProofUnknown::TargetGone),
+                Err(TraceProofUnknown::Unreadable),
+            ]
+        );
+        let regressed = TraceWorkTicket::test_new(proof.clone(), 100, 1_000);
+        proof.test_set_time(99);
+        assert_eq!(
+            cgroup_work_reason(&regressed, &proof),
+            Err(TraceProofUnknown::Unreadable)
+        );
+        proof.test_set_time(1_000);
+        assert_eq!(
+            cgroup_work_reason(&regressed, &proof),
+            Err(TraceProofUnknown::Unreadable)
+        );
+        proof.test_set_time(100);
+        let no_clock = TraceWorkTicket::test_new(proof.clone(), 100, 1_000);
+        proof.test_set_time(u64::MAX);
+        assert_eq!(
+            cgroup_work_reason(&no_clock, &proof),
+            Err(TraceProofUnknown::Unreadable)
+        );
+        proof.test_set_time(1_000);
+        assert_eq!(
+            cgroup_work_reason(&no_clock, &proof),
+            Err(TraceProofUnknown::Unreadable)
+        );
+        // Legacy PID/system wrappers deliberately retain their exact outcomes.
+        assert_eq!(regressed.check(&proof), Err(TraceWorkError::Deferred));
+        assert_eq!(foreign.check(&proof), Err(TraceWorkError::Deferred));
+        proof.test_set_time(100);
+        let expired_candidate = TraceWorkTicket::test_new(proof.clone(), 100, 1_000);
+        assert_eq!(
+            expired_candidate.cgroup_check(&proof, 100),
+            Err(CgroupWorkRefusal::Refused(TraceProofUnknown::AfterEvent))
+        );
+        let poisoned = TraceWorkTicket::test_new(proof.clone(), 100, 1_000);
+        let poisoned_state = poisoned.state.as_ref().unwrap().clone();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = poisoned_state.lock().unwrap();
+            panic!("poison work authority");
+        });
+        assert_eq!(
+            cgroup_work_reason(&poisoned, &proof),
+            Err(TraceProofUnknown::Unreadable)
+        );
+        let mut reads = TraceWorkTicket::test_new(proof.clone(), 100, 1_000);
+        let mut visits = TraceWorkTicket::test_new(proof.clone(), 100, 1_000);
+        for _ in 0..32 {
+            reads.external_read_checked(&proof).unwrap();
+            visits.visit_checked(&proof).unwrap();
+        }
+        assert_eq!(
+            reads.external_read_checked(&proof),
+            Err(CgroupWorkRefusal::BudgetDeferred)
+        );
+        assert_eq!(
+            visits.visit_checked(&proof),
+            Err(CgroupWorkRefusal::BudgetDeferred)
+        );
+        assert_eq!(reads.external_read(&proof), Err(TraceWorkError::Deferred));
+        assert_eq!(visits.visit(&proof), Err(TraceWorkError::Deferred));
+    }
+    // Catches retaining an old successful clock stamp after a valid deadline
+    // observation, which can misclassify subsequent regression as retryable.
+    #[test]
+    fn cgroup_trace_bracket_clock_after_budget_close_cannot_be_retryable() {
+        let proof = ProofSession::test_session();
+        proof.test_set_time(100);
+        let mut budget_closed = TraceWorkTicket::test_new(proof.clone(), 100, 200);
+        proof.test_set_time(200);
+        assert_eq!(
+            budget_closed.cgroup_check(&proof, u64::MAX),
+            Err(CgroupWorkRefusal::BudgetDeferred)
+        );
+        proof.test_set_time(150);
+        assert_eq!(
+            budget_closed.cgroup_check(&proof, u64::MAX),
+            Err(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))
+        );
+        proof.test_set_time(300);
+        assert_eq!(
+            budget_closed.cgroup_check(&proof, u64::MAX),
+            Err(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))
+        );
+        assert_eq!(budget_closed.check(&proof), Err(TraceWorkError::Deferred));
+        assert_eq!(
+            budget_closed.external_read(&proof),
+            Err(TraceWorkError::Deferred)
+        );
+        let state = budget_closed.state.as_ref().unwrap().lock().unwrap();
+        assert_eq!(
+            (state.visits, state.reads),
+            (32, 32),
+            "refusal never refills or spends allowance"
+        );
+        drop(state);
+        proof.test_set_time(100);
+        let expired_candidate = TraceWorkTicket::test_new(proof.clone(), 100, 1_000);
+        proof.test_set_time(200);
+        assert_eq!(
+            expired_candidate.cgroup_check(&proof, 200),
+            Err(CgroupWorkRefusal::Refused(TraceProofUnknown::AfterEvent))
+        );
+        proof.test_set_time(150);
+        assert_eq!(
+            expired_candidate.cgroup_check(&proof, 1_000),
+            Err(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))
+        );
     }
 }

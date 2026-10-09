@@ -235,6 +235,88 @@ fn detailed_proof_poison_cleanup_has_no_recursive_lock() {
     assert_eq!(proof.usage(), (0, 0));
 }
 
+// Existing reservation cleanup must also remove cgroup's nonowning admission
+// indexes after poison, without destructor re-entry or retaining a descriptor.
+#[test]
+fn cgroup_trace_bracket_poisoned_registration_returns_its_only_charge() {
+    let scope = Scope::Cgroup {
+        id: 1,
+        path: "/retained-only".into(),
+        dir: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+    };
+    let proof = ProofSession::test_scope(&scope, true);
+    proof.test_set_time(100);
+    let view = crate::process::ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let mut work = TraceWorkTicket::test_new(proof.clone(), 100, 5_000_100);
+    let candidate = proof.register_cgroup(&view, &mut work).unwrap();
+    assert_eq!(proof.usage(), (1, 0));
+    let authority = proof.authority.clone();
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = authority.ledger.lock().unwrap();
+        panic!("poison registered authority");
+    });
+    assert_eq!(
+        proof.cgroup_registration_status(&candidate, &view, &work),
+        Err(TraceWorkError::Unknown(TraceProofUnknown::Unreadable))
+    );
+    drop(candidate);
+    assert_eq!(proof.usage(), (0, 0));
+    let ledger = authority
+        .ledger
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(ledger.pending.is_empty() && ledger.pids.is_empty() && ledger.cgroup_views.is_empty());
+}
+
+// Catches stale cancellation or drop erasing an already registered successor's
+// original admission alias. The old owner stays charged until its real drop.
+#[test]
+fn cgroup_trace_bracket_stale_owner_cannot_cancel_or_drop_successor() {
+    let scope = Scope::Cgroup {
+        id: 1,
+        path: "/retained-only".into(),
+        dir: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+    };
+    let proof = ProofSession::test_scope(&scope, true);
+    proof.test_set_time(100);
+    let view = crate::process::ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let mut work = TraceWorkTicket::test_new(proof.clone(), 100, 5_000_100);
+    let old = proof.register_cgroup(&view, &mut work).unwrap();
+    proof.cancel_cgroup_view(&old);
+    let next = crate::process::ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let successor = proof.register_cgroup(&next, &mut work).unwrap();
+    assert_eq!(proof.usage(), (2, 0));
+    proof.cancel_cgroup_view(&old);
+    assert_eq!(
+        proof.cgroup_registration_status(&successor, &next, &work),
+        Ok(())
+    );
+    let foreign = ProofSession::test_scope(&scope, true);
+    foreign.test_set_time(100);
+    let mut foreign_work = TraceWorkTicket::test_new(foreign.clone(), 100, 5_000_100);
+    let foreign_candidate = foreign.register_cgroup(&next, &mut foreign_work).unwrap();
+    proof.cancel_cgroup_view(&foreign_candidate);
+    foreign.cancel_cgroup_view(&successor);
+    assert_eq!(
+        proof.cgroup_registration_status(&successor, &next, &work),
+        Ok(())
+    );
+    assert_eq!(
+        foreign.cgroup_registration_status(&foreign_candidate, &next, &foreign_work),
+        Ok(())
+    );
+    drop(foreign_candidate);
+    assert_eq!(foreign.usage(), (0, 0));
+    drop(old);
+    assert_eq!(proof.usage(), (1, 0));
+    assert_eq!(
+        proof.cgroup_registration_status(&successor, &next, &work),
+        Ok(())
+    );
+    drop(successor);
+    assert_eq!(proof.usage(), (0, 0));
+}
+
 struct InterruptSample<'a> {
     inner: FixtureSample<'a>,
     interrupt: u8,

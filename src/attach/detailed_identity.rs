@@ -14,6 +14,7 @@ const ENTRY_CAP: usize = 16384;
 const PATH_CAP: usize = 8 * 1024 * 1024;
 const IMAGE_PATH_CAP: usize = 4096;
 const SAMPLE_WORK_BYTES: usize = 16384;
+const CGROUP_REGISTRATION_LEASE_NS: u64 = 60_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TraceProofUnknown {
@@ -81,6 +82,7 @@ struct ProofLedger {
     horizon: Option<u64>,
     pending: BTreeMap<SeedId, PendingSlot>,
     pids: BTreeMap<u32, SeedId>,
+    cgroup_views: BTreeMap<ProcessViewId, (SeedId, ViewAdmission)>,
 }
 
 #[derive(Clone)]
@@ -95,6 +97,8 @@ pub(crate) struct EntryReservation {
     bytes: usize,
     epoch: u64,
 }
+#[cfg(test)]
+type PendingTimesSnapshot = (SeedId, u64, u64, Option<(ProcessKey, u64, u64)>);
 impl ProofSession {
     fn new(
         events: EventsDomain,
@@ -178,6 +182,21 @@ impl ProofSession {
             .unwrap_or_else(|error| error.into_inner());
         (ledger.entries, ledger.path_bytes)
     }
+    #[cfg(test)]
+    pub(crate) fn test_pending_times(&self, pid: u32) -> Option<PendingTimesSnapshot> {
+        let ledger = self.ledger().ok()?;
+        let id = *ledger.pids.get(&pid)?;
+        let slot = ledger.pending.get(&id)?;
+        Some((
+            id,
+            slot.timing.start(),
+            match slot.timing {
+                PendingTiming::PidSystem { eligible_after, .. } => eligible_after,
+                PendingTiming::Cgroup { deadline, .. } => deadline,
+            },
+            slot.witness.map(|w| (w.key, w.event_ns, w.copied_ns)),
+        ))
+    }
 }
 impl EntryReservation {
     fn shrink(&mut self, bytes: usize) -> Result<(), TraceProofUnknown> {
@@ -236,12 +255,30 @@ struct Witness {
 }
 struct PendingSlot {
     pid: u32,
-    sample_start: u64,
-    eligible_after: u64,
+    timing: PendingTiming,
     epoch: u64,
     witness: Option<Witness>,
     armed: Option<u64>,
     problem: Option<TraceProofUnknown>,
+}
+enum PendingTiming {
+    PidSystem {
+        sample_start: u64,
+        eligible_after: u64,
+    },
+    Cgroup {
+        registered_ns: u64,
+        deadline: u64,
+        view: ProcessViewId,
+    },
+}
+impl PendingTiming {
+    fn start(&self) -> u64 {
+        match self {
+            Self::PidSystem { sample_start, .. } => *sample_start,
+            Self::Cgroup { registered_ns, .. } => *registered_ns,
+        }
+    }
 }
 struct SampleInterval {
     start: u64,
@@ -261,6 +298,36 @@ impl TraceSeed {
     }
     pub(crate) fn view_id(&self) -> ProcessViewId {
         self.view
+    }
+}
+/// Unsampled, non-Clone owner. The original admission carries no descriptor,
+/// and its one entry charge owns neither path bytes nor a second reservation.
+pub(crate) struct CgroupCandidate {
+    view: ProcessViewId,
+    admission: ViewAdmission,
+    entry: EntryReservation,
+}
+impl CgroupCandidate {
+    pub(crate) fn id(&self) -> SeedId {
+        self.entry.id
+    }
+}
+pub(crate) enum TraceCandidateBody {
+    PidSystem(TraceSeed),
+    Cgroup(CgroupCandidate),
+}
+impl TraceCandidateBody {
+    pub(crate) fn id(&self) -> SeedId {
+        match self {
+            Self::PidSystem(seed) => seed.id(),
+            Self::Cgroup(candidate) => candidate.id(),
+        }
+    }
+    pub(crate) fn view_id(&self) -> ProcessViewId {
+        match self {
+            Self::PidSystem(seed) => seed.view_id(),
+            Self::Cgroup(candidate) => candidate.view,
+        }
     }
 }
 #[derive(Clone)]
@@ -359,10 +426,18 @@ impl ProofLedger {
         }
     }
     fn remove(&mut self, id: SeedId) {
-        if let Some(slot) = self.pending.remove(&id)
-            && self.pids.get(&slot.pid) == Some(&id)
-        {
-            self.pids.remove(&slot.pid);
+        if let Some(slot) = self.pending.remove(&id) {
+            if self.pids.get(&slot.pid) == Some(&id) {
+                self.pids.remove(&slot.pid);
+            }
+            if let PendingTiming::Cgroup { view, .. } = slot.timing
+                && self
+                    .cgroup_views
+                    .get(&view)
+                    .is_some_and(|(seed, _)| *seed == id)
+            {
+                self.cgroup_views.remove(&view);
+            }
         }
     }
 }
@@ -398,6 +473,125 @@ impl ProofSession {
     }
     pub(crate) fn same_allocation(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.authority, &other.authority)
+    }
+    pub(crate) fn is_cgroup(&self) -> bool {
+        matches!(self.authority.coverage.scope, CoveredScope::Cgroup)
+    }
+    pub(crate) fn register_cgroup(
+        &self,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+    ) -> Result<CgroupCandidate, TraceWorkError> {
+        if !self.is_cgroup() || work.terminal() {
+            return Err(TraceProofUnknown::ProofPending.into());
+        }
+        if !self.authority.numbering_agrees {
+            return Err(TraceProofUnknown::NamespaceMismatch.into());
+        }
+        // These are retained custody facts, with no exit, cookie or procfs read.
+        view.retained_pin()
+            .pidfd()
+            .map_err(|_| TraceProofUnknown::Unreadable)?;
+        view.start_time().ok_or(TraceProofUnknown::Unreadable)?;
+        work.cgroup_check(self, u64::MAX)?;
+        let entry = self.reserve(0)?;
+        // G is the fresh checked completion stamp after acquiring the sole charge.
+        let registered_ns = work.cgroup_check(self, u64::MAX)?;
+        let deadline = registered_ns
+            .checked_add(CGROUP_REGISTRATION_LEASE_NS)
+            .ok_or(TraceProofUnknown::Unreadable)?;
+        if registered_ns < self.authority.coverage.started_ns {
+            return Err(TraceProofUnknown::Unreadable.into());
+        }
+        let admission = view.view_admission();
+        {
+            let mut ledger = self.ledger()?;
+            if ledger.exhausted || entry.epoch != ledger.loss_epoch {
+                return Err(TraceProofUnknown::LifecycleLoss.into());
+            }
+            if ledger.pids.contains_key(&view.pid()) || ledger.cgroup_views.contains_key(&view.id())
+            {
+                return Err(TraceProofUnknown::ProofPending.into());
+            }
+            let epoch = ledger.loss_epoch;
+            ledger.pending.insert(
+                entry.id,
+                PendingSlot {
+                    pid: view.pid(),
+                    timing: PendingTiming::Cgroup {
+                        registered_ns,
+                        deadline,
+                        view: view.id(),
+                    },
+                    epoch,
+                    witness: None,
+                    armed: None,
+                    problem: None,
+                },
+            );
+            ledger.pids.insert(view.pid(), entry.id);
+            ledger
+                .cgroup_views
+                .insert(view.id(), (entry.id, admission.clone()));
+        }
+        Ok(CgroupCandidate {
+            view: view.id(),
+            admission,
+            entry,
+        })
+    }
+    pub(crate) fn cgroup_registration_status(
+        &self,
+        candidate: &CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &TraceWorkTicket,
+    ) -> Result<(), TraceWorkError> {
+        if !self.owns(&candidate.entry)
+            || view.id() != candidate.view
+            || !view.view_admission().same_allocation(&candidate.admission)
+        {
+            return Err(TraceProofUnknown::TargetGone.into());
+        }
+        let deadline = {
+            let ledger = self.ledger()?;
+            let slot = ledger
+                .pending
+                .get(&candidate.id())
+                .ok_or(TraceProofUnknown::NotSeeded)?;
+            if let Some(reason) = ledger.slot_problem(slot) {
+                return Err(reason.into());
+            }
+            let Some((id, admission)) = ledger.cgroup_views.get(&candidate.view) else {
+                return Err(TraceProofUnknown::TargetGone.into());
+            };
+            if *id != candidate.id() || !admission.same_allocation(&candidate.admission) {
+                return Err(TraceProofUnknown::TargetGone.into());
+            }
+            let PendingTiming::Cgroup { deadline, .. } = slot.timing else {
+                return Err(TraceProofUnknown::DomainMismatch.into());
+            };
+            deadline
+        };
+        work.cgroup_check(self, deadline)?;
+        Ok(())
+    }
+    pub(crate) fn cancel_cgroup_view(&self, candidate: &CgroupCandidate) {
+        if !self.owns(&candidate.entry) {
+            return;
+        }
+        // Recover poisoned metadata solely for cancellation/accounting. No proof
+        // is minted through a poisoned authority, and no owner drops under lock.
+        let mut ledger = self
+            .authority
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((id, admission)) = ledger.cgroup_views.get(&candidate.view)
+            && *id == candidate.id()
+            && admission.same_allocation(&candidate.admission)
+        {
+            ledger.remove(candidate.id());
+        }
     }
     pub(crate) fn can_seed(
         &self,
@@ -559,14 +753,19 @@ impl ProofSession {
                 if let Some(reason) = slot.problem {
                     return Err(reason);
                 }
-                slot.eligible_after = completed.max(self.authority.coverage.started_ns);
+                let PendingTiming::PidSystem { eligible_after, .. } = &mut slot.timing else {
+                    return Err(TraceProofUnknown::DomainMismatch);
+                };
+                *eligible_after = completed.max(self.authority.coverage.started_ns);
             } else {
                 ledger.pending.insert(
                     entry.id,
                     PendingSlot {
                         pid,
-                        sample_start: start,
-                        eligible_after: completed.max(self.authority.coverage.started_ns),
+                        timing: PendingTiming::PidSystem {
+                            sample_start: start,
+                            eligible_after: completed.max(self.authority.coverage.started_ns),
+                        },
                         epoch,
                         witness: None,
                         armed: None,
@@ -626,14 +825,24 @@ impl ProofSession {
         let Some(slot) = ledger.pending.get_mut(&id) else {
             return;
         };
-        if timestamp <= slot.eligible_after || slot.problem.is_some() {
+        let eligible_after = match slot.timing {
+            PendingTiming::PidSystem { eligible_after, .. } => eligible_after,
+            PendingTiming::Cgroup { registered_ns, .. } => registered_ns,
+        };
+        if timestamp <= eligible_after || slot.problem.is_some() {
             return;
         }
         let Some(copied) = copied.filter(|copied| *copied >= timestamp) else {
             slot.problem = Some(TraceProofUnknown::Unreadable);
             return;
         };
-        if cookie == 0 {
+        if let PendingTiming::Cgroup { deadline, .. } = slot.timing
+            && copied >= deadline
+        {
+            slot.problem = Some(TraceProofUnknown::AfterEvent);
+            return;
+        }
+        if cookie == 0 || (self.is_cgroup() && self.authority.events.id() == 0) {
             slot.problem = Some(TraceProofUnknown::Unreadable);
             return;
         }
@@ -662,7 +871,7 @@ impl ProofSession {
         let Some(slot) = ledger.pending.get_mut(&id) else {
             return;
         };
-        if timestamp >= slot.sample_start && slot.problem.is_none() {
+        if timestamp >= slot.timing.start() && slot.problem.is_none() {
             slot.problem = Some(if exec {
                 TraceProofUnknown::ExecChanged
             } else {
@@ -723,7 +932,10 @@ impl ProofSession {
             return Ok(());
         }
         let witness = slot.witness.ok_or(TraceProofUnknown::ProofPending)?;
-        if witness.event_ns <= slot.eligible_after {
+        let PendingTiming::PidSystem { eligible_after, .. } = slot.timing else {
+            return Err(TraceProofUnknown::ProofPending);
+        };
+        if witness.event_ns <= eligible_after {
             slot.problem = Some(TraceProofUnknown::AfterEvent);
             return Err(TraceProofUnknown::AfterEvent);
         }
@@ -1220,8 +1432,10 @@ impl ProofSession {
                 entry.id,
                 PendingSlot {
                     pid: view.pid(),
-                    sample_start: start,
-                    eligible_after: u64::MAX,
+                    timing: PendingTiming::PidSystem {
+                        sample_start: start,
+                        eligible_after: u64::MAX,
+                    },
                     epoch,
                     witness: None,
                     armed: None,

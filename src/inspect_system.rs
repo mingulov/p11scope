@@ -245,6 +245,38 @@ pub(crate) struct MemberGeneration {
     pub exe: Option<ExeIdentity>,
 }
 
+/// Private absence authority, minted by the scan producer and never serialized.
+#[derive(Clone)]
+pub(crate) struct CompleteMemberScan {
+    generation: MemberGeneration,
+    started_ns: u64,
+    finished_ns: u64,
+}
+
+impl CompleteMemberScan {
+    pub(crate) fn generation(&self) -> &MemberGeneration {
+        &self.generation
+    }
+    pub(crate) fn started_ns(&self) -> u64 {
+        self.started_ns
+    }
+    pub(crate) fn finished_ns(&self) -> u64 {
+        self.finished_ns
+    }
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        generation: MemberGeneration,
+        started_ns: u64,
+        finished_ns: u64,
+    ) -> Self {
+        Self {
+            generation,
+            started_ns,
+            finished_ns,
+        }
+    }
+}
+
 /// One scope member's deep-scan result: its status, what it mapped, and
 /// the pins the scan earned. Empty unless a scan ran.
 struct MemberResult {
@@ -252,6 +284,7 @@ struct MemberResult {
     view: ProcessViewId,
     status: MemberStatus,
     generation: Option<MemberGeneration>,
+    complete_scan: Option<CompleteMemberScan>,
     modules: Vec<ScannedModule>,
     /// Objects this member's own deep scan examined without finding a
     /// module (C1b "examined" keys; empty unless the scan completed).
@@ -407,6 +440,8 @@ fn scan_member(
     budget: &mut CaptureWorkBudget,
     noise: &mut DiscoveryNoiseAggregator,
 ) -> MemberResult {
+    let started_ns = monotonic_ns();
+    let budget_before = (budget.stopped_reason(), budget.refusal_counts());
     let mut gaps = Vec::new();
     let opened = ProcessView::open(view, pid);
     let view_handle = match opened {
@@ -487,6 +522,31 @@ fn scan_member(
             gaps,
         );
     }
+    let generation_current = generation.start_time.is_some()
+        && generation.exe.is_some()
+        && generation.exe == read_exe_identity(pid)
+        && generation.start_time == view_handle.start_time()
+        && view_handle.still_the_same();
+    let finished_ns = monotonic_ns();
+    let complete_scan = if generation_current
+        && retirement_scan_allows_absence(
+            hints,
+            &outcome,
+            &pin_skips,
+            budget_before,
+            (budget.stopped_reason(), budget.refusal_counts()),
+        ) {
+        started_ns
+            .zip(finished_ns)
+            .filter(|(pre, post)| *pre > 0 && post > pre)
+            .map(|(started_ns, finished_ns)| CompleteMemberScan {
+                generation: generation.clone(),
+                started_ns,
+                finished_ns,
+            })
+    } else {
+        None
+    };
     let scan_ms = match &outcome {
         ScanOutcome::Scanned { scan_ms, .. } => *scan_ms,
         ScanOutcome::Unavailable { .. } => 0,
@@ -504,6 +564,7 @@ fn scan_member(
         } => (modules, MemberStatus::MemoryUnavailable { reason }),
     };
     MemberResult {
+        complete_scan,
         pid,
         view,
         status,
@@ -514,6 +575,29 @@ fn scan_member(
         gaps,
         scan_ms,
     }
+}
+
+/// Strict private omission vocabulary. Display completeness has a separate contract.
+fn retirement_scan_allows_absence(
+    hints: &[PathBuf],
+    outcome: &ScanOutcome,
+    pin_skips: &[Skipped],
+    before: (Option<&'static str>, (u64, u64)),
+    after: (Option<&'static str>, (u64, u64)),
+) -> bool {
+    const NO_TABLE_SUFFIX: &str =
+        "; a table built at run time in .bss or on the heap is outside the memory scan's reach";
+    hints.is_empty()
+        && matches!(outcome, ScanOutcome::Scanned { .. })
+        && pin_skips.is_empty()
+        && before.0.is_none()
+        && after.0.is_none()
+        && before.1 == after.1
+        && outcome.skipped().iter().all(|skip| {
+            skip.reason
+                .strip_prefix(crate::discovery::scan::NO_TABLE_FOUND_MARKER)
+                == Some(NO_TABLE_SUFFIX)
+        })
 }
 
 /// A member no scan inventoried: provably-gone is the silent `exited`
@@ -536,6 +620,7 @@ fn member_not_scanned(
         None => MemberStatus::Exited,
     };
     MemberResult {
+        complete_scan: None,
         pid,
         view,
         status,
@@ -712,6 +797,7 @@ pub(crate) struct ProcessRecord {
     /// The generation the member's mappings belong to (deep scans and
     /// maps matches); `None` when no read reached it.
     pub generation: Option<MemberGeneration>,
+    pub complete_scan: Option<CompleteMemberScan>,
 }
 
 /// A discovered relationship between catalog objects: two observations of
@@ -922,13 +1008,24 @@ fn bind_collection(collection: &mut Collection) -> Bound {
     // equal raw keys with unequal full identity reject the group — the
     // same absorb semantics capture relies on.
     let mut aggregate = PinnedObjects::empty();
+    let mut aggregate_lost = false;
     for member in &mut collection.members {
         let pins = std::mem::replace(&mut member.pins, PinnedObjects::empty());
-        for skip in aggregate.absorb(pins) {
+        let losses = aggregate.absorb(pins);
+        aggregate_lost |= !losses.is_empty();
+        if !losses.is_empty() {
+            member.complete_scan = None;
+        }
+        for skip in losses {
             member.gaps.push(PidGap::member(member.pid, skip));
         }
     }
     let (_collapsed, overlay_lost) = canonicalize_scanned_overlays(&mut aggregate);
+    if aggregate_lost || !overlay_lost.is_empty() {
+        for member in &mut collection.members {
+            member.complete_scan = None;
+        }
+    }
     let mut bind_gaps: Vec<PidGap> = overlay_lost.into_iter().map(PidGap::scope).collect();
 
     // Bind each module on its own so every loss attributes to the pid
@@ -953,6 +1050,16 @@ fn bind_collection(collection: &mut Collection) -> Bound {
                     lost.into_iter().map(|skip| skip.reason).collect(),
                 )),
             }
+        }
+    }
+    let affected: BTreeSet<u32> = bind_gaps.iter().filter_map(|gap| gap.pid).collect();
+    let global_loss = collection.cap_hit
+        || collection.proc_list_failed
+        || !collection.scope_gaps.is_empty()
+        || bind_gaps.iter().any(|gap| gap.pid.is_none());
+    for member in &mut collection.members {
+        if global_loss || affected.contains(&member.pid) {
+            member.complete_scan = None;
         }
     }
     Bound {
@@ -1096,6 +1203,14 @@ fn assemble(
         bind_gaps,
     } = bound;
     let mut bind_gaps = bind_gaps;
+    if attributed
+        .as_ref()
+        .is_some_and(|attributed| !attributed.changed.is_empty() || !attributed.refused.is_empty())
+    {
+        for member in &mut collection.members {
+            member.complete_scan = None;
+        }
+    }
 
     // The existing plan-lowering path, scan evidence only: no manifests,
     // no history, no reserved slots, no attach. The lowering is pure over
@@ -1319,6 +1434,9 @@ fn assemble(
             (MemberStatus::NotSelected { loss }, Vec::new(), None)
         };
         processes.push(ProcessRecord {
+            complete_scan: members_by_pid
+                .get(pid)
+                .and_then(|member| member.complete_scan.clone()),
             pid: *pid,
             status,
             objects,
@@ -2238,12 +2356,14 @@ mod tests {
             scan_ms: 7,
             processes: vec![
                 ProcessRecord {
+                    complete_scan: None,
                     pid: 100,
                     status: MemberStatus::Scanned,
                     objects: vec![0],
                     generation: None,
                 },
                 ProcessRecord {
+                    complete_scan: None,
                     pid: 200,
                     status: MemberStatus::Scanned,
                     objects: if objects.len() > 1 { vec![1] } else { vec![] },
@@ -2405,6 +2525,7 @@ mod tests {
             pins: PinnedObjects,
         ) -> MemberResult {
             MemberResult {
+                complete_scan: None,
                 pid,
                 view: ProcessViewId(view),
                 status: MemberStatus::Scanned,
@@ -2926,6 +3047,7 @@ mod tests {
             cap_hit: false,
             members: vec![
                 MemberResult {
+                    complete_scan: None,
                     pid: 1,
                     view: ProcessViewId(0),
                     generation: None,
@@ -2941,6 +3063,7 @@ mod tests {
                     scan_ms: 0,
                 },
                 MemberResult {
+                    complete_scan: None,
                     pid: 2,
                     view: ProcessViewId(1),
                     status: MemberStatus::Exited,
@@ -3361,6 +3484,145 @@ mod tests {
         assert!(
             text.contains("0 admitted, 1 refused, 0 unresolved"),
             "{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod demotion_retirement_producer_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    // The scanner must expose each real unusable mapping before pinning.
+    #[test]
+    fn demotion_retirement_mapped_unlinked_or_unusable_owner_never_retires() {
+        for name in [
+            std::ffi::OsString::from("deleted.so"),
+            std::ffi::OsString::from("ambiguous\n.so"),
+            std::ffi::OsString::from_vec(vec![b'b', 0xff, b'.', b's', b'o']),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(&name);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(4096).unwrap();
+            use std::os::fd::AsRawFd;
+            // SAFETY: a retained 4096-byte file is mapped read/execute, never called, and released below.
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED);
+            let expected = if name == std::ffi::OsStr::new("deleted.so") {
+                std::fs::remove_file(&path).unwrap();
+                "deleted mapping"
+            } else if name.as_encoded_bytes().contains(&b'\n') {
+                "ambiguous \\012 pathname"
+            } else {
+                "non-UTF-8 pathname"
+            };
+            let mut budget = CaptureWorkBudget::default();
+            let mut noise = DiscoveryNoiseAggregator::default();
+            let member = scan_member(
+                std::process::id(),
+                ProcessViewId(0),
+                &[],
+                &HookRegistry::builtin(),
+                &mut budget,
+                &mut noise,
+            );
+            // SAFETY: the exact owned mapping is no longer used by the scanner.
+            assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
+            assert!(
+                member.gaps.iter().any(|gap| gap.reason == expected),
+                "actual omission must be observed: {expected}"
+            );
+            assert!(
+                !crate::discovery::scan::scan_skip_truncates(expected),
+                "public completeness remains unchanged"
+            );
+            assert!(
+                member.complete_scan.is_none(),
+                "omitted file may still contain a current owner"
+            );
+        }
+    }
+
+    #[test]
+    fn demotion_retirement_hint_selection_never_proves_physical_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced.so");
+        let original = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        original.set_len(4096).unwrap();
+        use std::os::fd::AsRawFd;
+        // SAFETY: the owned executable mapping remains retained but is never invoked.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                original.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        std::fs::rename(&path, dir.path().join("still-mapped.so")).unwrap();
+        std::fs::write(&path, b"replacement physical file").unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let mut noise = DiscoveryNoiseAggregator::default();
+        let member = scan_member(
+            std::process::id(),
+            ProcessViewId(0),
+            &[path],
+            &HookRegistry::builtin(),
+            &mut budget,
+            &mut noise,
+        );
+        // SAFETY: scanning completed; this is the exact owned 4096-byte mapping.
+        assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
+        assert!(
+            member
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == crate::discovery::scan::HINT_NOT_MAPPED_REASON)
+        );
+        assert!(
+            member.complete_scan.is_none(),
+            "hint absence supplies no physical absence authority"
+        );
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let member = scan_member(
+            child.id(),
+            ProcessViewId(0),
+            &[],
+            &HookRegistry::builtin(),
+            &mut CaptureWorkBudget::default(),
+            &mut noise,
+        );
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(
+            member.complete_scan.is_some(),
+            "unrestricted complete scan is the positive control"
         );
     }
 }

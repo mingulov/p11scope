@@ -514,6 +514,7 @@ impl Scene {
             processes: members
                 .iter()
                 .map(|(pid, start)| crate::inspect_system::ProcessRecord {
+                    complete_scan: None,
                     pid: *pid,
                     status: crate::inspect_system::MemberStatus::Scanned,
                     objects: vec![0],

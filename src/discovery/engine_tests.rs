@@ -7166,12 +7166,27 @@ fn expected_target_exit_completes_only_after_conservative_cleanup() {
 /// continuation removes it.
 #[test]
 fn a_real_terminal_drain_blocks_expected_exit_until_its_journal_clears() {
-    let pid = std::process::id();
+    let mut child = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.pid();
     let (mut engine, owner) = Engine::retiring_loader_context(pid);
     let view = engine.views[0].id();
     let mut session = ScriptedSession::with_records([], 16);
     session.detach_exports = vec![terminal_export()];
     start_failed_terminal_drain(&mut engine, &mut session, owner);
+    // The original exits while the real terminal journal is retained. Use
+    // the exit transition: a still-live EXEC refresh correctly owes a rescan.
+    child.reap().unwrap();
+    assert!(engine.views[0].original_exited().unwrap());
+    engine.queue_retirement(
+        view,
+        RetirementCause::ExpectedRemoval,
+        &mut PendingViewRetirements::new(),
+    );
 
     let retained = std::mem::take(&mut engine.views);
     let intents = std::mem::take(&mut engine.retirement_intents);
@@ -7193,9 +7208,10 @@ fn a_real_terminal_drain_blocks_expected_exit_until_its_journal_clears() {
 
     assert!(engine.terminal_journal.is_none());
     assert!(engine.loader_registry.context(owner).is_none());
-    engine.views.clear();
-    engine.retirement_intents.clear();
-    engine.pending_retirements.clear();
+    assert!(engine.views.is_empty());
+    assert!(engine.retirement_intents.is_empty());
+    assert!(engine.pending_retirements.is_empty());
+    assert!(!engine.refresh_requested.contains_key(&pid));
     engine.finalize_expected_target_exit();
     assert!(engine.expected_target_exit);
 }

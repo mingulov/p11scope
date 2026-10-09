@@ -218,8 +218,14 @@ def resolve_ring_bytes(value):
         raise ValueError(f"unparseable ring_bytes: {value!r}")
 
 
-CALL_LINE_RE = re.compile(
-    r"^\d{2}:\d{2}:\d{2}\.\d{6} pid \d+ tid \d+ (?:sess#\d+ )?(\S+)(.*) \u2192 (\S+) (.+)$")
+CALL_PREFIX_RE = re.compile(
+    r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid \d+ tid \d+|"
+    r"Unknown executable \(PID [0-9]+, TID [0-9]+\)) (?P<body>.*)$")
+CALL_LINE_RE = re.compile(r"^(\S+)(.*) \u2192 (\S+) (.+)$")
+TRACE_CONTEXT_LINES = frozenset((
+    "Trace — completed call events in arrival order",
+    "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
+))
 LOST_LINE_RE = re.compile(r"^LOST (\d+) events$")
 TRUNCATED_LINE_RE = re.compile(r"^TRUNCATED at \d+ events")
 
@@ -228,6 +234,7 @@ def parse_trace_stream(lines):
     """Parse a `p11scope trace` line stream into exact tallies.
 
     Line taxonomy (src/trace.rs + src/run.rs): one CAPTURE header first,
+    optional exact fixed context lines for unknown executable identity,
     timestamped completed-call lines, cumulative `LOST n events` reports
     (the kernel counter value, not a delta), at most one TRUNCATED line,
     then COUNT_EVIDENCE and EVIDENCE JSON records last. Anything else
@@ -249,6 +256,8 @@ def parse_trace_stream(lines):
     if not content[-1].startswith("EVIDENCE "):
         raise ValueError("trace stream must close with the EVIDENCE record")
     for line in content:
+        if line in TRACE_CONTEXT_LINES:
+            continue
         if line.startswith("CAPTURE "):
             capture_seen += 1
             continue
@@ -275,7 +284,17 @@ def parse_trace_stream(lines):
         if TRUNCATED_LINE_RE.match(line) is not None:
             truncated = True
             continue
-        call = CALL_LINE_RE.match(line)
+        prefix = CALL_PREFIX_RE.match(line)
+        body = prefix.group("body") if prefix else ""
+        # Consume the reserved session position once, before function parsing.
+        # An optional regex must not backtrack and reinterpret sess#N as a name.
+        if body.startswith("sess#"):
+            session, separator, body = body.partition(" ")
+            if not separator or not re.fullmatch(r"sess#[0-9]+", session):
+                raise ValueError(f"malformed trace session: {line!r}")
+        if body.startswith(("pid ", "Unknown executable ", "sess#")):
+            raise ValueError(f"duplicate trace identity/session: {line!r}")
+        call = CALL_LINE_RE.match(body) if prefix else None
         if call is not None:
             function, middle = call.group(1), call.group(2)
             per_function[function] = per_function.get(function, 0) + 1

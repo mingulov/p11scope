@@ -4679,13 +4679,14 @@ fn capture_profile(
                     .as_deref()
                     .and_then(|owned| owned.still_running.then_some(owned.pid)),
             );
-            let frame = render::live(
+            let frame = render::live_scoped(
                 &reports,
                 &ev,
                 elapsed,
                 &engine.capture_facts().heading(),
                 mode,
                 policy,
+                scope.kind(),
             );
             if let Some(bytes) = live_display.frame_bytes(&frame, false) {
                 write_stdout(stdout, &mut stdout_open, bytes.as_bytes())?;
@@ -5044,13 +5045,14 @@ fn capture_profile(
                     ev.apply_stop_quiescence(consumers.stop_quiescence);
                     ev.settle_terminal(profile);
                     let facts = context.0.capture_facts();
-                    let frame = render::live(
+                    let frame = render::live_scoped(
                         &reports,
                         &ev,
                         clock.elapsed(),
                         &facts.heading(),
                         mode,
                         policy,
+                        scope.kind(),
                     );
                     if let Some(bytes) = live_display.frame_bytes(&frame, true) {
                         write_stdout(context.3, context.4, bytes.as_bytes())?;
@@ -5196,7 +5198,11 @@ fn capture_trace(
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
     if let Err(error) = emit_trace_line(
-        &trace::capture_line(policy),
+        &format!(
+            "{}\n{}",
+            trace::capture_line(policy),
+            trace::identity_note()
+        ),
         stdout,
         &mut stdout_open,
         out_file,

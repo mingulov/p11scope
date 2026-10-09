@@ -108,6 +108,9 @@ def profile_exact(document, iters, module_suffix=PROVIDER, expect_observer=None)
 
 
 CALL_LINE = re.compile(r"^\S+ pid (\d+) tid (\d+) (?:sess#\d+ )?(C_\w+)\b.* → (CKR_\w+)")
+UNKNOWN_CALL_LINE = re.compile(
+    r"^\d{2}:\d{2}:\d{2}\.\d{6} Unknown executable \(PID ([0-9]+), TID ([0-9]+)\) "
+    r"(?:sess#\d+ )?(C_\w+)\b.* → (CKR_\w+)")
 
 
 def trace_exact(text, iters, expect_observer=None):
@@ -122,12 +125,14 @@ def trace_exact(text, iters, expect_observer=None):
         if line.startswith("COUNT_EVIDENCE "):
             counts = json.loads(line[len("COUNT_EVIDENCE "):])
             continue
-        match = CALL_LINE.match(line)
+        match = CALL_LINE.match(line) or UNKNOWN_CALL_LINE.match(line)
         if match:
             pid, _tid, name, rv = match.groups()
             assert rv == "CKR_OK", line
             per_name[name] = per_name.get(name, 0) + 1
             pids.add(int(pid))
+        elif re.match(r"^\d{2}:\d{2}:\d{2}\.", line):
+            raise AssertionError(f"unrecognized trace call line: {line!r}")
     assert evidence is not None, "no EVIDENCE line"
     assert counts is not None, "no COUNT_EVIDENCE line"
     assert per_name == {name: iters for name in LEDGER_FUNCTIONS}, per_name

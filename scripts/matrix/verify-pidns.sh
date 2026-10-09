@@ -134,16 +134,34 @@ PY
   d=$(python3 - "$OUT" "$ITERS" <<'PY'
 import json,re,sys
 out,n=sys.argv[1],int(sys.argv[2])
-text=open(f"{out}/nested-trace.txt",errors="replace").read()
+with open(f"{out}/nested-trace.txt",errors="replace") as source:
+    text=source.read()
 lines=[l for l in text.splitlines() if " → " in l]
-pids=sorted({int(m.group(1)) for l in lines for m in [re.search(r" pid (\d+) tid ",l)] if m})
+prefix=re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid ([0-9]+) tid [0-9]+|"
+                  r"Unknown executable \(PID ([0-9]+), TID [0-9]+\)) (?P<body>.*)$")
+pids=set()
+for line in lines:
+    match=prefix.match(line)
+    assert match, f"unrecognized trace call identity: {line!r}"
+    body=match.group("body")
+    if body.startswith("sess#"):
+        session,separator,body=body.partition(" ")
+        assert separator and re.fullmatch(r"sess#[0-9]+",session), f"malformed trace session: {line!r}"
+    assert body and not body.startswith(("pid ","Unknown executable ","sess#")), \
+        f"duplicate trace identity/session: {line!r}"
+    assert re.fullmatch(r"\S+.* → \S+ .+",body), f"malformed trace call: {line!r}"
+    pids.add(int(match.group(1) or match.group(2)))
+pids=sorted(pids)
 ev=[json.loads(l[len("EVIDENCE "):]) for l in text.splitlines() if l.startswith("EVIDENCE ")]
-wl=open(f"{out}/nested-trace.wl").read()
+with open(f"{out}/nested-trace.wl") as source:
+    wl=source.read()
 nested=int(re.search(r"READY pid=(\d+)",wl).group(1))
+with open(f"{out}/nested-trace.rc") as source:
+    rc=int(source.read())
 print(json.dumps({"call_lines":len(lines),"expected":6*n,"printed_pids":pids,"workload_nested_pid":nested,
  "pid_namespace":ev[-1].get("pid_namespace") if ev else None,
  "observation":ev[-1].get("gap_classes",{}).get("observation") if ev else None,
- "rc":int(open(f"{out}/nested-trace.rc").read())}))
+ "rc":rc}))
 PY
 )
   result nested-trace $(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(1 if d["call_lines"]==d["expected"] and d["printed_pids"] and d["workload_nested_pid"] not in d["printed_pids"] and (d["pid_namespace"] or {}).get("observer")=="nested" and (d["pid_namespace"] or {}).get("kernel_pids")=="initial" else 0)' "$d") "$d"

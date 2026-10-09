@@ -230,10 +230,15 @@ STRING_IDENTITIES = [value for value in LOADER_PAUSE_IDENTITIES.values()
 # one; every observer surface is scanned for all of them.
 WORKLOAD_IDENTITIES = [value for name, value in LOADER_PAUSE_IDENTITIES.items()
                        if name != "interface_name_bytes"]
-# `HH:MM:SS.ffffff pid P tid T [sess#N] FUNCTION[ MECHANISM] → CKR_x DURATION`
-# (src/trace.rs). The two identity positions are captured so they can be
-# removed structurally rather than by exempting the whole surface.
-TRACE_EVENT = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{6} pid \d+ tid \d+ (?P<rest>.*)$")
+# Only the legacy diagnostic prefix and the fixed unknown-executable prefix
+# from src/trace.rs are exempted. Named executables have no authority here.
+TRACE_EVENT = re.compile(
+    r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid \d+ tid \d+|"
+    r"Unknown executable \(PID [0-9]+, TID [0-9]+\)) (?P<rest>.*)$")
+TRACE_CONTEXT_LINES = frozenset((
+    "Trace — completed call events in arrival order",
+    "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
+))
 
 
 def assert_json_identity_structure(label, value, path="$"):
@@ -274,6 +279,9 @@ def trace_scannable(label, text):
     """
     kept = []
     for line in text.splitlines():
+        if line in TRACE_CONTEXT_LINES:
+            kept.append(line)
+            continue
         if not line or line.startswith((
             "CAPTURE ", "COUNT_EVIDENCE ", "EVIDENCE ", "LOST "
         )):
@@ -281,7 +289,17 @@ def trace_scannable(label, text):
             continue
         event = TRACE_EVENT.match(line)
         assert event, f"{label} rendered an unfrozen trace line: {line!r}"
-        kept.append(event.group("rest"))
+        rest = event.group("rest")
+        body = rest
+        # Keep the session in the scanned suffix, but validate its one reserved
+        # position deterministically before checking for a repeated identity.
+        if body.startswith("sess#"):
+            session, separator, body = body.partition(" ")
+            assert separator and re.fullmatch(r"sess#[0-9]+", session), \
+                f"{label} rendered a malformed trace session: {line!r}"
+        assert body and not body.startswith(("pid ", "Unknown executable ", "sess#")), \
+            f"{label} rendered duplicate trace identity/session: {line!r}"
+        kept.append(rest)
     return "\n".join(kept)
 
 

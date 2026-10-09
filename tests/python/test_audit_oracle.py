@@ -322,6 +322,30 @@ class OwnedCoverageTests(unittest.TestCase):
                       record["truth_vs_observed"]["match_note"])
         self.assertFalse(record["window"]["window_valid"])
 
+    def test_unknown_executable_trace_preserves_aggregate_attribution_limits(self):
+        lines = ["03:15:44.123456 Unknown executable (PID 111, TID 111) "
+                 "C_GenerateRandom → CKR_OK 1.23µs"] * 7
+        evidence = {name: 0 for name in CHECKER["COUNTERS"]}
+        evidence.update(schema="p11scope/capture-evidence/v1", completeness="PARTIAL",
+                        attached_probes=136, slots=68,
+                        discovery=[{"path": "controlled-owned.so", "dev": [8, 1],
+                                    "ino": 11, "sha256": "aa"}])
+        with tempfile.TemporaryDirectory() as raw:
+            record = run_measure(
+                Path(raw), scope="system", mode="trace",
+                workload_argv=["controlled-owned.so"],
+                report_text=trace_stream(lines=lines, stats_returned=7,
+                                        raw_calls=7, evidence=evidence),
+                truth={"C_GenerateRandom": 7},
+                receipt=[{"dev": [8, 1], "ino": 11, "sha256": "aa",
+                          "path": "controlled-owned.so"}])
+        self.assertEqual(record["trace_stream"]["call_lines_total"], 7)
+        self.assertTrue(record["trace_stream"]["crosscheck_holds"])
+        self.assertFalse(record["truth_vs_observed"]["counts_match"])
+        self.assertIn("lacks per-module attribution",
+                      record["truth_vs_observed"]["match_note"])
+        self.assertFalse(record["window"]["window_valid"])
+
 
 def early_exit_samples():
     """Fd trace whose target is gone before the computed expiry: a ramp

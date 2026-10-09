@@ -136,13 +136,16 @@ fn fmt_wall_time(wall_ns: u128) -> String {
 }
 
 /// One trace line, in the design spec's shape:
-/// `HH:MM:SS.ffffff pid P tid T [sess#N] FUNCTION[ MECHANISM] → CKR_x DURATION`.
+/// `HH:MM:SS.ffffff Unknown executable (PID P, TID T) [sess#N] FUNCTION[ MECHANISM] → CKR_x DURATION`.
 /// A pure function — no I/O, no shared state — so it is directly
 /// testable: given a known `Event` and its resolved wall-clock time,
 /// function name, and session pseudonym, it always renders the same line.
 pub fn format_line(ev: &Event, wall_ns: u128, function: &str, session: Option<u64>) -> String {
     let (pid, tid) = pid_tid(ev.pid_tgid);
-    let mut line = format!("{} pid {pid} tid {tid}", fmt_wall_time(wall_ns));
+    let mut line = format!(
+        "{} Unknown executable (PID {pid}, TID {tid})",
+        fmt_wall_time(wall_ns)
+    );
     if let Some(n) = session {
         line.push_str(&format!(" sess#{n}"));
     }
@@ -183,6 +186,12 @@ pub fn truncated_line(limit: u64, explicit: bool) -> String {
 
 pub fn capture_line(policy: CapturePolicy) -> String {
     format!("CAPTURE privacy={}", policy.privacy_mode())
+}
+
+/// Context for completed event lines without a producer-backed image label.
+/// This header is human text; terminal EVIDENCE and count records stay intact.
+pub fn identity_note() -> &'static str {
+    "Trace — completed call events in arrival order\nExecutable identity unavailable; event PID/TID remain diagnostic identifiers."
 }
 
 /// Final machine-readable evidence record for a normally stopped trace.
@@ -449,7 +458,7 @@ mod tests {
         // — "18.0µs", not the spec prose's illustrative "18µs".
         assert_eq!(
             line,
-            "12:00:01.123456 pid 12345 tid 12401 sess#7 C_SignInit \
+            "12:00:01.123456 Unknown executable (PID 12345, TID 12401) sess#7 C_SignInit \
              CKM_RSA_PKCS_PSS(hash=SHA256 mgf=MGF1_SHA256 salt=32) \u{2192} CKR_OK 18.0\u{b5}s"
         );
     }
@@ -494,7 +503,7 @@ mod tests {
         let line = format_line(&ev, 0, "C_EncryptInit", None);
         assert!(line.contains("CKM_AES_GCM"), "line: {line}");
         assert!(
-            !line.contains('('),
+            !line.contains("CKM_AES_GCM("),
             "no parameters rendered without a decoded shape: {line}"
         );
     }
@@ -942,7 +951,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_OK 18.0µs"
+            "00:00:00.000000 Unknown executable (PID 100, TID 1) C_OpenSession [semantics unverified] → CKR_OK 18.0µs"
         );
         for forbidden in [
             "sess#",

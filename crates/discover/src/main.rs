@@ -10,7 +10,9 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 
-const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json]\n       p11scope-discover --version";
+const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json]\n       p11scope-discover --version\n\nPrepare a discovery manifest using an absolute provider path. This executes provider code in its own helper process, using the host ABI; use a helper matching the provider's ABI.\n\nExample: p11scope-discover --module /absolute/provider.so -o manifest.json\nWithout -o, manifest JSON goes to stdout. With -o, it is saved privately to a regular file.\n\nUse the result only after an explicit observer --manifest choice. A manifest does not prove application use or semantic attestation.";
+
+const MANIFEST_GUIDANCE: &str = "Use it only after an explicit observer --manifest choice; it does not prove application use or semantic attestation.";
 
 #[derive(Clone, Copy)]
 struct DropTarget {
@@ -622,12 +624,16 @@ fn main() {
         Ok(m) => {
             let json = serde_json::to_string_pretty(&m).expect("manifest serializes");
             match out {
-                None => println!("{json}"),
+                None => {
+                    println!("{json}");
+                    eprintln!("Manifest written to stdout. {MANIFEST_GUIDANCE}");
+                }
                 Some(p) => {
                     if let Err(e) = write_private_atomically(&p, json.as_bytes()) {
                         eprintln!("p11scope-discover: write {}: {e}", p.display());
                         std::process::exit(1);
                     }
+                    eprintln!("Manifest written to file. {MANIFEST_GUIDANCE}");
                 }
             }
         }

@@ -2591,9 +2591,9 @@ def demotion_file_hash(root, relative):
 def demotion_bindings(receipt, manifest):
     demotion_fields(receipt["run"], {"nonce", "source_commit", "source_tree", "hashes"})
     run = receipt["run"]
-    for field, size in (("nonce", 32), ("source_commit", 40), ("source_tree", 40)):
-        demotion_hex(run[field], size)
-        demotion_require(run[field] == manifest[field], "artifact_binding_mismatch")
+    for field_name, size in (("nonce", 32), ("source_commit", 40), ("source_tree", 40)):
+        demotion_hex(run[field_name], size)
+        demotion_require(run[field_name] == manifest[field_name], "artifact_binding_mismatch")
     keys = {"observer_binary", "bpf_object", "fixture_source", "fixture_binaries", "checker"}
     demotion_fields(manifest["artifacts"], keys)
     demotion_fields(run["hashes"], keys | {"inventory", "ledger", "manifest"})

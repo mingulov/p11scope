@@ -784,10 +784,26 @@ struct ActiveInventoryWindow {
     stop_reason: Option<&'static str>,
 }
 
+/// Cooperative collection control and shared work, used by the cgroup
+/// serial collector. Returning false is sticky within the scan budget.
+#[derive(Clone)]
+pub(crate) struct CollectionWork(Arc<dyn Fn(u64) -> bool + Send + Sync>);
+impl std::fmt::Debug for CollectionWork {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("CollectionWork")
+    }
+}
+impl CollectionWork {
+    pub(crate) fn new(checkpoint: impl Fn(u64) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(checkpoint))
+    }
+}
+
 /// One capture's concrete discovery allowance. Memory snapshots and file hashes
 /// spend the same byte total; cardinality counters stop decoded-record amplification.
 #[derive(Debug)]
 pub struct CaptureWorkBudget {
+    collection_work: Option<CollectionWork>,
     limits: ScanLimits,
     policy: DiscoveryPolicy,
     domain: Option<Arc<BudgetDomain>>,
@@ -830,6 +846,7 @@ pub struct CaptureWorkBudget {
 impl CaptureWorkBudget {
     pub fn new(limits: ScanLimits) -> Self {
         Self {
+            collection_work: None,
             limits,
             policy: DiscoveryPolicy::DetailedLegacy,
             domain: None,
@@ -860,6 +877,31 @@ impl CaptureWorkBudget {
             scan_stop_reason: None,
             scan_stop_reported: false,
         }
+    }
+
+    pub(crate) fn set_collection_work(&mut self, work: CollectionWork) {
+        self.collection_work = Some(work);
+    }
+
+    pub(crate) fn has_collection_work(&self) -> bool {
+        self.collection_work.is_some()
+    }
+    pub(crate) fn poll_collection(&mut self, units: u64) -> bool {
+        self.collection_checkpoint(units)
+    }
+
+    fn collection_checkpoint(&mut self, units: u64) -> bool {
+        let Some(work) = &self.collection_work else {
+            return true;
+        };
+        if self.scan_stop_reason.is_some() {
+            return false;
+        }
+        if !(work.0)(units) {
+            self.set_scan_stop("cgroup collection stopped or shared work allowance exhausted");
+            return false;
+        }
+        true
     }
 
     /// Set the work ceiling (tests of where a ceiling stops).
@@ -1069,6 +1111,9 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn allowed_io(&mut self, operation_bytes: u64, wanted: usize) -> usize {
+        if !self.collection_checkpoint(1) {
+            return 0;
+        }
         if matches!(self.policy, DiscoveryPolicy::Inventory(_)) && self.active_scan.is_none() {
             return 0;
         }
@@ -1087,6 +1132,9 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn record_io(&mut self, bytes: usize) {
+        // Bound input/parse amplification as well as decoded work. Existing
+        // I/O ceilings remain independent. Checks cannot interrupt a read.
+        self.collection_checkpoint((bytes as u64).div_ceil(32));
         self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
         if let Some(window) = self.active_window.as_mut() {
             window.io_bytes = window.io_bytes.saturating_add(bytes as u64);
@@ -1094,7 +1142,7 @@ impl CaptureWorkBudget {
     }
 
     pub fn charge(&mut self, units: u64) -> bool {
-        if self.scan_stop_reason.is_some() {
+        if self.scan_stop_reason.is_some() || !self.collection_checkpoint(units) {
             return false;
         }
         if let DiscoveryPolicy::Inventory(_) = self.policy {
@@ -1152,6 +1200,7 @@ impl CaptureWorkBudget {
     }
 
     fn check_deadline(&mut self, now: Option<u64>) -> Option<&'static str> {
+        self.collection_checkpoint(0);
         if let Some(reason) = self.scan_stop_reason {
             return Some(reason);
         }
@@ -1172,7 +1221,10 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn check_deadline_now(&mut self) -> Option<&'static str> {
-        if self.deadline_ns.is_some() || self.active_window.is_some() {
+        if self.deadline_ns.is_some()
+            || self.active_window.is_some()
+            || self.collection_work.is_some()
+        {
             self.check_deadline(crate::attach::monotonic_ns())
         } else {
             None
@@ -1180,7 +1232,7 @@ impl CaptureWorkBudget {
     }
 
     fn has_deadline(&self) -> bool {
-        self.deadline_ns.is_some() || self.active_window.is_some()
+        self.deadline_ns.is_some() || self.active_window.is_some() || self.collection_work.is_some()
     }
 
     /// The capture's stop, sticky reason first and otherwise one clock poll:
@@ -1217,6 +1269,9 @@ impl CaptureWorkBudget {
     }
 
     fn allowed_capture_io(&mut self, wanted: usize) -> usize {
+        if !self.collection_checkpoint(1) {
+            return 0;
+        }
         if matches!(self.policy, DiscoveryPolicy::Inventory(_)) && self.active_scan.is_none() {
             return 0;
         }
@@ -2929,6 +2984,37 @@ impl MapsReadBuffers {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod maps_read_test {
+    use std::cell::RefCell;
+
+    type Observer = Box<dyn FnMut(usize)>;
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
+    }
+
+    struct Restore(Option<Observer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| observer.replace(self.0.take()));
+        }
+    }
+
+    pub(crate) fn observe<T>(observer: impl FnMut(usize) + 'static, run: impl FnOnce() -> T) -> T {
+        let previous = OBSERVER.with(|current| current.replace(Some(Box::new(observer))));
+        let _restore = Restore(previous);
+        run()
+    }
+
+    pub(super) fn returned(bytes: usize) {
+        OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(bytes);
+            }
+        });
+    }
+}
+
 fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
     reader: R,
     budget: &mut CaptureWorkBudget,
@@ -2992,6 +3078,8 @@ fn read_maps_bytes_with_buffers<R: Read, F: FnMut() -> Option<u64>, B: MapsReadB
             break;
         }
         let read = reader.read(&mut chunk[..allowed])?;
+        #[cfg(test)]
+        maps_read_test::returned(read);
         if read == 0 {
             break;
         }
@@ -3202,6 +3290,7 @@ impl CaptureWorkBudget {
         Self {
             limits: self.limits,
             policy: self.policy,
+            collection_work: self.collection_work.clone(),
             domain: self.domain.clone(),
             attempted_io_bytes: self.attempted_io_bytes,
             work_ceiling: self.work_ceiling,
@@ -6141,6 +6230,78 @@ mod tests {
         assert_eq!(
             exact_table_addresses(&snapshot, LinuxLayout::Lp64).unwrap(),
             [0x1110, 0x3330]
+        );
+    }
+
+    #[test]
+    fn cgroup_shared_control_stops_actual_scan_charge() {
+        let control = crate::scope::inventory_cgroup::CollectionControl::new(None);
+        let checked = control.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(CollectionWork::new(move |_| checked.check().is_ok()));
+        assert!(budget.charge(1));
+        control.cancel();
+        assert!(
+            !budget.charge(1),
+            "a stopped collection cannot continue decoded-record work"
+        );
+    }
+
+    #[test]
+    fn cgroup_shared_control_stops_actual_scan_and_maps_reads() {
+        let control = crate::scope::inventory_cgroup::CollectionControl::new(None);
+        let checked = control.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(CollectionWork::new(move |_| checked.check().is_ok()));
+        assert_eq!(budget.allowed_io(0, 10), 10);
+        struct StopAfterRead {
+            control: crate::scope::inventory_cgroup::CollectionControl,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for StopAfterRead {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let read = self.bytes.read(out)?;
+                self.control.cancel();
+                Ok(read)
+            }
+        }
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = StopAfterRead {
+            control: control.clone(),
+            reads: reads.clone(),
+            bytes: std::io::Cursor::new(b"1000-2000 r-xp 00000000 08:01 7 /lib/a.so\n".to_vec()),
+        };
+        let result = read_maps_checked(
+            reader,
+            &mut budget,
+            MapsReadLimits {
+                max_bytes: 1024,
+                max_entries: 10,
+                chunk: 8,
+            },
+            || Some(1),
+            &mut MapsReadBuffers::default(),
+        );
+        assert!(
+            result.is_err(),
+            "the production maps read loop must stop after cancellation"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no second read after the checkpoint observes cancellation"
+        );
+        assert_eq!(
+            budget.allowed_io(0, 10),
+            0,
+            "the deep scan read boundary must poll control"
+        );
+        assert_eq!(
+            budget.allowed_capture_io(10),
+            0,
+            "the maps sweep read boundary must poll control"
         );
     }
 

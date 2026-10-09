@@ -2829,3 +2829,164 @@ fn a_caller_range_is_any_executable_shared_object_mapping() {
         "an executable non-shared-object mapping is not a provider caller range"
     );
 }
+
+// The production confirmation functions run against normally returning proof
+// reads. This fixture cancels after the first read, with another range/member
+// queued; it does not claim to interrupt an in-flight kernel operation.
+struct CgroupProofProbe {
+    inner: CountingProbe,
+    control: crate::scope::inventory_cgroup::CollectionControl,
+    cancel_first: bool,
+    opens: RefCell<Vec<u32>>,
+}
+struct CgroupProofIo<'a> {
+    inner: CountingIo<'a>,
+    control: &'a crate::scope::inventory_cgroup::CollectionControl,
+    cancel_first: bool,
+    opens: &'a RefCell<Vec<u32>>,
+}
+impl CgroupProofProbe {
+    fn new(sweep: &[(u32, Vec<MapEntry>)], cancel_first: bool) -> Self {
+        Self {
+            inner: CountingProbe::over(sweep),
+            control: crate::scope::inventory_cgroup::CollectionControl::new(None),
+            cancel_first,
+            opens: RefCell::new(Vec::new()),
+        }
+    }
+    fn io(&self, pid: u32) -> CgroupProofIo<'_> {
+        CgroupProofIo {
+            inner: self.inner.io(pid),
+            control: &self.control,
+            cancel_first: self.cancel_first,
+            opens: &self.opens,
+        }
+    }
+    fn budget(&self) -> CaptureWorkBudget {
+        let control = self.control.clone();
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_collection_work(crate::discovery::scan::CollectionWork::new(move |_| {
+            control.check().is_ok()
+        }));
+        budget
+    }
+}
+impl ConfirmIo for CgroupProofIo<'_> {
+    type Pin = u64;
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        let answer = self.inner.mapped_file(pid, start, end);
+        if self.cancel_first && self.inner.reads.borrow().len() == 1 {
+            self.control.cancel();
+        }
+        answer
+    }
+    fn open(&mut self, pid: u32) -> Result<u64, String> {
+        self.opens.borrow_mut().push(pid);
+        self.inner.open(pid)
+    }
+    fn start_time(&self, pin: &u64) -> Option<u64> {
+        self.inner.start_time(pin)
+    }
+    fn still_the_same(&self, pin: &u64) -> bool {
+        self.inner.still_the_same(pin)
+    }
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        self.inner.exe(pid)
+    }
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        self.inner.maps(pid, budget)
+    }
+    fn gone(&self, pid: u32) -> bool {
+        self.inner.gone(pid)
+    }
+}
+impl MemberProbe for CgroupProofProbe {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        confirm_with(&mut self.io(pid), pid, prove, budget)
+    }
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        stat_unpinned(&mut self.io(pid), pid, ranges, budget)
+    }
+}
+
+#[test]
+fn cgroup_review_confirmation_stop_prevents_next_range_and_member() {
+    let sweep = vec![(10_001, caller5()), (10_002, caller5())];
+    let index = caller5_index();
+    assert_eq!(
+        proof_ranges(&caller5(), &index.map_files_keys()).len(),
+        2,
+        "the fixture has two independent proof ranges"
+    );
+    let mut probe = CgroupProofProbe::new(&sweep, true);
+    let mut budget = probe.budget();
+    let attribution = attribute_unselected(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index,
+        &mut probe,
+        &mut budget,
+    );
+    assert_eq!(
+        probe.inner.reads.borrow().len(),
+        1,
+        "a returning first proof read cancels before the next range"
+    );
+    assert_eq!(
+        *probe.opens.borrow(),
+        vec![10_001],
+        "the next member cannot open a generation after cancellation"
+    );
+    assert!(attribution.members.is_empty());
+    assert!(budget.stopped_reason().is_some());
+}
+
+#[test]
+fn cgroup_review_unpinned_stop_prevents_next_range() {
+    let sweep = vec![(10_001, caller5())];
+    let probe = CgroupProofProbe::new(&sweep, true);
+    let mut budget = probe.budget();
+    let answers = stat_unpinned(
+        &mut probe.io(10_001),
+        10_001,
+        &[PROVIDER_TEXT, LIBC_TEXT],
+        &mut budget,
+    );
+    assert_eq!(
+        probe.inner.reads.borrow().len(),
+        1,
+        "precharged ranges cannot drain after cancellation"
+    );
+    assert_eq!(answers.len(), 1, "the unread suffix remains unproven");
+    assert!(budget.stopped_reason().is_some());
+}
+
+#[test]
+fn cgroup_review_confirmation_without_stop_preserves_both_members() {
+    let sweep = vec![(10_001, caller5()), (10_002, caller5())];
+    let mut probe = CgroupProofProbe::new(&sweep, false);
+    let mut budget = probe.budget();
+    let attribution = attribute_unselected(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &caller5_index(),
+        &mut probe,
+        &mut budget,
+    );
+    assert_eq!(probe.inner.reads.borrow().len(), 4);
+    assert_eq!(*probe.opens.borrow(), vec![10_001, 10_002]);
+    assert_eq!(attribution.members.len(), 2);
+    assert!(budget.stopped_reason().is_none());
+}

@@ -708,6 +708,11 @@ pub(crate) fn caller_event_payload(
             "caller": id.label(),
             "reason": reason,
         }),
+        CallerEvent::Retired { id, reason } => serde_json::json!({
+            "event": "retired",
+            "caller": id.label(),
+            "reason": reason,
+        }),
         CallerEvent::ExecRetired { old, new } => serde_json::json!({
             "event": "exec_retired",
             "old": old.label(),
@@ -734,7 +739,9 @@ pub(crate) fn caller_event_payload(
         }),
     };
     let context = match event {
-        CallerEvent::Admitted { id } | CallerEvent::Exited { id, .. } => serde_json::json!({
+        CallerEvent::Admitted { id }
+        | CallerEvent::Exited { id, .. }
+        | CallerEvent::Retired { id, .. } => serde_json::json!({
             "version": 1,
             "caller": identities.caller_context(*id),
         }),
@@ -748,7 +755,9 @@ pub(crate) fn caller_event_payload(
         CallerEvent::AdmitFailed { .. } => return payload,
     };
     payload["identity_context"] = bounded_context(context, || match event {
-        CallerEvent::Admitted { id } | CallerEvent::Exited { id, .. } => serde_json::json!({
+        CallerEvent::Admitted { id }
+        | CallerEvent::Exited { id, .. }
+        | CallerEvent::Retired { id, .. } => serde_json::json!({
             "version": 1,
             "caller": context_budget_caller(*id),
         }),
@@ -1366,3 +1375,45 @@ pub(crate) fn ended_payload(
 #[cfg(test)]
 #[path = "inventory_events_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod scoped_retirement_tests {
+    use super::*;
+    use crate::discovery::caller_registry::{ImageAuthority, RegistryLimits};
+    use crate::discovery::inventory_workload::Harness;
+
+    #[test]
+    fn old_only_retirement_event_names_real_caller_without_a_successor() {
+        let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+        harness.source().spawn(7, 500);
+        let caller = harness
+            .coordinator_mut()
+            .adapter_mut()
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let events = harness
+            .coordinator_mut()
+            .adapter_mut()
+            .exec_transition_scoped(caller, 100);
+        harness
+            .coordinator_mut()
+            .apply_reconcile_events(&events, 100);
+        harness.commit();
+        let presentation = Presentation::capture(harness.coordinator(), "workload", 50, 100, 1);
+        let event = caller_event_payload(&events[0], &IdentityIndex::new(&presentation));
+        assert_eq!(event["event"], "retired");
+        assert_eq!(event["caller"], caller.label());
+        assert!(event["reason"].as_str().unwrap().contains("later image"));
+        assert!(event.get("new").is_none());
+        assert!(event["identity_context"]["caller"].is_object());
+        assert_eq!(harness.coordinator().adapter().len(), 1);
+        assert!(
+            harness
+                .coordinator()
+                .adapter()
+                .record(caller)
+                .unwrap()
+                .retired
+        );
+    }
+}

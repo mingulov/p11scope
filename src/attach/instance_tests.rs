@@ -6,12 +6,14 @@
 use super::*;
 use crate::discovery::identity::pin_scanned_view_objects;
 use crate::discovery::instances::{
-    CallFacts, EntryIp, InstanceId, InstanceRouter, ObserveOutcome, Route, RouterLimits,
-    UnknownReason, stable_scan,
+    InstanceId, InstanceRouter, ObserveOutcome, Route, RouterLimits, UnknownReason,
 };
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
 use crate::plan::{AttachPlan, Slot};
 use crate::process::{PidPin, ProcessView, ProcessViewId};
+use crate::semantic_capture::{
+    InvalidationScope, SemanticCapture, TickLimits, TickOutcome, TickReport,
+};
 use anyhow::ensure;
 use p11scope_ebpf_common::{EventRecord, SlotSemantics, event_type, instance};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
@@ -21,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::ops::ControlFlow;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -64,7 +67,7 @@ struct Target {
     child: Child,
     input: ChildStdin,
     lines: mpsc::Receiver<String>,
-    pin: PidPin,
+    pin: Arc<PidPin>,
     ledger: Vec<String>,
 }
 
@@ -91,7 +94,7 @@ impl Target {
             }
         });
         let pin = match PidPin::open(child.id()) {
-            Ok(pin) => pin,
+            Ok(pin) => Arc::new(pin),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -279,14 +282,14 @@ struct ScanStats {
 /// The observer half: one Session, one router, and the scan protocol.
 struct Harness {
     session: Session,
-    router: InstanceRouter,
+    capture: SemanticCapture,
     file_slot: u32,
-    maps_keys: Vec<ObjectKey>,
-    identity: crate::discovery::instances::MappedFileIdentity,
     offsets: BTreeMap<u32, u64>,
-    next_token: u64,
-    awaiting: BTreeMap<u64, (u32, u64)>,
+
     routed: Vec<Routed>,
+    retired_images: Vec<p11scope_ebpf_common::ImageIdentity>,
+    retired_instances: Vec<InstanceId>,
+    retired_tasks: Vec<u64>,
     misses: u64,
     scan: ScanStats,
     events: u64,
@@ -294,6 +297,15 @@ struct Harness {
 
 impl Harness {
     fn start(plan: &AttachPlan, pid: u32, pins: &PinnedObjects) -> Result<Self> {
+        Self::start_with_backend(plan, pid, pins, BackendSelection::Singles)
+    }
+
+    fn start_with_backend(
+        plan: &AttachPlan,
+        pid: u32,
+        pins: &PinnedObjects,
+        backend: BackendSelection,
+    ) -> Result<Self> {
         let session = Session::start(
             plan,
             &Scope::Pid(pid),
@@ -302,7 +314,7 @@ impl Harness {
             None,
             None,
             None,
-            BackendSelection::Singles,
+            backend,
         )?;
         ensure!(
             session.attach_failures().is_empty(),
@@ -325,138 +337,101 @@ impl Harness {
             .iter()
             .map(|slot| (slot.index, slot.file_offset))
             .collect();
-        let domain = session.native_domain().context("native router domain")?;
+        let capture = SemanticCapture::new(&session, TickLimits::default())?;
         Ok(Self {
             session,
-            router: InstanceRouter::new(domain, RouterLimits::default()),
+            capture,
             file_slot: watched.file_slot,
-            maps_keys: watched.maps_keys,
-            identity: watched.identity,
+
             offsets,
-            next_token: 0,
-            awaiting: BTreeMap::new(),
+
             routed: Vec::new(),
+            retired_images: Vec::new(),
+            retired_instances: Vec::new(),
+            retired_tasks: Vec::new(),
             misses: 0,
             scan: ScanStats::default(),
             events: 0,
         })
     }
 
-    fn record(&mut self, token: u64, route: Route) {
-        if let Some((slot, tag)) = self.awaiting.remove(&token) {
-            self.routed.push(Routed { slot, tag, route });
+    fn record_report(
+        &mut self,
+        report: TickReport,
+        elapsed: u128,
+        pending: bool,
+    ) -> Option<ObserveOutcome> {
+        self.events += report.collected_calls as u64;
+        self.scan.scans += report.scans as u64;
+        if pending {
+            self.scan.pending_scans += report.scans as u64;
         }
-    }
-
-    /// One stable scan of (pid, provider), observed by the router.
-    fn scan(&mut self, target: &Target, pending: bool) -> Result<Option<ObserveOutcome>> {
-        let started = Instant::now();
-        // The fence is read before the scan starts: a scan cached past a
-        // later fault-era reset must observe as StaleEra, never as New.
-        let fence = self.router.fence();
-        let observation = {
-            let pidfd = target.pin.pidfd()?;
-            let mut reader = LiveScan {
-                maps: self.session.instance_maps(),
-                pidfd,
-                pid: target.pid(),
-                file_slot: self.file_slot,
-                maps_keys: &self.maps_keys,
-                identity: self.identity,
-            };
-            stable_scan(&mut reader, self.file_slot, 8, fence)
-        };
-        let elapsed = started.elapsed().as_nanos();
-        self.scan.scans += 1;
-        self.scan.pending_scans += u64::from(pending);
         self.scan.total_ns += elapsed;
         self.scan.max_ns = self.scan.max_ns.max(elapsed);
-        let observation = match observation {
-            Ok(observation) => observation,
-            Err(refusal) => {
-                self.scan.unstable += 1;
-                *self
-                    .scan
-                    .outcomes
-                    .entry(format!("{refusal:?}"))
-                    .or_default() += 1;
-                return Ok(None);
-            }
-        };
-        let (outcome, resolved) = self.router.observe_legacy(observation);
-        *self
-            .scan
-            .outcomes
-            .entry(format!("{outcome:?}"))
-            .or_default() += 1;
-        for (token, route) in resolved {
-            self.record(token, route);
+        for refusal in &report.scan_refusals {
+            self.scan.unstable += 1;
+            *self
+                .scan
+                .outcomes
+                .entry(format!("{refusal:?}"))
+                .or_default() += 1;
         }
-        Ok(Some(outcome))
+        for observation in &report.observations {
+            *self
+                .scan
+                .outcomes
+                .entry(format!("{observation:?}"))
+                .or_default() += 1;
+        }
+        let last = report.observations.last().cloned();
+        for outcome in report.into_outcomes() {
+            match outcome {
+                TickOutcome::Call(call) => self.routed.push(Routed {
+                    slot: call.record().event.slot,
+                    tag: call.record().event.slot_id,
+                    route: call.route(),
+                }),
+                TickOutcome::Invalidation(change) => match change.scope() {
+                    InvalidationScope::ImageRetired(image) => self.retired_images.push(*image),
+                    InvalidationScope::InstancesRetired { ids, .. } => {
+                        self.retired_instances.extend(ids)
+                    }
+                    InvalidationScope::TaskRetired(cookie) => self.retired_tasks.push(*cookie),
+                    _ => {}
+                },
+                TickOutcome::Other(_) => {}
+            }
+        }
+        last
     }
 
-    /// Drains EVENTS, audits faults/misses, routes every call, and scans
-    /// while any call waits for a stable observation.
+    /// Explicit bounded refresh through the production full-image seal path.
+    fn scan(&mut self, target: &Target, pending: bool) -> Result<Option<ObserveOutcome>> {
+        let started = Instant::now();
+        let report = self
+            .capture
+            .refresh(&mut self.session, target.pin.clone(), 0)?;
+        Ok(self.record_report(report, started.elapsed().as_nanos(), pending))
+    }
+
+    /// The sole production collect/audit/route/scheduler owns EVENTS and all
+    /// pending records. This harness records its opaque outputs only.
     fn pump(&mut self, target: &Target) -> Result<usize> {
-        let mut batch: Vec<EventRecord> = Vec::new();
-        let drain = self.session.event_drain()?;
-        let _ = drain.poll_records(Some(1 << 20), |record| {
-            batch.push(record);
-            ControlFlow::Continue(())
-        });
-        ensure!(drain.malformed() == 0, "malformed EVENTS records");
+        let started = Instant::now();
+        let report = self
+            .capture
+            .tick(&mut self.session, std::slice::from_ref(&target.pin))?;
+        let count = report.collected_calls;
+        self.record_report(report, started.elapsed().as_nanos(), true);
         while self.session.discovery_dequeue()?.is_some() {}
-        // Batch audit before routing: hook-program misses raise the fault
-        // generation, so no call stamped before them can join afterwards.
-        let misses: u64 = self
+        // Diagnostic only; the production tick already audited exact IDs and
+        // each hook miss counter before granting any cached join.
+        self.misses = self
             .session
             .instance_hook_stats()?
             .iter()
             .map(|(_, stats)| stats.recursion_misses)
             .sum();
-        if misses != self.misses {
-            self.misses = misses;
-            self.session.instance_maps().raise_fault()?;
-        }
-        let maps = self.session.instance_maps();
-        let (fault, sticky) = (maps.fault()?, maps.sticky()?);
-        // Seam: the production capture loop (Stage 2+ activation) polls
-        // `instance_hook_stats()` and raises the fault exactly like this
-        // pump does; the router's miss latch then stays a backstop for a
-        // loop that passes misses without raising (DR-T3A-1).
-        for (token, route) in self.router.audit(fault, sticky, misses) {
-            self.record(token, route);
-        }
-        let mut count = 0;
-        for record in batch {
-            let (event, continuity) = (record.event, record.continuity);
-            if event.event_type != event_type::CALL {
-                continue;
-            }
-            count += 1;
-            self.events += 1;
-            let token = self.next_token;
-            self.next_token += 1;
-            self.awaiting.insert(token, (event.slot, event.slot_id));
-            let route = self.router.route(CallFacts {
-                token,
-                domain: self.router.domain(),
-                image: event.image,
-                entry: continuity.entry_stamp,
-                ret: continuity.return_stamp,
-                ip: EntryIp::new(continuity.entry_ip),
-                attached_offset: self.offsets.get(&event.slot).copied(),
-            });
-            if route != Route::Pending {
-                self.record(token, route);
-            }
-        }
-        for _ in 0..4 {
-            if self.router.pending_len() == 0 {
-                break;
-            }
-            self.scan(target, true)?;
-        }
         Ok(count)
     }
 
@@ -678,6 +653,148 @@ fn native_image_retained_kernel_ids(session: &Session) -> Result<BTreeMap<String
         }
     }
     Ok(ids)
+}
+
+/// Production tick integration, including explicit endpoint rebind after
+/// de_thread. This qualifies routing within one retained proof domain; it
+/// does not claim automatic recovery of fixed PID-scoped Multi links.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_semantic_capture_multi_reload_and_rebound_successor() -> Result<()> {
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start_with_backend(&plan, pid, &pins, BackendSelection::Multi)?;
+    ensure!(
+        harness.session.static_multi_attached() && harness.session.backend_fallback().is_none()
+    );
+    let domain = harness
+        .session
+        .native_domain()
+        .context("retained native domain")?;
+    let ids = native_image_retained_kernel_ids(&harness.session)?;
+    let hooks = harness
+        .session
+        .instance_hook_stats()?
+        .into_iter()
+        .map(|(name, stats)| (name, stats.program_id))
+        .collect::<BTreeMap<_, _>>();
+    let window = || capture::ReadWindow::new(1, Instant::now() + Duration::from_secs(3));
+    ensure!(matches!(
+        harness.session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    target.command(b'c')?;
+    let first = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(harness.retired_instances.is_empty() && harness.retired_images.is_empty());
+    ensure!(harness.capture.router().ranges_retained() > 0);
+    eprintln!("semantic tick: first nonempty join verified");
+    let reload = target.command(b'r')?;
+    let fields: Vec<_> = reload.split_whitespace().collect();
+    ensure!(
+        fields.len() == 4 && fields[2] == fields[3],
+        "not same-address reload: {reload}"
+    );
+    target.command(b'c')?;
+    let reloaded = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(reloaded != first && harness.retired_instances.contains(&first));
+    target.command(b'e')?;
+    ensure!(matches!(
+        harness.session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    target.command(b'c')?;
+    let leader = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(leader != reloaded && harness.retired_images.len() == 1);
+    eprintln!("semantic tick: same-address reload and leader successor verified");
+    target.command(b'E')?;
+    ensure!(
+        target.pid() == pid
+            && matches!(
+                harness.session.query_images(&[&target.pin], window()?),
+                Err(image_query::ImageQueryRefusal::Unknown)
+            )
+    );
+    harness.session.detach_slots(&plan.slots)?;
+    ensure!(harness.session.detach_failures().is_empty() && !harness.session.has_slot_link(0));
+    let (failed, completed) = harness.session.attach_targets(&plan.slots, &pins)?;
+    ensure!(failed.is_empty() && completed.len() == 1 && completed[0].0 == 0);
+    let owned_sides = harness
+        .session
+        .links
+        .iter()
+        .filter(|link| link.slots().contains(&0))
+        .map(|link| match link {
+            RegisteredLink::MultiUProbe {
+                program,
+                slots,
+                fds,
+            } => {
+                ensure!(slots == &[0] && fds.len() == 1);
+                Ok(*program)
+            }
+            _ => bail!("successor endpoint is not owned Multi"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        owned_sides.len() == 2
+            && BTreeSet::from_iter(owned_sides)
+                == BTreeSet::from([
+                    entry_program(
+                        &plan.slots[0].semantics,
+                        CapturePolicy::Allowlisted,
+                        false,
+                        ElfAbi::Lp64
+                    ),
+                    "p11_return"
+                ])
+    );
+    ensure!(
+        harness.session.native_domain() == Some(domain)
+            && harness.session.backend_fallback().is_none()
+    );
+    ensure!(native_image_retained_kernel_ids(&harness.session)? == ids);
+    ensure!(harness.session.instance_tracking().hook_link_count() == 4);
+    ensure!(
+        harness
+            .session
+            .instance_hook_stats()?
+            .into_iter()
+            .map(|(name, stats)| (name, stats.program_id))
+            .collect::<BTreeMap<_, _>>()
+            == hooks
+    );
+    ensure!(matches!(
+        harness.session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    target.command(b'c')?;
+    let successor = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        successor != leader
+            && harness.retired_images.len() == 2
+            && harness.retired_tasks.is_empty()
+    );
+    ensure!(
+        harness.capture.router().ranges_retained() > 0
+            && harness.capture.router().pending_len() == 0
+    );
+    eprintln!("semantic tick: rebound nonleader successor in same proof domain verified");
+    // An actual ordinary fault rejects a collected old-era call; a genuine
+    // later entry and fresh proof recover without restarting the owner.
+    target.command(b'c')?;
+    harness.session.instance_maps().raise_fault()?;
+    let old = pump_until(&mut harness, &target, 1)?;
+    ensure!(old.len() == 1 && old[0].route == Route::Unknown(UnknownReason::FaultEra));
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(harness.false_joins().is_empty());
+    eprintln!("semantic tick: old-fault refusal and fresh-entry recovery verified");
+    Ok(())
 }
 
 // Fixed PID-scoped Multi links retain the original leader task/mm and do not
@@ -1089,7 +1206,7 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
     eprintln!(
         "T3A_ROUTING steps={steps:?} sibling=({e:?},{f:?}) counters={counters:?} hooks={hooks:?} scans={:?} minted={}",
         harness.scan,
-        harness.router.instances_minted()
+        harness.capture.router().instances_minted()
     );
     ensure!(counters.local_bumps > counters_before.local_bumps);
     ensure!(counters.faults == 0 && harness.misses == 0);
@@ -1256,7 +1373,7 @@ fn privileged_instance_reload_race_has_zero_false_joins() -> Result<()> {
         harness.events,
         ids.len(),
         false_joins.len(),
-        harness.router.pending_len(),
+        harness.capture.router().pending_len(),
         harness.scan,
         harness.misses
     );
@@ -1267,7 +1384,8 @@ fn privileged_instance_reload_race_has_zero_false_joins() -> Result<()> {
         harness.events
     );
     ensure!(
-        harness.routed.len() as u64 == harness.events && harness.router.pending_len() == 0,
+        harness.routed.len() as u64 == harness.events
+            && harness.capture.router().pending_len() == 0,
         "every call must be joined or explicitly unknown"
     );
     ensure!(
@@ -1461,9 +1579,9 @@ fn privileged_instance_continuity_experiment_softhsm() -> Result<()> {
         counters_end.faults - counters_start.faults,
         hook_ns as f64 / elapsed.as_nanos() as f64 * 100.0,
         harness.scan,
-        harness.router.instances_minted(),
-        harness.router.ranges_retained(),
-        harness.router.pending_len(),
+        harness.capture.router().instances_minted(),
+        harness.capture.router().ranges_retained(),
+        harness.capture.router().pending_len(),
         harness.misses,
     );
     target.send(b'x')?;
@@ -1894,8 +2012,8 @@ fn privileged_instance_nonleader_exec_detaches_without_misrouting() -> Result<()
         "post-exec scan unexpectedly worked: {outcome:?}"
     );
     ensure!(
-        harness.scan.outcomes.contains_key("NoCookie"),
-        "post-exec scan must refuse on the missing cookie: {:?}",
+        harness.scan.outcomes.contains_key("Unknown"),
+        "post-exec full-image query must remain Unknown: {:?}",
         harness.scan.outcomes
     );
     let counters = harness.session.instance_maps().counters()?;

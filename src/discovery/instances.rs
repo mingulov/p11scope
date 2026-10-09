@@ -202,6 +202,7 @@ impl fmt::Debug for EpochReading {
 
 /// What one scan needs: epochs (record through a pidfd, global and fault
 /// cells) and the watched file's ranges from `/proc/PID/maps`.
+#[cfg(test)]
 pub(crate) trait ScanReader {
     fn epochs(&mut self) -> Result<EpochReading, String>;
     fn ranges(&mut self) -> Result<Vec<MapRange>, String>;
@@ -214,12 +215,13 @@ pub(crate) struct StableObservation {
     pub(crate) reading: EpochReading,
     pub(crate) ranges: Vec<MapRange>,
     /// The router's publication fence as read before the scan started
-    /// (see [`stable_scan`]). A fault-era advance bumps the router's
+    /// (as sealed by the full-image scan). A fault-era advance bumps the router's
     /// fence, so a scan cached across the reset observes as `StaleEra`
     /// even when its fault reading already matches the new era.
     pub(crate) fence: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ScanRefusal {
     /// Every attempt saw an epoch move during the maps read.
@@ -238,6 +240,7 @@ pub(crate) enum ScanRefusal {
 /// observation is cached past a later fault-era advance then observes as
 /// `StaleEra` (see [`InstanceRouter::observe`]). Stamping at observe time
 /// instead would revalidate stale scans and defeat the fence.
+#[cfg(test)]
 pub(crate) fn stable_scan(
     reader: &mut impl ScanReader,
     file_slot: u32,
@@ -332,6 +335,8 @@ pub(crate) enum UnknownReason {
     RangeCapacity,
     /// The pending-join ceiling refused this call.
     PendingCapacity,
+    /// A new cookie association exceeded retained original-pidfd capacity.
+    BindingCapacity,
     /// The process was retired before the call could join.
     Retired,
 }
@@ -587,6 +592,16 @@ pub(crate) struct InstanceRouter {
     ranges: usize,
     unknown: BTreeMap<UnknownReason, u64>,
     counters: RouterCounters,
+    /// Exact current partitions lost at the actual observation eviction.
+    /// Nonempty entries contain unique minted IDs, so the lifetime bound is
+    /// MAX_INSTANCES even when an adapter has not drained them yet.
+    observation_losses: Vec<ObservationLoss>,
+}
+
+pub(crate) struct ObservationLoss {
+    pub(crate) image: ImageIdentity,
+    pub(crate) file_slot: u32,
+    pub(crate) ids: Vec<InstanceId>,
 }
 
 impl fmt::Debug for InstanceRouter {
@@ -633,6 +648,7 @@ impl InstanceRouter {
             ranges: 0,
             unknown: BTreeMap::new(),
             counters: RouterCounters::default(),
+            observation_losses: Vec::new(),
         }
     }
 
@@ -652,8 +668,60 @@ impl InstanceRouter {
         self.pending.len()
     }
 
-    /// The current observation publication fence, for scan stamping (see
-    /// [`stable_scan`]). Read before the scan starts, never after.
+    /// Current partition IDs only, for the owning adapter's exact prior-ID
+    /// retirement output. Older observations remain valid historical joins.
+    pub(crate) fn current_instances(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        file: u32,
+    ) -> Vec<InstanceId> {
+        if domain != self.domain {
+            return Vec::new();
+        }
+        self.observed
+            .get(&(image.into(), file))
+            .and_then(|list| list.back())
+            .map(|observation| {
+                observation
+                    .partitions
+                    .iter()
+                    .filter_map(|(_, id)| *id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn take_observation_losses(&mut self) -> Vec<ObservationLoss> {
+        std::mem::take(&mut self.observation_losses)
+    }
+
+    pub(crate) fn refuse_image_pending(
+        &mut self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        reason: UnknownReason,
+    ) -> Vec<(u64, Route)> {
+        if domain != self.domain {
+            return Vec::new();
+        }
+        self.fail_pending(|call| call.facts.image == image, reason)
+    }
+
+    /// No scalar production adapter can declare task death. The private
+    /// proof retains the exact original pin whose pidfd became READY.
+    pub(crate) fn retire_task(
+        &mut self,
+        proof: crate::semantic_capture::TerminalTaskProof,
+    ) -> Option<Vec<(u64, Route)>> {
+        if proof.domain() != self.domain || RetirementLedger::index(proof.cookie()).is_none() {
+            return None;
+        }
+        Some(self.retire_task_cookie(proof.cookie()))
+    }
+
+    /// The current publication fence for full-image sealing. Read before
+    /// the scan starts; the consumer checks this exact original value again.
     pub(crate) fn fence(&self) -> u64 {
         self.fence
     }
@@ -772,7 +840,7 @@ impl InstanceRouter {
         self.retire_task_cookie(cookie)
     }
 
-    // Accessible in production only through the future adapter's sealed
+    // Accessible in production only through the adapter's sealed
     // original-pidfd terminal proof; tests exercise the same retirement body.
     fn retire_task_cookie(&mut self, cookie: u64) -> Vec<(u64, Route)> {
         if RetirementLedger::index(cookie).is_none() {
@@ -954,9 +1022,24 @@ impl InstanceRouter {
                 while self.observed.len() >= self.limits.observed_keys
                     && !self.observed.contains_key(&key)
                 {
-                    let Some((_, evicted)) = self.observed.pop_first() else {
+                    let Some(((owner, file_slot), evicted)) = self.observed.pop_first() else {
                         break;
                     };
+                    let ids: Vec<_> = evicted
+                        .back()
+                        .into_iter()
+                        .flat_map(|o| o.partitions.iter().filter_map(|(_, id)| *id))
+                        .collect();
+                    if !ids.is_empty() {
+                        self.observation_losses.push(ObservationLoss {
+                            image: ImageIdentity {
+                                task_cookie: owner.cookie,
+                                exec_id: owner.exec,
+                            },
+                            file_slot,
+                            ids,
+                        });
+                    }
                     self.ranges -= evicted.iter().map(|o| o.ranges.len()).sum::<usize>();
                     self.counters.observed_evictions =
                         self.counters.observed_evictions.saturating_add(1);

@@ -1109,7 +1109,7 @@ fn se05_pid_zero_is_a_usage_error_exit_2() {
             "{argv:?}: {}",
             usage.stderr
         );
-        assert_scoped_hint(&usage.stderr, argv[0].as_str());
+        assert_scoped_hint(&usage.stderr, argv[0]);
     }
 }
 

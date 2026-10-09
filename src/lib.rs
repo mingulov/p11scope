@@ -37,6 +37,7 @@ pub mod events;
 #[cfg(test)]
 mod first_use_probe;
 pub mod inspect;
+pub(crate) mod inspect_identity;
 pub mod inspect_system;
 pub mod inventory;
 pub(crate) mod inventory_capture;

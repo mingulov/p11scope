@@ -7,7 +7,10 @@ which is IMPLEMENTED in v0.2.0 by owner ruling FB-PRIV (2026-10-03), and
 [offline inventory diff re-projection](#offline-inventory-diff-re-projection),
 which describes the implemented offline report and grants no capture authority,
 and [inline inventory identity](#inline-inventory-identity-p5u-2026-10-09),
-which implements the reviewed compact re-projection with no new capture.**
+which implements the reviewed compact re-projection with no new capture,
+and [inspect presentation identity](#inspect-presentation-identity-p5u-2026-10-09),
+a reviewed scan-local presentation contract whose PID/system implementation
+and installed qualification are tracked separately.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -538,3 +541,21 @@ blobs, random output and operation-state contents remain prohibited. There
 is no pre-collection for a later `CKA_ID` feature and no unsafe decoder
 activation. A new field, read site, broader set, longer retention or wider
 output needs a new explicit review.
+
+## Inspect presentation identity (P5U, 2026-10-09)
+
+This amendment authorizes only scan-local executable presentation in
+`p11scope/inspect/v1`, `p11scope/inspect-system/v1` and their text detail.
+It adds no call-derived identity, provider-memory capture or output authority
+for profile, metrics or trace. V1 and v2 remain byte-for-byte unchanged.
+
+| Field | Source and validation | Output/retention | Failure |
+| --- | --- | --- | --- |
+| Inspect `application`: observed executable `path`, `dev`, `ino`, `mtime_secs`, `mtime_nanos`, retained `start_time`, finite identity `status` | New private validated application receipt from BOTH PID and system deep-scan producers: executable and fresh start-time samples before scan and after scan/provider pinning agree while the SAME original ProcessView pin holds. Retained pin start-time is also checked. MapsMatched instead consumes the separately confirmed SweptMember through its dedicated producer adapter. Raw ProcessRecord.generation.exe and pidfd liveness alone grant no publication. No cmdline, environ, comm, argument or extra memory read. | Additive root application/application_status in inspect v1 and per-process application/application_status in inspect-system v1, plus their text detail. Existing PID numbering/references persist. Application contains exactly path/dev/ino/mtime_secs/mtime_nanos/start_time/status; successful status is observed. Retain only this completed scan's fact; render without live lookup or late repair. | Null application and finite application_status: unavailable, changed, lost or not_examined. Scanned/MemoryUnavailable may name only after successful receipt and completed mapping scan; Unreadable/Exited/NotSelected stay unknown. MapsMatched uses confirmed attribution only. A receipt rejection withholds names without reclassifying provider mappings. |
+
+The path is an observed executable-link label, including a retained deleted
+marker, not a service/package/script or trust identity. Text escapes controls,
+shows basename before PID and full path/physical details; equal display labels
+never merge records. Mapped-only means no activity was captured by inspect.
+Unchanged-image re-exec, including A-to-B-to-A between samples, is a documented
+scan limitation. These receipts provide no trace-event naming authority.

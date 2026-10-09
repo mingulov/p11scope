@@ -379,8 +379,9 @@ fn drive<L: CaptureLane<PidPin>>(
     let deadline = Some(Instant::now() + Duration::from_secs(120));
     let mut driver = ClassicDriver {
         coordinator,
-        inventory_scope: &inventory_scope,
-        scope,
+        inventory_scope: Some(inventory_scope),
+        scope: scope.into(),
+        cgroup: None,
         max_scan_pids: None,
         guard: UnavailableImageGuard,
         deadline,
@@ -2429,8 +2430,9 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
     let deadline = Some(Instant::now() + Duration::from_secs(120));
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
-        inventory_scope: &inventory_scope,
-        scope: InspectScope::Pid(target.pid()),
+        inventory_scope: Some(inventory_scope),
+        scope: InspectScope::Pid(target.pid()).into(),
+        cgroup: None,
         max_scan_pids: None,
         guard: UnavailableImageGuard,
         deadline,

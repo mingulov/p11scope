@@ -27,8 +27,8 @@ use crate::discovery::native_binding::NativeIdentity;
 #[cfg(test)]
 use crate::inventory_capture::run_classic;
 use crate::inventory_capture::{
-    FacadeLane, LaneSummary, LaneWindows, LoopClock, NativeLane, PassDriver, Publish, SERVICE_TICK,
-    run_classic_finalizing,
+    CgroupJobFailure, CollectJob, CollectedPass, FacadeLane, LaneSummary, LaneWindows, LoopClock,
+    NativeLane, PassDriver, Publish, SERVICE_TICK, run_classic_finalizing,
 };
 use crate::inventory_dashboard::{
     DashboardIo, Display, DisplayAccount, RESCAN_INTERVAL, RESTORE_RETRY_BUDGET, StderrRoute,
@@ -124,9 +124,10 @@ impl DiagnosticsState {
         &mut self,
         coordinator: &mut InventoryCoordinator<Source>,
         mode: CaptureMode,
-        scope: InspectScope,
+        scope: impl Into<InventoryRunScope>,
         pid_filter: Option<u32>,
     ) {
+        let scope = scope.into();
         if self.destination.is_none() {
             return;
         }
@@ -138,8 +139,9 @@ impl DiagnosticsState {
                 CaptureMode::Scan => unreachable!("scan diagnostics are refused before setup"),
             },
             scope: match scope {
-                InspectScope::Pid(_) => DiagnosticScope::Pid,
-                InspectScope::System => DiagnosticScope::System,
+                InventoryRunScope::Pid(_) => DiagnosticScope::Pid,
+                InventoryRunScope::System => DiagnosticScope::System,
+                InventoryRunScope::Cgroup => DiagnosticScope::Cgroup,
             },
             ..DiagnosticConfig::default()
         };
@@ -417,7 +419,7 @@ fn registry_limits(max_gaps: Option<usize>) -> RegistryLimits {
 /// empty-success reports.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    scope: InspectScope,
+    scope: impl Into<crate::cli::ScopeArg>,
     modules: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
@@ -435,6 +437,7 @@ pub fn run(
     diagnostics: Option<&Path>,
     diagnostics_pid: Option<u32>,
 ) -> Result<i32> {
+    let scope: crate::cli::ScopeArg = scope.into();
     let endpoint_budget = inventory_endpoint_budget(max_endpoints).map_err(anyhow::Error::msg)?;
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
     // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
@@ -468,6 +471,7 @@ pub fn run(
             pid_filter: diagnostics_pid,
             second_signal: &|| stop.signal_count() >= 2,
         },
+        Some(stop.signal_source()),
         #[cfg(test)]
         None,
     )
@@ -665,13 +669,14 @@ fn run_with_terminal_diagnostics(
         stdout,
         terminal,
         request,
+        None,
         event_fault,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_with_terminal_budget(
-    scope: InspectScope,
+    scope: impl Into<InventorySelection>,
     modules: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
@@ -692,18 +697,20 @@ fn run_with_terminal_budget(
     stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
     request: DiagnosticRequest<'_>,
+    operator_stop_source: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)] event_fault: Option<crate::inventory_events::EventFault>,
 ) -> Result<i32> {
+    let (engine_scope, numbering) = scope.into().resolve()?;
+    let scope = InventoryRunScope::from(&engine_scope);
     // DR-K8S-1: the kernel-side PID filter numbers tasks in the initial PID
     // namespace; a mismatched observer's --pid would match nothing, so it
     // is refused by name before anything is opened or scanned.
-    let numbering = crate::pidns::numbering();
     match scope {
-        InspectScope::Pid(pid) => {
-            crate::pidns::require_numbering_agrees(numbering, &format!("inventory --pid {pid}"))?;
+        InventoryRunScope::Pid(pid) => {
+            crate::pidns::require_numbering_agrees(&numbering, &format!("inventory --pid {pid}"))?;
         }
-        InspectScope::System => {
-            if let Some(warning) = crate::pidns::nested_warning(numbering) {
+        InventoryRunScope::System => {
+            if let Some(warning) = crate::pidns::nested_warning(&numbering) {
                 inventory_diagnostic(&warning);
             }
             // Resolve the proof-stat and shard diagnostic knobs now: their
@@ -712,6 +719,7 @@ fn run_with_terminal_budget(
             let _ = crate::discovery::proof_stats::proof_stat_threads();
             let _ = crate::discovery::sweep_shards::shard_threads();
         }
+        InventoryRunScope::Cgroup => crate::pidns::require_inventory_cgroup_numbering(&numbering)?,
     }
     if request.path.is_some() && capture == CaptureMode::Scan {
         anyhow::bail!("--diagnostics requires native capture or auto fallback");
@@ -747,17 +755,14 @@ fn run_with_terminal_budget(
     if let Some(writer) = stream.writer.as_mut() {
         writer.fault = event_fault;
     }
-    let (inventory_scope, engine_scope, scope_label) = match scope {
-        InspectScope::Pid(pid) => (
-            InventoryScope::Pid(pid),
-            Scope::Pid(pid),
-            format!("pid:{pid}"),
-        ),
-        InspectScope::System => (InventoryScope::System, Scope::System, "system".to_string()),
+    let (inventory_scope, scope_label) = match scope {
+        InventoryRunScope::Pid(pid) => (Some(InventoryScope::Pid(pid)), format!("pid:{pid}")),
+        InventoryRunScope::System => (Some(InventoryScope::System), "system".to_string()),
+        InventoryRunScope::Cgroup => (None, "cgroup".to_string()),
     };
     let started_ns = now_ns();
     let mut coordinator = InventoryCoordinator::new_with_budget(
-        engine_scope,
+        engine_scope.clone(),
         hooks.clone(),
         modules.to_vec(),
         OsProcessSource,
@@ -766,14 +771,21 @@ fn run_with_terminal_budget(
     )?;
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
-    stage_numbering_gap(&mut coordinator, numbering);
+    stage_numbering_gap(&mut coordinator, &numbering);
     // The scan lane stages no usage coverage: every edge reads
     // `unknown (scan only)`. The native lane stages per-edge coverage
     // notes and witnesses; `auto` falls back to scan with a named gap.
     if let Some(diagnostics) = diagnostics.as_mut() {
         diagnostics.enable(&mut coordinator, capture, scope, request.pid_filter);
     }
-    let lane = match open_native_lane(capture, attach_backend, scope, &mut coordinator) {
+    let cgroup = matches!(scope, InventoryRunScope::Cgroup)
+        .then(|| CgroupDriverState::new(deadline_for_duration(duration), operator_stop_source));
+    let lane = match open_native_lane(
+        capture,
+        attach_backend,
+        engine_scope.clone(),
+        &mut coordinator,
+    ) {
         Ok(lane) => lane,
         Err(error) => {
             // There is no native lane to retire, but available diagnostics
@@ -811,6 +823,7 @@ fn run_with_terminal_budget(
                     DashboardRun {
                         scope,
                         inventory_scope,
+                        cgroup,
                         scope_label,
                         started_ns,
                         max_scan_pids,
@@ -857,11 +870,14 @@ fn run_with_terminal_budget(
         (_, error) => error,
     };
     let mut stream_state = StreamState::new();
-    let deadline = deadline_for_duration(duration);
+    let deadline = cgroup
+        .as_ref()
+        .map_or_else(|| deadline_for_duration(duration), |state| state.deadline);
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
-        inventory_scope: &inventory_scope,
+        inventory_scope,
         scope,
+        cgroup,
         max_scan_pids,
         guard: UnavailableImageGuard,
         deadline,
@@ -1039,11 +1055,126 @@ fn finish_failed_startup<Source: ProcessSource>(
     )
 }
 
+#[derive(Clone, Copy)]
+enum InventoryRunScope {
+    Pid(u32),
+    System,
+    Cgroup,
+}
+
+enum InventorySelection {
+    Operator(crate::cli::ScopeArg),
+    #[cfg(test)]
+    Retained {
+        scope: Scope,
+        numbering: crate::pidns::PidNumbering,
+    },
+}
+
+impl From<crate::cli::ScopeArg> for InventorySelection {
+    fn from(scope: crate::cli::ScopeArg) -> Self {
+        Self::Operator(scope)
+    }
+}
+
+impl From<InspectScope> for InventorySelection {
+    fn from(scope: InspectScope) -> Self {
+        Self::Operator(scope.into())
+    }
+}
+
+impl From<InspectScope> for InventoryRunScope {
+    fn from(scope: InspectScope) -> Self {
+        match scope {
+            InspectScope::Pid(pid) => Self::Pid(pid),
+            InspectScope::System => Self::System,
+        }
+    }
+}
+
+impl From<InspectScope> for Scope {
+    fn from(scope: InspectScope) -> Self {
+        match scope {
+            InspectScope::Pid(pid) => Self::Pid(pid),
+            InspectScope::System => Self::System,
+        }
+    }
+}
+
+impl From<&Scope> for InventoryRunScope {
+    fn from(scope: &Scope) -> Self {
+        match scope {
+            Scope::Pid(pid) => Self::Pid(*pid),
+            Scope::System => Self::System,
+            Scope::Cgroup { .. } => Self::Cgroup,
+        }
+    }
+}
+
+impl InventorySelection {
+    fn resolve(self) -> Result<(Scope, crate::pidns::PidNumbering)> {
+        match self {
+            Self::Operator(scope) => {
+                let numbering = crate::pidns::numbering().clone();
+                let scope = match scope {
+                    crate::cli::ScopeArg::Pid(pid) => Scope::Pid(pid),
+                    crate::cli::ScopeArg::System => Scope::System,
+                    crate::cli::ScopeArg::Cgroup(path) => {
+                        crate::pidns::require_inventory_cgroup_numbering(&numbering)?;
+                        crate::scope::capture_cgroup(&path).map_err(|error| {
+                            anyhow::anyhow!(
+                                "{}",
+                                crate::render::escape_controls(&format!("{error:#}"))
+                            )
+                        })?
+                    }
+                };
+                Ok((scope, numbering))
+            }
+            #[cfg(test)]
+            Self::Retained { scope, numbering } => {
+                if !matches!(scope, Scope::Cgroup { .. }) {
+                    anyhow::bail!("retained cgroup test input requires an explicit cgroup scope");
+                }
+                crate::pidns::require_inventory_cgroup_numbering(&numbering)?;
+                Ok((scope, numbering))
+            }
+        }
+    }
+}
+
+struct CgroupDriverState {
+    continuation: Option<crate::scope::inventory_cgroup::CgroupWalkState>,
+    limits: crate::scope::inventory_cgroup::CgroupWalkLimits,
+    control: crate::scope::inventory_cgroup::CollectionControl,
+    deadline: Option<Instant>,
+}
+
+impl CgroupDriverState {
+    fn new(
+        deadline: Option<Instant>,
+        source: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Self {
+        let control = crate::scope::inventory_cgroup::CollectionControl::new(deadline);
+        let control = match source {
+            Some(source) => control.with_operator_stop_source(source),
+            None => control,
+        };
+        Self {
+            continuation: Some(crate::scope::inventory_cgroup::CgroupWalkState::default()),
+            limits: crate::scope::inventory_cgroup::CgroupWalkLimits::default(),
+            control,
+            deadline,
+        }
+    }
+}
+
 /// The classic loop's pass side over the production coordinator.
 struct ClassicDriver<'a> {
     coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
-    inventory_scope: &'a InventoryScope,
-    scope: InspectScope,
+    inventory_scope: Option<InventoryScope>,
+    scope: InventoryRunScope,
+    cgroup: Option<CgroupDriverState>,
     max_scan_pids: Option<usize>,
     guard: UnavailableImageGuard,
     deadline: Option<Instant>,
@@ -1072,22 +1203,72 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn collector(&mut self) -> crate::inventory_capture::CollectJob {
-        Box::new(
-            self.coordinator
-                .collector(*self.inventory_scope, self.max_scan_pids),
-        )
+        if let Some(cgroup) = &mut self.cgroup {
+            let task = cgroup
+                .continuation
+                .take()
+                .ok_or(CgroupJobFailure::Preparation)
+                .and_then(|state| {
+                    self.coordinator
+                        .cgroup_collector(
+                            state,
+                            cgroup.limits.clone(),
+                            cgroup.control.clone(),
+                            self.max_scan_pids,
+                        )
+                        .map(|job| Box::new(job) as crate::inventory_capture::CgroupCollectJob)
+                        .map_err(|_| CgroupJobFailure::Preparation)
+                });
+            return CollectJob::Cgroup {
+                control: cgroup.control.clone(),
+                task,
+            };
+        }
+        match self.inventory_scope {
+            Some(scope) => CollectJob::Legacy(Box::new(
+                self.coordinator.collector(scope, self.max_scan_pids),
+            )),
+            None => CollectJob::Cgroup {
+                control: crate::scope::inventory_cgroup::CollectionControl::new(self.deadline),
+                task: Err(CgroupJobFailure::Preparation),
+            },
+        }
+    }
+
+    fn collection_control(&self) -> Option<crate::scope::inventory_cgroup::CollectionControl> {
+        self.cgroup.as_ref().map(|cgroup| cgroup.control.clone())
     }
 
     fn apply(
         &mut self,
-        collected: Result<crate::inspect_system::Catalog>,
+        collected: CollectedPass,
         identity: &mut dyn NativeIdentity<PidPin>,
         now_ns: u64,
     ) -> Result<PassReport> {
+        let collected = match collected {
+            CollectedPass::Cgroup(Ok(collection)) => {
+                return self
+                    .coordinator
+                    .apply_cgroup_collection(*collection, now_ns);
+            }
+            CollectedPass::Cgroup(Err(failure)) => {
+                self.coordinator
+                    .note_scope_gap("cgroup collection failed".into(), failure.reason().into());
+                anyhow::bail!("{}", failure.reason());
+            }
+            CollectedPass::Legacy(catalog) => catalog.map(|catalog| *catalog),
+        };
+        let scope = match self.scope {
+            InventoryRunScope::Pid(pid) => InspectScope::Pid(pid),
+            InventoryRunScope::System => InspectScope::System,
+            InventoryRunScope::Cgroup => {
+                anyhow::bail!("cgroup requires a scoped collection result")
+            }
+        };
         let (report, warning) = apply_one_pass(
             self.coordinator,
             collected,
-            self.scope,
+            scope,
             &mut self.guard,
             self.deadline,
             identity,
@@ -1101,6 +1282,26 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 
     fn commit(&mut self, engine_changed: bool) -> Result<()> {
         self.coordinator.commit_batch(engine_changed).map(|_| ())
+    }
+
+    fn finish_pass(&mut self, report: &mut PassReport) -> Result<()> {
+        if let Some(cgroup) = &mut self.cgroup {
+            let completion = self.coordinator.take_cgroup_completion().ok_or_else(|| {
+                anyhow::anyhow!("cgroup publication did not supply its owned completion")
+            })?;
+            cgroup.continuation = Some(completion.state);
+            report.scan_callers = completion.scan_callers;
+            report.events.extend(completion.events);
+            if completion.outcome
+                != crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete
+            {
+                self.warn(&format!(
+                    "p11scope: cgroup collection incomplete: {}",
+                    completion.outcome.reason()
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn on_tick(&mut self) {
@@ -1120,7 +1321,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 fn open_native_lane(
     mode: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
-    scope: InspectScope,
+    scope: impl Into<Scope>,
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
 ) -> Result<Option<NativeLane<FacadeLane>>> {
     open_native_lane_with(
@@ -1128,8 +1329,50 @@ fn open_native_lane(
         attach_backend,
         scope,
         coordinator,
-        FacadeLane::prepare,
+        |scope, budget, backend| {
+            #[cfg(test)]
+            if let Some(prepare) = native_preparation_test::take() {
+                return prepare(scope, budget, backend);
+            }
+            FacadeLane::prepare(scope, budget, backend)
+        },
     )
+}
+
+#[cfg(test)]
+mod native_preparation_test {
+    use super::*;
+    type Prepare = Box<
+        dyn FnOnce(
+            crate::attach::capture::CaptureScope,
+            InventoryBudget,
+            crate::attach::BackendSelection,
+        ) -> Result<FacadeLane>,
+    >;
+    thread_local! {
+        static PREPARE: std::cell::RefCell<Option<Prepare>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn take() -> Option<Prepare> {
+        PREPARE.with(|slot| slot.borrow_mut().take())
+    }
+    pub(super) fn with<R>(
+        prepare: impl FnOnce(
+            crate::attach::capture::CaptureScope,
+            InventoryBudget,
+            crate::attach::BackendSelection,
+        ) -> Result<FacadeLane>
+        + 'static,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore(Option<Prepare>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PREPARE.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(PREPARE.with(|slot| slot.borrow_mut().replace(Box::new(prepare))));
+        run()
+    }
 }
 
 /// The preparation boundary permits testing its actual arguments and startup
@@ -1137,7 +1380,7 @@ fn open_native_lane(
 fn open_native_lane_with(
     mode: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
-    scope: InspectScope,
+    scope: impl Into<Scope>,
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     prepare: impl FnOnce(
         crate::attach::capture::CaptureScope,
@@ -1162,12 +1405,13 @@ fn open_native_lane_with(
     if mode == CaptureMode::Scan {
         return Ok(None);
     }
-    let capture_scope = match scope {
-        InspectScope::Pid(pid) => match PidPin::open(pid) {
+    let capture_scope = match scope.into() {
+        Scope::Pid(pid) => match PidPin::open(pid) {
             Ok(pin) => crate::attach::capture::CaptureScope::Pid(pin),
             Err(reason) => return unavailable(coordinator, reason),
         },
-        InspectScope::System => crate::attach::capture::CaptureScope::System,
+        Scope::System => crate::attach::capture::CaptureScope::System,
+        scope @ Scope::Cgroup { .. } => crate::attach::capture::CaptureScope::cgroup(scope)?,
     };
     let capture = match prepare(
         capture_scope,
@@ -1656,8 +1900,9 @@ fn note_native_observation(document: &mut serde_json::Value, summary: &LaneSumma
 
 /// What the interactive dashboard run is over.
 struct DashboardRun {
-    scope: InspectScope,
-    inventory_scope: InventoryScope,
+    scope: InventoryRunScope,
+    inventory_scope: Option<InventoryScope>,
+    cgroup: Option<CgroupDriverState>,
     scope_label: String,
     started_ns: u64,
     max_scan_pids: Option<usize>,
@@ -1784,6 +2029,7 @@ fn run_dashboard(
     let DashboardRun {
         scope,
         inventory_scope,
+        cgroup,
         scope_label,
         started_ns,
         max_scan_pids,
@@ -1797,11 +2043,14 @@ fn run_dashboard(
         (false, Some(error)) => return Err(error),
         (_, error) => error,
     };
-    let deadline = deadline_for_duration(duration);
+    let deadline = cgroup
+        .as_ref()
+        .map_or_else(|| deadline_for_duration(duration), |state| state.deadline);
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
-        inventory_scope: &inventory_scope,
+        inventory_scope,
         scope,
+        cgroup,
         max_scan_pids,
         guard: UnavailableImageGuard,
         deadline,
@@ -5275,3 +5524,7 @@ mod edge_stream_tests;
 #[cfg(test)]
 #[path = "inventory_diagnostics_runtime_tests.rs"]
 mod diagnostics_runtime_tests;
+
+#[cfg(test)]
+#[path = "inventory_cgroup_runtime_tests.rs"]
+mod cgroup_runtime_tests;

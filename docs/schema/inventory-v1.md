@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # `p11scope/inventory/v1`: module/caller inventory
 
-Answers "which module is used by whom" for one scope (`--pid` or
+Answers "which module is used by whom" for one scope (`--pid`, `--cgroup`, or
 `--system`) over one snapshot pass or a `--duration` observation window.
 Emitted by `p11scope inventory [--json | -o <out.json>]`.
 
@@ -20,7 +20,10 @@ carries: `{"observer": "initial" | "nested" | "unknown", "kernel_pids":
 document (`callers[].pid`, `gaps[].pid`) is read through `/proc`, so it is
 in the numbering `proc_pids` names; it equals the kernel's initial-namespace
 PID only when `observer` is `initial` and `proc_pids` is `observer`.
-`inventory --pid` is refused (`pid-namespace-mismatch`) otherwise, and
+`inventory --pid` and `inventory --cgroup` are refused (`pid-namespace-mismatch`)
+otherwise. Cgroup refusal applies to scan, auto and native; userspace discovery
+and native image identity both require initial task numbering. The refusal
+precedes report, event and diagnostic output creation. In contrast,
 `inventory --system` then also carries one scope-level gap (`caller`,
 `module` and `pid` null, `subject` `pid namespace`) from its first pass on,
 so a consumer reading only `gaps[]` still sees the incompleteness: the scan
@@ -65,7 +68,8 @@ A native document adds to `observation`:
     the in-BPF PID guard: `"kernel-pid+bpf"` (the uprobe-multi links name
     the target; the kernel pid filter was proven to cover every thread)
     or `"perf-task+bpf"` (each per-offset link is bound to the target's
-    task); `null` under `--system`.
+    task); `"bpf-cgroup"` under `--cgroup` (all-process links restricted by the
+    frozen retained-root BPF filter); `null` under `--system`.
 - `lifecycle`: the lifecycle feed's own account. The native lane drains
   the kernel's 2 MiB lifecycle (exec and exit) ring every 10 ms,
   including while a pass collects `/proc` on a worker thread; it stages
@@ -88,6 +92,32 @@ In the native lane an admitted edge no coverage note reached reads
 not the kernel's (`pid_namespace`), native `--system` still binds witnesses
 (through pidfd cookies, never PID numbers) but never claims a watch: every
 admitted edge's coverage is `unknown` (`loss`) with a gap saying why.
+
+## Cgroup scope
+
+The top-level scope label is exactly `"cgroup"`; neither the operator path nor
+descendant names appear as scope metadata. The retained root and current
+descendants select bounded discovery candidates. Fresh begin/end membership of
+the original held process generation is required at actual caller publication;
+candidate enumeration alone grants no admission. Directory/member/byte/work
+limits and cooperative cancellation produce finite incomplete gaps, never
+complete absence or invented exit/unmap facts. `--max-scan-pids` limits deep
+scans separately from traversal work.
+
+Quiet cgroup edges use `unknown` with reason `scope_membership_unproven` when
+otherwise covered: endpoint samples do not prove continuous residency and cannot
+authorize `watched_no_use`. Existing valid counted history remains usable.
+Same-image reentry retains its caller ID; a deferred successor need not have an
+ID merely to retire an old image. Scoped native owner activation/refresh is
+currently deferred and carries a gap; scan-pinned caller facts remain available.
+The main thread services lifecycle evidence before scoped admission, then
+publishes newly admitted targets before extending them and publishes native
+receipts before output. Cancellation is cooperative at returning-operation
+checkpoints; it cannot interrupt a blocked kernel operation.
+
+Two recorded `"cgroup"` labels do not establish the same physical scope or
+continuous counts. Offline comparison preserves independent windows and
+`scope_completeness_unknown`.
 
 ## Privacy
 

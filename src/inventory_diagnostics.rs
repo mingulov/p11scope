@@ -86,7 +86,11 @@ pub(crate) enum CaptureSettlement {
     Unavailable,
 }
 vocabulary!(CaptureMode { Native, Auto });
-vocabulary!(DiagnosticScope { System, Pid });
+vocabulary!(DiagnosticScope {
+    System,
+    Pid,
+    Cgroup
+});
 
 /// Domain-tagged native identity remains opaque and is never formatted or serialized.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

@@ -1934,6 +1934,19 @@ impl StopFlag {
         self.signals.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn signal_source(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.signals)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_without_handlers() -> Self {
+        Self {
+            signals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            exit_on_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            _hooks: Vec::new(),
+        }
+    }
+
     /// From now on a stop signal exits the process at once (R-C51-4: the
     /// output attempts finished; only the blocking probe detach may remain).
     pub(crate) fn exit_on_next_signal(&self) {

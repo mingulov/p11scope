@@ -685,6 +685,7 @@ const UNKNOWN_REASONS: &[&str] = &[
     "use_before_admission",
     "pending_first_use",
     "uncounted",
+    "scope_membership_unproven",
 ];
 const SEMANTICS: &[&str] = &[
     "observed",
@@ -1013,7 +1014,10 @@ fn parse_observation(o: &Object<'_>) -> Result<Observation> {
                 selection: a.label("selection", &["auto", "multi", "singles"])?,
                 mechanism: a.label("mechanism", &["uprobe-multi", "per-offset"])?,
                 fallback: a.text_null("fallback")?,
-                scope_filter: a.label_null("scope_filter", &["kernel-pid+bpf", "perf-task+bpf"])?,
+                scope_filter: a.label_null(
+                    "scope_filter",
+                    &["kernel-pid+bpf", "perf-task+bpf", "bpf-cgroup"],
+                )?,
             })
         })
         .transpose()?;

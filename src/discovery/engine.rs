@@ -1282,40 +1282,25 @@ fn manifest_module_object(manifest: &Manifest, pinned: &PinnedObjects) -> Option
     pinned.id_for_manifest(key, path)
 }
 
-fn lower_manifest_selection_tables(
-    plan: &mut plan::AttachPlan,
-    allocated: &plan::AttachPlan,
-    manifests: &[Manifest],
-    manifest_ordinals: &[u32],
-    pinned: &PinnedObjects,
-) -> (Vec<ManifestSelectionAdmission>, Vec<String>) {
-    let mut admissions = Vec::new();
-    let mut refused = Vec::new();
-    for (manifest, ordinal) in manifests.iter().zip(manifest_ordinals) {
-        let Some(provider) = manifest_module_object(manifest, pinned) else {
-            continue;
-        };
-        let Some(module) = plan
-            .modules
-            .iter()
-            .find(|module| module.object == provider)
-            .map(|module| module.id)
-        else {
-            continue;
-        };
-        let reachable: BTreeSet<_> = manifest
-            .selection_evidence
-            .queries
-            .iter()
-            .filter(|query| matches!(query.authority, SelectionAuthority::SelectionCountOnly))
-            .filter_map(|query| query.selection_table)
-            .collect();
-        for table in manifest
-            .selection_evidence
-            .tables
-            .iter()
-            .filter(|table| reachable.contains(&table.id))
-        {
+/// The reachable count-only claims, before slot admission. Shared with the
+/// semantic completeness check; these never authorize argument decoding.
+pub(crate) fn manifest_selection_targets<'a>(
+    manifest: &'a Manifest,
+    pinned: &'a PinnedObjects,
+) -> impl Iterator<Item = (u8, Vec<plan::SelectionTableTarget>)> + 'a {
+    let reachable: BTreeSet<_> = manifest
+        .selection_evidence
+        .queries
+        .iter()
+        .filter(|query| matches!(query.authority, SelectionAuthority::SelectionCountOnly))
+        .filter_map(|query| query.selection_table)
+        .collect();
+    manifest
+        .selection_evidence
+        .tables
+        .iter()
+        .filter(move |table| reachable.contains(&table.id))
+        .map(|table| {
             let mut targets = Vec::new();
             for function in &table.functions {
                 let Resolution::Resolved {
@@ -1347,9 +1332,35 @@ fn lower_manifest_selection_tables(
                     name,
                 });
             }
+            (table.id, targets)
+        })
+}
+
+fn lower_manifest_selection_tables(
+    plan: &mut plan::AttachPlan,
+    allocated: &plan::AttachPlan,
+    manifests: &[Manifest],
+    manifest_ordinals: &[u32],
+    pinned: &PinnedObjects,
+) -> (Vec<ManifestSelectionAdmission>, Vec<String>) {
+    let mut admissions = Vec::new();
+    let mut refused = Vec::new();
+    for (manifest, ordinal) in manifests.iter().zip(manifest_ordinals) {
+        let Some(provider) = manifest_module_object(manifest, pinned) else {
+            continue;
+        };
+        let Some(module) = plan
+            .modules
+            .iter()
+            .find(|module| module.object == provider)
+            .map(|module| module.id)
+        else {
+            continue;
+        };
+        for (table, targets) in manifest_selection_targets(manifest, pinned) {
             match plan.add_selection_table(allocated, module, targets.clone()) {
                 Ok(()) => admissions.push(ManifestSelectionAdmission {
-                    source: (*ordinal, table.id),
+                    source: (*ordinal, table),
                     targets,
                 }),
                 Err(reason) => refused.push(reason),

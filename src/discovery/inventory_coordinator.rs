@@ -73,6 +73,9 @@ use count_eligibility::{
     ReceiptView, ReceiptWork, RecoveryWorkBudget,
 };
 
+#[path = "inventory_coordinator/semantics.rs"]
+pub(crate) mod semantics;
+
 /// What one inventory pass scans: one named process, or the machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InventoryScope {
@@ -183,6 +186,8 @@ impl<Pin> AuthorityResolver<'_, Pin> {
 /// catalog's Inventory lowering feeds every pass.
 pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     engine: Engine,
+    /// Explicit semantic inputs are independent of broad physical admission.
+    semantic_inputs: semantics::SemanticInputs,
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
@@ -288,6 +293,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         adapter.set_max_callers(registry_limits.max_callers);
         Ok(Self {
             engine: Engine::inventory(inventory_config(endpoint_budget)?, scope, hooks, hints)?,
+            semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
             adapter,
             registry: CallerRegistry::new(registry_limits),
             attach_set: InventoryAttachSet::new(endpoint_budget),
@@ -325,6 +331,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// pass lines. `None` until a native drain stages (the scan lane).
     pub(crate) fn lifecycle_high_water_bytes(&self) -> Option<u64> {
         self.lifecycle_high_water_bytes
+    }
+
+    pub(crate) fn set_semantic_manifests(&mut self, manifests: Vec<PathBuf>) {
+        self.semantic_inputs = semantics::SemanticInputs::new(manifests);
+    }
+
+    #[expect(
+        dead_code,
+        reason = "H3 runtime wiring follows the attested subset gate"
+    )]
+    pub(crate) fn prepare_semantic_subset(&mut self) -> semantics::SubsetPreparation {
+        self.semantic_inputs.prepare(&self.engine)
     }
 
     pub(crate) fn enable_diagnostics(&mut self, config: DiagnosticConfig) -> Result<(), InitError> {

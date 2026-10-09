@@ -9784,7 +9784,7 @@ impl Engine {
     /// request or counting an unperformed retry as another dropped record.
     /// `None` keeps the original arrival clock-unknown.
     fn request_refresh(&mut self, pid: u32, now_ns: Option<u64>) -> bool {
-        let accepted = self.request_refresh_with(pid, now_ns, false);
+        let accepted = self.request_refresh_with(pid, now_ns, false, None);
         if !accepted {
             // A retained owner's skipped setup/replacement must remain owed
             // when the PID queue cannot accept it. The existing bounded
@@ -9803,10 +9803,28 @@ impl Engine {
     /// Each consumed record renews pending intent while keeping its first
     /// arrival mark. Refusing that record preserves explicit loss evidence.
     fn request_refresh_consumed(&mut self, pid: u32, now_ns: Option<u64>) -> bool {
-        self.request_refresh_with(pid, now_ns, true)
+        self.request_refresh_with(pid, now_ns, true, None)
     }
 
-    fn request_refresh_with(&mut self, pid: u32, now_ns: Option<u64>, consumed: bool) -> bool {
+    /// The lifecycle matcher already identified this record's retained
+    /// owner. Keep that identity when an original pin now proves exit:
+    /// the late record still belongs to the ended group, not a replacement.
+    fn request_refresh_consumed_for_view(
+        &mut self,
+        pid: u32,
+        now_ns: Option<u64>,
+        owner: ProcessViewId,
+    ) -> bool {
+        self.request_refresh_with(pid, now_ns, true, Some(owner))
+    }
+
+    fn request_refresh_with(
+        &mut self,
+        pid: u32,
+        now_ns: Option<u64>,
+        consumed: bool,
+        owner: Option<ProcessViewId>,
+    ) -> bool {
         let existing = self.refresh_requested.get(&pid).copied();
         if existing.is_some() && !consumed {
             return true;
@@ -9855,11 +9873,12 @@ impl Engine {
             return false;
         };
         self.last_refresh_serial = serial;
-        let owner = self
-            .views
-            .iter()
-            .find(|view| view.pid() == pid && view.still_the_same())
-            .map(ProcessView::id);
+        let owner = owner.or_else(|| {
+            self.views
+                .iter()
+                .find(|view| view.pid() == pid && view.still_the_same())
+                .map(ProcessView::id)
+        });
         self.refresh_requested.insert(
             pid,
             RefreshRequest {
@@ -15331,7 +15350,7 @@ impl Engine {
                 if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {
                     admission.closed_ns = None;
                 }
-                self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
+                self.request_refresh_consumed_for_view(pid, crate::attach::monotonic_ns(), view);
                 self.queue_retirement(view, cause, pending_views);
             }
             (cause == RetirementCause::ExecRefresh).then_some(view)

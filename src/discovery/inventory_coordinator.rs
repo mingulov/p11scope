@@ -218,13 +218,7 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     diagnostic_native_unavailable: bool,
 }
 
-/// The capture-lifetime Inventory endpoint budget: the engine's admission
-/// policy and the attach set's bound are this one value.
-fn default_inventory_budget() -> Result<InventoryBudget> {
-    InventoryBudget::new(4096, 4096 * 8).map_err(anyhow::Error::msg)
-}
-
-fn default_inventory_config() -> Result<InventoryDiscoveryConfig> {
+fn inventory_config(endpoint_budget: InventoryBudget) -> Result<InventoryDiscoveryConfig> {
     let window = InventoryWindowLimits::new(16 << 20, 1 << 20, 4096, 32768, 4096)
         .map_err(anyhow::Error::msg)?;
     let retained = InventoryRetainedLimits::new(8192, 32768, 8192, 128, 128, 16 << 20)
@@ -234,11 +228,14 @@ fn default_inventory_config() -> Result<InventoryDiscoveryConfig> {
     Ok(InventoryDiscoveryConfig::new(
         work,
         InventoryOwnerLimits::new(1024, 8, 32768).map_err(anyhow::Error::msg)?,
-        default_inventory_budget()?,
+        endpoint_budget,
     ))
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    // Retain the default constructor for existing internal harness callers;
+    // the public runtime always supplies its already-resolved budget.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         scope: Scope,
         hooks: HookRegistry,
@@ -246,15 +243,35 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         source: Source,
         registry_limits: RegistryLimits,
     ) -> Result<Self> {
+        Self::new_with_budget(
+            scope,
+            hooks,
+            hints,
+            source,
+            registry_limits,
+            crate::capacity::inventory_endpoint_budget(None).map_err(anyhow::Error::msg)?,
+        )
+    }
+
+    /// One immutable endpoint policy for engine admission, catalog lowering,
+    /// the append-only attach set, and subsequent native preparation.
+    pub(crate) fn new_with_budget(
+        scope: Scope,
+        hooks: HookRegistry,
+        hints: Vec<PathBuf>,
+        source: Source,
+        registry_limits: RegistryLimits,
+        endpoint_budget: InventoryBudget,
+    ) -> Result<Self> {
         let mut adapter = CallerAdapter::new(source);
         // One caller budget, enforced where incarnations are minted; the
         // registry's caller cap stands behind it as a backstop.
         adapter.set_max_callers(registry_limits.max_callers);
         Ok(Self {
-            engine: Engine::inventory(default_inventory_config()?, scope, hooks, hints)?,
+            engine: Engine::inventory(inventory_config(endpoint_budget)?, scope, hooks, hints)?,
             adapter,
             registry: CallerRegistry::new(registry_limits),
-            attach_set: InventoryAttachSet::new(default_inventory_budget()?),
+            attach_set: InventoryAttachSet::new(endpoint_budget),
             pending_targets: TargetDelta::default(),
             capture: None,
             binder: NativeBinder::new(BinderLimits::default()),
@@ -5151,6 +5168,135 @@ mod tests {
             RegistryLimits::default_limits(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn inventory_selected_budget_reaches_plan_and_attach_set() {
+        for n in [1, 4097, 6531, 8192] {
+            let budget = crate::capacity::inventory_endpoint_budget(Some(n)).unwrap();
+            let selected = InventoryCoordinator::new_with_budget(
+                Scope::Pid(std::process::id()),
+                HookRegistry::builtin(),
+                Vec::new(),
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+                budget,
+            )
+            .unwrap();
+            assert_eq!(selected.attach_set().budget(), budget);
+            assert_eq!(
+                selected.engine.plan().admission_policy(),
+                crate::plan::AdmissionPolicy::Inventory(budget)
+            );
+        }
+        let default = coordinator();
+        let budget = crate::capacity::inventory_endpoint_budget(None).unwrap();
+        assert_eq!(default.attach_set().budget(), budget);
+        assert_eq!(
+            default.engine.plan().admission_policy(),
+            crate::plan::AdmissionPolicy::Inventory(budget)
+        );
+    }
+
+    #[test]
+    fn inventory_selected_budget_growth_refusal_keeps_ids_and_positive_history() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let mut scene = CaptureScene::new(2);
+        let budget = crate::capacity::inventory_endpoint_budget(Some(3)).unwrap();
+        scene.coordinator = InventoryCoordinator::new_with_budget(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            scene.source.clone(),
+            RegistryLimits::default_limits(),
+            budget,
+        )
+        .unwrap();
+        let other = fx::provider(&scene._dir, "b.so", "provider-b");
+        scene.pins = fx::pass_pins(&[(&scene.path, "sha-a"), (&other, "sha-b")]);
+        let policy = crate::plan::AdmissionPolicy::Inventory(budget);
+        let initial = [
+            fx::module(&scene.pins, &scene.path, &fx::offsets(2)),
+            fx::module(&scene.pins, &other, &fx::offsets(1)),
+        ];
+        let absorbed = scene
+            .coordinator
+            .attach_set
+            .absorb(&fx::lower_named(&initial, &scene.pins, policy), &scene.pins);
+        scene.delta = absorbed.delta;
+        scene.verdicts = absorbed.verdicts;
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let path = scene.path.clone();
+        scene.project_paths(7, &[&path, &other], 60);
+        scene.coordinator.commit_batch(false).unwrap();
+        let mut native = NativeScene::over(scene, 0);
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 5;
+        native.witness(vec![row]);
+        let retained: Vec<_> = native
+            .scene
+            .coordinator
+            .attach_set
+            .endpoints()
+            .copied()
+            .collect();
+        let positive = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller && edge.entry_count == 5)
+            .map(|edge| {
+                (
+                    edge.module,
+                    edge.entry_count,
+                    edge.entry_first_seen_ns,
+                    edge.entry_last_seen_ns,
+                )
+            })
+            .expect("initial positive");
+
+        // Lowering fits A's new3 whole first, then refuses B. The lifetime
+        // set already holds A2+B1, so it must refuse A's one new ID too.
+        let growth = [
+            fx::module(&native.scene.pins, &path, &fx::offsets(3)),
+            fx::module(&native.scene.pins, &other, &fx::offsets(1)),
+        ];
+        let absorbed = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(&growth, &native.scene.pins, policy),
+            &native.scene.pins,
+        );
+        assert!(absorbed.delta.is_empty());
+        assert_eq!(absorbed.gaps.len(), 1);
+        assert_eq!(absorbed.gaps[0].budget, Some((ENDPOINT_RESOURCE, 3, 4)));
+        native.scene.verdicts.extend(absorbed.verdicts);
+        native.scene.project_paths(7, &[&path, &other], 10_000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .endpoints()
+                .copied()
+                .collect::<Vec<_>>(),
+            retained
+        );
+        let preserved = native
+            .scene
+            .coordinator
+            .registry
+            .edge(caller, positive.0)
+            .unwrap();
+        assert_eq!(preserved.entry_count, positive.1);
+        assert_eq!(preserved.entry_first_seen_ns, positive.2);
+        assert_eq!(preserved.entry_last_seen_ns, positive.3);
     }
 
     /// E-test-style fixture build: compile one C source with gcc into the

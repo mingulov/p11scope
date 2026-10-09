@@ -21,6 +21,27 @@ use std::sync::{
 /// One compact inventory value is one atomic `u64` constrained to 0/1.
 pub const INVENTORY_ENDPOINT_BYTES: u64 = size_of::<u64>() as u64;
 
+/// Public Inventory policy. The upper bound is a candidate capacity,
+/// separate from the lower-level u32 ID space and measured release limits.
+pub const DEFAULT_INVENTORY_ENDPOINT_LIMIT: u64 = 4096;
+pub const MAX_INVENTORY_ENDPOINT_LIMIT: u64 = 8192;
+
+/// Resolve the capture-lifetime physical endpoint budget before opening sinks
+/// or preparing native maps. Other discovery and caller-pair limits are
+/// independent of this selection.
+pub fn inventory_endpoint_budget(requested: Option<u64>) -> Result<InventoryBudget, String> {
+    let endpoints = requested.unwrap_or(DEFAULT_INVENTORY_ENDPOINT_LIMIT);
+    if !(1..=MAX_INVENTORY_ENDPOINT_LIMIT).contains(&endpoints) {
+        return Err(format!(
+            "--max-endpoints must be in 1..={MAX_INVENTORY_ENDPOINT_LIMIT} (requested {endpoints})"
+        ));
+    }
+    let payload = endpoints
+        .checked_mul(INVENTORY_ENDPOINT_BYTES)
+        .ok_or_else(|| "inventory payload budget overflowed".to_string())?;
+    InventoryBudget::new(endpoints, payload)
+}
+
 /// Validated capacity for the compact provider-usage inventory.
 ///
 /// The endpoint count is the capture-lifetime ID bound. Its payload is exactly
@@ -2323,6 +2344,30 @@ pub fn t7_is_envelope_exhaustion(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_endpoint_policy_checks_range_and_exact_payload() {
+        let default = inventory_endpoint_budget(None).unwrap();
+        assert_eq!(default.endpoint_limit(), 4096);
+        assert_eq!(default.payload_bytes(), 32_768);
+        for n in [1, 4097, 6531, 8192] {
+            let selected = inventory_endpoint_budget(Some(n)).unwrap();
+            assert_eq!(selected.endpoint_limit(), n);
+            assert_eq!(selected.payload_bytes(), n.checked_mul(8).unwrap());
+        }
+        for n in [0, 8193, u64::from(u32::MAX) + 1, u64::MAX] {
+            let refusal = inventory_endpoint_budget(Some(n)).unwrap_err();
+            assert!(refusal.contains("--max-endpoints") && refusal.contains("1..=8192"));
+        }
+        // The public policy does not narrow the general, checked ID API.
+        let general = u64::from(u32::MAX);
+        assert_eq!(
+            InventoryBudget::new(general, general * 8)
+                .unwrap()
+                .endpoint_limit(),
+            general
+        );
+    }
 
     #[test]
     fn inventory_budget_requires_an_exact_checked_eight_byte_payload() {

@@ -1,6 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Known limitations (v0.3.0)
 
+Inventory accepts `--max-endpoints` from 1 through 8192, with the unchanged
+4096 default. This is a finite, capture-lifetime physical endpoint budget;
+unloading does not refund IDs. The 8192 candidate policy bound does not
+qualify native attach/stop cost, supported-kernel behavior or a release
+capacity envelope. Caller-pair, discovery-owner and work limits are separate,
+and selecting a larger endpoint budget does not increase them. Wider public
+native growth and resource measurements remain pending.
+
 User-facing limits of p11scope v0.3.0: per-edge entry counts end to end
 (DR-02 closed), load-instance continuity, and sharded discovery.
 The v0.2.0 cut was qualified on 2026-10-04 (from merged and green

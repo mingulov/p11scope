@@ -1513,6 +1513,7 @@ pub(crate) mod tests {
         ];
         set.absorb(&lower_named(&modules, &pins, policy), &pins);
         assert_eq!(set.len(), 8);
+        let retained_ids = ids_by_target(&set);
 
         // A grows by one: the fresh lowering admits A whole (6) first-come
         // and refuses B, which no longer fits beside it.
@@ -1526,6 +1527,7 @@ pub(crate) mod tests {
         let outcome = set.absorb(&plan, &pins);
         assert!(outcome.delta.is_empty(), "{:?}", outcome.delta);
         assert_eq!(set.len(), 8);
+        assert_eq!(ids_by_target(&set), retained_ids);
         let Some(AttachVerdict::Admitted { endpoints, reasons }) =
             outcome.verdicts.get(&module_key(&a, "sha-a"))
         else {
@@ -1544,6 +1546,7 @@ pub(crate) mod tests {
         assert_eq!(*endpoints, 3);
         assert_eq!(reasons.len(), 1, "the lowering's refusal is disclosed");
         assert_eq!(outcome.gaps.len(), 1, "{:?}", outcome.gaps);
+        assert_eq!(outcome.gaps[0].budget, Some((ENDPOINT_RESOURCE, 8, 9)));
         assert_eq!(set.module_endpoints(&module_key(&a, "sha-a")), Some(5));
         assert_eq!(set.module_endpoints(&module_key(&b, "sha-b")), Some(3));
     }

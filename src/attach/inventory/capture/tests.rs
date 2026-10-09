@@ -686,10 +686,29 @@ fn capture_activation_admits_pid_only_with_matching_live_custody() {
 
 #[test]
 fn the_default_caller_budget_is_p_65536_with_exact_payload() {
-    let callers = default_caller_budget(budget(4096)).unwrap();
-    assert_eq!(callers.pair_limit(), 65_536);
-    assert_eq!(callers.endpoint_budget(), budget(4096));
-    assert_eq!(callers.additional_payload_bytes(), 4096 * 8 + 65_536 * 64);
+    let mut totals = Vec::new();
+    for (n, total) in [(4096, 4_259_840), (8192, 4_325_376)] {
+        let endpoints = budget(n);
+        let callers = default_caller_budget(endpoints).unwrap();
+        assert_eq!(callers.pair_limit(), 65_536);
+        assert_eq!(callers.endpoint_budget(), endpoints);
+        assert_eq!(endpoints.payload_bytes(), n * 8);
+        assert_eq!(callers.additional_payload_bytes(), n * 8 + 65_536 * 64);
+        let payload = endpoints
+            .payload_bytes()
+            .checked_add(callers.additional_payload_bytes())
+            .unwrap();
+        assert_eq!(
+            payload,
+            n.checked_mul(16)
+                .unwrap()
+                .checked_add(65_536_u64.checked_mul(64).unwrap())
+                .unwrap()
+        );
+        assert_eq!(payload, total);
+        totals.push(payload);
+    }
+    assert_eq!(totals[1] - totals[0], 65_536);
 }
 
 #[test]
@@ -2784,17 +2803,32 @@ fn a_multi_extend_honours_the_window_and_defers_the_rest_unpublished() {
 
 #[test]
 fn the_multi_fd_preflight_needs_the_group_bound_not_n() {
-    let n = 4096;
-    let singles = n + 3 + FD_RESERVE;
-    let multi = MULTI_LINK_BOUND + 3 + FD_RESERVE;
-    assert!(fd_preflight(AttachBackend::Singles, n, singles - 1, 0).is_err());
-    assert!(fd_preflight(AttachBackend::Multi, n, singles - 1, 0).is_ok());
-    assert!(fd_preflight(AttachBackend::Multi, n, multi, 0).is_ok());
-    let refused = fd_preflight(AttachBackend::Multi, n, multi - 1, 0).unwrap_err();
-    assert!(refused.detail.contains("attach-group links"), "{refused}");
+    for n in [4096, 8192] {
+        let singles = n + 3 + FD_RESERVE;
+        let multi = MULTI_LINK_BOUND + 3 + FD_RESERVE;
+        assert!(fd_preflight(AttachBackend::Singles, n, singles, 0).is_ok());
+        assert!(fd_preflight(AttachBackend::Singles, n, singles - 1, 0).is_err());
+        assert!(fd_preflight(AttachBackend::Multi, n, singles - 1, 0).is_ok());
+        assert!(fd_preflight(AttachBackend::Multi, n, multi, 0).is_ok());
+        let refused = fd_preflight(AttachBackend::Multi, n, multi - 1, 0).unwrap_err();
+        assert!(refused.detail.contains("attach-group links"), "{refused}");
+        assert_eq!(entry_link_bound(AttachBackend::Singles, n), n);
+        // The reserve is FREE descriptors: existing descriptors count too.
+        for backend in [AttachBackend::Singles, AttachBackend::Multi] {
+            let needed = if backend == AttachBackend::Singles {
+                singles
+            } else {
+                multi
+            };
+            assert!(fd_preflight(backend, n, needed + 10, 10).is_ok());
+            assert!(fd_preflight(backend, n, needed + 10, 11).is_err());
+        }
+        if n == 8192 {
+            assert_eq!((singles, multi), (8259, 1091));
+        }
+    }
     // A small N bounds Multi too.
     assert_eq!(entry_link_bound(AttachBackend::Multi, 16), 16);
-    assert_eq!(entry_link_bound(AttachBackend::Singles, n), n);
 }
 
 /// Review R1: the loaded-host mode of the I3a cells asserts through this

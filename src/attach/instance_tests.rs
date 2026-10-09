@@ -31,11 +31,18 @@ const TAG_SIBLING: u64 = 0x7100_0000;
 const TAG_RACE: u64 = 0x7200_0000;
 
 fn compile(directory: &Path, provider: bool) -> Result<PathBuf> {
+    compile_for_abi(directory, provider, ElfAbi::Lp64)
+}
+
+fn compile_for_abi(directory: &Path, provider: bool, abi: ElfAbi) -> Result<PathBuf> {
     let source = directory.join("instance-continuity.c");
     std::fs::write(&source, SOURCE)?;
     let output = directory.join(if provider { "provider.so" } else { "driver" });
     let mut cc = Command::new("cc");
     cc.args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]);
+    if abi == ElfAbi::Ilp32 {
+        cc.arg("-m32");
+    }
     if provider {
         cc.args(["-fPIC", "-shared", "-DINSTANCE_PROVIDER"]);
     }
@@ -148,11 +155,20 @@ fn pin_and_plan(
     provider: &Path,
     functions: &[&str],
 ) -> Result<(ProcessView, PinnedObjects, AttachPlan, ObjectKey)> {
+    pin_and_plan_for_abi(pid, provider, functions, ElfAbi::Lp64)
+}
+
+fn pin_and_plan_for_abi(
+    pid: u32,
+    provider: &Path,
+    functions: &[&str],
+    abi: ElfAbi,
+) -> Result<(ProcessView, PinnedObjects, AttachPlan, ObjectKey)> {
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(anyhow::Error::msg)?;
     let file = open_object(provider).map_err(anyhow::Error::msg)?;
     let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
     let elf = ElfSnapshot::read(&file).map_err(anyhow::Error::msg)?;
-    ensure!(elf.abi() == ElfAbi::Lp64);
+    ensure!(elf.abi() == abi);
     let key = ObjectKey {
         device: Device {
             major: mapping.device_major,
@@ -529,6 +545,155 @@ fn spawn_cmd_target() -> Result<CmdSetup> {
         provider,
         target,
     })
+}
+
+/// A real endpoint call and its private continuity record, collected without
+/// the legacy cookie-only router harness.
+fn native_image_call(session: &mut Session, target: &mut Target) -> Result<EventRecord> {
+    let reply = target.command(b'c')?;
+    ensure!(reply.starts_with("CALL "), "owned call ledger: {reply}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let drain = session.event_drain()?;
+        let mut calls = Vec::new();
+        let _ = drain.poll_records(Some(1 << 20), |record| {
+            if record.event.event_type == event_type::CALL {
+                calls.push(record);
+            }
+            ControlFlow::Continue(())
+        });
+        ensure!(drain.malformed() == 0, "malformed native call record");
+        if !calls.is_empty() {
+            ensure!(calls.len() == 1, "one owned call must produce one record");
+            let record = calls.pop().unwrap();
+            ensure!(record.event.slot_id == TAG_MAIN);
+            ensure!(record.continuity.entry_stamp.flags == instance::STAMP_VALID);
+            ensure!(record.continuity.return_stamp.flags == instance::STAMP_VALID);
+            return Ok(record);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "owned native call record timed out"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// Explicit PID-scoped Multi supplies genuine entries after de_thread. Classic
+// Singles detach on the old leader's death; its separate refusal gate remains.
+fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile_for_abi(directory.path(), true, abi)?;
+    let driver = compile_for_abi(directory.path(), false, abi)?;
+    let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()], &[])?;
+    ensure!(target.line(Duration::from_secs(10))?.starts_with("READY"));
+    let (_view, pins, plan, _key) =
+        pin_and_plan_for_abi(target.pid(), &provider, &["C_GetSlotInfo"], abi)?;
+    let mut session = Session::start(
+        &plan,
+        &Scope::Pid(target.pid()),
+        &pins,
+        CapturePolicy::Allowlisted,
+        None,
+        None,
+        None,
+        BackendSelection::Multi,
+    )?;
+    ensure!(
+        session.static_multi_attached() && session.backend_fallback().is_none(),
+        "full-image successor positive requires attached Multi with no fallback"
+    );
+    ensure!(session.attach_failures().is_empty());
+    ensure!(
+        session.instance_tracking().refused().is_none(),
+        "full-image native startup refused: {:?}",
+        session.instance_tracking().refused()
+    );
+    let window = || capture::ReadWindow::new(1, Instant::now() + Duration::from_secs(3));
+    // Neither a fresh query nor process admission may manufacture Ready.
+    ensure!(matches!(
+        session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    let first = native_image_call(&mut session, &mut target)?;
+    let domain = session.native_domain().context("retained native domain")?;
+    let router = InstanceRouter::new(RouterLimits::default());
+    let fence = router.fence();
+    let scan = session
+        .scan_image(&target.pin, plan.slots[0].object, window()?, fence, || {
+            router.fence()
+        })
+        .map_err(|refusal| anyhow::anyhow!("full-image native scan refused: {refusal:?}"))?;
+    ensure!(scan.domain() == domain && scan.image() == first.event.image);
+    ensure!(
+        !scan.ranges().is_empty(),
+        "full-image positive must contain ranges"
+    );
+    ensure!(scan.file_slot() + 1 == u32::from(first.continuity.entry_stamp.file_slot_plus1));
+    ensure!(scan.fence() == router.fence());
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    // Poison is not repaired by a query. The real post-exec entry must renew.
+    ensure!(matches!(
+        session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    let renewed = native_image_call(&mut session, &mut target)?;
+    ensure!(renewed.event.image.task_cookie == first.event.image.task_cookie);
+    ensure!(renewed.event.image.exec_id > first.event.image.exec_id);
+    let scan = session
+        .scan_image(&target.pin, plan.slots[0].object, window()?, fence, || {
+            router.fence()
+        })
+        .map_err(|refusal| anyhow::anyhow!("renewed full-image scan refused: {refusal:?}"))?;
+    ensure!(scan.domain() == domain && scan.image() == renewed.event.image);
+    ensure!(!scan.ranges().is_empty());
+    let original_birth = target.pin.start_time();
+    let original_pid = target.pid();
+    let ready = target.command(b'E')?;
+    ensure!(ready.starts_with("READY") && target.pid() == original_pid);
+    // de_thread transfers leader birth time/PID custody. It must not be
+    // mistaken for unchanged full image identity by the scan owner.
+    ensure!(crate::process::process_start_time(original_pid).ok() == original_birth);
+    ensure!(matches!(
+        session.query_images(&[&target.pin], window()?),
+        Err(image_query::ImageQueryRefusal::Unknown)
+    ));
+    let successor = native_image_call(&mut session, &mut target)?;
+    ensure!(successor.event.image.task_cookie != renewed.event.image.task_cookie);
+    let scan = session
+        .scan_image(&target.pin, plan.slots[0].object, window()?, fence, || {
+            router.fence()
+        })
+        .map_err(|refusal| {
+            anyhow::anyhow!("nonleader successor full-image scan refused: {refusal:?}")
+        })?;
+    ensure!(scan.domain() == domain && scan.image() == successor.event.image);
+    ensure!(!scan.ranges().is_empty());
+    session
+        .audit_image_continuity()
+        .map_err(|refusal| anyhow::anyhow!("final full-image audit refused: {refusal:?}"))?;
+    let retired = target.pin.try_clone().map_err(anyhow::Error::msg)?;
+    drop(target);
+    // Real original-pin retirement control; numeric PID reuse is a separate
+    // kernel fixture, not inferred from this newly exited original.
+    ensure!(matches!(
+        session.query_images(&[&retired], window()?),
+        Err(image_query::ImageQueryRefusal::Custody)
+    ));
+    Ok(())
+}
+
+#[test]
+#[ignore = "privileged: explicit Multi, same-object iterator and nonempty LP64 successor proof"]
+fn privileged_full_image_native_multi_query_and_scan_lp64() -> Result<()> {
+    native_full_image_multi_query_and_scan(ElfAbi::Lp64)
+}
+
+#[test]
+#[ignore = "privileged: explicit Multi, same-object iterator and nonempty ia32 successor proof"]
+fn privileged_full_image_native_multi_query_and_scan_ia32() -> Result<()> {
+    native_full_image_multi_query_and_scan(ElfAbi::Ilp32)
 }
 
 /// Pins one `C_GetSlotInfo` slot per provider, in order; slot 0 is the

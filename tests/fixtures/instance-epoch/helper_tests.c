@@ -25,6 +25,15 @@ static unsigned long long test_cas(unsigned long long *cell, unsigned long long 
 }
 #include "instance_epoch.c"
 
+/* The image-continuity unit's result at the authentic entry boundary.
+ * The epoch unit must withhold and erase stamps when this authority refuses. */
+static int image_entry_ok = 1;
+u32 p11_image_entry(u64 tgid, u64 cookie, u64 exec_id)
+{
+    assert(tgid == 77 && cookie == 1 && exec_id == 0);
+    return image_entry_ok;
+}
+
 /* F5: small-state must shrink INSTANCE_START (LRU-eviction injection);
  * the default capacity is unchanged. */
 #ifdef P11SCOPE_SMALL_STATE_MAPS
@@ -213,6 +222,7 @@ static void reset(void)
     borrower.group_leader = 0;
     borrower.flags = 0;
     current_task = &thread;
+    image_entry_ok = 1;
 }
 
 static void map_hook(struct vm_area_struct___p11inst *v)
@@ -256,6 +266,14 @@ int main(void)
     inst_current_task = task;
     leader.group_leader = &leader;
     leader.mm = &mm;
+
+    /* A disabled/poisoned image may never leave a joinable entry stamp. */
+    reset();
+    struct instance_start_key refused_call = { (77ULL << 32) | 78, 3, 0 };
+    image_entry_ok = 0;
+    assert(p11_instance_entry(&refused_call, 0x1230, 1, 0) == 0);
+    assert(!start_used[0] && start_deletes == 1);
+    reset();
 
     /* Unwatched file: nothing moves, nothing is created. */
     reset();
@@ -519,7 +537,7 @@ int main(void)
     slot_file[3] = 6;
     map_hook(&vma); /* epoch 1 */
     struct instance_start_key call = { (77ULL << 32) | 78, 3, 0 };
-    assert(p11_instance_entry(&call, 0x7f0000001230ULL) == 1);
+    assert(p11_instance_entry(&call, 0x7f0000001230ULL, 1, 0) == 1);
     assert(start_used[0] && start_values[0].entry_ip == 0x7f0000001230ULL);
     assert(start_values[0].entry_stamp.epoch == 1);
     struct instance_continuity tail;
@@ -530,22 +548,22 @@ int main(void)
     assert(!memcmp(&tail.entry_stamp, &tail.return_stamp, sizeof(tail.entry_stamp)));
     assert(!start_used[0]);
     /* A mutation during the call: the halves differ (a straddle). */
-    assert(p11_instance_entry(&call, 0x7f0000001230ULL) == 1);
+    assert(p11_instance_entry(&call, 0x7f0000001230ULL, 1, 0) == 1);
     unmap_hook(&vma);
     assert(p11_instance_return(&call, &tail) == 1);
     assert(tail.entry_stamp.epoch == 1 && tail.return_stamp.epoch == 2);
     /* A failed entry update removes any stale entry for the key. */
-    assert(p11_instance_entry(&call, 0x1111) == 1);
+    assert(p11_instance_entry(&call, 0x1111, 1, 0) == 1);
     start_update_fail = 1;
     start_deletes = 0;
-    assert(p11_instance_entry(&call, 0x2222) == 0);
+    assert(p11_instance_entry(&call, 0x2222, 1, 0) == 0);
     assert(start_deletes == 1 && !start_used[0]);
     start_update_fail = 0;
     memset(&tail, 0xa5, sizeof(tail));
     assert(p11_instance_return(&call, &tail) == 0);
     assert(tail.entry_ip == 0 && tail.entry_stamp.flags == 0);
     assert(tail.return_stamp.flags == INST_STAMP_VALID && tail.return_stamp.epoch == 2);
-    assert(p11_instance_entry(0, 1) == 0);
+    assert(p11_instance_entry(0, 1, 1, 0) == 0);
 
     /* BEGIN loss: the kernel evicts a live entry (LRU pressure on a full
      * table) between the halves; the return faults instead of settling. */
@@ -553,7 +571,7 @@ int main(void)
     slot_file[3] = 6;
     map_hook(&vma); /* epoch 1 */
     struct instance_start_key victim = { (77ULL << 32) | 78, 3, 0 };
-    assert(p11_instance_entry(&victim, 0x7f0000001230ULL) == 1);
+    assert(p11_instance_entry(&victim, 0x7f0000001230ULL, 1, 0) == 1);
     assert(start_used[0] && start_values[0].entry_ip == 0x7f0000001230ULL);
     /* The harness plays the kernel's eviction role: the slot is reclaimed
      * out from under the in-flight call. */

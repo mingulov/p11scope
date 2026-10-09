@@ -87,6 +87,8 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_fork.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_query.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_query.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/stop_gate.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
@@ -201,6 +203,7 @@ fn build_variant(
         BpfFlavor::Detailed => &[
             "image_identity",
             "image_identity_fork",
+            "image_identity_query",
             "task_owner",
             "root_affiliation",
             "instance_epoch",
@@ -357,6 +360,10 @@ fn build_variant(
             "link-arg=--export=p11_inst_vma_unmap",
             "-C",
             "link-arg=--export=p11_inst_vma_copy",
+            "-C",
+            "link-arg=--export=p11_image_exec_release",
+            "-C",
+            "link-arg=--export=p11_image_query",
             "-C",
             "link-arg=--export=p11_instance_entry",
             "-C",

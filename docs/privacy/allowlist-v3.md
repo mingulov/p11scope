@@ -353,6 +353,33 @@ Kernel-side state, owned by the exact observer:
   stamp `{epoch, global, fault, file slot, flags}`. Consumed and deleted on
   return; eviction is a counted unknown, never a join.
 
+Detailed image continuity keeps, per existing task cookie, only its existing
+exec ID, a nonwrapping serialization sequence and finite Ready/Poisoned
+state. Authentic admitted non-aggregate entries alone establish/renew Ready.
+Before any joinable stamp, that entry publishes a bounded private index
+from its existing initial-kernel TGID to its existing cookie. The pre-mm
+`exec_mm_release` hook reads current TGID through the existing PID helper,
+looks up this index and poisons the indexed record before replacement.
+This index supplies negative invalidation only: selected-task queries
+freshly obtain TASK_COOKIE/self_exec_id and never consult it or repair
+state. The hook reads no task-storage value, arguments or mm pointer.
+State, index, query buffers and finite health remain private and bounded
+to the owning Session; no new public identity, target memory, syscall
+range, path or pointer retention is introduced. Metrics and both Inventory
+producers perform none of these new reads/writes. This narrow clarification
+was accepted for Task 1 implementation on 2026-10-09; the proposed object
+and attribute reads above retain their separate approval gates.
+
+Both continuity hashes cap at 16,384 retained nodes and are frozen against
+userspace writes before producers attach. Their combined raw key/value
+payload is 768 KiB, plus hash bucket/allocator overhead and one 8-byte
+coverage cell. No node is deleted, evicted or replaced. The index changes
+only through ordered 64-bit CAS at an authentic entry. Before mutating a
+missing or foreign index, an existing continuity record causes permanent
+coverage failure; it cannot be repaired. The selected-task query uses at
+most 1,024 private request slots and a 65,536-callback visit cap under the
+original scan deadline. All state dies with the owning Session.
+
 Kernel metadata read transiently by the hooks and never stored except as
 the counters above: `vm_file`, `f_inode`, `i_ino`, `i_sb->s_dev`, `vm_mm`,
 `mm_users`, `current->mm`, `current->flags` (the `PF_KTHREAD` bit only, to

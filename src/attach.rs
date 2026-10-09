@@ -52,6 +52,8 @@ pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
 // Task 3 Stage A: the readers are consumed by the Task 6 native seam
 // (`stage_native`, DR-T3A-1) and today by the privileged instance gates.
 #[allow(dead_code)]
+pub(crate) mod image_query;
+#[allow(dead_code)]
 mod instance;
 #[allow(unused_imports)]
 pub(crate) use instance::{
@@ -1192,6 +1194,8 @@ pub struct Session {
     /// Mmap of the STOP_GATE cell. Declared first so the mapping unmaps
     /// before the map FDs owned by `ebpf` close.
     stop_gate: StopGate,
+    image_coverage: image_query::CoverageControl,
+    image_query: Option<image_query::ImageQueryOwner>,
     pub(crate) ebpf: Ebpf,
     events_domain: events::EventsDomain,
     /// The session's single retained `EVENTS` consumer, built once from
@@ -2598,11 +2602,23 @@ pub(crate) fn load_capture_object(
     events_bytes: u32,
     discovery_bytes: u32,
 ) -> std::result::Result<Ebpf, aya::EbpfError> {
+    load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)
+}
+
+fn load_capture_object_with_images(
+    btf: &Btf,
+    events_bytes: u32,
+    discovery_bytes: u32,
+    full_images: bool,
+) -> std::result::Result<Ebpf, aya::EbpfError> {
     EbpfLoader::new()
         .btf(Some(btf))
         .allow_unsupported_maps()
         .map_max_entries("EVENTS", events_bytes)
         .map_max_entries("DISCOVERY", discovery_bytes)
+        .map_max_entries("IMAGE_CONTINUITY", if full_images { 16_384 } else { 1 })
+        .map_max_entries("IMAGE_TGID_INDEX", if full_images { 16_384 } else { 1 })
+        .map_max_entries("IMAGE_QUERY_REQUESTS", if full_images { 1_024 } else { 1 })
         .load(crate::EBPF_OBJECT)
 }
 
@@ -2693,6 +2709,7 @@ fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
     // The continuity hooks are present in every Detailed object but load
     // after activation, optionally (`InstanceTracking::start`).
     expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
+    expected.insert("p11_image_query");
     let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
     if actual != expected {
         bail!("eBPF program inventory {actual:?} differs from {expected:?}");
@@ -3056,10 +3073,16 @@ impl Session {
         // baked-in default, which is a no-op override of the ELF value.
         let btf =
             Btf::from_sys_fs().context("loading required vmlinux BTF for typed task_newtask")?;
-        let mut ebpf = load_capture_object(
+        let domain = if policy.wants_instance_hooks() {
+            Some(capture::NativeDomainId::try_mint()?)
+        } else {
+            None
+        };
+        let mut ebpf = load_capture_object_with_images(
             &btf,
             crate::run::resolve_ring_bytes(ring_bytes),
             discovery_ring_bytes(scope),
+            policy.wants_instance_hooks(),
         )
         .context("loading BPF object with required task storage")?;
         let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
@@ -3079,6 +3102,7 @@ impl Session {
                 SessionPreparation::ValidateRuntime => {
                     validate_runtime_maps(&ebpf, discovery_ring_bytes(scope))
                         .context("validating live-discovery runtime maps")?;
+                    image_query::prepare_maps(&ebpf, policy.wants_instance_hooks())?;
                 }
                 SessionPreparation::ValidateStopGate => {
                     validate_stop_gate(&ebpf).context("stop gate unavailable")?;
@@ -3237,10 +3261,29 @@ impl Session {
         // never join per-call records, so their slots stay unmapped.
         let trace_coverage =
             detailed_identity::TraceCoverage::after_activation(scope, monotonic_ns());
-        let instance = InstanceTracking::start(&mut ebpf, &btf, policy);
+        let image_coverage = image_query::CoverageControl::new(&ebpf)?;
+        let (image_query, image_query_refusal) = match domain {
+            Some(domain) => match image_query::ImageQueryOwner::start(&mut ebpf, &btf, domain) {
+                Ok(owner) => (Some(owner), None),
+                Err(error) => {
+                    image_coverage.fail();
+                    (None, Some(format!("{error:#}")))
+                }
+            },
+            None => (None, None),
+        };
+        let instance = InstanceTracking::start(
+            &mut ebpf,
+            &btf,
+            policy,
+            &image_coverage,
+            image_query_refusal,
+        );
 
         Ok(Self {
             stop_gate: stop_gate.expect("preparation established the stop gate"),
+            image_coverage,
+            image_query,
             ebpf,
             events_domain,
             events_consumer: None,
@@ -4548,6 +4591,8 @@ fn finish_producer_detach(
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Refuse continuity before closing any owned producer/hook link.
+        self.image_coverage.fail();
         // Never block on a worker-owned link: leftovers move to the
         // worker and close in the background (at process exit the kernel
         // finishes). Evidence is best-effort; there is no caller to fail.

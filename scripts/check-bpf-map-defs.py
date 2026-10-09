@@ -407,6 +407,8 @@ EXACT_PROGRAM_SECTIONS = {
     "p11_inst_vma_map": "fentry/uprobe_mmap",
     "p11_inst_vma_unmap": "fentry/uprobe_munmap",
     "p11_inst_vma_copy": "fexit/copy_vma",
+    "p11_image_exec_release": "fentry/exec_mm_release",
+    "p11_image_query": "iter/task",
 }
 
 DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
@@ -450,7 +452,8 @@ def validate_private_helpers(elf, prefix, required, optional, label,
     # file-level semantics without them (as task_newtask).
     for name, location in EXACT_PROGRAM_SECTIONS.items():
         if inventory and name in ("task_newtask", "p11_inst_vma_map",
-                                  "p11_inst_vma_unmap", "p11_inst_vma_copy"):
+                                  "p11_inst_vma_unmap", "p11_inst_vma_copy",
+                                  "p11_image_exec_release", "p11_image_query"):
             continue
         matches = [s for s in elf.symbols if s[0] == name]
         if (len(matches) != 1 or matches[0][1] != 0x12 or matches[0][2] != 0
@@ -1535,7 +1538,11 @@ SAFE_MAPS = {
         "SLOT_FILE": (2, 4, 4, 512, 128),
         "PROC_EPOCH": (29, 4, 144, 0, 1),
         "G_EPOCH": (2, 4, 8, 1_024),
-        "INSTANCE_GEN": (2, 4, 8, 3, 1024),
+        "INSTANCE_GEN": (2, 4, 8, 4, 1024),
+        "IMAGE_CONTINUITY": (1, 8, 24, 16_384, 17),
+        "IMAGE_TGID_INDEX": (1, 8, 8, 16_384, 17),
+        "IMAGE_QUERY_REQUESTS": (1, 8, 24, 1_024, 129),
+        "IMAGE_QUERY_CTL": (2, 4, 56, 1),
         "INSTANCE_CALIB": (2, 4, 40, 1),
         "INSTANCE_COUNT": (2, 4, 80, 1),
         "INSTANCE_START": (9, 16, 24, 16_384),
@@ -1571,8 +1578,11 @@ SAFE_PROGRAMS = {
     "p11_inst_vma_map",
     "p11_inst_vma_unmap",
     "p11_inst_vma_copy",
+    "p11_image_exec_release",
+    "p11_image_query",
 }
-INSTANCE_PROGRAMS = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"}
+INSTANCE_PROGRAMS = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
+                     "p11_image_exec_release", "p11_image_query"}
 UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
     "p11_entry_ia32",
     "p11_entry_template", "p11_entry_template_pair",
@@ -1600,6 +1610,7 @@ INVENTORY_FORBIDDEN_MAPS = {
     "ASYNC_FUNCTIONS", "ATTR_BOOL_BITS", "PAUSE_PIDS", "TASK_COOKIE", "COOKIE_CTL",
     "ROOT_AFFILIATION", "ROOT_CTL", "WATCHED_FILES", "SLOT_FILE", "PROC_EPOCH", "G_EPOCH",
     "INSTANCE_GEN", "INSTANCE_CALIB", "INSTANCE_COUNT", "INSTANCE_START",
+    "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS", "IMAGE_QUERY_CTL",
 }
 INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "ENDPOINT_OBJECT": map_def(2, 4, 8, 1, 128),
@@ -1669,7 +1680,7 @@ def validate_inventory(variant, maps, programs, symbols):
         forbidden = {name for name in symbols if name not in allowed and
                      (name in INVENTORY_FORBIDDEN_MAPS
                       or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_",
-                                          "p11_inst")))}
+                                          "p11_inst", "p11_image_")))}
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
@@ -1719,12 +1730,12 @@ def self_test():
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
     assert "PAIR_CALLS" not in SAFE_MAPS
     assert "PAIR_CALLS" not in INVENTORY_MAPS
-    assert len(SAFE_MAPS) == 32
-    assert len(UNSAFE_MAPS) == 34
-    assert len(WIDE_MAPS) == 32
-    assert len(WIDE_UNSAFE_MAPS) == 34
-    assert len(SAFE_PROGRAMS) == 16
-    assert len(UNSAFE_PROGRAMS) == 21
+    assert len(SAFE_MAPS) == 36
+    assert len(UNSAFE_MAPS) == 38
+    assert len(WIDE_MAPS) == 36
+    assert len(WIDE_UNSAFE_MAPS) == 38
+    assert len(SAFE_PROGRAMS) == 18
+    assert len(UNSAFE_PROGRAMS) == 23
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)
     diagnostic = (

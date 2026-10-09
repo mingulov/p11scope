@@ -5162,11 +5162,12 @@ fn frozen_policy_inventory_matches_embedded_object() {
         (true, false) => ("wide-default", "wide-diagnostic", "default"),
         (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
     };
-    // Task 3 Stage A adds eight instance maps and three VMA hook programs.
+    // Stage A plus image continuity: four additional private maps, one
+    // pre-mm hook and one same-object task iterator.
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (34, 21)
+        (38, 23)
     } else {
-        (32, 16)
+        (36, 18)
     };
     let report = run_ok(
         "python3",
@@ -6075,6 +6076,128 @@ fn instance_epoch_kernel_shapes_are_flavored_apart_from_other_units() {
     assert!(
         read("crates/ebpf/native/instance_epoch.h").contains("0x00200000"),
         "INST_PF_KTHREAD must be the sched.h PF_KTHREAD bit"
+    );
+}
+
+#[test]
+fn stagea_hook_census_accepts_exact_kernel_names_and_refuses_collisions() {
+    let source = read("scripts/bench-stagea-overhead.sh");
+    let script = between(
+        &source,
+        "# STAGEA_HOOK_CENSUS_BEGIN\n",
+        "# STAGEA_HOOK_CENSUS_END",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let programs = directory.path().join("programs.json");
+    let links = directory.path().join("links.json");
+    let names = [
+        "p11_inst_vma_map",
+        "p11_inst_vma_unmap",
+        "p11_inst_vma_copy",
+        "p11_image_exec_release",
+    ];
+    let good: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            serde_json::json!({
+                "id":index + 1, "name":&name[..15], "run_time_ns":10, "run_cnt":1
+            })
+        })
+        .collect();
+    let good_links: Vec<_> = (0..4)
+        .map(|index| serde_json::json!({"id":index + 100,"prog_id":index + 1,"type":"tracing"}))
+        .collect();
+    fs::write(&programs, serde_json::to_vec(&good).unwrap()).unwrap();
+    fs::write(&links, serde_json::to_vec(&good_links).unwrap()).unwrap();
+    let run = |mode: &str| {
+        Command::new("python3")
+            .args(["-I", "-c", script])
+            .arg(&programs)
+            .arg(&links)
+            .arg(mode)
+            .output()
+            .unwrap()
+    };
+    for (mode, expected) in [("programs", "4"), ("links", "4"), ("stats", "40 4")] {
+        let output = run(mode);
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    }
+    for case in 0..2 {
+        let mut bad = good_links.clone();
+        if case == 0 {
+            // Keep the total four while omitting the required exec hook.
+            bad[3]["prog_id"] = serde_json::json!(1);
+        } else {
+            bad[3]["type"] = serde_json::json!("raw_tracepoint");
+        }
+        fs::write(&links, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(
+            !run("links").status.success(),
+            "hook link census case {case} was accepted"
+        );
+    }
+    fs::write(&links, serde_json::to_vec(&good_links).unwrap()).unwrap();
+    for case in 0..4 {
+        let mut bad = good.clone();
+        match case {
+            0 => {
+                bad.pop();
+            }
+            1 => {
+                let mut duplicate = good[3].clone();
+                duplicate["id"] = serde_json::json!(99);
+                bad.push(duplicate);
+            }
+            2 => {
+                bad[3]["name"] = serde_json::json!("p11_image_exec_collision");
+            }
+            _ => {
+                bad[3].as_object_mut().unwrap().remove("run_time_ns");
+            }
+        }
+        fs::write(&programs, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(
+            !run("stats").status.success(),
+            "hook census case {case} was accepted"
+        );
+    }
+}
+
+#[test]
+fn image_continuity_native_entry_index_poison_and_query() {
+    let directory = tempfile::tempdir().expect("temporary native image query test");
+    let binary = directory.path().join("image-query-tests");
+    let compile = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/image-identity/query_tests.c",
+            "-pthread",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile native image continuity/query regression");
+    assert!(
+        compile.status.success(),
+        "native image compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(binary)
+        .output()
+        .expect("run native image continuity/query regression");
+    assert!(
+        run.status.success(),
+        "native image regression failed: {}",
+        String::from_utf8_lossy(&run.stderr)
     );
 }
 

@@ -722,6 +722,317 @@ pub struct PidPin {
     start_time: Option<u64>,
 }
 
+/// Acquisition seam shared by the strict proc owner and its race regressions.
+fn acquire_proc_dir_with<T>(
+    has_pidfd: bool,
+    birth: Option<u64>,
+    mut alive: impl FnMut() -> Result<bool, String>,
+    open: impl FnOnce() -> Result<T, String>,
+    directory_birth: impl FnOnce(&T) -> Result<u64, String>,
+) -> Result<T, String> {
+    if !has_pidfd {
+        return Err("full-image custody requires the original pidfd".into());
+    }
+    let birth =
+        birth.ok_or_else(|| "full-image custody requires the admission start time".to_string())?;
+    if !alive()? {
+        return Err("original process exited before proc acquisition".into());
+    }
+    let directory = open()?;
+    if !alive()? {
+        return Err("original process exited during proc acquisition".into());
+    }
+    if directory_birth(&directory)? != birth {
+        return Err("proc acquisition crossed a process generation change".into());
+    }
+    if !alive()? {
+        return Err("original process exited while proc identity was read".into());
+    }
+    Ok(directory)
+}
+
+/// A proc directory acquired under original-pidfd custody. It pins a struct
+/// pid, not an mm: only the full-image scan brackets authorize its ranges.
+pub(crate) struct ProcPin<'a> {
+    pin: &'a PidPin,
+    directory: OwnedFd,
+}
+
+fn relative_proc_open(directory: BorrowedFd<'_>, path: &std::ffi::CStr) -> Result<OwnedFd, String> {
+    // SAFETY: live directory fd and NUL-terminated, internally selected path.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "opening retained proc member: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: openat returned a newly owned fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+impl PidPin {
+    pub(crate) fn open_proc_dir(&self) -> Result<ProcPin<'_>, String> {
+        if !crate::pidns::numbering().agrees() {
+            return Err("full-image custody requires observer/proc/kernel PID agreement".into());
+        }
+        let path = std::ffi::CString::new(format!("/proc/{}", self.pid)).unwrap();
+        let directory = acquire_proc_dir_with(
+            self.pidfd.is_some(),
+            self.start_time,
+            || self.original_exited().map(|exited| !exited),
+            || {
+                // SAFETY: internally formed numeric proc path, no symlink.
+                let fd = unsafe {
+                    libc::open(
+                        path.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+                if fd < 0 {
+                    return Err(format!(
+                        "acquiring proc directory: {}",
+                        io::Error::last_os_error()
+                    ));
+                }
+                // SAFETY: open returned a new owned directory descriptor.
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            },
+            |directory| {
+                let stat = relative_proc_open(directory.as_fd(), c"stat")?;
+                let text = read_stat_bytes(std::fs::File::from(stat))
+                    .map_err(|error| format!("reading retained proc stat: {error}"))?;
+                start_time_from_stat(&text)
+                    .map_err(|error| format!("parsing retained proc stat: {error}"))
+            },
+        )?;
+        Ok(ProcPin {
+            pin: self,
+            directory,
+        })
+    }
+}
+
+impl ProcPin<'_> {
+    fn before_io(&self, deadline: std::time::Instant) -> Result<(), String> {
+        if std::time::Instant::now() >= deadline {
+            return Err("full-image scan deadline exhausted".into());
+        }
+        if self.pin.original_exited()? {
+            return Err("original process exited during full-image scan".into());
+        }
+        Ok(())
+    }
+
+    /// One relative maps open retained to real EOF. `max_bytes` includes all
+    /// maps rows, not just selected ranges; truncation never means completion.
+    pub(crate) fn read_maps(
+        &self,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        self.read_maps_with(deadline, max_bytes, || {})
+    }
+
+    fn read_maps_with(
+        &self,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+        mut after_read: impl FnMut(),
+    ) -> Result<Vec<u8>, String> {
+        use std::io::Read as _;
+        if max_bytes == 0 || max_bytes > 8 * 1024 * 1024 {
+            return Err("invalid maps byte bound".into());
+        }
+        self.before_io(deadline)?;
+        let fd = relative_proc_open(self.directory.as_fd(), c"maps")?;
+        self.before_io(deadline)?;
+        let mut file = std::fs::File::from(fd);
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            self.before_io(deadline)?;
+            let count = file
+                .read(&mut buffer)
+                .map_err(|error| format!("reading retained maps: {error}"))?;
+            after_read();
+            self.before_io(deadline)?;
+            if count == 0 {
+                return Ok(bytes);
+            }
+            if count > max_bytes.saturating_sub(bytes.len()) {
+                return Err("retained maps exceeds its byte bound".into());
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_open_at<'a>(
+        pin: &'a PidPin,
+        path: &std::path::Path,
+    ) -> Result<ProcPin<'a>, String> {
+        let directory = acquire_proc_dir_with(
+            pin.pidfd.is_some(),
+            pin.start_time,
+            || pin.original_exited().map(|exited| !exited),
+            || {
+                std::fs::File::open(path)
+                    .map(OwnedFd::from)
+                    .map_err(|error| error.to_string())
+            },
+            |directory| {
+                let stat = relative_proc_open(directory.as_fd(), c"stat")?;
+                let text = read_stat_bytes(std::fs::File::from(stat))
+                    .map_err(|error| error.to_string())?;
+                start_time_from_stat(&text).map_err(|error| error.to_string())
+            },
+        )?;
+        Ok(ProcPin { pin, directory })
+    }
+
+    /// Typed range confirmation only; no raw descriptor or arbitrary-path API.
+    pub(crate) fn mapped_file_identity(
+        &self,
+        start: u64,
+        end: u64,
+        deadline: std::time::Instant,
+    ) -> Result<crate::discovery::instances::MappedFileIdentity, String> {
+        if start >= end || start & 4095 != 0 || end & 4095 != 0 {
+            return Err("invalid mapped range".into());
+        }
+        self.before_io(deadline)?;
+        let path = std::ffi::CString::new(format!("map_files/{start:x}-{end:x}")).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: retained directory, typed internally generated range path,
+        // output buffer; flags=0 follows this procfs map_files link.
+        let result = unsafe {
+            libc::fstatat(
+                self.directory.as_raw_fd(),
+                path.as_ptr(),
+                stat.as_mut_ptr(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(format!(
+                "confirming retained mapped file: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        self.before_io(deadline)?;
+        // SAFETY: successful fstatat initialized the complete stat buffer.
+        let stat = unsafe { stat.assume_init() };
+        Ok(crate::discovery::instances::MappedFileIdentity {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        })
+    }
+}
+
+#[cfg(test)]
+mod proc_custody_tests {
+    use super::acquire_proc_dir_with;
+    use std::cell::Cell;
+
+    #[test]
+    fn pid_reuse_between_pin_and_proc_open_refuses() {
+        let calls = Cell::new(0);
+        let result = acquire_proc_dir_with(
+            true,
+            Some(11),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(calls.get() == 1)
+            },
+            || Ok(22),
+            |directory| Ok(*directory),
+        );
+        assert!(result.is_err(), "replacement proc directory was accepted");
+    }
+
+    #[test]
+    fn changed_admission_birth_during_proc_open_refuses() {
+        let result = acquire_proc_dir_with(
+            true,
+            Some(11),
+            || Ok(true),
+            || Ok(22),
+            |directory| Ok(*directory),
+        );
+        assert!(result.is_err(), "a changed admission birth was accepted");
+    }
+
+    #[test]
+    fn strict_proc_acquisition_requires_birth_and_original_pidfd() {
+        for (pidfd, birth) in [(false, Some(11)), (true, None)] {
+            let result = acquire_proc_dir_with(
+                pidfd,
+                birth,
+                || Ok(true),
+                || Ok(11),
+                |directory| Ok(*directory),
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn stable_proc_acquisition_keeps_directory_after_final_liveness_check() {
+        let calls = Cell::new(0);
+        let result = acquire_proc_dir_with(
+            true,
+            Some(11),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(true)
+            },
+            || Ok(11),
+            |directory| Ok(*directory),
+        );
+        assert_eq!(result.unwrap(), 11);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn original_pin_death_during_actual_maps_read_refuses() {
+        struct ReapOnDrop(std::process::Child);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ReapOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let pin = super::PidPin::open(child.0.id()).unwrap();
+        let proc = pin.open_proc_dir().unwrap();
+        let mut killed = false;
+        let result = proc.read_maps_with(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            8 * 1024 * 1024,
+            || {
+                if !killed {
+                    child.0.kill().unwrap();
+                    child.0.wait().unwrap();
+                    killed = true;
+                }
+            },
+        );
+        assert!(killed && result.is_err());
+    }
+}
+
 impl PidPin {
     /// A second custody handle on the same pinned generation: the pidfd is
     /// duplicated (`F_DUPFD_CLOEXEC`), never reopened by PID, so it names
@@ -1077,6 +1388,10 @@ fn gone_from(start_time: io::Result<u64>) -> bool {
 
 pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
     let stat = read_proc_stat(pid)?;
+    start_time_from_stat(&stat)
+}
+
+fn start_time_from_stat(stat: &str) -> io::Result<u64> {
     let end = stat
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat comm"))?;

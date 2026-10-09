@@ -2556,7 +2556,7 @@ unsafe extern "C" {
     /// call's START key; the return half fills an `EventRecord`'s private
     /// tail in place. Both own their stack frames, so no probe frame grows.
     #[cfg(not(feature = "inventory-only"))]
-    fn p11_instance_entry(key: *const StartKey, ip: u64) -> u32;
+    fn p11_instance_entry(key: *const StartKey, ip: u64, cookie: u64, exec_id: u64) -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_return(key: *const StartKey, out: *mut InstanceContinuity) -> u32;
     #[cfg(not(feature = "inventory-only"))]
@@ -2716,7 +2716,14 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     // not grow). A failure leaves no entry, which the return half reports as
     // an invalid, never-joining stamp. An entry orphaned by a later refusal
     // is overwritten by the key's next call or reclaimed by the LRU.
-    let _ = unsafe { p11_instance_entry(&key, entry_ip(&ctx, layout)) };
+    let _ = unsafe {
+        p11_instance_entry(
+            &key,
+            entry_ip(&ctx, layout),
+            start.image.task_cookie,
+            start.image.exec_id,
+        )
+    };
     start.session = SESSION_NONE;
     start.mechanism = MECH_NONE;
     start.user_type = USER_TYPE_NONE;

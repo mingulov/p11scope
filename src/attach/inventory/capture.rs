@@ -424,9 +424,12 @@ impl ReadWindow {
     }
 
     /// The row bound (scripted facades honour it).
-    #[cfg(test)]
     pub(crate) fn max_rows(&self) -> usize {
         self.max_rows
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
     }
 }
 
@@ -443,8 +446,41 @@ impl NativeDomainId {
     /// process: the Inventory capture here and the Detailed (C6) object
     /// alike must mint through it, so no two loaded objects ever share
     /// a domain.
+    pub(crate) fn try_mint() -> Result<Self> {
+        mint_domain_from(&NEXT_DOMAIN)
+    }
+
+    #[cfg(test)]
     pub(crate) fn mint() -> Self {
-        Self(NEXT_DOMAIN.fetch_add(1, Ordering::Relaxed))
+        Self::try_mint().expect("test domain allocation is not exhausted")
+    }
+}
+
+fn mint_domain_from(counter: &AtomicU64) -> Result<NativeDomainId> {
+    let value = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            if next == 0 { None } else { next.checked_add(1) }
+        })
+        .map_err(|_| anyhow::anyhow!("native identity domain exhausted"))?;
+    Ok(NativeDomainId(value))
+}
+
+#[cfg(test)]
+mod domain_mint_tests {
+    use super::*;
+
+    #[test]
+    fn domain_mint_refuses_zero_and_exhaustion_without_reusing_identity() {
+        for initial in [0, u64::MAX] {
+            let counter = AtomicU64::new(initial);
+            assert!(mint_domain_from(&counter).is_err());
+            assert_eq!(counter.load(Ordering::Relaxed), initial);
+        }
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let last = mint_domain_from(&counter).unwrap();
+        assert_eq!(last, NativeDomainId(u64::MAX - 1));
+        assert!(mint_domain_from(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
 
@@ -1155,14 +1191,25 @@ impl CaptureBook {
         )
     }
 
+    #[cfg(test)]
     fn new_scoped(
         budget: InventoryBudget,
         pair_limit: usize,
         scope: HeldCaptureScope,
         now_ns: u64,
     ) -> Self {
+        Self::new_scoped_with_domain(NativeDomainId::mint(), budget, pair_limit, scope, now_ns)
+    }
+
+    fn new_scoped_with_domain(
+        domain: NativeDomainId,
+        budget: InventoryBudget,
+        pair_limit: usize,
+        scope: HeldCaptureScope,
+        now_ns: u64,
+    ) -> Self {
         Self {
-            domain: NativeDomainId::mint(),
+            domain,
             budget,
             backend: AttachBackend::Singles,
             groups: Vec::new(),
@@ -1985,6 +2032,7 @@ impl InventoryCapture {
         callers: CallerBudget,
         backend: AttachBackend,
     ) -> Result<Self> {
+        let domain = NativeDomainId::try_mint()?;
         if backend == AttachBackend::Multi && matches!(scope, CaptureScope::Pid(_)) {
             crate::attach::kernel_multi_pid_filter().map_err(|reason| {
                 anyhow::anyhow!(
@@ -2014,8 +2062,14 @@ impl InventoryCapture {
             PreparedInventory::prepare_callers_pinned(scope, pid_pin, endpoints, callers, backend)?;
         Ok(Self {
             state: CaptureState::Prepared(Box::new(prepared)),
-            book: CaptureBook::new_scoped(endpoints, pair_limit, held_scope, monotonic_ns())
-                .with_backend(backend),
+            book: CaptureBook::new_scoped_with_domain(
+                domain,
+                endpoints,
+                pair_limit,
+                held_scope,
+                monotonic_ns(),
+            )
+            .with_backend(backend),
         })
     }
 

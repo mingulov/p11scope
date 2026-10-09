@@ -457,6 +457,44 @@ class Reader:
         return ''.join(self.lines)
 
 
+def wait_capture_started(errors, allow_empty=False, seconds=10):
+    count = r'(?:0|[1-9]\d*)' if allow_empty else r'[1-9]\d*'
+    return errors.wait(lambda reader: any(re.fullmatch(
+        rf'p11scope: capturing: {count} probe\(s\) attached; stop with Ctrl-C\n?', line)
+        for line in reader.lines), seconds)
+
+
+def wait_run_provider_ready(capture, image, provider, seconds=10):
+    row_pattern = runpy.run_path(str(ROOT / 'scripts/cgroup-trace-oracle.py'))['ROW']
+    def attached_setup(reader):
+        key = image['image'], 'C_OpenSession'
+        ready = [row for row in reader.records
+                 if row.get('kind') == 'ready' and row.get('image') == key[0]]
+        calls = [row for row in reader.records if row.get('kind') == 'call'
+                 and (row.get('image'), row.get('fn'), row.get('phase')) == (*key, 'setup')]
+        targets = [row for row in reader.records if row.get('kind') == 'target'
+                   and (row.get('image'), row.get('fn')) == key]
+        if not ready or not calls or not targets:
+            return None
+        if len(ready) != 1 or len(calls) != 1 or len(targets) != 1:
+            raise ValueError('run setup readiness requires one authentic setup completion')
+        call, target = calls[0], targets[0]
+        if (call.get('pid') != image['pid'] or call.get('tid') != image['pid']
+                or call.get('rv') != 0 or call.get('scope') != 'selected'
+                or not 0 <= call['t0'] <= call['t1'] <= ready[0]['t']):
+            raise ValueError('run setup readiness disagrees with owned caller identity/interval')
+        if (target.get('dev') != provider['dev'] or target.get('ino') != provider['ino']
+                or not isinstance(target.get('file_offset'), int) or target['file_offset'] < 0):
+            raise ValueError('run setup readiness lacks the independently held provider target')
+        for line in reader.lines:
+            match = row_pattern.fullmatch(line.rstrip('\n'))
+            if match and (int(match['pid']), int(match['tid']), match['fn'], match['rv']) == (
+                    call['pid'], call['tid'], call['fn'], 'CKR_OK'):
+                return call
+        return None
+    return capture.wait(attached_setup, seconds)
+
+
 class Resources:
     def __init__(self, owner):
         self.owner, self.samples, self.stop_event = owner, [], threading.Event()
@@ -605,9 +643,7 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
         errors = Reader(proc.stderr, directory / 'observer.stderr.txt')
         readers.extend((capture, errors))
         sampler = Resources(observer)
-        errors.wait(lambda reader: any(re.fullmatch(
-            r'p11scope: capturing: [1-9]\d* probe\(s\) attached; stop with Ctrl-C\n?', line)
-            for line in reader.lines))
+        wait_capture_started(errors, allow_empty=name == 'run')
         receipt['observer_ready_ns'] = time.monotonic_ns()
         if name == 'run':
             capture.record('ready')
@@ -616,6 +652,10 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
                 caller = OwnedProcess(image['pid'], observer.pid, args.uid)
                 owners.insert(0, caller)
             images.append(callers[0].image_receipt(image, caller))
+            wait_run_provider_ready(capture, images[0], receipt['provider_before'])
+            # Setup remains explicitly ledgered before this gate-release
+            # readiness; every later main/teardown call stays mandatory.
+            receipt['observer_ready_ns'] = time.monotonic_ns()
             gate.touch(mode=0o644)
             done = capture.record('ack', 0, 'done')
             stop_started = time.monotonic_ns()

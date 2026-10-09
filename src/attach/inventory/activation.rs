@@ -215,8 +215,7 @@ pub(super) fn validate_capture_activation(
             );
             require_live_pid_custody(pin)?;
         }
-        Scope::System => {}
-        Scope::Cgroup { .. } => bail!("Inventory capture does not offer cgroup scope yet"),
+        Scope::System | Scope::Cgroup { .. } => {}
     }
     // Both backends: Multi loads the entries for uprobe-multi and attaches
     // them only through `attach_entry_group`.
@@ -1478,7 +1477,7 @@ impl PreparedInventory {
 /// The capture facade's entry scope: `OneProcess` for PID scope (the same
 /// seam Detailed uses), so the kernel binds each entry to the original
 /// task and a reused PID never fires it; process-wide otherwise.
-fn capture_entry_scope(scope: &Scope) -> UProbeScope {
+pub(super) fn capture_entry_scope(scope: &Scope) -> UProbeScope {
     match scope {
         Scope::Pid(pid) => match std::num::NonZeroU32::new(*pid) {
             Some(pid) => UProbeScope::OneProcess(pid),

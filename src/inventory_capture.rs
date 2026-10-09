@@ -6,7 +6,7 @@
 //!
 //! The order is the C3/C4 contract (`task6-c5-plan.md` §1 C5.1):
 //!
-//! 1. Startup: `begin_capture_coverage(incarnation)`, then an empty-delta
+//! 1. Startup: `begin_capture_coverage(scope)`, then an empty-delta
 //!    `extend` that activates the lifecycle roots before the first scan,
 //!    then `note_extend_receipt`. The activating receipt carries
 //!    `exec_coverage`, so it is forwarded before any native batch of its
@@ -47,9 +47,9 @@
 //! discloses the mechanism and any fallback reason.
 
 use crate::attach::capture::{
-    CaptureScope, CaptureTargets, CleanupSummary, CookieQuery, DiscoveryBatch, ExtendReceipt,
-    ExtendWindow, InventoryCapture, NativeDomainId, ReadWindow, RetiredCapture, RetiringCapture,
-    ScopeCustody, ScopeIncarnation, WitnessBatch, default_caller_budget,
+    CaptureScope, CaptureScopeCoverage, CaptureTargets, CleanupSummary, CookieQuery,
+    DiscoveryBatch, ExtendReceipt, ExtendWindow, InventoryCapture, NativeDomainId, ReadWindow,
+    RetiredCapture, RetiringCapture, ScopeCustody, WitnessBatch, default_caller_budget,
 };
 use crate::attach::{AttachBackend, BackendSelection};
 use crate::discovery::caller_registry::{CallerEvent, ProcessSource, UnknownReason, now_ns};
@@ -60,7 +60,7 @@ use crate::discovery::inventory_attach_set::TargetDelta;
 use crate::discovery::native_binding::{NativeIdentity, ScanOnlyIdentity};
 use crate::inspect_system::Catalog;
 use crate::process::PidPin;
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use p11scope_ebpf_common::ImageIdentity;
 use std::time::{Duration, Instant};
 
@@ -222,6 +222,8 @@ pub(crate) enum ScopeFilter {
     /// PID scope, Multi: each group names the target (the proven kernel
     /// uprobe-multi pid filter), plus the in-BPF PID_FILTER guard.
     KernelPidAndBpf,
+    /// Cgroup scope: all-process links plus the frozen retained-root filter.
+    BpfCgroup,
 }
 
 impl ScopeFilter {
@@ -230,6 +232,7 @@ impl ScopeFilter {
             ScopeFilter::None => None,
             ScopeFilter::PerfTaskAndBpf => Some("perf-task+bpf"),
             ScopeFilter::KernelPidAndBpf => Some("kernel-pid+bpf"),
+            ScopeFilter::BpfCgroup => Some("bpf-cgroup"),
         }
     }
 }
@@ -312,6 +315,40 @@ pub(crate) fn prepare_on_backend<T>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiScopeProbe {
+    General,
+    PidFilter,
+}
+
+/// The facade's backend selection with its retained scope carried through
+/// every attempt. Cgroup uses the general probe and never becomes System on
+/// retry; only PID links need the functional kernel PID-filter probe.
+fn prepare_scoped_on_backend<T>(
+    selection: BackendSelection,
+    scope: &CaptureScope,
+    mut probe: impl FnMut(MultiScopeProbe) -> std::result::Result<(), String>,
+    mut prepare: impl FnMut(CaptureScope, AttachBackend) -> Result<T>,
+) -> Result<(T, LaneBackend)> {
+    let coverage = scope.scope_coverage();
+    let probe_kind = match coverage {
+        CaptureScopeCoverage::Pid(_) => MultiScopeProbe::PidFilter,
+        CaptureScopeCoverage::System | CaptureScopeCoverage::Cgroup => MultiScopeProbe::General,
+    };
+    let (capture, mut backend) = prepare_on_backend(
+        selection,
+        || probe(probe_kind),
+        |backend| prepare(scope.clone_for_prepare()?, backend),
+    )?;
+    backend.scope_filter = match (coverage, backend.backend) {
+        (CaptureScopeCoverage::System, _) => ScopeFilter::None,
+        (CaptureScopeCoverage::Cgroup, _) => ScopeFilter::BpfCgroup,
+        (CaptureScopeCoverage::Pid(_), AttachBackend::Multi) => ScopeFilter::KernelPidAndBpf,
+        (CaptureScopeCoverage::Pid(_), AttachBackend::Singles) => ScopeFilter::PerfTaskAndBpf,
+    };
+    Ok((capture, backend))
+}
+
 /// The production functional probe ([`crate::attach::multi_functional_probe`],
 /// shared with the classic session's backend selection).
 pub(crate) use crate::attach::multi_functional_probe;
@@ -330,7 +367,7 @@ pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
     fn live_links(&self) -> Option<usize> {
         None
     }
-    fn incarnation(&self) -> Option<ScopeIncarnation>;
+    fn scope_coverage(&self) -> CaptureScopeCoverage;
     fn extend(
         &mut self,
         delta: TargetDelta,
@@ -351,7 +388,7 @@ pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
 /// The coordinator calls the lane makes (the C3/C4 staging API). A test
 /// host records them around a real coordinator.
 pub(crate) trait LaneHost<Pin> {
-    fn begin_capture_coverage(&mut self, scope: Option<ScopeIncarnation>);
+    fn begin_capture_coverage(&mut self, scope: CaptureScopeCoverage);
     /// Forget a capture coverage that never activated (the auto fallback).
     fn abandon_capture_coverage(&mut self);
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt);
@@ -375,7 +412,7 @@ pub(crate) trait LaneHost<Pin> {
 }
 
 impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
-    fn begin_capture_coverage(&mut self, scope: Option<ScopeIncarnation>) {
+    fn begin_capture_coverage(&mut self, scope: CaptureScopeCoverage) {
         InventoryCoordinator::begin_capture_coverage(self, scope);
     }
 
@@ -560,7 +597,7 @@ impl<L> NativeLane<L> {
         L: CaptureLane<Pin>,
         H: LaneHost<Pin> + ?Sized,
     {
-        host.begin_capture_coverage(capture.incarnation());
+        host.begin_capture_coverage(capture.scope_coverage());
         let receipt = capture.extend(
             TargetDelta::default(),
             host.capture_targets(),
@@ -1301,7 +1338,7 @@ where
 /// The production lane: the owned facade across its typestates.
 pub(crate) struct FacadeLane {
     domain: NativeDomainId,
-    incarnation: Option<ScopeIncarnation>,
+    scope_coverage: CaptureScopeCoverage,
     backend: LaneBackend,
     state: FacadeState,
 }
@@ -1324,43 +1361,18 @@ impl FacadeLane {
         selection: BackendSelection,
     ) -> Result<Self> {
         let callers = default_caller_budget(endpoints)?;
-        // A PID scope's custody is one pidfd: a retried preparation needs
-        // its own clone of the same pin, never a reopened PID.
-        let mut scope = Some(scope);
-        // PID scope's probe is the pid-filter probe: it links a counting
-        // uprobe-multi probe named by PID, so it proves both that the
-        // kernel links one and that its filter covers every thread.
-        let system = matches!(scope, Some(CaptureScope::System));
-        let (capture, mut backend) = prepare_on_backend(
+        let (capture, backend) = prepare_scoped_on_backend(
             selection,
-            || {
-                if system {
-                    multi_functional_probe()
-                } else {
-                    crate::attach::kernel_multi_pid_filter()
-                }
+            &scope,
+            |probe| match probe {
+                MultiScopeProbe::General => multi_functional_probe(),
+                MultiScopeProbe::PidFilter => crate::attach::kernel_multi_pid_filter(),
             },
-            |backend| {
-                let attempt = match scope.as_ref().context("the capture scope was consumed")? {
-                    CaptureScope::System => CaptureScope::System,
-                    CaptureScope::Pid(pin) => CaptureScope::Pid(
-                        pin.try_clone()
-                            .map_err(anyhow::Error::msg)
-                            .context("cloning the PID custody for a preparation")?,
-                    ),
-                };
-                InventoryCapture::prepare(attempt, endpoints, callers, backend)
-            },
+            |attempt, backend| InventoryCapture::prepare(attempt, endpoints, callers, backend),
         )?;
-        scope.take();
-        backend.scope_filter = match (system, backend.backend) {
-            (true, _) => ScopeFilter::None,
-            (false, AttachBackend::Multi) => ScopeFilter::KernelPidAndBpf,
-            (false, AttachBackend::Singles) => ScopeFilter::PerfTaskAndBpf,
-        };
         Ok(Self {
             domain: capture.domain(),
-            incarnation: capture.incarnation(),
+            scope_coverage: capture.scope_coverage(),
             backend,
             state: FacadeState::Active(Box::new(capture)),
         })
@@ -1404,8 +1416,8 @@ impl CaptureLane<PidPin> for FacadeLane {
         }
     }
 
-    fn incarnation(&self) -> Option<ScopeIncarnation> {
-        self.incarnation
+    fn scope_coverage(&self) -> CaptureScopeCoverage {
+        self.scope_coverage
     }
 
     fn extend(

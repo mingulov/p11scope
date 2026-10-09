@@ -71,6 +71,7 @@ struct CountSpec {
 /// number of polls (never, when `None`).
 struct ScriptedLane {
     log: Log,
+    scope_coverage: CaptureScopeCoverage,
     domain: NativeDomainId,
     stamps: Stamps,
     activated: bool,
@@ -136,6 +137,7 @@ impl ScriptedLane {
         cookies.insert((PID, START), TICKET);
         Self {
             log: Rc::clone(log),
+            scope_coverage: CaptureScopeCoverage::System,
             domain: NativeDomainId::mint(),
             stamps: Stamps::default(),
             activated: false,
@@ -171,6 +173,14 @@ impl ScriptedLane {
     fn note(&self, entry: impl Into<String>) {
         self.log.borrow_mut().push(entry.into());
     }
+
+    fn custody(&self) -> ScopeCustody {
+        match self.scope_coverage {
+            CaptureScopeCoverage::System => ScopeCustody::System,
+            CaptureScopeCoverage::Pid(_) => ScopeCustody::PidHeld,
+            CaptureScopeCoverage::Cgroup => ScopeCustody::CgroupHeld,
+        }
+    }
 }
 
 impl NativeIdentity<Pin> for ScriptedLane {
@@ -194,8 +204,8 @@ impl CaptureLane<Pin> for ScriptedLane {
         self.domain
     }
 
-    fn incarnation(&self) -> Option<ScopeIncarnation> {
-        None
+    fn scope_coverage(&self) -> CaptureScopeCoverage {
+        self.scope_coverage
     }
 
     fn extend(
@@ -211,7 +221,7 @@ impl CaptureLane<Pin> for ScriptedLane {
             .collect();
         self.note(format!("extend[{}]", ids.join(",")));
         let mut receipt = ExtendReceipt {
-            custody: Some(ScopeCustody::System),
+            custody: Some(self.custody()),
             ..ExtendReceipt::default()
         };
         if !self.activated {
@@ -366,7 +376,7 @@ impl CaptureLane<Pin> for ScriptedLane {
             rows_read_ns,
             counts_read_ns: rows_read_ns,
             changed_objects: Vec::new(),
-            custody: ScopeCustody::System,
+            custody: self.custody(),
             custody_proven_ns: None,
             unsettled: self.stopping,
         }
@@ -583,7 +593,7 @@ impl Scene {
 }
 
 impl LaneHost<Pin> for Scene {
-    fn begin_capture_coverage(&mut self, scope: Option<ScopeIncarnation>) {
+    fn begin_capture_coverage(&mut self, scope: CaptureScopeCoverage) {
         self.note("begin_capture_coverage");
         self.coordinator.begin_capture_coverage(scope);
     }
@@ -845,6 +855,24 @@ fn the_lane_follows_the_contract_order_from_startup_through_stop() {
     assert_eq!(entries(&log), expected);
     assert_eq!(stopped.summary.passes, 2);
     assert_eq!(stopped.summary.attached, 2);
+    assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
+}
+
+#[test]
+fn cgroup_lane_startup_and_terminal_reads_preserve_explicit_coverage() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.scope_coverage = CaptureScopeCoverage::Cgroup;
+    let (stopped, _) = run(&mut scene, lane, 2);
+    assert_eq!(
+        scene.coverage(),
+        UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+    );
+    assert_eq!(
+        stopped.capture.scope_coverage(),
+        CaptureScopeCoverage::Cgroup
+    );
     assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
 }
 
@@ -2834,6 +2862,98 @@ fn the_collection_worker_hands_back_its_value_or_its_panic() {
 }
 
 // ---- C5.11: backend selection and disclosure --------------------------------
+
+mod cgroup_backend_selection {
+    use super::*;
+    use crate::inventory_capture::{MultiScopeProbe, prepare_scoped_on_backend};
+    use std::sync::Arc;
+
+    #[test]
+    fn cgroup_multi_retry_uses_general_probe_and_the_same_retained_root() {
+        let tree = tempfile::tempdir().unwrap();
+        let selected = tree.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        let saved = crate::scope::cgroup(&selected).unwrap();
+        let crate::attach::Scope::Cgroup { dir: original, .. } = &saved else {
+            unreachable!()
+        };
+        let original = Arc::clone(original);
+        let scope = CaptureScope::cgroup(saved).unwrap();
+        let tried = RefCell::new(Vec::new());
+        let probes = RefCell::new(Vec::new());
+        let (prepared, chosen) = prepare_scoped_on_backend(
+            BackendSelection::Auto,
+            &scope,
+            |probe| {
+                probes.borrow_mut().push(probe);
+                assert_eq!(probe, MultiScopeProbe::General);
+                Ok(())
+            },
+            |attempt, backend| {
+                let CaptureScope::Cgroup(cgroup) = attempt else {
+                    panic!("scope changed")
+                };
+                assert!(Arc::ptr_eq(&original, cgroup.root()));
+                tried.borrow_mut().push(backend);
+                if backend == AttachBackend::Multi {
+                    std::fs::rename(&selected, tree.path().join("held-original")).unwrap();
+                    std::fs::create_dir(&selected).unwrap();
+                    return Err(anyhow!("scripted Multi refusal"));
+                }
+                Ok(cgroup)
+            },
+        )
+        .unwrap();
+        assert_eq!(probes.into_inner(), [MultiScopeProbe::General]);
+        assert_eq!(
+            tried.into_inner(),
+            [AttachBackend::Multi, AttachBackend::Singles]
+        );
+        assert!(Arc::ptr_eq(&original, prepared.root()));
+        assert_eq!(chosen.scope_filter.label(), Some("bpf-cgroup"));
+        assert_eq!(chosen.backend, AttachBackend::Singles);
+    }
+
+    #[test]
+    fn cgroup_singles_does_not_probe_and_keeps_cgroup_filter() {
+        let tree = tempfile::tempdir().unwrap();
+        let scope = CaptureScope::cgroup(crate::scope::cgroup(tree.path()).unwrap()).unwrap();
+        let (_, chosen) = prepare_scoped_on_backend(
+            BackendSelection::Singles,
+            &scope,
+            |_| panic!("Singles must not probe"),
+            |attempt, backend| {
+                assert_eq!(backend, AttachBackend::Singles);
+                assert_eq!(attempt.scope_coverage(), CaptureScopeCoverage::Cgroup);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(chosen.scope_filter, ScopeFilter::BpfCgroup);
+    }
+
+    #[test]
+    fn cgroup_forced_multi_never_tries_singles_after_refusal() {
+        let tree = tempfile::tempdir().unwrap();
+        let scope = CaptureScope::cgroup(crate::scope::cgroup(tree.path()).unwrap()).unwrap();
+        let tried = RefCell::new(Vec::new());
+        let outcome = prepare_scoped_on_backend(
+            BackendSelection::Multi,
+            &scope,
+            |probe| {
+                assert_eq!(probe, MultiScopeProbe::General);
+                Ok(())
+            },
+            |attempt, backend| {
+                assert_eq!(attempt.scope_coverage(), CaptureScopeCoverage::Cgroup);
+                tried.borrow_mut().push(backend);
+                Err::<(), _>(anyhow!("scripted forced refusal"))
+            },
+        );
+        assert!(outcome.is_err());
+        assert_eq!(tried.into_inner(), [AttachBackend::Multi]);
+    }
+}
 
 mod backend_selection {
     use crate::attach::{AttachBackend, BackendSelection};

@@ -849,6 +849,8 @@ pub(crate) enum UnknownReason {
     /// The caller's identity cannot be bound to native evidence.
     #[allow(dead_code)] // Task 6 C4 binder stages it.
     IdentityUnavailable,
+    /// A retained cgroup filter does not prove continuous caller residency.
+    ScopeMembershipUnproven,
     /// A capture capacity (named resource) ran out.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C3/C4 stage it.
     CapacityLimited(&'static str),
@@ -883,6 +885,7 @@ impl UnknownReason {
             Self::NotAttached => "not_attached",
             Self::AttachFailed => "attach_failed",
             Self::IdentityUnavailable => "identity_unavailable",
+            Self::ScopeMembershipUnproven => "scope_membership_unproven",
             Self::CapacityLimited(_) => "capacity_limited",
             Self::Loss(_) => "loss",
             Self::RetiredBeforeCoverage => "retired_before_coverage",
@@ -911,6 +914,7 @@ impl UnknownReason {
             Self::NotAttached => "not attached".into(),
             Self::AttachFailed => "attach failed".into(),
             Self::IdentityUnavailable => "caller identity unavailable".into(),
+            Self::ScopeMembershipUnproven => "continuous cgroup membership unproven".into(),
             Self::CapacityLimited(resource) => format!("capacity limited: {resource}"),
             Self::Loss(reason) => format!("loss: {reason}"),
             Self::RetiredBeforeCoverage => "retired before coverage".into(),

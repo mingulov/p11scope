@@ -13,11 +13,26 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-cgroup-trace.py'))
+
+
+class CellTimingTests(unittest.TestCase):
+    def test_long_sparse_waits_cover_the_real_span_and_final_drain(self):
+        for name, span in (('sparse1', 4), ('sparse10', 30), ('sparse59', 118), ('sparse61', 122)):
+            with self.subTest(cell=name):
+                budget = HARNESS['cell_timing'](name)
+                self.assertGreaterEqual(budget['acknowledgement_seconds'], span + 10)
+                self.assertGreaterEqual(budget['duration_seconds'], span + 30)
+
+    def test_existing_cells_keep_their_bounded_duration_and_wait(self):
+        for name in HARNESS['INITIAL_CELLS']:
+            self.assertEqual(HARNESS['cell_timing'](name),
+                             dict(duration_seconds=20, acknowledgement_seconds=10))
 
 
 class CleanupTests(unittest.TestCase):
@@ -309,6 +324,50 @@ class AcquisitionTests(unittest.TestCase):
 
 
 class TerminationTests(unittest.TestCase):
+    def test_short_child_stays_enrolled_when_term_interrupts_after_acquisition(self):
+        # Interrupt the former remove/insert gap, or the first post-acquisition
+        # read once enrollment is continuous. Deliver a real SIGTERM through
+        # the installed guard and clean only actual direct Popen children.
+        class Owners(list):
+            def remove(owners, child):
+                super().remove(child)
+                os.kill(os.getpid(), signal.SIGTERM)
+        owners, acquired = Owners(), []
+        original_spawn = HARNESS['spawn_owned']
+        def spawn(owners, _argv, **options):
+            for option in ('user', 'group', 'extra_groups'):
+                options.pop(option, None)
+            child = original_spawn(owners,
+                [sys.executable, '-c', 'import time; time.sleep(10)'], **options)
+            acquired.append(child)
+            return child
+        def interrupted_read(*_args):
+            os.kill(os.getpid(), signal.SIGTERM)
+            self.fail('installed termination guard did not unwind')
+        namespace = HARNESS['short_workload'].__globals__
+        selected = mock.Mock()
+        try:
+            with tempfile.TemporaryDirectory() as directory, HARNESS['signal_cleanup']():
+                try:
+                    with mock.patch.dict(namespace, spawn_owned=spawn, Reader=interrupted_read):
+                        with self.assertRaises(HARNESS['TerminationRequested']):
+                            HARNESS['short_workload'](mock.Mock(uid=os.getuid(), gid=os.getgid()),
+                                Path(directory), os.environ, mock.Mock(), mock.Mock(),
+                                selected, owners, [], [])
+                    self.assertEqual(owners, acquired, 'TERM lost the acquired child from cleanup')
+                    selected.move.assert_not_called()
+                finally:
+                    HARNESS['cleanup_processes'](owners)
+            self.assertIsNotNone(acquired[0].popen.poll())
+            self.assertIsNone(acquired[0].pidfd)
+        finally:
+            # Also bound the deliberately broken RED path without signaling
+            # arbitrary PIDs or leaving its acquired pidfd/streams open.
+            HARNESS['cleanup_processes'](acquired)
+            for child in acquired:
+                for stream in (child.popen.stdout, child.popen.stderr):
+                    stream.close()
+
     def test_actual_sigterm_unwinds_and_second_term_cannot_abort_cleanup(self):
         # Children retire themselves if the deliberately broken RED controller
         # dies; the test never abandons descendants or guesses replacement PIDs.
@@ -368,6 +427,186 @@ except h['TerminationRequested'] as error:
             controller.stderr.close()
 
 
+class NativeMatrixFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.provider = Path('/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so')
+        if not self.provider.is_file() or not shutil.which('softhsm2-util') or not shutil.which('gcc'):
+            self.skipTest('requires existing SoftHSM/gcc; installs nothing')
+        self.scratch = tempfile.TemporaryDirectory(prefix='n3-matrix-native-')
+        self.addCleanup(self.scratch.cleanup)
+        self.directory = Path(self.scratch.name)
+        self.executable = self.directory / 'trace-a'
+        subprocess.run(['gcc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
+                        '-o', str(self.executable), str(ROOT / 'tests/fixtures/cgroup-trace/caller.c'),
+                        '-ldl'], check=True, capture_output=True, timeout=20)
+        self.successor = self.directory / 'trace-b'
+        shutil.copyfile(self.executable, self.successor)
+        self.successor.chmod(0o700)
+        tokens = self.directory / 'tokens'
+        tokens.mkdir()
+        config = self.directory / 'softhsm2.conf'
+        config.write_text(f'directories.tokendir = {tokens}\nlog.level = ERROR\n')
+        self.env = dict(os.environ, SOFTHSM2_CONF=str(config))
+        subprocess.run(['softhsm2-util', '--init-token', '--free', '--label', 'n3-matrix-host',
+                        '--so-pin', '5678', '--pin', '1234'], env=self.env, check=True,
+                       capture_output=True, timeout=10)
+        self.owners, self.readers, self.pins = [], [], []
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        try:
+            HARNESS['cleanup_processes'](self.owners)
+        finally:
+            for reader in self.readers:
+                reader.finish()
+            for pin in self.pins:
+                pin.close()
+            for owner in self.owners:
+                if owner.popen:
+                    for stream in (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr):
+                        if stream:
+                            stream.close()
+
+    def start(self, extra=()):
+        self.spawn_started = time.monotonic_ns()
+        owner = HARNESS['spawn_owned'](self.owners,
+            [str(self.executable), str(self.provider), '0', 'selected', *extra], os.getuid(),
+            env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        stdout = HARNESS['Reader'](owner.popen.stdout, self.directory / 'ledger')
+        stderr = HARNESS['Reader'](owner.popen.stderr, self.directory / 'stderr')
+        self.readers.extend((stdout, stderr))
+        return owner, stdout
+
+    def image(self, reader, owner, path, number):
+        pin = HARNESS['FilePin'](path)
+        self.pins.append(pin)
+        return pin.image_receipt(reader.record('image', number), owner)
+
+    def stop(self, owner, reader, number):
+        owner.popen.stdin.write('stop\n')
+        owner.popen.stdin.flush()
+        reader.record('ack', number, 'done')
+        self.assertEqual(owner.popen.wait(timeout=3), 0)
+        pin = runpy.run_path(str(ROOT / 'scripts/mapped-provider-pin.py'))['pin'](self.provider)
+        targets = {(x['image'], x['fn']): x for x in reader.records if x['kind'] == 'target'}
+        for call in (x for x in reader.records if x['kind'] == 'call'):
+            target = targets[call['image'], call['fn']]
+            self.assertEqual((target['dev'], target['ino']), (pin['dev'], pin['ino']))
+            self.assertEqual(call['rv'], 0)
+
+    def test_real_spaced_calls_complete_and_record_actual_gaps(self):
+        owner, reader = self.start()
+        reader.record('ready')
+        self.image(reader, owner, self.executable, 0)
+        phases = []
+        HARNESS['command'](owner, reader, 'C_GetSessionInfo', 3, 20, 'sparse', 'selected',
+                           phases=phases, spaced=True, acknowledgement_seconds=1)
+        calls = [x for x in reader.records if x['kind'] == 'call' and x['phase'] == 'sparse']
+        self.assertEqual(len(calls), 3)
+        for earlier, later in zip(calls, calls[1:]):
+            self.assertGreaterEqual(later['t0'] - earlier['t1'], 20_000_000)
+        self.assertEqual(phases[0]['gap_ms'], 20)
+        self.stop(owner, reader, 0)
+
+    def test_spaced_request_outside_the_bounded_schedule_performs_no_work(self):
+        owner, reader = self.start()
+        reader.record('ready')
+        owner.popen.stdin.write('spaced C_GetSessionInfo 4 61000 refused selected\n')
+        owner.popen.stdin.flush()
+        self.assertEqual(owner.popen.wait(timeout=1), 2)
+        reader.finish()
+        self.assertFalse(any(x['kind'] == 'call' and x['phase'] == 'refused' for x in reader.records))
+
+    def exec_control(self, command, path, mode):
+        owner, reader = self.start()
+        reader.record('ready')
+        before = self.image(reader, owner, self.executable, 0)
+        HARNESS['command'](owner, reader, 'C_GetInfo', 1, 0, 'outside', 'outside')
+        owner.popen.stdin.write(f'{command} {path}\n')
+        owner.popen.stdin.flush()
+        reader.record('ready', 1)
+        after = self.image(reader, owner, path, 1)
+        request = reader.wait(lambda r: next((x for x in r.records
+            if x['kind'] == 'exec' and x['image'] == 0), None), seconds=0.2)
+        self.assertEqual((before['pid'], before['start_time']), (after['pid'], after['start_time']))
+        self.assertEqual(request['mode'], mode)
+        self.assertEqual(request['path'], str(path))
+        self.assertEqual(request['scope'], 'outside')
+        self.assertLess(request['t'], reader.record('image', 1)['t'])
+        if mode == 'nonleader':
+            self.assertNotEqual(request['tid'], request['pid'])
+        else:
+            self.assertEqual(request['tid'], request['pid'])
+        HARNESS['command'](owner, reader, 'C_GetSessionInfo', 2, 0, 'after', 'selected', 1)
+        self.stop(owner, reader, 1)
+        return before, after
+
+    def test_real_same_path_exec_keeps_file_and_birth_but_reports_generation(self):
+        before, after = self.exec_control('exec', self.executable, 'leader')
+        self.assertEqual((before['path'], before['ino']), (after['path'], after['ino']))
+
+    def test_real_nonleader_exec_has_a_distinct_executing_tid(self):
+        before, after = self.exec_control('thread-exec', self.successor, 'nonleader')
+        self.assertNotEqual((before['path'], before['ino']), (after['path'], after['ino']))
+
+    def test_short_native_start_gate_precedes_provider_calls_and_actual_exit(self):
+        gate = self.directory / 'start-gate'
+        owner, reader = self.start(('--start-gate', str(gate), '--auto-gate', str(gate),
+                                    '--auto-count', '1', '--auto-delay-ms', '0'))
+        self.image(reader, owner, self.executable, 0)
+        self.assertFalse(any(x['kind'] == 'call' for x in reader.records))
+        gate.touch()
+        reader.record('ack', 0, 'done')
+        self.assertTrue(owner.wait_exit(1))
+        self.assertLessEqual((time.monotonic_ns() - self.spawn_started) / 1e9, 1)
+        self.assertEqual(owner.popen.wait(timeout=1), 0)
+        calls = [x for x in reader.records if x['kind'] == 'call']
+        self.assertEqual(Counter(x['phase'] for x in calls), Counter(setup=4, main=1, teardown=2))
+
+    def short_adapter(self, refuse_move=False):
+        # Exercise the actual producer adapter with owned ordinary-user native
+        # processes. The cgroup write is the only mocked privileged seam.
+        class Group:
+            path = Path('/sys/fs/cgroup/owned-host-control')
+            def move(group, owner):
+                owner.verify()
+                if refuse_move:
+                    raise ValueError('owned membership barrier refused')
+                group.moved_ns = time.monotonic_ns()
+        selected = Group()
+        caller = HARNESS['FilePin'](self.executable)
+        provider = HARNESS['FilePin'](self.provider)
+        self.pins.extend((caller, provider))
+        original_spawn = HARNESS['spawn_owned']
+        def ordinary_spawn(owners, argv, **options):
+            for option in ('user', 'group', 'extra_groups'):
+                options.pop(option, None)
+            return original_spawn(owners, argv, **options)
+        args = mock.Mock(uid=os.getuid(), gid=os.getgid())
+        images = []
+        with mock.patch.dict(HARNESS['short_workload'].__globals__, spawn_owned=ordinary_spawn):
+            result = HARNESS['short_workload'](args, self.directory, self.env, provider, caller,
+                                              selected, self.owners, self.readers, images)
+        return result, selected, images
+
+    def test_short_real_adapter_validates_image_and_observes_pidfd_exit(self):
+        result, selected, images = self.short_adapter()
+        self.assertEqual(result['caller_rc'], 0)
+        self.assertEqual(images[0]['image'], 1)
+        self.assertGreaterEqual(result['phase']['t0'], selected.moved_ns)
+        lifetime = result['lifetime']
+        self.assertLessEqual((lifetime['exit_observed_ns'] - lifetime['spawn_started_ns']) / 1e9, 1)
+        calls = [x for x in result['reader'].records if x['kind'] == 'call']
+        self.assertEqual(Counter(x['phase'] for x in calls), Counter(setup=4, main=1, teardown=2))
+
+    def test_short_real_adapter_refuses_before_gate_on_membership_failure(self):
+        with self.assertRaises(ValueError):
+            self.short_adapter(refuse_move=True)
+        self.assertFalse((self.directory / 'short-start-gate').exists())
+        self.assertFalse(any(x['kind'] == 'call' for reader in self.readers for x in reader.records))
+
+
 class NativeFixtureTests(unittest.TestCase):
     def test_real_provider_setup_calls_exec_and_teardown_are_all_ledgered(self):
         provider = Path('/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so')
@@ -376,7 +615,7 @@ class NativeFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='n3-native-') as scratch:
             directory = Path(scratch)
             executable = directory / 'trace-a'
-            subprocess.run(['gcc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+            subprocess.run(['gcc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
                             '-o', str(executable), str(ROOT / 'tests/fixtures/cgroup-trace/caller.c'),
                             '-ldl'], check=True, capture_output=True, timeout=20)
             successor = directory / 'trace-b'

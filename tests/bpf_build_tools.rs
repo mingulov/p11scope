@@ -44,6 +44,106 @@ fn env_change(command: &std::process::Command, name: &str) -> Option<Option<OsSt
         .map(|(_, value)| value.map(OsStr::to_os_string))
 }
 
+fn output_command(root: &std::path::Path, prepared: bool) -> std::process::Command {
+    let mut command = if prepared {
+        bpf_tools::bpf_cargo_command(
+            Some(fixture("selected-cargo").into_os_string()),
+            Some(recording_rustc(root).into_os_string()),
+            None,
+        )
+        .unwrap()
+    } else {
+        bpf_tools::bpf_cargo_command(None, None, None).unwrap()
+    };
+    command.arg("build").env(
+        "PATH",
+        fixture(if prepared { "path-decoy" } else { "fallback" }),
+    );
+    command
+}
+
+#[test]
+fn output_isolation_overrides_parent_build_directory_for_both_tool_selections() {
+    for prepared in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent build with space");
+        let mut child_directories = Vec::new();
+        for flavor in [
+            "ebpf-target",
+            "ebpf-inventory-target",
+            "ebpf-inventory-callers-target",
+        ] {
+            let child = root.path().join("out with space").join(flavor);
+            assert!(child.is_absolute());
+            assert!(!child.exists(), "isolation must accept an uncreated path");
+            let tools = root.path().join(flavor);
+            fs::create_dir(&tools).unwrap();
+            let mut command = output_command(&tools, prepared);
+            command.env("CARGO_BUILD_BUILD_DIR", &parent);
+            bpf_tools::isolate_bpf_output(&mut command, &child);
+
+            let record = execute(command, &root.path().join(format!("{flavor}.record")));
+            assert!(
+                record.contains(&format!("build_dir={}\n", child.display())),
+                "prepared={prepared}, {flavor}: child retained parent build directory:\n{record}"
+            );
+            assert!(record.contains(&format!("arg=--target-dir\narg={}\n", child.display())));
+            assert!(!record.contains(parent.to_str().unwrap()));
+            child_directories.push(child);
+        }
+        for (index, directory) in child_directories.iter().enumerate() {
+            assert!(!child_directories[..index].contains(directory));
+        }
+    }
+}
+
+#[test]
+fn output_isolation_sets_build_directory_without_parent_environment() {
+    for prepared in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("out with space/ebpf-target");
+        let mut command = output_command(root.path(), prepared);
+        command.env_remove("CARGO_BUILD_BUILD_DIR");
+        bpf_tools::isolate_bpf_output(&mut command, &child);
+
+        let record = execute(command, &root.path().join("record"));
+        assert!(
+            record.contains(&format!("build_dir={}\n", child.display())),
+            "prepared={prepared}: build directory must be set even when only Cargo configuration can select a parent directory:\n{record}"
+        );
+        assert!(record.contains(&format!("arg=--target-dir\narg={}\n", child.display())));
+    }
+}
+
+#[test]
+fn output_isolation_preserves_non_utf8_paths_for_both_tool_selections() {
+    for prepared in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let child = root
+            .path()
+            .join(OsString::from_vec(b"out with space-\xff".to_vec()))
+            .join("ebpf-target");
+        let mut command = output_command(root.path(), prepared);
+        command.env("CARGO_BUILD_BUILD_DIR", root.path().join("parent"));
+        bpf_tools::isolate_bpf_output(&mut command, &child);
+
+        assert_eq!(
+            env_change(&command, "CARGO_BUILD_BUILD_DIR"),
+            Some(Some(child.clone().into_os_string()))
+        );
+        let mut expected = Vec::new();
+        if !prepared {
+            expected.push(OsStr::new("+nightly-2026-05-20"));
+        }
+        expected.extend([
+            OsStr::new("build"),
+            OsStr::new("--target-dir"),
+            child.as_os_str(),
+        ]);
+        assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+    }
+}
+
 fn effective_uid() -> u32 {
     fs::read_to_string("/proc/self/status")
         .expect("read effective uid")
@@ -288,5 +388,16 @@ fn build_script_selects_tools_before_clang_and_declares_cache_inputs() {
         "cargo:rerun-if-changed=build_support/bpf_tools.rs",
     ] {
         assert!(source.contains(declaration), "missing {declaration}");
+    }
+    assert!(source.contains("bpf_tools::isolate_bpf_output(&mut cmd, &target_dir);"));
+    for flavor_directory in [
+        "BpfFlavor::Detailed => \"ebpf-target\"",
+        "BpfFlavor::InventoryGlobal => \"ebpf-inventory-target\"",
+        "BpfFlavor::InventoryCallers => \"ebpf-inventory-callers-target\"",
+    ] {
+        assert!(
+            source.contains(flavor_directory),
+            "missing {flavor_directory}"
+        );
     }
 }

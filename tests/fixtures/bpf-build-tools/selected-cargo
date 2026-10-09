@@ -7,6 +7,7 @@ set -eu
     printf 'ld_library_path=%s\n' "${LD_LIBRARY_PATH-unset}"
     printf 'workspace_wrapper=%s\n' "${RUSTC_WORKSPACE_WRAPPER-unset}"
     printf 'wrapper=%s\n' "${RUSTC_WRAPPER-unset}"
+    printf 'build_dir=%s\n' "${CARGO_BUILD_BUILD_DIR-unset}"
     for argument in "$@"; do
         printf 'arg=%s\n' "$argument"
     done

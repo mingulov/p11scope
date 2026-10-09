@@ -31,6 +31,33 @@ for the cut rows, the released-code build aa62b87 for the re-measured M1
 and R4 rows, the cut build 6abd2b7 (pool from 8 ranges) as the R4 base. Ranges below are
 the min..max of per-sample p95.
 
+## Offline inventory comparison
+
+`inventory diff` compares the supported projection of two saved inventory v1
+snapshots. Exact recorded executable paths are presentation groups; they do
+not prove equal executable bytes, processes or deployments. Module SHA-256
+matches content, not physical files or load instances. Host/boot, process,
+physical continuity and each side's scope completeness remain unknown,
+including for empty or gap-free inventories. Not observed after does not
+prove removal, and an unchanged projection is not compliance evidence.
+
+Counts remain separate lower-bound entry observations for independent windows;
+no count, time, gap-repeat or budget-counter delta is computed. Missing
+coverage, witnessed use without a count, loss, saturation and in-flight
+entries retain their limits. Instance and detailed semantic changes are not
+compared; physical-edge counts are never distributed across load instances.
+Missing executable paths/digests remain unresolved rather than matched by
+basename, path or build ID. Unknown clock units retain their raw numbers.
+
+The reader accepts only regular inventory v1 JSON files and applies all five
+[input limits](schema/inventory-diff-v1.md#input-and-compatibility) together.
+The row ceiling does not guarantee acceptance below other bounds, and there
+is no numeric report-size or RSS guarantee. Differences and unknown evidence
+exit 0; that status means the comparison succeeded, not complete coverage.
+See [the operator guide](usage.md#offline-inventory-comparison) for output
+publication and errors. This offline capability does not qualify new live
+capture behavior or establish the provenance of its input files.
+
 ## Kernels and backends
 
 ### Optimal path on 6.8 and later (uprobe-multi, probe-proven pid filter)

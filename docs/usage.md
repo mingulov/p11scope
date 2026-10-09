@@ -24,6 +24,7 @@ implementation limits are code contracts, not measurements.
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
 - [Quickstart](#quickstart)
+- [Offline inventory comparison](#offline-inventory-comparison)
 - [PKCS #11 versions and interface names](#pkcs-11-versions-and-interface-names)
 - [Privileges, per environment](#privileges-per-environment)
 - [PID namespaces](#pid-namespaces)
@@ -1007,6 +1008,63 @@ changing capture behavior, it joins the table above and the `--help` list.
   be read.
 - `2` — a CLI usage error (unknown flag, missing value, mutually exclusive
   options, removed subcommand).
+
+## Offline inventory comparison
+
+`inventory diff` compares saved [inventory v1](schema/inventory-v1.md)
+snapshots as an ordinary user. It performs no live process lookup, loads no
+provider, and requires no capture privileges. It accepts neither profile
+reports nor inventory-event JSONL.
+
+```bash
+p11scope inventory diff before.json after.json
+p11scope inventory diff before.json after.json --json
+p11scope inventory diff before.json after.json -o comparison.json
+# Options precede -- when the input names begin with a dash.
+p11scope inventory diff --json -- -before.json -after.json
+```
+
+Default stdout is readable text, with application names, full recorded paths,
+module content digests, and separate before/after evidence. `--json` emits one
+`p11scope/inventory-diff/v1` document plus newline. `-o` atomically saves that
+JSON regardless of stdout mode, before writing stdout. Output aliases of
+either input, including hardlinks and symlinks, are refused; the existing
+trusted-directory/final-name protections apply. The final check and rename
+are not a lock against replacement by a writer in that trusted directory.
+Stdin (`-`) and `-o -` are unsupported; use `--json` for JSON stdout and
+prefix a dash-leading output name with `./`.
+
+For an illustrative application upgrade, suppose `/opt/service/bin/worker`
+has an edge to `/opt/vendor/lib/pkcs11.so` with digest A before and digest B
+after. A and B here stand for different valid 64-digit SHA-256 values, not
+literal input values. The report names one changed application group, two
+content-presence rows, and different module content observed at that path.
+If counts are 128 before and 24 after, they remain separate window
+observations; no -104 delta or throughput change is inferred. Equal digests
+mean equal module bytes, while different inodes remain separate physical
+records in each snapshot. Exact executable paths group application
+observations; equal basenames at different paths remain separate groups.
+
+Read coverage alongside those observations: witnessed use may have no entry
+count; watched no-use applies only to its recorded coverage; absent, unknown,
+lossy, saturated, and in-flight evidence remain explicit. A missing module
+digest or executable path remains unresolved. Each side's scope completeness
+is unknown even with no gaps. Host/boot, process and physical continuity
+remain unknown. Not observed after does not prove removal. An unchanged
+supported projection does not prove equal instance populations or detailed
+semantics: instance and detailed semantic changes are not compared.
+
+Differences and unknown evidence exit 0; input, schema or output failures
+exit 1; usage errors exit 2. A broken stdout pipe exits 0 after any requested
+file succeeds. Another stdout error can exit 1 after that file was published.
+Malformed inputs and exceeded limits fail without a partial successful parse.
+Per input, limits are 64 MiB actually read, 250,000 combined caller/module/
+edge/gap rows, 16,384 decoded UTF-8 bytes per string or key, nesting depth 64,
+and 2,000,000 JSON values plus object keys. All apply together. Legacy
+additive omissions retain unknown states; unknown additive data is bounded
+and ignored rather than copied through. Unknown clock units retain raw values.
+See the [diff schema](schema/inventory-diff-v1.md) for exact fields,
+side-local evidence references, population multiplicity and interpretation.
 
 ## Privileges, per environment
 

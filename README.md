@@ -43,6 +43,13 @@ quantitative claim there cites the script that measured it).
 The v0.3.0 user-facing limits live in
 [docs/known-limitations.md](docs/known-limitations.md).
 
+Saved inventories can be compared offline with
+`p11scope inventory diff before.json after.json`. The readable report groups
+observations by recorded application path and module content; `--json` and
+`-o comparison.json` provide the [diff schema](docs/schema/inventory-diff-v1.md).
+Counts describe independent windows, and absence does not prove removal.
+See [offline comparison examples](docs/usage.md#offline-inventory-comparison).
+
 ## Building from source
 
 The root manifest selects two patched crates reconstructed from

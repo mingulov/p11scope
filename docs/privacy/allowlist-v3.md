@@ -3,8 +3,10 @@
 
 **Status: PROPOSED; pending independent privacy and implementation review,
 except [Inventory caller identity](#inventory-caller-identity-owner-ruling-fb-priv),
-which is IMPLEMENTED in v0.2.0 by owner ruling FB-PRIV (2026-10-03).**
-Apart from that one section, this document does not enable capture, describe
+which is IMPLEMENTED in v0.2.0 by owner ruling FB-PRIV (2026-10-03), and
+[offline inventory diff re-projection](#offline-inventory-diff-re-projection),
+which describes the implemented offline report and grants no capture authority.**
+Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
 exclusions are unchanged.
@@ -434,6 +436,37 @@ new kernel-side state is the per-pair entry counter BPF already keeps.
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
 | Per-edge entry count and last activity (C7 C4) | The uprobe firing on an admitted endpoint, counted in BPF against the existing CALLER_USE key for the (caller image, provider object) pair. No target-memory read, no argument read, no BPF timestamp: recency is derived in userspace from the read instant. | Public per (caller incarnation × module) edge in `p11scope/inventory/v1` (`edges[].entries`: saturating lower-bound `count` of entries on attached endpoints since the pair's first record, including calls that returned errors, with `last_seen_ns` at pass resolution), the inventory event stream's `edge_observed` records, and the inventory dashboard/pager. Never per function, per thread, or per call time. A pair with no row reads `unknown (uncounted)` and names the `PairInsertFailure` evidence, never 0. | A count read mid-capture is a lower bound; only the post-stop read is final, and settlement stays `unsettled`. An unreadable health cell withholds watches without inventing counts. Documented in [inventory v1](../schema/inventory-v1.md) (`edges[].entries.coverage`) and [inventory events v1](../schema/inventory-events-v1.md) (`edge_observed`). |
+
+## Offline inventory diff re-projection
+
+`p11scope inventory diff` reads two explicitly supplied saved
+`p11scope/inventory/v1` files as an ordinary user. Its
+[inventory-diff v1 report](../schema/inventory-diff-v1.md) reprojects only
+already-published inventory fields. It performs no target-memory or argument
+read, live process lookup, provider loading, or new capture. This section
+adds no permission to any live observer, decoder, profile, metrics, trace,
+inventory producer or kernel map. V1/v2 exclusions remain unchanged.
+
+| Field | Source, authority and validation | Retention and public output | Failure and evidence boundary |
+| --- | --- | --- | --- |
+| Offline inventory comparison | Exact saved inventory v1 schema, bounded JSON and resolved same-input caller/module references; no additional authority inferred from file contents. | Per-side scope/clock/window, PID-namespace labels, budgets/refusals, loss/gap evidence; pooled caller PID/start/executable path and file metadata/lifecycle; pooled module recorded paths/device/inode/digest/build ID/admission/lifecycle/unbound-use; pooled physical-edge mapping/entry count/coverage and semantic-availability label. Report-local numeric references, occurrence/population lists, shared executable-path dictionary, content/path/application presence and change codes, summary counts and limitations are derived from those fields only. | Malformed shapes/references and exceeded limits fail. Unknown additive data is bounded and ignored, never copied to output. Unknown labels/units remain unknown. Validate staged installed offline behavior separately from input capture provenance and live capture qualification. |
+
+The [schema's field inventory](../schema/inventory-diff-v1.md#evidence-pools-and-references)
+defines the precise output projection. Input caller/module IDs, incarnation,
+task cookies and exec IDs are not output identities. Detailed mechanism and
+operation values, additive load-instance and semantic-edge data, and arbitrary
+unknown subtrees are not copied into the report. Recorded paths and allowed
+free-text evidence remain input facts; a saved file does not authorize new
+reads or establish that the application called a provider. Text/diagnostics
+escape controls; JSON preserves decoded input strings through JSON escaping.
+
+Every count and clock belongs to its own observation window; no counter delta
+or host/boot/process/physical continuity is inferred. Missing observations do
+not prove removal or inactivity, and unknown scope completeness remains
+explicit. This re-projection introduces no host ID, boot ID, machine ID,
+executable hash, command line, argument, buffer, handle, or raw address capture.
+Its output remains subject to the input publication's privacy contract; it is
+not a secret scrubber for fabricated or otherwise untrusted saved input.
 
 ## Required evidence before activation
 

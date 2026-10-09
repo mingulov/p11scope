@@ -3729,12 +3729,64 @@ fn check_pin_after_read(after: Result<Pin, String>, before: &Pin) -> Result<(), 
     }
 }
 
+/// Opt-in inventory identity scan. Custody receives the already opened file,
+/// never a pathname to reconstruct after the scan has completed.
+#[allow(dead_code)]
+pub(crate) fn scan_process_view_held(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    custody: &mut super::kernel_identity::ExaminedCustody,
+    scan: u64,
+) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+    scan_view_with_custody(request, view, budget, &mut ProcScanIo, true, custody, scan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_view_with_custody(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+    scan_memory: bool,
+    custody: &mut super::kernel_identity::ExaminedCustody,
+    scan: u64,
+) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+    let result = scan_view_examined_mode(
+        request,
+        view,
+        budget,
+        io,
+        scan_memory,
+        Some((&mut *custody, scan)),
+    );
+    if !result
+        .as_ref()
+        .is_ok_and(|(outcome, _)| outcome.mapping_scan_completed())
+        || budget.stopped_reason().is_some()
+    {
+        custody.discard_scan(scan);
+    }
+    result
+}
+
 fn scan_view_with_examined(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
     io: &mut impl ScanIo,
     scan_memory: bool,
+) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+    scan_view_examined_mode(request, view, budget, io, scan_memory, None)
+}
+
+fn scan_view_examined_mode(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    io: &mut impl ScanIo,
+    scan_memory: bool,
+    mut custody: Option<(&mut super::kernel_identity::ExaminedCustody, u64)>,
 ) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
@@ -3969,6 +4021,20 @@ fn scan_view_with_examined(
                     identity: held.identity,
                     key_is_identity: held.key_is_identity(key),
                 });
+                if let Some((custody, scan)) = &mut custody {
+                    // The census includes this actual File and all current
+                    // scan/admitted FDs. Enclosing stop/deadline checks refuse
+                    // a count that completes after the collection has stopped.
+                    if budget.check_deadline_now().is_none() && budget.poll_collection(1) {
+                        custody.offer(*scan, *examined.last().expect("just examined"), file);
+                        if budget.check_deadline_now().is_some() || !budget.poll_collection(0) {
+                            custody.close();
+                        }
+                    } else {
+                        custody.close();
+                        custody.offer(*scan, *examined.last().expect("just examined"), file);
+                    }
+                }
             }
             continue;
         }
@@ -4203,6 +4269,70 @@ pub(crate) fn final_maps_refusal_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_scan_transfers_opened_nonprovider_and_invalidates_failed_brackets() {
+        use crate::discovery::kernel_identity::ExaminedCustody;
+        use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
+        use std::os::fd::AsRawFd;
+        for failure in 0..4 {
+            let mut fixture = BracketFixture::new(8, false);
+            let meta = std::fs::metadata(&fixture.path).unwrap();
+            let identity = crate::discovery::identity::FileIdentity {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            };
+            fixture.mapped = Some((identity, identity));
+            fixture.fail_open_b = failure == 1;
+            fixture.fail_read_b = failure == 2;
+            fixture.fail_generation = failure == 3;
+            // Script maps/memory reads, but retain the real file the scanner
+            // opened. This does not claim a live kernel identity proof.
+            let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+            let hooks = HookRegistry::builtin();
+            let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 2);
+            let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+            let scan = custody.begin_scan();
+            let mut budget = CaptureWorkBudget::default();
+            let (outcome, examined) = scan_view_with_custody(
+                &ScanRequest {
+                    pid: view.pid(),
+                    hints: &[],
+                    hooks: &hooks,
+                },
+                &view,
+                &mut budget,
+                &mut fixture,
+                false,
+                &mut custody,
+                scan,
+            )
+            .unwrap();
+            if failure == 0 {
+                assert!(outcome.mapping_scan_completed());
+                assert_eq!(examined.len(), 1);
+                assert_eq!(
+                    owner.examined_for_test().0,
+                    1,
+                    "scan returned metadata without its exact File"
+                );
+                let fd = custody.file_for_test(scan).unwrap().as_raw_fd();
+                std::fs::remove_file(&fixture.path).unwrap();
+                assert!(custody.file_for_test(scan).unwrap().metadata().is_ok());
+                drop(custody);
+                // SAFETY: descriptor observation only, after custody drop.
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+            } else {
+                assert!(!outcome.mapping_scan_completed());
+                assert!(examined.is_empty());
+                assert_eq!(
+                    owner.examined_for_test().0,
+                    0,
+                    "failed scan retained file custody"
+                );
+            }
+        }
+    }
 
     pub(super) fn final_maps_refusal(
         view: &ProcessView,
@@ -6111,15 +6241,12 @@ mod tests {
         for decision in [
             "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
             "if hinted && !attributable {",
-            "if request.hints.is_empty() && exports.is_empty() {\n            \
-             // Opened, identified, and read: examined, and not a provider.\n            \
-             if let Some(held) = held {\n                \
-             examined.push(ExaminedObject {\n                    \
+            "if request.hints.is_empty() && exports.is_empty() {",
+            "examined.push(ExaminedObject {\n                    \
              key,\n                    \
              identity: held.identity,\n                    \
              key_is_identity: held.key_is_identity(key),\n                \
-             });\n            }\n            \
-             continue;\n        }",
+             });",
         ] {
             assert!(
                 scan_body.contains(decision),

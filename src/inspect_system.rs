@@ -36,6 +36,7 @@ use crate::discovery::identity::{
     ExaminedObject, PinnedObjectId, PinnedObjects, ReconciledModule, bind_scanned_modules,
     canonicalize_scanned_overlays, pin_scanned_view_objects,
 };
+use crate::discovery::kernel_identity::{EXAMINED_ANCHOR_CAP, ExaminedCustody};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::proof_stats::{ProofStatPool, proof_stat_threads};
 use crate::discovery::scan::{
@@ -357,6 +358,16 @@ fn collect_members(
     max_scan_pids: Option<usize>,
     timings: &mut StageTimings,
 ) -> Collection {
+    collect_members_identity(hints, hooks, max_scan_pids, timings, false).0
+}
+
+fn collect_members_identity(
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    max_scan_pids: Option<usize>,
+    timings: &mut StageTimings,
+    identity: bool,
+) -> (Collection, Option<ExaminedCustody>) {
     progress!("p11scope: enumerating processes...");
     let scope = Scope::System;
     let (pids, unlisted) = scope_pids(&scope);
@@ -404,6 +415,40 @@ fn collect_members(
     };
     let cap_hit = pids.len() > cap;
 
+    let mut custody = identity.then(|| {
+        let mut callers = BTreeMap::new();
+        let selected_set: BTreeSet<_> = selected.iter().copied().collect();
+        for (pid, entries) in &sweep {
+            if selected_set.contains(pid) {
+                continue;
+            }
+            let keys: BTreeSet<_> = entries
+                .iter()
+                .filter(|entry| is_caller_range(entry))
+                .map(ObjectKey::of)
+                .collect();
+            for key in keys {
+                *callers.entry(key).or_default() += 1;
+            }
+        }
+        // A failed strict census starts a closed custody phase: the normal
+        // userspace scan still runs, but no partial anchor population forms.
+        match SegmentPolicy::try_snapshot(0, 0) {
+            Ok(policy) => ExaminedCustody::new(
+                ReservationOwner::for_examined(policy, EXAMINED_ANCHOR_CAP),
+                callers,
+            ),
+            Err(reason) => {
+                let mut failed = ExaminedCustody::new(
+                    ReservationOwner::for_examined(SegmentPolicy::from_headroom(0, 0, 0), 0),
+                    callers,
+                );
+                let _ = failed.reconcile_census(Err(reason));
+                failed
+            }
+        }
+    });
+
     let mut members = Vec::with_capacity(selected.len());
     let deep_start = monotonic_ns();
     for (index, pid) in selected.iter().enumerate() {
@@ -417,29 +462,33 @@ fn collect_members(
         let Ok(view_index) = u32::try_from(index) else {
             break;
         };
-        members.push(scan_member(
+        members.push(scan_member_identity(
             *pid,
             ProcessViewId(view_index),
             hints,
             hooks,
             &mut budget,
             &mut noise,
+            custody.as_mut(),
         ));
     }
     timings.span(StageKind::Scan, "deep_scan", deep_start, monotonic_ns());
     noise.report();
-    Collection {
-        enumerated: pids,
-        selected,
-        cap,
-        cap_hit,
-        members,
-        scope_gaps,
-        proc_list_failed,
-        sweep,
-        sweep_unavailable,
-        budget,
-    }
+    (
+        Collection {
+            enumerated: pids,
+            selected,
+            cap,
+            cap_hit,
+            members,
+            scope_gaps,
+            proc_list_failed,
+            sweep,
+            sweep_unavailable,
+            budget,
+        },
+        custody,
+    )
 }
 
 /// Deep-scan one member and pin what it named, fail-open: an unreadable
@@ -451,6 +500,18 @@ fn scan_member(
     hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     noise: &mut DiscoveryNoiseAggregator,
+) -> MemberResult {
+    scan_member_identity(pid, view, hints, hooks, budget, noise, None)
+}
+
+fn scan_member_identity(
+    pid: u32,
+    view: ProcessViewId,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    noise: &mut DiscoveryNoiseAggregator,
+    custody: Option<&mut ExaminedCustody>,
 ) -> MemberResult {
     let started_ns = monotonic_ns();
     let budget_before = (budget.stopped_reason(), budget.refusal_counts());
@@ -469,7 +530,7 @@ fn scan_member(
     };
     let mut reader = ProcessViewImageReader::new(&view_handle);
     scan_member_application_with(&mut reader, |reader| {
-        scan_pinned_member(
+        scan_pinned_member_identity(
             reader.view(),
             hints,
             hooks,
@@ -477,6 +538,7 @@ fn scan_member(
             noise,
             started_ns,
             budget_before,
+            custody,
         )
     })
 }
@@ -490,6 +552,61 @@ fn scan_pinned_member(
     noise: &mut DiscoveryNoiseAggregator,
     started_ns: Option<u64>,
     budget_before: (Option<&'static str>, (u64, u64)),
+) -> MemberResult {
+    scan_pinned_member_identity(
+        view_handle,
+        hints,
+        hooks,
+        budget,
+        noise,
+        started_ns,
+        budget_before,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_pinned_member_identity(
+    view_handle: &ProcessView,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    noise: &mut DiscoveryNoiseAggregator,
+    started_ns: Option<u64>,
+    budget_before: (Option<&'static str>, (u64, u64)),
+    mut custody: Option<&mut ExaminedCustody>,
+) -> MemberResult {
+    let scan = custody.as_mut().map(|held| held.begin_scan());
+    let result = scan_pinned_member_inner(
+        view_handle,
+        hints,
+        hooks,
+        budget,
+        noise,
+        started_ns,
+        budget_before,
+        custody.as_deref_mut().zip(scan),
+    );
+    if (!result.mapping_scan_completed
+        || !result.status.inventoried()
+        || result.complete_scan.is_none())
+        && let Some((custody, scan)) = custody.zip(scan)
+    {
+        custody.discard_scan(scan);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_pinned_member_inner(
+    view_handle: &ProcessView,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    noise: &mut DiscoveryNoiseAggregator,
+    started_ns: Option<u64>,
+    budget_before: (Option<&'static str>, (u64, u64)),
+    custody: Option<(&mut ExaminedCustody, u64)>,
 ) -> MemberResult {
     let pid = view_handle.pid();
     let view = view_handle.id();
@@ -513,19 +630,29 @@ fn scan_pinned_member(
             gaps,
         );
     }
-    let (outcome, examined) =
-        match scan_process_view_examined(&ScanRequest { pid, hints, hooks }, view_handle, budget) {
-            Ok(scanned) => scanned,
-            Err(error) => {
-                return member_not_scanned(
-                    pid,
-                    view,
-                    &format!("the process could not be scanned: {error}"),
-                    noise,
-                    gaps,
-                );
-            }
-        };
+    let request = ScanRequest { pid, hints, hooks };
+    let scanned = match custody {
+        Some((custody, scan)) => crate::discovery::scan::scan_process_view_held(
+            &request,
+            view_handle,
+            budget,
+            custody,
+            scan,
+        ),
+        None => scan_process_view_examined(&request, view_handle, budget),
+    };
+    let (outcome, examined) = match scanned {
+        Ok(scanned) => scanned,
+        Err(error) => {
+            return member_not_scanned(
+                pid,
+                view,
+                &format!("the process could not be scanned: {error}"),
+                noise,
+                gaps,
+            );
+        }
+    };
     if !view_handle.still_the_same() {
         return member_not_scanned(
             pid,
@@ -946,8 +1073,43 @@ pub(crate) fn collect(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
 ) -> Result<Catalog> {
+    collect_identity(hints, hooks, max_scan_pids, policy, false).map(|(catalog, _)| catalog)
+}
+
+/// Dormant opt-in collection seam for the inventory identity backend. The
+/// catalog and its admitted pins own no references into the custody sidecar.
+#[allow(dead_code)]
+pub(crate) fn collect_inventory_identity(
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    max_scan_pids: Option<usize>,
+    policy: AdmissionPolicy,
+) -> Result<(Catalog, ExaminedCustody)> {
+    if !matches!(policy, AdmissionPolicy::Inventory(_)) {
+        return Err(anyhow::anyhow!(
+            "physical identity collection requires inventory policy"
+        ));
+    }
+    let (catalog, custody) = collect_identity(hints, hooks, max_scan_pids, policy, true)?;
+    Ok((catalog, custody.expect("opt-in collection owns custody")))
+}
+
+fn collect_identity(
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    max_scan_pids: Option<usize>,
+    policy: AdmissionPolicy,
+    identity: bool,
+) -> Result<(Catalog, Option<ExaminedCustody>)> {
     let mut timings = StageTimings::new();
-    let mut collection = collect_members(hints, hooks, max_scan_pids, &mut timings);
+    let (mut collection, mut custody) = if identity {
+        collect_members_identity(hints, hooks, max_scan_pids, &mut timings, true)
+    } else {
+        (
+            collect_members(hints, hooks, max_scan_pids, &mut timings),
+            None,
+        )
+    };
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
         scanned: collection.scanned(),
@@ -970,8 +1132,29 @@ pub(crate) fn collect(
     // for this confirmation stage only (DR-C1b-3); the shards never nest
     // that pool.
     let shards = shard_count(collection.sweep.len(), shard_threads());
-    let segment_policy = SegmentPolicy::snapshot(shard_threads(), collection.sweep.len());
-    let reservations = ReservationOwner::new(segment_policy);
+    let (segment_policy, reservations) = if let Some(held) = &mut custody {
+        let ready = !held.failed()
+            && collection.budget.check_deadline_now().is_none()
+            && collection.budget.poll_collection(0);
+        let census = if ready {
+            let census = SegmentPolicy::try_snapshot(shard_threads(), collection.sweep.len());
+            if collection.budget.check_deadline_now().is_some()
+                || !collection.budget.poll_collection(0)
+            {
+                Err(crate::discovery::sweep_attribution::FD_CENSUS_REASON.into())
+            } else {
+                census
+            }
+        } else {
+            Err(crate::discovery::sweep_attribution::FD_CENSUS_REASON.into())
+        };
+        let segment_policy =
+            identity_confirmation_policy(held, census).map_err(anyhow::Error::msg)?;
+        (segment_policy, held.owner.clone())
+    } else {
+        let policy = SegmentPolicy::snapshot(shard_threads(), collection.sweep.len());
+        (policy, ReservationOwner::new(policy))
+    };
     let attribute = |pools: ProofPools<'_>| {
         attribute_sweep_with(
             &mut collection,
@@ -999,7 +1182,24 @@ pub(crate) fn collect(
     let mut catalog = assemble(collection, bound, attributed, policy);
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
-    Ok(catalog)
+    Ok((catalog, custody))
+}
+
+/// The exact post-bind integration branch. A strict refusal closes custody
+/// and permits only the bounded immediate fallback on the same owner. It
+/// cannot trigger another census or restore batch workers.
+fn identity_confirmation_policy(
+    held: &mut ExaminedCustody,
+    census: Result<SegmentPolicy, String>,
+) -> Result<SegmentPolicy, String> {
+    let strict_policy = census.as_ref().ok().copied();
+    if held.reconcile_census(census).is_ok() {
+        Ok(strict_policy.expect("successful reconciliation has a complete census"))
+    } else {
+        let policy = SegmentPolicy::from_headroom(3, 0, 0);
+        held.owner.reconcile(policy)?;
+        Ok(policy)
+    }
 }
 
 /// Immediate work keeps its FD-free proof pool even when the population
@@ -2391,6 +2591,62 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn d3b_failed_strict_census_never_reenumerates_or_restores_batch() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        for refusal in ["timeout", "entry cap", "stopped budget"] {
+            let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 2);
+            let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+            let file = tempfile::tempfile().unwrap();
+            let fd = file.as_raw_fd();
+            let meta = file.metadata().unwrap();
+            let key = ObjectKey {
+                device: p11scope_manifest::maps::Device {
+                    major: libc::major(meta.dev()) as u64,
+                    minor: libc::minor(meta.dev()) as u64,
+                },
+                inode: meta.ino(),
+            };
+            let scan = custody.begin_scan();
+            assert!(custody.offer_for_test(
+                scan,
+                ExaminedObject {
+                    key,
+                    identity: crate::discovery::identity::FileIdentity {
+                        dev: meta.dev(),
+                        ino: meta.ino(),
+                    },
+                    key_is_identity: false,
+                },
+                file
+            ));
+            let (policy, calls) =
+                crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+                    identity_confirmation_policy(&mut custody, Err(format!("injected {refusal}")))
+                        .unwrap()
+                });
+            assert_eq!(calls, 0, "strict refusal retried a census after {refusal}");
+            assert_eq!(
+                (policy.headroom, policy.workers, policy.retained),
+                (3, 0, 0)
+            );
+            assert!(custody.failed());
+            assert_eq!(owner.examined_for_test().0, 0);
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: fstat observes a possibly closed descriptor; matching
+            // metadata only guards against FD-number reuse by other tests.
+            let still_held = unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0 && {
+                // SAFETY: successful fstat initialized stat.
+                let stat = unsafe { stat.assume_init() };
+                stat.st_dev == meta.dev() && stat.st_ino == meta.ino()
+            };
+            assert!(!still_held, "strict refusal leaked its examined File");
+            assert_eq!(owner.examined_capacity(), 0);
+            assert!(owner.examined().is_err());
+        }
+    }
+
     use super::*;
     use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedTable};
 

@@ -804,17 +804,28 @@ mod tests {
         );
         let attach = include_str!("attach.rs");
         let capture = body(attach, "    fn start_inner(");
-        assert!(capture.contains("load_capture_object("));
+        assert!(capture.contains("load_capture_object_with_images("));
         assert!(
             !capture.contains("EbpfLoader"),
             "a second loader configuration"
         );
-        let shared = body(attach, "pub(crate) fn load_capture_object(");
+        let wrapper = body(attach, "pub(crate) fn load_capture_object(");
+        assert!(wrapper.contains(
+            "load_capture_object_with_images(btf, events_bytes, discovery_bytes, false)"
+        ));
+        assert!(
+            !wrapper.contains("EbpfLoader"),
+            "a second loader configuration"
+        );
+        let shared = body(attach, "fn load_capture_object_with_images(");
         for setting in [
             ".btf(Some(btf))",
             ".allow_unsupported_maps()",
             ".map_max_entries(\"EVENTS\", events_bytes)",
             ".map_max_entries(\"DISCOVERY\", discovery_bytes)",
+            ".map_max_entries(\"IMAGE_CONTINUITY\", if full_images { 16_384 } else { 1 })",
+            ".map_max_entries(\"IMAGE_TGID_INDEX\", if full_images { 16_384 } else { 1 })",
+            ".map_max_entries(\"IMAGE_QUERY_REQUESTS\", if full_images { 1_024 } else { 1 })",
             ".load(crate::EBPF_OBJECT)",
         ] {
             assert!(shared.contains(setting), "{setting}");
